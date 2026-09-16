@@ -64,7 +64,8 @@ defmodule LoopctlWeb.IntakeSourceController do
         "is refused with 403 `api_key_mint_forbidden`. 422 when the repository is not " <>
         "`owner/name`, an active source already binds it, or the project is missing, not a " <>
         "work project, or archived, or `target_epic_id` names an epic that is not in that " <>
-        "project. The secret is encrypted at rest.",
+        "project. The secret is encrypted at rest. `base_branch` defaults to `master` when " <>
+        "the body does not name it.",
     request_body:
       {"Intake source", "application/json",
        %Schema{
@@ -85,6 +86,20 @@ defmodule LoopctlWeb.IntakeSourceController do
                  "in; it must belong to this source's project. Omit it and reports from " <>
                  "this source are escalated to a human instead of becoming stories, which " <>
                  "is the safe default rather than a guess."
+           },
+           base_branch: %Schema{
+             type: :string,
+             minLength: 1,
+             maxLength: 255,
+             description:
+               "Optional. The branch every dispatch for this repository is cut FROM, and " <>
+                 "the `base_branch` an unattended dispatch carries (#803). OMIT IT for " <>
+                 "`master`, which is what dispatches carried before the field existed; send " <>
+                 "`main` for a repository created on GitHub since 2020, or the loop places " <>
+                 "work against a branch that does not exist. NOT nullable, unlike " <>
+                 "`target_epic_id`: there is no unanswered state for a branch a dispatch " <>
+                 "must name, so an explicit null or an empty string is a 422 rather than a " <>
+                 "silent fallback to the default. Changed afterwards with PATCH."
            }
          }
        }},
@@ -101,9 +116,7 @@ defmodule LoopctlWeb.IntakeSourceController do
            }
          }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
-      422 =>
-        {"Validation error, or `nothing_to_update` — the body named neither field",
-         "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -208,11 +221,19 @@ defmodule LoopctlWeb.IntakeSourceController do
     # (an epic outside this source's project, refused at enrollment). Dropping it here is what
     # made the column unreachable through every documented path — the only way to set it was
     # direct SQL, so every promote escalated and the feature had no code path at all.
-    attrs = %{
-      repo_full_name: params["repo_full_name"],
-      project_id: params["project_id"],
-      target_epic_id: params["target_epic_id"]
-    }
+    # `base_branch` is read by PRESENCE, the way `update/2` reads both of its fields, and NOT
+    # passed through as given like `target_epic_id`. The column is NOT NULL with a default of
+    # `master`, so absent and explicitly null are different requests: absent keeps the default
+    # every enrolment has always taken, while a caller that named the field gets its value
+    # validated. Passing the key unconditionally would turn every enrolment that omits it into
+    # a `can't be blank` 422.
+    attrs =
+      %{
+        repo_full_name: params["repo_full_name"],
+        project_id: params["project_id"],
+        target_epic_id: params["target_epic_id"]
+      }
+      |> put_if_present(params, "base_branch", :base_branch)
 
     with {:ok, %{source: source, webhook_secret: secret}} <-
            Intake.create_source(tenant.id, attrs, actor_lineage: actor_lineage(conn)) do

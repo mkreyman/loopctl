@@ -80,7 +80,18 @@ defmodule Loopctl.Intake.Source do
   @spec create_changeset(t(), map()) :: Ecto.Changeset.t()
   def create_changeset(%__MODULE__{} = source, attrs) do
     source
-    |> cast(attrs, [:repo_full_name, :base_branch])
+    |> cast(attrs, [:repo_full_name])
+    # THE BRANCH IS CAST ON ITS OWN, with `empty_values: []`, which is NOT Ecto's default.
+    # The default treats `""` as absent, so an empty branch would be dropped from the
+    # changeset and the row would take the schema default while the caller believed it had
+    # named one — a silent substitution for a request that was plainly wrong. This is the
+    # same choice `Loopctl.Intake.update_source/4` makes, for the same reason: a caller that
+    # SENT a value gets an answer about the value it sent.
+    #
+    # A key that is ABSENT is still absent: nothing is cast, so the schema default `master`
+    # stands and `validate_required/2` below is satisfied by it. That is what keeps an
+    # enrolment that names no branch working exactly as it did before the field was offered.
+    |> cast(attrs, [:base_branch], empty_values: [])
     |> validate_required([:repo_full_name, :base_branch])
     |> validate_length(:base_branch, min: 1, max: 255)
     |> validate_format(:repo_full_name, @repo_format, message: "must be owner/name")

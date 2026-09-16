@@ -52,10 +52,34 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Presence decides on update, so `target_epic_id: null` is the CLEAR and not a neutral value —
   clearing it returns the source to escalating every report to a human instead of filing a
   story; the client omits an unnamed field rather than nulling it, and says so in the
-  imperative. And a new source ALWAYS starts at `base_branch` `master` — the create path builds
-  its attrs from three params and `base_branch` is not one of them — so a repository whose trunk
-  is `main` needs `intake_source_update` immediately after enrolling, or the loop places work
-  against a branch that does not exist.
+  imperative. And `base_branch` is named at ENROLMENT: it defaults to `master`
+  when the body omits it, so a repository whose trunk is `main` — GitHub's default since 2020 —
+  must name it or the loop places work against a branch that does not exist, and the failure
+  arrives after the claim. It is not nullable, since every dispatch must name a branch to cut
+  from, so a null or a blank one is refused here rather than falling back to the default.
+  `intake_source_update` is what corrects a source already pointed at the wrong trunk.
+
+  **The source object in every result is built from NAMED FIELDS, not echoed.** All four tools
+  reshape it to `id`, `project_id`, `repo_full_name`, `base_branch`, `target_epic_id`,
+  `revoked_at`, `inserted_at`, `updated_at`. A tool result is stringified into the transcript
+  and the audit log, so echoing the server's object would rest "the secret never enters a
+  transcript" entirely on the server's own encoder allowlist continuing to exclude it; one
+  commit widening that list would carry it into every transcript with nothing in this package
+  to stop it. The cost is that a new server field is invisible until this list names it, which
+  is the intended direction of the failure.
+
+  **`intake_source_enroll` recovers what it can and revokes what it cannot.** A 2xx carrying
+  the source and the secret but no `webhook_path` is no longer discarded — the path is a pure
+  function of the source id, so it is derived and the result carries `webhook_url_derived: true`
+  — and an outcome that proves a source id but no usable secret now REVOKES that source, as
+  `runner_enroll` does, rather than asking the operator to list and revoke by hand: it could
+  never authenticate a delivery and it holds the repository's unique slot until it is gone.
+
+  **A blank `target_epic_id` is refused as OPTIONAL, not as required.** The shared UUID check
+  answers "required" for an empty string, which is the opposite of the truth here: a caller
+  that cannot emit a JSON null sends `""` to mean the clear, and being told the field is
+  required invites it to invent an epic id. The refusal now names the remedy — null to clear on
+  update, omit to leave it alone.
 
   All four take `LOOPCTL_USER_KEY`, pinned exactly. The controller is `role: :user` with
   `RequireHumanAnchor` on the writes, and create additionally requires a caller no dispatch

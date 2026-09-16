@@ -43,14 +43,19 @@
  * whose JSON failed to parse reaches this code as `{error: true, status: 201, body: "<first
  * 200 characters of the raw text>"}` — which is the secret.
  *
- * ## WHERE THIS DELIBERATELY DOES LESS THAN `runner_enroll`
+ * ## WHERE THIS DIFFERS FROM `runner_enroll`
  *
- * `enrollRunner` scrapes the runner id out of an unparseable 2xx body so it can revoke what
- * it cannot identify by name — a runner found by NAME alone might be an earlier, legitimate
- * enrollment. An intake source needs no such scraping: `intake_sources_active_repo_uidx` is
- * unique on `(tenant_id, repo_full_name)` WHERE `revoked_at IS NULL`, so at most one ACTIVE
- * source ever binds a repository and `intake_source_list` identifies it exactly. The
- * ambiguous branch therefore names that pair of tools instead of guessing at an id.
+ * The RECOVERY is the same: an outcome that is not a clean creation revokes the source when
+ * the response proved its id, since the secret cannot be re-read and an unusable source still
+ * holds the repository's unique slot.
+ *
+ * What is not the same is the fallback when no id was proved. `enrollRunner` scrapes the
+ * runner id out of an unparseable 2xx body, because a runner found by NAME alone might be an
+ * earlier, legitimate enrollment. An intake source needs no such scraping:
+ * `intake_sources_active_repo_uidx` is unique on `(tenant_id, repo_full_name)` WHERE
+ * `revoked_at IS NULL`, so at most one ACTIVE source ever binds a repository and
+ * `intake_source_list` identifies it exactly — so that branch names the pair of tools rather
+ * than guessing at an id.
  *
  * A source whose secret nobody holds is also INERT rather than dangerous: no delivery can
  * ever be signed for it, so every POST to its URL is refused `401 invalid_signature`. What it
@@ -99,8 +104,73 @@ function refuse(body) {
   return { error: true, status: 0, body };
 }
 
+/**
+ * `target_epic_id` when the caller sent SOMETHING for it — the shared `uuid()` check, except
+ * for a blank value.
+ *
+ * `uuid()` answers "`target_epic_id` is required" for an empty or blank string, which is the
+ * OPPOSITE of the truth for this field: it is optional everywhere it appears. A caller that
+ * has read "an explicit null CLEARS it" and cannot emit a JSON null — a model filling a
+ * `type: "string"` schema — sends `""` to mean the clear, is told the optional field is
+ * required, and its likeliest next move is to invent an epic id, which is a WRONG epic rather
+ * than a refused call.
+ *
+ * A blank is refused rather than TAKEN AS the clear, and the asymmetry is deliberate: on
+ * update, clearing is a real mutation that returns the source to escalating every report to a
+ * human, and `""` is equally consistent with a caller whose variable was empty by accident.
+ * On enrol, accepting it would silently produce the source with no epic that this tool's own
+ * description warns is not a neutral default. Both cases refuse and name the remedy.
+ */
+function epicRefusal(value, { clearable }) {
+  if (typeof value === "string" && value.trim() === "") {
+    return refuse(
+      "`target_epic_id` is OPTIONAL, and an empty string is not how to say so. " +
+        (clearable
+          ? "Send null to CLEAR the epic (which returns the source to escalating every report " +
+            "to a human), or leave the field out entirely to leave it exactly as it is."
+          : "Leave the field out entirely, which enrols the source with no epic — every " +
+            "report from it is then escalated to a human until intake_source_update names " +
+            "one.") +
+        " Otherwise send the epic's UUID.",
+    );
+  }
+
+  return uuidRefusal(value, "target_epic_id");
+}
+
 export function sourcePath(sourceId) {
   return `${SOURCES_PATH}/${encodeURIComponent(sourceId)}`;
+}
+
+/**
+ * The source fields this client will put in a tool result, named one by one.
+ *
+ * AN ALLOWLIST IN THIS PROCESS, not a restatement of the server's. Every tool result is
+ * JSON-stringified into the session transcript and into `~/.claude/audit/`, so echoing the
+ * server's object verbatim would rest this module's headline property — the webhook secret
+ * never enters a transcript — entirely on `@derive {Jason.Encoder, only: [...]}` in
+ * `lib/loopctl/intake/source.ex` continuing to exclude it. One commit adding `:webhook_secret`
+ * back to that list, or adding a field derived from it, would carry it into every transcript
+ * from then on with nothing here to stop it. `enrollRunner` reshapes its response for exactly
+ * this reason (`lib/runners.js`), and this is the same defence.
+ *
+ * The cost is that a genuinely new server field is invisible until this list names it. That is
+ * the intended direction of the failure: a missing field is a visible gap, a leaked secret is
+ * not.
+ */
+export function publicSource(source) {
+  if (!source || typeof source !== "object") return source;
+
+  return {
+    id: source.id,
+    project_id: source.project_id,
+    repo_full_name: source.repo_full_name,
+    base_branch: source.base_branch,
+    target_epic_id: source.target_epic_id,
+    revoked_at: source.revoked_at,
+    inserted_at: source.inserted_at,
+    updated_at: source.updated_at,
+  };
 }
 
 /**
@@ -122,7 +192,7 @@ export function webhookUrl(baseUrl, webhookPath) {
  * shape. It never throws.
  */
 export async function enrollIntakeSource(
-  { repo_full_name, project_id, target_epic_id, secret_file } = {},
+  { repo_full_name, project_id, target_epic_id, base_branch, secret_file } = {},
   { userKey, apiCall, baseUrl, fs = defaultFs, homedir = os.homedir() } = {},
 ) {
   if (!userKey) return refuse(MISSING_USER_KEY);
@@ -141,8 +211,24 @@ export async function enrollIntakeSource(
   // that names no epic is ESCALATED to a human rather than landing in an epic chosen for it
   // (`lib/loopctl/intake/source.ex`). An explicit null means the same thing on create.
   if (target_epic_id !== undefined && target_epic_id !== null) {
-    const badEpic = uuidRefusal(target_epic_id, "target_epic_id");
+    const badEpic = epicRefusal(target_epic_id, { clearable: false });
     if (badEpic) return badEpic;
+  }
+
+  // OPTIONAL, and read by PRESENCE at the server: omitted, the column takes its `master`
+  // default; named, the value is validated. There is no cleared state for it — every dispatch
+  // must name a branch to cut from — so a null or an empty string is a 422 there and is
+  // refused here, where the reason can be stated. This is the same shape `updateIntakeSource`
+  // refuses, and the two must not disagree about what a valid branch is.
+  if (base_branch !== undefined) {
+    if (typeof base_branch !== "string" || base_branch.trim() === "") {
+      return refuse(
+        "`base_branch` must be a non-empty branch name, or must be left out entirely. It " +
+          "cannot be null or blank: every dispatch for this repository is cut from it, so " +
+          "there is no cleared state for it and the server answers 422. Leave it out for " +
+          "`master`, or send `main` for a repository created on GitHub since 2020.",
+      );
+    }
   }
 
   if (typeof secret_file !== "string" || secret_file.trim() === "") {
@@ -193,6 +279,7 @@ export async function enrollIntakeSource(
   if (target_epic_id !== undefined && target_epic_id !== null) {
     body.target_epic_id = target_epic_id;
   }
+  if (base_branch !== undefined) body.base_branch = base_branch;
 
   let result;
   try {
@@ -212,15 +299,23 @@ export async function enrollIntakeSource(
   const secret = result && result.error !== true ? result.webhook_secret : undefined;
   const webhookPath = result && result.error !== true ? result.webhook_path : undefined;
 
-  if (
-    !source ||
-    typeof source.id !== "string" ||
-    typeof secret !== "string" ||
-    secret === "" ||
-    typeof webhookPath !== "string"
-  ) {
+  const sourceId =
+    source && typeof source.id === "string" && source.id !== "" ? source.id : undefined;
+  const sentPath = typeof webhookPath === "string" && webhookPath !== "" ? webhookPath : undefined;
+  const usableSecret = typeof secret === "string" && secret !== "";
+
+  // A 2xx carrying a usable source AND its secret but no `webhook_path` is RECOVERABLE, and
+  // discarding it throws away the one thing that cannot be recovered: the secret is returned
+  // once. The path is a pure function of the id — `/api/v1/intake/github/<id>`, the route this
+  // module's header names — so it is derived rather than lost. A FALLBACK only: what the
+  // server sent always wins, and the result says when the URL was derived, because a derived
+  // one is a claim this process is making and not something the server answered.
+  const derivedPath = sentPath === undefined && sourceId !== undefined;
+  const path = derivedPath ? `/api/v1/intake/github/${encodeURIComponent(sourceId)}` : sentPath;
+
+  if (!sourceId || !usableSecret || path === undefined) {
     const removed = await discardReservation(fs, handle, secretPath, opened);
-    return ambiguousEnrollment(result, repo_full_name, secretPath, removed);
+    return ambiguousEnrollment(result, apiCall, sourceId, repo_full_name, secretPath, removed);
   }
 
   try {
@@ -244,8 +339,9 @@ export async function enrollIntakeSource(
   }
 
   return {
-    source,
-    webhook_url: webhookUrl(baseUrl, webhookPath),
+    source: publicSource(source),
+    webhook_url: webhookUrl(baseUrl, path),
+    ...(derivedPath ? { webhook_url_derived: true } : {}),
     secret_file: secretPath,
   };
 }
@@ -256,10 +352,16 @@ export async function enrollIntakeSource(
  * lacks the secret. NO RESPONSE BODY IS EVER ECHOED — a 2xx body that failed to parse is the
  * creation itself, secret included, and `apiCall` puts its first 200 characters in `body`.
  *
- * The recovery names the tools rather than an id, because it can: an ACTIVE source is unique
- * per repository (`intake_sources_active_repo_uidx`), so the list identifies it exactly.
+ * WHEN THE RESPONSE PROVES AN ID, THE SOURCE IS REVOKED HERE, exactly as `enrollRunner` does:
+ * reaching this function means the secret cannot be relied on, so the source can never
+ * authenticate a delivery while still holding the repository's unique slot. Leaving that to
+ * the operator asked them to do by hand what this process could already prove and do itself.
+ *
+ * With NO id — an unparseable body, a timeout — the recovery names the tools instead, because
+ * it can: an ACTIVE source is unique per repository (`intake_sources_active_repo_uidx`), so
+ * the list identifies it exactly.
  */
-function ambiguousEnrollment(result, repoFullName, secretPath, removed) {
+async function ambiguousEnrollment(result, apiCall, sourceId, repoFullName, secretPath, removed) {
   const status = result && Number.isInteger(result.status) ? result.status : undefined;
 
   const what =
@@ -268,15 +370,27 @@ function ambiguousEnrollment(result, repoFullName, secretPath, removed) {
       : `Intake-source outcome unknown (HTTP ${status ?? "?"}; response body withheld: it may ` +
         "contain the webhook secret).";
 
+  let next;
+  if (sourceId) {
+    const revoked = await revoke(apiCall, sourceId);
+    next = revoked.ok
+      ? `The response identified source ${sourceId}; it was revoked, since its secret cannot ` +
+        "be recovered and an unusable source holds this repository's unique slot. Enrol again."
+      : `The response identified source ${sourceId}, but revoking it FAILED ` +
+        `(${revoked.detail}); revoke it with intake_source_revoke source_id ${sourceId} — ` +
+        "until you do, a second source for this repository is refused 422.";
+  } else {
+    next =
+      `A source for '${repoFullName}' may exist with a secret nobody holds — it can never ` +
+      "authenticate a delivery, and it holds that repository's unique slot, so a second " +
+      "enrolment is refused 422 until it is gone. Run intake_source_list, and revoke any " +
+      `active source for '${repoFullName}' with intake_source_revoke before enrolling again.`;
+  }
+
   return {
     error: true,
     status: status ?? 0,
-    body:
-      `${what} A source for '${repoFullName}' may exist with a secret nobody holds — it can ` +
-      "never authenticate a delivery, and it holds that repository's unique slot, so a second " +
-      "enrolment is refused 422 until it is gone. Run intake_source_list, and revoke any " +
-      `active source for '${repoFullName}' with intake_source_revoke before enrolling again. ` +
-      reservationOutcome(secretPath, removed),
+    body: `${what} ${next} ${reservationOutcome(secretPath, removed)}`,
   };
 }
 
@@ -284,7 +398,15 @@ function ambiguousEnrollment(result, repoFullName, secretPath, removed) {
 export async function listIntakeSources({ include_revoked } = {}, { userKey, apiCall } = {}) {
   if (!userKey) return refuse(MISSING_USER_KEY);
   const query = include_revoked ? "?include_revoked=true" : "";
-  return apiCall("GET", `${SOURCES_PATH}${query}`, null);
+  const result = await apiCall("GET", `${SOURCES_PATH}${query}`, null);
+
+  // RESHAPED, for the reason in `publicSource`: a listing is the widest surface here — every
+  // source the tenant has, in one tool result — so a server-side widening of what a source
+  // serialises to would land in the transcript N times rather than once. An error passes
+  // through untouched; only the rows are named.
+  if (!result || result.error === true || !Array.isArray(result.sources)) return result;
+
+  return { ...result, sources: result.sources.map(publicSource) };
 }
 
 /**
@@ -317,7 +439,7 @@ export async function updateIntakeSource(args = {}, { userKey, apiCall } = {}) {
 
   if (args.target_epic_id !== undefined) {
     if (args.target_epic_id !== null) {
-      const badEpic = uuidRefusal(args.target_epic_id, "target_epic_id");
+      const badEpic = epicRefusal(args.target_epic_id, { clearable: true });
       if (badEpic) return badEpic;
     }
     body.target_epic_id = args.target_epic_id;
@@ -342,7 +464,11 @@ export async function updateIntakeSource(args = {}, { userKey, apiCall } = {}) {
     );
   }
 
-  return apiCall("PATCH", sourcePath(args.source_id), body);
+  const result = await apiCall("PATCH", sourcePath(args.source_id), body);
+
+  if (!result || result.error === true || !result.source) return result;
+
+  return { ...result, source: publicSource(result.source) };
 }
 
 /**
@@ -359,7 +485,13 @@ export async function revokeIntakeSource({ source_id } = {}, { userKey, apiCall 
   const bad = uuidRefusal(source_id, "source_id");
   if (bad) return bad;
 
-  return apiCall("DELETE", sourcePath(source_id), null);
+  const result = await apiCall("DELETE", sourcePath(source_id), null);
+
+  // The fourth path that carries a source object back, reshaped for the same reason as the
+  // other three. The reviewer named enrol, list and update; revoke returns the revoked row.
+  if (!result || result.error === true || !result.source) return result;
+
+  return { ...result, source: publicSource(result.source) };
 }
 
 async function revoke(apiCall, sourceId) {

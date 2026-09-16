@@ -95,6 +95,75 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       assert body["source"]["target_epic_id"] == nil
     end
 
+    test "base_branch is stored as enrolled, and omitting it still yields master", %{conn: conn} do
+      ctx = operator_ctx()
+
+      # BOTH HALVES. The controller built its attrs from three params and `base_branch` was
+      # not one of them, so a source could only ever be enrolled at the schema default and a
+      # repository whose trunk is `main` — GitHub's default since 2020 — sent every dispatch
+      # to cut from a branch that does not exist, the failure arriving after the claim. The
+      # second half is what catches the obvious regression in the fix: reading the parameter
+      # by presence rather than passing it through, so an enrolment that names no branch
+      # keeps taking `master` instead of failing `validate_required`.
+      named =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(
+          ~p"/api/v1/intake/sources",
+          Map.put(create_params(ctx), "base_branch", "main")
+        )
+        |> json_response(201)
+
+      assert named["source"]["base_branch"] == "main"
+      assert AdminRepo.get!(Source, named["source"]["id"]).base_branch == "main"
+
+      # AND ON THE CHAIN. A later repoint appends `intake_source_base_branch_set` carrying the
+      # new value, so without the branch in the creation entry the chain could say what a
+      # branch was changed TO and never what the source started at.
+      assert [%Entry{payload: %{"base_branch" => "main"}}] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where:
+                     e.tenant_id == ^ctx.tenant.id and
+                       e.entity_id == ^named["source"]["id"]
+               )
+
+      omitted =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", create_params(ctx, "mkreyman/cron_books"))
+        |> json_response(201)
+
+      assert omitted["source"]["base_branch"] == "master"
+      assert AdminRepo.get!(Source, omitted["source"]["id"]).base_branch == "master"
+    end
+
+    test "a base_branch the caller SENT is answered about, never silently defaulted", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+
+      # NOT nullable and not blankable: every dispatch must name a branch to cut from, so
+      # there is no cleared state for it. Ecto's default `empty_values` would drop `""` from
+      # the changeset and let the row take `master` on a 201, telling a caller who plainly
+      # named a branch that it had been accepted. `update_source/4` refuses the same pair for
+      # the same reason, and the two must not disagree about what a valid branch is.
+      for blank <- ["", String.duplicate("b", 256)] do
+        body =
+          conn
+          |> auth(ctx.operator_key)
+          |> post(
+            ~p"/api/v1/intake/sources",
+            Map.put(create_params(ctx), "base_branch", blank)
+          )
+          |> json_response(422)
+
+        assert body["error"]["details"]["base_branch"]
+      end
+
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+
     test "422 naming target_epic_id for an epic outside the source's project", %{conn: conn} do
       ctx = operator_ctx()
       other_project = fixture(:project, %{tenant_id: ctx.tenant.id})

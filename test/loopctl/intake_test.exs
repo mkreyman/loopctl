@@ -172,6 +172,42 @@ defmodule Loopctl.IntakeTest do
       assert AdminRepo.get!(Source, source.id).target_epic_id == nil
     end
 
+    test "the base branch is read by PRESENCE: absent takes master, an explicit nil is refused" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      assert {:ok, %{source: named}} =
+               Intake.create_source(tenant.id, %{
+                 repo_full_name: "mkreyman/home_care_billing",
+                 project_id: project.id,
+                 base_branch: "main"
+               })
+
+      assert named.base_branch == "main"
+      assert AdminRepo.get!(Source, named.id).base_branch == "main"
+
+      assert {:ok, %{source: defaulted}} =
+               Intake.create_source(tenant.id, %{
+                 repo_full_name: "mkreyman/cron_books",
+                 project_id: project.id
+               })
+
+      assert defaulted.base_branch == "master"
+
+      # THE DIFFERENCE A MAP CAN CARRY that `Map.get/2` cannot: the column is NOT NULL with a
+      # default, so "absent" keeps that default while "explicitly null" is a caller naming a
+      # branch that cannot exist. Reading the key with `Map.get/2` would collapse the two and
+      # fail every enrolment that omits it, which is the regression this half exists to catch.
+      assert {:error, changeset} =
+               Intake.create_source(tenant.id, %{
+                 repo_full_name: "mkreyman/loopctl",
+                 project_id: project.id,
+                 base_branch: nil
+               })
+
+      assert %{base_branch: ["can't be blank"]} = errors_on(changeset)
+    end
+
     test "an unusable project puts its error on project_id and NOT on target_epic_id" do
       tenant = fixture(:tenant)
       good_project = fixture(:project, %{tenant_id: tenant.id})

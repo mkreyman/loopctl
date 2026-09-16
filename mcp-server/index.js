@@ -8232,7 +8232,11 @@ const TOOLS = [
       "path. The path is reserved before the request, so an existing file or an unwritable " +
       "directory is refused while there is still nothing to lose, and any outcome that is not " +
       "a clean creation withholds the response body because an unparsed 2xx body IS the " +
-      "secret.\n\n" +
+      "secret. A 2xx that carries the source and the secret but no webhook path is RECOVERED " +
+      "rather than discarded — the path is derived from the source id and the result says so " +
+      "with `webhook_url_derived` — while an outcome that proves a source id but no usable " +
+      "secret REVOKES that source, since it could never authenticate a delivery and would " +
+      "hold the repository's unique slot.\n\n" +
       "THEN CONFIGURE GITHUB — the tool stops at the loopctl end and this is the other half. " +
       "On the repository: Settings > Webhooks > Add webhook, Payload URL = the `webhook_url` " +
       "returned, Content type = application/json, Secret = the contents of `secret_file`, and " +
@@ -8256,10 +8260,13 @@ const TOOLS = [
       "that repository (revoke it first — the uniqueness is partial on not-yet-revoked), when " +
       "the project is missing, archived or not a work project, or when `target_epic_id` names " +
       "an epic outside that project. 429 when rate limited.\n\n" +
-      "A NEW SOURCE ALWAYS STARTS WITH `base_branch` OF `master` — this endpoint has no way to " +
-      "name one, so a repository whose trunk is `main` (GitHub's default since 2020) needs " +
-      "intake_source_update straight afterwards, or every dispatch is cut from a branch that " +
-      "does not exist.",
+      "NAME `base_branch` AT ENROLMENT for a repository whose trunk is not `master`. It is the " +
+      "branch every dispatch for this repository is cut FROM, it defaults to `master` when the " +
+      "body does not name it, and GitHub has created repositories with `main` since 2020 — so " +
+      "an unnamed branch on a `main` repository sends every dispatch to cut from a branch that " +
+      "does not exist, and the failure arrives after the claim. There is no cleared state for " +
+      "it (a dispatch must name one), so null or blank is refused rather than falling back to " +
+      "the default; intake_source_update changes it afterwards.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8284,6 +8291,17 @@ const TOOLS = [
             "every record from this source stays `pending_triage` and is retried until " +
             "intake_source_update names one — at which point they all promote on the next run " +
             "with nothing lost. Unanswered is the safe state rather than a guess.",
+        },
+        base_branch: {
+          type: "string",
+          description:
+            "Optional. The branch every dispatch for this repository is cut FROM, and the " +
+            "`base_branch` an unattended dispatch carries. Omit it for `master`; send `main` " +
+            "for a repository created on GitHub since 2020, or the loop places work against a " +
+            "branch that does not exist. NOT nullable, unlike target_epic_id — there is no " +
+            "unanswered state for a branch a dispatch must name — so null or blank is refused " +
+            "here rather than silently taking the default. Changed later with " +
+            "intake_source_update.",
         },
         secret_file: {
           type: "string",
@@ -8334,9 +8352,11 @@ const TOOLS = [
       "report to a human instead of filing a story. Leave the field out instead. " +
       "`base_branch` has no cleared state at all (every dispatch must name a branch to cut " +
       "from), so a null there is refused.\n\n" +
-      "THIS IS THE FIX FOR A `main` REPOSITORY. Enrolment always starts a source at `master`, " +
-      "so on any repository created on GitHub since 2020 this call is the second half of " +
-      "enrolling it — without it the loop places work against a trunk that does not exist. It " +
+      "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
+      "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
+      "call; this is what corrects one that was not — a source enrolled before the parameter " +
+      "existed, or enrolled without it, places work against a trunk that does not exist until " +
+      "it is repointed. It " +
       "is also the remedy for a source enrolled before it had an epic: until one is named " +
       "every record from it stays `pending_triage` and is retried, and the moment one is they " +
       "promote on the next run with nothing lost.\n\n" +

@@ -48,7 +48,13 @@ const SOURCE_ID = "9f2a1c44-6d3e-4f8b-9a21-77c0e5b1d0aa";
 const PROJECT_ID = "3781bee6-2b97-4df0-9664-7f01a492630f";
 const EPIC_ID = "d9975b31-032d-4f44-b154-c48af09640c7";
 const REPO = "mkreyman/home_care_billing";
-const SECRET = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+// 64 characters, like the real HMAC secret, so the length-sensitive paths see the same shape
+// — but SELF-DESCRIBING and low-entropy on purpose. The previous fixture was 64 hex digits (a
+// walking pattern repeated twice), which is obviously synthetic to a human and indistinguishable
+// from a live webhook secret to a scanner: GitGuardian scored it as high entropy and failed the
+// check. A fixture that says what it is costs nothing here, because every assertion this file
+// makes about the secret turns on the string being DISTINCTIVE and never on it looking real.
+const SECRET = "NOT-A-SECRET-fake-webhook-hmac-for-tests-only-000000000000000000";
 
 let tmpdir;
 
@@ -60,6 +66,13 @@ afterEach(async () => {
   await fs.rm(tmpdir, { recursive: true, force: true });
 });
 
+// THE FAKE SOURCE CARRIES THE SECRET, deliberately, and every test that scans a result for
+// SECRET depends on it. The server's `@derive {Jason.Encoder, only: [...]}` excludes
+// `webhook_secret` today, so a fake mirroring the server exactly would put the secret ONLY at
+// the top level — and the "appears NOWHERE in the result" tests would pass against a client
+// that echoes the source object verbatim, which is precisely the channel they exist to close.
+// The fake therefore models the server AFTER the widening the client must survive: one commit
+// adding the field back to that list, or adding one derived from it.
 function created(overrides = {}) {
   return {
     source: {
@@ -70,6 +83,7 @@ function created(overrides = {}) {
       target_epic_id: null,
       revoked_at: null,
       inserted_at: "2026-09-16T00:00:00Z",
+      webhook_secret: SECRET,
     },
     webhook_secret: SECRET,
     webhook_path: `/api/v1/intake/github/${SOURCE_ID}`,
@@ -126,7 +140,15 @@ describe("intake_source_enroll", () => {
     // The whole point of the file. `toContent` JSON-stringifies whatever this resolves to
     // straight into the tool output, so a scan of the serialised object is the only check
     // that can see a secret carried in a field nobody thought about.
-    const { apiCall } = fakeApi(created());
+    const fake = created();
+
+    // THE PRECONDITION THAT MAKES THE SCAN BELOW MEAN ANYTHING, asserted rather than assumed:
+    // with the secret only at the top level, this test passes against a client that echoes
+    // the source object verbatim — which is the channel it exists to close. A later edit that
+    // quietly "tidies" the fake to mirror today's server would silently defeat it.
+    assert.equal(fake.source.webhook_secret, SECRET);
+
+    const { apiCall } = fakeApi(fake);
 
     const result = await enrollIntakeSource(
       { repo_full_name: REPO, project_id: PROJECT_ID, secret_file: secretFileIn() },
@@ -134,6 +156,125 @@ describe("intake_source_enroll", () => {
     );
 
     assert.ok(!JSON.stringify(result).includes(SECRET), "the webhook secret is in the result");
+
+    // AND THE SOURCE IS BUILT FROM NAMED FIELDS, not echoed. The assertion above is the one
+    // that matters, but it can only see the leak because the fake's source carries the secret
+    // — so this pins the mechanism that makes it survivable: a field the server grows is not
+    // in the result at all, whatever it is called.
+    assert.deepEqual(Object.keys(result.source).sort(), [
+      "base_branch",
+      "id",
+      "inserted_at",
+      "project_id",
+      "repo_full_name",
+      "revoked_at",
+      "target_epic_id",
+      "updated_at",
+    ]);
+  });
+
+  test("a 2xx with the source and secret but NO webhook_path is recovered, not thrown away", async () => {
+    // The enrolment is COMPLETE at the server and the secret is in hand — and the secret is
+    // returned once, so discarding this costs the one thing that cannot be re-fetched. The
+    // path is a pure function of the id, so it is derived and the result says so.
+    const { calls, apiCall } = fakeApi(created({ webhook_path: undefined }));
+    const secret_file = secretFileIn();
+
+    const result = await enrollIntakeSource(
+      { repo_full_name: REPO, project_id: PROJECT_ID, secret_file },
+      deps({ apiCall }),
+    );
+
+    assert.equal(result.error, undefined, `the enrolment was discarded: ${result.body}`);
+    assert.equal(result.webhook_url, `https://loopctl.com/api/v1/intake/github/${SOURCE_ID}`);
+    assert.equal(result.webhook_url_derived, true);
+    assert.equal(await fs.readFile(secret_file, "utf8"), SECRET);
+    assert.equal(calls.length, 1, "nothing was revoked: the enrolment is usable");
+    assert.ok(!JSON.stringify(result).includes(SECRET), "the recovered result leaked the secret");
+  });
+
+  test("a server-sent webhook_path always wins over the derived one", async () => {
+    const { apiCall } = fakeApi(created({ webhook_path: "/api/v1/intake/github/elsewhere" }));
+
+    const result = await enrollIntakeSource(
+      { repo_full_name: REPO, project_id: PROJECT_ID, secret_file: secretFileIn() },
+      deps({ apiCall }),
+    );
+
+    assert.equal(result.webhook_url, "https://loopctl.com/api/v1/intake/github/elsewhere");
+    assert.equal(result.webhook_url_derived, undefined);
+  });
+
+  test("a 2xx that proves an id but carries no secret REVOKES the source it named", async () => {
+    // Unrecoverable: the secret is returned once, so this source can never authenticate a
+    // delivery, and it holds the repository's unique slot until it is revoked. Telling the
+    // operator to do that by hand asked them for something this process had already proved.
+    const { calls, apiCall } = fakeApi(created({ webhook_secret: undefined }), { ok: true });
+
+    const result = await enrollIntakeSource(
+      { repo_full_name: REPO, project_id: PROJECT_ID, secret_file: secretFileIn() },
+      deps({ apiCall }),
+    );
+
+    assert.equal(result.error, true);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].method, "DELETE");
+    assert.equal(calls[1].path, `/api/v1/intake/sources/${SOURCE_ID}`);
+    assert.match(result.body, /it was revoked/);
+    assert.ok(!JSON.stringify(result).includes(SECRET));
+  });
+
+  test("a failed revoke of a proven id names the id and the tool, and does not claim success", async () => {
+    const { apiCall } = fakeApi(created({ webhook_secret: undefined }), {
+      error: true,
+      status: 500,
+    });
+
+    const result = await enrollIntakeSource(
+      { repo_full_name: REPO, project_id: PROJECT_ID, secret_file: secretFileIn() },
+      deps({ apiCall }),
+    );
+
+    assert.match(result.body, /revoking it FAILED/);
+    assert.match(result.body, new RegExp(`intake_source_revoke source_id ${SOURCE_ID}`));
+  });
+
+  test("with NO id proved, the recovery still names the list-and-revoke pair", async () => {
+    // The unparseable-body case, where there is nothing to revoke BY id: active sources are
+    // unique per repository, so the listing identifies it exactly.
+    const { calls, apiCall } = fakeApi({ error: true, status: 201, body: "{partial" });
+
+    const result = await enrollIntakeSource(
+      { repo_full_name: REPO, project_id: PROJECT_ID, secret_file: secretFileIn() },
+      deps({ apiCall }),
+    );
+
+    assert.equal(calls.length, 1, "nothing may be revoked when no id was proved");
+    assert.match(result.body, /intake_source_list/);
+    assert.match(result.body, /intake_source_revoke/);
+  });
+
+  test("a BLANK target_epic_id is refused as optional, never as required", async () => {
+    // `uuid()` answers "`target_epic_id` is required" for a blank, which is the opposite of
+    // the truth: a model that cannot emit a JSON null sends "" to mean the clear, is told the
+    // optional field is required, and its next move is to invent an epic id — a WRONG epic
+    // instead of a refused call.
+    const { calls, apiCall } = fakeApi(created());
+
+    const result = await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        target_epic_id: "  ",
+        secret_file: secretFileIn(),
+      },
+      deps({ apiCall }),
+    );
+
+    assert.match(result.body, /`target_epic_id` is OPTIONAL/);
+    assert.ok(!/is required/.test(result.body), `refused as required: ${result.body}`);
+    assert.match(result.body, /Leave the field out entirely/);
+    assert.equal(calls.length, 0);
   });
 
   test("sends target_epic_id only when given", async () => {
@@ -155,6 +296,57 @@ describe("intake_source_enroll", () => {
       deps({ apiCall }),
     );
     assert.equal(calls[1].body.target_epic_id, EPIC_ID);
+  });
+
+  test("sends base_branch only when given, so an omitted one takes the server default", async () => {
+    const { calls, apiCall } = fakeApi(created(), created());
+
+    await enrollIntakeSource(
+      { repo_full_name: REPO, project_id: PROJECT_ID, secret_file: secretFileIn("a") },
+      deps({ apiCall }),
+    );
+
+    // PRESENCE at the server: absent keeps the `master` default, and a null or a blank is a
+    // 422 rather than a fallback to it. Sending the key with an undefined-turned-null value
+    // would therefore refuse every enrolment that does not name a branch.
+    assert.ok(
+      !("base_branch" in calls[0].body),
+      "an unnamed base_branch reached the server, where it is refused rather than defaulted",
+    );
+
+    await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        base_branch: "main",
+        secret_file: secretFileIn("b"),
+      },
+      deps({ apiCall }),
+    );
+    assert.equal(calls[1].body.base_branch, "main");
+  });
+
+  test("a null or blank base_branch is refused locally, without enrolling anything", async () => {
+    // It is NOT nullable — every dispatch for this repository is cut from it, so there is no
+    // cleared state — and enrolment is the one call that cannot simply be repeated: a source
+    // created and then refused holds the repository's unique slot until it is revoked.
+    for (const [i, bad] of [null, "", "   "].entries()) {
+      const { calls, apiCall } = fakeApi(created());
+
+      const result = await enrollIntakeSource(
+        {
+          repo_full_name: REPO,
+          project_id: PROJECT_ID,
+          base_branch: bad,
+          secret_file: secretFileIn(`blank-${i}.secret`),
+        },
+        deps({ apiCall }),
+      );
+
+      assert.equal(result.error, true);
+      assert.match(result.body, /`base_branch` must be a non-empty branch name/);
+      assert.equal(calls.length, 0, "a refused enrolment must not reach the API");
+    }
   });
 
   test("refuses an existing secret_file without calling the API, and leaves it untouched", async () => {
@@ -389,6 +581,30 @@ describe("intake_source_list", () => {
     assert.equal(calls[1].path, "/api/v1/intake/sources?include_revoked=true");
   });
 
+  test("each listed source is built from named fields, so a widened row cannot leak", async () => {
+    // The WIDEST surface here: every source the tenant has, in one result. A server that grew
+    // a secret-bearing field would land it in the transcript once per row.
+    const { apiCall } = fakeApi({ sources: [created().source, created().source] });
+
+    const result = await listIntakeSources({}, deps({ apiCall }));
+
+    assert.equal(result.sources.length, 2);
+    assert.ok(!JSON.stringify(result).includes(SECRET), "a listed source carried the secret");
+    for (const listed of result.sources) {
+      assert.ok(!("webhook_secret" in listed));
+      assert.equal(listed.id, SOURCE_ID);
+      assert.equal(listed.repo_full_name, REPO);
+    }
+  });
+
+  test("an error from the server passes through untouched", async () => {
+    const { apiCall } = fakeApi({ error: true, status: 403, body: "custody_tier_required" });
+
+    const result = await listIntakeSources({}, deps({ apiCall }));
+
+    assert.deepEqual(result, { error: true, status: 403, body: "custody_tier_required" });
+  });
+
   test("errors clearly without LOOPCTL_USER_KEY and calls nothing", async () => {
     const { calls, apiCall } = fakeApi({ sources: [] });
     const result = await listIntakeSources({}, deps({ apiCall, userKey: undefined }));
@@ -424,6 +640,36 @@ describe("intake_source_update", () => {
       !("target_epic_id" in calls[0].body),
       "an unnamed target_epic_id reached the server and would have cleared the epic",
     );
+  });
+
+  test("the updated source comes back built from named fields", async () => {
+    const { apiCall } = fakeApi({ source: created().source });
+
+    const result = await updateIntakeSource(
+      { source_id: SOURCE_ID, base_branch: "main" },
+      deps({ apiCall }),
+    );
+
+    assert.ok(!JSON.stringify(result).includes(SECRET));
+    assert.ok(!("webhook_secret" in result.source));
+    assert.equal(result.source.base_branch, "master");
+  });
+
+  test("a BLANK target_epic_id names null as the clear, and is never called required", async () => {
+    // The field is optional here too, and a blank is refused rather than TAKEN as the clear:
+    // clearing returns the source to escalating every report to a human, and "" is equally
+    // consistent with a caller whose variable was empty by accident.
+    const { calls, apiCall } = fakeApi({ source: {} });
+
+    const result = await updateIntakeSource(
+      { source_id: SOURCE_ID, target_epic_id: "" },
+      deps({ apiCall }),
+    );
+
+    assert.match(result.body, /`target_epic_id` is OPTIONAL/);
+    assert.match(result.body, /Send null to CLEAR/);
+    assert.ok(!/is required/.test(result.body), `refused as required: ${result.body}`);
+    assert.equal(calls.length, 0);
   });
 
   test("an EXPLICIT null target_epic_id is forwarded, because that is how it is cleared", async () => {
@@ -484,6 +730,16 @@ describe("intake_source_revoke", () => {
     assert.equal(calls[0].method, "DELETE");
     assert.equal(calls[0].path, `/api/v1/intake/sources/${SOURCE_ID}`);
     assert.equal(calls[0].body, null);
+  });
+
+  test("the revoked source comes back built from named fields", async () => {
+    const { apiCall } = fakeApi({ source: created().source });
+
+    const result = await revokeIntakeSource({ source_id: SOURCE_ID }, deps({ apiCall }));
+
+    assert.ok(!JSON.stringify(result).includes(SECRET));
+    assert.ok(!("webhook_secret" in result.source));
+    assert.equal(result.source.id, SOURCE_ID);
   });
 
   test("a malformed or missing source_id is refused before any call", async () => {

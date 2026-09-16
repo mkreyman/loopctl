@@ -11,9 +11,10 @@ All notable changes to loopctl are documented here.
   DELETE /api/v1/intake/sources` have been served since #803 and no MCP tool called any of
   them, so the one step that gives the delivery loop an input — pointing a GitHub repository
   at loopctl — could be taken only from a shell on the production node. The loop had therefore
-  never received a single issue. No endpoint changed here; what changed is that an operator can
-  reach them: `intake_source_enroll`, `intake_source_list`, `intake_source_update`,
-  `intake_source_revoke`.
+  never received a single issue. What changed is that an operator can reach them:
+  `intake_source_enroll`, `intake_source_list`, `intake_source_update`, `intake_source_revoke`.
+  One endpoint changed with them: `POST /api/v1/intake/sources` now accepts an optional
+  `base_branch`, below.
 
   **Operator-visible, and the part to read before enrolling:** the webhook secret is returned
   ONCE by the create endpoint and can never be read again, so the tool does NOT return it —
@@ -22,10 +23,15 @@ All notable changes to loopctl are documented here.
   must not. Configure the repository webhook from that file, content type `application/json`,
   the `Issues` event only.
 
-  **A new source always starts with `base_branch` of `master`**, because the create endpoint
-  has no parameter for it. On any repository whose trunk is `main` — GitHub's default since
-  2020 — the enrolment is not finished until `PATCH /api/v1/intake/sources/:id` sets it, or
-  every dispatch for that repository is cut from a branch that does not exist.
+  **`POST /api/v1/intake/sources` now accepts `base_branch`, and it is optional.** The
+  endpoint built its attrs from three parameters and this was not one of them, so every source
+  started at the schema default `master` whatever the caller asked for — and on a repository
+  whose trunk is `main`, GitHub's default since 2020, every dispatch was cut from a branch that
+  does not exist. Omitting it still yields `master`, so nothing changes for an existing caller;
+  naming it is now the one-call way to enrol a `main` repository. It is NOT nullable — every
+  dispatch must name a branch to cut from — so an explicit null or an empty string is a 422
+  rather than a silent fallback to the default. `PATCH /api/v1/intake/sources/:id` still
+  corrects a source that is already pointed at the wrong trunk.
 
 - **A runner declares the branch prefixes it accepts, and loopctl derives a conforming branch
   (#846.2, runner contract 1.14.0). RE-VENDOR to send the field.** loopctl derived
