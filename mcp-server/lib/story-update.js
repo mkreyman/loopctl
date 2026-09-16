@@ -59,7 +59,28 @@
  * `LOOPCTL_API_KEY` of any sufficient role still wins, exactly as it does for `create_story`
  * and `backfill_story`. The tenant must also be human-anchored (`RequireHumanAnchor`,
  * `story_controller.ex:35-36`): an agent-rooted tenant is refused 403 `custody_tier_required`.
+ *
+ * ## `story_id` IS SHAPE-CHECKED, ON THE SHARED GUARD AND NOT A SECOND COPY
+ *
+ * This tool shipped without one while all four verbs in `lib/delivery-loop.js` had it, and the
+ * omission made this file's own tool description false: it promises "404 for an unknown story"
+ * as that status's only meaning. A malformed id gets the SAME 404.
+ * `StoryController.update/2` reaches `Stories.get_story/2`
+ * (`lib/loopctl/work_breakdown/stories.ex:185-190`), whose `AdminRepo.get_by(Story, id:
+ * story_id, …)` puts the value into a `where` against a `:binary_id` column with no cast; the
+ * `Ecto.Query.CastError` that raises is mapped to 404 by loopctl's deliberate backstop
+ * (`lib/loopctl_web/plugs/cast_error_handler.ex:32-35`), and the body is
+ * `LoopctlWeb.ErrorJSON`'s generic `{"error": {"status": 404, "message": "Not found"}}` — byte
+ * for byte what `FallbackController` answers for a well-formed id naming no story
+ * (`lib/loopctl_web/fallback_controller.ex:74-78`). Two opposite remedies, one answer.
+ *
+ * The check is `uuid()`, IMPORTED from `lib/delivery-loop.js` rather than reimplemented, so the
+ * refusal a caller reads for a bad `story_id` does not depend on which tool they reached for.
+ * Its reasoning — why the refusal carries `status: 0` and never echoes the value — is the long
+ * comment over it there, and it is not restated here.
  */
+
+import { uuid as uuidRefusal } from "./delivery-loop.js";
 
 const UPDATABLE = ["title", "description", "acceptance_criteria", "estimated_hours", "metadata"];
 
@@ -102,11 +123,10 @@ export function updateBody(args = {}) {
  * criteria, estimate or metadata.
  */
 export async function updateStory(args = {}, { apiCall } = {}) {
-  const { story_id } = args;
+  const bad = uuidRefusal(args.story_id, "story_id");
+  if (bad) return bad;
 
-  if (typeof story_id !== "string" || story_id.trim() === "") {
-    return refuse("`story_id` is required.");
-  }
+  const { story_id } = args;
 
   const { body, error } = updateBody(args);
   if (error) return refuse(error);

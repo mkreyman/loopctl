@@ -33,6 +33,31 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
 export const PKG_DIR = path.join(DIR, "..");
 export const REPO_DIR = path.join(PKG_DIR, "..");
 
+/**
+ * Line and block comments out — the ONE copy, shared by every guard here that reads source as
+ * text (`custody_key_pinning`, `delivery_loop_tools`, `mcp_version_tool`, `story_update_tool`,
+ * `route_coverage`).
+ *
+ * WHY EVERY SUCH GUARD NEEDS IT. Each of them asserts that some wiring is PRESENT by matching
+ * it in the source, and a disabling edit's natural shape is to comment the wiring out — which
+ * leaves the text in the file and the assertion green. #861 round 1 closed that on two of them
+ * by hand, each with its own inline pair of `replace` calls; `route_coverage`'s dispatch-case
+ * scan was written afterwards, excluded line comments (by anchoring `case` to the start of a
+ * line) and not BLOCK comments, and so counted a block-commented `case` as dispatched. Four
+ * hand-kept copies is how the fifth site gets written without one.
+ *
+ * ITS ONE LIMIT, stated because a caller that hands it a WHOLE FILE is exposed to it and the
+ * handler-slice callers were not: it does not parse strings, so a block-comment OPENER inside a
+ * string literal would swallow source up to the next closer. Measured on `index.js`
+ * (2026-09-16): 6 such openers, all of them real comments, and the dispatch-case count is identical
+ * before and after stripping. The failure direction is loud rather than silent — swallowed
+ * source means a declared tool reads as having no `case`, which fails the assertion that
+ * follows with the tool named.
+ */
+export function stripComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
+
 /** `index.js` plus every module in `lib/`, concatenated — the package's whole request surface. */
 export function packageSource() {
   const libs = readdirSync(path.join(PKG_DIR, "lib"))
@@ -407,8 +432,18 @@ export function reachedRoutes() {
 // Which /api/v1 routes loopctl serves
 // ---------------------------------------------------------------------------
 
-const ROUTE_LINE =
-  /^(get|post|put|patch|delete)\s+"([^"]+)",\s*([A-Za-z0-9_.]+),\s*:([a-z_0-9]+)/;
+const VERBS = "get|post|put|patch|delete";
+
+const ROUTE_LINE = new RegExp(`^(${VERBS})\\s+"([^"]+)",\\s*([A-Za-z0-9_.]+),\\s*:([a-z_0-9]+)`);
+
+// What can BEGIN a route declaration, and therefore what the line joiner below must recognise
+// as the head of one. The verb list is SHARED with `ROUTE_LINE` rather than written twice: a
+// macro the matcher knows and the joiner does not is exactly the blindness that hid nine
+// routes, and two hand-kept lists reproduce it the next time a verb is added.
+const ROUTE_MACRO_HEAD = new RegExp(`^(?:resources|${VERBS})\\s`);
+
+// How many lines one declaration may span before the joiner declares it has misread something.
+const MAX_CONTINUATION_LINES = 6;
 
 // Phoenix's `resources` macro, expanded. The default action set and the paths each one
 // generates are `Phoenix.Router.Resource`'s: `update` really does generate BOTH a PATCH and a
@@ -437,11 +472,29 @@ const RESOURCE_ROUTES = {
  * different deployment than the tree it sits in.
  *
  * `resources` IS EXPANDED, and the first version of this parser did not do it — it matched
- * only the seven verb macros, so eleven `resources` lines covering projects, api_keys,
+ * only the verb macros, so eleven `resources` lines covering projects, api_keys,
  * runners, webhooks, skills and articles were invisible. That direction is the safe one (a
  * route nobody knows about is never reported as an invented gap) and it is still wrong: the
  * coverage sweep in `route_coverage.test.js` would have answered for a surface with a hole in
  * it, which is the one thing a sweep must not do.
+ *
+ * A MULTI-LINE DECLARATION IS JOINED FOR BOTH MACRO KINDS, and the first version of the
+ * joining did it only for `resources` — which made this paragraph half true, and half true is
+ * worse than silent, because it reads as the blindness having been fixed. Nine verb-macro
+ * routes were written across lines and were therefore invisible: `router.ex:329`, `:691`,
+ * `:695`, `:699`, `:703`, `:709`, `:713`, `:717`, `:735`. One of them,
+ * `GET /api/v1/knowledge/analytics/projects/:id/usage` (`router.ex:713-715`), is called by no
+ * tool in this package — so it was absent from the parse, absent from the sweep's UNREACHED
+ * list and absent from its DECLARED inventory, and the sweep passed green. That is the exact
+ * failure the paragraph above says a sweep must not have, reached by a different route.
+ *
+ * LAYOUT, NOT LENGTH, is what decides whether a declaration wraps, which is why matching one
+ * line could never be enough. `.formatter.exs` sets no `line_length`, so `mix format` uses its
+ * 98-column default — and it preserves a break the author already made, so eight of these nine
+ * FIT on one line and stay wrapped anyway (`router.ex:717` is 85 columns joined, `:329` is the
+ * only one over 98). Both mechanisms produce the same invisibility: a route long enough to be
+ * wrapped BY the formatter escapes the ratchet by formatting alone, and a short one escapes it
+ * by having been typed across two lines.
  */
 export function routerRoutes() {
   const src = readFileSync(path.join(REPO_DIR, "lib", "loopctl_web", "router.ex"), "utf8");
@@ -449,20 +502,38 @@ export function routerRoutes() {
   const scopes = [];
   let depth = 0;
 
-  // A `resources` declaration wraps onto a second line when its `only:` list is long. Joined
-  // here rather than handled below, so the scope/depth bookkeeping sees one statement.
+  // A route declaration continues onto further lines when it was laid out that way. Joined
+  // here rather than handled below, so the scope/depth bookkeeping sees one statement. See the
+  // doc comment above for why this covers the verb macros and not `resources` alone.
   let pending = null;
+  let pendingLines = 0;
 
   for (const raw of src.split("\n")) {
     let line = raw.trim();
 
     if (pending !== null) {
       pending = `${pending} ${line}`;
+      pendingLines++;
+
+      // A statement that never terminates means this joiner has misread a line as a route
+      // head, and the damage of guessing is silent: everything up to the next terminator is
+      // swallowed and every route inside it disappears. Formatted route macros run to three
+      // lines (path, controller, action) and a `resources` with options to four, so a run past
+      // this bound is a shape to teach the parser, not one to absorb.
+      if (pendingLines > MAX_CONTINUATION_LINES) {
+        throw new Error(
+          `a route declaration in router.ex did not terminate within ` +
+            `${MAX_CONTINUATION_LINES} lines: ${pending.slice(0, 120)}`,
+        );
+      }
+
       if (line.endsWith(",")) continue;
       line = pending;
       pending = null;
-    } else if (/^resources\s/.test(line) && line.endsWith(",")) {
+      pendingLines = 0;
+    } else if (ROUTE_MACRO_HEAD.test(line) && line.endsWith(",")) {
       pending = line;
+      pendingLines = 1;
       continue;
     }
 

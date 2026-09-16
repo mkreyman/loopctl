@@ -4076,7 +4076,9 @@ const TOOLS = [
       "orchestrator-role key or higher (LOOPCTL_ORCH_KEY, or LOOPCTL_API_KEY of that role) " +
       "and a human-anchored tenant (403 `custody_tier_required` otherwise). 404 for an " +
       "unknown story; 422 with the changeset errors for a title over 500 characters or a " +
-      "description over 50000.",
+      "description over 50000. A `story_id` that is not a UUID is refused here, before any " +
+      "call — loopctl answers one with the IDENTICAL 404 an unknown story gets, so that " +
+      "status means one thing only because this tool takes the other case first.",
     inputSchema: {
       type: "object",
       properties: {

@@ -66,6 +66,23 @@ would publish two different trees under one number.
   expressible remedy for that refusal with nothing to show the operator why. The declaration
   says `base_branch` is expected alongside it.
 
+- **`update_story` refuses a `story_id` that is not a UUID**, before any request, on the same
+  shared guard the four delivery-loop verbs use. Without it a malformed id reached loopctl and
+  came back as a 404 BYTE-IDENTICAL to the one an unknown story gets — `Stories.get_story/2`
+  puts the value into a query against a `:binary_id` with no cast, and `Ecto.Query.CastError`
+  has a deliberate 404 impl — so the two cases, whose remedies are opposite (re-read the
+  argument you passed, or go find the right story), were one answer. This tool's own
+  description promises "404 for an unknown story" as that status's only meaning, which the
+  missing check made false. The refusal carries `status: 0`, the marker every local refusal in
+  this client uses for "no request was sent".
+
+- **`mcp_version` reports the CAUSE of a failed discovery request**, not just `status 0`. The
+  status alone says only that no server answered; the reason — `Network error: … ENOTFOUND …`,
+  a timeout, or loopctl's own error body — was in `result.body` and was discarded. That is the
+  one field worth reading in exactly the session this tool exists for, where a typo'd
+  `LOOPCTL_SERVER`, a dead network and a slow one otherwise produce the same message. Bounded
+  to 300 characters and never allowed to throw: this tool always answers.
+
 ### Internal
 
 - `test/description_schema_drift.test.js` — the generalisable half of the fix above: a scan that
@@ -81,9 +98,40 @@ would publish two different trees under one number.
   It also pins, for every tool rather than a named few, that a declaration has a dispatch case
   and a case has a declaration.
 - `test/tool-surface.js` — the router parser now expands Phoenix's `resources` macro. It matched
-  only the seven verb macros before, so eleven `resources` lines covering projects, api_keys,
+  only the verb macros before, so eleven `resources` lines covering projects, api_keys,
   runners, webhooks, skills and articles were invisible to the sweep above — 34 additional
   routes, none of them previously checked.
+
+  It also JOINS a route declaration written across several lines, for the verb macros and not
+  just for `resources`. Nine routes are laid out that way in `router.ex` and were invisible
+  because of it, and one of them — `GET /api/v1/knowledge/analytics/projects/:id/usage` — is
+  reached by no tool, so it was absent from the parse, from the unreached list and from the
+  declared inventory at once, and the sweep passed green. LAYOUT decided visibility rather than
+  the route: eight of those nine fit inside the formatter's 98-column default and stay wrapped
+  anyway, and a route long enough to be wrapped BY the formatter escaped the ratchet by
+  formatting alone.
+
+  `stripComments` moves here as the one copy, and the dispatch-case scan uses it. `^\s*case`
+  already excluded a line-commented case and excluded nothing about a BLOCK-commented one, so a
+  tool disabled that way kept a green wiring assertion — the same hole #861 round 1 closed on
+  two sibling guards, in a scan written after them. Four hand-kept copies were how a fifth site
+  got written without the fix.
+
+- `test/route_coverage.test.js` — seven exemptions re-examined and re-categorised, and one of
+  the categories given a mechanical guard.
+
+  Five `PUT` twins (intake sources, projects, webhooks, skills, token-budgets) were excused as
+  `duplicate` — "already reached by a tool on its twin route" — against a `PATCH` declared a
+  `gap` in the same table. Nothing reached either verb, so five real gaps were counted as
+  exemptions. A new assertion makes that unrepeatable: a `PUT` excused as a duplicate must have
+  a `PATCH` twin this package REALLY SENDS. Only `PUT /api/v1/articles/:param` was ever a true
+  duplicate.
+
+  Two authenticator routes were excused as `ceremony` on evidence from a DIFFERENT controller.
+  Neither verifies a WebAuthn assertion — `rename/2`'s own API description says in so many words
+  that it needs none, and `index/1` is a plain list. The index is the one with a consequence:
+  `revoke_authenticator` ships and takes an `authenticator_id` no tool can obtain, because a
+  browser ceremony discards the 201 body that carried it. Both are `gap` now.
 
 ## 2.97.0 — 2026-09-15 (a story stuck at `claimed` can be freed)
 

@@ -51,6 +51,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { exactKeyMissingMessage, orchestratorKeyArgs } from "../lib/custody-key.js";
+import { stripComments } from "./tool-surface.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
@@ -145,11 +146,6 @@ function handlerSource(name) {
   assert.ok(end > start, `${name} has no following function to bound it`);
 
   return stripComments(INDEX_SRC.slice(start, end));
-}
-
-/** Line and block comments out; string contents are left alone (none here carry code). */
-function stripComments(source) {
-  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
 }
 
 const EXACT_ROLE_ORCHESTRATOR = [

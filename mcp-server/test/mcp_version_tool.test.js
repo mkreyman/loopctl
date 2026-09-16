@@ -20,7 +20,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import { DISCOVERY_PATH, compareVersions, mcpVersion, packageVersion } from "../lib/mcp-version.js";
-import { PKG_DIR, loadTools } from "./tool-surface.js";
+import { PKG_DIR, loadTools, stripComments } from "./tool-surface.js";
 
 const INDEX_SRC = readFileSync(path.join(PKG_DIR, "index.js"), "utf8");
 const README = readFileSync(path.join(PKG_DIR, "README.md"), "utf8");
@@ -144,6 +144,50 @@ describe("it answers when loopctl does not", () => {
     assert.equal(result.error, undefined, "a version report must not be an error result");
   });
 
+  test("the transport failure's CAUSE reaches the detail, not just `status 0`", async () => {
+    // The scenario this tool exists for: a session where nothing else answers. `status 0` says
+    // only that no server replied — `publicApiCall` stamps it on every local failure and puts
+    // the reason in `body` (`index.js`, its catch around `fetch`) — so a typo'd LOOPCTL_SERVER,
+    // a dead network and a slow one were one indistinguishable message.
+    const { publicApiCall } = fakeDiscovery({
+      error: true,
+      status: 0,
+      body: "Network error: fetch failed (getaddrinfo ENOTFOUND loopctl.invalid)",
+    });
+
+    const result = await mcpVersion({}, { publicApiCall, version: "2.98.0" });
+
+    assert.equal(result.status, "unknown");
+    assert.equal(result.running, "2.98.0", "the half that always answers must still answer");
+    assert.match(result.detail, /status 0/);
+    assert.match(result.detail, /ENOTFOUND/, "the cause was discarded");
+  });
+
+  test("a non-string body is rendered rather than dropped or thrown on", async () => {
+    // An HTTP failure carries loopctl's own parsed error body, and a version report that
+    // throws is worse than one that says little: this tool must always answer.
+    const { publicApiCall } = fakeDiscovery({
+      error: true,
+      status: 503,
+      body: { error: { message: "upstream unavailable" } },
+    });
+
+    const result = await mcpVersion({}, { publicApiCall, version: "2.98.0" });
+
+    assert.match(result.detail, /upstream unavailable/);
+
+    const circular = { error: "x" };
+    circular.self = circular;
+    const unserialisable = fakeDiscovery({ error: true, status: 0, body: circular });
+    const survived = await mcpVersion(
+      {},
+      { publicApiCall: unserialisable.publicApiCall, version: "2.98.0" },
+    );
+
+    assert.equal(survived.status, "unknown");
+    assert.match(survived.detail, /status 0/);
+  });
+
   test("a discovery document without the field yields `unknown`, and says which field", async () => {
     const { publicApiCall } = fakeDiscovery({ spec_version: "2" });
 
@@ -192,9 +236,7 @@ describe("the wiring in index.js", () => {
     const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
     assert.ok(end > start, "the handler has no following function to bound it");
 
-    const handler = INDEX_SRC.slice(start, end)
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/\/\/[^\n]*/g, "");
+    const handler = stripComments(INDEX_SRC.slice(start, end));
 
     assert.match(handler, /publicApiCall/, "it no longer uses the unauthenticated helper");
     assert.match(handler, /version: SERVER_VERSION/, "it does not report the derived version");

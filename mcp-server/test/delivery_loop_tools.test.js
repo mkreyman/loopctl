@@ -26,6 +26,7 @@ import {
   stagePath,
   storyStage,
 } from "../lib/delivery-loop.js";
+import { stripComments } from "./tool-surface.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
@@ -464,9 +465,7 @@ describe("the wiring in index.js", () => {
     // the wiring has been commented OUT, which is the shape a disabling edit takes. Verified
     // by mutation: without this, replacing the wiring with a block comment left the suite
     // green.
-    const handler = INDEX_SRC.slice(start, end)
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/\/\/[^\n]*/g, "");
+    const handler = stripComments(INDEX_SRC.slice(start, end));
 
     assert.match(
       handler,

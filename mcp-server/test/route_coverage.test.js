@@ -58,6 +58,16 @@
  *     challenge (`tenant_audit_key_controller.ex:7-16`); `bootstrap` is documented UNREACHABLE
  *     for every current and future tenant (`:29-31`). A tool could mint the challenge and
  *     could never answer it.
+ *
+ *     THE EVIDENCE MUST COME FROM THE ACTION BEING EXCUSED. Two routes on a DIFFERENT
+ *     controller were excused on the paragraph above — `GET /tenants/:id/authenticators` and
+ *     `PATCH /tenants/:id/authenticators/:auth_id` — and neither verifies an assertion of any
+ *     kind. Both are plain `role: :user` + tenant ownership
+ *     (`tenant_authenticator_controller.ex:95-97`), `index/1` is a list (`:121-147`) and
+ *     `rename/2` a validate-and-update (`:660-686`) whose own OpenAPI description says in so
+ *     many words that "Unlike revocation this needs NO WebAuthn assertion" (`:619-620`). They
+ *     are `gap` below. Being on a controller whose OTHER actions are ceremonies is not
+ *     evidence about these.
  *   - `superadmin`: the cross-tenant console under `scope "/api/v1/admin"`
  *     (`router.ex:740-741`), gated `exact_role: :superadmin` at the controller
  *     (`router.ex:771`). That is a different principal from every key this package sends, and
@@ -65,10 +75,20 @@
  *     (`router.ex:767-774`).
  *   - `duplicate`: the same action, already reached by a tool on its twin route. Phoenix's
  *     `resources` macro generates BOTH `PATCH` and `PUT` for `update` (`router.ex:340`, `:449`,
- *     `:499` and the other eight `resources` lines), and this package sends PATCH — so each
- *     `PUT` twin here is served, unused and harmless. `GET /api/v1` is the welcome landing;
+ *     `:499` and the other eight `resources` lines), and where this package sends the PATCH the
+ *     `PUT` twin is served, unused and harmless. `GET /api/v1` is the welcome landing;
  *     `list_routes` answers the same question by calling `GET /api/v1/routes` (`index.js`,
  *     `listRoutes`).
+ *
+ *     "REACHED" IS THE WHOLE CATEGORY, AND FIVE ENTRIES DID NOT HAVE IT. The `PUT` twins for
+ *     intake sources, projects, webhooks, skills and token-budgets were excused as duplicates
+ *     of a `PATCH` that is itself declared `gap` in the same table — so nothing reached either
+ *     verb, and five real gaps were counted as exemptions. Only `PUT /api/v1/articles/:param`
+ *     was ever a true duplicate: `knowledge_update` sends the PATCH (`index.js`,
+ *     `knowledgeUpdate`). The five are `gap` now, and
+ *     the test "a PUT excused as a duplicate has a PATCH twin this package really sends" below
+ *     makes the mistake unrepeatable — an exemption whose evidence is another entry in this
+ *     same table is self-evidently empty, and a test can say so where a reader has to notice.
  *
  * Everything else is `gap` — a real, undone instance of the rule, recorded so the NEXT one is
  * caught the day it lands. A `gap` entry is a debt, not a decision: delete it when you ship
@@ -87,6 +107,7 @@ import {
   normalisePath,
   reachedRoutes,
   routerRoutes,
+  stripComments,
 } from "./tool-surface.js";
 
 /**
@@ -105,8 +126,6 @@ const DECLARED = {
   "POST /api/v1/tenants/:param/rotate-audit-key/challenge": "ceremony", // TenantAuditKeyController.challenge
   "POST /api/v1/tenants/:param/rotate-audit-key": "ceremony", // TenantAuditKeyController.rotate
   "POST /api/v1/tenants/:param/bootstrap-audit-key": "ceremony", // TenantAuditKeyController.bootstrap
-  "GET /api/v1/tenants/:param/authenticators": "ceremony", // TenantAuthenticatorController.index
-  "PATCH /api/v1/tenants/:param/authenticators/:param": "ceremony", // TenantAuthenticatorController.rename
 
   // ── superadmin: the cross-tenant console, a principal this package never holds
   "GET /api/v1/admin/tenants": "superadmin", // AdminTenantController.index
@@ -125,14 +144,26 @@ const DECLARED = {
 
   // ── duplicate: the same action, reached by a tool on its twin route ───────
   "GET /api/v1": "duplicate", // WelcomeController.index
-  "PUT /api/v1/intake/sources/:param": "duplicate", // IntakeSourceController.update
-  "PUT /api/v1/projects/:param": "duplicate", // ProjectController.update
-  "PUT /api/v1/webhooks/:param": "duplicate", // WebhookController.update
-  "PUT /api/v1/skills/:param": "duplicate", // SkillController.update
-  "PUT /api/v1/token-budgets/:param": "duplicate", // TokenBudgetController.update
-  "PUT /api/v1/articles/:param": "duplicate", // ArticleController.update
+  "PUT /api/v1/articles/:param": "duplicate", // ArticleController.update — knowledge_update PATCHes it
 
   // ── gap: no tool reaches this. Real debt — delete the line when you ship one
+  //
+  // The two authenticator reads were `ceremony` until #846 round 1: neither verifies an
+  // assertion (`tenant_authenticator_controller.ex:95-97`, `:121-147`, `:660-686`), and the
+  // index is the concrete one — `revoke_authenticator` ships and takes an `authenticator_id`
+  // no tool can obtain, because a browser ceremony discards the 201 body that carried it
+  // (`tenant_authenticator_controller.ex:9-16`).
+  "GET /api/v1/tenants/:param/authenticators": "gap", // TenantAuthenticatorController.index
+  "PATCH /api/v1/tenants/:param/authenticators/:param": "gap", // TenantAuthenticatorController.rename
+  //
+  // The five PUT twins below were `duplicate` until the same round, each excused against a
+  // PATCH that is itself a `gap` a few lines down. Nothing reaches either verb.
+  "PUT /api/v1/intake/sources/:param": "gap", // IntakeSourceController.update
+  "PUT /api/v1/projects/:param": "gap", // ProjectController.update
+  "PUT /api/v1/webhooks/:param": "gap", // WebhookController.update
+  "PUT /api/v1/skills/:param": "gap", // SkillController.update
+  "PUT /api/v1/token-budgets/:param": "gap", // TokenBudgetController.update
+  //
   "GET /api/v1/audit/sth/:param/inclusion/:param": "gap", // AuditSthController.inclusion
   "GET /api/v1/channel/posts/quarantined": "gap", // ChannelPostController.quarantined
   "POST /api/v1/channel/posts/:param/release": "gap", // ChannelPostController.release
@@ -227,6 +258,10 @@ const DECLARED = {
   "PATCH /api/v1/entities/:param": "gap", // ContextRetrieverController.update
   "DELETE /api/v1/entities/:param": "gap", // ContextRetrieverController.delete
   "GET /api/v1/corpora/:param": "gap", // CorpusController.show
+  // Invisible to this sweep until #846 round 1 taught `routerRoutes()` to join a wrapped verb
+  // macro: it is declared across three lines (`router.ex:713-715`), so it was absent from the
+  // parse, from UNREACHED and from this table at once, and the sweep passed green.
+  "GET /api/v1/knowledge/analytics/projects/:param/usage": "gap", // KnowledgeAnalyticsController.project_usage
   "GET /api/v1/knowledge/export": "gap", // KnowledgeExportController.export
   "GET /api/v1/knowledge/pipeline": "gap", // KnowledgePipelineController.status
   "POST /api/v1/projects/:param/articles": "gap", // ArticleController.create
@@ -343,6 +378,27 @@ describe("no /api/v1 route loses its tool silently", () => {
     assert.deepEqual(bad, [], "an unknown category excuses a route without saying anything");
   });
 
+  test("a PUT excused as a `duplicate` has a PATCH twin this package really sends", () => {
+    // The category means "already reached by a tool on its twin route", and five entries were
+    // excused against a twin that is a `gap` in this same table — an exemption whose evidence
+    // is another line of the inventory it belongs to. A reader has to notice that; this does
+    // not. REACHED, not "absent from DECLARED", is the predicate: a PATCH twin the router does
+    // not serve at all is an equally empty excuse and fails here for the same reason.
+    const unearned = Object.entries(DECLARED)
+      .filter(([route, kind]) => kind === "duplicate" && route.startsWith("PUT "))
+      .map(([route]) => route.replace(/^PUT /, "PATCH "))
+      .filter((twin) => !REACHED.has(twin))
+      .sort();
+
+    assert.deepEqual(
+      unearned,
+      [],
+      "a PUT is excused as a duplicate of this PATCH, and no tool in this package sends it — " +
+        "so neither verb is reached and the exemption hides a gap. Declare the PUT a `gap`, " +
+        "or ship the tool that makes the twin real.",
+    );
+  });
+
   test("the declaration is not vacuous — it holds both exemptions and real debt", () => {
     // A future edit that collapsed every entry to one permissive category would leave the
     // assertions above green while saying nothing. Both kinds must be present, and the
@@ -372,7 +428,15 @@ describe("every declared tool is actually dispatchable", () => {
   // prototypes, so a cross-realm empty array is not equal to `[]` and this assertion failed
   // with an empty diff while both sides were empty.
   const declared = Array.from(loadTools(), (t) => t.name);
-  const dispatched = [...INDEX_SRC.matchAll(/^\s*case "([a-z0-9_]+)":/gm)].map((m) => m[1]);
+  // COMMENTS STRIPPED FIRST, on the shared `stripComments` the sibling wiring guards use.
+  // `^\s*case` already excludes a LINE-commented case — `//` is not whitespace — and excluded
+  // nothing about a BLOCK-commented one, so a `case` inside `/* … */` counted as dispatched and
+  // a tool disabled that way kept its green wiring assertion. That is the same hole #861 round
+  // 1 closed on `custody_key_pinning` and `delivery_loop_tools`; this scan was written after
+  // them and did not inherit the fix.
+  const dispatched = [...stripComments(INDEX_SRC).matchAll(/^\s*case "([a-z0-9_]+)":/gm)].map(
+    (m) => m[1],
+  );
 
   test("every tool in TOOLS has a dispatch case", () => {
     const orphaned = declared.filter((name) => !dispatched.includes(name)).sort();

@@ -31,6 +31,13 @@ All notable changes to loopctl are documented here.
   pass `repo` and `base_branch` explicitly, and the declared schema had only `base_branch`. It
   worked solely because no schema sets `additionalProperties: false`.
 
+  **Two refusals an operator will notice.** `update_story` now refuses a `story_id` that is not
+  a UUID before sending anything: loopctl answers a malformed one with a 404 byte-identical to
+  the one an unknown story gets, and the two have opposite remedies. And `mcp_version` now
+  prints WHY a discovery request failed — the `ENOTFOUND`, the timeout, or loopctl's own error
+  body — instead of a bare `status 0`, which is the whole answer in the situation that tool
+  exists for.
+
   **Nothing required of an operator.** All three are additive; a session picks them up on the
   next `/mcp` or restart once `loopctl-mcp-server@2.99.0` has published. 2.98.0 is deliberately
   skipped — it is claimed by a branch in flight, and two trees must not share one version.

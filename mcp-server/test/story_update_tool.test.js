@@ -17,7 +17,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import { storyPath, updateBody, updateStory } from "../lib/story-update.js";
-import { PKG_DIR, loadTools } from "./tool-surface.js";
+import { PKG_DIR, loadTools, stripComments } from "./tool-surface.js";
 
 const INDEX_SRC = readFileSync(path.join(PKG_DIR, "index.js"), "utf8");
 const README = readFileSync(path.join(PKG_DIR, "README.md"), "utf8");
@@ -150,6 +150,41 @@ describe("the refusals, each for an answer the server cannot distinguish from su
     assert.match(result.body, /story_id/);
     assert.equal(calls.length, 0);
   });
+
+  test("refuses a MALFORMED story id, on the same guard the delivery verbs use", async () => {
+    // This tool shipped without the check while all four verbs in `lib/delivery-loop.js` had
+    // it, and the omission made this tool's own description false: it promises "404 for an
+    // unknown story" as that status's only meaning. A malformed id gets the SAME 404 —
+    // `Stories.get_story/2` puts it into a `where` against a `:binary_id` with no cast
+    // (`stories.ex:185-190`) and `Ecto.Query.CastError` is mapped to 404
+    // (`cast_error_handler.ex:32-35`), byte-identical to `FallbackController`'s not-found
+    // (`fallback_controller.ex:74-78`). Two opposite remedies, one answer.
+    const { calls, apiCall } = fakeApi();
+
+    const result = await updateStory({ story_id: "not-a-uuid", title: "t" }, { apiCall });
+
+    assert.equal(result.error, true);
+    assert.match(result.body, /story_id/);
+    assert.match(result.body, /must be a UUID/, "it did not name the shape");
+    assert.equal(calls.length, 0, "a request went out anyway");
+  });
+
+  test("the guard is IMPORTED, not a second copy of the same check", () => {
+    // Two implementations would give one parameter two different refusals depending on which
+    // tool took it. The import is the assertion: a reimplementation here would pass the test
+    // above and fail this one.
+    const src = stripComments(readFileSync(path.join(PKG_DIR, "lib", "story-update.js"), "utf8"));
+
+    assert.match(
+      src,
+      /import\s*\{[^}]*\buuid\b[^}]*\}\s*from\s*"\.\/delivery-loop\.js"/,
+      "it no longer imports the shared uuid guard from lib/delivery-loop.js",
+    );
+    assert.ok(
+      !/UUID_RE|\[0-9a-f\]\{8\}/.test(src),
+      "it carries its own UUID pattern — one check, one refusal, one place",
+    );
+  });
 });
 
 describe("updateBody", () => {
@@ -240,9 +275,7 @@ describe("the wiring in index.js", () => {
     const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
     assert.ok(end > start, "the handler has no following function to bound it");
 
-    const handler = INDEX_SRC.slice(start, end)
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/\/\/[^\n]*/g, "");
+    const handler = stripComments(INDEX_SRC.slice(start, end));
 
     assert.match(handler, /updateStoryRequest\(/, "it does not call the lib");
     assert.match(handler, /LOOPCTL_ORCH_KEY/, "it does not send the orchestrator key");

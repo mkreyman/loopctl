@@ -50,6 +50,14 @@ function refuse(body) {
 /**
  * A client-side shape check on the ids that go into a URL PATH: `story_id` and `runner_id`.
  *
+ * EXPORTED, because it is one check and not a pattern to copy. `update_story`
+ * (`lib/story-update.js`) interpolates a `story_id` into a path exactly as the verbs below do
+ * and shipped without it, which is the way a rule stated in a comment decays: the comment says
+ * "any argument interpolated into a URL path", and the check was reachable only from this file.
+ * A second implementation would give the same parameter two different refusals depending on
+ * which tool took it — the thing the paragraph on `place_dispatch`'s `story_id` below already
+ * refuses to do.
+ *
  * NOT on `place_dispatch`'s `dispatch_id`, which is an id and is forwarded unchecked. That is a
  * decision and not an omission: it travels in the request BODY, and `Placement.place/4` casts it
  * with `fetch_uuid/2` (`lib/loopctl/delivery/placement.ex:786-791`) as the second clause of its
@@ -104,7 +112,7 @@ function refuse(body) {
  */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function uuid(value, field) {
+export function uuid(value, field) {
   if (typeof value !== "string" || value.trim() === "") {
     return refuse(`\`${field}\` is required.`);
   }

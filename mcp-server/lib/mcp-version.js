@@ -132,6 +132,42 @@ const REMEDY = {
 };
 
 /**
+ * What `result.body` adds to a failed discovery request, as a sentence to append.
+ *
+ * `status 0` ALONE IS NOT A DIAGNOSIS, and this tool exists for exactly the session where the
+ * diagnosis is the whole answer. `publicApiCall` uses status 0 for every local failure and puts
+ * the cause in `body`: `Network error: <message> (<cause>)` — which is where an `ENOTFOUND` or a
+ * `ECONNREFUSED` lives — or `Request timed out after 30s` (`index.js`, its `catch` around
+ * `fetch`). A caller reading only the 0 learns that no server answered and nothing about why,
+ * so a typo'd LOOPCTL_SERVER, a dead network and a slow one are one message. An HTTP failure
+ * puts the server's own error body there instead, which is equally the thing to read.
+ *
+ * Bounded and never trusted to be a string: `apiCall`-shaped bodies are parsed JSON as often as
+ * text, and this string goes into a tool result a session reads.
+ */
+function cause(body) {
+  if (body === undefined || body === null || body === "") return "";
+
+  const text = typeof body === "string" ? body : safeJson(body);
+  if (!text) return "";
+
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  if (trimmed === "") return "";
+
+  return ` ${trimmed.length > 300 ? `${trimmed.slice(0, 300)}… (truncated)` : trimmed}`;
+}
+
+function safeJson(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    // A circular or otherwise unserialisable body must not turn a version report into a
+    // throw — the whole contract of this tool is that it always answers.
+    return "";
+  }
+}
+
+/**
  * `mcp_version`: what this process is running, what loopctl expects, and what the difference
  * means.
  *
@@ -148,7 +184,7 @@ export async function mcpVersion(_args = {}, { publicApiCall, version, baseUrl }
   const result = await publicApiCall("GET", DISCOVERY_PATH, null);
 
   if (result && result.error) {
-    detail = `loopctl discovery request failed (status ${result.status}).`;
+    detail = `loopctl discovery request failed (status ${result.status}).${cause(result.body)}`;
   } else {
     expected = result?.mcp_server?.npm_version ?? null;
     if (!expected) {
