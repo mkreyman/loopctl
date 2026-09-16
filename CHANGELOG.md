@@ -335,6 +335,34 @@ All notable changes to loopctl are documented here.
 
 ### Fixed
 
+- **The admin "active API keys" counts ignored expiry (846.8).** `GET /api/v1/admin/stats`
+  (`total_api_keys`) and `GET /api/v1/admin/tenants[/:id]` (`api_key_count`) counted
+  `revoked_at IS NULL` alone, so every expired-but-unrevoked key read as active. That set
+  never drains on its own: `RevokeExpiredApiKeysWorker` deliberately never revokes a
+  `user`/`superadmin` key nor any key with no `agent_id`, because doing so would destroy the
+  rotate path without freeing an `api_keys_one_role_per_agent_idx` slot. Both counts now use
+  the auth pipeline's own definition — not revoked AND not past `expires_at` — so
+  **the numbers an operator reads on those two endpoints will DROP** to the keys that can
+  actually authenticate. Nothing about which keys work changed; only the counts did.
+
+- **`POST /api/v1/stories/:id/force-unclaim` answered a stacktrace instead of an error
+  (846.8).** The controller matched only `{:ok, _}` and `{:error, :not_found}`, and the
+  context function matched three of its transaction's five steps — so any other refusal was
+  a `CaseClauseError`, i.e. an unrendered 500, on the one call an operator makes to unstick a
+  parked story. Refusals now render through the standard error body (422 for a rejected
+  release write, 500 with a logged reason otherwise).
+
+- **A placement that could not revoke its session credential erased the remedy for it
+  (846.8).** `Delivery.Placement`'s compensation cleared the story's
+  `implementer_dispatch_id` BEFORE revoking the dispatch, so a clear that succeeded ahead of a
+  revoke that failed left the operator holding a story that named nothing — while the
+  credential went on occupying the runner agent's one-key-per-role slot, refusing every later
+  placement onto that machine with 422 `agent already has an active key with this role` until
+  its TTL. **Operator-visible:** `POST /api/v1/stories/:id/force-unclaim` (MCP
+  `force_unclaim_story`) now recovers that state, which is what the placement's own error log
+  has always told you to run. Observed once in production on 2026-09-15: one story parked for
+  four hours.
+
 - **Contract 1.9.2 — a nullable enum publishes `null` as a member.** `incomplete` was typed
   `["string", "null"]` with an enum of the five reasons, and under JSON Schema 2020-12 an
   `enum` constrains EVERY instance, `null` included — so the two keywords contradicted each

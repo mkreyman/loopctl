@@ -2807,9 +2807,19 @@ defmodule Loopctl.Progress do
 
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
+  - `{:error, %Ecto.Changeset{}}` if the release write itself is refused
+  - `{:error, :force_unclaim_failed}` if any LATER step of the transaction is — see the
+    result `case` below for which steps those are and why none of them can reach it today
+
+  The changeset shape is why this spec is not the `{:error, atom()}` it used to claim: the
+  `:story` clause has handed back a changeset since this function was written, so the spec
+  and the code disagreed. This is an OPERATOR'S REMEDY for a parked story — the one call
+  that unsticks a claim nothing else will release — so every refusal it can produce has to
+  be a value the caller can report, and a `@spec` it does not honour is the first step
+  towards a caller that believes it.
   """
   @spec force_unclaim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()} | {:error, atom() | Ecto.Changeset.t()}
   def force_unclaim_story(tenant_id, story_id, opts \\ []) do
     orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
     actor_id = Keyword.get(opts, :actor_id)
@@ -2878,6 +2888,35 @@ defmodule Loopctl.Progress do
         }
       end)
 
+    # ONE CLAUSE PER MULTI STEP, and deliberately NO catch-all. The Multi has five steps and
+    # this matched three of them, so a refusal at `:stage`, `:audit` or `:webhook_events` was
+    # a `CaseClauseError` — an exception out of the one call an operator makes to unstick a
+    # parked story, and one that contradicted this function's own `@spec` (846.8, AC-5).
+    #
+    # A catch-all would have been the wrong repair and is what this house style refuses (see
+    # `LoopctlWeb.DispatchController.revoke_ceiling/3`): it hides the SIXTH step somebody adds
+    # later, which is exactly how the defect arrived. `test/loopctl/progress/
+    # force_unclaim_result_coverage_test.exs` reads this function's source and fails when a
+    # step name appears in the Multi and not here, so adding a step without deciding what its
+    # failure means is caught at the gate rather than in production.
+    #
+    # ## None of the three added clauses can fire TODAY, and they are not pretending otherwise
+    #
+    #   * `:stage` — `Stages.follow_release/5` is specced `{:ok, StoryStage.t() | nil}` and
+    #     every one of its three branches returns `{:ok, _}` (`stages.ex:976-988`). Its own
+    #     failures are `true = ` and `{1, [updated]} = ` MATCHES and unguarded `AdminRepo`
+    #     statements, so they raise and abort the transaction rather than returning a tuple.
+    #   * `:audit` — `Audit.log_in_multi/3` inserts an `AuditLog.create_changeset/1` whose four
+    #     required fields (`entity_type`, `entity_id`, `action`, `actor_type`) are all set here
+    #     from literals or from `updated.id`, so the changeset is valid by construction. There
+    #     is no `unique_constraint` on that changeset either, so a database refusal raises.
+    #   * `:webhook_events` — `EventGenerator.generate_events/3` ends `{:ok, events}` on every
+    #     path and hard-matches `{:ok, _}` on the inserts underneath, so it too raises instead.
+    #
+    # So the shape that actually reaches a caller from those three is an EXCEPTION, which
+    # `Placement.release_claim/5` rescues by design. These clauses exist for the step that is
+    # added next, and the log line is what tells an operator which one it was — the returned
+    # atom names none of them, because `:webhook_events` is not a fact about the story.
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} ->
         revoke_released_session_credential(tenant_id, updated, opts)
@@ -2888,6 +2927,18 @@ defmodule Loopctl.Progress do
 
       {:error, :story, changeset, _} ->
         {:error, changeset}
+
+      {:error, step, reason, _} when step in [:stage, :audit, :webhook_events] ->
+        Logger.error(
+          "force_unclaim rolled back at a step that is not supposed to be able to refuse. " <>
+            "The story is UNCHANGED — still claimed, still held — and the remedy has to be " <>
+            "re-run. tenant_id=#{tenant_id} story_id=#{story_id} step=#{inspect(step)} " <>
+            "reason=#{inspect(reason)}",
+          tenant_id: tenant_id,
+          story_id: story_id
+        )
+
+        {:error, :force_unclaim_failed}
     end
   end
 

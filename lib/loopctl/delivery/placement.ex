@@ -631,6 +631,16 @@ defmodule Loopctl.Delivery.Placement do
   # Returns `:ok` or the failure, so the undo can report it rather than swallow it. The failure
   # is worth naming on its own, and the message has to name the CONSEQUENCE rather than the
   # timestamp — see below.
+  #
+  # **AND IT SWALLOWS A RAISE, not only an `{:error, _}`** — the hole `release_claim/5` already
+  # closed for the same reason, and closing it here is what makes a failed revoke a VALUE this
+  # function's caller can act on rather than an exception that escapes `place/4`. `Dispatches.revoke/3` returns tuples from its own Multi, but the
+  # statements under it are ordinary `AdminRepo` calls on a 3-connection pool with no
+  # `lock_timeout`, so a DBConnection error — or a constraint — is a RAISE. Unrescued it
+  # replaced the push refusal the caller is owed with an unrelated one AND skipped the two
+  # steps after it, so `log_undo/5` said nothing and `park_unreleased_claim/6` never ran:
+  # a failed release went un-escalated, which is the whole of 846.1 undone by a raise in
+  # the step before it.
   defp revoke_session_dispatch(tenant_id, session, reason) do
     case Dispatches.revoke(tenant_id, session.id, actor_lineage: caller_lineage(session)) do
       {:ok, _count} ->
@@ -652,20 +662,27 @@ defmodule Loopctl.Delivery.Placement do
         # holding the dispatch id revokes it directly, and the one holding only the story id
         # force-unclaims (`Progress.force_unclaim_story/3` revokes this story's session
         # dispatch on its way past).
-        Logger.error(
-          "placement could not revoke the session dispatch its claim never used. The key stays " <>
-            "usable for its full TTL and OCCUPIES the agent's one-key-per-role slot until " <>
-            "then, so every later placement onto this agent is refused 422 'agent already has " <>
-            "an active key with this role'. Revoke it: POST " <>
-            "/api/v1/dispatches/#{session.id}/revoke (MCP revoke_dispatch), or force-unclaim " <>
-            "the story. tenant_id=#{tenant_id} dispatch_id=#{session.id} " <>
-            "agent_id=#{inspect(session.agent_id)} claim_error=#{inspect(reason)} " <>
-            "revoke_error=#{inspect(other)}",
-          tenant_id: tenant_id
-        )
-
-        other
+        log_revoke_failure(tenant_id, session, reason, other)
     end
+  rescue
+    error -> log_revoke_failure(tenant_id, session, reason, {:error, error})
+  end
+
+  defp log_revoke_failure(tenant_id, session, reason, outcome) do
+    Logger.error(
+      "placement could not revoke the session dispatch its claim never used. The key stays " <>
+        "usable for its full TTL and OCCUPIES the agent's one-key-per-role slot until " <>
+        "then, so every later placement onto this agent is refused 422 'agent already has " <>
+        "an active key with this role'. Revoke it: POST " <>
+        "/api/v1/dispatches/#{session.id}/revoke (MCP revoke_dispatch), or force-unclaim " <>
+        "the story — which works BECAUSE this branch leaves the story naming this dispatch " <>
+        "(see `undo_claim/5`). tenant_id=#{tenant_id} dispatch_id=#{session.id} " <>
+        "agent_id=#{inspect(session.agent_id)} claim_error=#{inspect(reason)} " <>
+        "revoke_error=#{inspect(outcome)}",
+      tenant_id: tenant_id
+    )
+
+    outcome
   end
 
   # Everything from here on has a COMMITTED claim behind it, so every refusal releases it.
@@ -839,16 +856,35 @@ defmodule Loopctl.Delivery.Placement do
   # `Progress.clear_unused_implementer_dispatch/3` for why the opposite claim, which this
   # comment used to make, was false.
   #
-  # ## What the ORDER is and is not
+  # ## What the ORDER is, and why REVOKE NOW COMES BEFORE CLEAR (846.8, AC-1)
   #
   # RELEASE FIRST IS REQUIRED. Everything downstream describes a story nobody is working on,
   # and the release is what makes that true.
   #
-  # CLEAR BEFORE REVOKE IS NOT REQUIRED, and this no longer claims it is. It was justified by
-  # the false mechanism above; with that gone the two are independent — a story naming a
-  # revoked dispatch and one naming a live dispatch are refused identically. They stay in this
-  # order because it reads as the undo of the claim that recorded it, not because a window
-  # between them is dangerous.
+  # REVOKE BEFORE CLEAR IS REQUIRED TOO, and the clear is CONDITIONAL on the revoke having
+  # succeeded (`clear_if_revoked/4`). This comment used to say the two were independent
+  # because "a story naming a revoked dispatch and one naming a live dispatch are refused
+  # identically" — true about the L4 gates, and irrelevant to the thing that actually
+  # depends on the order. What depends on it is the REMEDY.
+  #
+  # `Progress.force_unclaim_story/3` is the remediation path for a credential this undo
+  # could not revoke, and it finds that credential through the story's
+  # `implementer_dispatch_id` (`revoke_released_session_credential/3` ->
+  # `Dispatches.revoke_story_session/4`). Clearing that column first and then failing to
+  # revoke therefore erases the only handle the remedy has: the operator holds a story id,
+  # the story names nothing, and nothing short of a direct dispatch id — which the log line
+  # in `revoke_session_dispatch/3` is then the sole record of — gets the agent's
+  # one-key-per-role slot back before the TTL. That is not hypothetical; it parked story
+  # d9975b31 for four hours on 2026-09-15. The two remediation paths could not cover each
+  # other in the one case where covering matters.
+  #
+  # So: revoke, and clear ONLY if it worked. When it did not, the stale id is KEPT on
+  # purpose, and that trade is one-sided. Keeping it costs the story's next claimant a
+  # refusal, and only if that claimant is UNLINEAGED (`caller_lineage_required`) or shares a
+  # chain with the dead dispatch (`self_report_blocked`) — a re-claim THROUGH A DISPATCH,
+  # which is what `place/4` itself does, overwrites the column and is unaffected. Dropping
+  # it costs every later placement onto that agent a 422 for the whole TTL with no remedy
+  # reachable from the story at all.
   #
   # Each step reports, and `log_undo/5` says so when any of them did not do what it was for.
   # Nothing here rolls anything back on failure: the caller is owed the refusal that brought it
@@ -903,11 +939,35 @@ defmodule Loopctl.Delivery.Placement do
   # and it is still held exactly when the release failed.
   defp undo_claim(tenant_id, story, session, reason, opts) do
     release = release_claim(tenant_id, story.id, reason, caller_lineage(session), opts)
-    cleared = Progress.clear_unused_implementer_dispatch(tenant_id, story.id, session.id)
     revoked = revoke_session_dispatch(tenant_id, session, reason)
+    cleared = clear_if_revoked(tenant_id, story.id, session, revoked)
     log_undo(tenant_id, story.id, session, reason, {release, cleared, revoked})
     park_unreleased_claim(tenant_id, story, session, reason, release, opts)
   end
+
+  # TWO TOTAL CLAUSES over what `revoke_session_dispatch/3` returns, matching the shape
+  # `park_unreleased_claim/6` uses and for the same reason: `:ok` is the only success, and a
+  # catch-all would silently absorb a third shape if one were ever added — which on this
+  # branch means silently clearing the handle the remedy needs.
+  #
+  # `:kept_for_remediation` is not a failure and is not `{:ok, :cleared}`, so `log_undo/5`
+  # falls to its warning clause and the line names all three outcomes. That is correct: the
+  # undo genuinely did not fully undo, and the residue is a live credential PLUS a story
+  # still naming it, which is the state `force_unclaim_story/3` is then able to clear.
+  #
+  # The raise is swallowed for the reason `release_claim/5` and `revoke_session_dispatch/3`
+  # swallow theirs: `park_unreleased_claim/6` runs AFTER this, so an exception from the clear
+  # would take the 846.1 escalation with it. `clear_unused_implementer_dispatch/3`
+  # cannot return an error, but it is one `update_all` plus an audit insert on the same
+  # unguarded 3-connection pool, so it can raise.
+  defp clear_if_revoked(tenant_id, story_id, session, :ok) do
+    Progress.clear_unused_implementer_dispatch(tenant_id, story_id, session.id)
+  rescue
+    error -> {:error, error}
+  end
+
+  defp clear_if_revoked(_tenant_id, _story_id, _session, _revoke_failed),
+    do: {:ok, :kept_for_remediation}
 
   # THE CONDITION, and it is two total clauses over what `release_claim/5` returns rather than a
   # predicate plus a catch-all: a released claim needs nothing, and every other outcome of that

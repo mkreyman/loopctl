@@ -150,11 +150,31 @@ defmodule Loopctl.Auth.ApiKeyCacheTest do
 
       # Populate the cache read-through.
       assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw)
+      assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak.key_hash)
 
       # The cron worker revokes the expired dispatch + its api_key and MUST bust the
-      # cache in-band (AC-33.3.2) — deleting worker line 56 would leave this green
-      # only because of the assertion below.
+      # cache in-band (AC-33.3.2). Deleting the worker's
+      # `Auth.invalidate_key_cache_by_hashes/1` call is caught by BOTH assertions below,
+      # and they are not the same assertion twice (846.8, AC-3):
+      #
+      #   * the CACHE-LAYER one is the direct property and is the one the worker line
+      #     exists for. It holds whatever `verify_api_key/1` would go on to decide.
+      #   * the AUTH-LAYER one is the security outcome. It is falsifiable HERE only
+      #     because the cached struct was taken BEFORE the sweep and therefore carries
+      #     `revoked_at: nil` and `expires_at: nil` — it is the DISPATCH that expired,
+      #     not the key — so `Auth.valid_now?/1` re-enforcing the wall clock against the
+      #     cached struct cannot repair it. Where the KEY ITSELF is cached already past
+      #     its expiry, `valid_now?/1` rejects it whether or not anything was busted and
+      #     an auth-layer assertion IS vacuous; see the cache-invalidation test in
+      #     `test/loopctl/workers/revoke_expired_api_keys_worker_test.exs`, which asserts
+      #     at the cache layer for exactly that reason.
+      #
+      # The cache assertion is FIRST so it is the one that reports, rather than being
+      # masked by the auth assertion failing ahead of it.
       assert :ok = RevokeExpiredDispatchesWorker.perform(%Oban.Job{args: %{}})
+
+      # The entry is gone, not merely unusable.
+      assert ApiKeyCache.fetch(ak.key_hash) == :miss
 
       # Immediately unauthorized on the very next request, not after the TTL.
       assert Auth.verify_api_key(raw) == {:error, :unauthorized}

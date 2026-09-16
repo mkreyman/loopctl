@@ -676,6 +676,63 @@ defmodule Loopctl.Delivery.PlacementTest do
       refute event.actor_label == "api:dispatch_placement"
     end
 
+    # 846.8 AC-1. THE COVERING PROPERTY, not the call order. `undo_claim/5` used to clear
+    # `implementer_dispatch_id` and THEN revoke, so a clear that succeeded ahead of a revoke
+    # that failed erased the only handle the other remediation path has: the operator holds a
+    # story id, `force_unclaim_story/3` reads `story.implementer_dispatch_id` to find the
+    # credential, and the story named nothing. The two remediation paths could not cover each
+    # other in the one case where covering matters — story d9975b31, four hours, 2026-09-15.
+    #
+    # So this asserts the RECOVERY, not the ordering: a test that pinned "revoke is called
+    # before clear" would pin the mechanism and go green on any refactor that kept the order
+    # and dropped the condition, which is the half that actually does the covering.
+    test "a revoke the undo could not do leaves force_unclaim able to finish it", ctx do
+      %{runner: runner, story: story, channel: channel} = ctx
+
+      # Staged BEFORE the placement, because the session dispatch does not exist until
+      # `place/4` mints it — which is why the trigger is scoped to the tenant and to the
+      # revoke's own column transition rather than to an id.
+      name = fail_the_revoke!(runner.tenant_id)
+      disconnect(channel, runner)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          # Claims, is refused by the absent runner, then compensates. The caller still gets
+          # its own refusal — a revoke that RAISES used to replace it with a Postgrex error
+          # and skip both steps after it, `park_unreleased_claim/6` included.
+          assert {:error, :runner_not_connected} = place(ctx, dispatch_payload(story))
+        end)
+
+      assert log =~ "placement could not revoke the session dispatch"
+      assert log =~ "placement undo did not fully undo"
+
+      # THE RESIDUE, and it is the recoverable shape: a credential still live, and a story
+      # that still NAMES it. Either half missing and the remedy below has nothing to work
+      # from — the id is the whole handle.
+      held = unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end)
+      refute held.revoked_at
+      released = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert released.implementer_dispatch_id == held.id
+
+      # THE REMEDY. An operator holding only the story id force-unclaims, and that revokes
+      # the credential the placement could not — which is what frees the agent's
+      # `api_keys_one_role_per_agent_idx` slot and lets the loop place onto it again.
+      drop_the_revoke_trigger!(name)
+
+      assert {:ok, _} =
+               unboxed(fn ->
+                 Progress.force_unclaim_story(runner.tenant_id, story.id, actor_label: "operator")
+               end)
+
+      recovered = unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end)
+      assert recovered.revoked_at
+
+      # The KEY, not only the dispatch row: the slot is held by `api_keys`, so a dispatch
+      # marked revoked with a live key would read as recovered and still refuse every later
+      # placement onto this agent for the whole TTL.
+      assert unboxed(fn -> AdminRepo.get!(ApiKey, recovered.api_key_id) end).revoked_at
+    end
+
     test "a claim the undo could not give back is PARKED for a human", ctx do
       %{runner: runner, story: story} = ctx
 
@@ -1544,6 +1601,58 @@ defmodule Loopctl.Delivery.PlacementTest do
   defp drop_the_release_trigger!(name) do
     Sandbox.unboxed_run(AdminRepo, fn ->
       AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON story_stages")
+      AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+    end)
+
+    :ok
+  end
+
+  # MAKES THE REVOKE FAIL, the same way and for the same reason `fail_the_release!/1` makes
+  # the release fail: nothing reachable from Elixir can. `Dispatches.revoke/3` runs an
+  # `AdminRepo` Multi over rows this test's own placement just committed, so a mock would have
+  # to replace the module, and `undo_claim/5` resolves it at compile time.
+  #
+  # SCOPED TO THE REVOKE'S OWN TRANSITION — `revoked_at` going from NULL to non-NULL — and to
+  # this tenant, so it names the two revokes of the undo path (the release's post-commit one
+  # and `revoke_session_dispatch/3`'s) and nothing the setup or the claim writes. Both are
+  # wanted: the release rescues its own and reports success, which is exactly the state the
+  # undo then has to handle.
+  #
+  # Returns the trigger NAME so the test can drop it mid-run — the remedy it then asserts is
+  # itself a revoke, and a trigger still installed would break the recovery it is measuring.
+  defp fail_the_revoke!(tenant_id) do
+    name = "placement_revoke_fails_#{System.unique_integer([:positive])}"
+
+    unboxed(fn ->
+      {:ok, _} =
+        AdminRepo.transaction(fn ->
+          AdminRepo.query!("SET LOCAL lock_timeout = '5s'")
+
+          AdminRepo.query!(
+            "CREATE FUNCTION #{name}() RETURNS trigger AS $fn$ BEGIN " <>
+              "RAISE EXCEPTION 'placement test: this dispatch cannot be revoked'; " <>
+              "END; $fn$ LANGUAGE plpgsql"
+          )
+
+          AdminRepo.query!(
+            "CREATE TRIGGER #{name}_t BEFORE UPDATE ON dispatches FOR EACH ROW " <>
+              "WHEN (NEW.tenant_id = '#{tenant_id}'::uuid " <>
+              "AND OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL) " <>
+              "EXECUTE FUNCTION #{name}()"
+          )
+        end)
+    end)
+
+    on_exit(fn -> drop_the_revoke_trigger!(name) end)
+
+    name
+  end
+
+  # `IF EXISTS` on both, so the mid-test drop and the `on_exit` one compose. Unguarded and
+  # untransactioned for the reasons `drop_the_release_trigger!/1` states at length.
+  defp drop_the_revoke_trigger!(name) do
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON dispatches")
       AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)
 

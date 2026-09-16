@@ -469,12 +469,16 @@ defmodule LoopctlWeb.StoryVerificationController do
           actor_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
         )
 
-      case Progress.force_unclaim_story(tenant_id, story_id, opts) do
-        {:ok, story} ->
-          json(conn, %{story: story})
-
-        {:error, :not_found} ->
-          {:error, :not_found}
+      # `with`, not a two-clause `case` (846.8, AC-5). This matched `{:ok, _}` and
+      # `{:error, :not_found}` and nothing else, so the OTHER refusals this function has
+      # always been able to return — a changeset from its `:story` step, and now
+      # `:force_unclaim_failed` — were a `CaseClauseError`, i.e. a 500 with a stacktrace
+      # instead of the 422/500 `LoopctlWeb.FallbackController` renders for each. That is the
+      # worst failure shape available to the one endpoint an operator calls to unstick a
+      # parked story. The fallback already has a clause for every shape the `@spec` admits,
+      # so delegating is both shorter and total.
+      with {:ok, story} <- Progress.force_unclaim_story(tenant_id, story_id, opts) do
+        json(conn, %{story: story})
       end
     end
   end
