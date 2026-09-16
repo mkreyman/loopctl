@@ -725,6 +725,15 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert row.escalation_reason =~ "does NOT clear this escalation"
       refute row.escalation_reason =~ "contract it before placing it again"
 
+      # AND THE FIRST REMEDY NAMES ITS PRECONDITION, which is the half that was missing: the
+      # orchestrator key that ran `place/4` produced this escalation and is the likeliest
+      # reader of it, and `stage/resolve` refuses that key three times over (`RequireRole,
+      # role: :user`, `RequireHumanAnchor`, then `Stages.human?/1` wanting
+      # `actor_lineage == []`). A remedy an operator is structurally unable to perform, named
+      # without saying so, is the same defect the `refute` above exists for.
+      assert row.escalation_reason =~ "403 insufficient_role"
+      assert row.escalation_reason =~ "minted by no dispatch"
+
       # And it is LOOPCTL'S OWN WORDS carrying loopctl's own error terms — there is no path
       # here by which session-authored text reaches an append-only chain entry.
       assert row.escalation_reason =~ "placement_error=:runner_not_connected"
@@ -1019,11 +1028,12 @@ defmodule Loopctl.Delivery.PlacementTest do
       # before the transition, so a reason past the bound produces no escalation at all and no
       # `escalation_reason` to measure — the stage assertion goes red first, every time.
       #
-      # What it therefore guards, beyond `:limit`: two of these terms plus the constant prose
-      # is 3_643 of the 4_000, or 91%, so an edit that grows `unreleased_claim_reason/2` past
-      # the remaining 357 codepoints fails HERE rather than losing a park in production. That
-      # is the reachable half of the bound, and the reason the whole-text clamp was not
-      # restored — a clamp would absorb exactly that edit, silently.
+      # So beyond `:limit`, this is what guards the PROSE: an edit that grows
+      # `unreleased_claim_reason/2` past what is left of the 4_000 fails HERE rather than
+      # losing a park in production, and that is why the whole-text clamp was not restored —
+      # a clamp would absorb exactly that edit, silently. No codepoint budget is quoted: the
+      # figure moved every time somebody stated it, and this assertion is what actually holds
+      # the bound.
       assert row.escalation_reason =~ "resolve_escalation"
 
       # BOTH DIAGNOSTICS SURVIVED, not just the remedy: the pair fits, so an operator still
@@ -1469,7 +1479,8 @@ defmodule Loopctl.Delivery.PlacementTest do
         AdminRepo.transaction(fn ->
           # `SET LOCAL`, never a bare `SET`: `CREATE TRIGGER` takes an ACCESS EXCLUSIVE lock, so
           # this fails fast instead of hanging the run, and the setting reverts with the
-          # transaction rather than riding a pooled connection into the next test.
+          # transaction rather than riding a pooled connection into the next test. It is safe
+          # HERE and not on the DROP — see `drop_the_release_trigger!/1` for the asymmetry.
           AdminRepo.query!("SET LOCAL lock_timeout = '5s'")
 
           AdminRepo.query!(
@@ -1497,25 +1508,27 @@ defmodule Loopctl.Delivery.PlacementTest do
   # story that happened to reuse this id, and the function would outlive the database's
   # tenants. `IF EXISTS` so a failure before the trigger was created still cleans up.
   #
-  # AND GUARDED EXACTLY AS THE CREATE IS, because it carries the identical hazard: `DROP
-  # TRIGGER` takes the same ACCESS EXCLUSIVE lock on `story_stages`. Unguarded, contention
-  # parks this callback until ExUnit kills it on its on-exit timeout — and then BOTH objects
-  # leak into a test database this box shares with every other placement run, where they
-  # surface later as somebody else's release failing for no visible reason. Failing fast
-  # reports the leak as this test's own error instead.
+  # AND DELIBERATELY UNGUARDED WHERE THE CREATE IS GUARDED, because the two are not symmetric.
+  # A `lock_timeout` on the CREATE aborts a transaction that created nothing: a clean failure
+  # with no residue. On the DROP it aborts with BOTH objects still in the database, which IS
+  # the leak — so for any contention between the timeout and ExUnit's on-exit kill (60s, the
+  # default `test/test_helper.exs` leaves in place), a guard converts a slow success into a
+  # guaranteed leak. A second session holding a sandbox transaction that touched `story_stages`
+  # is routine on this box and sits squarely in that window. Unguarded, the DROP waits and then
+  # succeeds; only past 60s do the objects leak either way, and all a guard buys there is a
+  # named error instead of a killed callback.
   #
-  # A named function rather than a third nested closure: `SET LOCAL` needs the transaction, and
-  # `on_exit` + `unboxed_run` + `transaction` is one level past what `mix credo --strict`
-  # allows in a body.
+  # NO TRANSACTION EITHER, now that no `SET LOCAL` needs one — and that is an improvement, not
+  # a leftover: wrapped, a failure on the second statement rolls the first one back and leaves
+  # the TRIGGER, the object that does the damage. Run sequentially, the trigger goes first and
+  # a failed `DROP FUNCTION` leaves an orphan nothing fires.
   defp drop_the_release_trigger!(name) do
     Sandbox.unboxed_run(AdminRepo, fn ->
-      {:ok, _} =
-        AdminRepo.transaction(fn ->
-          AdminRepo.query!("SET LOCAL lock_timeout = '5s'")
-          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON story_stages")
-          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-        end)
+      AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON story_stages")
+      AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)
+
+    :ok
   end
 
   # A story CLAIMED while its stage row is still at `queued` — what

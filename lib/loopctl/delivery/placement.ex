@@ -991,12 +991,20 @@ defmodule Loopctl.Delivery.Placement do
   # have would be a false statement in the one place an operator goes to reconstruct what
   # happened. The CLAIM half is this call's own and is stated flatly, because in the
   # already-parked case it is the only thing this line adds.
+  #
+  # AND THE REMEDY NAMES ITS PRECONDITION HERE TOO, at more length than
+  # `unreleased_claim_reason/2` can afford: this is a Logger call under no length bound, and
+  # the reader of this line is the orchestrator key that just ran `place/4` — the one principal
+  # `stage/resolve` refuses. The three gates are named above `unreleased_claim_reason/2`.
   defp log_park({:ok, _row}, tenant_id, story, session, placement_error, release_error) do
     Logger.warning(
       "placement could not release the claim it made; the story is ESCALATED and waiting for " <>
         "a human, with that claim still standing. " <>
         "Resolve it to queued (POST /api/v1/stories/#{story.id}/stage/resolve, MCP " <>
-        "resolve_escalation), which releases the claim and re-contracts the story. " <>
+        "resolve_escalation), which releases the claim and re-contracts the story. THAT CALL " <>
+        "NEEDS A HUMAN KEY: role user or above, minted by no dispatch — the orchestrator key " <>
+        "that placed this story is refused 403 insufficient_role, and a dispatch-minted user " <>
+        "key clears the plugs and is then refused human_required. " <>
         "tenant_id=#{tenant_id} story_id=#{story.id} claim_epoch=#{story.claim_epoch} " <>
         "session_dispatch_id=#{session.id} placement_error=#{short(placement_error)} " <>
         "release_error=#{short(release_error)}",
@@ -1045,83 +1053,58 @@ defmodule Loopctl.Delivery.Placement do
     :ok
   end
 
-  # LOOPCTL'S OWN WORDS. The escalation reason is operator-facing and reaches the story's
-  # `escalation_reason` column and, on this chained transition, the tenant's append-only hash
-  # chain — so none of it may be session-authored text (`Loopctl.Delivery.Untrusted` exists for
-  # the text that is). Every clause here is composed from constants plus two loopctl-side error
-  # terms.
+  # LOOPCTL'S OWN WORDS. This text reaches the story's `escalation_reason` column and, on this
+  # chained transition, the tenant's append-only hash chain, so none of it may be
+  # session-authored — `Loopctl.Delivery.Untrusted` exists for the text that is.
   #
-  # THE SECOND REMEDY SAYS WHAT FORCE-UNCLAIM DOES NOT DO, because this text is read off an
-  # ESCALATED row and force-unclaim does not clear an escalation. `Stages.follow_release/5`
-  # requeues only a row whose stage is in `StageMachine.in_flight_stages/0`; `escalated` is not
-  # in that list, so the release REBINDS the row and the stage is still `escalated` afterwards.
-  # `claimable/2` requires stage `queued`, so an operator who force-unclaimed and re-contracted
-  # got `{:error, :wrong_stage}` with nothing here saying why — which this line used to cause,
-  # by promising that contracting was the only step left.
+  # THE PRIMARY REMEDY NAMES ITS PRECONDITION, because the principal most likely to read this
+  # row cannot perform it: `stage/resolve` is gated by `RequireRole, role: :user`, then
+  # `RequireHumanAnchor` (`LoopctlWeb.StoryEscalationController`), then `Stages.human?/1`,
+  # which also wants `actor_lineage == []`. The orchestrator key that ran `place/4` gets
+  # `403 insufficient_role`; a dispatch-minted `:user` key clears both plugs and is then
+  # refused `:human_required`. Only an unlineaged `user`+ key on a human-anchored tenant
+  # resolves it.
   #
-  # THE REMEDY IS WRITTEN FIRST AND THE DIAGNOSTICS LAST. `story_stages_text_bounds` is a
-  # CHECK and `Stages.advance/4` refuses an over-long reason with `:invalid_reason` BEFORE the
-  # transition, so a fat error term would turn "the release failed" into "the release failed
-  # AND the story could not be parked" — the one outcome nothing downstream picks up. `short/1`
-  # is what prevents that, by bounding each term rather than the whole, and the ordering means
-  # that even if a future edit did overrun it, what an operator loses is the diagnostics and
-  # not the instruction.
+  # THE SECOND REMEDY SAYS WHAT FORCE-UNCLAIM DOES NOT DO, because this is read off an
+  # ESCALATED row. `Stages.follow_release/5` requeues only a stage in
+  # `StageMachine.in_flight_stages/0` and `escalated` is not one, so the release rebinds the
+  # row and the stage stays `escalated`, while `claimable/2` requires `queued`. An operator who
+  # force-unclaimed and re-contracted got `{:error, :wrong_stage}` with nothing here saying why.
   #
-  # THE HEADROOM, MEASURED rather than estimated, and re-measured in round 2 because the first
-  # measurement was taken on the wrong term. `max_reason_length/0` is 4_000 codepoints and the
-  # check is on codepoints at both ends — `reason_within_bound?/1` counts them and the column's
-  # CHECK is `char_length`. The constant prose below is 727 of them. A whole
-  # `%Ecto.Changeset{}` carrying 40 errors of 500 characters — the fattest shape reachable
-  # here, since `Progress.force_unclaim_story/3` hands back the `:story` changeset itself —
-  # renders at 1_458 through `short/1`, so the worst realistic pair is 3_643: 91% of the bound,
-  # not the 72% this said. That figure measured a bare 5-key map rather than the struct that
-  # actually arrives.
+  # THE GATE IS `reason_within_bound?/1`, 4_000 codepoints of the RAW text, and the fit is
+  # ASSERTED rather than argued: `placement_test.exs`'s "an error term whose size is its
+  # ELEMENT COUNT cannot lose the escalation" parks with the fattest pair reachable here and
+  # asserts the row reached `escalated`, which IS the length check — over the bound
+  # `Stages.advance/4` refuses `:invalid_reason` BEFORE the transition, so there is no park to
+  # read a length off. An edit that eats the headroom reds that test instead of losing a park
+  # in production (mutation-proved: 450 characters added to the prose below turns it red). The
+  # remedy is written FIRST and the diagnostics LAST so that an overrun a future edit did slip
+  # past would cost an operator the diagnostics and not the instruction. No headroom FIGURE is
+  # quoted here: three rounds stated it three different ways, all wrong in the same direction,
+  # and two careful measurements still disagreed — the assertion is what holds the bound.
   #
-  # 357 codepoints of headroom is thin, and PROSE IS WHAT GROWS — this reason gained about 60
-  # codepoints in round 1 alone. So the fit is ASSERTED rather than assumed, in
-  # `placement_test.exs`'s "an error term whose size is its ELEMENT COUNT cannot lose the
-  # escalation": it parks with that pair and asserts the row reached `escalated`, which IS the
-  # length check — `Stages.advance/4` refuses an over-long reason BEFORE the transition, so a
-  # reason past the bound produces no park to read a length off. An edit that eats the headroom
-  # therefore fails a test instead of losing a park in production (proved by mutation: 450
-  # characters added to the prose below turns that test red).
+  # BOTH `short/1` OPTIONS EARN THEIR PLACE, AND NEITHER IS UNFALSIFIABLE. `:limit` is spent
+  # across the WHOLE traversal rather than per container, so nesting cannot multiply the output
+  # (20 sibling 5-element lists render at the width of 5), and it is the only bound on a term
+  # whose size is its ELEMENT COUNT — opening it to `:infinity` reds the test above.
+  # `:printable_limit` is the only bound on one long binary, the shape a changeset's `:errors`
+  # has; opening IT reds two tests.
   #
-  # A SECOND, WHOLE-TEXT TRUNCATION WAS HERE AND STAYS GONE — decided again in round 2, not
-  # inherited, because the sentence that justified deleting it was false as an absolute.
-  #
-  # TRUE: `:limit` is spent across the WHOLE traversal rather than per container, so nesting
-  # cannot multiply the output (`inspect/2` at `limit: 5` renders six levels of 5-tuples in 40
-  # characters), and `:printable_limit` caps each binary. Between them every CONTAINER and
-  # every BINARY lands in the low thousands whatever it is handed — measured: 1_458 for the
-  # changeset above, 1_080 for a 40-element keyword list, 282 for a `%Postgrex.Error{}` holding
-  # a 20 KB message, 22 for a 20 KB non-printable binary.
-  #
-  # NOT TRUE: this used to add "no term this function can be given reaches 4_000 through it",
-  # which is a property of `short/1` and is not one it has. Neither option bounds a
-  # NON-CONTAINER SCALAR: `inspect(<a 30_000-digit integer>, limit: 5, printable_limit: 200)`
-  # is 30_000 characters, and it would lose the park. The claim that holds is about this path's
-  # two error sources, not about the formatter — `placement_error` is what `Runners.dispatch/3`
-  # and `fetch_uuid/2` refuse with (atoms, `{:invalid, [binary]}`), and `release_error` is what
-  # `Progress.force_unclaim_story/3` returns or what `release_claim/5`'s rescue caught (a
-  # changeset, an atom, an exception struct). None of those is an unbounded scalar.
-  #
-  # SO THE CLAMP STAYS OUT, and that is a choice between two hazards rather than a claim that
-  # there is only one. It would absorb the hazard that IS reachable — this prose growing into
-  # the 357 codepoints above — by eating the diagnostics silently, where the test now fails
-  # loudly; and it would guard the unreachable one with a clause nothing can falsify, which is
-  # the objection `may_mint_session_dispatch/2` records above. `:limit` is NOT in that category
-  # and is asserted: opening it to `:infinity` takes a 40-element term from 1_080 to 8_631 and
-  # the park is refused `:invalid_reason`. WHAT WOULD OVERTURN THIS: a caller handing `short/1`
-  # a term whose size is neither a container's element count nor a binary's length — then the
-  # clamp belongs INSIDE `short/1`, where it also covers `unreleased_claim_event_data/2`'s
-  # 8_000-byte bound, and not on the composed text where it sat before.
+  # A WHOLE-TEXT CLAMP STAYS OUT: it would absorb exactly that edit, silently. WHAT WOULD
+  # OVERTURN THAT — a term whose size is neither an element count nor a binary's length, which
+  # neither option bounds (a 30_000-digit integer is one). This path has no such source:
+  # `placement_error` is what `Runners.dispatch/3` and `fetch_uuid/2` refuse with, and
+  # `release_error` is a changeset, an atom or an exception struct. A new one puts the clamp
+  # INSIDE `short/1`, where it also covers `unreleased_claim_event_data/2`'s 8_000-byte bound.
   defp unreleased_claim_reason(placement_error, release_error) do
     "loopctl claimed this story for a runner, the dispatch was refused, and the compensating " <>
       "release of that claim ALSO failed. The story is held by a session that will never " <>
       "run, and no automatic path frees it before the claim lease. REMEDY: resolve this " <>
       "escalation to queued (POST /api/v1/stories/:id/stage/resolve, MCP " <>
       "resolve_escalation) — that releases the claim, revokes its session credential and " <>
-      "re-contracts the story, so one call makes it placeable again. Force-unclaim (POST " <>
+      "re-contracts the story, so one call makes it placeable again. That call needs a HUMAN " <>
+      "key: role user or above, minted by no dispatch — the orchestrator key that placed " <>
+      "this story is refused 403 insufficient_role. Force-unclaim (POST " <>
       "/api/v1/stories/:id/force-unclaim, MCP force_unclaim_story) frees the claim but does " <>
       "NOT clear this escalation: the stage row stays at escalated, so the story is still " <>
       "unplaceable and you have to resolve it anyway. " <>
