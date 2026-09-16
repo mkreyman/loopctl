@@ -5,6 +5,55 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.98.0 — 2026-09-15 (a dead session's key can be revoked)
+
+### Added
+
+- **`revoke_dispatch`** (loopctl #862, `POST /api/v1/dispatches/:id/revoke`). Revokes a dispatch
+  AND ITS WHOLE SUBTREE, plus the ephemeral api_key each one minted — `Dispatches.revoke/2`
+  matches the dispatch OR any row carrying it in `lineage_path`, so name a LEAF unless you mean
+  the subtree.
+
+  It exists because a dead session's key blocks new work. An un-revoked key occupies its agent's
+  slot in the partial unique index `api_keys_one_role_per_agent_idx`, which tests
+  `revoked_at IS NULL` and CANNOT also test `expires_at` (a partial-index predicate must be
+  IMMUTABLE and `now()` is STABLE), so even an EXPIRED key holds it and the next mint answers
+  `422 agent already has an active key with this role`. Measured on story `d9975b31`:
+  `place_dispatch` returned exactly that and wrote nothing.
+
+  **Waiting also works, slowly** — loopctl sweeps expired dispatches every minute and expired
+  api_keys every five, so the slot clears at the TTL, four hours for a placement session
+  dispatch. This tool is for not waiting. For a PARKED STORY prefer `force_unclaim_story`, which
+  revokes that story's own session dispatch and frees the stage as well.
+
+  It does NOT clear `implementer_dispatch_id`: that is custody provenance, and a revoked dispatch
+  still resolves, so verify / report / review-complete compare the same lineage afterwards.
+
+  **No env var is pinned; `LOOPCTL_USER_KEY` is PREFERRED.** The ROLE gate is
+  `role: :orchestrator` WITH the hierarchy, not `exact_role`, so pinning one variable would
+  refuse configurations the server accepts. But the endpoint also applies the LINEAGE CEILING,
+  where an UNLINEAGED caller passes only at `role: :user` — so the user key is sent as an
+  ordinary override (`LOOPCTL_API_KEY` still wins; a legacy `LOOPCTL_ORCH_KEY` is still sent
+  last, and gets the server's own message rather than a local refusal). Refusals:
+  `403 insufficient_role` for an agent key, `403 custody_tier_required` on an agent-rooted
+  tenant, `403 dispatch_outside_caller_lineage` when the target is not in your lineage (the body
+  carries `remediation.your_dispatch_id`; the tenant's `user`-role operator key may revoke
+  anywhere in its tenant), `403 unlineaged_revoke_forbidden` when your key was minted by no
+  dispatch and is below `user` role — with no lineage there is no subtree that would bound a
+  cascading revoke, so such a key could otherwise revoke the tenant's root; use the operator
+  key, or `force_unclaim_story` for a parked story, or mint a dispatch under an active parent
+  and revoke from inside that lineage. Also `503 tenant_halted` under a custody halt, 404 for an
+  unknown dispatch or another tenant's. A `dispatch_id` that is not a UUID is refused locally,
+  before any call, because the server answers such an id with the SAME 404 a well-formed unknown
+  id gets.
+
+  Idempotent: an already-revoked dispatch answers 200 with `revoked_count: 0` and its ORIGINAL
+  `revoked_at` — for two revokes racing as well as for a sequential retry, so a subtree revoked
+  from two places at once leaves no dispatch counted in two audit-chain entries. One entry is
+  appended per revoke CALL that changed something, keyed on the dispatch you named and carrying
+  `revoked_count` for the whole cascade — revoking a parent with two children appends ONE entry,
+  not three.
+
 ## 2.97.0 — 2026-09-15 (a story stuck at `claimed` can be freed)
 
 ### Added

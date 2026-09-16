@@ -133,6 +133,15 @@ defmodule LoopctlWeb.CustodySurface do
   defp custody_path?(["epics", _id, "verify-all"]), do: true
   defp custody_path?(["projects", _id, "import"]), do: true
   defp custody_path?(["dispatches"]), do: true
+  # `POST /dispatches/:id/revoke`. A halt suspends it for the same reason it suspends minting:
+  # revocation changes the ACTIVE dispatch set (`is_nil(revoked_at) and expires_at > now`) that
+  # `Dispatches.select_verifier/3` draws its pool from, and a halted tenant is precisely the one
+  # whose actor may be trying to shape that pool. It is NOT the root-of-trust exception above:
+  # that one is `role: :user` plus a human anchor plus proof of possession of the outgoing key,
+  # i.e. human-rooted by construction, while this is reachable at `role: :orchestrator`. Nothing
+  # is stranded by suspending it — a halted tenant cannot mint a dispatch either, so no credential
+  # slot it might free is blocking anything until the halt clears.
+  defp custody_path?(["dispatches", _id, "revoke"]), do: true
   defp custody_path?(["memory" | _rest]), do: true
   # `recall` and everything under it: the merged recall itself, and
   # `POST /recall/:recall_id/referenced`, which writes an analytics row. A halt suspends

@@ -54,6 +54,7 @@ import {
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
 } from "./lib/delivery-loop.js";
+import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -2916,6 +2917,30 @@ async function createDispatch({
 
   const result = await apiCall("POST", "/api/v1/dispatches", body);
   return toContent(result);
+}
+
+// #862: the reachable half of `Dispatches.revoke/2`.
+//
+// LOOPCTL_USER_KEY is PREFERRED but NOT pinned, and the distinction is the whole point.
+// The role gate is `role: :orchestrator` WITH the hierarchy, not `exact_role`, so pinning
+// one variable would refuse configurations the server accepts — the break #861 round 2 had
+// to revert. But the endpoint also applies the LINEAGE CEILING, and there an UNLINEAGED
+// caller passes only at `role: :user` (`403 unlineaged_revoke_forbidden` otherwise, review
+// #862 finding 1). A bare legacy LOOPCTL_ORCH_KEY is exactly that shape, so sending it by
+// default made the commonest configuration the refused one.
+//
+// So the key is passed as an ORDINARY override, not with `exactKey`: `resolveKey`'s order is
+// LOOPCTL_API_KEY > this > LOOPCTL_ORCH_KEY. A global key still wins (it may be the operator
+// key, or a dispatch-minted one revoking inside its own subtree — both legitimate), the
+// operator key is next, and a legacy orchestrator key is still SENT rather than refused
+// locally, so the caller gets the server's own message naming what to do instead.
+async function revokeDispatch(args) {
+  return toContent(
+    await revokeDispatchRequest(args, {
+      apiCall: (method, path, body) =>
+        apiCall(method, path, body, process.env.LOOPCTL_USER_KEY),
+    }),
+  );
 }
 
 // LCP-1 §9.2: register/rotate the tenant custody owner key (root of trust).
@@ -7638,6 +7663,64 @@ const TOOLS = [
     },
   },
 
+  {
+    name: "revoke_dispatch",
+    description:
+      "REVOKE A DISPATCH AND ITS WHOLE SUBTREE (POST /api/v1/dispatches/:id/revoke), plus the " +
+      "ephemeral api_key each one minted. `Dispatches.revoke/2` matches the dispatch OR any row " +
+      "carrying it in `lineage_path`, so revoking a tree's root revokes the tree — name a LEAF " +
+      "unless you mean the subtree.\n\n" +
+      "WHAT IT IS FOR. A session dispatch whose session is gone still has `revoked_at IS NULL`, " +
+      "so it OCCUPIES its agent's slot in the partial unique index " +
+      "`api_keys_one_role_per_agent_idx` — `(tenant_id, agent_id, role)` WHERE " +
+      "`revoked_at IS NULL`. That index cannot also test `expires_at` (Postgres requires a " +
+      "partial-index predicate to be IMMUTABLE and `now()` is STABLE), so an EXPIRED key still " +
+      "holds the slot and the next mint for that agent answers 422 'agent already has an active " +
+      "key with this role'. Measured on story d9975b31: place_dispatch returned exactly that and " +
+      "wrote nothing.\n\n" +
+      "WAITING ALSO WORKS, SLOWLY. RevokeExpiredDispatchesWorker sweeps expired dispatches every " +
+      "minute and RevokeExpiredApiKeysWorker sweeps expired keys every five, so a stranded " +
+      "credential clears at its TTL — four hours for a placement session dispatch. Use this to " +
+      "not wait. For a PARKED STORY prefer force_unclaim_story: it revokes that story's own " +
+      "session dispatch on its way past, and it frees the stage as well.\n\n" +
+      "IT DOES NOT CLEAR `implementer_dispatch_id`. That is custody provenance, and loopctl " +
+      "resolves it with a read that returns a REVOKED row exactly as it returns a live one, so " +
+      "verify / report / review-complete compare the same lineage afterwards. Revoking kills the " +
+      "credential and changes no custody verdict.\n\n" +
+      "REFUSALS. `role: :orchestrator` WITH the hierarchy, so an orchestrator, user or superadmin " +
+      "key passes and an agent key is 403 insufficient_role — this is not exact_role, so no " +
+      "particular env var is pinned; LOOPCTL_USER_KEY is merely PREFERRED, because of the " +
+      "ceiling below. 403 custody_tier_required on an agent-rooted tenant. " +
+      "403 dispatch_outside_caller_lineage " +
+      "when the target is not in your lineage: a dispatch may only be revoked by a caller it " +
+      "descends from, because the revoke cascades — the body carries your own dispatch id as " +
+      "remediation.your_dispatch_id, and the tenant's user-role operator key may revoke anywhere " +
+      "in its tenant. 403 unlineaged_revoke_forbidden when your key was minted by NO dispatch " +
+      "and is below user role — a legacy LOOPCTL_ORCH_KEY is exactly that: it carries no " +
+      "lineage, so there is no subtree that would bound a cascading revoke, and it would " +
+      "otherwise be able to revoke the tenant's root. Use the user-role operator key, or " +
+      "force_unclaim_story for a parked story, or mint a dispatch under an active parent and " +
+      "revoke from inside that lineage. " +
+      "503 tenant_halted under a custody halt. 404 for an unknown dispatch, and " +
+      "for another tenant's. A `dispatch_id` that is not a UUID is refused here, before any " +
+      "call.\n\n" +
+      "IDEMPOTENT: an already-revoked dispatch answers 200 with revoked_count 0 and its ORIGINAL " +
+      "revoked_at. No request body.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dispatch_id: {
+          type: "string",
+          description:
+            "UUID of the dispatch to revoke, together with every descendant. From the " +
+            "`dispatch` tool's response, from `implementer_dispatch_id` on a story, or from " +
+            "GET /api/v1/dispatches.",
+        },
+      },
+      required: ["dispatch_id"],
+    },
+  },
+
   // Issue #809: runner enrollment and the Presence pool (user key)
   {
     name: "runner_enroll",
@@ -8876,6 +8959,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "dispatch":
       return await createDispatch(args);
+
+    case "revoke_dispatch":
+      return await revokeDispatch(args);
 
     case "runner_enroll":
       return await runnerEnroll(args);

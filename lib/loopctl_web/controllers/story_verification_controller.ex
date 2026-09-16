@@ -458,7 +458,16 @@ defmodule LoopctlWeb.StoryVerificationController do
 
     with :ok <- validate_orchestrator_agent_linked(api_key) do
       tenant_id = api_key.tenant_id
-      opts = Keyword.merge(AuditContext.from_conn(conn), orchestrator_agent_id: api_key.agent_id)
+      # `:actor_lineage` is for the `dispatch_revoked` chain entry force-unclaim now writes
+      # when it revokes the released story's session credential. Resolved SERVER-SIDE from the
+      # authenticating key, never taken from the request, like every other lineage on this
+      # surface. One AdminRepo read on an operator remediation path, not a hot one.
+      opts =
+        AuditContext.from_conn(conn)
+        |> Keyword.merge(
+          orchestrator_agent_id: api_key.agent_id,
+          actor_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+        )
 
       case Progress.force_unclaim_story(tenant_id, story_id, opts) do
         {:ok, story} ->

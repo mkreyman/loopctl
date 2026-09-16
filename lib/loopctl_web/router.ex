@@ -337,6 +337,15 @@ defmodule LoopctlWeb.Router do
     # LCP-1 §9.1.1 — transparency read of enrolled agent keys (before :show so it
     # is not captured as a dispatch id).
     get "/dispatches/enrolled-keys", DispatchController, :enrolled_keys
+    # Revocation: the reachable half of `Dispatches.revoke/3`, which had no route and no MCP
+    # tool, so a stranded ephemeral key could only be waited out.
+    #
+    # Its position here is CONVENTION, not a constraint — unlike `enrolled-keys` two lines
+    # up, which genuinely must precede `resources` because `GET /dispatches/:id` would match
+    # it. `only: [:create, :show, :index]` generates `POST /dispatches`, `GET /dispatches/:id`
+    # and `GET /dispatches`, and none of those can match a POST on three segments, so moving
+    # this line below `resources` would change nothing. It is kept with its sibling.
+    post "/dispatches/:id/revoke", DispatchController, :revoke
     resources "/dispatches", DispatchController, only: [:create, :show, :index]
 
     # API key management

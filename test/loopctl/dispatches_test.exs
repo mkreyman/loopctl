@@ -5,9 +5,12 @@ defmodule Loopctl.DispatchesTest do
 
   use Loopctl.DataCase, async: true
 
+  import Ecto.Query
   import Loopctl.Fixtures
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Dispatches
+  alias Loopctl.Dispatches.Dispatch
 
   setup :verify_on_exit!
 
@@ -127,6 +130,95 @@ defmodule Loopctl.DispatchesTest do
 
       {:ok, revoked_root} = Dispatches.get_dispatch(tenant.id, root.id)
       assert revoked_root.revoked_at != nil
+    end
+  end
+
+  describe "revoke_dispatch_rows/3 — the advisory read's re-assertion" do
+    # #862 review round 2, finding 2. `revoke/3`'s candidate read (`dispatches_query`) runs
+    # OUTSIDE the transaction and already carries `is_nil(d.revoked_at)`, so through `revoke/3`
+    # the two guards are REDUNDANT: a sequential re-revoke hands the write an EMPTY id list and
+    # the write's own predicate can be deleted with every assertion still green. Under READ
+    # COMMITTED that predicate is the ONLY thing that stops a second concurrent writer, whose
+    # candidate read also saw the row un-revoked and which re-evaluates just its own `where`
+    # after the row lock clears.
+    #
+    # THAT CONCURRENCY IS NOT REPRODUCIBLE HERE — the Ecto SQL sandbox runs the whole test on
+    # one checked-out connection, so two "concurrent" transactions serialise instead of
+    # contending — so these reach the write DIRECTLY with ids the candidate read would never
+    # have produced. Both consequences of the missing predicate are asserted separately: the
+    # timestamp rewrite, and the COUNT, which is what `revoke/3` audits on.
+    defp revoked_dispatch(tenant, agent, at) do
+      {:ok, %{dispatch: dispatch}} =
+        Dispatches.create_dispatch(tenant.id, %{role: :agent, agent_id: agent.id})
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(d in Dispatch, where: d.id == ^dispatch.id),
+          set: [revoked_at: at]
+        )
+
+      dispatch
+    end
+
+    defp reload_dispatch(id), do: AdminRepo.get!(Dispatch, id)
+
+    test "an id that is already revoked is skipped, keeping its ORIGINAL revoked_at" do
+      %{tenant: tenant, agent: agent} = setup_dispatch_context()
+
+      original =
+        DateTime.utc_now() |> DateTime.add(-7200, :second) |> DateTime.truncate(:microsecond)
+
+      dispatch = revoked_dispatch(tenant, agent, original)
+
+      assert Dispatches.revoke_dispatch_rows(tenant.id, [dispatch.id], DateTime.utc_now()) == 0
+
+      assert DateTime.compare(reload_dispatch(dispatch.id).revoked_at, original) == :eq,
+             "a second revoker must not rewrite a revocation timestamp the chain already names"
+    end
+
+    test "an un-revoked id IS revoked and counted" do
+      # The positive control: without it, "skip the revoked one" is satisfied by a function
+      # that writes nothing at all.
+      %{tenant: tenant, agent: agent} = setup_dispatch_context()
+
+      {:ok, %{dispatch: dispatch}} =
+        Dispatches.create_dispatch(tenant.id, %{role: :agent, agent_id: agent.id})
+
+      now = DateTime.utc_now()
+
+      assert Dispatches.revoke_dispatch_rows(tenant.id, [dispatch.id], now) == 1
+      assert reload_dispatch(dispatch.id).revoked_at
+    end
+
+    test "the COUNT is what the statement CHANGED, not how many ids it was handed" do
+      # This is the half that reaches the hash chain. `revoke/3` audits on `count > 0` and
+      # writes `revoked_count` into an IMMUTABLE, STH-covered entry, so a count taken from the
+      # id list rather than from the UPDATE inflates a number nobody can correct afterwards.
+      %{tenant: tenant, agent: agent} = setup_dispatch_context()
+      already = revoked_dispatch(tenant, agent, DateTime.utc_now())
+      other_agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      {:ok, %{dispatch: live}} =
+        Dispatches.create_dispatch(tenant.id, %{role: :agent, agent_id: other_agent.id})
+
+      assert Dispatches.revoke_dispatch_rows(tenant.id, [already.id, live.id], DateTime.utc_now()) ==
+               1
+    end
+
+    test "an id belonging to ANOTHER tenant is not revoked and not counted" do
+      # #862 review round 3, finding 3. This write runs on `AdminRepo`, which is BYPASSRLS, so
+      # the explicit `tenant_id` predicate is the only isolation there is — `revoke/3`'s
+      # candidate read carried one and the write did not, so a stray id from another tenant
+      # (a caller's own bug) was revocable across the boundary and counted into an immutable
+      # `dispatch_revoked` entry keyed on the FIRST tenant.
+      %{tenant: tenant} = setup_dispatch_context()
+      %{tenant: other_tenant, agent: other_agent} = setup_dispatch_context()
+
+      {:ok, %{dispatch: theirs}} =
+        Dispatches.create_dispatch(other_tenant.id, %{role: :agent, agent_id: other_agent.id})
+
+      assert Dispatches.revoke_dispatch_rows(tenant.id, [theirs.id], DateTime.utc_now()) == 0
+      refute reload_dispatch(theirs.id).revoked_at
     end
   end
 
