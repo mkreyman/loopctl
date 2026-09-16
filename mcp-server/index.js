@@ -54,6 +54,7 @@ import {
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
 } from "./lib/delivery-loop.js";
+import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -2916,6 +2917,16 @@ async function createDispatch({
 
   const result = await apiCall("POST", "/api/v1/dispatches", body);
   return toContent(result);
+}
+
+// #862: the reachable half of `Dispatches.revoke/2`. No key pinning here, deliberately:
+// the endpoint is `role: :orchestrator` WITH the hierarchy (dispatch_controller.ex), not
+// `exact_role`, so an orchestrator, user or superadmin key all pass and `resolveKey`'s
+// ordinary selection is correct — the same choice `createDispatch` makes at the same gate.
+// Pinning LOOPCTL_ORCH_KEY here would refuse a working configuration locally, which is the
+// break #861 round 2 had to revert.
+async function revokeDispatch(args) {
+  return toContent(await revokeDispatchRequest(args, { apiCall }));
 }
 
 // LCP-1 §9.2: register/rotate the tenant custody owner key (root of trust).
@@ -7638,6 +7649,57 @@ const TOOLS = [
     },
   },
 
+  {
+    name: "revoke_dispatch",
+    description:
+      "REVOKE A DISPATCH AND ITS WHOLE SUBTREE (POST /api/v1/dispatches/:id/revoke), plus the " +
+      "ephemeral api_key each one minted. `Dispatches.revoke/2` matches the dispatch OR any row " +
+      "carrying it in `lineage_path`, so revoking a tree's root revokes the tree — name a LEAF " +
+      "unless you mean the subtree.\n\n" +
+      "WHAT IT IS FOR. A session dispatch whose session is gone still has `revoked_at IS NULL`, " +
+      "so it OCCUPIES its agent's slot in the partial unique index " +
+      "`api_keys_one_role_per_agent_idx` — `(tenant_id, agent_id, role)` WHERE " +
+      "`revoked_at IS NULL`. That index cannot also test `expires_at` (Postgres requires a " +
+      "partial-index predicate to be IMMUTABLE and `now()` is STABLE), so an EXPIRED key still " +
+      "holds the slot and the next mint for that agent answers 422 'agent already has an active " +
+      "key with this role'. Measured on story d9975b31: place_dispatch returned exactly that and " +
+      "wrote nothing.\n\n" +
+      "WAITING ALSO WORKS, SLOWLY. RevokeExpiredDispatchesWorker sweeps expired dispatches every " +
+      "minute and RevokeExpiredApiKeysWorker sweeps expired keys every five, so a stranded " +
+      "credential clears at its TTL — four hours for a placement session dispatch. Use this to " +
+      "not wait. For a PARKED STORY prefer force_unclaim_story: it revokes that story's own " +
+      "session dispatch on its way past, and it frees the stage as well.\n\n" +
+      "IT DOES NOT CLEAR `implementer_dispatch_id`. That is custody provenance, and loopctl " +
+      "resolves it with a read that returns a REVOKED row exactly as it returns a live one, so " +
+      "verify / report / review-complete compare the same lineage afterwards. Revoking kills the " +
+      "credential and changes no custody verdict.\n\n" +
+      "REFUSALS. `role: :orchestrator` WITH the hierarchy, so an orchestrator, user or superadmin " +
+      "key passes and an agent key is 403 insufficient_role — this is not exact_role, so no " +
+      "particular env var is pinned and whichever key is configured is sent, as with `dispatch`. " +
+      "403 custody_tier_required on an agent-rooted tenant. 403 dispatch_outside_caller_lineage " +
+      "when the target is not in your lineage: a dispatch may only be revoked by a caller it " +
+      "descends from, because the revoke cascades — the body carries your own dispatch id as " +
+      "remediation.your_dispatch_id, and the tenant's user-role operator key may revoke anywhere " +
+      "in its tenant. 503 tenant_halted under a custody halt. 404 for an unknown dispatch, and " +
+      "for another tenant's. A `dispatch_id` that is not a UUID is refused here, before any " +
+      "call.\n\n" +
+      "IDEMPOTENT: an already-revoked dispatch answers 200 with revoked_count 0 and its ORIGINAL " +
+      "revoked_at. No request body.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dispatch_id: {
+          type: "string",
+          description:
+            "UUID of the dispatch to revoke, together with every descendant. From the " +
+            "`dispatch` tool's response, from `implementer_dispatch_id` on a story, or from " +
+            "GET /api/v1/dispatches.",
+        },
+      },
+      required: ["dispatch_id"],
+    },
+  },
+
   // Issue #809: runner enrollment and the Presence pool (user key)
   {
     name: "runner_enroll",
@@ -8876,6 +8938,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "dispatch":
       return await createDispatch(args);
+
+    case "revoke_dispatch":
+      return await revokeDispatch(args);
 
     case "runner_enroll":
       return await runnerEnroll(args);

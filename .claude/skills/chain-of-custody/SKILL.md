@@ -73,7 +73,7 @@ If yes, the change is wrong.
 Enforced in `lib/loopctl/progress.ex`. The three gates are NOT one implementation, but ALL THREE now
 compare dispatch lineage and all three fail closed on a story with no custody provenance. The
 caller's lineage is always resolved SERVER-SIDE from the authenticating key
-(`Dispatches.lineage_for_api_key/2`, `dispatches.ex:526-536`) — never read from the request body.
+(`Dispatches.lineage_for_api_key/2`, `dispatches.ex:591-601`) — never read from the request body.
 
 - **verify** — `validate_not_self_verify/4`. `nil` orchestrator identity is untrusted; a custody-orphaned story fails closed with
   `:missing_assigned_agent` ("nil is never permissive"); then the CALLER's lineage vs the

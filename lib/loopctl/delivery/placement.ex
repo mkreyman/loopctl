@@ -498,9 +498,14 @@ defmodule Loopctl.Delivery.Placement do
 
   # The race `claimable/2` cannot close. A claim that fails here leaves a minted dispatch that
   # will never be an implementer, so it is REVOKED rather than left to expire: its ephemeral key
-  # is live for four hours otherwise, and nothing else would ever revoke it. The chain entry it
-  # already wrote stays — entries are immutable — which is why the pre-check above is the part
-  # that bounds a loop.
+  # would otherwise be live for the whole `@session_expires_in_seconds` TTL, holding the agent's
+  # one-key-per-role slot and refusing every later placement onto it (see
+  # `revoke_session_dispatch/3`). Two things DO eventually revoke it — this claim never reached
+  # the story, so `force_unclaim_story/3` has no `implementer_dispatch_id` to find, leaving
+  # `Loopctl.Workers.RevokeExpiredDispatchesWorker` at the TTL as the only backstop — and a TTL
+  # is far too late for a loop that dispatches continuously. The chain entry it already wrote
+  # stays — entries are immutable — which is why the pre-check above is the part that bounds a
+  # loop.
   defp claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts) do
     case claim(tenant_id, story_id, agent_id, session, opts) do
       {:ok, story} ->
@@ -513,18 +518,38 @@ defmodule Loopctl.Delivery.Placement do
   end
 
   # Returns `:ok` or the failure, so the undo can report it rather than swallow it. The failure
-  # is worth naming on its own: the ephemeral key stays live for its full TTL with no session
-  # that will ever use it, and nothing else revokes it.
+  # is worth naming on its own, and the message has to name the CONSEQUENCE rather than the
+  # timestamp — see below.
   defp revoke_session_dispatch(tenant_id, session, reason) do
     case Dispatches.revoke(tenant_id, session.id) do
       {:ok, _count} ->
         :ok
 
       other ->
+        # This message used to end "the key stays live until it expires", which was true and
+        # useless: it reads as a thing that resolves itself, so an operator who hit it waited
+        # out a TTL instead of acting. What it left out is the only part that matters. The
+        # ephemeral key is `revoked_at IS NULL`, so it OCCUPIES the runner agent's slot in
+        # `api_keys_one_role_per_agent_idx` (`(tenant_id, agent_id, role)` WHERE
+        # `revoked_at IS NULL`) for the whole `@session_expires_in_seconds` TTL — and the index
+        # cannot test expiry, since a partial-index predicate must be IMMUTABLE and `now()` is
+        # STABLE. So EVERY later placement onto that agent is refused 422 `agent already has an
+        # active key with this role` until the TTL passes, which is the delivery loop stopping
+        # dead rather than one leaked credential.
+        #
+        # Both remedies are named because they are reached from different places: the operator
+        # holding the dispatch id revokes it directly, and the one holding only the story id
+        # force-unclaims (`Progress.force_unclaim_story/3` revokes this story's session
+        # dispatch on its way past).
         Logger.error(
-          "placement could not revoke the session dispatch its claim never used; the key " <>
-            "stays live until it expires: tenant_id=#{tenant_id} dispatch_id=#{session.id} " <>
-            "claim_error=#{inspect(reason)} revoke_error=#{inspect(other)}",
+          "placement could not revoke the session dispatch its claim never used. The key stays " <>
+            "usable for its full TTL and OCCUPIES the agent's one-key-per-role slot until " <>
+            "then, so every later placement onto this agent is refused 422 'agent already has " <>
+            "an active key with this role'. Revoke it: POST " <>
+            "/api/v1/dispatches/#{session.id}/revoke (MCP revoke_dispatch), or force-unclaim " <>
+            "the story. tenant_id=#{tenant_id} dispatch_id=#{session.id} " <>
+            "agent_id=#{inspect(session.agent_id)} claim_error=#{inspect(reason)} " <>
+            "revoke_error=#{inspect(other)}",
           tenant_id: tenant_id
         )
 

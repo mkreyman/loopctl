@@ -514,6 +514,71 @@ defmodule Loopctl.Dispatches do
   end
 
   @doc """
+  Revokes `dispatch_id` ONLY IF it was minted FOR `story_id` — the credential a
+  story's own session holds, and nothing wider.
+
+  This is what `Loopctl.Progress.force_unclaim_story/3` calls when an orchestrator
+  takes a story back: the session that held it is presumed gone, so its key must
+  die rather than sit `revoked_at IS NULL` until its TTL, holding the agent's
+  `api_keys_one_role_per_agent_idx` slot and refusing every later mint for that
+  agent with `agent already has an active key with this role`.
+
+  ## Why it is scoped by `story_id` rather than just revoking the implementer
+
+  `stories.implementer_dispatch_id` names two structurally different things, and
+  only one of them is this story's credential:
+
+    * a SESSION dispatch minted for this story — `Loopctl.Delivery.Placement`
+      mints one per placement with `story_id` set (`mint_session_dispatch/5`), and
+      an orchestrator may mint a per-story agent dispatch the same way. Nothing
+      but this story is behind it, so revoking it costs nothing else.
+    * a general agent dispatch (`story_id: nil`, or another story's) that merely
+      happened to be the caller when the story was claimed. `Dispatches.revoke/2`
+      cascades to DESCENDANTS, so revoking that would kill the agent's whole
+      subtree — every other story it is working on included — as a side effect of
+      parking ONE story. Force-unclaim is a routine compensation
+      (`Placement.undo_claim/5` runs it on every placement refusal), so that
+      blast radius would be paid constantly and for no gain.
+
+  So the narrow case is revoked and the wide one is left alone and REPORTED, never
+  silently skipped.
+
+  ## What this does NOT do
+
+  It does not clear `stories.implementer_dispatch_id`. That field is custody
+  PROVENANCE: every L4 gate resolves it through `Progress`'s `get_dispatch_lineage/2`
+  -> `get_dispatch/2`, which reads the row REGARDLESS of `revoked_at`, so verify,
+  report and review-complete compare exactly the lineage they compared before.
+  Revoking the key kills the credential; the pointer stays and the custody
+  comparison is unchanged. Clearing it is a different act with a different caller
+  (`Progress.clear_unused_implementer_dispatch/3`, for a dispatch that never
+  implemented anything).
+
+  ## Returns
+
+    * `{:ok, count}` — the dispatch was this story's session and `count` rows
+      (it plus its descendants) were revoked
+    * `{:ok, :no_dispatch}` — the story names no implementer dispatch
+    * `{:ok, :not_story_session}` — the dispatch exists but was not minted for
+      this story, so it is left alone
+    * `{:ok, :dispatch_not_found}` — the story names a dispatch row that no
+      longer resolves
+    * `{:error, reason}` — the revoke itself failed
+  """
+  @spec revoke_story_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
+          {:ok, non_neg_integer() | :no_dispatch | :not_story_session | :dispatch_not_found}
+          | {:error, term()}
+  def revoke_story_session(_tenant_id, _story_id, nil), do: {:ok, :no_dispatch}
+
+  def revoke_story_session(tenant_id, story_id, dispatch_id) do
+    case get_dispatch(tenant_id, dispatch_id) do
+      {:ok, %Dispatch{story_id: ^story_id}} -> revoke(tenant_id, dispatch_id)
+      {:ok, %Dispatch{}} -> {:ok, :not_story_session}
+      {:error, :not_found} -> {:ok, :dispatch_not_found}
+    end
+  end
+
+  @doc """
   Returns the lineage path of the (non-revoked) dispatch that minted `api_key_id`.
 
   This is the server-side way to learn the CALLER's lineage: it is derived from

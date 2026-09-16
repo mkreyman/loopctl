@@ -616,6 +616,15 @@ defmodule Loopctl.ObanConfig do
            # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
            {"*/5 * * * *", Loopctl.Workers.CustodyPostureSweepWorker},
            {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
+           # Revokes api_keys whose TTL has passed. The sibling above only reaches keys a
+           # DISPATCH minted; a key minted directly at POST /api/v1/api_keys with an
+           # expires_at has no dispatch row, so nothing revoked it and it held its agent's
+           # `api_keys_one_role_per_agent_idx` slot for ever — the index tests
+           # `revoked_at IS NULL` and CANNOT test expiry (a partial-index predicate must be
+           # IMMUTABLE; `now()` is STABLE). Every 5 minutes: the key is already unusable for
+           # auth the moment it expires, so this only frees the slot. Bounded per run. Keep
+           # in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"*/5 * * * *", Loopctl.Workers.RevokeExpiredApiKeysWorker},
            # #803: releases story claims whose lease ran out. Every 5 minutes is plenty
            # against a lease measured in hours; the lease, not this interval, is the
            # knob. Bounded per run. Keep in sync with the crontab assertion in

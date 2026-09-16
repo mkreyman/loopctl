@@ -2868,10 +2868,87 @@ defmodule Loopctl.Progress do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
+      {:ok, %{story: updated}} ->
+        revoke_released_session_credential(tenant_id, updated)
+        {:ok, updated}
+
+      {:error, :lock, reason, _} ->
+        {:error, reason}
+
+      {:error, :story, changeset, _} ->
+        {:error, changeset}
     end
+  end
+
+  # Taking a story back kills the credential the previous holder had. AFTER the commit,
+  # deliberately, on three counts: the release is what the caller asked for and must not be
+  # rolled back by a revoke failure; `Dispatches.revoke/2` runs its own AdminRepo transaction
+  # and busts the api-key cache when it returns, so running it inside this one would bust the
+  # cache BEFORE the release commits; and a revoke is idempotent, so re-running force-unclaim
+  # is still the operator's remedy.
+  #
+  # It runs on the IDEMPOTENT `:pending` branch too. That is not an oversight: a story already
+  # back at `pending` whose session key was never revoked is exactly the state this exists to
+  # clear, and re-running force-unclaim is the documented remedy for the residue of a failed
+  # compensation (`Placement.undo_claim/5`).
+  #
+  # `revoke_story_session/3` revokes ONLY a dispatch minted FOR this story, so a general agent
+  # dispatch that merely claimed it keeps its key — see that function for why the cascade makes
+  # the wide case unacceptable. It does NOT clear `implementer_dispatch_id`: that is custody
+  # provenance, `get_dispatch_lineage/2` reads a revoked row exactly as it reads a live one, and
+  # every L4 comparison is therefore unchanged by this.
+  #
+  # AND IT SWALLOWS A RAISE, not only an `{:error, _}`. `Dispatches.revoke/2` returns tuples
+  # from its own Multi, but the statements under it are ordinary AdminRepo calls on a
+  # 3-connection pool with no `lock_timeout`, so a DBConnection error is a RAISE. Unrescued,
+  # that turns a release that ALREADY COMMITTED into a 500: the caller is told the story was
+  # not freed when it was, and re-runs a compensation that had already succeeded. The caller is
+  # owed the outcome of the release it asked for, not the outcome of the cleanup that followed
+  # it. Same reasoning, and the same shape, as `Placement.release_claim/4`.
+  defp revoke_released_session_credential(tenant_id, story) do
+    case Dispatches.revoke_story_session(tenant_id, story.id, story.implementer_dispatch_id) do
+      {:ok, count} when is_integer(count) ->
+        :ok
+
+      {:ok, skipped} ->
+        Logger.debug(
+          "force_unclaim left the implementer dispatch's key alone: reason=#{skipped} " <>
+            "tenant_id=#{tenant_id} story_id=#{story.id} " <>
+            "implementer_dispatch_id=#{inspect(story.implementer_dispatch_id)}"
+        )
+
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "force_unclaim could not revoke the released session's key. It stays usable until " <>
+            "its TTL, and it OCCUPIES this agent's one-key-per-role slot until then, so every " <>
+            "later dispatch mint for the agent is refused 422 'agent already has an active " <>
+            "key with this role'. Revoke it directly: POST /api/v1/dispatches/:id/revoke " <>
+            "(MCP revoke_dispatch). tenant_id=#{tenant_id} story_id=#{story.id} " <>
+            "implementer_dispatch_id=#{inspect(story.implementer_dispatch_id)} " <>
+            "revoke_error=#{inspect(reason)}",
+          tenant_id: tenant_id,
+          story_id: story.id
+        )
+
+        :ok
+    end
+  rescue
+    error ->
+      Logger.error(
+        "force_unclaim RAISED while revoking the released session's key; the release itself " <>
+          "COMMITTED and the story is free. The key stays usable until its TTL and occupies " <>
+          "this agent's one-key-per-role slot until then, so later dispatch mints for the " <>
+          "agent are refused 422. Revoke it directly: POST /api/v1/dispatches/:id/revoke " <>
+          "(MCP revoke_dispatch). tenant_id=#{tenant_id} story_id=#{story.id} " <>
+          "implementer_dispatch_id=#{inspect(story.implementer_dispatch_id)} " <>
+          "error=#{inspect(error)}",
+        tenant_id: tenant_id,
+        story_id: story.id
+      )
+
+      :ok
   end
 
   # --- Verification/Rejection helpers ---

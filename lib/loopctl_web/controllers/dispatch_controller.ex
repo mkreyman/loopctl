@@ -12,11 +12,35 @@ defmodule LoopctlWeb.DispatchController do
 
   action_fallback LoopctlWeb.FallbackController
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create]
+  # `revoke` sits at the SAME gate as `create`, and deliberately not higher or lower.
+  #
+  # Not `:user`. CLAUDE.md's rule of thumb puts an operation at `:user` when it IRREVERSIBLY
+  # REMOVES DATA or is itself a CUSTODY GATE. Revoking is neither: it sets `revoked_at` on
+  # rows that all stay, and it certifies nothing — `get_dispatch/2` reads a revoked row exactly
+  # as it reads a live one, so every L4 lineage comparison is untouched by it and a revoke
+  # cannot launder custody. It is the DE-escalation of the authority `create` mints, and the
+  # delivery loop's orchestrator has to be able to free a stuck credential slot without a human
+  # in the loop — the same reason work-breakdown composition is orchestrator-role.
+  #
+  # Not `:agent` either, and not `exact_role`. Revoking changes the ACTIVE dispatch pool that
+  # `Dispatches.select_verifier/3` draws from (`is_nil(revoked_at) and expires_at > now`), and
+  # an agent is precisely the principal that must not be able to shape its own verifier pool.
+  # `role:` rather than `exact_role:` because the tenant's `:user` operator key must be able to
+  # clean up its own tree; nothing here is a separation-of-duties gate, so the hierarchy is not
+  # the hole it is on `verify`/`report`.
+  #
+  # The LINEAGE CEILING is what actually bounds the blast radius, and it is applied in
+  # `revoke/2` below — without it any orchestrator dispatch could revoke the tenant's root and
+  # take the whole tenant down, or prune the pool until only a verifier it prefers is left.
+  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :revoke]
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:show, :index, :enrolled_keys]
 
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create]
+  #
+  # `revoke` is anchored with `create` so the whole mutating dispatch surface sits behind one
+  # tier gate. It costs an `agent_rooted` tenant nothing: `create` is anchored and so is
+  # `Loopctl.Delivery.Placement.place/4`, so such a tenant has no dispatches to revoke.
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :revoke]
 
   @doc "POST /api/v1/dispatches"
   def create(conn, params) do
@@ -367,6 +391,127 @@ defmodule LoopctlWeb.DispatchController do
         |> put_status(:not_found)
         |> json(%{error: %{message: "Not found", status: 404}})
     end
+  end
+
+  @doc """
+  POST /api/v1/dispatches/:id/revoke
+
+  Revokes a dispatch AND EVERY DESCENDANT, and the ephemeral api_key each one
+  minted (`Dispatches.revoke/2`). The reachable half of a remediation that until
+  now only existed as a context function: nothing outside the app could call it,
+  so a leaked or stranded ephemeral key could only be waited out.
+
+  What it is usually for: a session dispatch whose session is gone. Its key is
+  still `revoked_at IS NULL`, so it OCCUPIES its agent's slot in
+  `api_keys_one_role_per_agent_idx` and every later mint for that agent at that
+  role is refused 422 `agent already has an active key with this role` — the
+  index tests `revoked_at IS NULL` and CANNOT test `expires_at` (a partial-index
+  predicate must be IMMUTABLE and `now()` is STABLE), so only a revoke frees it
+  before the TTL.
+
+  Idempotent: an already-revoked dispatch answers 200 with `revoked_count: 0` and
+  its original `revoked_at` — the revoke query only touches `revoked_at IS NULL`
+  rows, so a retry never rewrites a revocation timestamp an audit reader may be
+  relying on.
+
+  It does NOT clear `stories.implementer_dispatch_id`. That is custody
+  provenance, and `Progress`'s lineage lookups resolve a revoked dispatch row
+  exactly as they resolve a live one, so no L4 comparison changes.
+  """
+  def revoke(conn, %{"id" => id}) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+    caller_lineage = Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+    operator? = caller_lineage == [] and Role.role_at_least?(api_key.role, :user)
+
+    case Dispatches.get_dispatch(tenant_id, id) do
+      {:ok, dispatch} ->
+        # THE SAME CEILING `create` APPLIES, for a sharper reason. Minting outside your own
+        # subtree buys you separation you should not have; REVOKING outside it is destructive
+        # and reaches further: `Dispatches.revoke/2` cascades to descendants, so an
+        # unrestricted revoke lets any orchestrator dispatch take down the tenant's root tree,
+        # and lets an implementer prune `select_verifier/3`'s pool (which draws only on
+        # dispatches that are `is_nil(revoked_at) and expires_at > now`) until the verifier it
+        # wants is the one left. The []-caller exemption is inherited on purpose: a legacy
+        # env-var key has no subtree to step outside of, it is already trusted to VERIFY at
+        # this role, and revoking is strictly less than certifying.
+        if lineage_within_caller?(dispatch.lineage_path, caller_lineage, operator?) do
+          do_revoke_dispatch(conn, tenant_id, dispatch)
+        else
+          reject_revoke_escape(conn, api_key, caller_lineage, dispatch.id)
+        end
+
+      {:error, :not_found} ->
+        conn
+        |> put_status(:not_found)
+        |> json(%{error: %{message: "Not found", status: 404}})
+    end
+  end
+
+  defp do_revoke_dispatch(conn, tenant_id, dispatch) do
+    case Dispatches.revoke(tenant_id, dispatch.id) do
+      {:ok, count} ->
+        # Re-read so `revoked_at` is the committed value rather than the pre-revoke `nil`.
+        # An already-revoked dispatch re-reads to its ORIGINAL timestamp, which is what makes
+        # the idempotent answer honest rather than merely quiet.
+        {:ok, revoked} = Dispatches.get_dispatch(tenant_id, dispatch.id)
+
+        json(conn, %{
+          data: %{
+            dispatch: serialize(revoked),
+            revoked_count: count,
+            note:
+              "Revokes this dispatch AND its descendants, plus the ephemeral api_key each " <>
+                "minted. `implementer_dispatch_id` on any story is deliberately left as it " <>
+                "is: it is custody provenance, and the lineage it names still resolves."
+          }
+        })
+
+      {:error, _reason} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          error: %{
+            status: 422,
+            code: "dispatch_revoke_failed",
+            message: "Dispatch revocation failed. Nothing was revoked; retry is safe."
+          }
+        })
+    end
+  end
+
+  defp reject_revoke_escape(conn, api_key, caller_lineage, dispatch_id) do
+    log_ceiling_refusal("dispatch_outside_caller_lineage", api_key, caller_lineage, dispatch_id)
+
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      error: %{
+        status: 403,
+        code: "dispatch_outside_caller_lineage",
+        message:
+          "That dispatch is not in your lineage. A dispatch may only be revoked by a caller " <>
+            "it descends from, because revocation cascades to every descendant — an " <>
+            "unrestricted revoke would let one principal take down another's whole tree, and " <>
+            "let an implementer narrow the pool its own verifier is chosen from. Revoke one " <>
+            "of your own dispatches (or a descendant of one), or ask the tenant's `user`-role " <>
+            "operator key, which may revoke anywhere in its tenant.",
+        remediation: revoke_escape_remediation(caller_lineage)
+      }
+    })
+  end
+
+  # Same discipline as the mint refusals: OMIT `your_dispatch_id` rather than emit a bare null
+  # when the caller has no dispatch of its own, and never name a remedy it cannot perform.
+  defp revoke_escape_remediation([]),
+    do: %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
+
+  defp revoke_escape_remediation(caller_lineage) do
+    %{
+      your_dispatch_id: List.last(caller_lineage),
+      your_lineage_path: caller_lineage,
+      learn_more: "https://loopctl.com/wiki/dispatch-lineage"
+    }
   end
 
   @doc "GET /api/v1/dispatches"
