@@ -88,6 +88,15 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
 
 ## How changes get made here
 
+**The rule to DISPATCH binds the SESSION Mark is talking to, not the agent it dispatches.** If you
+are that agent: do the work you were sent for and do not re-delegate it — but the rest of this
+section still applies to you, and one bullet of it especially. THE BRANCH, THE COMMIT, THE PUSH,
+THE PR AND THE MERGE ARE NEVER THE DISPATCHED AGENT'S; leave your changes uncommitted and
+describe them, which is your correct end state (SOUL's Subordination Rule). They belong to the
+session, which is what the bullet below says from the other side. This file is the one
+tier a subagent is guaranteed to read, which is why the scoping is written here rather than
+assumed — and why it scopes one rule rather than waving the section away.
+
 - **Implementation is DISPATCHED, not typed by the session.** Any change to ELIXIR code — a
   feature, a fix, a refactor, and the fixes a review round asks for — goes to `elixir-engineer`.
   Mark, 2026-09-15: *"make it a standing rule that you dispatch an engineer agent on high effort
