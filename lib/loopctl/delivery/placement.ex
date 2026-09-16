@@ -114,6 +114,17 @@ defmodule Loopctl.Delivery.Placement do
     added. The unrecord no longer depends on the release having succeeded (it predicates on the
     dispatch id alone), so in practice the gap is the revoke; `log_undo/5` names any step that
     did not do what it was for, because nothing downstream will.
+
+    **And a failed release ESCALATES the story, because the lease is hours and nobody is
+    reading the log.** Observed 2026-09-15: the release ran, failed, wrote its `Logger.error`
+    and the story sat at `claimed` for four hours. Nothing automatic recovers that state —
+    `place/4` answers `:invalid_transition` because the story is `assigned` rather than
+    `contracted`, the only stage edges that take `claimed` back to a PLACEABLE `queued` are the
+    release's own `:claim_released` — the write that just failed — and the reclaimer's
+    `:runner_lost`, and the reclaimer is hours away and skips a halted tenant entirely — so
+    `undo_claim/5` parks it over `:session_escalated` and an operator resolves it in one call.
+    See `escalate_unreleased_claim/6` for why only the RELEASE earns that, and where the
+    recursion stops.
   - **Pushed, never claimed.** A session starts work on a story whose stage row refuses every
     report it makes, for as long as the session runs. Nothing recovers it, because nothing is
     wrong from the row's point of view. That is the failure that was observed in production,
@@ -160,14 +171,17 @@ defmodule Loopctl.Delivery.Placement do
   alias Loopctl.Auth.Role
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.ImplementerInput
+  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryPayload
   alias Loopctl.Dispatches
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Tenants
   alias Loopctl.WorkBreakdown.Stories
+  alias Loopctl.WorkBreakdown.Story
 
   # How long the session dispatch's credential lives. `Dispatches.create_dispatch/3` caps this
   # at four hours of its own accord, while a dispatch's `wall_clock_seconds` may be a day, so
@@ -175,6 +189,30 @@ defmodule Loopctl.Delivery.Placement do
   # lineage is what the custody gates read and it outlives the key, while the key itself has
   # no holder at all (see the moduledoc).
   @session_expires_in_seconds 14_400
+
+  # The attribution on a park this module's COMPENSATION wrote. Both this and
+  # `StoryPayload`'s park put a story at `escalated` over the same edge, and an operator
+  # reading the escalated queue has to be able to tell "loopctl could not describe this story
+  # inside the contract" from "loopctl could not give this story's claim back", because the
+  # two have different remedies.
+  #
+  # THE DISTINCTION IS THE SUFFIX, NOT THIS CONSTANT, and that is the correction #865 round 1
+  # made. A default only applies when `opts` carries no `:actor_label`, and BOTH callers of
+  # `place/4` always pass one — `"api:dispatch_placement"`
+  # (`LoopctlWeb.DispatchPlacementController`) and `"worker:dispatch_driver"`
+  # (`Loopctl.Delivery.DispatchDriver`). `attach_story/6` forwards that same key into
+  # `StoryPayload.build/3`, so in production the two parks carried the IDENTICAL label and the
+  # distinction this comment promised did not exist anywhere an operator could read it. The
+  # base is now composed with `@compensation_suffix` (`compensation_actor/1`), so the caller is
+  # still named and the compensation is distinguishable from the story-object park it may
+  # follow. The constant remains as the base for a caller that passes no label at all.
+  @escalation_actor "control:placement"
+
+  # Appended to whatever label the placement caller gave, because that label is the only thing
+  # in scope that identifies the principal and it is the SAME one `StoryPayload`'s park writes.
+  # `story_stage_events.actor_label` is unbounded `text` and `audit_log.actor_label` is
+  # `varchar(255)`, so a suffix on a caller label costs nothing at either end.
+  @compensation_suffix "/unreleased-claim"
 
   @type error ::
           :root_dispatch_forbidden
@@ -262,7 +300,10 @@ defmodule Loopctl.Delivery.Placement do
     session dispatch minted for it is REVOKED before returning.
   - everything `Loopctl.Dispatches.create_dispatch/3`, `Loopctl.Delivery.Stages.advance/4`
     and `Loopctl.Runners.dispatch/3` refuse, unchanged. Every refusal after the claim commits
-    releases the claim before returning.
+    releases the claim before returning, and a release that FAILS parks the story at
+    `escalated` instead (`escalate_unreleased_claim/6`) — the refusal the caller is handed is
+    the same either way, because it is the push refusal that is owed, not the compensation's.
+    Read the story's stage to tell the two apart.
 
   ## A dispatch_id is spent by the claim it was placed under
 
@@ -600,7 +641,11 @@ defmodule Loopctl.Delivery.Placement do
         # BOTH, and the dispatch revoke is not optional here either. The claim goes back, and
         # the session dispatch it recorded is revoked and UNRECORDED — see
         # `undo_claim/5` for why leaving the id behind is worse than leaving it unrevoked.
-        undo_claim(tenant_id, story.id, session, reason, opts)
+        #
+        # THE WHOLE STORY, not its id: `undo_claim/5` needs `claim_epoch` to fence the
+        # escalation it falls back on, and re-reading the epoch there would be the wrong
+        # value as well as an extra read — see `escalate_unreleased_claim/6`.
+        undo_claim(tenant_id, story, session, reason, opts)
         {:error, reason}
     end
   end
@@ -754,12 +799,336 @@ defmodule Loopctl.Delivery.Placement do
   # Each step reports, and `log_undo/5` says so when any of them did not do what it was for.
   # Nothing here rolls anything back on failure: the caller is owed the refusal that brought it
   # here, not a second one.
-  defp undo_claim(tenant_id, story_id, session, reason, opts) do
-    release = release_claim(tenant_id, story_id, reason, caller_lineage(session), opts)
-    cleared = Progress.clear_unused_implementer_dispatch(tenant_id, story_id, session.id)
+  #
+  # ## A FAILED RELEASE IS ESCALATED, because a log line is not a remedy
+  #
+  # `log_undo/5` was the whole of the answer to a failed step, and on 2026-09-15 that cost four
+  # hours: the release ran, failed, wrote its `Logger.error`, and the story sat at `claimed`
+  # until somebody read the log. This loop's entire premise is running unattended, so the
+  # residue of a failed compensation has to reach a human through the mechanism built for
+  # reaching one rather than through a box nobody is tailing.
+  #
+  # ONLY THE RELEASE, and the stage machine is what decides that rather than a judgement call:
+  #
+  #   * `release` failed — the `force_unclaim_story/3` Multi rolled back, so the story is still
+  #     `assigned` at an in-flight stage with no session that will ever run under it, and NO
+  #     AUTOMATIC PATH RECOVERS IT INSIDE THE LEASE. A later `place/4` is refused
+  #     `:invalid_transition` by `claimable/2` (the story is `assigned`, not `contracted`), and
+  #     the only edges the machine offers out of `claimed` back to a PLACEABLE `queued` are
+  #     `:claim_released` — written by `Progress.force_unclaim_story/3`, i.e. the release that
+  #     just failed, and the operator remedy that repeats it — and `:runner_lost`, which is
+  #     `ReclaimExpiredClaimsWorker`'s, hours away and skipping a halted tenant entirely. That
+  #     is the incident, and it is the one thing here a human has to decide about.
+  #
+  #     `claimed` IS NOT A DEAD END in the machine, and this used to say it was ("no edge out
+  #     of `claimed` that control can drive"). `attempt_park/7`, a hundred-odd lines below,
+  #     drives `{:claimed, :escalated, :session_escalated}` from control and is the whole of
+  #     this feature; `:budget_exceeded` leaves `claimed` as well. Neither returns the story to
+  #     placeable, which is the property that makes this state an incident.
+  #   * `cleared` — `Progress.clear_unused_implementer_dispatch/3` returns `{:ok, :cleared}` or
+  #     `{:ok, :unchanged}` and CANNOT return an error; `{:ok, :unchanged}` is explicitly not a
+  #     failure (see `log_undo/5`), so escalating on it would fire on the healthy path. Its only
+  #     failure mode is a raise, which does not reach this decision at all.
+  #   * `revoked` failed — the RELEASE SUCCEEDED, so this story is not what is stranded; a
+  #     CREDENTIAL is, occupying the runner agent's one-key-per-role slot, which is an
+  #     agent-level fault and not this story's. WHERE the story ends up depends on which step
+  #     refused, and this bullet used to name only the first of the two: on the ordinary path
+  #     the row was in flight, so `Stages.follow_release/5` REQUEUES it and it is back at
+  #     `queued` and placeable, but on the `attach_story/6` path `StoryPayload.build/3` has
+  #     ALREADY parked the story it could not describe, and `escalated` is not in
+  #     `StageMachine.in_flight_stages/0` — so the release REBINDS that row and the stage stays
+  #     `escalated`, a story already in front of a human. That second half is not an argument:
+  #     `placement_test.exs`'s "a story too large for the contract is ESCALATED, and the claim
+  #     goes back" drives it through a real `place/4`. Escalating either is impossible
+  #     rather than merely wrong: `:session_escalated` leaves `@in_flight ++ [:merged,
+  #     :deployed]`, and neither `queued` nor `escalated` is in those, so there is no edge to
+  #     take. `revoke_session_dispatch/3`'s error log already names both remedies for the
+  #     credential.
+  #
+  # So the machine and the defect agree: the story is escalatable exactly when it is still held,
+  # and it is still held exactly when the release failed.
+  defp undo_claim(tenant_id, story, session, reason, opts) do
+    release = release_claim(tenant_id, story.id, reason, caller_lineage(session), opts)
+    cleared = Progress.clear_unused_implementer_dispatch(tenant_id, story.id, session.id)
     revoked = revoke_session_dispatch(tenant_id, session, reason)
-    log_undo(tenant_id, story_id, session, reason, {release, cleared, revoked})
+    log_undo(tenant_id, story.id, session, reason, {release, cleared, revoked})
+    park_unreleased_claim(tenant_id, story, session, reason, release, opts)
   end
+
+  # THE CONDITION, and it is two total clauses over what `release_claim/5` returns rather than a
+  # predicate plus a catch-all: a released claim needs nothing, and every other outcome of that
+  # function is a failure by construction. A catch-all here would silently absorb a third shape
+  # if one were ever added, which on this branch means silently NOT escalating.
+  defp park_unreleased_claim(_tenant_id, _story, _session, _reason, :ok, _opts), do: :ok
+
+  defp park_unreleased_claim(tenant_id, story, session, reason, {:error, release_error}, opts) do
+    escalate_unreleased_claim(tenant_id, story, session, reason, release_error, opts)
+  end
+
+  @doc """
+  Parks a story whose claim this placement made and could not give back.
+
+  Public only so the failed-compensation half can be exercised without staging a database
+  failure inside a live `place/4` — the same reason `Loopctl.Delivery.StoryPayload` publishes
+  `settle_if_parked/3`, and for the same trade: the alternative is a mockable seam through the
+  claim path, which is the one path in this module that must not grow a configuration surface.
+  `place/4` reaches it through `undo_claim/5` and nothing else should call it.
+
+  Always returns `:ok`. The caller is owed the refusal that brought it here, not this one.
+
+  ## The epoch is the CLAIM's, and is never re-read
+
+  Fenced on the epoch this placement claimed under, which is still the story's:
+  `Progress.force_unclaim_story/3` performs every write in one `AdminRepo.transaction/1`, and
+  its only post-commit step is `revoke_released_session_credential/3`, which rescues everything
+  and always returns `:ok` — so a REPORTED release failure is always a rolled-back transaction
+  and the epoch cannot have moved under it.
+
+  Re-reading it would be worse than redundant. An epoch read fresh would let this park a story
+  whose claim HAD gone back and been re-taken by somebody else — a live session's work stopped
+  by a compensation that no longer owns anything, which is exactly the hazard `resume/4` refuses
+  to take for the same reason. If the epoch has moved despite the argument above,
+  `Stages.advance/4` answers `:stale_claim_epoch` and `settle_if_parked/3` re-reads the row: an
+  escalated row is the outcome whoever wrote it, and anything else is reported as stranded. The
+  fence failing is the safe direction.
+
+  ## The stage is READ, not assumed
+
+  `claimed` is the ordinary case, but `enter_claimed_and_push/6` also reaches its `else` when the
+  `queued -> claimed` advance itself was refused — leaving a story that is claimed while its row
+  is still at `queued`, which `:session_escalated` cannot leave. The edge is therefore checked
+  against `StageMachine.transitions/0` and a stage with no edge is NAMED rather than reported as
+  a bare `:invalid_transition`. That check reads the machine's own table, so it cannot drift from
+  it; it is deliberately a second copy of the shape in `StoryPayload` rather than a shared
+  helper, because the two compose different reasons and event data and share only four lines. A
+  third caller is what should extract it.
+
+  ## Where the recursion stops, and why here
+
+  ONE attempt, no retry, and no compensation for this compensation. Escalation is terminal by
+  construction: it is the mechanism for putting a decision in front of a human, and there is
+  nothing above a human to escalate to — a fallback for a failed escalation could only be
+  another escalation, with the same failure modes, on the same row. So a refusal is logged at
+  `:error` with the story named as stranded, which is the same shape and the same argument
+  `Loopctl.Delivery.StoryPayload` already uses for `{:escalation_failed, _, _}`. What remains
+  underneath is what was there before this function existed: the claim lease, and the operator
+  remedies the log names.
+
+  A RAISE is swallowed for the same reason the release swallows one — `Stages.get/2` and the
+  chain append run on a pool with no `lock_timeout` of their own, and an exception here would
+  replace the push refusal the caller is owed with a second, unrelated one.
+  """
+  @spec escalate_unreleased_claim(
+          Ecto.UUID.t(),
+          Story.t(),
+          Dispatch.t(),
+          term(),
+          term(),
+          keyword()
+        ) :: :ok
+  def escalate_unreleased_claim(tenant_id, story, session, placement_error, release_error, opts) do
+    tenant_id
+    |> park(story, session, placement_error, release_error, opts)
+    |> log_park(tenant_id, story, session, placement_error, release_error)
+  rescue
+    error ->
+      log_park({:error, error}, tenant_id, story, session, placement_error, release_error)
+  end
+
+  defp park(tenant_id, story, session, placement_error, release_error, opts) do
+    case stage_of(tenant_id, story.id) do
+      nil ->
+        {:error, :unknown_story_stage}
+
+      stage ->
+        tenant_id
+        |> attempt_park(story, stage, session, placement_error, release_error, opts)
+        |> StoryPayload.settle_if_parked(tenant_id, story.id)
+    end
+  end
+
+  defp attempt_park(tenant_id, story, stage, session, placement_error, release_error, opts) do
+    transition = {stage, :escalated, :session_escalated}
+
+    if transition in StageMachine.transitions() do
+      Stages.advance(tenant_id, story.id, transition,
+        claim_epoch: story.claim_epoch,
+        # The PLACEMENT CALLER, exactly as `release_claim/5` and `revoke_session_dispatch/3`
+        # attribute their own compensations: the session this was minted for never ran, so
+        # recording its lineage on an immutable chain entry would say a session asked for a
+        # human when no session existed. An empty list here is an ATTESTED absence (an
+        # operator-key caller mints a root), which `lineage_declared/4` accepts and
+        # `human_gate/2` never sees — `:session_escalated` is not a human-only edge, so the
+        # `actor_lineage == []` half of `Stages.human?/1` is not in play on this transition.
+        actor_lineage: caller_lineage(session),
+        actor_label: compensation_actor(opts),
+        reason: unreleased_claim_reason(placement_error, release_error),
+        event_data: unreleased_claim_event_data(session, placement_error, release_error)
+      )
+    else
+      {:error, {:no_escalation_edge, stage}}
+    end
+  end
+
+  # The caller's own label plus what this park was for — see `@escalation_actor` for why a
+  # DEFAULT could not carry that, and the closing assertions of `placement_test.exs`'s "a
+  # release that genuinely FAILED escalates the story, through place/4" for what holds it.
+  #
+  # A `case` and not `Keyword.get/3`: an explicit `actor_label: nil` is a present key, so the
+  # default would not apply and `nil <> suffix` would raise — swallowed by the rescue in
+  # `escalate_unreleased_claim/6`, which would LOSE the park rather than mislabel it.
+  defp compensation_actor(opts) do
+    case Keyword.get(opts, :actor_label) do
+      label when is_binary(label) -> label <> @compensation_suffix
+      _ -> @escalation_actor <> @compensation_suffix
+    end
+  end
+
+  # "is ESCALATED", not "has been escalated BY THIS CALL": `settle_if_parked/3` reaches this
+  # branch for a row somebody ELSE parked — a retried placement, or the story object builder
+  # having already parked an undispatchable story before the push was ever refused. The row
+  # being at `escalated` is the outcome either way, and a line claiming authorship it does not
+  # have would be a false statement in the one place an operator goes to reconstruct what
+  # happened. The CLAIM half is this call's own and is stated flatly, because in the
+  # already-parked case it is the only thing this line adds.
+  #
+  # AND THE REMEDY NAMES ITS PRECONDITION HERE TOO, at more length than
+  # `unreleased_claim_reason/2` can afford: this is a Logger call under no length bound, and
+  # the reader of this line is the orchestrator key that just ran `place/4` — the one principal
+  # `stage/resolve` refuses. The three gates are named above `unreleased_claim_reason/2`.
+  defp log_park({:ok, _row}, tenant_id, story, session, placement_error, release_error) do
+    Logger.warning(
+      "placement could not release the claim it made; the story is ESCALATED and waiting for " <>
+        "a human, with that claim still standing. " <>
+        "Resolve it to queued (POST /api/v1/stories/#{story.id}/stage/resolve, MCP " <>
+        "resolve_escalation), which releases the claim and re-contracts the story. THAT CALL " <>
+        "NEEDS A HUMAN KEY: role user or above, minted by no dispatch — the orchestrator key " <>
+        "that placed this story is refused 403 insufficient_role, and a dispatch-minted user " <>
+        "key clears the plugs and is then refused human_required. " <>
+        "tenant_id=#{tenant_id} story_id=#{story.id} claim_epoch=#{story.claim_epoch} " <>
+        "session_dispatch_id=#{session.id} placement_error=#{short(placement_error)} " <>
+        "release_error=#{short(release_error)}",
+      tenant_id: tenant_id,
+      story_id: story.id
+    )
+
+    :ok
+  end
+
+  # LOUDER THAN THE BRANCH ABOVE, on the same argument `StoryPayload.refuse/4` makes: an
+  # escalated story is the harmless outcome because a human has it. This one is the story that
+  # is neither placeable nor parked, held by a session that will never run, with nothing
+  # downstream that will pick it up before the lease — which a halted tenant never reaches at
+  # all, since `ReclaimExpiredClaimsWorker` skips it.
+  #
+  # AND THE REMEDY NAMES ITS OWN PRECONDITION, because the halted tenant this message reasons
+  # about in that same sentence is refused the remedy it used to name. `force-unclaim` is in
+  # `LoopctlWeb.CustodySurface`'s `@story_custody_ops`, so `LoopctlWeb.Plugs.CheckCustodyHalt`
+  # — mounted in the `:authenticated` pipeline (`LoopctlWeb.Router`) — answers
+  # `503 tenant_halted` before the controller runs, and an operator in exactly the state
+  # described here followed the only remedy named and got a 503. The break-glass is the
+  # precondition and is named with it.
+  #
+  # `stage/resolve` is NOT the answer on this branch even though it is halt-exempt (its path
+  # has four segments, so `custody_path?/1` falls through to `false`): this is the branch where
+  # the escalation did not happen, so there is no escalation to resolve.
+  defp log_park({:error, reason}, tenant_id, story, session, placement_error, release_error) do
+    Logger.error(
+      "placement could not release the claim it made AND COULD NOT ESCALATE the story. It is " <>
+        "held at its current stage by a session that will never run, and no automatic path " <>
+        "frees it before the claim lease — a halted tenant never reaches that either. Free it: " <>
+        "POST /api/v1/stories/#{story.id}/force-unclaim (MCP force_unclaim_story), then " <>
+        "contract it before placing it again. IF THIS TENANT IS HALTED, force-unclaim is " <>
+        "suspended with every other custody operation and answers 503 tenant_halted: clear " <>
+        "the halt first, through the superadmin break-glass ceremony (POST " <>
+        "/api/v1/admin/tenants/#{tenant_id}/clear-halt/challenge, then .../clear-halt). " <>
+        "tenant_id=#{tenant_id} story_id=#{story.id} " <>
+        "claim_epoch=#{story.claim_epoch} session_dispatch_id=#{session.id} " <>
+        "placement_error=#{short(placement_error)} release_error=#{short(release_error)} " <>
+        "escalation_error=#{short(reason)}",
+      tenant_id: tenant_id,
+      story_id: story.id
+    )
+
+    :ok
+  end
+
+  # LOOPCTL'S OWN WORDS. This text reaches the story's `escalation_reason` column and, on this
+  # chained transition, the tenant's append-only hash chain, so none of it may be
+  # session-authored — `Loopctl.Delivery.Untrusted` exists for the text that is.
+  #
+  # THE PRIMARY REMEDY NAMES ITS PRECONDITION, because the principal most likely to read this
+  # row cannot perform it: `stage/resolve` is gated by `RequireRole, role: :user`, then
+  # `RequireHumanAnchor` (`LoopctlWeb.StoryEscalationController`), then `Stages.human?/1`,
+  # which also wants `actor_lineage == []`. The orchestrator key that ran `place/4` gets
+  # `403 insufficient_role`; a dispatch-minted `:user` key clears both plugs and is then
+  # refused `:human_required`. Only an unlineaged `user`+ key on a human-anchored tenant
+  # resolves it.
+  #
+  # THE SECOND REMEDY SAYS WHAT FORCE-UNCLAIM DOES NOT DO, because this is read off an
+  # ESCALATED row. `Stages.follow_release/5` requeues only a stage in
+  # `StageMachine.in_flight_stages/0` and `escalated` is not one, so the release rebinds the
+  # row and the stage stays `escalated`, while `claimable/2` requires `queued`. An operator who
+  # force-unclaimed and re-contracted got `{:error, :wrong_stage}` with nothing here saying why.
+  #
+  # THE GATE IS `reason_within_bound?/1`, 4_000 codepoints of the RAW text, and the fit is
+  # ASSERTED rather than argued: `placement_test.exs`'s "an error term whose size is its
+  # ELEMENT COUNT cannot lose the escalation" parks with the fattest pair reachable here and
+  # asserts the row reached `escalated`, which IS the length check — over the bound
+  # `Stages.advance/4` refuses `:invalid_reason` BEFORE the transition, so there is no park to
+  # read a length off. An edit that eats the headroom reds that test instead of losing a park
+  # in production (mutation-proved: 450 characters added to the prose below turns it red). The
+  # remedy is written FIRST and the diagnostics LAST so that an overrun a future edit did slip
+  # past would cost an operator the diagnostics and not the instruction. No headroom FIGURE is
+  # quoted here: three rounds stated it three different ways, all wrong in the same direction,
+  # and two careful measurements still disagreed — the assertion is what holds the bound.
+  #
+  # BOTH `short/1` OPTIONS EARN THEIR PLACE, AND NEITHER IS UNFALSIFIABLE. `:limit` is spent
+  # across the WHOLE traversal rather than per container, so nesting cannot multiply the output
+  # (20 sibling 5-element lists render at the width of 5), and it is the only bound on a term
+  # whose size is its ELEMENT COUNT — opening it to `:infinity` reds the test above.
+  # `:printable_limit` is the only bound on one long binary, the shape a changeset's `:errors`
+  # has; opening IT reds two tests.
+  #
+  # A WHOLE-TEXT CLAMP STAYS OUT: it would absorb exactly that edit, silently. WHAT WOULD
+  # OVERTURN THAT — a term whose size is neither an element count nor a binary's length, which
+  # neither option bounds (a 30_000-digit integer is one). This path has no such source:
+  # `placement_error` is what `Runners.dispatch/3` and `fetch_uuid/2` refuse with, and
+  # `release_error` is a changeset, an atom or an exception struct. A new one puts the clamp
+  # INSIDE `short/1`, where it also covers `unreleased_claim_event_data/2`'s 8_000-byte bound.
+  defp unreleased_claim_reason(placement_error, release_error) do
+    "loopctl claimed this story for a runner, the dispatch was refused, and the compensating " <>
+      "release of that claim ALSO failed. The story is held by a session that will never " <>
+      "run, and no automatic path frees it before the claim lease. REMEDY: resolve this " <>
+      "escalation to queued (POST /api/v1/stories/:id/stage/resolve, MCP " <>
+      "resolve_escalation) — that releases the claim, revokes its session credential and " <>
+      "re-contracts the story, so one call makes it placeable again. That call needs a HUMAN " <>
+      "key: role user or above, minted by no dispatch — the orchestrator key that placed " <>
+      "this story is refused 403 insufficient_role. Force-unclaim (POST " <>
+      "/api/v1/stories/:id/force-unclaim, MCP force_unclaim_story) frees the claim but does " <>
+      "NOT clear this escalation: the stage row stays at escalated, so the story is still " <>
+      "unplaceable and you have to resolve it anyway. " <>
+      "placement_error=#{short(placement_error)} release_error=#{short(release_error)}"
+  end
+
+  # Small by construction rather than by fitting: four short scalars, well under
+  # `Stages.max_event_data_bytes/0`, so there is no halving dance to get wrong. The bounded
+  # inspects are what keep it that way — an unbounded changeset would be the one term that
+  # could push it over and turn the escalation into `:invalid_event_data`, which is the
+  # "neither dispatchable nor parked" outcome the truncation everywhere else exists to prevent.
+  defp unreleased_claim_event_data(session, placement_error, release_error) do
+    %{
+      "placement_compensation" => "release_failed",
+      "placement_error" => short(placement_error),
+      "release_error" => short(release_error),
+      "session_dispatch_id" => session.id
+    }
+  end
+
+  # Bounded on BOTH axes: `:limit` caps how many elements of a container are shown, and
+  # `:printable_limit` caps the bytes of any one binary inside it. Capping only the first still
+  # lets a single long message through, and a changeset's `:errors` is exactly that shape.
+  defp short(term), do: inspect(term, limit: 5, printable_limit: 200)
 
   # Silent when the undo did everything it is for. `{:ok, :unchanged}` from the clear is NOT a
   # failure — it means the story no longer names this dispatch, which is what a re-claim
