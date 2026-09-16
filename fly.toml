@@ -43,6 +43,87 @@ kill_timeout = 90
   # ScaleAlerts.config_status/2 flags BOTH half-done directions, so doing one without the
   # other turns /health/ready red with a reason naming the setting to fix.
   SCALE_ALERTS_ENABLED = "false"
+
+  # #803: THE UNATTENDED DISPATCH DRIVER IS ON. Enabled 2026-09-16 on Mark's
+  # instruction ("enable the loop. Let it succeed or fail on the next filed issue"),
+  # after the intake-source MCP tools made the loop wireable at all. With this true
+  # and DISPATCH_WALL_CLOCK_SECONDS and DISPATCH_MAX_TURNS set, DispatchDriverWorker
+  # places queued stories on whichever runner has slots free, with nobody watching.
+  #
+  # TWO KEYS GATE THE IMPLEMENT DRIVER, NOT FOUR. DispatchDriver.budgets/0
+  # (dispatch_driver.ex:236-241) reads only :dispatch_wall_clock_seconds and
+  # :dispatch_max_turns; the TRIAGE pair below gates TriageDispatcher and nothing else.
+  # Debugging "the driver placed nothing"? Check those two. And do not read an unset
+  # triage pair as the implement driver being safely off — it is not one of its gates.
+  #
+  # THE OFF SWITCH IS A DEPLOY, and only a deploy: `fly deploy -a loopctl` with this line
+  # set to "false". config/runtime.exs reads the variable at BOOT, so nothing picks up a
+  # change until every machine restarts, and [deploy] strategy is "rolling" — the machine
+  # still running the old release keeps placing stories until it is replaced. Budget for
+  # placements during the rollout; this is not an instant stop.
+  #
+  # DO NOT reach for `fly secrets set DISPATCH_DRIVER_ENABLED=false`. It is faster and it
+  # is a trap: a Fly secret OUTRANKS this [env] line and PERSISTS, so the driver stays off
+  # afterwards no matter what is written here, and a later deploy that means to turn it
+  # back on silently does nothing. Recovering needs `fly secrets unset
+  # DISPATCH_DRIVER_ENABLED`, which is another restart. If an incident genuinely needs the
+  # secret, record that it was set — the next operator reads this file, not the secret list.
+  DISPATCH_DRIVER_ENABLED = "true"
+
+  # THE BUDGETS ARE A COST POLICY, not a timeout, and they have no defaults on purpose
+  # (config/runtime.exs:177) — a default would be our guess quietly becoming Mark's
+  # spend. Calibrated against the ONE measured unattended run (2026-09-14, one story):
+  # 28.8 minutes, 108 turns, about USD 10.40. Both implement numbers are ~2x that, so a
+  # typical run finishes well inside them and a runaway is capped near an hour rather
+  # than a day. Expect roughly USD 10-20 per implement run at these figures; lower them
+  # to cap harder, raise them only with a measured run that needed it.
+  DISPATCH_WALL_CLOCK_SECONDS = "3600"
+  DISPATCH_MAX_TURNS = "200"
+
+  # THE FLEET MULTIPLIER. The two budgets above bound ONE session; what we actually spend is
+  # that times how many run at once, so the multiplier belongs next to the multiplicand or
+  # the block states half a cost policy. This is the TENANT-WIDE admission cap
+  # (config/runtime.exs:161-168 -> Loopctl.Runners.Capacity.limit/0 at capacity.ex:223,
+  # code default 6).
+  #
+  # IT IS AN UPPER BOUND AND USUALLY NOT THE BINDING ONE. Capacity.reserve/3 also gates per
+  # runner on `in_flight < max_sessions`, and max_sessions follows each runner's OWN
+  # enrolment declaration — loopctl derives it and never stores an independent copy
+  # (KB 8dff6636) — so the real ceiling on concurrent unattended sessions is
+  #
+  #     min(tenant cap, sum of declared max_sessions over non-draining runners)
+  #
+  # and this line binds only while declared capacity EXCEEDS it. Read the right-hand term
+  # from `runner_pool` before reasoning about spend; do not infer it from this file.
+  # Measured on the live pool 2026-09-16 21:33Z: blockit max_sessions 2, draining; mac-mini
+  # max_sessions 2, draining; minis max_sessions 1, not draining — so declared capacity was
+  # 1 and the effective ceiling was min(2, 1) = 1, which at roughly USD 10-20 per implement
+  # run (KB a08b94b2) is roughly USD 10-20/hour sustained. That is a DATED reading of a pool
+  # that changes on every enrolment and every drain, never a standing fact about how many
+  # runners there are.
+  #
+  # 2, because implementation quality is still n=1: exactly one successful unattended run
+  # (KB a08b94b2). What the cap BUYS is not cutting today's fleet down — today's fleet is
+  # already below it — but surviving the day somebody re-enrols three runners at 4 slots
+  # each: declared capacity 12, spend held at 2 concurrent (roughly USD 20-40/hour) until
+  # this line is deliberately raised. Raise it when several runs have landed reviewable
+  # work, not before.
+  RUNNER_MAX_IN_FLIGHT_SESSIONS = "2"
+
+  # A TRIAGE session reads a ticket and answers with a verdict — a fraction of an
+  # implement run — so it gets its own far smaller pair (#803 §4). Inheriting the
+  # implement numbers would hand a reading session an hour of wall clock.
+  #
+  # UNLIKE THE IMPLEMENT PAIR, THIS ONE IS ASSERTED, NOT MEASURED. The implement budgets
+  # are 2x a real run; no triage run has ever been measured, so 600/40 is a reasoned guess.
+  # What a too-small guess looks like: the runner reports `wall_clock_exceeded` or
+  # `no_verdict_written` (runner_contract.ex:1463), and TriageVerdict.route/1
+  # (triage_verdict.ex:230) escalates EVERY incomplete reason — so every ticket escalates to
+  # a human while the workers log clean `:dispatched` tallies and the loop reads as working.
+  # There is no error to notice. CHECK THE FIRST TRIAGE RUNS against these numbers, and
+  # raise them from what those runs actually took.
+  TRIAGE_WALL_CLOCK_SECONDS = "600"
+  TRIAGE_MAX_TURNS = "40"
   # BEAM clustering over Fly's private network. DNSCluster resolves this name to every
   # started machine's 6PN address and connects to the node of the same release there; the
   # node name and IPv6 distribution come from rel/env.sh.eex. Not a secret: it names no

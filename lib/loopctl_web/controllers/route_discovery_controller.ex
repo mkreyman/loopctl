@@ -863,6 +863,71 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description: "Release your own advisory file soft-lock. MCP tool: channel_unlock"
       },
 
+      # Agent delivery loop — GitHub intake (#803/#874). A loop with no intake source has no
+      # input, and this index is where a session looks "before probing blindly", so these
+      # routes shipped served and undiscoverable: five routes, not one row here.
+      %{
+        method: "POST",
+        path: "/api/v1/intake/sources",
+        description:
+          "Bind ONE GitHub repository to ONE ACTIVE WORK project and mint its webhook secret — " <>
+            "the step that gives the delivery loop an input, and the row place_dispatch reads " <>
+            "repo and base_branch from (its 409 no_intake_source means this was never done). " <>
+            "THE SECRET IS RETURNED EXACTLY ONCE and can never be read again: it is encrypted " <>
+            "at rest and redacted on the schema, so losing it costs a revoke, a re-enrolment " <>
+            "and a reconfigured GitHub webhook. Role: user, on a human-anchored tenant, AND an " <>
+            "UNLINEAGED caller — a dispatch-minted key is 403 api_key_mint_forbidden, because " <>
+            "this mints a credential belonging to no lineage. Also refuses an agent-rooted " <>
+            "tenant (403 custody_tier_required), a repo that is not owner/name, a repository " <>
+            "an active source already binds, and a project that is missing, archived or not a " <>
+            "work project. base_branch defaults to master — name main explicitly or every " <>
+            "dispatch is cut from a trunk that does not exist. MCP tool: intake_source_enroll"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/intake/sources",
+        description:
+          "List the tenant's intake sources: id (the webhook URL is /api/v1/intake/github/<id>), " <>
+            "project_id, repo_full_name, base_branch, target_epic_id, revoked_at. The webhook " <>
+            "secret is NOT here and is nowhere — this is not how to recover one. Role: user; " <>
+            "the only one of the four that does not also need a human-anchored tenant. " <>
+            "Optional include_revoked. MCP tool: intake_source_list"
+      },
+      %{
+        method: "PATCH",
+        path: "/api/v1/intake/sources/:id",
+        description:
+          "Set where a source's work lands: target_epic_id (the epic triaged stories are " <>
+            "created in) and base_branch. Presence decides — an unnamed field is untouched, " <>
+            "naming neither is 422 nothing_to_update, and an explicit null on target_epic_id " <>
+            "CLEARS it, which returns the source to escalating every report. A revoked source " <>
+            "is 404, not a no-op. 422 when the epic is not in this source's project. Role: " <>
+            "user on a human-anchored tenant. MCP tool: intake_source_update"
+      },
+      %{
+        method: "DELETE",
+        path: "/api/v1/intake/sources/:id",
+        description:
+          "Revoke an intake source: the verb is DELETE and the act is a revoke — revoked_at is " <>
+            "stamped, the row is kept, and nothing already received is discarded. Afterwards " <>
+            "every delivery to that URL is refused 401 invalid_signature exactly as a wrong " <>
+            "secret is, so delete the GitHub webhook too. Idempotent. Frees the repository's " <>
+            "uniqueness slot and clears target_epic_id, which is what makes that epic " <>
+            "deletable. Role: user on a human-anchored tenant. MCP tool: intake_source_revoke"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/intake/github/:source_id",
+        description:
+          "GitHub's own webhook delivery endpoint — called by GitHub, not by you, and there is " <>
+            "no MCP tool. Authenticated by an HMAC over the RAW body against the secret minted " <>
+            "at enrolment, never by an API key. Configure it as the Payload URL with content " <>
+            "type application/json and the Issues event only. Every failure is the SAME 401 " <>
+            "invalid_signature — unknown or revoked source, suspended tenant, missing or wrong " <>
+            "signature, or a payload whose repository.full_name does not match — so Recent " <>
+            "Deliveries cannot tell you which."
+      },
+
       # OpenAPI spec
       %{method: "GET", path: "/api/v1/openapi", description: "Full OpenAPI 3.0 spec (Swagger)"},
 
