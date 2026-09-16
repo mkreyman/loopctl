@@ -36,6 +36,21 @@ All notable changes to loopctl are documented here.
   sending `branch`: it is no longer listed as required and loopctl derives it. The story number and
   an id fragment are always in the derived name, and are never shortened to make a prefix fit.
 
+  **A caller-supplied `branch` is now also checked for being a git ref name at all** — `422
+  invalid_branch_name`, nothing claimed. `branch` is declared on the wire as a string of 1..255
+  characters with no pattern, so a value such as `--upload-pack=/bin/sh`, `-o` or `a..b` used to
+  cast clean and be pushed verbatim to a machine that hands it to git. It must now start with a
+  letter or digit and hold only letters, digits, `.`, `_`, `/` and `-`; no path component may begin
+  with `.` or end with `.lock`, and `..` may not appear anywhere.
+
+  **Neither prefix refusal can be raised by a RETRY** carrying a `dispatch_id` loopctl already
+  holds. That claim committed on an earlier call and is standing, so refusing the retry would leave
+  the story at `claimed` with no session until its lease expired — and the refusal would say
+  nothing was claimed, which is false there. On that path the declaration only steers the NAME: a
+  declaration that can produce no valid branch falls back to the un-prefixed derivation and the
+  machine's own refusal reaches a person, costing no claim. `invalid_branch_name` IS still raised
+  on a retry, because its remedy is in the request itself.
+
 - **A runner's capacity now follows what the machine declares, not what it was enrolled with
   (#846.4, runner contract 1.13.0).** `runners.max_sessions` — the number `Loopctl.Runners.Capacity`
   reserves against — was written once at enrollment and had no path from the runner's own

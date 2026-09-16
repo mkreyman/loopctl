@@ -94,6 +94,27 @@ defmodule Loopctl.Delivery.DispatchPayloadTest do
       end
     end
 
+    # 846.2 REVIEW FINDING 4. Every one of these is admitted by `@branch_name` (which allows
+    # `.`) and produces a name git REFUSES, and none was checked: the guard standing in for
+    # them tested `String.ends_with?(branch, ".lock")` against the WHOLE composed name, which
+    # always ends with the `story-N-<id8>` suffix, so it could not fire for any input this
+    # function receives. Git's rules are per-COMPONENT and that is where they are applied now.
+    test "a prefix breaking a git rule on a PATH COMPONENT refuses" do
+      for bad <- ["x.lock/", "a/.b/", "a/x.lock/", "a/b./"] do
+        assert {:error, {:no_conforming_branch, [^bad]}} =
+                 DispatchPayload.branch_for(@story, [bad]),
+               "#{inspect(bad)} produced a branch name git refuses"
+      end
+    end
+
+    # The other half of finding 4, and the reason the component rules did not simply replace
+    # the `..` check: `a..b` is ONE component, breaks no component rule, and git refuses the
+    # ref anyway.
+    test "`..` inside a single component still refuses" do
+      assert {:error, {:no_conforming_branch, ["a..b/"]}} =
+               DispatchPayload.branch_for(@story, ["a..b/"])
+    end
+
     test "the refusal names the prefixes, which is the fact an operator cannot otherwise read" do
       assert {:error, {:no_conforming_branch, ["loop//", "-x"]}} =
                DispatchPayload.branch_for(@story, ["loop//", "-x"])

@@ -240,6 +240,24 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
       assert body["error"]["branch_prefixes"] == ["loop/"]
       assert body["error"]["message"] =~ "Omit `branch`"
     end
+
+    # 846.2 REVIEW FINDING 3. A THIRD tuple, and a different refusal from the two above: the
+    # name is not a git ref at all, so no machine could create it whatever it declares. It has
+    # its own code because its remedy is different — the two above are about a machine's
+    # declaration, this one is about the string in the request.
+    test "a branch that is not a git ref name renders its own refusal" do
+      conn =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          {:invalid_branch_name, "--upload-pack=/bin/sh"}
+        )
+
+      assert conn.status == 422
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["code"] == "invalid_branch_name"
+      assert body["error"]["branch"] == "--upload-pack=/bin/sh"
+      assert body["error"]["message"] =~ "Nothing was claimed"
+    end
   end
 
   describe "the role gate" do

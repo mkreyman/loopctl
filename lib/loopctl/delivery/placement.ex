@@ -427,11 +427,18 @@ defmodule Loopctl.Delivery.Placement do
   #     accepted and not new work.
   #   * `Runners.dispatch/3` — an operator push by name. It claims nothing either, so the
   #     runner's own refusal reaches a person, which is the trade `accepts?/5` documents.
-  defp runner_accepting_work(tenant_id, runner_id) do
-    case sole_live_meta(tenant_id, runner_id) do
-      nil -> :ok
-      meta -> if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
-    end
+  #
+  # TAKES THE ALREADY-RESOLVED META rather than reading one (846.2 review finding 5). Its
+  # caller reads the sole live meta ONCE and asks both questions of that one value, so the
+  # draining judgement and the branch declaration cannot come from two different sockets: a
+  # runner that rejoins between two reads would otherwise have the placement judge its
+  # capacity from one declaration and derive its branch from another, which is exactly the
+  # split `Runners.declared_branch_prefixes/1` leans on "the caller resolves the SOLE live
+  # meta" to rule out.
+  defp runner_accepting_work(nil), do: :ok
+
+  defp runner_accepting_work(meta) do
+    if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
   end
 
   # WHAT THIS MACHINE SAID IT ACCEPTS, off the meta of the ONE socket a push would reach
@@ -440,17 +447,13 @@ defmodule Loopctl.Delivery.Placement do
   # capacity could not.
   #
   # `[]` for zero sockets and for an ambiguous pair, which is the same answer
-  # `runner_accepting_work/2` gives and for the same reason: with no single meta there is no
+  # `runner_accepting_work/1` gives and for the same reason: with no single meta there is no
   # declaration to read, and `Runners.dispatch/3` is the one place that judges those two
   # states (`:runner_not_connected`, `:runner_ambiguous`). Deriving the un-prefixed default
   # there is not a guess that costs anything — the push is refused before it reaches a
   # machine.
-  defp declared_branch_prefixes(tenant_id, runner_id) do
-    case sole_live_meta(tenant_id, runner_id) do
-      nil -> []
-      meta -> Runners.declared_branch_prefixes(meta)
-    end
-  end
+  defp declared_branch_prefixes(nil), do: []
+  defp declared_branch_prefixes(meta), do: Runners.declared_branch_prefixes(meta)
 
   defp sole_live_meta(tenant_id, runner_id) do
     case Runners.live_metas(tenant_id, runner_id) do
@@ -536,11 +539,49 @@ defmodule Loopctl.Delivery.Placement do
   # random or a "best" one), so a retry against an unchanged declaration re-derives the same
   # string byte for byte. The ledger stores no branch, so there is nothing here to compare
   # against and nothing that could drift out of agreement with a stored copy.
+  #
+  # ## THE DECLARATION STEERS THE NAME AND CANNOT REFUSE THE RESUME (846.2 review finding 1)
+  #
+  # `:prefix_policy` is `:advise` here for the ONE reason `runner_accepting_work/1` is not
+  # mounted on this path at all: the claim this call is re-pushing under COMMITTED on an
+  # earlier call and is LIVE. A refusal for a machine-state reason leaves the story at
+  # `claimed` with no session until its lease expires, which is the exact outcome that gate
+  # exists to prevent, and the `dispatch_id` is spent, so a new placement cannot be made while
+  # the claim stands.
+  #
+  # It is not hypothetical, and the scenario is the DOCUMENTED remediation path. A runner
+  # declares `["loop/"]`; an operator places naming `branch: "loop/mine"` — the field the
+  # pre-1.14.0 schema REQUIRED, so every client built before this change sends one; the HTTP
+  # response is lost; the operator fixes the machine's configuration and it rejoins declaring
+  # `["agent/"]`, which is what the contract tells them to do. Under `:refuse` the retry
+  # carrying the same `dispatch_id` is answered `branch_not_allowed`, whose message says
+  # nothing was claimed — false here, the same both-halves-false message
+  # `runner_declines_work` carried on this path until #866 round 2 moved it. So this is the
+  # same fix in the same place: the gate belongs on the CLAIMING path, and this one is exempt.
+  #
+  # What `:advise` still gets right is the NAME. The declaration is used wherever it can
+  # produce a conforming branch, so the ordinary rejoin above resumes on `agent/...`, and only
+  # a declaration that can produce no valid name at all falls back to the un-prefixed default.
+  # The machine may then refuse that frame, which is the outcome this path is built for
+  # everywhere else too — `push_resumed/4` writes no compensating release — so the refusal
+  # reaches a person while the claim and any session under it stay exactly as they were.
+  #
+  # THE NAME CHECK IS NOT EXEMPT, and it is a different question rather than the same one
+  # twice. A prefix is a fact about ANOTHER MACHINE that changed under the caller: its remedy
+  # is a config file on that box, and until someone acts there the claim is stranded. A branch
+  # NAME is a fact about the string in THIS REQUEST: its remedy is this request, retryable
+  # immediately under the same `dispatch_id`, because a refusal here writes nothing at all.
+  # And a name git will not take cannot start a session on any machine, so pushing it is not
+  # the kinder outcome — it costs the same claim one round trip later.
   defp resume_payload(tenant_id, runner_id, dispatch, record) do
-    prefixes = declared_branch_prefixes(tenant_id, runner_id)
+    prefixes = declared_branch_prefixes(sole_live_meta(tenant_id, runner_id))
 
     with {:ok, story} <- Stories.get_story(tenant_id, record.story_id),
-         {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch, branch_prefixes: prefixes),
+         {:ok, dispatch} <-
+           DispatchPayload.fill(tenant_id, dispatch,
+             branch_prefixes: prefixes,
+             prefix_policy: :advise
+           ),
          {:ok, dispatch} <- rebuild_story(dispatch, story) do
       {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
     end
@@ -593,12 +634,19 @@ defmodule Loopctl.Delivery.Placement do
   # `Runners.dispatch/3` — which runs after a session dispatch has been minted, the story
   # claimed, and two IMMUTABLE chain entries appended. A caller that omitted one of the five
   # paid all of that and then got a 422. Every one of them is something loopctl can look up.
+  #
+  # ONE READ OF THE POOL serves both questions this asks about the machine — is it taking work,
+  # and what branch prefixes did it declare. See `runner_accepting_work/1` for why the pair
+  # must come from the SAME meta.
   defp claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts) do
-    prefixes = declared_branch_prefixes(tenant_id, runner_id)
+    meta = sole_live_meta(tenant_id, runner_id)
 
-    with :ok <- runner_accepting_work(tenant_id, runner_id),
+    with :ok <- runner_accepting_work(meta),
          {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
-         {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch, branch_prefixes: prefixes),
+         {:ok, dispatch} <-
+           DispatchPayload.fill(tenant_id, dispatch,
+             branch_prefixes: declared_branch_prefixes(meta)
+           ),
          :ok <- claimable(tenant_id, story_id),
          {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
       claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)

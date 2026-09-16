@@ -328,6 +328,20 @@ defmodule Loopctl.Delivery.DispatchDriver do
         {:error, :custody_tier_required} ->
           blocked(candidate, :custody_tier_required)
 
+        # THE RUNNER'S OWN DECLARATION LEAVES NO ROOM FOR A BRANCH, so its remedy is
+        # `branch_prefixes` on that machine's configuration and a reconnect — a state that
+        # clears only when a person acts, which is `blocked/2`'s stated criterion and not
+        # `unplaceable/2`'s (846.2 review finding 2). `Runners.accepts?/5` knows nothing about
+        # branch prefixes, so `available_runner/2` keeps selecting the same misconfigured
+        # machine on every pass: left as `:unplaceable` this printed one INFO line a minute
+        # for ever while an operator watching a queue that never drains saw nothing.
+        #
+        # `{:branch_not_allowed, _, _}` and `{:invalid_branch_name, _}` cannot arrive here and
+        # so get no clause: both are refusals of a CALLER-supplied `branch`, and `dispatch/3`
+        # below deliberately sends no `branch` key at all.
+        {:error, {:no_conforming_branch, _} = reason} ->
+          blocked(candidate, reason)
+
         {:error, reason} ->
           unplaceable(candidate, reason)
       end

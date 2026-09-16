@@ -7994,7 +7994,12 @@ const TOOLS = [
       "The body echoes the declared prefixes; the fix is on that machine's own configuration, " +
       "not in this call. 422 `branch_not_allowed` is the other half: you passed a `branch` " +
       "outside those prefixes, so the machine would have refused the dispatch — omit it and " +
-      "loopctl derives a conforming one.",
+      "loopctl derives a conforming one. 422 `invalid_branch_name` is a different refusal " +
+      "again: the `branch` you passed is not a valid git ref name at all, so no machine " +
+      "could create it — nothing was claimed, and the remedy is in this call. Neither " +
+      "prefix refusal can be raised by a RETRY carrying a dispatch_id loopctl already " +
+      "holds: its claim is already standing, so a declaration that changed under you only " +
+      "steers the name and never strands the story.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8038,8 +8043,9 @@ const TOOLS = [
             "RUNNER declared it accepts on join (`branch_prefixes`, runner contract 1.14.0) " +
             "— a per-machine fact only the server can read, and the reason this is derived " +
             "rather than named. A branch you pass is never rewritten, so one outside that " +
-            "machine's prefixes is refused 422 `branch_not_allowed` (nothing claimed). " +
-            "runner_pool shows each machine's `branch_prefixes`.",
+            "machine's prefixes is refused 422 `branch_not_allowed`, and one that is not a " +
+            "valid git ref name is refused 422 `invalid_branch_name` (nothing claimed on " +
+            "either). runner_pool shows each machine's `branch_prefixes`.",
         },
         base_branch: { type: "string", description: "Optional. The branch it is cut from." },
         wall_clock_seconds: { type: "integer", description: "Optional. Overrides the default." },

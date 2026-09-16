@@ -375,6 +375,22 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       refute_push "dispatch", _pushed
     end
 
+    # 846.2 REVIEW FINDING 2. `Runners.accepts?/5` knows nothing about branch prefixes, so
+    # `available_runner/2` selects this same machine on every pass and the placement fails the
+    # same way each time. Classified `:unplaceable` it printed one INFO line a minute for ever
+    # — "leaving for the next pass" — while its actual remedy is an operator editing
+    # `branch_prefixes` on that box and reconnecting it, which is `blocked/2`'s own criterion:
+    # a state that clears only when a person acts.
+    test "a runner whose declared prefixes can produce no branch is BLOCKED, not unplaceable",
+         ctx do
+      bind_repo(ctx, queued_story(ctx), @repo)
+      channel = join_runner(ctx, %{"branch_prefixes" => ["loop//"]})
+
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:blocked]
+      refute_push "dispatch", _pushed
+      leave_channel(channel)
+    end
+
     test "a story whose project has no intake source is not selected at all, and does not " <>
            "hold a slot in the batch",
          ctx do

@@ -1614,6 +1614,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @spec dispatchable_kinds() :: [String.t()]
     def dispatchable_kinds, do: Kinds.dispatchable()
 
+    # PUBLISHED AND READ BACK, rather than copied. `Loopctl.Delivery.DispatchPayload` judges a
+    # CALLER-supplied `branch` before anything is claimed — the cast below runs after the
+    # claim, which is the whole reason that check moved earlier — and it bounds the length
+    # against this, so the number a caller is refused on is the number the contract states.
+    @max_branch_length 255
+
+    @doc "The longest branch name a dispatch may carry, on `branch` and on `base_branch`."
+    @spec max_branch_length() :: pos_integer()
+    def max_branch_length, do: @max_branch_length
+
     OpenApiSpex.schema(
       %{
         title: "RunnerDispatch",
@@ -1648,8 +1658,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           story_id: %Schema{type: :string, format: :uuid},
           kind: %Schema{type: :string, enum: Kinds.all()},
           repo: %Schema{type: :string, pattern: "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$"},
-          base_branch: %Schema{type: :string, minLength: 1, maxLength: 255},
-          branch: %Schema{type: :string, minLength: 1, maxLength: 255},
+          base_branch: %Schema{type: :string, minLength: 1, maxLength: @max_branch_length},
+          branch: %Schema{type: :string, minLength: 1, maxLength: @max_branch_length},
           claim_epoch: %Schema{
             type: :integer,
             minimum: 0,

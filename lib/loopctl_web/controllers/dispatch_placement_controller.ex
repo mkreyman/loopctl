@@ -142,7 +142,8 @@ defmodule LoopctlWeb.DispatchPlacementController do
                  "(`branch_prefixes` on the runner contract's join, since 1.14.0) — which " <>
                  "is a per-machine fact only the server can read. A branch you name is " <>
                  "never rewritten, so one outside that machine's prefixes is refused " <>
-                 "`branch_not_allowed` and nothing is claimed."
+                 "`branch_not_allowed`, and one that is not a valid git ref name is refused " <>
+                 "`invalid_branch_name`. Nothing is claimed on either."
            },
            base_branch: %Schema{type: :string},
            wall_clock_seconds: %Schema{type: :integer, minimum: 1},
@@ -185,6 +186,8 @@ defmodule LoopctlWeb.DispatchPlacementController do
         {"Validation error; `branch_not_allowed` — the `branch` you named does not start " <>
            "with any prefix the runner declared, so the machine would refuse the dispatch; " <>
            "omit `branch` and loopctl derives a conforming one, and nothing was claimed; or " <>
+           "`invalid_branch_name` — the `branch` you named is not a valid git ref name at " <>
+           "all, so no machine could create it, and nothing was claimed; or " <>
            "`story_not_accepted` — the story object is built by loopctl from " <>
            "its own records and may not be supplied by a caller; or " <>
            "`story_not_dispatchable` — the story exceeds a cap the runner contract declares " <>
@@ -409,6 +412,23 @@ defmodule LoopctlWeb.DispatchPlacementController do
           "derives a conforming one.",
       branch: branch,
       branch_prefixes: prefixes
+    })
+  end
+
+  # THE NAME IS NOT A GIT REF AT ALL, which is a different refusal from `branch_not_allowed`
+  # and is checked on EVERY path including a resume: `branch` carries `minLength`/`maxLength`
+  # and no pattern on the wire, so `--upload-pack=/bin/sh`, `-o` and `a..b` all cast clean and
+  # would be pushed verbatim to a machine that hands the value to git. The remedy is in this
+  # request, which is why the refusal is safe where the prefix refusal is not.
+  defp refuse(conn, {:invalid_branch_name, branch}) do
+    error(conn, 422, "invalid_branch_name", %{
+      message:
+        "The branch you named is not a valid git ref name, so no machine could create it. " <>
+          "Nothing was claimed. It must start with a letter or a digit and hold only " <>
+          "letters, digits, `.`, `_`, `/` and `-`; no path component may begin with `.` or " <>
+          "end with `.lock`, and `..` may not appear. Omit `branch` and loopctl derives a " <>
+          "conforming one.",
+      branch: branch
     })
   end
 
