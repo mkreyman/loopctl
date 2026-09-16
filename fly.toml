@@ -54,7 +54,7 @@ kill_timeout = 90
   DISPATCH_DRIVER_ENABLED = "true"
 
   # THE BUDGETS ARE A COST POLICY, not a timeout, and they have no defaults on purpose
-  # (config/runtime.exs:176) — a default would be our guess quietly becoming Mark's
+  # (config/runtime.exs:177) — a default would be our guess quietly becoming Mark's
   # spend. Calibrated against the ONE measured unattended run (2026-09-14, one story):
   # 28.8 minutes, 108 turns, about USD 10.40. Both implement numbers are ~2x that, so a
   # typical run finishes well inside them and a runaway is capped near an hour rather
