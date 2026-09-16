@@ -13,12 +13,17 @@ defmodule Loopctl.FlyTomlTest do
   use ExUnit.Case, async: true
 
   alias Loopctl.Delivery.DispatchDriver
-  alias Loopctl.Runners.Capacity
 
   # Defaults of the dependencies whose own shutdown follows the socket drain, used unless
   # config sets them: ThousandIsland's `shutdown_timeout` and Oban's `shutdown_grace_period`.
   @bandit_shutdown_ms 15_000
   @oban_grace_ms 15_000
+
+  # loopctl.com's OWN spend policy: the most concurrent unattended sessions this deployment
+  # is willing to pay for, as a ceiling on the RUNNER_MAX_IN_FLIGHT_SESSIONS it deploys.
+  # Not an invariant of the code and not a bound on anyone else's install — raise it here,
+  # deliberately, when several unattended runs have landed reviewable work.
+  @max_deployed_concurrency 6
 
   defp top_level(path) do
     path
@@ -172,14 +177,17 @@ defmodule Loopctl.FlyTomlTest do
     # the runtime guard ever loosens, this test is merely stricter than production, which is
     # the safe direction.
     #
-    # ARM 2 — it may never exceed what NOT SETTING IT would give. This line exists to LOWER
-    # the tenant-wide ceiling below the code default; a value above it silently buys more
-    # concurrency, and therefore more spend, than deleting the line entirely. Bounded by
-    # `Capacity.limit/0` read live rather than by a literal, so 1..default all pass and the
-    # policy can rise as the comment in fly.toml says it should — raising it past the default
-    # means editing `@default_limit`, which is the deliberate act this is asking for. A bare
-    # `<= 2` would freeze today's caution and train people to edit assertions instead.
-    test "RUNNER_MAX_IN_FLIGHT_SESSIONS is accepted by runtime.exs and never raises the default" do
+    # ARM 2 — a SPEND RATCHET. The deployed cap is the multiplier on the per-session budgets,
+    # so raising it raises sustained spend, and nothing else in the suite notices. Bounded by
+    # `@max_deployed_concurrency` below: a named policy ceiling, deliberately a constant in
+    # THIS test and not `Capacity.limit/0`. Coupling it to the code default would have made
+    # editing `@default_limit` the only way to deploy higher, and that attribute is the
+    # ceiling every self-hosted install inherits when it sets no variable at all — the one
+    # lever here with blast radius outside this repo. It is also not a literal `<= 2`, which
+    # would freeze today's caution as law: the number is expected to rise once several runs
+    # have landed reviewable work, and raising it is a one-line edit HERE that changes
+    # loopctl.com's own spend policy and nothing anyone else runs.
+    test "RUNNER_MAX_IN_FLIGHT_SESSIONS is accepted by runtime.exs and inside the spend policy" do
       value = env_table("fly.toml")["RUNNER_MAX_IN_FLIGHT_SESSIONS"]
       assert value, "RUNNER_MAX_IN_FLIGHT_SESSIONS is not set in [env]"
 
@@ -191,32 +199,11 @@ defmodule Loopctl.FlyTomlTest do
              "#{sessions} is not positive, so runtime.exs silently ignores it and the code " <>
                "default applies"
 
-      refute Application.get_env(:loopctl, :runner_max_in_flight_sessions),
-             "the test environment now configures this key, so Capacity.limit/0 below is no " <>
-               "longer the CODE default and this bound has quietly moved"
-
-      assert sessions <= Capacity.limit(),
-             "#{sessions} is above the code default #{Capacity.limit()}, so " <>
-               "this line RAISES the fleet ceiling instead of lowering it — deleting it " <>
-               "entirely would cost less"
-    end
-
-    # The invariant the deployed lease exists to hold: the runner hard-kills a session at
-    # DISPATCH_WALL_CLOCK_SECONDS, so a lease ABOVE that (plus teardown grace) can never
-    # release work an agent is still implementing. Inverted, `ReclaimExpiredClaimsWorker`
-    # force-unclaims live sessions and the duplicate-work race a claim exists to prevent is
-    # back — with nothing in the logs, because releasing a claim is a normal event.
-    test "STORY_CLAIM_LEASE_SECONDS outlasts the wall clock the runner kills a session at" do
-      env = env_table("fly.toml")
-
-      assert lease_value = env["STORY_CLAIM_LEASE_SECONDS"]
-      assert wall_clock_value = env["DISPATCH_WALL_CLOCK_SECONDS"]
-
-      lease = String.to_integer(lease_value)
-      wall_clock = String.to_integer(wall_clock_value)
-
-      assert lease > wall_clock,
-             "claim lease #{lease}s does not outlast the #{wall_clock}s dispatch wall clock"
+      assert sessions <= @max_deployed_concurrency,
+             "#{sessions} is above the #{@max_deployed_concurrency} concurrent sessions this " <>
+               "deployment's spend policy allows. Raising it is a deliberate edit to " <>
+               "@max_deployed_concurrency in this file, not something a config change does " <>
+               "quietly"
     end
   end
 end

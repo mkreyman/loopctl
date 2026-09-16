@@ -191,7 +191,7 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 
 | Variable                    | Default | Description |
 |-----------------------------|---------|-------------|
-| `STORY_CLAIM_LEASE_SECONDS` | `86400`; `"4200"` in `fly.toml` `[env]` | How long a story claim lives without a renewal (`POST /api/v1/stories/:id/renew-claim`). Past it, `ReclaimExpiredClaimsWorker` (every 5 minutes) releases the story back to `pending` and bumps its `claim_epoch`. Positive integer seconds; unset, blank or malformed leaves the 24h default rather than failing boot. **Too SHORT releases stories agents are still working** — the duplicate-work race a claim exists to prevent, and it fires on long HEALTHY sessions, not on crashed ones. Too long only delays reopening a story whose session is already gone. Bias long, and have claimants renew well inside the window. Applies to leases granted or renewed after a restart; existing `claimed_until` values are not rewritten. Also the renewal grace granted when a custody halt is cleared or a tenant is re-activated: every live lease is extended to at least one lease from the clear. **Deployed at 4200** (`fly.toml` `[env]`) = `DISPATCH_WALL_CLOCK_SECONDS` 3600 + 600s teardown grace: with the unattended driver on, the runner hard-kills at the wall clock, so no session can still be implementing past it and the bias-long argument no longer applies. Keep it strictly above that budget and raise the two together. Residue, unfixed: a released story goes back to stage `queued` with `agent_status` `pending`, which the driver does not pick up (it requires `contracted`) — a human must re-contract it, and a shorter lease only shortens the silence |
+| `STORY_CLAIM_LEASE_SECONDS` | `86400` | How long a story claim lives without a renewal (`POST /api/v1/stories/:id/renew-claim`). Past it, `ReclaimExpiredClaimsWorker` (every 5 minutes) releases the story back to `pending` and bumps its `claim_epoch`. Positive integer seconds; unset, blank or malformed leaves the 24h default rather than failing boot. **Too SHORT releases stories agents are still working** — the duplicate-work race a claim exists to prevent, and it fires on long HEALTHY sessions, not on crashed ones. Too long only delays reopening a story whose session is already gone. Bias long, and have claimants renew well inside the window. Applies to leases granted or renewed after a restart; existing `claimed_until` values are not rewritten. Also the renewal grace granted when a custody halt is cleared or a tenant is re-activated: every live lease is extended to at least one lease from the clear |
 
 #### Runner admission control
 
@@ -201,10 +201,14 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 
 #### Agent delivery loop: the unattended dispatch driver
 
-Plain config variables (`fly.toml` `[env]` is fine — none of them is a credential), and
-they are a set: the driver runs only when all three are right, and says which one is not.
-**Turn it on last**, once runners are enrolled, connected and the queue holds work you are
-willing to have picked up unattended.
+Plain config variables (`fly.toml` `[env]` is fine — none of them is a credential), and they
+gate two different workers. `DISPATCH_DRIVER_ENABLED` turns the whole thing on;
+`DispatchDriver.budgets/0` then reads `DISPATCH_WALL_CLOCK_SECONDS` and `DISPATCH_MAX_TURNS`,
+and those two alone decide whether the IMPLEMENT driver places anything. `TRIAGE_WALL_CLOCK_SECONDS`
+and `TRIAGE_MAX_TURNS` gate `TriageDispatcher` and nothing else — an unset triage pair does not
+make the implement driver safe. Each worker names the key it is missing rather than failing
+silently. **Turn it on last**, once runners are enrolled, connected and the queue holds work you
+are willing to have picked up unattended.
 
 | Variable                        | Default | Description |
 |---------------------------------|---------|-------------|

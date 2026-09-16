@@ -47,8 +47,14 @@ kill_timeout = 90
   # #803: THE UNATTENDED DISPATCH DRIVER IS ON. Enabled 2026-09-16 on Mark's
   # instruction ("enable the loop. Let it succeed or fail on the next filed issue"),
   # after the intake-source MCP tools made the loop wireable at all. With this true
-  # and the four budgets below set, DispatchDriverWorker places queued stories on
-  # whichever runner has slots free, with nobody watching.
+  # and DISPATCH_WALL_CLOCK_SECONDS and DISPATCH_MAX_TURNS set, DispatchDriverWorker
+  # places queued stories on whichever runner has slots free, with nobody watching.
+  #
+  # TWO KEYS GATE THE IMPLEMENT DRIVER, NOT FOUR. DispatchDriver.budgets/0
+  # (dispatch_driver.ex:236-241) reads only :dispatch_wall_clock_seconds and
+  # :dispatch_max_turns; the TRIAGE pair below gates TriageDispatcher and nothing else.
+  # Debugging "the driver placed nothing"? Check those two. And do not read an unset
+  # triage pair as the implement driver being safely off — it is not one of its gates.
   #
   # THE OFF SWITCH IS A DEPLOY, and only a deploy: `fly deploy -a loopctl` with this line
   # set to "false". config/runtime.exs reads the variable at BOOT, so nothing picks up a
@@ -103,27 +109,6 @@ kill_timeout = 90
   # this line is deliberately raised. Raise it when several runs have landed reviewable
   # work, not before.
   RUNNER_MAX_IN_FLIGHT_SESSIONS = "2"
-
-  # THE CLAIM LEASE TRACKS THE WALL CLOCK: 3600 + 600s of teardown grace. Unset, it is the
-  # 24-HOUR default (Loopctl.Progress @default_claim_lease_seconds), which against a
-  # 3600-second wall clock means a session the runner kills at an hour leaves its story
-  # `claimed` for up to 24 more.
-  #
-  # progress.ex:1298-1302 argues in as many words for biasing LONG — "a lease too short
-  # releases a story an agent is still implementing". That asymmetry assumed an UNBOUNDED
-  # session. With the driver on, the runner HARD-KILLS at DISPATCH_WALL_CLOCK_SECONDS, so
-  # no session can still be implementing past it, and a lease above wall clock plus grace
-  # cannot release live work. Keep this strictly GREATER than DISPATCH_WALL_CLOCK_SECONDS
-  # (test/loopctl/fly_toml_test.exs holds it there) and raise it with that budget.
-  #
-  # THE RESIDUE, WHICH THIS DOES NOT FIX: releasing sets agent_status "pending"
-  # (progress.ex:1656) and moves the delivery stage back to `queued`
-  # (Stages.follow_release/5, progress.ex:1586), while the driver only picks up stories at
-  # queued AND agent_status == :contracted (dispatch_driver.ex:137). Nothing re-contracts,
-  # so a crashed story lands queued-and-pending and the loop never retries it. A HUMAN MUST
-  # RE-CONTRACT IT. Shortening the lease turns 24 hours of silence into about 70 minutes of
-  # it; it does not make the story reachable again. Filed separately.
-  STORY_CLAIM_LEASE_SECONDS = "4200"
 
   # A TRIAGE session reads a ticket and answers with a verdict — a fraction of an
   # implement run — so it gets its own far smaller pair (#803 §4). Inheriting the
