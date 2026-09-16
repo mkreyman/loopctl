@@ -19,8 +19,8 @@
 # THE NAME MUST BE BYTE-IDENTICAL to what worktree-partition.sh produces. The hooks,
 # claude-config's bin/worktree-remove.sh and bin/worktree-db-sweep.sh create, drop and sweep
 # the shell's spelling; a divergence of one character means the suite runs on a database
-# nothing manages. `config_worktree_partition_test.exs` pins five measured outputs of the
-# shell implementation for that reason. Change neither side alone.
+# nothing manages. `config_worktree_partition_test.exs` pins measured outputs of the shell
+# implementation for that reason (`@shell_vectors`). Change neither side alone.
 defmodule Loopctl.Config.WorktreePartition do
   @moduledoc """
   Derives the `MIX_TEST_PARTITION` suffix for a linked git worktree.
@@ -33,7 +33,16 @@ defmodule Loopctl.Config.WorktreePartition do
   """
 
   @doc """
-  The suffix `config/test.exs` appends to every test database name.
+  The suffix appended to every test database name — the whole derivation in one call.
+
+  `config/test.exs` deliberately does NOT call this. It performs the
+  `System.get_env("MIX_TEST_PARTITION")` read itself and hands the value to `choose/2`,
+  because claude-config's `bin/worktree-remove.sh` gates the per-worktree database drop on
+  `grep -qs MIX_TEST_PARTITION config/test.exs`: with the read hidden behind this function
+  the token survived only in a prose comment, and one reflow would have made the sweeper
+  orphan every loopctl worktree database. The RULES stay here — this function and the
+  config resolve through the same `choose/2` — only the environment read is duplicated, and
+  `test/loopctl/config_worktree_partition_test.exs` pins that it stays executable code.
 
   An explicitly SET `MIX_TEST_PARTITION` always wins, INCLUDING an empty string: CI sets
   it per partition and the git hooks export it, and either would otherwise be overridden
@@ -67,8 +76,8 @@ defmodule Loopctl.Config.WorktreePartition do
   def derive(cd \\ nil) do
     with {:ok, base} <- base_dir(cd),
          {:ok, [git_dir, common_dir, root]} <- rev_parse(cd),
-         true <-
-           linked_worktree?(Path.expand(git_dir, base), Path.expand(common_dir, base)) do
+         :linked <-
+           linked_worktree_status(Path.expand(git_dir, base), Path.expand(common_dir, base)) do
       partition_for_root(root)
     else
       _ -> nil
@@ -129,8 +138,15 @@ defmodule Loopctl.Config.WorktreePartition do
   end
 
   @doc """
-  `true` when the git dir is a LINKED worktree's private dir, `false` in the main tree,
+  `:linked` when the git dir is a LINKED worktree's private dir, `:main` in the main tree,
   `:indeterminate` when either path cannot be read.
+
+  THREE STATES, AND DELIBERATELY NOT A `?` PREDICATE. The house rule is that a `?` function
+  answers `true`/`false`, and this one cannot: "I could not read the path" is a third
+  answer, not a `false`. Named `linked_worktree?/2` it returned the TRUTHY atom
+  `:indeterminate`, so `derive/1` was safe only because it matched `true <-`; a single `if`
+  at a future call site would have read "cannot classify" as "linked" and partitioned the
+  MAIN tree's database into a name the worktree sweeper treats as disposable.
 
   Identity is by (inode, device) rather than by string, which is what the shell's
   `cd "$dir" && pwd -P` comparison approximates: either path may come back relative
@@ -140,26 +156,39 @@ defmodule Loopctl.Config.WorktreePartition do
   under the common one; a submodule's git dir IS its own common dir, so it reads as a main
   tree, exactly as it does in the shell.
 
-  `:indeterminate` is distinct from `true` on purpose: `derive/1` must leave the shared
+  `:indeterminate` is distinct from `:linked` on purpose: `derive/1` must leave the shared
   database name alone when it cannot classify a tree, never invent a partition no tooling
   knows about.
   """
-  def linked_worktree?(git_dir, common_dir) do
+  def linked_worktree_status(git_dir, common_dir) do
     with {:ok, %File.Stat{inode: ia, major_device: da}} <- File.stat(git_dir),
          {:ok, %File.Stat{inode: ib, major_device: db}} <- File.stat(common_dir) do
-      {ia, da} != {ib, db}
+      if {ia, da} == {ib, db}, do: :main, else: :linked
     else
       _ -> :indeterminate
     end
   end
 
   # One git invocation, three answers, in flag order. Anything unexpected — a missing git
-  # binary, a non-zero exit, a stderr line joined to the output, a path containing a
-  # newline — falls through to :error and leaves the database name alone.
-  defp rev_parse(cd) do
-    opts = [stderr_to_stdout: true] ++ if(cd, do: [cd: cd], else: [])
+  # binary, a non-zero exit, a path containing a newline — falls through to :error and
+  # leaves the database name alone.
+  #
+  # RUN THROUGH `sh` SO STDERR IS DISCARDED AT THE SOURCE, exactly as the shell half does
+  # (`git rev-parse --git-dir 2>/dev/null`). It is not decoration: `stderr_to_stdout: true`
+  # merged git's stderr INTO the text being parsed, so any benign diagnostic on a
+  # SUCCESSFUL run broke the three-line split and degraded a linked worktree back onto the
+  # shared database — the exact defect this file exists to end. Measured: `GIT_TRACE=1`,
+  # an ordinary developer variable, makes this command exit 0 with FOUR lines. Merely
+  # dropping the option would fix the parse but print git's own `fatal: not a git
+  # repository` into the suite output for the no-repo case, which `2>/dev/null` also
+  # silences. The command is a fixed literal — no interpolation reaches the shell — and
+  # `cd` is passed to `System.cmd/3`, not spliced into it.
+  @rev_parse_cmd "git rev-parse --git-dir --git-common-dir --show-toplevel 2>/dev/null"
 
-    case System.cmd("git", ~w(rev-parse --git-dir --git-common-dir --show-toplevel), opts) do
+  defp rev_parse(cd) do
+    opts = if cd, do: [cd: cd], else: []
+
+    case System.cmd("sh", ["-c", @rev_parse_cmd], opts) do
       {out, 0} ->
         case String.split(out, "\n", trim: true) do
           [_git_dir, _common_dir, _root] = three -> {:ok, three}

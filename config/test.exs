@@ -55,8 +55,23 @@ test_db_port = String.to_integer(System.get_env("TEST_DB_PORT", "5432"))
 # the project is compiled. The suite requires the SAME file
 # (`test/loopctl/config_worktree_partition_test.exs`), so there is one implementation of
 # the naming rules and never two copies that can drift.
+#
+# THE `System.get_env("MIX_TEST_PARTITION")` BELOW IS LOAD-BEARING TWICE OVER, so do not
+# fold it back into `WorktreePartition.suffix/0` for tidiness. Besides reading the variable,
+# it is what claude-config's `bin/worktree-remove.sh` looks for: that sweeper drops a
+# worktree's database only if `grep -qs MIX_TEST_PARTITION config/test.exs` matches, and
+# otherwise prints "skip: config/test.exs does not read MIX_TEST_PARTITION" and drops
+# nothing. With the read hidden inside the module the token survived here only in a comment,
+# one reflow away from orphaning every loopctl worktree database. `choose/2` holds the
+# resolution rules, so there is still exactly one implementation of them; the pin is
+# `test/loopctl/config_worktree_partition_test.exs`, "config/test.exs wiring".
 Code.require_file("worktree_partition.exs", __DIR__)
-test_partition = Loopctl.Config.WorktreePartition.suffix()
+
+test_partition =
+  Loopctl.Config.WorktreePartition.choose(
+    System.get_env("MIX_TEST_PARTITION"),
+    &Loopctl.Config.WorktreePartition.derive/0
+  )
 
 # Configure your database
 config :loopctl, Loopctl.Repo,
