@@ -42,17 +42,44 @@ config :ex_unit, max_cases: test_concurrency, capture_log: true
 # database, not a disposable CI one.
 test_db_port = String.to_integer(System.get_env("TEST_DB_PORT", "5432"))
 
-# Configure your database
+# The suffix every test database (and the local secrets file) carries.
 #
-# The MIX_TEST_PARTITION environment variable can be used
-# to provide built-in test partitioning in CI environment.
-# Run `mix help test` for more information.
+# `MIX_TEST_PARTITION` is the CI knob (`mix help test`) and is also what claude-config's
+# git hooks export for a linked worktree. An explicitly set value always wins; when it is
+# UNSET, the partition is derived from the TREE — so a linked worktree gets its own
+# database on a bare `mix test` too, not only under the two git hooks. Two suites sharing
+# one database is not a slow suite but a wrong one: it produced a cross-suite row in
+# another test's `assert ... == []` (minis, 2026-09-16).
+#
+# `Code.require_file/2` rather than a module under `lib/`: this file is evaluated BEFORE
+# the project is compiled. The suite requires the SAME file
+# (`test/loopctl/config_worktree_partition_test.exs`), so there is one implementation of
+# the naming rules and never two copies that can drift.
+#
+# THE `System.get_env("MIX_TEST_PARTITION")` BELOW IS LOAD-BEARING TWICE OVER, so do not
+# fold it back into `WorktreePartition.suffix/0` for tidiness. Besides reading the variable,
+# it is what claude-config's `bin/worktree-remove.sh` looks for: that sweeper drops a
+# worktree's database only if `grep -qs MIX_TEST_PARTITION config/test.exs` matches, and
+# otherwise prints "skip: config/test.exs does not read MIX_TEST_PARTITION" and drops
+# nothing. With the read hidden inside the module the token survived here only in a comment,
+# one reflow away from orphaning every loopctl worktree database. `choose/2` holds the
+# resolution rules, so there is still exactly one implementation of them; the pin is
+# `test/loopctl/config_worktree_partition_test.exs`, "config/test.exs wiring".
+Code.require_file("worktree_partition.exs", __DIR__)
+
+test_partition =
+  Loopctl.Config.WorktreePartition.choose(
+    System.get_env("MIX_TEST_PARTITION"),
+    &Loopctl.Config.WorktreePartition.derive/0
+  )
+
+# Configure your database
 config :loopctl, Loopctl.Repo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
   port: test_db_port,
-  database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
+  database: "loopctl_test#{test_partition}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: test_pool_size
 
@@ -62,7 +89,7 @@ config :loopctl, Loopctl.AdminRepo,
   password: "postgres",
   hostname: "localhost",
   port: test_db_port,
-  database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
+  database: "loopctl_test#{test_partition}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: test_pool_size,
   # Scale tests seed ~80k rows under Sandbox.unboxed_run/2, which can exceed the
@@ -87,7 +114,7 @@ config :loopctl, Loopctl.HeavyReadRepo,
   password: "postgres",
   hostname: "localhost",
   port: test_db_port,
-  database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
+  database: "loopctl_test#{test_partition}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: test_pool_size,
   ownership_timeout: :timer.minutes(30)
@@ -619,12 +646,13 @@ config :loopctl, :secrets_adapter, Loopctl.MockSecrets
 # #496: file path for the SELF-HOST `Loopctl.Secrets.LocalFileAdapter`. Unused by the
 # suite at large (`:secrets_adapter` is the mock above); only its own async:false unit
 # test exercises the adapter, and reads this path. Partition-suffixed so parallel CI
-# partitions never share the file.
+# partitions — and linked worktrees, which derive their own partition — never share the
+# file.
 config :loopctl,
        :secrets_file,
        Path.join(
          System.tmp_dir!(),
-         "loopctl_local_secrets_test#{System.get_env("MIX_TEST_PARTITION")}.json"
+         "loopctl_local_secrets_test#{test_partition}.json"
        )
 
 # DI (US-27.3): suggested-links executor. The default stub in
