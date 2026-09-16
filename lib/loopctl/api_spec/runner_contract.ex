@@ -1615,7 +1615,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     def dispatchable_kinds, do: Kinds.dispatchable()
 
     # PUBLISHED AND READ BACK, rather than copied. `Loopctl.Delivery.DispatchPayload` judges a
-    # CALLER-supplied `branch` before anything is claimed — the cast below runs after the
+    # CALLER-supplied ref field before anything is claimed — the cast below runs after the
     # claim, which is the whole reason that check moved earlier — and it bounds the length
     # against this, so the number a caller is refused on is the number the contract states.
     @max_branch_length 255
@@ -1623,6 +1623,56 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @doc "The longest branch name a dispatch may carry, on `branch` and on `base_branch`."
     @spec max_branch_length() :: pos_integer()
     def max_branch_length, do: @max_branch_length
+
+    # EVERY STRING ON THIS SCHEMA IS CLASSIFIED, AND THAT IS THE POINT (846.2 review round 2,
+    # findings 1, 2 and 7). Round 1 closed an argument-injection on `branch` by adding a check
+    # to `branch`. Round 2 then found the identical schema one line above it on `base_branch`
+    # with no check at all, a non-string `branch` skipping the check entirely, and a
+    # caller-supplied `branch` defeating the uniqueness this contract publishes — three leaks
+    # in one round, each fixable by naming another spelling, which is precisely the failure
+    # mode KB `909ba2b2` records: a guard must exempt by PROVING a property, never by
+    # enumerating dangerous spellings.
+    #
+    # So the fields are declared here, once, and `DispatchPayload.fill/3` validates FROM this
+    # list rather than from a pair of literals it happens to remember. The two lists are a
+    # TOTAL partition of the schema's string properties, and
+    # `test/loopctl/api_spec/runner_contract_test.exs` fails in both directions — a new string
+    # property classified as neither, and a classified name that is not a property. A ninth
+    # ref-shaped field therefore cannot be added without the author deciding which list it is
+    # in, which is the only thing that stops the next round finding a fourth spelling.
+    #
+    # The DISPOSITION is the second decision, and it is here for the same reason. `:story_unique`
+    # means the value becomes the branch a session WORKS ON, so it must carry the story's own
+    # suffix or two stories on one repository can share a branch and the second session finds
+    # the first's work already there. `:shared` means the value names a ref the session reads
+    # FROM, which is deliberately common across stories — `master` on every dispatch in the
+    # tenant — so uniqueness would be wrong rather than merely strict.
+    @ref_fields [branch: :story_unique, base_branch: :shared]
+
+    # NOT refs, each for a reason that is checked elsewhere: `dispatch_id` and `story_id` are
+    # UUIDs (`format: :uuid`), `kind` is closed by an `enum`, and `repo` carries its own
+    # `owner/name` pattern. None of them reaches a git ref argument.
+    @non_ref_string_fields [:dispatch_id, :story_id, :kind, :repo]
+
+    @doc """
+    The fields of a dispatch whose value becomes a GIT REF, and what each one must satisfy.
+
+    `:story_unique` — the branch a session works on; must carry the story's own suffix.
+    `:shared` — a ref the session reads from; any valid ref name.
+
+    Read by `Loopctl.Delivery.DispatchPayload`, which validates every entry BEFORE the claim.
+    """
+    @spec ref_fields() :: keyword(:story_unique | :shared)
+    def ref_fields, do: @ref_fields
+
+    @doc """
+    The schema's remaining string fields, declared so the classification is TOTAL.
+
+    Nothing reads this at runtime; it exists so that adding a string property without deciding
+    whether it is a ref fails a test rather than shipping unvalidated.
+    """
+    @spec non_ref_string_fields() :: [atom()]
+    def non_ref_string_fields, do: @non_ref_string_fields
 
     OpenApiSpex.schema(
       %{

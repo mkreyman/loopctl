@@ -241,22 +241,88 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
       assert body["error"]["message"] =~ "Omit `branch`"
     end
 
-    # 846.2 REVIEW FINDING 3. A THIRD tuple, and a different refusal from the two above: the
-    # name is not a git ref at all, so no machine could create it whatever it declares. It has
-    # its own code because its remedy is different — the two above are about a machine's
-    # declaration, this one is about the string in the request.
-    test "a branch that is not a git ref name renders its own refusal" do
+    # 846.2 REVIEW FINDING 3, AND ROUND 2 FINDINGS 1, 2 AND 7. The refusals about the VALUES a
+    # caller sent, as distinct from the two above, which are about a machine's declaration.
+    # Each NAMES ITS FIELD: round 1 answered about `branch` alone, and round 2 found
+    # `base_branch` open on the identical schema one line above it.
+    test "a ref field that is not a git ref name renders its own refusal, per field" do
+      for field <- [:branch, :base_branch] do
+        conn =
+          DispatchPlacementController.render_refusal(
+            Phoenix.ConnTest.build_conn(),
+            {:invalid_branch_name, field, "--upload-pack=/bin/sh"}
+          )
+
+        assert conn.status == 422
+        body = Jason.decode!(conn.resp_body)
+        assert body["error"]["code"] == "invalid_branch_name"
+        assert body["error"]["field"] == to_string(field)
+        assert body["error"]["value"] == "--upload-pack=/bin/sh"
+        assert body["error"]["message"] =~ "Nothing was claimed"
+      end
+    end
+
+    # A NON-STRING IS THE SAME REFUSAL AND IS REPORTED BY TYPE. `{"branch": null}` is what a
+    # generated client sends for an unset optional now that the field is documented OMIT THIS,
+    # and until round 2 it was deferred to the contract cast — which runs AFTER the claim.
+    test "a non-string ref value is refused too, and reported by type rather than echoed" do
+      for {value, type} <- [{nil, "null"}, {7, "number"}, {%{}, "object"}, {[], "array"}] do
+        conn =
+          DispatchPlacementController.render_refusal(
+            Phoenix.ConnTest.build_conn(),
+            {:invalid_branch_name, :branch, value}
+          )
+
+        assert conn.status == 422
+        body = Jason.decode!(conn.resp_body)
+        assert body["error"]["code"] == "invalid_branch_name"
+        assert body["error"]["value_type"] == type
+        refute Map.has_key?(body["error"], "value")
+      end
+    end
+
+    # The echo is BOUNDED: length is one of the things a value can fail on, so the refusal must
+    # not mirror an unbounded caller string back into the response.
+    test "an over-long branch is echoed truncated" do
+      long = String.duplicate("a", 5_000)
+
       conn =
         DispatchPlacementController.render_refusal(
           Phoenix.ConnTest.build_conn(),
-          {:invalid_branch_name, "--upload-pack=/bin/sh"}
+          {:invalid_branch_name, :branch, long}
+        )
+
+      assert String.length(Jason.decode!(conn.resp_body)["error"]["value"]) == 255
+    end
+
+    test "a branch that does not carry the story's suffix names the suffix it needs" do
+      conn =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          {:branch_not_unique, :branch, "loop/mine", "story-7-a1b2c3d4"}
         )
 
       assert conn.status == 422
       body = Jason.decode!(conn.resp_body)
-      assert body["error"]["code"] == "invalid_branch_name"
-      assert body["error"]["branch"] == "--upload-pack=/bin/sh"
-      assert body["error"]["message"] =~ "Nothing was claimed"
+      assert body["error"]["code"] == "branch_not_unique"
+      assert body["error"]["branch"] == "loop/mine"
+
+      # The fact a caller cannot otherwise derive: it may keep its prefix, but not drop this.
+      assert body["error"]["required_suffix"] == "story-7-a1b2c3d4"
+    end
+
+    test "a retry naming a different branch is told which one this dispatch holds" do
+      conn =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          {:branch_conflict, "agent/story-7-a1b2c3d4", "loop/story-7-a1b2c3d4"}
+        )
+
+      assert conn.status == 422
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["code"] == "branch_conflict"
+      assert body["error"]["recorded_branch"] == "loop/story-7-a1b2c3d4"
+      assert body["error"]["message"] =~ "may be running on the first name"
     end
   end
 

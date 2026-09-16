@@ -239,6 +239,9 @@ defmodule Loopctl.Delivery.Placement do
           | {:escalation_failed, term(), [String.t()]}
           | {:no_conforming_branch, [String.t()]}
           | {:branch_not_allowed, String.t(), [String.t()]}
+          | {:invalid_branch_name, atom(), term()}
+          | {:branch_not_unique, atom(), String.t(), String.t()}
+          | {:branch_conflict, String.t(), String.t()}
 
   @doc """
   Claims `dispatch["story_id"]` for `runner_id` and pushes the dispatch to it.
@@ -524,21 +527,28 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
-  # THE BRANCH IS RE-DERIVED, from the declaration this machine is carrying NOW, and that is
-  # the answer to "can a retry place two dispatches on two different branch names for one
-  # story". It can produce a different name, in exactly one case, and the case is bounded:
-  # the machine reconnected with a different `branch_prefixes` between the first push and this
-  # one. A resume only runs against a ledger row still at `sent` — `record_sent/3` fences a
-  # row that has been answered (`:dispatch_already_replied`) — so the first frame was never
-  # ACCEPTED, no session started, and no branch exists on that machine to disagree with. The
-  # name this call derives is the one the machine as it is now will accept, which is the only
-  # name worth sending.
+  # THE BRANCH IS THE ONE THE FIRST PUSH NAMED, read back off the ledger row, and a retry can
+  # therefore never land on a second name (846.2 review round 2, finding 4).
   #
-  # The name is stable everywhere else, and deliberately: it is a pure function of the story
-  # and the declaration (`DispatchPayload.branch_for/2` takes the FIRST usable prefix, never a
-  # random or a "best" one), so a retry against an unchanged declaration re-derives the same
-  # string byte for byte. The ledger stores no branch, so there is nothing here to compare
-  # against and nothing that could drift out of agreement with a stored copy.
+  # This function re-DERIVED it until that round, on the argument that a resume only runs
+  # against a row still at `sent` — `record_sent/3` fences a row that has been answered — so
+  # "the first frame was never ACCEPTED, no session started, and no branch exists on that
+  # machine to disagree with". That overstates what `sent` means. It means no reply was
+  # RECORDED, and a LOST REPLY is precisely the case a resume exists for: the machine may have
+  # accepted the dispatch and be running a session on the first branch right now. Re-deriving
+  # after a rejoin that changed `branch_prefixes` would then push a SECOND name under the same
+  # `dispatch_id`, against a session already working on the first — and before contract 1.14.0
+  # that could not happen at all, because the name was a pure function of the story.
+  #
+  # So `runner_dispatches.branch` records it on the first insert and `on_conflict: :nothing`
+  # keeps it, and `pin_recorded_branch/2` is what puts it back into the payload. A row written
+  # before that column existed carries NULL and falls through to the derivation, which is the
+  # pre-round-2 behaviour for exactly the rows that cannot do better.
+  #
+  # What the derivation still decides, for those rows and for them only: it is a pure function
+  # of the story and the declaration (`DispatchPayload.branch_for/2` takes the FIRST usable
+  # prefix, never a random or a "best" one), so an unchanged declaration re-derives the same
+  # string byte for byte.
   #
   # ## THE DECLARATION STEERS THE NAME AND CANNOT REFUSE THE RESUME (846.2 review finding 1)
   #
@@ -577,6 +587,13 @@ defmodule Loopctl.Delivery.Placement do
     prefixes = declared_branch_prefixes(sole_live_meta(tenant_id, runner_id))
 
     with {:ok, story} <- Stories.get_story(tenant_id, record.story_id),
+         # BEFORE the pin, so a MALFORMED name is answered as malformed rather than as a
+         # conflict. `-o` is both a different name and not a ref name at all, and the useful
+         # message is the second: the remedy for a conflict is "send the recorded one", which
+         # is not what a caller who sent `-o` needs to hear. `fill/3` re-runs this over the
+         # finished payload; running it twice costs a string comparison.
+         :ok <- DispatchPayload.validate_refs(dispatch, story),
+         {:ok, dispatch} <- pin_recorded_branch(dispatch, record),
          {:ok, dispatch} <-
            DispatchPayload.fill(tenant_id, dispatch,
              branch_prefixes: prefixes,
@@ -586,6 +603,28 @@ defmodule Loopctl.Delivery.Placement do
       {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
     end
   end
+
+  # THE LEDGER'S BRANCH WINS, AND A CALLER NAMING A DIFFERENT ONE IS REFUSED RATHER THAN
+  # OVERWRITTEN. Silently substituting would be the rewrite `DispatchPayload` forbids on every
+  # other path — the session would run on a name nobody in this request chose — and accepting
+  # the caller's would put the second name on the wire that finding 4 is about. So the two
+  # disagreeing is a 422 whose remedy is in the request: drop `branch`, or send the one this
+  # dispatch already has.
+  #
+  # A non-binary is NOT treated as a conflict. It is a malformed value rather than a different
+  # name, and `DispatchPayload.validate_refs/2` refuses it with the same `invalid_branch_name`
+  # a first placement would — one answer for one mistake, on both paths.
+  defp pin_recorded_branch(dispatch, %{branch: recorded}) when is_binary(recorded) do
+    case Map.fetch(dispatch, "branch") do
+      :error -> {:ok, Map.put(dispatch, "branch", recorded)}
+      {:ok, ^recorded} -> {:ok, dispatch}
+      {:ok, other} when is_binary(other) -> {:error, {:branch_conflict, other, recorded}}
+      {:ok, _not_a_string} -> {:ok, dispatch}
+    end
+  end
+
+  # A ledger row written before `runner_dispatches.branch` existed. Nothing to pin.
+  defp pin_recorded_branch(dispatch, _record), do: {:ok, dispatch}
 
   # `ImplementerInput.story_object/2` is the pure half of `StoryPayload.build/3` — the same
   # allowlist and the same caps, with no database write of any kind. Non-implement kinds carry

@@ -7,9 +7,11 @@ defmodule Loopctl.RunnersTest do
   alias Loopctl.Agents.Agent
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Auth
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Runners
   alias Loopctl.Runners.Runner
   alias Loopctl.Tenants
+  alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
 
@@ -397,11 +399,38 @@ defmodule Loopctl.RunnersTest do
 
     # AC-1: silence is NO CONSTRAINT, which is what makes the field additive. A runner built
     # before 1.14.0 sends no such key and must behave exactly as it did.
-    test "silence, an empty array and a list with a non-string are all no constraint" do
+    test "silence and an empty array are no constraint" do
       assert Runners.declared_branch_prefixes(%{max_sessions: 2}) == []
       assert Runners.declared_branch_prefixes(%{branch_prefixes: []}) == []
-      assert Runners.declared_branch_prefixes(%{branch_prefixes: ["loop/", 3]}) == []
       assert Runners.declared_branch_prefixes(%{}) == []
+    end
+
+    # 846.2 REVIEW ROUND 2, FINDING 6. This returned `[]` for a list carrying ANY non-binary,
+    # and `[]` means NO CONSTRAINT — so `["loop/", 3]` had loopctl derive `feature/...` and
+    # push it to a machine that enforces `loop/`, which refuses it AFTER the claim. That is the
+    # original 846.2 failure, reached through the defence written against it, and it is the
+    # disagreement the finding is about: `DispatchPayload.branch_for/2` filtered per entry all
+    # along while placement came through here.
+    #
+    # A meta reaches this without passing `cast_join/1`, which is the only way a non-binary
+    # gets in at all — the wire schema refuses one.
+    test "a non-binary entry is dropped, and the usable ones still constrain" do
+      assert Runners.declared_branch_prefixes(%{branch_prefixes: ["loop/", 3]}) == ["loop/"]
+      assert Runners.declared_branch_prefixes(%{branch_prefixes: [3, "loop/"]}) == ["loop/"]
+      assert Runners.declared_branch_prefixes(%{branch_prefixes: [nil, %{}]}) == []
+    end
+
+    # ONE READING, TWO CALLERS. The pool read and the derivation must filter the same list the
+    # same way, which is the thing that drifted.
+    test "it agrees with the derivation on which entries are usable" do
+      mixed = ["loop/", 3, "agent/"]
+      story = %Story{number: 7, id: "a1b2c3d4-e5f6-4789-abcd-ef0123456789"}
+
+      assert DispatchPayload.branch_for(story, mixed) ==
+               DispatchPayload.branch_for(
+                 story,
+                 Runners.declared_branch_prefixes(%{branch_prefixes: mixed})
+               )
     end
   end
 

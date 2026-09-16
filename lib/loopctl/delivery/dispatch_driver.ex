@@ -157,28 +157,57 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   @doc """
   A runner of `tenant_id` that would accept an `implement` dispatch for `repo` right now, or
-  `nil`.
+  `nil` — the FIRST of `available_runners/2`.
+
+  Kept as the single-runner question because that is what most callers and every test asked;
+  the placing path uses the list, for the reason `available_runners/2` gives.
+  """
+  @spec available_runner(Ecto.UUID.t(), String.t()) :: Runner.t() | nil
+  def available_runner(tenant_id, repo) when is_binary(tenant_id) and is_binary(repo) do
+    case available_runners(tenant_id, repo) do
+      [runner | _] -> runner
+      [] -> nil
+    end
+  end
+
+  @doc """
+  Every runner of `tenant_id` that would accept an `implement` dispatch for `repo` right now,
+  in the order to try them.
 
   Every half of the moduledoc's eligibility rule, in the order that costs least: the tenant's
   admission headroom is one aggregate read and gates the whole pass for that tenant; the
   presence metas answer draining, repos and kind with no database at all; the row read is what
   answers capacity. Fewest slots first, so a fleet spreads rather than filling one machine.
+
+  ## Why the PASS needs the list and not the head (846.2 review round 2, finding 3)
+
+  `Runners.accepts?/5` knows nothing about `branch_prefixes`, so a machine whose declaration
+  can produce no valid branch is still "accepting" — and is selected FIRST, because it is idle
+  and this orders by fewest slots. Every story for that repository then failed
+  `{:no_conforming_branch, _}` and the pass never reached the healthy second runner. One
+  misconfigured box stopped delivery for a whole repository.
+
+  Before contract 1.14.0 no placement could fail for a DECLARATION reason at all, so this is a
+  new way for one machine to halt a queue rather than an old one this change exposes. The
+  answer is to try the next candidate rather than to teach `accepts?/5` about prefixes: the
+  derivation needs the STORY to know whether a prefix can produce a valid name, and
+  `accepts?/5` is a per-runner predicate that has no story — a copy of the derivation there
+  would be a second implementation of the thing story 846.2 exists to make singular.
   """
-  @spec available_runner(Ecto.UUID.t(), String.t()) :: Runner.t() | nil
-  def available_runner(tenant_id, repo) when is_binary(tenant_id) and is_binary(repo) do
+  @spec available_runners(Ecto.UUID.t(), String.t()) :: [Runner.t()]
+  def available_runners(tenant_id, repo) when is_binary(tenant_id) and is_binary(repo) do
     with :ok <- Capacity.admit(Loopctl.AdminRepo, tenant_id),
          [_ | _] = ids <- accepting_runner_ids(tenant_id, repo) do
-      Loopctl.AdminRepo.one(
+      Loopctl.AdminRepo.all(
         from r in Runner,
           where: r.tenant_id == ^tenant_id,
           where: is_nil(r.revoked_at),
           where: r.id in ^ids,
           where: r.in_flight < r.max_sessions,
-          order_by: [asc: r.in_flight],
-          limit: 1
+          order_by: [asc: r.in_flight, asc: r.id]
       )
     else
-      _admission_reached_or_nobody_accepting -> nil
+      _admission_reached_or_nobody_accepting -> []
     end
   end
 
@@ -358,18 +387,46 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
     with {:ok, story} <- fetch_story(tenant_id, story_id),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
-         %Runner{} = runner <-
-           available_runner(tenant_id, source.repo_full_name) || {:error, :no_runner},
+         [_ | _] = runners <- available_runners(tenant_id, source.repo_full_name),
          {{:ok, key}, cache} <- operator_key(tenant_id, cache) do
-      {Placement.place(tenant_id, runner.id, dispatch(story, source, budgets),
-         api_key: key,
-         actor_label: "worker:dispatch_driver"
-       ), cache}
+      {place_on_first_usable(tenant_id, runners, story, source, budgets, key), cache}
     else
       {{:error, _reason} = error, %{} = cache} -> {error, cache}
       {:error, reason} -> {{:error, reason}, cache}
-      nil -> {{:error, :no_runner}, cache}
+      [] -> {{:error, :no_runner}, cache}
     end
+  end
+
+  # ONE MISCONFIGURED MACHINE MAY NOT STOP A REPOSITORY (846.2 review round 2, finding 3). A
+  # runner whose `branch_prefixes` can produce no valid branch is still "accepting" to
+  # `Runners.accepts?/5`, and is selected FIRST because it is idle, so every story for that
+  # repository was refused `{:no_conforming_branch, _}` and the healthy second runner was never
+  # tried.
+  #
+  # ONLY THAT REFUSAL ADVANCES, and the reason is what makes this safe rather than a retry
+  # loop. `{:no_conforming_branch, _}` is decided inside `DispatchPayload.fill/3`, which runs
+  # BEFORE `claimable/2` and before the mint, so a refused attempt has written nothing at all —
+  # no dispatch row, no ephemeral key, no chain entry, no claim. Every other refusal either
+  # concerns the STORY (`invalid_transition`, `story_not_dispatchable`, the tenant's halt and
+  # tier), which the next machine would answer identically, or has already spent something, so
+  # advancing on it would either loop pointlessly or compensate once per candidate.
+  #
+  # The LAST refusal is the one returned, so a pass on which every machine is misconfigured
+  # still reports `{:no_conforming_branch, _}` and `attempt/3` still classifies it `:blocked` —
+  # an operator sees the state that needs them, not a `:no_runner` that reads as "wait".
+  defp place_on_first_usable(tenant_id, runners, story, source, budgets, key) do
+    Enum.reduce_while(runners, {:error, :no_runner}, fn runner, _last ->
+      result =
+        Placement.place(tenant_id, runner.id, dispatch(story, source, budgets),
+          api_key: key,
+          actor_label: "worker:dispatch_driver"
+        )
+
+      case result do
+        {:error, {:no_conforming_branch, _}} -> {:cont, result}
+        _placed_or_refused_for_another_reason -> {:halt, result}
+      end
+    end)
   end
 
   # NO `branch` KEY, WHICH IS HOW THE TWO PATHS ARE MADE UNABLE TO DISAGREE (story 846.2).

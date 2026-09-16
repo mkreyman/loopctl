@@ -141,11 +141,26 @@ defmodule LoopctlWeb.DispatchPlacementController do
                  "fragment, behind a prefix the TARGET RUNNER declared it accepts " <>
                  "(`branch_prefixes` on the runner contract's join, since 1.14.0) — which " <>
                  "is a per-machine fact only the server can read. A branch you name is " <>
-                 "never rewritten, so one outside that machine's prefixes is refused " <>
-                 "`branch_not_allowed`, and one that is not a valid git ref name is refused " <>
-                 "`invalid_branch_name`. Nothing is claimed on either."
+                 "never rewritten, only judged, and it must satisfy three things: it must be " <>
+                 "a valid git ref name (`invalid_branch_name` — which also refuses a " <>
+                 "non-string such as `null`), it must start with one of that machine's " <>
+                 "declared prefixes (`branch_not_allowed`), and it must END WITH THIS " <>
+                 "STORY'S OWN SUFFIX (`branch_not_unique`), so that two stories on one " <>
+                 "repository can never be given one branch. You may choose the prefix; you " <>
+                 "may not drop the suffix. Nothing is claimed on any of the three. A retry " <>
+                 "naming a different branch from the one this dispatch was already sent on " <>
+                 "is `branch_conflict`."
            },
-           base_branch: %Schema{type: :string},
+           base_branch: %Schema{
+             type: :string,
+             description:
+               "The ref the session cuts FROM. Defaults to the project's intake source, " <>
+                 "which is where an operator sets `main` for a repository that uses it. It " <>
+                 "is judged as a git ref name exactly as `branch` is (`invalid_branch_name`, " <>
+                 "nothing claimed) — it reaches git on the runner just as `branch` does — " <>
+                 "but it is NOT story-unique: every dispatch in the tenant cutting from " <>
+                 "`master` is the normal case."
+           },
            wall_clock_seconds: %Schema{type: :integer, minimum: 1},
            max_turns: %Schema{type: :integer, minimum: 1}
          }
@@ -186,8 +201,12 @@ defmodule LoopctlWeb.DispatchPlacementController do
         {"Validation error; `branch_not_allowed` — the `branch` you named does not start " <>
            "with any prefix the runner declared, so the machine would refuse the dispatch; " <>
            "omit `branch` and loopctl derives a conforming one, and nothing was claimed; or " <>
-           "`invalid_branch_name` — the `branch` you named is not a valid git ref name at " <>
-           "all, so no machine could create it, and nothing was claimed; or " <>
+           "`invalid_branch_name` — a ref field you named (`branch` or `base_branch`) is " <>
+           "not a string, or is not a valid git ref name, so no machine could create it; or " <>
+           "`branch_not_unique` — the `branch` you named does not carry this story's own " <>
+           "suffix, so two stories on one repository could share it; or `branch_conflict` — " <>
+           "a retry named a different `branch` from the one this dispatch was already sent " <>
+           "on. Nothing was claimed on any of them. Or " <>
            "`story_not_accepted` — the story object is built by loopctl from " <>
            "its own records and may not be supplied by a caller; or " <>
            "`story_not_dispatchable` — the story exceeds a cap the runner contract declares " <>
@@ -415,20 +434,73 @@ defmodule LoopctlWeb.DispatchPlacementController do
     })
   end
 
-  # THE NAME IS NOT A GIT REF AT ALL, which is a different refusal from `branch_not_allowed`
-  # and is checked on EVERY path including a resume: `branch` carries `minLength`/`maxLength`
-  # and no pattern on the wire, so `--upload-pack=/bin/sh`, `-o` and `a..b` all cast clean and
-  # would be pushed verbatim to a machine that hands the value to git. The remedy is in this
-  # request, which is why the refusal is safe where the prefix refusal is not.
-  defp refuse(conn, {:invalid_branch_name, branch}) do
-    error(conn, 422, "invalid_branch_name", %{
+  # NOT A GIT REF AT ALL, which is a different refusal from `branch_not_allowed` and is checked
+  # on EVERY ref field and EVERY path including a resume. `branch` and `base_branch` are both
+  # declared on the wire as 1..255 characters with NO pattern, so `--upload-pack=/bin/sh`, `-o`
+  # and `a..b` all cast clean and would be pushed verbatim to a machine that hands the value to
+  # git. The remedy is in this request, which is why the refusal is safe where the prefix
+  # refusal is not.
+  #
+  # IT NAMES THE FIELD, because there is more than one: round 1 answered about `branch` alone
+  # and round 2 found `base_branch` open on the identical schema one line above it.
+  #
+  # A NON-STRING lands here too — `{"branch": null}`, which is what a generated client sends
+  # for an unset optional now that the field is documented OMIT THIS. That used to be deferred
+  # to the contract cast, which runs AFTER the claim, so the story was claimed and only then
+  # refused. The echo is therefore conditional: a string comes back (truncated, since the
+  # length bound is one of the things it can fail), and anything else is reported by TYPE
+  # rather than echoed as an arbitrary caller value.
+  defp refuse(conn, {:invalid_branch_name, field, value}) do
+    error(
+      conn,
+      422,
+      "invalid_branch_name",
+      Map.merge(
+        %{
+          message:
+            "`#{field}` is not a valid git ref name, so no machine could create it. Nothing " <>
+              "was claimed. It must be a STRING that starts with a letter or a digit and " <>
+              "holds only letters, digits, `.`, `_`, `/` and `-`; no path component may " <>
+              "begin with `.` or end with `.lock`, and `..` may not appear. Omit `branch` " <>
+              "and loopctl derives a conforming one.",
+          field: field
+        },
+        echoed_ref(value)
+      )
+    )
+  end
+
+  # THE NAME WOULD NOT BE THIS STORY'S ALONE. The contract publishes that two stories on one
+  # repository can never share a branch, and it is the derived name that carries the story
+  # number and id fragment which makes that true — so a caller naming `loop/mine` for two
+  # stories put both sessions on one branch and the second found the first's work there. The
+  # caller may still choose the PREFIX, so the refusal names the suffix rather than the whole
+  # branch: that is the part it has to keep.
+  defp refuse(conn, {:branch_not_unique, field, branch, suffix}) do
+    error(conn, 422, "branch_not_unique", %{
       message:
-        "The branch you named is not a valid git ref name, so no machine could create it. " <>
-          "Nothing was claimed. It must start with a letter or a digit and hold only " <>
-          "letters, digits, `.`, `_`, `/` and `-`; no path component may begin with `.` or " <>
-          "end with `.lock`, and `..` may not appear. Omit `branch` and loopctl derives a " <>
-          "conforming one.",
-      branch: branch
+        "`#{field}` must end with this story's own suffix, or two stories on one repository " <>
+          "could share a branch and the second session would find the first's work there. " <>
+          "Nothing was claimed. Keep your prefix and append the suffix, or omit `branch` and " <>
+          "loopctl derives the whole name.",
+      field: field,
+      branch: branch,
+      required_suffix: suffix
+    })
+  end
+
+  # A RETRY NAMED A DIFFERENT BRANCH FROM THE ONE THIS DISPATCH WAS SENT ON. The branch is
+  # recorded on the ledger row at the first push and re-sent verbatim, so a retry cannot move a
+  # session that may already be running on the first name. Refused rather than silently
+  # substituted: loopctl never rewrites a branch a caller named.
+  defp refuse(conn, {:branch_conflict, supplied, recorded}) do
+    error(conn, 422, "branch_conflict", %{
+      message:
+        "This dispatch was already sent on another branch, and a retry may not move it — a " <>
+          "session may be running on the first name right now. Nothing was claimed. Omit " <>
+          "`branch` to re-send the recorded one, or send that one.",
+      branch: supplied,
+      recorded_branch: recorded
     })
   end
 
@@ -586,6 +658,15 @@ defmodule LoopctlWeb.DispatchPlacementController do
   # The fallback's own atom-only catch-all still answers 500 for an atom nobody mapped, which
   # is the loudness that belongs there rather than here.
   defp refuse(conn, reason), do: LoopctlWeb.FallbackController.call(conn, {:error, reason})
+
+  # A caller value is echoed only where echoing it is bounded and meaningful.
+  defp echoed_ref(value) when is_binary(value), do: %{value: String.slice(value, 0, 255)}
+  defp echoed_ref(nil), do: %{value_type: "null"}
+  defp echoed_ref(value) when is_number(value), do: %{value_type: "number"}
+  defp echoed_ref(value) when is_boolean(value), do: %{value_type: "boolean"}
+  defp echoed_ref(value) when is_list(value), do: %{value_type: "array"}
+  defp echoed_ref(value) when is_map(value), do: %{value_type: "object"}
+  defp echoed_ref(_value), do: %{value_type: "unsupported"}
 
   defp error(conn, status, code, extra) do
     conn

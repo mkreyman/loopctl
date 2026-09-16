@@ -36,20 +36,47 @@ All notable changes to loopctl are documented here.
   sending `branch`: it is no longer listed as required and loopctl derives it. The story number and
   an id fragment are always in the derived name, and are never shortened to make a prefix fit.
 
-  **A caller-supplied `branch` is now also checked for being a git ref name at all** — `422
-  invalid_branch_name`, nothing claimed. `branch` is declared on the wire as a string of 1..255
-  characters with no pattern, so a value such as `--upload-pack=/bin/sh`, `-o` or `a..b` used to
-  cast clean and be pushed verbatim to a machine that hands it to git. It must now start with a
-  letter or digit and hold only letters, digits, `.`, `_`, `/` and `-`; no path component may begin
-  with `.` or end with `.lock`, and `..` may not appear anywhere.
+  **EVERY caller-supplied value that becomes a git ref is now validated before the claim**, from
+  the contract's own declaration of which fields those are, and three refusals follow. `branch` and
+  `base_branch` are both declared on the wire as strings of 1..255 characters with NO pattern, so a
+  value such as `--upload-pack=/bin/sh`, `-o` or `a..b` used to cast clean and be pushed verbatim to
+  a machine that hands it to git. Nothing is claimed on any of the three.
 
-  **Neither prefix refusal can be raised by a RETRY** carrying a `dispatch_id` loopctl already
-  holds. That claim committed on an earlier call and is standing, so refusing the retry would leave
-  the story at `claimed` with no session until its lease expired — and the refusal would say
-  nothing was claimed, which is false there. On that path the declaration only steers the NAME: a
-  declaration that can produce no valid branch falls back to the un-prefixed derivation and the
-  machine's own refusal reaches a person, costing no claim. `invalid_branch_name` IS still raised
-  on a retry, because its remedy is in the request itself.
+  - `422 invalid_branch_name` — the value is not a string, or is not a valid git ref name. **A
+    non-string is the likely case, not an edge one**: `branch` is now optional and documented OMIT
+    THIS, and a generated client serialises an unset optional as `null`. That used to be deferred to
+    the runner-contract cast, which runs AFTER the claim, so `{"branch": null}` claimed the story and
+    was refused afterwards. A ref name must start with a letter or digit and hold only letters,
+    digits, `.`, `_`, `/` and `-`; no path component may begin with `.` or end with `.lock`, and `..`
+    may not appear anywhere. **`base_branch` is judged too** — it reaches git on the runner exactly as
+    `branch` does — though it is NOT story-unique, since every dispatch cutting from `master` is the
+    normal case.
+  - `422 branch_not_unique` — a `branch` you named does not end with this story's own suffix. The
+    uniqueness this release publishes was true only of the DERIVED name: two placements naming
+    `loop/mine` both succeeded onto one branch, and the second session would find the first's work
+    there. **You may still choose the prefix; you may not drop the suffix**, and the error names it.
+  - `422 branch_conflict` — a retry named a different `branch` from the one this dispatch was
+    already sent on. See below.
+
+  **A retry re-sends the branch the first push used.** `runner_dispatches` gains a nullable `branch`
+  column (additive migration, no manual step, no backfill): the name is recorded at the first push
+  and re-sent verbatim, so a machine that rejoined declaring different prefixes cannot move a
+  dispatch onto a second branch. It could before, because a ledger row at `sent` means only that no
+  reply was RECORDED — and a lost reply is exactly the case a retry exists for, so a session may be
+  running on the first name. Rows written before this column fall back to deriving.
+
+  **No prefix refusal can be raised by a RETRY** carrying a `dispatch_id` loopctl already holds.
+  That claim committed on an earlier call and is standing, so refusing the retry would leave the
+  story at `claimed` with no session until its lease expired — and the refusal would say nothing was
+  claimed, which is false there. `invalid_branch_name`, `branch_not_unique` and `branch_conflict`
+  ARE still raised on a retry, because each one's remedy is in the request itself.
+
+  **One misconfigured machine no longer stops a repository.** A runner whose declared prefixes can
+  produce no valid branch is still "accepting" and is picked first because it is idle, so every
+  story for that repository was refused and the healthy second runner was never tried. The
+  unattended driver now advances to the next candidate on that refusal alone — which costs nothing,
+  because it is decided before anything is claimed or minted — and still reports `blocked` when
+  every machine is misconfigured.
 
 - **A runner's capacity now follows what the machine declares, not what it was enrolled with
   (#846.4, runner contract 1.13.0).** `runners.max_sessions` — the number `Loopctl.Runners.Capacity`

@@ -512,12 +512,23 @@ describe("the wiring in index.js", () => {
 
       assert.ok(place, "place_dispatch has no README row");
 
-      for (const code of ["no_conforming_branch", "branch_not_allowed", "invalid_branch_name"]) {
+      for (const code of [
+        "no_conforming_branch",
+        "branch_not_allowed",
+        "invalid_branch_name",
+        "branch_not_unique",
+        "branch_conflict",
+      ]) {
         assert.ok(place.includes(code), `place_dispatch's row never mentions ${code}`);
       }
 
+      // `base_branch` reaches git on the runner exactly as `branch` does, and round 1 of the
+      // 846.2 review documented only `branch` — which is how the schema one line above it
+      // went unchecked for a round.
+      assert.match(place, /base_branch/);
+
       // The steer is the point of the row, not the refusal list: a caller that never sends
-      // `branch` cannot earn two of those three.
+      // `branch` cannot earn three of those five.
       assert.match(place, /should not send|OMIT|omit/);
     });
   });

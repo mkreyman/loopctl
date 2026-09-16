@@ -2346,4 +2346,67 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     room = div(max - ByteRule.bytes(base), per_char)
     %{base | "description" => string(room)}
   end
+
+  # 846.2 REVIEW ROUND 2, FINDINGS 1, 2 AND 7 — THE STRUCTURAL HALF.
+  #
+  # Round 1 closed an argument-injection on `branch` by checking `branch`. Round 2 then found
+  # `base_branch` open on the identical schema one line above, a non-string `branch` skipping
+  # the check, and a caller-supplied `branch` defeating the published uniqueness. Three leaks,
+  # one per round, each fixable by naming a further spelling — the shape KB `909ba2b2` records:
+  # a guard must exempt by PROVING a property, never by enumerating dangerous spellings.
+  #
+  # THIS IS THE TEST THAT HAS TO EXIST FOR THAT TO BE FIXED RATHER THAN FIXED AGAIN. Adding a
+  # ninth string field to `RunnerDispatch` and not deciding whether it becomes a git ref fails
+  # here, at compile-and-test time, before it can reach a machine unvalidated. What it CANNOT
+  # catch is a field deliberately misclassified into `non_ref_string_fields/0` — that is a
+  # judgement, and the point is that the author must now make it in writing.
+  describe "every string a caller can put on a dispatch is classified as a ref or not" do
+    test "the classification is TOTAL over the schema's string properties" do
+      strings =
+        for {name, %Schema{type: :string}} <- RunnerDispatch.schema().properties,
+            do: name
+
+      classified =
+        Keyword.keys(RunnerDispatch.ref_fields()) ++ RunnerDispatch.non_ref_string_fields()
+
+      unclassified = Enum.sort(strings -- classified)
+      phantom = Enum.sort(classified -- strings)
+
+      assert unclassified == [],
+             "#{inspect(unclassified)} is a string field of RunnerDispatch that is classified " <>
+               "neither as a git ref (RunnerDispatch.ref_fields/0, validated before the claim " <>
+               "by Loopctl.Delivery.DispatchPayload) nor as explicitly not one " <>
+               "(non_ref_string_fields/0). Decide which it is. If its value can reach a git " <>
+               "command on the runner it belongs in ref_fields/0 with a disposition; if it " <>
+               "cannot, say so by naming it in non_ref_string_fields/0"
+
+      assert phantom == [],
+             "#{inspect(phantom)} is classified but is not a property of RunnerDispatch, so " <>
+               "the validator iterates a field no payload can carry"
+    end
+
+    test "nothing is in both lists, so a ref field cannot be excused by the other one" do
+      refs = Keyword.keys(RunnerDispatch.ref_fields())
+
+      assert refs -- RunnerDispatch.non_ref_string_fields() == refs
+    end
+
+    test "every disposition is one this repository knows how to enforce" do
+      for {field, disposition} <- RunnerDispatch.ref_fields() do
+        assert disposition in [:story_unique, :shared],
+               "#{field} declares #{inspect(disposition)}, which " <>
+                 "Loopctl.Delivery.DispatchPayload.validate_refs/2 does not enforce — a " <>
+                 "disposition it does not know falls through its `cond` as though the field " <>
+                 "were unconstrained"
+      end
+    end
+
+    # The two dispositions are not interchangeable and the schema must not drift into saying
+    # they are: `branch` is the branch a session WORKS ON and `base_branch` is the ref it reads
+    # FROM, which is deliberately shared across every story in the tenant.
+    test "the branch a session works on is story-unique and the one it cuts from is shared" do
+      assert RunnerDispatch.ref_fields()[:branch] == :story_unique
+      assert RunnerDispatch.ref_fields()[:base_branch] == :shared
+    end
+  end
 end

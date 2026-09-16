@@ -416,6 +416,98 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
     end
   end
 
+  # 846.2 REVIEW ROUND 2, FINDING 8. The moduledoc said this file deliberately does NOT copy
+  # `GitEnv`'s `GIT_CONFIG_GLOBAL=/dev/null` pinning, while the `GIT_*` deny list cleared every
+  # `GIT_CONFIG*` variable anyway — so on a box whose global git config is supplied only
+  # through them (Nix and home-manager point `GIT_CONFIG_GLOBAL` at a store path; some CI
+  # images use the `GIT_CONFIG_COUNT`/`KEY`/`VALUE` trio) the pinning WAS effectively applied,
+  # `safe.directory` went with it, `rev-parse` refused the tree as dubiously owned, and the
+  # suite fell back to the shared `loopctl_test` database. That is the collision this file
+  # exists to prevent, so the two sentences were resolved in favour of NOT clearing.
+  describe "cleared_git_env/0 and the GIT_CONFIG exception" do
+    setup do
+      stash_ambient_git_env!(
+        @ambient_git_vars ++
+          ~w(GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+             GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_WOBBLE_NEW)
+      )
+    end
+
+    test "config variables are NOT cleared, so a machine keeps its own safe.directory" do
+      names =
+        ~w(GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+           GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0)
+
+      for name <- names, do: System.put_env(name, "set")
+      cleared = MapSet.new(WorktreePartition.cleared_git_env(), fn {name, nil} -> name end)
+
+      for name <- names do
+        refute MapSet.member?(cleared, name),
+               "#{name} selects or supplies CONFIG; it cannot move what rev-parse answers " <>
+                 "(pinned by the test below). Clearing it strips the global config on a box " <>
+                 "configured through it, git then refuses a dubiously-owned tree, derive/1 " <>
+                 "returns nil, and the worktree suite silently shares loopctl_test"
+      end
+    end
+
+    # THE DENY-LIST DEFAULT IS STILL THE DEFAULT. Without this, the exception above could be
+    # widened to `GIT_` and nothing would notice.
+    test "an unknown GIT_ variable is still cleared by default" do
+      System.put_env("GIT_WOBBLE_NEW", "set")
+      cleared = MapSet.new(WorktreePartition.cleared_git_env(), fn {name, nil} -> name end)
+
+      assert MapSet.member?(cleared, "GIT_WOBBLE_NEW")
+    end
+
+    # THE PREMISE OF THE EXCEPTION, ASSERTED AGAINST GIT ITSELF rather than assumed — the shape
+    # the leaked-environment block uses, so a future git that started honouring `core.worktree`
+    # from these sources turns this red instead of silently partitioning on another tree.
+    # `core.worktree` is the only setting that could move the answer, and git honours it from
+    # repository-LOCAL config alone.
+    test "a global config that tries to move the worktree does not move derive/1" do
+      dir =
+        Path.join(System.tmp_dir!(), "wt_partition_cfg_#{System.unique_integer([:positive])}")
+
+      repo = Path.join(dir, "repo")
+      elsewhere = Path.join(dir, "elsewhere")
+      cfg = Path.join(dir, "global.cfg")
+
+      File.mkdir_p!(repo)
+      File.mkdir_p!(elsewhere)
+      {_, 0} = System.cmd("git", ["init", "-q", repo])
+      File.write!(cfg, "[core]\n\tworktree = #{elsewhere}\n\tbare = false\n")
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      {plain, 0} =
+        System.cmd("sh", ["-c", "git rev-parse --show-toplevel 2>/dev/null"], cd: repo)
+
+      {steered, 0} =
+        System.cmd("sh", ["-c", "git rev-parse --show-toplevel 2>/dev/null"],
+          cd: repo,
+          env: [{"GIT_CONFIG_GLOBAL", cfg}]
+        )
+
+      assert String.trim(steered) == String.trim(plain),
+             "git now honours core.worktree from a GIT_CONFIG_GLOBAL file, so config DOES " <>
+               "steer discovery and GIT_CONFIG* must go back on the deny list — read the " <>
+               "cleared_git_env/0 doc before changing this"
+
+      {injected, 0} =
+        System.cmd("sh", ["-c", "git rev-parse --show-toplevel 2>/dev/null"],
+          cd: repo,
+          env: [
+            {"GIT_CONFIG_COUNT", "1"},
+            {"GIT_CONFIG_KEY_0", "core.worktree"},
+            {"GIT_CONFIG_VALUE_0", elsewhere}
+          ]
+        )
+
+      assert String.trim(injected) == String.trim(plain),
+             "git now honours core.worktree injected through GIT_CONFIG_COUNT/KEY/VALUE, " <>
+               "which is `-c` and the highest precedence there is"
+    end
+  end
+
   describe "cleared_git_env/0 against the delivery gates' own list" do
     # ONE RULE, TWO SITES. `Loopctl.DeliveryGates.GitEnv` clears the same discovery variables
     # for the delivery gates — written 2026-09-14 after an inherited GIT_DIR let a fixture

@@ -57,7 +57,8 @@ defmodule Loopctl.Delivery.DispatchPayload do
           | {:over_contract_maximum, atom()}
           | {:no_conforming_branch, [String.t()]}
           | {:branch_not_allowed, String.t(), [String.t()]}
-          | {:invalid_branch_name, String.t()}
+          | {:invalid_branch_name, atom(), term()}
+          | {:branch_not_unique, atom(), String.t(), String.t()}
 
   # The prefix loopctl has always derived, and the one it still derives for a runner that
   # declares nothing. NOT changed to `loop/` to fix the machine that started this (story
@@ -116,9 +117,9 @@ defmodule Loopctl.Delivery.DispatchPayload do
     already STANDING, so a refusal there strands a live claim rather than preventing one; the
     argument is written out in full above `resume_payload/4`.
 
-    IT DOES NOT RELAX THE NAME CHECK, and the split is the point: a prefix is a fact about
-    another machine, and a name is a fact about the string in this request. See
-    `valid_ref_name?/1`.
+    IT DOES NOT RELAX `validate_refs/2`, and the split is the point: a prefix is a fact about
+    another machine, and everything `validate_refs/2` judges is a fact about the values in
+    this request. See `valid_ref_name?/1`.
   """
   @spec fill(Ecto.UUID.t(), map(), keyword()) :: {:ok, map()} | {:error, error()}
   def fill(tenant_id, %{} = dispatch, opts \\ []) when is_binary(tenant_id) and is_list(opts) do
@@ -128,9 +129,12 @@ defmodule Loopctl.Delivery.DispatchPayload do
     policy = Keyword.get(opts, :prefix_policy, :refuse)
 
     with {:ok, story} <- fetch_story(tenant_id, story_id),
+         :ok <- validate_refs(dispatch, story),
          {:ok, dispatch} <- fill_repo(tenant_id, story, dispatch),
-         {:ok, dispatch} <- fill_budgets(kind, dispatch) do
-      fill_branch(dispatch, story, prefixes, policy)
+         {:ok, dispatch} <- fill_budgets(kind, dispatch),
+         {:ok, dispatch} <- fill_branch(dispatch, story, prefixes, policy),
+         :ok <- validate_refs(dispatch, story) do
+      {:ok, dispatch}
     end
   end
 
@@ -175,7 +179,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
   @spec branch_for(Story.t(), [String.t()]) ::
           {:ok, String.t()} | {:error, {:no_conforming_branch, [String.t()]}}
   def branch_for(%Story{} = story, prefixes \\ []) when is_list(prefixes) do
-    suffix = "story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+    suffix = story_suffix(story)
 
     usable = for p <- prefixes, is_binary(p), do: p
     candidates = if usable == [], do: [@default_prefix], else: usable
@@ -183,6 +187,84 @@ defmodule Loopctl.Delivery.DispatchPayload do
     case Enum.find(candidates, &valid_branch?(&1 <> suffix)) do
       nil -> {:error, {:no_conforming_branch, prefixes}}
       prefix -> {:ok, prefix <> suffix}
+    end
+  end
+
+  @doc """
+  The part of a branch name that makes it this story's and nobody else's.
+
+  The story NUMBER is unique only within its project and two projects may hold intake sources
+  naming one repository, so the number alone would let two stories share a branch. Public
+  because a refusal has to NAME it: a caller told only that its branch is not unique cannot
+  act, and this is the string it has to end with.
+  """
+  @spec story_suffix(Story.t()) :: String.t()
+  def story_suffix(%Story{} = story), do: "story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+
+  @doc """
+  Judges EVERY field of `dispatch` that becomes a git ref, from the contract's own declaration
+  of which those are (`RunnerDispatch.ref_fields/0`).
+
+  ONE PLACE, AND IT IS READ FROM A LIST RATHER THAN WRITTEN AS A PAIR OF LITERALS (846.2
+  review round 2, findings 1, 2 and 7). Round 1 closed an argument-injection on `branch` by
+  checking `branch`; round 2 found `base_branch` open on the identical schema one line above,
+  a non-string `branch` skipping the check entirely, and a caller-supplied `branch` defeating
+  the uniqueness the contract publishes. Three leaks, each closable by naming a fourth
+  spelling — the shape KB `909ba2b2` names, where a guard enumerates dangerous spellings
+  instead of proving a property. The list is the contract's, the classification there is
+  TOTAL over the schema's string properties, and a test fails when a new string field is
+  classified as neither.
+
+  Three refusals, and each is a fact about the values in THIS request rather than about any
+  machine, which is why none of them is relaxed by `:prefix_policy` — see `fill/3`:
+
+  - a value that is present and NOT A STRING is `{:invalid_branch_name, field, value}`. It
+    used to be deferred to `cast_dispatch/1`, which runs inside `Loopctl.Runners.dispatch/3` —
+    AFTER the claim, the mint and two immutable chain entries — so `{"branch": null}` claimed a
+    story and was refused afterwards, making "Nothing was claimed" false in the 422 body that
+    said it. That is now the LIKELY shape rather than an edge case: `branch` became optional
+    and is documented OMIT THIS, and a generated client serialises an unset optional as `null`.
+  - a string that is not a git ref name is the same tuple. `RunnerDispatch` declares these
+    fields as 1..255 characters with NO pattern, so `--upload-pack=/bin/sh`, `-o` and `a..b`
+    all cast clean and reached a machine that hands the value to git.
+  - a `:story_unique` field that does not carry the story's suffix is
+    `{:branch_not_unique, field, value, suffix}`. The contract publishes that two stories on
+    one repository can never share a branch; `branch_allowed?/2` checks only the prefix, so
+    two placements naming `loop/mine` both succeeded onto one branch and the second session
+    would find the first's work there. A caller may still choose the PREFIX — what it may not
+    do is drop the part that makes the name unique.
+
+  CALLED TWICE BY `fill/3`, on the caller's own map and again on the finished payload. The
+  first call is what makes a caller's value cost nothing; the second is what makes the claim
+  "every value that becomes a git ref is validated" true rather than "every value the caller
+  sent" — `base_branch` is filled from the project's INTAKE SOURCE when the caller omits it,
+  which is a row an operator edits and which nothing else here judges.
+  """
+  @spec validate_refs(map(), Story.t()) :: :ok | {:error, error()}
+  def validate_refs(%{} = dispatch, %Story{} = story) do
+    Enum.reduce_while(RunnerDispatch.ref_fields(), :ok, fn {field, disposition}, :ok ->
+      case Map.fetch(dispatch, Atom.to_string(field)) do
+        :error -> {:cont, :ok}
+        {:ok, value} -> judge_ref(field, value, disposition, story)
+      end
+    end)
+  end
+
+  defp judge_ref(field, value, _disposition, _story) when not is_binary(value),
+    do: {:halt, {:error, {:invalid_branch_name, field, value}}}
+
+  defp judge_ref(field, value, disposition, story) do
+    suffix = story_suffix(story)
+
+    cond do
+      not valid_caller_branch?(value) ->
+        {:halt, {:error, {:invalid_branch_name, field, value}}}
+
+      disposition == :story_unique and not String.ends_with?(value, suffix) ->
+        {:halt, {:error, {:branch_not_unique, field, value, suffix}}}
+
+      true ->
+        {:cont, :ok}
     end
   end
 
@@ -252,24 +334,21 @@ defmodule Loopctl.Delivery.DispatchPayload do
   # branch an operator asked for would be worse than one that refuses: the session would run,
   # on a name nobody named, and the operator would go looking for work on the other one.
   #
-  # IT IS JUDGED ON TWO SEPARATE QUESTIONS, and only one of them is about the runner (846.2
-  # review findings 1 and 3). The NAME check asks whether the string is a git ref name at all
-  # and is applied on EVERY path including a resume: `RunnerDispatch.branch` carries
-  # `minLength`/`maxLength` and no pattern, so before this ran on the caller's value a
-  # placement would accept `branch: "--upload-pack=/bin/sh"`, `-o` or `a..b` and push it
-  # verbatim to a machine that hands it to git. That is a property of this request, its remedy
-  # is in this request, and a name git will not take cannot start a session on any machine, so
-  # refusing it is right even where a claim is already standing. The PREFIX check asks what
-  # another machine declared, so `:advise` turns it off where a refusal would strand a live
-  # claim.
+  # WHAT IS LEFT HERE IS THE ONE QUESTION ABOUT ANOTHER MACHINE: does the name start with a
+  # prefix the target runner declared. Everything that is a fact about the VALUE — its type,
+  # its shape as a git ref, and the story suffix that keeps two stories off one branch — was
+  # settled by `validate_refs/2` before this ran, for every ref field at once rather than for
+  # `branch` alone (846.2 review round 2). `:advise` turns THIS check off, and only this one,
+  # because a prefix is the only part a rejoin can change under a caller whose claim is
+  # already standing.
+  #
+  # The non-string clause that used to sit here is gone rather than moved: `validate_refs/2`
+  # refuses a non-binary before this function is reached, so a second clause for it would be
+  # the unreachable-guard defect this branch's round 1 was itself about.
   defp fill_branch(dispatch, story, prefixes, policy) do
     case Map.fetch(dispatch, "branch") do
-      {:ok, branch} when is_binary(branch) ->
+      {:ok, branch} ->
         judge_caller_branch(dispatch, branch, prefixes, policy)
-
-      {:ok, _not_a_string} ->
-        # Left to `cast_dispatch/1`, which is the one declaration of what the wire accepts.
-        {:ok, dispatch}
 
       :error ->
         with {:ok, branch} <- derive_branch(story, prefixes, policy),
@@ -279,7 +358,6 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   defp judge_caller_branch(dispatch, branch, prefixes, policy) do
     cond do
-      not valid_caller_branch?(branch) -> {:error, {:invalid_branch_name, branch}}
       policy == :advise -> {:ok, dispatch}
       branch_allowed?(branch, prefixes) -> {:ok, dispatch}
       true -> {:error, {:branch_not_allowed, branch, prefixes}}

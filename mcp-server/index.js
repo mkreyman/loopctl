@@ -7995,8 +7995,15 @@ const TOOLS = [
       "not in this call. 422 `branch_not_allowed` is the other half: you passed a `branch` " +
       "outside those prefixes, so the machine would have refused the dispatch — omit it and " +
       "loopctl derives a conforming one. 422 `invalid_branch_name` is a different refusal " +
-      "again: the `branch` you passed is not a valid git ref name at all, so no machine " +
-      "could create it — nothing was claimed, and the remedy is in this call. Neither " +
+      "again: a ref field you passed — `branch` OR `base_branch`, which reaches git on the " +
+      "runner just as `branch` does — is not a string, or is not a valid git ref name, so no " +
+      "machine could create it; nothing was claimed and the remedy is in this call. 422 " +
+      "`branch_not_unique` means the `branch` you passed does not end with this story's own " +
+      "suffix, so two stories on one repository could share a branch and the second session " +
+      "would find the first's work there: keep your prefix and append the suffix the error " +
+      "names, or omit `branch`. 422 `branch_conflict` means a retry named a different branch " +
+      "from the one this dispatch was already sent on — the branch is recorded at the first " +
+      "push and re-sent verbatim, because a session may be running on it right now. Neither " +
       "prefix refusal can be raised by a RETRY carrying a dispatch_id loopctl already " +
       "holds: its claim is already standing, so a declaration that changed under you only " +
       "steers the name and never strands the story.",
@@ -8043,11 +8050,22 @@ const TOOLS = [
             "RUNNER declared it accepts on join (`branch_prefixes`, runner contract 1.14.0) " +
             "— a per-machine fact only the server can read, and the reason this is derived " +
             "rather than named. A branch you pass is never rewritten, so one outside that " +
-            "machine's prefixes is refused 422 `branch_not_allowed`, and one that is not a " +
-            "valid git ref name is refused 422 `invalid_branch_name` (nothing claimed on " +
-            "either). runner_pool shows each machine's `branch_prefixes`.",
+            "machine's prefixes is refused 422 `branch_not_allowed`, one that is not a valid " +
+            "git ref name (or is not a string at all, such as null) is refused 422 " +
+            "`invalid_branch_name`, and one that does not END WITH THIS STORY'S OWN SUFFIX " +
+            "is refused 422 `branch_not_unique` — you may choose the prefix, you may not " +
+            "drop the suffix, which is what keeps two stories on one repository off one " +
+            "branch. Nothing is claimed on any of them. runner_pool shows each machine's " +
+            "`branch_prefixes`.",
         },
-        base_branch: { type: "string", description: "Optional. The branch it is cut from." },
+        base_branch: {
+          type: "string",
+          description:
+            "Optional. The ref the session cuts FROM; defaults to the project's intake " +
+            "source. Judged as a git ref name exactly as `branch` is (422 " +
+            "`invalid_branch_name`, nothing claimed), but NOT story-unique — every dispatch " +
+            "cutting from master is the normal case.",
+        },
         wall_clock_seconds: { type: "integer", description: "Optional. Overrides the default." },
         max_turns: { type: "integer", description: "Optional. Overrides the default." },
       },

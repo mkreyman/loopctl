@@ -1053,19 +1053,33 @@ defmodule Loopctl.Runners do
   reconnecting runner has two entries visible the placement path has no single meta at all —
   the same judgement `single_live_socket/2` makes for every other decision about that machine.
 
-  `[]` is returned for silence, for an empty array, and for a list carrying a non-binary —
-  every one of which means "this machine stated no usable constraint", which is exactly
-  today's behaviour. The declaration is otherwise returned VERBATIM, for the reason
-  `declared_kinds/1` gives at length: filtering here would hide half of what a machine
-  declared from the pool while changing no decision. A prefix that cannot produce a valid
-  branch is settled at the derivation, where the composed name is the thing that can actually
-  be judged, and it refuses the placement rather than being silently dropped — dropped, the
-  next prefix would be used and the runner would refuse the dispatch it produced.
+  `[]` is returned for silence and for an empty array, both of which mean "this machine stated
+  no constraint" — which is exactly the pre-1.14.0 behaviour and what makes the field additive.
+
+  NON-BINARY ENTRIES ARE DROPPED PER ENTRY, NOT ALL-OR-NOTHING (846.2 review round 2, finding
+  6). This used to return `[]` for a list carrying any non-binary, and that is the same
+  all-or-nothing reading that made the two non-cast-meta defences disagree:
+  `Loopctl.Delivery.DispatchPayload.branch_for/2` filters per entry, placement goes through
+  THIS function, so `["loop/", 3]` read as NO CONSTRAINT, loopctl derived `feature/...`, and a
+  machine that really enforces `loop/` refused the dispatch AFTER the claim — the original
+  846.2 failure, reached through the defence written against it. Per-entry is the safer
+  reading of the same list: a machine that stated one usable prefix stated a constraint, and
+  honouring it costs nothing that dropping it does not cost more of.
+
+  This is NOT the `declared_kinds/1` rule and the difference is real. A kind is a MEMBERSHIP
+  test, so an entry this server cannot use simply never matches and filtering it would change
+  no decision while hiding half of what a machine declared. A prefix is CONCATENATED into a
+  name that is then sent, so an unusable entry is not inert — it either constrains or it does
+  not, and reading "one bad entry" as "no constraint at all" is the only reading that can send
+  a name the machine refuses.
+
+  A prefix that survives this and still cannot produce a valid branch is settled at the
+  derivation, where the composed name is the thing that can actually be judged, and it refuses
+  the placement rather than being silently dropped.
   """
   @spec declared_branch_prefixes(map()) :: [String.t()]
-  def declared_branch_prefixes(%{branch_prefixes: [_ | _] = prefixes}) do
-    if Enum.all?(prefixes, &is_binary/1), do: prefixes, else: []
-  end
+  def declared_branch_prefixes(%{branch_prefixes: prefixes}) when is_list(prefixes),
+    do: for(p <- prefixes, is_binary(p), do: p)
 
   def declared_branch_prefixes(meta) when is_map(meta), do: []
 

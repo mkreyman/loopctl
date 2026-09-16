@@ -59,6 +59,9 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :story_id, :binary_id
     field :claim_epoch, :integer
     field :kind, :string
+    # The branch the FIRST push named, so a retry of this dispatch cannot land on another one
+    # (#846.2). NULL on every row written before that column existed.
+    field :branch, :string
     field :status, :string, default: "sent"
     field :reason, :string
     field :reason_detail, :string

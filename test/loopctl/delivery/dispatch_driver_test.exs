@@ -391,6 +391,54 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       leave_channel(channel)
     end
 
+    # 846.2 REVIEW ROUND 2, FINDING 3. `Runners.accepts?/5` knows nothing about branch
+    # prefixes, so a machine whose declaration can produce no valid branch is still
+    # "accepting" — and is selected FIRST, because it is idle and this orders by fewest slots.
+    # Every story for that repository then failed `no_conforming_branch` and the healthy second
+    # runner was never tried: one misconfigured box stopped delivery for a whole repository,
+    # which no placement could do before contract 1.14.0.
+    #
+    # The healthy runner is put at in_flight 1 so the ORDER is decided rather than left to a
+    # UUID comparison: the broken one is genuinely first, which is the case under test.
+    test "a misconfigured runner does not stop the repository — the next one is tried", ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+
+      {healthy_key, healthy} =
+        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
+
+      unusable = join_runner(ctx, %{"branch_prefixes" => ["loop//"]})
+      working = join_as(healthy, healthy_key, "beelink")
+      unboxed(fn -> set_in_flight(healthy.id, 1) end)
+
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:placed]
+
+      # Only the healthy machine can have produced this: the other one composes no valid name.
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.story_id == story.id
+      assert pushed.branch == "feature/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+
+      leave_channel(working)
+      leave_channel(unusable)
+    end
+
+    # The classification survives the fan-out: when EVERY candidate is misconfigured the pass
+    # still reports the state that needs a person, not a `:no_runner` that reads as "wait".
+    test "with every runner misconfigured it is still BLOCKED, not no_runner", ctx do
+      bind_repo(ctx, queued_story(ctx), @repo)
+
+      {other_key, other} =
+        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
+
+      first = join_runner(ctx, %{"branch_prefixes" => ["loop//"]})
+      second = join_as(other, other_key, "beelink", %{"branch_prefixes" => ["bad//"]})
+
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:blocked]
+      refute_push "dispatch", _pushed
+
+      leave_channel(second)
+      leave_channel(first)
+    end
+
     test "a story whose project has no intake source is not selected at all, and does not " <>
            "hold a slot in the batch",
          ctx do
@@ -509,6 +557,22 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       )
 
     # The join's own writes must be committed before the selection reads them.
+    _ = :sys.get_state(channel.channel_pid)
+    channel
+  end
+
+  # `join_runner/2` for a runner other than the one `setup` made, so a test can put two
+  # machines in the pool.
+  defp join_as(runner, key, machine, overrides \\ %{}) do
+    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(key))
+
+    {:ok, _reply, channel} =
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        Map.merge(join_payload(machine), overrides)
+      )
+
     _ = :sys.get_state(channel.channel_pid)
     channel
   end
