@@ -72,6 +72,10 @@ defmodule Loopctl.Config.WorktreePartition do
 
   Returns `nil` for every failure too — that is the safe direction, since it leaves the
   shared database name in place rather than inventing one no tooling knows about.
+
+  The question is about `cd` and about nothing else, so the git query runs with the ambient
+  git environment cleared — see `cleared_git_env/0`, which is what keeps an inherited
+  `GIT_DIR` from answering in this one's place.
   """
   def derive(cd \\ nil) do
     with {:ok, base} <- base_dir(cd),
@@ -169,6 +173,66 @@ defmodule Loopctl.Config.WorktreePartition do
     end
   end
 
+  @doc """
+  The `:env` overrides that strip the ambient git environment from the query.
+
+  A list of `{name, nil}` pairs for `System.cmd/3`'s `:env`, covering every inherited
+  `GIT_*` variable except the `GIT_TRACE*` diagnostics.
+
+  WHY THIS EXISTS. `derive/1` asks ONE question — which worktree does this PATH belong to —
+  and an ambient `GIT_DIR` describing some OTHER directory is never an input to it. A git
+  hook exports `GIT_DIR` (and `GIT_INDEX_FILE`, `GIT_PREFIX`, ...) into every child process,
+  so `mix precommit` run BY the pre-commit hook inherits it, and the derivation then answers
+  about the hook's repository instead of the path it was handed. Measured 2026-09-16 with a
+  linked worktree's private git dir exported and the query run in a directory that is not a
+  repository at all: git exits 0, reports that private dir as `--git-dir` and the common dir
+  as `--git-common-dir` (so the tree classifies as `:linked`) and reports the CWD as
+  `--show-toplevel` — a partition invented for a non-repository. `GIT_WORK_TREE` is the same
+  failure one field over: inside a real linked worktree it moves `--show-toplevel` alone, so
+  the tree stays `:linked` and the partition names a path that is not the tree.
+
+  THE FAILURE IS ASYMMETRIC, WHICH IS WHY IT SURVIVED: a main checkout's hook exports a
+  RELATIVE `GIT_DIR=.git` that resolves nowhere else, so it fails CLOSED by luck, while a
+  linked worktree's is ABSOLUTE and fails OPEN — so every main-tree commit passed the gate
+  and every worktree commit was refused. KB `d1f32cc7` has the full account.
+
+  THE PRECEDENT IS ALREADY IN THIS REPOSITORY, and this file was the one git caller that
+  could not reach it. `Loopctl.DeliveryGates.GitEnv` (2026-09-14, KB d1f32cc7) clears the
+  same discovery variables for the delivery gates, after an inherited GIT_DIR let a
+  measurement fixture commit ten times to the working branch and a drift fixture empty
+  `config/runtime.exs` and push. Its moduledoc states the rule this one follows: `-C` does
+  NOT win against `GIT_DIR`. The list here is a SUPERSET of that module's `@discovery`,
+  and the duplication is forced — `config/test.exs` evaluates before the project is
+  compiled, so nothing under `lib/` is loadable at the moment this runs. What is NOT
+  copied is that module's `GIT_CONFIG_GLOBAL=/dev/null` / `GIT_CONFIG_NOSYSTEM=1` pinning:
+  it buys measurement determinism, and here it would only make git refuse repositories a
+  developer's real `safe.directory` allows.
+
+  A DENY LIST, NOT AN ALLOW LIST. Anything `GIT_*` is assumed to change what git finds
+  unless it is known not to; a variable git adds later is cleared by default rather than
+  discovered by a wrong database. `GIT_TRACE*` is the deliberate exception: it changes what
+  git PRINTS to stderr, never what it finds, the command's own `2>/dev/null` is the defence
+  against it, and that defence is pinned by "still partitions when git writes to stderr on a
+  SUCCESSFUL run" — clearing it here would leave that test green and proving nothing, and
+  there is no env-free replacement: git ignores `trace2.*` from repository-local config
+  (checked on git 2.53.0), so an environment variable is the only way to make a SUCCESSFUL
+  rev-parse write to stderr. THE EXCEPTION ITSELF IS NOT FALSIFIABLE by this repo's suite —
+  flipping this clause to `true` leaves all 22 tests green (`bin/mutate.sh`, exit 1,
+  2026-09-16) — which is tolerable only because clearing GIT_TRACE would change nothing
+  the derivation ANSWERS; it would silence one developer's tracing of one command. Do not
+  read the green as cover for widening the exception to a variable that steers discovery.
+  Clearing `GIT_CONFIG_*` can make git refuse a repository it would otherwise read
+  (`safe.directory`); that direction is a non-zero exit and therefore `nil`, which is the
+  safe one.
+  """
+  def cleared_git_env do
+    for {name, _value} <- System.get_env(), clear_for_query?(name), do: {name, nil}
+  end
+
+  defp clear_for_query?("GIT_TRACE" <> _), do: false
+  defp clear_for_query?("GIT_" <> _), do: true
+  defp clear_for_query?(_), do: false
+
   # One git invocation, three answers, in flag order. Anything unexpected — a missing git
   # binary, a non-zero exit, a path containing a newline — falls through to :error and
   # leaves the database name alone.
@@ -183,10 +247,14 @@ defmodule Loopctl.Config.WorktreePartition do
   # repository` into the suite output for the no-repo case, which `2>/dev/null` also
   # silences. The command is a fixed literal — no interpolation reaches the shell — and
   # `cd` is passed to `System.cmd/3`, not spliced into it.
+  #
+  # THE ENVIRONMENT IS CLEARED IN THE `:env` OPTION, NOT IN THIS STRING, so that the
+  # discovery variables are gone before `sh` starts and nothing has to be quoted into a
+  # command line. `cleared_git_env/0` says what is cleared and why.
   @rev_parse_cmd "git rev-parse --git-dir --git-common-dir --show-toplevel 2>/dev/null"
 
   defp rev_parse(cd) do
-    opts = if cd, do: [cd: cd], else: []
+    opts = [env: cleared_git_env()] ++ if cd, do: [cd: cd], else: []
 
     case System.cmd("sh", ["-c", @rev_parse_cmd], opts) do
       {out, 0} ->
