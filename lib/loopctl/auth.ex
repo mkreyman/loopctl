@@ -142,6 +142,43 @@ defmodule Loopctl.Auth do
     end
   end
 
+  @doc """
+  Query over the api_keys that can AUTHENTICATE right now: not revoked, and not past
+  `expires_at`.
+
+  THE ONE DEFINITION OF "ACTIVE", public so an operator-facing count cannot drift from the
+  predicate a request is actually judged by. That predicate is `load_active_api_key/1` below,
+  re-enforced on a cache hit by `valid_now?/1`. A counter testing `revoked_at IS NULL` alone
+  answers a different question and overstates the live surface by every expired-but-unrevoked
+  row — a set that never drains, because `Loopctl.Workers.RevokeExpiredApiKeysWorker`
+  deliberately never revokes a `user`/`superadmin` key nor any key with a NULL `agent_id`
+  (revoking those destroys the rotate path and frees no
+  `api_keys_one_role_per_agent_idx` slot). Callers: `Loopctl.Tenants`' `active_api_keys/0`
+  behind the two admin counts, and `Loopctl.Knowledge.Analytics.get_agent_usage/3`'s
+  `api_key_count` and `top_articles`.
+
+  Composable and selects nothing, so a caller adds its own scoping and shape:
+
+      from(k in Auth.active_api_keys_query(), where: k.tenant_id == ^tid, select: count(k.id))
+
+  `now` is bound when the query is BUILT, matching `load_active_api_key/1`. The alternative,
+  `fragment("now()")`, is TRANSACTION time in PostgreSQL, which would make an expiry boundary
+  depend on how long a surrounding transaction had been open.
+
+  Not usable as an index predicate, and that is the whole reason the two notions can diverge:
+  a partial-index predicate must be IMMUTABLE and `now()` is STABLE, so
+  `api_keys_one_role_per_agent_idx` can only test revocation.
+  """
+  @spec active_api_keys_query() :: Ecto.Query.t()
+  def active_api_keys_query do
+    now = DateTime.utc_now()
+
+    from(ak in ApiKey,
+      where: is_nil(ak.revoked_at),
+      where: is_nil(ak.expires_at) or ak.expires_at > ^now
+    )
+  end
+
   # Uncached DB read of the ACTIVE (non-revoked, non-expired) api_key for a hash,
   # with :tenant preloaded (custody_halted_at). Mirrors the guards that make a
   # cache HIT safe to re-enforce in `valid_now?/1`.

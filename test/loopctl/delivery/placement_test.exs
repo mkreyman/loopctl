@@ -731,6 +731,17 @@ defmodule Loopctl.Delivery.PlacementTest do
       # marked revoked with a live key would read as recovered and still refuse every later
       # placement onto this agent for the whole TTL.
       assert unboxed(fn -> AdminRepo.get!(ApiKey, recovered.api_key_id) end).revoked_at
+
+      # AND THE STORY STILL NAMES THE DISPATCH. The remedy revokes the credential and does
+      # NOT clear `implementer_dispatch_id`, deliberately — clearing it there would drop real
+      # provenance on every OTHER story that reaches the same call, since force-unclaim cannot
+      # tell this residue from a story genuinely implemented under its dispatch (see the
+      # comment on `Progress.revoke_released_session_credential/3`). Asserted rather than left
+      # implied: the surrounding comments call this call the remediation path, and a reader
+      # would otherwise take it for a total one. What clears the column is the next claim
+      # THROUGH a dispatch, which `place/4` makes on its own.
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).implementer_dispatch_id ==
+               held.id
     end
 
     test "a claim the undo could not give back is PARKED for a human", ctx do

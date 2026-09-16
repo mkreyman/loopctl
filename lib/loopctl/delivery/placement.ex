@@ -676,7 +676,12 @@ defmodule Loopctl.Delivery.Placement do
         "an active key with this role'. Revoke it: POST " <>
         "/api/v1/dispatches/#{session.id}/revoke (MCP revoke_dispatch), or force-unclaim " <>
         "the story — which works BECAUSE this branch leaves the story naming this dispatch " <>
-        "(see `undo_claim/5`). tenant_id=#{tenant_id} dispatch_id=#{session.id} " <>
+        "(see `undo_claim/5`). EITHER REMEDY LEAVES THE STORY NAMING THIS DISPATCH: neither " <>
+        "clears implementer_dispatch_id, deliberately, so until the story is claimed again " <>
+        "through a dispatch its next claimant is refused on report if it holds a key no " <>
+        "dispatch minted (caller_lineage_required) or one sharing this dispatch's chain " <>
+        "(self_report_blocked). A re-claim by place/4 overwrites the column and clears it. " <>
+        "tenant_id=#{tenant_id} dispatch_id=#{session.id} " <>
         "agent_id=#{inspect(session.agent_id)} claim_error=#{inspect(reason)} " <>
         "revoke_error=#{inspect(outcome)}",
       tenant_id: tenant_id
@@ -886,6 +891,30 @@ defmodule Loopctl.Delivery.Placement do
   # it costs every later placement onto that agent a 422 for the whole TTL with no remedy
   # reachable from the story at all.
   #
+  # ### THE REMEDY DOES NOT CLEAR THE ID, and this comment used to read as if it did
+  #
+  # `Progress.force_unclaim_story/3` revokes the credential and frees the slot. It does NOT
+  # clear `implementer_dispatch_id` — `revoke_released_session_credential/3` says so at its
+  # own definition — so after the documented remedy the story still names a dispatch that
+  # never ran, and the refusals two paragraphs up (`caller_lineage_required`,
+  # `self_report_blocked`) still apply to its next claimant. The residue is smaller than the
+  # one the remedy clears, and it is not nothing.
+  #
+  # It is deliberately left, and clearing it inside `force_unclaim_story/3` is NOT the fix.
+  # That function is the operator's release for ANY claimed story, not only for this
+  # compensation's residue, and from inside it the two are indistinguishable: a story that
+  # was genuinely implemented under a dispatch reaches it in the same shape. Clearing there
+  # would drop real provenance and turn a dispatch-minted story into a pre-dispatch-shaped
+  # one, where the L4 gates fall back to `assigned_agent_id` equality alone — so a key in the
+  # implementer's own chain, on a different agent, could report work its own session did. An
+  # orchestrator key is all it takes to arrange, and orchestrator is exactly the role
+  # force-unclaim is gated to. That is the collapse the product exists to prevent; the stale
+  # pointer is the cheaper of the two.
+  #
+  # What actually clears it is the next claim THROUGH A DISPATCH, which `place/4` makes on
+  # its own the next time the loop picks the story up — so the residue is self-healing on the
+  # delivery loop's own path, and durable only for a re-claim with a legacy bearer key.
+  #
   # Each step reports, and `log_undo/5` says so when any of them did not do what it was for.
   # Nothing here rolls anything back on failure: the caller is owed the refusal that brought it
   # here, not a second one.
@@ -946,9 +975,18 @@ defmodule Loopctl.Delivery.Placement do
   end
 
   # TWO TOTAL CLAUSES over what `revoke_session_dispatch/3` returns, matching the shape
-  # `park_unreleased_claim/6` uses and for the same reason: `:ok` is the only success, and a
-  # catch-all would silently absorb a third shape if one were ever added — which on this
-  # branch means silently clearing the handle the remedy needs.
+  # `park_unreleased_claim/6` uses and for the same reason: `:ok` is the only success, and
+  # `{:error, _}` is the only failure — that function returns the `:ok` it maps `{:ok, count}`
+  # to, or the `{:error, term}` half of `Dispatches.revoke/3`'s own spec, which
+  # `log_revoke_failure/4` passes through unchanged.
+  #
+  # The second head matches `{:error, _}` EXPLICITLY and not `_`. It read as a catch-all until
+  # 846.8 while the comment claimed it was total, which is this branch's own subject one file
+  # over — and the consequence was the opposite of what this comment then stated: a new SUCCESS
+  # shape (`{:ok, :already_revoked}`, say) would have been absorbed as "revoke failed", so the
+  # story would have gone on naming a dispatch that WAS revoked, on the healthy path, silently.
+  # A third shape now raises `FunctionClauseError` here, which is the loud failure
+  # `park_unreleased_claim/6` takes for the same reason.
   #
   # `:kept_for_remediation` is not a failure and is not `{:ok, :cleared}`, so `log_undo/5`
   # falls to its warning clause and the line names all three outcomes. That is correct: the
@@ -966,7 +1004,7 @@ defmodule Loopctl.Delivery.Placement do
     error -> {:error, error}
   end
 
-  defp clear_if_revoked(_tenant_id, _story_id, _session, _revoke_failed),
+  defp clear_if_revoked(_tenant_id, _story_id, _session, {:error, _revoke_failed}),
     do: {:ok, :kept_for_remediation}
 
   # THE CONDITION, and it is two total clauses over what `release_claim/5` returns rather than a

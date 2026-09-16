@@ -335,22 +335,30 @@ All notable changes to loopctl are documented here.
 
 ### Fixed
 
-- **The admin "active API keys" counts ignored expiry (846.8).** `GET /api/v1/admin/stats`
-  (`total_api_keys`) and `GET /api/v1/admin/tenants[/:id]` (`api_key_count`) counted
-  `revoked_at IS NULL` alone, so every expired-but-unrevoked key read as active. That set
-  never drains on its own: `RevokeExpiredApiKeysWorker` deliberately never revokes a
-  `user`/`superadmin` key nor any key with no `agent_id`, because doing so would destroy the
-  rotate path without freeing an `api_keys_one_role_per_agent_idx` slot. Both counts now use
-  the auth pipeline's own definition — not revoked AND not past `expires_at` — so
-  **the numbers an operator reads on those two endpoints will DROP** to the keys that can
-  actually authenticate. Nothing about which keys work changed; only the counts did.
+- **The "active API keys" counts ignored expiry (846.8).** `GET /api/v1/admin/stats`
+  (`total_api_keys`), `GET /api/v1/admin/tenants[/:id]` (`api_key_count`) and
+  `GET /api/v1/knowledge/agents/:id/usage` (MCP `knowledge_agent_usage`: `api_key_count`, and
+  the `top_articles` list it scopes to live keys) all counted `revoked_at IS NULL` alone, so
+  every expired-but-unrevoked key read as active. That set never drains on its own:
+  `RevokeExpiredApiKeysWorker` deliberately never revokes a `user`/`superadmin` key nor any
+  key with no `agent_id`, because doing so would destroy the rotate path without freeing an
+  `api_keys_one_role_per_agent_idx` slot — and a `user` key MAY carry an `agent_id`, so it
+  lands in the agent rollup too. All three now share the auth pipeline's own definition,
+  `Loopctl.Auth.active_api_keys_query/0` — not revoked AND not past `expires_at` — so
+  **the numbers an operator reads on those endpoints will DROP** to the keys that can
+  actually authenticate, and `top_articles` will drop reads made by an expired key. Nothing
+  about which keys work changed; only the counts did. The per-agent LEADERBOARD
+  (`GET /api/v1/knowledge/top-articles?group_by=agent`) is deliberately unchanged: its two
+  buckets are exact complements and the second is published as `"revoked"`.
 
 - **`POST /api/v1/stories/:id/force-unclaim` answered a stacktrace instead of an error
   (846.8).** The controller matched only `{:ok, _}` and `{:error, :not_found}`, and the
   context function matched three of its transaction's five steps — so any other refusal was
   a `CaseClauseError`, i.e. an unrendered 500, on the one call an operator makes to unstick a
   parked story. Refusals now render through the standard error body (422 for a rejected
-  release write, 500 with a logged reason otherwise).
+  release write, 500 with a logged reason otherwise), and the endpoint's OpenAPI operation
+  declares 400/422/500 alongside the 200/404/429 it listed before — a client generated from
+  the published schema previously had no case for any of the three.
 
 - **A placement that could not revoke its session credential erased the remedy for it
   (846.8).** `Delivery.Placement`'s compensation cleared the story's

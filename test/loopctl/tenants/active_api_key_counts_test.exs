@@ -18,15 +18,22 @@ defmodule Loopctl.Tenants.ActiveApiKeyCountsTest do
   alias Loopctl.Auth
   alias Loopctl.Tenants
 
-  # Far enough in the past that no clock skew in the assertion window can make it live.
-  @past_expiry DateTime.add(DateTime.utc_now(), -3600, :second)
-  @future_expiry DateTime.add(DateTime.utc_now(), 3600, :second)
+  # FUNCTIONS, NOT MODULE ATTRIBUTES. An attribute is evaluated once, when ExUnit LOADS this
+  # file, so on a full-suite run that takes more than an hour to reach these tests the
+  # "expires in the FUTURE" key has already expired by the time it is written — and the
+  # positive control fails for a reason that has nothing to do with the counter it is
+  # guarding. An hour is not a hypothetical margin here; it is roughly this suite.
+  #
+  # An hour either way, so no clock skew inside an assertion window can move a key across
+  # the boundary.
+  defp past_expiry, do: DateTime.add(DateTime.utc_now(), -3600, :second)
+  defp future_expiry, do: DateTime.add(DateTime.utc_now(), 3600, :second)
 
   describe "tenant_with_stats api_key_count (get_tenant_admin/1, list_tenants_admin/1)" do
     test "an expired but UNREVOKED key is not counted as active" do
       tenant = fixture(:tenant)
       {_raw, expired} = fixture(:api_key, tenant_id: tenant.id, role: :user)
-      {:ok, expired} = Auth.expire_api_key(expired, @past_expiry)
+      {:ok, expired} = Auth.expire_api_key(expired, past_expiry())
 
       # The row is still un-revoked — this is the state the sweep leaves behind for ever,
       # so without an expiry term in the counter it reads as active.
@@ -40,7 +47,7 @@ defmodule Loopctl.Tenants.ActiveApiKeyCountsTest do
       # that returns zero for everything.
       tenant = fixture(:tenant)
       {_raw, future} = fixture(:api_key, tenant_id: tenant.id, role: :user)
-      {:ok, _future} = Auth.expire_api_key(future, @future_expiry)
+      {:ok, _future} = Auth.expire_api_key(future, future_expiry())
       {_raw, _never} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
 
       assert {:ok, stats} = Tenants.get_tenant_admin(tenant.id)
@@ -59,7 +66,7 @@ defmodule Loopctl.Tenants.ActiveApiKeyCountsTest do
     test "list_tenants_admin/1 answers the same, since it shares the predicate" do
       tenant = fixture(:tenant)
       {_raw, expired} = fixture(:api_key, tenant_id: tenant.id, role: :user)
-      {:ok, _} = Auth.expire_api_key(expired, @past_expiry)
+      {:ok, _} = Auth.expire_api_key(expired, past_expiry())
       {_raw, _live} = fixture(:api_key, tenant_id: tenant.id, role: :agent)
 
       assert {:ok, %{data: rows}} = Tenants.list_tenants_admin(search: tenant.slug)
@@ -84,7 +91,7 @@ defmodule Loopctl.Tenants.ActiveApiKeyCountsTest do
 
       tenant = fixture(:tenant)
       {_raw, expired} = fixture(:api_key, tenant_id: tenant.id, role: :user)
-      {:ok, _} = Auth.expire_api_key(expired, @past_expiry)
+      {:ok, _} = Auth.expire_api_key(expired, past_expiry())
 
       assert total_api_keys() == before
 

@@ -150,12 +150,34 @@ defmodule LoopctlWeb.StoryVerificationController do
 
   operation(:force_unclaim,
     summary: "Force unclaim story",
-    description: "Orchestrator force-unclaims a story, resetting it to pending.",
+    description:
+      "Orchestrator force-unclaims a story, resetting it to pending. Idempotent on an " <>
+        "already-pending story, which is the documented remedy for a placement whose " <>
+        "compensation could not revoke the story's session credential. It also revokes that " <>
+        "credential on its way past, freeing the agent's one-key-per-role slot; it does NOT " <>
+        "clear the story's `implementer_dispatch_id`, which is custody provenance.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},
+      400 =>
+        {"The orchestrator API key is not linked to a registered agent", "application/json",
+         Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      # 846.8 AC-5. These two were always reachable and were rendered as an unhandled
+      # `CaseClauseError` — a 500 with a stack trace — until the controller and the context
+      # function were made total over their own return shapes. A client generated from this
+      # schema had no case for either.
+      422 =>
+        {"The release write was rejected: the story row could not be updated to `pending`. " <>
+           "Nothing was released and the story is unchanged.", "application/json",
+         Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`internal_error` — the release transaction rolled back at a step that is not " <>
+           "supposed to be able to refuse (`stage`, `audit` or `webhook_events`). The story " <>
+           "is UNCHANGED — still claimed, still held — the cause is logged server-side with " <>
+           "the step name, and the remedy is to re-run this call.", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 

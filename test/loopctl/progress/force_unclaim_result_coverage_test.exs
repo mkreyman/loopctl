@@ -29,6 +29,12 @@ defmodule Loopctl.Progress.ForceUnclaimResultCoverageTest do
 
   @source_path "lib/loopctl/progress.ex"
 
+  # What a step's atom may look like. DIGITS are in it because `:step_2` is an ordinary step
+  # name and was invisible to the `[a-z_]+` class this used until 846.8's review. Shared by
+  # `multi_steps/1` and `handled_names/1`, which have to agree on it: if only the first is
+  # widened, a covered `:step_2` is reported as uncovered and the guard cries wolf.
+  @atom_name "[a-z_][a-z0-9_]*"
+
   describe "every Multi step has a result clause" do
     test "force_unclaim_story/3's Multi steps are all named in its result case" do
       body = function_source!(File.read!(@source_path), "force_unclaim_story")
@@ -44,9 +50,11 @@ defmodule Loopctl.Progress.ForceUnclaimResultCoverageTest do
       # Without this the assertion above is satisfied by an extractor that finds nothing.
       body = function_source!(File.read!(@source_path), "force_unclaim_story")
 
-      assert "lock" in multi_steps(body)
-      assert "story" in multi_steps(body)
-      assert length(multi_steps(body)) >= 3
+      # Every step the function actually has, by name. Naming them beats a count: adding a
+      # sixth step keeps all five present, so this stays green and the assertion above is the
+      # one that goes red — which is the division of labour these two tests are for.
+      assert Enum.sort(multi_steps(body)) ==
+               ~w(audit lock stage story webhook_events)
     end
 
     test "the check REPORTS a step that has no clause (negative control on the checker)" do
@@ -89,6 +97,64 @@ defmodule Loopctl.Progress.ForceUnclaimResultCoverageTest do
       """
 
       assert uncovered(fabricated) == ["notify_everyone"]
+    end
+
+    test "a step whose pipe the FORMATTER BROKE ACROSS LINES is still seen" do
+      # `mix format` writes this the moment the step's arguments get long, and it is what
+      # `force_unclaim_story/3`'s own steps would become if one more argument were added to
+      # any of them. The per-line scan this file used until 846.8's review saw only `lock`
+      # here — so the sixth step somebody adds is dropped from the comparison and the guard
+      # reports a clean function.
+      fabricated = """
+          multi =
+            Multi.new()
+            |> Multi.run(:lock, fn _repo, _changes -> {:ok, nil} end)
+            |> Multi.run(
+              :notify_everyone,
+              fn _repo, _changes -> {:ok, nil} end
+            )
+
+          case AdminRepo.transaction(multi) do
+            {:error, :lock, reason, _} -> {:error, reason}
+          end
+      """
+
+      assert uncovered(fabricated) == ["notify_everyone"]
+    end
+
+    test "a step whose atom carries a DIGIT is still seen" do
+      # `:step_2` is an ordinary Elixir atom and an ordinary step name; `[a-z_]+` matched only
+      # its `step_` prefix, and `step_` is not the step, so the step read as absent.
+      fabricated = """
+          multi =
+            Multi.new()
+            |> Multi.run(:lock, fn _repo, _changes -> {:ok, nil} end)
+            |> Multi.run(:step_2, fn _repo, _changes -> {:ok, nil} end)
+
+          case AdminRepo.transaction(multi) do
+            {:error, :lock, reason, _} -> {:error, reason}
+          end
+      """
+
+      assert uncovered(fabricated) == ["step_2"]
+    end
+
+    test "a digit-bearing step that IS handled reads as covered, not as a false positive" do
+      # The other half of the widening. `multi_steps/1` and `handled_names/1` have to agree on
+      # what an atom looks like: widening only the first turns a correctly-covered `:step_2`
+      # into a permanent failure, and a guard that fails on correct code gets deleted.
+      fabricated = """
+          multi =
+            Multi.new()
+            |> Multi.run(:step_2, fn _repo, _changes -> {:ok, nil} end)
+
+          case AdminRepo.transaction(multi) do
+            {:error, :step_2, reason, _} -> {:error, reason}
+          end
+      """
+
+      assert multi_steps(fabricated) == ["step_2"]
+      assert uncovered(fabricated) == []
     end
 
     test "a step named only in a COMMENT does not count as covered" do
@@ -148,11 +214,33 @@ defmodule Loopctl.Progress.ForceUnclaimResultCoverageTest do
   # Compared as STRINGS end to end. `String.to_existing_atom/1` would raise on a newly added
   # step whose atom this test process has never loaded — red, but red with an ArgumentError
   # instead of the name of the step somebody forgot, which is the one thing this test is for.
+  # SCANNED ACROSS THE WHOLE CHUNK, not line by line, and over an atom class that admits
+  # digits. Both halves are 846.8 review fixes, and both failure modes were silent in the
+  # direction that matters: a step this does not see is DROPPED from the comparison, so
+  # `uncovered/1` answers `[]` and the guard passes green on precisely the regression it is
+  # the only defence against. The two spellings that were invisible are the realistic ones —
+  #
+  #   * the formatter breaking a long step across lines:
+  #
+  #         |> Multi.run(
+  #           :notify_everyone,
+  #           fn _repo, _changes -> ... end
+  #         )
+  #
+  #   * an atom carrying a digit, `:step_2`.
+  #
+  # Against a body containing both, the per-line `[a-z_]+` scan found only `["lock"]`. Each
+  # has its own negative control above, because a fix with no control is the same vacuity one
+  # generation later, which is this file's whole subject.
+  #
+  # Comments are still stripped LINE BY LINE, before the join — which is why this joins
+  # `code_lines/1`'s output rather than scanning `multi_half/1` whole. A step named only in a
+  # comment therefore still does not count, and its control stays green.
   defp multi_steps(body) do
-    body
-    |> multi_half()
-    |> code_lines()
-    |> Enum.flat_map(&Regex.scan(~r/\|>\s*[A-Za-z_][\w.]*\(\s*:([a-z_]+)\s*,/, &1))
+    chunk = body |> multi_half() |> code_lines() |> Enum.join("\n")
+
+    ~r/\|>\s*[A-Za-z_][\w.]*\(\s*:(#{@atom_name})\s*,/
+    |> Regex.scan(chunk)
     |> Enum.map(fn [_, name] -> name end)
     |> Enum.uniq()
   end
@@ -176,12 +264,12 @@ defmodule Loopctl.Progress.ForceUnclaimResultCoverageTest do
   defp handled_names(body) do
     chunk = body |> result_half() |> code_lines() |> Enum.join("\n")
 
-    heads = Regex.scan(~r/\{\s*:error\s*,\s*:([a-z_]+)\s*,/, chunk)
+    heads = Regex.scan(~r/\{\s*:error\s*,\s*:(#{@atom_name})\s*,/, chunk)
 
     guards =
       ~r/\bwhen\s+\w+\s+in\s+\[([^\]]*)\]/
       |> Regex.scan(chunk)
-      |> Enum.flat_map(fn [_, list] -> Regex.scan(~r/:([a-z_]+)/, list) end)
+      |> Enum.flat_map(fn [_, list] -> Regex.scan(~r/:(#{@atom_name})/, list) end)
 
     (heads ++ guards) |> Enum.map(fn [_, name] -> name end) |> Enum.uniq()
   end

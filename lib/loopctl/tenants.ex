@@ -1302,7 +1302,6 @@ defmodule Loopctl.Tenants do
       |> AdminRepo.one()
 
     alias Loopctl.Agents.Agent
-    alias Loopctl.Auth.ApiKey
     alias Loopctl.Projects.Project
     alias Loopctl.WorkBreakdown.Epic
     alias Loopctl.WorkBreakdown.Story
@@ -1552,18 +1551,14 @@ defmodule Loopctl.Tenants do
   # These are ordinary queries and may test `expires_at` freely. The partial unique index
   # `api_keys_one_role_per_agent_idx` may NOT: a partial-index predicate must be IMMUTABLE
   # and `now()` is STABLE, which is the whole reason the two notions can diverge at all.
-  defp active_api_keys do
-    import Ecto.Query
-
-    alias Loopctl.Auth.ApiKey
-
-    now = DateTime.utc_now()
-
-    from(ak in ApiKey,
-      where: is_nil(ak.revoked_at),
-      where: is_nil(ak.expires_at) or ak.expires_at > ^now
-    )
-  end
+  #
+  # DELEGATED rather than spelled out here. The predicate had been copied to a third
+  # operator-facing count — `Loopctl.Knowledge.Analytics.get_agent_usage/3` — where it was
+  # still revocation-only, so writing it out a second time in this module would have left
+  # exactly the drift this fix is about: three sites, no way for any of them to notice the
+  # others moving. `Loopctl.Auth` owns it because `Auth.load_active_api_key/1` is the
+  # predicate a request is actually judged by, and matching it is the whole point.
+  defp active_api_keys, do: Auth.active_api_keys_query()
 
   defp count_stories_by_field(field) do
     import Ecto.Query

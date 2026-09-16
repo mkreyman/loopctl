@@ -2960,6 +2960,24 @@ defmodule Loopctl.Progress do
   # provenance, `get_dispatch_lineage/2` reads a revoked row exactly as it reads a live one, and
   # every L4 comparison is therefore unchanged by this.
   #
+  # NOT CLEARING IT HAS A COST, and it is stated here rather than left for a reader to
+  # discover: when this call is the remedy for a placement whose compensation could not revoke
+  # (`Delivery.Placement.undo_claim/5`), the credential dies but the story goes on naming the
+  # dispatch that never ran — so the next claimant is still refused on report if it holds a key
+  # no dispatch minted (`caller_lineage_required`) or one sharing that dispatch's chain
+  # (`self_report_blocked`), until a claim THROUGH A DISPATCH overwrites the column.
+  #
+  # Clearing it here would be worse, and the asymmetry is why this is not a TODO. Force-unclaim
+  # is the operator's release for ANY claimed story; from inside it, a story whose dispatch did
+  # nothing and one whose dispatch genuinely implemented it are the same shape. Clearing would
+  # therefore drop real provenance and reduce a dispatch-minted story to the pre-dispatch shape,
+  # where `lineage_status/2` returns `:ok` on the nil and the gates fall back to
+  # `assigned_agent_id` equality alone — letting a key in the implementer's own chain, on a
+  # different agent, report the work that chain did. `force_unclaim` is `exact_role:
+  # :orchestrator`, which is precisely the role that could arrange it. A narrower rule was
+  # looked for and none holds: `lifecycle_entered_at` is stamped by BOTH cases, and a second
+  # force-unclaim of an already-`pending` worked story is indistinguishable from the residue.
+  #
   # AND IT SWALLOWS A RAISE, not only an `{:error, _}`. `Dispatches.revoke/3` returns tuples
   # from its own Multi, but the statements under it are ordinary AdminRepo calls on a
   # 3-connection pool with no `lock_timeout`, so a DBConnection error is a RAISE. Unrescued,

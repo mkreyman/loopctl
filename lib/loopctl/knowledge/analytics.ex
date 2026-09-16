@@ -40,6 +40,7 @@ defmodule Loopctl.Knowledge.Analytics do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
+  alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
@@ -711,6 +712,16 @@ defmodule Loopctl.Knowledge.Analytics do
   # agent link, then LEFT JOIN agents so keys without a linked agent
   # still appear (bucketed under `agent_id: nil`, `agent_name: "unassigned"`).
   # Revoked keys are handled in a separate sentinel rollup below.
+  #
+  # REVOCATION ALONE HERE, deliberately, and NOT `Auth.active_api_keys_query/0`
+  # the way `build_agent_usage/4` does it. This is not a claim about who can
+  # authenticate now; it is a PARTITION of the window's events into two buckets
+  # whose predicates must stay exact complements, and the second bucket is
+  # published to operators under the name "revoked" (TC-25.2.8). Adding expiry
+  # to this half alone would drop every expired-key event out of BOTH buckets
+  # and the leaderboard would silently lose rows; adding it to both would file
+  # expired keys under a row labelled "revoked". Moving it is a rename of an
+  # operator-facing row, not this fix.
   defp list_top_by_agent(tenant_id, since, access_type, project_id, limit, offset) do
     # Live keys — keys that exist AND are not revoked.
     live_query =
@@ -833,16 +844,18 @@ defmodule Loopctl.Knowledge.Analytics do
   - `:api_key_id` -- the caller-supplied id (when `resolved_as == :api_key`)
   - `:agent_id` -- the logical agent id (when `resolved_as == :agent`)
   - `:agent_name` -- the agent's name (when `resolved_as == :agent`)
-  - `:api_key_count` -- number of *live* (non-revoked) keys currently
-    belonging to the agent (when `resolved_as == :agent`)
+  - `:api_key_count` -- number of *active* keys currently belonging to the
+    agent (when `resolved_as == :agent`): neither revoked nor past
+    `expires_at`, i.e. the keys that can authenticate right now. It counted
+    un-revoked keys alone until 846.8, which included expired ones
   - `:total_reads` -- total events across ALL keys (live + revoked) for
     the agent. Revoked-key events still count toward historical totals.
   - `:unique_articles` -- distinct articles across ALL keys (live + revoked)
   - `:access_by_type` -- per-type counts across ALL keys (live + revoked)
-  - `:top_articles` -- top articles read via *live* keys only. Revoked-key
-    reads are excluded here so the list reflects the agent's current
-    operational surface. This is the only field that uses the live-keys
-    subset; every other aggregate includes revoked-key history.
+  - `:top_articles` -- top articles read via *active* keys only. Reads by a
+    key that is revoked OR expired are excluded here so the list reflects the
+    agent's current operational surface. This is the only field that uses the
+    active-keys subset; every other aggregate includes the full history.
 
   …or `{:error, :not_found}` if neither an api_key nor an agent with the
   given id exists in the tenant.
@@ -952,6 +965,10 @@ defmodule Loopctl.Knowledge.Analytics do
   # current operational surface. This intentional split means
   # `sum(top_articles[:access_count])` can be less than `total_reads`
   # when the agent has revoked keys with historical reads.
+  #
+  # "Live" here means ACTIVE, which is the auth pipeline's definition and not
+  # revocation alone: an expired key cannot authenticate either, so it is no
+  # part of a CURRENT surface. See `Auth.active_api_keys_query/0`.
   defp build_agent_usage(tenant_id, agent_id, since, limit) do
     agent = AdminRepo.get_by(Agent, id: agent_id, tenant_id: tenant_id)
 
@@ -963,10 +980,19 @@ defmodule Loopctl.Knowledge.Analytics do
         select: k.id
       )
 
+    # ACTIVE, not merely un-revoked (846.8 review). `Auth.active_api_keys_query/0` is the
+    # auth pipeline's own predicate — not revoked AND not past `expires_at` — and these two
+    # fields claim to describe the agent's CURRENT OPERATIONAL SURFACE, so a key that can no
+    # longer authenticate does not belong in either. Testing revocation alone counted every
+    # expired-but-unrevoked key, and that set does not drain on its own: the sweep reaches
+    # agent-keyed keys but never a `user`/`superadmin` one, and a `user` key may carry an
+    # `agent_id` and so land in this rollup.
+    #
+    # Shared with the two admin counts (`Loopctl.Tenants`' `active_api_keys/0`) through that
+    # one function rather than copied, which is how this site came to disagree with them.
     live_keys =
-      from(k in ApiKey,
+      from(k in Auth.active_api_keys_query(),
         where: k.agent_id == ^agent_id and k.tenant_id == ^tenant_id,
-        where: is_nil(k.revoked_at),
         select: k.id
       )
 
@@ -996,9 +1022,8 @@ defmodule Loopctl.Knowledge.Analytics do
       |> Map.new()
 
     api_key_count =
-      from(k in ApiKey,
-        where: k.agent_id == ^agent_id and k.tenant_id == ^tenant_id,
-        where: is_nil(k.revoked_at)
+      from(k in Auth.active_api_keys_query(),
+        where: k.agent_id == ^agent_id and k.tenant_id == ^tenant_id
       )
       |> AdminRepo.aggregate(:count, :id)
 

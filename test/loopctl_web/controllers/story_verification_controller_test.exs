@@ -951,6 +951,66 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
     end
   end
 
+  describe "force_unclaim's OpenAPI responses cover every shape it can return" do
+    # 846.8 review. `operation(:force_unclaim, ...)` declared 200/404/429 while the action
+    # could also answer 400, 422 and 500, and the CHANGELOG entry in this same change
+    # announced two of them — so a client generated from the published schema had no case for
+    # the refusals an operator is most likely to hit.
+    #
+    # Bound to the RENDERER, not to a list of numbers written twice. Each shape below is one
+    # `Progress.force_unclaim_story/3`'s `@spec` admits (or, for the 400, one the action's own
+    # guard produces); it is pushed through the `action_fallback` this controller mounts, and
+    # the status that comes BACK is what the documented map has to contain. Adding a shape
+    # without documenting it fails here, and so does re-rendering an existing one.
+    test "every error shape the action can produce renders a status the spec declares" do
+      documented =
+        Loopctl.ApiSpec.spec().paths["/api/v1/stories/{id}/force-unclaim"].post.responses
+        |> Map.keys()
+
+      # Not `> 0`: a spec that lost its error rows entirely would satisfy that while the
+      # assertion below passed on an empty shape list.
+      assert 200 in documented
+
+      shapes = [
+        {:error, :bad_request, "orchestrator key is not linked to an agent"},
+        {:error, :not_found},
+        {:error, invalid_story_changeset()},
+        {:error, :force_unclaim_failed}
+      ]
+
+      rendered =
+        ExUnit.CaptureLog.capture_log(fn ->
+          statuses =
+            Enum.map(shapes, fn shape ->
+              LoopctlWeb.FallbackController.call(build_conn(), shape).status
+            end)
+
+          send(self(), {:statuses, statuses})
+        end)
+
+      assert_received {:statuses, statuses}
+      assert rendered =~ "force_unclaim_failed"
+
+      # The shapes really do reach four DIFFERENT statuses — otherwise one undocumented
+      # number could hide behind three documented ones.
+      assert Enum.sort(statuses) == [400, 404, 422, 500]
+
+      for status <- statuses do
+        assert status in documented,
+               "POST /stories/{id}/force-unclaim can answer #{status}, and its operation/2 " <>
+                 "does not declare it. Declared: #{inspect(Enum.sort(documented))}."
+      end
+    end
+  end
+
+  # The shape the `:story` Multi step returns when the release UPDATE is rejected — an
+  # invalid `Story` changeset, which the fallback renders 422.
+  defp invalid_story_changeset do
+    %Loopctl.WorkBreakdown.Story{}
+    |> Ecto.Changeset.change(%{})
+    |> Ecto.Changeset.add_error(:agent_status, "is invalid")
+  end
+
   # --- Tenant isolation tests ---
 
   describe "tenant isolation" do
