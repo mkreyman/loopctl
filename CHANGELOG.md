@@ -240,6 +240,54 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A story stuck at `claimed` can be freed: `force_unclaim_story` (#846).** `POST
+  /api/v1/stories/:id/force-unclaim` resets the story to `pending` AND makes its delivery
+  stage row follow the release back to `queued`. It had no MCP tool, and every session on the
+  fleet reaches loopctl through the MCP server and only through it, so a story left holding a
+  claim nobody was working could be freed by a shell on the production node and by nothing
+  else. No endpoint changed; this is the tool the rule in `CLAUDE.md` already required.
+
+  **It frees the STAGE. It does not make the story placeable, and the first draft of this
+  entry said it did.** `Placement.claimable/2` wants `agent_status: :contracted` AND stage
+  `queued`; the release leaves the story at `:pending`, whose only transition is
+  `pending -> contracted`. An operator who read the old copy, ran the tool and then ran
+  `place_dispatch` got back the identical 409 `invalid_transition` the copy claimed to cure.
+  The remedy is three calls, in this order, and every description now says so:
+  `force_unclaim_story`, then `contract_story`, then `place_dispatch`. (`resolve_escalation` is the verb that does both —
+  `Escalations.prepare_story/5` releases and re-contracts on its `queued` route — which is why
+  the entry below can claim placeability and this one cannot.)
+
+  **Nor is a parked story what a refused dispatch normally leaves**, which the old copy also
+  said. `Placement.place/4` answers a `Runners.dispatch/3` refusal INLINE with `undo_claim/5`:
+  it releases the claim, unrecords the session dispatch and revokes it. If that release itself
+  fails, the claim lease is a further backstop — `Progress.reclaim_expired_claim/3` releases
+  over `:runner_lost` and requeues the stage, swept every five minutes once `claimed_until`
+  has passed. A story still at `claimed` with nobody on it is therefore the residue of a
+  compensation that did not complete, and this tool is for taking it back now rather than at
+  lease expiry.
+
+  **It needs an ORCHESTRATOR-ROLE key, and exactly that role.** The action is
+  `exact_role: :orchestrator`, where the role hierarchy does not apply, so a user or superadmin
+  key is 403'd there like any other non-member. Set `LOOPCTL_ORCH_KEY` and that is the key sent,
+  with no `LOOPCTL_API_KEY` substitution; with no orchestrator key set, `LOOPCTL_API_KEY` is
+  still sent, so an orchestrator-role global key works. The key must also be linked to a
+  registered agent, and the tenant must be human-anchored.
+
+  **NOTHING BREAKS IF YOU HAVE ONLY A GLOBAL KEY**, and no action is required of you. The same
+  honouring of `LOOPCTL_ORCH_KEY` now covers `verify_story`, `reject_story`, `verify_all_in_epic`
+  and `bulk_mark_complete`, which are gated by the same plug and were discarding an orchestrator
+  key you had set in favour of whatever `LOOPCTL_API_KEY` held. Every configuration that worked
+  before still works: the pin applies only when `LOOPCTL_ORCH_KEY` is set, and a
+  `LOOPCTL_API_KEY` holding an orchestrator-role key still reaches the gate — the server tests
+  the key's ROLE, not which variable carried it. (An earlier draft of this entry told you to set
+  `LOOPCTL_ORCH_KEY` because those four "now refuse locally, naming the variable". They do not.
+  That unconditional pin was reverted before release for breaking a documented configuration in
+  a minor version, and this paragraph described it for one round after the code stopped doing
+  it.)
+
+  The npm package's own entry for 2.97.0 in `mcp-server/CHANGELOG.md` is the detailed record of
+  the same change; the two say the same thing and neither supersedes the other.
+
 - **The delivery loop is reachable from a session: `place_dispatch`, `story_stage`,
   `resolve_escalation` (#803, #850).** Three MCP tools and the two endpoints two of them
   needed. The placement endpoint shipped with #842 and NO tool called it — and `curl` at

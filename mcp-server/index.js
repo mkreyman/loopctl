@@ -42,12 +42,14 @@ import {
   createGeneratedToolsRuntime,
   GENERATED_TOOL_PREFIX,
 } from "./lib/generated-tools.js";
+import { exactKeyMissingMessage, orchestratorKeyArgs } from "./lib/custody-key.js";
 import { createHandoff } from "./lib/handoff.js";
 import { readPayloadFile } from "./lib/payload-path.js";
 import { enrollRunner, listRunners, revokeRunner, runnerPool } from "./lib/runners.js";
 import { claimLeaseNotice, renewStoryClaim as renewStoryClaimRequest } from "./lib/claim-lease.js";
 import { escalateStory as escalateStoryRequest, escalationNotice } from "./lib/escalation.js";
 import {
+  forceUnclaimStory as forceUnclaimStoryRequest,
   placeDispatch as placeDispatchRequest,
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
@@ -149,12 +151,38 @@ function cachedClientContextHeader() {
   return clientContextHeaderCache;
 }
 
-async function apiCall(method, path, body, keyOverride, { exactKey = false, timeoutMs } = {}) {
+async function apiCall(
+  method,
+  path,
+  body,
+  keyOverride,
+  { exactKey = false, timeoutMs, keyHint } = {},
+) {
   const url = `${getBaseUrl()}${path}`;
-  // Secret-managing tools pass exactKey:true so the request uses the EXACT
-  // role-pinned key (LOOPCTL_USER_KEY) and does NOT fall back to the global
-  // LOOPCTL_API_KEY override — a secret op must never silently run under a
-  // non-user global key (review #12).
+  // `exactKey` sends `keyOverride` VERBATIM instead of consulting `resolveKey`
+  // (defined above), whose priority is LOOPCTL_API_KEY > keyOverride >
+  // LOOPCTL_ORCH_KEY — so without it a global LOOPCTL_API_KEY displaces the key a
+  // tool names. Two families pass it, for two different reasons:
+  //
+  //   - USER-ROLE-PINNED tools pass LOOPCTL_USER_KEY with `exactKey: true`
+  //     UNCONDITIONALLY. Named rather than cited by line, because a line number here
+  //     drifts with every edit above it: `llmConfig` / `setLlmConfig`, the egress
+  //     allowlist verbs (`clearLocalOnly`, `declareTrustedEndpoint`,
+  //     `revokeTrustedEndpoint`), the WebAuthn enrollment and revocation verbs
+  //     (`requestAuthenticatorChallenge`, `enrollAuthenticator`,
+  //     `requestAuthenticatorRevokeChallenge`, `revokeAuthenticator`), and the shared
+  //     `runnerDeps()` / `deliveryDeps()` factories — the latter covering
+  //     `place_dispatch` and `resolve_escalation`, which need an unlineaged human
+  //     principal. `grep -n 'exactKey: true' index.js` is the current list. None of
+  //     them may silently run under a global key of another role (review #12).
+  //   - The `exact_role: :orchestrator` CUSTODY verbs pass it CONDITIONALLY, and
+  //     nothing here decides that: `orchestratorKeyArgs` (`lib/custody-key.js`)
+  //     returns `exactKey` only when LOOPCTL_ORCH_KEY is set, and returns no options
+  //     at all when only LOOPCTL_API_KEY is — an orchestrator-role global key was a
+  //     working, documented configuration before 2.97.0 and still reaches the gate.
+  //     The reason for pinning is the operator's EXPRESSED CHOICE of variable, never
+  //     the shape of the server's 403; `lib/custody-key.js` reads the plug and shows
+  //     why that 403 was never ambiguous.
   const key = exactKey ? keyOverride : resolveKey(keyOverride);
 
   if (!key) {
@@ -162,7 +190,12 @@ async function apiCall(method, path, body, keyOverride, { exactKey = false, time
       error: true,
       status: 0,
       body: exactKey
-        ? "No user-role API key configured. Set LOOPCTL_USER_KEY to a user-role key to manage LLM configuration."
+        ? // `keyHint` names the env var THIS site is pinned to. Without it the message
+          // below talks about LLM configuration, which is right for set_llm_config and
+          // actively misleading for a custody verb that is missing its orchestrator key.
+          keyHint
+          ? exactKeyMissingMessage(keyHint)
+          : "No user-role API key configured. Set LOOPCTL_USER_KEY to a user-role key to manage LLM configuration."
         : "No API key configured. Set LOOPCTL_API_KEY, LOOPCTL_ORCH_KEY, or LOOPCTL_AGENT_KEY.",
     };
   }
@@ -1246,21 +1279,34 @@ async function verifyStory({ story_id, summary, review_type, claim }) {
   if (review_type) body.review_type = review_type;
   if (claim) body.claim = claim;
 
+  // `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`). When
+  // LOOPCTL_ORCH_KEY is set it is sent EXACTLY, because `resolveKey` would otherwise
+  // discard it in favour of a global LOOPCTL_API_KEY on the very calls it was set for.
+  // When it is NOT set, the global key still goes — see lib/custody-key.js for why the
+  // pin is narrowed that way, and for what the 403 from that gate actually says.
+  const orch = orchestratorKeyArgs();
+
   const result = await apiCall(
     "POST",
     `/api/v1/stories/${story_id}/verify`,
     body,
-    process.env.LOOPCTL_ORCH_KEY
+    orch.override,
+    orch.options,
   );
   return toContent(result);
 }
 
 async function rejectStory({ story_id, reason }) {
+  // `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`) — see
+  // lib/custody-key.js.
+  const orch = orchestratorKeyArgs();
+
   const result = await apiCall(
     "POST",
     `/api/v1/stories/${story_id}/reject`,
     { reason },
-    process.env.LOOPCTL_ORCH_KEY
+    orch.override,
+    orch.options,
   );
   return toContent(result);
 }
@@ -1269,21 +1315,31 @@ async function rejectStory({ story_id, reason }) {
 
 async function bulkMarkComplete({ stories }) {
   // stories: [{story_id, summary, review_type}]
+  // `exact_role: :orchestrator` (`bulk_operations_controller.ex:24-25`) — see
+  // lib/custody-key.js.
+  const orch = orchestratorKeyArgs();
+
   const result = await apiCall(
     "POST",
     "/api/v1/stories/bulk/mark-complete",
     { stories },
-    process.env.LOOPCTL_ORCH_KEY
+    orch.override,
+    orch.options,
   );
   return toContent(result);
 }
 
 async function verifyAllInEpic({ epic_id, review_type, summary }) {
+  // `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`, `:verify_all`) —
+  // see lib/custody-key.js.
+  const orch = orchestratorKeyArgs();
+
   const result = await apiCall(
     "POST",
     `/api/v1/epics/${epic_id}/verify-all`,
     { review_type, summary },
-    process.env.LOOPCTL_ORCH_KEY
+    orch.override,
+    orch.options,
   );
   return toContent(result);
 }
@@ -3186,6 +3242,26 @@ async function storyStage(args) {
 
 async function resolveEscalation(args) {
   return toContent(await resolveEscalationRequest(args, deliveryDeps()));
+}
+
+// #846: force-unclaim is `exact_role: :orchestrator`
+// (`story_verification_controller.ex:29-30`), so this is the one delivery-loop verb that wants
+// the ORCH key. Same selection as the other four custody verbs: when LOOPCTL_ORCH_KEY is set it
+// is sent EXACTLY, because `resolveKey` (`index.js:132-138`) would otherwise discard it for a
+// global LOOPCTL_API_KEY on the one call it was set for; when it is not set, a global key still
+// goes, because an orchestrator-role LOOPCTL_API_KEY was a documented, working configuration
+// before 2.97.0. `orch.resolved` is undefined only when NEITHER is set, which is the one case
+// `forceUnclaimStoryRequest` refuses locally. `keyHint` rides along so the missing-key message
+// names LOOPCTL_ORCH_KEY instead of apiCall's LLM-config default (`index.js:174-181`).
+async function forceUnclaimStory(args) {
+  const orch = orchestratorKeyArgs();
+
+  return toContent(
+    await forceUnclaimStoryRequest(args, {
+      orchKey: orch.resolved,
+      apiCall: (method, path, body) => apiCall(method, path, body, orch.override, orch.options),
+    }),
+  );
 }
 
 // US-26: Signed Tree Head retrieval
@@ -7745,6 +7821,52 @@ const TOOLS = [
       required: ["story_id", "to"],
     },
   },
+  {
+    name: "force_unclaim_story",
+    description:
+      "TAKE A STORY BACK from the agent holding it (POST /api/v1/stories/:id/force-unclaim). " +
+      "Two things happen: the story resets to `agent_status: pending` with " +
+      "`assigned_agent_id` cleared, AND — in the same transaction — its delivery stage row " +
+      "follows the release back to `queued`.\n\n" +
+      "IT FREES THE STAGE; IT DOES NOT MAKE THE STORY PLACEABLE. place_dispatch wants " +
+      "`agent_status: contracted` AND stage `queued` (`Placement.claimable/2`), and the " +
+      "release leaves the story at `pending`, whose only transition is `pending -> " +
+      "contracted`. Run place_dispatch straight after this one and you get back the IDENTICAL " +
+      "409 `invalid_transition`. THE REMEDY IS THREE CALLS, in this order: " +
+      "force_unclaim_story, then contract_story, then place_dispatch.\n\n" +
+      "WHEN TO REACH FOR IT. A story sitting at `claimed` with nobody on it is the residue of " +
+      "a compensation that did not complete — it is NOT what a refused dispatch normally " +
+      "leaves. Placement answers a runner's refusal INLINE by releasing the claim itself " +
+      "(`Placement.undo_claim/5`), and if that release fails the claim lease is a further " +
+      "backstop: `Progress.reclaim_expired_claim/3` releases over `:runner_lost` and requeues " +
+      "the stage, unattended, once `claimed_until` has passed. Use this tool to get the story " +
+      "back NOW rather than at lease expiry, or when both of those have left it held.\n\n" +
+      "The release requeues from any stage a claim holds (`claimed`, `worktree`, " +
+      "`implementing`, `reviewing`, `pr_open`, `ci`); a stage no claim holds keeps its stage " +
+      "and is rebound to the new claim epoch; `done` and `failed` are left alone. An ESCALATED " +
+      "story is not this tool's job — use resolve_escalation, which releases AND re-contracts " +
+      "for you, so a story it sends to `queued` really is placeable.\n\n" +
+      "REFUSALS. Requires an ORCHESTRATOR-ROLE key, in LOOPCTL_ORCH_KEY or LOOPCTL_API_KEY: " +
+      "the action is `exact_role: :orchestrator`, so a user or superadmin key is 403'd like " +
+      "any other non-member and reaching for a higher-privileged key does NOT get past it. " +
+      "When LOOPCTL_ORCH_KEY is set it is the key sent, and a global LOOPCTL_API_KEY does not " +
+      "displace it. The orchestrator key must also be LINKED TO " +
+      "A REGISTERED AGENT — an unlinked one is refused 400 naming that — and the tenant must be " +
+      "human-anchored (403 `custody_tier_required` otherwise). 404 for an unknown story, 429 " +
+      "when rate limited. A `story_id` that is not a UUID is refused here, before any call.\n\n" +
+      "It does NOT touch `verified_status`, and it is safe to run twice: on an already-pending " +
+      "story the stage row is written only when it needs to be — a row STRANDED behind the " +
+      "story's claim epoch is rebound to it (the remedy for a row an older release left " +
+      "behind) and an in-flight row is requeued, while a row already at that epoch is left " +
+      "exactly as it is. It takes no request body.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The story UUID to free." },
+      },
+      required: ["story_id"],
+    },
+  },
 
   // LCP-1 §9 signed-profile tools
   {
@@ -8775,6 +8897,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "resolve_escalation":
       return await resolveEscalation(args);
+
+    case "force_unclaim_story":
+      return await forceUnclaimStory(args);
 
     case "register_custody_owner_key":
       return await registerCustodyOwnerKey(args);

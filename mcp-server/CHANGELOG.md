@@ -5,6 +5,117 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.97.0 — 2026-09-15 (a story stuck at `claimed` can be freed)
+
+### Added
+
+- **`force_unclaim_story`** (loopctl #846, `POST /api/v1/stories/:id/force-unclaim`, ORCH key).
+  Takes a story back from the agent holding it: `agent_status` to `pending`,
+  `assigned_agent_id` cleared, and — in the same transaction — the delivery stage row follows
+  the release back to `queued`. The endpoint was the only thing that could free such a story
+  and no tool called it, so it was reachable by a shell on the production node and by nothing
+  else.
+
+  **IT FREES THE STAGE; IT DOES NOT MAKE THE STORY PLACEABLE.** `Placement.claimable/2` wants
+  `agent_status: :contracted` AND stage `queued`, and the release leaves the story at
+  `:pending`, whose only transition is `pending -> contracted`. Run `place_dispatch` next and
+  you get back the identical 409 `invalid_transition`. The remedy is THREE CALLS, in this
+  order: `force_unclaim_story`, then `contract_story`, then `place_dispatch`.
+  `resolve_escalation` is the verb that does both for you — it releases AND re-contracts on
+  its `queued` route.
+
+  **When to reach for it.** A story sitting at `claimed` with nobody on it is the residue of a
+  compensation that did not complete, not what a refused dispatch normally leaves: placement
+  answers a runner's refusal inline by releasing the claim itself, and if that release fails
+  the claim lease releases it unattended once `claimed_until` has passed. Use this tool to get
+  the story back now rather than at lease expiry.
+
+  It needs an ORCHESTRATOR-ROLE key. The action is `exact_role: :orchestrator`, so a user or
+  superadmin key is 403'd there like any other non-member. Set `LOOPCTL_ORCH_KEY` and that is
+  the key sent, with no `LOOPCTL_API_KEY` substitution; with no orchestrator key set,
+  `LOOPCTL_API_KEY` is still sent, so an orchestrator-role global key works. The orchestrator
+  key must also be linked to a registered agent, and the tenant must be human-anchored.
+
+### Changed
+
+- **A `LOOPCTL_ORCH_KEY` you set is no longer discarded** by `verify_story`, `reject_story`,
+  `verify_all_in_epic`, `bulk_mark_complete` and `force_unclaim_story`. All five are
+  `exact_role: :orchestrator` endpoints, where the role hierarchy does not apply, and all five
+  passed the orchestrator key to `resolveKey` — which prefers a global `LOOPCTL_API_KEY` over
+  it. So an operator running `LOOPCTL_ORCH_KEY` for the custody verbs and `LOOPCTL_API_KEY` of
+  another role for everything else had the orchestrator key silently dropped on exactly the
+  calls they set it for. When `LOOPCTL_ORCH_KEY` is set, it is now the key sent.
+
+  **NOTHING BREAKS IF YOU HAVE ONLY A GLOBAL KEY.** `LOOPCTL_API_KEY` holding an
+  orchestrator-role key, with no `LOOPCTL_ORCH_KEY` at all, was documented and working, and
+  the gate accepts it — the server tests the key's ROLE, not which variable it came from. It
+  is still sent. The pin applies only when `LOOPCTL_ORCH_KEY` is set. (A draft of this release
+  pinned unconditionally, which refused that configuration locally and told the operator their
+  key was the wrong role when it was not.) `report_story` and `review_complete` are unpinned
+  for the same reason, one case wider: their gates take a role RANGE, and the fallback is what
+  makes the common agent configuration work — that is `LOOPCTL_API_KEY` set to an agent key.
+  `LOOPCTL_AGENT_KEY` alone is NOT that configuration for these two, and never was: `resolveKey`
+  reads `LOOPCTL_API_KEY`, then the TOOL'S OWN key, then `LOOPCTL_ORCH_KEY`, and never
+  `LOOPCTL_AGENT_KEY` by name — and both `report_story` and `review_complete` name
+  `LOOPCTL_ORCH_KEY` as their own, so under `LOOPCTL_AGENT_KEY` alone they answer "No API key
+  configured" without reaching a gate. Most other agent-facing tools name `LOOPCTL_AGENT_KEY`
+  as theirs and do work under it alone; `story_stage` reads it explicitly for the same reason.
+
+  For the record, since this changelog claimed otherwise in an earlier draft: the 403 from an
+  `exact_role` gate is NOT ambiguous and never resembled a custody refusal.
+  `LoopctlWeb.Plugs.RequireRole` is mounted first and halts with `code: "insufficient_role"`,
+  `required_roles: ["orchestrator"]` and "This endpoint requires the orchestrator role" — the
+  request never reaches the controller, so it never reaches the `self_verify_blocked` family
+  of 409s at all.
+
+- **A missing exact key is reported by NAME.** `apiCall`'s `exactKey` branch answered every
+  site with "Set LOOPCTL_USER_KEY ... to manage LLM configuration", which is right for
+  `set_llm_config` and nonsense for a custody verb missing its orchestrator key. A new
+  `keyHint` names the variable the site is pinned to, on all five custody verbs —
+  `force_unclaim_story` was the one that shipped without it in a draft of this release, so a
+  missing orchestrator key was reported to it as an LLM-configuration problem. The message
+  offers `LOOPCTL_API_KEY` as well, because that branch is reached only when BOTH are unset
+  and setting either to an orchestrator-role key works.
+
+- **A malformed id is refused client-side** by `place_dispatch`, `story_stage`,
+  `resolve_escalation` and `force_unclaim_story`. **This never produced a 500** — an earlier
+  draft of this entry said it did, and no shipped release behaved that way: loopctl maps
+  `Ecto.Query.CastError` to a 404 on purpose. What it produced is a 404 whose body is
+  byte-identical to the 404 for a well-formed id naming no story, so an operator could not
+  tell "you passed something that is not a UUID" from "that story does not exist" — two
+  problems with opposite remedies. The client check tells them apart without a round trip, and
+  it names the SHAPE and its length while never echoing the value: a malformed id is often a
+  token or a path pasted into the wrong argument, and a tool result lands in the transcript.
+
+  **Shape change for anything parsing the result:** a refusal from this check carries
+  `"status": 0` — this client's marker for "no request was sent", shared with its missing-key,
+  network-error and timeout refusals — where the same call previously came back `"status":
+  404` from the server. It is deliberately not stamped 404: a local refusal that looks like a
+  server answer restores the ambiguity the check exists to remove.
+
+### Fixed
+
+- **`place_dispatch`'s README row no longer advertises `triage`.** 2.96.0 narrowed the `kind`
+  enum to `implement` alone and corrected the tool description; the README row still offered
+  `triage` as an option, which is the copy an operator reads first.
+
+- **The README's `[runner tools]` link pointed at an anchor that no longer exists** — the
+  heading became "Runner and delivery-loop tools". A dead anchor scrolls nowhere and reports
+  nothing, so a test now resolves every in-document link in the README against the headings it
+  actually has.
+
+- **The environment-variable table said `LOOPCTL_API_KEY` is "always used"**, which the
+  exact-key tools have never been. The table now states the exception and lists which tools
+  take it, and the `LOOPCTL_ORCH_KEY` row no longer reads "(verify, reject, review, import)".
+
+- **Two wiring tests could not fail.** The delivery-loop wiring check grepped only for
+  `case "<tool>":` — pointing that case body at a different handler left the whole suite green
+  — so it now asserts the dispatched IDENTIFIER, and the README half asserts a table ROW
+  rather than the name appearing anywhere in the file. A second test still passed
+  `kind: "triage"` to `place_dispatch` and asserted it was forwarded, pinning the opposite of
+  the enum 2.96.0 shipped; it now source-pins `enum: ["implement"]` and goes red if the enum
+  is widened.
+
 ## 2.96.0 — 2026-09-15 (triage is dispatchable, but not through this tool)
 
 ### Changed
