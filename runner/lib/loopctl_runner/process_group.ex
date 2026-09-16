@@ -90,18 +90,31 @@ defmodule LoopctlRunner.ProcessGroup do
   process: a recorded pid whose start time no longer matches has been reused.
   """
   @spec recorded(String.t() | nil) :: [pos_integer()]
-  def recorded(nil), do: []
+  def recorded(tree_file), do: for({pid, _start} <- recorded_entries(tree_file), do: pid)
 
-  def recorded(tree_file) do
+  @doc """
+  `recorded/1`, keeping each pid's start time as the tree file recorded it.
+
+  The start time is the FILE's, not a fresh reading: it was captured by whoever wrote the
+  line, at the moment it detached the process, which is the only moment a writer knows a
+  start time a later pid reuse cannot counterfeit. A caller that pins these pids into a
+  tree file of its own has to write that value, since re-reading it after this scan would
+  hand a stranger the line meant for a process that has since exited.
+  """
+  @spec recorded_entries(String.t() | nil) :: [{pos_integer(), String.t()}]
+  def recorded_entries(nil), do: []
+
+  def recorded_entries(tree_file) do
     case File.read(tree_file) do
       {:ok, raw} ->
         starts = start_times()
 
         for line <- String.split(raw, "\n", trim: true),
-            [pid_s, start] <- [String.split(line, " ", parts: 2)],
+            [pid_s, raw_start] <- [String.split(line, " ", parts: 2)],
             {pid, ""} <- [Integer.parse(pid_s)],
-            Map.get(starts, pid) == squeeze(start),
-            do: pid
+            start <- [squeeze(raw_start)],
+            Map.get(starts, pid) == start,
+            do: {pid, start}
 
       {:error, _} ->
         []

@@ -6,6 +6,9 @@
 #   FAKE_CLAUDE_MODE   stream | hang | exit_leaving_child
 #   FAKE_EXIT          exit code for stream mode (default 0)
 #   FAKE_AGENTS        busy | idle | fail — what `claude agents --json` reports
+#
+# LOOPCTL_TEST_STRAGGLERS, inherited from the suite, is where every process this file
+# detaches is recorded so the suite can end it (test/support/test_stragglers.ex).
 
 set -u
 state=${FAKE_STATE_DIR:?FAKE_STATE_DIR required}
@@ -40,6 +43,26 @@ printf '%s\n' "$@" > "$state/argv"
 # claude-config's loop mode needs LOOP_STORY_FILE to be a regular, fresh file when hooks run.
 if [ -f "${LOOP_STORY_FILE:-}" ]; then echo regular > "$state/story_file"; else echo missing > "$state/story_file"; fi
 
+# Every process this file detaches outlives a test that fails before the assertion which
+# would have ended it, so each one is recorded for the suite's own sweep: pid and start
+# time, written here because here is the only place the start time still belongs to the
+# process meant and not to whatever later reuses the pid. Silent when unset — the fixture
+# is also run by hand.
+note_straggler() {
+    [ -n "${LOOPCTL_TEST_STRAGGLERS:-}" ] || return 0
+    local start
+    start=$(ps -o lstart= -p "$1" 2>/dev/null)
+    # A line with no start time is worse than no line: the sweep compares the real start
+    # time against the empty string, drops the line, and the process is invisible to it for
+    # ever — and on macOS the ledger is the whole mechanism, not a fallback. Said out loud
+    # instead, since a loss you can see beats one you cannot.
+    if [ -z "$start" ]; then
+        echo "note_straggler: no start time for $1, not recorded" >&2
+        return 0
+    fi
+    printf '%s %s\n' "$1" "$start" >> "$LOOPCTL_TEST_STRAGGLERS" 2>/dev/null
+}
+
 # What Claude Code's Bash tool does with every command (measured on 2.1.270): a NEW
 # session, so neither the launcher's group signal nor a parent walk reaches it once
 # its parent is gone. Only the inherited LOOP_SESSION_ID marker does.
@@ -48,6 +71,7 @@ detach() {
     local pid=$!
     # setsid makes it a group leader; `ps -o sid` is Linux-only, pgid is portable.
     while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+    note_straggler "$pid"
     # Published only once detached: tests wait on this file, then signal the group.
     printf '%s' "$pid" > "$state/detached_pid.tmp" && mv "$state/detached_pid.tmp" "$state/detached_pid"
 }
@@ -105,6 +129,7 @@ Should the billing total include voided visits? It changes $5 or $10 per `visit`
 ESCALATION
         # Keeps working after asking: the runner must stop it.
         sleep 1000 >/dev/null 2>&1 &
+        note_straggler "$!"
         wait
         ;;
     escalate_later_and_exit)
@@ -139,7 +164,9 @@ ESCALATION
     hang)
         echo "$init"
         sleep 1000 >/dev/null 2>&1 &
-        printf '%s' "$!" > "$state/grandchild_pid"
+        grandchild=$!
+        note_straggler "$grandchild"
+        printf '%s' "$grandchild" > "$state/grandchild_pid"
         detach
         wait
         ;;
@@ -148,9 +175,12 @@ ESCALATION
         # still be ended, so nothing may exclude processes by name.
         echo "$init"
         # Loops, so killing its current `sleep` does not end it: only a signal to it does.
-        perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sh -c 'while :; do sleep 1; done' session-launcher.sh >/dev/null 2>&1 &
+        # Counted rather than endless: the suite's sweep cannot run when the BEAM is killed
+        # outright, and this is the one fixture that would otherwise outlive the machine's day.
+        perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sh -c 'i=0; while [ $i -lt 1000 ]; do sleep 1; i=$((i+1)); done' session-launcher.sh >/dev/null 2>&1 &
         pid=$!
         while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+        note_straggler "$pid"
         printf '%s' "$pid" > "$state/named_pid.tmp" && mv "$state/named_pid.tmp" "$state/named_pid"
         wait
         ;;
@@ -161,6 +191,7 @@ ESCALATION
         perl -MPOSIX -e '$SIG{TERM} = "IGNORE"; POSIX::setsid(); exec "sleep", "1002"' >/dev/null 2>&1 &
         pid=$!
         while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+        note_straggler "$pid"
         printf '%s' "$pid" > "$state/stubborn_pid.tmp" && mv "$state/stubborn_pid.tmp" "$state/stubborn_pid"
         sleep 2
         exit 0
@@ -169,7 +200,9 @@ ESCALATION
         echo "$init"
         # Inherits stdout on purpose: a straggler holding the Port's pipe.
         sleep 1000 &
-        printf '%s' "$!" > "$state/grandchild_pid"
+        grandchild=$!
+        note_straggler "$grandchild"
+        printf '%s' "$grandchild" > "$state/grandchild_pid"
         detach
         # Live long enough for the launcher's tree recorder to see the detached child.
         sleep 2
