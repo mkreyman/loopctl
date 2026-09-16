@@ -222,14 +222,19 @@ defmodule LoopctlWeb.RunnerController do
         "reported. `reported_in_flight` is a hint — it counts the runner's sessions, not " <>
         "loopctl's reservations. `reported_max_sessions` is NOT: since contract 1.13.0 " <>
         "loopctl copies it into `max_sessions` on every join, capped at the runner's " <>
-        "`enrolled_max_sessions`. So `max_sessions` below `reported_max_sessions` means one " <>
-        "of three things — the runner has not reconnected since, it is still holding more " <>
-        "sessions than it now declares, or it is declaring ABOVE the ceiling it was enrolled " <>
-        "with, which `enrolled_max_sessions` here tells apart from the other two. " <>
-        "`max_sessions` ABOVE `reported_max_sessions` means exactly one thing and it is not " <>
-        "drift: the machine declared `0`, which the 1..64 column holds as `1` while this " <>
-        "field shows the raw `0`. No NEW placement is made on it — `0` is refused like " <>
-        "`draining`; a retry of a dispatch loopctl already holds is still re-sent. " <>
+        "`enrolled_max_sessions`. The two can differ in EITHER direction, and a difference " <>
+        "is worth reading rather than assuming. `max_sessions` BELOW " <>
+        "`reported_max_sessions` happens when the machine is declaring above the ceiling it " <>
+        "was enrolled with — `enrolled_max_sessions` is what makes that one visible in the " <>
+        "payload, and the rest are not — when the declaration write has not LANDED, which " <>
+        "can fail " <>
+        "under lock contention on the runner row and is retried on that socket's 30-second " <>
+        "recheck downward only, or when the socket joined a node older than contract 1.13.0 " <>
+        "and has not reconnected since. `max_sessions` ABOVE it happens when the machine " <>
+        "declared `0`, which the 1..64 column holds as `1` while this field shows the raw " <>
+        "`0` — no NEW placement is made on such a machine, `0` is refused like `draining`, " <>
+        "though a retry of a dispatch loopctl already holds is still re-sent — and, again, " <>
+        "when a declaration write has not landed and the row keeps an older, larger number. " <>
         "`kinds` is what the runner DECLARED on join (contract 1.6.0), " <>
         "and where it is present it alone decides which dispatches the machine is sent — " <>
         "so a connected machine that never gets work is explained by `kinds` or by " <>
@@ -307,7 +312,9 @@ defmodule LoopctlWeb.RunnerController do
                          "contract 1.13.0: it is what `max_sessions` is copied from, capped " <>
                          "at `enrolled_max_sessions`. `0` means the machine is taking no " <>
                          "work — held as `1` because the column is 1..64, and refused a " <>
-                         "NEW placement like `draining`."
+                         "NEW placement like `draining`. It can differ from `max_sessions` " <>
+                         "in either direction; this operation's own description lists the " <>
+                         "causes."
                    },
                    sample: %Schema{
                      type: :object,

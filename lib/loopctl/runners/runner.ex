@@ -16,7 +16,7 @@ defmodule Loopctl.Runners.Runner do
   `Loopctl.Runners.Capacity`, never through a changeset after the insert.
 
   `max_sessions` is the MACHINE's own number BOUNDED BY THE OPERATOR's: every join writes
-  `LEAST(declared, enrolled_max_sessions)` (`Loopctl.Runners.apply_declaration/3`, contract
+  `LEAST(declared, enrolled_max_sessions)` (`Loopctl.Runners.apply_declaration/4`, contract
   1.13.0). A machine may always lower itself and never raise itself. That asymmetry is the
   whole design: holding more than a machine can run places a dispatch it refuses
   `at_capacity`, and the refusal costs the story's claim, while holding less only under-uses
@@ -131,7 +131,7 @@ defmodule Loopctl.Runners.Runner do
     |> check_constraint(:max_sessions, name: :runners_max_sessions_range)
     # The GRANT is the enrolled number, and it is taken from the validated `max_sessions`
     # rather than cast, so the two agree at the insert by construction. Nothing writes it
-    # again: `Capacity.apply_declared/4` reads it as the ceiling and never sets it.
+    # again: `Capacity.apply_declared/5` reads it as the ceiling and never sets it.
     |> put_enrolled_max_sessions()
     |> check_constraint(:enrolled_max_sessions, name: :runners_enrolled_max_sessions_range)
     |> validate_format(:name, @name_format,

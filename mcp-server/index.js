@@ -7935,14 +7935,19 @@ const TOOLS = [
       "reported_max_sessions are what the runner itself last reported. reported_in_flight is a " +
       "hint (the runner counts sessions, loopctl counts reservations); reported_max_sessions is " +
       "NOT — since contract 1.13.0 loopctl copies it into max_sessions on every join, capped at " +
-      "the runner's enrolled_max_sessions, which is also returned. So max_sessions BELOW " +
-      "reported_max_sessions means one of three things: the runner has not reconnected since, " +
-      "it is still holding more sessions than it now declares, or it is declaring ABOVE the " +
-      "ceiling it was enrolled with — which enrolled_max_sessions tells apart from the other " +
-      "two. max_sessions ABOVE reported_max_sessions means exactly one thing and it is not " +
-      "drift: the machine declared 0, which the 1..64 column holds as 1 while this field shows " +
-      "the raw 0. Either way a reported_max_sessions of 0 means the machine is taking no work " +
-      "and place_dispatch refuses a new placement on it, like draining. " +
+      "the runner's enrolled_max_sessions, which is also returned. The two can differ in EITHER " +
+      "direction, so read a difference rather than assuming it. max_sessions BELOW " +
+      "reported_max_sessions happens when the machine is declaring above the ceiling it was " +
+      "enrolled with (enrolled_max_sessions is what makes that one visible in the payload; the " +
+      "rest are not), when the declaration write has not LANDED — it can fail under lock " +
+      "contention " +
+      "on the runner row and is retried on that socket's 30-second recheck, downward only — or " +
+      "when the socket joined a node older than contract 1.13.0 and has not reconnected since. " +
+      "max_sessions ABOVE reported_max_sessions happens when the machine declared 0, which the " +
+      "1..64 column holds as 1 while this field shows the raw 0, and again when a declaration " +
+      "write has not landed and the row keeps an older, larger number. A reported_max_sessions " +
+      "of 0 means the machine is taking no work and place_dispatch refuses a new placement on " +
+      "it, like draining. " +
       "live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +

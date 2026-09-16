@@ -8,7 +8,7 @@ defmodule Loopctl.Runners.Capacity do
   In Postgres, and only there. `runners.max_sessions` is how many slots loopctl will reserve
   on a machine — the machine's OWN declaration re-applied from the join payload on every
   connect, CAPPED at `runners.enrolled_max_sessions`, the grant an operator made at
-  enrollment and no join ever writes (`apply_declared/4`) — `runners.in_flight` the slots
+  enrollment and no join ever writes (`apply_declared/5`) — `runners.in_flight` the slots
   reserved on it now, and every reservation is one `runner_dispatches` row whose
   `released_at` is NULL. The invariant is
 
@@ -17,12 +17,26 @@ defmodule Loopctl.Runners.Capacity do
   and every write below keeps it inside one transaction. No process owns a counter, so a
   node that dies mid-dispatch leaves nothing behind but a rolled-back transaction.
 
-  It holds with ONE deliberate exception: `apply_declared/4` clamps `in_flight` DOWN when a
+  It holds with ONE deliberate exception: `apply_declared/5` clamps `in_flight` DOWN when a
   machine rejoins declaring fewer sessions than it currently holds, because
-  `runners_in_flight_range` makes the honest count unrepresentable there. That is why every
-  write to the counter afterwards RECOUNTS rather than decrementing (`give_back/3`) — a
-  decrement compounds the gap and frees a slot a session still holds, while a recount
-  converges from it.
+  `runners_in_flight_range` makes the honest count unrepresentable there. The counter is then
+  SHORT of the rows until they drain.
+
+  What each writer does about that gap:
+
+  * `reserve/3` INCREMENTS, under the predicate `in_flight < max_sessions`. On the dispatch
+    path both sides of the count move together, because the ledger clears the dispatch row's
+    `released_at` in the same transaction, so the gap is unchanged. Taken on
+    its own through `Loopctl.Runners.reserve_slot/2` it leaves the counter ABOVE the live
+    rows instead, which is the untied slot a recount reclaims.
+  * `release/4` RECOUNTS (`give_back/3`) instead of decrementing. A decrement is the right
+    answer only while `in_flight = count(unreleased)` holds, so from a clamped row it frees a
+    slot a session still holds; a recount converges from any drifted value.
+  * `apply_declared/5` clamps inside its own statement and then RECOUNTS. The clamp only ever
+    LOWERS, so a machine that rejoins declaring MORE — reverting a configuration change, say
+    — used to keep the short counter while its ceiling went back up, and `reserve/3` handed
+    out a slot the machine was already using.
+  * `heal/3` recounts too, after releasing the reservations that can no longer be running.
 
   Presence carries `max_sessions` and `in_flight` too, as the RUNNER reports them, and
   nothing here ever reads them: a CRDT with no compare-and-set cannot hand out the last slot
@@ -62,16 +76,16 @@ defmodule Loopctl.Runners.Capacity do
   A dispatch row can hold several slots over its life: one released because the push never
   reached a socket is taken again when the same `dispatch_id` is re-sent. So a release
   names the `slot_generation` it means, and `release/4` sets `released_at`
-  `WHERE released_at IS NULL AND slot_generation = $g`, decrementing only when that write
-  matched a row. A release replayed for an earlier generation — a reply re-sent after a
-  lost acknowledgement, a supersede found again by a later trace, the heal sweep finding
-  what an inline release already did, a caller retrying after the dispatch was re-sent —
-  matches nothing and changes nothing, because the recount that follows a matched write is
-  not reached at all.
+  `WHERE released_at IS NULL AND slot_generation = $g`, recounting the runner's slots only
+  when that write matched a row. A release replayed for an earlier generation — a reply
+  re-sent after a lost acknowledgement, a supersede found again by a later trace, the heal
+  sweep finding what an inline release already did, a caller retrying after the dispatch was
+  re-sent — matches nothing and changes nothing, because the recount that follows a matched
+  write is not reached at all.
 
   The release does not DECREMENT: it recounts the runner's unreleased rows under the row
   lock and writes `min(live, max_sessions)` (`give_back/3`). A decrement is the right answer
-  only while the invariant above holds, and `apply_declared/4` breaks it deliberately when a
+  only while the invariant above holds, and `apply_declared/5` breaks it deliberately when a
   machine rejoins declaring fewer sessions than it currently holds.
 
   A slot is released when its dispatch reaches a terminal state the ledger models
@@ -302,7 +316,7 @@ defmodule Loopctl.Runners.Capacity do
   Neither number alone is the tenant's true load, because each is knowingly short in one
   direction:
 
-  * `in_flight` is short after `apply_declared/4` CLAMPS it. A machine holding 3 that rejoins
+  * `in_flight` is short after `apply_declared/5` CLAMPS it. A machine holding 3 that rejoins
     declaring 1 is left at `in_flight: 1` with three unreleased rows, and `write_count/5` pins
     the counter at `min(live, max_sessions)` so the gap persists until those sessions drain.
     That break is correct for `reserve/3` — the machine takes no new work, which is what it
@@ -360,8 +374,13 @@ defmodule Loopctl.Runners.Capacity do
 
   @doc """
   Sets an active runner's held `max_sessions` to the capacity its machine DECLARED, BOUNDED
-  BY the capacity it was ENROLLED with, in one conditional UPDATE. Returns
-  `{:ok, %{max_sessions: m, in_flight: f}}` with the values after the write, or `:unchanged`.
+  BY the capacity it was ENROLLED with, in one conditional UPDATE, then RECOUNTS `in_flight`.
+  Returns `{:ok, %{max_sessions: m, in_flight: f}}` with the values after both, or
+  `:unchanged` when the predicate matched nothing.
+
+  `only_lower: true` narrows that predicate to a write that takes the held capacity DOWN; a
+  declaration that would raise it answers `:unchanged`. See "a write whose CURRENCY the caller
+  cannot establish" below.
 
   `declared` must already be inside `Runner.max_sessions_range/0` — the caller validates it
   (`Loopctl.Runners.declared_max_sessions/1`), because a value this column cannot hold is a
@@ -407,6 +426,26 @@ defmodule Loopctl.Runners.Capacity do
   ever. A runner that is gone or revoked answers `:unchanged` as well: its capacity decides
   nothing, and `reserve/3` refuses it on its own.
 
+  ## `only_lower: true` — a write whose CURRENCY the caller cannot establish (#846.4 review round 3, finding 5)
+
+  With it the predicate becomes `max_sessions > LEAST(declared, enrolled)`, so the call can
+  only take the held capacity DOWN and answers `:unchanged` for anything that would raise it.
+
+  It exists for the retry in `LoopctlWeb.RunnerChannel`, which re-applies a declaration its
+  own connection carried and may by then be the older of two — a second socket can have
+  joined, written a smaller number and gone again between two 30-second rechecks, and no
+  liveness check made at the moment of the retry can see a connection that is already over.
+  What the caller can say is which DIRECTION is safe when it does not know: the module's
+  asymmetry (see above) says holding more than a machine can run places a dispatch it refuses
+  `at_capacity` and costs the story's claim, while holding less only under-uses it. So an
+  uncertain write is allowed to be wrong only in the cheap direction.
+
+  This costs the retry nothing it was for. The state it exists to repair is a row left holding
+  a LARGER stale number while the machine has declared a smaller one — "until it lands, the
+  machine is dispatchable against the stale number" — and that repair is a lowering. What it
+  gives up is a retried RAISE: a machine whose declaration went up and whose join write failed
+  stays under-used until it reconnects.
+
   ## Why `in_flight` is clamped in the SAME statement, and why the clamp is SAFE ONLY because releases recount
 
   `runners_in_flight_range` CHECKs `in_flight <= max_sessions`, so lowering capacity under
@@ -437,16 +476,55 @@ defmodule Loopctl.Runners.Capacity do
   whole path exists to end. `heal/3` did not rescue it either: `write_count/5` computes
   `min(live, max_sessions) = min(2, 1) = 1`, which EQUALS the drifted counter, so the drift
   was a stable state rather than a transient one. The `give_back/3` doc carries the rest.
+
+  ## Why a RECOUNT follows the statement (#846.4 review round 3, finding 1)
+
+  `LEAST(in_flight, LEAST(declared, enrolled))` only ever LOWERS, so the clamp on its own says
+  nothing about a declaration that goes back UP while the clamped sessions are still running.
+  That is a reachable sequence, not a hypothetical, and it is the one the contract's own
+  promise walks into — "lowering it below the sessions loopctl currently holds sends no more
+  work until those drain, rather than cancelling them":
+
+      machine holds 2, rejoins declaring 1  -> max_sessions 1, in_flight 1, 2 unreleased rows
+      operator reverts the configuration
+      machine rejoins declaring 2           -> max_sessions 2, in_flight STILL 1, live 2
+
+  `reserve/3` gates on `in_flight < max_sessions`, so at `1 < 2` it hands out a THIRD slot on
+  a machine already running its declared maximum. `heal/3` closes it within the minute, and
+  the dispatch that went out in the meantime is already on the machine.
+
+  So the statement is followed by `recount/3` — the same one `give_back/3` and `heal/3` run,
+  under the same argument about the lock order. It writes `min(count(unreleased),
+  max_sessions)`, which is `min(2, 2) = 2` above and leaves every other case exactly where the
+  clamp left it: on a LOWER the count is `min(2, 1) = 1`, which the clamp already wrote, so
+  there is nothing to write.
+
+  It COULD have been folded into the statement instead — a correlated `count(*)` over the
+  unreleased rows would make `LEAST(GREATEST(in_flight, live), new_max)` a single expression,
+  and `runners_in_flight_range` would be satisfied by it. Reusing `recount/3` is preferred
+  because it keeps ONE spelling of the recount in the module: a second one in SQL would have
+  to be kept in step with `write_count/5` by hand, and the two disagreeing is a drift nothing
+  would report. The clamp itself stays in the statement and is not optional there — the CHECK
+  is evaluated per statement, so a bare write of the new `max_sessions` under the live count
+  raises before any later recount could run.
+
+  The lock order is the one `give_back/3` documents and is not extended here: the UPDATE takes
+  the `runners` row, and the recount then re-takes that same row (already held, in the caller's
+  transaction) and COUNTS dispatch rows, which is a plain read taking no row locks.
+
+  The cost is one `SELECT count(*)` on a join that MOVES the capacity, and none on the rest —
+  which is most of them, since the predicate above answers `:unchanged` for the re-declaration
+  that arrives on every reconnect.
   """
-  @spec apply_declared(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t(), pos_integer()) ::
+  @spec apply_declared(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t(), pos_integer(), keyword()) ::
           {:ok, %{max_sessions: pos_integer(), in_flight: non_neg_integer()}} | :unchanged
-  def apply_declared(repo \\ Repo, tenant_id, runner_id, declared)
+  def apply_declared(repo \\ Repo, tenant_id, runner_id, declared, opts \\ [])
       when is_integer(declared) and declared > 0 do
     query =
       from r in Runner,
         where: r.id == ^runner_id and r.tenant_id == ^tenant_id,
         where: is_nil(r.revoked_at),
-        where: r.max_sessions != fragment("LEAST(?, ?)", ^declared, r.enrolled_max_sessions),
+        where: ^moves_capacity(declared, Keyword.get(opts, :only_lower, false)),
         update: [
           set: [
             max_sessions: fragment("LEAST(?, ?)", ^declared, r.enrolled_max_sessions),
@@ -462,9 +540,26 @@ defmodule Loopctl.Runners.Capacity do
         select: %{max_sessions: r.max_sessions, in_flight: r.in_flight}
 
     case repo.update_all(query, set: [updated_at: DateTime.utc_now()]) do
-      {1, [held]} -> {:ok, held}
+      {1, [held]} -> {:ok, %{held | in_flight: recounted(repo, tenant_id, runner_id, held)}}
       {0, _} -> :unchanged
     end
+  end
+
+  # `!=` writes in whichever direction the declaration moved; `>` writes only downward. Both
+  # compare the value that would actually be WRITTEN, so a declaration above the enrolled
+  # ceiling is judged at the ceiling rather than raw.
+  defp moves_capacity(declared, false) do
+    dynamic([r], r.max_sessions != fragment("LEAST(?, ?)", ^declared, r.enrolled_max_sessions))
+  end
+
+  defp moves_capacity(declared, true) do
+    dynamic([r], r.max_sessions > fragment("LEAST(?, ?)", ^declared, r.enrolled_max_sessions))
+  end
+
+  # The row is locked by the UPDATE that just matched it, in this transaction, so `recount/3`
+  # finds it; the `nil` clause is the shape of its return and not a state reachable from here.
+  defp recounted(repo, tenant_id, runner_id, held) do
+    recount(repo, tenant_id, runner_id) || held.in_flight
   end
 
   # The dispatch row records WHICH slot it now holds. `slot_generation` only ever rises, so
@@ -640,7 +735,7 @@ defmodule Loopctl.Runners.Capacity do
     live = repo.aggregate(unreleased(tenant_id, runner_id), :count)
 
     # Above `max_sessions` when the machine rejoined declaring fewer sessions than it holds
-    # (`apply_declared/4`) or was re-enrolled smaller; the CHECK would refuse the exact
+    # (`apply_declared/5`) or was re-enrolled smaller; the CHECK would refuse the exact
     # count, and admitting nothing until the rows drain is the same outcome. This `min/2` is
     # what keeps a release from freeing a slot a session still holds: at `live > max` the
     # released row lowers `live` and the answer stays pinned at `max`, so `reserve/3` sees
@@ -668,7 +763,7 @@ defmodule Loopctl.Runners.Capacity do
   # `write_count/5` gives everywhere else: `min(count(unreleased), max_sessions)`.
   #
   # It used to be `GREATEST(in_flight - n, 0)`, which is the right answer ONLY while
-  # `in_flight = count(unreleased)` holds — and `apply_declared/4` knowingly breaks that
+  # `in_flight = count(unreleased)` holds — and `apply_declared/5` knowingly breaks that
   # invariant when a machine rejoins declaring fewer sessions than it currently holds. On a
   # row left at `in_flight: 1` with two unreleased rows, decrementing on the first release
   # wrote `0` while the second session was still running, and `reserve/3` then handed out a
@@ -676,7 +771,7 @@ defmodule Loopctl.Runners.Capacity do
   # declaration path exists to end, reinstated one function along.
   #
   # Recounting is the fix rather than DEFERRING the lowering until the row drains, because
-  # nothing would ever apply a deferred one: `apply_declared/4` runs on a JOIN and a machine
+  # nothing would ever apply a deferred one: `apply_declared/5` runs on a JOIN and a machine
   # that is already connected does not join again. A deferral would leave the larger
   # capacity live and `reserve/3` would hand out a slot the instant one drained — the same
   # over-dispatch, kept for longer. Recounting also needs no new state and no new sweep: it

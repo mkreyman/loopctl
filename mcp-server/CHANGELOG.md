@@ -27,9 +27,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `runner_pool`,
   `reported_max_sessions` is no longer a hint — it is what `max_sessions` is copied from, capped at
   the new `enrolled_max_sessions` field, which is what tells "declaring above its ceiling" apart
-  from "has not reconnected" and "still holding more than it declares". A `max_sessions` ABOVE
-  `reported_max_sessions` is the one remaining case and is not drift at all: the machine declared
-  `0`, held as `1` because the column is 1..64.
+  from the other reasons the two can differ: a declaration write that has not landed, or a socket
+  that joined a node older than 1.13.0. `max_sessions` ABOVE `reported_max_sessions` happens when
+  the machine declared `0` — held as `1` because the column is 1..64, and nothing is placed on it
+  — and, again, when a declaration write has not landed and the row keeps an older larger number.
   And `place_dispatch` now answers `409 runner_declines_work` for a machine declaring `draining` or
   a `max_sessions` of 0, refused before the story is claimed — on a NEW placement only, since a
   retry carrying a `dispatch_id` loopctl already holds is re-sent as before.

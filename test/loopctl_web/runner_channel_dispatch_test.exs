@@ -455,10 +455,14 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       assert held_capacity(runner).max_sessions == 1
 
-      # AND THE WRITE IS NOT LOST, only deferred: `declaration_pending` is left armed, so once
-      # the ambiguity clears the declaration this socket carries does land. Nothing was risked
-      # by waiting — a runner with two live sockets is `:runner_ambiguous` to `dispatch/3`, so
-      # no dispatch could have been decided against the stale number in the meantime.
+      # AND IT IS STILL REFUSED ONCE B IS GONE (#846.4 review ROUND 3, finding 5). The check
+      # above is `sole_live_socket?/1`, which reads the pool AT THIS INSTANT — so B leaving
+      # makes A sole again and, on that check alone, free to write its 4 over the
+      # configuration the machine now runs. Nothing A can read tells it that a newer
+      # connection existed and has ended; B could equally have joined, written and gone
+      # between two of A's 30-second rechecks, never overlapping A at all. What holds instead
+      # is that the retry may only LOWER: A's 4 is a raise and is refused whether or not B is
+      # visible when A asks.
       Process.unlink(socket_b.channel_pid)
       ref = leave(socket_b)
       assert_reply ref, :ok, _, @reply_timeout
@@ -471,7 +475,17 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       send(socket_a.channel_pid, :recheck)
       _ = :sys.get_state(socket_a.channel_pid)
 
+      assert held_capacity(runner).max_sessions == 1
+
+      # And it stays refused rather than being retried for ever: the machine gets its 4 back
+      # by RECONNECTING, which is a join and carries no such bound.
+      send(socket_a.channel_pid, :recheck)
+      _ = :sys.get_state(socket_a.channel_pid)
+      assert held_capacity(runner).max_sessions == 1
+
+      socket_c = rejoin(runner, raw, socket_a, %{"max_sessions" => 4})
       assert held_capacity(runner).max_sessions == 4
+      assert Process.alive?(socket_c.channel_pid)
     end
 
     test "lowering it under the slots the machine already holds sends no more work" do

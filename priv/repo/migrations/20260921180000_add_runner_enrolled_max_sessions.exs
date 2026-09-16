@@ -36,15 +36,37 @@ defmodule Loopctl.Repo.Migrations.AddRunnerEnrolledMaxSessions do
   # A BEFORE INSERT trigger CAN read the row, so it fills from `max_sessions` — exactly the
   # derivation `Loopctl.Runners.Runner.create_changeset/2` already makes
   # (`put_enrolled_max_sessions/1`). BEFORE ROW triggers run before NOT NULL is evaluated, so
-  # the constraint stays. It is KEPT rather than dropped after the roll, because it is not a
-  # deploy patch: it makes it impossible for ANY writer — a future one, a migration, a hand
-  # INSERT — to create a runner whose ceiling is not the grant it was enrolled with. The
-  # original "fail loudly rather than inherit a number nobody chose" rationale is satisfied,
-  # because `max_sessions` is not a number nobody chose: it IS the operator's grant.
+  # the constraint stays. The original "fail loudly rather than inherit a number nobody chose"
+  # rationale is satisfied, because `max_sessions` is not a number nobody chose: it IS the
+  # operator's grant. It is KEPT rather than dropped after the roll, so that a later writer
+  # which omits the column gets the same fill instead of a NOT NULL violation.
   #
-  # It fires on INSERT only. Nothing may raise `enrolled_max_sessions` on a live row — that is
-  # a security bound and wants its own change — and an UPDATE trigger filling it would be a
-  # second way in.
+  # ## WHAT IT ENFORCES, WHICH IS LESS THAN THIS COMMENT ONCE CLAIMED
+  # (#846.4 review round 3, finding 3)
+  #
+  # It fills an OMITTED value. It does not constrain a SUPPLIED one — `IF NEW.enrolled_max_sessions
+  # IS NULL` is the whole body — so an INSERT naming `max_sessions: 1,
+  # enrolled_max_sessions: 64`
+  # is accepted exactly as written. `test/loopctl/runners_test.exs` pins that behaviour ("a writer
+  # that DOES name it keeps its own value"); this comment claimed the opposite in the same commit.
+  #
+  # Making the assignment unconditional would make the stronger claim true for INSERT and would
+  # buy nothing, because the widening this column exists to prevent does not arrive by INSERT. The
+  # principal it bounds is a CONNECTED RUNNER, which reaches this row only through
+  # `Loopctl.Runners.Capacity.apply_declared/5`, and that reads `enrolled_max_sessions` and never
+  # writes it; `create_changeset/2` derives it and does not cast it. A principal that can INSERT
+  # into `runners` by hand can equally `UPDATE runners SET enrolled_max_sessions = 64`, which no
+  # BEFORE INSERT trigger sees — so airtightness on INSERT alone would be a sentence, not a bound.
+  # It would also silently narrow a legitimate row COPY (a restore, a clone) down to whatever
+  # `max_sessions` a join had lowered it to, which is data loss in the quiet direction.
+  #
+  # A `CHECK (enrolled_max_sessions = max_sessions)` is not the alternative either: a CHECK is
+  # evaluated on UPDATE as well, so the first join that lowers `max_sessions` below the grant
+  # would be refused by it — and that lowering is the feature.
+  #
+  # It fires on INSERT only. An UPDATE trigger filling it would be a second way to write the
+  # column. Today `put_enrolled_max_sessions/1`, inside `create_changeset/2`, is the only write
+  # to it under `lib/` — one `git grep enrolled_max_sessions lib/` re-checks that.
   def up do
     alter table(:runners) do
       add :enrolled_max_sessions, :integer, null: true

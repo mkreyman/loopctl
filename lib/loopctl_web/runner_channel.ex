@@ -190,7 +190,7 @@ defmodule LoopctlWeb.RunnerChannel do
     # ENROLLED with — and it happens HERE, before `Presence.track/4`. A dispatch needs a single
     # live socket in the pool (`Runners.dispatch/3`), so until the track below there is no way
     # to place one on THIS socket. It never refuses the join and never raises; see
-    # `Runners.apply_declaration/3` for why the machine's number wins downward, why the
+    # `Runners.apply_declaration/4` for why the machine's number wins downward, why the
     # enrolled one is a ceiling, and why nothing about it reaches the audit chain.
     #
     # A FAILED write is REMEMBERED, not lost. The realistic failure is `:capacity_busy` — the
@@ -198,8 +198,8 @@ defmodule LoopctlWeb.RunnerChannel do
     # contends on, i.e. exactly the load under which being dispatchable against a stale larger
     # number does the most harm — and nothing else reconciles it, since the heal sweep
     # recomputes `in_flight` and never `max_sessions`. So it is re-armed on the `:recheck`
-    # timer below, which this socket already runs every 30 seconds — and only while this
-    # socket is the runner's sole live one, see `retry_declaration/1`.
+    # timer below, which this socket already runs every 30 seconds — as a write that may only
+    # LOWER the held capacity, see `retry_declaration/1`.
     socket = assign(socket, :declaration_pending, apply_declaration(tenant_id, runner, meta))
 
     {:ok, ref} =
@@ -911,36 +911,44 @@ defmodule LoopctlWeb.RunnerChannel do
   # `:meta` is the right thing to re-apply: capacity arrives once per connection and a
   # `RunnerStatus` event can never carry it (`max_sessions` is not among its fields), so the
   # value here is still the one this machine declared on join.
-  defp apply_declaration(tenant_id, runner, meta) do
-    Runners.apply_declaration(tenant_id, runner, meta) != :ok
+  defp apply_declaration(tenant_id, runner, meta, opts \\ []) do
+    Runners.apply_declaration(tenant_id, runner, meta, opts) != :ok
   end
 
   # The retry runs AFTER `Presence.track/4`, so it does not have `:after_join`'s ordering
   # argument and does not need it: a lowering applied while the machine is dispatchable is
-  # clamped by `Capacity.apply_declared/4` and converges, because every release RECOUNTS
+  # clamped by `Capacity.apply_declared/5` and converges, because the release path RECOUNTS
   # rather than decrementing. Staying over-dispatched until the machine happens to reconnect
   # is the worse of the two, and it was the behaviour before this.
   #
-  # ONLY FROM THE RUNNER'S SOLE LIVE SOCKET, though, and that IS what `:after_join`'s ordering
-  # argument bought for free (#846.4 review round 2, finding 3). Two sockets can be live at
-  # once — `Runners`' moduledoc documents the reconnect window in which a silent node's entry
-  # lingers — and this retry re-applies a declaration this connection carried, which is by
-  # then possibly the OLDER of two. Ungated: socket A joins declaring 4 and loses the runner
-  # row's lock; the machine is reconfigured and reconnects as B declaring 1, which writes 1;
-  # A's next `:recheck` writes 4 back over it and re-asserts it every 30 seconds, leaving the
-  # machine dispatched against a capacity it no longer declares — the defect this whole path
-  # exists to end. `sole_live_socket?/1` is the same arbiter `dispatch_to_socket/2` uses, and
-  # for the same reason: "NOT ME", not "nobody".
+  # IT CAN ONLY LOWER (#846.4 review round 3, finding 5). This retry re-applies a declaration
+  # THIS connection carried, and a connection can be superseded: two sockets can be live at
+  # once (`Runners`' moduledoc documents the reconnect window in which a silent node's entry
+  # lingers), so socket A, which joined declaring 4 and lost the runner row's lock, may be
+  # retrying after socket B joined declaring 1 and wrote it. `only_lower: true` is what makes
+  # that harmless — A's 4 is refused as a raise, whether or not B is still visible when A
+  # retries, and the doc on `Capacity.apply_declared/5` carries the reasoning. The state this
+  # retry exists to repair is the opposite one (a row left holding a LARGER stale number), so
+  # the bound costs it nothing it was for.
   #
-  # `declaration_pending` is deliberately LEFT ARMED rather than cleared, so the write lands
-  # on the first recheck after the ambiguity clears. Nothing is lost by waiting: a runner with
-  # two live sockets is `:runner_ambiguous` to `Runners.dispatch/3`, so no dispatch is decided
-  # against the stale capacity in the meantime.
+  # `sole_live_socket?/1` is kept in front of it as the cheap half of the same judgement:
+  # while a runner has two live sockets it is `:runner_ambiguous` to `Runners.dispatch/3` and
+  # no dispatch is being decided against the row at all, so there is nothing to gain by taking
+  # the lock. It is NOT what makes the retry safe — round 2 read it that way, and it cannot
+  # be: it is a check on the pool AT THIS INSTANT, and B can have joined, written and gone
+  # between two of A's 30-second rechecks, leaving A sole and its declaration stale.
+  #
+  # `declaration_pending` is deliberately LEFT ARMED while ambiguous rather than cleared, so
+  # the write lands on the first recheck after the ambiguity clears.
   defp retry_declaration(%{assigns: %{declaration_pending: true}} = socket) do
     if sole_live_socket?(socket) do
       %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
 
-      assign(socket, :declaration_pending, apply_declaration(tenant_id, runner, meta))
+      assign(
+        socket,
+        :declaration_pending,
+        apply_declaration(tenant_id, runner, meta, only_lower: true)
+      )
     else
       socket
     end

@@ -150,7 +150,7 @@ defmodule Loopctl.Runners do
   then records the enrollment on the audit chain. `max_sessions` (1..64, default
   `Runner.default_max_sessions/0`) is the CEILING on how many slots loopctl will ever reserve
   on this machine, and the value it starts at. Since contract 1.13.0 every join re-applies the
-  machine's own declaration (`apply_declaration/3`), bounded by this: the held capacity is
+  machine's own declaration (`apply_declaration/4`), bounded by this: the held capacity is
   `LEAST(declared, enrolled)`, so a machine may always lower itself below its grant and never
   raise itself above it.
 
@@ -771,19 +771,28 @@ defmodule Loopctl.Runners do
   `%{in_flight, max_sessions, enrolled_max_sessions}`.
 
   `max_sessions` here is the machine's own declaration CAPPED at `enrolled_max_sessions` and
-  then into the column's own range, written at its last join (`apply_declaration/3`). Both are
+  then into the column's own range, written at its last join (`apply_declaration/4`). Both are
   returned so an operator can tell a machine held down by its own declaration from one held
   down by the ceiling. `in_flight` is loopctl's count of slots handed out and is never the
   runner's.
 
-  It matches `reported_max_sessions` on the pool for any runner that has connected since
-  contract 1.13.0 and declares INSIDE `Runner.max_sessions_range/0` at or below its grant.
-  A declared `0` is the case where they legitimately differ and the one an operator is most
-  likely to be looking at: the column is 1..64, so `declared_max_sessions/1` holds a `0` as
-  `1` while the pool renders the raw `0` the machine sent. Nothing is dispatched to it either
-  way — `accepting_work?/1` reads the meta's `0` and refuses every path that claims a story
-  before it pushes — so the pair reads `max_sessions: 1` against `reported_max_sessions: 0`
-  and that is the machine saying it takes no work, not a drifted row.
+  It matches `reported_max_sessions` on the pool once a runner's declaration has been applied
+  and that declaration is inside `Runner.max_sessions_range/0` at or below its grant. The
+  differences an operator will actually meet, and what each looks like:
+
+  * a declared `0` — the column is 1..64, so `declared_max_sessions/1` holds it as `1` while
+    the pool renders the raw `0`. Nothing is dispatched to it either way, because
+    `accepting_work?/1` reads the meta's `0` and refuses every path that claims a story before
+    it pushes. `max_sessions: 1` against `reported_max_sessions: 0` is the machine saying it
+    takes no work, not a drifted row.
+  * a declaration ABOVE the grant — held at `enrolled_max_sessions`, which is returned here
+    so the pair explains itself.
+  * a declaration write that has NOT LANDED — `apply_declaration/4` can fail with
+    `:capacity_busy` under contention on the runner row, and the socket retries it on its
+    30-second recheck, downward only. Until then the row keeps its older value, which can sit
+    on either side of what the machine reports.
+  * a socket that joined a node older than contract 1.13.0 and has not reconnected since:
+    that join applied no declaration at all.
   """
   @spec capacity(Ecto.UUID.t()) :: %{
           Ecto.UUID.t() => %{
@@ -1068,7 +1077,7 @@ defmodule Loopctl.Runners do
   Applies what a joining runner DECLARED about itself to the row loopctl decides from.
 
   Today that is capacity alone: `runners.max_sessions` is set to the machine's declared
-  `max_sessions` (`Capacity.apply_declared/4`), clamped into the column's range by
+  `max_sessions` (`Capacity.apply_declared/5`), clamped into the column's range by
   `declared_max_sessions/1`. Returns `:ok` whatever it found — an unchanged capacity, a
   runner revoked since the socket opened, and a meta with no declaration all mean there is
   nothing to write.
@@ -1117,7 +1126,7 @@ defmodule Loopctl.Runners do
   `single_live_socket/2` can resolve to the STALE meta and `dispatch/3` can reserve against
   the old `max_sessions` in the window between this join and this write's commit. That window
   is milliseconds, and what is on the other side of it is now bounded too: a slot taken
-  against the old number is clamped by the write (`Capacity.apply_declared/4`) and given back
+  against the old number is clamped by the write (`Capacity.apply_declared/5`) and given back
   by a RECOUNT rather than a decrement (`Capacity.give_back/3`), so an over-count converges
   instead of compounding. Running this AFTER `Presence.track/4` would widen the same window
   from milliseconds to the whole of the join, which is why the order stays.
@@ -1142,18 +1151,21 @@ defmodule Loopctl.Runners do
   `in_flight` and never touches `max_sessions`, so a swallowed failure left the machine
   dispatchable against the stale larger number until it happened to reconnect
   (#846.4 review finding 5). `LoopctlWeb.RunnerChannel` re-arms it on its `:recheck` timer,
-  but only while that socket is the runner's SOLE live one — otherwise a socket lingering from
-  a previous connection would re-assert ITS declaration over the current one's.
+  passing `only_lower: true`. A retry re-applies a declaration its OWN connection carried,
+  which may by then be the older of two, and `Capacity.apply_declared/5` sets out why the
+  answer to not knowing is to allow the write only in the direction that is cheap when it is
+  wrong. The channel also skips the retry while the runner has more than one live socket,
+  which is the same judgement made where it is cheap to make.
   """
-  @spec apply_declaration(Ecto.UUID.t(), Runner.t(), map()) :: :ok | {:error, term()}
-  def apply_declaration(tenant_id, %Runner{} = runner, meta)
-      when is_binary(tenant_id) and is_map(meta) do
+  @spec apply_declaration(Ecto.UUID.t(), Runner.t(), map(), keyword()) :: :ok | {:error, term()}
+  def apply_declaration(tenant_id, %Runner{} = runner, meta, opts \\ [])
+      when is_binary(tenant_id) and is_map(meta) and is_list(opts) do
     case declared_max_sessions(meta) do
       :undeclared ->
         :ok
 
       {:ok, declared} ->
-        write_declared_capacity(tenant_id, runner, declared)
+        write_declared_capacity(tenant_id, runner, declared, opts)
 
       {:clamped, declared, raw} ->
         Logger.warning(
@@ -1164,12 +1176,12 @@ defmodule Loopctl.Runners do
             "delivered and the runner refuses it itself."
         )
 
-        write_declared_capacity(tenant_id, runner, declared)
+        write_declared_capacity(tenant_id, runner, declared, opts)
     end
   end
 
-  defp write_declared_capacity(tenant_id, runner, declared) do
-    case apply_declared_capacity(tenant_id, runner.id, declared) do
+  defp write_declared_capacity(tenant_id, runner, declared, opts) do
+    case apply_declared_capacity(tenant_id, runner.id, declared, opts) do
       :unchanged ->
         :ok
 
@@ -1201,13 +1213,13 @@ defmodule Loopctl.Runners do
 
   defp describe_failure(reason), do: inspect(reason)
 
-  defp apply_declared_capacity(tenant_id, runner_id, declared) do
+  defp apply_declared_capacity(tenant_id, runner_id, declared, opts) do
     Repo.with_tenant(tenant_id, fn ->
       # Bounded like every other capacity transaction: this one queues behind a reserve, a
       # release or a heal holding the same runner row, and the process it runs in is the one
       # holding the machine's socket.
       Capacity.set_lock_timeout!(Repo)
-      Capacity.apply_declared(Repo, tenant_id, runner_id, declared)
+      Capacity.apply_declared(Repo, tenant_id, runner_id, declared, opts)
     end)
     |> case do
       # NOT `flatten/1`: this call's success is `:unchanged` as often as it is `{:ok, held}`,

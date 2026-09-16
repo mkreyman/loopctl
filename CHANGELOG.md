@@ -34,11 +34,13 @@ All notable changes to loopctl are documented here.
   then write the NEW token to the machine's token file and restart the runner, because revoking
   invalidates the credential it is connected with.
   `GET /api/v1/runners` and `GET /api/v1/runners/pool` now both return `enrolled_max_sessions`
-  alongside `max_sessions`, so a machine held below what it declares is explicable from one read —
-  it has not reconnected, it still holds more sessions than it now declares, or it is declaring
-  above its ceiling. The one case that reads the OTHER way is a declared `0`: held as `1` because
-  the column is 1..64, so `max_sessions` sits ABOVE `reported_max_sessions`, and nothing is placed
-  on the machine anyway.
+  alongside `max_sessions`, which is what tells "the machine is declaring above its ceiling" apart
+  from the other reasons the held and reported numbers can differ — a declaration write that has
+  not landed yet (it can fail under lock contention on the runner row and is retried on the
+  socket's 30-second recheck, downward only), or a socket that joined a node older than 1.13.0 and
+  has not reconnected since. A declared `0` is the case that reads the other way round: held as
+  `1` because the column is 1..64, so `max_sessions` sits ABOVE `reported_max_sessions`, and
+  nothing is placed on the machine anyway.
 
   **A machine declaring `draining` or `max_sessions: 0` is now refused a NEW PLACEMENT** with
   `409 runner_declines_work`, before the story is claimed. Both were previously honoured only by

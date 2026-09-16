@@ -68,13 +68,13 @@ defmodule Loopctl.Runners.CapacityTest do
     end)
   end
 
-  defp apply_declared(runner, declared, tenant_id \\ nil) do
-    tenant_id = tenant_id || runner.tenant_id
+  defp apply_declared(runner, declared, opts \\ []) do
+    {tenant_id, opts} = Keyword.pop(opts, :tenant_id, runner.tenant_id)
 
     unboxed(fn ->
       {:ok, result} =
         Repo.with_tenant(tenant_id, fn ->
-          Capacity.apply_declared(Repo, tenant_id, runner.id, declared)
+          Capacity.apply_declared(Repo, tenant_id, runner.id, declared, opts)
         end)
 
       result
@@ -292,14 +292,18 @@ defmodule Loopctl.Runners.CapacityTest do
 
       # The machine took itself down to one on an earlier connection...
       assert {:ok, %{max_sessions: 1, in_flight: 0}} = apply_declared(runner, 1)
-      assert {:ok, 1} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
+      assert {:ok, _} = send_dispatch(runner, dispatch(runner.tenant_id))
 
-      assert unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
+      assert send_dispatch(runner, dispatch(runner.tenant_id)) ==
                {:error, :runner_at_capacity}
 
       # ...and puts itself back up, which is allowed because 3 is what it was ENROLLED with.
+      # The one session it is running is still counted, which is what the recount preserves:
+      # the raise reconciles the counter with the live rows, it does not zero it.
       assert {:ok, %{max_sessions: 3, in_flight: 1}} = apply_declared(runner, 3)
-      assert {:ok, 2} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
+      assert unreleased(runner) == 1
+      assert {:ok, _} = send_dispatch(runner, dispatch(runner.tenant_id))
+      assert in_flight(runner) == 2
     end
 
     test "a declaration ABOVE what the machine was enrolled with is held at the enrolled ceiling" do
@@ -407,7 +411,7 @@ defmodule Loopctl.Runners.CapacityTest do
       other = runner(%{max_sessions: 4})
 
       # RLS refuses it on the app role...
-      assert apply_declared(runner, 1, other.tenant_id) == :unchanged
+      assert apply_declared(runner, 1, tenant_id: other.tenant_id) == :unchanged
       assert held(runner).max_sessions == 4
 
       # ...and the explicit `tenant_id` predicate refuses it again on the BYPASSRLS repo,
@@ -419,6 +423,73 @@ defmodule Loopctl.Runners.CapacityTest do
              end) == :unchanged
 
       assert held(runner).max_sessions == 4
+    end
+
+    test "raising the declaration back does NOT hand out a slot the machine is already using" do
+      # #846.4 review ROUND 3, finding 1. The clamp in the UPDATE only ever LOWERS, so nothing
+      # in the statement reconciles the counter when `max_sessions` goes back UP while the
+      # clamped sessions are still running. This is the sequence the contract's own promise
+      # walks into — "lowering it below the sessions loopctl currently holds sends no more work
+      # until those drain, rather than cancelling them" — and the operator reverting the
+      # configuration is the second half of it.
+      runner = runner(%{max_sessions: 2})
+
+      for _ <- 1..2, do: assert({:ok, _} = send_dispatch(runner, dispatch(runner.tenant_id)))
+      assert in_flight(runner) == 2
+      assert unreleased(runner) == 2
+
+      # The machine rejoins declaring 1 while still holding both. The counter is now SHORT of
+      # its own live rows, deliberately and stably (`heal/3` writes the same 1).
+      assert {:ok, %{max_sessions: 1, in_flight: 1}} = apply_declared(runner, 1)
+      assert unreleased(runner) == 2
+
+      # The configuration is reverted and the machine rejoins declaring 2. BOTH sessions are
+      # still running. Without the recount the row reads `in_flight: 1` against
+      # `max_sessions: 2` and the reserve below is a THIRD concurrent dispatch on a machine
+      # already running its declared maximum — the over-dispatch this whole path removes,
+      # reinstated by the other direction of the same clamp.
+      # The OVER-DISPATCH is asserted first, and on its own line, so it is this behaviour that
+      # goes red when the recount is removed rather than the bookkeeping that explains it.
+      assert {:ok, %{max_sessions: 2}} = apply_declared(runner, 2)
+      assert unreleased(runner) == 2
+
+      assert send_dispatch(runner, dispatch(runner.tenant_id)) ==
+               {:error, :runner_at_capacity}
+
+      assert in_flight(runner) == 2
+    end
+
+    test "`only_lower: true` refuses a write that would RAISE the held capacity" do
+      # #846.4 review ROUND 3, finding 5. The channel's `:recheck` retry re-applies a
+      # declaration ITS OWN connection carried, and that connection can have been superseded by
+      # a newer socket which already wrote a smaller number and then gone again — no check made
+      # at the moment of the retry can see a connection that is already over. So the retry is
+      # allowed to be wrong only in the direction the module's asymmetry calls cheap.
+      runner = runner(%{max_sessions: 4})
+
+      # A newer socket declared 1 and wrote it.
+      assert {:ok, %{max_sessions: 1}} = apply_declared(runner, 1)
+
+      # The older socket, still live and still pending, retries ITS declaration of 4.
+      assert apply_declared(runner, 4, only_lower: true) == :unchanged
+      assert held(runner).max_sessions == 1
+
+      # Unbounded, the same call raises the machine straight back to a capacity it no longer
+      # declares — which is what this option exists to refuse.
+      assert {:ok, %{max_sessions: 4}} = apply_declared(runner, 4)
+    end
+
+    test "`only_lower: true` still applies the lowering the retry exists for" do
+      runner = runner(%{max_sessions: 4})
+
+      # The state the retry repairs: the row holds a LARGER stale number because the join's
+      # write never landed, so the machine is dispatchable against a capacity it did not
+      # declare. Bounding the retry downward costs it nothing here.
+      assert {:ok, %{max_sessions: 1, in_flight: 0}} = apply_declared(runner, 1, only_lower: true)
+      assert held(runner).max_sessions == 1
+
+      # And an equal declaration is a no-op under the bound, exactly as it is without it.
+      assert apply_declared(runner, 1, only_lower: true) == :unchanged
     end
   end
 
