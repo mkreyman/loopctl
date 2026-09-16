@@ -188,12 +188,29 @@ defmodule Loopctl.Delivery.Placement do
   # no holder at all (see the moduledoc).
   @session_expires_in_seconds 14_400
 
-  # The attribution on a park this module's COMPENSATION wrote, and deliberately not
-  # `StoryPayload`'s `"control:dispatch"`: both park a story at `escalated` over the same edge,
-  # and an operator reading the escalated queue has to be able to tell "loopctl could not
-  # describe this story inside the contract" from "loopctl could not give this story's claim
-  # back", because the two have different remedies.
+  # The attribution on a park this module's COMPENSATION wrote. Both this and
+  # `StoryPayload`'s park put a story at `escalated` over the same edge, and an operator
+  # reading the escalated queue has to be able to tell "loopctl could not describe this story
+  # inside the contract" from "loopctl could not give this story's claim back", because the
+  # two have different remedies.
+  #
+  # THE DISTINCTION IS THE SUFFIX, NOT THIS CONSTANT, and that is the correction #865 round 1
+  # made. A default only applies when `opts` carries no `:actor_label`, and BOTH callers of
+  # `place/4` always pass one — `"api:dispatch_placement"`
+  # (`LoopctlWeb.DispatchPlacementController`) and `"worker:dispatch_driver"`
+  # (`Loopctl.Delivery.DispatchDriver`). `attach_story/6` forwards that same key into
+  # `StoryPayload.build/3`, so in production the two parks carried the IDENTICAL label and the
+  # distinction this comment promised did not exist anywhere an operator could read it. The
+  # base is now composed with `@compensation_suffix` (`compensation_actor/1`), so the caller is
+  # still named and the compensation is distinguishable from the story-object park it may
+  # follow. The constant remains as the base for a caller that passes no label at all.
   @escalation_actor "control:placement"
+
+  # Appended to whatever label the placement caller gave, because that label is the only thing
+  # in scope that identifies the principal and it is the SAME one `StoryPayload`'s park writes.
+  # `story_stage_events.actor_label` is unbounded `text` and `audit_log.actor_label` is
+  # `varchar(255)`, so a suffix on a caller label costs nothing at either end.
+  @compensation_suffix "/unreleased-claim"
 
   @type error ::
           :root_dispatch_forbidden
@@ -802,12 +819,21 @@ defmodule Loopctl.Delivery.Placement do
   #     `{:ok, :unchanged}` and CANNOT return an error; `{:ok, :unchanged}` is explicitly not a
   #     failure (see `log_undo/5`), so escalating on it would fire on the healthy path. Its only
   #     failure mode is a raise, which does not reach this decision at all.
-  #   * `revoked` failed — the story is already back at `queued` and placeable; what is stranded
-  #     is a CREDENTIAL occupying the runner agent's one-key-per-role slot, which is an
-  #     agent-level fault and not this story's. Escalating it would also be impossible rather
-  #     than merely wrong: `:session_escalated` leaves `@in_flight ++ [:merged, :deployed]` and
-  #     `queued` is in none of those, so there is no edge to take. `revoke_session_dispatch/3`'s
-  #     error log already names both remedies for it.
+  #   * `revoked` failed — the RELEASE SUCCEEDED, so this story is not what is stranded; a
+  #     CREDENTIAL is, occupying the runner agent's one-key-per-role slot, which is an
+  #     agent-level fault and not this story's. WHERE the story ends up depends on which step
+  #     refused, and this bullet used to name only the first of the two: on the ordinary path
+  #     the row was in flight, so `Stages.follow_release/5` REQUEUES it and it is back at
+  #     `queued` and placeable, but on the `attach_story/6` path `StoryPayload.build/3` has
+  #     ALREADY parked the story it could not describe, and `escalated` is not in
+  #     `StageMachine.in_flight_stages/0` — so the release REBINDS that row and the stage stays
+  #     `escalated`, a story already in front of a human. That second half is not an argument:
+  #     `placement_test.exs`'s "a story too large for the contract is ESCALATED, and the claim
+  #     goes back" drives it through a real `place/4`. Escalating either is impossible
+  #     rather than merely wrong: `:session_escalated` leaves `@in_flight ++ [:merged,
+  #     :deployed]`, and neither `queued` nor `escalated` is in those, so there is no edge to
+  #     take. `revoke_session_dispatch/3`'s error log already names both remedies for the
+  #     credential.
   #
   # So the machine and the defect agree: the story is escalatable exactly when it is still held,
   # and it is still held exactly when the release failed.
@@ -925,12 +951,26 @@ defmodule Loopctl.Delivery.Placement do
         # `human_gate/2` never sees — `:session_escalated` is not a human-only edge, so the
         # `actor_lineage == []` half of `Stages.human?/1` is not in play on this transition.
         actor_lineage: caller_lineage(session),
-        actor_label: Keyword.get(opts, :actor_label, @escalation_actor),
+        actor_label: compensation_actor(opts),
         reason: unreleased_claim_reason(placement_error, release_error),
         event_data: unreleased_claim_event_data(session, placement_error, release_error)
       )
     else
       {:error, {:no_escalation_edge, stage}}
+    end
+  end
+
+  # The caller's own label plus what this park was for — see `@escalation_actor` for why a
+  # DEFAULT could not carry that, and the closing assertions of `placement_test.exs`'s "a
+  # release that genuinely FAILED escalates the story, through place/4" for what holds it.
+  #
+  # A `case` and not `Keyword.get/3`: an explicit `actor_label: nil` is a present key, so the
+  # default would not apply and `nil <> suffix` would raise — swallowed by the rescue in
+  # `escalate_unreleased_claim/6`, which would LOSE the park rather than mislabel it.
+  defp compensation_actor(opts) do
+    case Keyword.get(opts, :actor_label) do
+      label when is_binary(label) -> label <> @compensation_suffix
+      _ -> @escalation_actor <> @compensation_suffix
     end
   end
 
@@ -985,21 +1025,39 @@ defmodule Loopctl.Delivery.Placement do
   # the text that is). Every clause here is composed from constants plus two loopctl-side error
   # terms.
   #
+  # THE SECOND REMEDY SAYS WHAT FORCE-UNCLAIM DOES NOT DO, because this text is read off an
+  # ESCALATED row and force-unclaim does not clear an escalation. `Stages.follow_release/5`
+  # requeues only a row whose stage is in `StageMachine.in_flight_stages/0`; `escalated` is not
+  # in that list, so the release REBINDS the row and the stage is still `escalated` afterwards.
+  # `claimable/2` requires stage `queued`, so an operator who force-unclaimed and re-contracted
+  # got `{:error, :wrong_stage}` with nothing here saying why — which this line used to cause,
+  # by promising that contracting was the only step left.
+  #
   # THE REMEDY IS WRITTEN FIRST AND THE DIAGNOSTICS LAST. `story_stages_text_bounds` is a
   # CHECK and `Stages.advance/4` refuses an over-long reason with `:invalid_reason` BEFORE the
   # transition, so a fat error term would turn "the release failed" into "the release failed
   # AND the story could not be parked" — the one outcome nothing downstream picks up. `short/1`
-  # is what prevents that, by bounding each term rather than the whole: the constant prose plus
-  # two bounded inspects is under a third of `StageMachine.max_reason_length/0`, and the
-  # ordering means that even if a future edit did overrun it, what an operator loses is the
-  # diagnostics and not the instruction.
+  # is what prevents that, by bounding each term rather than the whole, and the ordering means
+  # that even if a future edit did overrun it, what an operator loses is the diagnostics and
+  # not the instruction.
   #
-  # A SECOND, WHOLE-TEXT TRUNCATION WAS HERE AND IS GONE. `bin/mutate.sh` opened it to the
-  # identity and every test still passed (exit 1), which is the tool saying nothing reaches it:
-  # `short/1` bounds both binaries and containers, so no term this function can be handed gets
-  # past it. An unreachable clause that reads as a guard is worse than no clause — the same
-  # argument `may_mint_session_dispatch/2` records above. The bound is now asserted where it is
-  # reachable, in `placement_test.exs`'s "a pathological error term cannot lose the escalation".
+  # THE HEADROOM, MEASURED rather than estimated (this said "under a third", which was wrong by
+  # half). `max_reason_length/0` is 4_000 codepoints and the check is on codepoints at both
+  # ends — `reason_within_bound?/1` counts them and the column's CHECK is `char_length`. The
+  # constant prose below is 727 of them. `short/1` emits at most ~1_055 for a 5-element tuple
+  # and ~1_091 for a 5-key map — a changeset's `changes` and `errors` are exactly those shapes
+  # — so a realistic worst-case pair is about 2_873, roughly 72%.
+  #
+  # A SECOND, WHOLE-TEXT TRUNCATION WAS HERE AND IS GONE, and the reason is a property of
+  # `inspect/2` rather than the percentage above. `bin/mutate.sh` opened it to the identity and
+  # every test still passed (exit 1). The mechanism: `:limit` is spent across the WHOLE
+  # traversal, not per container, so nesting cannot multiply the output — `inspect/2` at
+  # `limit: 5` renders six levels of 5-tuples in 40 characters. With `:printable_limit` capping
+  # each binary, `short/1` therefore has a ceiling in the low thousands whatever it is handed,
+  # and no term this function can be given reaches 4_000 through it. An unreachable clause that
+  # reads as a guard is worse than no clause — the same argument `may_mint_session_dispatch/2`
+  # records above. The bound is asserted where it IS reachable, in `placement_test.exs`'s "a
+  # pathological error term cannot lose the escalation".
   defp unreleased_claim_reason(placement_error, release_error) do
     "loopctl claimed this story for a runner, the dispatch was refused, and the compensating " <>
       "release of that claim ALSO failed. The story is held by a session that will never " <>
@@ -1007,8 +1065,9 @@ defmodule Loopctl.Delivery.Placement do
       "escalation to queued (POST /api/v1/stories/:id/stage/resolve, MCP " <>
       "resolve_escalation) — that releases the claim, revokes its session credential and " <>
       "re-contracts the story, so one call makes it placeable again. Force-unclaim (POST " <>
-      "/api/v1/stories/:id/force-unclaim, MCP force_unclaim_story) also frees the claim, but " <>
-      "leaves the story at pending: contract it before placing it again. " <>
+      "/api/v1/stories/:id/force-unclaim, MCP force_unclaim_story) frees the claim but does " <>
+      "NOT clear this escalation: the stage row stays at escalated, so the story is still " <>
+      "unplaceable and you have to resolve it anyway. " <>
       "placement_error=#{short(placement_error)} release_error=#{short(release_error)}"
   end
 
