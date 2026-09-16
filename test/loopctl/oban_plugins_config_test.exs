@@ -522,6 +522,38 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "RevokeExpiredApiKeysWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.RevokeExpiredApiKeysWorker} -> true
+          {_schedule, Loopctl.Workers.RevokeExpiredApiKeysWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the expired-api-key sweep is scheduled, every 5 minutes", %{entry: entry} do
+      assert entry,
+             "expected a RevokeExpiredApiKeysWorker crontab entry — without it an expired " <>
+               "api_key is never revoked, and because the partial unique index tests " <>
+               "`revoked_at IS NULL` and CANNOT test expiry, it occupies its agent's " <>
+               "one-key-per-role slot for ever"
+
+      assert elem(entry, 0) == "*/5 * * * *"
+    end
+
+    test "it is not parked" do
+      refute Loopctl.Workers.RevokeExpiredApiKeysWorker in Loopctl.ObanConfig.parked_crons()
+    end
+  end
+
   describe "#803: ReclaimExpiredClaimsWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

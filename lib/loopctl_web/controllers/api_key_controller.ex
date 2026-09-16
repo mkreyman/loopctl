@@ -48,7 +48,18 @@ defmodule LoopctlWeb.ApiKeyController do
 
   operation(:index,
     summary: "List API keys",
-    description: "Lists all API keys for the current tenant. Never exposes raw key or hash.",
+    description:
+      "Lists all API keys for the current tenant. Never exposes raw key or hash.\n\n" <>
+        "`include_revoked` defaults to FALSE, and since #862 a key that has passed its " <>
+        "`expires_at` is REVOKED by a background sweep " <>
+        "(`Loopctl.Workers.RevokeExpiredApiKeysWorker`, every 5 minutes) — but only for the " <>
+        "keys the partial unique index `api_keys_one_role_per_agent_idx` actually " <>
+        "CONSTRAINS: role neither `user` nor `superadmin`, AND a non-null `agent_id`. So an " <>
+        "expired agent-linked `agent`/`orchestrator` key disappears from this listing within " <>
+        "minutes of expiring; pass `include_revoked=true` to see it. A `user`/`superadmin` " <>
+        "key, and any key with NO `agent_id`, is deliberately NOT swept and stays listed — " <>
+        "such a key occupies no slot in that index, because Postgres treats NULL index keys " <>
+        "as distinct.",
     parameters: [
       include_revoked: [in: :query, type: :boolean, description: "Include revoked keys"]
     ],
@@ -83,7 +94,17 @@ defmodule LoopctlWeb.ApiKeyController do
         "A runner's key cannot be rotated here (422): revoke and re-enroll the runner. " <>
         "Like `create`, this mints a raw key that belongs to no dispatch lineage, so a " <>
         "caller whose own key carries a lineage is refused with 403 " <>
-        "`api_key_mint_forbidden`.",
+        "`api_key_mint_forbidden`.\n\n" <>
+        "A REVOKED key cannot be rotated (422 `Cannot rotate a revoked key`), and since #862 " <>
+        "an EXPIRED key becomes a revoked one — but only for the keys the partial unique " <>
+        "index `api_keys_one_role_per_agent_idx` actually CONSTRAINS: role neither `user` nor " <>
+        "`superadmin`, AND a non-null `agent_id`. " <>
+        "`Loopctl.Workers.RevokeExpiredApiKeysWorker` sweeps those every 5 minutes; rotate " <>
+        "such a key BEFORE it expires, or create a replacement. Everything else stays " <>
+        "rotatable after expiry, deliberately: a `user`/`superadmin` key, and any key with " <>
+        "NO `agent_id`, occupies no slot in that index (Postgres treats NULL index keys as " <>
+        "distinct), so sweeping it would free nothing and destroy the recovery path for an " <>
+        "expired credential.",
     parameters: [
       id: [in: :path, type: :string, description: "API key UUID to rotate"]
     ],

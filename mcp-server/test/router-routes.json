@@ -83,6 +83,7 @@
     ["GET","/api/v1/dispatches","LoopctlWeb.DispatchController",":index"],
     ["POST","/api/v1/dispatches","LoopctlWeb.DispatchController",":create"],
     ["GET","/api/v1/dispatches/:id","LoopctlWeb.DispatchController",":show"],
+    ["POST","/api/v1/dispatches/:id/revoke","LoopctlWeb.DispatchController",":revoke"],
     ["GET","/api/v1/dispatches/enrolled-keys","LoopctlWeb.DispatchController",":enrolled_keys"],
     ["DELETE","/api/v1/egress/local-only","LoopctlWeb.EgressController",":clear_local_only"],
     ["POST","/api/v1/egress/local-only","LoopctlWeb.EgressController",":enable_local_only"],

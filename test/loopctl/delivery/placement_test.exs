@@ -546,6 +546,45 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end).revoked_at
     end
 
+    test "the undo's revocation is attributed to the PLACEMENT CALLER, not the tenant operator",
+         ctx do
+      # #862 review round 2, finding 3. `undo_claim/5` releases the claim FIRST, and since
+      # #862 `force_unclaim_story/3` revokes the story's session dispatch itself — so the
+      # `dispatch_revoked` entry on the chain is written by the RELEASE, and the explicit
+      # `revoke_session_dispatch/3` that follows finds nothing left to revoke and appends
+      # nothing. `Progress` reads the lineage as `Keyword.get(opts, :actor_lineage, [])`, so
+      # passing only `actor_label:` recorded an agent's compensation with an EMPTY actor
+      # lineage — which on the chain is the shape the tenant's own operator key writes.
+      # Misattribution on an immutable, STH-covered record is worse than no record.
+      #
+      # PLACED BY A LINEAGED CALLER, deliberately. The default `place/4` caller here is the
+      # tenant's operator key, whose resolved lineage is `[]` — so the session dispatch is a
+      # ROOT, `Enum.drop(lineage_path, -1)` is `[]`, and the expected value would equal the
+      # DEFECT's value. A parent dispatch is what makes the two differ, which is what makes
+      # this assertion able to go red.
+      #
+      # Asserted against the SESSION's own lineage minus its leaf, which is what
+      # `mint_session_dispatch/5` parented it on — never against a literal, so the assertion
+      # cannot drift into agreeing with a hard-coded value.
+      %{runner: runner, story: story, channel: channel} = ctx
+      %{dispatch: parent, api_key: parent_key} = unboxed(fn -> orchestrator(runner.tenant_id) end)
+
+      disconnect(channel, runner)
+
+      assert {:error, :runner_not_connected} =
+               place(ctx, dispatch_payload(story), api_key: parent_key)
+
+      session = unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end)
+      assert session.revoked_at
+
+      assert [entry] = unboxed(fn -> revoked_entries(runner.tenant_id, session.id) end)
+      assert entry.actor_lineage == Enum.drop(session.lineage_path, -1)
+      assert entry.actor_lineage == parent.lineage_path
+
+      refute entry.actor_lineage == [],
+             "an empty actor lineage reads as the tenant operator having done this"
+    end
+
     test "a payload with no usable dispatch_id is refused before anything is claimed", ctx do
       %{runner: runner, story: story} = ctx
       payload = Map.put(dispatch_payload(story), "dispatch_id", "not-a-uuid")
@@ -803,6 +842,14 @@ defmodule Loopctl.Delivery.PlacementTest do
       from e in AuditChain.Entry,
         where: e.tenant_id == ^tenant_id and e.entity_id == ^story_id,
         where: e.action == "story_stage_claimed"
+    )
+  end
+
+  defp revoked_entries(tenant_id, dispatch_id) do
+    AdminRepo.all(
+      from e in AuditChain.Entry,
+        where: e.tenant_id == ^tenant_id and e.entity_id == ^dispatch_id,
+        where: e.action == "dispatch_revoked"
     )
   end
 

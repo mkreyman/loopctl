@@ -347,21 +347,76 @@ defmodule Loopctl.Delivery.Stages do
 
   def advance(tenant_id, story_id, {from, to, edge}, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
-    reason = Keyword.get(opts, :reason)
 
-    with :ok <- allowed_for_caller(from, to, edge),
-         :ok <- lineage_declared(from, to, edge, opts),
-         :ok <- human_gate(edge, opts),
-         :ok <- reason_given(to, edge, reason),
-         :ok <- event_data_ok(opts),
-         {:ok, effects} <- validate_effects(opts),
-         :ok <- required_effects_present(to, effects) do
+    with {:ok, effects} <- precheck_effects({from, to, edge}, opts) do
       # ESCAPED ONLY AFTER EVERY REFUSAL THE CALLER CAN PREDICT. See `sanitise_reason/1`:
       # the caller is bounded on the text it sent, the column holds the escaped form, and the
       # two numbers are deliberately different.
       in_tenant(tenant_id, fn ->
         transition(tenant_id, story_id, {from, to, edge}, epoch, effects, sanitise_reason(opts))
       end)
+    end
+  end
+
+  @doc """
+  Every refusal `advance/4` decides BEFORE it opens a transaction, asked WITHOUT advancing
+  anything — the authorization half of a transition, available to a caller that has
+  irreversible work to do first.
+
+  ## Why this is public, and what it is for
+
+  `Escalations.resolve/3` is the caller that forced it. Resolving an escalation to `queued`
+  has to RELEASE THE CLAIM before it can advance the stage row — the release bumps the epoch
+  the transition is then fenced on — and since #862 that release also revokes the story's
+  session credential and cascades to every descendant dispatch. Run before the human gate,
+  that made a REFUSED resolve destructive: a dispatch-minted `:user`-role key (a session
+  claiming to be a person, precisely what `human?/1` exists to refuse) got its refusal only
+  after the implementer's live credential was dead and its claim was gone, repeatably, on any
+  escalated story (#862 review round 3, finding 1).
+
+  So the gate is asked FIRST and the destruction happens only on a caller that will pass it.
+
+  ## It is the SAME chain `advance/4` runs, never a copy
+
+  `advance/4` calls the identical private function; this returns `:ok` where that keeps the
+  validated effects. A duplicated gate would be a gate that drifts, and the copy that drifts
+  is always the one guarding the side effect.
+
+  ## What it does NOT decide
+
+  Anything that needs the row or the transaction — among them `:not_found`, `:stale_stage`,
+  `:stale_claim_epoch`, `:not_claimed`, `:wrong_stage`, `:effect_conflict`, `:busy` and
+  `:audit_chain_append_failed`. So an `:ok` here is NOT a promise that the advance will
+  succeed; it is only the promise that it will not be refused for a reason the caller could
+  have been told before it did anything. Nor does passing it LATCH: `advance/4` re-runs this
+  chain itself, so a caller cannot pass the gate here and then hand it different
+  attribution.
+  """
+  @spec precheck(
+          {StageMachine.stage(), StageMachine.stage()} | StageMachine.transition(),
+          keyword()
+        ) :: :ok | {:error, advance_error()}
+  def precheck(transition, opts)
+
+  def precheck({from, to}, opts), do: precheck({from, to, :forward}, opts)
+
+  def precheck({_from, _to, _edge} = transition, opts) do
+    with {:ok, _effects} <- precheck_effects(transition, opts), do: :ok
+  end
+
+  # THE ONE DEFINITION of "what this caller may be refused before the database". Order is
+  # load-bearing and unchanged: the transition has to exist, its attribution has to be
+  # declared, the principal has to be allowed, and only then is its PAYLOAD examined — so a
+  # caller the gate refuses learns that rather than learning its reason was too long.
+  defp precheck_effects({from, to, edge}, opts) do
+    with :ok <- allowed_for_caller(from, to, edge),
+         :ok <- lineage_declared(from, to, edge, opts),
+         :ok <- human_gate(edge, opts),
+         :ok <- reason_given(to, edge, Keyword.get(opts, :reason)),
+         :ok <- event_data_ok(opts),
+         {:ok, effects} <- validate_effects(opts),
+         :ok <- required_effects_present(to, effects) do
+      {:ok, effects}
     end
   end
 

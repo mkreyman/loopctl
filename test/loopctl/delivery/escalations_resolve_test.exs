@@ -20,9 +20,12 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.AuditChain
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Dispatches
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -129,6 +132,77 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
       assert unboxed(fn -> Stages.get(ctx.tenant.id, ctx.story.id) end).stage == :escalated
     end
+
+    test "a REFUSED resolve does not revoke the implementer's session credential", ctx do
+      # #862 review round 3, finding 1 — and the direct reversal of what round 2's version of
+      # this test asserted. It pinned the destruction: "the release runs before the human gate,
+      # so the credential is already revoked". That was an accurate reading of the code and the
+      # wrong thing to hold in place.
+      #
+      # THE REACHABLE SHAPE. A dispatch-minted `:user`-role key is mintable (`@roles` in
+      # `Loopctl.Dispatches.Dispatch`) and clears the route's `role: :user` plug, so a SESSION
+      # can POST `to: queued` on any escalated story. `prepare_story/6` released the claim,
+      # bumped the epoch, revoked the implementer's LIVE session credential and every
+      # descendant dispatch, re-contracted the story — and only THEN did `Stages.human?/1`
+      # (`lib/loopctl/delivery/stages.ex:1127-1130`, which requires `actor_lineage == []`)
+      # refuse the caller. Repeatably, on any escalated story: a refusal that cost the
+      # implementing agent its key.
+      #
+      # SPLIT FROM THE STORY-STATE CASE BELOW ON PURPOSE. ExUnit stops a test at its first
+      # failed assertion, so a single test covering both would prove only whichever assertion
+      # happens to be written first — and the two cover different writes `prepare_story/6`
+      # made. Two tests means the ordering mutation has to turn TWO of them red.
+      %{tenant: tenant} = ctx
+      session = session_dispatch_for(ctx)
+      lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+
+      assert {:error, :human_required} = resolve(ctx, :queued, actor_lineage: lineage)
+
+      refute unboxed(fn -> AdminRepo.get!(Dispatch, session.id) end).revoked_at,
+             "a refused resolve must not revoke the implementer's live session credential"
+
+      assert unboxed(fn -> revoked_entries(tenant.id, session.id) end) == [],
+             "nothing was revoked, so the immutable chain must carry no revocation entry"
+    end
+
+    test "a REFUSED resolve does not release the claim", ctx do
+      # The other half of the pre-state. The release is what BUMPS the epoch, clears
+      # `assigned_agent_id` and re-contracts the story, and each of those is a write a caller
+      # the gate refuses must not be able to cause. The stage row is asserted last because it
+      # is the one thing the old ordering left alone — `Stages.advance/4` never ran — so a test
+      # that checked only the stage passed the defect this covers.
+      %{tenant: tenant} = ctx
+      before = reload(ctx)
+      lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+
+      assert {:error, :human_required} = resolve(ctx, :queued, actor_lineage: lineage)
+
+      after_refusal = reload(ctx)
+      assert after_refusal.claim_epoch == before.claim_epoch, "the claim epoch moved"
+      assert after_refusal.assigned_agent_id == before.assigned_agent_id, "the claim was released"
+      assert after_refusal.agent_status == before.agent_status, "the story was re-contracted"
+
+      assert unboxed(fn -> Stages.get(tenant.id, ctx.story.id) end).stage == :escalated
+    end
+
+    test "a caller that PASSES the gate still gets the release, so the gate did not break it",
+         ctx do
+      # The positive control for the test above. Without it, "a refused resolve destroys
+      # nothing" is satisfied by a `resolve/3` that destroys nothing ever — including on the
+      # human path, where releasing the claim and revoking the dead session's credential is
+      # exactly what the function is for.
+      session = session_dispatch_for(ctx)
+
+      assert {:ok, row} = resolve(ctx, :queued)
+      assert row.stage == :queued
+
+      assert unboxed(fn -> AdminRepo.get!(Dispatch, session.id) end).revoked_at,
+             "a human resolve to queued must still revoke the released session's credential"
+
+      story = reload(ctx)
+      assert story.assigned_agent_id == nil
+      assert story.claim_epoch > @epoch
+    end
   end
 
   describe "what may be resolved" do
@@ -163,6 +237,46 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
         actor_lineage: Keyword.get(opts, :actor_lineage, [])
       )
     end)
+  end
+
+  # A session dispatch minted FOR this story, recorded on it — the shape
+  # `Placement.mint_session_dispatch/5` produces, and the only shape
+  # `Dispatches.revoke_story_session/4` will revoke.
+  defp session_dispatch_for(ctx) do
+    unboxed(fn ->
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id})
+
+      {:ok, %{dispatch: root}} =
+        Dispatches.create_dispatch(ctx.tenant.id, %{role: :orchestrator}, actor_lineage: [])
+
+      {:ok, %{dispatch: session}} =
+        Dispatches.create_dispatch(
+          ctx.tenant.id,
+          %{
+            role: :agent,
+            agent_id: agent.id,
+            story_id: ctx.story.id,
+            parent_dispatch_id: root.id
+          },
+          actor_lineage: root.lineage_path
+        )
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(s in Story, where: s.id == ^ctx.story.id),
+          set: [implementer_dispatch_id: session.id]
+        )
+
+      session
+    end)
+  end
+
+  defp revoked_entries(tenant_id, dispatch_id) do
+    AdminRepo.all(
+      from e in AuditChain.Entry,
+        where: e.tenant_id == ^tenant_id and e.entity_id == ^dispatch_id,
+        where: e.action == "dispatch_revoked"
+    )
   end
 
   # ASKED THROUGH THE FUNCTION A PLACEMENT ASKS, never by restating its rule: a test that

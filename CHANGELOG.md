@@ -41,6 +41,65 @@ All notable changes to loopctl are documented here.
   **Nothing required of an operator.** All three are additive; a session picks them up on the
   next `/mcp` or restart once `loopctl-mcp-server@2.99.0` has published. 2.98.0 is deliberately
   skipped — it is claimed by a branch in flight, and two trees must not share one version.
+- **`POST /api/v1/dispatches/:id/revoke` — a dispatch can be revoked from outside the app, and
+  an expired api_key is now swept (#862).** Three changes to one invariant, and one blocker.
+
+  **The blocker, measured on story `d9975b31`.** `place_dispatch` answered
+  `422 agent already has an active key with this role` and wrote nothing, so the story stayed
+  `queued`. The cause is that "active api_key" has TWO definitions and only one was enforced.
+  `api_keys_one_role_per_agent_idx` is a partial unique index over `(tenant_id, agent_id, role)`
+  whose predicate is `revoked_at IS NULL`; the auth pipeline's is
+  `revoked_at IS NULL AND expires_at > now()`. The index cannot use the second — Postgres
+  requires a partial-index predicate to be IMMUTABLE and `now()` is STABLE — so a key that is
+  unusable for authentication still OCCUPIES its agent's slot, and the next mint for that agent
+  is refused.
+
+  **New endpoint — `POST /api/v1/dispatches/:id/revoke`**, with the MCP tool `revoke_dispatch`.
+  `Loopctl.Dispatches.revoke/2` existed and had no route and no tool, so a stranded ephemeral
+  key could only be waited out. It revokes the dispatch AND EVERY DESCENDANT plus the api_key
+  each one minted, so name a LEAF unless you mean the subtree. `role: :orchestrator` WITH the
+  hierarchy (an agent key is `403 insufficient_role`), human-anchored tenants only, suspended by
+  a custody halt, and bounded by the lineage ceiling: a dispatch may only be revoked by a caller
+  it descends from (`403 dispatch_outside_caller_lineage`), because an unrestricted cascading
+  revoke would let one principal take down another's tree and let an implementer prune the pool
+  its own verifier is selected from. A caller carrying NO lineage passes only at `user` role —
+  the tenant's operator key, which may revoke anywhere in its tenant; anything else unlineaged,
+  which is what a legacy `LOOPCTL_ORCH_KEY` is, gets `403 unlineaged_revoke_forbidden` naming
+  the three remedies it can actually perform. Every revoke that changes something now appends a
+  `dispatch_revoked` entry to the hash-chained audit log, carrying the caller's server-resolved
+  lineage; a revoke that changed nothing appends nothing. Idempotent: an already-revoked dispatch
+  answers 200 with `revoked_count: 0` and its ORIGINAL `revoked_at`, and that holds for two
+  revokes racing as well as for a sequential retry — so a subtree revoked from two places at
+  once leaves no dispatch counted in two entries, and each revoked row keeps the FIRST
+  revocation's timestamp. (An entry is written per revoke CALL, keyed on the dispatch you
+  named, carrying `revoked_count` for the whole cascade — so revoking a parent with two
+  children appends ONE entry, not three.)
+
+  **New cron — `RevokeExpiredApiKeysWorker`, every 5 minutes.** `RevokeExpiredDispatchesWorker`
+  only reaches keys a DISPATCH minted. A key created at `POST /api/v1/api_keys` with an
+  `expires_at` has no dispatch row, so nothing ever revoked it and it held its agent's slot
+  PERMANENTLY. The new sweep is keyed on the `api_keys` row instead, so it covers every mint
+  path. No configuration and no migration; it only writes `revoked_at` on rows that are already
+  past their own expiry.
+
+  **OPERATOR-FACING CONSEQUENCE, and the bound on it.** The sweep covers exactly the keys the
+  partial unique index CONSTRAINS: role neither `user` nor `superadmin`, AND a non-null
+  `agent_id`. For those, an expired key is now a REVOKED key, so it drops out of the default
+  `GET /api/v1/api_keys` listing (pass `include_revoked=true` to see it) and
+  `POST /api/v1/api_keys/:id/rotate` answers `422 Cannot rotate a revoked key`. Rotate such a
+  key before it expires, or create a replacement. Everything else is deliberately outside the
+  sweep for one reason: it occupies no slot in that index, so reaping it would free nothing
+  and would destroy the recovery path for an expired credential. That is `user`/`superadmin`
+  keys, and ALSO any key with no `agent_id` — the index is keyed on `(tenant_id, agent_id,
+  role)` and Postgres treats NULL index keys as distinct, so an agent-less key at ANY role
+  conflicts with nothing and blocks no mint.
+
+  **`force_unclaim_story` now revokes the story's session credential.** Taking a story back
+  kills the key the previous holder had, scoped to a dispatch minted FOR that story — a general
+  agent dispatch that merely claimed it is left alone, because the revoke cascades and would
+  otherwise kill that agent's other work. `stories.implementer_dispatch_id` is deliberately NOT
+  cleared: it is custody provenance, a revoked dispatch row still resolves, and every L4 lineage
+  comparison is unchanged.
 
 - **An escalation reason is ESCAPED for invisible characters before it is stored (#804).** It
   was stored strictly verbatim, and it is written by a SESSION — a model that had just read
