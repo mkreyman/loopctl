@@ -131,6 +131,30 @@ defmodule Loopctl.RunnersTest do
       assert Auth.count_api_keys(tenant.id) == 1
     end
 
+    test "raising a machine's ceiling is revoke-then-enrol, and the old credential dies with it" do
+      # #846.4 review ROUND 2, finding 6. Four operator-facing surfaces said only "re-enrol
+      # it", which is not an executable instruction: `runners_active_name_uidx` is partial on
+      # `revoked_at IS NULL`, so the revoke is not optional — and it invalidates the
+      # credential the machine is connected with, which is why a new token file and a restart
+      # are part of the procedure rather than a detail. This test is what makes the corrected
+      # wording checkable.
+      tenant = fixture(:tenant)
+      {raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "minis", max_sessions: 2})
+
+      assert {:error, %Ecto.Changeset{}} =
+               Runners.enroll_runner(tenant.id, %{name: "minis", max_sessions: 8})
+
+      {:ok, _} = Runners.revoke_runner(tenant.id, runner.id)
+
+      assert {:ok, %{runner: again, raw_key: new_raw}} =
+               Runners.enroll_runner(tenant.id, %{name: "minis", max_sessions: 8})
+
+      assert again.enrolled_max_sessions == 8
+      assert again.max_sessions == 8
+      assert {:error, _} = Auth.verify_api_key(raw)
+      assert {:ok, _} = Auth.verify_api_key(new_raw)
+    end
+
     test "allows re-enrolling a revoked machine under its old name" do
       tenant = fixture(:tenant)
       {_raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "minis"})
@@ -138,6 +162,58 @@ defmodule Loopctl.RunnersTest do
 
       assert {:ok, %{runner: again}} = Runners.enroll_runner(tenant.id, %{name: "minis"})
       assert again.id != runner.id
+    end
+  end
+
+  describe "the enrolled ceiling is filled by the database when a writer omits it" do
+    test "an INSERT that does not name enrolled_max_sessions takes it from max_sessions" do
+      # #846.4 review ROUND 2, finding 5. `fly.toml` runs migrations as the `release_command`
+      # and then replaces machines ONE AT A TIME, so for the length of a deploy the column
+      # exists and OLD instances are still serving. Their `Runner` schema has no
+      # `enrolled_max_sessions`, so their enrollment INSERT does not name it — and against a
+      # bare NOT NULL with no server-side fallback that is a not-null violation, i.e.
+      # `POST /api/v1/runners` and the `runner_enroll` tool 500 for the whole window.
+      #
+      # A BEFORE INSERT trigger fills it from `max_sessions`, which is the same derivation
+      # `Runner.create_changeset/2` makes, so the operator's own grant is what lands rather
+      # than a constant nobody chose. This INSERT is the old instance's statement.
+      tenant = fixture(:tenant)
+      {_raw, existing} = fixture(:runner, %{tenant_id: tenant.id, name: "minis"})
+      {_raw_key, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      now = DateTime.utc_now()
+
+      assert {1, _} =
+               AdminRepo.insert_all("runners", [
+                 %{
+                   id: Ecto.UUID.bingenerate(),
+                   tenant_id: Ecto.UUID.dump!(tenant.id),
+                   api_key_id: Ecto.UUID.dump!(key.id),
+                   agent_id: Ecto.UUID.dump!(existing.agent_id),
+                   name: "beelink",
+                   max_sessions: 8,
+                   in_flight: 0,
+                   inserted_at: now,
+                   updated_at: now
+                 }
+               ])
+
+      assert AdminRepo.one!(
+               from r in Runner,
+                 where: r.tenant_id == ^tenant.id and r.name == "beelink",
+                 select: r.enrolled_max_sessions
+             ) == 8
+    end
+
+    test "and a writer that DOES name it keeps its own value" do
+      # The trigger fills a NULL and never overwrites, so the ordinary enrollment path — which
+      # derives the grant in the changeset — is unaffected.
+      tenant = fixture(:tenant)
+
+      assert {:ok, %{runner: runner}} =
+               Runners.enroll_runner(tenant.id, %{name: "minis", max_sessions: 5})
+
+      assert runner.enrolled_max_sessions == 5
+      assert runner.max_sessions == 5
     end
   end
 

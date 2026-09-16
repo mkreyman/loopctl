@@ -186,6 +186,22 @@ defmodule LoopctlWeb.RunnerChannel do
   def handle_info(:after_join, socket) do
     %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
 
+    # WHAT THE MACHINE DECLARED BECOMES WHAT LOOPCTL RESERVES AGAINST — bounded by what it was
+    # ENROLLED with — and it happens HERE, before `Presence.track/4`. A dispatch needs a single
+    # live socket in the pool (`Runners.dispatch/3`), so until the track below there is no way
+    # to place one on THIS socket. It never refuses the join and never raises; see
+    # `Runners.apply_declaration/4` for why the machine's number wins downward, why the
+    # enrolled one is a ceiling, and why nothing about it reaches the audit chain.
+    #
+    # A FAILED write is REMEMBERED, not lost. The realistic failure is `:capacity_busy` — the
+    # `runners` row's lock timeout running out against the row every dispatch in the tenant
+    # contends on, i.e. exactly the load under which being dispatchable against a stale larger
+    # number does the most harm — and nothing else reconciles it, since the heal sweep
+    # recomputes `in_flight` and never `max_sessions`. So it is re-armed on the `:recheck`
+    # timer below, which this socket already runs every 30 seconds — as a write that may only
+    # LOWER the held capacity, see `retry_declaration/1`.
+    socket = assign(socket, :declaration_pending, apply_declaration(tenant_id, runner, meta))
+
     {:ok, ref} =
       Presence.track(
         self(),
@@ -238,7 +254,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
     if Runners.authorized?(tenant_id, runner.id) do
       schedule_recheck()
-      {:noreply, socket}
+      {:noreply, retry_declaration(socket)}
     else
       disconnect(socket, :no_longer_authorized)
     end
@@ -890,6 +906,55 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   defp schedule_recheck, do: Process.send_after(self(), :recheck, @recheck_interval_ms)
+
+  # `true` while the declaration this connection carried has NOT reached the row. The socket's
+  # `:meta` is the right thing to re-apply: capacity arrives once per connection and a
+  # `RunnerStatus` event can never carry it (`max_sessions` is not among its fields), so the
+  # value here is still the one this machine declared on join.
+  defp apply_declaration(tenant_id, runner, meta, opts \\ []) do
+    Runners.apply_declaration(tenant_id, runner, meta, opts) != :ok
+  end
+
+  # The retry runs AFTER `Presence.track/4`, so it does not have `:after_join`'s ordering
+  # argument and does not need it: a lowering applied while the machine is dispatchable is
+  # clamped by `Capacity.apply_declared/5` and converges, because the release path RECOUNTS
+  # rather than decrementing. Staying over-dispatched until the machine happens to reconnect
+  # is the worse of the two, and it was the behaviour before this.
+  #
+  # IT CAN ONLY LOWER (#846.4 review round 3, finding 5). This retry re-applies a declaration
+  # THIS connection carried, and a connection can be superseded: two sockets can be live at
+  # once (`Runners`' moduledoc documents the reconnect window in which a silent node's entry
+  # lingers), so socket A, which joined declaring 4 and lost the runner row's lock, may be
+  # retrying after socket B joined declaring 1 and wrote it. `only_lower: true` is what makes
+  # that harmless — A's 4 is refused as a raise, whether or not B is still visible when A
+  # retries, and the doc on `Capacity.apply_declared/5` carries the reasoning. The state this
+  # retry exists to repair is the opposite one (a row left holding a LARGER stale number), so
+  # the bound costs it nothing it was for.
+  #
+  # `sole_live_socket?/1` is kept in front of it as the cheap half of the same judgement:
+  # while a runner has two live sockets it is `:runner_ambiguous` to `Runners.dispatch/3` and
+  # no dispatch is being decided against the row at all, so there is nothing to gain by taking
+  # the lock. It is NOT what makes the retry safe — round 2 read it that way, and it cannot
+  # be: it is a check on the pool AT THIS INSTANT, and B can have joined, written and gone
+  # between two of A's 30-second rechecks, leaving A sole and its declaration stale.
+  #
+  # `declaration_pending` is deliberately LEFT ARMED while ambiguous rather than cleared, so
+  # the write lands on the first recheck after the ambiguity clears.
+  defp retry_declaration(%{assigns: %{declaration_pending: true}} = socket) do
+    if sole_live_socket?(socket) do
+      %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
+
+      assign(
+        socket,
+        :declaration_pending,
+        apply_declaration(tenant_id, runner, meta, only_lower: true)
+      )
+    else
+      socket
+    end
+  end
+
+  defp retry_declaration(socket), do: socket
 
   # Disconnecting the SOCKET (not just stopping this channel) keeps a revoked runner from
   # simply rejoining the topic on the connection it already has.

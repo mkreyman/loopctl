@@ -6,6 +6,59 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A runner's capacity now follows what the machine declares, not what it was enrolled with
+  (#846.4, runner contract 1.13.0).** `runners.max_sessions` — the number `Loopctl.Runners.Capacity`
+  reserves against — was written once at enrollment and had no path from the runner's own
+  declaration, which arrives on EVERY join and was documented as advisory. `minis` rejoined twice on
+  2026-09-16 declaring `max_sessions: 1` and `GET /api/v1/runners/pool` went on reporting a held `2`,
+  so loopctl placed a second concurrent dispatch on a machine that refuses it `at_capacity` — and a
+  refused dispatch costs the story's claim and parks it. Every join now copies the declaration into
+  the held row.
+
+  **The enrolled value remains a CEILING.** The held capacity is the LESSER of what the machine
+  declares and what it was enrolled with, so a machine may always take itself DOWN and can never
+  raise itself up. Without that bound a compromised or misconfigured runner could declare 64 and
+  absorb the tenant's whole admission budget, one dispatch of story content and one freshly minted
+  ephemeral key at a time — something it could not do before capacity followed the declaration at
+  all.
+
+  **Operator-visible:** the `max_sessions` you pass to `POST /api/v1/runners` (and to the
+  `runner_enroll` MCP tool) is that ceiling, and the value the row starts at. A machine enrolled at
+  8 that declares 1 is held at 1 from its first connect; one enrolled at 2 that declares 8 stays at
+  2. To make a machine carry FEWER sessions, change `control.max_sessions` in the runner's own
+  `runner.json` and reconnect it — no API call is needed. To let it carry MORE than its grant,
+  REVOKE the runner and enrol it again: there is no endpoint that widens the ceiling in place,
+  deliberately. That is three steps, not one, because `runners_active_name_uidx` is partial on
+  `revoked_at IS NULL` and refuses a second ACTIVE runner with the same machine name — revoke
+  (`DELETE /api/v1/runners/:id`, or the `runner_revoke` tool), enrol again at the larger number,
+  then write the NEW token to the machine's token file and restart the runner, because revoking
+  invalidates the credential it is connected with.
+  `GET /api/v1/runners` and `GET /api/v1/runners/pool` now both return `enrolled_max_sessions`
+  alongside `max_sessions`, which is what tells "the machine is declaring above its ceiling" apart
+  from the other reasons the held and reported numbers can differ — a declaration write that has
+  not landed yet (it can fail under lock contention on the runner row and is retried on the
+  socket's 30-second recheck, downward only), or a socket that joined a node older than 1.13.0 and
+  has not reconnected since. A declared `0` is the case that reads the other way round: held as
+  `1` because the column is 1..64, so `max_sessions` sits ABOVE `reported_max_sessions`, and
+  nothing is placed on the machine anyway.
+
+  **A machine declaring `draining` or `max_sessions: 0` is now refused a NEW PLACEMENT** with
+  `409 runner_declines_work`, before the story is claimed. Both were previously honoured only by
+  the unattended selectors, so `POST /api/v1/runners/:runner_id/dispatches` claimed the story and
+  let the runner refuse the push afterwards — leaving it at `claimed` with no session until its
+  lease expired. Two paths are deliberately exempt, both because they claim nothing: a dispatch an
+  operator pushes at a machine by name is still delivered for the runner to refuse, and a RETRY
+  carrying a `dispatch_id` loopctl already holds is still re-sent. That second exemption is the
+  graceful drain working as the contract describes it — `draining` means finish what you hold and
+  take nothing new, and a resume is what the machine holds. Refusing it would strand the standing
+  claim at `claimed` until its lease expired, and the `dispatch_id` is spent, so there is no other
+  runner to place it on.
+
+  **Re-vendoring `priv/runner_contract/v1.json` is worth doing and is not required.** Nothing
+  changed on the wire and no runner has to send anything new; a copy taken at 1.12.0 describes
+  this field as advisory, which is now wrong, and one taken mid-1.13.0 does not mention the
+  ceiling.
+
 - **Three more of loopctl's own surface becomes reachable, and a session can tell a MISSING tool
   from a STALE one (#846.5, #846.6, #846.7).** No endpoint changed; these are the tools the rule
   in `CLAUDE.md` already required, plus the sweep that finds the next miss.

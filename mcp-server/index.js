@@ -7877,8 +7877,18 @@ const TOOLS = [
           minimum: 1,
           maximum: 64,
           description:
-            "How many dispatches loopctl keeps in flight on this machine at once (default 2). " +
-            "The tenant's total across all its runners is capped separately by the server.",
+            "The CEILING on how many dispatches loopctl will ever keep in flight on this " +
+            "machine at once (default 2), and the value it starts at. Since runner contract " +
+            "1.13.0 every join re-applies the machine's own declared max_sessions BOUNDED BY " +
+            "this one, so a machine may take itself down below its grant and cannot raise " +
+            "itself above it. To make a machine carry FEWER sessions, change " +
+            "control.max_sessions in the runner's own config and reconnect it — no call here " +
+            "is needed. To let it carry MORE than its grant, runner_revoke it FIRST and then " +
+            "enrol it again: nothing widens this in place, and enrolling the same machine name " +
+            "while its current runner is active is a 422. The revoke invalidates the " +
+            "credential, so the new token_file must reach the machine and the runner be " +
+            "restarted. The tenant's total across all its runners is capped separately by " +
+            "the server.",
         },
       },
       required: ["name", "token_file"],
@@ -7922,7 +7932,23 @@ const TOOLS = [
       "and machine_id (Fly Machine) holding the socket. in_flight and max_sessions are the " +
       "CAPACITY loopctl holds in Postgres — the slots dispatch reserves against — and are null " +
       "only for a runner revoked while its socket drains; reported_in_flight and " +
-      "reported_max_sessions are what the runner itself last reported, a hint. live_sockets " +
+      "reported_max_sessions are what the runner itself last reported. reported_in_flight is a " +
+      "hint (the runner counts sessions, loopctl counts reservations); reported_max_sessions is " +
+      "NOT — since contract 1.13.0 loopctl copies it into max_sessions on every join, capped at " +
+      "the runner's enrolled_max_sessions, which is also returned. The two can differ in EITHER " +
+      "direction, so read a difference rather than assuming it. max_sessions BELOW " +
+      "reported_max_sessions happens when the machine is declaring above the ceiling it was " +
+      "enrolled with (enrolled_max_sessions is what makes that one visible in the payload; the " +
+      "rest are not), when the declaration write has not LANDED — it can fail under lock " +
+      "contention " +
+      "on the runner row and is retried on that socket's 30-second recheck, downward only — or " +
+      "when the socket joined a node older than contract 1.13.0 and has not reconnected since. " +
+      "max_sessions ABOVE reported_max_sessions happens when the machine declared 0, which the " +
+      "1..64 column holds as 1 while this field shows the raw 0, and again when a declaration " +
+      "write has not landed and the row keeps an older, larger number. A reported_max_sessions " +
+      "of 0 means the machine is taking no work and place_dispatch refuses a new placement on " +
+      "it, like draining. " +
+      "live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +
       "within a cluster, so on an unclustered multi-node deployment a runner on another node is " +
@@ -7948,7 +7974,14 @@ const TOOLS = [
       "IDEMPOTENT on `dispatch_id`, which is generated for you unless you pass one — pass the " +
       "SAME id to retry a call that timed out, or you start a second session on the same " +
       "story. Requires LOOPCTL_USER_KEY: only an unlineaged user key may root the custody " +
-      "lineage this mints.",
+      "lineage this mints.\n\n" +
+      "409 `runner_declines_work` means the machine's live socket declares `draining` (or a " +
+      "max_sessions of 0, which says the same thing). NOTHING WAS CLAIMED — it is refused " +
+      "before the mint — so place on another runner rather than repairing anything, with a " +
+      "NEW dispatch_id. Read `draining` and `reported_max_sessions` from runner_pool before " +
+      "choosing a machine. It refuses a NEW placement only: retrying with a dispatch_id " +
+      "loopctl already holds still re-sends that dispatch, because its claim is already " +
+      "standing and a draining machine is asked to finish what it holds, not to take more.",
     inputSchema: {
       type: "object",
       properties: {

@@ -11,10 +11,29 @@ defmodule Loopctl.Runners.Runner do
 
   The row carries no liveness. Presence does, and it dies with the socket.
 
-  It does carry CAPACITY (#803): `max_sessions`, set at enrollment, and `in_flight`, the
-  number of slots reserved on this machine right now. Those two are authoritative; the
-  values a runner reports in Presence are a hint. `in_flight` is written only by
-  `Loopctl.Runners.Capacity`, never through a changeset.
+  It does carry CAPACITY (#803): `max_sessions`, how many slots loopctl will reserve here, and
+  `in_flight`, the number reserved right now. Both are written only by
+  `Loopctl.Runners.Capacity`, never through a changeset after the insert.
+
+  `max_sessions` is the MACHINE's own number BOUNDED BY THE OPERATOR's: every join writes
+  `LEAST(declared, enrolled_max_sessions)` (`Loopctl.Runners.apply_declaration/4`, contract
+  1.13.0). A machine may always lower itself and never raise itself. That asymmetry is the
+  whole design: holding more than a machine can run places a dispatch it refuses
+  `at_capacity`, and the refusal costs the story's claim, while holding less only under-uses
+  the machine until it reconnects. Letting the declaration win OUTRIGHT would also have let a
+  compromised or misconfigured runner enlarge its own share of the tenant's admission budget
+  by declaring a bigger number — something it could not do before capacity followed the
+  declaration at all.
+
+  `enrolled_max_sessions` is therefore the operator's GRANT, written once at enrollment and
+  never by a join. It is the ceiling, not the held value; `max_sessions` is what
+  `Loopctl.Runners.Capacity` actually reserves against. Both are rendered, so a machine held
+  below what it declares is explicable from one read.
+
+  `max_sessions` stays a column rather than a read of the Presence meta because a reservation
+  is a conditional UPDATE and a CRDT replica cannot hand out the last slot to exactly one
+  caller. `in_flight` is loopctl's alone — the count a runner reports in Presence is of
+  sessions it is running, which is a different fact and only ever a hint.
 
   It also names the AGENT its sessions work as (#803): `agent_id`, the `runner:<name>` agent
   row `Loopctl.Runners.enroll_runner/3` gets or creates. A dispatch claims the story it is
@@ -27,7 +46,9 @@ defmodule Loopctl.Runners.Runner do
 
   `tenant_id`, `api_key_id`, `agent_id`, `revoked_at` and `in_flight` are set programmatically
   in `Loopctl.Runners`, never via `cast/3`. `name` and `max_sessions` are the caller-supplied
-  fields.
+  fields. `enrolled_max_sessions` is DERIVED from the cast `max_sessions` inside
+  `create_changeset/2` rather than cast itself, so the grant and the seeded held value cannot
+  be given different numbers by a caller, and nothing after the insert can raise the ceiling.
 
   ## Isolation
 
@@ -56,6 +77,7 @@ defmodule Loopctl.Runners.Runner do
     :id,
     :name,
     :max_sessions,
+    :enrolled_max_sessions,
     :in_flight,
     :revoked_at,
     :inserted_at,
@@ -70,6 +92,7 @@ defmodule Loopctl.Runners.Runner do
     field :agent_id, :binary_id
     field :name, :string
     field :max_sessions, :integer, default: @default_max_sessions
+    field :enrolled_max_sessions, :integer, default: @default_max_sessions
     field :in_flight, :integer, default: 0
     field :revoked_at, :utc_datetime_usec
 
@@ -106,6 +129,11 @@ defmodule Loopctl.Runners.Runner do
       less_than_or_equal_to: @max_sessions_range.last
     )
     |> check_constraint(:max_sessions, name: :runners_max_sessions_range)
+    # The GRANT is the enrolled number, and it is taken from the validated `max_sessions`
+    # rather than cast, so the two agree at the insert by construction. Nothing writes it
+    # again: `Capacity.apply_declared/5` reads it as the ceiling and never sets it.
+    |> put_enrolled_max_sessions()
+    |> check_constraint(:enrolled_max_sessions, name: :runners_enrolled_max_sessions_range)
     |> validate_format(:name, @name_format,
       message: "must be lowercase letters, digits, '.', '_' or '-', starting alphanumeric"
     )
@@ -114,6 +142,13 @@ defmodule Loopctl.Runners.Runner do
       name: :runners_active_name_uidx,
       message: "an active runner already uses this name"
     )
+  end
+
+  defp put_enrolled_max_sessions(changeset) do
+    case get_field(changeset, :max_sessions) do
+      nil -> changeset
+      max -> put_change(changeset, :enrolled_max_sessions, max)
+    end
   end
 
   @doc "Changeset that revokes a runner."

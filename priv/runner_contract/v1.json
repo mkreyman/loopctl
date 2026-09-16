@@ -277,7 +277,7 @@
           "type": "string"
         },
         "max_sessions": {
-          "description": "Concurrent sessions this machine accepts; it refuses past them with `at_capacity`. Advisory to loopctl, which reserves against the max_sessions the runner was ENROLLED with, never this value.",
+          "description": "Concurrent sessions this machine accepts; it refuses past them with `at_capacity`. AUTHORITATIVE DOWNWARD since 1.13.0: loopctl reserves against the LESSER of this and the max_sessions the runner was ENROLLED with, re-read on EVERY join. So a machine can always take itself DOWN and cannot raise itself above its enrolled ceiling — declaring more than that is held at the ceiling, silently, and `GET /api/v1/runners/pool` shows both numbers. Before 1.13.0 this field was advisory and only the enrolled value counted, which no join could correct. Send the real value every time: it is per-connection, so a machine whose configuration changed applies it by reconnecting. Lowering it below the sessions loopctl currently holds on this machine sends no more work until those drain, rather than cancelling them. `0` means THIS MACHINE IS TAKING NO WORK and is the same statement as `draining`: the held column is 1..64 so the row keeps `1`, and loopctl refuses to PLACE on a machine declaring either. Refusing a placement is what is promised and it is not the whole surface — a dispatch an operator pushes at this machine by name is still delivered, and the runner refuses it with `draining`, because that path claims nothing and the refusal reaches a person.",
           "maximum": 64,
           "minimum": 0,
           "type": "integer"
@@ -1637,5 +1637,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.12.0"
+  "x-contract-version": "1.13.0"
 }

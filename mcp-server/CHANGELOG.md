@@ -5,6 +5,36 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.100.0 — 2026-09-16 (a runner's capacity is the machine's own number)
+
+### Changed
+
+- **`runner_pool` and `runner_enroll` descriptions now say who owns a machine's capacity**
+  (loopctl #846.4, runner contract 1.13.0). No tool signature changed; what changed is the
+  server. `runners.max_sessions` — the number loopctl reserves dispatches against — used to be
+  written once at enrollment and had no path from the machine's own declaration, so a machine
+  configured for one session and enrolled at two was sent two, refused the second `at_capacity`,
+  and the refusal cost the story's claim. Every join now copies the declaration into the held
+  row.
+
+  For a session reading these tools that means three things. The `max_sessions` you pass to
+  `runner_enroll` is a CEILING and the value the row starts at: held capacity is the lesser of it
+  and what the machine declares, so a machine can take itself down and cannot raise itself up. To
+  make one carry fewer sessions, change `control.max_sessions` in the runner's own config and
+  reconnect it; to let it carry more than its grant, `runner_revoke` it and enrol it AGAIN — a
+  second active runner with the same name is a 422, so the revoke comes first, and it invalidates
+  the credential, so the new token file has to reach the machine and the runner be restarted. In
+  `runner_pool`,
+  `reported_max_sessions` is no longer a hint — it is what `max_sessions` is copied from, capped at
+  the new `enrolled_max_sessions` field, which is what tells "declaring above its ceiling" apart
+  from the other reasons the two can differ: a declaration write that has not landed, or a socket
+  that joined a node older than 1.13.0. `max_sessions` ABOVE `reported_max_sessions` happens when
+  the machine declared `0` — held as `1` because the column is 1..64, and nothing is placed on it
+  — and, again, when a declaration write has not landed and the row keeps an older larger number.
+  And `place_dispatch` now answers `409 runner_declines_work` for a machine declaring `draining` or
+  a `max_sessions` of 0, refused before the story is claimed — on a NEW placement only, since a
+  retry carrying a `dispatch_id` loopctl already holds is re-sent as before.
+
 ## 2.99.0 — 2026-09-16 (a filed story can be corrected, and a session can tell stale from missing)
 
 Version 2.98.0 is not skipped by accident: it was taken by the branch that became loopctl
