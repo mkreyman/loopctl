@@ -3,7 +3,7 @@
  *
  * ## The defect it exists for
  *
- * `Loopctl.Dispatches.revoke/2` had no route and no tool, so nothing outside the app
+ * `Loopctl.Dispatches.revoke/3` had no route and no tool, so nothing outside the app
  * could call it. That made a stranded ephemeral key unfixable rather than merely
  * inconvenient, because of an invariant two layers down:
  *
@@ -24,7 +24,7 @@
  * ## WHAT IT REVOKES — say this out loud before calling it
  *
  * The dispatch AND EVERY DESCENDANT, plus the ephemeral api_key each one minted. That
- * is `Dispatches.revoke/2`'s own semantics (its query is
+ * is `Dispatches.revoke/3`'s own semantics (its query is
  * `d.id == ^dispatch_id or ^dispatch_id in d.lineage_path`), not something this tool
  * adds. Revoking a tree's root revokes the tree.
  *
@@ -40,8 +40,8 @@
  *
  * - `403 insufficient_role` — the endpoint is `role: :orchestrator` WITH the hierarchy,
  *   so an orchestrator, user or superadmin key passes and an agent key does not. It is
- *   NOT `exact_role`, so this tool pins no particular env var: whichever key `apiCall`
- *   resolves is sent, exactly as `dispatch` does at the same gate.
+ *   NOT `exact_role`, so this tool pins no particular env var; it merely PREFERS
+ *   LOOPCTL_USER_KEY, for the ceiling reason two bullets down.
  * - `403 custody_tier_required` — an agent-rooted tenant. Such a tenant cannot mint a
  *   dispatch either, so it has none to revoke.
  * - `403 dispatch_outside_caller_lineage` — THE LINEAGE CEILING. A dispatch may only be
@@ -52,6 +52,14 @@
  *   left. The tenant's `user`-role operator key — one no dispatch minted — may revoke
  *   anywhere in its tenant. The refusal carries `remediation.your_dispatch_id` when the
  *   caller has one.
+ * - `403 unlineaged_revoke_forbidden` — THE OTHER HALF OF THAT CEILING, and the one a
+ *   default configuration meets. A key that no dispatch minted carries no lineage, so
+ *   there is no subtree a cascading revoke could be bounded by; it passes only at
+ *   `role: :user`, the tenant's operator key. A legacy LOOPCTL_ORCH_KEY is exactly that
+ *   shape and is refused. Remedies the refusal names: use the user-role operator key,
+ *   `force_unclaim_story` for a parked story (it revokes that story's own session
+ *   dispatch through a path this ceiling does not sit on), or mint a dispatch under an
+ *   active parent and revoke from inside that lineage.
  * - `503 tenant_halted` — a custody halt suspends this route, like dispatch minting.
  * - `404` — no such dispatch in your tenant. Another tenant's id answers 404 too.
  *

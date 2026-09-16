@@ -2919,14 +2919,28 @@ async function createDispatch({
   return toContent(result);
 }
 
-// #862: the reachable half of `Dispatches.revoke/2`. No key pinning here, deliberately:
-// the endpoint is `role: :orchestrator` WITH the hierarchy (dispatch_controller.ex), not
-// `exact_role`, so an orchestrator, user or superadmin key all pass and `resolveKey`'s
-// ordinary selection is correct — the same choice `createDispatch` makes at the same gate.
-// Pinning LOOPCTL_ORCH_KEY here would refuse a working configuration locally, which is the
-// break #861 round 2 had to revert.
+// #862: the reachable half of `Dispatches.revoke/2`.
+//
+// LOOPCTL_USER_KEY is PREFERRED but NOT pinned, and the distinction is the whole point.
+// The role gate is `role: :orchestrator` WITH the hierarchy, not `exact_role`, so pinning
+// one variable would refuse configurations the server accepts — the break #861 round 2 had
+// to revert. But the endpoint also applies the LINEAGE CEILING, and there an UNLINEAGED
+// caller passes only at `role: :user` (`403 unlineaged_revoke_forbidden` otherwise, review
+// #862 finding 1). A bare legacy LOOPCTL_ORCH_KEY is exactly that shape, so sending it by
+// default made the commonest configuration the refused one.
+//
+// So the key is passed as an ORDINARY override, not with `exactKey`: `resolveKey`'s order is
+// LOOPCTL_API_KEY > this > LOOPCTL_ORCH_KEY. A global key still wins (it may be the operator
+// key, or a dispatch-minted one revoking inside its own subtree — both legitimate), the
+// operator key is next, and a legacy orchestrator key is still SENT rather than refused
+// locally, so the caller gets the server's own message naming what to do instead.
 async function revokeDispatch(args) {
-  return toContent(await revokeDispatchRequest(args, { apiCall }));
+  return toContent(
+    await revokeDispatchRequest(args, {
+      apiCall: (method, path, body) =>
+        apiCall(method, path, body, process.env.LOOPCTL_USER_KEY),
+    }),
+  );
 }
 
 // LCP-1 §9.2: register/rotate the tenant custody owner key (root of trust).
@@ -7675,12 +7689,19 @@ const TOOLS = [
       "credential and changes no custody verdict.\n\n" +
       "REFUSALS. `role: :orchestrator` WITH the hierarchy, so an orchestrator, user or superadmin " +
       "key passes and an agent key is 403 insufficient_role — this is not exact_role, so no " +
-      "particular env var is pinned and whichever key is configured is sent, as with `dispatch`. " +
-      "403 custody_tier_required on an agent-rooted tenant. 403 dispatch_outside_caller_lineage " +
+      "particular env var is pinned; LOOPCTL_USER_KEY is merely PREFERRED, because of the " +
+      "ceiling below. 403 custody_tier_required on an agent-rooted tenant. " +
+      "403 dispatch_outside_caller_lineage " +
       "when the target is not in your lineage: a dispatch may only be revoked by a caller it " +
       "descends from, because the revoke cascades — the body carries your own dispatch id as " +
       "remediation.your_dispatch_id, and the tenant's user-role operator key may revoke anywhere " +
-      "in its tenant. 503 tenant_halted under a custody halt. 404 for an unknown dispatch, and " +
+      "in its tenant. 403 unlineaged_revoke_forbidden when your key was minted by NO dispatch " +
+      "and is below user role — a legacy LOOPCTL_ORCH_KEY is exactly that: it carries no " +
+      "lineage, so there is no subtree that would bound a cascading revoke, and it would " +
+      "otherwise be able to revoke the tenant's root. Use the user-role operator key, or " +
+      "force_unclaim_story for a parked story, or mint a dispatch under an active parent and " +
+      "revoke from inside that lineage. " +
+      "503 tenant_halted under a custody halt. 404 for an unknown dispatch, and " +
       "for another tenant's. A `dispatch_id` that is not a UUID is refused here, before any " +
       "call.\n\n" +
       "IDEMPOTENT: an already-revoked dispatch answers 200 with revoked_count 0 and its ORIGINAL " +

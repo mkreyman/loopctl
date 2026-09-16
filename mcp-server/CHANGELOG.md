@@ -29,15 +29,23 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   It does NOT clear `implementer_dispatch_id`: that is custody provenance, and a revoked dispatch
   still resolves, so verify / report / review-complete compare the same lineage afterwards.
 
-  **No env var is pinned.** The gate is `role: :orchestrator` WITH the hierarchy, not
-  `exact_role`, so an orchestrator, user or superadmin key all pass and whichever key is
-  configured is sent — the same choice `dispatch` makes at the same gate. Refusals:
+  **No env var is pinned; `LOOPCTL_USER_KEY` is PREFERRED.** The ROLE gate is
+  `role: :orchestrator` WITH the hierarchy, not `exact_role`, so pinning one variable would
+  refuse configurations the server accepts. But the endpoint also applies the LINEAGE CEILING,
+  where an UNLINEAGED caller passes only at `role: :user` — so the user key is sent as an
+  ordinary override (`LOOPCTL_API_KEY` still wins; a legacy `LOOPCTL_ORCH_KEY` is still sent
+  last, and gets the server's own message rather than a local refusal). Refusals:
   `403 insufficient_role` for an agent key, `403 custody_tier_required` on an agent-rooted
   tenant, `403 dispatch_outside_caller_lineage` when the target is not in your lineage (the body
   carries `remediation.your_dispatch_id`; the tenant's `user`-role operator key may revoke
-  anywhere in its tenant), `503 tenant_halted` under a custody halt, 404 for an unknown dispatch
-  or another tenant's. A `dispatch_id` that is not a UUID is refused locally, before any call,
-  because the server answers such an id with the SAME 404 a well-formed unknown id gets.
+  anywhere in its tenant), `403 unlineaged_revoke_forbidden` when your key was minted by no
+  dispatch and is below `user` role — with no lineage there is no subtree that would bound a
+  cascading revoke, so such a key could otherwise revoke the tenant's root; use the operator
+  key, or `force_unclaim_story` for a parked story, or mint a dispatch under an active parent
+  and revoke from inside that lineage. Also `503 tenant_halted` under a custody halt, 404 for an
+  unknown dispatch or another tenant's. A `dispatch_id` that is not a UUID is refused locally,
+  before any call, because the server answers such an id with the SAME 404 a well-formed unknown
+  id gets.
 
   Idempotent: an already-revoked dispatch answers 200 with `revoked_count: 0` and its ORIGINAL
   `revoked_at`.

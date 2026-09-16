@@ -13,7 +13,9 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorkerTest do
   `RevokeExpiredDispatchesWorker` covers keys a DISPATCH minted. A key minted straight
   at `POST /api/v1/api_keys` with an `expires_at` has no dispatch row, so nothing
   revoked it and it held the slot for ever. This worker is that sweep, keyed on the
-  `api_keys` row rather than on a dispatch, so it covers every mint path.
+  `api_keys` row rather than on a dispatch, so it covers every mint path — at exactly
+  the roles the index constrains, which is every role except `user`/`superadmin`
+  (#862 review, finding 6; see the worker's own Scope section for why).
   """
 
   use Loopctl.DataCase, async: true
@@ -148,12 +150,37 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorkerTest do
       assert reload(key_b.id).revoked_at
     end
 
-    test "a `user`-role key expires into revocation too" do
-      # The index ignores `user`/`superadmin`, but `Tenants.tenant_stats/1` and
-      # `count_active_api_keys/0` both count `revoked_at IS NULL` alone, so an expired
-      # user key inflates the operator-facing figure until something revokes it.
+    test "a `user`-role key is NOT swept — it holds no slot, and revoking it would strand it" do
+      # #862 review, finding 6. The sweep covers EXACTLY the roles the partial unique index
+      # constrains, and the index's own predicate excludes `user`/`superadmin`. Such a key
+      # occupies no slot, so reaping it buys this worker nothing — and it is not free:
+      # `POST /api/v1/api_keys/:id/rotate` refuses a REVOKED key (`validate_not_revoked/1`)
+      # while an expired one rotates fine, and `GET /api/v1/api_keys` defaults to
+      # `include_revoked: false`, so a swept operator key can be neither seen nor replaced.
+      #
+      # The cost accepted is a COUNT: `Tenants.tenant_stats/1` and `count_active_api_keys/0`
+      # test `revoked_at IS NULL` alone, so an expired user key still reads as active there.
+      # Fix that in the counters, which can test `expires_at` freely — never by widening
+      # this sweep.
       tenant = fixture(:tenant)
       {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      force(key.id, expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
+
+      assert :ok = RevokeExpiredApiKeysWorker.perform(%Oban.Job{args: %{}})
+
+      refute reload(key.id).revoked_at,
+             "an operator's expired user key must stay rotatable and visible"
+    end
+
+    test "the role exclusion is the INDEX's, not a blanket skip: an orchestrator key IS swept" do
+      # The positive control. Without it "do not sweep user keys" is satisfied by a sweep
+      # that skips everything with a role, and the whole worker goes inert.
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, tenant_id: tenant.id)
+
+      {_raw, key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator, agent_id: agent.id})
+
       force(key.id, expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
 
       assert :ok = RevokeExpiredApiKeysWorker.perform(%Oban.Job{args: %{}})
@@ -209,6 +236,19 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorkerTest do
       tenant = fixture(:tenant)
       key = agent_key(tenant)
       force(key.id, expires_at: nil)
+
+      assert :ok = RevokeExpiredApiKeysWorker.revoke_batch([key.id], DateTime.utc_now())
+
+      refute reload(key.id).revoked_at
+    end
+
+    test "a `user`-role id handed in directly is STILL skipped" do
+      # The re-assertion carries the role exclusion too. Without it the narrowing lives
+      # only in the candidate read, and any caller reaching `revoke_batch/2` — which is
+      # what this seam exists to make possible — sweeps a key the sweep is meant to spare.
+      tenant = fixture(:tenant)
+      {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      force(key.id, expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
 
       assert :ok = RevokeExpiredApiKeysWorker.revoke_batch([key.id], DateTime.utc_now())
 

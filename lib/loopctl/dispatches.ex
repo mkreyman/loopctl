@@ -451,10 +451,40 @@ defmodule Loopctl.Dispatches do
   end
 
   @doc """
-  Revokes a dispatch and all its descendants.
+  Revokes a dispatch and all its descendants, plus the ephemeral api_key each one minted.
+
+  `opts` takes `:actor_lineage` (default `[]`) — the lineage of the principal that asked
+  for this, recorded on the audit-chain entry. The HTTP caller's is resolved server-side
+  by `LoopctlWeb.DispatchController.revoke/2`; the in-process compensations
+  (`Progress.force_unclaim_story/3`, `Delivery.Placement.undo_claim/5`) pass what they
+  hold, and `[]` is the same "no lineage behind this" `create_dispatch/3` records.
+
+  ## It writes ONE chain entry, and only when it revoked something
+
+  Revocation being audited is the house norm — minting appends `dispatch_created`
+  (`do_create_dispatch/3`'s `:audit` step) and `Runners.revoke_runner/3` appends
+  `runner_revoked` — and this was the reachable half with no record of WHO.
+
+  The entry is conditional on `count > 0`, which is what makes it once-per-revocation
+  without a `revocation_audited?`-style pre-read: the update only touches rows that are
+  `revoked_at IS NULL`, so a second revoke of the same dispatch revokes nothing and
+  appends nothing. That also bounds the blast radius of the callers that run
+  constantly — `Placement.undo_claim/5` revokes on every placement refusal, but only a
+  refusal that actually had a session dispatch to kill writes an entry, and that
+  dispatch's own `dispatch_created` entry is already in the chain, so the pair balances.
+
+  The payload does NOT enumerate the cascade. An immutable, STH-covered entry is the
+  wrong place for an unbounded id list, and the set is derivable anyway: it is exactly
+  the rows carrying `entity_id` in their `lineage_path`, each stamped with the same
+  `revoked_at`.
+
+  It is the LAST step of the Multi, deliberately. `AuditChain.append/2` takes the
+  per-tenant chain advisory lock and the head row; the fleet-wide lock order puts the
+  chain lock last, and `do_create_dispatch/3` takes the dispatch rows before it too.
   """
-  @spec revoke(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, non_neg_integer()} | {:error, term()}
-  def revoke(tenant_id, dispatch_id) do
+  @spec revoke(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def revoke(tenant_id, dispatch_id, opts \\ []) do
     alias Loopctl.Auth.ApiKey
     now = DateTime.utc_now()
 
@@ -499,6 +529,9 @@ defmodule Loopctl.Dispatches do
           {:ok, []}
         end
       end)
+      |> Multi.run(:audit, fn _repo, %{revoke_dispatches: count} ->
+        audit_revocation(tenant_id, dispatch_id, count, now, opts)
+      end)
 
     case AdminRepo.transaction(multi) do
       {:ok, %{revoke_dispatches: count, revoke_keys: key_hashes}} ->
@@ -511,6 +544,23 @@ defmodule Loopctl.Dispatches do
       {:error, _step, reason, _} ->
         {:error, reason}
     end
+  end
+
+  # `:noop` rather than an entry when nothing was revoked — see `revoke/3`'s doc. The
+  # Multi step still has to return `{:ok, _}` so an idempotent re-revoke commits.
+  defp audit_revocation(_tenant_id, _dispatch_id, 0, _now, _opts), do: {:ok, :noop}
+
+  defp audit_revocation(tenant_id, dispatch_id, count, now, opts) do
+    AuditChain.append(tenant_id, %{
+      action: "dispatch_revoked",
+      actor_lineage: Keyword.get(opts, :actor_lineage, []),
+      entity_type: "dispatch",
+      entity_id: dispatch_id,
+      payload: %{
+        "revoked_count" => count,
+        "revoked_at" => DateTime.to_iso8601(now)
+      }
+    })
   end
 
   @doc """
@@ -530,10 +580,10 @@ defmodule Loopctl.Dispatches do
 
     * a SESSION dispatch minted for this story — `Loopctl.Delivery.Placement`
       mints one per placement with `story_id` set (`mint_session_dispatch/5`), and
-      an orchestrator may mint a per-story agent dispatch the same way. Nothing
-      but this story is behind it, so revoking it costs nothing else.
+      an orchestrator may mint a per-story agent dispatch the same way. It exists
+      because of this story, so this story ending is a reason to end it.
     * a general agent dispatch (`story_id: nil`, or another story's) that merely
-      happened to be the caller when the story was claimed. `Dispatches.revoke/2`
+      happened to be the caller when the story was claimed. `Dispatches.revoke/3`
       cascades to DESCENDANTS, so revoking that would kill the agent's whole
       subtree — every other story it is working on included — as a side effect of
       parking ONE story. Force-unclaim is a routine compensation
@@ -542,6 +592,27 @@ defmodule Loopctl.Dispatches do
 
   So the narrow case is revoked and the wide one is left alone and REPORTED, never
   silently skipped.
+
+  ## WHAT `story_id` BOUNDS: the ROOT of the cascade, not the cascade
+
+  `story_id` decides WHICH dispatch is revoked. `revoke/3` then cascades from it
+  unchanged — its query is `d.id == ^dispatch_id or ^dispatch_id in d.lineage_path`
+  — so a DESCENDANT of this story's session is revoked whatever its own `story_id`
+  is, including another story's.
+
+  That is reachable and it is correct, not merely tolerated. An orchestrator that is
+  an ancestor of story X's dispatch may mint a dispatch for story Y beneath it (the
+  `create` ceiling permits any parent inside the caller's own subtree), and
+  force-unclaiming X then kills Y's credential too. The alternative — filtering the
+  cascade by `story_id` — would leave a USABLE key hanging off a revoked lineage,
+  which is the exact failure `revoke/3`'s cascade exists to prevent: a descendant's
+  authority is delegated from the dispatch being revoked, so it cannot outlive it.
+  Y's session recovers by being re-placed; a live credential under a dead ancestor
+  recovers from nothing.
+
+  The narrow/wide split above is therefore about not revoking an agent's ROOT out
+  from under it — the case where the blast radius is unbounded and unrelated — and
+  never a claim that the cascade is confined to one story.
 
   ## What this does NOT do
 
@@ -557,7 +628,7 @@ defmodule Loopctl.Dispatches do
   ## Returns
 
     * `{:ok, count}` — the dispatch was this story's session and `count` rows
-      (it plus its descendants) were revoked
+      (it plus its descendants, whatever story each of THOSE names) were revoked
     * `{:ok, :no_dispatch}` — the story names no implementer dispatch
     * `{:ok, :not_story_session}` — the dispatch exists but was not minted for
       this story, so it is left alone
@@ -565,14 +636,16 @@ defmodule Loopctl.Dispatches do
       longer resolves
     * `{:error, reason}` — the revoke itself failed
   """
-  @spec revoke_story_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
+  @spec revoke_story_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil, keyword()) ::
           {:ok, non_neg_integer() | :no_dispatch | :not_story_session | :dispatch_not_found}
           | {:error, term()}
-  def revoke_story_session(_tenant_id, _story_id, nil), do: {:ok, :no_dispatch}
+  def revoke_story_session(tenant_id, story_id, dispatch_id, opts \\ [])
 
-  def revoke_story_session(tenant_id, story_id, dispatch_id) do
+  def revoke_story_session(_tenant_id, _story_id, nil, _opts), do: {:ok, :no_dispatch}
+
+  def revoke_story_session(tenant_id, story_id, dispatch_id, opts) do
     case get_dispatch(tenant_id, dispatch_id) do
-      {:ok, %Dispatch{story_id: ^story_id}} -> revoke(tenant_id, dispatch_id)
+      {:ok, %Dispatch{story_id: ^story_id}} -> revoke(tenant_id, dispatch_id, opts)
       {:ok, %Dispatch{}} -> {:ok, :not_story_session}
       {:error, :not_found} -> {:ok, :dispatch_not_found}
     end

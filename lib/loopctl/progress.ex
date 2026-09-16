@@ -2869,7 +2869,7 @@ defmodule Loopctl.Progress do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} ->
-        revoke_released_session_credential(tenant_id, updated)
+        revoke_released_session_credential(tenant_id, updated, opts)
         {:ok, updated}
 
       {:error, :lock, reason, _} ->
@@ -2882,7 +2882,7 @@ defmodule Loopctl.Progress do
 
   # Taking a story back kills the credential the previous holder had. AFTER the commit,
   # deliberately, on three counts: the release is what the caller asked for and must not be
-  # rolled back by a revoke failure; `Dispatches.revoke/2` runs its own AdminRepo transaction
+  # rolled back by a revoke failure; `Dispatches.revoke/3` runs its own AdminRepo transaction
   # and busts the api-key cache when it returns, so running it inside this one would bust the
   # cache BEFORE the release commits; and a revoke is idempotent, so re-running force-unclaim
   # is still the operator's remedy.
@@ -2898,23 +2898,53 @@ defmodule Loopctl.Progress do
   # provenance, `get_dispatch_lineage/2` reads a revoked row exactly as it reads a live one, and
   # every L4 comparison is therefore unchanged by this.
   #
-  # AND IT SWALLOWS A RAISE, not only an `{:error, _}`. `Dispatches.revoke/2` returns tuples
+  # AND IT SWALLOWS A RAISE, not only an `{:error, _}`. `Dispatches.revoke/3` returns tuples
   # from its own Multi, but the statements under it are ordinary AdminRepo calls on a
   # 3-connection pool with no `lock_timeout`, so a DBConnection error is a RAISE. Unrescued,
   # that turns a release that ALREADY COMMITTED into a 500: the caller is told the story was
   # not freed when it was, and re-runs a compensation that had already succeeded. The caller is
   # owed the outcome of the release it asked for, not the outcome of the cleanup that followed
   # it. Same reasoning, and the same shape, as `Placement.release_claim/4`.
-  defp revoke_released_session_credential(tenant_id, story) do
-    case Dispatches.revoke_story_session(tenant_id, story.id, story.implementer_dispatch_id) do
+  defp revoke_released_session_credential(tenant_id, story, opts) do
+    actor_lineage = Keyword.get(opts, :actor_lineage, [])
+
+    case Dispatches.revoke_story_session(
+           tenant_id,
+           story.id,
+           story.implementer_dispatch_id,
+           actor_lineage: actor_lineage
+         ) do
       {:ok, count} when is_integer(count) ->
         :ok
 
-      {:ok, skipped} ->
+      # NOTHING TO REVOKE, and nothing stranded by it: the story names no implementer
+      # dispatch, so there is no credential holding an `api_keys_one_role_per_agent_idx`
+      # slot. Every force-unclaim of a story that was never dispatch-claimed lands here,
+      # which is why it is the one outcome that stays at `:debug`.
+      {:ok, :no_dispatch} ->
         Logger.debug(
-          "force_unclaim left the implementer dispatch's key alone: reason=#{skipped} " <>
-            "tenant_id=#{tenant_id} story_id=#{story.id} " <>
-            "implementer_dispatch_id=#{inspect(story.implementer_dispatch_id)}"
+          "force_unclaim had no session credential to revoke: tenant_id=#{tenant_id} " <>
+            "story_id=#{story.id}"
+        )
+
+        :ok
+
+      # THE TWO CASES WHERE FORCE-UNCLAIM DOES NOT FREE THE SLOT — the whole point of the
+      # change — so they are the ones an operator must be able to read. They were at
+      # `:debug` while `config/dev.exs` and `config/prod.exs` both set `level: :info`,
+      # i.e. invisible in every environment that runs: the operator saw the story freed,
+      # then hit the same 422 on the next placement with nothing in the log saying why.
+      # `dispatches.ex` calls these "left alone and REPORTED, never silently skipped";
+      # `:warning` is what makes that sentence true.
+      {:ok, skipped} ->
+        Logger.warning(
+          "force_unclaim did NOT revoke this story's session credential, so the agent's " <>
+            "one-key-per-role slot may still be occupied and the next dispatch mint for it " <>
+            "can be refused 422 'agent already has an active key with this role'. " <>
+            "#{skip_explanation(skipped)} tenant_id=#{tenant_id} story_id=#{story.id} " <>
+            "implementer_dispatch_id=#{inspect(story.implementer_dispatch_id)}",
+          tenant_id: tenant_id,
+          story_id: story.id
         )
 
         :ok
@@ -2950,6 +2980,28 @@ defmodule Loopctl.Progress do
 
       :ok
   end
+
+  # Each skip has a DIFFERENT remedy, so the line names which one it is rather than
+  # printing a bare atom the operator has to go and look up.
+  #
+  # TOTAL over what reaches it, and deliberately with NO catch-all: the `{:ok, skipped}`
+  # branch above sees exactly the two atoms below, since `revoke_story_session/4` returns
+  # an integer or one of three atoms and `:no_dispatch` has its own clause. Dialyzer
+  # proved a catch-all unreachable (`pattern_match_cov`), and an unreachable clause that
+  # reads as a guard is worse than none — if a fourth outcome is ever added, the crash is
+  # what says so.
+  defp skip_explanation(:not_story_session),
+    do:
+      "reason=not_story_session: the dispatch this story names was not minted FOR it " <>
+        "(`story_id` differs), and revoking it would cascade to that agent's whole subtree, " <>
+        "so it is deliberately left alone. Revoke it yourself if it really is stranded: " <>
+        "POST /api/v1/dispatches/:id/revoke (MCP revoke_dispatch)."
+
+  defp skip_explanation(:dispatch_not_found),
+    do:
+      "reason=dispatch_not_found: the story names a dispatch row that no longer resolves in " <>
+        "this tenant, so nothing was revoked. Its api_key, if any, is unreachable from here " <>
+        "and will be swept at its TTL by RevokeExpiredApiKeysWorker."
 
   # --- Verification/Rejection helpers ---
 

@@ -1,7 +1,7 @@
 /**
  * `revoke_dispatch` — the MCP half of `POST /api/v1/dispatches/:id/revoke`.
  *
- * The endpoint exists because `Loopctl.Dispatches.revoke/2` was reachable by nothing
+ * The endpoint exists because `Loopctl.Dispatches.revoke/3` was reachable by nothing
  * outside the app; the TOOL exists because an endpoint with no tool is the same defect
  * one layer out — `curl` at loopctl is refused by the fleet's guardrail, so a route with
  * no tool is a verb only a shell on the production node can use.
@@ -113,7 +113,7 @@ describe("the tool description states what the endpoint refuses", () => {
   });
 
   test("it says the revoke CASCADES, in all three places the claim has to appear", () => {
-    // The single most surprising thing about the endpoint. `Dispatches.revoke/2` matches
+    // The single most surprising thing about the endpoint. `Dispatches.revoke/3` matches
     // `d.id == ^dispatch_id or ^dispatch_id in d.lineage_path`, so revoking a root revokes
     // the tree. A description that omitted this would invite exactly that.
     //
@@ -138,8 +138,18 @@ describe("the tool description states what the endpoint refuses", () => {
     assert.match(declaration, /not exact_role/);
   });
 
-  test("it names the lineage-ceiling refusal", () => {
+  test("it names BOTH halves of the lineage ceiling", () => {
+    // Two refusals, two different callers, two different remedies — and the second is the
+    // one a default configuration meets, because a legacy LOOPCTL_ORCH_KEY carries no
+    // lineage (#862 review, finding 1). A description naming only the first would tell a
+    // refused session to "revoke one of your own dispatches", which it has none of.
     assert.match(declaration, /dispatch_outside_caller_lineage/);
+    assert.match(declaration, /unlineaged_revoke_forbidden/);
+    assert.match(
+      declaration,
+      /force_unclaim_story/,
+      "the unlineaged refusal must name a remedy the refused caller can actually perform",
+    );
   });
 
   test("it says implementer_dispatch_id is NOT cleared", () => {
@@ -195,15 +205,32 @@ describe("the wiring in index.js", () => {
 
     assert.match(
       handler,
-      /revokeDispatchRequest\(args, \{ apiCall \}\)/,
+      /revokeDispatchRequest\(args, \{/,
       "it does not forward to lib/dispatch-revoke.js, so the shipped path is untested",
+    );
+
+    assert.match(
+      handler,
+      /apiCall\(method, path, body, process\.env\.LOOPCTL_USER_KEY\)/,
+      "the request module must be handed an apiCall that actually carries the key",
     );
   });
 
-  test("it pins NO env var — the gate is role:, not exact_role:", () => {
-    // Deliberate, and the reason is #861 round 2: pinning LOOPCTL_ORCH_KEY unconditionally
-    // refuses a configuration the SERVER accepts, because the gate tests the key's ROLE and
-    // not the variable's name. An orchestrator-role LOOPCTL_API_KEY passes this endpoint.
+  test("it PREFERS the user key without PINNING it — an override, never exactKey", () => {
+    // Two rules pulling opposite ways, and the shape is what satisfies both.
+    //
+    // Not pinned (#861 round 2): the ROLE gate is `role: :orchestrator` WITH the hierarchy,
+    // so `exactKey` on one variable would refuse configurations the SERVER accepts — an
+    // orchestrator-role LOOPCTL_API_KEY passes this endpoint, and a dispatch-minted key
+    // revoking inside its own subtree passes too.
+    //
+    // But preferred (#862 review, finding 1): the endpoint ALSO applies the lineage
+    // ceiling, where an UNLINEAGED caller passes only at `role: :user`. A bare legacy
+    // LOOPCTL_ORCH_KEY is exactly that shape and is now `403 unlineaged_revoke_forbidden`,
+    // so sending it by default made the commonest configuration the refused one.
+    //
+    // As an ordinary override, `resolveKey`'s order does the rest: LOOPCTL_API_KEY > this >
+    // LOOPCTL_ORCH_KEY. `exactKey` here would break the first and third of those.
     const start = INDEX_SRC.indexOf("async function revokeDispatch(");
     const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
     const handler = INDEX_SRC.slice(start, end)
@@ -214,6 +241,13 @@ describe("the wiring in index.js", () => {
       !handler.includes("orchestratorKeyArgs"),
       "it pins the orchestrator key, which would refuse an orchestrator-role LOOPCTL_API_KEY",
     );
-    assert.ok(!handler.includes("LOOPCTL_USER_KEY"), "it reaches for a key this gate does not need");
+    assert.ok(
+      handler.includes("LOOPCTL_USER_KEY"),
+      "it no longer prefers the user key, so a bare legacy LOOPCTL_ORCH_KEY is sent and 403s",
+    );
+    assert.ok(
+      !handler.includes("exactKey"),
+      "exactKey would discard LOOPCTL_API_KEY and stop a dispatch-minted key reaching the gate",
+    );
   });
 });

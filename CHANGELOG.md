@@ -27,16 +27,29 @@ All notable changes to loopctl are documented here.
   a custody halt, and bounded by the lineage ceiling: a dispatch may only be revoked by a caller
   it descends from (`403 dispatch_outside_caller_lineage`), because an unrestricted cascading
   revoke would let one principal take down another's tree and let an implementer prune the pool
-  its own verifier is selected from. The tenant's `user`-role operator key may revoke anywhere in
-  its tenant. Idempotent: an already-revoked dispatch answers 200 with `revoked_count: 0` and its
-  original `revoked_at`.
+  its own verifier is selected from. A caller carrying NO lineage passes only at `user` role —
+  the tenant's operator key, which may revoke anywhere in its tenant; anything else unlineaged,
+  which is what a legacy `LOOPCTL_ORCH_KEY` is, gets `403 unlineaged_revoke_forbidden` naming
+  the three remedies it can actually perform. Every revoke that changes something now appends a
+  `dispatch_revoked` entry to the hash-chained audit log, carrying the caller's server-resolved
+  lineage; a revoke that changed nothing appends nothing. Idempotent: an already-revoked dispatch
+  answers 200 with `revoked_count: 0` and its original `revoked_at`.
 
   **New cron — `RevokeExpiredApiKeysWorker`, every 5 minutes.** `RevokeExpiredDispatchesWorker`
   only reaches keys a DISPATCH minted. A key created at `POST /api/v1/api_keys` with an
   `expires_at` has no dispatch row, so nothing ever revoked it and it held its agent's slot
   PERMANENTLY. The new sweep is keyed on the `api_keys` row instead, so it covers every mint
-  path, at every role. No configuration and no migration; it only writes `revoked_at` on rows
-  that are already past their own expiry.
+  path. No configuration and no migration; it only writes `revoked_at` on rows that are already
+  past their own expiry.
+
+  **OPERATOR-FACING CONSEQUENCE, and the bound on it.** The sweep covers exactly the roles the
+  partial unique index constrains — every role EXCEPT `user` and `superadmin`. For the keys it
+  does cover, an expired key is now a REVOKED key, so it drops out of the default
+  `GET /api/v1/api_keys` listing (pass `include_revoked=true` to see it) and
+  `POST /api/v1/api_keys/:id/rotate` answers `422 Cannot rotate a revoked key`. Rotate such a
+  key before it expires, or create a replacement. `user`/`superadmin` keys are deliberately
+  outside the sweep for precisely that reason: they occupy no index slot, so reaping them would
+  buy nothing and would destroy the recovery path for an operator's own expired key.
 
   **`force_unclaim_story` now revokes the story's session credential.** Taking a story back
   kills the key the previous holder had, scoped to a dispatch minted FOR that story — a general

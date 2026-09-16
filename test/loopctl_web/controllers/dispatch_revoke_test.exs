@@ -1,6 +1,6 @@
 defmodule LoopctlWeb.DispatchRevokeTest do
   @moduledoc """
-  `POST /api/v1/dispatches/:id/revoke` — the reachable half of `Dispatches.revoke/2`.
+  `POST /api/v1/dispatches/:id/revoke` — the reachable half of `Dispatches.revoke/3`.
 
   Until this route existed the function had no caller outside the app: no route, no MCP
   tool. So a session dispatch whose session died left an ephemeral key that was still
@@ -11,7 +11,7 @@ defmodule LoopctlWeb.DispatchRevokeTest do
   active key with this role`, which is the delivery loop stopping.
 
   The gate is `role: :orchestrator` + `RequireHumanAnchor` + THE LINEAGE CEILING. The
-  ceiling is not decoration: `Dispatches.revoke/2` cascades to descendants, so an
+  ceiling is not decoration: `Dispatches.revoke/3` cascades to descendants, so an
   unrestricted revoke lets any orchestrator dispatch take down another principal's whole
   tree — and lets an implementer prune the pool `select_verifier/3` draws from (which
   admits only `is_nil(revoked_at) and expires_at > now`) until the verifier it wants is
@@ -20,7 +20,10 @@ defmodule LoopctlWeb.DispatchRevokeTest do
 
   use LoopctlWeb.ConnCase, async: true
 
+  import Ecto.Query
+
   alias Loopctl.AdminRepo
+  alias Loopctl.AuditChain.Entry
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
@@ -56,6 +59,17 @@ defmodule LoopctlWeb.DispatchRevokeTest do
   end
 
   defp reload(id), do: AdminRepo.get!(Dispatch, id)
+
+  # The api_keys row behind the operator's raw key, so a test can assert what
+  # `lineage_for_api_key/2` actually answers for it rather than assuming.
+  defp operator_key_id(ctx) do
+    AdminRepo.one!(
+      from(k in ApiKey,
+        where: k.tenant_id == ^ctx.tenant.id and k.role == :user,
+        select: k.id
+      )
+    )
+  end
 
   defp key_revoked?(dispatch_id) do
     dispatch = reload(dispatch_id)
@@ -150,6 +164,63 @@ defmodule LoopctlWeb.DispatchRevokeTest do
       assert reload(child["id"]).revoked_at
     end
 
+    test "AN UNLINEAGED ORCHESTRATOR KEY MAY NOT REVOKE AT ALL — 403, nothing revoked" do
+      # THE HOLE THIS CLAUSE EXISTS FOR (#862 review, finding 1). `lineage_for_api_key/2`
+      # returns [] for a key no dispatch minted — a legacy LOOPCTL_ORCH_KEY, the default the
+      # MCP tool used to send. The ceiling inherited `create`'s []-caller exemption, which
+      # returns TRUE, so such a key could revoke ANY dispatch in the tenant including the
+      # operator's root, cascading to every descendant: the exact blast radius the 403 below
+      # it, the surrounding comment, the MCP tool description and both CHANGELOGs all claim
+      # the ceiling prevents.
+      #
+      # The distinction is positive and role-based, the same one `create` and
+      # `Placement.may_mint_session_dispatch/2` draw: [] plus `role >= :user` is the
+      # operator; [] below that is a legacy key with no subtree to be BOUNDED BY.
+      ctx = anchored_tenant_ctx()
+      %{"dispatch" => root} = mint_root(ctx)
+
+      orch_agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      {legacy_orch_key, _} =
+        fixture(:api_key, %{
+          tenant_id: ctx.tenant.id,
+          role: :orchestrator,
+          agent_id: orch_agent.id
+        })
+
+      error = revoke(legacy_orch_key, root["id"]) |> json_response(403) |> Map.fetch!("error")
+
+      assert error["code"] == "unlineaged_revoke_forbidden"
+
+      refute reload(root["id"]).revoked_at,
+             "an unlineaged orchestrator key must not be able to revoke the operator's root"
+
+      refute key_revoked?(root["id"]),
+             "and it must not be able to kill the key that root minted"
+
+      # The refusal must name a remedy this caller can actually perform. It has no dispatch
+      # of its own, so `your_dispatch_id` is OMITTED rather than emitted as a bare null, and
+      # the message names the operator key and the two paths that do not go through here.
+      refute Map.has_key?(error["remediation"], "your_dispatch_id")
+      assert error["message"] =~ "force-unclaim"
+      assert error["message"] =~ "parent_dispatch_id"
+    end
+
+    test "the OPERATOR key is still let through — [] alone is not what is refused" do
+      # The other side of the same clause, and the reason it is a POSITIVE test rather than
+      # a blanket refusal of every empty lineage: `place_dispatch` requires an unlineaged
+      # USER key, so the operator path has to keep working. Refusing on [] alone would close
+      # the delivery loop's own remediation.
+      ctx = anchored_tenant_ctx()
+      %{"dispatch" => root} = mint_root(ctx)
+
+      assert Dispatches.lineage_for_api_key(ctx.tenant.id, operator_key_id(ctx)) == [],
+             "the operator key must carry no lineage, or this test proves nothing"
+
+      assert revoke(ctx.operator_key, root["id"]) |> json_response(200)
+      assert reload(root["id"]).revoked_at
+    end
+
     test "it may NOT revoke a dispatch outside its lineage" do
       ctx = anchored_tenant_ctx()
 
@@ -235,6 +306,75 @@ defmodule LoopctlWeb.DispatchRevokeTest do
 
       assert error["code"] == "tenant_halted"
       refute reload(root["id"]).revoked_at
+    end
+  end
+
+  describe "the revocation is on the hash chain" do
+    defp revoke_entries(tenant_id) do
+      Entry
+      |> where([e], e.tenant_id == ^tenant_id and e.action == "dispatch_revoked")
+      |> AdminRepo.all()
+    end
+
+    test "a revoke appends ONE entry naming the dispatch, the count and the CALLER" do
+      # Minting appends `dispatch_created`; revoking appended nothing, so the reachable
+      # half of the pair had no record of who asked for it (#862 review, finding 2).
+      # `Runners.revoke_runner/3` writes `runner_revoked` for the same reason.
+      ctx = anchored_tenant_ctx()
+      %{"dispatch" => root, "api_key" => %{"raw_key" => root_key}} = mint_root(ctx)
+      child_agent = fixture(:agent, %{tenant_id: ctx.tenant.id})
+
+      %{"dispatch" => child} =
+        mint(root_key, %{
+          "role" => "agent",
+          "agent_id" => child_agent.id,
+          "parent_dispatch_id" => root["id"]
+        })
+
+      # Revoke from INSIDE the tree so the recorded actor is a lineage and not `[]` —
+      # an `actor_lineage: []` assertion would pass with the caller's lineage never read.
+      assert revoke(root_key, child["id"]) |> json_response(200)
+
+      assert [entry] = revoke_entries(ctx.tenant.id)
+      assert entry.entity_type == "dispatch"
+      assert entry.entity_id == child["id"]
+      assert entry.payload["revoked_count"] == 1
+      assert entry.payload["revoked_at"]
+
+      assert entry.actor_lineage == root["lineage_path"],
+             "the actor must be the CALLER's server-resolved lineage, not the target's"
+    end
+
+    test "a revoke that changed NOTHING appends nothing" do
+      # What keeps this once-per-revocation without a pre-read, and what bounds the cost
+      # on `Placement.undo_claim/5`, which revokes on every placement refusal.
+      ctx = anchored_tenant_ctx()
+      %{"dispatch" => root} = mint_root(ctx)
+
+      assert revoke(ctx.operator_key, root["id"]) |> json_response(200)
+      assert length(revoke_entries(ctx.tenant.id)) == 1
+
+      assert revoke(ctx.operator_key, root["id"]) |> json_response(200)
+
+      assert length(revoke_entries(ctx.tenant.id)) == 1,
+             "an idempotent re-revoke revokes no row, so it must append no entry"
+    end
+
+    test "a REFUSED revoke appends nothing" do
+      ctx = anchored_tenant_ctx()
+      %{"dispatch" => root} = mint_root(ctx)
+      other_agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      {legacy_orch_key, _} =
+        fixture(:api_key, %{
+          tenant_id: ctx.tenant.id,
+          role: :orchestrator,
+          agent_id: other_agent.id
+        })
+
+      assert revoke(legacy_orch_key, root["id"]) |> json_response(403)
+
+      assert revoke_entries(ctx.tenant.id) == []
     end
   end
 

@@ -12,7 +12,7 @@ defmodule Loopctl.Progress.ForceUnclaimRevokesSessionTest do
 
   Two halves, and BOTH are load-bearing:
 
-    * the revoke is SCOPED to a dispatch minted FOR this story. `Dispatches.revoke/2`
+    * the revoke is SCOPED to a dispatch minted FOR this story. `Dispatches.revoke/3`
       cascades to descendants, so revoking a general agent dispatch that merely claimed
       the story would kill that agent's whole subtree — every other story it holds — as
       a side effect of parking ONE. Force-unclaim is a routine compensation
@@ -26,6 +26,7 @@ defmodule Loopctl.Progress.ForceUnclaimRevokesSessionTest do
   use Loopctl.DataCase, async: true
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
@@ -131,7 +132,7 @@ defmodule Loopctl.Progress.ForceUnclaimRevokesSessionTest do
 
   describe "scope: only a dispatch minted FOR this story" do
     test "a general agent dispatch (story_id: nil) keeps its key" do
-      # The blast-radius bound. `Dispatches.revoke/2` cascades to descendants, so
+      # The blast-radius bound. `Dispatches.revoke/3` cascades to descendants, so
       # revoking here would kill every other story the agent holds.
       %{tenant_id: tenant_id, story: story, dispatch: dispatch} =
         story_with_session_dispatch(%{story_id: nil})
@@ -166,6 +167,46 @@ defmodule Loopctl.Progress.ForceUnclaimRevokesSessionTest do
       refute reload_dispatch(elsewhere.id).revoked_at
     end
 
+    test "the story_id bound is on the ROOT of the cascade, NOT on the cascade" do
+      # #862 review, finding 3. `revoke_story_session/4` checks `dispatch.story_id`, then
+      # hands off to `revoke/3`, whose query is
+      # `d.id == ^dispatch_id or ^dispatch_id in d.lineage_path` — so a DESCENDANT is
+      # revoked whatever story IT names. Reachable: the `create` ceiling lets a caller
+      # parent anywhere inside its own subtree, so a dispatch for story Y can sit under
+      # story X's session, and force-unclaiming X kills Y's credential.
+      #
+      # Pinned rather than narrowed, because the alternative is worse: filtering the
+      # cascade by `story_id` would leave a USABLE key hanging off a REVOKED lineage,
+      # which is the failure the cascade exists to prevent. The docstring says exactly
+      # this now; this test is what stops it drifting back into the false bound it
+      # claimed before ("nothing but this story is behind it").
+      %{tenant_id: tenant_id, story: story, dispatch: session} = story_with_session_dispatch()
+
+      other_story = fixture(:story, %{tenant_id: tenant_id, agent_status: :contracted})
+      other_agent = fixture(:agent, %{tenant_id: tenant_id})
+
+      {:ok, %{dispatch: child}} =
+        Dispatches.create_dispatch(tenant_id, %{
+          role: :agent,
+          agent_id: other_agent.id,
+          story_id: other_story.id,
+          parent_dispatch_id: session.id
+        })
+
+      assert child.story_id == other_story.id
+      assert session.id in child.lineage_path
+
+      {:ok, _released} = Progress.force_unclaim_story(tenant_id, story.id)
+
+      assert reload_dispatch(session.id).revoked_at
+
+      assert reload_dispatch(child.id).revoked_at,
+             "a descendant is revoked with its ancestor whatever story it names — a " <>
+               "credential may not outlive the lineage that delegated it"
+
+      assert key_for(child).revoked_at
+    end
+
     test "a story with no implementer dispatch releases normally" do
       agent = fixture(:agent, %{agent_type: :implementer})
       story = fixture(:story, %{tenant_id: agent.tenant_id, agent_status: :contracted})
@@ -177,7 +218,74 @@ defmodule Loopctl.Progress.ForceUnclaimRevokesSessionTest do
     end
   end
 
-  describe "Dispatches.revoke_story_session/3" do
+  describe "the skip is REPORTED at a level the operator actually sees" do
+    # #862 review, finding 4. These were `Logger.debug` while `config/dev.exs:124` and
+    # `config/prod.exs:20` both set `level: :info`, so the ONE case where force-unclaim
+    # does not free the slot — the whole point of the change — produced no line anywhere
+    # it runs. The operator saw the story freed, hit the same 422 on the next placement,
+    # and had nothing to read. `dispatches.ex` calls these "left alone and REPORTED,
+    # never silently skipped"; the level is what makes that sentence true.
+    #
+    # `capture_log` defaults to the :error level, so `level: :warning` is passed
+    # EXPLICITLY — without it these pass at `debug` too and the assertion is vacuous.
+
+    test ":not_story_session warns, and names the remedy" do
+      %{tenant_id: tenant_id, dispatch: dispatch} = story_with_session_dispatch()
+      other = fixture(:story, %{tenant_id: tenant_id, agent_status: :contracted})
+
+      {1, _} =
+        from(s in Story, where: s.id == ^other.id)
+        |> AdminRepo.update_all(set: [implementer_dispatch_id: dispatch.id])
+
+      log =
+        capture_log([level: :warning], fn ->
+          {:ok, _} = Progress.force_unclaim_story(tenant_id, other.id)
+        end)
+
+      assert log =~ "not_story_session"
+      assert log =~ "one-key-per-role slot"
+
+      assert log =~ "/api/v1/dispatches/:id/revoke",
+             "the line has to name the call that DOES free the slot"
+    end
+
+    test ":dispatch_not_found warns" do
+      # An id that is not in the dispatches table at all trips the FK, so the reachable
+      # shape of this outcome is a row that exists but belongs to ANOTHER tenant:
+      # `get_dispatch/2` is tenant-scoped, so it answers `:not_found` from here.
+      %{tenant_id: tenant_id, story: story} = story_with_session_dispatch()
+      elsewhere = story_with_session_dispatch()
+
+      {1, _} =
+        from(s in Story, where: s.id == ^story.id)
+        |> AdminRepo.update_all(set: [implementer_dispatch_id: elsewhere.dispatch.id])
+
+      log =
+        capture_log([level: :warning], fn ->
+          {:ok, _} = Progress.force_unclaim_story(tenant_id, story.id)
+        end)
+
+      assert log =~ "dispatch_not_found"
+    end
+
+    test "a story that never had a dispatch stays QUIET" do
+      # The other half, and the reason `:no_dispatch` is not folded in with the two
+      # above: nothing is stranded — there is no credential — so warning on it would put
+      # a line on every force-unclaim of an unclaimed story and bury the two that matter.
+      agent = fixture(:agent, %{agent_type: :implementer})
+      story = fixture(:story, %{tenant_id: agent.tenant_id, agent_status: :contracted})
+      {:ok, _} = Progress.claim_story(agent.tenant_id, story.id, agent_id: agent.id)
+
+      log =
+        capture_log([level: :warning], fn ->
+          {:ok, _} = Progress.force_unclaim_story(agent.tenant_id, story.id)
+        end)
+
+      refute log =~ "one-key-per-role slot"
+    end
+  end
+
+  describe "Dispatches.revoke_story_session/4" do
     test "reports WHY it left a dispatch alone rather than returning a bare :ok" do
       # A silent skip and a successful revoke would be indistinguishable to the caller,
       # and the caller is what logs the operator-facing remedy.

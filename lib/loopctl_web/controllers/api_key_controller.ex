@@ -48,7 +48,15 @@ defmodule LoopctlWeb.ApiKeyController do
 
   operation(:index,
     summary: "List API keys",
-    description: "Lists all API keys for the current tenant. Never exposes raw key or hash.",
+    description:
+      "Lists all API keys for the current tenant. Never exposes raw key or hash.\n\n" <>
+        "`include_revoked` defaults to FALSE, and since #862 a key that has passed its " <>
+        "`expires_at` is REVOKED by a background sweep " <>
+        "(`Loopctl.Workers.RevokeExpiredApiKeysWorker`, every 5 minutes) at every role the " <>
+        "partial unique index `api_keys_one_role_per_agent_idx` constrains — i.e. every role " <>
+        "except `user` and `superadmin`. So an expired `agent`/`orchestrator` key disappears " <>
+        "from this listing within minutes of expiring; pass `include_revoked=true` to see it. " <>
+        "A `user`/`superadmin` key is deliberately NOT swept and stays listed.",
     parameters: [
       include_revoked: [in: :query, type: :boolean, description: "Include revoked keys"]
     ],
@@ -83,7 +91,14 @@ defmodule LoopctlWeb.ApiKeyController do
         "A runner's key cannot be rotated here (422): revoke and re-enroll the runner. " <>
         "Like `create`, this mints a raw key that belongs to no dispatch lineage, so a " <>
         "caller whose own key carries a lineage is refused with 403 " <>
-        "`api_key_mint_forbidden`.",
+        "`api_key_mint_forbidden`.\n\n" <>
+        "A REVOKED key cannot be rotated (422 `Cannot rotate a revoked key`), and since #862 " <>
+        "an EXPIRED key becomes a revoked one: `Loopctl.Workers.RevokeExpiredApiKeysWorker` " <>
+        "sweeps expired keys every 5 minutes at every role the partial unique index " <>
+        "`api_keys_one_role_per_agent_idx` constrains (every role except `user` and " <>
+        "`superadmin`). Rotate such a key BEFORE it expires, or create a replacement. " <>
+        "`user`/`superadmin` keys are deliberately outside that sweep precisely so an " <>
+        "operator's expired key stays rotatable.",
     parameters: [
       id: [in: :path, type: :string, description: "API key UUID to rotate"]
     ],

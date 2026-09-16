@@ -521,7 +521,13 @@ defmodule Loopctl.Delivery.Placement do
   # is worth naming on its own, and the message has to name the CONSEQUENCE rather than the
   # timestamp — see below.
   defp revoke_session_dispatch(tenant_id, session, reason) do
-    case Dispatches.revoke(tenant_id, session.id) do
+    # The actor on the `dispatch_revoked` chain entry is the principal that asked for the
+    # PLACEMENT, and it is already in hand: `mint_session_dispatch/5` parented this session
+    # on the caller's own leaf, so the caller's lineage is this one without its last element.
+    # No extra read on the 3-connection pool for a compensation that runs on every refusal.
+    caller_lineage = Enum.drop(session.lineage_path, -1)
+
+    case Dispatches.revoke(tenant_id, session.id, actor_lineage: caller_lineage) do
       {:ok, _count} ->
         :ok
 
