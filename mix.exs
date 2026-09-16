@@ -67,7 +67,14 @@ defmodule Loopctl.MixProject do
 
   def cli do
     [
-      preferred_envs: [precommit: :test, "test.e2e": :test]
+      preferred_envs: [
+        precommit: :test,
+        "test.e2e": :test,
+        # The snapshot is asserted byte-for-byte by an ExUnit test, which runs in :test.
+        # Generating it in another env would render a route table from a different
+        # compile_env and put the file permanently at odds with its own guard.
+        "loopctl.routes_snapshot": :test
+      ]
     ]
   end
 

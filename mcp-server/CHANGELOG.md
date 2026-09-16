@@ -5,6 +5,173 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.99.0 — 2026-09-16 (a filed story can be corrected, and a session can tell stale from missing)
+
+Version 2.98.0 is not skipped by accident: it was taken by the branch that became loopctl
+#862, which has since merged and published. This branch chose 2.99.0 while #862 was still in
+flight, because reusing its number would have published two different trees under one.
+
+### Added
+
+- **`update_story`** (loopctl #846.6, `PATCH /api/v1/stories/:id`, ORCH key or higher). Corrects
+  a filed story's `title`, `description`, `acceptance_criteria`, `estimated_hours` or
+  `metadata`. The endpoint has been served since long before this package's write surface was
+  built and no tool reached it, so a session that filed a story and then found its own severity
+  wrong could not fix it — `import_stories` with `merge: true` posts a whole epic payload, which
+  means resending every sibling to change one field.
+
+  **SENDING `metadata` REPLACES THE WHOLE MAP.** There is no merge on this path: the field is
+  cast straight onto the story, so a partial send keeps what you sent, silently drops everything
+  else, and answers 200. Read the story first and send the map complete;
+  `acceptance_criteria` is replaced whole for the same reason. That erasure is not
+  hypothetical — `lifecycle_entered_at`, the marker that says a story may not be backfilled
+  straight to `verified`, lived in metadata and one ordinary PATCH erased it. It is a COLUMN
+  now that no changeset casts, so this endpoint can no longer reach THAT key; every other one is
+  still yours to lose.
+
+  Three things it refuses locally, each because the server's own answer would be a 200 that
+  changed nothing and is therefore indistinguishable from success: a request naming no updatable
+  field (the controller would still write an `updated` audit entry), any field set to `null`
+  (nils are dropped before the changeset), and an `estimated_hours` no decimal parser accepts
+  (the parse failure is dropped the same way, leaving the old estimate). The action is
+  `role: :orchestrator` — the HIERARCHY form, so a `:user` or `:superadmin` key passes too, and
+  `LOOPCTL_ORCH_KEY` is therefore sent as an ordinary override rather than pinned. The tenant
+  must be human-anchored.
+
+- **`mcp_version`** (loopctl #846.7). What this process is running, what loopctl ships, and what
+  the difference means: `running`, `expected`, a `status` of `current` / `behind` / `ahead` /
+  `unknown`, and a remedy. **It needs no API key** — it reads loopctl's unauthenticated
+  discovery document — so it answers in a session where nothing else does.
+
+  MCP binds its tool list at session start, so from inside a session "this tool does not exist"
+  and "this tool exists and my process is older than it" are the same observation: a name that
+  is not in the surface. 2.97.0's `force_unclaim_story` merged, deployed and went green, and the
+  session that needed it reported the capability as MISSING while it was merely STALE. This is
+  the discriminator, and the shape is the one the runner contract already uses — both sides
+  publish a version, so neither has to infer.
+
+  **The remedy for `behind` is `/mcp` or a session restart, never a retry**: the tool list is
+  fixed for the life of the process. `expected` is the version in the tree the deployment you
+  are pointed at was built from, not a registry lookup — so `behind` can briefly precede the npm
+  publish (the deploy and the publish run independently), and `ahead` is normal when running
+  this package from a checkout. The running version is READ from `package.json`, never written
+  down: a constant that drifts from the package would be the same defect one layer down.
+
+### Fixed
+
+- **`place_dispatch` declares `repo`** (loopctl #846.5). Its description offered `repo` as an
+  override and loopctl's own `409 no_intake_source` tells the caller to "pass `repo` and
+  `base_branch` explicitly", while the `inputSchema` declared only `base_branch`. It reached the
+  server anyway, purely because no schema here sets `additionalProperties: false` — so one
+  reasonable decision to close a schema, or a stricter MCP client, would have removed the only
+  expressible remedy for that refusal with nothing to show the operator why. The declaration
+  says `base_branch` is expected alongside it.
+
+- **`update_story` refuses a `story_id` that is not a UUID**, before any request, on the same
+  shared guard the four delivery-loop verbs use. Without it a malformed id reached loopctl and
+  came back as a 404 BYTE-IDENTICAL to the one an unknown story gets — `Stories.get_story/2`
+  puts the value into a query against a `:binary_id` with no cast, and `Ecto.Query.CastError`
+  has a deliberate 404 impl — so the two cases, whose remedies are opposite (re-read the
+  argument you passed, or go find the right story), were one answer. This tool's own
+  description promises "404 for an unknown story" as that status's only meaning, which the
+  missing check made false. The refusal carries `status: 0`, the marker every local refusal in
+  this client uses for "no request was sent".
+
+- **`mcp_version` reports the CAUSE of a failed discovery request**, not just `status 0`. The
+  status alone says only that no server answered; the reason — `Network error: … ENOTFOUND …`,
+  a timeout, or loopctl's own error body — was in `result.body` and was discarded. That is the
+  one field worth reading in exactly the session this tool exists for, where a typo'd
+  `LOOPCTL_SERVER`, a dead network and a slow one otherwise produce the same message. Bounded
+  to 300 characters and never allowed to throw: this tool always answers.
+
+### Internal
+
+- `test/description_schema_drift.test.js` — the generalisable half of the fix above: a scan that
+  fails when any tool's description offers a parameter its schema does not declare. Two offer
+  shapes are read, an offer verb governing a token and an anaphoric "pass any of them" whose
+  referent is the sentence before — the second is what hid #846.5. The extractor is pinned on
+  hand-written fixtures so it stays falsifiable when every shipped description is clean.
+- `test/route_coverage.test.js` — a sweep of every `/api/v1` route loopctl serves against every
+  route this package calls. Unreached routes are DECLARED with a category, and the assertion
+  runs both ways: an undeclared gap fails, and so does a declaration whose route has since been
+  covered or deleted. Nearly half the surface was unreached when it was written, so it is a
+  ratchet rather than a hard fail — new debt cannot land silently, and the list can only shrink.
+  It also pins, for every tool rather than a named few, that a declaration has a dispatch case
+  and a case has a declaration.
+- `test/tool-surface.js` — **THE ROUTER PARSER IS GONE.** The sweep above needs to know what
+  loopctl serves, and it answered that by parsing `lib/loopctl_web/router.ex` with regexes. That
+  parse was silently wrong four times across two review rounds: `resources` was never expanded
+  (eleven lines, 34 routes); a multi-line declaration was joined for `resources` and not for the
+  verb macros (nine more, one of them — `GET /api/v1/knowledge/analytics/projects/:id/usage` —
+  reached by nothing, so it was absent from the parse, from the unreached list and from the
+  declared inventory at once); a `#` comment or a blank line INSIDE a wrapped declaration was
+  absorbed into the join and dropped the route it interrupted; and a plug mounted with no action
+  atom (`get "/openapi", OpenApiSpex.Plug.RenderSpec, []`) could never match a matcher that
+  required a trailing `:action`. Every one of those left the sweep green while it answered for a
+  surface with a hole in it.
+
+  Each round patched the pattern that had just been caught and the file's own header then
+  claimed the class was closed. It was not, and the fifth pattern would have gone the same way,
+  because the defect is not in any regex: it is a parser ASSERTING ITS OWN COMPLETENESS with
+  nothing to check it against. LAYOUT decided visibility rather than the route — eight of those
+  nine wrapped declarations fit inside the formatter's 98-column default and stay wrapped anyway
+  — so a route escaped the ratchet by formatting alone.
+
+  `routerRoutes()` now reads `test/router-routes.json`, which the new
+  `mix loopctl.routes_snapshot` generates from `Phoenix.Router.routes(LoopctlWeb.Router)`. There
+  is no second opinion left to disagree with the router. Staleness is what replaces
+  mis-parsing as the risk, and it is loud: `test/loopctl_web/router_snapshot_test.exs` asserts
+  the checked-in file is byte-identical to the router's table NOW, and runs in `mix precommit`
+  and the CI Test job — both on every change to the Elixir project, including a `router.ex`
+  change the node workflow's `mcp-server/**` path filter would skip. Regenerating touches
+  `mcp-server/**`, which is what makes the node job re-run the sweep against the surface that
+  just changed, and why the file lives under `mcp-server/test/` rather than in `priv/`.
+
+  The change found its own first defect on its first run: `GET /api/v1/openapi` is a live route
+  this sweep had never been able to see, and it is now declared `machine` — its consumers are
+  API tooling (SwaggerUI is mounted on it in-tree) and the document is 606,959 bytes across 214
+  paths, which is why a tool returning it into a session's context would be unusable rather than
+  merely missing.
+
+  `stripComments` moves here as the one copy, and the dispatch-case scan uses it. `^\s*case`
+  already excluded a line-commented case and excluded nothing about a BLOCK-commented one, so a
+  tool disabled that way kept a green wiring assertion — the same hole #861 round 1 closed on
+  two sibling guards, in a scan written after them. Four hand-kept copies were how a fifth site
+  got written without the fix.
+
+- `test/route_coverage.test.js` — the sweep's own SCOPE is a declaration now, not a filter. It
+  covers `/api/v1`, and `startsWith("/api/v1")` is a silent exclusion: a whole new JSON surface
+  at `/api/v2` would be dropped by it with nothing to say so — the same blindness as the parser
+  above, one level up. A `NON_API` table names every route loopctl serves outside `/api/v1` with
+  its kind (`browser`, `probe`, `discovery`), and a route that is neither in the sweep nor in
+  that table fails.
+
+- `test/route_coverage.test.js` — eight exemptions re-examined and re-categorised, and the
+  `duplicate` category given a mechanical guard on BOTH sides.
+
+  Five `PUT` twins (intake sources, projects, webhooks, skills, token-budgets) were excused as
+  `duplicate` — "already reached by a tool on its twin route" — against a `PATCH` declared a
+  `gap` in the same table. Nothing reached either verb, so five real gaps were counted as
+  exemptions. A new assertion makes that unrepeatable: a `PUT` excused as a duplicate must have
+  a `PATCH` twin this package REALLY SENDS. Only `PUT /api/v1/articles/:param` was ever a true
+  duplicate.
+
+  Two authenticator routes were excused as `ceremony` on evidence from a DIFFERENT controller.
+  Neither verifies a WebAuthn assertion — `rename/2`'s own API description says in so many words
+  that it needs none, and `index/1` is a plain list. The index is the one with a consequence:
+  `revoke_authenticator` ships and takes an `authenticator_id` no tool can obtain, because a
+  browser ceremony discards the 201 body that carried it. Both are `gap` now.
+
+  The eighth is `GET /api/v1`, the welcome landing, excused as a `duplicate` because
+  `list_routes` calls `GET /api/v1/routes` — a different controller action on a different path,
+  which is the same evidence-from-elsewhere the five PUT twins were re-categorised for. It also
+  showed the guard could not reach it: that assertion filters `PUT `, so anything else wearing
+  the label was excused by a category NOTHING checked. The category is bounded from both ends
+  now — one test says every `duplicate` is a `PUT`, the other says its `PATCH` twin is really
+  sent — so a route the guard cannot verify can no longer carry the label. The twin guard also
+  gained a non-vacuity anchor, which it lacked while every sibling scan in the file had one: a
+  reviewer re-categorised the single true duplicate and all twelve tests stayed green, because
+  an empty filter asserts nothing.
 ## 2.98.0 — 2026-09-15 (a dead session's key can be revoked)
 
 ### Added

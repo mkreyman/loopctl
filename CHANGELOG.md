@@ -6,6 +6,41 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Three more of loopctl's own surface becomes reachable, and a session can tell a MISSING tool
+  from a STALE one (#846.5, #846.6, #846.7).** No endpoint changed; these are the tools the rule
+  in `CLAUDE.md` already required, plus the sweep that finds the next miss.
+
+  **`update_story` — a filed story can be corrected.** `PATCH /api/v1/stories/:id` has been
+  served since long before the MCP server had a write surface and nothing reached it, so a
+  session that filed a story and then found its own severity wrong had no way to fix it.
+  **Sending `metadata` REPLACES THE WHOLE MAP** — there is no merge on that endpoint, so a
+  partial send drops every key you left out and answers 200. Read the story first, send the map
+  complete. The one key it can no longer erase is `lifecycle_entered_at`, which is a COLUMN
+  precisely because it used to live in metadata and one ordinary PATCH erased it, restoring the
+  claim → force-unclaim → backfill-to-verified launder.
+
+  **`mcp_version` — the discriminator.** MCP binds its tool list at session start, so from
+  inside a session "this tool does not exist" and "this tool exists and my process is older than
+  it" are the same observation. `force_unclaim_story` shipped in 2.97.0, merged green and
+  deployed, and the session that needed it reported the capability as MISSING while it was
+  merely STALE. This tool needs NO API KEY — it reads the unauthenticated discovery document at
+  `/.well-known/loopctl` — so it answers in a session where nothing else does. **The remedy for
+  `behind` is `/mcp` or a session restart, never a retry.**
+
+  **`place_dispatch` now declares `repo`.** Its own `409 no_intake_source` tells the caller to
+  pass `repo` and `base_branch` explicitly, and the declared schema had only `base_branch`. It
+  worked solely because no schema sets `additionalProperties: false`.
+
+  **Two refusals an operator will notice.** `update_story` now refuses a `story_id` that is not
+  a UUID before sending anything: loopctl answers a malformed one with a 404 byte-identical to
+  the one an unknown story gets, and the two have opposite remedies. And `mcp_version` now
+  prints WHY a discovery request failed — the `ENOTFOUND`, the timeout, or loopctl's own error
+  body — instead of a bare `status 0`, which is the whole answer in the situation that tool
+  exists for.
+
+  **Nothing required of an operator.** All three are additive; a session picks them up on the
+  next `/mcp` or restart once `loopctl-mcp-server@2.99.0` has published. 2.98.0 is deliberately
+  skipped — it is claimed by a branch in flight, and two trees must not share one version.
 - **`POST /api/v1/dispatches/:id/revoke` — a dispatch can be revoked from outside the app, and
   an expired api_key is now swept (#862).** Three changes to one invariant, and one blocker.
 
