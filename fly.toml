@@ -43,6 +43,31 @@ kill_timeout = 90
   # ScaleAlerts.config_status/2 flags BOTH half-done directions, so doing one without the
   # other turns /health/ready red with a reason naming the setting to fix.
   SCALE_ALERTS_ENABLED = "false"
+
+  # #803: THE UNATTENDED DISPATCH DRIVER IS ON. Enabled 2026-09-16 on Mark's
+  # instruction ("enable the loop. Let it succeed or fail on the next filed issue"),
+  # after the intake-source MCP tools made the loop wireable at all. With this true
+  # and the four budgets below set, DispatchDriverWorker places queued stories on
+  # whichever runner has slots free, with nobody watching. Set it to "false" to stop
+  # placements without touching anything else; the workers keep running and place
+  # nothing, which is the state this was in until today.
+  DISPATCH_DRIVER_ENABLED = "true"
+
+  # THE BUDGETS ARE A COST POLICY, not a timeout, and they have no defaults on purpose
+  # (config/runtime.exs:176) — a default would be our guess quietly becoming Mark's
+  # spend. Calibrated against the ONE measured unattended run (2026-09-14, one story):
+  # 28.8 minutes, 108 turns, about USD 10.40. Both implement numbers are ~2x that, so a
+  # typical run finishes well inside them and a runaway is capped near an hour rather
+  # than a day. Expect roughly USD 10-20 per implement run at these figures; lower them
+  # to cap harder, raise them only with a measured run that needed it.
+  DISPATCH_WALL_CLOCK_SECONDS = "3600"
+  DISPATCH_MAX_TURNS = "200"
+
+  # A TRIAGE session reads a ticket and answers with a verdict — a fraction of an
+  # implement run — so it gets its own far smaller pair (#803 §4). Inheriting the
+  # implement numbers would hand a reading session an hour of wall clock.
+  TRIAGE_WALL_CLOCK_SECONDS = "600"
+  TRIAGE_MAX_TURNS = "40"
   # BEAM clustering over Fly's private network. DNSCluster resolves this name to every
   # started machine's 6PN address and connects to the node of the same release there; the
   # node name and IPv6 distribution come from rel/env.sh.eex. Not a secret: it names no
