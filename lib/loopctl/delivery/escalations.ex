@@ -305,16 +305,34 @@ defmodule Loopctl.Delivery.Escalations do
   def resolve(tenant_id, story_id, opts) do
     to = Keyword.fetch!(opts, :to)
 
+    # Fetched ONCE, here, and threaded — not re-fetched at each use. It reaches TWO writers,
+    # not one: `Stages.advance/4` below, and `force_unclaim_story/3` under `prepare_story/6`,
+    # which since #862 revokes the story's session dispatch and puts a `dispatch_revoked`
+    # entry on the hash chain. That second one was passed `actor_label:` alone while this
+    # function was holding the lineage, so `Progress`'s `Keyword.get(opts, :actor_lineage,
+    # [])` wrote an EMPTY actor on it (#862 review round 2, finding 3).
+    #
+    # ON THE SUCCESSFUL PATH THAT CHANGES NOTHING, and saying otherwise would be inventing a
+    # mechanism: `:human_resolution` is a human-only edge and `Stages.human?/1`
+    # (`lib/loopctl/delivery/stages.ex:1073-1076`) requires `actor_lineage == []`, so a
+    # resolve that completes is one whose lineage is empty. What it changes is the REFUSED
+    # path — a LINEAGED caller, i.e. a session claiming to be a person, which is precisely
+    # what that gate exists to refuse. `prepare_story/6` runs BEFORE `Stages.advance/4`, so
+    # by the time the refusal lands the claim is released and the credential revoked, and the
+    # chain carries an entry for a revocation that session caused. `[]` on that entry reads
+    # as the tenant's operator key having done it.
+    actor_lineage = Keyword.fetch!(opts, :actor_lineage)
+
     with :ok <- resolvable(to),
          {:ok, row} <- live_row(tenant_id, story_id),
          :ok <- at_escalated(row),
-         {:ok, epoch} <- prepare_story(tenant_id, story_id, to, row, opts) do
+         {:ok, epoch} <- prepare_story(tenant_id, story_id, to, row, opts, actor_lineage) do
       Stages.advance(tenant_id, story_id, {:escalated, to, :human_resolution},
         claim_epoch: epoch,
         reason: Keyword.get(opts, :reason),
         actor_label: Keyword.get(opts, :actor_label),
         actor_role: Keyword.fetch!(opts, :actor_role),
-        actor_lineage: Keyword.fetch!(opts, :actor_lineage)
+        actor_lineage: actor_lineage
       )
     end
   end
@@ -332,21 +350,31 @@ defmodule Loopctl.Delivery.Escalations do
   #
   # `done` and `failed` prepare nothing: the story is finished with, and re-contracting it
   # would be inventing work.
-  defp prepare_story(tenant_id, story_id, :queued, _row, opts) do
+  defp prepare_story(tenant_id, story_id, :queued, _row, opts, actor_lineage) do
     label = Keyword.get(opts, :actor_label)
 
-    with {:ok, story} <- release_claim(tenant_id, story_id, label),
+    with {:ok, story} <- release_claim(tenant_id, story_id, label, actor_lineage),
          {:ok, story} <- recontract(tenant_id, story, label) do
       {:ok, story.claim_epoch}
     end
   end
 
-  defp prepare_story(_tenant_id, _story_id, _to, row, _opts), do: {:ok, row.claim_epoch}
+  defp prepare_story(_tenant_id, _story_id, _to, row, _opts, _actor_lineage),
+    do: {:ok, row.claim_epoch}
 
   # Idempotent by `force_unclaim_story/3`'s own design: a story already at `:pending` — its
   # claim released by the lease while it sat escalated — passes through with its current epoch.
-  defp release_claim(tenant_id, story_id, label) do
-    Progress.force_unclaim_story(tenant_id, story_id, actor_label: label)
+  #
+  # The lineage is FORWARDED, not defaulted: this call revokes the story's session dispatch
+  # (#862) and is therefore an audit-chain writer, so `resolve/3`'s server-resolved caller
+  # lineage has to reach it. It is `[]` on every resolve that SUCCEEDS (the human-only edge
+  # demands that) and non-empty only on one the human gate is about to refuse — which is the
+  # case worth attributing. See the note in `resolve/3`.
+  defp release_claim(tenant_id, story_id, label, actor_lineage) do
+    Progress.force_unclaim_story(tenant_id, story_id,
+      actor_label: label,
+      actor_lineage: actor_lineage
+    )
   end
 
   # `pending -> contracted` is the only transition into the state a placement needs, and a

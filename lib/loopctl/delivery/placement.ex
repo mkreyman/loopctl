@@ -517,17 +517,27 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
+  # The actor on every `dispatch_revoked` chain entry this module causes: the principal that
+  # asked for the PLACEMENT. It is already in hand — `mint_session_dispatch/5` parented this
+  # session on the caller's own leaf, so the caller's lineage is this one without its last
+  # element. No extra read on the 3-connection pool for a compensation that runs on every
+  # refusal.
+  #
+  # BOTH revoking paths have to use it, and only one of them did (#862 review round 2,
+  # finding 3). `undo_claim/5` runs `release_claim/5` FIRST, and since #862
+  # `force_unclaim_story/3` revokes the story's session dispatch itself — so the revoke that
+  # actually happens on that path is the one inside the release, not the explicit one below,
+  # and the explicit one then finds nothing to revoke and appends nothing. Computing the
+  # lineage only here therefore wrote `actor_lineage: []` on the entry that reached the
+  # chain, which reads as "the tenant's operator key did this" — a misattribution of an
+  # agent's compensation, which is worse than no entry.
+  defp caller_lineage(session), do: Enum.drop(session.lineage_path, -1)
+
   # Returns `:ok` or the failure, so the undo can report it rather than swallow it. The failure
   # is worth naming on its own, and the message has to name the CONSEQUENCE rather than the
   # timestamp — see below.
   defp revoke_session_dispatch(tenant_id, session, reason) do
-    # The actor on the `dispatch_revoked` chain entry is the principal that asked for the
-    # PLACEMENT, and it is already in hand: `mint_session_dispatch/5` parented this session
-    # on the caller's own leaf, so the caller's lineage is this one without its last element.
-    # No extra read on the 3-connection pool for a compensation that runs on every refusal.
-    caller_lineage = Enum.drop(session.lineage_path, -1)
-
-    case Dispatches.revoke(tenant_id, session.id, actor_lineage: caller_lineage) do
+    case Dispatches.revoke(tenant_id, session.id, actor_lineage: caller_lineage(session)) do
       {:ok, _count} ->
         :ok
 
@@ -708,8 +718,18 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
-  # THE WHOLE UNDO: release the claim, UNRECORD the session dispatch, revoke it. Three steps
-  # because the claim's release does only the first.
+  # THE WHOLE UNDO: release the claim, UNRECORD the session dispatch, revoke it.
+  #
+  # Since #862 the release does the FIRST AND THE THIRD: `Progress.force_unclaim_story/3`
+  # revokes the story's own session dispatch (`revoke_released_session_credential/3`) on its
+  # way past, so on this path `revoke_session_dispatch/3` below normally finds the dispatch
+  # already revoked, revokes nothing and appends nothing. It stays because it is the only
+  # revoke on the OTHER caller, `claim_then_push/7`, where the claim never reached the story
+  # and there is no `implementer_dispatch_id` for the release to find — and because a release
+  # that failed leaves the credential live, which is exactly when a second attempt is wanted.
+  #
+  # That ordering is why `release_claim/5` is handed the caller's lineage: the entry the chain
+  # actually gets on this path is written by the release, not by the explicit revoke.
   #
   # `Progress.release_claim_changes/1` clears `assigned_agent_id` and does NOT clear
   # `implementer_dispatch_id` — correctly, for its own callers: a reclaimed or unclaimed story
@@ -735,7 +755,7 @@ defmodule Loopctl.Delivery.Placement do
   # Nothing here rolls anything back on failure: the caller is owed the refusal that brought it
   # here, not a second one.
   defp undo_claim(tenant_id, story_id, session, reason, opts) do
-    release = release_claim(tenant_id, story_id, reason, opts)
+    release = release_claim(tenant_id, story_id, reason, caller_lineage(session), opts)
     cleared = Progress.clear_unused_implementer_dispatch(tenant_id, story_id, session.id)
     revoked = revoke_session_dispatch(tenant_id, session, reason)
     log_undo(tenant_id, story_id, session, reason, {release, cleared, revoked})
@@ -780,9 +800,16 @@ defmodule Loopctl.Delivery.Placement do
   # lease is the backstop, nothing is stranded" — no longer true now that the undo has steps
   # the lease does not perform, and the caller cannot tell a released claim from a swallowed
   # failure if every outcome looks the same.
-  defp release_claim(tenant_id, story_id, reason, opts) do
+  #
+  # `actor_lineage` is FORWARDED, not defaulted. `force_unclaim_story/3` revokes the story's
+  # session dispatch on its way past, so this call is what puts a `dispatch_revoked` entry on
+  # the hash chain for the undo path — and `Progress` reads the lineage as
+  # `Keyword.get(opts, :actor_lineage, [])`, so omitting it recorded the placement caller's
+  # compensation as the tenant operator's act.
+  defp release_claim(tenant_id, story_id, reason, actor_lineage, opts) do
     case Progress.force_unclaim_story(tenant_id, story_id,
-           actor_label: Keyword.get(opts, :actor_label)
+           actor_label: Keyword.get(opts, :actor_label),
+           actor_lineage: actor_lineage
          ) do
       {:ok, _story} -> :ok
       other -> log_release_failure(tenant_id, story_id, reason, other)

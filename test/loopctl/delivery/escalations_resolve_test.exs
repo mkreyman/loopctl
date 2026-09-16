@@ -20,9 +20,12 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.AuditChain
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Dispatches
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -152,6 +155,39 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       assert {:error, {:unresolvable_target, :implementing}} = resolve(ctx, :implementing)
       assert unboxed(fn -> Stages.get(ctx.tenant.id, ctx.story.id) end).stage == :escalated
     end
+
+    test "a REFUSED resolve still names the CALLER on the revocation it already caused", ctx do
+      # #862 review round 2, finding 3. `prepare_story/6` releases the claim, and since #862
+      # `force_unclaim_story/3` revokes the story's session dispatch on its way past — so the
+      # release is an audit-chain writer, and `Progress` reads its actor as
+      # `Keyword.get(opts, :actor_lineage, [])`. `resolve/3` was passing only `actor_label:`
+      # down while holding the caller's server-resolved lineage, so that entry was written
+      # with an EMPTY actor — the shape the tenant's own operator key writes.
+      #
+      # THE REFUSED PATH IS WHERE THIS IS OBSERVABLE, and that is a fact about the gate rather
+      # than a convenience. `:human_resolution` is a human-only edge and `Stages.human?/1`
+      # (`lib/loopctl/delivery/stages.ex:1073-1076`) requires `actor_lineage == []`, so a
+      # SUCCESSFUL resolve is by construction one whose lineage is empty and the forwarding
+      # changes nothing there. A LINEAGED caller — a session claiming to be a person, exactly
+      # what that gate exists to refuse — is refused at `Stages.advance/4`, which runs AFTER
+      # `prepare_story/6` has already released the claim and revoked the credential. So the
+      # chain gets an entry for a revocation a session caused, and whose name is on it is what
+      # this forwarding decides.
+      %{tenant: tenant} = ctx
+      session = session_dispatch_for(ctx)
+      lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+
+      assert {:error, :human_required} = resolve(ctx, :queued, actor_lineage: lineage)
+
+      assert unboxed(fn -> AdminRepo.get!(Dispatch, session.id) end).revoked_at,
+             "the release runs before the human gate, so the credential is already revoked"
+
+      assert [entry] = unboxed(fn -> revoked_entries(tenant.id, session.id) end)
+      assert entry.actor_lineage == lineage
+
+      refute entry.actor_lineage == [],
+             "an empty actor lineage reads as the tenant operator having done this"
+    end
   end
 
   defp resolve(ctx, to, opts \\ []) do
@@ -163,6 +199,46 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
         actor_lineage: Keyword.get(opts, :actor_lineage, [])
       )
     end)
+  end
+
+  # A session dispatch minted FOR this story, recorded on it — the shape
+  # `Placement.mint_session_dispatch/5` produces, and the only shape
+  # `Dispatches.revoke_story_session/4` will revoke.
+  defp session_dispatch_for(ctx) do
+    unboxed(fn ->
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id})
+
+      {:ok, %{dispatch: root}} =
+        Dispatches.create_dispatch(ctx.tenant.id, %{role: :orchestrator}, actor_lineage: [])
+
+      {:ok, %{dispatch: session}} =
+        Dispatches.create_dispatch(
+          ctx.tenant.id,
+          %{
+            role: :agent,
+            agent_id: agent.id,
+            story_id: ctx.story.id,
+            parent_dispatch_id: root.id
+          },
+          actor_lineage: root.lineage_path
+        )
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(s in Story, where: s.id == ^ctx.story.id),
+          set: [implementer_dispatch_id: session.id]
+        )
+
+      session
+    end)
+  end
+
+  defp revoked_entries(tenant_id, dispatch_id) do
+    AdminRepo.all(
+      from e in AuditChain.Entry,
+        where: e.tenant_id == ^tenant_id and e.entity_id == ^dispatch_id,
+        where: e.action == "dispatch_revoked"
+    )
   end
 
   # ASKED THROUGH THE FUNCTION A PLACEMENT ASKS, never by restating its rule: a test that

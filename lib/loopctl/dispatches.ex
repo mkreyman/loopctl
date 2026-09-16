@@ -465,13 +465,28 @@ defmodule Loopctl.Dispatches do
   (`do_create_dispatch/3`'s `:audit` step) and `Runners.revoke_runner/3` appends
   `runner_revoked` — and this was the reachable half with no record of WHO.
 
-  The entry is conditional on `count > 0`, which is what makes it once-per-revocation
-  without a `revocation_audited?`-style pre-read: the update only touches rows that are
-  `revoked_at IS NULL`, so a second revoke of the same dispatch revokes nothing and
-  appends nothing. That also bounds the blast radius of the callers that run
+  The entry is conditional on `count > 0`, and `count` is what the UPDATE ITSELF changed —
+  never the length of the candidate list. That is what makes it once-per-revocation without
+  a `revocation_audited?`-style pre-read: `revoke_dispatch_rows/2` re-asserts
+  `revoked_at IS NULL` on the write, so a second revoke of the same dispatch changes no row,
+  counts 0 and appends nothing. That also bounds the blast radius of the callers that run
   constantly — `Placement.undo_claim/5` revokes on every placement refusal, but only a
   refusal that actually had a session dispatch to kill writes an entry, and that
   dispatch's own `dispatch_created` entry is already in the chain, so the pair balances.
+
+  **The re-assertion on the WRITE is the whole mechanism, and taking it from the candidate
+  read alone was #862 review round 2, finding 2.** `dispatches_query` runs OUTSIDE the
+  transaction, so it is ADVISORY — the same shape `RevokeExpiredApiKeysWorker` uses. Under
+  READ COMMITTED two concurrent revokes whose candidate reads both saw a row un-revoked
+  would both reach the UPDATE; the second blocks on the row lock and then re-evaluates its
+  own WHERE, which is the only place `revoked_at IS NULL` can still stop it. Without the
+  predicate there it did not, and the damage took two shapes on an IMMUTABLE, STH-covered
+  record. An operator revoking parent `P` while a force-unclaim revoked child `C` in `P`'s
+  subtree REWROTE `C.revoked_at` to the later timestamp and counted `C` again inside `P`'s
+  entry, so that entry's `revoked_count` names rows it did not change. And two revokes of
+  the SAME dispatch both updated it, both counted 1, and appended TWO `dispatch_revoked`
+  entries for one revocation. The sibling `:revoke_keys` step always carried its own
+  `is_nil(k.revoked_at)`; this step is where the pattern was missing.
 
   The payload does NOT enumerate the cascade. An immutable, STH-covered entry is the
   wrong place for an unbounded id list, and the set is derivable anyway: it is exactly
@@ -506,11 +521,7 @@ defmodule Loopctl.Dispatches do
     multi =
       Multi.new()
       |> Multi.run(:revoke_dispatches, fn _repo, _ ->
-        {count, _} =
-          from(d in Dispatch, where: d.id in ^dispatch_ids)
-          |> AdminRepo.update_all(set: [revoked_at: now])
-
-        {:ok, count}
+        {:ok, revoke_dispatch_rows(dispatch_ids, now)}
       end)
       |> Multi.run(:revoke_keys, fn _repo, _ ->
         if key_ids != [] do
@@ -544,6 +555,38 @@ defmodule Loopctl.Dispatches do
       {:error, _step, reason, _} ->
         {:error, reason}
     end
+  end
+
+  @doc """
+  Marks the subset of `dispatch_ids` that is STILL un-revoked as revoked at `now`, and
+  returns how many rows THIS STATEMENT changed.
+
+  Public as a TEST SEAM, and that is not cosmetic. `revoke/3`'s candidate read already
+  carries `is_nil(d.revoked_at)`, so through `revoke/3` the two guards are REDUNDANT and each
+  masks the other: a sequential double-revoke hands this function an EMPTY id list, and the
+  write's predicate can be deleted with every assertion still green. Reaching the write
+  directly, with an id the candidate read would never have produced, is what makes the
+  re-assertion falsifiable — the same reason `RevokeExpiredApiKeysWorker.revoke_batch/2` is
+  public.
+
+  The re-assertion is not redundant in production. The candidate read runs OUTSIDE the
+  transaction and is ADVISORY: under READ COMMITTED a concurrent revoke can commit between
+  the read and this write, and the second writer re-evaluates only ITS OWN `where`. Without
+  the predicate that writer rewrites a `revoked_at` an audit reader is relying on, and —
+  because the count it returns is what `revoke/3` audits on — makes an immutable
+  `dispatch_revoked` entry claim rows it did not change, or write a second entry for a
+  revocation the chain already records.
+
+  The COUNT is the statement's own, never `length(dispatch_ids)`, so `count > 0` means
+  "this call revoked something" rather than "this call was asked about something".
+  """
+  @spec revoke_dispatch_rows([Ecto.UUID.t()], DateTime.t()) :: non_neg_integer()
+  def revoke_dispatch_rows(dispatch_ids, now) do
+    {count, _} =
+      from(d in Dispatch, where: d.id in ^dispatch_ids and is_nil(d.revoked_at))
+      |> AdminRepo.update_all(set: [revoked_at: now])
+
+    count
   end
 
   # `:noop` rather than an entry when nothing was revoked — see `revoke/3`'s doc. The

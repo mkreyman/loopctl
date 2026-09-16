@@ -410,9 +410,12 @@ defmodule LoopctlWeb.DispatchController do
   before the TTL.
 
   Idempotent: an already-revoked dispatch answers 200 with `revoked_count: 0` and
-  its original `revoked_at` — the revoke query only touches `revoked_at IS NULL`
-  rows, so a retry never rewrites a revocation timestamp an audit reader may be
-  relying on.
+  its original `revoked_at`. That holds for a CONCURRENT retry too, not only a
+  sequential one: the candidate read runs outside the transaction and is advisory,
+  so the UPDATE re-asserts `revoked_at IS NULL` itself
+  (`Dispatches.revoke_dispatch_rows/2`) and `revoked_count` is what that statement
+  changed. So a retry never rewrites a revocation timestamp an audit reader may be
+  relying on, and never appends a second `dispatch_revoked` entry to the chain.
 
   It does NOT clear `stories.implementer_dispatch_id`. That is custody
   provenance, and `Progress`'s lineage lookups resolve a revoked dispatch row

@@ -13,9 +13,16 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorkerTest do
   `RevokeExpiredDispatchesWorker` covers keys a DISPATCH minted. A key minted straight
   at `POST /api/v1/api_keys` with an `expires_at` has no dispatch row, so nothing
   revoked it and it held the slot for ever. This worker is that sweep, keyed on the
-  `api_keys` row rather than on a dispatch, so it covers every mint path — at exactly
-  the roles the index constrains, which is every role except `user`/`superadmin`
-  (#862 review, finding 6; see the worker's own Scope section for why).
+  `api_keys` row rather than on a dispatch, so it covers every mint path — for exactly
+  the keys the index CONSTRAINS (#862 review, finding 6 and round 2 finding 1; see the
+  worker's own Scope section for why).
+
+  "Constrained" is narrower than "at a role the index names", and that is what round 2
+  corrected. The index is keyed on `(tenant_id, agent_id, role)` and is not declared
+  `NULLS NOT DISTINCT`, so a row with a NULL `agent_id` conflicts with nothing at ANY
+  role — it holds no slot, its `rotate` path works, and sweeping it would take that away
+  for nothing. Nothing forbids the state: the create changeset requires `[:name, :role]`
+  only, and the CHECK that would have required `agent_id` was deferred and never added.
   """
 
   use Loopctl.DataCase, async: true
@@ -172,6 +179,50 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorkerTest do
              "an operator's expired user key must stay rotatable and visible"
     end
 
+    test "an `agent`-role key with NO agent_id is NOT swept — it occupies no slot either" do
+      # #862 review round 2, finding 1. The role exclusion alone was the WRONG predicate: the
+      # index is keyed on `(tenant_id, agent_id, role)` and is not `NULLS NOT DISTINCT`, so a
+      # NULL `agent_id` conflicts with nothing and blocks no mint at ANY role. Sweeping such a
+      # key freed no slot and cost it the `rotate` path `validate_not_revoked/1` leaves open
+      # for an expired key — the exact harm the `user`/`superadmin` exclusion exists to avoid.
+      #
+      # The state is reachable, which is the whole reason this is a defect and not a
+      # hypothetical: the create changeset requires `[:name, :role]` only, and the CHECK that
+      # would have required `agent_id` was deferred and never added. The first assertion below
+      # PROVES reachability rather than assuming it — if a CHECK is ever added, this line
+      # fails and says so, instead of the test quietly covering an impossible row.
+      tenant = fixture(:tenant)
+
+      assert {:ok, {_raw, key}} =
+               Auth.generate_api_key(%{tenant_id: tenant.id, name: "agentless", role: :agent})
+
+      assert is_nil(key.agent_id)
+      force(key.id, expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
+
+      assert :ok = RevokeExpiredApiKeysWorker.perform(%Oban.Job{args: %{}})
+
+      refute reload(key.id).revoked_at,
+             "a key holding no index slot must stay rotatable and visible"
+    end
+
+    test "an agent-less key's slot really is free: a second one inserts WITHOUT any sweep" do
+      # The load-bearing premise of the test above, asserted rather than reasoned about. If
+      # Postgres ever refused this insert — a `NULLS NOT DISTINCT` index, or an `agent_id`
+      # CHECK — then such a key WOULD hold a slot and excluding it from the sweep would be the
+      # bug instead of the fix. Without this, "do not sweep agent-less keys" rests on a claim
+      # about NULL semantics that nothing in the suite checks.
+      tenant = fixture(:tenant)
+
+      assert {:ok, {_raw, first}} =
+               Auth.generate_api_key(%{tenant_id: tenant.id, name: "one", role: :agent})
+
+      assert {:ok, {_raw, second}} =
+               Auth.generate_api_key(%{tenant_id: tenant.id, name: "two", role: :agent})
+
+      assert is_nil(first.agent_id) and is_nil(second.agent_id)
+      assert first.id != second.id
+    end
+
     test "the role exclusion is the INDEX's, not a blanket skip: an orchestrator key IS swept" do
       # The positive control. Without it "do not sweep user keys" is satisfied by a sweep
       # that skips everything with a role, and the whole worker goes inert.
@@ -248,6 +299,21 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorkerTest do
       # what this seam exists to make possible — sweeps a key the sweep is meant to spare.
       tenant = fixture(:tenant)
       {_raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      force(key.id, expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
+
+      assert :ok = RevokeExpiredApiKeysWorker.revoke_batch([key.id], DateTime.utc_now())
+
+      refute reload(key.id).revoked_at
+    end
+
+    test "an agent-less id handed in directly is STILL skipped" do
+      # The re-assertion carries the `agent_id` half too, for the same reason it carries the
+      # role half: this seam is reachable with ids the candidate read never produced.
+      tenant = fixture(:tenant)
+
+      assert {:ok, {_raw, key}} =
+               Auth.generate_api_key(%{tenant_id: tenant.id, name: "agentless", role: :agent})
+
       force(key.id, expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
 
       assert :ok = RevokeExpiredApiKeysWorker.revoke_batch([key.id], DateTime.utc_now())
