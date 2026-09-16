@@ -474,4 +474,85 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       assert Stages.get(story.tenant_id, story.id).stage == :implementing
     end
   end
+
+  describe "resolve's OpenAPI responses cover every shape it can return" do
+    # 846.8 review round 2, finding 2. `Escalations.resolve/3`'s `:queued` path calls
+    # `Progress.force_unclaim_story/3` and propagates its refusals verbatim through a `with`
+    # with no `else` — so `{:error, :force_unclaim_failed}` (500) and `{:error, %Changeset{}}`
+    # (422) reach this controller's `other -> other` and the fallback. The operation declared
+    # neither; it also declared neither the 400 its own `resolution_target/1` produces, nor
+    # the 503 a contended stage write answers.
+    #
+    # Bound to the RENDERER rather than to a list of numbers written twice: each shape is one
+    # `Escalations.error()` admits (or one this controller itself produces), it is pushed
+    # through the mounted `action_fallback`, and the status that comes BACK must be a key of
+    # the generated spec's `responses` map. A shape that starts rendering differently, or a
+    # response row deleted, fails here.
+    test "every error shape resolve/2 can produce renders a status the spec declares" do
+      documented =
+        Loopctl.ApiSpec.spec().paths["/api/v1/stories/{id}/stage/resolve"].post.responses
+        |> Map.keys()
+
+      assert 200 in documented
+
+      shapes = [
+        # the controller's own, before `Escalations` is reached
+        {:error, :bad_request, "to must be one of queued, done, failed"},
+        # Escalations' own vocabulary
+        {:error, :not_found},
+        {:error, :busy},
+        {:error, :invalid_transition},
+        {:error, :audit_chain_append_failed},
+        {:error, {:unresolvable_target, :nowhere}},
+        # PROPAGATED from Progress by prepare_story/6 — the three round 2 named
+        {:error, :force_unclaim_failed},
+        {:error, invalid_story_changeset()},
+        {:error, {:contract_mismatch, %{expected: 1, got: 2}}}
+      ]
+
+      rendered = Enum.map(shapes, &render/1)
+      statuses = Enum.map(rendered, & &1.status)
+
+      # The propagated 500 is named, not an unmapped-atom fallthrough.
+      codes =
+        shapes
+        |> Enum.zip(rendered)
+        |> Enum.filter(fn {_shape, conn} -> conn.status == 500 end)
+        |> Enum.map(fn {_shape, conn} -> Jason.decode!(conn.resp_body)["error"]["code"] end)
+
+      assert "force_unclaim_failed" in codes
+
+      # The shapes reach genuinely different statuses, so one undocumented number cannot hide
+      # behind the documented ones.
+      assert Enum.sort(Enum.uniq(statuses)) == [400, 404, 409, 422, 500, 503]
+
+      for {shape, status} <- Enum.zip(shapes, statuses) do
+        assert status in documented,
+               "POST /stories/{id}/stage/resolve can answer #{status} (from " <>
+                 "#{inspect(elem(shape, 1))}), and its operation/2 does not declare it. " <>
+                 "Declared: #{inspect(Enum.sort(documented))}."
+      end
+    end
+
+    # `{:error, {:not_escalated, stage}}` never reaches the fallback — `resolve/2` renders it
+    # itself — so it is asserted separately rather than left out, which would have read as the
+    # shape not existing.
+    test "the not_escalated shape the controller renders itself is declared too" do
+      documented =
+        Loopctl.ApiSpec.spec().paths["/api/v1/stories/{id}/stage/resolve"].post.responses
+        |> Map.keys()
+
+      assert 409 in documented
+    end
+  end
+
+  defp render(shape),
+    do: LoopctlWeb.FallbackController.call(Phoenix.ConnTest.build_conn(), shape)
+
+  # What `force_unclaim_story/3`'s `:story` step returns when the release UPDATE is rejected.
+  defp invalid_story_changeset do
+    %Loopctl.WorkBreakdown.Story{}
+    |> Ecto.Changeset.change(%{})
+    |> Ecto.Changeset.add_error(:agent_status, "is invalid")
+  end
 end

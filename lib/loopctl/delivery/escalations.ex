@@ -108,6 +108,24 @@ defmodule Loopctl.Delivery.Escalations do
           | {:not_escalated, StageMachine.stage()}
           | {:unresolvable_target, term()}
           | Stages.advance_error()
+          # PROPAGATED VERBATIM by `prepare_story/6`'s `with`, which has no `else` (846.8
+          # review round 2). `resolve/3`'s `:queued` path calls
+          # `Progress.force_unclaim_story/3` and then `Progress.contract_story/4`, and every
+          # refusal either returns is this function's refusal too. The three below are the
+          # shapes those two specs admit that nothing above already covers — and the
+          # changeset is the one that matters, because it is not an atom at all, so a caller
+          # matching `{:error, atom}` on this type would never have seen it.
+          #
+          # `Progress.contract_story/4` is specced `{:error, atom() | ...}`, i.e. OPEN: an
+          # atom it gains tomorrow propagates here without this type changing. That coupling
+          # is named rather than papered over with a bare `atom()`, which would make this
+          # type say nothing at all. `test/loopctl_web/controllers/
+          # story_escalation_controller_test.exs` holds the rendered statuses against the
+          # operation's `responses` map, so a new shape that renders an undeclared status
+          # fails there.
+          | :force_unclaim_failed
+          | {:contract_mismatch, map()}
+          | Ecto.Changeset.t()
 
   @doc """
   Escalates `story_id` to a human on behalf of its claiming agent. Returns the story's stage

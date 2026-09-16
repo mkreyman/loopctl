@@ -360,6 +360,16 @@ All notable changes to loopctl are documented here.
   declares 400/422/500 alongside the 200/404/429 it listed before — a client generated from
   the published schema previously had no case for any of the three.
 
+  **Error-code change:** that 500 now carries `code: "force_unclaim_failed"` where it
+  previously fell through to the generic `internal_error`. The message says the story is
+  unchanged and the call should be re-run.
+
+  **`POST /api/v1/stories/:id/stage/resolve` is affected too**, and was not before: resolving
+  an escalated story to `queued` RELEASES its claim first, so every refusal force-unclaim can
+  return is a refusal of that endpoint. It now declares 400, 422, 500 and 503 alongside the
+  statuses it already listed, and renders the same named 500. A caller resolving to `done` or
+  `failed` is unaffected — those release nothing.
+
 - **A placement that could not revoke its session credential erased the remedy for it
   (846.8).** `Delivery.Placement`'s compensation cleared the story's
   `implementer_dispatch_id` BEFORE revoking the dispatch, so a clear that succeeded ahead of a

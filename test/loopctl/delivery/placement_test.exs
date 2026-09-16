@@ -676,6 +676,51 @@ defmodule Loopctl.Delivery.PlacementTest do
       refute event.actor_label == "api:dispatch_placement"
     end
 
+    # 846.8 REVIEW ROUND 2, finding 1. THE POSITION PROPERTY: `clear_if_revoked/4` runs THIRD
+    # of `undo_claim/5`'s five statements, so anything that aborts it takes `log_undo/5` and
+    # `park_unreleased_claim/6` with it — and neither `undo_claim/5` nor `place/4` rescues, so
+    # the caller's real refusal is replaced by an exception and the story is left `claimed`
+    # with NO HUMAN TOLD. That is the four-hour incident this branch exists to end, reached by
+    # a different door.
+    #
+    # It is why the clear's `rescue` exists and why its third clause returns a tagged term
+    # instead of crashing (`park_unreleased_claim/6` may crash; it is LAST). The property is
+    # stated in comments at both places, and this is the test that holds it: the clear is made
+    # to raise for real, and both things that follow it must still have happened.
+    test "a clear that RAISES still leaves the caller its refusal and still escalates", ctx do
+      %{runner: runner, story: story, channel: channel} = ctx
+
+      # Release fails (so the park has something to escalate) AND the clear raises. The two
+      # triggers are on different tables and different column transitions, so neither sees the
+      # other's write: the release is `story_stages` claimed -> queued, the clear is `stories`
+      # implementer_dispatch_id -> NULL.
+      fail_the_release!(story.id)
+      fail_the_clear!(story.id)
+      disconnect(channel, runner)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, :runner_not_connected} =
+                   place(ctx, dispatch_payload(story), actor_label: "api:dispatch_placement")
+        end)
+
+      # THE TWO STATEMENTS AFTER THE CLEAR BOTH RAN. `log_undo/5` reports the undo, and the
+      # park escalated — which is the whole of what a raise here would have cost.
+      assert log =~ "placement undo did not fully undo"
+      assert log =~ "the story is ESCALATED"
+      refute log =~ "COULD NOT ESCALATE"
+
+      row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
+      assert row.stage == :escalated
+      assert row.escalation_reason =~ "release of that claim ALSO failed"
+
+      # And the story still names its dispatch, because the clear is what would have removed
+      # it — so the remedy still has its handle, exactly as on the failed-revoke path.
+      held = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      session = unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end)
+      assert held.implementer_dispatch_id == session.id
+    end
+
     # 846.8 AC-1. THE COVERING PROPERTY, not the call order. `undo_claim/5` used to clear
     # `implementer_dispatch_id` and THEN revoke, so a clear that succeeded ahead of a revoke
     # that failed erased the only handle the other remediation path has: the operator holds a
@@ -1612,6 +1657,53 @@ defmodule Loopctl.Delivery.PlacementTest do
   defp drop_the_release_trigger!(name) do
     Sandbox.unboxed_run(AdminRepo, fn ->
       AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON story_stages")
+      AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+    end)
+
+    :ok
+  end
+
+  # MAKES THE CLEAR RAISE. Same DDL technique and same reason as `fail_the_release!/1`:
+  # `Progress.clear_unused_implementer_dispatch/3` is one `update_all` on an unguarded pool,
+  # and nothing reachable from Elixir makes it fail.
+  #
+  # SCOPED TO THE CLEAR'S OWN COLUMN TRANSITION — `implementer_dispatch_id` going from
+  # non-NULL to NULL on this story — so it cannot fire on the release, which writes
+  # `agent_status` and `assigned_agent_id` and leaves that column alone. Dropped on exit; a
+  # leaked trigger would break every later clear of a story reusing this id.
+  defp fail_the_clear!(story_id) do
+    name = "placement_clear_fails_#{System.unique_integer([:positive])}"
+
+    unboxed(fn ->
+      {:ok, _} =
+        AdminRepo.transaction(fn ->
+          AdminRepo.query!("SET LOCAL lock_timeout = '5s'")
+
+          AdminRepo.query!(
+            "CREATE FUNCTION #{name}() RETURNS trigger AS $fn$ BEGIN " <>
+              "RAISE EXCEPTION 'placement test: this story cannot drop its dispatch'; " <>
+              "END; $fn$ LANGUAGE plpgsql"
+          )
+
+          AdminRepo.query!(
+            "CREATE TRIGGER #{name}_t BEFORE UPDATE ON stories FOR EACH ROW " <>
+              "WHEN (NEW.id = '#{story_id}'::uuid " <>
+              "AND OLD.implementer_dispatch_id IS NOT NULL " <>
+              "AND NEW.implementer_dispatch_id IS NULL) " <>
+              "EXECUTE FUNCTION #{name}()"
+          )
+        end)
+    end)
+
+    on_exit(fn -> drop_the_clear_trigger!(name) end)
+
+    :ok
+  end
+
+  # Unguarded and untransactioned for the reasons `drop_the_release_trigger!/1` states.
+  defp drop_the_clear_trigger!(name) do
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON stories")
       AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)
 

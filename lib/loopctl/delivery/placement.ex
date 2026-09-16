@@ -969,39 +969,63 @@ defmodule Loopctl.Delivery.Placement do
   defp undo_claim(tenant_id, story, session, reason, opts) do
     release = release_claim(tenant_id, story.id, reason, caller_lineage(session), opts)
     revoked = revoke_session_dispatch(tenant_id, session, reason)
-    cleared = clear_if_revoked(tenant_id, story.id, session, revoked)
+    cleared = safe_clear(tenant_id, story.id, session, revoked)
     log_undo(tenant_id, story.id, session, reason, {release, cleared, revoked})
     park_unreleased_claim(tenant_id, story, session, reason, release, opts)
   end
 
-  # TWO TOTAL CLAUSES over what `revoke_session_dispatch/3` returns, matching the shape
-  # `park_unreleased_claim/6` uses and for the same reason: `:ok` is the only success, and
-  # `{:error, _}` is the only failure — that function returns the `:ok` it maps `{:ok, count}`
-  # to, or the `{:error, term}` half of `Dispatches.revoke/3`'s own spec, which
-  # `log_revoke_failure/4` passes through unchanged.
+  # TWO TOTAL CLAUSES over what `revoke_session_dispatch/3` returns: `:ok` is the only success
+  # and `{:error, _}` the only failure — that function returns the `:ok` it maps
+  # `{:ok, count}` to, or the `{:error, term}` half of `Dispatches.revoke/3`'s own spec, which
+  # `log_revoke_failure/4` passes through unchanged. A miss is caught by `safe_clear/4` above
+  # rather than by a clause here; read that comment for why the two halves are split.
   #
   # The second head matches `{:error, _}` EXPLICITLY and not `_`. It read as a catch-all until
   # 846.8 while the comment claimed it was total, which is this branch's own subject one file
-  # over — and the consequence was the opposite of what this comment then stated: a new SUCCESS
+  # over — and the consequence was the opposite of what that comment stated: a new SUCCESS
   # shape (`{:ok, :already_revoked}`, say) would have been absorbed as "revoke failed", so the
   # story would have gone on naming a dispatch that WAS revoked, on the healthy path, silently.
-  # A third shape now raises `FunctionClauseError` here, which is the loud failure
-  # `park_unreleased_claim/6` takes for the same reason.
+  # That shape now reaches `safe_clear/4`'s rescue instead, where it is reported rather than
+  # absorbed: `log_undo/5` prints the `FunctionClauseError` under `clear=`, which names the
+  # function AND the unmatched argument.
   #
   # `:kept_for_remediation` is not a failure and is not `{:ok, :cleared}`, so `log_undo/5`
   # falls to its warning clause and the line names all three outcomes. That is correct: the
   # undo genuinely did not fully undo, and the residue is a live credential PLUS a story
   # still naming it, which is the state `force_unclaim_story/3` is then able to clear.
   #
-  # The raise is swallowed for the reason `release_claim/5` and `revoke_session_dispatch/3`
-  # swallow theirs: `park_unreleased_claim/6` runs AFTER this, so an exception from the clear
-  # would take the 846.1 escalation with it. `clear_unused_implementer_dispatch/3`
-  # cannot return an error, but it is one `update_all` plus an audit insert on the same
-  # unguarded 3-connection pool, so it can raise.
-  defp clear_if_revoked(tenant_id, story_id, session, :ok) do
-    Progress.clear_unused_implementer_dispatch(tenant_id, story_id, session.id)
+  # `clear_unused_implementer_dispatch/3` cannot return an error, but it is one `update_all`
+  # plus an audit insert on the same unguarded 3-connection pool, so it can RAISE — which is
+  # the first of the two things `safe_clear/4` above rescues, for the reason
+  # `release_claim/5` and `revoke_session_dispatch/3` swallow theirs.
+  # ONE RESCUE FOR BOTH WAYS THIS STEP CAN GO WRONG, and it is at the CALL rather than inside
+  # a clause, which is what makes it cover the second way: a `FunctionClauseError` from a
+  # revoke outcome neither clause below matches is raised HERE, in this body, so it is caught
+  # exactly like a raise from the clear itself.
+  #
+  # Both matter because of POSITION. This runs THIRD of `undo_claim/5`'s five statements:
+  # `log_undo/5` and `park_unreleased_claim/6` follow it, neither `undo_claim/5` nor `place/4`
+  # rescues, so anything that escapes here replaces the caller's real refusal with an
+  # exception AND SKIPS THE 846.1 ESCALATION — a story left `claimed` with no human told,
+  # which is the four-hour incident this branch exists to end, reached by a different door.
+  # `park_unreleased_claim/6` may crash for the same class of miss because it is LAST;
+  # nothing is lost after it. That argument does not transfer to this function, and for one
+  # review round the comment below claimed it did.
+  #
+  # A THIRD CLAUSE WAS THE OBVIOUS FIX AND DIALYZER REFUSES IT: `revoke_session_dispatch/3`'s
+  # success typing is `:ok | {:error, _}`, so a catch-all is `pattern_match_cov`, and
+  # `@dialyzer` suppressions are not allowed here. `Progress.skip_explanation/1` records the
+  # same collision and resolves it the same way — no unreachable clause, let the miss crash —
+  # and the only thing this adds is that a crash HERE must not take two statements with it.
+  # A rescue is invisible to that analysis, so it buys the safety without the dead clause.
+  defp safe_clear(tenant_id, story_id, session, revoked) do
+    clear_if_revoked(tenant_id, story_id, session, revoked)
   rescue
     error -> {:error, error}
+  end
+
+  defp clear_if_revoked(tenant_id, story_id, session, :ok) do
+    Progress.clear_unused_implementer_dispatch(tenant_id, story_id, session.id)
   end
 
   defp clear_if_revoked(_tenant_id, _story_id, _session, {:error, _revoke_failed}),

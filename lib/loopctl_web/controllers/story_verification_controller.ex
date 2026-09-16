@@ -173,7 +173,7 @@ defmodule LoopctlWeb.StoryVerificationController do
          Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
-        {"`internal_error` — the release transaction rolled back at a step that is not " <>
+        {"`force_unclaim_failed` — the release transaction rolled back at a step that is not " <>
            "supposed to be able to refuse (`stage`, `audit` or `webhook_events`). The story " <>
            "is UNCHANGED — still claimed, still held — the cause is logged server-side with " <>
            "the step name, and the remedy is to re-run this call.", "application/json",

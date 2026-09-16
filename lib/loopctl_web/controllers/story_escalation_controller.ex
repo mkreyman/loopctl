@@ -175,11 +175,32 @@ defmodule LoopctlWeb.StoryEscalationController do
        }},
     responses: %{
       200 => {"The story's new stage row", "application/json", Schemas.StoryStageResponse},
+      400 =>
+        {"`to` is missing or not one of queued, done, failed", "application/json",
+         Schemas.ErrorResponse},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"The story is not escalated", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      409 =>
+        {"The story is not escalated (`not_escalated`, naming the stage it IS at), or the " <>
+           "stage machine has no such transition (`invalid_transition`)", "application/json",
+         Schemas.ErrorResponse},
+      # 846.8 review round 2. Resolving to `queued` RELEASES THE CLAIM first
+      # (`prepare_story/6`), so every refusal `Progress.force_unclaim_story/3` and
+      # `Progress.contract_story/4` can return is a refusal of this endpoint — and two of
+      # them, a rejected release write and `force_unclaim_failed`, were undeclared. So was
+      # the 400 above and the 503 below.
+      422 =>
+        {"The release or re-contract write was rejected (a changeset error, or " <>
+           "`contract_mismatch`), or `unresolvable_target`", "application/json",
+         Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`force_unclaim_failed` — the claim release rolled back at a step that cannot " <>
+           "refuse, or the transition's audit-chain entry did not land. Nothing was written.",
+         "application/json", Schemas.ErrorResponse},
+      503 =>
+        {"A lock the write needed was not free; nothing was written", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 

@@ -978,18 +978,17 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         {:error, :force_unclaim_failed}
       ]
 
-      rendered =
-        ExUnit.CaptureLog.capture_log(fn ->
-          statuses =
-            Enum.map(shapes, fn shape ->
-              LoopctlWeb.FallbackController.call(build_conn(), shape).status
-            end)
+      rendered = Enum.map(shapes, &LoopctlWeb.FallbackController.call(build_conn(), &1))
+      statuses = Enum.map(rendered, & &1.status)
 
-          send(self(), {:statuses, statuses})
-        end)
-
-      assert_received {:statuses, statuses}
-      assert rendered =~ "force_unclaim_failed"
+      # The 500 really is THIS refusal and not an unmapped-atom fallthrough — the fallback
+      # names `:force_unclaim_failed` explicitly, so an operator reading the body learns the
+      # story is untouched and the remedy is to re-run.
+      assert %{"error" => %{"code" => "force_unclaim_failed"}} =
+               rendered
+               |> Enum.find(&(&1.status == 500))
+               |> Map.fetch!(:resp_body)
+               |> Jason.decode!()
 
       # The shapes really do reach four DIFFERENT statuses — otherwise one undocumented
       # number could hide behind three documented ones.
