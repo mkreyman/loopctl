@@ -177,6 +177,7 @@ const DECLARED = {
 
   // ── duplicate: a PUT whose PATCH twin a tool really sends ────────────────
   "PUT /api/v1/articles/:param": "duplicate", // ArticleController.update — knowledge_update PATCHes it
+  "PUT /api/v1/intake/sources/:param": "duplicate", // IntakeSourceController.update — intake_source_update PATCHes it
 
   // ── gap: no tool reaches this. Real debt — delete the line when you ship one
   //
@@ -196,9 +197,11 @@ const DECLARED = {
   "GET /api/v1/tenants/:param/authenticators": "gap", // TenantAuthenticatorController.index
   "PATCH /api/v1/tenants/:param/authenticators/:param": "gap", // TenantAuthenticatorController.rename
   //
-  // The five PUT twins below were `duplicate` until the same round, each excused against a
-  // PATCH that is itself a `gap` a few lines down. Nothing reaches either verb.
-  "PUT /api/v1/intake/sources/:param": "gap", // IntakeSourceController.update
+  // The four PUT twins below were `duplicate` until the same round, each excused against a
+  // PATCH that is itself a `gap` a few lines down. Nothing reaches either verb. There were
+  // five: the intake-source PUT rejoined the `duplicate` block above when
+  // `intake_source_update` made its PATCH twin real, which is the ratchet working in the
+  // direction it is meant to move.
   "PUT /api/v1/projects/:param": "gap", // ProjectController.update
   "PUT /api/v1/webhooks/:param": "gap", // WebhookController.update
   "PUT /api/v1/skills/:param": "gap", // SkillController.update
@@ -215,10 +218,6 @@ const DECLARED = {
   "GET /api/v1/api_keys": "gap", // ApiKeyController.index
   "DELETE /api/v1/api_keys/:param": "gap", // ApiKeyController.delete
   "POST /api/v1/api_keys/:param/rotate": "gap", // ApiKeyController.rotate
-  "POST /api/v1/intake/sources": "gap", // IntakeSourceController.create
-  "GET /api/v1/intake/sources": "gap", // IntakeSourceController.index
-  "PATCH /api/v1/intake/sources/:param": "gap", // IntakeSourceController.update
-  "DELETE /api/v1/intake/sources/:param": "gap", // IntakeSourceController.delete
   "GET /api/v1/audit": "gap", // AuditController.index
   "GET /api/v1/changes": "gap", // ChangeController.index
   "GET /api/v1/stories/blocked": "gap", // DependencyGraphController.blocked

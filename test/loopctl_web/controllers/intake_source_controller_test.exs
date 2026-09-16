@@ -23,6 +23,39 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
   defp create_params(ctx, repo \\ "mkreyman/home_care_billing"),
     do: %{"repo_full_name" => repo, "project_id" => ctx.project.id}
 
+  describe "the documented source shape" do
+    test "names every field a source actually serialises", %{conn: conn} do
+      # BOUND TO THE ENCODER RATHER THAN TO A LIST SOMEONE REMEMBERED. `base_branch` was added
+      # to the schema's `@derive` and to both request bodies, and the RESPONSE schema was left
+      # behind — so a client generated from this document got a source type without the one
+      # field the tools tell a caller to check before placing work. Encoding an empty struct
+      # yields exactly the derived keys, so this cannot drift from the `@derive` list.
+      serialised = %Source{} |> Jason.encode!() |> Jason.decode!() |> Map.keys() |> Enum.sort()
+
+      documented =
+        conn
+        |> get("/api/v1/openapi")
+        |> json_response(200)
+        |> get_in([
+          "paths",
+          "/api/v1/intake/sources",
+          "post",
+          "responses",
+          "201",
+          "content",
+          "application/json",
+          "schema",
+          "properties",
+          "source",
+          "properties"
+        ])
+        |> Map.keys()
+        |> Enum.sort()
+
+      assert documented == serialised
+    end
+  end
+
   describe "POST /api/v1/intake/sources" do
     test "creates a source and returns its secret once", %{conn: conn} do
       ctx = operator_ctx()
@@ -93,6 +126,181 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       # that is out of date instead.
       assert Map.has_key?(body["source"], "target_epic_id")
       assert body["source"]["target_epic_id"] == nil
+    end
+
+    test "base_branch is stored as enrolled, and omitting it still yields master", %{conn: conn} do
+      ctx = operator_ctx()
+
+      # BOTH HALVES. The controller built its attrs from three params and `base_branch` was
+      # not one of them, so a source could only ever be enrolled at the schema default and a
+      # repository whose trunk is `main` — GitHub's default since 2020 — sent every dispatch
+      # to cut from a branch that does not exist, the failure arriving after the claim. The
+      # second half is what catches the obvious regression in the fix: reading the parameter
+      # by presence rather than passing it through, so an enrolment that names no branch
+      # keeps taking `master` instead of failing `validate_required`.
+      named =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(
+          ~p"/api/v1/intake/sources",
+          Map.put(create_params(ctx), "base_branch", "main")
+        )
+        |> json_response(201)
+
+      assert named["source"]["base_branch"] == "main"
+      assert AdminRepo.get!(Source, named["source"]["id"]).base_branch == "main"
+
+      # AND ON THE CHAIN. A later repoint appends `intake_source_base_branch_set` carrying the
+      # new value, so without the branch in the creation entry the chain could say what a
+      # branch was changed TO and never what the source started at.
+      assert [%Entry{payload: %{"base_branch" => "main"}}] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where:
+                     e.tenant_id == ^ctx.tenant.id and
+                       e.entity_id == ^named["source"]["id"]
+               )
+
+      omitted =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", create_params(ctx, "mkreyman/cron_books"))
+        |> json_response(201)
+
+      assert omitted["source"]["base_branch"] == "master"
+      assert AdminRepo.get!(Source, omitted["source"]["id"]).base_branch == "master"
+    end
+
+    test "a base_branch that is not a git ref name is refused at enrolment", %{conn: conn} do
+      ctx = operator_ctx()
+
+      # THE VALUE IS HANDED TO GIT. `Loopctl.Delivery.TriageDispatcher` puts this column into a
+      # dispatch as BOTH `branch` and `base_branch` without passing through
+      # `DispatchPayload.fill/3`, whose second `validate_refs/2` call is what judges a value
+      # the intake source supplied — so a length check alone let a 22-character argument reach
+      # git on a dev machine the first time an issue arrived on the repository.
+      #
+      # The benign half is why this belongs at the WRITE: `feature branch` and `a..b` would
+      # enrol happily and then refuse every place_dispatch for that project for ever, with
+      # nothing said at the point the value was written.
+      for bad <- [
+            "--upload-pack=/bin/sh",
+            "-o",
+            "a..b",
+            "feature branch",
+            "main\n",
+            "-",
+            ".hidden/x",
+            "x/.hidden",
+            "release.lock",
+            "a//b",
+            "/leading",
+            "trailing/"
+          ] do
+        body =
+          conn
+          |> auth(ctx.operator_key)
+          |> post(~p"/api/v1/intake/sources", Map.put(create_params(ctx), "base_branch", bad))
+          |> json_response(422)
+
+        assert body["error"]["details"]["base_branch"],
+               "#{inspect(bad)} enrolled without being refused on base_branch"
+      end
+
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+
+    test "an ordinary branch name still enrols, so the refusal above is not refusing everything",
+         %{conn: conn} do
+      ctx = operator_ctx()
+
+      # THE POSITIVE CONTROL. Without it the loop above passes against a guard that refuses
+      # every branch, which is the same column unreachable by another route.
+      for {repo, branch} <- [
+            {"mkreyman/a", "main"},
+            {"mkreyman/b", "master"},
+            {"mkreyman/c", "release/2.0"},
+            {"mkreyman/d", "feature_x-1"}
+          ] do
+        body =
+          conn
+          |> auth(ctx.operator_key)
+          |> post(
+            ~p"/api/v1/intake/sources",
+            Map.put(create_params(ctx, repo), "base_branch", branch)
+          )
+          |> json_response(201)
+
+        assert body["source"]["base_branch"] == branch
+      end
+    end
+
+    test "a repoint is judged by the same rule as an enrolment", %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      # ONE derivation for both paths: two writers of a column that reaches git must not
+      # disagree about what a usable value is, and the update path is the older of the two.
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
+          "base_branch" => "--upload-pack=/bin/sh"
+        })
+        |> json_response(422)
+
+      assert body["error"]["details"]["base_branch"]
+      assert AdminRepo.get!(Source, source.id).base_branch == "master"
+    end
+
+    test "the repository keeps the case it was enrolled with, and the uniqueness folds it", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      authed = auth(conn, ctx.operator_key)
+
+      # WHAT THE RECOVERY GUIDANCE RESTS ON, asserted rather than assumed: the index is on
+      # `lower(repo_full_name)` while the stored value is verbatim, so a caller looking for
+      # the source that is blocking its re-enrolment must match IGNORING CASE or miss the row.
+      body =
+        authed
+        |> post(~p"/api/v1/intake/sources", create_params(ctx, "MKREYMAN/Loopctl"))
+        |> json_response(201)
+
+      assert body["source"]["repo_full_name"] == "MKREYMAN/Loopctl"
+
+      assert json_response(
+               post(authed, ~p"/api/v1/intake/sources", create_params(ctx, "mkreyman/loopctl")),
+               422
+             )
+    end
+
+    test "a base_branch the caller SENT is answered about, never silently defaulted", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+
+      # NOT nullable and not blankable: every dispatch must name a branch to cut from, so
+      # there is no cleared state for it. Ecto's default `empty_values` would drop `""` from
+      # the changeset and let the row take `master` on a 201, telling a caller who plainly
+      # named a branch that it had been accepted. `update_source/4` refuses the same pair for
+      # the same reason, and the two must not disagree about what a valid branch is.
+      for blank <- ["", String.duplicate("b", 256)] do
+        body =
+          conn
+          |> auth(ctx.operator_key)
+          |> post(
+            ~p"/api/v1/intake/sources",
+            Map.put(create_params(ctx), "base_branch", blank)
+          )
+          |> json_response(422)
+
+        assert body["error"]["details"]["base_branch"]
+      end
+
+      assert Intake.list_sources(ctx.tenant.id) == []
     end
 
     test "422 naming target_epic_id for an epic outside the source's project", %{conn: conn} do

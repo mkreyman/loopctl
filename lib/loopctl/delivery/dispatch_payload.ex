@@ -45,6 +45,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Delivery.DispatchDriver
+  alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Story
@@ -65,18 +66,6 @@ defmodule Loopctl.Delivery.DispatchPayload do
   # 846.2): that repairs minis and breaks the next box. The control plane stops guessing; it
   # does not guess differently.
   @default_prefix "feature/"
-
-  # A GIT REF NAME, fully anchored, applied to a WHOLE branch name — the one this module
-  # composed, or the one a caller supplied — and never to a prefix on its own.
-  #
-  # `RunnerJoin.branch_prefixes` already refuses most of this at the wire and says why it is
-  # not enough: its `^...$` admits a trailing newline under PCRE, it cannot see `//` spanning
-  # a prefix, and a Presence meta can be built without passing that cast at all.
-  # `RunnerDispatch.branch` refuses NONE of it — a string of 1..255 characters and no pattern
-  # — and its cast runs after the claim besides. This is the check that decides on both sides,
-  # and it is deliberately narrower than git's own rules: every name it admits is one git
-  # accepts, which is the direction that matters.
-  @branch_name ~r{\A[A-Za-z0-9][A-Za-z0-9._/-]*\z}
 
   # Nothing on the wire can reach this: eight prefixes of 40 characters and a suffix under 30
   # leave it unreachable by a factor of two. It is the bound that holds when the prefixes came
@@ -298,36 +287,14 @@ defmodule Loopctl.Delivery.DispatchPayload do
     valid_ref_name?(branch) and byte_size(branch) <= RunnerDispatch.max_branch_length()
   end
 
-  # Narrower than git's own rules on purpose: everything admitted here is a name git accepts.
-  #
-  # WHAT EACH CLAUSE IS FOR, because a clause that can never fire is worse than no clause —
-  # it reads as a guard while the case it names goes unchecked (846.2 review finding 4, which
-  # is what the per-component pass below fixes):
-  #
-  #   * `@branch_name` bounds the CHARACTER SET and forces an alphanumeric first byte, so no
-  #     name reaches git as an OPTION, and no shell metacharacter, whitespace or control
-  #     character survives. Fully anchored (`\A`/`\z`), which the wire pattern on
-  #     `RunnerJoin.branch_prefixes` cannot be — `^...$` admits a trailing newline under PCRE.
-  #   * `..` is refused ANYWHERE, which no per-component rule catches: `a..b` is one component
-  #     and breaks none of git's component rules while git refuses the ref.
-  #   * the per-COMPONENT pass is where git's remaining rules actually live, and where the old
-  #     `String.ends_with?(branch, ".lock")` was dead: applied to the whole composed name it
-  #     tested a name that always ends with the `story-N-<id8>` suffix, so it could not fire,
-  #     while the cases it was written for — a prefix like `x.lock/` or `a/.b/`, both of which
-  #     `@branch_name` admits because it allows `.` — went unchecked and produced a name git
-  #     refuses. An EMPTY component is `//`, a leading `/` or a trailing one, so those need no
-  #     clause of their own either.
-  defp valid_ref_name?(branch) do
-    Regex.match?(@branch_name, branch) and
-      not String.contains?(branch, "..") and
-      branch |> String.split("/") |> Enum.all?(&valid_component?/1)
-  end
-
-  defp valid_component?(component) do
-    component != "" and
-      not String.starts_with?(component, ".") and
-      not String.ends_with?(component, [".lock", "."])
-  end
+  # THE RULE ITSELF LIVES IN `Loopctl.GitRef` and is not restated here (#874 review round 2,
+  # finding 1). It used to be private to this module, which judged a CALLER's ref fields —
+  # while `intake_sources.base_branch`, settable through the API and validated only by length,
+  # reached git through `Loopctl.Delivery.TriageDispatcher` without ever passing `fill/3`.
+  # Writing a second copy of the predicate next to that schema is the same defect one step
+  # later: two copies drift, and the weaker one is the one an attacker reaches. Both sites
+  # call one definition, and neither owns it.
+  defp valid_ref_name?(branch), do: GitRef.valid_name?(branch)
 
   # A CALLER'S OWN BRANCH IS NEVER REWRITTEN, only judged. Every other field here follows the
   # module's rule that a caller's value wins, and a control plane that silently renamed the

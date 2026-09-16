@@ -6,6 +6,48 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The GitHub intake sources of the delivery loop are reachable from an MCP session
+  (#803/#846). RE-VENDOR `loopctl-mcp-server` to 2.102.0 to get the tools.** `POST/GET/PATCH/
+  DELETE /api/v1/intake/sources` have been served since #803 and no MCP tool called any of
+  them, so the one step that gives the delivery loop an input — pointing a GitHub repository
+  at loopctl — could be taken only from a shell on the production node. The loop had therefore
+  never received a single issue. What changed is that an operator can reach them:
+  `intake_source_enroll`, `intake_source_list`, `intake_source_update`, `intake_source_revoke`.
+  One endpoint changed with them: `POST /api/v1/intake/sources` now accepts an optional
+  `base_branch`, below.
+
+  **Operator-visible, and the part to read before enrolling:** the webhook secret is returned
+  ONCE by the create endpoint and can never be read again, so the tool does NOT return it —
+  it writes it to a path you name, mode 0600, and returns the source row, the webhook URL and
+  that path. A tool result lands in a session transcript and in the audit log; a credential
+  must not. Configure the repository webhook from that file, content type `application/json`,
+  the `Issues` event only.
+
+  **`POST /api/v1/intake/sources` now accepts `base_branch`, and it is optional.** The
+  endpoint built its attrs from three parameters and this was not one of them, so every source
+  started at the schema default `master` whatever the caller asked for — and on a repository
+  whose trunk is `main`, GitHub's default since 2020, every dispatch was cut from a branch that
+  does not exist. Omitting it still yields `master`, so nothing changes for an existing caller;
+  naming it is now the one-call way to enrol a `main` repository. It is NOT nullable — every
+  dispatch must name a branch to cut from — so an explicit null or an empty string is a 422
+  rather than a silent fallback to the default. `PATCH /api/v1/intake/sources/:id` still
+  corrects a source that is already pointed at the wrong trunk.
+
+  **It must be a valid git branch name, and that is a SECURITY constraint rather than a
+  nicety.** The column is handed to git on the runner: the placement path already judged it
+  (`DispatchPayload.fill/3` validates ref fields a second time, after filling them from the
+  intake source), but `Loopctl.Delivery.TriageDispatcher` builds its own payload and puts this
+  value in as BOTH `branch` and `base_branch` without going through it — so a length-only check
+  let `--upload-pack=/bin/sh` enrol at 22 characters and reach git the first time an issue
+  arrived on that repository. Enrolment and repoint now both refuse a value that is not a git
+  ref name, using the same predicate the dispatch path uses (`Loopctl.GitRef.valid_name?/1`,
+  which is where that rule now lives rather than being copied), and the triage dispatcher
+  refuses to push a source whose stored branch does not satisfy it — which is what covers a row
+  written before this. **Operator-visible:** a value like `feature branch` or `a..b` that was
+  previously accepted at `PATCH /api/v1/intake/sources/:id` is now a 422 naming `base_branch`;
+  such a row already refused every `place_dispatch` for that project, silently, from the moment
+  it was written.
+
 - **A runner declares the branch prefixes it accepts, and loopctl derives a conforming branch
   (#846.2, runner contract 1.14.0). RE-VENDOR to send the field.** loopctl derived
   `feature/story-<n>-<id>`; the `minis` runner's config accepts `loop/` alone and refuses anything

@@ -155,6 +155,12 @@ defmodule Loopctl.Intake do
 
   Returns `{:ok, %{source: source, webhook_secret: secret}}`. The secret is returned once.
 
+  `attrs` may also carry `:target_epic_id` (optional, and `nil` means "not answered") and
+  `:base_branch` (optional, and read by PRESENCE: omit it for the `master` default, or name
+  the branch this repository's dispatches are cut from — `main` for a repository created on
+  GitHub since 2020. It is NOT nullable, so an explicit `nil` or `""` is a validation error
+  rather than a silent fallback to the default).
+
   ## Options
 
   - `:actor_lineage` — the creating caller's dispatch lineage, for the audit entry.
@@ -170,13 +176,40 @@ defmodule Loopctl.Intake do
 
     changeset =
       %Source{tenant_id: tenant_id, webhook_secret: secret}
-      |> Source.create_changeset(%{repo_full_name: repo})
+      |> Source.create_changeset(create_attrs(repo, attrs))
       |> put_project(tenant_id, project_id)
       |> put_target_epic(tenant_id, target_epic_id)
 
     with {:ok, changeset} <- valid(changeset),
          {:ok, source} <- insert_source(tenant_id, changeset, opts) do
       {:ok, %{source: source, webhook_secret: secret}}
+    end
+  end
+
+  # PRESENCE, for `:base_branch`, exactly as `update_source/4` reads it. The column is NOT
+  # NULL with a default of `master`, so "absent" and "explicitly null" are different requests:
+  # absent keeps the default an enrolment has always taken, while a caller that named the
+  # field gets its value validated — including the refusal for `nil` or `""`, since there is no
+  # cleared state for a branch every dispatch must name. Passing the key through
+  # unconditionally would turn every enrolment that omits it into a `can't be blank` 422.
+  #
+  # Without this the field was unreachable at enrolment: `create_changeset/2` casts it and
+  # nothing ever handed it a value, so every source started at `master` whatever the caller
+  # asked for — and a repository whose trunk is `main` (GitHub's default since 2020) sent
+  # every dispatch to cut from a branch that does not exist.
+  defp create_attrs(repo, attrs) do
+    base = %{repo_full_name: repo}
+
+    case fetch_either(attrs, :base_branch, "base_branch") do
+      {:ok, branch} -> Map.put(base, :base_branch, branch)
+      :error -> base
+    end
+  end
+
+  defp fetch_either(attrs, atom_key, string_key) do
+    case Map.fetch(attrs, atom_key) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(attrs, string_key)
     end
   end
 
@@ -272,7 +305,12 @@ defmodule Loopctl.Intake do
                payload: %{
                  "repo_full_name" => source.repo_full_name,
                  "project_id" => source.project_id,
-                 "target_epic_id" => source.target_epic_id
+                 "target_epic_id" => source.target_epic_id,
+                 # RECORDED, now that a caller can name it at enrolment: a later repoint
+                 # appends `intake_source_base_branch_set` carrying the new value, so without
+                 # this the chain could say what a branch was changed TO and never what it
+                 # started as.
+                 "base_branch" => source.base_branch
                }
              }) do
         source
@@ -371,11 +409,15 @@ defmodule Loopctl.Intake do
   # as an absent value, so an empty branch was dropped from the changeset and the source kept
   # its old one while the caller got a 200 — a silent no-op for a request that was plainly
   # wrong. A caller that SENT a value gets an answer about the value it sent.
+  #
+  # The VALIDATION is `Source.validate_base_branch/1`, the same function `create_changeset/2`
+  # runs, so enrolment and repoint cannot disagree about what a usable branch is — and neither
+  # of them restates the ref-name rule, which lives in `Loopctl.GitRef` (#874 round 2,
+  # finding 1). Two paths write this column and it is handed to git.
   defp cast_base_branch(changeset, value) do
     changeset
     |> Ecto.Changeset.cast(%{base_branch: value}, [:base_branch], empty_values: [])
-    |> Ecto.Changeset.validate_required([:base_branch])
-    |> Ecto.Changeset.validate_length(:base_branch, min: 1, max: 255)
+    |> Source.validate_base_branch()
   end
 
   # ONE transaction for the row and BOTH chain entries: a rebase recorded without its repoint,

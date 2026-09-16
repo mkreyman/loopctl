@@ -54,6 +54,12 @@ import {
   storyStage as storyStageRequest,
 } from "./lib/delivery-loop.js";
 import { updateStory as updateStoryRequest } from "./lib/story-update.js";
+import {
+  enrollIntakeSource,
+  listIntakeSources,
+  revokeIntakeSource,
+  updateIntakeSource,
+} from "./lib/intake-sources.js";
 import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-version.js";
 import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
 
@@ -3287,6 +3293,48 @@ async function forceUnclaimStory(args) {
       apiCall: (method, path, body) => apiCall(method, path, body, orch.override, orch.options),
     }),
   );
+}
+
+// #803/#846: GitHub intake sources — the row that makes a webhook possible, and the binding
+// `place_dispatch` reads `repo` and `base_branch` from. The logic, including how the enrol
+// path keeps the webhook secret out of the tool result, lives in lib/intake-sources.js.
+//
+// THE FACTORY IS DECLARED BELOW THESE FOUR, not above them, and that is load-bearing rather
+// than a style: several sibling guards read a handler's source as the slice from its own
+// `async function` to the NEXT one (`delivery_loop_tools.test.js`, `custody_key_pinning.js`,
+// `mcp_arg_forwarding.js`'s `functionSource`). A plain `function` declaration sitting between
+// two handlers is swallowed by the earlier one's slice — putting `intakeDeps` above
+// `intakeSourceEnroll` made `forceUnclaimStory`'s guard read this factory's
+// `process.env.LOOPCTL_USER_KEY` and correctly fail. Hoisting keeps the call sites valid.
+async function intakeSourceEnroll(args) {
+  return toContent(await enrollIntakeSource(args, intakeDeps()));
+}
+
+async function intakeSourceList(args) {
+  return toContent(await listIntakeSources(args, intakeDeps()));
+}
+
+async function intakeSourceUpdate(args) {
+  return toContent(await updateIntakeSource(args, intakeDeps()));
+}
+
+async function intakeSourceRevoke(args) {
+  return toContent(await revokeIntakeSource(args, intakeDeps()));
+}
+
+// All four take the EXACT user-role key, like the `runner_*` family: the controller is
+// `role: :user` with `RequireHumanAnchor` on the writes, and create additionally requires a
+// caller NO DISPATCH MINTED (`RequireUnlineagedCaller`) — it mints the webhook secret, a
+// credential belonging to no lineage — so a global LOOPCTL_API_KEY of another shape must never
+// stand in for it. `baseUrl` is injected so the webhook URL names the server this process is
+// actually talking to.
+function intakeDeps() {
+  const userKey = process.env.LOOPCTL_USER_KEY;
+  return {
+    userKey,
+    baseUrl: getBaseUrl(),
+    apiCall: (method, path, body) => apiCall(method, path, body, userKey, { exactKey: true }),
+  };
 }
 
 // #846.6: correct a filed story. The action is `role: :orchestrator`
@@ -8164,6 +8212,216 @@ const TOOLS = [
     },
   },
 
+  {
+    name: "intake_source_enroll",
+    description:
+      "BIND A GITHUB REPOSITORY TO A WORK PROJECT and mint its webhook secret (POST " +
+      "/api/v1/intake/sources). This is how the agent delivery loop gets an input at all: " +
+      "until a repository has an intake source, no webhook anywhere points at loopctl and no " +
+      "issue can reach a queue. It is also the binding place_dispatch reads — a project bound " +
+      "to no source refuses 409 `no_intake_source`, and one bound to two refuses 409 " +
+      "`ambiguous_intake_source`; this tool is what those two refusals mean by enrolling a " +
+      "source.\n\n" +
+      "THE WEBHOOK SECRET IS RETURNED ONCE AND CAN NEVER BE READ AGAIN. The column is " +
+      "encrypted at rest and redacted on the schema, so neither intake_source_list nor " +
+      "intake_source_update ever carries it; losing it costs a revoke, a second enrolment and " +
+      "a reconfigured GitHub webhook. THIS TOOL DOES NOT RETURN IT EITHER — a tool result " +
+      "lands in the session transcript and the audit log, so the secret is written to " +
+      "`secret_file` with mode 0600 (the same handling runner_enroll gives a runner " +
+      "credential) and the result carries only the source row, the `webhook_url` and that " +
+      "path. The path is reserved before the request, so an existing file or an unwritable " +
+      "directory is refused while there is still nothing to lose, and any outcome that is not " +
+      "a clean creation withholds the response body because an unparsed 2xx body IS the " +
+      "secret. A 2xx that carries the source and the secret but no webhook path is RECOVERED " +
+      "rather than discarded — the path is derived from the source id and the result says so " +
+      "with `webhook_url_derived` — while an outcome that proves a source id but no usable " +
+      "secret REVOKES that source, since it could never authenticate a delivery and would " +
+      "hold the repository's unique slot.\n\n" +
+      "THEN CONFIGURE GITHUB — the tool stops at the loopctl end and this is the other half. " +
+      "On the repository: Settings > Webhooks > Add webhook, Payload URL = the `webhook_url` " +
+      "returned, Content type = application/json, Secret = the contents of `secret_file`, and " +
+      "under 'Let me select individual events' tick ISSUES ONLY. The secret is the HMAC key " +
+      "GitHub signs the RAW body with as `X-Hub-Signature-256`; loopctl verifies it before " +
+      "trusting a byte. In one command, without the secret ever passing through this " +
+      "transcript: gh api repos/OWNER/REPO/hooks -f name=web -f config[url]=<webhook_url> -f " +
+      "config[content_type]=json -f config[secret]=\"$(cat <secret_file>)\" -f 'events[]=issues'\n\n" +
+      "EVERY delivery failure afterwards is the SAME 401 `invalid_signature` — an unknown or " +
+      "revoked source, a suspended tenant, a missing or wrong signature, and a payload whose " +
+      "`repository.full_name` does not match this source's repository. That is deliberate (a " +
+      "valid signature for the wrong repository is a misrouted or replayed delivery), and it " +
+      "means the webhook's own Recent Deliveries tab cannot tell you which of them happened.\n\n" +
+      "REFUSALS. 403 `api_key_mint_forbidden` if your key was minted by a dispatch: this call " +
+      "mints a credential belonging to no lineage, so only a key that is itself unlineaged — " +
+      "the tenant's operator key in LOOPCTL_USER_KEY — may make it, and reaching for a more " +
+      "privileged ephemeral key does not get past it. 403 `custody_tier_required` on an " +
+      "agent-rooted tenant, which may not open an intake surface for itself (an intake source " +
+      "admits outside text into the queue of a project whose stories an implementer will act " +
+      "on). 422 when the repository is not `owner/name`, when an ACTIVE source already binds " +
+      "that repository (revoke it first — the uniqueness is partial on not-yet-revoked), when " +
+      "the project is missing, archived or not a work project, or when `target_epic_id` names " +
+      "an epic outside that project. 429 when rate limited.\n\n" +
+      "NAME `base_branch` AT ENROLMENT for a repository whose trunk is not `master`. It is the " +
+      "branch every dispatch for this repository is cut FROM, it defaults to `master` when the " +
+      "body does not name it, and GitHub has created repositories with `main` since 2020 — so " +
+      "an unnamed branch on a `main` repository sends every dispatch to cut from a branch that " +
+      "does not exist, and the failure arrives after the claim. There is no cleared state for " +
+      "it (a dispatch must name one), so null or blank is refused rather than falling back to " +
+      "the default; intake_source_update changes it afterwards.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo_full_name: {
+          type: "string",
+          description:
+            "The repository as `owner/name`, e.g. `mkreyman/home_care_billing`. Not a URL. " +
+            "Matched case-insensitively against each delivery's `repository.full_name`.",
+        },
+        project_id: {
+          type: "string",
+          description:
+            "The ACTIVE WORK project (UUID) whose queue this repository's issues feed. A `kb` " +
+            "scope or an archived project is a 422.",
+        },
+        target_epic_id: {
+          type: "string",
+          description:
+            "Optional. The epic a story triaged from this source's issues is created in; it " +
+            "must belong to the project above. OMITTING IT IS NOT A NEUTRAL DEFAULT: with no " +
+            "epic, a triaged report is ESCALATED to a human instead of becoming a story, and " +
+            "every record from this source stays `pending_triage` and is retried until " +
+            "intake_source_update names one — at which point they all promote on the next run " +
+            "with nothing lost. Unanswered is the safe state rather than a guess.",
+        },
+        base_branch: {
+          type: "string",
+          description:
+            "Optional. The branch every dispatch for this repository is cut FROM, and the " +
+            "`base_branch` an unattended dispatch carries. Omit it for `master`; send `main` " +
+            "for a repository created on GitHub since 2020, or the loop places work against a " +
+            "branch that does not exist. NOT nullable, unlike target_epic_id — there is no " +
+            "unanswered state for a branch a dispatch must name — so null or blank is refused " +
+            "here rather than silently taking the default. Changed later with " +
+            "intake_source_update.",
+        },
+        secret_file: {
+          type: "string",
+          description:
+            "REQUIRED. Absolute path (or starting with `~/`) the webhook secret is written to, " +
+            "mode 0600. It is never returned in the result. Refused if the path already " +
+            "exists, and nothing is enrolled in that case.",
+        },
+      },
+      required: ["repo_full_name", "project_id", "secret_file"],
+    },
+  },
+  {
+    name: "intake_source_list",
+    description:
+      "LIST THE TENANT'S GITHUB INTAKE SOURCES (GET /api/v1/intake/sources): per source its " +
+      "`id` (the webhook URL is /api/v1/intake/github/<id>), `project_id`, `repo_full_name`, " +
+      "`base_branch`, `target_epic_id`, `revoked_at` and timestamps. Active sources only " +
+      "unless `include_revoked` is true.\n\n" +
+      "THE WEBHOOK SECRET IS NOT HERE AND IS NOT ANYWHERE. It is returned once by " +
+      "intake_source_enroll and the column is redacted on the schema, so this is not the way " +
+      "to recover one — revoking and enrolling again is. Use this to find the source behind a " +
+      "409 `no_intake_source` (the project is bound to none) or a 409 " +
+      "`ambiguous_intake_source` (bound to two, so revoke the one that no longer applies), to " +
+      "check a repository's `base_branch` before placing work, and to identify a source left " +
+      "behind by an enrolment whose outcome was unknown. Requires LOOPCTL_USER_KEY; this read " +
+      "is the one action of the four that does not need a human-anchored tenant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_revoked: {
+          type: "boolean",
+          description: "Include revoked sources. Default false.",
+        },
+      },
+    },
+  },
+  {
+    name: "intake_source_update",
+    description:
+      "SET WHERE A SOURCE'S WORK LANDS (PATCH /api/v1/intake/sources/:id): `target_epic_id`, " +
+      "the epic triaged stories are created in, and `base_branch`, the branch every dispatch " +
+      "for this repository is cut FROM and carries.\n\n" +
+      "PRESENCE DECIDES, AND A FIELD YOU DO NOT NAME IS LEFT EXACTLY AS IT WAS. Naming " +
+      "neither is refused 422 `nothing_to_update` rather than being a silent no-op. DO NOT " +
+      "SEND `target_epic_id: null` TO MEAN 'I AM NOT CHANGING THIS' — an explicit null is the " +
+      "only way to CLEAR the epic, and clearing it returns the source to escalating every " +
+      "report to a human instead of filing a story. Leave the field out instead. " +
+      "`base_branch` has no cleared state at all (every dispatch must name a branch to cut " +
+      "from), so a null there is refused.\n\n" +
+      "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
+      "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
+      "call; this is what corrects one that was not — a source enrolled before the parameter " +
+      "existed, or enrolled without it, places work against a trunk that does not exist until " +
+      "it is repointed. It " +
+      "is also the remedy for a source enrolled before it had an epic: until one is named " +
+      "every record from it stays `pending_triage` and is retried, and the moment one is they " +
+      "promote on the next run with nothing lost.\n\n" +
+      "REVOKED SOURCES ARE 404, not a no-op: revoking CLEARS the target epic precisely so that " +
+      "epic can be deleted, and repointing a source that will never report again would put " +
+      "that block back. 422 when the epic is not in this source's project. Requires " +
+      "LOOPCTL_USER_KEY and a human-anchored tenant (403 `custody_tier_required`). A " +
+      "`source_id` that is not a UUID is refused here, before any call — the server answers " +
+      "the same 404 for a malformed id as for an unknown one.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_id: {
+          type: "string",
+          description: "The intake source UUID (from intake_source_list).",
+        },
+        target_epic_id: {
+          type: ["string", "null"],
+          description:
+            "The epic triaged stories land in; it must belong to this source's project. An " +
+            "explicit null CLEARS it, which returns the source to escalating every report. " +
+            "Omit the field entirely to leave the current value alone.",
+        },
+        base_branch: {
+          type: "string",
+          description:
+            "The branch dispatches for this repository are cut from, e.g. `main`. 1-255 " +
+            "characters, not nullable. Omit to leave the current value alone.",
+        },
+      },
+      required: ["source_id"],
+    },
+  },
+  {
+    name: "intake_source_revoke",
+    description:
+      "REVOKE A GITHUB INTAKE SOURCE (DELETE /api/v1/intake/sources/:id). The HTTP verb is " +
+      "DELETE and the action is a REVOKE: `revoked_at` is stamped, the row is kept, and " +
+      "intake_source_list still returns it with `include_revoked`. Nothing already received " +
+      "is discarded.\n\n" +
+      "Afterwards every delivery to that webhook URL is refused 401 `invalid_signature`, " +
+      "exactly as a wrong secret is — so the GitHub webhook does not know it has been cut off " +
+      "and should be deleted on the repository too. IDEMPOTENT: revoking twice answers 200 " +
+      "with the original `revoked_at`.\n\n" +
+      "TWO THINGS IT UNBLOCKS. It frees the repository's uniqueness slot, so a source with a " +
+      "lost secret, a wrong project or a typo'd repository is corrected by revoking and " +
+      "enrolling again — the active-repository index is partial on not-yet-revoked, so the " +
+      "422 `an active intake source already binds this repository` clears the moment this " +
+      "returns. And it CLEARS `target_epic_id`, which is what makes that epic deletable: the " +
+      "reference blocks an epic delete, and this is the remedy that refusal names.\n\n" +
+      "Requires LOOPCTL_USER_KEY and a human-anchored tenant (403 `custody_tier_required`). " +
+      "404 for an unknown source or another tenant's; a `source_id` that is not a UUID is " +
+      "refused here, before any call, because the server answers that same 404 for both.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_id: {
+          type: "string",
+          description: "The intake source UUID to revoke (from intake_source_list).",
+        },
+      },
+      required: ["source_id"],
+    },
+  },
+
   // LCP-1 §9 signed-profile tools
   {
     name: "register_custody_owner_key",
@@ -9205,6 +9463,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "force_unclaim_story":
       return await forceUnclaimStory(args);
+
+    case "intake_source_enroll":
+      return await intakeSourceEnroll(args);
+
+    case "intake_source_list":
+      return await intakeSourceList(args);
+
+    case "intake_source_update":
+      return await intakeSourceUpdate(args);
+
+    case "intake_source_revoke":
+      return await intakeSourceRevoke(args);
 
     case "register_custody_owner_key":
       return await registerCustodyOwnerKey(args);

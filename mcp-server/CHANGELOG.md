@@ -5,6 +5,87 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.102.0 — 2026-09-16 (the delivery loop can finally be given an input)
+
+### Added
+
+- **`intake_source_enroll`, `intake_source_list`, `intake_source_update`, `intake_source_revoke`**
+  (loopctl #803/#846, `/api/v1/intake/sources`). loopctl's agent delivery loop is built end to
+  end — webhook intake, triage, the stage machine, placement, the unattended driver — and had
+  never received a GitHub issue, because no webhook anywhere pointed at it and the row that
+  makes one possible could be created by nothing outside the app. All five intake-source routes
+  were declared `gap` in the route sweep; `curl` at loopctl is refused from every session by the
+  fleet's own guardrail. So the loop's wiring step was reachable by a human with `iex` on the
+  production node and by nothing else — this package's own rule failing at the step everything
+  else depends on.
+
+  An intake source does two things. It mints the webhook secret and names the URL GitHub posts
+  to, and it BINDS a project to a `repo_full_name` and a `base_branch` — which is where
+  `place_dispatch` reads the repository and trunk from, and whose absence is its `409
+  no_intake_source` refusal.
+
+  **The webhook secret is never returned by these tools.** The server returns it ONCE and it can
+  never be read again (encrypted at rest, redacted on the schema, absent from the list and
+  update responses). A tool result lands in the session transcript and the audit log, so
+  `intake_source_enroll` takes a REQUIRED `secret_file`, writes the secret there with mode 0600
+  and returns only the source row, the `webhook_url` and that path — the same handling
+  `runner_enroll` gives a runner credential. The path is reserved (`O_CREAT|O_EXCL`) before the
+  request, so an existing file or an unwritable directory is refused with nothing enrolled; a
+  write failure after creation revokes the source, because a source whose secret nobody holds
+  can never authenticate a delivery AND holds that repository's uniqueness slot; and every
+  outcome that is not a clean creation withholds the response body, since an unparsed 2xx body
+  IS the secret. GitHub is then configured from the file, so the value need never pass through a
+  transcript: `gh api repos/OWNER/REPO/hooks -f name=web -f config[url]=<webhook_url> -f
+  config[content_type]=json -f config[secret]="$(cat <secret_file>)" -f 'events[]=issues'`.
+
+  **`intake_source_revoke` is named for what it does**, not for its HTTP verb: `DELETE` on this
+  resource stamps `revoked_at`, keeps the row, clears `target_epic_id` (which is what makes that
+  epic deletable) and is idempotent. Calling it `delete` would have been a claim the code
+  contradicts.
+
+  **`update` is ONE tool, which PATCHes.** The router serves both `PATCH` and `PUT` for that
+  action; the sweep's `duplicate` category is exactly "a PUT whose PATCH twin this package
+  sends", and until now neither verb was reached, so both were declared debt. The PUT is now a
+  real duplicate of a PATCH a tool really sends.
+
+  Two hazards the descriptions carry because a session reads them instead of the controller.
+  Presence decides on update, so `target_epic_id: null` is the CLEAR and not a neutral value —
+  clearing it returns the source to escalating every report to a human instead of filing a
+  story; the client omits an unnamed field rather than nulling it, and says so in the
+  imperative. And `base_branch` is named at ENROLMENT: it defaults to `master`
+  when the body omits it, so a repository whose trunk is `main` — GitHub's default since 2020 —
+  must name it or the loop places work against a branch that does not exist, and the failure
+  arrives after the claim. It is not nullable, since every dispatch must name a branch to cut
+  from, so a null or a blank one is refused here rather than falling back to the default.
+  `intake_source_update` is what corrects a source already pointed at the wrong trunk.
+
+  **The source object in every result is built from NAMED FIELDS, not echoed.** All four tools
+  reshape it to `id`, `project_id`, `repo_full_name`, `base_branch`, `target_epic_id`,
+  `revoked_at`, `inserted_at`, `updated_at`. A tool result is stringified into the transcript
+  and the audit log, so echoing the server's object would rest "the secret never enters a
+  transcript" entirely on the server's own encoder allowlist continuing to exclude it; one
+  commit widening that list would carry it into every transcript with nothing in this package
+  to stop it. The cost is that a new server field is invisible until this list names it, which
+  is the intended direction of the failure.
+
+  **`intake_source_enroll` recovers what it can and revokes what it cannot.** A 2xx carrying
+  the source and the secret but no `webhook_path` is no longer discarded — the path is a pure
+  function of the source id, so it is derived and the result carries `webhook_url_derived: true`
+  — and an outcome that proves a source id but no usable secret now REVOKES that source, as
+  `runner_enroll` does, rather than asking the operator to list and revoke by hand: it could
+  never authenticate a delivery and it holds the repository's unique slot until it is gone.
+
+  **A blank `target_epic_id` is refused as OPTIONAL, not as required.** The shared UUID check
+  answers "required" for an empty string, which is the opposite of the truth here: a caller
+  that cannot emit a JSON null sends `""` to mean the clear, and being told the field is
+  required invites it to invent an epic id. The refusal now names the remedy — null to clear on
+  update, omit to leave it alone.
+
+  All four take `LOOPCTL_USER_KEY`, pinned exactly. The controller is `role: :user` with
+  `RequireHumanAnchor` on the writes, and create additionally requires a caller no dispatch
+  minted (`RequireUnlineagedCaller`, `403 api_key_mint_forbidden`): enrolling MINTS a credential
+  that belongs to no lineage, so only a principal that has none may do it.
+
 ## 2.100.0 — 2026-09-16 (a runner's capacity is the machine's own number)
 
 ### Changed

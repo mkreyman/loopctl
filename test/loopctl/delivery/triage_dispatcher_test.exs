@@ -203,6 +203,36 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       refute story.id in candidate_ids(50)
     end
 
+    test "a LEGACY source whose base_branch is not a git ref name is blocked, not pushed", ctx do
+      story = detected_story(ctx)
+      join_runner(ctx, %{"kinds" => ["triage"]})
+
+      # WRITTEN PAST THE CHANGESET ON PURPOSE, because that is the only way this row can exist:
+      # `Source.validate_base_branch/1` refuses the value at enrolment and at repoint, so what
+      # is modelled here is a row written BEFORE that validation — checked for length alone,
+      # which `--upload-pack=/bin/sh` passes at 22 characters. The DB check bounds length too
+      # and nothing else, so the update lands.
+      #
+      # This module is the one dispatch path that never goes through `DispatchPayload.fill/3`,
+      # whose second `validate_refs/2` call is what judges a value the intake source supplied.
+      # `dispatch/4` puts this column in as BOTH `branch` and `base_branch`, so without the
+      # guard the string reaches git on a dev machine the first time an issue arrives.
+      unboxed(fn ->
+        {1, _} =
+          AdminRepo.update_all(
+            from(s in Loopctl.Intake.Source,
+              where: s.tenant_id == ^ctx.tenant.id and s.project_id == ^story.project_id
+            ),
+            set: [base_branch: "--upload-pack=/bin/sh"]
+          )
+      end)
+
+      # `:blocked` — "BLOCKED until somebody changes something" — which is what this is: an
+      # operator has to repoint the source, and no later pass can change it by itself.
+      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:blocked]
+      refute_push "dispatch", _pushed
+    end
+
     test "a story whose project has no intake source is not a candidate at all", ctx do
       _story = detected_story(ctx, bind_repo: false)
       join_runner(ctx, %{"kinds" => ["triage"]})
