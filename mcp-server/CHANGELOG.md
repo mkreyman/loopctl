@@ -97,19 +97,40 @@ would publish two different trees under one number.
   ratchet rather than a hard fail — new debt cannot land silently, and the list can only shrink.
   It also pins, for every tool rather than a named few, that a declaration has a dispatch case
   and a case has a declaration.
-- `test/tool-surface.js` — the router parser now expands Phoenix's `resources` macro. It matched
-  only the verb macros before, so eleven `resources` lines covering projects, api_keys,
-  runners, webhooks, skills and articles were invisible to the sweep above — 34 additional
-  routes, none of them previously checked.
+- `test/tool-surface.js` — **THE ROUTER PARSER IS GONE.** The sweep above needs to know what
+  loopctl serves, and it answered that by parsing `lib/loopctl_web/router.ex` with regexes. That
+  parse was silently wrong four times across two review rounds: `resources` was never expanded
+  (eleven lines, 34 routes); a multi-line declaration was joined for `resources` and not for the
+  verb macros (nine more, one of them — `GET /api/v1/knowledge/analytics/projects/:id/usage` —
+  reached by nothing, so it was absent from the parse, from the unreached list and from the
+  declared inventory at once); a `#` comment or a blank line INSIDE a wrapped declaration was
+  absorbed into the join and dropped the route it interrupted; and a plug mounted with no action
+  atom (`get "/openapi", OpenApiSpex.Plug.RenderSpec, []`) could never match a matcher that
+  required a trailing `:action`. Every one of those left the sweep green while it answered for a
+  surface with a hole in it.
 
-  It also JOINS a route declaration written across several lines, for the verb macros and not
-  just for `resources`. Nine routes are laid out that way in `router.ex` and were invisible
-  because of it, and one of them — `GET /api/v1/knowledge/analytics/projects/:id/usage` — is
-  reached by no tool, so it was absent from the parse, from the unreached list and from the
-  declared inventory at once, and the sweep passed green. LAYOUT decided visibility rather than
-  the route: eight of those nine fit inside the formatter's 98-column default and stay wrapped
-  anyway, and a route long enough to be wrapped BY the formatter escaped the ratchet by
-  formatting alone.
+  Each round patched the pattern that had just been caught and the file's own header then
+  claimed the class was closed. It was not, and the fifth pattern would have gone the same way,
+  because the defect is not in any regex: it is a parser ASSERTING ITS OWN COMPLETENESS with
+  nothing to check it against. LAYOUT decided visibility rather than the route — eight of those
+  nine wrapped declarations fit inside the formatter's 98-column default and stay wrapped anyway
+  — so a route escaped the ratchet by formatting alone.
+
+  `routerRoutes()` now reads `test/router-routes.json`, which the new
+  `mix loopctl.routes_snapshot` generates from `Phoenix.Router.routes(LoopctlWeb.Router)`. There
+  is no second opinion left to disagree with the router. Staleness is what replaces
+  mis-parsing as the risk, and it is loud: `test/loopctl_web/router_snapshot_test.exs` asserts
+  the checked-in file is byte-identical to the router's table NOW, and runs in `mix precommit`
+  and the CI Test job — both on every change to the Elixir project, including a `router.ex`
+  change the node workflow's `mcp-server/**` path filter would skip. Regenerating touches
+  `mcp-server/**`, which is what makes the node job re-run the sweep against the surface that
+  just changed, and why the file lives under `mcp-server/test/` rather than in `priv/`.
+
+  The change found its own first defect on its first run: `GET /api/v1/openapi` is a live route
+  this sweep had never been able to see, and it is now declared `machine` — its consumers are
+  API tooling (SwaggerUI is mounted on it in-tree) and the document is 606,959 bytes across 214
+  paths, which is why a tool returning it into a session's context would be unusable rather than
+  merely missing.
 
   `stripComments` moves here as the one copy, and the dispatch-case scan uses it. `^\s*case`
   already excluded a line-commented case and excluded nothing about a BLOCK-commented one, so a
@@ -117,8 +138,15 @@ would publish two different trees under one number.
   two sibling guards, in a scan written after them. Four hand-kept copies were how a fifth site
   got written without the fix.
 
-- `test/route_coverage.test.js` — seven exemptions re-examined and re-categorised, and one of
-  the categories given a mechanical guard.
+- `test/route_coverage.test.js` — the sweep's own SCOPE is a declaration now, not a filter. It
+  covers `/api/v1`, and `startsWith("/api/v1")` is a silent exclusion: a whole new JSON surface
+  at `/api/v2` would be dropped by it with nothing to say so — the same blindness as the parser
+  above, one level up. A `NON_API` table names every route loopctl serves outside `/api/v1` with
+  its kind (`browser`, `probe`, `discovery`), and a route that is neither in the sweep nor in
+  that table fails.
+
+- `test/route_coverage.test.js` — eight exemptions re-examined and re-categorised, and the
+  `duplicate` category given a mechanical guard on BOTH sides.
 
   Five `PUT` twins (intake sources, projects, webhooks, skills, token-budgets) were excused as
   `duplicate` — "already reached by a tool on its twin route" — against a `PATCH` declared a
@@ -132,6 +160,17 @@ would publish two different trees under one number.
   that it needs none, and `index/1` is a plain list. The index is the one with a consequence:
   `revoke_authenticator` ships and takes an `authenticator_id` no tool can obtain, because a
   browser ceremony discards the 201 body that carried it. Both are `gap` now.
+
+  The eighth is `GET /api/v1`, the welcome landing, excused as a `duplicate` because
+  `list_routes` calls `GET /api/v1/routes` — a different controller action on a different path,
+  which is the same evidence-from-elsewhere the five PUT twins were re-categorised for. It also
+  showed the guard could not reach it: that assertion filters `PUT `, so anything else wearing
+  the label was excused by a category NOTHING checked. The category is bounded from both ends
+  now — one test says every `duplicate` is a `PUT`, the other says its `PATCH` twin is really
+  sent — so a route the guard cannot verify can no longer carry the label. The twin guard also
+  gained a non-vacuity anchor, which it lacked while every sibling scan in the file had one: a
+  reviewer re-categorised the single true duplicate and all twelve tests stayed green, because
+  an empty filter asserts nothing.
 
 ## 2.97.0 — 2026-09-15 (a story stuck at `claimed` can be freed)
 

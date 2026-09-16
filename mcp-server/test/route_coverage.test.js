@@ -20,8 +20,26 @@
  *
  * `reachedRoutes()` (`test/tool-surface.js`) resolves every `apiCall`/`publicApiCall` site in
  * the files npm SHIPS — `index.js` plus `lib/` — to the `VERB /path` it sends, normalising ids
- * to `:param`. `routerRoutes()` parses `lib/loopctl_web/router.ex` for what loopctl serves.
+ * to `:param`. `routerRoutes()` reads `test/router-routes.json`, which
+ * `mix loopctl.routes_snapshot` generates from `Phoenix.Router.routes(LoopctlWeb.Router)`.
  * The sweep is the difference.
+ *
+ * ## THE INVENTORY IS THE ROUTER'S OWN ANSWER, NOT A PARSE OF IT
+ *
+ * It was a parse until #846 round 2, and the parse was silently wrong four times across two
+ * review rounds — unexpanded `resources`, a wrapped verb macro, a `#` comment inside a wrapped
+ * declaration, and a plug mounted with no action atom. Every one of them made this sweep answer
+ * for a surface with a hole in it while staying green, which is the one thing a sweep must not
+ * do, and each round patched the pattern that had just been caught and declared the class
+ * closed. The class was never the patterns: it was a second source of truth that nothing
+ * reconciled against the first. `test/tool-surface.js`'s `routerRoutes()` carries the full
+ * account; what matters here is that this file no longer holds an opinion about what loopctl
+ * serves, so it can no longer hold a WRONG one.
+ *
+ * The snapshot is kept current by `test/loopctl_web/router_snapshot_test.exs`, which asserts it
+ * is byte-identical to the router's table NOW and runs in `mix precommit` and the CI Test job.
+ * `GET /api/v1/openapi` below is what that change found on its first run: a live route this
+ * file had never been able to see, and therefore had never been asked to account for.
  *
  * SO IT PROVES "THE PACKAGE CALLS THIS ROUTE SOMEWHERE", not "THIS TOOL calls it". A route
  * called only from a function no dispatch case can reach would read as covered. That is closed
@@ -53,6 +71,16 @@
  *     (`router.ex:169-173`, piped through `GithubIntakeThrottle`), and
  *     `GET /api/v1/tenants/:id/audit_public_key` is unauthenticated for an EXTERNAL verifier
  *     (`tenant_audit_key_controller.ex:6-7`: "intended for external verification").
+ *
+ *     `GET /api/v1/openapi` (`router.ex:124`) joins them, and it is the route that proves the
+ *     inventory change above: it is a bare plug mount with no action atom
+ *     (`get "/openapi", OpenApiSpex.Plug.RenderSpec, []`), so the parser this file used to read
+ *     could not match it and this table was never asked about it. Its consumers are API
+ *     tooling — SwaggerUI is mounted on it in-tree (`router.ex:176`) — and the size is why a
+ *     session is not one of them: the document is 606,959 bytes across 214 paths (measured
+ *     2026-09-16, `Loopctl.ApiSpec.spec() |> Jason.encode!() |> byte_size()`). A tool returning
+ *     that into a context window is unusable, not merely missing. The question a session
+ *     actually has — what does this server serve — is `list_routes`.
  *   - `ceremony`: a challenge-bound WebAuthn reauthentication an MCP tool cannot complete.
  *     Rotation is two-step and verifies a client assertion against a stored, single-use
  *     challenge (`tenant_audit_key_controller.ex:7-16`); `bootstrap` is documented UNREACHABLE
@@ -73,22 +101,26 @@
  *     (`router.ex:771`). That is a different principal from every key this package sends, and
  *     two of the thirteen are additionally a WebAuthn break-glass ceremony
  *     (`router.ex:767-774`).
- *   - `duplicate`: the same action, already reached by a tool on its twin route. Phoenix's
- *     `resources` macro generates BOTH `PATCH` and `PUT` for `update` (`router.ex:340`, `:449`,
- *     `:499` and the other eight `resources` lines), and where this package sends the PATCH the
- *     `PUT` twin is served, unused and harmless. `GET /api/v1` is the welcome landing;
- *     `list_routes` answers the same question by calling `GET /api/v1/routes` (`index.js`,
- *     `listRoutes`).
+ *   - `duplicate`: A `PUT` WHOSE `PATCH` TWIN THIS PACKAGE SENDS, and nothing else. Phoenix's
+ *     `resources` macro generates BOTH verbs for `update` (`router.ex:340`, `:449`, `:499` and
+ *     the other eight `resources` lines), and where this package sends the PATCH the `PUT` twin
+ *     is served, unused and harmless.
  *
- *     "REACHED" IS THE WHOLE CATEGORY, AND FIVE ENTRIES DID NOT HAVE IT. The `PUT` twins for
- *     intake sources, projects, webhooks, skills and token-budgets were excused as duplicates
- *     of a `PATCH` that is itself declared `gap` in the same table — so nothing reached either
- *     verb, and five real gaps were counted as exemptions. Only `PUT /api/v1/articles/:param`
- *     was ever a true duplicate: `knowledge_update` sends the PATCH (`index.js`,
- *     `knowledgeUpdate`). The five are `gap` now, and
- *     the test "a PUT excused as a duplicate has a PATCH twin this package really sends" below
- *     makes the mistake unrepeatable — an exemption whose evidence is another entry in this
- *     same table is self-evidently empty, and a test can say so where a reader has to notice.
+ *     THE DEFINITION IS NARROW ON PURPOSE, because this is the category that keeps excusing
+ *     things it cannot prove. It said "the same action, already reached by a tool on its twin
+ *     route" and was wrong twice over. Five `PUT` twins — intake sources, projects, webhooks,
+ *     skills, token-budgets — were excused against a `PATCH` that is itself a `gap` a few lines
+ *     down, so nothing reached either verb and five real gaps were counted as exemptions
+ *     (#846 round 1). Then `GET /api/v1` was excused on `list_routes` calling
+ *     `GET /api/v1/routes` — a DIFFERENT controller action on a different path, which is the
+ *     same shape of evidence-from-elsewhere the five were re-categorised for, and which the
+ *     PUT/PATCH guard below could not reach because it filters `PUT ` (#846 round 2). It is a
+ *     `gap`.
+ *
+ *     So the category is now exactly what the guard checks: two tests below, one asserting
+ *     every `duplicate` is a `PUT` and one asserting its `PATCH` twin is REACHED. A route that
+ *     does not fit cannot be labelled `duplicate` any more, which is the difference between a
+ *     category a reader has to police and one a test does.
  *
  * Everything else is `gap` — a real, undone instance of the rule, recorded so the NEXT one is
  * caught the day it lands. A `gap` entry is a debt, not a decision: delete it when you ship
@@ -121,6 +153,7 @@ const DECLARED = {
   // ── machine: the caller is a machine, never a session ──────────────────
   "GET /api/v1/tenants/:param/audit_public_key": "machine", // TenantAuditKeyController.show
   "POST /api/v1/intake/github/:param": "machine", // GithubIntakeController.deliver
+  "GET /api/v1/openapi": "machine", // OpenApiSpex.Plug.RenderSpec — a 607 KB spec for API tooling
 
   // ── ceremony: a WebAuthn challenge an MCP tool cannot answer ─────────────
   "POST /api/v1/tenants/:param/rotate-audit-key/challenge": "ceremony", // TenantAuditKeyController.challenge
@@ -142,11 +175,18 @@ const DECLARED = {
   "POST /api/v1/admin/tenants/:param/clear-halt/challenge": "superadmin", // AdminTenantController.clear_halt_challenge
   "POST /api/v1/admin/tenants/:param/clear-halt": "superadmin", // AdminTenantController.clear_halt
 
-  // ── duplicate: the same action, reached by a tool on its twin route ───────
-  "GET /api/v1": "duplicate", // WelcomeController.index
+  // ── duplicate: a PUT whose PATCH twin a tool really sends ────────────────
   "PUT /api/v1/articles/:param": "duplicate", // ArticleController.update — knowledge_update PATCHes it
 
   // ── gap: no tool reaches this. Real debt — delete the line when you ship one
+  //
+  // `GET /api/v1` was `duplicate` until #846 round 2, excused because `list_routes` calls
+  // `GET /api/v1/routes` — a different controller action on a different path, which is not
+  // "the same action on its twin route" by any reading. The welcome landing is reached by
+  // nothing, so it is debt like any other: the category vocabulary here has no "never worth
+  // a tool" kind, and inventing one to retire this line would be the relabelling the
+  // vacuity test below exists to catch.
+  "GET /api/v1": "gap", // WelcomeController.index
   //
   // The two authenticator reads were `ceremony` until #846 round 1: neither verifies an
   // assertion (`tenant_authenticator_controller.ex:95-97`, `:121-147`, `:660-686`), and the
@@ -258,9 +298,13 @@ const DECLARED = {
   "PATCH /api/v1/entities/:param": "gap", // ContextRetrieverController.update
   "DELETE /api/v1/entities/:param": "gap", // ContextRetrieverController.delete
   "GET /api/v1/corpora/:param": "gap", // CorpusController.show
-  // Invisible to this sweep until #846 round 1 taught `routerRoutes()` to join a wrapped verb
-  // macro: it is declared across three lines (`router.ex:713-715`), so it was absent from the
-  // parse, from UNREACHED and from this table at once, and the sweep passed green.
+  // Invisible to this sweep for as long as it read a PARSE of router.ex. The declaration is
+  // wrapped across three lines (`router.ex:713-715`), so it was absent from the parse, from
+  // UNREACHED and from this table at once, and the sweep passed green. #846 round 1 taught the
+  // parser to join a wrapped verb macro; round 2 found that a `#` comment inside the same wrap
+  // put it back out of sight. Reading the router's own route table is what ended that — which
+  // is the entry's second job now, as the anchor in "the route snapshot carries loopctl's
+  // /api/v1 surface".
   "GET /api/v1/knowledge/analytics/projects/:param/usage": "gap", // KnowledgeAnalyticsController.project_usage
   "GET /api/v1/knowledge/export": "gap", // KnowledgeExportController.export
   "GET /api/v1/knowledge/pipeline": "gap", // KnowledgePipelineController.status
@@ -274,8 +318,43 @@ const DECLARED = {
 
 const EXEMPT_KINDS = new Set(["machine", "ceremony", "superadmin", "duplicate"]);
 
+/**
+ * Every route loopctl serves OUTSIDE `/api/v1`, and why the sweep does not cover it.
+ *
+ * The sweep's scope is a `startsWith("/api/v1")` filter, and a filter is a silent exclusion:
+ * a whole new JSON surface at `/api/v2` or `/api/internal` would be dropped by it and nothing
+ * would say so — the same shape of blindness as the parser this file used to read, one level
+ * up. This turns the filter into a declaration. A route that is neither `/api/v1` nor listed
+ * here fails the test below, and the remedy is a line here or a wider sweep.
+ */
+const NON_API = {
+  // browser: an HTML page. There is no MCP tool shape for one.
+  "GET /": "browser", // PageController.home
+  "GET /docs": "browser", // PageController.docs
+  "GET /terms": "browser", // PageController.terms
+  "GET /privacy": "browser", // PageController.privacy
+  "GET /signup": "browser", // SignupLive — the WebAuthn ceremony's own page
+  "GET /tenants/:param/onboarding": "browser", // OnboardingLive
+  "GET /enroll": "browser", // EnrollLive
+  "GET /wiki": "browser", // WikiLive.index
+  "GET /wiki/:param": "browser", // WikiLive.show
+  "GET /swaggerui": "browser", // OpenApiSpex.Plug.SwaggerUI over GET /api/v1/openapi
+  "GET /swagger": "browser", // RedirectController.swagger — convenience alias to the above
+
+  // probe: infrastructure, not a caller. `/health` is Fly's continuous liveness check
+  // (fly.toml); `/health/ready` is the deploy-time smoke gate (router.ex:100-108).
+  "GET /health": "probe", // HealthController.check
+  "GET /health/ready": "probe", // HealthController.ready
+
+  // discovery: RFC 8615, unauthenticated, and reached by this package already —
+  // `mcp_version` sends `GET /.well-known/loopctl` through `publicApiCall`.
+  "GET /.well-known/loopctl": "discovery", // WellKnownController.discovery
+  "GET /.well-known/loopctl/schema.json": "discovery", // WellKnownController.schema
+};
+
 const REACHED = reachedRoutes();
-const API_ROUTES = routerRoutes().filter((r) => r.path.startsWith("/api/v1"));
+const ALL_ROUTES = routerRoutes();
+const API_ROUTES = ALL_ROUTES.filter((r) => r.path.startsWith("/api/v1"));
 
 function routeKey(route) {
   return `${route.verb} ${normalisePath(route.path)}`;
@@ -284,15 +363,53 @@ function routeKey(route) {
 const UNREACHED = API_ROUTES.filter((r) => !REACHED.has(routeKey(r)));
 
 describe("the sweep reads what it claims to read", () => {
-  test("the router parse finds loopctl's /api/v1 surface", () => {
-    // A parse that silently found nothing would make every route "reached" by vacuity and
-    // this whole file green for ever. Anchored on routes that must exist for the package to
-    // work at all, not on a count (which is wrong by the next merge).
+  test("the route snapshot carries loopctl's /api/v1 surface", () => {
+    // An inventory that silently came back empty would make every route "reached" by vacuity
+    // and this whole file green for ever. Anchored on routes that must exist for the package
+    // to work at all, not on a count (which is wrong by the next merge). `routerRoutes()`
+    // throws on a missing, unreadable or empty snapshot, so this is the second line rather
+    // than the only one.
     const keys = new Set(API_ROUTES.map(routeKey));
 
-    assert.ok(API_ROUTES.length > 100, `only ${API_ROUTES.length} /api/v1 routes were parsed`);
-    assert.ok(keys.has("PATCH /api/v1/stories/:param"), "the story PATCH route was not parsed");
-    assert.ok(keys.has("GET /api/v1/projects"), "the projects index was not parsed");
+    assert.ok(API_ROUTES.length > 100, `only ${API_ROUTES.length} /api/v1 routes in the snapshot`);
+    assert.ok(keys.has("PATCH /api/v1/stories/:param"), "the story PATCH route is missing");
+    assert.ok(keys.has("GET /api/v1/projects"), "the projects index is missing");
+    // A bare plug mount with no action atom, and a route whose declaration is WRAPPED across
+    // lines in router.ex: the two shapes the retired parser could not see. Reading the
+    // router's own output makes layout irrelevant, and these say so rather than assuming it.
+    assert.ok(keys.has("GET /api/v1/openapi"), "the plug-mount route is missing");
+    assert.ok(
+      keys.has("GET /api/v1/knowledge/analytics/projects/:param/usage"),
+      "the wrapped-declaration route is missing",
+    );
+  });
+
+  test("every route loopctl serves is in the sweep, or declared out of it", () => {
+    // The sweep filters to /api/v1. Without this, that filter is a silent exclusion and a
+    // whole new API surface could land outside it with nothing to say so.
+    const stray = ALL_ROUTES.filter((r) => !r.path.startsWith("/api/v1"))
+      .map(routeKey)
+      .filter((k) => !(k in NON_API))
+      .sort();
+
+    assert.deepEqual(
+      [...new Set(stray)],
+      [],
+      "loopctl serves this route and the coverage sweep does not look at it, because the " +
+        "sweep only reads /api/v1. If it is a JSON surface a session should reach, widen the " +
+        "sweep; if it is a page or a probe, add it to NON_API with the kind that says so.",
+    );
+  });
+
+  test("no NON_API declaration is stale", () => {
+    // Same ratchet as DECLARED: a route deleted from the router leaves a line here that
+    // excuses nothing, and the table rots into decoration.
+    const live = new Set(ALL_ROUTES.map(routeKey));
+    const dead = Object.keys(NON_API)
+      .filter((k) => !live.has(k))
+      .sort();
+
+    assert.deepEqual(dead, [], "NON_API names a route loopctl no longer serves — delete it");
   });
 
   test("every apiCall site in the shipped files resolves to a path", () => {
@@ -378,14 +495,50 @@ describe("no /api/v1 route loses its tool silently", () => {
     assert.deepEqual(bad, [], "an unknown category excuses a route without saying anything");
   });
 
+  test("every `duplicate` is a PUT, which is the only shape the guard below can check", () => {
+    // WHY THE CATEGORY IS BOUNDED BY A TEST AND NOT BY ITS PROSE. The guard below filters
+    // `PUT `, so anything else labelled `duplicate` is excused by a category NOTHING checks —
+    // and that is not hypothetical: `GET /api/v1` sat here excused because `list_routes` calls
+    // `GET /api/v1/routes`, a different action on a different path, and the guard could not
+    // reach it to say so. A category whose membership the guard cannot verify is exactly the
+    // "evidence from somewhere else in the table" shape the five PUT twins were re-categorised
+    // for. If a genuine non-PUT duplicate ever appears, widen the guard FIRST.
+    const unreachable = Object.entries(DECLARED)
+      .filter(([route, kind]) => kind === "duplicate" && !route.startsWith("PUT "))
+      .map(([route]) => route)
+      .sort();
+
+    assert.deepEqual(
+      unreachable,
+      [],
+      "this route is excused as a `duplicate` and the PUT/PATCH twin guard cannot check it, " +
+        "so the category is saying something no test verifies. Declare it a `gap`, or widen " +
+        "the guard to the shape of twin it really has.",
+    );
+  });
+
   test("a PUT excused as a `duplicate` has a PATCH twin this package really sends", () => {
     // The category means "already reached by a tool on its twin route", and five entries were
     // excused against a twin that is a `gap` in this same table — an exemption whose evidence
     // is another line of the inventory it belongs to. A reader has to notice that; this does
     // not. REACHED, not "absent from DECLARED", is the predicate: a PATCH twin the router does
     // not serve at all is an equally empty excuse and fails here for the same reason.
-    const unearned = Object.entries(DECLARED)
-      .filter(([route, kind]) => kind === "duplicate" && route.startsWith("PUT "))
+    const puts = Object.entries(DECLARED).filter(
+      ([route, kind]) => kind === "duplicate" && route.startsWith("PUT "),
+    );
+
+    // NON-VACUITY, and this is not decoration: a reviewer re-categorised the one true
+    // duplicate as a probe and all twelve tests in this file stayed green, because an empty
+    // filter asserts nothing. Every other scan here carries such an anchor and this one did
+    // not. If the last PUT duplicate is ever legitimately retired, delete this test with it —
+    // do not weaken it to `>= 0`, which is the same as deleting it while looking like a check.
+    assert.ok(
+      puts.length > 0,
+      "no PUT is declared a `duplicate`, so the guard below scans an empty set and proves " +
+        "nothing about the category it exists to bound",
+    );
+
+    const unearned = puts
       .map(([route]) => route.replace(/^PUT /, "PATCH "))
       .filter((twin) => !REACHED.has(twin))
       .sort();

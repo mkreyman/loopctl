@@ -31,7 +31,6 @@ import path from "node:path";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 export const PKG_DIR = path.join(DIR, "..");
-export const REPO_DIR = path.join(PKG_DIR, "..");
 
 /**
  * Line and block comments out — the ONE copy, shared by every guard here that reads source as
@@ -429,173 +428,97 @@ export function reachedRoutes() {
 }
 
 // ---------------------------------------------------------------------------
-// Which /api/v1 routes loopctl serves
+// Which routes loopctl serves — read from the router's own output, never parsed
 // ---------------------------------------------------------------------------
 
-const VERBS = "get|post|put|patch|delete";
-
-const ROUTE_LINE = new RegExp(`^(${VERBS})\\s+"([^"]+)",\\s*([A-Za-z0-9_.]+),\\s*:([a-z_0-9]+)`);
-
-// What can BEGIN a route declaration, and therefore what the line joiner below must recognise
-// as the head of one. The verb list is SHARED with `ROUTE_LINE` rather than written twice: a
-// macro the matcher knows and the joiner does not is exactly the blindness that hid nine
-// routes, and two hand-kept lists reproduce it the next time a verb is added.
-const ROUTE_MACRO_HEAD = new RegExp(`^(?:resources|${VERBS})\\s`);
-
-// How many lines one declaration may span before the joiner declares it has misread something.
-const MAX_CONTINUATION_LINES = 6;
-
-// Phoenix's `resources` macro, expanded. The default action set and the paths each one
-// generates are `Phoenix.Router.Resource`'s: `update` really does generate BOTH a PATCH and a
-// PUT, and both are served, so both are counted.
-const RESOURCE_ACTIONS = ["index", "edit", "new", "show", "create", "update", "delete"];
-
-const RESOURCE_ROUTES = {
-  index: [["GET", ""]],
-  new: [["GET", "/new"]],
-  create: [["POST", ""]],
-  show: [["GET", "/:id"]],
-  edit: [["GET", "/:id/edit"]],
-  update: [
-    ["PATCH", "/:id"],
-    ["PUT", "/:id"],
-  ],
-  delete: [["DELETE", "/:id"]],
-};
+/** The generated route table. Written by `mix loopctl.routes_snapshot` at the repo root. */
+export const ROUTER_SNAPSHOT = path.join(DIR, "router-routes.json");
 
 /**
- * Every route declared in `lib/loopctl_web/router.ex`, with its `scope` prefixes applied.
+ * Every route `LoopctlWeb.Router` serves, as `{ verb, path, plug, plugOpts }`.
  *
- * The router is read as text rather than asked at runtime because this suite is `node --test`
- * with no BEAM anywhere near it. `mix phx.routes` would be the authority; a parse of the file
- * that DECLARES the routes is the next thing to it, and it cannot silently answer for a
- * different deployment than the tree it sits in.
+ * ## THIS USED TO BE A REGEX PARSER, AND THAT WAS THE DEFECT
  *
- * `resources` IS EXPANDED, and the first version of this parser did not do it — it matched
- * only the verb macros, so eleven `resources` lines covering projects, api_keys,
- * runners, webhooks, skills and articles were invisible. That direction is the safe one (a
- * route nobody knows about is never reported as an invented gap) and it is still wrong: the
- * coverage sweep in `route_coverage.test.js` would have answered for a surface with a hole in
- * it, which is the one thing a sweep must not do.
+ * It read `lib/loopctl_web/router.ex` as text and the suite treated its output as the
+ * complete route table. Over two review rounds it was silently wrong FOUR times:
  *
- * A MULTI-LINE DECLARATION IS JOINED FOR BOTH MACRO KINDS, and the first version of the
- * joining did it only for `resources` — which made this paragraph half true, and half true is
- * worse than silent, because it reads as the blindness having been fixed. Nine verb-macro
- * routes were written across lines and were therefore invisible: `router.ex:329`, `:691`,
- * `:695`, `:699`, `:703`, `:709`, `:713`, `:717`, `:735`. One of them,
- * `GET /api/v1/knowledge/analytics/projects/:id/usage` (`router.ex:713-715`), is called by no
- * tool in this package — so it was absent from the parse, absent from the sweep's UNREACHED
- * list and absent from its DECLARED inventory, and the sweep passed green. That is the exact
- * failure the paragraph above says a sweep must not have, reached by a different route.
+ *   1. `resources` was never expanded — eleven lines, 34 routes, invisible;
+ *   2. a multi-line declaration was joined for `resources` and not for the verb macros —
+ *      nine more, one of them (`GET /api/v1/knowledge/analytics/projects/:id/usage`) live
+ *      and reached by nothing, so it was absent from the parse, from the UNREACHED list and
+ *      from the declared inventory at once;
+ *   3. a `#` comment or a blank line INSIDE a wrapped declaration was absorbed into the
+ *      join, producing a statement the line matcher did not match, and the route vanished
+ *      (292 routes became 291 with all twelve tests still green; re-measured on this branch
+ *      at the `/api/v1` subset the sweep reads, one `#` comment took it 283 -> 282 and the
+ *      route it interrupted was the one that disappeared);
+ *   4. a plug mounted with no action atom — `get "/openapi", OpenApiSpex.Plug.RenderSpec,
+ *      []` (`router.ex:124`) — could never match a matcher that required a trailing
+ *      `:action`.
  *
- * LAYOUT, NOT LENGTH, is what decides whether a declaration wraps, which is why matching one
- * line could never be enough. `.formatter.exs` sets no `line_length`, so `mix format` uses its
- * 98-column default — and it preserves a break the author already made, so eight of these nine
- * FIT on one line and stay wrapped anyway (`router.ex:717` is 85 columns joined, `:329` is the
- * only one over 98). Both mechanisms produce the same invisibility: a route long enough to be
- * wrapped BY the formatter escapes the ratchet by formatting alone, and a short one escapes it
- * by having been typed across two lines.
+ * Each round patched the regex that had just been caught and each time this comment claimed
+ * the class was closed. It was not, because the defect is not in any of the four patterns:
+ * it is a parser ASSERTING ITS OWN COMPLETENESS with nothing to check it against. A fifth
+ * pattern would have gone the same way.
+ *
+ * ## SO THE ROUTER ANSWERS FOR ITSELF
+ *
+ * `mix loopctl.routes_snapshot` writes `Phoenix.Router.routes(LoopctlWeb.Router)` to
+ * `router-routes.json`, and this function reads it. There is no second opinion left to
+ * disagree with the router, and layout — a wrap, a comment, a blank line, a macro nobody
+ * taught a regex — cannot change the answer, because the answer is taken after the router
+ * is compiled rather than before.
+ *
+ * WHAT KEEPS IT CURRENT is `test/loopctl_web/router_snapshot_test.exs`, which asserts the
+ * checked-in file is byte-identical to what the router renders NOW. It runs in
+ * `mix precommit` and in the CI Test job, both on every change to the Elixir project — so a
+ * router edit that skips the regeneration is red there, and regenerating touches
+ * `mcp-server/**`, which is what makes the node workflow re-run the coverage sweep against
+ * the surface that just changed.
+ *
+ * The one exposure that remains, stated rather than papered over: if BOTH that test and
+ * this file's reader are removed, nothing notices. That is true of any guard, and it is a
+ * different thing from the silent disagreement between two live sources that this replaces.
  */
 export function routerRoutes() {
-  const src = readFileSync(path.join(REPO_DIR, "lib", "loopctl_web", "router.ex"), "utf8");
-  const routes = [];
-  const scopes = [];
-  let depth = 0;
+  let snapshot;
 
-  // A route declaration continues onto further lines when it was laid out that way. Joined
-  // here rather than handled below, so the scope/depth bookkeeping sees one statement. See the
-  // doc comment above for why this covers the verb macros and not `resources` alone.
-  let pending = null;
-  let pendingLines = 0;
-
-  for (const raw of src.split("\n")) {
-    let line = raw.trim();
-
-    if (pending !== null) {
-      pending = `${pending} ${line}`;
-      pendingLines++;
-
-      // A statement that never terminates means this joiner has misread a line as a route
-      // head, and the damage of guessing is silent: everything up to the next terminator is
-      // swallowed and every route inside it disappears. Formatted route macros run to three
-      // lines (path, controller, action) and a `resources` with options to four, so a run past
-      // this bound is a shape to teach the parser, not one to absorb.
-      if (pendingLines > MAX_CONTINUATION_LINES) {
-        throw new Error(
-          `a route declaration in router.ex did not terminate within ` +
-            `${MAX_CONTINUATION_LINES} lines: ${pending.slice(0, 120)}`,
-        );
-      }
-
-      if (line.endsWith(",")) continue;
-      line = pending;
-      pending = null;
-      pendingLines = 0;
-    } else if (ROUTE_MACRO_HEAD.test(line) && line.endsWith(",")) {
-      pending = line;
-      pendingLines = 1;
-      continue;
-    }
-
-    const scope = line.match(/^scope\s+"([^"]*)"/);
-    if (scope) {
-      scopes.push({ depth, prefix: scope[1] });
-      depth++;
-      continue;
-    }
-
-    if (/^(if|else|unless|case|cond|defmodule|def |defp |pipeline |live_session|live |forward)/.test(line)) {
-      if (/\bdo\b\s*$/.test(line)) depth++;
-      continue;
-    }
-
-    if (line === "end") {
-      depth--;
-      if (scopes.length && scopes[scopes.length - 1].depth === depth) scopes.pop();
-      continue;
-    }
-
-    const prefix = scopes.map((s) => s.prefix).join("");
-    const push = (verb, routePath, controller, action) =>
-      routes.push({
-        verb,
-        path: `${prefix}${routePath}`.replace(/\/{2,}/g, "/").replace(/(.)\/$/, "$1"),
-        controller,
-        action,
-      });
-
-    const resource = line.match(/^resources\s+"([^"]+)",\s*([A-Za-z0-9_.]+)(?:,\s*(.*))?$/);
-    if (resource) {
-      const [, base, controller, opts = ""] = resource;
-      const only = opts.match(/\bonly:\s*\[([^\]]*)\]/);
-      const except = opts.match(/\bexcept:\s*\[([^\]]*)\]/);
-      const names = (m) =>
-        m[1]
-          .split(",")
-          .map((a) => a.trim().replace(/^:/, ""))
-          .filter(Boolean);
-
-      const actions = only
-        ? names(only)
-        : except
-          ? RESOURCE_ACTIONS.filter((a) => !names(except).includes(a))
-          : RESOURCE_ACTIONS;
-
-      for (const action of actions) {
-        for (const [verb, suffix] of RESOURCE_ROUTES[action] ?? []) {
-          push(verb, `${base}${suffix}`, controller, action);
-        }
-      }
-      continue;
-    }
-
-    const m = line.match(ROUTE_LINE);
-    if (!m) continue;
-
-    push(m[1].toUpperCase(), m[2], m[3], m[4]);
+  try {
+    snapshot = JSON.parse(readFileSync(ROUTER_SNAPSHOT, "utf8"));
+  } catch (cause) {
+    throw new Error(
+      `${ROUTER_SNAPSHOT} could not be read as JSON. It is generated — run ` +
+        `\`mix loopctl.routes_snapshot\` at the repo root and commit the result. ` +
+        `(${cause.message})`,
+      { cause },
+    );
   }
 
-  return routes;
+  if (!Array.isArray(snapshot.routes) || snapshot.routes.length === 0) {
+    throw new Error(
+      `${ROUTER_SNAPSHOT} carries no routes. An empty inventory makes every sweep that ` +
+        `reads it vacuously green — regenerate it with \`mix loopctl.routes_snapshot\`.`,
+    );
+  }
+
+  return snapshot.routes.map((row) => {
+    // CHECKED BEFORE IT IS DESTRUCTURED. A row shape this does not understand is thrown on
+    // rather than coerced: a `[verb, path]` pair read as a route with an undefined controller
+    // is the same "answer for something you did not read" failure the parser was retired for,
+    // and destructuring first would make a non-array row a bare TypeError naming nothing.
+    const shaped =
+      Array.isArray(row) && row.length === 4 && row.slice(0, 2).every((c) => typeof c === "string");
+
+    if (!shaped) {
+      throw new Error(
+        `${ROUTER_SNAPSHOT} has a row this reader does not understand: ${JSON.stringify(row)}. ` +
+          `Its columns are ${JSON.stringify(snapshot.columns)}.`,
+      );
+    }
+
+    const [verb, routePath, plug, plugOpts] = row;
+    return { verb, path: routePath, plug, plugOpts };
+  });
 }
 
 /** Router path ids normalised the way `reachedRoutes()` normalises them. */
