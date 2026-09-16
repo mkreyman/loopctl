@@ -176,6 +176,11 @@ defmodule Loopctl.Runners.DispatchLedger do
       story_id: dispatch.story_id,
       claim_epoch: dispatch.claim_epoch,
       kind: dispatch.kind,
+      # RECORDED ON THE FIRST INSERT AND NEVER REWRITTEN (#846.2 review round 2, finding 4).
+      # `on_conflict: :nothing` below means a retry leaves this alone, which is the whole
+      # property: `Loopctl.Delivery.Placement` re-sends the name that is here rather than
+      # re-deriving one from a declaration the machine may have changed since.
+      branch: dispatch.branch,
       status: "sent",
       trace_acked_seq: -1,
       wall_clock_seconds: dispatch.wall_clock_seconds,

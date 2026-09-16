@@ -6,6 +6,78 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A runner declares the branch prefixes it accepts, and loopctl derives a conforming branch
+  (#846.2, runner contract 1.14.0). RE-VENDOR to send the field.** loopctl derived
+  `feature/story-<n>-<id>`; the `minis` runner's config accepts `loop/` alone and refuses anything
+  else — so the delivery loop's first real placement was refused `branch_not_allowed`, the story
+  was parked, and the run never started. The one machine was never the defect: loopctl chose a
+  prefix, each operator chooses a prefix per machine, and nothing reconciled them. An operator
+  could learn the required prefix only by reading a config file on the target box.
+
+  `RunnerJoin` now carries an optional `branch_prefixes`, and
+  `Loopctl.Delivery.DispatchPayload.branch_for/2` derives a branch starting with the FIRST entry —
+  the same derivation the operator endpoint and the unattended driver both go through, so a placed
+  dispatch and a driver-placed one cannot disagree about the name. A prefix must start with a
+  letter or digit and may contain only letters, digits, `_`, `/` and `-`, so no declaration can
+  produce a branch git reads as an option or a malformed ref.
+
+  **Nothing changes for a runner that does not send it.** Silence is read as NO CONSTRAINT and the
+  branch is byte-for-byte the one loopctl derived before this version, so an un-upgraded runner
+  behaves exactly as it did. **But a runner that ENFORCES a prefix must DECLARE it**: it is the
+  only way the fact reaches the control plane, and a machine enforcing an undeclared prefix refuses
+  every dispatch loopctl sends it, each refusal costing the story's claim.
+
+  **Operator-visible:** `GET /api/v1/runners/pool` (and the `runner_pool` MCP tool) returns
+  `branch_prefixes` per machine — `[]` when the machine declared none, which is what a runner
+  enforcing an undeclared prefix looks like. `POST /api/v1/runners/:runner_id/dispatches` gains two
+  refusals, both BEFORE the claim so nothing is spent: `409 no_conforming_branch` when no declared
+  prefix can produce a valid unique branch name (the body echoes the prefixes; the fix is on that
+  machine), and `422 branch_not_allowed` when a caller-supplied `branch` falls outside them. Stop
+  sending `branch`: it is no longer listed as required and loopctl derives it. The story number and
+  an id fragment are always in the derived name, and are never shortened to make a prefix fit.
+
+  **EVERY caller-supplied value that becomes a git ref is now validated before the claim**, from
+  the contract's own declaration of which fields those are, and three refusals follow. `branch` and
+  `base_branch` are both declared on the wire as strings of 1..255 characters with NO pattern, so a
+  value such as `--upload-pack=/bin/sh`, `-o` or `a..b` used to cast clean and be pushed verbatim to
+  a machine that hands it to git. Nothing is claimed on any of the three.
+
+  - `422 invalid_branch_name` — the value is not a string, or is not a valid git ref name. **A
+    non-string is the likely case, not an edge one**: `branch` is now optional and documented OMIT
+    THIS, and a generated client serialises an unset optional as `null`. That used to be deferred to
+    the runner-contract cast, which runs AFTER the claim, so `{"branch": null}` claimed the story and
+    was refused afterwards. A ref name must start with a letter or digit and hold only letters,
+    digits, `.`, `_`, `/` and `-`; no path component may begin with `.` or end with `.lock`, and `..`
+    may not appear anywhere. **`base_branch` is judged too** — it reaches git on the runner exactly as
+    `branch` does — though it is NOT story-unique, since every dispatch cutting from `master` is the
+    normal case.
+  - `422 branch_not_unique` — a `branch` you named does not end with this story's own suffix. The
+    uniqueness this release publishes was true only of the DERIVED name: two placements naming
+    `loop/mine` both succeeded onto one branch, and the second session would find the first's work
+    there. **You may still choose the prefix; you may not drop the suffix**, and the error names it.
+  - `422 branch_conflict` — a retry named a different `branch` from the one this dispatch was
+    already sent on. See below.
+
+  **A retry re-sends the branch the first push used.** `runner_dispatches` gains a nullable `branch`
+  column (additive migration, no manual step, no backfill): the name is recorded at the first push
+  and re-sent verbatim, so a machine that rejoined declaring different prefixes cannot move a
+  dispatch onto a second branch. It could before, because a ledger row at `sent` means only that no
+  reply was RECORDED — and a lost reply is exactly the case a retry exists for, so a session may be
+  running on the first name. Rows written before this column fall back to deriving.
+
+  **No prefix refusal can be raised by a RETRY** carrying a `dispatch_id` loopctl already holds.
+  That claim committed on an earlier call and is standing, so refusing the retry would leave the
+  story at `claimed` with no session until its lease expired — and the refusal would say nothing was
+  claimed, which is false there. `invalid_branch_name`, `branch_not_unique` and `branch_conflict`
+  ARE still raised on a retry, because each one's remedy is in the request itself.
+
+  **One misconfigured machine no longer stops a repository.** A runner whose declared prefixes can
+  produce no valid branch is still "accepting" and is picked first because it is idle, so every
+  story for that repository was refused and the healthy second runner was never tried. The
+  unattended driver now advances to the next candidate on that refusal alone — which costs nothing,
+  because it is decided before anything is claimed or minted — and still reports `blocked` when
+  every machine is misconfigured.
+
 - **A runner's capacity now follows what the machine declares, not what it was enrolled with
   (#846.4, runner contract 1.13.0).** `runners.max_sessions` — the number `Loopctl.Runners.Capacity`
   reserves against — was written once at enrollment and had no path from the runner's own

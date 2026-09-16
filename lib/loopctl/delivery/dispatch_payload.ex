@@ -14,24 +14,36 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   - `repo` and `base_branch` are the story's project's intake SOURCE — the row that binds a
     project to a repository, and where an operator sets `main` for a repository that uses it;
-  - `branch` is derived from the story, so two stories never share one;
+  - `branch` is derived from the story, so two stories never share one — behind a prefix the
+    TARGET RUNNER declared it accepts (`RunnerJoin.branch_prefixes`, contract 1.14.0), so
+    loopctl no longer guesses a name each machine independently decides whether to allow;
   - the budgets are the operator's configured policy, which is where a cost decision belongs.
 
-  So an operator names a story and a runner, and nothing else. This is the same derivation
-  `Loopctl.Delivery.DispatchDriver` makes for an unattended placement — one module, so the
-  branch an operator's dispatch lands on and the one the driver would have chosen are the
-  same name.
+  So an operator names a story and a runner, and nothing else. `Loopctl.Delivery.DispatchDriver`
+  names neither a branch nor a repo for the same reason: an unattended placement goes through
+  THIS module rather than through a copy of it, so the branch an operator's dispatch lands on
+  and the one the driver would have chosen cannot be two names.
 
   ## What it will NOT fill in
 
-  A caller's own value always wins: a deliberate `branch` or a smaller `max_turns` passes
-  through untouched. What no caller may supply is the `story` object, which
-  `Placement.place/4` refuses outright — loopctl builds that from the story row, because a
-  control plane able to hand a runner prose is able to run anything on that machine.
+  A caller's own value wins where loopctl has no better claim to it: a smaller `max_turns` or
+  a deliberate `repo` passes through untouched.
+
+  `branch` IS NOW JUDGED rather than merely deferred to (contract 1.14.0, story 846.2), and
+  that is the one place this module's own rule bends. A caller's branch is still never
+  REWRITTEN — silently renaming the branch an operator asked for would start a session on a
+  name nobody chose — but one that violates the target runner's declared prefixes is refused
+  here (`{:branch_not_allowed, branch, prefixes}`) instead of being refused by the machine
+  after the story has been claimed for it.
+
+  What no caller may supply at all is the `story` object, which `Placement.place/4` refuses
+  outright — loopctl builds that from the story row, because a control plane able to hand a
+  runner prose is able to run anything on that machine.
   """
 
   import Ecto.Query
 
+  alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Delivery.DispatchDriver
   alias Loopctl.Intake
   alias Loopctl.Repo
@@ -43,6 +55,40 @@ defmodule Loopctl.Delivery.DispatchPayload do
           | {:ambiguous_intake_source, Ecto.UUID.t(), pos_integer()}
           | {:unset, atom()}
           | {:over_contract_maximum, atom()}
+          | {:no_conforming_branch, [String.t()]}
+          | {:branch_not_allowed, String.t(), [String.t()]}
+          | {:invalid_branch_name, atom(), term()}
+          | {:branch_not_unique, atom(), String.t(), String.t()}
+
+  # The prefix loopctl has always derived, and the one it still derives for a runner that
+  # declares nothing. NOT changed to `loop/` to fix the machine that started this (story
+  # 846.2): that repairs minis and breaks the next box. The control plane stops guessing; it
+  # does not guess differently.
+  @default_prefix "feature/"
+
+  # A GIT REF NAME, fully anchored, applied to a WHOLE branch name — the one this module
+  # composed, or the one a caller supplied — and never to a prefix on its own.
+  #
+  # `RunnerJoin.branch_prefixes` already refuses most of this at the wire and says why it is
+  # not enough: its `^...$` admits a trailing newline under PCRE, it cannot see `//` spanning
+  # a prefix, and a Presence meta can be built without passing that cast at all.
+  # `RunnerDispatch.branch` refuses NONE of it — a string of 1..255 characters and no pattern
+  # — and its cast runs after the claim besides. This is the check that decides on both sides,
+  # and it is deliberately narrower than git's own rules: every name it admits is one git
+  # accepts, which is the direction that matters.
+  @branch_name ~r{\A[A-Za-z0-9][A-Za-z0-9._/-]*\z}
+
+  # Nothing on the wire can reach this: eight prefixes of 40 characters and a suffix under 30
+  # leave it unreachable by a factor of two. It is the bound that holds when the prefixes came
+  # from somewhere other than `cast_join/1`, the same role `Runners.declared_max_sessions/1`'s
+  # clamp plays for capacity.
+  #
+  # IT BOUNDS THE DERIVATION ONLY. A branch a CALLER named is judged against the contract's own
+  # bound on the field instead (`RunnerDispatch.max_branch_length/0`, read at the call rather
+  # than copied, so the two cannot drift): 120 is headroom this module chose for names it
+  # composes itself, and refusing a caller's 130-character branch here would refuse a name the
+  # PUBLISHED contract accepts — a refusal no reader of the contract could account for.
+  @max_branch_length 120
 
   @doc """
   Fills the dispatch fields `dispatch` does not carry, from the story's own records.
@@ -54,30 +100,282 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   `kind` decides which budgets are read: an `implement` session and a `triage` session are
   different pieces of work with different costs, and the operator sets them separately.
+
+  ## Options
+
+  - `:branch_prefixes` — what the TARGET RUNNER declared it accepts
+    (`RunnerJoin.branch_prefixes`, contract 1.14.0), read live off its Presence meta by
+    `Loopctl.Delivery.Placement`. `[]` — which is what every runner built before 1.14.0
+    yields — is no constraint and derives exactly the branch this module derived before the
+    field existed.
+
+  - `:prefix_policy` — what a declaration this dispatch cannot satisfy DOES. `:refuse`, the
+    default, answers `{:branch_not_allowed, _, _}` or `{:no_conforming_branch, _}`. `:advise`
+    uses the declaration wherever it can and falls back to the unconstrained derivation where
+    it cannot, refusing for no prefix reason at all. `Loopctl.Delivery.Placement` passes
+    `:advise` on the RESUME path and nowhere else — a resume is re-pushing a claim that is
+    already STANDING, so a refusal there strands a live claim rather than preventing one; the
+    argument is written out in full above `resume_payload/4`.
+
+    IT DOES NOT RELAX `validate_refs/2`, and the split is the point: a prefix is a fact about
+    another machine, and everything `validate_refs/2` judges is a fact about the values in
+    this request. See `valid_ref_name?/1`.
   """
-  @spec fill(Ecto.UUID.t(), map()) :: {:ok, map()} | {:error, error()}
-  def fill(tenant_id, %{} = dispatch) when is_binary(tenant_id) do
+  @spec fill(Ecto.UUID.t(), map(), keyword()) :: {:ok, map()} | {:error, error()}
+  def fill(tenant_id, %{} = dispatch, opts \\ []) when is_binary(tenant_id) and is_list(opts) do
     story_id = Map.get(dispatch, "story_id")
     kind = Map.get(dispatch, "kind", "implement")
+    prefixes = Keyword.get(opts, :branch_prefixes, [])
+    policy = Keyword.get(opts, :prefix_policy, :refuse)
 
     with {:ok, story} <- fetch_story(tenant_id, story_id),
+         :ok <- validate_refs(dispatch, story),
          {:ok, dispatch} <- fill_repo(tenant_id, story, dispatch),
-         {:ok, dispatch} <- fill_budgets(kind, dispatch) do
-      {:ok, put_new(dispatch, "branch", branch_for(story))}
+         {:ok, dispatch} <- fill_budgets(kind, dispatch),
+         {:ok, dispatch} <- fill_branch(dispatch, story, prefixes, policy),
+         :ok <- validate_refs(dispatch, story) do
+      {:ok, dispatch}
     end
   end
 
   @doc """
-  The branch a story's session works on: its number, and eight characters of its id.
+  The branch a story's session works on: its number, and eight characters of its id, behind a
+  prefix the target runner accepts.
 
   The id is in it because a story NUMBER is unique only within its project, and two projects
   may hold intake sources naming the same repository — nothing forbids it. Without the suffix
   two different stories dispatched to one repository could be given one branch, and the second
   session would find the first's work already there.
+
+  ## Why `prefixes` is an argument and not a constant
+
+  The prefix used to be hard-coded `feature/`, and each runner's own config carries the
+  prefixes it accepts, and NOTHING RECONCILED THEM: the delivery loop's first real placement
+  was refused `branch_not_allowed` because minis accepted `loop/` alone, the story was parked,
+  and an operator could discover the required prefix only by reading a config file on that
+  machine. That is the shape `kinds` had before contract 1.6.0 — a per-machine capability the
+  control plane had to guess — and it has the same fix: the runner DECLARES
+  (`RunnerJoin.branch_prefixes`), loopctl DERIVES.
+
+  `[]` is no constraint and yields the `feature/` name this function has always produced, so
+  a runner that declares nothing is placed on exactly as it was. Otherwise the FIRST prefix
+  that produces a valid branch name wins — the declaration is in the machine's own preference
+  order, and taking the first is what makes a retry of one story produce one name rather than
+  a different one per attempt.
+
+  ## When it refuses
+
+  `{:error, {:no_conforming_branch, prefixes}}` when no declared prefix can produce a valid
+  branch name — a prefix carrying `//`, one that would push the name past
+  `#{@max_branch_length}` characters, one that survived the wire with a trailing newline.
+
+  The suffix is NEVER shortened to make one fit. It is what keeps two stories on one
+  repository off one branch, so a prefix that leaves no room for it is a refusal and not a
+  truncation. It refuses the PLACEMENT and not the join, following the same trade
+  `Loopctl.Runners.declared_max_sessions/1` documents: a machine that cannot get a socket is
+  out of the fleet entirely, which is a far worse outcome than one story that cannot be
+  placed on it.
   """
-  @spec branch_for(Story.t()) :: String.t()
-  def branch_for(%Story{} = story),
-    do: "feature/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+  @spec branch_for(Story.t(), [String.t()]) ::
+          {:ok, String.t()} | {:error, {:no_conforming_branch, [String.t()]}}
+  def branch_for(%Story{} = story, prefixes \\ []) when is_list(prefixes) do
+    suffix = story_suffix(story)
+
+    usable = for p <- prefixes, is_binary(p), do: p
+    candidates = if usable == [], do: [@default_prefix], else: usable
+
+    case Enum.find(candidates, &valid_branch?(&1 <> suffix)) do
+      nil -> {:error, {:no_conforming_branch, prefixes}}
+      prefix -> {:ok, prefix <> suffix}
+    end
+  end
+
+  @doc """
+  The part of a branch name that makes it this story's and nobody else's.
+
+  The story NUMBER is unique only within its project and two projects may hold intake sources
+  naming one repository, so the number alone would let two stories share a branch. Public
+  because a refusal has to NAME it: a caller told only that its branch is not unique cannot
+  act, and this is the string it has to end with.
+  """
+  @spec story_suffix(Story.t()) :: String.t()
+  def story_suffix(%Story{} = story), do: "story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+
+  @doc """
+  Judges EVERY field of `dispatch` that becomes a git ref, from the contract's own declaration
+  of which those are (`RunnerDispatch.ref_fields/0`).
+
+  ONE PLACE, AND IT IS READ FROM A LIST RATHER THAN WRITTEN AS A PAIR OF LITERALS (846.2
+  review round 2, findings 1, 2 and 7). Round 1 closed an argument-injection on `branch` by
+  checking `branch`; round 2 found `base_branch` open on the identical schema one line above,
+  a non-string `branch` skipping the check entirely, and a caller-supplied `branch` defeating
+  the uniqueness the contract publishes. Three leaks, each closable by naming a fourth
+  spelling — the shape KB `909ba2b2` names, where a guard enumerates dangerous spellings
+  instead of proving a property. The list is the contract's, the classification there is
+  TOTAL over the schema's string properties, and a test fails when a new string field is
+  classified as neither.
+
+  Three refusals, and each is a fact about the values in THIS request rather than about any
+  machine, which is why none of them is relaxed by `:prefix_policy` — see `fill/3`:
+
+  - a value that is present and NOT A STRING is `{:invalid_branch_name, field, value}`. It
+    used to be deferred to `cast_dispatch/1`, which runs inside `Loopctl.Runners.dispatch/3` —
+    AFTER the claim, the mint and two immutable chain entries — so `{"branch": null}` claimed a
+    story and was refused afterwards, making "Nothing was claimed" false in the 422 body that
+    said it. That is now the LIKELY shape rather than an edge case: `branch` became optional
+    and is documented OMIT THIS, and a generated client serialises an unset optional as `null`.
+  - a string that is not a git ref name is the same tuple. `RunnerDispatch` declares these
+    fields as 1..255 characters with NO pattern, so `--upload-pack=/bin/sh`, `-o` and `a..b`
+    all cast clean and reached a machine that hands the value to git.
+  - a `:story_unique` field that does not carry the story's suffix is
+    `{:branch_not_unique, field, value, suffix}`. The contract publishes that two stories on
+    one repository can never share a branch; `branch_allowed?/2` checks only the prefix, so
+    two placements naming `loop/mine` both succeeded onto one branch and the second session
+    would find the first's work there. A caller may still choose the PREFIX — what it may not
+    do is drop the part that makes the name unique.
+
+  CALLED TWICE BY `fill/3`, on the caller's own map and again on the finished payload. The
+  first call is what makes a caller's value cost nothing; the second is what makes the claim
+  "every value that becomes a git ref is validated" true rather than "every value the caller
+  sent" — `base_branch` is filled from the project's INTAKE SOURCE when the caller omits it,
+  which is a row an operator edits and which nothing else here judges.
+  """
+  @spec validate_refs(map(), Story.t()) :: :ok | {:error, error()}
+  def validate_refs(%{} = dispatch, %Story{} = story) do
+    Enum.reduce_while(RunnerDispatch.ref_fields(), :ok, fn {field, disposition}, :ok ->
+      case Map.fetch(dispatch, Atom.to_string(field)) do
+        :error -> {:cont, :ok}
+        {:ok, value} -> judge_ref(field, value, disposition, story)
+      end
+    end)
+  end
+
+  defp judge_ref(field, value, _disposition, _story) when not is_binary(value),
+    do: {:halt, {:error, {:invalid_branch_name, field, value}}}
+
+  defp judge_ref(field, value, disposition, story) do
+    suffix = story_suffix(story)
+
+    cond do
+      not valid_caller_branch?(value) ->
+        {:halt, {:error, {:invalid_branch_name, field, value}}}
+
+      disposition == :story_unique and not String.ends_with?(value, suffix) ->
+        {:halt, {:error, {:branch_not_unique, field, value, suffix}}}
+
+      true ->
+        {:cont, :ok}
+    end
+  end
+
+  @doc """
+  Whether `branch` satisfies what the runner declared — the check for a branch the CALLER
+  supplied, where there is nothing to derive.
+
+  An operator naming a branch by hand hits the same wall the derivation was fixed for, and on
+  the placement path it costs more: the runner's `branch_not_allowed` arrives after the story
+  has been claimed for it. So `Loopctl.Delivery.Placement` asks this before the claim. `[]`
+  allows everything, which is both the pre-1.14.0 behaviour and the right answer for a
+  machine that has declared no constraint.
+  """
+  @spec branch_allowed?(String.t(), [String.t()]) :: boolean()
+  def branch_allowed?(branch, prefixes) when is_binary(branch) and is_list(prefixes) do
+    case for p <- prefixes, is_binary(p), do: p do
+      [] -> true
+      usable -> Enum.any?(usable, &String.starts_with?(branch, &1))
+    end
+  end
+
+  # The composed name, against the rules AND the derivation's own length bound.
+  defp valid_branch?(branch) do
+    valid_ref_name?(branch) and byte_size(branch) <= @max_branch_length
+  end
+
+  # A name a CALLER supplied, against the same rules and the CONTRACT's bound. Read from
+  # `RunnerDispatch` rather than copied, so a change to the published field cannot leave a
+  # second number here disagreeing with it.
+  defp valid_caller_branch?(branch) do
+    valid_ref_name?(branch) and byte_size(branch) <= RunnerDispatch.max_branch_length()
+  end
+
+  # Narrower than git's own rules on purpose: everything admitted here is a name git accepts.
+  #
+  # WHAT EACH CLAUSE IS FOR, because a clause that can never fire is worse than no clause —
+  # it reads as a guard while the case it names goes unchecked (846.2 review finding 4, which
+  # is what the per-component pass below fixes):
+  #
+  #   * `@branch_name` bounds the CHARACTER SET and forces an alphanumeric first byte, so no
+  #     name reaches git as an OPTION, and no shell metacharacter, whitespace or control
+  #     character survives. Fully anchored (`\A`/`\z`), which the wire pattern on
+  #     `RunnerJoin.branch_prefixes` cannot be — `^...$` admits a trailing newline under PCRE.
+  #   * `..` is refused ANYWHERE, which no per-component rule catches: `a..b` is one component
+  #     and breaks none of git's component rules while git refuses the ref.
+  #   * the per-COMPONENT pass is where git's remaining rules actually live, and where the old
+  #     `String.ends_with?(branch, ".lock")` was dead: applied to the whole composed name it
+  #     tested a name that always ends with the `story-N-<id8>` suffix, so it could not fire,
+  #     while the cases it was written for — a prefix like `x.lock/` or `a/.b/`, both of which
+  #     `@branch_name` admits because it allows `.` — went unchecked and produced a name git
+  #     refuses. An EMPTY component is `//`, a leading `/` or a trailing one, so those need no
+  #     clause of their own either.
+  defp valid_ref_name?(branch) do
+    Regex.match?(@branch_name, branch) and
+      not String.contains?(branch, "..") and
+      branch |> String.split("/") |> Enum.all?(&valid_component?/1)
+  end
+
+  defp valid_component?(component) do
+    component != "" and
+      not String.starts_with?(component, ".") and
+      not String.ends_with?(component, [".lock", "."])
+  end
+
+  # A CALLER'S OWN BRANCH IS NEVER REWRITTEN, only judged. Every other field here follows the
+  # module's rule that a caller's value wins, and a control plane that silently renamed the
+  # branch an operator asked for would be worse than one that refuses: the session would run,
+  # on a name nobody named, and the operator would go looking for work on the other one.
+  #
+  # WHAT IS LEFT HERE IS THE ONE QUESTION ABOUT ANOTHER MACHINE: does the name start with a
+  # prefix the target runner declared. Everything that is a fact about the VALUE — its type,
+  # its shape as a git ref, and the story suffix that keeps two stories off one branch — was
+  # settled by `validate_refs/2` before this ran, for every ref field at once rather than for
+  # `branch` alone (846.2 review round 2). `:advise` turns THIS check off, and only this one,
+  # because a prefix is the only part a rejoin can change under a caller whose claim is
+  # already standing.
+  #
+  # The non-string clause that used to sit here is gone rather than moved: `validate_refs/2`
+  # refuses a non-binary before this function is reached, so a second clause for it would be
+  # the unreachable-guard defect this branch's round 1 was itself about.
+  defp fill_branch(dispatch, story, prefixes, policy) do
+    case Map.fetch(dispatch, "branch") do
+      {:ok, branch} ->
+        judge_caller_branch(dispatch, branch, prefixes, policy)
+
+      :error ->
+        with {:ok, branch} <- derive_branch(story, prefixes, policy),
+             do: {:ok, Map.put(dispatch, "branch", branch)}
+    end
+  end
+
+  defp judge_caller_branch(dispatch, branch, prefixes, policy) do
+    cond do
+      policy == :advise -> {:ok, dispatch}
+      branch_allowed?(branch, prefixes) -> {:ok, dispatch}
+      true -> {:error, {:branch_not_allowed, branch, prefixes}}
+    end
+  end
+
+  # `:advise` FALLS BACK RATHER THAN REFUSING, and the fallback is the un-prefixed derivation
+  # — the name this module produced before the field existed, which is always valid. The
+  # runner may still refuse that name, and on the resume path that refusal is the right place
+  # for it: it reaches a person and costs no claim, the trade `Runners.dispatch/3` documents.
+  defp derive_branch(story, prefixes, :advise) do
+    case branch_for(story, prefixes) do
+      {:ok, _branch} = ok -> ok
+      {:error, {:no_conforming_branch, _}} -> branch_for(story, [])
+    end
+  end
+
+  defp derive_branch(story, prefixes, :refuse), do: branch_for(story, prefixes)
 
   defp fill_repo(tenant_id, story, dispatch) do
     if Map.has_key?(dispatch, "repo") and Map.has_key?(dispatch, "base_branch") do

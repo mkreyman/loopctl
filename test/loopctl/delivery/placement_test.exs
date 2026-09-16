@@ -22,6 +22,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StageEvent
@@ -30,6 +31,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
+  alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Stories
@@ -1475,7 +1477,19 @@ defmodule Loopctl.Delivery.PlacementTest do
   # REFUSES a caller-supplied one — a caller able to hand a runner prose is able to run
   # anything on that machine. What the runner receives is asserted in "the dispatch carries
   # the story object loopctl built" rather than echoed from here.
-  defp dispatch_payload(story), do: build(:runner_dispatch, %{"story_id" => story.id})
+  # NO `branch`, which is the shape an operator sends now that loopctl derives one from the
+  # target runner's declaration (story 846.2) and the endpoint documents OMIT THIS. The
+  # fixture names a branch of its own; since round 2 that branch is REFUSED
+  # `branch_not_unique`, because a caller-supplied name must still carry the story's own
+  # suffix or two stories on one repository could share one. Tests that are ABOUT a
+  # caller-supplied branch put one back explicitly.
+  defp dispatch_payload(story) do
+    :runner_dispatch |> build(%{"story_id" => story.id}) |> Map.delete("branch")
+  end
+
+  # A branch the caller named that satisfies everything except what the test is probing: the
+  # story's suffix behind a prefix of the caller's choosing.
+  defp caller_branch(story, prefix), do: prefix <> DispatchPayload.story_suffix(story)
 
   # The runner drops its socket and joins again declaring `overrides`. A capacity or draining
   # declaration is per-CONNECTION, so this is the only way to change one.
@@ -1949,4 +1963,420 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert_push "dispatch", _pushed, @reply_timeout
     end
   end
+
+  # STORY 846.2. The delivery loop's first real placement was refused `branch_not_allowed`:
+  # loopctl derived `feature/story-<n>-<id>` and the minis runner's config accepted `loop/`
+  # alone, so the dispatch was refused, the story was parked, and the run never started. The
+  # one field was never the defect — loopctl chose a prefix, each operator chose a prefix per
+  # machine, and nothing reconciled them.
+  describe "a machine that declares the branch prefixes it accepts" do
+    # AC-4, and the test AC-4 names its own mutation for: make the derivation ignore the
+    # declared prefix and this goes red. It asserts on the frame the RUNNER receives, so it
+    # binds the whole path — the declaration reaching the Presence meta, the placement reading
+    # the sole live meta, and `DispatchPayload.fill/3` using it — rather than the derivation
+    # in isolation, which `Loopctl.Delivery.DispatchPayloadTest` covers.
+    test "the pushed branch starts with the prefix the runner declared", ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/"]})
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", pushed, @reply_timeout
+
+      assert pushed.branch ==
+               "loop/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+
+      # AC-5: the prefix moved and the unique part did not. Without this a derivation that
+      # returned the bare prefix would satisfy the assertion above.
+      assert String.ends_with?(pushed.branch, String.slice(story.id, 0, 8))
+      assert runner.name == "minis"
+    end
+
+    # AC-1, END TO END. The inertness claim is the whole safety of shipping this before any
+    # runner declares the field, so it is asserted against the DERIVATION rather than against
+    # a literal: whatever `branch_for/2` produces with no declaration is what an undeclaring
+    # runner must be sent.
+    test "a runner that declares nothing is sent exactly the branch it was sent before", ctx do
+      %{story: story} = ctx
+      rejoin(ctx, %{"draining" => false, "max_sessions" => 2})
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", pushed, @reply_timeout
+
+      assert {:ok, unconstrained} = DispatchPayload.branch_for(story)
+      assert pushed.branch == unconstrained
+    end
+
+    # AC-5 is not negotiable, so a declaration that leaves no room for a unique name is a
+    # refusal. BEFORE the claim, like `runner_declines_work`: the runner would refuse the push
+    # itself, and by then the story is claimed for it and sits at `claimed` until its lease
+    # expires.
+    test "a prefix that cannot produce a valid branch refuses before anything is claimed",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop//"]})
+
+      assert {:error, {:no_conforming_branch, ["loop//"]}} =
+               place(ctx, dispatch_payload(story))
+
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
+    # A CALLER'S BRANCH IS JUDGED, NEVER REWRITTEN. Refused here it costs nothing; left to the
+    # runner it costs the claim, which is the same failure this story exists to end wearing a
+    # different hat.
+    test "a caller-supplied branch outside the declaration is refused before the claim", ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/"]})
+
+      # UNIQUE but outside the declaration, so the refusal under test is the prefix one and
+      # not `branch_not_unique`, which is judged first.
+      outside = caller_branch(story, "feature/")
+      payload = Map.put(dispatch_payload(story), "branch", outside)
+
+      assert {:error, {:branch_not_allowed, ^outside, ["loop/"]}} = place(ctx, payload)
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
+    test "a caller-supplied branch INSIDE the declaration is passed through untouched", ctx do
+      %{story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/"]})
+
+      payload = Map.put(dispatch_payload(story), "branch", caller_branch(story, "loop/"))
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.branch == caller_branch(story, "loop/")
+    end
+
+    # SOUL RULE 9, THE RETRY QUESTION — and round 2 finding 4 REVERSED the answer this test
+    # asserted. It used to say a retry MAY land on a different branch when the machine rejoined
+    # declaring a different set, on the argument that a row still at `sent` means the first
+    # frame was never accepted. `sent` means only that no reply was RECORDED, and a LOST REPLY
+    # is exactly the case a resume exists for — so a session may be running on the first name
+    # right now. `runner_dispatches.branch` records the name at the first push and the resume
+    # re-sends THAT, which is the property this test now binds.
+    #
+    # ON THE SHARED SANDBOX CONNECTION, not `unboxed/1`, for the reason the draining resume
+    # test above sets out at length: the channel marked the ledger row `pushed` inside the
+    # sandbox transaction and holds that row lock, so a resume on a real connection would
+    # wait out its `lock_timeout`. Sound because a resume claims, mints and appends nothing.
+    test "a RESUME re-sends the recorded name, even after the declaration moved", ctx do
+      %{runner: runner, story: story} = ctx
+      # THREADED, because `rejoin/2` disconnects the channel in the ctx it is given: a second
+      # rejoin from the original ctx would drop an already-dead channel and leave the live
+      # entry in the pool.
+      ctx = %{ctx | channel: rejoin(ctx, %{"branch_prefixes" => ["loop/"]})}
+      payload = dispatch_payload(story)
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+      assert String.starts_with?(first.branch, "loop/")
+
+      # The operator changed the machine's configuration and it reconnected. A session may be
+      # running on `loop/...` — the reply is merely not recorded.
+      ctx = %{ctx | channel: rejoin(ctx, %{"branch_prefixes" => ["agent/"]})}
+
+      assert {:ok, resumed} =
+               Placement.place(runner.tenant_id, runner.id, payload, api_key: ctx.operator)
+
+      assert resumed.dispatch_id == placed.dispatch_id
+      assert resumed.claim_epoch == placed.claim_epoch
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.dispatch_id == payload["dispatch_id"]
+
+      # THE NAME DID NOT MOVE. Not the new declaration's, not the un-prefixed default's.
+      assert again.branch == first.branch
+      assert again.branch == caller_branch(story, "loop/")
+    end
+
+    # THE LEDGER'S NAME IS NOT OVERWRITTEN BY A CALLER'S EITHER, and the disagreement is
+    # refused rather than resolved: substituting silently would be the rewrite this module
+    # forbids everywhere else, and accepting the caller's would put a second name on the wire
+    # against a session that may be running on the first.
+    test "a RESUME naming a DIFFERENT branch is refused, not silently substituted", ctx do
+      %{runner: runner, story: story} = ctx
+      ctx = %{ctx | channel: rejoin(ctx, %{"branch_prefixes" => ["loop/", "agent/"]})}
+      payload = dispatch_payload(story)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+
+      retry = Map.put(payload, "branch", caller_branch(story, "agent/"))
+
+      assert {:error, {:branch_conflict, other, recorded}} =
+               Placement.place(runner.tenant_id, runner.id, retry, api_key: ctx.operator)
+
+      assert recorded == first.branch
+      assert other == caller_branch(story, "agent/")
+      refute_push "dispatch", _pushed, @reply_timeout
+
+      # Nothing was written, so the same dispatch_id still resumes on the recorded name.
+      assert {:ok, _resumed} =
+               Placement.place(runner.tenant_id, runner.id, payload, api_key: ctx.operator)
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.branch == first.branch
+    end
+
+    # The pool is where an operator looks at a machine that is connected and refusing
+    # everything, so it is where the declaration has to be readable — the whole defect was
+    # that these prefixes lived only in a config file on the target box.
+    test "the pool echoes what the machine declared", ctx do
+      %{runner: runner} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/", "feature/"]})
+
+      assert [meta] = Runners.live_metas(runner.tenant_id, runner.id)
+      assert Runners.declared_branch_prefixes(meta) == ["loop/", "feature/"]
+    end
+
+    test "a machine declaring neither prefixes nor anything else is placed on as before", ctx do
+      %{story: story} = ctx
+
+      # Declaring the number the row ALREADY holds, deliberately: a rejoin that MOVES capacity
+      # writes on the channel's sandbox connection, whose transaction never commits, so the
+      # `runners` row stays locked for the rest of the test and the placement below would time
+      # out at `:capacity_busy` on the lock rather than on anything this test is about.
+      rejoin(ctx, %{"draining" => false, "max_sessions" => 2})
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+    end
+  end
+
+  # 846.2 REVIEW FINDINGS 1 AND 3. Two questions are asked about a caller's branch and they
+  # are NOT the same question: what another MACHINE declared, and whether the STRING is a git
+  # ref name. The first can strand a live claim on the resume path and is advisory there; the
+  # second is a property of the request, is checked everywhere, and was checked nowhere at all
+  # for a caller-supplied value — `branch_allowed?/2` returns true unconditionally against the
+  # `[]` every runner in the fleet declares today, and `RunnerDispatch.branch` carries no
+  # pattern on the wire.
+  describe "the two refusals a branch can earn, and which of them a resume is exempt from" do
+    # THE STRAND. The claim committed on the first call and is live; a `dispatch_id` is spent,
+    # so no new placement can be made while it stands. Refused here, the story sits at
+    # `claimed` with no session until its lease expires — the outcome the draining gate's own
+    # comment calls "the exact outcome this gate exists to prevent".
+    #
+    # The sequence is the DOCUMENTED remediation: the operator fixed the machine's
+    # configuration and it rejoined. Here the new declaration is one no valid branch can be
+    # built from, which is what `:refuse` would have answered `no_conforming_branch` to.
+    # `:advise` IS STILL REACHABLE, AND THIS IS WHERE IT IS REACHED. Since round 2 pinned the
+    # branch to the ledger row, a resume normally never consults the declaration at all —
+    # except for a row written BEFORE `runner_dispatches.branch` existed, which carries NULL
+    # and must still fall back to deriving rather than refusing. Those rows are exactly the
+    # ones that cannot do better, and exactly the ones a refusal would strand.
+    #
+    # ASSERTED AT `fill/3` RATHER THAN THROUGH A PUSH, deliberately. Producing a NULL-branch
+    # ledger row end to end means UPDATEing a row the runner channel holds `FOR UPDATE` inside
+    # its own sandbox transaction for the rest of the test, which no other connection can do
+    # and which deadlocks the suite for fifteen seconds before it times out (measured here).
+    # The policy is the thing under test and `fill/3` is where it lives; the WIRING — that a
+    # resume is not refused for a declaration that moved under it — is bound end to end by the
+    # caller-branch test above, which would be `branch_not_allowed` under `:refuse`.
+    test "the policy a pre-column resume falls back on derives instead of refusing", ctx do
+      %{story: story, runner: runner} = ctx
+      unsatisfiable = ["loop//"]
+      payload = dispatch_payload(story)
+
+      assert {:error, {:no_conforming_branch, ^unsatisfiable}} =
+               unboxed(fn ->
+                 DispatchPayload.fill(runner.tenant_id, payload, branch_prefixes: unsatisfiable)
+               end)
+
+      assert {:ok, filled} =
+               unboxed(fn ->
+                 DispatchPayload.fill(runner.tenant_id, payload,
+                   branch_prefixes: unsatisfiable,
+                   prefix_policy: :advise
+                 )
+               end)
+
+      assert {:ok, unconstrained} = DispatchPayload.branch_for(story)
+      assert filled["branch"] == unconstrained
+    end
+
+    # The same strand reached through the other refusal. `branch` was REQUIRED by the schema
+    # before 1.14.0, so every client built against it names one, which makes this the likelier
+    # half of the two.
+    test "a RESUME is not refused when the caller's branch is outside the declaration", ctx do
+      %{runner: runner, story: story} = ctx
+      ctx = %{ctx | channel: rejoin(ctx, %{"branch_prefixes" => ["loop/"]})}
+      payload = Map.put(dispatch_payload(story), "branch", caller_branch(story, "loop/"))
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+      assert first.branch == caller_branch(story, "loop/")
+
+      _channel = rejoin(ctx, %{"branch_prefixes" => ["agent/"]})
+
+      assert {:ok, resumed} =
+               Placement.place(runner.tenant_id, runner.id, payload, api_key: ctx.operator)
+
+      assert resumed.dispatch_id == payload["dispatch_id"]
+
+      # NEVER REWRITTEN, on this path as on every other: the caller's own name goes back out.
+      assert_push "dispatch", again, @reply_timeout
+      assert again.branch == caller_branch(story, "loop/")
+
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :assigned
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :claimed
+    end
+
+    # FINDING 3, AND ROUND 2 FINDINGS 1 AND 2 — SWEPT OVER THE CONTRACT'S OWN LIST RATHER THAN
+    # OVER A PAIR OF FIELD NAMES THIS TEST REMEMBERS.
+    #
+    # Round 1 asserted this for `branch`. Round 2 found `base_branch` open on the identical
+    # schema one line above it, and a NON-STRING `branch` skipping the check entirely and
+    # costing a claim. Enumerating a third spelling here would have left the same hole one
+    # field further along, so the loop is over `RunnerDispatch.ref_fields/0`: a ninth
+    # ref-shaped field is covered by this test the moment it is declared, and the contract
+    # test refuses to let one be added without being declared.
+    #
+    # The runner declares NOTHING, which is every machine in the fleet today and the case
+    # `branch_allowed?/2` passes unconditionally. Each of these values casts clean against the
+    # wire schema (a string, 1..255, no pattern) and was pushed verbatim to a machine that
+    # hands it to git: a leading `-` is read as an OPTION rather than a ref, which is this
+    # change's own stated rationale for the join-side pattern.
+    test "NO ref field a caller sends reaches a machine unvalidated, and none costs a claim",
+         ctx do
+      %{runner: runner, story: story} = ctx
+
+      not_ref_names = ["--upload-pack=/bin/sh", "-o", "a..b", "loop/\n", "feature/x.lock"]
+      not_strings = [nil, 7, %{}, [], true]
+
+      for {field, _disposition} <- RunnerContract.RunnerDispatch.ref_fields(),
+          bad <- not_ref_names ++ not_strings do
+        payload = Map.put(dispatch_payload(story), to_string(field), bad)
+
+        assert {:error, {:invalid_branch_name, ^field, ^bad}} = place(ctx, payload),
+               "#{to_string(field)}=#{inspect(bad)} was accepted"
+      end
+
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
+    # ROUND 2 FINDING 1, STATED AS THE PROPERTY RATHER THAN AS A FIELD NAME. `base_branch` was
+    # the leak round 1 left: identical schema, caller-supplied on this endpoint, and
+    # `fill_repo/3` short-circuits on `Map.has_key?` so a caller's value beats the intake
+    # source outright.
+    test "base_branch is judged too, and a caller's value beating the intake source cannot " <>
+           "smuggle an argument",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      payload = Map.put(dispatch_payload(story), "base_branch", "--upload-pack=/bin/sh")
+
+      assert {:error, {:invalid_branch_name, :base_branch, _}} = place(ctx, payload)
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
+    # ROUND 2 FINDING 7. The contract publishes that two stories on one repository can never
+    # share a branch, and that was true only of the DERIVED name: `branch_allowed?/2` checks
+    # the prefix and nothing else, so two placements naming `loop/mine` both succeeded onto one
+    # branch and the second session would find the first's work there. `branch` was REQUIRED
+    # before 1.14.0, so every client built against that schema sends one.
+    test "a caller's branch that drops the story's suffix is refused, prefix kept", ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/"]})
+
+      suffix = DispatchPayload.story_suffix(story)
+      shared = Map.put(dispatch_payload(story), "branch", "loop/mine")
+
+      assert {:error, {:branch_not_unique, :branch, "loop/mine", ^suffix}} = place(ctx, shared)
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+      refute_push "dispatch", _pushed, @reply_timeout
+
+      # The caller keeps its prefix. What it may not drop is the part that makes the name this
+      # story's and nobody else's.
+      kept = Map.put(dispatch_payload(story), "branch", caller_branch(story, "loop/"))
+
+      assert {:ok, _placed} = place(ctx, kept)
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.branch == caller_branch(story, "loop/")
+    end
+
+    # `base_branch` IS NOT STORY-UNIQUE, and that is a decision rather than an omission: it is
+    # the ref a session cuts FROM, deliberately shared by every dispatch in the tenant.
+    # Requiring a suffix there would refuse `master`, which is the only value anyone sends.
+    test "base_branch is shared, so an ordinary ref name is accepted", ctx do
+      %{story: story} = ctx
+      payload = Map.put(dispatch_payload(story), "base_branch", "main")
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.base_branch == "main"
+    end
+
+    # THE OTHER SIDE OF THE RESUME DECISION, and the reason the two refusals are not folded
+    # into one exemption. The remedy for a malformed name is in this very request and the
+    # refusal writes nothing, so the same `dispatch_id` is immediately retryable — while a
+    # name git will not take could not have started a session on any machine anyway.
+    test "a RESUME is still refused for a branch that is not a git ref name", ctx do
+      %{runner: runner, story: story} = ctx
+      ctx = %{ctx | channel: rejoin(ctx, %{"branch_prefixes" => ["loop/"]})}
+      payload = Map.put(dispatch_payload(story), "branch", caller_branch(story, "loop/"))
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+
+      retry = Map.put(payload, "branch", "-o")
+
+      assert {:error, {:invalid_branch_name, :branch, "-o"}} =
+               Placement.place(runner.tenant_id, runner.id, retry, api_key: ctx.operator)
+
+      refute_push "dispatch", _pushed, @reply_timeout
+
+      # Nothing was written, so the claim stands and the caller can retry the same
+      # `dispatch_id` with a name that works.
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :assigned
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :claimed
+
+      assert {:ok, _resumed} =
+               Placement.place(runner.tenant_id, runner.id, payload, api_key: ctx.operator)
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.branch == caller_branch(story, "loop/")
+    end
+  end
+
+  # 846.2 REVIEW ROUND 2, FINDING 5. `Placement.place/4` returns whatever
+  # `DispatchPayload.fill/3` returns, so the two `@type error()` unions are one declaration in
+  # two files — and round 1 added `invalid_branch_name` to the payload's and not to the
+  # placement's. Dialyzer does not catch it (measured: `bin/mutate.sh` on that union exits 1
+  # against `mix dialyzer`, because the placement union already carries a bare `atom()` and
+  # dialyzer only refuses a contract that is impossible, never one that is merely too narrow).
+  # So the drift needs a test, and this is it: the next caller written against the DOCUMENTED
+  # set falls through to the fallback controller and answers 500 on an ordinary refusal.
+  describe "the error union Placement documents" do
+    test "covers every error DispatchPayload can hand it" do
+      missing = error_union(DispatchPayload) -- error_union(Placement)
+
+      assert missing == [],
+             "#{inspect(missing)} is returned by DispatchPayload.fill/3, which Placement.place/4 " <>
+               "passes through, and is not in Placement's own @type error() — a caller written " <>
+               "against the documented set has no clause for it and answers 500"
+    end
+  end
+
+  # The members of a module's `@type error()` union, as strings, read off the compiled
+  # typespec rather than by parsing source.
+  defp error_union(module) do
+    {:ok, types} = Code.Typespec.fetch_types(module)
+    {:type, spec} = Enum.find(types, fn {_kind, {name, _ast, _vars}} -> name == :error end)
+
+    {:"::", _, [_head, union]} = Code.Typespec.type_to_quoted(spec)
+    flatten_union(union)
+  end
+
+  defp flatten_union({:|, _, [left, right]}), do: flatten_union(left) ++ flatten_union(right)
+  defp flatten_union(other), do: [Macro.to_string(other)]
 end

@@ -486,6 +486,53 @@ describe("the wiring in index.js", () => {
     );
   });
 
+  // 846.2 REVIEW FINDING 6. `index.js` and `README.md` are two declarations of one surface,
+  // and CLAUDE.md names the README as the SINGLE SOURCE OF TRUTH for the tool list — which is
+  // what a session reads before calling a tool. Contract 1.14.0 landed in the descriptions and
+  // not in the rows, so the README's `runner_pool` row enumerated the fields it returns and
+  // silently omitted one, and its `place_dispatch` row still listed `branch` as an ordinary
+  // optional parameter.
+  //
+  // Asserted per FACT rather than by diffing the two texts: they are written for different
+  // readers and are not meant to be byte-identical.
+  describe("the README rows carry what the descriptions carry", () => {
+    const row = (tool) =>
+      README.split("\n").find((line) => line.startsWith(`| \`${tool}\` |`)) ?? "";
+
+    test("runner_pool's row names branch_prefixes among the fields it returns", () => {
+      const pool = row("runner_pool");
+
+      assert.ok(pool, "runner_pool has no README row");
+      assert.match(pool, /branch_prefixes/);
+      assert.match(pool, /1\.14\.0/);
+    });
+
+    test("place_dispatch's row says to omit branch, and names all three refusals", () => {
+      const place = row("place_dispatch");
+
+      assert.ok(place, "place_dispatch has no README row");
+
+      for (const code of [
+        "no_conforming_branch",
+        "branch_not_allowed",
+        "invalid_branch_name",
+        "branch_not_unique",
+        "branch_conflict",
+      ]) {
+        assert.ok(place.includes(code), `place_dispatch's row never mentions ${code}`);
+      }
+
+      // `base_branch` reaches git on the runner exactly as `branch` does, and round 1 of the
+      // 846.2 review documented only `branch` — which is how the schema one line above it
+      // went unchecked for a round.
+      assert.match(place, /base_branch/);
+
+      // The steer is the point of the row, not the refusal list: a caller that never sends
+      // `branch` cannot earn three of those five.
+      assert.match(place, /should not send|OMIT|omit/);
+    });
+  });
+
   test("the paths the tools build are the routes loopctl serves", () => {
     assert.equal(placementPath(RUNNER_ID), `/api/v1/runners/${RUNNER_ID}/dispatches`);
     assert.equal(stagePath(STORY_ID), `/api/v1/stories/${STORY_ID}/stage`);

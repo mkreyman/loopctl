@@ -7948,6 +7948,12 @@ const TOOLS = [
       "write has not landed and the row keeps an older, larger number. A reported_max_sessions " +
       "of 0 means the machine is taking no work and place_dispatch refuses a new placement on " +
       "it, like draining. " +
+      "branch_prefixes is what the machine declared it ACCEPTS as a branch-name prefix (runner " +
+      "contract 1.14.0): loopctl derives a branch starting with the FIRST entry, and [] means " +
+      "the machine declared no constraint. Read it when place_dispatch refuses 409 " +
+      "no_conforming_branch, and when a machine refuses dispatches with branch_not_allowed — a " +
+      "runner that ENFORCES a prefix and declares none shows [] here, which is that " +
+      "misconfiguration made visible. Per-CONNECTION, like kinds. " +
       "live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +
@@ -7981,7 +7987,26 @@ const TOOLS = [
       "NEW dispatch_id. Read `draining` and `reported_max_sessions` from runner_pool before " +
       "choosing a machine. It refuses a NEW placement only: retrying with a dispatch_id " +
       "loopctl already holds still re-sends that dispatch, because its claim is already " +
-      "standing and a draining machine is asked to finish what it holds, not to take more.",
+      "standing and a draining machine is asked to finish what it holds, not to take more.\n\n" +
+      "409 `no_conforming_branch` means the machine declares `branch_prefixes` (runner " +
+      "contract 1.14.0) and none of them can produce a valid branch name carrying the story " +
+      "number and id fragment that keeps two stories off one branch. NOTHING WAS CLAIMED. " +
+      "The body echoes the declared prefixes; the fix is on that machine's own configuration, " +
+      "not in this call. 422 `branch_not_allowed` is the other half: you passed a `branch` " +
+      "outside those prefixes, so the machine would have refused the dispatch — omit it and " +
+      "loopctl derives a conforming one. 422 `invalid_branch_name` is a different refusal " +
+      "again: a ref field you passed — `branch` OR `base_branch`, which reaches git on the " +
+      "runner just as `branch` does — is not a string, or is not a valid git ref name, so no " +
+      "machine could create it; nothing was claimed and the remedy is in this call. 422 " +
+      "`branch_not_unique` means the `branch` you passed does not end with this story's own " +
+      "suffix, so two stories on one repository could share a branch and the second session " +
+      "would find the first's work there: keep your prefix and append the suffix the error " +
+      "names, or omit `branch`. 422 `branch_conflict` means a retry named a different branch " +
+      "from the one this dispatch was already sent on — the branch is recorded at the first " +
+      "push and re-sent verbatim, because a session may be running on it right now. Neither " +
+      "prefix refusal can be raised by a RETRY carrying a dispatch_id loopctl already " +
+      "holds: its claim is already standing, so a declaration that changed under you only " +
+      "steers the name and never strands the story.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8017,8 +8042,30 @@ const TOOLS = [
             "project bound to NO intake source (409 `no_intake_source`) or to TWO (409 " +
             "`ambiguous_intake_source`) — both refusals name these two parameters.",
         },
-        branch: { type: "string", description: "Optional. The branch the session works on." },
-        base_branch: { type: "string", description: "Optional. The branch it is cut from." },
+        branch: {
+          type: "string",
+          description:
+            "Optional, and you almost certainly should NOT pass it. loopctl derives the " +
+            "branch from the story number and an id fragment, behind a prefix the TARGET " +
+            "RUNNER declared it accepts on join (`branch_prefixes`, runner contract 1.14.0) " +
+            "— a per-machine fact only the server can read, and the reason this is derived " +
+            "rather than named. A branch you pass is never rewritten, so one outside that " +
+            "machine's prefixes is refused 422 `branch_not_allowed`, one that is not a valid " +
+            "git ref name (or is not a string at all, such as null) is refused 422 " +
+            "`invalid_branch_name`, and one that does not END WITH THIS STORY'S OWN SUFFIX " +
+            "is refused 422 `branch_not_unique` — you may choose the prefix, you may not " +
+            "drop the suffix, which is what keeps two stories on one repository off one " +
+            "branch. Nothing is claimed on any of them. runner_pool shows each machine's " +
+            "`branch_prefixes`.",
+        },
+        base_branch: {
+          type: "string",
+          description:
+            "Optional. The ref the session cuts FROM; defaults to the project's intake " +
+            "source. Judged as a git ref name exactly as `branch` is (422 " +
+            "`invalid_branch_name`, nothing claimed), but NOT story-unique — every dispatch " +
+            "cutting from master is the normal case.",
+        },
         wall_clock_seconds: { type: "integer", description: "Optional. Overrides the default." },
         max_turns: { type: "integer", description: "Optional. Overrides the default." },
       },

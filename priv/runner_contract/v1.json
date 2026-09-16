@@ -243,6 +243,16 @@
     "RunnerJoin": {
       "description": "The payload a runner joins its own `runner:<runner_id>` topic with.",
       "properties": {
+        "branch_prefixes": {
+          "description": "The branch-name prefixes this machine ACCEPTS (since 1.14.0). loopctl derives a branch that starts with the FIRST entry, so declare them in preference order; the rest are fallbacks used only when the first cannot produce a valid branch name. Omitting the field, or sending an EMPTY array, declares NO constraint and loopctl derives exactly the branch it derived before this field existed — which is why an un-upgraded runner is unaffected. A RUNNER THAT ENFORCES A PREFIX MUST DECLARE IT: silence is read as no constraint, so a machine enforcing an undeclared prefix refuses every dispatch loopctl sends and each refusal costs the story's claim. Declare the SAME set you enforce — a superset is the same failure. At most 8 entries of 40 characters, each starting with a letter or digit and made only of letters, digits, `_`, `/` and `-`; a branch never begins with `-` and never contains `..`. The derived branch always carries the story number and an id fragment, so two stories on one repository can never share one: a prefix leaving no room for that refuses the placement, not the join. Per-CONNECTION, so declare it on EVERY join — a machine whose configuration changed applies it by reconnecting.",
+          "items": {
+            "maxLength": 40,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_/-]*$",
+            "type": "string"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
         "contract_version": {
           "description": "The contract version the runner was built against (semver).",
           "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
@@ -1637,5 +1647,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.13.0"
+  "x-contract-version": "1.14.0"
 }

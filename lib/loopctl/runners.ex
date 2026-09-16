@@ -1034,6 +1034,56 @@ defmodule Loopctl.Runners do
   def declared_kinds(meta) when is_map(meta), do: {:implied, Kinds.implied_by_silence()}
 
   @doc """
+  The branch-name prefixes a runner's join meta declares (`RunnerJoin.branch_prefixes`,
+  contract 1.14.0), or `[]` when it declared none.
+
+  READ LIVE AT THE DECISION AND STORED NOWHERE, which is the same shape as `declared_kinds/1`
+  and is the point rather than an implementation detail. A runner declares a capability and
+  loopctl DERIVES from the declaration; it never keeps an independent copy that can drift.
+  Capacity is the one field that could not be done this way — a reservation is a conditional
+  UPDATE under a row lock and a CRDT replica cannot hand out the last slot to exactly one
+  caller — and `apply_declaration/4` says so. A branch NAME needs no lock, so it takes the
+  purer form: `Loopctl.Delivery.Placement` reads the meta of the sole live socket the push
+  would reach and passes the list to `Loopctl.Delivery.DispatchPayload.fill/3`.
+
+  Two things follow from there being no stored copy, and both are answers rather than
+  caveats. A reconnect carrying a different set simply decides differently from then on,
+  with nothing to reconcile and no migration to write. And a STALE Presence entry cannot be
+  read as a declaration on its own: the caller resolves the SOLE live meta, so while a
+  reconnecting runner has two entries visible the placement path has no single meta at all —
+  the same judgement `single_live_socket/2` makes for every other decision about that machine.
+
+  `[]` is returned for silence and for an empty array, both of which mean "this machine stated
+  no constraint" — which is exactly the pre-1.14.0 behaviour and what makes the field additive.
+
+  NON-BINARY ENTRIES ARE DROPPED PER ENTRY, NOT ALL-OR-NOTHING (846.2 review round 2, finding
+  6). This used to return `[]` for a list carrying any non-binary, and that is the same
+  all-or-nothing reading that made the two non-cast-meta defences disagree:
+  `Loopctl.Delivery.DispatchPayload.branch_for/2` filters per entry, placement goes through
+  THIS function, so `["loop/", 3]` read as NO CONSTRAINT, loopctl derived `feature/...`, and a
+  machine that really enforces `loop/` refused the dispatch AFTER the claim — the original
+  846.2 failure, reached through the defence written against it. Per-entry is the safer
+  reading of the same list: a machine that stated one usable prefix stated a constraint, and
+  honouring it costs nothing that dropping it does not cost more of.
+
+  This is NOT the `declared_kinds/1` rule and the difference is real. A kind is a MEMBERSHIP
+  test, so an entry this server cannot use simply never matches and filtering it would change
+  no decision while hiding half of what a machine declared. A prefix is CONCATENATED into a
+  name that is then sent, so an unusable entry is not inert — it either constrains or it does
+  not, and reading "one bad entry" as "no constraint at all" is the only reading that can send
+  a name the machine refuses.
+
+  A prefix that survives this and still cannot produce a valid branch is settled at the
+  derivation, where the composed name is the thing that can actually be judged, and it refuses
+  the placement rather than being silently dropped.
+  """
+  @spec declared_branch_prefixes(map()) :: [String.t()]
+  def declared_branch_prefixes(%{branch_prefixes: prefixes}) when is_list(prefixes),
+    do: for(p <- prefixes, is_binary(p), do: p)
+
+  def declared_branch_prefixes(meta) when is_map(meta), do: []
+
+  @doc """
   The capacity a join declared, as a value `runners.max_sessions` can hold.
 
   `{:ok, n}` when the declaration is already inside `Runner.max_sessions_range/0`,
@@ -1104,14 +1154,20 @@ defmodule Loopctl.Runners do
      `max_sessions`), so this costs one conditional UPDATE and no new message.
 
   This is the THIRD field to move this way, not a capacity special case: `kinds` moved at
-  contract 1.6.0, `branch_prefixes` is queued behind the runner declaring it (story 846.2,
-  not built here), and capacity is this. The shape they share is that a runner DECLARES a
-  capability and loopctl DERIVES from the declaration instead of keeping an independent copy
-  — `declared_kinds/1` stores nothing at all and reads the meta at the decision. Capacity
-  cannot be read that way, because a reservation is a conditional UPDATE against a column and
-  a CRDT replica cannot hand out the last slot to exactly one caller. So this is the same rule
-  with the one mechanism it allows when the fact must be decided under a row lock: copy it in
-  at the moment the machine states it, and nowhere else.
+  contract 1.6.0, `branch_prefixes` at 1.14.0 (story 846.2), and capacity is this. The shape
+  they share is that a runner DECLARES a capability and loopctl DERIVES from the declaration
+  instead of keeping an independent copy — `declared_kinds/1` and
+  `declared_branch_prefixes/1` store nothing at all and read the meta at the decision.
+
+  **CAPACITY IS THE ONLY ONE THAT NEEDED THIS FUNCTION, and the reason is the test for a
+  fourth.** A reservation is a conditional UPDATE against a column, and a CRDT replica cannot
+  hand out the last slot to exactly one caller, so the fact has to be decided under a row
+  lock and therefore has to be IN a row. Nothing else here has that property: a kind is a
+  membership test and a branch prefix is a string concatenation, both decided in the process
+  that already holds the meta. So this is the same rule with the one mechanism it allows when
+  a fact must be decided under a row lock — copy it in at the moment the machine states it,
+  and nowhere else. A field that does NOT need a lock belongs in `declared_*`, without a
+  migration and without a second copy to reconcile.
 
   ## Where it runs, and what it is NOT on
 

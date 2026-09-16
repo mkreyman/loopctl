@@ -29,6 +29,7 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
   end
 
   alias Loopctl.Config.WorktreePartition
+  alias Loopctl.DeliveryGates.GitEnv
 
   @wt "/home/mkreyman/workspace/x/.claude/worktrees"
 
@@ -41,6 +42,21 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
   @rev_parse_sh "git rev-parse --git-dir --git-common-dir --show-toplevel 2>/dev/null"
 
   @rev_parse_flags ~w(--git-dir --git-common-dir --show-toplevel)
+
+  # Every git variable that steers DISCOVERY, which is what a git hook exports into every
+  # child process it runs. The blocks below fabricate repositories and ask git questions
+  # about them, so an inherited value has to be OUT OF THE WAY before a test deliberately
+  # sets one: this file's own reproduction is `GIT_DIR=... mix test <this file>`, and an
+  # inherited GIT_DIR otherwise reaches the fixtures' `git init` — which re-initialises
+  # whatever repository GIT_DIR names, not the one being fabricated — and silently moves
+  # every hand-written oracle here off the tree it is meant to describe.
+  #
+  # Hand-written and deliberately NOT read from the module, on the same principle as
+  # @rev_parse_sh: a fixture steered by the code under test cannot contradict it.
+  @ambient_git_vars ~w(GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_PREFIX
+                       GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+                       GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
+                       GIT_NAMESPACE)
 
   @shell_vectors [
     {"/home/mkreyman/workspace/loopctl/.claude/worktrees/dispatch-key-revocation",
@@ -134,6 +150,10 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
   end
 
   describe "derive/1" do
+    setup do
+      stash_ambient_git_env!()
+    end
+
     test "yields nothing outside a git repository" do
       dir =
         Path.join(System.tmp_dir!(), "wt_partition_nogit_#{System.unique_integer([:positive])}")
@@ -185,6 +205,8 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
       repo = Path.join(dir, "repo")
       wt = Path.join(dir, "wt")
       private = Path.join(repo, ".git/worktrees/probe")
+
+      stash_ambient_git_env!()
 
       {_, 0} = System.cmd("git", ["init", "-q", repo])
       File.mkdir_p!(private)
@@ -248,6 +270,10 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
     # not tell `2>/dev/null` from a derivation that stopped calling git; (b) alone says
     # nothing about stderr.
 
+    setup do
+      stash_ambient_git_env!()
+    end
+
     test "is still the three-flag git rev-parse" do
       cmd = module_attribute!(:rev_parse_cmd)
 
@@ -287,6 +313,225 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
                "that — prints git's `fatal: not a git repository` into the output, and a " <>
                "developer with GIT_TRACE=1 set gets a trace line per git call. Got: " <>
                inspect(out)
+    end
+  end
+
+  describe "derive/1 with a leaked git environment" do
+    # THE DEFECT THIS BLOCK EXISTS FOR. A git hook exports GIT_DIR into every child process,
+    # so `mix precommit` run BY the pre-commit hook inherits it and the derivation answered
+    # about the hook's repository instead of the path it was handed — which is the test
+    # DATABASE the suite then runs on. KB `d1f32cc7` has the cause and the asymmetry that
+    # hid it.
+    #
+    # THE SHAPE HERE IS DELIBERATE: leak a variable naming a REAL repository, then ask
+    # `derive/1` about a path outside it and assert the answer is about the path. Naming the
+    # repository to git instead — an explicit `--git-dir` — would make the query echo what
+    # was passed in, and neither the code nor these tests could then fail. Each test also
+    # ASSERTS ITS PRECONDITION against raw git first, so a future git that ignored the
+    # variable makes them go red rather than green-and-vacuous.
+    setup do
+      # The same fabricated linked worktree the NOISY block builds: three plain files under
+      # the common git dir plus a `.git` file in the tree, which is a worktree's whole
+      # identity, so `git worktree add`'s commit requirement does not apply.
+      dir =
+        Path.join(System.tmp_dir!(), "wt_partition_env_#{System.unique_integer([:positive])}")
+
+      repo = Path.join(dir, "repo")
+      wt = Path.join(dir, "wt")
+      elsewhere = Path.join(dir, "elsewhere")
+      nogit = Path.join(dir, "nogit")
+      private = Path.join(repo, ".git/worktrees/probe")
+
+      stash_ambient_git_env!()
+
+      {_, 0} = System.cmd("git", ["init", "-q", repo])
+      File.mkdir_p!(private)
+      File.mkdir_p!(wt)
+      File.mkdir_p!(elsewhere)
+      File.mkdir_p!(nogit)
+      File.write!(Path.join(private, "gitdir"), Path.join(wt, ".git") <> "\n")
+      File.write!(Path.join(private, "commondir"), "../..\n")
+      File.write!(Path.join(private, "HEAD"), "ref: refs/heads/probe\n")
+      File.write!(Path.join(wt, ".git"), "gitdir: " <> private <> "\n")
+
+      # git's OWN spelling of the root, taken before anything is leaked and without going
+      # through the module: /tmp is a symlink on macOS, so the string `wt` is not
+      # necessarily what `--show-toplevel` prints, and `partition_for_root/1` hashes the
+      # verbatim output.
+      {root, 0} = System.cmd("sh", ["-c", "git rev-parse --show-toplevel 2>/dev/null"], cd: wt)
+      root = String.trim_trailing(root, "\n")
+
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      %{
+        repo_git: Path.join(repo, ".git"),
+        private: private,
+        wt: wt,
+        root: root,
+        elsewhere: elsewhere,
+        nogit: nogit
+      }
+    end
+
+    test "an inherited GIT_DIR does not turn a non-repository into a worktree", ctx do
+      System.put_env("GIT_DIR", ctx.private)
+
+      assert [ctx.private, ctx.repo_git, ctx.nogit] == raw_rev_parse(ctx.nogit),
+             "precondition: an absolute GIT_DIR must still make git answer in a directory " <>
+               "that is not a repository, reporting the CWD as --show-toplevel. If it no " <>
+               "longer does, this test proves nothing"
+
+      assert WorktreePartition.derive(ctx.nogit) == nil,
+             "a directory that is no repository at all has no partition. With a worktree's " <>
+               "GIT_DIR leaked in by a git hook, git exits 0, the private-vs-common dirs " <>
+               "classify as :linked and --show-toplevel is the CWD — so the derivation " <>
+               "invents a database name for a path git never placed in a repository"
+    end
+
+    test "an inherited GIT_DIR does not reclassify a real linked worktree", ctx do
+      System.put_env("GIT_DIR", ctx.repo_git)
+
+      assert [ctx.repo_git, ctx.repo_git, ctx.root] == raw_rev_parse(ctx.wt),
+             "precondition: GIT_DIR must still override discovery INSIDE a linked worktree, " <>
+               "making --git-dir and --git-common-dir the same main-tree path"
+
+      assert WorktreePartition.derive(ctx.wt) == WorktreePartition.partition_for_root(ctx.root),
+             "the tree at this path is a linked worktree whatever the environment says. " <>
+               "With the MAIN tree's GIT_DIR leaked in, --git-dir equals --git-common-dir, " <>
+               "the worktree reads as :main and its suite falls back onto the SHARED " <>
+               "loopctl_test database"
+    end
+
+    test "an inherited GIT_WORK_TREE does not move the tree derive/1 answers about", ctx do
+      System.put_env("GIT_WORK_TREE", ctx.elsewhere)
+
+      assert [ctx.private, ctx.repo_git, ctx.elsewhere] == raw_rev_parse(ctx.wt),
+             "precondition: GIT_WORK_TREE must still move --show-toplevel alone, leaving the " <>
+               "git dirs — and therefore the :linked classification — untouched"
+
+      assert WorktreePartition.derive(ctx.wt) == WorktreePartition.partition_for_root(ctx.root),
+             "GIT_WORK_TREE is the same failure one field over: the tree still classifies as " <>
+               ":linked, so the derivation returns a partition — for a path that is not the " <>
+               "tree it was asked about. Clearing GIT_DIR alone does not cover this"
+    end
+  end
+
+  # 846.2 REVIEW ROUND 2, FINDING 8. The moduledoc said this file deliberately does NOT copy
+  # `GitEnv`'s `GIT_CONFIG_GLOBAL=/dev/null` pinning, while the `GIT_*` deny list cleared every
+  # `GIT_CONFIG*` variable anyway — so on a box whose global git config is supplied only
+  # through them (Nix and home-manager point `GIT_CONFIG_GLOBAL` at a store path; some CI
+  # images use the `GIT_CONFIG_COUNT`/`KEY`/`VALUE` trio) the pinning WAS effectively applied,
+  # `safe.directory` went with it, `rev-parse` refused the tree as dubiously owned, and the
+  # suite fell back to the shared `loopctl_test` database. That is the collision this file
+  # exists to prevent, so the two sentences were resolved in favour of NOT clearing.
+  describe "cleared_git_env/0 and the GIT_CONFIG exception" do
+    setup do
+      stash_ambient_git_env!(
+        @ambient_git_vars ++
+          ~w(GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+             GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_WOBBLE_NEW)
+      )
+    end
+
+    test "config variables are NOT cleared, so a machine keeps its own safe.directory" do
+      names =
+        ~w(GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+           GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0)
+
+      for name <- names, do: System.put_env(name, "set")
+      cleared = MapSet.new(WorktreePartition.cleared_git_env(), fn {name, nil} -> name end)
+
+      for name <- names do
+        refute MapSet.member?(cleared, name),
+               "#{name} selects or supplies CONFIG; it cannot move what rev-parse answers " <>
+                 "(pinned by the test below). Clearing it strips the global config on a box " <>
+                 "configured through it, git then refuses a dubiously-owned tree, derive/1 " <>
+                 "returns nil, and the worktree suite silently shares loopctl_test"
+      end
+    end
+
+    # THE DENY-LIST DEFAULT IS STILL THE DEFAULT. Without this, the exception above could be
+    # widened to `GIT_` and nothing would notice.
+    test "an unknown GIT_ variable is still cleared by default" do
+      System.put_env("GIT_WOBBLE_NEW", "set")
+      cleared = MapSet.new(WorktreePartition.cleared_git_env(), fn {name, nil} -> name end)
+
+      assert MapSet.member?(cleared, "GIT_WOBBLE_NEW")
+    end
+
+    # THE PREMISE OF THE EXCEPTION, ASSERTED AGAINST GIT ITSELF rather than assumed — the shape
+    # the leaked-environment block uses, so a future git that started honouring `core.worktree`
+    # from these sources turns this red instead of silently partitioning on another tree.
+    # `core.worktree` is the only setting that could move the answer, and git honours it from
+    # repository-LOCAL config alone.
+    test "a global config that tries to move the worktree does not move derive/1" do
+      dir =
+        Path.join(System.tmp_dir!(), "wt_partition_cfg_#{System.unique_integer([:positive])}")
+
+      repo = Path.join(dir, "repo")
+      elsewhere = Path.join(dir, "elsewhere")
+      cfg = Path.join(dir, "global.cfg")
+
+      File.mkdir_p!(repo)
+      File.mkdir_p!(elsewhere)
+      {_, 0} = System.cmd("git", ["init", "-q", repo])
+      File.write!(cfg, "[core]\n\tworktree = #{elsewhere}\n\tbare = false\n")
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      {plain, 0} =
+        System.cmd("sh", ["-c", "git rev-parse --show-toplevel 2>/dev/null"], cd: repo)
+
+      {steered, 0} =
+        System.cmd("sh", ["-c", "git rev-parse --show-toplevel 2>/dev/null"],
+          cd: repo,
+          env: [{"GIT_CONFIG_GLOBAL", cfg}]
+        )
+
+      assert String.trim(steered) == String.trim(plain),
+             "git now honours core.worktree from a GIT_CONFIG_GLOBAL file, so config DOES " <>
+               "steer discovery and GIT_CONFIG* must go back on the deny list — read the " <>
+               "cleared_git_env/0 doc before changing this"
+
+      {injected, 0} =
+        System.cmd("sh", ["-c", "git rev-parse --show-toplevel 2>/dev/null"],
+          cd: repo,
+          env: [
+            {"GIT_CONFIG_COUNT", "1"},
+            {"GIT_CONFIG_KEY_0", "core.worktree"},
+            {"GIT_CONFIG_VALUE_0", elsewhere}
+          ]
+        )
+
+      assert String.trim(injected) == String.trim(plain),
+             "git now honours core.worktree injected through GIT_CONFIG_COUNT/KEY/VALUE, " <>
+               "which is `-c` and the highest precedence there is"
+    end
+  end
+
+  describe "cleared_git_env/0 against the delivery gates' own list" do
+    # ONE RULE, TWO SITES. `Loopctl.DeliveryGates.GitEnv` clears the same discovery variables
+    # for the delivery gates — written 2026-09-14 after an inherited GIT_DIR let a fixture
+    # commit to the working branch and another empty `config/runtime.exs` and push — and its
+    # moduledoc says why two lists are one list and one bug: the weaker one is what a future
+    # caller copies. This derivation CANNOT call it (`config/test.exs` evaluates before the
+    # project is compiled, so nothing under `lib/` is loadable), so the duplication is forced
+    # and only a test can hold the two together.
+    setup do
+      stash_ambient_git_env!(Enum.uniq(@ambient_git_vars ++ GitEnv.discovery_overrides()))
+    end
+
+    test "clears every discovery variable the delivery gates clear" do
+      for name <- GitEnv.discovery_overrides(), do: System.put_env(name, "leaked")
+
+      cleared = MapSet.new(WorktreePartition.cleared_git_env(), fn {name, nil} -> name end)
+
+      for name <- GitEnv.discovery_overrides() do
+        assert MapSet.member?(cleared, name),
+               "#{name} steers git's repository discovery — GitEnv clears it for exactly that " <>
+                 "reason — so the partition derivation, which asks git which worktree a PATH " <>
+                 "belongs to, must not inherit it either. This list is meant to be a SUPERSET " <>
+                 "of GitEnv's, never a narrower second opinion"
+      end
     end
   end
 
@@ -400,6 +645,33 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
              in a comment, one reflow away from a silent sweeper.\
              """
     end
+  end
+
+  # Removes @ambient_git_vars from the BEAM's environment for the duration of one test and
+  # puts them back afterwards. `derive/1` reads the environment of the process it runs in, so
+  # a test that leaks a variable on purpose does it with `System.put_env/2` after this — and
+  # then the ONLY leaked variable is the one that test names.
+  defp stash_ambient_git_env!(names \\ @ambient_git_vars) do
+    saved = Map.new(names, fn name -> {name, System.get_env(name)} end)
+    Enum.each(names, &System.delete_env/1)
+
+    on_exit(fn -> restore_git_env(saved) end)
+
+    :ok
+  end
+
+  defp restore_git_env(saved) do
+    for {name, value} <- saved do
+      if value, do: System.put_env(name, value), else: System.delete_env(name)
+    end
+  end
+
+  # The derivation's git query run WITHOUT the module's environment clearing — how the tests
+  # above show that a leaked variable really does move git's answer on this machine. The
+  # module's own invocation is this command plus `cleared_git_env/0`.
+  defp raw_rev_parse(cd) do
+    {out, 0} = System.cmd("sh", ["-c", @rev_parse_sh], cd: cd)
+    String.split(out, "\n", trim: true)
   end
 
   # The literal value of a module attribute in `config/worktree_partition.exs`, read out of
