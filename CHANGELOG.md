@@ -33,6 +33,21 @@ All notable changes to loopctl are documented here.
   rather than a silent fallback to the default. `PATCH /api/v1/intake/sources/:id` still
   corrects a source that is already pointed at the wrong trunk.
 
+  **It must be a valid git branch name, and that is a SECURITY constraint rather than a
+  nicety.** The column is handed to git on the runner: the placement path already judged it
+  (`DispatchPayload.fill/3` validates ref fields a second time, after filling them from the
+  intake source), but `Loopctl.Delivery.TriageDispatcher` builds its own payload and puts this
+  value in as BOTH `branch` and `base_branch` without going through it — so a length-only check
+  let `--upload-pack=/bin/sh` enrol at 22 characters and reach git the first time an issue
+  arrived on that repository. Enrolment and repoint now both refuse a value that is not a git
+  ref name, using the same predicate the dispatch path uses (`Loopctl.GitRef.valid_name?/1`,
+  which is where that rule now lives rather than being copied), and the triage dispatcher
+  refuses to push a source whose stored branch does not satisfy it — which is what covers a row
+  written before this. **Operator-visible:** a value like `feature branch` or `a..b` that was
+  previously accepted at `PATCH /api/v1/intake/sources/:id` is now a 422 naming `base_branch`;
+  such a row already refused every `place_dispatch` for that project, silently, from the moment
+  it was written.
+
 - **A runner declares the branch prefixes it accepts, and loopctl derives a conforming branch
   (#846.2, runner contract 1.14.0). RE-VENDOR to send the field.** loopctl derived
   `feature/story-<n>-<id>`; the `minis` runner's config accepts `loop/` alone and refuses anything

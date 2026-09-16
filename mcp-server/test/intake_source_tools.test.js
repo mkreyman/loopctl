@@ -912,14 +912,37 @@ describe("the descriptions carry what a caller needs instead of the controller",
     }
   });
 
-  test("intake_source_enroll says a new source starts at master and cannot be given a branch", () => {
-    // The endpoint's create path builds its attrs from three params and `base_branch` is not
-    // one of them (`intake_source_controller.ex:211-215`), so the column takes its `master`
-    // default. On a `main` repository that is a dispatch cut from a branch that does not
-    // exist, and the second call is the only fix.
+  test("intake_source_enroll says base_branch is named HERE and defaults to master", () => {
+    // THIS TEST ASSERTED THE OPPOSITE UNTIL #874 ROUND 2. It was named "a new source starts at
+    // master and cannot be given a branch" and its comment cited the create path building its
+    // attrs from three params — true until that same PR added `base_branch` to it. The
+    // assertions were loose enough to keep passing against the rewritten description, so
+    // nothing went red and a later reader would have taken the name as the behaviour.
+    //
+    // What is asserted now is what a caller must know at the moment it enrols: the parameter
+    // exists, omitting it yields `master`, and a `main` repository has to say so.
     for (const text of [description("intake_source_enroll"), row("intake_source_enroll")]) {
-      assert.match(text, /master/);
-      assert.match(text, /intake_source_update/);
+      assert.match(text, /base_branch/, "it never names the parameter");
+      assert.match(text, /master/, "it never says what omitting it yields");
+      assert.match(text, /main/, "it never names the case that needs it");
+      assert.ok(
+        !/(always starts|cannot be given|no parameter for it|has no way to name)/i.test(text),
+        "it still claims enrolment cannot name a branch",
+      );
+    }
+  });
+
+  test("intake_source_update is described as the CORRECTION, not as the only way to set a branch", () => {
+    // The other half of the same residue: while enrolment could not name a branch, this tool
+    // was "the second half of enrolling any repository whose trunk is main". It is now the
+    // remedy for a source already pointed at the wrong trunk, and saying otherwise sends a
+    // caller to make two calls where one does.
+    for (const text of [description("intake_source_update"), row("intake_source_update")]) {
+      assert.match(text, /base_branch/);
+      assert.ok(
+        !/(always starts|enrolment always|second half of enrolling)/i.test(text),
+        "it still says enrolment cannot name the branch",
+      );
     }
   });
 

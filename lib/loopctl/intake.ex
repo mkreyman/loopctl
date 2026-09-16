@@ -409,11 +409,15 @@ defmodule Loopctl.Intake do
   # as an absent value, so an empty branch was dropped from the changeset and the source kept
   # its old one while the caller got a 200 — a silent no-op for a request that was plainly
   # wrong. A caller that SENT a value gets an answer about the value it sent.
+  #
+  # The VALIDATION is `Source.validate_base_branch/1`, the same function `create_changeset/2`
+  # runs, so enrolment and repoint cannot disagree about what a usable branch is — and neither
+  # of them restates the ref-name rule, which lives in `Loopctl.GitRef` (#874 round 2,
+  # finding 1). Two paths write this column and it is handed to git.
   defp cast_base_branch(changeset, value) do
     changeset
     |> Ecto.Changeset.cast(%{base_branch: value}, [:base_branch], empty_values: [])
-    |> Ecto.Changeset.validate_required([:base_branch])
-    |> Ecto.Changeset.validate_length(:base_branch, min: 1, max: 255)
+    |> Source.validate_base_branch()
   end
 
   # ONE transaction for the row and BOTH chain entries: a rebase recorded without its repoint,

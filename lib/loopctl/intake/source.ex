@@ -27,6 +27,8 @@ defmodule Loopctl.Intake.Source do
 
   use Loopctl.Schema
 
+  alias Loopctl.GitRef
+
   @type t :: %__MODULE__{}
 
   # GitHub owner: alphanumeric or hyphen, starting alphanumeric, at most 39. Repository:
@@ -92,8 +94,8 @@ defmodule Loopctl.Intake.Source do
     # stands and `validate_required/2` below is satisfied by it. That is what keeps an
     # enrolment that names no branch working exactly as it did before the field was offered.
     |> cast(attrs, [:base_branch], empty_values: [])
-    |> validate_required([:repo_full_name, :base_branch])
-    |> validate_length(:base_branch, min: 1, max: 255)
+    |> validate_required([:repo_full_name])
+    |> validate_base_branch()
     |> validate_format(:repo_full_name, @repo_format, message: "must be owner/name")
     |> check_constraint(:repo_full_name, name: :intake_sources_repo_shape)
     |> unique_constraint(:repo_full_name,
@@ -101,6 +103,37 @@ defmodule Loopctl.Intake.Source do
       message: "an active intake source already binds this repository"
     )
     |> foreign_key_constraint(:project_id)
+  end
+
+  @doc """
+  Everything `base_branch` must satisfy, in ONE place, for every path that writes it.
+
+  THE SHAPE CHECK IS THE HALF THAT WAS MISSING, and it is a security check rather than a
+  nicety (#874 review round 2, finding 1). The column is handed to git: `Loopctl.Delivery`'s
+  placement path judges it again in `DispatchPayload.fill/3`, but
+  `Loopctl.Delivery.TriageDispatcher` builds its own payload and puts this value in as BOTH
+  `branch` and `base_branch`, so a length check alone let `--upload-pack=/bin/sh` enrol at 22
+  characters and reach git on a dev machine the first time an issue arrived. The predicate is
+  `Loopctl.GitRef.valid_name?/1` — the SAME function that path calls, not a copy of it, so the
+  two cannot drift and leave the weaker one facing the caller.
+
+  The benign half is why this belongs at the WRITE and not only at the read: `feature branch`
+  or `a..b` would enrol happily and then refuse every `place_dispatch` for that project for
+  ever, with no signal at the point the value was written.
+
+  Length is bounded here rather than in `GitRef` because 1..255 is this COLUMN's own fact —
+  `varchar(255)` plus `intake_sources_base_branch_shape`.
+  """
+  @spec validate_base_branch(Ecto.Changeset.t()) :: Ecto.Changeset.t()
+  def validate_base_branch(%Ecto.Changeset{} = changeset) do
+    changeset
+    |> validate_required([:base_branch])
+    |> validate_length(:base_branch, min: 1, max: 255)
+    |> validate_change(:base_branch, fn :base_branch, value ->
+      if GitRef.valid_name?(value),
+        do: [],
+        else: [base_branch: {GitRef.refusal_message(), [validation: :git_ref_name]}]
+    end)
   end
 
   @doc "Changeset that revokes a source."

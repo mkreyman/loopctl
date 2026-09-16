@@ -32,7 +32,15 @@ defmodule LoopctlWeb.IntakeSourceController do
 
   @source_schema %Schema{
     type: :object,
-    required: [:id, :project_id, :repo_full_name, :target_epic_id, :revoked_at, :inserted_at],
+    required: [
+      :id,
+      :project_id,
+      :repo_full_name,
+      :base_branch,
+      :target_epic_id,
+      :revoked_at,
+      :inserted_at
+    ],
     properties: %{
       id: %Schema{type: :string, format: :uuid},
       project_id: %Schema{type: :string, format: :uuid},
@@ -46,6 +54,18 @@ defmodule LoopctlWeb.IntakeSourceController do
             "ESCALATED to a human rather than landing in an epic chosen for it."
       },
       repo_full_name: %Schema{type: :string, pattern: Source.repo_format().source},
+      # EVERY RESPONSE CARRIES IT — `Source`'s `@derive {Jason.Encoder, only: [...]}` includes
+      # it, so create, index, update and delete all serialise it — and it was missing here, so
+      # a client generated from `GET /api/v1/openapi` got a source type without the one field
+      # the README and `intake_source_list` tell a caller to check before placing work.
+      base_branch: %Schema{
+        type: :string,
+        minLength: 1,
+        maxLength: 255,
+        description:
+          "The branch every dispatch for this repository is cut FROM. `master` unless the " <>
+            "source named or was repointed to another."
+      },
       revoked_at: %Schema{type: :string, format: :"date-time", nullable: true},
       inserted_at: %Schema{type: :string, format: :"date-time"},
       updated_at: %Schema{type: :string, format: :"date-time"}
@@ -99,7 +119,11 @@ defmodule LoopctlWeb.IntakeSourceController do
                  "work against a branch that does not exist. NOT nullable, unlike " <>
                  "`target_epic_id`: there is no unanswered state for a branch a dispatch " <>
                  "must name, so an explicit null or an empty string is a 422 rather than a " <>
-                 "silent fallback to the default. Changed afterwards with PATCH."
+                 "silent fallback to the default. It must also be a valid GIT BRANCH NAME " <>
+                 "— letters, digits, `.`, `_`, `-` and `/` only, starting with a letter or " <>
+                 "digit, no `..` — judged by the same predicate `place_dispatch` applies to " <>
+                 "a ref field, because this value is handed to git on the runner. Changed " <>
+                 "afterwards with PATCH."
            }
          }
        }},
@@ -197,7 +221,9 @@ defmodule LoopctlWeb.IntakeSourceController do
                  "places work against a branch that does not exist. OPTIONAL and NOT " <>
                  "nullable, unlike `target_epic_id`: omitting it leaves the current value " <>
                  "(there is no unanswered state for a branch a dispatch must name), and an " <>
-                 "explicit null is a 422."
+                 "explicit null is a 422. It must be a valid GIT BRANCH NAME, judged by the " <>
+                 "same predicate as at enrolment and on `place_dispatch`: this value is " <>
+                 "handed to git on the runner."
            }
          }
        }},

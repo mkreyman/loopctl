@@ -52,10 +52,15 @@
  * What is not the same is the fallback when no id was proved. `enrollRunner` scrapes the
  * runner id out of an unparseable 2xx body, because a runner found by NAME alone might be an
  * earlier, legitimate enrollment. An intake source needs no such scraping:
- * `intake_sources_active_repo_uidx` is unique on `(tenant_id, repo_full_name)` WHERE
- * `revoked_at IS NULL`, so at most one ACTIVE source ever binds a repository and
- * `intake_source_list` identifies it exactly — so that branch names the pair of tools rather
- * than guessing at an id.
+ * `intake_sources_active_repo_uidx` is unique on `(tenant_id, lower(repo_full_name))` WHERE
+ * `revoked_at IS NULL` — CASE-INSENSITIVELY, because GitHub names are — so at most one ACTIVE
+ * source ever binds a repository however it was spelled, and `intake_source_list` identifies
+ * it exactly. That branch therefore names the pair of tools rather than guessing at an id.
+ *
+ * MATCH THAT LISTING CASE-INSENSITIVELY. The uniqueness folds case; the STORED value does not
+ * — the row keeps the spelling it was enrolled with — so a source enrolled as
+ * `MKREYMAN/loopctl` refuses a re-enrolment of `mkreyman/loopctl` with a 422 while a reader
+ * comparing the two exactly concludes there is nothing to revoke.
  *
  * A source whose secret nobody holds is also INERT rather than dangerous: no delivery can
  * ever be signed for it, so every POST to its URL is refused `401 invalid_signature`. What it
@@ -384,7 +389,10 @@ async function ambiguousEnrollment(result, apiCall, sourceId, repoFullName, secr
       `A source for '${repoFullName}' may exist with a secret nobody holds — it can never ` +
       "authenticate a delivery, and it holds that repository's unique slot, so a second " +
       "enrolment is refused 422 until it is gone. Run intake_source_list, and revoke any " +
-      `active source for '${repoFullName}' with intake_source_revoke before enrolling again.`;
+      `active source whose repo_full_name equals '${repoFullName}' IGNORING CASE with ` +
+      "intake_source_revoke before enrolling again — the uniqueness is case-insensitive " +
+      "(`lower(repo_full_name)`) while the stored value keeps whatever spelling it was " +
+      "enrolled with, so an exact match can miss the row that is blocking you.";
   }
 
   return {
@@ -413,9 +421,11 @@ export async function listIntakeSources({ include_revoked } = {}, { userKey, api
  * `PATCH /api/v1/intake/sources/:id` — set the epic triaged stories land in, and/or the
  * branch dispatches for this repository are cut from.
  *
- * PRESENCE DECIDES, on both fields, and the controller reads it with `Map.fetch/2`
- * (`intake_source_controller.ex:243-247`): a field you do not send is left exactly as it was.
- * So `undefined` here means "not named" and is omitted from the body.
+ * PRESENCE DECIDES, on both fields, and the controller reads it with `Map.fetch/2` — see
+ * `LoopctlWeb.IntakeSourceController.update/2` and its `put_if_present/4`: a field you do not
+ * send is left exactly as it was. So `undefined` here means "not named" and is omitted from
+ * the body. (Named by FUNCTION, not by line range: the range this cited rotted inside one PR,
+ * when that same PR added `base_branch` to `create/2` above it.)
  *
  * `target_epic_id: null` IS FORWARDED, because null is the endpoint's only way to clear the
  * target and clearing it is a real operation — a source that names no epic escalates every

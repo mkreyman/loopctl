@@ -61,6 +61,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriagePayload
+  alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
@@ -255,6 +256,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
     with {:ok, story} <- fetch_story(tenant_id, story_id),
          {:ok, record} <- Intake.get_record(tenant_id, story.intake_record_id),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
+         :ok <- usable_base_branch(source),
          {:ok, triage} <- TriagePayload.build(record),
          %Runner{} = runner <-
            available_runner(tenant_id, source.repo_full_name) || {:error, :no_runner} do
@@ -263,6 +265,24 @@ defmodule Loopctl.Delivery.TriageDispatcher do
       {:error, reason} -> {:error, reason}
       nil -> {:error, :no_runner}
     end
+  end
+
+  # THE SECOND HALF OF #874 ROUND 2 FINDING 1, and the half that covers rows written before it.
+  # `Source.validate_base_branch/1` now refuses a value that is not a git ref name at the WRITE,
+  # but a row enrolled or repointed earlier was checked only for length — and this module is
+  # the one dispatch path that never goes through `DispatchPayload.fill/3`, whose second
+  # `validate_refs/2` call is what judges a value the intake source supplied. `dispatch/4`
+  # below puts `source.base_branch` in as BOTH `branch` and `base_branch`, so without this the
+  # legacy row reaches git on a dev machine.
+  #
+  # It lands on `blocked/2` — "BLOCKED until somebody changes something" — which is exactly
+  # what this is: an operator has to repoint the source, and no later pass can change it. The
+  # reason is a bare atom so the value is not echoed into the log; the story id names the row
+  # to go and look at.
+  defp usable_base_branch(%{base_branch: branch}) do
+    if GitRef.valid_name?(branch) and byte_size(branch) <= 255,
+      do: :ok,
+      else: {:error, :invalid_base_branch}
   end
 
   # The same reader the push itself uses, applied BEFORE the ledger row is written: a refusal
