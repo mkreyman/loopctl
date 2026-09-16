@@ -15,19 +15,35 @@ All notable changes to loopctl are documented here.
   refused dispatch costs the story's claim and parks it. Every join now copies the declaration into
   the held row.
 
-  **Operator-visible:** the `max_sessions` you pass to `POST /api/v1/runners` (and to the
-  `runner_enroll` MCP tool) SEEDS the row and no longer caps it. A machine enrolled at 8 that
-  declares 1 is held at 1 from its first connect. To change a machine's capacity, change
-  `control.max_sessions` in the runner's own `runner.json` and reconnect it; re-enrolling will not
-  do it. `runner_pool`'s `reported_max_sessions` and `max_sessions` now agree for any runner that
-  has connected since, and a disagreement means one of three things: it has not reconnected, it
-  declared a value outside 1..64 (held clamped into that range — `0` becomes `1`, and `draining` is
-  how a machine asks for no work), or it still holds more sessions than it now declares, in which
-  case it is sent nothing further until those drain.
+  **The enrolled value remains a CEILING.** The held capacity is the LESSER of what the machine
+  declares and what it was enrolled with, so a machine may always take itself DOWN and can never
+  raise itself up. Without that bound a compromised or misconfigured runner could declare 64 and
+  absorb the tenant's whole admission budget, one dispatch of story content and one freshly minted
+  ephemeral key at a time — something it could not do before capacity followed the declaration at
+  all.
 
-  **Runners must RE-VENDOR `priv/runner_contract/v1.json`.** Nothing changed on the wire and no
-  runner has to send anything new; a copy taken at 1.12.0 states that this field is advisory, which
-  is now false.
+  **Operator-visible:** the `max_sessions` you pass to `POST /api/v1/runners` (and to the
+  `runner_enroll` MCP tool) is that ceiling, and the value the row starts at. A machine enrolled at
+  8 that declares 1 is held at 1 from its first connect; one enrolled at 2 that declares 8 stays at
+  2. To make a machine carry FEWER sessions, change `control.max_sessions` in the runner's own
+  `runner.json` and reconnect it — no API call is needed. To let it carry MORE than its grant,
+  re-enrol it: there is no endpoint that widens the ceiling in place, deliberately.
+  `GET /api/v1/runners` and `GET /api/v1/runners/pool` now both return `enrolled_max_sessions`
+  alongside `max_sessions`, so a machine held below what it declares is explicable from one read —
+  it has not reconnected, it declared outside 1..64 (held clamped — `0` becomes `1`), it still
+  holds more sessions than it now declares, or it is declaring above its ceiling.
+
+  **A machine declaring `draining` or `max_sessions: 0` is now refused a PLACEMENT** with
+  `409 runner_declines_work`, before the story is claimed. Both were previously honoured only by
+  the unattended selectors, so `POST /api/v1/runners/:runner_id/dispatches` claimed the story and
+  let the runner refuse the push afterwards — leaving it at `claimed` with no session until its
+  lease expired. A dispatch an operator pushes at a machine by name is still delivered for the
+  runner to refuse, because that path claims nothing.
+
+  **Re-vendoring `priv/runner_contract/v1.json` is worth doing and is not required.** Nothing
+  changed on the wire and no runner has to send anything new; a copy taken at 1.12.0 describes
+  this field as advisory, which is now wrong, and one taken mid-1.13.0 does not mention the
+  ceiling.
 
 - **Three more of loopctl's own surface becomes reachable, and a session can tell a MISSING tool
   from a STALE one (#846.5, #846.6, #846.7).** No endpoint changed; these are the tools the rule

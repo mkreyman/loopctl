@@ -186,14 +186,20 @@ defmodule LoopctlWeb.RunnerChannel do
   def handle_info(:after_join, socket) do
     %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
 
-    # WHAT THE MACHINE DECLARED BECOMES WHAT LOOPCTL RESERVES AGAINST, and it happens HERE,
-    # before `Presence.track/4`. A dispatch needs a single live socket in the pool
-    # (`Runners.dispatch/3`), so until the track below there is no way to place one — which
-    # makes this the last moment at which the capacity can be replaced with nobody reserving
-    # against the old number. It never refuses the join and never raises; see
-    # `Runners.apply_declaration/3` for why the runner's number wins and why nothing about it
-    # reaches the audit chain.
-    :ok = Runners.apply_declaration(tenant_id, runner, meta)
+    # WHAT THE MACHINE DECLARED BECOMES WHAT LOOPCTL RESERVES AGAINST — bounded by what it was
+    # ENROLLED with — and it happens HERE, before `Presence.track/4`. A dispatch needs a single
+    # live socket in the pool (`Runners.dispatch/3`), so until the track below there is no way
+    # to place one on THIS socket. It never refuses the join and never raises; see
+    # `Runners.apply_declaration/3` for why the machine's number wins downward, why the
+    # enrolled one is a ceiling, and why nothing about it reaches the audit chain.
+    #
+    # A FAILED write is REMEMBERED, not lost. The realistic failure is `:capacity_busy` — the
+    # `runners` row's lock timeout running out against the row every dispatch in the tenant
+    # contends on, i.e. exactly the load under which being dispatchable against a stale larger
+    # number does the most harm — and nothing else reconciles it, since the heal sweep
+    # recomputes `in_flight` and never `max_sessions`. So it is re-armed on the `:recheck`
+    # timer below, which this socket already runs every 30 seconds.
+    socket = assign(socket, :declaration_pending, apply_declaration(tenant_id, runner, meta))
 
     {:ok, ref} =
       Presence.track(
@@ -247,7 +253,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
     if Runners.authorized?(tenant_id, runner.id) do
       schedule_recheck()
-      {:noreply, socket}
+      {:noreply, retry_declaration(socket)}
     else
       disconnect(socket, :no_longer_authorized)
     end
@@ -899,6 +905,27 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   defp schedule_recheck, do: Process.send_after(self(), :recheck, @recheck_interval_ms)
+
+  # `true` while the declaration this connection carried has NOT reached the row. The socket's
+  # `:meta` is the right thing to re-apply: capacity arrives once per connection and a
+  # `RunnerStatus` event can never carry it (`max_sessions` is not among its fields), so the
+  # value here is still the one this machine declared on join.
+  defp apply_declaration(tenant_id, runner, meta) do
+    Runners.apply_declaration(tenant_id, runner, meta) != :ok
+  end
+
+  # The retry runs AFTER `Presence.track/4`, so it does not have `:after_join`'s ordering
+  # argument and does not need it: a lowering applied while the machine is dispatchable is
+  # clamped by `Capacity.apply_declared/4` and converges, because every release RECOUNTS
+  # rather than decrementing. Staying over-dispatched until the machine happens to reconnect
+  # is the worse of the two, and it was the behaviour before this.
+  defp retry_declaration(%{assigns: %{declaration_pending: true}} = socket) do
+    %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
+
+    assign(socket, :declaration_pending, apply_declaration(tenant_id, runner, meta))
+  end
+
+  defp retry_declaration(socket), do: socket
 
   # Disconnecting the SOCKET (not just stopping this channel) keeps a revoked runner from
   # simply rejoining the topic on the connection it already has.

@@ -1364,6 +1364,25 @@ defmodule Loopctl.Delivery.PlacementTest do
   # the story object loopctl built" rather than echoed from here.
   defp dispatch_payload(story), do: build(:runner_dispatch, %{"story_id" => story.id})
 
+  # The runner drops its socket and joins again declaring `overrides`. A capacity or draining
+  # declaration is per-CONNECTION, so this is the only way to change one.
+  defp rejoin(ctx, overrides) do
+    %{runner: runner, channel: channel, runner_key: raw} = ctx
+    disconnect(channel, runner)
+
+    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
+
+    {:ok, _reply, channel} =
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        Map.merge(join_payload("minis"), overrides)
+      )
+
+    _ = :sys.get_state(channel.channel_pid)
+    channel
+  end
+
   # The criteria as `ImplementerInput.story_object/2` renders them — the one derivation, so
   # this asserts the object came from the story rather than re-implementing the builder here.
   defp expected_criteria(story) do
@@ -1614,5 +1633,52 @@ defmodule Loopctl.Delivery.PlacementTest do
       "in_flight" => 0,
       "draining" => false
     }
+  end
+
+  describe "a machine that declares it takes no work" do
+    # #846.4 review findings 3 and 8. The contract tells runner authors that a machine wanting
+    # no work declares `draining`, and that a `max_sessions` of 0 says the same thing. Until
+    # these tests both statements were honoured only by the unattended SELECTORS
+    # (`Runners.accepts?/5`): a placement naming the runner reached neither, so the contract's
+    # advice was unactionable on the one path that CLAIMS THE STORY BEFORE IT PUSHES.
+    test "draining is refused before anything is claimed", ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"draining" => true})
+
+      assert {:error, :runner_declines_work} = place(ctx, dispatch_payload(story))
+
+      # NOTHING WAS SPENT. Refused before the mint and the claim, so there is no compensation
+      # to get right: the story is still queued and no session dispatch exists.
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
+    test "a declared max_sessions of 0 is refused too, though the column holds 1", ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"max_sessions" => 0})
+
+      # The column is 1..64, so `declared_max_sessions/1` holds the 0 as a 1 (proved in
+      # `Loopctl.Runners.CapacityTest`, where every write is unboxed and therefore visible).
+      # Without the meta being read at the DECISION, that clamp puts exactly ONE dispatch on a
+      # machine that said it accepts none — which is what this refusal prevents.
+      assert {:error, :runner_declines_work} = place(ctx, dispatch_payload(story))
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
+    test "a machine declaring neither is placed on as before", ctx do
+      %{story: story} = ctx
+
+      # Declaring the number the row ALREADY holds, deliberately: a rejoin that MOVES capacity
+      # writes on the channel's sandbox connection, whose transaction never commits, so the
+      # `runners` row stays locked for the rest of the test and the placement below would time
+      # out at `:capacity_busy` on the lock rather than on anything this test is about.
+      rejoin(ctx, %{"draining" => false, "max_sessions" => 2})
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+    end
   end
 end

@@ -17,13 +17,16 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   and the refusal cost the story's claim. Every join now copies the declaration into the held
   row.
 
-  For a session reading these tools that means two things. The `max_sessions` you pass to
-  `runner_enroll` SEEDS the row and no longer caps it: to change a machine's capacity, change
-  `control.max_sessions` in the runner's own config and reconnect it. And in `runner_pool`,
-  `reported_max_sessions` is no longer a hint — it is what `max_sessions` is copied from, so the
-  two agreeing is the normal state and a disagreement means the runner has not reconnected
-  since, declared a value outside 1..64 (held clamped into it, `0` becoming `1`), or is still
-  holding more sessions than it now declares.
+  For a session reading these tools that means three things. The `max_sessions` you pass to
+  `runner_enroll` is a CEILING and the value the row starts at: held capacity is the lesser of it
+  and what the machine declares, so a machine can take itself down and cannot raise itself up. To
+  make one carry fewer sessions, change `control.max_sessions` in the runner's own config and
+  reconnect it; to let it carry more than its grant, re-enrol it. In `runner_pool`,
+  `reported_max_sessions` is no longer a hint — it is what `max_sessions` is copied from, capped at
+  the new `enrolled_max_sessions` field, which is what tells "declaring above its ceiling" apart
+  from "has not reconnected", "declared outside 1..64" and "still holding more than it declares".
+  And `place_dispatch` now answers `409 runner_declines_work` for a machine declaring `draining` or
+  a `max_sessions` of 0, refused before the story is claimed.
 
 ## 2.99.0 — 2026-09-16 (a filed story can be corrected, and a session can tell stale from missing)
 

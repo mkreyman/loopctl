@@ -221,6 +221,7 @@ defmodule Loopctl.Delivery.Placement do
           | :tenant_halted
           | :not_authorized
           | :runner_not_provisioned
+          | :runner_declines_work
           | :invalid_transition
           | :wrong_stage
           | :busy
@@ -294,6 +295,9 @@ defmodule Loopctl.Delivery.Placement do
   - `:runner_not_provisioned` — a runner row with no `agent_id`, which the
     `add_agent_id_to_runners` migration makes unreachable and this refuses rather than
     claiming a story for nobody
+  - `:runner_declines_work` — the machine's live socket declares `draining`, or a
+    `max_sessions` of `0`. Refused BEFORE the claim: the runner would refuse the push itself,
+    but only after the story had been claimed for it
   - `:not_found`, `:invalid_transition`, `:wrong_stage` — from the pre-mint readiness check.
     A story that passes the check and is claimed by someone else in between instead gets
     `Loopctl.Progress.claim_story/3`'s own richer `{:invalid_transition, map()}`, and the
@@ -329,7 +333,8 @@ defmodule Loopctl.Delivery.Placement do
          {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
          :ok <- not_halted(tenant_id),
          :ok <- Tenants.require_human_anchor(tenant_id),
-         :ok <- may_mint_session_dispatch(caller.lineage, caller.role) do
+         :ok <- may_mint_session_dispatch(caller.lineage, caller.role),
+         :ok <- runner_accepting_work(tenant_id, runner_id) do
       case DispatchLedger.get_record(tenant_id, dispatch_id) do
         nil -> claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts)
         record -> resume(tenant_id, runner_id, dispatch, record)
@@ -368,6 +373,33 @@ defmodule Loopctl.Delivery.Placement do
   end
 
   defp resolve_caller(_tenant_id, _api_key), do: {:error, :not_authorized}
+
+  # A MACHINE THAT SAID IT TAKES NO WORK IS REFUSED BEFORE THE CLAIM (#846.4 review finding 3
+  # and finding 8). The contract tells runner authors that a machine wanting no work declares
+  # `draining` (or `max_sessions: 0`, which is the same statement), and until now that was
+  # honoured only by the unattended SELECTORS — `Loopctl.Delivery.DispatchDriver` and
+  # `TriageDispatcher` skip such a runner via `Runners.accepts?/5`. A placement naming the
+  # runner outright reached neither, and `Runners.do_dispatch/3` checks halt, authorization,
+  # single-live-socket and kind and never `draining`. So the contract's own advice was
+  # unactionable on this path, which is the path that CLAIMS THE STORY BEFORE IT PUSHES: the
+  # runner would refuse with `draining` after the claim committed, and the story would sit at
+  # `claimed` with no session until its lease expired.
+  #
+  # Checked HERE, before the mint and the claim, for the same reason `claimable/2` is: nothing
+  # is spent on an outcome that was never going to succeed, and there is no compensation to
+  # get right. It reads the ONE live meta a push would reach; zero sockets or an ambiguous
+  # pair are left to `Runners.dispatch/3`, which already answers `:runner_not_connected` and
+  # `:runner_ambiguous` and is the single place that judgement is made.
+  #
+  # `dispatch/3` itself is deliberately NOT changed. It claims nothing, so an operator pushing
+  # at a draining machine gets the runner's own refusal and a person reads it — which is the
+  # trade `accepts?/5` documents.
+  defp runner_accepting_work(tenant_id, runner_id) do
+    case Runners.live_metas(tenant_id, runner_id) do
+      [meta] -> if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
+      _other -> :ok
+    end
+  end
 
   # THE L6 HALT, applied here for the same reason the tier gate is: `CheckCustodyHalt` is a
   # PIPELINE plug, and this path has no `conn`. Both endpoints that do what a placement does —

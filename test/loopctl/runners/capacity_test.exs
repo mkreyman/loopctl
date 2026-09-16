@@ -60,6 +60,7 @@ defmodule Loopctl.Runners.CapacityTest do
           where: r.id == ^runner.id,
           select: %{
             max_sessions: r.max_sessions,
+            enrolled_max_sessions: r.enrolled_max_sessions,
             in_flight: r.in_flight,
             updated_at: r.updated_at
           }
@@ -262,11 +263,23 @@ defmodule Loopctl.Runners.CapacityTest do
       assert in_flight(runner) == 0
     end
 
-    test "another tenant's runner cannot be reserved by id" do
+    test "another tenant's runner cannot be reserved by id, at either layer" do
       runner = runner(%{max_sessions: 3})
       other = runner(%{max_sessions: 3})
 
+      # RLS refuses it on the app role...
       assert unboxed(fn -> Runners.reserve_slot(other.tenant_id, runner.id) end) ==
+               {:error, :runner_at_capacity}
+
+      assert in_flight(runner) == 0
+
+      # ...and `reserve/3`'s explicit `tenant_id` predicate refuses it again on the BYPASSRLS
+      # repo, which is the only layer where that second predicate is observable at all. Without
+      # this call the test passes with the predicate DELETED, since `with_tenant/2` has already
+      # set the RLS context and the policy filtered the row — a defence-in-depth claim nothing
+      # proved (#846.4 review finding 9, mutation-checked, the same shape as the
+      # `apply_declared/4` case below).
+      assert unboxed(fn -> Capacity.reserve(AdminRepo, other.tenant_id, runner.id) end) ==
                {:error, :runner_at_capacity}
 
       assert in_flight(runner) == 0
@@ -274,15 +287,49 @@ defmodule Loopctl.Runners.CapacityTest do
   end
 
   describe "apply_declared/4" do
-    test "raises the held capacity to what the machine declared, and the slots follow at once" do
-      runner = runner(%{max_sessions: 1})
+    test "raises the held capacity back up to what the machine declares, and the slots follow at once" do
+      runner = runner(%{max_sessions: 3})
+
+      # The machine took itself down to one on an earlier connection...
+      assert {:ok, %{max_sessions: 1, in_flight: 0}} = apply_declared(runner, 1)
       assert {:ok, 1} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
 
       assert unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
                {:error, :runner_at_capacity}
 
+      # ...and puts itself back up, which is allowed because 3 is what it was ENROLLED with.
       assert {:ok, %{max_sessions: 3, in_flight: 1}} = apply_declared(runner, 3)
       assert {:ok, 2} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
+    end
+
+    test "a declaration ABOVE what the machine was enrolled with is held at the enrolled ceiling" do
+      runner = runner(%{max_sessions: 2})
+
+      # A machine may lower itself freely...
+      assert {:ok, %{max_sessions: 1}} = apply_declared(runner, 1)
+
+      # ...and may not raise itself past the operator's grant. Without the ceiling this writes
+      # 64, and the runner has just enlarged its own share of the tenant's admission budget.
+      assert {:ok, %{max_sessions: 2}} = apply_declared(runner, 64)
+      assert held(runner).max_sessions == 2
+      assert held(runner).enrolled_max_sessions == 2
+
+      # And the slots follow the CEILING, not the declaration.
+      assert {:ok, 1} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
+      assert {:ok, 2} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
+
+      assert unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
+               {:error, :runner_at_capacity}
+    end
+
+    test "re-declaring above the ceiling while already held there writes nothing at all" do
+      runner = runner(%{max_sessions: 2})
+      before = held(runner)
+
+      # The predicate compares what would be WRITTEN, not the raw declaration, so a machine
+      # that declares 8 on every reconnect does not take the runner row's lock every time.
+      assert apply_declared(runner, 8) == :unchanged
+      assert held(runner) == before
     end
 
     test "lowering it under the machine's live slots clamps in_flight, releases nothing, and stops new work" do
@@ -305,6 +352,38 @@ defmodule Loopctl.Runners.CapacityTest do
 
       assert unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
                {:error, :runner_at_capacity}
+    end
+
+    test "after the clamp, releasing ONE of the machine's live sessions frees NO slot" do
+      runner = runner(%{max_sessions: 2})
+      [first, second] = for _ <- 1..2, do: dispatch(runner.tenant_id)
+      for d <- [first, second], do: assert({:ok, _} = send_dispatch(runner, d))
+
+      assert in_flight(runner) == 2
+      assert unreleased(runner) == 2
+
+      # The machine rejoins declaring one while still running two. The clamp is the only
+      # representable write (`runners_in_flight_range`), and it leaves the row deliberately
+      # BELOW its own unreleased count — the one place the module's invariant is false.
+      assert {:ok, %{max_sessions: 1, in_flight: 1}} = apply_declared(runner, 1)
+      assert unreleased(runner) == 2
+
+      # THE DEFECT THIS TEST EXISTS FOR IS ONE STEP PAST THE CLAMP. The first session ends.
+      # A release that DECREMENTED wrote in_flight 0 here while the second session was still
+      # running, and the reserve below then succeeded — putting two concurrent dispatches on a
+      # machine that declares one, which is the over-dispatch this whole path removes.
+      assert release(runner, first.dispatch_id) == {:ok, :released}
+      assert unreleased(runner) == 1
+      assert in_flight(runner) == 1
+
+      assert unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
+               {:error, :runner_at_capacity}
+
+      # Only when the machine is genuinely under its declared capacity does a slot come back.
+      assert release(runner, second.dispatch_id) == {:ok, :released}
+      assert unreleased(runner) == 0
+      assert in_flight(runner) == 0
+      assert {:ok, 1} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
     end
 
     test "a declaration equal to the held capacity writes nothing at all" do

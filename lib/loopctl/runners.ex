@@ -148,11 +148,17 @@ defmodule Loopctl.Runners do
   Enrolls a machine as a runner: mints its `:agent` API key, gets or creates the
   `runner:<name>` agent its sessions work as, and binds both to `name` in one transaction,
   then records the enrollment on the audit chain. `max_sessions` (1..64, default
-  `Runner.default_max_sessions/0`) is how many slots loopctl will reserve on it UNTIL THE
-  MACHINE FIRST JOINS, and no longer: since contract 1.13.0 every join re-applies the
-  machine's own declaration (`apply_declaration/3`), so this attribute seeds the row and is
-  not a ceiling on it. An operator who wants a machine to carry fewer sessions changes the
-  runner's own `control.max_sessions`, not this.
+  `Runner.default_max_sessions/0`) is the CEILING on how many slots loopctl will ever reserve
+  on this machine, and the value it starts at. Since contract 1.13.0 every join re-applies the
+  machine's own declaration (`apply_declaration/3`), bounded by this: the held capacity is
+  `LEAST(declared, enrolled)`, so a machine may always lower itself below its grant and never
+  raise itself above it.
+
+  Which means an operator has two controls and they do different things. To make a machine
+  carry FEWER sessions, change its own `control.max_sessions` and reconnect it — the machine
+  owns that fact and no operator write is needed. To let it carry MORE than its grant,
+  re-enrol it: nothing raises `enrolled_max_sessions` on a live row, deliberately, because an
+  endpoint that widens a security bound wants its own change.
 
   The agent is GOT or created, never created blindly: `runners_active_name_uidx` is partial on
   `revoked_at IS NULL`, so re-enrolling a revoked machine makes a second runner row for the
@@ -756,20 +762,32 @@ defmodule Loopctl.Runners do
   @doc """
   The capacity of a tenant's active runners as Postgres holds it — the values every
   reservation is decided against, not the ones runners report in Presence: runner id to
-  `%{in_flight, max_sessions}`.
+  `%{in_flight, max_sessions, enrolled_max_sessions}`.
 
-  `max_sessions` here is the machine's own declaration, copied in at its last join
-  (`apply_declaration/3`), so it matches `reported_max_sessions` on the pool for any runner
-  that has connected since contract 1.13.0. `in_flight` is loopctl's count of slots handed
-  out and is never the runner's.
+  `max_sessions` here is the machine's own declaration CAPPED at `enrolled_max_sessions`,
+  written at its last join (`apply_declaration/3`), so it matches `reported_max_sessions` on
+  the pool for any runner that has connected since contract 1.13.0 and declares at or below
+  its grant. Both are returned so an operator can tell a machine held down by its own
+  declaration from one held down by the ceiling. `in_flight` is loopctl's count of slots
+  handed out and is never the runner's.
   """
   @spec capacity(Ecto.UUID.t()) :: %{
-          Ecto.UUID.t() => %{in_flight: non_neg_integer(), max_sessions: pos_integer()}
+          Ecto.UUID.t() => %{
+            in_flight: non_neg_integer(),
+            max_sessions: pos_integer(),
+            enrolled_max_sessions: pos_integer()
+          }
         }
   def capacity(tenant_id) when is_binary(tenant_id) do
     from(r in Runner,
       where: r.tenant_id == ^tenant_id and is_nil(r.revoked_at),
-      select: {r.id, %{in_flight: r.in_flight, max_sessions: r.max_sessions}}
+      select:
+        {r.id,
+         %{
+           in_flight: r.in_flight,
+           max_sessions: r.max_sessions,
+           enrolled_max_sessions: r.enrolled_max_sessions
+         }}
     )
     |> AdminRepo.all()
     |> Map.new()
@@ -842,9 +860,11 @@ defmodule Loopctl.Runners do
 
   `dispatch/3` applies `kind` itself and leaves `draining` and `repos` to the runner, which
   refuses them with `draining` and `repo_not_allowed`. That is correct for an operator-driven
-  push, where a refusal reaches a person. It is NOT enough for the unattended driver: a
-  placement CLAIMS the story first, and `dispatch/3` answers `:ok` the moment it broadcasts,
-  so a refusal the RUNNER makes arrives after the claim has committed — the story sits at
+  push, where nothing is claimed and a refusal reaches a person. It is NOT enough for
+  anything that CLAIMS FIRST — the unattended driver, and `Loopctl.Delivery.Placement`, which
+  gates on `accepting_work?/1` for exactly this reason: a placement CLAIMS the story first,
+  and `dispatch/3` answers `:ok` the moment it broadcasts, so a refusal the RUNNER makes
+  arrives after the claim has committed — the story sits at
   `claimed` with no session until its lease expires, and comes back `queued` with
   `agent_status: :pending`, which no automated path re-contracts.
 
@@ -860,10 +880,31 @@ defmodule Loopctl.Runners do
   def accepts?(tenant_id, runner_id, meta, kind, repo)
       when is_binary(kind) and is_binary(repo) do
     cond do
-      Map.get(meta, :draining) == true -> {:error, :runner_draining}
+      not accepting_work?(meta) -> {:error, :runner_draining}
       not repo_allowed?(meta, repo) -> {:error, :repo_not_allowed}
       true -> kind_supported(tenant_id, runner_id, meta, kind)
     end
+  end
+
+  @doc """
+  Whether a runner's live meta says it will take ANY work right now — the question that is
+  about the machine alone, with no story, kind or repo in it.
+
+  TWO wire spellings, read as ONE statement (#846.4 review finding 8). `draining: true` is
+  the declared one. A declared `max_sessions: 0` is the other, and it has to be read here
+  because the control plane's column is 1..64: `declared_max_sessions/1` holds a `0` as `1`,
+  which is the closest the column can come, and without this predicate that clamp would put
+  exactly one dispatch on a machine that said it accepts none. Held at 1 and refused here,
+  the machine gets what it asked for and the column stays representable — the same shape as
+  `declared_kinds/1`, which stores nothing and reads the meta at the decision.
+
+  This is a judgement about the SOLE live meta a push would reach. It is not the whole of
+  `accepts?/5`, which also applies `repos` and `kind`; it is the part `Loopctl.Delivery.Placement`
+  can ask without knowing either.
+  """
+  @spec accepting_work?(map()) :: boolean()
+  def accepting_work?(meta) when is_map(meta) do
+    Map.get(meta, :draining) != true and Map.get(meta, :max_sessions) != 0
   end
 
   # A runner that declared NO repos has declared nothing to check — it is the pre-1.x shape
@@ -985,13 +1026,15 @@ defmodule Loopctl.Runners do
   `runners_max_sessions_range` violation.
 
   **Zero is the case that is really in range on the wire and NOT in range in the column**,
-  and it is clamped UP to one rather than honoured or ignored. Honouring it is not available:
-  the column is 1..64 and widening it would make "this machine takes no work" a second way of
-  saying `draining`, which the contract already defines and `accepts?/5` already enforces.
-  Ignoring it is worse than clamping, because ignoring leaves whatever the row held — a
-  machine declaring `0` against an enrolled `2` would keep the `2`, which is the exact
-  over-reservation this path exists to end. One is the closest the column can come to what
-  the machine said.
+  and it is clamped UP to one HERE while being honoured in full at the decision. The column is
+  1..64, so one is the closest it can come to what the machine said; ignoring the zero would
+  be worse, because it leaves whatever the row held — a machine declaring `0` against an
+  enrolled `2` would keep the `2`, the exact over-reservation this path exists to end.
+
+  What makes the clamp honest rather than a one-dispatch lie is that `accepting_work?/1` reads
+  the declared `0` off the meta and refuses, on every path that claims a story before it
+  pushes (#846.4 review finding 8). So `0` and `draining` are two spellings of one statement
+  and both are actionable; the column holds `1` and nothing is sent to it.
 
   **A join is never refused over this.** Same reasoning as `declared_kinds/1`: a machine that
   cannot get a socket is out of the fleet, and a capacity loopctl can clamp is not worth that.
@@ -1049,9 +1092,21 @@ defmodule Loopctl.Runners do
 
   ## Where it runs, and what it is NOT on
 
-  In `LoopctlWeb.RunnerChannel`'s `:after_join`, BEFORE `Presence.track/4`. Nothing can be
-  dispatched to a runner that is not in the pool (`dispatch/3` needs a single live socket),
-  so no dispatch is ever placed against the capacity this call is about to replace.
+  In `LoopctlWeb.RunnerChannel`'s `:after_join`, BEFORE `Presence.track/4` — which is the last
+  instant at which THIS socket cannot yet be dispatched to, since `dispatch/3` needs a live
+  socket in the pool.
+
+  That is a bound, not a guarantee, and the difference matters because it is the sentence a
+  later change would lean on. It holds absolutely only when the joining socket is the runner's
+  ONLY one. On a RECONNECT the previous socket's Presence entry can still be visible — a
+  silent node's entries linger up to 30 seconds (see the moduledoc) — so
+  `single_live_socket/2` can resolve to the STALE meta and `dispatch/3` can reserve against
+  the old `max_sessions` in the window between this join and this write's commit. That window
+  is milliseconds, and what is on the other side of it is now bounded too: a slot taken
+  against the old number is clamped by the write (`Capacity.apply_declared/4`) and given back
+  by a RECOUNT rather than a decrement (`Capacity.give_back/3`), so an over-count converges
+  instead of compounding. Running this AFTER `Presence.track/4` would widen the same window
+  from milliseconds to the whole of the join, which is why the order stays.
 
   It appends NOTHING to the audit chain, deliberately. Enrollment is on the chain because it
   mints a credential and binds it to a machine — custody evidence. A slot count decides
@@ -1061,8 +1116,20 @@ defmodule Loopctl.Runners do
   possible time. A capacity move is instead LOGGED here and visible on
   `GET /api/v1/runners/pool` as both numbers at once. Revisit if a capacity a machine
   declared is ever cited in a custody dispute.
+
+  ## What a FAILED write returns, and who retries it
+
+  `:ok` means the declaration is SETTLED — applied, already equal, nothing declared, or a
+  runner that is gone. `{:error, reason}` means the write was attempted and did not land, and
+  it is returned rather than swallowed so the caller can try again: the realistic failure is
+  `:capacity_busy`, the `runners` row's 5-second `lock_timeout` running out against the row
+  every dispatch in the tenant contends on — which is exactly the load under which
+  over-dispatching hurts most. Nothing else reconciles it: `Capacity.heal/3` recomputes
+  `in_flight` and never touches `max_sessions`, so a swallowed failure left the machine
+  dispatchable against the stale larger number until it happened to reconnect
+  (#846.4 review finding 5). `LoopctlWeb.RunnerChannel` re-arms it on its `:recheck` timer.
   """
-  @spec apply_declaration(Ecto.UUID.t(), Runner.t(), map()) :: :ok
+  @spec apply_declaration(Ecto.UUID.t(), Runner.t(), map()) :: :ok | {:error, term()}
   def apply_declaration(tenant_id, %Runner{} = runner, meta)
       when is_binary(tenant_id) and is_map(meta) do
     case declared_max_sessions(meta) do
@@ -1076,7 +1143,9 @@ defmodule Loopctl.Runners do
         Logger.warning(
           "runner #{runner.name} declared max_sessions #{raw}, outside the " <>
             "#{inspect(Runner.max_sessions_range())} loopctl can hold; using #{declared}. " <>
-            "A machine that wants no work sets draining, not max_sessions 0."
+            "A machine that wants no work declares draining or max_sessions 0, either of " <>
+            "which loopctl refuses a PLACEMENT against; a direct operator push is still " <>
+            "delivered and the runner refuses it itself."
         )
 
         write_declared_capacity(tenant_id, runner, declared)
@@ -1098,15 +1167,23 @@ defmodule Loopctl.Runners do
 
       {:error, reason} ->
         # The runner keeps the capacity the row already held, which is the behaviour that
-        # existed before this path — never a refused join, and never a silent one.
+        # existed before this path — never a refused join, and never a silent one. RETURNED
+        # rather than swallowed as `:ok`, so the channel re-arms it: until it lands, the
+        # machine is dispatchable against the stale number and nothing else reconciles that.
         Logger.error(
           "could not apply runner #{runner.name}'s declared max_sessions #{declared} " <>
-            "(#{inspect(reason)}); loopctl goes on reserving against the capacity it holds"
+            "(#{describe_failure(reason)}); loopctl goes on reserving against the capacity " <>
+            "it holds and will retry on this socket's next recheck"
         )
 
-        :ok
+        {:error, reason}
     end
   end
+
+  defp describe_failure(%_{} = exception) when is_exception(exception),
+    do: "#{inspect(exception.__struct__)}: #{Exception.message(exception)}"
+
+  defp describe_failure(reason), do: inspect(reason)
 
   defp apply_declared_capacity(tenant_id, runner_id, declared) do
     Repo.with_tenant(tenant_id, fn ->
@@ -1123,11 +1200,26 @@ defmodule Loopctl.Runners do
       {:ok, {:ok, held}} -> {:ok, held}
       {:error, reason} -> {:error, reason}
     end
+
+    # EVERY DATABASE FAILURE IS CAUGHT HERE, and none is re-raised (#846.4 review finding 4).
+    # This call runs inside `handle_info(:after_join, ...)`, so an exception escaping it kills
+    # the channel and takes the runner OUT OF THE POOL — and the runner reconnects, which under
+    # a database blip is a crash/reconnect loop across the whole fleet at once. Before capacity
+    # followed the declaration, `:after_join` touched no database and could not do that.
+    #
+    # Rescuing `Postgrex.Error` alone was not enough in either direction. A pool-checkout
+    # timeout or a dropped connection arrives as `DBConnection.ConnectionError`, which is a
+    # different struct and was not caught at all; and a database RESTART arrives as a
+    # `Postgrex.Error` that `retryable?/1` says no to, so it was caught and then re-raised. Both
+    # are availability, both have the same right answer, and it is the one this path already
+    # documents: keep the capacity the row holds, log it, try again on the next recheck. The
+    # signal a re-raise would have carried is the `Logger.error` above, which now names the
+    # exception.
   rescue
-    error in Postgrex.Error ->
+    error in [DBConnection.ConnectionError, Postgrex.Error] ->
       if Capacity.retryable?(error),
         do: {:error, :capacity_busy},
-        else: reraise(error, __STACKTRACE__)
+        else: {:error, error}
   end
 
   @doc """

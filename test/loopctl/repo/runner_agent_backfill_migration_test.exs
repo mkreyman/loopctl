@@ -203,6 +203,10 @@ defmodule Loopctl.Repo.RunnerAgentBackfillMigrationTest do
 
   # `revoked: true` is what makes a SECOND row of the same name legal: the active-name index is
   # partial on `revoked_at IS NULL`.
+  #
+  # `enrolled_max_sessions` is stated explicitly because the column is NOT NULL with no DB
+  # default, deliberately: it is the ceiling a join can never raise, so a writer that forgets
+  # to grant one must fail loudly rather than inherit a number nobody chose.
   defp insert_runner(tenant_id, name, opts \\ []) do
     id = Ecto.UUID.generate()
     key_id = insert_api_key(tenant_id, name)
@@ -210,8 +214,8 @@ defmodule Loopctl.Repo.RunnerAgentBackfillMigrationTest do
 
     AdminRepo.query!(
       """
-      INSERT INTO runners (id, tenant_id, api_key_id, name, max_sessions, in_flight, revoked_at, inserted_at, updated_at)
-      VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 2, 0, $5, now(), now())
+      INSERT INTO runners (id, tenant_id, api_key_id, name, max_sessions, enrolled_max_sessions, in_flight, revoked_at, inserted_at, updated_at)
+      VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 2, 2, 0, $5, now(), now())
       """,
       [
         Ecto.UUID.dump!(id),

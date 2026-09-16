@@ -45,7 +45,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.10.0) TRIAGE IS DISPATCHABLE. `x-connection.dispatchable_kinds` is `triage` and `implement`, so loopctl sends a `triage` dispatch for a story it has just detected. Only a runner that DECLARES `triage` on join receives one — `implied_by_silence` stays `implement` alone | | | | |
   | (1.11.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it. `x-connection.error_fields` publishes what EVERY refusal carries beside its `reason`, per event and complete, and `permanent_error_conditions` now names the one state in which `stale_stage` is permanent for `stage`. RE-VENDOR: a copy taken at 1.10.0 has neither key, and the version string is the only signal that it is missing them | | | | |
   | (1.12.0) A SECURITY CORRECTION TO WHAT THIS CONTRACT PROMISES. `RunnerTriageVerdict` said loopctl "fences these strings wherever they later reach a prompt — `story` included". It does not and never did: a drafted story becomes loopctl's own story row and reaches a runner as `RunnerStory`, typed and unfenced. What loopctl DOES do is escape invisible characters and SCREEN the draft with its injection detector, escalating a flagged one to a human instead of queueing it, so it never reaches an implement dispatch. RE-VENDOR and re-read: a copy taken at 1.11.0 tells you the implement path is fenced | | | | |
-  | (1.13.0) `RunnerJoin.max_sessions` IS AUTHORITATIVE. loopctl now copies the value a runner declares on join into the capacity it reserves against, on every join, instead of reserving against the `max_sessions` the machine was ENROLLED with. Until now the enrolled number was written once and no join could correct it, so a machine configured for one session was sent two and refused the second `at_capacity` — a refusal that costs the story's claim. Nothing changes on the wire and no runner has to send anything new; what changes is that the number you already send is believed. `0` is held as `1` (the control plane's range is 1..64); `draining` is how a machine asks for no work. RE-VENDOR: a copy taken at 1.12.0 says this field is advisory | | | | |
+  | (1.13.0) `RunnerJoin.max_sessions` IS AUTHORITATIVE DOWNWARD. loopctl now reserves against the LESSER of the value a runner declares on join and the `max_sessions` it was ENROLLED with, re-read on every join. Until now only the enrolled number counted, written once with no path from any join, so a machine configured for one session was sent two and refused the second `at_capacity` — a refusal that costs the story's claim. A machine may therefore always lower itself; it cannot raise itself past its enrolled ceiling, which is what stops a compromised runner enlarging its own share of the tenant's admission budget. Nothing changes on the wire and no runner has to send anything new. `0` is the same statement as `draining` — the row keeps `1` because its range is 1..64, and loopctl refuses to PLACE on a machine declaring either, while a direct operator push is still delivered for the runner to refuse. Re-vendoring is worth it for the description, not required for the wire | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -602,17 +602,23 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             maximum: 64,
             description:
               "Concurrent sessions this machine accepts; it refuses past them with " <>
-                "`at_capacity`. AUTHORITATIVE since 1.13.0: loopctl copies it into the " <>
-                "capacity it reserves against on EVERY join, so the number sent here is the " <>
-                "number of dispatches this machine will be given at once. Before 1.13.0 it " <>
-                "was advisory and loopctl reserved against the max_sessions the runner was " <>
-                "ENROLLED with, which no join could correct. Send the real value every time: " <>
-                "it is per-connection, so a machine whose configuration changed applies it by " <>
-                "reconnecting. `0` is accepted on the wire and held as `1`, because the " <>
-                "control plane's range is 1..64 — a machine that wants NO work sets " <>
-                "`draining`, which loopctl refuses dispatches against. Lowering it below the " <>
-                "sessions loopctl currently holds on this machine sends no more work until " <>
-                "those drain, rather than cancelling them."
+                "`at_capacity`. AUTHORITATIVE DOWNWARD since 1.13.0: loopctl reserves " <>
+                "against the LESSER of this and the max_sessions the runner was ENROLLED " <>
+                "with, re-read on EVERY join. So a machine can always take itself DOWN and " <>
+                "cannot raise itself above its enrolled ceiling — declaring more than that " <>
+                "is held at the ceiling, silently, and `GET /api/v1/runners/pool` shows both " <>
+                "numbers. Before 1.13.0 this field was advisory and only the enrolled value " <>
+                "counted, which no join could correct. Send the real value every time: it is " <>
+                "per-connection, so a machine whose configuration changed applies it by " <>
+                "reconnecting. Lowering it below the sessions loopctl currently holds on " <>
+                "this machine sends no more work until those drain, rather than cancelling " <>
+                "them. `0` means THIS MACHINE IS TAKING NO WORK and is the same statement as " <>
+                "`draining`: the held column is 1..64 so the row keeps `1`, and loopctl " <>
+                "refuses to PLACE on a machine declaring either. Refusing a placement is " <>
+                "what is promised and it is not the whole surface — a dispatch an operator " <>
+                "pushes at this machine by name is still delivered, and the runner refuses " <>
+                "it with `draining`, because that path claims nothing and the refusal reaches " <>
+                "a person."
           },
           in_flight: %Schema{
             type: :integer,

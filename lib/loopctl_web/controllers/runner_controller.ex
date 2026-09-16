@@ -37,7 +37,15 @@ defmodule LoopctlWeb.RunnerController do
 
   @runner_schema %Schema{
     type: :object,
-    required: [:id, :name, :max_sessions, :in_flight, :revoked_at, :inserted_at],
+    required: [
+      :id,
+      :name,
+      :max_sessions,
+      :enrolled_max_sessions,
+      :in_flight,
+      :revoked_at,
+      :inserted_at
+    ],
     properties: %{
       id: %Schema{type: :string, format: :uuid},
       name: %Schema{type: :string, pattern: Runner.name_format().source},
@@ -45,7 +53,19 @@ defmodule LoopctlWeb.RunnerController do
         type: :integer,
         minimum: Runner.max_sessions_range().first,
         maximum: Runner.max_sessions_range().last,
-        description: "The most capacity slots loopctl reserves on this machine at once."
+        description:
+          "The most capacity slots loopctl reserves on this machine at once: the machine's " <>
+            "own declared `max_sessions`, capped at `enrolled_max_sessions`. Re-applied on " <>
+            "every join (contract 1.13.0)."
+      },
+      enrolled_max_sessions: %Schema{
+        type: :integer,
+        minimum: Runner.max_sessions_range().first,
+        maximum: Runner.max_sessions_range().last,
+        description:
+          "The CEILING an operator granted at enrollment. Never written by a join, so a " <>
+            "machine can declare itself lower and never higher. Raising it means " <>
+            "re-enrolling the machine."
       },
       in_flight: %Schema{
         type: :integer,
@@ -91,10 +111,13 @@ defmodule LoopctlWeb.RunnerController do
         "runner presents it in the `x-loopctl-runner-token` header when it connects to " <>
         "`/runner/socket/websocket`, and joins the topic `runner:<runner.id>` declaring " <>
         "exactly this `name`. The wire contract is `priv/runner_contract/v1.json`. " <>
-        "`max_sessions` (default #{Runner.default_max_sessions()}) is how many dispatches " <>
-        "loopctl will have in flight on this machine at once UNTIL IT FIRST JOINS: since " <>
-        "contract 1.13.0 every join re-applies the machine's own declared `max_sessions`, " <>
-        "so this value seeds the row and does not cap it. Requires user role; " <>
+        "`max_sessions` (default #{Runner.default_max_sessions()}) is the CEILING on how " <>
+        "many dispatches loopctl will have in flight on this machine at once, and the value " <>
+        "it starts at: since contract 1.13.0 every join re-applies the machine's own " <>
+        "declared `max_sessions`, bounded by this one, so a machine may lower itself below " <>
+        "its grant and never raise itself above it. Raising the ceiling later means " <>
+        "re-enrolling the machine; there is no endpoint that widens it in place. " <>
+        "Requires user role; " <>
         "a caller whose key was minted by a dispatch is refused with 403 " <>
         "`api_key_mint_forbidden`. 422 when the name is malformed, already used by an " <>
         "active runner, `max_sessions` is out of range, or the tenant is at its API key limit.",
@@ -115,10 +138,11 @@ defmodule LoopctlWeb.RunnerController do
              maximum: Runner.max_sessions_range().last,
              default: Runner.default_max_sessions(),
              description:
-               "The most dispatches loopctl keeps in flight on this machine at once, until " <>
-                 "the machine first joins and declares its own (contract 1.13.0) — after " <>
-                 "that the runner's number governs and this one is only what the row " <>
-                 "started at. The tenant's total is capped separately " <>
+               "The most dispatches loopctl will EVER keep in flight on this machine at " <>
+                 "once, and the value the row starts at. From its first join the machine's " <>
+                 "own declared `max_sessions` governs (contract 1.13.0), bounded by this: " <>
+                 "held capacity is the LESSER of the two, so a runner can take itself down " <>
+                 "and cannot raise itself up. The tenant's total is capped separately " <>
                  "(RUNNER_MAX_IN_FLIGHT_SESSIONS)."
            }
          }
@@ -194,9 +218,12 @@ defmodule LoopctlWeb.RunnerController do
         "`reported_in_flight` and `reported_max_sessions` are what the runner itself last " <>
         "reported. `reported_in_flight` is a hint — it counts the runner's sessions, not " <>
         "loopctl's reservations. `reported_max_sessions` is NOT: since contract 1.13.0 " <>
-        "loopctl copies it into `max_sessions` on every join, so the two differ only for a " <>
-        "runner that has not reconnected since, one that declared a value outside 1..64 " <>
-        "(held clamped), or one still holding more sessions than it now declares. " <>
+        "loopctl copies it into `max_sessions` on every join, capped at the runner's " <>
+        "`enrolled_max_sessions`. So `max_sessions` below `reported_max_sessions` means one " <>
+        "of four things — the runner has not reconnected since, it declared a value outside " <>
+        "1..64 (held clamped), it is still holding more sessions than it now declares, or " <>
+        "it is declaring ABOVE the ceiling it was enrolled with, which `enrolled_max_sessions` " <>
+        "here tells apart from the other three. " <>
         "`kinds` is what the runner DECLARED on join (contract 1.6.0), " <>
         "and where it is present it alone decides which dispatches the machine is sent — " <>
         "so a connected machine that never gets work is explained by `kinds` or by " <>
@@ -221,6 +248,7 @@ defmodule LoopctlWeb.RunnerController do
                    :in_flight,
                    :draining,
                    :max_sessions,
+                   :enrolled_max_sessions,
                    :reported_in_flight,
                    :reported_max_sessions,
                    :sample,
@@ -246,7 +274,17 @@ defmodule LoopctlWeb.RunnerController do
                      type: :integer,
                      minimum: 1,
                      nullable: true,
-                     description: "The runner's enrolled slot limit (Postgres)."
+                     description:
+                       "The slot limit dispatch reserves against (Postgres): the machine's " <>
+                         "declared value capped at `enrolled_max_sessions`."
+                   },
+                   enrolled_max_sessions: %Schema{
+                     type: :integer,
+                     minimum: 1,
+                     nullable: true,
+                     description:
+                       "The ceiling granted at enrollment (Postgres). A declaration above " <>
+                         "it is held at it."
                    },
                    reported_in_flight: %Schema{
                      type: :integer,
@@ -258,7 +296,12 @@ defmodule LoopctlWeb.RunnerController do
                      type: :integer,
                      minimum: 0,
                      nullable: true,
-                     description: "The session limit the runner declared on join. A hint."
+                     description:
+                       "The session limit the runner declared on join. NOT a hint since " <>
+                         "contract 1.13.0: it is what `max_sessions` is copied from, capped " <>
+                         "at `enrolled_max_sessions`. `0` means the machine is taking no " <>
+                         "work — held as `1` because the column is 1..64, and refused a " <>
+                         "placement like `draining`."
                    },
                    sample: %Schema{
                      type: :object,
@@ -409,6 +452,7 @@ defmodule LoopctlWeb.RunnerController do
       in_flight: Map.get(held, :in_flight),
       draining: Map.get(meta, :draining),
       max_sessions: Map.get(held, :max_sessions),
+      enrolled_max_sessions: Map.get(held, :enrolled_max_sessions),
       reported_in_flight: Map.get(meta, :in_flight),
       reported_max_sessions: Map.get(meta, :max_sessions),
       sample: Map.get(meta, :sample),

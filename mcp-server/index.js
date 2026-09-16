@@ -7877,11 +7877,14 @@ const TOOLS = [
           minimum: 1,
           maximum: 64,
           description:
-            "How many dispatches loopctl keeps in flight on this machine at once (default 2), " +
-            "UNTIL the machine first joins: since runner contract 1.13.0 every join re-applies the " +
-            "machine's own declared max_sessions, so this seeds the row and does not cap it. To " +
-            "change a machine's capacity, change control.max_sessions in the runner's own config " +
-            "and reconnect it. The tenant's total across all its runners is capped separately by " +
+            "The CEILING on how many dispatches loopctl will ever keep in flight on this " +
+            "machine at once (default 2), and the value it starts at. Since runner contract " +
+            "1.13.0 every join re-applies the machine's own declared max_sessions BOUNDED BY " +
+            "this one, so a machine may take itself down below its grant and cannot raise " +
+            "itself above it. To make a machine carry FEWER sessions, change " +
+            "control.max_sessions in the runner's own config and reconnect it — no call here " +
+            "is needed. To let it carry MORE than its grant, re-enrol it: nothing widens this " +
+            "in place. The tenant's total across all its runners is capped separately by " +
             "the server.",
         },
       },
@@ -7928,9 +7931,13 @@ const TOOLS = [
       "only for a runner revoked while its socket drains; reported_in_flight and " +
       "reported_max_sessions are what the runner itself last reported. reported_in_flight is a " +
       "hint (the runner counts sessions, loopctl counts reservations); reported_max_sessions is " +
-      "NOT — since contract 1.13.0 loopctl copies it into max_sessions on every join. The two " +
-      "differing means the runner has not reconnected since, declared a value outside 1..64 " +
-      "(held clamped into it), or is still holding more sessions than it now declares. " +
+      "NOT — since contract 1.13.0 loopctl copies it into max_sessions on every join, capped at " +
+      "the runner's enrolled_max_sessions, which is also returned. So max_sessions BELOW " +
+      "reported_max_sessions means one of four things: the runner has not reconnected since, it " +
+      "declared a value outside 1..64 (held clamped into it), it is still holding more sessions " +
+      "than it now declares, or it is declaring ABOVE the ceiling it was enrolled with — which " +
+      "enrolled_max_sessions tells apart from the other three. A reported_max_sessions of 0 " +
+      "means the machine is taking no work and place_dispatch will refuse it, like draining. " +
       "live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +
@@ -7957,7 +7964,11 @@ const TOOLS = [
       "IDEMPOTENT on `dispatch_id`, which is generated for you unless you pass one — pass the " +
       "SAME id to retry a call that timed out, or you start a second session on the same " +
       "story. Requires LOOPCTL_USER_KEY: only an unlineaged user key may root the custody " +
-      "lineage this mints.",
+      "lineage this mints.\n\n" +
+      "409 `runner_declines_work` means the machine's live socket declares `draining` (or a " +
+      "max_sessions of 0, which says the same thing). NOTHING WAS CLAIMED — it is refused " +
+      "before the mint — so place on another runner rather than repairing anything. Read " +
+      "`draining` and `reported_max_sessions` from runner_pool before choosing a machine.",
     inputSchema: {
       type: "object",
       properties: {
