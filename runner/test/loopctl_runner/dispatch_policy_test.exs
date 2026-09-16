@@ -77,6 +77,28 @@ defmodule LoopctlRunner.DispatchPolicyTest do
     assert %ControlConfig{accepts_dispatches: false} = struct(ControlConfig, [])
   end
 
+  test "the refusal says WHICH dispatches_disabled this is, and never says nothing", ctx do
+    # One reason, two conditions — a machine configured not to take work, and a foreground
+    # `mix loopctl.serve` run refusing by default. From loopctl's side the reason alone cannot
+    # tell them apart, so the caller supplies the alternative wording.
+    off = %{accepts_dispatches: false}
+    foreground = "a foreground dev run refuses dispatches by default"
+
+    assert {:refuse, "dispatches_disabled", ^foreground} =
+             decide(ctx, @dispatch, Map.put(@ready, :dispatches_disabled_detail, foreground), off)
+
+    # Absent, and the configured case keeps its own sentence.
+    configured = "this runner is not configured to accept dispatches"
+    assert {:refuse, "dispatches_disabled", ^configured} = decide(ctx, @dispatch, @ready, off)
+
+    # An empty or nil detail is never sent: a detail that says nothing is worse than the default,
+    # because loopctl would have to special-case it.
+    for empty <- ["", nil] do
+      state = Map.put(@ready, :dispatches_disabled_detail, empty)
+      assert {:refuse, "dispatches_disabled", ^configured} = decide(ctx, @dispatch, state, off)
+    end
+  end
+
   test "draining and capacity come before anything about the dispatch itself", ctx do
     bad_repo = %{@dispatch | "repo" => "someone/else"}
     assert reason(decide(ctx, bad_repo, %{@ready | draining: true})) == "draining"

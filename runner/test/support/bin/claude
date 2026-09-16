@@ -37,7 +37,18 @@ here=$(realpath .)
 printf '%s\n' "$here" > "$state/cwd"
 # Names only for the key, never values: a failing assertion prints this file, and the
 # real environment carries credentials.
-env | awk -F= '$1 == "ANTHROPIC_API_KEY" || $1 ~ /^GIT_/ || $1 ~ /^RELEASE_/ || $1 == "EMU" { print $1 " PRESENT"; next } $1 ~ /^LOOP_[A-Z_]*$/ || $1 == "RUNNER_ENV_PROBE"' > "$state/env"
+# Matched by CATEGORY and by SHAPE, never by the individual name, so a name added to Session's
+# unset lists cannot go unrecorded here — an unrecorded name turns a test's `refute ... PRESENT`
+# into an assertion that passes whether or not the unset happened. The claim is only as good as
+# its coverage, which is why `test/credential_recording_canary_test.exs` runs THIS FILE against
+# every name Session unsets and fails when one of them comes back unrecorded.
+env | awk -F= '
+  $1 == "ANTHROPIC_API_KEY" || $1 ~ /^GIT_/ || $1 ~ /^SSH_/ || $1 ~ /^(GH|GITHUB|GPG)_/ ||
+  $1 ~ /^RELEASE_/ || $1 == "EMU" ||
+  toupper($1) ~ /TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|API_KEY|PRIVATE_KEY|_KEY$|_KEY_/ {
+      print $1 " PRESENT"; next
+  }
+  $1 ~ /^LOOP_[A-Z_]*$/ || $1 == "RUNNER_ENV_PROBE"' > "$state/env"
 case ":$PATH:" in *loopctl-release-canary*) echo "RELEASE_PATH PRESENT" >> "$state/env" ;; esac
 printf '%s\n' "$@" > "$state/argv"
 # claude-config's loop mode needs LOOP_STORY_FILE to be a regular, fresh file when hooks run.

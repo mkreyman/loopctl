@@ -361,6 +361,53 @@ defmodule LoopctlRunner.ControlConfigTest do
              :logger.get_primary_config()
   end
 
+  test "the child spec carries the foreground task's refusal, and nothing otherwise" do
+    # The other end of Mix.Tasks.Loopctl.Serve: the marker must reach the Control child spec, or
+    # the task's default is a variable nobody reads and every foreground run takes real work.
+    root = tmp_dir!("daemon-foreground")
+    token = Path.join(root, "token")
+    File.write!(token, "lc_x")
+    File.chmod!(token, 0o600)
+
+    control = %{
+      "url" => "wss://loopctl.example/runner/socket/websocket",
+      "runner_id" => "3781bee6-2b97-4df0-9664-7f01a492630f",
+      "machine" => "minis",
+      "token_file" => token,
+      "repos" => ["mkreyman/home_care_billing"],
+      "max_sessions" => 1,
+      # What an enrolled machine actually has, which is what makes the override load-bearing.
+      "accepts_dispatches" => true
+    }
+
+    path = Path.join(root, "runner.json")
+    File.write!(path, JSON.encode!(Map.put(config_map(root), "control", control)))
+    System.put_env("LOOPCTL_RUNNER_CONFIG", path)
+    marker = LoopctlRunner.Application.refuse_dispatches_var()
+    %{metadata: before} = :logger.get_primary_config()
+
+    on_exit(fn ->
+      System.delete_env("LOOPCTL_RUNNER_CONFIG")
+      System.delete_env(marker)
+      :logger.update_primary_config(%{metadata: before})
+    end)
+
+    System.put_env(marker, "1")
+
+    assert [_run_supervisor, {LoopctlRunner.Control, opts}] =
+             LoopctlRunner.Application.daemon_children!()
+
+    assert opts[:accepts_dispatches] == false
+
+    # Under a service manager the config is the authority and nothing overrides it.
+    System.delete_env(marker)
+
+    assert [_run_supervisor, {LoopctlRunner.Control, service}] =
+             LoopctlRunner.Application.daemon_children!()
+
+    refute Keyword.has_key?(service, :accepts_dispatches)
+  end
+
   test "the daemon refuses to start without a control section" do
     root = tmp_dir!("daemon")
     path = Path.join(root, "runner.json")

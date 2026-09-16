@@ -7,7 +7,14 @@ defmodule LoopctlRunner.DispatchPolicy do
   loopctl's own checks are not enough: the runner decides from its own configuration. The
   first failing check names the refusal, as `RunnerDispatchReply.reason`:
 
-    1. `dispatches_disabled` — `control.accepts_dispatches` is not true (the default);
+    1. `dispatches_disabled` — `control.accepts_dispatches` is not true (the default). The
+       `detail` says WHICH `dispatches_disabled` this is: the reason is one value for two
+       conditions — a machine configured not to take work, and a foreground `mix loopctl.serve`
+       run refusing by default — and from loopctl's side they are otherwise indistinguishable, so
+       a reader guesses which machine is misconfigured. The caller supplies the alternative
+       wording through `:dispatches_disabled_detail` in `state`; absent, the configured case's own
+       sentence is used. Never an empty string: a detail that says nothing is worse than the
+       default one, because loopctl would have to special-case it;
     2. `draining`, then `at_capacity` (in flight at `control.max_sessions`);
     3. `repo_not_allowed` — the repo is not in `control.repos`, or has no local checkout in
        `repos` under its name;
@@ -28,10 +35,13 @@ defmodule LoopctlRunner.DispatchPolicy do
   @ref_format ~r/\A[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}\z/
 
   @type state :: %{
-          draining: boolean(),
-          in_flight: non_neg_integer(),
+          :draining => boolean(),
+          :in_flight => non_neg_integer(),
           # Free MB on the volume holding a path, nil when unreadable.
-          free_disk_mb: (String.t() -> non_neg_integer() | nil)
+          :free_disk_mb => (String.t() -> non_neg_integer() | nil),
+          # What to say instead of the configured-false sentence, when something other than the
+          # config turned dispatches off for this process.
+          optional(:dispatches_disabled_detail) => String.t() | nil
         }
 
   @type decision ::
@@ -39,7 +49,7 @@ defmodule LoopctlRunner.DispatchPolicy do
 
   @spec decide(map(), Config.t(), state()) :: decision()
   def decide(dispatch, %Config{control: %ControlConfig{} = control} = config, state) do
-    with :ok <- enabled(control),
+    with :ok <- enabled(control, state),
          :ok <- capacity(control, state),
          {:ok, repo, path} <- repo(dispatch, control, config),
          :ok <- disk(control, state, [config.runs_dir, path]),
@@ -64,10 +74,16 @@ defmodule LoopctlRunner.DispatchPolicy do
     end
   end
 
-  defp enabled(%ControlConfig{accepts_dispatches: true}), do: :ok
+  @configured_off "this runner is not configured to accept dispatches"
 
-  defp enabled(_control),
-    do: {:refuse, "dispatches_disabled", "this runner is not configured to accept dispatches"}
+  defp enabled(%ControlConfig{accepts_dispatches: true}, _state), do: :ok
+
+  defp enabled(_control, state) do
+    case Map.get(state, :dispatches_disabled_detail) do
+      detail when is_binary(detail) and detail != "" -> {:refuse, "dispatches_disabled", detail}
+      _absent_or_empty -> {:refuse, "dispatches_disabled", @configured_off}
+    end
+  end
 
   defp capacity(_control, %{draining: true}), do: {:refuse, "draining", "this runner is draining"}
 

@@ -69,8 +69,36 @@ defmodule LoopctlRunner.Config do
   @spec load(String.t()) :: {:ok, t()} | {:error, String.t()}
   def load(path) do
     with {:ok, raw} <- read(path),
-         {:ok, map} <- decode(raw) do
-      from_map(map)
+         {:ok, map} <- decode(raw),
+         {:ok, config} <- from_map(map),
+         :ok <- readable_by_owner_only(path, config) do
+      {:ok, config}
+    end
+  end
+
+  # `session_env` is the sanctioned place to keep a credential a session needs — it is the whole
+  # escape hatch for the shape deny (`Session.unset_names/2`) — and both that doc and the comment
+  # on `session_env/2` justify it as a file only the operator can read. Nothing made that true:
+  # under a default umask `runner.json` is 0644, so an operator following the drop log would put a
+  # real credential in a world-readable file on a machine carrying live credentials already. Same
+  # test as `ControlConfig.read_token/1` uses for the channel token, and checked only when
+  # `session_env` carries something: a config without it holds no secret of its own, and refusing
+  # one would stop daemons over a property they never relied on.
+  defp readable_by_owner_only(_path, %__MODULE__{session_env: env}) when map_size(env) == 0,
+    do: :ok
+
+  defp readable_by_owner_only(path, _config) do
+    case File.stat(path) do
+      {:ok, %File.Stat{mode: mode}} ->
+        if Bitwise.band(mode, 0o077) == 0,
+          do: :ok,
+          else:
+            {:error,
+             "config #{path} carries session_env, which may hold a credential, and is readable " <>
+               "by other users; chmod 600 it"}
+
+      {:error, reason} ->
+        {:error, "cannot stat config #{path}: #{:file.format_error(reason)}"}
     end
   end
 
@@ -280,7 +308,10 @@ defmodule LoopctlRunner.Config do
   # creates, so {run} leaves a new database behind on every run, while {story} reuses one per
   # story, as its worktree is. A name the runner sets or reads itself (LOOP_*, LOOPCTL_*,
   # ANTHROPIC_*, GIT_*) is refused, as is one a session never inherits from the release
-  # (Session.release_env_name?/1: RELEASE_*, EMU, ROOTDIR...), and a repo not in repos.
+  # (Session.release_env_name?/1: RELEASE_*, EMU, ROOTDIR...) or because it is unconditionally
+  # unset as a credential (Session.credential_env_name?/1: SSH_AUTH_SOCK, GH_TOKEN...), and a repo
+  # not in repos. A name matching the SHAPE deny is allowed: naming it here is how an operator
+  # keeps it for one repo, which is the whole escape hatch (Session.unset_names/2).
   @env_name ~r/\A[A-Z_][A-Z0-9_]{0,63}\z/
   @reserved_env ["LOOP_", "LOOPCTL_", "ANTHROPIC_", "GIT_"]
 
@@ -306,9 +337,9 @@ defmodule LoopctlRunner.Config do
       not Map.has_key?(repos, repo) ->
         {:error, "config session_env names #{inspect(repo)}, which is not in repos"}
 
-      bad = Enum.find(vars, fn {name, value} -> not env_var?(name, value) end) ->
-        {name, _} = bad
-        {:error, "config session_env.#{repo}.#{name} is not an allowed variable and string value"}
+      bad = Enum.find(vars, fn {name, value} -> env_var_refusal(name, value) != nil end) ->
+        {name, value} = bad
+        {:error, "config session_env.#{repo}.#{name} #{env_var_refusal(name, value)}"}
 
       true ->
         {:ok, vars}
@@ -318,12 +349,65 @@ defmodule LoopctlRunner.Config do
   defp repo_env(repo, _vars, _repos),
     do: {:error, "config session_env.#{repo} must be an object"}
 
-  defp env_var?(name, value) do
-    is_binary(name) and name =~ @env_name and
-      not Enum.any?(@reserved_env, &String.starts_with?(name, &1)) and
-      not LoopctlRunner.Session.release_env_name?(name) and
-      is_binary(value) and byte_size(value) <= 1024 and not String.contains?(value, <<0>>)
+  # Nil when the pair is allowed, otherwise WHY it is refused. One message for every cause read
+  # identically whether an operator mistyped a value or a name became a refused credential in this
+  # release, and the second is a breaking change that aborts rel/install.sh's whole preflight: a
+  # config that loaded yesterday stops loading, and the message pointed at the value.
+  defp env_var_refusal(name, value) do
+    cond do
+      not env_name?(name) ->
+        "is not an allowed variable name"
+
+      runner_managed_name?(name) ->
+        "is a name the runner manages itself and unsets for every session, so a value here " <>
+          "would be dropped silently; remove it"
+
+      credential_name?(name) ->
+        "is a credential this runner unsets for every session UNCONDITIONALLY, so a value here " <>
+          "would be dropped silently and no session would ever see it; remove it"
+
+      not env_value?(value) ->
+        "is not a string value of at most 1024 bytes"
+
+      true ->
+        nil
+    end
   end
+
+  # PARENTHESISED ON PURPOSE. `not` binds tighter than `=~`, so `not name =~ @env_name` parses as
+  # `(not name) =~ @env_name` and raises `:erlang.not("GH_TOKEN")` at runtime, on every config
+  # carrying a session_env. It reads correctly in English, which is how it survives review. The
+  # chain this was split out of was safe only because `not` applied to whole predicate CALLS
+  # there; the moment a condition becomes an infix expression it needs its own parentheses.
+  @doc """
+  Whether `session_env` would ACCEPT `name` — i.e. whether naming it there actually keeps it.
+
+  `Session` asks before advising an operator to use the hatch: a drop log that recommends a name
+  this would refuse sends them to a config that then fails to load, which raises in
+  `Application.daemon_children!/0` and aborts the release preflight. One source of truth rather
+  than a second copy of the rule in the module doing the advising.
+  """
+  @spec session_env_allows?(String.t()) :: boolean()
+  def session_env_allows?(name),
+    do: env_name?(name) and not runner_managed_name?(name) and not credential_name?(name)
+
+  defp env_name?(name), do: is_binary(name) and name =~ @env_name
+
+  defp runner_managed_name?(name) do
+    Enum.any?(@reserved_env, &String.starts_with?(name, &1)) or
+      LoopctlRunner.Session.release_env_name?(name)
+  end
+
+  # ONLY the unconditional list. A SHAPE-matched name is deliberately allowed here, and refusing
+  # it was a defect in two ways: the shape deny is conditional — `port_env/4` unsets a shaped name
+  # only when the DAEMON's environment carries it, and under systemd it carries none — so the
+  # refusal claimed a certainty it did not have; and `session_env` IS the escape hatch for the
+  # judgement the heuristic cannot make (per repo, mode-600, revocable), so refusing it left an
+  # operator with no way at all to keep a `SECRET_KEY_BASE` or a `*_PUBLISHABLE_KEY`.
+  defp credential_name?(name), do: LoopctlRunner.Session.credential_env_name?(name)
+
+  defp env_value?(value),
+    do: is_binary(value) and byte_size(value) <= 1024 and not String.contains?(value, <<0>>)
 
   @doc """
   The session environment `config` adds for `story`'s run `run_id` in `repo`, as name-value pairs.

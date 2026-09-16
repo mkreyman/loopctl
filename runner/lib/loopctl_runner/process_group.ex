@@ -20,6 +20,8 @@ defmodule LoopctlRunner.ProcessGroup do
   machines.
   """
 
+  alias LoopctlRunner.Session
+
   @poll_ms 200
 
   @type outcome :: :already_gone | :terminated | :killed | {:error, :survived}
@@ -267,7 +269,16 @@ defmodule LoopctlRunner.ProcessGroup do
         :exit_status,
         :stderr_to_stdout,
         args: args,
-        env: [{~c"ANTHROPIC_API_KEY", false}]
+        # The same scrub a session gets, from the same source rather than a copy: this Port also
+        # runs the CLI (the liveness probe is `claude agents --json`), and a hand-kept one-name
+        # list here was a second security list with nothing binding it to the first — it still
+        # said ANTHROPIC_API_KEY alone after that list grew to eight names and a shape deny.
+        # `@git_program_env` is deliberately not included: the probe runs no git.
+        env:
+          Enum.map(
+            Session.credential_env() ++ Session.credential_shaped_env(System.get_env()),
+            &{to_charlist(&1), false}
+          )
       ])
 
     {:os_pid, os_pid} = Port.info(port, :os_pid)

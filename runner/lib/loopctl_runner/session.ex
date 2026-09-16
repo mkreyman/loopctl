@@ -22,6 +22,8 @@ defmodule LoopctlRunner.Session do
 
   use GenServer
 
+  require Logger
+
   alias LoopctlRunner.{
     Config,
     Liveness,
@@ -326,6 +328,138 @@ defmodule LoopctlRunner.Session do
      }}
   end
 
+  # Credentials the runner's own environment may carry, which a session must not inherit. The
+  # Port environment is built by SUBTRACTION, not construction: the session inherits the daemon's
+  # whole environment and keeps everything this list does not name, so a credential missing from
+  # here reaches the session silently.
+  #
+  # ANTHROPIC_API_KEY outranks the claude.ai login, which is why `claude-headless.sh` unsets it
+  # too (Config refuses any other launcher) — this is the same removal one layer earlier.
+  # SSH_AUTH_SOCK and SSH_AGENT_PID are live in the daemon's environment on a dev machine
+  # (measured on minis, 2026-09-16): an agent socket holding the operator's GitHub identity, next
+  # to a worktree whose `origin` is `git@github.com:...` and whose `.git` is the parent's. NO
+  # SECOND LAYER IS ADDED BY REMOVING THEM, and an earlier draft of this comment implied one: on
+  # the Linux boxes the identity GitHub accepts is `~/.ssh/id_ed25519` as a PLAIN FILE under the
+  # inherited HOME, which ssh reads with no agent involved. So this closes the agent path while
+  # the key-file path stays open, and what still stands between a session and a push as the
+  # operator is `git push` being off the allow-list — one layer, as before. Closing the rest
+  # needs the deploy key's `IdentitiesOnly=yes` with an explicit `IdentityFile`, or a HOME of the
+  # session's own, neither of which is here yet. The agent goes because no session wants it in
+  # either design: the planned deploy key passes `IdentityAgent=none`, which refuses it outright.
+  # GPG_AGENT_INFO is the same class as the ssh agent and is also live on a dev machine: a socket
+  # to an agent holding the operator's private keys. UNSETTING IT IS NECESSARY AND NOT SUFFICIENT,
+  # and the limit belongs here rather than in whoever next reads the list: it is the LEGACY
+  # discovery path, which modern GnuPG ignores in favour of a fixed socket under XDG_RUNTIME_DIR
+  # ($XDG_RUNTIME_DIR/gnupg/S.gpg-agent), and XDG_RUNTIME_DIR is inherited on purpose (it is a
+  # capability the session may need, and unsetting it breaks more than it closes). So this entry
+  # closes the old path and leaves the current one open; the remedy for the rest is the OS
+  # boundary this runner does not have yet, not another name here.
+  # GH_TOKEN, GITHUB_TOKEN and the askpass pair are in no runner environment today and are named
+  # defensively, so a machine that later gains one does not hand it over. The askpass pair is a
+  # credential-ACQUISITION path rather than a credential: it names a program git and ssh run to
+  # obtain one, so an unattended session could acquire the operator's credential with no terminal
+  # anywhere in the picture. Both names are needed, because git falls through GIT_ASKPASS ->
+  # core.askPass -> SSH_ASKPASS: removing one alone just moves the path down one rung. IT DOES
+  # NOT CLOSE THE LADDER, though an earlier draft here claimed it did: rung 2 is `core.askPass`
+  # in `~/.gitconfig`, which no unset touches because it is a FILE, reached through the inherited
+  # HOME. ssh, with no config-file rung of its own, does fail closed; git falls to rung 2 and
+  # then asks a terminal it does not have.
+  @credential_env ~w(ANTHROPIC_API_KEY SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO GH_TOKEN
+                     GITHUB_TOKEN GIT_ASKPASS SSH_ASKPASS)
+
+  @doc "Every credential name `port_env/4` unsets by NAME. The shape deny is separate."
+  @spec credential_env() :: [String.t()]
+  def credential_env, do: @credential_env
+
+  @doc """
+  Whether `name` is a credential `port_env/4` unsets. `Config` refuses these in `session_env` for
+  the same reason it refuses `release_env_name?/1`: the unset wins over a repo's value, and only
+  under the daemon, so a configured credential would vanish where nothing could see it.
+  """
+  @spec credential_env_name?(String.t()) :: boolean()
+  def credential_env_name?(name), do: name in @credential_env
+
+  # THE NAME LIST ABOVE IS CALIBRATED TO ONE ENVIRONMENT AND THERE ARE TWO. Under systemd the
+  # daemon's environment is the unit's, which carries no credential at all; `mix loopctl.serve`
+  # (Mix.Tasks.Loopctl.Serve) sets LOOPCTL_RUNNER_DAEMON=1, joins the pool and accepts dispatches
+  # from the OPERATOR'S LOGIN SHELL, where 41 names matching token/secret/key/password/api/
+  # credential were counted on minis, 2026-09-16 — none of them on the list, every one of them
+  # subtracted from nothing and handed to a session with a Bash tool.
+  #
+  # THIS IS A HEURISTIC OVER A HOSTILE-BY-DEFAULT ENVIRONMENT, not a guarantee. It catches the
+  # conventional spellings and misses a credential named for what it opens (a bare `NPM_AUTH`, a
+  # `PGPASSFILE` pointing at a file) — a shape deny cannot do better, because the set it must
+  # exclude is open. THE REAL FIX IS TO CONSTRUCT THE ENVIRONMENT INSTEAD OF SUBTRACTING FROM IT:
+  # enumerate what a session legitimately needs (PATH, HOME, LANG, the asdf and XDG furniture)
+  # and pass only that, which turns every unknown name into a default-deny. That is a bigger
+  # change than this one and it fails LOUDLY when the enumeration is short — the runner stops
+  # building rather than leaking — which is why it is the right answer and not a drop-in.
+  @credential_shapes ~w(TOKEN SECRET PASSWORD PASSWD PASSPHRASE CREDENTIAL API_KEY PRIVATE_KEY)
+
+  @doc """
+  Whether `name` has the SHAPE of a credential, whatever this runner knows about it by name.
+
+  Matched case-insensitively against the conventional spellings, plus a `_KEY` suffix or infix,
+  which is what `AWS_SECRET_ACCESS_KEY`, `HEX_API_KEY` and `FLY_API_TOKEN` have in common and
+  what `HOME`, `PATH`, `LANG`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` do not.
+  """
+  @spec credential_shaped?(String.t()) :: boolean()
+  def credential_shaped?(name) do
+    up = String.upcase(name)
+
+    Enum.any?(@credential_shapes, &String.contains?(up, &1)) or
+      String.ends_with?(up, "_KEY") or String.contains?(up, "_KEY_")
+  end
+
+  @doc """
+  The names in `env` that have a credential's shape, sorted — what the name list cannot enumerate.
+  """
+  @spec credential_shaped_env(%{String.t() => String.t()}) :: [String.t()]
+  def credential_shaped_env(env) do
+    env
+    |> Map.keys()
+    |> Enum.filter(&credential_shaped?/1)
+    |> Enum.sort()
+  end
+
+  # A DIFFERENT CLASS from the list above, and "is it a credential?" is the wrong test for it:
+  # these name a PROGRAM GIT EXECUTES for every transport operation. Whatever puts a value in the
+  # daemon's environment gets arbitrary code run by every git call an unattended session makes,
+  # with no credential anywhere in the picture — and a value that merely redirects `ssh` also
+  # decides which identity git authenticates with, so it overrides a deploy key silently.
+  # `Config` needs no companion check here: `@reserved_env` already refuses every `GIT_` name in
+  # `session_env`, which is why `credential_env_name?/1` stays about credentials only.
+  @git_program_env ~w(GIT_SSH_COMMAND GIT_SSH)
+
+  @doc "Every name `port_env/4` unsets because it names a program git executes."
+  @spec git_program_env() :: [String.t()]
+  def git_program_env, do: @git_program_env
+
+  @doc """
+  What `port_env/4` unsets, for the daemon's `env` and the `{name, value}` pairs a caller supplies.
+
+  TWO RULES, AND THEY DIFFER ON PURPOSE. The name lists are UNCONDITIONAL: every name in them is
+  unset whatever anyone supplies, because each is a credential this runner knows by name or a
+  program git executes, and there is no session that wants one. The SHAPE deny is a heuristic over
+  an environment nobody enumerated, and a heuristic is wrong sometimes — `SECRET_KEY_BASE` for a
+  test env, a `*_PUBLISHABLE_KEY` that is public by design, a `*_TOKENS` tuning knob. So a shaped
+  name a caller supplies DELIBERATELY is not unset: the operator naming it in the config's
+  `session_env` has made the judgement the shape cannot, for the one repo that needs it.
+
+  That escape hatch is deliberately `session_env` and deliberately not a keep-list in this module.
+  A keep-list here would apply to every repo, session and machine, for ever, with nobody
+  revisiting it — an unscoped exemption is a silent global disable (KB 7a9afe2e), and enumerating
+  safe spellings fails the same way enumerating dangerous ones does (KB 909ba2b2). `session_env`
+  is per repo, in a mode-600 file only the operator writes, and revocable in one place.
+  """
+  @spec unset_names(%{String.t() => String.t()}, [{String.t(), String.t()}]) :: [String.t()]
+  def unset_names(env, extra) do
+    supplied = MapSet.new(extra, fn {name, _value} -> name end)
+    shaped = Enum.reject(credential_shaped_env(env), &MapSet.member?(supplied, &1))
+
+    @credential_env ++ @git_program_env ++ shaped ++ Worktree.repo_locating_env()
+  end
+
   defp port_env(run_dir, session_id, config, extra) do
     base = [
       {"LOOP_ESCALATE", escalate_script()},
@@ -338,14 +472,74 @@ defmodule LoopctlRunner.Session do
       {"LOOP_TREE_FILE", Path.join(run_dir, "stderr.log.tree")}
     ]
 
-    unset = ["ANTHROPIC_API_KEY" | Worktree.repo_locating_env()]
+    env = System.get_env()
+    unset = unset_names(env, extra)
+    log_shaped(session_id, credential_shaped_env(env), unset)
 
     # The repo's own session_env comes after PATH, so a configured PATH still wins; the names
     # release_env/1 unsets are refused in session_env by Config, so nothing there is lost.
-    Enum.map(base ++ release_path(System.get_env()) ++ extra, fn {k, v} ->
+    #
+    # THE DEPLOY KEY CANNOT BE WIRED BY EITHER OBVIOUS ROUTE, and both are closed for different
+    # reasons. GIT_SSH_COMMAND is unset UNCONDITIONALLY above, so a value supplied in the BASE
+    # environment — `Environment=` in rel/systemd/loopctl-runner.service, `EnvironmentVariables`
+    # in the launchd plist, which is where a per-machine key would naturally go — never reaches a
+    # session at all. And the unsets are appended AFTER `extra`, so for a name in both THE UNSET
+    # WINS and a value passed through `:env` is removed again; re-ordering these two `Enum.map`s
+    # is what would fix that half, and it would NOT recover the service-definition half.
+    # Whoever wires the deploy key must supply the command by a path the unset cannot reach — an
+    # explicit option this module reads, not an environment variable it also deletes.
+    #
+    # The one exception to that ordering, and it is expressed as a SUBTRACTION rather than a
+    # re-order: a SHAPED name the caller supplies is never put in `unset` at all (`unset_names/2`),
+    # so it survives whatever the order is. Re-ordering these two `Enum.map`s would have made
+    # EVERY unset overridable by any `:env` caller — ANTHROPIC_API_KEY included — which is a much
+    # larger grant than the one being made.
+    #
+    # Unsetting GIT_SSH_COMMAND is itself a WIDENING and is kept deliberately: git falls back to
+    # plain `ssh`, which reads the inherited `~/.ssh/config` and offers the operator's key, so
+    # this removes an operator's restriction as readily as an attacker's redirection. It stays
+    # because the value is also arbitrary code git executes, and because nothing legitimately
+    # sets it today; the moment something does, it needs the explicit path above.
+    # `LoopctlRunner.RunTest` has a characterisation test naming today's `extra` behaviour.
+    Enum.map(base ++ release_path(env) ++ extra, fn {k, v} ->
       {to_charlist(k), to_charlist(v)}
     end) ++
-      Enum.map(unset ++ release_env(System.get_env()), &{to_charlist(&1), false})
+      Enum.map(unset ++ release_env(env), &{to_charlist(&1), false})
+  end
+
+  # A silent irreversible subtraction is worse than a loud one even when it is right: without this
+  # an operator meets the shape deny as a build that fails for no stated reason, with the name
+  # they need nowhere in any log. NAMES ONLY, never values — this is written on every session
+  # start, on a machine whose environment carries live credentials.
+  defp log_shaped(session_id, shaped, unset) do
+    {dropped, kept} = Enum.split_with(shaped, &(&1 in unset))
+    # The advice is only true for names session_env would ACCEPT. A name on @credential_env is
+    # unset unconditionally and Config refuses it there, so recommending it produces a config that
+    # will not load — which raises in daemon_children!/0 and aborts the release preflight, for a
+    # name this line suggested. A lowercase one has no hatch either: the shape test upcases and
+    # the config's name format does not.
+    {hatchable, unconditional} = Enum.split_with(dropped, &Config.session_env_allows?/1)
+
+    case notes(hatchable, unconditional, kept) do
+      [] -> :ok
+      notes -> Logger.info("session #{session_id}: " <> Enum.join(notes, "; "))
+    end
+  end
+
+  defp notes(hatchable, unconditional, kept) do
+    [
+      if(hatchable != [],
+        do:
+          "unsetting #{length(hatchable)} credential-shaped name(s): " <>
+            Enum.join(hatchable, ", ") <>
+            " (name one in this repo's session_env to keep it)"
+      ),
+      if(unconditional != [],
+        do: "unset unconditionally, with no way to keep them: " <> Enum.join(unconditional, ", ")
+      ),
+      if(kept != [], do: "kept by session_env: " <> Enum.join(kept, ", "))
+    ]
+    |> Enum.reject(&is_nil/1)
   end
 
   @doc """

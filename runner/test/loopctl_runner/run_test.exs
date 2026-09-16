@@ -3,6 +3,7 @@ defmodule LoopctlRunner.RunTest do
   use ExUnit.Case, async: false
 
   alias LoopctlRunner.{Run, RunState, Story, Trace, WorktreeLock}
+  import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
 
   @moduletag timeout: 60_000
@@ -34,6 +35,47 @@ defmodule LoopctlRunner.RunTest do
 
   defp types(events), do: Enum.map(events, & &1["type"])
 
+  # Sets `vars` for the duration of `fun` and puts back WHAT WAS THERE, which is not the same as
+  # deleting them afterwards. SSH_AUTH_SOCK, GPG_AGENT_INFO and ANTHROPIC_API_KEY are all live in
+  # the shell that runs `mix test`, so a `System.delete_env/1` teardown removes the operator's
+  # real value from this BEAM for every test that runs after it — silently, and only on a machine
+  # where the variable was set.
+  defp with_env(vars, fun) do
+    saved = Enum.map(vars, fn {name, _} -> {name, System.get_env(name)} end)
+    # A nil value means UNSET for the duration — the only way a test can control what
+    # `System.get_env/0` holds on a machine whose own environment carries shaped names.
+    Enum.each(vars, fn
+      {name, nil} -> System.delete_env(name)
+      {name, value} -> System.put_env(name, value)
+    end)
+
+    try do
+      fun.()
+    after
+      Enum.each(saved, fn
+        {name, nil} -> System.delete_env(name)
+        {name, value} -> System.put_env(name, value)
+      end)
+    end
+  end
+
+  test "with_env/2 restores what was there, which deleting afterwards does not" do
+    # The teardown this replaces was `System.delete_env/1`, which is correct only for a name that
+    # was unset to begin with. SSH_AUTH_SOCK, GPG_AGENT_INFO and ANTHROPIC_API_KEY are live in the
+    # shell that runs `mix test`, so the old shape removed the operator's real values from this
+    # BEAM for every test that ran afterwards. Placeholders below are this test's own, not read
+    # from the environment.
+    name = "RUN_TEST_RESTORE_PROBE"
+    System.put_env(name, "was-here")
+
+    with_env([{name, "during"}], fn -> assert System.get_env(name) == "during" end)
+    assert System.get_env(name) == "was-here"
+
+    System.delete_env(name)
+    with_env([{name, "during"}], fn -> assert System.get_env(name) == "during" end)
+    refute System.get_env(name)
+  end
+
   test "a repo's session_env reaches its session, with {run} and {story} rendered", %{
     root: root,
     state: state
@@ -59,17 +101,19 @@ defmodule LoopctlRunner.RunTest do
   } do
     # Built at runtime: a key-named variable assigned a string literal reads to a secret
     # scanner as a leaked credential.
-    System.put_env("ANTHROPIC_API_KEY", "canary-#{System.unique_integer([:positive])}")
-    # What a mix release boots with: a session must inherit none of it.
     release_root = Path.join(root, "loopctl-release-canary")
-    path = System.get_env("PATH")
-    System.put_env("RELEASE_ROOT", release_root)
-    System.put_env("RELEASE_COOKIE", "canary-#{System.unique_integer([:positive])}")
-    System.put_env("EMU", "beam")
-    System.put_env("PATH", Path.join(release_root, "erts-0/bin") <> ":" <> path)
+
+    # What a mix release boots with: a session must inherit none of it.
+    vars = [
+      {"ANTHROPIC_API_KEY", "canary-#{System.unique_integer([:positive])}"},
+      {"RELEASE_ROOT", release_root},
+      {"RELEASE_COOKIE", "canary-#{System.unique_integer([:positive])}"},
+      {"EMU", "beam"},
+      {"PATH", Path.join(release_root, "erts-0/bin") <> ":" <> System.get_env("PATH")}
+    ]
 
     result =
-      try do
+      with_env(vars, fn ->
         run!(
           root,
           state,
@@ -79,10 +123,7 @@ defmodule LoopctlRunner.RunTest do
             "allowed_tools" => ["Edit(./lib/**)"]
           }
         )
-      after
-        System.put_env("PATH", path)
-        Enum.each(~w(ANTHROPIC_API_KEY RELEASE_ROOT RELEASE_COOKIE EMU), &System.delete_env/1)
-      end
+      end)
 
     assert result.status == "succeeded"
     assert result.session.exit_status == 0
@@ -166,18 +207,264 @@ defmodule LoopctlRunner.RunTest do
   } do
     # What git exports to a pre-commit hook, pointed somewhere harmful.
     vars = [{"GIT_INDEX_FILE", ".git/index"}, {"GIT_DIR", Path.join(root, "not-a-repo")}]
-    Enum.each(vars, fn {k, v} -> System.put_env(k, v) end)
 
-    result =
-      try do
-        run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}])
-      after
-        Enum.each(vars, fn {k, _} -> System.delete_env(k) end)
-      end
+    result = with_env(vars, fn -> run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}]) end)
 
     assert result.status == "succeeded"
     env = File.read!(Path.join(state, "env"))
     refute env =~ ~r/^GIT_(INDEX_FILE|DIR) PRESENT$/m
+  end
+
+  test "the operator's agent socket and forge tokens reach no session", %{
+    root: root,
+    state: state
+  } do
+    # Set HERE, not merely asserted absent: a bare refutation of a name nothing sets would pass
+    # with the whole unset list deleted. Some of these ARE in the shell that runs `mix test` and
+    # some are not, which is exactly why they are set rather than assumed either way — and why
+    # `with_env/2` puts the real values back instead of deleting them. Values are inert and built
+    # at runtime (a token-named variable assigned a literal reads to a secret scanner as a leak);
+    # nothing ever asserts on a value, only on whether the NAME arrived.
+    nonce = Integer.to_string(System.unique_integer([:positive]))
+
+    vars = [
+      # Live in the daemon's environment on a dev machine: an agent holding the operator's
+      # GitHub identity, one allow-list entry away from a push as him.
+      {"SSH_AUTH_SOCK", "/tmp/not-a-real-agent-socket-" <> nonce},
+      {"SSH_AGENT_PID", "0"},
+      # The same class, and also live on a dev machine — though only the legacy discovery path:
+      # modern GnuPG finds the agent under XDG_RUNTIME_DIR, which stays inherited.
+      {"GPG_AGENT_INFO", "/tmp/not-a-real-gpg-socket-" <> nonce <> ":0:1"},
+      {"GH_TOKEN", "not-a-real-value-" <> nonce},
+      {"GITHUB_TOKEN", "not-a-real-value-" <> nonce},
+      # Not a credential but the path to one: the program git and ssh run to obtain a
+      # passphrase, which is how an unattended session acquires one with no terminal involved.
+      {"GIT_ASKPASS", "/tmp/not-a-real-askpass-" <> nonce},
+      {"SSH_ASKPASS", "/tmp/not-a-real-askpass-" <> nonce}
+    ]
+
+    result = with_env(vars, fn -> run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}]) end)
+
+    assert result.status == "succeeded"
+    env = File.read!(Path.join(state, "env"))
+
+    for {name, _} <- vars do
+      refute env =~ ~r/^#{name} PRESENT$/m, "#{name} reached the session"
+    end
+
+    # The session still got the environment it is supposed to have: the assertions above are
+    # about a subtraction, and would also hold if the launch had never happened.
+    assert env =~ ~r/^LOOP_MODE=1$/m
+  end
+
+  test "a credential the runner has never heard of is unset by SHAPE", %{root: root, state: state} do
+    # The name list is calibrated to the systemd daemon's environment, which carries no
+    # credential at all. `mix loopctl.serve` is a daemon too and runs in the operator's LOGIN
+    # shell, where 41 names of this shape were counted — none of them on any list, all of them
+    # handed to a session with a Bash tool. Inert values, and never asserted on.
+    nonce = Integer.to_string(System.unique_integer([:positive]))
+
+    vars =
+      Enum.map(
+        # The last two are matched by the `_KEY` suffix and infix arms and by nothing else, so
+        # dropping that arm has to show up here rather than only in the shape unit test.
+        ~w(NPM_TOKEN AWS_SECRET_ACCESS_KEY HEX_API_KEY PGPASSWORD SOME_VENDOR_PRIVATE_KEY
+           SIGNING_KEY DEPLOY_KEY_PATH),
+        &{&1, "not-a-real-value-" <> nonce}
+      )
+
+    result = with_env(vars, fn -> run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}]) end)
+
+    assert result.status == "succeeded"
+    env = File.read!(Path.join(state, "env"))
+
+    for {name, _} <- vars do
+      refute env =~ ~r/^#{name} PRESENT$/m, "#{name} reached the session"
+    end
+
+    assert env =~ ~r/^LOOP_MODE=1$/m
+  end
+
+  test "a shaped name in session_env survives, though the same name in the environment does not",
+       %{root: root, state: state} do
+    # The escape hatch, end to end and against the ordering trap: SANDBOX_API_KEY is in the
+    # DAEMON's environment (where the shape deny would unset it) AND in this repo's session_env
+    # (where the operator said this repo's session needs it). The sibling test above proves the
+    # first half alone loses it, so its arrival here is the configuration and nothing else.
+    nonce = Integer.to_string(System.unique_integer([:positive]))
+    assert LoopctlRunner.Session.credential_shaped?("SANDBOX_API_KEY")
+
+    result =
+      with_env([{"SANDBOX_API_KEY", "not-a-real-value-" <> nonce}], fn ->
+        run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
+          "session_env" => %{"fixture" => %{"SANDBOX_API_KEY" => "from-session-env"}}
+        })
+      end)
+
+    assert result.status == "succeeded"
+    env = File.read!(Path.join(state, "env"))
+    # By NAME: the fixture records a credential-shaped variable's presence and never its value,
+    # so what is proved here is that the name reached the session. That its VALUE is the
+    # configured one rather than the inherited one is the next test, on a name whose value the
+    # fixture may record because it is a test probe and not a credential.
+    assert env =~ ~r/^SANDBOX_API_KEY PRESENT$/m
+  end
+
+  test "a session_env value wins over the same name inherited from the daemon", %{
+    root: root,
+    state: state
+  } do
+    # The other half of the ordering question, on RUNNER_ENV_PROBE because the fixture records
+    # ITS value: session_env comes after the inherited environment, so the configured value is
+    # what a session sees. Without this, the test above could hold while the session still read
+    # the daemon's value.
+    result =
+      with_env([{"RUNNER_ENV_PROBE", "from-the-daemon-environment"}], fn ->
+        run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
+          "session_env" => %{"fixture" => %{"RUNNER_ENV_PROBE" => "from-session-env"}}
+        })
+      end)
+
+    assert result.status == "succeeded"
+    env = File.read!(Path.join(state, "env"))
+    assert env =~ ~r/^RUNNER_ENV_PROBE=from-session-env$/m
+    refute env =~ ~r/^RUNNER_ENV_PROBE=from-the-daemon-environment$/m
+  end
+
+  test "the shaped names being unset are LOGGED, by name and never by value", %{
+    root: root,
+    state: state
+  } do
+    # A silent irreversible subtraction is worse than a loud one even when it is right: without
+    # this an operator meets the shape deny as a build failing for no stated reason, with the
+    # name they need in no log anywhere. Values never appear — this line is written on every
+    # session start, on machines whose environment carries live credentials.
+    nonce = Integer.to_string(System.unique_integer([:positive]))
+    dropped_value = "not-a-real-value-" <> nonce
+
+    # The suite runs at :warning (test_helper.exs) and this line is deliberately :info — it is
+    # written on every session start, and a warning on every routine run trains operators to
+    # ignore warnings. Sync tests never run beside async ones, so the level is this test's alone.
+    previous = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: previous) end)
+
+    log =
+      capture_log(fn ->
+        result =
+          with_env([{"NPM_TOKEN", dropped_value}, {"SANDBOX_API_KEY", dropped_value}], fn ->
+            run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
+              "session_env" => %{"fixture" => %{"SANDBOX_API_KEY" => "from-session-env"}}
+            })
+          end)
+
+        assert result.status == "succeeded"
+      end)
+
+    assert log =~ "NPM_TOKEN"
+    assert log =~ "kept by session_env: SANDBOX_API_KEY"
+    # It names the way back, or the operator has a mystery instead of a decision.
+    assert log =~ "session_env to keep it"
+    refute log =~ dropped_value
+    refute log =~ "from-session-env"
+
+    # ANTHROPIC_API_KEY is shape-matched AND unconditional, and it is set for this run by the
+    # test above it. The advice must never point at a name session_env would refuse: following
+    # it produces a config that will not load, which aborts the release preflight.
+    assert log =~ "unset unconditionally, with no way to keep them"
+    assert Regex.run(~r/unsetting [0-9]+ credential-shaped name\(s\): ([^(]*)/, log)
+    [_, advised] = Regex.run(~r/unsetting [0-9]+ credential-shaped name\(s\): ([^(]*)/, log)
+
+    for name <- advised |> String.split(", ") |> Enum.map(&String.trim/1), name != "" do
+      assert LoopctlRunner.Config.session_env_allows?(name),
+             "the drop log advised session_env for #{name}, which the config would refuse"
+    end
+  end
+
+  test "the drop log degenerates into nothing when every shaped name is kept", %{
+    root: root,
+    state: state
+  } do
+    # Guarded on what was DROPPED, not on what was shaped: otherwise a run where session_env
+    # supplies every shaped name present printed "unsetting 0 credential-shaped name(s): " with
+    # an empty list and advice to do the thing that had already been done.
+    previous = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: previous) end)
+
+    # Deterministic on any machine: this one's own environment carries shaped names, so without
+    # clearing them `dropped` is never empty here and the case under test never arises. They are
+    # restored by with_env/2, values included.
+    cleared =
+      Enum.map(
+        LoopctlRunner.Session.credential_shaped_env(System.get_env()) -- ["SANDBOX_API_KEY"],
+        &{&1, nil}
+      )
+
+    log =
+      capture_log(fn ->
+        result =
+          with_env([{"SANDBOX_API_KEY", "not-a-real-value"} | cleared], fn ->
+            run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
+              "session_env" => %{"fixture" => %{"SANDBOX_API_KEY" => "from-session-env"}}
+            })
+          end)
+
+        assert result.status == "succeeded"
+      end)
+
+    # The line was emitted at all, so the refutations below are about its CONTENT. Without this
+    # they would also pass on a run that logged nothing.
+    assert log =~ "kept by session_env: SANDBOX_API_KEY"
+    refute log =~ "unsetting 0"
+    refute log =~ "name(s): ;"
+    refute log =~ ~r/name\(s\): \s*(;|\.|$)/m
+  end
+
+  test "a git transport override in the runner's environment reaches no session", %{
+    root: root,
+    state: state
+  } do
+    # A different class from the credentials above: these name the PROGRAM git executes, so an
+    # inherited value runs arbitrary code on every git call a session makes, and a value that
+    # merely redirects ssh picks the identity git authenticates with. Set here, not merely
+    # refuted, for the same reason as the test above. Inert: /bin/true accepts ssh's arguments
+    # and does nothing, and the value is never asserted on.
+    vars = [{"GIT_SSH_COMMAND", "/bin/true"}, {"GIT_SSH", "/bin/true"}]
+
+    result = with_env(vars, fn -> run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}]) end)
+
+    assert result.status == "succeeded"
+    env = File.read!(Path.join(state, "env"))
+
+    for {name, _} <- vars do
+      refute env =~ ~r/^#{name} PRESENT$/m, "#{name} reached the session"
+    end
+
+    assert env =~ ~r/^LOOP_MODE=1$/m
+  end
+
+  test "characterisation, not a desired property: a deliberate :env value loses to the unset list",
+       %{root: root, state: state} do
+    # WHAT THIS RECORDS, so a future reader knows it is a trap and not a guarantee: port_env/4
+    # appends the unsets AFTER the caller's `:env`, so for a name in both the unset wins and the
+    # supplied value never reaches the session. Harmless today — Config refuses every unset name
+    # in session_env and nothing else supplies one — and a live hazard for the planned deploy
+    # key, which sets GIT_SSH_COMMAND on purpose and would be silently dropped. When that change
+    # makes an explicit value win, THIS TEST IS SUPPOSED TO GO RED: invert it, do not delete it.
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    result =
+      try do
+        config = config!(root)
+        {:ok, story} = Story.from_map(story_map(), config)
+        Run.execute(config, story, env: [{"GIT_SSH_COMMAND", "/bin/true"}])
+      after
+        restore.()
+      end
+
+    assert result.status == "succeeded"
+    refute File.read!(Path.join(state, "env")) =~ ~r/^GIT_SSH_COMMAND PRESENT$/m
   end
 
   test "a non-zero exit fails the run and still tears down", %{root: root, state: state} do

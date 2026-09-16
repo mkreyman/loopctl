@@ -346,13 +346,23 @@ defmodule LoopctlRunner.Control do
             # The config decides; the option lets a test override it.
             accepts_dispatches:
               Keyword.get(opts, :accepts_dispatches, control.accepts_dispatches),
+            # What a `dispatches_disabled` refusal says when something other than the config
+            # turned dispatches off for this process — the foreground dev task. nil for a daemon
+            # under a service manager, where the config IS the reason and says so itself.
+            dispatch_refusal_detail: Keyword.get(opts, :dispatch_refusal_detail),
+            # Whether a crashed predecessor's pending accepts are resumed. The decide path is not
+            # the only way a session starts: `restore_pending_starts/1` resends an accept for work
+            # ALREADY taken, and `ok` starts the run — so a process that must take no work has to
+            # be stopped over the START path too, not only over the decision.
+            restores_pending_starts: restores_pending_starts?(opts),
             # Where accepted runs are started, and what runs them (replaceable in tests).
             run_supervisor: Keyword.get(opts, :run_supervisor, LoopctlRunner.RunSupervisor),
             run: Keyword.get(opts, :run, &Run.execute/3),
             triage_run: Keyword.get(opts, :triage_run, &TriageRun.execute/4),
             # dispatch_id => claim_epoch for every dispatch this process started a run for, so
             # a repeat of one is never run twice.
-            started_dispatches: started_dispatches(config.runs_dir),
+            started_dispatches:
+              started_dispatches(config.runs_dir, restores_pending_starts?(opts)),
             # In memory, for the life of this PROCESS — `mark_unjoined/2` does not clear it, and
             # that is deliberate rather than an oversight: a superseded ledger row stays
             # superseded, so the fact does not expire with a connection, and forgetting it on a
@@ -472,16 +482,30 @@ defmodule LoopctlRunner.Control do
     end
   end
 
+  defp restores_pending_starts?(opts), do: Keyword.get(opts, :restores_pending_starts, true)
+
   # Every dispatch a run on this machine is bound to, in any status: a Control that restarted
   # must answer a redelivered dispatch accepted again, and never start it a second time.
-  defp started_dispatches(runs_dir) do
+  #
+  # A pending entry counts ONLY when this process will resume it. `handle_dispatch/2` consults
+  # this map BEFORE the policy and answers a match `accepted` — so a process that leaves the
+  # pending files for the service daemon and claims their ids here tells loopctl a story is
+  # executing that nothing will run: `settle_reply/3` then calls `start_pending/2`, which pops
+  # nothing and returns, in silence, until the claim lease expires. Seeded from RunState alone,
+  # a redelivery falls through to `decide_dispatch/2` and is refused `dispatches_disabled`,
+  # which is the truth.
+  defp started_dispatches(runs_dir, restores_pending_starts?) do
     bound =
       for {_dir, %{"dispatch_id" => id, "claim_epoch" => epoch}} <- RunState.all(runs_dir),
           do: {id, epoch}
 
     pending =
-      for %{"dispatch_id" => id, "claim_epoch" => epoch} <- PendingStarts.all(runs_dir),
-          do: {id, epoch}
+      if restores_pending_starts? do
+        for %{"dispatch_id" => id, "claim_epoch" => epoch} <- PendingStarts.all(runs_dir),
+            do: {id, epoch}
+      else
+        []
+      end
 
     for {id, epoch} <- bound ++ pending,
         is_binary(id) and is_integer(epoch),
@@ -1352,7 +1376,13 @@ defmodule LoopctlRunner.Control do
 
   defp decision(a, dispatch) do
     config = %{a.config | control: %{a.config.control | accepts_dispatches: a.accepts_dispatches}}
-    state = %{draining: a.draining, in_flight: in_flight(a), free_disk_mb: &free_disk_mb(a, &1)}
+
+    state = %{
+      draining: a.draining,
+      in_flight: in_flight(a),
+      free_disk_mb: &free_disk_mb(a, &1),
+      dispatches_disabled_detail: a.dispatch_refusal_detail
+    }
 
     with :ok <- declared_kind(dispatch),
          {:accept, fields} <- a.decide.(dispatch, config, state),
@@ -1511,6 +1541,29 @@ defmodule LoopctlRunner.Control do
   # A Control starting over pending files resends each accept and starts the run on ok, as for a
   # fresh accept. The work is rebuilt against the current config; work that no longer builds is
   # logged and forgotten rather than started.
+  defp restore_pending_starts(%{assigns: %{restores_pending_starts: false}} = socket) do
+    # The scenario this refuses is ordinary and ends in a real production session: the service
+    # daemon accepts a dispatch and writes a pending entry, it dies, and someone runs
+    # `mix loopctl.serve` over the SAME runs_dir to see why. Recovery does not go through
+    # `DispatchPolicy` — `rebuild_work/2` forces `accepts_dispatches: true`, because the accept
+    # was already given — so the foreground refusal would be bypassed entirely and the run would
+    # start in the operator's login shell. Nothing is deleted and no accept is resent: the entry
+    # is work this process is not taking, and the service daemon resumes it on its next start.
+    case PendingStarts.all(socket.assigns.config.runs_dir) do
+      [] ->
+        socket
+
+      pending ->
+        Logger.warning(
+          "not resuming #{length(pending)} pending start(s): this process takes no work, and " <>
+            "resuming one would start a session here. They are left for the service daemon; " <>
+            "pass --accept-dispatches to resume them in the foreground."
+        )
+
+        socket
+    end
+  end
+
   defp restore_pending_starts(socket) do
     a = socket.assigns
 

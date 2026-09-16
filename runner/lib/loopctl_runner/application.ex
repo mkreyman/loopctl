@@ -19,6 +19,56 @@ defmodule LoopctlRunner.Application do
 
   defp daemon?, do: System.get_env("LOOPCTL_RUNNER_DAEMON") == "1"
 
+  # How `mix loopctl.serve` tells this daemon to refuse work. The prefix is not incidental:
+  # `Session.release_env/1` unsets every LOOPCTL_RUNNER_* name for a session, so this marker
+  # cannot reach the thing it exists to protect against.
+  @refuse_dispatches_var "LOOPCTL_RUNNER_REFUSE_DISPATCHES"
+
+  # What the refusal says on the wire. `dispatches_disabled` is one reason for two conditions —
+  # a machine configured not to take work, and this — and loopctl cannot tell them apart from the
+  # reason alone, so whoever reads it there guesses which machine is misconfigured. It carries no
+  # path, hostname or environment value: this string leaves the machine.
+  @foreground_detail "a foreground mix loopctl.serve run refuses dispatches by default, " <>
+                       "so this machine's configuration was not consulted; " <>
+                       "restart it with --accept-dispatches to use the config's answer"
+
+  @doc false
+  @spec refuse_dispatches_var() :: String.t()
+  def refuse_dispatches_var, do: @refuse_dispatches_var
+
+  @doc """
+  Control options the foreground dev task forces on this daemon, or `[]` under a service manager.
+
+  `mix loopctl.serve` runs the identical daemon on the identical config, from the operator's
+  LOGIN SHELL, and an enrolled machine's `control.accepts_dispatches` is true — so the task
+  refuses work unless it was asked for it (`--accept-dispatches`), and this is the wire.
+
+  It is TWO options, not one, because a session starts by two paths. The decision path is
+  `accepts_dispatches: false` below. The other is recovery: `Control.init/1` resends the accept
+  of a crashed predecessor's pending start and runs it on `ok`, WITHOUT consulting
+  `DispatchPolicy` — the accept was already given — so a foreground run over a service daemon's
+  `runs_dir` would start a real session in the login shell. `restores_pending_starts: false`
+  closes that one, leaving the entries for the service daemon.
+
+  The refusal is expressed as `accepts_dispatches: false`, which `LoopctlRunner.DispatchPolicy`
+  answers `dispatches_disabled`: a statement about how THIS PROCESS is configured, which is what
+  a foreground dev task is. It is deliberately not a capability reason — `kind_not_supported`
+  would tell loopctl this MACHINE never runs that kind, which is a lie a dev session would leave
+  behind it. It also reports `draining: true` on the join (`Control.reported_draining/2`), so
+  loopctl reserves no capacity here for a session that would not start; the runner still joins,
+  which is what the task is for.
+  """
+  @spec foreground_overrides() :: keyword()
+  def foreground_overrides do
+    if System.get_env(@refuse_dispatches_var) == "1",
+      do: [
+        accepts_dispatches: false,
+        dispatch_refusal_detail: @foreground_detail,
+        restores_pending_starts: false
+      ],
+      else: []
+  end
+
   @doc """
   Checks, before a release is installed, everything the daemon needs to start: the config
   loads, it has a control section, and the token file is readable by this user alone.
@@ -76,7 +126,9 @@ defmodule LoopctlRunner.Application do
         # is never blocked by one, and a Control restart does not take running sessions down.
         [
           {Task.Supervisor, name: LoopctlRunner.RunSupervisor},
-          {Control, config: config, name: Control, run_supervisor: LoopctlRunner.RunSupervisor}
+          {Control,
+           [config: config, name: Control, run_supervisor: LoopctlRunner.RunSupervisor] ++
+             foreground_overrides()}
         ]
 
       {:error, reason} ->

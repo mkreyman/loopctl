@@ -119,6 +119,12 @@ defmodule LoopctlRunner.ConfigTest do
             %{repo => %{"LOOPCTL_LAUNCHER_SETSID" => "1"}},
             %{repo => %{"ANTHROPIC_API_KEY" => "x"}},
             %{repo => %{"GIT_DIR" => "/tmp"}},
+            # A credential port_env/4 unsets: configured here it would be dropped silently,
+            # and only under the daemon.
+            %{repo => %{"SSH_AUTH_SOCK" => "/tmp/agent"}},
+            %{repo => %{"GH_TOKEN" => "x"}},
+            %{repo => %{"GPG_AGENT_INFO" => "/tmp/agent:0:1"}},
+            %{repo => %{"SSH_ASKPASS" => "/tmp/askpass"}},
             %{repo => %{"RELEASE_COOKIE" => "x"}},
             %{repo => %{"ERL_CRASH_DUMP_SECONDS" => "0"}},
             %{repo => %{"ROOTDIR" => "/tmp"}},
@@ -129,6 +135,84 @@ defmodule LoopctlRunner.ConfigTest do
           ] do
         assert {:error, _} = Config.from_map(with_env(root, bad)), inspect(bad)
       end
+    end
+
+    test "a config carrying session_env is refused when other users can read it" do
+      # The hatch is only as good as the file it lives in: we now tell operators to put a
+      # credential here, and under a default umask runner.json is 0644. The same 0o077 test the
+      # channel token already gets, and only when session_env carries something — a config
+      # without it holds no secret of its own.
+      root = tmp_dir!("session-env-mode")
+      repo = config_map(root)["repos"] |> Map.keys() |> hd()
+      path = Path.join(root, "runner.json")
+
+      File.write!(path, JSON.encode!(with_env(root, %{repo => %{"SECRET_KEY_BASE" => "x"}})))
+      File.chmod!(path, 0o644)
+
+      assert {:error, message} = Config.load(path)
+      assert message =~ "session_env"
+      assert message =~ "chmod 600"
+
+      File.chmod!(path, 0o600)
+      assert {:ok, _} = Config.load(path)
+
+      # A config with no session_env is not refused: that property was never relied on there.
+      plain = Path.join(root, "plain.json")
+      File.write!(plain, JSON.encode!(config_map(root)))
+      File.chmod!(plain, 0o644)
+      assert {:ok, _} = Config.load(plain)
+    end
+
+    test "a SHAPE-matched name is allowed here: this is the escape hatch for the heuristic" do
+      # The shape deny is a heuristic over an environment nobody enumerated, and it over-matches
+      # real cases — SECRET_KEY_BASE for a test env, a key that is publishable by design. Naming
+      # one here is the operator making the judgement the shape cannot, for ONE repo, in a file
+      # only they write. Refusing it left them no way to keep it at all.
+      root = tmp_dir!("session-env-shaped")
+      repo = config_map(root)["repos"] |> Map.keys() |> hd()
+
+      env = %{repo => %{"SECRET_KEY_BASE" => "x", "STRIPE_PUBLISHABLE_KEY" => "y"}}
+      assert {:ok, config} = Config.from_map(with_env(root, env))
+
+      assert [{"SECRET_KEY_BASE", "x"}, {"STRIPE_PUBLISHABLE_KEY", "y"}] =
+               Config.session_env_for(config, repo, "story-a", "0123456789abcdef")
+
+      # ...and they really are names the shape deny matches, or this proves nothing.
+      assert LoopctlRunner.Session.credential_shaped?("SECRET_KEY_BASE")
+      assert LoopctlRunner.Session.credential_shaped?("STRIPE_PUBLISHABLE_KEY")
+    end
+
+    test "the refusal says WHICH rule refused, because one of them is a breaking change" do
+      # A repo that set GH_TOKEN here loaded yesterday and does not today, and the failure is not
+      # local: Config.load/1 refuses the WHOLE config, which aborts rel/install.sh's preflight. A
+      # message identical to a mistyped value sends the operator to look at the value.
+      root = tmp_dir!("session-env-message")
+      repo = config_map(root)["repos"] |> Map.keys() |> hd()
+
+      assert {:error, credential} =
+               Config.from_map(with_env(root, %{repo => %{"GH_TOKEN" => "x"}}))
+
+      assert credential =~ "session_env.#{repo}.GH_TOKEN"
+      # The reason must be TRUE for this name: GH_TOKEN is unset whatever the environment holds.
+      # The message used to claim that certainty for SHAPE-matched names too, where it is false —
+      # port_env/4 unsets a shaped name only when the daemon's environment carries it — and it
+      # sent the operator to change LoopctlRunner.Session, where no mechanism to help them exists.
+      assert credential =~ "UNCONDITIONALLY"
+      refute credential =~ "LoopctlRunner.Session"
+
+      # A shaped name is no longer refused at all: naming it here is how it is kept.
+      assert {:ok, _} = Config.from_map(with_env(root, %{repo => %{"NPM_TOKEN" => "x"}}))
+
+      # The other causes keep their own wording, so the three are told apart.
+      assert {:error, managed} =
+               Config.from_map(with_env(root, %{repo => %{"GIT_DIR" => "/tmp"}}))
+
+      assert managed =~ "the runner manages itself"
+      refute managed =~ "UNCONDITIONALLY"
+
+      assert {:error, value} = Config.from_map(with_env(root, %{repo => %{"OK" => 1}}))
+      assert value =~ "is not a string value"
+      refute value =~ "UNCONDITIONALLY"
     end
   end
 

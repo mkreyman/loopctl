@@ -296,6 +296,59 @@ defmodule LoopctlRunner.ControlTest do
       assert Control.info(pid).joined
     end
 
+    test "the foreground dev task refuses a dispatch that the CONFIG would have accepted", ctx do
+      # The whole point of the flag, end to end: `mix loopctl.serve` starts this daemon on a
+      # config whose accepts_dispatches is TRUE — the normal state of an enrolled machine — and
+      # a session started from that shell would inherit the operator's login environment. So the
+      # config here says yes and the reply must still be a refusal. Delete the override in
+      # Application.foreground_overrides/0 and this dispatch is ACCEPTED, which is what makes
+      # this a test of the wiring rather than of the reason string.
+      config = %{
+        ctx.config
+        | control: %{ctx.config.control | accepts_dispatches: true, status_interval_s: 30}
+      }
+
+      overrides =
+        try do
+          System.put_env(LoopctlRunner.Application.refuse_dispatches_var(), "1")
+          LoopctlRunner.Application.foreground_overrides()
+        after
+          System.delete_env(LoopctlRunner.Application.refuse_dispatches_var())
+        end
+
+      {pid, _ref} = start_control(config, overrides)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+      topic = "runner:" <> TestLoopctl.get(:runner_id)
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", @dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+      assert Contract.validate("RunnerDispatchReply", reply) == :ok
+      assert reply["decision"] == "refused"
+      # A DispatchPolicy reason about this process, never a capability claim about the machine.
+      assert reply["reason"] == "dispatches_disabled"
+      refute reply["reason"] == "kind_not_supported"
+
+      # One reason, two conditions: the detail is the only thing that tells loopctl WHICH, so a
+      # reader there does not go looking for a misconfigured machine.
+      assert reply["detail"] =~ "mix loopctl.serve"
+      assert reply["detail"] =~ "--accept-dispatches"
+      refute reply["detail"] == "this runner is not configured to accept dispatches"
+      # It leaves the machine: no path, hostname or environment value may ride along.
+      refute reply["detail"] =~ ~r"/"
+      refute String.contains?(reply["detail"], ctx.root)
+      assert byte_size(reply["detail"]) <= 500
+
+      # It still JOINS, and reports draining so loopctl reserves no capacity for it.
+      assert %{joined: true, draining: true, accepts_dispatches: false} = Control.info(pid)
+    end
+
+    test "under a service manager the config decides, and nothing overrides it", ctx do
+      # The other half: without the marker the task's refusal must not leak into the release
+      # path, where the unit's environment is the clean one and the config is the authority.
+      System.delete_env(LoopctlRunner.Application.refuse_dispatches_var())
+      assert LoopctlRunner.Application.foreground_overrides() == []
+    end
+
     test "a rate-limited dispatch_reply is resent, and does not trigger a status", ctx do
       TestLoopctl.put(:dispatch_reply_replies, [{:error, %{reason: "rate_limited"}}])
       {_pid, topic} = joined_control(ctx)
@@ -1710,6 +1763,55 @@ defmodule LoopctlRunner.ControlTest do
       assert story_id == DispatchRun.story_id(dispatch["story_id"])
       assert LoopctlRunner.PendingStarts.all(ctx.config.runs_dir) == []
       runs_done(pid)
+    end
+
+    test "a foreground run resumes NO pending start, and leaves it for the service daemon", ctx do
+      # The HIGH from round 2, and the path that actually starts a session: recovery does not go
+      # through DispatchPolicy at all (rebuild_work forces accepts_dispatches: true, because the
+      # accept was already given), so the decide-path refusal does not reach it. A service daemon
+      # dies holding a pending accept, someone runs `mix loopctl.serve` over the same runs_dir to
+      # debug, and without this the run starts in their login shell.
+      test = self()
+      dispatch = story_dispatch()
+      :ok = LoopctlRunner.PendingStarts.write(ctx.config.runs_dir, dispatch)
+
+      marker = LoopctlRunner.Application.refuse_dispatches_var()
+
+      overrides =
+        try do
+          System.put_env(marker, "1")
+          LoopctlRunner.Application.foreground_overrides()
+        after
+          System.delete_env(marker)
+        end
+
+      {pid, _} = accepting_control(ctx, "stream", %{}, [run: counting_run(test)] ++ overrides)
+
+      # No accept resent, and above all no run started: both are the defect, in that order.
+      refute_receive {:test_loopctl, {:dispatch_reply, _}}, 1_500
+      refute_receive {:run_started, _}, 100
+      # Nothing is deleted either: the entry is work this process is not taking, and the service
+      # daemon must still find it.
+      assert [%{"dispatch_id" => id}] = LoopctlRunner.PendingStarts.all(ctx.config.runs_dir)
+      assert id == dispatch["dispatch_id"]
+      assert Control.info(pid).joined
+
+      # AND IT MUST NOT CLAIM THE ID EITHER. loopctl redelivers the dispatch — that is the
+      # designed-for case after a restart — and `handle_dispatch/2` consults started_dispatches
+      # BEFORE the policy. Seeded from the pending files, this process would answer `accepted`
+      # for a run it has already decided not to start: loopctl would record the story as
+      # executing here, `start_pending/2` would pop nothing, and nothing would say so until the
+      # claim lease expired. The refusal has to be honest end to end.
+      topic = "runner:" <> TestLoopctl.get(:runner_id)
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+      assert reply["decision"] == "refused"
+      assert reply["reason"] == "dispatches_disabled"
+      refute_receive {:run_started, _}, 100
+
+      # Still on disk afterwards: the service daemon is the one that resumes it.
+      assert [%{"dispatch_id" => ^id}] = LoopctlRunner.PendingStarts.all(ctx.config.runs_dir)
     end
 
     test "a run's stage message reaches a Control that registers after it was sent" do
