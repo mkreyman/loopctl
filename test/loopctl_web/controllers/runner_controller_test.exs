@@ -275,6 +275,36 @@ defmodule LoopctlWeb.RunnerControllerTest do
       assert entry["joined_at"] == "2026-09-12T10:00:00Z"
     end
 
+    # STORY 846.2. The prefixes a machine accepts lived ONLY in a config file on that machine,
+    # so a placement refused `branch_not_allowed` was undiagnosable from the control plane.
+    # The pool is where an operator looks at a connected machine that refuses everything, so
+    # it is where the declaration has to be readable.
+    test "echoes the branch prefixes a runner declared, and [] when it declared none",
+         %{conn: conn} do
+      ctx = operator_ctx()
+      {_raw, declaring} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "minis"})
+      {_raw, silent} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "nuc"})
+
+      track_runner(declaring, %{branch_prefixes: ["loop/", "feature/"]})
+      track_runner(silent)
+
+      entries =
+        conn
+        |> auth(ctx.operator_key)
+        |> get(~p"/api/v1/runners/pool")
+        |> json_response(200)
+        |> Map.fetch!("runners")
+        |> Map.new(&{&1["machine"], &1["branch_prefixes"]})
+
+      assert entries["minis"] == ["loop/", "feature/"]
+
+      # `[]`, not null — an absent declaration means NO CONSTRAINT here, which is a real
+      # statement about how loopctl will derive a branch. (`kinds` renders null for silence
+      # for the opposite reason: there, silence is read as `["implement"]`, and printing that
+      # as the machine's declaration would report words it never said.)
+      assert entries["nuc"] == []
+    end
+
     test "is tenant-scoped: another tenant's key sees none of this tenant's runners" do
       ctx_a = operator_ctx()
       ctx_b = operator_ctx()

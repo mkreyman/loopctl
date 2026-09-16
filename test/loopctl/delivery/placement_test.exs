@@ -22,6 +22,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StageEvent
@@ -30,6 +31,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
+  alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Stories
@@ -1364,6 +1366,12 @@ defmodule Loopctl.Delivery.PlacementTest do
   # the story object loopctl built" rather than echoed from here.
   defp dispatch_payload(story), do: build(:runner_dispatch, %{"story_id" => story.id})
 
+  # The same payload with NO `branch`, which is the shape an operator sends now that
+  # loopctl derives one from the target runner's declaration (story 846.2). The fixture
+  # names a branch of its own, so a test about DERIVATION has to drop it or it asserts on
+  # the caller's value passing through.
+  defp derived_branch_payload(story), do: Map.delete(dispatch_payload(story), "branch")
+
   # The runner drops its socket and joins again declaring `overrides`. A capacity or draining
   # declaration is per-CONNECTION, so this is the only way to change one.
   defp rejoin(ctx, overrides) do
@@ -1725,6 +1733,159 @@ defmodule Loopctl.Delivery.PlacementTest do
     end
 
     test "a machine declaring neither is placed on as before", ctx do
+      %{story: story} = ctx
+
+      # Declaring the number the row ALREADY holds, deliberately: a rejoin that MOVES capacity
+      # writes on the channel's sandbox connection, whose transaction never commits, so the
+      # `runners` row stays locked for the rest of the test and the placement below would time
+      # out at `:capacity_busy` on the lock rather than on anything this test is about.
+      rejoin(ctx, %{"draining" => false, "max_sessions" => 2})
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+    end
+  end
+
+  # STORY 846.2. The delivery loop's first real placement was refused `branch_not_allowed`:
+  # loopctl derived `feature/story-<n>-<id>` and the minis runner's config accepted `loop/`
+  # alone, so the dispatch was refused, the story was parked, and the run never started. The
+  # one field was never the defect — loopctl chose a prefix, each operator chose a prefix per
+  # machine, and nothing reconciled them.
+  describe "a machine that declares the branch prefixes it accepts" do
+    # AC-4, and the test AC-4 names its own mutation for: make the derivation ignore the
+    # declared prefix and this goes red. It asserts on the frame the RUNNER receives, so it
+    # binds the whole path — the declaration reaching the Presence meta, the placement reading
+    # the sole live meta, and `DispatchPayload.fill/3` using it — rather than the derivation
+    # in isolation, which `Loopctl.Delivery.DispatchPayloadTest` covers.
+    test "the pushed branch starts with the prefix the runner declared", ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/"]})
+
+      assert {:ok, _placed} = place(ctx, derived_branch_payload(story))
+      assert_push "dispatch", pushed, @reply_timeout
+
+      assert pushed.branch ==
+               "loop/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+
+      # AC-5: the prefix moved and the unique part did not. Without this a derivation that
+      # returned the bare prefix would satisfy the assertion above.
+      assert String.ends_with?(pushed.branch, String.slice(story.id, 0, 8))
+      assert runner.name == "minis"
+    end
+
+    # AC-1, END TO END. The inertness claim is the whole safety of shipping this before any
+    # runner declares the field, so it is asserted against the DERIVATION rather than against
+    # a literal: whatever `branch_for/2` produces with no declaration is what an undeclaring
+    # runner must be sent.
+    test "a runner that declares nothing is sent exactly the branch it was sent before", ctx do
+      %{story: story} = ctx
+      rejoin(ctx, %{"draining" => false, "max_sessions" => 2})
+
+      assert {:ok, _placed} = place(ctx, derived_branch_payload(story))
+      assert_push "dispatch", pushed, @reply_timeout
+
+      assert {:ok, unconstrained} = DispatchPayload.branch_for(story)
+      assert pushed.branch == unconstrained
+    end
+
+    # AC-5 is not negotiable, so a declaration that leaves no room for a unique name is a
+    # refusal. BEFORE the claim, like `runner_declines_work`: the runner would refuse the push
+    # itself, and by then the story is claimed for it and sits at `claimed` until its lease
+    # expires.
+    test "a prefix that cannot produce a valid branch refuses before anything is claimed",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop//"]})
+
+      assert {:error, {:no_conforming_branch, ["loop//"]}} =
+               place(ctx, derived_branch_payload(story))
+
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
+    # A CALLER'S BRANCH IS JUDGED, NEVER REWRITTEN. Refused here it costs nothing; left to the
+    # runner it costs the claim, which is the same failure this story exists to end wearing a
+    # different hat.
+    test "a caller-supplied branch outside the declaration is refused before the claim", ctx do
+      %{runner: runner, story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/"]})
+
+      payload = Map.put(dispatch_payload(story), "branch", "feature/mine")
+
+      assert {:error, {:branch_not_allowed, "feature/mine", ["loop/"]}} = place(ctx, payload)
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
+    test "a caller-supplied branch INSIDE the declaration is passed through untouched", ctx do
+      %{story: story} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/"]})
+
+      payload = Map.put(dispatch_payload(story), "branch", "loop/mine")
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.branch == "loop/mine"
+    end
+
+    # SOUL RULE 9, the retry question, answered by a test rather than only by a comment: can
+    # a retry place two dispatches on two different branch names for one story? It can, in
+    # exactly one case — the machine reconnected declaring a different set between the first
+    # push and this one — and the new name is the RIGHT one, because a resume only runs
+    # against a ledger row still at `sent`, so the first frame was never accepted and no
+    # session exists on the old name to disagree with. The branch is otherwise a pure
+    # function of the story and the declaration, so an unchanged declaration re-derives the
+    # same string.
+    #
+    # ON THE SHARED SANDBOX CONNECTION, not `unboxed/1`, for the reason the draining resume
+    # test above sets out at length: the channel marked the ledger row `pushed` inside the
+    # sandbox transaction and holds that row lock, so a resume on a real connection would
+    # wait out its `lock_timeout`. Sound because a resume claims, mints and appends nothing.
+    test "a RESUME re-derives the branch from the declaration the machine carries NOW", ctx do
+      %{runner: runner, story: story} = ctx
+      # THREADED, because `rejoin/2` disconnects the channel in the ctx it is given: a second
+      # rejoin from the original ctx would drop an already-dead channel and leave the live
+      # entry in the pool.
+      ctx = %{ctx | channel: rejoin(ctx, %{"branch_prefixes" => ["loop/"]})}
+      payload = derived_branch_payload(story)
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+      assert String.starts_with?(first.branch, "loop/")
+
+      # The operator fixed the machine's configuration and it reconnected. The dispatch was
+      # never answered, so nothing is running on `loop/...`.
+      ctx = %{ctx | channel: rejoin(ctx, %{"branch_prefixes" => ["agent/"]})}
+
+      assert {:ok, resumed} =
+               Placement.place(runner.tenant_id, runner.id, payload, api_key: ctx.operator)
+
+      assert resumed.dispatch_id == placed.dispatch_id
+      assert resumed.claim_epoch == placed.claim_epoch
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.dispatch_id == payload["dispatch_id"]
+
+      # The declaration decided, not the first push and not the un-prefixed default.
+      assert again.branch == "agent/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+    end
+
+    # The pool is where an operator looks at a machine that is connected and refusing
+    # everything, so it is where the declaration has to be readable — the whole defect was
+    # that these prefixes lived only in a config file on the target box.
+    test "the pool echoes what the machine declared", ctx do
+      %{runner: runner} = ctx
+      rejoin(ctx, %{"branch_prefixes" => ["loop/", "feature/"]})
+
+      assert [meta] = Runners.live_metas(runner.tenant_id, runner.id)
+      assert Runners.declared_branch_prefixes(meta) == ["loop/", "feature/"]
+    end
+
+    test "a machine declaring neither prefixes nor anything else is placed on as before", ctx do
       %{story: story} = ctx
 
       # Declaring the number the row ALREADY holds, deliberately: a rejoin that MOVES capacity

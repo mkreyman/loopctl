@@ -386,6 +386,25 @@ defmodule Loopctl.RunnersTest do
     end
   end
 
+  describe "declared_branch_prefixes/1 (contract 1.14.0)" do
+    # STORED NOWHERE — this reads the live meta at the decision, which is why there is no
+    # migration and nothing to reconcile on a reconnect. See the function's own doc for why a
+    # branch prefix can take that form where capacity could not.
+    test "a declaration is returned verbatim, in the order the runner sent it" do
+      assert Runners.declared_branch_prefixes(%{branch_prefixes: ["loop/", "feature/"]}) ==
+               ["loop/", "feature/"]
+    end
+
+    # AC-1: silence is NO CONSTRAINT, which is what makes the field additive. A runner built
+    # before 1.14.0 sends no such key and must behave exactly as it did.
+    test "silence, an empty array and a list with a non-string are all no constraint" do
+      assert Runners.declared_branch_prefixes(%{max_sessions: 2}) == []
+      assert Runners.declared_branch_prefixes(%{branch_prefixes: []}) == []
+      assert Runners.declared_branch_prefixes(%{branch_prefixes: ["loop/", 3]}) == []
+      assert Runners.declared_branch_prefixes(%{}) == []
+    end
+  end
+
   describe "tenant isolation" do
     test "tenant B can neither see, fetch, revoke nor authorize tenant A's runner" do
       tenant_a = fixture(:tenant)

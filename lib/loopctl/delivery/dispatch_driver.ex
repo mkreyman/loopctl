@@ -73,7 +73,6 @@ defmodule Loopctl.Delivery.DispatchDriver do
   import Ecto.Query
 
   alias Loopctl.ApiSpec.RunnerContract
-  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
@@ -248,7 +247,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   # ONE CEILING PER BUDGET KEY, and every key a caller may pass must have a clause — this is a
   # private function on a public entry point, so a key it does not name is a
   # `FunctionClauseError` inside an Oban worker rather than an error return. The triage pair
-  # (`Loopctl.Delivery.TriageDispatcher.budgets/0`, `DispatchPayload.fill/2` on a triage kind)
+  # (`Loopctl.Delivery.TriageDispatcher.budgets/0`, `DispatchPayload.fill/3` on a triage kind)
   # had no clause, so setting `TRIAGE_WALL_CLOCK_SECONDS` — which is what the deploy doc tells
   # an operator to do — crashed every pass, three Oban retries and a discard a minute, with no
   # triage dispatch ever sent. It was green because the only budget test asserts the UNSET
@@ -359,19 +358,23 @@ defmodule Loopctl.Delivery.DispatchDriver do
     end
   end
 
-  # THE SAME DERIVATION AN OPERATOR'S PLACEMENT MAKES — `Loopctl.Delivery.DispatchPayload` —
-  # so the branch this driver would have chosen and the one
-  # `POST /api/v1/runners/:runner_id/dispatches` chooses are one name rather than two copies
-  # of one convention. The budgets are passed rather than re-read: a pass reads them once, so
-  # every story it places spends against the same policy even if an operator changes it
-  # mid-pass.
+  # NO `branch` KEY, WHICH IS HOW THE TWO PATHS ARE MADE UNABLE TO DISAGREE (story 846.2).
+  # This used to call `DispatchPayload.branch_for/1` here, which was the same function an
+  # operator's placement used and therefore the same name — until the derivation gained an
+  # input this module does not have. Since contract 1.14.0 the branch depends on what the
+  # TARGET RUNNER declared it accepts (`RunnerJoin.branch_prefixes`), read off the live socket
+  # the push will reach, and only `Loopctl.Delivery.Placement` holds that. A second derivation
+  # here would have to re-read the pool and could still resolve a different meta, so the key
+  # is omitted and `DispatchPayload.fill/3` fills it: one call site, no copy to drift.
+  #
+  # The budgets are passed rather than re-read: a pass reads them once, so every story it
+  # places spends against the same policy even if an operator changes it mid-pass.
   defp dispatch(story, source, budgets) do
     %{
       "dispatch_id" => Ecto.UUID.generate(),
       "story_id" => story.id,
       "kind" => @kind,
       "repo" => source.repo_full_name,
-      "branch" => DispatchPayload.branch_for(story),
       "base_branch" => source.base_branch,
       "wall_clock_seconds" => budgets.wall_clock_seconds,
       "max_turns" => budgets.max_turns

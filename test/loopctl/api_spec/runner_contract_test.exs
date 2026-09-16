@@ -37,7 +37,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "d5bdba85b633e760c36814e6d7b507f9bd6a959c767261ca4ba88cafb1529db6"
+  @digest "d9674007beaec7b658efd19bbd338a8ed5189995d8f51db569f94d1f9884881d"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -71,8 +71,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.13.0"
-      assert schema["x-contract-version"] == "1.13.0"
+      assert RunnerContract.version() == "1.14.0"
+      assert schema["x-contract-version"] == "1.14.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -1136,6 +1136,98 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "a non-string entry is refused, which is why declared_kinds keeps its own guard" do
       assert {:error, {:invalid, _}} =
                RunnerContract.cast_join(Map.put(@join, "kinds", ["implement", 3]))
+    end
+  end
+
+  describe "cast_join/1 branch_prefixes (contract 1.14.0)" do
+    # AC-1: OPTIONAL, and a runner that omits it must be INDISTINGUISHABLE from one built
+    # before the field existed. `@join` is the 1.0.0 payload at the top of this file and
+    # carries no `branch_prefixes`, so this is that runner exactly.
+    test "is optional: a join that omits it is accepted and carries no such key" do
+      assert {:ok, join} = RunnerContract.cast_join(@join)
+      refute Map.has_key?(join, :branch_prefixes)
+    end
+
+    test "a declared list is carried through verbatim, in the order it was sent" do
+      assert {:ok, %{branch_prefixes: ["loop/", "feature/"]}} =
+               RunnerContract.cast_join(Map.put(@join, "branch_prefixes", ["loop/", "feature/"]))
+    end
+
+    # A PREFIX REACHES A GIT BRANCH NAME THAT LOOPCTL HANDS TO A SHELL ON THE DECLARING
+    # MACHINE, so what may not be expressed is refused at the wire, the way `machine` and
+    # `repos` already refuse theirs. The leading-character rule is the one that matters most:
+    # a branch beginning `-` is read by git as an OPTION rather than a ref.
+    test "a prefix that could not be a safe branch fragment is refused at the wire" do
+      for hostile <- [
+            "-o",
+            "--upload-pack=x",
+            "loop/;rm -rf /",
+            "loop/$(id)",
+            "loop/`id`",
+            "loop with space/",
+            "loop/..",
+            ".lock",
+            "loop/ ",
+            "/absolute",
+            "",
+            "üñî/"
+          ] do
+        assert {:error, {:invalid, _}} =
+                 RunnerContract.cast_join(Map.put(@join, "branch_prefixes", [hostile])),
+               "#{inspect(hostile)} was accepted as a branch prefix"
+      end
+    end
+
+    test "the ordinary shapes an operator writes are accepted" do
+      for ok <- ["loop/", "loop", "feature/", "agent-work/", "a_b/c-d/", "x"] do
+        assert {:ok, %{branch_prefixes: [^ok]}} =
+                 RunnerContract.cast_join(Map.put(@join, "branch_prefixes", [ok])),
+               "#{inspect(ok)} was refused as a branch prefix"
+      end
+    end
+
+    # The same two-part bound `kinds` carries, for the same reason: this value is replicated
+    # to every node by Presence for the life of the socket and echoed on the pool read, so
+    # the resource is entries TIMES length and bounding one alone bounds nothing.
+    test "the entry count and the entry length are both bounded" do
+      assert {:ok, %{branch_prefixes: [_]}} =
+               RunnerContract.cast_join(
+                 Map.put(@join, "branch_prefixes", [String.duplicate("a", 40)])
+               )
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_join(
+                 Map.put(@join, "branch_prefixes", [String.duplicate("a", 41)])
+               )
+
+      assert {:ok, _} =
+               RunnerContract.cast_join(
+                 Map.put(@join, "branch_prefixes", for(i <- 1..8, do: "p#{i}/"))
+               )
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_join(
+                 Map.put(@join, "branch_prefixes", for(i <- 1..9, do: "p#{i}/"))
+               )
+    end
+
+    # Refused by the cast, which is why `Runners.declared_branch_prefixes/1` keeps its own
+    # `is_binary` guard for a meta built some other way.
+    test "a non-string entry is refused" do
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_join(Map.put(@join, "branch_prefixes", ["loop/", 3]))
+    end
+
+    # AC-3 lives in the PUBLISHED document, not only in this repo's moduledoc: the vendored
+    # file is the whole of what a runner author reads, so an invariant stated only here binds
+    # nobody. Asserted on the exported description rather than on the schema module, because
+    # that is the copy that travels.
+    test "the published field states that a runner enforcing a prefix must DECLARE it" do
+      published =
+        RunnerContract.json_schema()["$defs"]["RunnerJoin"]["properties"]["branch_prefixes"]
+
+      assert published["description"] =~ "A RUNNER THAT ENFORCES A PREFIX MUST DECLARE IT"
+      refute "branch_prefixes" in RunnerContract.json_schema()["$defs"]["RunnerJoin"]["required"]
     end
   end
 

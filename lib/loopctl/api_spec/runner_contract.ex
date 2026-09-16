@@ -46,6 +46,32 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.11.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it. `x-connection.error_fields` publishes what EVERY refusal carries beside its `reason`, per event and complete, and `permanent_error_conditions` now names the one state in which `stale_stage` is permanent for `stage`. RE-VENDOR: a copy taken at 1.10.0 has neither key, and the version string is the only signal that it is missing them | | | | |
   | (1.12.0) A SECURITY CORRECTION TO WHAT THIS CONTRACT PROMISES. `RunnerTriageVerdict` said loopctl "fences these strings wherever they later reach a prompt — `story` included". It does not and never did: a drafted story becomes loopctl's own story row and reaches a runner as `RunnerStory`, typed and unfenced. What loopctl DOES do is escape invisible characters and SCREEN the draft with its injection detector, escalating a flagged one to a human instead of queueing it, so it never reaches an implement dispatch. RE-VENDOR and re-read: a copy taken at 1.11.0 tells you the implement path is fenced | | | | |
   | (1.13.0) `RunnerJoin.max_sessions` IS AUTHORITATIVE DOWNWARD. loopctl now reserves against the LESSER of the value a runner declares on join and the `max_sessions` it was ENROLLED with, re-read on every join. Until now only the enrolled number counted, written once with no path from any join, so a machine configured for one session was sent two and refused the second `at_capacity` — a refusal that costs the story's claim. A machine may therefore always lower itself; it cannot raise itself past its enrolled ceiling, which is what stops a compromised runner enlarging its own share of the tenant's admission budget. Nothing changes on the wire and no runner has to send anything new. `0` is the same statement as `draining` — the row keeps `1` because its range is 1..64, and loopctl refuses to PLACE on a machine declaring either, while a direct operator push is still delivered for the runner to refuse. Re-vendoring is worth it for the description, not required for the wire | | | | |
+  | (1.14.0) A RUNNER DECLARES THE BRANCH PREFIXES IT ACCEPTS (`RunnerJoin.branch_prefixes`), and loopctl DERIVES a conforming branch instead of guessing one. A runner that enforces a prefix and does not declare it refuses every dispatch loopctl sends, which is what happened: the first real placement was refused `branch_not_allowed` because loopctl derived `feature/story-<n>-<id>` while the machine's config accepted `loop/` alone, and the operator could learn the required prefix only by reading a config file on that box. OMITTING THE FIELD IS EXACTLY TODAY'S BEHAVIOUR — no constraint, and the branch is the one loopctl already derived — so an un-upgraded runner is unaffected and nothing on the wire changes for it. RE-VENDOR to send it | | | | |
+
+  ## Branch prefixes (since 1.14.0)
+
+  A runner may refuse a dispatch whose `branch` does not start with one of the prefixes it is
+  configured for. `RunnerJoin.branch_prefixes` is how it says so, and loopctl then derives a
+  branch that satisfies the declaration (`Loopctl.Delivery.DispatchPayload.branch_for/2`).
+
+  **THE INVARIANT, and it is stronger than "silence means no constraint": A RUNNER THAT
+  ENFORCES A PREFIX MUST DECLARE IT.** Silence is read as no constraint — that is what makes
+  the field additive, and it is the right reading of a runner built before 1.14.0 — but it is
+  not a licence to enforce one silently. A runner enforcing an undeclared prefix refuses
+  EVERY dispatch loopctl sends it, permanently and invisibly: loopctl has no way to derive the
+  name that machine wants, and the refusal costs the story's claim each time. There is no
+  second signal. The declaration is the only way the fact reaches the control plane.
+
+  Per-CONNECTION, like `kinds`: it is re-read on every join, so a machine whose configuration
+  changed applies it by reconnecting rather than by being re-enrolled. Declare it on EVERY
+  join, and declare the SAME set the runner actually enforces — a declaration that is a
+  superset of what the machine accepts puts loopctl back where it started.
+
+  The FIRST entry is the one loopctl uses, so declare them in preference order. Uniqueness is
+  not negotiable: a derived branch always carries the story number and an id fragment, and a
+  prefix that leaves no room for a valid branch name refuses the PLACEMENT rather than the
+  join — a machine that cannot get a socket is out of the fleet, which is the trade
+  `RunnerJoin.max_sessions` and `RunnerJoin.kinds` already make.
 
   ## The story object (since 1.5.0)
 
@@ -309,7 +335,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.13.0"
+  @version "1.14.0"
   @major 1
 
   defmodule ByteRule do
@@ -559,6 +585,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # node by Presence and echoed on the pool read.
     @max_kind_length 64
 
+    # `branch_prefixes` carries the SAME exposure as `kinds` and is bounded the same way, in
+    # both dimensions: the value goes verbatim into the Presence meta, which `Phoenix.Tracker`
+    # replicates to every node for the life of the socket, and `GET /api/v1/runners/pool`
+    # echoes it. Entries alone bound nothing — the size that matters is entries TIMES length.
+    # Smaller than the `kinds` pair because a prefix is a branch-name fragment a person types
+    # into a config file, not an identifier space that grows with the contract.
+    @max_declared_branch_prefixes 8
+    @max_branch_prefix_length 40
+
     OpenApiSpex.schema(
       %{
         title: "RunnerJoin",
@@ -682,6 +717,52 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "a statement about the vocabulary. Declare it on EVERY join: it is " <>
                 "per-connection, so an upgraded runner becomes eligible for a new kind by " <>
                 "reconnecting rather than by being re-enrolled."
+          },
+          # WHAT A PREFIX MAY BE IS REFUSED AT THE WIRE, because this value reaches a GIT
+          # BRANCH NAME that loopctl hands to a shell on the declaring machine. `machine` and
+          # `repos` already draw that line with a `pattern` and this does the same: it must
+          # start with an alphanumeric, so no declaration can produce a branch beginning `-`
+          # and be read by git as an OPTION rather than a ref; and the class admits only
+          # `A-Za-z0-9`, `_`, `/` and `-`, which leaves no shell metacharacter, no whitespace,
+          # no control character, and — by excluding `.` outright — no `..` and no `.lock`,
+          # the two sequences git refuses in a ref name. Excluding `.` costs a prefix nothing
+          # real and removes both cases without a lookahead this exporter could not publish.
+          #
+          # THAT PATTERN IS NOT THE WHOLE GUARD, and saying where the rest lives is the point
+          # of this comment. `^...$` is what the other patterns here use, and under PCRE `$`
+          # also matches before a FINAL NEWLINE, so `"loop/\n"` satisfies it. The composed
+          # branch is therefore re-validated, fully anchored, by the one derivation
+          # (`Loopctl.Delivery.DispatchPayload.branch_for/2`), which also catches what no
+          # per-entry pattern can see: `//` inside a prefix, a name that would end on `/`, and
+          # a meta built without passing this cast at all. A prefix that survives the wire and
+          # still cannot produce a valid branch refuses the PLACEMENT, never the join.
+          branch_prefixes: %Schema{
+            type: :array,
+            maxItems: @max_declared_branch_prefixes,
+            items: %Schema{
+              type: :string,
+              maxLength: @max_branch_prefix_length,
+              pattern: "^[A-Za-z0-9][A-Za-z0-9_/-]*$"
+            },
+            description:
+              "The branch-name prefixes this machine ACCEPTS (since 1.14.0). loopctl " <>
+                "derives a branch that starts with the FIRST entry, so declare them in " <>
+                "preference order; the rest are fallbacks used only when the first cannot " <>
+                "produce a valid branch name. Omitting the field, or sending an EMPTY " <>
+                "array, declares NO constraint and loopctl derives exactly the branch it " <>
+                "derived before this field existed — which is why an un-upgraded runner is " <>
+                "unaffected. A RUNNER THAT ENFORCES A PREFIX MUST DECLARE IT: silence is " <>
+                "read as no constraint, so a machine enforcing an undeclared prefix refuses " <>
+                "every dispatch loopctl sends and each refusal costs the story's claim. " <>
+                "Declare the SAME set you enforce — a superset is the same failure. At most " <>
+                "#{@max_declared_branch_prefixes} entries of #{@max_branch_prefix_length} " <>
+                "characters, each starting with a letter or digit and made only of letters, " <>
+                "digits, `_`, `/` and `-`; a branch never begins with `-` and never " <>
+                "contains `..`. The derived branch always carries the story number and an " <>
+                "id fragment, so two stories on one repository can never share one: a " <>
+                "prefix leaving no room for that refuses the placement, not the join. " <>
+                "Per-CONNECTION, so declare it on EVERY join — a machine whose " <>
+                "configuration changed applies it by reconnecting."
           },
           sample: RunnerSample.schema()
         }

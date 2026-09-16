@@ -97,13 +97,20 @@ defmodule LoopctlWeb.DispatchPlacementController do
          # has `dispatch_created` and `story_stage_claimed` appended to an IMMUTABLE chain and
          # the story claimed — and only then is refused. That is exactly the cost the pre-mint
          # readiness check exists to avoid, reintroduced by a wrong schema.
+         #
+         # `branch` IS THE EXCEPTION, and it became one with contract 1.14.0 (story 846.2).
+         # `DispatchPayload.fill/3` derives it from the story AND from the branch prefixes the
+         # target runner declared on join, which only the server can read — so a caller that
+         # names one now risks `branch_not_allowed`, and listing it as required steers every
+         # caller into the one field it should leave alone. The refusal argument above does
+         # not apply to it either: an omitted `branch` is FILLED before the cast, never
+         # refused by it.
          required: [
            :dispatch_id,
            :story_id,
            :kind,
            :repo,
            :base_branch,
-           :branch,
            :wall_clock_seconds,
            :max_turns
          ],
@@ -127,7 +134,16 @@ defmodule LoopctlWeb.DispatchPlacementController do
              description: "Only the kinds in `x-connection.dispatchable_kinds` are accepted."
            },
            repo: %Schema{type: :string},
-           branch: %Schema{type: :string},
+           branch: %Schema{
+             type: :string,
+             description:
+               "OMIT THIS. loopctl derives the branch from the story number and an id " <>
+                 "fragment, behind a prefix the TARGET RUNNER declared it accepts " <>
+                 "(`branch_prefixes` on the runner contract's join, since 1.14.0) — which " <>
+                 "is a per-machine fact only the server can read. A branch you name is " <>
+                 "never rewritten, so one outside that machine's prefixes is refused " <>
+                 "`branch_not_allowed` and nothing is claimed."
+           },
            base_branch: %Schema{type: :string},
            wall_clock_seconds: %Schema{type: :integer, minimum: 1},
            max_turns: %Schema{type: :integer, minimum: 1}
@@ -159,9 +175,17 @@ defmodule LoopctlWeb.DispatchPlacementController do
          }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Not placeable", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Not placeable; includes `no_conforming_branch` — the runner declares branch " <>
+           "prefixes (contract 1.14.0) and none of them can produce a valid branch name " <>
+           "carrying the story number and id fragment, so nothing was claimed and an " <>
+           "operator has to fix `branch_prefixes` on that machine. The body echoes the " <>
+           "declared prefixes", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Validation error; `story_not_accepted` — the story object is built by loopctl from " <>
+        {"Validation error; `branch_not_allowed` — the `branch` you named does not start " <>
+           "with any prefix the runner declared, so the machine would refuse the dispatch; " <>
+           "omit `branch` and loopctl derives a conforming one, and nothing was claimed; or " <>
+           "`story_not_accepted` — the story object is built by loopctl from " <>
            "its own records and may not be supplied by a caller; or " <>
            "`story_not_dispatchable` — the story exceeds a cap the runner contract declares " <>
            "and HAS BEEN ESCALATED to a human, with the claim released and nothing " <>
@@ -353,6 +377,38 @@ defmodule LoopctlWeb.DispatchPlacementController do
       message:
         "This runner declares draining (or max_sessions 0), so it is taking no work. " <>
           "Nothing was claimed. Place on another runner, or reconnect this one without it."
+    })
+  end
+
+  # THE MACHINE'S OWN DECLARATION LEAVES NO ROOM FOR A UNIQUE BRANCH (contract 1.14.0). 409
+  # and beside `runner_declines_work` for the same reason: a state the machine chose, which
+  # does not clear on its own and which an operator fixes on that box. The prefixes are echoed
+  # because the whole defect this field exists to end was that they were readable ONLY by
+  # opening a config file on the target machine — a refusal that named none of them would put
+  # the operator straight back there.
+  defp refuse(conn, {:no_conforming_branch, prefixes}) do
+    error(conn, 409, "no_conforming_branch", %{
+      message:
+        "This runner declares branch prefixes, and none of them can produce a valid branch " <>
+          "name carrying the story number and id fragment that keeps two stories off one " <>
+          "branch. Nothing was claimed. Fix branch_prefixes on the machine and reconnect it.",
+      branch_prefixes: prefixes
+    })
+  end
+
+  # THE CALLER NAMED A BRANCH THE MACHINE WILL NOT TAKE. 422 rather than 409: unlike the two
+  # above, the request itself is what is wrong and dropping the field is the fix — loopctl
+  # then derives a conforming name. Refused here so it costs nothing; left to the runner, the
+  # `branch_not_allowed` refusal arrives after the story has been claimed for it, which is the
+  # failure story 846.2 exists to end.
+  defp refuse(conn, {:branch_not_allowed, branch, prefixes}) do
+    error(conn, 422, "branch_not_allowed", %{
+      message:
+        "The branch you named does not start with any prefix this runner accepts, so the " <>
+          "machine would refuse the dispatch. Nothing was claimed. Omit `branch` and loopctl " <>
+          "derives a conforming one.",
+      branch: branch,
+      branch_prefixes: prefixes
     })
   end
 

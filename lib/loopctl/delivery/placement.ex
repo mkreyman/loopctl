@@ -237,6 +237,8 @@ defmodule Loopctl.Delivery.Placement do
           | {:story_not_dispatchable, [String.t()]}
           | {:story_no_longer_dispatchable, [String.t()]}
           | {:escalation_failed, term(), [String.t()]}
+          | {:no_conforming_branch, [String.t()]}
+          | {:branch_not_allowed, String.t(), [String.t()]}
 
   @doc """
   Claims `dispatch["story_id"]` for `runner_id` and pushes the dispatch to it.
@@ -302,6 +304,16 @@ defmodule Loopctl.Delivery.Placement do
     because it claims nothing and the claim it re-pushes under is live: refusing it would
     strand that claim at `claimed` until its lease expired, which is what the gate exists to
     prevent
+  - `{:no_conforming_branch, prefixes}` — the machine declared branch prefixes
+    (`RunnerJoin.branch_prefixes`, contract 1.14.0) and none of them can produce a valid
+    branch name carrying the story number and id fragment. Refused BEFORE the claim, like
+    `:runner_declines_work`, because the runner would refuse the push itself and the claim
+    would already be spent. The remedy is on the machine — an operator fixes its
+    `branch_prefixes` and reconnects it — which is why it refuses the placement and not the
+    join.
+  - `{:branch_not_allowed, branch, prefixes}` — the CALLER supplied a `branch` the target
+    machine's declaration does not accept. loopctl never rewrites a caller's branch, so the
+    only honest answers are to refuse it here or to let the runner refuse it after the claim.
   - `:not_found`, `:invalid_transition`, `:wrong_stage` — from the pre-mint readiness check.
     A story that passes the check and is claimed by someone else in between instead gets
     `Loopctl.Progress.claim_story/3`'s own richer `{:invalid_transition, map()}`, and the
@@ -416,9 +428,34 @@ defmodule Loopctl.Delivery.Placement do
   #   * `Runners.dispatch/3` — an operator push by name. It claims nothing either, so the
   #     runner's own refusal reaches a person, which is the trade `accepts?/5` documents.
   defp runner_accepting_work(tenant_id, runner_id) do
+    case sole_live_meta(tenant_id, runner_id) do
+      nil -> :ok
+      meta -> if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
+    end
+  end
+
+  # WHAT THIS MACHINE SAID IT ACCEPTS, off the meta of the ONE socket a push would reach
+  # (contract 1.14.0, story 846.2). Nothing is stored, so this is the whole read — see
+  # `Runners.declared_branch_prefixes/1` for why a branch prefix takes that form where
+  # capacity could not.
+  #
+  # `[]` for zero sockets and for an ambiguous pair, which is the same answer
+  # `runner_accepting_work/2` gives and for the same reason: with no single meta there is no
+  # declaration to read, and `Runners.dispatch/3` is the one place that judges those two
+  # states (`:runner_not_connected`, `:runner_ambiguous`). Deriving the un-prefixed default
+  # there is not a guess that costs anything — the push is refused before it reaches a
+  # machine.
+  defp declared_branch_prefixes(tenant_id, runner_id) do
+    case sole_live_meta(tenant_id, runner_id) do
+      nil -> []
+      meta -> Runners.declared_branch_prefixes(meta)
+    end
+  end
+
+  defp sole_live_meta(tenant_id, runner_id) do
     case Runners.live_metas(tenant_id, runner_id) do
-      [meta] -> if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
-      _other -> :ok
+      [meta] -> meta
+      _zero_or_ambiguous -> nil
     end
   end
 
@@ -479,14 +516,31 @@ defmodule Loopctl.Delivery.Placement do
   # claim stands, the session under it is untouched, and the next placement through the claim
   # path is what parks the story — with the fences applied first, where they belong.
   defp resume(tenant_id, runner_id, dispatch, record) do
-    with {:ok, payload} <- resume_payload(tenant_id, dispatch, record) do
+    with {:ok, payload} <- resume_payload(tenant_id, runner_id, dispatch, record) do
       push_resumed(tenant_id, runner_id, payload, record)
     end
   end
 
-  defp resume_payload(tenant_id, dispatch, record) do
+  # THE BRANCH IS RE-DERIVED, from the declaration this machine is carrying NOW, and that is
+  # the answer to "can a retry place two dispatches on two different branch names for one
+  # story". It can produce a different name, in exactly one case, and the case is bounded:
+  # the machine reconnected with a different `branch_prefixes` between the first push and this
+  # one. A resume only runs against a ledger row still at `sent` — `record_sent/3` fences a
+  # row that has been answered (`:dispatch_already_replied`) — so the first frame was never
+  # ACCEPTED, no session started, and no branch exists on that machine to disagree with. The
+  # name this call derives is the one the machine as it is now will accept, which is the only
+  # name worth sending.
+  #
+  # The name is stable everywhere else, and deliberately: it is a pure function of the story
+  # and the declaration (`DispatchPayload.branch_for/2` takes the FIRST usable prefix, never a
+  # random or a "best" one), so a retry against an unchanged declaration re-derives the same
+  # string byte for byte. The ledger stores no branch, so there is nothing here to compare
+  # against and nothing that could drift out of agreement with a stored copy.
+  defp resume_payload(tenant_id, runner_id, dispatch, record) do
+    prefixes = declared_branch_prefixes(tenant_id, runner_id)
+
     with {:ok, story} <- Stories.get_story(tenant_id, record.story_id),
-         {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch),
+         {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch, branch_prefixes: prefixes),
          {:ok, dispatch} <- rebuild_story(dispatch, story) do
       {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
     end
@@ -540,9 +594,11 @@ defmodule Loopctl.Delivery.Placement do
   # claimed, and two IMMUTABLE chain entries appended. A caller that omitted one of the five
   # paid all of that and then got a 422. Every one of them is something loopctl can look up.
   defp claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts) do
+    prefixes = declared_branch_prefixes(tenant_id, runner_id)
+
     with :ok <- runner_accepting_work(tenant_id, runner_id),
          {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
-         {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch),
+         {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch, branch_prefixes: prefixes),
          :ok <- claimable(tenant_id, story_id),
          {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
       claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)

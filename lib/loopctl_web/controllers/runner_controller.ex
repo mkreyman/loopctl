@@ -267,6 +267,7 @@ defmodule LoopctlWeb.RunnerController do
                    :node,
                    :machine_id,
                    :kinds,
+                   :branch_prefixes,
                    :suppressed_kinds,
                    :unsupported_kinds
                  ],
@@ -350,6 +351,19 @@ defmodule LoopctlWeb.RunnerController do
                          "refuses one outside it, whatever `unsupported_kinds` holds. A " <>
                          "connected machine that never gets work is explained by this " <>
                          "field or by that one — read both. Per-CONNECTION, so it can " <>
+                         "change when the runner reconnects."
+                   },
+                   branch_prefixes: %Schema{
+                     type: :array,
+                     items: %Schema{type: :string},
+                     description:
+                       "The branch-name prefixes this runner DECLARED on join (contract " <>
+                         "1.14.0), or `[]` from a runner that declared none. loopctl " <>
+                         "derives a branch starting with the FIRST entry. Read it when a " <>
+                         "placement is refused `no_conforming_branch`, or when a machine " <>
+                         "refuses dispatches with `branch_not_allowed` — a runner that " <>
+                         "ENFORCES a prefix and declares none shows `[]` here, which is " <>
+                         "that misconfiguration made visible. Per-CONNECTION, so it can " <>
                          "change when the runner reconnects."
                    },
                    suppressed_kinds: %Schema{
@@ -481,6 +495,13 @@ defmodule LoopctlWeb.RunnerController do
       # Null, not [], for a runner that declared nothing: an empty declaration and no
       # declaration are DIFFERENT states here, and only one of them decides anything.
       kinds: declared_kinds(meta),
+      # `[]` for silence rather than null, which is the opposite of `kinds` above and is not
+      # an inconsistency. An absent `kinds` is read as `["implement"]` — loopctl's own
+      # reading of silence, and printing it as the machine's declaration would report words
+      # it never said — while an absent `branch_prefixes` is read as NO CONSTRAINT, which is
+      # exactly what `[]` means here. The same function the derivation decides on, so the
+      # pool cannot show one thing while a placement does another.
+      branch_prefixes: Runners.declared_branch_prefixes(meta),
       suppressed_kinds: Runners.suppressed_kinds(meta),
       unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), [])
     }

@@ -204,6 +204,42 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
       assert body["error"]["code"] == "story_no_longer_dispatchable"
       assert body["error"]["message"] =~ "the claim stands"
     end
+
+    # STORY 846.2. Both are TUPLES, so the fallback's `is_atom(reason)` catch-all would answer
+    # 500 and a crash log for two outcomes that are ordinary — the whole reason the tuple
+    # refusals above are mapped here at all.
+    test "the branch-prefix refusals render, and each ECHOES the declaration" do
+      no_branch =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          {:no_conforming_branch, ["loop//"]}
+        )
+
+      assert no_branch.status == 409
+      body = Jason.decode!(no_branch.resp_body)
+      assert body["error"]["code"] == "no_conforming_branch"
+
+      # The prefixes are the fact an operator could otherwise read ONLY by opening a config
+      # file on the target machine, which is the defect this whole field exists to end. A
+      # refusal that named none of them would send them straight back there.
+      assert body["error"]["branch_prefixes"] == ["loop//"]
+      assert body["error"]["message"] =~ "Nothing was claimed"
+
+      not_allowed =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          {:branch_not_allowed, "feature/mine", ["loop/"]}
+        )
+
+      # 422 rather than 409: unlike the one above, the REQUEST is what is wrong and omitting
+      # the field is the fix.
+      assert not_allowed.status == 422
+      body = Jason.decode!(not_allowed.resp_body)
+      assert body["error"]["code"] == "branch_not_allowed"
+      assert body["error"]["branch"] == "feature/mine"
+      assert body["error"]["branch_prefixes"] == ["loop/"]
+      assert body["error"]["message"] =~ "Omit `branch`"
+    end
   end
 
   describe "the role gate" do
