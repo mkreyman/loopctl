@@ -45,6 +45,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.10.0) TRIAGE IS DISPATCHABLE. `x-connection.dispatchable_kinds` is `triage` and `implement`, so loopctl sends a `triage` dispatch for a story it has just detected. Only a runner that DECLARES `triage` on join receives one — `implied_by_silence` stays `implement` alone | | | | |
   | (1.11.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it. `x-connection.error_fields` publishes what EVERY refusal carries beside its `reason`, per event and complete, and `permanent_error_conditions` now names the one state in which `stale_stage` is permanent for `stage`. RE-VENDOR: a copy taken at 1.10.0 has neither key, and the version string is the only signal that it is missing them | | | | |
   | (1.12.0) A SECURITY CORRECTION TO WHAT THIS CONTRACT PROMISES. `RunnerTriageVerdict` said loopctl "fences these strings wherever they later reach a prompt — `story` included". It does not and never did: a drafted story becomes loopctl's own story row and reaches a runner as `RunnerStory`, typed and unfenced. What loopctl DOES do is escape invisible characters and SCREEN the draft with its injection detector, escalating a flagged one to a human instead of queueing it, so it never reaches an implement dispatch. RE-VENDOR and re-read: a copy taken at 1.11.0 tells you the implement path is fenced | | | | |
+  | (1.13.0) `RunnerJoin.max_sessions` IS AUTHORITATIVE. loopctl now copies the value a runner declares on join into the capacity it reserves against, on every join, instead of reserving against the `max_sessions` the machine was ENROLLED with. Until now the enrolled number was written once and no join could correct it, so a machine configured for one session was sent two and refused the second `at_capacity` — a refusal that costs the story's claim. Nothing changes on the wire and no runner has to send anything new; what changes is that the number you already send is believed. `0` is held as `1` (the control plane's range is 1..64); `draining` is how a machine asks for no work. RE-VENDOR: a copy taken at 1.12.0 says this field is advisory | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -308,7 +309,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.12.0"
+  @version "1.13.0"
   @major 1
 
   defmodule ByteRule do
@@ -601,8 +602,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             maximum: 64,
             description:
               "Concurrent sessions this machine accepts; it refuses past them with " <>
-                "`at_capacity`. Advisory to loopctl, which reserves against the max_sessions " <>
-                "the runner was ENROLLED with, never this value."
+                "`at_capacity`. AUTHORITATIVE since 1.13.0: loopctl copies it into the " <>
+                "capacity it reserves against on EVERY join, so the number sent here is the " <>
+                "number of dispatches this machine will be given at once. Before 1.13.0 it " <>
+                "was advisory and loopctl reserved against the max_sessions the runner was " <>
+                "ENROLLED with, which no join could correct. Send the real value every time: " <>
+                "it is per-connection, so a machine whose configuration changed applies it by " <>
+                "reconnecting. `0` is accepted on the wire and held as `1`, because the " <>
+                "control plane's range is 1..64 — a machine that wants NO work sets " <>
+                "`draining`, which loopctl refuses dispatches against. Lowering it below the " <>
+                "sessions loopctl currently holds on this machine sends no more work until " <>
+                "those drain, rather than cancelling them."
           },
           in_flight: %Schema{
             type: :integer,

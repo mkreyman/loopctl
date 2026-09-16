@@ -11,10 +11,17 @@ defmodule Loopctl.Runners.Runner do
 
   The row carries no liveness. Presence does, and it dies with the socket.
 
-  It does carry CAPACITY (#803): `max_sessions`, set at enrollment, and `in_flight`, the
-  number of slots reserved on this machine right now. Those two are authoritative; the
-  values a runner reports in Presence are a hint. `in_flight` is written only by
-  `Loopctl.Runners.Capacity`, never through a changeset.
+  It does carry CAPACITY (#803): `max_sessions`, how many slots loopctl will reserve here, and
+  `in_flight`, the number reserved right now. Both are written only by
+  `Loopctl.Runners.Capacity`, never through a changeset after the insert.
+
+  `max_sessions` is the MACHINE's own number, not the enroller's: it is seeded from the
+  enrollment attribute and then re-applied from every join payload
+  (`Loopctl.Runners.apply_declaration/3`, contract 1.13.0), so the enrolled value holds only
+  until the machine first connects. It stays a column rather than a read of the Presence meta
+  because a reservation is a conditional UPDATE and a CRDT replica cannot hand out the last
+  slot to exactly one caller. `in_flight` is loopctl's alone — the count a runner reports in
+  Presence is of sessions it is running, which is a different fact and only ever a hint.
 
   It also names the AGENT its sessions work as (#803): `agent_id`, the `runner:<name>` agent
   row `Loopctl.Runners.enroll_runner/3` gets or creates. A dispatch claims the story it is

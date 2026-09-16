@@ -32,11 +32,13 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Auth
+  alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Presence
+  alias Loopctl.Runners.Runner
   alias Loopctl.Tenants
   alias LoopctlWeb.RunnerSocket
 
@@ -129,6 +131,136 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     epoch = Map.get(attrs, "claim_epoch", 0)
     story = fixture(:ledger_story, %{tenant_id: tenant_id, claim_epoch: epoch})
     build(:runner_dispatch, Map.put(attrs, "story_id", story.id))
+  end
+
+  # The capacity loopctl DECIDES from — read on the RLS connection, because `Loopctl.Repo`
+  # and `Loopctl.AdminRepo` hold separate sandbox transactions and the channel's write lands
+  # in the first (see this module's "Why `async: false`").
+  defp held_capacity(runner) do
+    {:ok, held} =
+      Repo.with_tenant(runner.tenant_id, fn ->
+        Repo.one!(
+          from r in Runner,
+            where: r.id == ^runner.id,
+            select: %{
+              max_sessions: r.max_sessions,
+              in_flight: r.in_flight,
+              updated_at: r.updated_at
+            }
+        )
+      end)
+
+    held
+  end
+
+  describe "the capacity a joining machine declares" do
+    test "is what loopctl reserves against, downward from what the machine was enrolled with" do
+      # The defect this closes (846.4): minis was enrolled at two, its own runner.json says one,
+      # and every rejoin left the held row at two. loopctl then placed a SECOND concurrent
+      # dispatch on a machine that refuses it `at_capacity` — and a refused dispatch costs the
+      # story's claim and parks it, which is the failure #865 built an escalation for.
+      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
+      assert held_capacity(runner).max_sessions == 2
+
+      {:ok, socket} = connect_runner(raw)
+      {_reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 1})
+
+      assert held_capacity(runner).max_sessions == 1
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, @reply_timeout
+
+      assert {:error, :runner_at_capacity} =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      refute_push "dispatch", _
+    end
+
+    test "and upward, so a machine reconfigured for more slots is used without re-enrolling" do
+      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 1})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 3})
+
+      assert held_capacity(runner).max_sessions == 3
+
+      for _ <- 1..3 do
+        assert :ok =
+                 Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+        assert_push "dispatch", _, @reply_timeout
+      end
+    end
+
+    test "is held as one when the machine declares zero, and the join is not refused" do
+      # Zero is inside `RunnerJoin`'s range and outside the column's. Ignoring it would leave
+      # the enrolled two standing — the exact over-reservation this path exists to end. A
+      # machine that wants NO work sets `draining`.
+      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
+      {:ok, socket} = connect_runner(raw)
+
+      log =
+        capture_log(fn ->
+          {reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 0})
+          assert reply == %{contract_version: RunnerContract.version()}
+        end)
+
+      assert held_capacity(runner).max_sessions == 1
+      assert log =~ "declared max_sessions 0"
+    end
+
+    test "leaves the row untouched when a rejoin declares what is already held" do
+      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
+
+      written_at = held_capacity(runner).updated_at
+      assert held_capacity(runner).max_sessions == 4
+
+      Process.unlink(channel.channel_pid)
+      ref = leave(channel)
+      assert_reply ref, :ok, _, @reply_timeout
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+
+      {:ok, socket} = connect_runner(raw)
+      {_reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
+
+      # No write at all, so a reconnect never takes the lock on the row every dispatch in the
+      # tenant contends on.
+      assert held_capacity(runner).updated_at == written_at
+    end
+
+    test "lowering it under the slots the machine already holds sends no more work" do
+      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 2})
+
+      for _ <- 1..2 do
+        assert :ok =
+                 Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+        assert_push "dispatch", _, @reply_timeout
+      end
+
+      assert held_capacity(runner).in_flight == 2
+
+      Process.unlink(channel.channel_pid)
+      ref = leave(channel)
+      assert_reply ref, :ok, _, @reply_timeout
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+
+      {:ok, socket} = connect_runner(raw)
+      {_reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 1})
+
+      # `runners_in_flight_range` CHECKs in_flight <= max_sessions, so the clamp is what makes
+      # the write representable; at in_flight == max_sessions nothing more is handed out.
+      assert held_capacity(runner) |> Map.take([:max_sessions, :in_flight]) ==
+               %{max_sessions: 1, in_flight: 1}
+
+      assert {:error, :runner_at_capacity} =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+    end
   end
 
   describe "dispatch" do
@@ -389,7 +521,10 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         })
 
       {:ok, socket_b} = connect_runner(raw_b)
-      {_reply, _channel_b} = join_pool(socket_b, "blockit")
+      # DECLARED on the join, not merely enrolled: since contract 1.13.0 the join is what sets
+      # the capacity loopctl reserves against, so a payload declaring the default 2 would give
+      # this runner two slots and the tenant limit below would never be what refuses it.
+      {_reply, _channel_b} = join_pool(socket_b, "blockit", %{"max_sessions" => 8})
 
       for _ <- 1..Capacity.limit() do
         assert :ok =
@@ -1061,6 +1196,42 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     end
   end
 
+  describe "declared_max_sessions/1" do
+    test "passes a declaration the column can already hold" do
+      assert Runners.declared_max_sessions(%{max_sessions: 1}) == {:ok, 1}
+      assert Runners.declared_max_sessions(%{max_sessions: 64}) == {:ok, 64}
+    end
+
+    # A meta built without passing `cast_join/1` is the only way these reach here — the join
+    # schema bounds the field 0..64 — and this is the last thing between the wire and a
+    # `runners_max_sessions_range` violation.
+    test "clamps a declaration outside the column's range rather than dropping it" do
+      assert Runners.declared_max_sessions(%{max_sessions: 0}) == {:clamped, 1, 0}
+      assert Runners.declared_max_sessions(%{max_sessions: -3}) == {:clamped, 1, -3}
+      assert Runners.declared_max_sessions(%{max_sessions: 9_999}) == {:clamped, 64, 9_999}
+    end
+
+    test "a meta with no integer declaration says so, and never guesses a number" do
+      assert Runners.declared_max_sessions(%{}) == :undeclared
+      assert Runners.declared_max_sessions(%{machine: "minis"}) == :undeclared
+      assert Runners.declared_max_sessions(%{max_sessions: "2"}) == :undeclared
+      assert Runners.declared_max_sessions(%{max_sessions: nil}) == :undeclared
+    end
+
+    # The clamp is bound to the CHECK constraint's range, not to a number retyped here: a
+    # migration that widened the column and left this reading 1..64 would silently keep
+    # refusing values the column had started accepting.
+    test "clamps to the range the schema declares, whatever it is" do
+      range = Runner.max_sessions_range()
+
+      assert Runners.declared_max_sessions(%{max_sessions: range.first - 1}) ==
+               {:clamped, range.first, range.first - 1}
+
+      assert Runners.declared_max_sessions(%{max_sessions: range.last + 1}) ==
+               {:clamped, range.last, range.last + 1}
+    end
+  end
+
   # The minimum intervals are per channel process; a test that sends several messages in a
   # row resets them rather than sleeping, so the rate-limit tests below are what cover them.
   defp reset_intervals(channel) do
@@ -1176,7 +1347,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     setup do
       {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 4})
       {:ok, socket} = connect_runner(raw)
-      {_reply, channel} = join_pool(socket, "minis")
+      {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
       %{runner: runner, channel: channel}
     end
 

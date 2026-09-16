@@ -5,6 +5,26 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.100.0 — 2026-09-16 (a runner's capacity is the machine's own number)
+
+### Changed
+
+- **`runner_pool` and `runner_enroll` descriptions now say who owns a machine's capacity**
+  (loopctl #846.4, runner contract 1.13.0). No tool signature changed; what changed is the
+  server. `runners.max_sessions` — the number loopctl reserves dispatches against — used to be
+  written once at enrollment and had no path from the machine's own declaration, so a machine
+  configured for one session and enrolled at two was sent two, refused the second `at_capacity`,
+  and the refusal cost the story's claim. Every join now copies the declaration into the held
+  row.
+
+  For a session reading these tools that means two things. The `max_sessions` you pass to
+  `runner_enroll` SEEDS the row and no longer caps it: to change a machine's capacity, change
+  `control.max_sessions` in the runner's own config and reconnect it. And in `runner_pool`,
+  `reported_max_sessions` is no longer a hint — it is what `max_sessions` is copied from, so the
+  two agreeing is the normal state and a disagreement means the runner has not reconnected
+  since, declared a value outside 1..64 (held clamped into it, `0` becoming `1`), or is still
+  holding more sessions than it now declares.
+
 ## 2.99.0 — 2026-09-16 (a filed story can be corrected, and a session can tell stale from missing)
 
 Version 2.98.0 is not skipped by accident: it was taken by the branch that became loopctl

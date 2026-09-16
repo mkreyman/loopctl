@@ -92,7 +92,9 @@ defmodule LoopctlWeb.RunnerController do
         "`/runner/socket/websocket`, and joins the topic `runner:<runner.id>` declaring " <>
         "exactly this `name`. The wire contract is `priv/runner_contract/v1.json`. " <>
         "`max_sessions` (default #{Runner.default_max_sessions()}) is how many dispatches " <>
-        "loopctl will have in flight on this machine at once. Requires user role; " <>
+        "loopctl will have in flight on this machine at once UNTIL IT FIRST JOINS: since " <>
+        "contract 1.13.0 every join re-applies the machine's own declared `max_sessions`, " <>
+        "so this value seeds the row and does not cap it. Requires user role; " <>
         "a caller whose key was minted by a dispatch is refused with 403 " <>
         "`api_key_mint_forbidden`. 422 when the name is malformed, already used by an " <>
         "active runner, `max_sessions` is out of range, or the tenant is at its API key limit.",
@@ -113,8 +115,11 @@ defmodule LoopctlWeb.RunnerController do
              maximum: Runner.max_sessions_range().last,
              default: Runner.default_max_sessions(),
              description:
-               "The most dispatches loopctl keeps in flight on this machine at once. The " <>
-                 "tenant's total is capped separately (RUNNER_MAX_IN_FLIGHT_SESSIONS)."
+               "The most dispatches loopctl keeps in flight on this machine at once, until " <>
+                 "the machine first joins and declares its own (contract 1.13.0) — after " <>
+                 "that the runner's number governs and this one is only what the row " <>
+                 "started at. The tenant's total is capped separately " <>
+                 "(RUNNER_MAX_IN_FLIGHT_SESSIONS)."
            }
          }
        }},
@@ -187,7 +192,12 @@ defmodule LoopctlWeb.RunnerController do
         "capacity Postgres holds for the runner — the values dispatch reserves against — and " <>
         "are null only for a runner revoked while its socket is still draining; " <>
         "`reported_in_flight` and `reported_max_sessions` are what the runner itself last " <>
-        "reported, a hint. `kinds` is what the runner DECLARED on join (contract 1.6.0), " <>
+        "reported. `reported_in_flight` is a hint — it counts the runner's sessions, not " <>
+        "loopctl's reservations. `reported_max_sessions` is NOT: since contract 1.13.0 " <>
+        "loopctl copies it into `max_sessions` on every join, so the two differ only for a " <>
+        "runner that has not reconnected since, one that declared a value outside 1..64 " <>
+        "(held clamped), or one still holding more sessions than it now declares. " <>
+        "`kinds` is what the runner DECLARED on join (contract 1.6.0), " <>
         "and where it is present it alone decides which dispatches the machine is sent — " <>
         "so a connected machine that never gets work is explained by `kinds` or by " <>
         "`unsupported_kinds`, and both have to be read. Requires user role. Presence is a liveness " <>

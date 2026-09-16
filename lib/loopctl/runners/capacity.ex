@@ -5,17 +5,22 @@ defmodule Loopctl.Runners.Capacity do
 
   ## Where the state lives
 
-  In Postgres, and only there. `runners.max_sessions` is what a machine was enrolled to
-  carry, `runners.in_flight` the slots reserved on it now, and every reservation is one
+  In Postgres, and only there. `runners.max_sessions` is how many slots loopctl will reserve
+  on a machine — the machine's OWN declaration, re-applied from the join payload on every
+  connect (`apply_declared/4`), with the enrollment value holding it only until the first
+  join — `runners.in_flight` the slots reserved on it now, and every reservation is one
   `runner_dispatches` row whose `released_at` is NULL. The invariant is
 
       runners.in_flight = count(runner_dispatches WHERE runner_id AND released_at IS NULL)
 
   and every write below keeps it inside one transaction. No process owns a counter, so a
   node that dies mid-dispatch leaves nothing behind but a rolled-back transaction.
-  Presence carries `max_sessions` and `in_flight` too, as the RUNNER reports them: a hint
-  for an operator, never read here, because a CRDT with no compare-and-set cannot hand out
-  the last slot to exactly one caller.
+  Presence carries `max_sessions` and `in_flight` too, as the RUNNER reports them, and
+  nothing here ever reads them: a CRDT with no compare-and-set cannot hand out the last slot
+  to exactly one caller. The runner's `max_sessions` is not merely a hint, though — it is
+  COPIED into the row at join time, once, so that every decision below is still taken on one
+  counter under a row lock. `in_flight` stays a hint: the runner's count is of sessions it is
+  running, loopctl's is of slots it has handed out, and only the second can decide the next.
 
   ## Reserve
 
@@ -286,6 +291,58 @@ defmodule Loopctl.Runners.Capacity do
     case repo.update_all(query, inc: [in_flight: 1], set: [updated_at: DateTime.utc_now()]) do
       {1, [in_flight]} -> {:ok, in_flight}
       {0, _} -> {:error, :runner_at_capacity}
+    end
+  end
+
+  @doc """
+  Sets an active runner's held `max_sessions` to the capacity its machine DECLARED, in one
+  conditional UPDATE. Returns `{:ok, %{max_sessions: m, in_flight: f}}` with the values
+  after the write, or `:unchanged`.
+
+  `declared` must already be inside `Runner.max_sessions_range/0` — the caller validates it
+  (`Loopctl.Runners.declared_max_sessions/1`), because a value this column cannot hold is a
+  fact about the CONTRACT's domain and not about one runner's row.
+
+  ## Why the predicate carries `max_sessions != declared`
+
+  A runner re-declares the same number on every reconnect, so the overwhelmingly common
+  call has nothing to write. Without the predicate each one still takes the `runners` row's
+  lock — the row every dispatch in the tenant contends on — for the length of a no-op. With
+  it, an unchanged capacity touches no row and returns `:unchanged`. A runner that is gone
+  or revoked answers `:unchanged` too: its capacity decides nothing, and `reserve/3` refuses
+  it on its own.
+
+  ## Why `in_flight` is clamped in the SAME statement
+
+  `runners_in_flight_range` CHECKs `in_flight <= max_sessions`, so lowering capacity under
+  the slots a machine currently holds is unrepresentable and a bare write would raise. The
+  clamp is not a repair of the counter: it is the same answer `write_count/4` already gives
+  that state (`target = min(live, max_sessions)`), for the same reason — at
+  `in_flight = max_sessions` `reserve/3`'s `in_flight < max_sessions` is false, so the
+  machine takes no new work until its live dispatches drain, which is exactly what a runner
+  that just told us it carries fewer sessions is asking for. The unreleased ledger rows are
+  untouched and `heal/3` recomputes to the same clamped value, so nothing here can free a
+  slot a session still holds.
+  """
+  @spec apply_declared(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t(), pos_integer()) ::
+          {:ok, %{max_sessions: pos_integer(), in_flight: non_neg_integer()}} | :unchanged
+  def apply_declared(repo \\ Repo, tenant_id, runner_id, declared)
+      when is_integer(declared) and declared > 0 do
+    query =
+      from r in Runner,
+        where: r.id == ^runner_id and r.tenant_id == ^tenant_id,
+        where: is_nil(r.revoked_at) and r.max_sessions != ^declared,
+        update: [
+          set: [
+            max_sessions: ^declared,
+            in_flight: fragment("LEAST(?, ?)", r.in_flight, ^declared)
+          ]
+        ],
+        select: %{max_sessions: r.max_sessions, in_flight: r.in_flight}
+
+    case repo.update_all(query, set: [updated_at: DateTime.utc_now()]) do
+      {1, [held]} -> {:ok, held}
+      {0, _} -> :unchanged
     end
   end
 

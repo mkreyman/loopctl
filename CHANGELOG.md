@@ -6,6 +6,29 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A runner's capacity now follows what the machine declares, not what it was enrolled with
+  (#846.4, runner contract 1.13.0).** `runners.max_sessions` — the number `Loopctl.Runners.Capacity`
+  reserves against — was written once at enrollment and had no path from the runner's own
+  declaration, which arrives on EVERY join and was documented as advisory. `minis` rejoined twice on
+  2026-09-16 declaring `max_sessions: 1` and `GET /api/v1/runners/pool` went on reporting a held `2`,
+  so loopctl placed a second concurrent dispatch on a machine that refuses it `at_capacity` — and a
+  refused dispatch costs the story's claim and parks it. Every join now copies the declaration into
+  the held row.
+
+  **Operator-visible:** the `max_sessions` you pass to `POST /api/v1/runners` (and to the
+  `runner_enroll` MCP tool) SEEDS the row and no longer caps it. A machine enrolled at 8 that
+  declares 1 is held at 1 from its first connect. To change a machine's capacity, change
+  `control.max_sessions` in the runner's own `runner.json` and reconnect it; re-enrolling will not
+  do it. `runner_pool`'s `reported_max_sessions` and `max_sessions` now agree for any runner that
+  has connected since, and a disagreement means one of three things: it has not reconnected, it
+  declared a value outside 1..64 (held clamped into that range — `0` becomes `1`, and `draining` is
+  how a machine asks for no work), or it still holds more sessions than it now declares, in which
+  case it is sent nothing further until those drain.
+
+  **Runners must RE-VENDOR `priv/runner_contract/v1.json`.** Nothing changed on the wire and no
+  runner has to send anything new; a copy taken at 1.12.0 states that this field is advisory, which
+  is now false.
+
 - **Three more of loopctl's own surface becomes reachable, and a session can tell a MISSING tool
   from a STALE one (#846.5, #846.6, #846.7).** No endpoint changed; these are the tools the rule
   in `CLAUDE.md` already required, plus the sweep that finds the next miss.

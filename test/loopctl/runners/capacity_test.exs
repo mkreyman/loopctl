@@ -53,6 +53,33 @@ defmodule Loopctl.Runners.CapacityTest do
     end)
   end
 
+  defp held(runner) do
+    unboxed(fn ->
+      AdminRepo.one!(
+        from r in Runner,
+          where: r.id == ^runner.id,
+          select: %{
+            max_sessions: r.max_sessions,
+            in_flight: r.in_flight,
+            updated_at: r.updated_at
+          }
+      )
+    end)
+  end
+
+  defp apply_declared(runner, declared, tenant_id \\ nil) do
+    tenant_id = tenant_id || runner.tenant_id
+
+    unboxed(fn ->
+      {:ok, result} =
+        Repo.with_tenant(tenant_id, fn ->
+          Capacity.apply_declared(Repo, tenant_id, runner.id, declared)
+        end)
+
+      result
+    end)
+  end
+
   defp unreleased(runner) do
     unboxed(fn ->
       {:ok, count} =
@@ -243,6 +270,76 @@ defmodule Loopctl.Runners.CapacityTest do
                {:error, :runner_at_capacity}
 
       assert in_flight(runner) == 0
+    end
+  end
+
+  describe "apply_declared/4" do
+    test "raises the held capacity to what the machine declared, and the slots follow at once" do
+      runner = runner(%{max_sessions: 1})
+      assert {:ok, 1} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
+
+      assert unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
+               {:error, :runner_at_capacity}
+
+      assert {:ok, %{max_sessions: 3, in_flight: 1}} = apply_declared(runner, 3)
+      assert {:ok, 2} = unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end)
+    end
+
+    test "lowering it under the machine's live slots clamps in_flight, releases nothing, and stops new work" do
+      runner = runner(%{max_sessions: 3})
+
+      for _ <- 1..2 do
+        assert {:ok, _} = send_dispatch(runner, dispatch(runner.tenant_id))
+      end
+
+      assert in_flight(runner) == 2
+      assert unreleased(runner) == 2
+
+      # `runners_in_flight_range` CHECKs in_flight <= max_sessions, so the clamp is what makes
+      # this write representable at all — a bare one would raise.
+      assert {:ok, %{max_sessions: 1, in_flight: 1}} = apply_declared(runner, 1)
+
+      # The two sessions the machine is still running keep their ledger rows; only the number
+      # loopctl will hand out moved.
+      assert unreleased(runner) == 2
+
+      assert unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
+               {:error, :runner_at_capacity}
+    end
+
+    test "a declaration equal to the held capacity writes nothing at all" do
+      runner = runner(%{max_sessions: 2})
+      before = held(runner)
+
+      assert apply_declared(runner, 2) == :unchanged
+      assert held(runner) == before
+    end
+
+    test "a revoked runner is left alone" do
+      runner = runner(%{max_sessions: 4})
+      revoke(runner)
+
+      assert apply_declared(runner, 1) == :unchanged
+      assert held(runner).max_sessions == 4
+    end
+
+    test "another tenant cannot move a runner's capacity by id, at either layer" do
+      runner = runner(%{max_sessions: 4})
+      other = runner(%{max_sessions: 4})
+
+      # RLS refuses it on the app role...
+      assert apply_declared(runner, 1, other.tenant_id) == :unchanged
+      assert held(runner).max_sessions == 4
+
+      # ...and the explicit `tenant_id` predicate refuses it again on the BYPASSRLS repo,
+      # which is the only place that second layer can be observed at all. Asserted here
+      # because on `Repo` alone the predicate is inert: drop it and this describe still
+      # passes, since the policy has already filtered the row (mutation-checked).
+      assert unboxed(fn ->
+               Capacity.apply_declared(AdminRepo, other.tenant_id, runner.id, 1)
+             end) == :unchanged
+
+      assert held(runner).max_sessions == 4
     end
   end
 

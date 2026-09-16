@@ -186,6 +186,15 @@ defmodule LoopctlWeb.RunnerChannel do
   def handle_info(:after_join, socket) do
     %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
 
+    # WHAT THE MACHINE DECLARED BECOMES WHAT LOOPCTL RESERVES AGAINST, and it happens HERE,
+    # before `Presence.track/4`. A dispatch needs a single live socket in the pool
+    # (`Runners.dispatch/3`), so until the track below there is no way to place one — which
+    # makes this the last moment at which the capacity can be replaced with nobody reserving
+    # against the old number. It never refuses the join and never raises; see
+    # `Runners.apply_declaration/3` for why the runner's number wins and why nothing about it
+    # reaches the audit chain.
+    :ok = Runners.apply_declaration(tenant_id, runner, meta)
+
     {:ok, ref} =
       Presence.track(
         self(),

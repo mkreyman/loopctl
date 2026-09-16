@@ -277,7 +277,7 @@
           "type": "string"
         },
         "max_sessions": {
-          "description": "Concurrent sessions this machine accepts; it refuses past them with `at_capacity`. Advisory to loopctl, which reserves against the max_sessions the runner was ENROLLED with, never this value.",
+          "description": "Concurrent sessions this machine accepts; it refuses past them with `at_capacity`. AUTHORITATIVE since 1.13.0: loopctl copies it into the capacity it reserves against on EVERY join, so the number sent here is the number of dispatches this machine will be given at once. Before 1.13.0 it was advisory and loopctl reserved against the max_sessions the runner was ENROLLED with, which no join could correct. Send the real value every time: it is per-connection, so a machine whose configuration changed applies it by reconnecting. `0` is accepted on the wire and held as `1`, because the control plane's range is 1..64 — a machine that wants NO work sets `draining`, which loopctl refuses dispatches against. Lowering it below the sessions loopctl currently holds on this machine sends no more work until those drain, rather than cancelling them.",
           "maximum": 64,
           "minimum": 0,
           "type": "integer"
@@ -1637,5 +1637,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.12.0"
+  "x-contract-version": "1.13.0"
 }

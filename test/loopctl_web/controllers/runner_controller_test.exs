@@ -226,7 +226,11 @@ defmodule LoopctlWeb.RunnerControllerTest do
 
       assert entry["machine"] == "minis"
       assert entry["runner_id"] == runner.id
-      # Capacity is Postgres's; what the runner reported is kept apart as a hint.
+      # Postgres's capacity and the runner's report are separate FIELDS, and this staged
+      # meta is what makes them differ: nothing here joined, so nothing applied the
+      # declaration to the row (contract 1.13.0). A machine that actually connects moves
+      # `max_sessions` onto `reported_max_sessions`; see
+      # `LoopctlWeb.RunnerChannelDispatchTest`, "the capacity a joining machine declares".
       assert entry["in_flight"] == 0
       assert entry["max_sessions"] == 3
       assert entry["reported_in_flight"] == 1

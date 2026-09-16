@@ -53,11 +53,16 @@ defmodule LoopctlWeb.RunnerChannelTest do
   # Joins and waits for the channel to process :after_join (the Presence track).
   defp topic(socket), do: "runner:" <> socket.assigns.runner.id
 
-  defp join_pool(socket, machine) do
-    {:ok, reply, channel} = subscribe_and_join(socket, topic(socket), join_payload(machine))
+  defp join_pool(socket, machine, overrides \\ %{}) do
+    {:ok, reply, channel} =
+      subscribe_and_join(socket, topic(socket), join_payload(machine, overrides))
+
     _ = :sys.get_state(channel.channel_pid)
     {reply, channel}
   end
+
+  # The capacity loopctl DECIDES from, not the meta the runner reported.
+  defp held_capacity(runner), do: Map.fetch!(Runners.capacity(runner.tenant_id), runner.id)
 
   defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
 
@@ -140,6 +145,20 @@ defmodule LoopctlWeb.RunnerChannelTest do
       assert meta.cores == 16
       assert meta.max_sessions == 2
       assert meta.repos == ["mkreyman/home_care_billing"]
+    end
+
+    test "a declaration outside the contract's own range never reaches the row" do
+      {raw, runner} = fixture(:runner, %{name: "minis", max_sessions: 2})
+      {:ok, socket} = connect_runner(raw)
+
+      assert {:error, %{reason: "invalid_payload"}} =
+               subscribe_and_join(
+                 socket,
+                 topic(socket),
+                 join_payload("minis", %{"max_sessions" => 9_999})
+               )
+
+      assert held_capacity(runner).max_sessions == 2
     end
 
     test "the runner vanishes from the pool when its process is killed, with no sweeper" do

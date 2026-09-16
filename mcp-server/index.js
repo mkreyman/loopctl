@@ -7877,8 +7877,12 @@ const TOOLS = [
           minimum: 1,
           maximum: 64,
           description:
-            "How many dispatches loopctl keeps in flight on this machine at once (default 2). " +
-            "The tenant's total across all its runners is capped separately by the server.",
+            "How many dispatches loopctl keeps in flight on this machine at once (default 2), " +
+            "UNTIL the machine first joins: since runner contract 1.13.0 every join re-applies the " +
+            "machine's own declared max_sessions, so this seeds the row and does not cap it. To " +
+            "change a machine's capacity, change control.max_sessions in the runner's own config " +
+            "and reconnect it. The tenant's total across all its runners is capped separately by " +
+            "the server.",
         },
       },
       required: ["name", "token_file"],
@@ -7922,7 +7926,12 @@ const TOOLS = [
       "and machine_id (Fly Machine) holding the socket. in_flight and max_sessions are the " +
       "CAPACITY loopctl holds in Postgres — the slots dispatch reserves against — and are null " +
       "only for a runner revoked while its socket drains; reported_in_flight and " +
-      "reported_max_sessions are what the runner itself last reported, a hint. live_sockets " +
+      "reported_max_sessions are what the runner itself last reported. reported_in_flight is a " +
+      "hint (the runner counts sessions, loopctl counts reservations); reported_max_sessions is " +
+      "NOT — since contract 1.13.0 loopctl copies it into max_sessions on every join. The two " +
+      "differing means the runner has not reconnected since, declared a value outside 1..64 " +
+      "(held clamped into it), or is still holding more sessions than it now declares. " +
+      "live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +
       "within a cluster, so on an unclustered multi-node deployment a runner on another node is " +
