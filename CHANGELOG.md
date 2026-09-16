@@ -6,6 +6,27 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The GitHub intake sources of the delivery loop are reachable from an MCP session
+  (#803/#846). RE-VENDOR `loopctl-mcp-server` to 2.102.0 to get the tools.** `POST/GET/PATCH/
+  DELETE /api/v1/intake/sources` have been served since #803 and no MCP tool called any of
+  them, so the one step that gives the delivery loop an input — pointing a GitHub repository
+  at loopctl — could be taken only from a shell on the production node. The loop had therefore
+  never received a single issue. No endpoint changed here; what changed is that an operator can
+  reach them: `intake_source_enroll`, `intake_source_list`, `intake_source_update`,
+  `intake_source_revoke`.
+
+  **Operator-visible, and the part to read before enrolling:** the webhook secret is returned
+  ONCE by the create endpoint and can never be read again, so the tool does NOT return it —
+  it writes it to a path you name, mode 0600, and returns the source row, the webhook URL and
+  that path. A tool result lands in a session transcript and in the audit log; a credential
+  must not. Configure the repository webhook from that file, content type `application/json`,
+  the `Issues` event only.
+
+  **A new source always starts with `base_branch` of `master`**, because the create endpoint
+  has no parameter for it. On any repository whose trunk is `main` — GitHub's default since
+  2020 — the enrolment is not finished until `PATCH /api/v1/intake/sources/:id` sets it, or
+  every dispatch for that repository is cut from a branch that does not exist.
+
 - **A runner declares the branch prefixes it accepts, and loopctl derives a conforming branch
   (#846.2, runner contract 1.14.0). RE-VENDOR to send the field.** loopctl derived
   `feature/story-<n>-<id>`; the `minis` runner's config accepts `loop/` alone and refuses anything
