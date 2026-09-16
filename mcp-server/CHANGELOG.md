@@ -21,12 +21,18 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `runner_enroll` is a CEILING and the value the row starts at: held capacity is the lesser of it
   and what the machine declares, so a machine can take itself down and cannot raise itself up. To
   make one carry fewer sessions, change `control.max_sessions` in the runner's own config and
-  reconnect it; to let it carry more than its grant, re-enrol it. In `runner_pool`,
+  reconnect it; to let it carry more than its grant, `runner_revoke` it and enrol it AGAIN — a
+  second active runner with the same name is a 422, so the revoke comes first, and it invalidates
+  the credential, so the new token file has to reach the machine and the runner be restarted. In
+  `runner_pool`,
   `reported_max_sessions` is no longer a hint — it is what `max_sessions` is copied from, capped at
   the new `enrolled_max_sessions` field, which is what tells "declaring above its ceiling" apart
-  from "has not reconnected", "declared outside 1..64" and "still holding more than it declares".
+  from "has not reconnected" and "still holding more than it declares". A `max_sessions` ABOVE
+  `reported_max_sessions` is the one remaining case and is not drift at all: the machine declared
+  `0`, held as `1` because the column is 1..64.
   And `place_dispatch` now answers `409 runner_declines_work` for a machine declaring `draining` or
-  a `max_sessions` of 0, refused before the story is claimed.
+  a `max_sessions` of 0, refused before the story is claimed — on a NEW placement only, since a
+  retry carrying a `dispatch_id` loopctl already holds is re-sent as before.
 
 ## 2.99.0 — 2026-09-16 (a filed story can be corrected, and a session can tell stale from missing)
 

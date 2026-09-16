@@ -156,9 +156,15 @@ defmodule Loopctl.Runners do
 
   Which means an operator has two controls and they do different things. To make a machine
   carry FEWER sessions, change its own `control.max_sessions` and reconnect it — the machine
-  owns that fact and no operator write is needed. To let it carry MORE than its grant,
-  re-enrol it: nothing raises `enrolled_max_sessions` on a live row, deliberately, because an
-  endpoint that widens a security bound wants its own change.
+  owns that fact and no operator write is needed. To let it carry MORE than its grant, REVOKE
+  it and enrol it again: nothing raises `enrolled_max_sessions` on a live row, deliberately,
+  because an endpoint that widens a security bound wants its own change.
+
+  "Enrol it again" is not one call. `runners_active_name_uidx` is partial on
+  `revoked_at IS NULL`, so enrolling the same machine name while the current runner is ACTIVE
+  is a 422 — `revoke_runner/3` comes first, and that invalidates the credential the machine is
+  connected with, so the new token has to reach its token file and the runner has to be
+  restarted. Say so wherever this is offered to an operator.
 
   The agent is GOT or created, never created blindly: `runners_active_name_uidx` is partial on
   `revoked_at IS NULL`, so re-enrolling a revoked machine makes a second runner row for the
@@ -764,12 +770,20 @@ defmodule Loopctl.Runners do
   reservation is decided against, not the ones runners report in Presence: runner id to
   `%{in_flight, max_sessions, enrolled_max_sessions}`.
 
-  `max_sessions` here is the machine's own declaration CAPPED at `enrolled_max_sessions`,
-  written at its last join (`apply_declaration/3`), so it matches `reported_max_sessions` on
-  the pool for any runner that has connected since contract 1.13.0 and declares at or below
-  its grant. Both are returned so an operator can tell a machine held down by its own
-  declaration from one held down by the ceiling. `in_flight` is loopctl's count of slots
-  handed out and is never the runner's.
+  `max_sessions` here is the machine's own declaration CAPPED at `enrolled_max_sessions` and
+  then into the column's own range, written at its last join (`apply_declaration/3`). Both are
+  returned so an operator can tell a machine held down by its own declaration from one held
+  down by the ceiling. `in_flight` is loopctl's count of slots handed out and is never the
+  runner's.
+
+  It matches `reported_max_sessions` on the pool for any runner that has connected since
+  contract 1.13.0 and declares INSIDE `Runner.max_sessions_range/0` at or below its grant.
+  A declared `0` is the case where they legitimately differ and the one an operator is most
+  likely to be looking at: the column is 1..64, so `declared_max_sessions/1` holds a `0` as
+  `1` while the pool renders the raw `0` the machine sent. Nothing is dispatched to it either
+  way — `accepting_work?/1` reads the meta's `0` and refuses every path that claims a story
+  before it pushes — so the pair reads `max_sessions: 1` against `reported_max_sessions: 0`
+  and that is the machine saying it takes no work, not a drifted row.
   """
   @spec capacity(Ecto.UUID.t()) :: %{
           Ecto.UUID.t() => %{
@@ -1127,7 +1141,9 @@ defmodule Loopctl.Runners do
   over-dispatching hurts most. Nothing else reconciles it: `Capacity.heal/3` recomputes
   `in_flight` and never touches `max_sessions`, so a swallowed failure left the machine
   dispatchable against the stale larger number until it happened to reconnect
-  (#846.4 review finding 5). `LoopctlWeb.RunnerChannel` re-arms it on its `:recheck` timer.
+  (#846.4 review finding 5). `LoopctlWeb.RunnerChannel` re-arms it on its `:recheck` timer,
+  but only while that socket is the runner's SOLE live one — otherwise a socket lingering from
+  a previous connection would re-assert ITS declaration over the current one's.
   """
   @spec apply_declaration(Ecto.UUID.t(), Runner.t(), map()) :: :ok | {:error, term()}
   def apply_declaration(tenant_id, %Runner{} = runner, meta)

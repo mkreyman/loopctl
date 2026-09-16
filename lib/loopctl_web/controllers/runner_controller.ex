@@ -116,7 +116,10 @@ defmodule LoopctlWeb.RunnerController do
         "it starts at: since contract 1.13.0 every join re-applies the machine's own " <>
         "declared `max_sessions`, bounded by this one, so a machine may lower itself below " <>
         "its grant and never raise itself above it. Raising the ceiling later means " <>
-        "re-enrolling the machine; there is no endpoint that widens it in place. " <>
+        "REVOKING this runner and enrolling the machine again — the active-name index refuses " <>
+        "a second active runner with the same name, and the revoke invalidates the credential, " <>
+        "so the new token must reach the machine's token file and the runner be restarted. " <>
+        "There is no endpoint that widens the ceiling in place. " <>
         "Requires user role; " <>
         "a caller whose key was minted by a dispatch is refused with 403 " <>
         "`api_key_mint_forbidden`. 422 when the name is malformed, already used by an " <>
@@ -220,10 +223,13 @@ defmodule LoopctlWeb.RunnerController do
         "loopctl's reservations. `reported_max_sessions` is NOT: since contract 1.13.0 " <>
         "loopctl copies it into `max_sessions` on every join, capped at the runner's " <>
         "`enrolled_max_sessions`. So `max_sessions` below `reported_max_sessions` means one " <>
-        "of four things — the runner has not reconnected since, it declared a value outside " <>
-        "1..64 (held clamped), it is still holding more sessions than it now declares, or " <>
-        "it is declaring ABOVE the ceiling it was enrolled with, which `enrolled_max_sessions` " <>
-        "here tells apart from the other three. " <>
+        "of three things — the runner has not reconnected since, it is still holding more " <>
+        "sessions than it now declares, or it is declaring ABOVE the ceiling it was enrolled " <>
+        "with, which `enrolled_max_sessions` here tells apart from the other two. " <>
+        "`max_sessions` ABOVE `reported_max_sessions` means exactly one thing and it is not " <>
+        "drift: the machine declared `0`, which the 1..64 column holds as `1` while this " <>
+        "field shows the raw `0`. No NEW placement is made on it — `0` is refused like " <>
+        "`draining`; a retry of a dispatch loopctl already holds is still re-sent. " <>
         "`kinds` is what the runner DECLARED on join (contract 1.6.0), " <>
         "and where it is present it alone decides which dispatches the machine is sent — " <>
         "so a connected machine that never gets work is explained by `kinds` or by " <>
@@ -301,7 +307,7 @@ defmodule LoopctlWeb.RunnerController do
                          "contract 1.13.0: it is what `max_sessions` is copied from, capped " <>
                          "at `enrolled_max_sessions`. `0` means the machine is taking no " <>
                          "work — held as `1` because the column is 1..64, and refused a " <>
-                         "placement like `draining`."
+                         "NEW placement like `draining`."
                    },
                    sample: %Schema{
                      type: :object,

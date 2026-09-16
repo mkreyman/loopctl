@@ -7883,8 +7883,11 @@ const TOOLS = [
             "this one, so a machine may take itself down below its grant and cannot raise " +
             "itself above it. To make a machine carry FEWER sessions, change " +
             "control.max_sessions in the runner's own config and reconnect it — no call here " +
-            "is needed. To let it carry MORE than its grant, re-enrol it: nothing widens this " +
-            "in place. The tenant's total across all its runners is capped separately by " +
+            "is needed. To let it carry MORE than its grant, runner_revoke it FIRST and then " +
+            "enrol it again: nothing widens this in place, and enrolling the same machine name " +
+            "while its current runner is active is a 422. The revoke invalidates the " +
+            "credential, so the new token_file must reach the machine and the runner be " +
+            "restarted. The tenant's total across all its runners is capped separately by " +
             "the server.",
         },
       },
@@ -7933,11 +7936,13 @@ const TOOLS = [
       "hint (the runner counts sessions, loopctl counts reservations); reported_max_sessions is " +
       "NOT — since contract 1.13.0 loopctl copies it into max_sessions on every join, capped at " +
       "the runner's enrolled_max_sessions, which is also returned. So max_sessions BELOW " +
-      "reported_max_sessions means one of four things: the runner has not reconnected since, it " +
-      "declared a value outside 1..64 (held clamped into it), it is still holding more sessions " +
-      "than it now declares, or it is declaring ABOVE the ceiling it was enrolled with — which " +
-      "enrolled_max_sessions tells apart from the other three. A reported_max_sessions of 0 " +
-      "means the machine is taking no work and place_dispatch will refuse it, like draining. " +
+      "reported_max_sessions means one of three things: the runner has not reconnected since, " +
+      "it is still holding more sessions than it now declares, or it is declaring ABOVE the " +
+      "ceiling it was enrolled with — which enrolled_max_sessions tells apart from the other " +
+      "two. max_sessions ABOVE reported_max_sessions means exactly one thing and it is not " +
+      "drift: the machine declared 0, which the 1..64 column holds as 1 while this field shows " +
+      "the raw 0. Either way a reported_max_sessions of 0 means the machine is taking no work " +
+      "and place_dispatch refuses a new placement on it, like draining. " +
       "live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +
@@ -7967,8 +7972,11 @@ const TOOLS = [
       "lineage this mints.\n\n" +
       "409 `runner_declines_work` means the machine's live socket declares `draining` (or a " +
       "max_sessions of 0, which says the same thing). NOTHING WAS CLAIMED — it is refused " +
-      "before the mint — so place on another runner rather than repairing anything. Read " +
-      "`draining` and `reported_max_sessions` from runner_pool before choosing a machine.",
+      "before the mint — so place on another runner rather than repairing anything, with a " +
+      "NEW dispatch_id. Read `draining` and `reported_max_sessions` from runner_pool before " +
+      "choosing a machine. It refuses a NEW placement only: retrying with a dispatch_id " +
+      "loopctl already holds still re-sends that dispatch, because its claim is already " +
+      "standing and a draining machine is asked to finish what it holds, not to take more.",
     inputSchema: {
       type: "object",
       properties: {

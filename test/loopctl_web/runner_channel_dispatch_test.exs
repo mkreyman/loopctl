@@ -166,6 +166,21 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     channel
   end
 
+  # Moves the capacity Postgres holds, COMMITTED, with no channel involved — see the caller
+  # for why a join would not do. `max_sessions` only; `enrolled_max_sessions` is the grant and
+  # nothing but an enrollment writes it.
+  defp hold_capacity_at!(runner, max_sessions) do
+    Sandbox.unboxed_run(Loopctl.AdminRepo, fn ->
+      {1, _} =
+        Loopctl.AdminRepo.update_all(
+          from(r in Runner, where: r.id == ^runner.id and r.tenant_id == ^runner.tenant_id),
+          set: [max_sessions: max_sessions, updated_at: DateTime.utc_now()]
+        )
+    end)
+
+    :ok
+  end
+
   # Holds `FOR UPDATE` on the runner's row from a COMMITTED transaction on its own connection,
   # so a write from the channel's connection really blocks. Returns the holder and a ref to
   # release it with.
@@ -293,6 +308,21 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       assert held_capacity(runner).max_sessions == 1
       assert log =~ "declared max_sessions 0"
+
+      # #846.4 review ROUND 2, finding 4: the held number (1, asserted above) and the one the
+      # pool reports are NOT equal here, and this is the one case where that is correct rather
+      # than drift — `Runners.capacity/1`'s docstring claimed they always match for a machine
+      # declaring at or below its grant, and a declared `0` is both. This is what makes the
+      # corrected sentence checkable. Read through `held_capacity/1` rather than
+      # `Runners.capacity/1`, which is the same column and the same query but on `AdminRepo` —
+      # a second sandbox connection that cannot see the channel's uncommitted write (see this
+      # module's "Why `async: false`").
+      #
+      # The ONE live meta is what `LoopctlWeb.RunnerController`'s `pool_entry/2` renders
+      # `reported_max_sessions` from.
+      assert [meta] = Runners.live_metas(runner.tenant_id, runner.id)
+      assert meta.max_sessions == 0
+      refute Runners.accepting_work?(meta)
     end
 
     test "leaves the row untouched when a rejoin declares what is already held" do
@@ -370,6 +400,78 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       assert log =~ "could not apply runner minis's declared max_sessions 1"
       assert log =~ "will retry on this socket's next recheck"
+    end
+
+    test "is not re-asserted on recheck by a socket that is no longer the runner's only one" do
+      # #846.4 review ROUND 2, finding 3. `declaration_pending` stays true until a write lands,
+      # and the retry re-applied THIS socket's `meta` with no check that the socket is still
+      # the one the runner is dispatched through — unlike the join-time write, whose whole
+      # ordering argument is that the socket is not yet dispatchable. Two sockets can be live
+      # at once (`Loopctl.Runners`' moduledoc, the reconnect window), so an older socket on a
+      # silent node re-asserted its stale declaration over a newer connection's, every 30
+      # seconds, leaving the machine dispatched against a capacity it no longer declares — the
+      # defect this story exists to end.
+      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 4})
+
+      # The row starts at 1 under a ceiling of 4, so the socket under test has something to
+      # write. Done as a COMMITTED update rather than by joining a first socket: a channel's
+      # capacity write lands in the shared sandbox transaction, which never commits, and the
+      # `runners` row would then stay locked for the rest of the test — the lock this test
+      # needs to hand to `lock_runner_row/1` deliberately, at a moment of its own choosing.
+      hold_capacity_at!(runner, 1)
+      assert held_capacity(runner).max_sessions == 1
+
+      # SOCKET A declares 4 and loses the runner row's lock, so its declaration is PENDING.
+      # Cancelled at 50ms rather than waiting out `Capacity.lock_timeout_ms/0`.
+      {locker, lock_ref} = lock_runner_row(runner)
+      Repo.query!("SET LOCAL statement_timeout = '50ms'")
+
+      {socket_a, log} =
+        with_log(fn ->
+          {:ok, socket} = connect_runner(raw)
+          {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
+          channel
+        end)
+
+      assert log =~ "will retry on this socket's next recheck"
+
+      Repo.query!("SET LOCAL statement_timeout = 0")
+      release_runner_row(locker, lock_ref)
+
+      # A never landed its 4, and A is still alive and tracked.
+      assert held_capacity(runner).max_sessions == 1
+      assert Process.alive?(socket_a.channel_pid)
+
+      # SOCKET B — the machine reconnected after being reconfigured — declares 1, which is
+      # what the row already holds, so B's own write is a no-op and the row stands at B's
+      # number. Both sockets are now live.
+      {:ok, socket} = connect_runner(raw)
+      {_reply, socket_b} = join_pool(socket, "minis", %{"max_sessions" => 1})
+      assert length(Runners.live_metas(runner.tenant_id, runner.id)) == 2
+
+      # A's recheck. Ungated it writes 4 back over B's 1 and re-asserts it every 30 seconds.
+      send(socket_a.channel_pid, :recheck)
+      _ = :sys.get_state(socket_a.channel_pid)
+
+      assert held_capacity(runner).max_sessions == 1
+
+      # AND THE WRITE IS NOT LOST, only deferred: `declaration_pending` is left armed, so once
+      # the ambiguity clears the declaration this socket carries does land. Nothing was risked
+      # by waiting — a runner with two live sockets is `:runner_ambiguous` to `dispatch/3`, so
+      # no dispatch could have been decided against the stale number in the meantime.
+      Process.unlink(socket_b.channel_pid)
+      ref = leave(socket_b)
+      assert_reply ref, :ok, _, @reply_timeout
+
+      assert eventually(
+               fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end,
+               @reply_timeout
+             )
+
+      send(socket_a.channel_pid, :recheck)
+      _ = :sys.get_state(socket_a.channel_pid)
+
+      assert held_capacity(runner).max_sessions == 4
     end
 
     test "lowering it under the slots the machine already holds sends no more work" do

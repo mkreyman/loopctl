@@ -27,18 +27,30 @@ All notable changes to loopctl are documented here.
   8 that declares 1 is held at 1 from its first connect; one enrolled at 2 that declares 8 stays at
   2. To make a machine carry FEWER sessions, change `control.max_sessions` in the runner's own
   `runner.json` and reconnect it — no API call is needed. To let it carry MORE than its grant,
-  re-enrol it: there is no endpoint that widens the ceiling in place, deliberately.
+  REVOKE the runner and enrol it again: there is no endpoint that widens the ceiling in place,
+  deliberately. That is three steps, not one, because `runners_active_name_uidx` is partial on
+  `revoked_at IS NULL` and refuses a second ACTIVE runner with the same machine name — revoke
+  (`DELETE /api/v1/runners/:id`, or the `runner_revoke` tool), enrol again at the larger number,
+  then write the NEW token to the machine's token file and restart the runner, because revoking
+  invalidates the credential it is connected with.
   `GET /api/v1/runners` and `GET /api/v1/runners/pool` now both return `enrolled_max_sessions`
   alongside `max_sessions`, so a machine held below what it declares is explicable from one read —
-  it has not reconnected, it declared outside 1..64 (held clamped — `0` becomes `1`), it still
-  holds more sessions than it now declares, or it is declaring above its ceiling.
+  it has not reconnected, it still holds more sessions than it now declares, or it is declaring
+  above its ceiling. The one case that reads the OTHER way is a declared `0`: held as `1` because
+  the column is 1..64, so `max_sessions` sits ABOVE `reported_max_sessions`, and nothing is placed
+  on the machine anyway.
 
-  **A machine declaring `draining` or `max_sessions: 0` is now refused a PLACEMENT** with
+  **A machine declaring `draining` or `max_sessions: 0` is now refused a NEW PLACEMENT** with
   `409 runner_declines_work`, before the story is claimed. Both were previously honoured only by
   the unattended selectors, so `POST /api/v1/runners/:runner_id/dispatches` claimed the story and
   let the runner refuse the push afterwards — leaving it at `claimed` with no session until its
-  lease expired. A dispatch an operator pushes at a machine by name is still delivered for the
-  runner to refuse, because that path claims nothing.
+  lease expired. Two paths are deliberately exempt, both because they claim nothing: a dispatch an
+  operator pushes at a machine by name is still delivered for the runner to refuse, and a RETRY
+  carrying a `dispatch_id` loopctl already holds is still re-sent. That second exemption is the
+  graceful drain working as the contract describes it — `draining` means finish what you hold and
+  take nothing new, and a resume is what the machine holds. Refusing it would strand the standing
+  claim at `claimed` until its lease expired, and the `dispatch_id` is spent, so there is no other
+  runner to place it on.
 
   **Re-vendoring `priv/runner_contract/v1.json` is worth doing and is not required.** Nothing
   changed on the wire and no runner has to send anything new; a copy taken at 1.12.0 describes

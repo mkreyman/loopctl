@@ -582,6 +582,50 @@ defmodule Loopctl.Runners.CapacityTest do
                {:ok, %{in_flight: 1, limit: 6}}
     end
 
+    test "a machine that clamped its counter still counts its live sessions against the tenant" do
+      # #846.4 review ROUND 2, finding 2. `apply_declared/4` clamps `in_flight` DOWN without
+      # releasing a single reservation, and `write_count/5` pins the counter at
+      # `min(live, max_sessions)` so the gap persists until those sessions drain. That break is
+      # right for `reserve/3` and WRONG for `admit/2`: summed raw, one machine could lower the
+      # tenant's visible load by up to 63 and the tenant would run that many more concurrent
+      # sessions than `RUNNER_MAX_IN_FLIGHT_SESSIONS` allows, stably — `heal/3`'s
+      # `min(3, 1) = 1` equals the drifted value. Newly reachable with this change: before it,
+      # the only route to `live > max` was re-enrolment at a smaller value, which makes a NEW
+      # row.
+      a = runner(%{max_sessions: 3})
+      b = runner(%{max_sessions: 4, tenant_id: a.tenant_id})
+      assert Capacity.limit() == 6
+
+      for _ <- 1..3, do: assert({:ok, _} = send_dispatch(a, dispatch(a.tenant_id)))
+      assert in_flight(a) == 3
+
+      # The machine rejoins declaring 1 while three of its sessions are still running.
+      assert {:ok, %{max_sessions: 1, in_flight: 1}} = apply_declared(a, 1)
+      assert ledger_rows(a) == 3
+
+      # Three sessions ARE running on `a`, so that is what the tenant is running.
+      assert unboxed(fn -> Runners.admission(a.tenant_id) end) == {:ok, %{in_flight: 3, limit: 6}}
+
+      for _ <- 1..3, do: assert({:ok, _} = send_dispatch(b, dispatch(a.tenant_id)))
+
+      # The limit binds at 6. Reading `a`'s counter instead, the tenant would have admitted a
+      # fourth here and run 8 concurrent sessions against a cap of 6.
+      assert send_dispatch(b, dispatch(a.tenant_id)) == {:error, :admission_limit_reached}
+      assert in_flight(b) == 3
+    end
+
+    test "a slot taken with no dispatch row of its own still counts against the tenant" do
+      # The other half of the same sum, and the reason it is `GREATEST` rather than a count of
+      # live reservations: `Runners.reserve_slot/2` increments the counter and ties the slot to
+      # no `runner_dispatches` row at all, so counting rows alone would have made it free.
+      a = runner(%{max_sessions: 2})
+
+      assert {:ok, 1} = unboxed(fn -> Runners.reserve_slot(a.tenant_id, a.id) end)
+      assert ledger_rows(a) == 0
+
+      assert unboxed(fn -> Runners.admission(a.tenant_id) end) == {:ok, %{in_flight: 1, limit: 6}}
+    end
+
     test "a revoked runner's slots stop counting against the tenant at once" do
       a = runner(%{max_sessions: 5})
       b = runner(%{max_sessions: 4, tenant_id: a.tenant_id})

@@ -297,7 +297,11 @@ defmodule Loopctl.Delivery.Placement do
     claiming a story for nobody
   - `:runner_declines_work` — the machine's live socket declares `draining`, or a
     `max_sessions` of `0`. Refused BEFORE the claim: the runner would refuse the push itself,
-    but only after the story had been claimed for it
+    but only after the story had been claimed for it. **On the CLAIM path only.** A RESUME —
+    a `dispatch_id` the ledger already holds — is pushed at a draining machine as before,
+    because it claims nothing and the claim it re-pushes under is live: refusing it would
+    strand that claim at `claimed` until its lease expired, which is what the gate exists to
+    prevent
   - `:not_found`, `:invalid_transition`, `:wrong_stage` — from the pre-mint readiness check.
     A story that passes the check and is claimed by someone else in between instead gets
     `Loopctl.Progress.claim_story/3`'s own richer `{:invalid_transition, map()}`, and the
@@ -333,8 +337,7 @@ defmodule Loopctl.Delivery.Placement do
          {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
          :ok <- not_halted(tenant_id),
          :ok <- Tenants.require_human_anchor(tenant_id),
-         :ok <- may_mint_session_dispatch(caller.lineage, caller.role),
-         :ok <- runner_accepting_work(tenant_id, runner_id) do
+         :ok <- may_mint_session_dispatch(caller.lineage, caller.role) do
       case DispatchLedger.get_record(tenant_id, dispatch_id) do
         nil -> claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts)
         record -> resume(tenant_id, runner_id, dispatch, record)
@@ -385,15 +388,33 @@ defmodule Loopctl.Delivery.Placement do
   # runner would refuse with `draining` after the claim committed, and the story would sit at
   # `claimed` with no session until its lease expired.
   #
-  # Checked HERE, before the mint and the claim, for the same reason `claimable/2` is: nothing
-  # is spent on an outcome that was never going to succeed, and there is no compensation to
-  # get right. It reads the ONE live meta a push would reach; zero sockets or an ambiguous
-  # pair are left to `Runners.dispatch/3`, which already answers `:runner_not_connected` and
-  # `:runner_ambiguous` and is the single place that judgement is made.
+  # Checked from `claim_and_push/6`, before the mint and the claim, for the same reason
+  # `claimable/2` is: nothing is spent on an outcome that was never going to succeed, and
+  # there is no compensation to get right. It reads the ONE live meta a push would reach; zero
+  # sockets or an ambiguous pair are left to `Runners.dispatch/3`, which already answers
+  # `:runner_not_connected` and `:runner_ambiguous` and is the single place that judgement is
+  # made.
   #
-  # `dispatch/3` itself is deliberately NOT changed. It claims nothing, so an operator pushing
-  # at a draining machine gets the runner's own refusal and a person reads it — which is the
-  # trade `accepts?/5` documents.
+  # ## WHICH PATH THIS COVERS, AND WHY THE OTHER TWO ARE EXEMPT (#846.4 review round 2,
+  # finding 1)
+  #
+  # The whole argument above is about the path that CLAIMS BEFORE IT PUSHES, so it is mounted
+  # inside `claim_and_push/6` and NOT in `place/4`'s own `with`. Two paths are deliberately
+  # left ungated, for the same reason and not for two:
+  #
+  #   * `resume/4` — a retry of a `dispatch_id` the ledger already holds. It claims nothing;
+  #     the claim it is re-pushing under COMMITTED on an earlier call and is live. Gated here,
+  #     a retry against a machine that has since declared `draining` was refused
+  #     `:runner_declines_work`, whose message says nothing was claimed and to place on
+  #     another runner — BOTH false: the claim stands, and a spent `dispatch_id` cannot be
+  #     re-placed anywhere. The story then sat at `claimed` with no session until its lease
+  #     expired, which is the exact outcome this gate exists to prevent. And `draining` is
+  #     mutable MID-CONNECTION (`RunnerStatus`), so the ordinary graceful drain — finish what
+  #     you hold, take nothing new — put every in-flight dispatch of that machine one lost
+  #     frame away from it. A resume is "what you hold", so it is work the machine already
+  #     accepted and not new work.
+  #   * `Runners.dispatch/3` — an operator push by name. It claims nothing either, so the
+  #     runner's own refusal reaches a person, which is the trade `accepts?/5` documents.
   defp runner_accepting_work(tenant_id, runner_id) do
     case Runners.live_metas(tenant_id, runner_id) do
       [meta] -> if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
@@ -519,7 +540,8 @@ defmodule Loopctl.Delivery.Placement do
   # claimed, and two IMMUTABLE chain entries appended. A caller that omitted one of the five
   # paid all of that and then got a 422. Every one of them is something loopctl can look up.
   defp claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts) do
-    with {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
+    with :ok <- runner_accepting_work(tenant_id, runner_id),
+         {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
          {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch),
          :ok <- claimable(tenant_id, story_id),
          {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do

@@ -345,7 +345,9 @@ defmodule LoopctlWeb.DispatchPlacementController do
   # The machine's own socket says it takes no work — `draining`, or a declared `max_sessions`
   # of `0`. 409 rather than 429: this is not backpressure that clears on its own, it is a
   # state the machine chose and leaves. NOTHING was claimed and nothing was minted, which is
-  # the whole point of checking it before the claim.
+  # the whole point of checking it before the claim — and it is why the gate is mounted on the
+  # CLAIM path alone: a retry carrying a dispatch_id the ledger already holds never reaches
+  # it, so this message's two claims are true wherever it is read.
   defp refuse(conn, :runner_declines_work) do
     error(conn, 409, "runner_declines_work", %{
       message:

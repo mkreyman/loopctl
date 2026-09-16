@@ -1668,6 +1668,62 @@ defmodule Loopctl.Delivery.PlacementTest do
       refute_push "dispatch", _pushed, @reply_timeout
     end
 
+    # #846.4 review ROUND 2, finding 1. The gate above sat in `place/4`'s own `with`, ahead of
+    # the ledger lookup that routes a retry, so it applied to the RESUME path too — where
+    # nothing is claimed by this call and the claim it re-pushes under is already standing.
+    # A machine draining mid-connection is the ordinary graceful drain (finish what you hold,
+    # take nothing new), so every in-flight dispatch on that machine was one lost frame away
+    # from a 409 whose body says "Nothing was claimed. Place on another runner" — both halves
+    # false, since the claim is live and the dispatch_id is spent. The story then sat at
+    # `claimed` with no session until its lease expired, which is the outcome the gate exists
+    # to prevent.
+    test "a RESUME under the same dispatch_id is still pushed at a machine that went draining",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+      assert first.dispatch_id == payload["dispatch_id"]
+
+      # THE CLAIM COMMITTED AND IS LIVE. Everything below is about work this machine already
+      # holds, which is exactly what a draining machine is asked to finish.
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :assigned
+
+      rejoin(ctx, %{"draining" => true})
+
+      # The SAME dispatch_id, which is what `place_dispatch`'s own description instructs after
+      # a lost response or a dropped frame.
+      #
+      # ON THE SHARED SANDBOX CONNECTION, not `unboxed/1`, and that is the only way this
+      # module can assert a SECOND push. The channel marked the ledger row `pushed` inside the
+      # sandbox transaction (`DispatchLedger.record_push/2` takes it `FOR UPDATE`), and a row
+      # lock is held to the end of the TOP-LEVEL transaction, so the resume's own `record_sent`
+      # would wait out its `lock_timeout` on a real connection and answer `:capacity_busy` —
+      # which is why the re-send tests above disconnect the runner instead. Run here, it takes
+      # a lock the connection already holds.
+      #
+      # Sound because a RESUME is not a placement: it claims nothing, mints nothing and
+      # appends nothing to the chain, so it makes no WRITE outside `Loopctl.Repo` and the
+      # two-repo split the moduledoc calls out does not arise. It still READS through
+      # `AdminRepo` (`Dispatches.lineage_for_api_key/2`), which is fine for the same reason:
+      # every row it reads on either connection — tenant, operator key, story, runner, ledger
+      # row, session dispatch — was committed by the placement above or by the setup.
+      assert {:ok, resumed} =
+               Placement.place(runner.tenant_id, runner.id, payload, api_key: ctx.operator)
+
+      assert resumed.dispatch_id == placed.dispatch_id
+      assert resumed.claim_epoch == placed.claim_epoch
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.dispatch_id == payload["dispatch_id"]
+      assert again.story.id == story.id
+
+      # And the claim is untouched: a resume compensates nothing, because it took nothing.
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :assigned
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :claimed
+    end
+
     test "a machine declaring neither is placed on as before", ctx do
       %{story: story} = ctx
 
