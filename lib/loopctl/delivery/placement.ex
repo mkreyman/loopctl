@@ -119,10 +119,12 @@ defmodule Loopctl.Delivery.Placement do
     reading the log.** Observed 2026-09-15: the release ran, failed, wrote its `Logger.error`
     and the story sat at `claimed` for four hours. Nothing automatic recovers that state —
     `place/4` answers `:invalid_transition` because the story is `assigned` rather than
-    `contracted`, the machine has no control-driven edge out of `claimed`, and the reclaimer
-    skips a halted tenant entirely — so `undo_claim/5` parks it over `:session_escalated` and
-    an operator resolves it in one call. See `escalate_unreleased_claim/6` for why only the
-    RELEASE earns that, and where the recursion stops.
+    `contracted`, the only stage edges that take `claimed` back to a PLACEABLE `queued` are the
+    release's own `:claim_released` — the write that just failed — and the reclaimer's
+    `:runner_lost`, and the reclaimer is hours away and skips a halted tenant entirely — so
+    `undo_claim/5` parks it over `:session_escalated` and an operator resolves it in one call.
+    See `escalate_unreleased_claim/6` for why only the RELEASE earns that, and where the
+    recursion stops.
   - **Pushed, never claimed.** A session starts work on a story whose stage row refuses every
     report it makes, for as long as the session runs. Nothing recovers it, because nothing is
     wrong from the row's point of view. That is the failure that was observed in production,
@@ -811,10 +813,18 @@ defmodule Loopctl.Delivery.Placement do
   #   * `release` failed — the `force_unclaim_story/3` Multi rolled back, so the story is still
   #     `assigned` at an in-flight stage with no session that will ever run under it, and NO
   #     AUTOMATIC PATH RECOVERS IT INSIDE THE LEASE. A later `place/4` is refused
-  #     `:invalid_transition` by `claimable/2` (the story is `assigned`, not `contracted`), the
-  #     stage machine has no edge out of `claimed` that control can drive, and
-  #     `ReclaimExpiredClaimsWorker` is hours away and skips a halted tenant entirely. That is
-  #     the incident, and it is the one thing here a human has to decide about.
+  #     `:invalid_transition` by `claimable/2` (the story is `assigned`, not `contracted`), and
+  #     the only edges the machine offers out of `claimed` back to a PLACEABLE `queued` are
+  #     `:claim_released` — written by `Progress.force_unclaim_story/3`, i.e. the release that
+  #     just failed, and the operator remedy that repeats it — and `:runner_lost`, which is
+  #     `ReclaimExpiredClaimsWorker`'s, hours away and skipping a halted tenant entirely. That
+  #     is the incident, and it is the one thing here a human has to decide about.
+  #
+  #     `claimed` IS NOT A DEAD END in the machine, and this used to say it was ("no edge out
+  #     of `claimed` that control can drive"). `attempt_park/7`, a hundred-odd lines below,
+  #     drives `{:claimed, :escalated, :session_escalated}` from control and is the whole of
+  #     this feature; `:budget_exceeded` leaves `claimed` as well. Neither returns the story to
+  #     placeable, which is the property that makes this state an incident.
   #   * `cleared` — `Progress.clear_unused_implementer_dispatch/3` returns `{:ok, :cleared}` or
   #     `{:ok, :unchanged}` and CANNOT return an error; `{:ok, :unchanged}` is explicitly not a
   #     failure (see `log_undo/5`), so escalating on it would fire on the healthy path. Its only
@@ -1002,13 +1012,29 @@ defmodule Loopctl.Delivery.Placement do
   # is neither placeable nor parked, held by a session that will never run, with nothing
   # downstream that will pick it up before the lease — which a halted tenant never reaches at
   # all, since `ReclaimExpiredClaimsWorker` skips it.
+  #
+  # AND THE REMEDY NAMES ITS OWN PRECONDITION, because the halted tenant this message reasons
+  # about in that same sentence is refused the remedy it used to name. `force-unclaim` is in
+  # `LoopctlWeb.CustodySurface`'s `@story_custody_ops`, so `LoopctlWeb.Plugs.CheckCustodyHalt`
+  # — mounted in the `:authenticated` pipeline (`LoopctlWeb.Router`) — answers
+  # `503 tenant_halted` before the controller runs, and an operator in exactly the state
+  # described here followed the only remedy named and got a 503. The break-glass is the
+  # precondition and is named with it.
+  #
+  # `stage/resolve` is NOT the answer on this branch even though it is halt-exempt (its path
+  # has four segments, so `custody_path?/1` falls through to `false`): this is the branch where
+  # the escalation did not happen, so there is no escalation to resolve.
   defp log_park({:error, reason}, tenant_id, story, session, placement_error, release_error) do
     Logger.error(
       "placement could not release the claim it made AND COULD NOT ESCALATE the story. It is " <>
         "held at its current stage by a session that will never run, and no automatic path " <>
         "frees it before the claim lease — a halted tenant never reaches that either. Free it: " <>
         "POST /api/v1/stories/#{story.id}/force-unclaim (MCP force_unclaim_story), then " <>
-        "contract it before placing it again. tenant_id=#{tenant_id} story_id=#{story.id} " <>
+        "contract it before placing it again. IF THIS TENANT IS HALTED, force-unclaim is " <>
+        "suspended with every other custody operation and answers 503 tenant_halted: clear " <>
+        "the halt first, through the superadmin break-glass ceremony (POST " <>
+        "/api/v1/admin/tenants/#{tenant_id}/clear-halt/challenge, then .../clear-halt). " <>
+        "tenant_id=#{tenant_id} story_id=#{story.id} " <>
         "claim_epoch=#{story.claim_epoch} session_dispatch_id=#{session.id} " <>
         "placement_error=#{short(placement_error)} release_error=#{short(release_error)} " <>
         "escalation_error=#{short(reason)}",
@@ -1041,23 +1067,54 @@ defmodule Loopctl.Delivery.Placement do
   # that even if a future edit did overrun it, what an operator loses is the diagnostics and
   # not the instruction.
   #
-  # THE HEADROOM, MEASURED rather than estimated (this said "under a third", which was wrong by
-  # half). `max_reason_length/0` is 4_000 codepoints and the check is on codepoints at both
-  # ends — `reason_within_bound?/1` counts them and the column's CHECK is `char_length`. The
-  # constant prose below is 727 of them. `short/1` emits at most ~1_055 for a 5-element tuple
-  # and ~1_091 for a 5-key map — a changeset's `changes` and `errors` are exactly those shapes
-  # — so a realistic worst-case pair is about 2_873, roughly 72%.
+  # THE HEADROOM, MEASURED rather than estimated, and re-measured in round 2 because the first
+  # measurement was taken on the wrong term. `max_reason_length/0` is 4_000 codepoints and the
+  # check is on codepoints at both ends — `reason_within_bound?/1` counts them and the column's
+  # CHECK is `char_length`. The constant prose below is 727 of them. A whole
+  # `%Ecto.Changeset{}` carrying 40 errors of 500 characters — the fattest shape reachable
+  # here, since `Progress.force_unclaim_story/3` hands back the `:story` changeset itself —
+  # renders at 1_458 through `short/1`, so the worst realistic pair is 3_643: 91% of the bound,
+  # not the 72% this said. That figure measured a bare 5-key map rather than the struct that
+  # actually arrives.
   #
-  # A SECOND, WHOLE-TEXT TRUNCATION WAS HERE AND IS GONE, and the reason is a property of
-  # `inspect/2` rather than the percentage above. `bin/mutate.sh` opened it to the identity and
-  # every test still passed (exit 1). The mechanism: `:limit` is spent across the WHOLE
-  # traversal, not per container, so nesting cannot multiply the output — `inspect/2` at
-  # `limit: 5` renders six levels of 5-tuples in 40 characters. With `:printable_limit` capping
-  # each binary, `short/1` therefore has a ceiling in the low thousands whatever it is handed,
-  # and no term this function can be given reaches 4_000 through it. An unreachable clause that
-  # reads as a guard is worse than no clause — the same argument `may_mint_session_dispatch/2`
-  # records above. The bound is asserted where it IS reachable, in `placement_test.exs`'s "a
-  # pathological error term cannot lose the escalation".
+  # 357 codepoints of headroom is thin, and PROSE IS WHAT GROWS — this reason gained about 60
+  # codepoints in round 1 alone. So the fit is ASSERTED rather than assumed, in
+  # `placement_test.exs`'s "an error term whose size is its ELEMENT COUNT cannot lose the
+  # escalation": it parks with that pair and asserts the row reached `escalated`, which IS the
+  # length check — `Stages.advance/4` refuses an over-long reason BEFORE the transition, so a
+  # reason past the bound produces no park to read a length off. An edit that eats the headroom
+  # therefore fails a test instead of losing a park in production (proved by mutation: 450
+  # characters added to the prose below turns that test red).
+  #
+  # A SECOND, WHOLE-TEXT TRUNCATION WAS HERE AND STAYS GONE — decided again in round 2, not
+  # inherited, because the sentence that justified deleting it was false as an absolute.
+  #
+  # TRUE: `:limit` is spent across the WHOLE traversal rather than per container, so nesting
+  # cannot multiply the output (`inspect/2` at `limit: 5` renders six levels of 5-tuples in 40
+  # characters), and `:printable_limit` caps each binary. Between them every CONTAINER and
+  # every BINARY lands in the low thousands whatever it is handed — measured: 1_458 for the
+  # changeset above, 1_080 for a 40-element keyword list, 282 for a `%Postgrex.Error{}` holding
+  # a 20 KB message, 22 for a 20 KB non-printable binary.
+  #
+  # NOT TRUE: this used to add "no term this function can be given reaches 4_000 through it",
+  # which is a property of `short/1` and is not one it has. Neither option bounds a
+  # NON-CONTAINER SCALAR: `inspect(<a 30_000-digit integer>, limit: 5, printable_limit: 200)`
+  # is 30_000 characters, and it would lose the park. The claim that holds is about this path's
+  # two error sources, not about the formatter — `placement_error` is what `Runners.dispatch/3`
+  # and `fetch_uuid/2` refuse with (atoms, `{:invalid, [binary]}`), and `release_error` is what
+  # `Progress.force_unclaim_story/3` returns or what `release_claim/5`'s rescue caught (a
+  # changeset, an atom, an exception struct). None of those is an unbounded scalar.
+  #
+  # SO THE CLAMP STAYS OUT, and that is a choice between two hazards rather than a claim that
+  # there is only one. It would absorb the hazard that IS reachable — this prose growing into
+  # the 357 codepoints above — by eating the diagnostics silently, where the test now fails
+  # loudly; and it would guard the unreachable one with a clause nothing can falsify, which is
+  # the objection `may_mint_session_dispatch/2` records above. `:limit` is NOT in that category
+  # and is asserted: opening it to `:infinity` takes a 40-element term from 1_080 to 8_631 and
+  # the park is refused `:invalid_reason`. WHAT WOULD OVERTURN THIS: a caller handing `short/1`
+  # a term whose size is neither a container's element count nor a binary's length — then the
+  # clamp belongs INSIDE `short/1`, where it also covers `unreleased_claim_event_data/2`'s
+  # 8_000-byte bound, and not on the composed text where it sat before.
   defp unreleased_claim_reason(placement_error, release_error) do
     "loopctl claimed this story for a runner, the dispatch was refused, and the compensating " <>
       "release of that claim ALSO failed. The story is held by a session that will never " <>

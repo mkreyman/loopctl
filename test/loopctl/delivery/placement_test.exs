@@ -956,6 +956,126 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert row.escalation_reason =~ "force_unclaim_story"
     end
 
+    test "an error term whose size is its ELEMENT COUNT cannot lose the escalation", ctx do
+      %{runner: runner, story: story} = ctx
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      claimed = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      session = unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end)
+
+      # THE OTHER AXIS, and the one the test above cannot see. That one uses a single 20 KB
+      # binary, which `:printable_limit` bounds by itself — so it holds `:limit` to nothing,
+      # and opening `limit: 5` to `limit: :infinity` left the whole file green. Here the size
+      # comes from the COUNT of elements instead, every one of them well under the printable
+      # cap: a changeset carrying 40 errors of 500 characters, which is what
+      # `Progress.force_unclaim_story/3` hands back on its `{:error, :story, changeset, _}`
+      # branch. It arrives wrapped in `{:error, _}` and only on the release side, so passing it
+      # BARE and on BOTH sides is deliberately the pessimistic form of the real shape: the
+      # wrapper would spend limit budget of its own, and a real `placement_error` is a refusal
+      # atom or `{:invalid, [binary]}`.
+      #
+      # Unbounded, one of these renders 18_823 codepoints against a 4_000 bound, so
+      # `Stages.advance/4` refuses `:invalid_reason` BEFORE the transition and the story is
+      # left neither placeable nor parked — the outcome this whole path exists to prevent.
+      errors =
+        for i <- 1..40,
+            do: {:"field_#{i}", {String.duplicate("x", 500), [validation: :required]}}
+
+      fat = %Ecto.Changeset{
+        action: nil,
+        changes: Map.new(errors, fn {field, _} -> {field, String.duplicate("x", 500)} end),
+        errors: errors,
+        data: %{},
+        types: %{},
+        valid?: false
+      }
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok =
+                   unboxed(fn ->
+                     Placement.escalate_unreleased_claim(
+                       runner.tenant_id,
+                       claimed,
+                       session,
+                       fat,
+                       fat,
+                       []
+                     )
+                   end)
+        end)
+
+      assert log =~ "the story is ESCALATED"
+      refute log =~ "COULD NOT ESCALATE"
+
+      row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
+      assert row.stage == :escalated
+
+      # AND THAT ASSERTION IS ALSO THE HEADROOM CHECK, which is why there is no separate
+      # `String.length(...) <= max_reason_length()` line here: there could never be one that
+      # fails on its own. `Stages.advance/4` REFUSES an over-long reason with `:invalid_reason`
+      # before the transition, so a reason past the bound produces no escalation at all and no
+      # `escalation_reason` to measure — the stage assertion goes red first, every time.
+      #
+      # What it therefore guards, beyond `:limit`: two of these terms plus the constant prose
+      # is 3_643 of the 4_000, or 91%, so an edit that grows `unreleased_claim_reason/2` past
+      # the remaining 357 codepoints fails HERE rather than losing a park in production. That
+      # is the reachable half of the bound, and the reason the whole-text clamp was not
+      # restored — a clamp would absorb exactly that edit, silently.
+      assert row.escalation_reason =~ "resolve_escalation"
+
+      # BOTH DIAGNOSTICS SURVIVED, not just the remedy: the pair fits, so an operator still
+      # gets the shape of each error rather than one of them at the cost of the other.
+      assert row.escalation_reason =~ "placement_error=#Ecto.Changeset<"
+      assert row.escalation_reason =~ "release_error=#Ecto.Changeset<"
+    end
+
+    test "an explicit actor_label: nil mislabels the park rather than losing it", ctx do
+      %{runner: runner, story: story} = ctx
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      claimed = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      session = unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end)
+
+      # A PRESENT KEY WITH A nil VALUE, which is the one input `Keyword.get/3` cannot defend
+      # against: the default applies only when the key is ABSENT, so `nil <> @compensation_suffix`
+      # raises, `escalate_unreleased_claim/6`'s rescue swallows it, and `log_park/6` takes the
+      # loud branch — leaving the story held at `claimed` with a log line, which is the incident
+      # this feature exists to end. `compensation_actor/1`'s `case` is what keeps the worst case
+      # at a mislabelled park instead of no park at all. Every other test here passes a binary
+      # or `[]`, so nothing else reaches this clause.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok =
+                   unboxed(fn ->
+                     Placement.escalate_unreleased_claim(
+                       runner.tenant_id,
+                       claimed,
+                       session,
+                       :runner_not_connected,
+                       :not_found,
+                       actor_label: nil
+                     )
+                   end)
+        end)
+
+      assert log =~ "the story is ESCALATED"
+      refute log =~ "COULD NOT ESCALATE"
+
+      row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
+      assert row.stage == :escalated
+
+      # AND IT IS STILL ATTRIBUTED. A caller that named no usable label falls back to
+      # `@escalation_actor`, and the suffix is what tells this park apart from the story-object
+      # park in the escalated queue.
+      assert [event] = unboxed(fn -> escalation_events(runner.tenant_id, story.id) end)
+      assert event.actor_label == "control:placement/unreleased-claim"
+    end
+
     test "a raise inside the park does not replace the refusal the caller is owed", ctx do
       %{runner: runner, story: story} = ctx
 
@@ -1367,18 +1487,35 @@ defmodule Loopctl.Delivery.PlacementTest do
         end)
     end)
 
-    # DROPPED EXPLICITLY, because nothing else will. The rows here are committed, so there is
-    # no sandbox rollback to undo the DDL — a leaked trigger would fail every later release of
-    # a story that happened to reuse this id, and the function would outlive the database's
-    # tenants. `IF EXISTS` so a failure before the trigger was created still cleans up.
-    on_exit(fn ->
-      Sandbox.unboxed_run(AdminRepo, fn ->
-        AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON story_stages")
-        AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-      end)
-    end)
+    on_exit(fn -> drop_the_release_trigger!(name) end)
 
     :ok
+  end
+
+  # DROPPED EXPLICITLY, because nothing else will. The rows here are committed, so there is no
+  # sandbox rollback to undo the DDL — a leaked trigger would fail every later release of a
+  # story that happened to reuse this id, and the function would outlive the database's
+  # tenants. `IF EXISTS` so a failure before the trigger was created still cleans up.
+  #
+  # AND GUARDED EXACTLY AS THE CREATE IS, because it carries the identical hazard: `DROP
+  # TRIGGER` takes the same ACCESS EXCLUSIVE lock on `story_stages`. Unguarded, contention
+  # parks this callback until ExUnit kills it on its on-exit timeout — and then BOTH objects
+  # leak into a test database this box shares with every other placement run, where they
+  # surface later as somebody else's release failing for no visible reason. Failing fast
+  # reports the leak as this test's own error instead.
+  #
+  # A named function rather than a third nested closure: `SET LOCAL` needs the transaction, and
+  # `on_exit` + `unboxed_run` + `transaction` is one level past what `mix credo --strict`
+  # allows in a body.
+  defp drop_the_release_trigger!(name) do
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      {:ok, _} =
+        AdminRepo.transaction(fn ->
+          AdminRepo.query!("SET LOCAL lock_timeout = '5s'")
+          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON story_stages")
+          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+        end)
+    end)
   end
 
   # A story CLAIMED while its stage row is still at `queued` — what
