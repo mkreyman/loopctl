@@ -1,7 +1,7 @@
 /**
  * Key selection for the `exact_role: :orchestrator` custody verbs.
  *
- * WHAT THE PINNING IS FOR. `resolveKey` (`index.js:132-138`) reads
+ * WHAT THE PINNING IS FOR. `resolveKey` in `index.js` reads
  * `LOOPCTL_API_KEY || keyOverride || LOOPCTL_ORCH_KEY`, so the global override wins over the
  * key a tool names. An operator who set LOOPCTL_ORCH_KEY specifically for these verbs, and a
  * LOOPCTL_API_KEY of some other role for everything else, had the orchestrator key silently
@@ -31,9 +31,12 @@
  * WHAT IS DELIBERATELY NOT HERE. `report` (`exact_role: [:agent, :orchestrator]`) and
  * `review-complete` (`exact_role: [:orchestrator, :user]`) are LIST-form gates, and for them the
  * LOOPCTL_API_KEY fallback is load-bearing rather than a hazard: the common agent configuration
- * sets LOOPCTL_API_KEY to an agent key and no orchestrator key at all, and `report` works today
- * only because `resolveKey` finds it. That is the SAME reasoning the conditional pin above
- * applies to the five, one case wider.
+ * sets LOOPCTL_API_KEY to an agent key and no orchestrator key at all, and `report_story` works
+ * today only because `resolveKey` finds it there. Note what that does NOT mean — both of these
+ * hand `apiCall` LOOPCTL_ORCH_KEY as their tool-specific override, and `resolveKey` never reads
+ * LOOPCTL_AGENT_KEY by name, so LOOPCTL_AGENT_KEY ALONE is not a configuration either of them
+ * runs under. That is the SAME reasoning the conditional pin above applies to the five, one
+ * case wider.
  *
  * Two layers: the selection is behaviour and is tested as behaviour; the wiring of each handler
  * to it is a fact about index.js with no injection seam, so it is source-pinned.
@@ -98,8 +101,9 @@ describe("orchestratorKeyArgs — which key a custody verb sends", () => {
     const args = orchestratorKeyArgs({});
 
     assert.equal(args.resolved, undefined, "callers refuse locally on exactly this");
-    // `exactKey` + `keyHint` is what makes apiCall's missing-key branch (`index.js:174-181`)
-    // name LOOPCTL_ORCH_KEY instead of defaulting to the set_llm_config wording.
+    // `exactKey` + `keyHint` is what makes `apiCall`'s missing-key branch (its `if (!key)`
+    // clause, in `index.js`) name LOOPCTL_ORCH_KEY instead of defaulting to the
+    // set_llm_config wording.
     assert.equal(args.options.exactKey, true);
     assert.equal(args.options.keyHint, "LOOPCTL_ORCH_KEY");
   });
@@ -216,6 +220,23 @@ describe("exact_role: :orchestrator verbs select their key through orchestratorK
       assert.ok(
         !source.includes("orchestratorKeyArgs"),
         `${handler} selects its key as an exact_role verb does; its gate is a role RANGE`,
+      );
+
+      // And their tool-specific key is LOOPCTL_ORCH_KEY, not LOOPCTL_AGENT_KEY. This is the
+      // fact the README and both changelogs now state: `resolveKey` never reads
+      // LOOPCTL_AGENT_KEY by name, so under LOOPCTL_AGENT_KEY alone these two answer "No API
+      // key configured" and never reach their gate. Three copies of the docs said the
+      // fallback made "an agent-key-only configuration" work; it makes LOOPCTL_API_KEY=<agent
+      // key> work, which is a different setup.
+      assert.ok(
+        source.includes("process.env.LOOPCTL_ORCH_KEY"),
+        `${handler} no longer names LOOPCTL_ORCH_KEY as its key — the docs' claim about ` +
+          `which configurations reach it is now wrong and must be re-derived`,
+      );
+      assert.ok(
+        !source.includes("LOOPCTL_AGENT_KEY"),
+        `${handler} now reads LOOPCTL_AGENT_KEY, so the docs' "not agent-key-only" caveat ` +
+          `is stale`,
       );
     }
   });

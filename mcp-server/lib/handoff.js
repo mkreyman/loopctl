@@ -19,9 +19,17 @@
  * lib/http-helpers.js). The three HTTP calls are INJECTED (`deps`), so every branch
  * below is testable with fakes and no network.
  *
- * NEVER attempts `create_project`. A work project is human-anchor-gated by design
- * (#505); trying it first is exactly the dead-end #517 hit, and its 403 reads as a wall
- * rather than a redirect.
+ * NEVER attempts `create_project`. A work project is human-anchor-gated by design, so on an
+ * agent-rooted tenant it cannot succeed and the attempt is a wasted round trip — that is the
+ * dead end #517 hit. NOT because the 403 is unhelpful: an earlier draft of this comment said
+ * it "reads as a wall rather than a redirect", and #505 is precisely what stopped that being
+ * true. `ProjectController` mounts `RequireHumanAnchor` on `:create` with an `alternative:`
+ * naming `create_kb_scope` (`lib/loopctl_web/controllers/project_controller.ex:46-58`), which
+ * the plug renders as `remediation.agent_native_alternative`
+ * (`lib/loopctl_web/plugs/require_human_anchor.ex:166-169`), and it mounts that tier gate
+ * BEFORE `RequireRole` (`:62`) so an agent-role key reads THAT 403 rather than
+ * `insufficient_role`. The 403 points at the kb scope. This code goes straight there because
+ * the round trip buys nothing, not because the answer would confuse anyone.
  */
 
 export const HANDOFF_KEY_PREFIX = "handoff:";

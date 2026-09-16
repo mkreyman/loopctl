@@ -11,16 +11,23 @@
  *
  * WHAT THE PINNING IS FOR — and what it is NOT for.
  *
- * NOT for the error message. An earlier draft of this comment, and six copies of it, claimed a
- * 403 from that gate "reads as a custody refusal about the STORY rather than a misconfigured
- * key". That is false and the source says so: `RequireRole.forbid/3` (`require_role.ex:112-128`)
- * halts with 403, `code: "insufficient_role"`, `required_roles: ["orchestrator"]` and the message
- * "This endpoint requires the orchestrator role", and the plug is mounted FIRST, so the request
- * never reaches the controller and never reaches `Progress.validate_not_self_verify/4` where the
- * custody 409s are raised. The role error is unambiguous. Do not reintroduce that justification.
+ * NOT for the error message. An earlier draft of this comment, and every copy of it that had
+ * spread across this package and both changelogs, claimed a 403 from that gate "reads as a
+ * custody refusal about the STORY rather than a misconfigured key". That is false and the
+ * source says so: `RequireRole.forbid/3` (`require_role.ex:112-128`) halts with 403,
+ * `code: "insufficient_role"`, `required_roles: ["orchestrator"]` and the message "This
+ * endpoint requires the orchestrator role", and the plug is mounted FIRST, so the request
+ * never reaches the controller and never reaches `Progress.validate_not_self_verify/4` where
+ * the custody 409s are raised. The role error is unambiguous. Do not reintroduce that
+ * justification. It came back twice after being "removed everywhere", so it is no longer swept
+ * by hand: `test/no_false_403_claim.test.js` fails on any assertion of it anywhere in this
+ * package or in either changelog. It admits a quotation like the one above, but only where a
+ * disproof marker sits within a sentence or so of it — a whole-paragraph rule was too loose,
+ * since this refutation runs a dozen lines and its closing "do not reintroduce" would have
+ * excused an assertion at the far end of the very block that disproves the claim.
  *
- * What the pinning IS for is an operator's expressed configuration. `resolveKey`
- * (`index.js:132-138`) reads `LOOPCTL_API_KEY || keyOverride || LOOPCTL_ORCH_KEY` — the global
+ * What the pinning IS for is an operator's expressed configuration. `resolveKey` in
+ * `index.js` reads `LOOPCTL_API_KEY || keyOverride || LOOPCTL_ORCH_KEY` — the global
  * override wins over the key the tool names. So an operator who set `LOOPCTL_ORCH_KEY`
  * specifically for these verbs AND a `LOOPCTL_API_KEY` of some other role for everything else
  * had the orchestrator key silently discarded on precisely the calls they set it for, and paid a
@@ -52,7 +59,8 @@ export function orchestratorKeyArgs(env = process.env) {
 
   if (orchKey) {
     // The operator named a key for this role. Send exactly it: `exactKey` makes `apiCall` use
-    // the override verbatim instead of `resolveKey` (`index.js:168`).
+    // the override verbatim instead of `resolveKey` — the `const key = exactKey ? keyOverride :
+    // resolveKey(keyOverride)` line in `index.js`.
     return {
       override: orchKey,
       options: { exactKey: true, keyHint: "LOOPCTL_ORCH_KEY" },
@@ -70,9 +78,10 @@ export function orchestratorKeyArgs(env = process.env) {
     return { override: undefined, options: {}, resolved: globalKey };
   }
 
-  // Nothing configured. Pin anyway, so `apiCall`'s missing-key branch takes the `keyHint` path
-  // (`index.js:174-181`) and names LOOPCTL_ORCH_KEY rather than the LLM-config default. Callers
-  // that refuse locally (see `forceUnclaimStory`) branch on `resolved` being undefined.
+  // Nothing configured. Pin anyway, so `apiCall`'s missing-key branch (`if (!key)`, in
+  // `index.js`) takes the `keyHint` path and names LOOPCTL_ORCH_KEY rather than falling back to
+  // the LLM-config default. Callers that refuse locally (see `forceUnclaimStory`) branch on
+  // `resolved` being undefined.
   return {
     override: undefined,
     options: { exactKey: true, keyHint: "LOOPCTL_ORCH_KEY" },

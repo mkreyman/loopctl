@@ -70,7 +70,7 @@ Or if installed locally:
 | `LOOPCTL_API_KEY` | Global API key override: used for every tool except the exact-key ones below, and for the `exact_role: :orchestrator` custody verbs when `LOOPCTL_ORCH_KEY` is unset | -- |
 | `LOOPCTL_ORCH_KEY` | Orchestrator role API key (report, review, import, and the `exact_role: :orchestrator` custody verbs `verify_story` / `reject_story` / `verify_all_in_epic` / `bulk_mark_complete` / `force_unclaim_story` — when it is set, it is the key those five send) | -- |
 | `LOOPCTL_AGENT_KEY` | Agent role API key (contract, claim, start, request-review) | -- |
-| `LOOPCTL_USER_KEY` | User role API key (minted at signup). Required for **first-time BYO LLM key provisioning** (`set_llm_config` / `llm_config` — see [First-time setup](#first-time-setup--provision-your-byo-llm-keys)) and for destructive admin tools like `knowledge_bulk_publish`, and for the [runner and delivery-loop tools](#runner-and-delivery-loop-tools). | -- |
+| `LOOPCTL_USER_KEY` | User role API key (minted at signup). Required for **first-time BYO LLM key provisioning** (`set_llm_config` / `llm_config` — see [First-time setup](#first-time-setup--provision-your-byo-llm-keys)), for destructive admin tools like `knowledge_bulk_publish`, and for the `runner_*` tools plus `place_dispatch` and `resolve_escalation` in [Runner and delivery-loop tools](#runner-and-delivery-loop-tools). **Not for the whole of that section:** `story_stage` takes `LOOPCTL_AGENT_KEY`, and `force_unclaim_story` is `exact_role: :orchestrator`, where a user key is 403'd like any other non-member. | -- |
 | `LOOPCTL_STH_STATE_PATH` | Absolute path for the witness-protocol STH cache file (see [Witness protocol](#witness-protocol-sth)). Optional. | per-(server + key) file under the OS temp dir |
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
@@ -95,8 +95,15 @@ which names the problem correctly.
 
 `report_story` and `review_complete` are NOT in this table: their gates take a role RANGE
 (`exact_role: [:agent, :orchestrator]` and `[:orchestrator, :user]`), so the
-`LOOPCTL_API_KEY` fallback is what makes an agent-key-only configuration work. The
-conditional pin in the first row is that same reasoning applied to the single-role gates.
+`LOOPCTL_API_KEY` fallback is what makes the common agent configuration work — that is
+`LOOPCTL_API_KEY` set to an agent key. **`LOOPCTL_AGENT_KEY` alone is not that configuration
+for these two**: the priority above never consults `LOOPCTL_AGENT_KEY` by name, only a tool's
+own key, and `report_story` and `review_complete` both name `LOOPCTL_ORCH_KEY` as theirs — so
+with only `LOOPCTL_AGENT_KEY` set they answer "No API key configured" before reaching their
+gate. Most agent-facing tools do name `LOOPCTL_AGENT_KEY` as their own key and so do work
+under it alone; these two are the exception, and `story_stage` reads it explicitly for the
+same reason. The conditional pin in the first row is that same reasoning applied to the
+single-role gates.
 
 ## First-time setup — provision your BYO LLM keys
 

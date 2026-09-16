@@ -287,7 +287,8 @@ describe("force_unclaim_story", () => {
 
 describe("id validation — shared by every verb here", () => {
   // NOT because the server 500s on a malformed id; it does not. `Ecto.Query.CastError` has a
-  // deliberate `Plug.Exception` impl returning 404 (`cast_error_handler.ex:26-29`, pinned by
+  // deliberate `Plug.Exception` impl returning 404 (`cast_error_handler.ex:32-35` — the
+  // `Ecto.CastError` impl three lines above it is a different exception; pinned by
   // `cast_error_handler_test.exs:9-12`), and the body is the generic
   // `{"error": {"status": 404, "message": "Not found"}}`. The problem is that this is the
   // IDENTICAL answer a well-formed id naming no story gets (`fallback_controller.ex:74-78`),
@@ -325,6 +326,30 @@ describe("id validation — shared by every verb here", () => {
     assert.match(result.body, /runner_id/);
     assert.match(result.body, /must be a UUID/);
     assert.equal(calls.length, 0);
+  });
+
+  test("place_dispatch forwards a malformed dispatch_id UNCHECKED — a decision, not a gap", async () => {
+    // `dispatch_id` is an id and is deliberately outside `uuid()`. It travels in the BODY, and
+    // `Placement.place/4` casts it with `fetch_uuid/2` as the SECOND clause of its `with` —
+    // before the caller is resolved and before anything is minted or claimed — so the server
+    // answers `422 invalid_payload` naming the parameter and the shape. That is unambiguous,
+    // which is the opposite of the 404 the path ids get, so a client check has nothing here to
+    // disambiguate. Pinned because the comment over `uuid()` states it: if a future change adds
+    // the check, this test is what makes it update that claim in the same edit.
+    const { calls, apiCall } = fakeApi();
+
+    const result = await placeDispatch(
+      { story_id: STORY_ID, runner_id: RUNNER_ID, dispatch_id: MALFORMED },
+      deps({ apiCall }),
+    );
+
+    assert.equal(result.error, undefined, "place_dispatch refused locally on dispatch_id");
+    assert.equal(calls.length, 1, "no request was sent, so the server's own cast never ran");
+    assert.equal(
+      calls[0].body.dispatch_id,
+      MALFORMED,
+      "the value was altered or dropped; it must reach the server's own cast verbatim",
+    );
   });
 
   test("names the SHAPE and never echoes the value back", async () => {
@@ -369,7 +394,8 @@ describe("id validation — shared by every verb here", () => {
     // this client's marker for "no request was sent" — `apiCall`'s missing-key, network-error
     // and timeout branches all use it. Stamping the refusal 404 instead would make it
     // indistinguishable from the server's own answer for a malformed id
-    // (`cast_error_handler.ex:26-29`), which is the ambiguity the check exists to REMOVE.
+    // (the `Ecto.Query.CastError` impl, `cast_error_handler.ex:32-35`), which is the ambiguity
+    // the check exists to REMOVE.
     const { calls, apiCall } = fakeApi();
 
     const result = await forceUnclaimStory(

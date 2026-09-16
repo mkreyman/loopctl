@@ -159,13 +159,30 @@ async function apiCall(
   { exactKey = false, timeoutMs, keyHint } = {},
 ) {
   const url = `${getBaseUrl()}${path}`;
-  // Secret-managing tools pass exactKey:true so the request uses the EXACT
-  // role-pinned key (LOOPCTL_USER_KEY) and does NOT fall back to the global
-  // LOOPCTL_API_KEY override — a secret op must never silently run under a
-  // non-user global key (review #12). `exact_role`-gated CUSTODY actions pass it
-  // for the same reason one layer over: a global key of any other role is 403'd
-  // by that gate, and the 403 reads as the story being unverifiable rather than
-  // the key being the wrong one.
+  // `exactKey` sends `keyOverride` VERBATIM instead of consulting `resolveKey`
+  // (defined above), whose priority is LOOPCTL_API_KEY > keyOverride >
+  // LOOPCTL_ORCH_KEY — so without it a global LOOPCTL_API_KEY displaces the key a
+  // tool names. Two families pass it, for two different reasons:
+  //
+  //   - USER-ROLE-PINNED tools pass LOOPCTL_USER_KEY with `exactKey: true`
+  //     UNCONDITIONALLY. Named rather than cited by line, because a line number here
+  //     drifts with every edit above it: `llmConfig` / `setLlmConfig`, the egress
+  //     allowlist verbs (`clearLocalOnly`, `declareTrustedEndpoint`,
+  //     `revokeTrustedEndpoint`), the WebAuthn enrollment and revocation verbs
+  //     (`requestAuthenticatorChallenge`, `enrollAuthenticator`,
+  //     `requestAuthenticatorRevokeChallenge`, `revokeAuthenticator`), and the shared
+  //     `runnerDeps()` / `deliveryDeps()` factories — the latter covering
+  //     `place_dispatch` and `resolve_escalation`, which need an unlineaged human
+  //     principal. `grep -n 'exactKey: true' index.js` is the current list. None of
+  //     them may silently run under a global key of another role (review #12).
+  //   - The `exact_role: :orchestrator` CUSTODY verbs pass it CONDITIONALLY, and
+  //     nothing here decides that: `orchestratorKeyArgs` (`lib/custody-key.js`)
+  //     returns `exactKey` only when LOOPCTL_ORCH_KEY is set, and returns no options
+  //     at all when only LOOPCTL_API_KEY is — an orchestrator-role global key was a
+  //     working, documented configuration before 2.97.0 and still reaches the gate.
+  //     The reason for pinning is the operator's EXPRESSED CHOICE of variable, never
+  //     the shape of the server's 403; `lib/custody-key.js` reads the plug and shows
+  //     why that 403 was never ambiguous.
   const key = exactKey ? keyOverride : resolveKey(keyOverride);
 
   if (!key) {

@@ -53,7 +53,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   pinned unconditionally, which refused that configuration locally and told the operator their
   key was the wrong role when it was not.) `report_story` and `review_complete` are unpinned
   for the same reason, one case wider: their gates take a role RANGE, and the fallback is what
-  makes an agent-key-only configuration work.
+  makes the common agent configuration work — that is `LOOPCTL_API_KEY` set to an agent key.
+  `LOOPCTL_AGENT_KEY` alone is NOT that configuration for these two, and never was: `resolveKey`
+  reads `LOOPCTL_API_KEY`, then the TOOL'S OWN key, then `LOOPCTL_ORCH_KEY`, and never
+  `LOOPCTL_AGENT_KEY` by name — and both `report_story` and `review_complete` name
+  `LOOPCTL_ORCH_KEY` as their own, so under `LOOPCTL_AGENT_KEY` alone they answer "No API key
+  configured" without reaching a gate. Most other agent-facing tools name `LOOPCTL_AGENT_KEY`
+  as theirs and do work under it alone; `story_stage` reads it explicitly for the same reason.
 
   For the record, since this changelog claimed otherwise in an earlier draft: the 403 from an
   `exact_role` gate is NOT ambiguous and never resembled a custody refusal.

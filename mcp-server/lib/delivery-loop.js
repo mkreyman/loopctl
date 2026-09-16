@@ -48,12 +48,24 @@ function refuse(body) {
 }
 
 /**
- * A client-side shape check on every id these verbs take.
+ * A client-side shape check on the ids that go into a URL PATH: `story_id` and `runner_id`.
  *
- * WHY, stated correctly — an earlier draft of this comment said a malformed id made the server
- * "500", and it does not. loopctl has a deliberate backstop:
+ * NOT on `place_dispatch`'s `dispatch_id`, which is an id and is forwarded unchecked. That is a
+ * decision and not an omission: it travels in the request BODY, and `Placement.place/4` casts it
+ * with `fetch_uuid/2` (`lib/loopctl/delivery/placement.ex:786-791`) as the second clause of its
+ * `with` — before the caller is resolved, before anything is minted and before the claim — so a
+ * malformed one answers `422 invalid_payload` with `details: ["dispatch_id: must be a UUID"]`
+ * (`lib/loopctl_web/controllers/dispatch_placement_controller.ex:321-326`). That names the
+ * parameter and the shape, costs nothing on the server, and is the opposite of the ambiguity
+ * below. There is nothing here for a client check to disambiguate. An earlier draft of this
+ * comment said the check covered "every id these verbs take"; it never did.
+ *
+ * WHY THE PATH IDS DO NEED IT — stated correctly, since an earlier draft of this comment said a
+ * malformed id made the server "500", and it does not. loopctl has a deliberate backstop:
  * `defimpl Plug.Exception, for: Ecto.Query.CastError` maps it to 404
- * (`lib/loopctl_web/plugs/cast_error_handler.ex:26-29`), pinned by
+ * (`lib/loopctl_web/plugs/cast_error_handler.ex:32-35` — the file also carries an
+ * `Ecto.CastError` impl at `:27-30` and an `Ecto.ChangeError` impl at `:37-42`; the query path
+ * below raises the `Ecto.Query.CastError` one), pinned by
  * `test/loopctl_web/plugs/cast_error_handler_test.exs:9-12`. What the caller actually gets is
  * `{"error": {"status": 404, "message": "Not found"}}` — the generic body
  * `LoopctlWeb.ErrorJSON.render("404.json", …)` emits
@@ -69,10 +81,13 @@ function refuse(body) {
  * SCOPE OF THAT TRACE. The path read end to end is force-unclaim:
  * `Progress.force_unclaim_story/3` reaches `lock_story/2` (`lib/loopctl/progress.ex:3467-3470`),
  * which puts `story_id` straight into a `where` against a `:binary_id` column with no cast. The
- * other three verbs are NOT claimed to reach that same code, and `place_dispatch` does not even
- * put `story_id` in a path — it goes in the request body. They do not need to: a shape check is
- * worth its line on any argument that must be a UUID, whatever the server would do with a value
- * that is not one.
+ * other verbs are NOT claimed to reach that same code. They do not need to: a shape check is
+ * worth its line on any argument that is interpolated into a URL path and must be a UUID,
+ * whatever the server would do with a value that is not one. `place_dispatch`'s `story_id` is
+ * the one exception in the other direction — it travels in the body, like `dispatch_id` — and it
+ * is checked because `story_id` is a PATH id in the three sibling verbs and `uuid()` is one
+ * shared check: giving the same parameter two different refusals depending on which verb took it
+ * is worse than checking it once too often.
  *
  * THE REFUSAL CARRIES `status: 0`, NOT 404, and that is deliberate. Every local refusal in this
  * client uses it — `refuse()` below, `apiCall`'s missing-key branch and its network/timeout
