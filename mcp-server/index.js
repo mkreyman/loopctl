@@ -13,8 +13,7 @@ import {
 import { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import crypto from "node:crypto";
-import { fileURLToPath } from "node:url";
-import path, { dirname, join } from "node:path";
+import path from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
@@ -54,14 +53,15 @@ import {
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
 } from "./lib/delivery-loop.js";
+import { updateStory as updateStoryRequest } from "./lib/story-update.js";
+import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-version.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
 // Keeping it derived prevents the handshake version from drifting from the
-// published package version.
-const SERVER_VERSION = JSON.parse(
-  readFileSync(join(dirname(fileURLToPath(import.meta.url)), "package.json"), "utf8")
-).version;
+// published package version — and, since #846.7, from the version the
+// `mcp_version` tool reports, which reads it through the same function.
+const SERVER_VERSION = packageVersion();
 
 // ---------------------------------------------------------------------------
 // HTTP helper — witness protocol state
@@ -3264,6 +3264,36 @@ async function forceUnclaimStory(args) {
   );
 }
 
+// #846.6: correct a filed story. The action is `role: :orchestrator`
+// (`story_controller.ex:29-30`) and NOT `exact_role:`, so the hierarchy applies and a `:user`
+// or `:superadmin` key passes too. That is why LOOPCTL_ORCH_KEY goes through `resolveKey` as an
+// ordinary override here rather than being pinned with `exactKey` the way the custody verbs
+// are: there is no role a global LOOPCTL_API_KEY could hold that the gate accepts and this
+// override would improve on. Same selection as `create_story` and `backfill_story`.
+async function updateStory(args) {
+  return toContent(
+    await updateStoryRequest(args, {
+      apiCall: (method, path, body) =>
+        apiCall(method, path, body, process.env.LOOPCTL_ORCH_KEY),
+    }),
+  );
+}
+
+// #846.7: what this process is running versus what loopctl ships. NO KEY — `publicApiCall`
+// sends no Authorization header at all, and /.well-known/loopctl is unauthenticated
+// (`router.ex:113-118`), which is the point: the staleness question arises precisely in a
+// session where keyed calls are failing. SERVER_VERSION is passed rather than re-read so the
+// handshake and this report cannot disagree; both come from `packageVersion()`.
+async function mcpVersion(args) {
+  return toContent(
+    await mcpVersionRequest(args, {
+      publicApiCall,
+      version: SERVER_VERSION,
+      baseUrl: getBaseUrl(),
+    }),
+  );
+}
+
 // US-26: Signed Tree Head retrieval
 async function getSth({ tenant_id }) {
   const result = await apiCall("GET", `/api/v1/audit/sth/${tenant_id}`);
@@ -4020,6 +4050,67 @@ const TOOLS = [
         },
       },
       required: ["story"],
+    },
+  },
+  {
+    name: "update_story",
+    description:
+      "CORRECT A FILED STORY (PATCH /api/v1/stories/:id): its title, description, acceptance " +
+      "criteria, estimate or metadata. This is the tool for a story whose own author found it " +
+      "wrong — a severity that understates the defect, a title that misnames it — without " +
+      "resending its siblings the way import_stories with merge would.\n\n" +
+      "SENDING `metadata` REPLACES THE WHOLE MAP. There is no merge on this path: the field " +
+      "is cast straight onto the story, so a partial send keeps the keys you sent and " +
+      "SILENTLY DROPS every other one, and answers 200. READ THE STORY FIRST (get_story), " +
+      "then send the complete map with your change in it. That erasure is not hypothetical: " +
+      "the marker that says a story has entered the lifecycle — and therefore may not be " +
+      "backfilled straight to `verified` — used to live in metadata, and one ordinary PATCH " +
+      "erased it. It is a COLUMN now (`lifecycle_entered_at`) that NO changeset casts, which " +
+      "is why this endpoint can no longer reach it; every other metadata key is still yours " +
+      "to lose. `acceptance_criteria` is replaced whole for the same reason.\n\n" +
+      "WHAT IT CANNOT DO. Only these five fields are updatable — `number` is fixed at " +
+      "creation, and `agent_status` / `verified_status` are custody state with their own " +
+      "gated endpoints (contract, claim, report, review-complete, verify), never a PATCH. A " +
+      "field cannot be NULLED either: the controller drops every nil before the changeset " +
+      "sees it, so `null` is refused here rather than answering 200 unchanged. Requires an " +
+      "orchestrator-role key or higher (LOOPCTL_ORCH_KEY, or LOOPCTL_API_KEY of that role) " +
+      "and a human-anchored tenant (403 `custody_tier_required` otherwise). 404 for an " +
+      "unknown story; 422 with the changeset errors for a title over 500 characters or a " +
+      "description over 50000.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The UUID of the story to correct." },
+        title: {
+          type: "string",
+          description: "Replaces the title. Max 500 characters (422 beyond it).",
+        },
+        description: {
+          type: "string",
+          description: "Replaces the description. Max 50000 characters (422 beyond it).",
+        },
+        acceptance_criteria: {
+          type: "array",
+          items: { type: "object" },
+          description:
+            "REPLACES the whole list — each entry is an object, conventionally " +
+            "{ id, description }. Send every criterion you want the story to keep.",
+        },
+        estimated_hours: {
+          type: "number",
+          description:
+            "Replaces the estimate. loopctl parses this with a decimal parser and DROPS the " +
+            "field when the parse fails, so an unparseable value would answer 200 with the " +
+            "old estimate; this tool refuses one instead.",
+        },
+        metadata: {
+          type: "object",
+          description:
+            "REPLACES the whole metadata map — read the story first and send it complete. " +
+            "Anything you leave out is gone.",
+        },
+      },
+      required: ["story_id"],
     },
   },
   {
@@ -7568,6 +7659,35 @@ const TOOLS = [
       required: [],
     },
   },
+  {
+    name: "mcp_version",
+    description:
+      "WHICH VERSION OF THIS MCP SERVER YOU ARE ACTUALLY RUNNING, and which one loopctl " +
+      "ships. Answers `running`, `expected`, a `status` of current / behind / ahead / " +
+      "unknown, and the remedy. Needs no API key and reads loopctl's unauthenticated " +
+      "discovery document, so it answers in a session where nothing else does.\n\n" +
+      "WHAT IT IS FOR. MCP binds its tool list at session start, so 'this tool does not " +
+      "exist' and 'this tool exists and my process is older than it' look IDENTICAL from " +
+      "inside a session — a name that is not in the surface. That is how a merged, deployed, " +
+      "green tool got reported as a missing capability. This is the discriminator: at " +
+      "`current`, a tool you cannot see genuinely is not in this version, so look for another " +
+      "name or file it rather than waiting. At `behind`, your surface is stale and the tool " +
+      "may well exist.\n\n" +
+      "THE REMEDY FOR `behind` IS /mcp OR A SESSION RESTART, NEVER A RETRY: the tool list is " +
+      "fixed for the life of this process, so the same call will fail the same way for ever. " +
+      "If a reconnect does not pick the tool up, npm may not have finished publishing yet — " +
+      "the deploy and the publish run independently — so wait and reconnect again.\n\n" +
+      "`expected` is the version in the tree the DEPLOYMENT you are pointed at was built " +
+      "from (loopctl publishes it at /.well-known/loopctl), not a registry lookup; nothing " +
+      "here talks to npm. `ahead` is normal when running this package from a checkout. And " +
+      "if this tool is itself absent from your surface, that IS the answer: your process " +
+      "predates 2.99.0.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
 
   // Dispatch Tool (US-26.2.3)
   {
@@ -7767,6 +7887,17 @@ const TOOLS = [
           description:
             "Optional. The idempotency key. Generated when absent; pass the id you used " +
             "before to RETRY rather than start a second session.",
+        },
+        repo: {
+          type: "string",
+          description:
+            "Optional. `owner/name` of the repository the session works in, OVERRIDING the " +
+            "repository loopctl would derive from the project's intake source. Pass " +
+            "`base_branch` alongside it: the derivation supplies both from one intake " +
+            "source, so naming a repository whose base branch loopctl still has to guess " +
+            "is how a session gets cut from the wrong trunk. Required in practice on a " +
+            "project bound to NO intake source (409 `no_intake_source`) or to TWO (409 " +
+            "`ambiguous_intake_source`) — both refusals name these two parameters.",
         },
         branch: { type: "string", description: "Optional. The branch the session works on." },
         base_branch: { type: "string", description: "Optional. The branch it is cut from." },
@@ -8586,6 +8717,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "create_story":
       return await createStory(args);
 
+    case "update_story":
+      return await updateStory(args);
+
     case "import_stories":
       return await importStories(args);
 
@@ -8873,6 +9007,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Discovery Tools
     case "list_routes":
       return await listRoutes();
+
+    case "mcp_version":
+      return await mcpVersion(args);
 
     case "dispatch":
       return await createDispatch(args);

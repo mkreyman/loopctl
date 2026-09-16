@@ -5,6 +5,86 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.99.0 — 2026-09-16 (a filed story can be corrected, and a session can tell stale from missing)
+
+Version 2.98.0 is deliberately skipped: it is taken by a branch in flight, and reusing it
+would publish two different trees under one number.
+
+### Added
+
+- **`update_story`** (loopctl #846.6, `PATCH /api/v1/stories/:id`, ORCH key or higher). Corrects
+  a filed story's `title`, `description`, `acceptance_criteria`, `estimated_hours` or
+  `metadata`. The endpoint has been served since long before this package's write surface was
+  built and no tool reached it, so a session that filed a story and then found its own severity
+  wrong could not fix it — `import_stories` with `merge: true` posts a whole epic payload, which
+  means resending every sibling to change one field.
+
+  **SENDING `metadata` REPLACES THE WHOLE MAP.** There is no merge on this path: the field is
+  cast straight onto the story, so a partial send keeps what you sent, silently drops everything
+  else, and answers 200. Read the story first and send the map complete;
+  `acceptance_criteria` is replaced whole for the same reason. That erasure is not
+  hypothetical — `lifecycle_entered_at`, the marker that says a story may not be backfilled
+  straight to `verified`, lived in metadata and one ordinary PATCH erased it. It is a COLUMN
+  now that no changeset casts, so this endpoint can no longer reach THAT key; every other one is
+  still yours to lose.
+
+  Three things it refuses locally, each because the server's own answer would be a 200 that
+  changed nothing and is therefore indistinguishable from success: a request naming no updatable
+  field (the controller would still write an `updated` audit entry), any field set to `null`
+  (nils are dropped before the changeset), and an `estimated_hours` no decimal parser accepts
+  (the parse failure is dropped the same way, leaving the old estimate). The action is
+  `role: :orchestrator` — the HIERARCHY form, so a `:user` or `:superadmin` key passes too, and
+  `LOOPCTL_ORCH_KEY` is therefore sent as an ordinary override rather than pinned. The tenant
+  must be human-anchored.
+
+- **`mcp_version`** (loopctl #846.7). What this process is running, what loopctl ships, and what
+  the difference means: `running`, `expected`, a `status` of `current` / `behind` / `ahead` /
+  `unknown`, and a remedy. **It needs no API key** — it reads loopctl's unauthenticated
+  discovery document — so it answers in a session where nothing else does.
+
+  MCP binds its tool list at session start, so from inside a session "this tool does not exist"
+  and "this tool exists and my process is older than it" are the same observation: a name that
+  is not in the surface. 2.97.0's `force_unclaim_story` merged, deployed and went green, and the
+  session that needed it reported the capability as MISSING while it was merely STALE. This is
+  the discriminator, and the shape is the one the runner contract already uses — both sides
+  publish a version, so neither has to infer.
+
+  **The remedy for `behind` is `/mcp` or a session restart, never a retry**: the tool list is
+  fixed for the life of the process. `expected` is the version in the tree the deployment you
+  are pointed at was built from, not a registry lookup — so `behind` can briefly precede the npm
+  publish (the deploy and the publish run independently), and `ahead` is normal when running
+  this package from a checkout. The running version is READ from `package.json`, never written
+  down: a constant that drifts from the package would be the same defect one layer down.
+
+### Fixed
+
+- **`place_dispatch` declares `repo`** (loopctl #846.5). Its description offered `repo` as an
+  override and loopctl's own `409 no_intake_source` tells the caller to "pass `repo` and
+  `base_branch` explicitly", while the `inputSchema` declared only `base_branch`. It reached the
+  server anyway, purely because no schema here sets `additionalProperties: false` — so one
+  reasonable decision to close a schema, or a stricter MCP client, would have removed the only
+  expressible remedy for that refusal with nothing to show the operator why. The declaration
+  says `base_branch` is expected alongside it.
+
+### Internal
+
+- `test/description_schema_drift.test.js` — the generalisable half of the fix above: a scan that
+  fails when any tool's description offers a parameter its schema does not declare. Two offer
+  shapes are read, an offer verb governing a token and an anaphoric "pass any of them" whose
+  referent is the sentence before — the second is what hid #846.5. The extractor is pinned on
+  hand-written fixtures so it stays falsifiable when every shipped description is clean.
+- `test/route_coverage.test.js` — a sweep of every `/api/v1` route loopctl serves against every
+  route this package calls. Unreached routes are DECLARED with a category, and the assertion
+  runs both ways: an undeclared gap fails, and so does a declaration whose route has since been
+  covered or deleted. Nearly half the surface was unreached when it was written, so it is a
+  ratchet rather than a hard fail — new debt cannot land silently, and the list can only shrink.
+  It also pins, for every tool rather than a named few, that a declaration has a dispatch case
+  and a case has a declaration.
+- `test/tool-surface.js` — the router parser now expands Phoenix's `resources` macro. It matched
+  only the seven verb macros before, so eleven `resources` lines covering projects, api_keys,
+  runners, webhooks, skills and articles were invisible to the sweep above — 34 additional
+  routes, none of them previously checked.
+
 ## 2.97.0 — 2026-09-15 (a story stuck at `claimed` can be freed)
 
 ### Added

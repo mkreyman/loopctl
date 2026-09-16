@@ -588,6 +588,42 @@ So, for any endpoint an operator, an orchestrator or an agent is meant to use:
 Internal endpoints a machine calls — the runner socket, webhooks — are exempt: their caller is
 the machine, and it already exists.
 
+#### The subject is a REMEDIATION PATH, not an endpoint — and it is not done until a caller can reach the tool without a deploy
+
+Driving the delivery loop on 2026-09-15 broke this rule FIVE times in one night, and the
+heading as written above catches ONE of them. Read "endpoint" as **the whole path by which
+something outside the app unsticks the loop**: a context function with no route, a schema that
+cannot express what its own error demands, and a shipped tool that has not reached the caller
+yet are the same failure wearing three faces — a thing that would unstick the loop, reachable
+by nothing that needs it.
+
+The five, with ids so a later session can check this rather than trust it: **846.3**,
+force-unclaim had an endpoint and no tool — the only one the old wording catches. **846.5**,
+`place_dispatch`'s `inputSchema` omitted `repo`, which its own 409 `no_intake_source` tells the
+caller to pass (`dispatch_placement_controller.ex:418-426`); it reached the server only because
+no schema here sets `additionalProperties: false`. **846.6**, `PATCH /api/v1/stories/:id`
+(`router.ex:477`) had been served for months with no tool, so a session could file a story and
+not correct it. **846.7**, a tool that merged, went green and deployed and was still uncallable,
+because it ships as an npm package and MCP binds its tool list at session start. And **PR #862**,
+`Dispatches.revoke/2` (`dispatches.ex:457`) — a context function with no route at all, so the
+one call that unsticks a parked dispatch key was reachable only from `iex`.
+
+**The second clause: until a caller can reach the tool without a deploy.** It cannot mean zero
+latency — the deploy and `mcp-autopublish.yml` fire independently, and a session binds its tool
+surface at start, so some window always exists. What it means is that the window must be
+OBSERVABLE from inside a session: `mcp_version` compares the running package against the version
+the deployment was built from, so "this tool does not exist" and "my process is older than it"
+stop being the same observation. Ship the tool, and leave a caller able to tell which of those
+two they are in.
+
+The mechanism is not here: `mcp-server/test/route_coverage.test.js` sweeps loopctl's `/api/v1`
+surface for routes no tool reaches and makes the undone ones a declared, shrinking list. Read
+that file for how it decides; this section is only the rule.
+
+**What would overturn this:** the sweep proving to be noise — a run of declared gaps that are
+all correctly exempt and none worth a tool — or MCP gaining a live tool-list refresh, which
+retires the second clause outright.
+
 ### Doc hygiene: ALWAYS document a new env var or API constraint
 
 The inverse rule, and the one that actually bit us. Two things are easy to ship
