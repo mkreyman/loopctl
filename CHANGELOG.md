@@ -35,8 +35,10 @@ All notable changes to loopctl are documented here.
   lineage; a revoke that changed nothing appends nothing. Idempotent: an already-revoked dispatch
   answers 200 with `revoked_count: 0` and its ORIGINAL `revoked_at`, and that holds for two
   revokes racing as well as for a sequential retry — so a subtree revoked from two places at
-  once still leaves exactly one `dispatch_revoked` entry per dispatch, with the first
-  revocation's timestamp.
+  once leaves no dispatch counted in two entries, and each revoked row keeps the FIRST
+  revocation's timestamp. (An entry is written per revoke CALL, keyed on the dispatch you
+  named, carrying `revoked_count` for the whole cascade — so revoking a parent with two
+  children appends ONE entry, not three.)
 
   **New cron — `RevokeExpiredApiKeysWorker`, every 5 minutes.** `RevokeExpiredDispatchesWorker`
   only reaches keys a DISPATCH minted. A key created at `POST /api/v1/api_keys` with an

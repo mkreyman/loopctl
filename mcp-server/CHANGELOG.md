@@ -49,7 +49,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
   Idempotent: an already-revoked dispatch answers 200 with `revoked_count: 0` and its ORIGINAL
   `revoked_at` — for two revokes racing as well as for a sequential retry, so a subtree revoked
-  from two places at once still leaves exactly one audit-chain entry per dispatch.
+  from two places at once leaves no dispatch counted in two audit-chain entries. One entry is
+  appended per revoke CALL that changed something, keyed on the dispatch you named and carrying
+  `revoked_count` for the whole cascade — revoking a parent with two children appends ONE entry,
+  not three.
 
 ## 2.97.0 — 2026-09-15 (a story stuck at `claimed` can be freed)
 

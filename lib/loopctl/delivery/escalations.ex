@@ -292,6 +292,12 @@ defmodule Loopctl.Delivery.Escalations do
   authenticating key, and the lineage is server-resolved, so a session cannot resolve the
   escalation it raised by claiming to be a person.
 
+  **A caller that fails that gate changes NOTHING.** The gate is asked through
+  `Stages.precheck/2` before the claim is released, so a refused resolve leaves the story
+  exactly as it found it: claim held, epoch unmoved, session credential alive, row still at
+  `escalated`. It did not until #862 review round 3 — the release ran first, and a refusal
+  arrived after the implementer's credential had already been revoked.
+
   ## The epoch
 
   Read fresh, not taken from the caller. An escalated story is not held by a claim — that is
@@ -304,6 +310,7 @@ defmodule Loopctl.Delivery.Escalations do
           {:ok, StoryStage.t()} | {:error, error()}
   def resolve(tenant_id, story_id, opts) do
     to = Keyword.fetch!(opts, :to)
+    transition = {:escalated, to, :human_resolution}
 
     # Fetched ONCE, here, and threaded — not re-fetched at each use. It reaches TWO writers,
     # not one: `Stages.advance/4` below, and `force_unclaim_story/3` under `prepare_story/6`,
@@ -311,29 +318,48 @@ defmodule Loopctl.Delivery.Escalations do
     # entry on the hash chain. That second one was passed `actor_label:` alone while this
     # function was holding the lineage, so `Progress`'s `Keyword.get(opts, :actor_lineage,
     # [])` wrote an EMPTY actor on it (#862 review round 2, finding 3).
-    #
-    # ON THE SUCCESSFUL PATH THAT CHANGES NOTHING, and saying otherwise would be inventing a
-    # mechanism: `:human_resolution` is a human-only edge and `Stages.human?/1`
-    # (`lib/loopctl/delivery/stages.ex:1073-1076`) requires `actor_lineage == []`, so a
-    # resolve that completes is one whose lineage is empty. What it changes is the REFUSED
-    # path — a LINEAGED caller, i.e. a session claiming to be a person, which is precisely
-    # what that gate exists to refuse. `prepare_story/6` runs BEFORE `Stages.advance/4`, so
-    # by the time the refusal lands the claim is released and the credential revoked, and the
-    # chain carries an entry for a revocation that session caused. `[]` on that entry reads
-    # as the tenant's operator key having done it.
     actor_lineage = Keyword.fetch!(opts, :actor_lineage)
 
+    # Built ONCE and used TWICE — by the precheck and by the advance — so the attribution the
+    # gate JUDGES is necessarily the attribution the transition RECORDS. Two separately
+    # assembled keyword lists would let those drift, which on a human-only edge is the whole
+    # of the gate.
+    advance_opts = [
+      reason: Keyword.get(opts, :reason),
+      actor_label: Keyword.get(opts, :actor_label),
+      actor_role: Keyword.fetch!(opts, :actor_role),
+      actor_lineage: actor_lineage
+    ]
+
+    # THE HUMAN GATE IS ASKED BEFORE ANYTHING IS DESTROYED, and that ordering is the fix for
+    # #862 review round 3, finding 1. `prepare_story/6` RELEASES THE CLAIM — it has to, since
+    # the release bumps the epoch this transition is then fenced on — and since #862 the
+    # release also revokes the story's session credential and cascades to every descendant
+    # dispatch and its `api_keys` row.
+    #
+    # Run in the old order, that made a REFUSED resolve destructive. A dispatch-minted
+    # `:user`-role key is mintable (`@roles` in `Loopctl.Dispatches.Dispatch`) and clears the
+    # route's `role: :user` plug, so a SESSION could POST `to: queued` on any escalated story:
+    # the claim was released, the epoch bumped, the implementer's live credential and its
+    # whole subtree revoked, the story re-contracted — and only THEN did `Stages.human?/1`
+    # (`lib/loopctl/delivery/stages.ex:1127-1130`, which requires `actor_lineage == []`)
+    # refuse it. The caller got a refusal; the implementing agent got a dead key.
+    # `LoopctlWeb.StoryEscalationController` publishes that gate's purpose to callers in its
+    # `escalate` operation description — "so a session cannot escalate and then resolve its
+    # own escalation" — and the separation was being enforced one step AFTER the damage.
+    #
+    # `Stages.precheck/2` is the SAME guard chain `advance/4` runs, not a copy of it, so this
+    # cannot answer differently from the advance that follows. It decides only what is
+    # decidable without the row; `:stale_stage` and `:stale_claim_epoch` still belong to the
+    # transaction, which is why `at_escalated/1` stays ahead of it — a story that is not
+    # escalated is named as such rather than answered with a gate error about a transition it
+    # was never going to take.
     with :ok <- resolvable(to),
          {:ok, row} <- live_row(tenant_id, story_id),
          :ok <- at_escalated(row),
+         :ok <- Stages.precheck(transition, advance_opts),
          {:ok, epoch} <- prepare_story(tenant_id, story_id, to, row, opts, actor_lineage) do
-      Stages.advance(tenant_id, story_id, {:escalated, to, :human_resolution},
-        claim_epoch: epoch,
-        reason: Keyword.get(opts, :reason),
-        actor_label: Keyword.get(opts, :actor_label),
-        actor_role: Keyword.fetch!(opts, :actor_role),
-        actor_lineage: actor_lineage
-      )
+      Stages.advance(tenant_id, story_id, transition, [claim_epoch: epoch] ++ advance_opts)
     end
   end
 
@@ -367,9 +393,16 @@ defmodule Loopctl.Delivery.Escalations do
   #
   # The lineage is FORWARDED, not defaulted: this call revokes the story's session dispatch
   # (#862) and is therefore an audit-chain writer, so `resolve/3`'s server-resolved caller
-  # lineage has to reach it. It is `[]` on every resolve that SUCCEEDS (the human-only edge
-  # demands that) and non-empty only on one the human gate is about to refuse — which is the
-  # case worth attributing. See the note in `resolve/3`.
+  # lineage has to reach it rather than `Progress`'s `Keyword.get(opts, :actor_lineage, [])`
+  # default, which writes the shape the tenant's own operator key writes.
+  #
+  # ON EVERY PATH `resolve/3` CAN TAKE TODAY THE TWO ARE THE SAME VALUE, and this comment says
+  # so rather than claiming a mechanism the code no longer has. `:human_resolution` is a
+  # human-only edge, `Stages.human?/1` requires `actor_lineage == []`, and since #862 review
+  # round 3 that gate is checked BEFORE this call — so the only lineage that reaches here is
+  # `[]`. The forwarding is what keeps the attribution correct if a future edge into
+  # `prepare_story/6` is not human-only; it is not something a test can currently falsify
+  # through `resolve/3`, and pretending otherwise is how an inert guard gets believed.
   defp release_claim(tenant_id, story_id, label, actor_lineage) do
     Progress.force_unclaim_story(tenant_id, story_id,
       actor_label: label,

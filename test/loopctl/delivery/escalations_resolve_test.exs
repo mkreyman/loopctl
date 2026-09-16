@@ -132,6 +132,77 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
       assert unboxed(fn -> Stages.get(ctx.tenant.id, ctx.story.id) end).stage == :escalated
     end
+
+    test "a REFUSED resolve does not revoke the implementer's session credential", ctx do
+      # #862 review round 3, finding 1 — and the direct reversal of what round 2's version of
+      # this test asserted. It pinned the destruction: "the release runs before the human gate,
+      # so the credential is already revoked". That was an accurate reading of the code and the
+      # wrong thing to hold in place.
+      #
+      # THE REACHABLE SHAPE. A dispatch-minted `:user`-role key is mintable (`@roles` in
+      # `Loopctl.Dispatches.Dispatch`) and clears the route's `role: :user` plug, so a SESSION
+      # can POST `to: queued` on any escalated story. `prepare_story/6` released the claim,
+      # bumped the epoch, revoked the implementer's LIVE session credential and every
+      # descendant dispatch, re-contracted the story — and only THEN did `Stages.human?/1`
+      # (`lib/loopctl/delivery/stages.ex:1127-1130`, which requires `actor_lineage == []`)
+      # refuse the caller. Repeatably, on any escalated story: a refusal that cost the
+      # implementing agent its key.
+      #
+      # SPLIT FROM THE STORY-STATE CASE BELOW ON PURPOSE. ExUnit stops a test at its first
+      # failed assertion, so a single test covering both would prove only whichever assertion
+      # happens to be written first — and the two cover different writes `prepare_story/6`
+      # made. Two tests means the ordering mutation has to turn TWO of them red.
+      %{tenant: tenant} = ctx
+      session = session_dispatch_for(ctx)
+      lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+
+      assert {:error, :human_required} = resolve(ctx, :queued, actor_lineage: lineage)
+
+      refute unboxed(fn -> AdminRepo.get!(Dispatch, session.id) end).revoked_at,
+             "a refused resolve must not revoke the implementer's live session credential"
+
+      assert unboxed(fn -> revoked_entries(tenant.id, session.id) end) == [],
+             "nothing was revoked, so the immutable chain must carry no revocation entry"
+    end
+
+    test "a REFUSED resolve does not release the claim", ctx do
+      # The other half of the pre-state. The release is what BUMPS the epoch, clears
+      # `assigned_agent_id` and re-contracts the story, and each of those is a write a caller
+      # the gate refuses must not be able to cause. The stage row is asserted last because it
+      # is the one thing the old ordering left alone — `Stages.advance/4` never ran — so a test
+      # that checked only the stage passed the defect this covers.
+      %{tenant: tenant} = ctx
+      before = reload(ctx)
+      lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+
+      assert {:error, :human_required} = resolve(ctx, :queued, actor_lineage: lineage)
+
+      after_refusal = reload(ctx)
+      assert after_refusal.claim_epoch == before.claim_epoch, "the claim epoch moved"
+      assert after_refusal.assigned_agent_id == before.assigned_agent_id, "the claim was released"
+      assert after_refusal.agent_status == before.agent_status, "the story was re-contracted"
+
+      assert unboxed(fn -> Stages.get(tenant.id, ctx.story.id) end).stage == :escalated
+    end
+
+    test "a caller that PASSES the gate still gets the release, so the gate did not break it",
+         ctx do
+      # The positive control for the test above. Without it, "a refused resolve destroys
+      # nothing" is satisfied by a `resolve/3` that destroys nothing ever — including on the
+      # human path, where releasing the claim and revoking the dead session's credential is
+      # exactly what the function is for.
+      session = session_dispatch_for(ctx)
+
+      assert {:ok, row} = resolve(ctx, :queued)
+      assert row.stage == :queued
+
+      assert unboxed(fn -> AdminRepo.get!(Dispatch, session.id) end).revoked_at,
+             "a human resolve to queued must still revoke the released session's credential"
+
+      story = reload(ctx)
+      assert story.assigned_agent_id == nil
+      assert story.claim_epoch > @epoch
+    end
   end
 
   describe "what may be resolved" do
@@ -154,39 +225,6 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
     test "a target the machine has no edge for is refused before anything is read", ctx do
       assert {:error, {:unresolvable_target, :implementing}} = resolve(ctx, :implementing)
       assert unboxed(fn -> Stages.get(ctx.tenant.id, ctx.story.id) end).stage == :escalated
-    end
-
-    test "a REFUSED resolve still names the CALLER on the revocation it already caused", ctx do
-      # #862 review round 2, finding 3. `prepare_story/6` releases the claim, and since #862
-      # `force_unclaim_story/3` revokes the story's session dispatch on its way past — so the
-      # release is an audit-chain writer, and `Progress` reads its actor as
-      # `Keyword.get(opts, :actor_lineage, [])`. `resolve/3` was passing only `actor_label:`
-      # down while holding the caller's server-resolved lineage, so that entry was written
-      # with an EMPTY actor — the shape the tenant's own operator key writes.
-      #
-      # THE REFUSED PATH IS WHERE THIS IS OBSERVABLE, and that is a fact about the gate rather
-      # than a convenience. `:human_resolution` is a human-only edge and `Stages.human?/1`
-      # (`lib/loopctl/delivery/stages.ex:1073-1076`) requires `actor_lineage == []`, so a
-      # SUCCESSFUL resolve is by construction one whose lineage is empty and the forwarding
-      # changes nothing there. A LINEAGED caller — a session claiming to be a person, exactly
-      # what that gate exists to refuse — is refused at `Stages.advance/4`, which runs AFTER
-      # `prepare_story/6` has already released the claim and revoked the credential. So the
-      # chain gets an entry for a revocation a session caused, and whose name is on it is what
-      # this forwarding decides.
-      %{tenant: tenant} = ctx
-      session = session_dispatch_for(ctx)
-      lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
-
-      assert {:error, :human_required} = resolve(ctx, :queued, actor_lineage: lineage)
-
-      assert unboxed(fn -> AdminRepo.get!(Dispatch, session.id) end).revoked_at,
-             "the release runs before the human gate, so the credential is already revoked"
-
-      assert [entry] = unboxed(fn -> revoked_entries(tenant.id, session.id) end)
-      assert entry.actor_lineage == lineage
-
-      refute entry.actor_lineage == [],
-             "an empty actor lineage reads as the tenant operator having done this"
     end
   end
 

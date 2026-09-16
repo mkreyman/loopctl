@@ -413,7 +413,7 @@ defmodule LoopctlWeb.DispatchController do
   its original `revoked_at`. That holds for a CONCURRENT retry too, not only a
   sequential one: the candidate read runs outside the transaction and is advisory,
   so the UPDATE re-asserts `revoked_at IS NULL` itself
-  (`Dispatches.revoke_dispatch_rows/2`) and `revoked_count` is what that statement
+  (`Dispatches.revoke_dispatch_rows/3`) and `revoked_count` is what that statement
   changed. So a retry never rewrites a revocation timestamp an audit reader may be
   relying on, and never appends a second `dispatch_revoked` entry to the chain.
 
@@ -559,7 +559,7 @@ defmodule LoopctlWeb.DispatchController do
   # making "Nothing was revoked; retry is safe" the wrong reading of a revoke that happened.
   # The `rescue` is the same call: `get_dispatch/2` is an ordinary AdminRepo read on the
   # 3-connection pool, so a checkout timeout is a RAISE and not an `{:error, _}`, exactly as
-  # `Progress.revoke_released_session_credential/2` rescues its own post-commit cleanup.
+  # `Progress.revoke_released_session_credential/3` rescues its own post-commit cleanup.
   #
   # `nil` rather than the struct in hand: serializing the PRE-revoke row would answer
   # `revoked_at: null` inside a 200 that just revoked, which is the same false "nothing

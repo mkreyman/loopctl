@@ -467,7 +467,7 @@ defmodule Loopctl.Dispatches do
 
   The entry is conditional on `count > 0`, and `count` is what the UPDATE ITSELF changed —
   never the length of the candidate list. That is what makes it once-per-revocation without
-  a `revocation_audited?`-style pre-read: `revoke_dispatch_rows/2` re-asserts
+  a `revocation_audited?`-style pre-read: `revoke_dispatch_rows/3` re-asserts
   `revoked_at IS NULL` on the write, so a second revoke of the same dispatch changes no row,
   counts 0 and appends nothing. That also bounds the blast radius of the callers that run
   constantly — `Placement.undo_claim/5` revokes on every placement refusal, but only a
@@ -521,7 +521,7 @@ defmodule Loopctl.Dispatches do
     multi =
       Multi.new()
       |> Multi.run(:revoke_dispatches, fn _repo, _ ->
-        {:ok, revoke_dispatch_rows(dispatch_ids, now)}
+        {:ok, revoke_dispatch_rows(tenant_id, dispatch_ids, now)}
       end)
       |> Multi.run(:revoke_keys, fn _repo, _ ->
         if key_ids != [] do
@@ -558,16 +558,38 @@ defmodule Loopctl.Dispatches do
   end
 
   @doc """
-  Marks the subset of `dispatch_ids` that is STILL un-revoked as revoked at `now`, and
-  returns how many rows THIS STATEMENT changed.
+  Marks the subset of `dispatch_ids` that belongs to `tenant_id` and is STILL un-revoked as
+  revoked at `now`, and returns how many rows THIS STATEMENT changed.
 
-  Public as a TEST SEAM, and that is not cosmetic. `revoke/3`'s candidate read already
-  carries `is_nil(d.revoked_at)`, so through `revoke/3` the two guards are REDUNDANT and each
-  masks the other: a sequential double-revoke hands this function an EMPTY id list, and the
+  ## THIS IS ONE THIRD OF A REVOCATION — read this before calling it
+
+  It writes `dispatches.revoked_at` and NOTHING ELSE. It deliberately omits the three things
+  `revoke/3` does around it, and a caller that needs any of them must call `revoke/3`:
+
+    * it does NOT revoke the linked `api_keys` row, so the CREDENTIAL stays usable and keeps
+      holding its agent's `api_keys_one_role_per_agent_idx` slot;
+    * it does NOT call `Auth.invalidate_key_cache_by_hashes/1`, so a key already in the
+      auth cache keeps authenticating until that entry ages out;
+    * it does NOT append a `dispatch_revoked` entry to the hash chain, so nothing records
+      that this happened or who asked for it.
+
+  It also does not CASCADE: it revokes exactly the ids it is handed, never their
+  descendants. The cascade is the candidate read in `revoke/3`.
+
+  ## Why it is public
+
+  A TEST SEAM, and that is not cosmetic. `revoke/3`'s candidate read already carries
+  `is_nil(d.revoked_at)`, so through `revoke/3` the two guards are REDUNDANT and each masks
+  the other: a sequential double-revoke hands this function an EMPTY id list, and the
   write's predicate can be deleted with every assertion still green. Reaching the write
   directly, with an id the candidate read would never have produced, is what makes the
   re-assertion falsifiable — the same reason `RevokeExpiredApiKeysWorker.revoke_batch/2` is
   public.
+
+  `RevokeExpiredDispatchesWorker` is the second caller, and it is the reason the write needs
+  its own predicate AND its own tenant scope rather than inheriting either from a candidate
+  read: that worker sweeps every tenant at once, so it groups its expired rows by tenant and
+  calls this once per group.
 
   The re-assertion is not redundant in production. The candidate read runs OUTSIDE the
   transaction and is ADVISORY: under READ COMMITTED a concurrent revoke can commit between
@@ -577,13 +599,21 @@ defmodule Loopctl.Dispatches do
   `dispatch_revoked` entry claim rows it did not change, or write a second entry for a
   revocation the chain already records.
 
+  `tenant_id` is on the WRITE for the same reason: this runs on `AdminRepo`, which is
+  BYPASSRLS, so the explicit predicate is the ONLY tenant isolation there is
+  (`.claude/skills/tenancy-rls/SKILL.md`, invariant 6). The candidate read in `revoke/3`
+  carried one and the write dropped it, which made a stray id from another tenant — a
+  caller's own bug, not an attack — revocable across the boundary.
+
   The COUNT is the statement's own, never `length(dispatch_ids)`, so `count > 0` means
   "this call revoked something" rather than "this call was asked about something".
   """
-  @spec revoke_dispatch_rows([Ecto.UUID.t()], DateTime.t()) :: non_neg_integer()
-  def revoke_dispatch_rows(dispatch_ids, now) do
+  @spec revoke_dispatch_rows(Ecto.UUID.t(), [Ecto.UUID.t()], DateTime.t()) :: non_neg_integer()
+  def revoke_dispatch_rows(tenant_id, dispatch_ids, now) do
     {count, _} =
-      from(d in Dispatch, where: d.id in ^dispatch_ids and is_nil(d.revoked_at))
+      from(d in Dispatch,
+        where: d.tenant_id == ^tenant_id and d.id in ^dispatch_ids and is_nil(d.revoked_at)
+      )
       |> AdminRepo.update_all(set: [revoked_at: now])
 
     count

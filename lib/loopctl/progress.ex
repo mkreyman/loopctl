@@ -2790,7 +2790,18 @@ defmodule Loopctl.Progress do
 
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
-  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`
+  - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`,
+    `:actor_lineage`
+
+  `:actor_lineage` is LOAD-BEARING and defaults to `[]`. Since #862 this function revokes the
+  released session's dispatch credential, and that revocation appends a `dispatch_revoked`
+  entry to the immutable, hash-chained audit log naming this lineage as its actor — so an
+  omitted `:actor_lineage` does not merely lose attribution, it writes `[]`, which is the
+  shape the tenant's own operator key writes. Pass the caller's SERVER-RESOLVED lineage
+  (`Dispatches.lineage_for_api_key/2`); pass an explicit `[]` only when the caller genuinely
+  has none. Two of the three call sites silently took the default (#862 review round 2,
+  finding 3), which is why it is documented here rather than left to the reader of
+  `revoke_released_session_credential/3`.
 
   ## Returns
 
@@ -2892,7 +2903,7 @@ defmodule Loopctl.Progress do
   # clear, and re-running force-unclaim is the documented remedy for the residue of a failed
   # compensation (`Placement.undo_claim/5`).
   #
-  # `revoke_story_session/3` revokes ONLY a dispatch minted FOR this story, so a general agent
+  # `revoke_story_session/4` revokes ONLY a dispatch minted FOR this story, so a general agent
   # dispatch that merely claimed it keeps its key — see that function for why the cascade makes
   # the wide case unacceptable. It does NOT clear `implementer_dispatch_id`: that is custody
   # provenance, `get_dispatch_lineage/2` reads a revoked row exactly as it reads a live one, and

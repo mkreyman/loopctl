@@ -133,7 +133,7 @@ defmodule Loopctl.DispatchesTest do
     end
   end
 
-  describe "revoke_dispatch_rows/2 — the advisory read's re-assertion" do
+  describe "revoke_dispatch_rows/3 — the advisory read's re-assertion" do
     # #862 review round 2, finding 2. `revoke/3`'s candidate read (`dispatches_query`) runs
     # OUTSIDE the transaction and already carries `is_nil(d.revoked_at)`, so through `revoke/3`
     # the two guards are REDUNDANT: a sequential re-revoke hands the write an EMPTY id list and
@@ -170,7 +170,7 @@ defmodule Loopctl.DispatchesTest do
 
       dispatch = revoked_dispatch(tenant, agent, original)
 
-      assert Dispatches.revoke_dispatch_rows([dispatch.id], DateTime.utc_now()) == 0
+      assert Dispatches.revoke_dispatch_rows(tenant.id, [dispatch.id], DateTime.utc_now()) == 0
 
       assert DateTime.compare(reload_dispatch(dispatch.id).revoked_at, original) == :eq,
              "a second revoker must not rewrite a revocation timestamp the chain already names"
@@ -186,7 +186,7 @@ defmodule Loopctl.DispatchesTest do
 
       now = DateTime.utc_now()
 
-      assert Dispatches.revoke_dispatch_rows([dispatch.id], now) == 1
+      assert Dispatches.revoke_dispatch_rows(tenant.id, [dispatch.id], now) == 1
       assert reload_dispatch(dispatch.id).revoked_at
     end
 
@@ -201,7 +201,24 @@ defmodule Loopctl.DispatchesTest do
       {:ok, %{dispatch: live}} =
         Dispatches.create_dispatch(tenant.id, %{role: :agent, agent_id: other_agent.id})
 
-      assert Dispatches.revoke_dispatch_rows([already.id, live.id], DateTime.utc_now()) == 1
+      assert Dispatches.revoke_dispatch_rows(tenant.id, [already.id, live.id], DateTime.utc_now()) ==
+               1
+    end
+
+    test "an id belonging to ANOTHER tenant is not revoked and not counted" do
+      # #862 review round 3, finding 3. This write runs on `AdminRepo`, which is BYPASSRLS, so
+      # the explicit `tenant_id` predicate is the only isolation there is — `revoke/3`'s
+      # candidate read carried one and the write did not, so a stray id from another tenant
+      # (a caller's own bug) was revocable across the boundary and counted into an immutable
+      # `dispatch_revoked` entry keyed on the FIRST tenant.
+      %{tenant: tenant} = setup_dispatch_context()
+      %{tenant: other_tenant, agent: other_agent} = setup_dispatch_context()
+
+      {:ok, %{dispatch: theirs}} =
+        Dispatches.create_dispatch(other_tenant.id, %{role: :agent, agent_id: other_agent.id})
+
+      assert Dispatches.revoke_dispatch_rows(tenant.id, [theirs.id], DateTime.utc_now()) == 0
+      refute reload_dispatch(theirs.id).revoked_at
     end
   end
 
