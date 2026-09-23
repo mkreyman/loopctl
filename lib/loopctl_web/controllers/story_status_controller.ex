@@ -294,7 +294,9 @@ defmodule LoopctlWeb.StoryStatusController do
     description:
       "The story's assigned agent extends its claim's lease: `claimed_until` becomes now " <>
         "plus the lease length (default 24 hours, `STORY_CLAIM_LEASE_SECONDS`) — measured " <>
-        "from NOW, so renewing often never banks a longer lease. A claim not renewed " <>
+        "from NOW, so renewing often never banks a longer lease. A claim a placement took " <>
+        "for a runner dispatch carries a `claim_lease_cap` (its dispatch deadline): its " <>
+        "renewal is the EARLIER of that lease and the cap, never later. A claim not renewed " <>
         "before `claimed_until` is released back to `pending` by the reclaimer, which " <>
         "bumps `claim_epoch`. The caller must present the `claim_epoch` its claim returned. " <>
         "Refusals: 400 when `claim_epoch` is missing or not a non-negative integer; " <>

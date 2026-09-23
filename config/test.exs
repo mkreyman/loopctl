@@ -971,3 +971,8 @@ config :loopctl, :delivery_github_req_plug, {Req.Test, Loopctl.Delivery.GitHubPu
 # than left to the runtime default so the suite never depends on a developer's shell, and
 # so a test can assert the name that reached the forge call.
 config :loopctl, :delivery_deploy_environment, "production"
+
+# #879 (US-44.5): the dispatch lease grace, pinned at its production default so a placed
+# claim's cap is exactly placed_at + wall_clock_seconds + 900 in the suite and never depends on
+# a developer's shell.
+config :loopctl, :dispatch_lease_grace_seconds, 900

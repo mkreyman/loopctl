@@ -36,6 +36,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "deadline_at": {
+          "description": "Since 1.16.0, OPTIONAL. The instant loopctl's claim on this story ends: placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`, and no renewal ever moves it later. Stop the session at the EARLIER of its wall clock and this instant — past it control may place the story again, so a session still running would be one of two. Present on a dispatch control PLACED under a claim; absent otherwise, and absent means the wall clock alone, as before 1.16.0.",
+          "format": "date-time",
+          "type": "string"
+        },
         "dispatch_id": {
           "format": "uuid",
           "type": "string"
@@ -1801,5 +1806,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.15.0"
+  "x-contract-version": "1.16.0"
 }

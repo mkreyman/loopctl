@@ -109,6 +109,26 @@ describe("claimLeaseNotice", () => {
     assert.match(notice, /renew_story_claim/);
   });
 
+  test("names the dispatch-deadline cap when the claim carries one (#879)", () => {
+    const notice = claimLeaseNotice({
+      story: {
+        id: STORY_ID,
+        claim_epoch: 2,
+        claimed_until: "2026-09-23T11:15:00Z",
+        claim_lease_cap: "2026-09-23T11:15:00Z",
+      },
+    });
+    assert.match(notice, /CAPPED at its dispatch deadline 2026-09-23T11:15:00Z/);
+    assert.match(notice, /never moves claimed_until past it/);
+  });
+
+  test("says nothing about a cap on an uncapped claim", () => {
+    const notice = claimLeaseNotice({
+      story: { claim_epoch: 1, claimed_until: "2026-09-13T10:00:00Z", claim_lease_cap: null },
+    });
+    assert.doesNotMatch(notice, /CAPPED/);
+  });
+
   test("says there is no lease when claimed_until is null", () => {
     assert.match(claimLeaseNotice({ story: { claim_epoch: 0, claimed_until: null } }), /no lease/);
   });
@@ -137,6 +157,19 @@ describe("index.js wiring", () => {
     assert.match(decl, /required: \["story_id", "claim_epoch"\]/);
     assert.match(INDEX_SRC, /case "renew_story_claim":\s*\n\s*return await renewStoryClaim\(args\);/);
     assert.ok(README.includes("`renew_story_claim`"));
+  });
+
+  test("renew_story_claim's description and README row say a driver-placed claim is capped at its dispatch deadline (#879)", () => {
+    const start = INDEX_SRC.indexOf('name: "renew_story_claim",');
+    const decl = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+    assert.match(decl, /DRIVER-PLACED claim/);
+    assert.match(decl, /CAPPED AT ITS DISPATCH DEADLINE/);
+    assert.match(decl, /never moves claimed_until past that instant/);
+
+    const row = README.split("\n").find((line) => line.startsWith("| `renew_story_claim` |"));
+    assert.ok(row, "README must carry a renew_story_claim row");
+    assert.match(row, /driver-placed claim/);
+    assert.match(row, /capped at its dispatch deadline/);
   });
 
   test("the handler injects the real apiCall and surfaces the lease", () => {

@@ -48,6 +48,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.13.0) `RunnerJoin.max_sessions` IS AUTHORITATIVE DOWNWARD. loopctl now reserves against the LESSER of the value a runner declares on join and the `max_sessions` it was ENROLLED with, re-read on every join. Until now only the enrolled number counted, written once with no path from any join, so a machine configured for one session was sent two and refused the second `at_capacity` — a refusal that costs the story's claim. A machine may therefore always lower itself; it cannot raise itself past its enrolled ceiling, which is what stops a compromised runner enlarging its own share of the tenant's admission budget. Nothing changes on the wire and no runner has to send anything new. `0` is the same statement as `draining` — the row keeps `1` because its range is 1..64, and loopctl refuses to PLACE on a machine declaring either, while a direct operator push is still delivered for the runner to refuse. Re-vendoring is worth it for the description, not required for the wire | | | | |
   | (1.14.0) A RUNNER DECLARES THE BRANCH PREFIXES IT ACCEPTS (`RunnerJoin.branch_prefixes`), and loopctl DERIVES a conforming branch instead of guessing one. A runner that enforces a prefix and does not declare it refuses every dispatch loopctl sends, which is what happened: the first real placement was refused `branch_not_allowed` because loopctl derived `feature/story-<n>-<id>` while the machine's config accepted `loop/` alone, and the operator could learn the required prefix only by reading a config file on that box. OMITTING THE FIELD IS EXACTLY TODAY'S BEHAVIOUR — no constraint, and the branch is the one loopctl already derived — so an un-upgraded runner is unaffected and nothing on the wire changes for it. RE-VENDOR to send it | | | | |
   | (1.15.0) A triage verdict message may carry `lens_verdicts` (`RunnerLensVerdict`, exactly one per lens, only beside a `verdict`, capped together by `RunnerLensVerdict.max_bytes/0`). Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies; a verdict without them escalates at triage. RE-VENDOR to send them; a 1.14.0 holder keeps working and its verdicts escalate at triage | | | | |
+  | (1.16.0) A dispatch control PLACES may carry `deadline_at` (`RunnerDispatch.deadline_at`): the instant loopctl's claim on the story ends, which is placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS` and which no renewal moves later (#879). A runner that adopts it stops the session at the EARLIER of its wall clock and `deadline_at`, so a runner cut off from control never keeps working past the moment control may place the story again. OPTIONAL and additive: a 1.15.0 holder ignores it (undeclared keys are dropped) and keeps its wall clock alone, which is today's behaviour. RE-VENDOR to adopt it | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -334,7 +335,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.15.0"
+  @version "1.16.0"
   @major 1
 
   defmodule ByteRule do
@@ -1744,9 +1745,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @ref_fields [branch: :story_unique, base_branch: :shared]
 
     # NOT refs, each for a reason that is checked elsewhere: `dispatch_id` and `story_id` are
-    # UUIDs (`format: :uuid`), `kind` is closed by an `enum`, and `repo` carries its own
-    # `owner/name` pattern. None of them reaches a git ref argument.
-    @non_ref_string_fields [:dispatch_id, :story_id, :kind, :repo]
+    # UUIDs (`format: :uuid`), `kind` is closed by an `enum`, `repo` carries its own
+    # `owner/name` pattern, and `deadline_at` is a `date-time` loopctl writes from the claim
+    # and never takes from a caller. None of them reaches a git ref argument.
+    @non_ref_string_fields [:dispatch_id, :story_id, :kind, :repo, :deadline_at]
 
     @doc """
     The fields of a dispatch whose value becomes a GIT REF, and what each one must satisfy.
@@ -1821,6 +1823,18 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           },
           max_turns: %Schema{type: :integer, minimum: 1},
           token_budget: %Schema{type: :integer, minimum: 1, nullable: true},
+          deadline_at: %Schema{
+            type: :string,
+            format: :"date-time",
+            description:
+              "Since 1.16.0, OPTIONAL. The instant loopctl's claim on this story ends: " <>
+                "placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`, and no " <>
+                "renewal ever moves it later. Stop the session at the EARLIER of its wall " <>
+                "clock and this instant — past it control may place the story again, so a " <>
+                "session still running would be one of two. Present on a dispatch control " <>
+                "PLACED under a claim; absent otherwise, and absent means the wall clock " <>
+                "alone, as before 1.16.0."
+          },
           story: RunnerStory.schema(),
           triage: RunnerTriage.schema()
         }

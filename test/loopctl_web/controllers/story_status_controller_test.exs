@@ -962,6 +962,36 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       assert body["story"]["claimed_until"] >= claimed["claimed_until"]
     end
 
+    test "the claim response carries a nil claim_lease_cap on an ordinary claim", %{conn: conn} do
+      %{claimed: claimed} = claimed_via_api(conn)
+
+      assert Map.has_key?(claimed, "claim_lease_cap")
+      assert claimed["claim_lease_cap"] == nil
+    end
+
+    # #879 (US-44.5): a claim a placement took is capped at its dispatch deadline, and the
+    # renewal the claimant sees says so — the MCP lease notice reads this field.
+    test "renew-claim on a driver-placed claim stops at the cap and returns it", %{conn: conn} do
+      %{story: story, raw_key: raw_key, agent: agent, tenant: tenant} =
+        setup_story_with_agent(%{agent_status: :contracted})
+
+      cap = DateTime.add(DateTime.utc_now(), 600, :second)
+
+      {:ok, _} =
+        Loopctl.Progress.claim_story(tenant.id, story.id, agent_id: agent.id, lease_until: cap)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 1})
+        |> json_response(200)
+
+      assert {:ok, returned_cap, 0} = DateTime.from_iso8601(body["story"]["claim_lease_cap"])
+      assert {:ok, until, 0} = DateTime.from_iso8601(body["story"]["claimed_until"])
+      assert returned_cap == cap
+      assert until == cap
+    end
+
     test "renew-claim without claim_epoch, or with a string, is 400", %{conn: conn} do
       %{story: story, raw_key: raw_key} = claimed_via_api(conn)
 

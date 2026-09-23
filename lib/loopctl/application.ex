@@ -5,6 +5,7 @@ defmodule Loopctl.Application do
 
   use Application
 
+  alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Telemetry.IngestionWriteStats
   alias Loopctl.Telemetry.SlowQueryLogger
 
@@ -14,6 +15,11 @@ defmodule Loopctl.Application do
     # shorter than the session-turn TTL — otherwise SessionMemoryPruneWorker could
     # delete turns before they are promoted (silent golden-nugget loss).
     Loopctl.Memory.assert_promotion_ttl_invariant!()
+
+    # #879 (US-44.5): refuse to boot with a dispatch lease grace below the runner capacity
+    # release grace — a driver-placed claim would be released while its session may still
+    # be running, and the story placed again under it.
+    DispatchLease.validate!()
 
     Loopctl.TenantKeys.init_cache()
 

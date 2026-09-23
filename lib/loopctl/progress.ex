@@ -147,11 +147,22 @@ defmodule Loopctl.Progress do
   The returned story carries both, and the claimant echoes `claim_epoch` on later
   calls so a message from a claim that has since ended is refused.
 
+  ## A lease capped at a dispatch deadline (#879)
+
+  With `lease_until:` the claim's lease is that instant instead of now plus
+  `claim_lease_seconds/0`, and the same instant is stored as `claim_lease_cap`: no renewal
+  ever moves `claimed_until` past it (`renew_claim/3`, `grant_renewal_grace/2`), and the
+  `stories_claim_lease_within_cap` CHECK holds every other writer to it. Only
+  `Loopctl.Delivery.Placement` passes it — the runner hard-kills the session at the same
+  instant, so a claim outliving it would hold the story for a session that no longer exists.
+  Without the option nothing changes: the global lease, and a NULL cap.
+
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
-  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`
+  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`, and optionally
+    `:lease_until` (a `DateTime`, see above)
 
   ## Returns
 
@@ -191,7 +202,7 @@ defmodule Loopctl.Progress do
               assigned_agent_id: agent_id,
               assigned_at: now
             },
-            claim_lease_change(story, now)
+            claim_lease_change(story, now, Keyword.get(opts, :lease_until))
           )
 
         # US-26.2.2 AC-3: record implementer's dispatch at claim time
@@ -243,6 +254,7 @@ defmodule Loopctl.Progress do
             "assigned_agent_id" => agent_id,
             "agent_id" => agent_id,
             "claimed_until" => DateTime.to_iso8601(updated.claimed_until),
+            "claim_lease_cap" => iso8601_or_nil(updated.claim_lease_cap),
             "claim_epoch" => updated.claim_epoch
           }
         }
@@ -1322,19 +1334,45 @@ defmodule Loopctl.Progress do
   @doc """
   The lease-and-epoch change a CLAIM writes: a fresh lease from `now` and the next epoch.
 
+  With a `lease_until` (#879) the lease IS that instant and it is recorded as the claim's
+  `claim_lease_cap`; with `nil` the lease is now plus `claim_lease_seconds/0` and the cap is
+  written NULL — explicitly, so a stale cap can never ride into an uncapped claim.
+
   Public because `Loopctl.BulkOperations.bulk_claim/4` claims too and must write the
-  identical change.
+  identical change (it never passes a cap).
   """
-  @spec claim_lease_change(Story.t(), DateTime.t()) :: map()
-  def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{} = now) do
+  @spec claim_lease_change(Story.t(), DateTime.t(), DateTime.t() | nil) :: map()
+  def claim_lease_change(story, now, lease_until \\ nil)
+
+  def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{} = now, nil) do
     %{
       claimed_until: DateTime.add(now, claim_lease_seconds(), :second),
+      claim_lease_cap: nil,
       claim_epoch: epoch + 1
     }
   end
 
+  def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{}, %DateTime{} = lease_until) do
+    %{claimed_until: lease_until, claim_lease_cap: lease_until, claim_epoch: epoch + 1}
+  end
+
   @doc """
-  The change every RELEASE writes: no lease, and the next epoch.
+  The lease a RENEWAL grants from `now`: `claim_lease_seconds/0` later, but never past the
+  claim's `claim_lease_cap` when it has one (#879). The cap is absolute — the runner has
+  stopped the session by then, so a later lease would only hold the story for nobody.
+  """
+  @spec renewed_lease(Story.t(), DateTime.t()) :: DateTime.t()
+  def renewed_lease(%Story{claim_lease_cap: cap}, %DateTime{} = now) do
+    lease = DateTime.add(now, claim_lease_seconds(), :second)
+
+    case cap do
+      nil -> lease
+      %DateTime{} -> Enum.min([lease, cap], DateTime)
+    end
+  end
+
+  @doc """
+  The change every RELEASE writes: no lease, no lease cap, and the next epoch.
 
   The bump is what fences the released claimant. Were a release to leave the epoch
   alone, a session still holding it would pass `check_claim_epoch/3` on a story it no
@@ -1343,7 +1381,12 @@ defmodule Loopctl.Progress do
   """
   @spec claim_release_change(Story.t()) :: map()
   def claim_release_change(%Story{claim_epoch: epoch}),
-    do: %{claimed_until: nil, claim_epoch: epoch + 1, review_requested_at: nil}
+    do: %{
+      claimed_until: nil,
+      claim_lease_cap: nil,
+      claim_epoch: epoch + 1,
+      review_requested_at: nil
+    }
 
   @doc """
   Clears a story's `implementer_dispatch_id` when the dispatch it names NEVER IMPLEMENTED
@@ -1454,11 +1497,16 @@ defmodule Loopctl.Progress do
   end
 
   @doc """
-  Renews the caller's claim: extends `claimed_until` to now plus `claim_lease_seconds/0`.
+  Renews the caller's claim: extends `claimed_until` to now plus `claim_lease_seconds/0`
+  (`renewed_lease/2`).
 
   The new lease runs from NOW, not from the old `claimed_until`, so renewing often
   cannot bank an unbounded lease. Renewing a claim made before leases existed (NULL
   `claimed_until`) gives it one, and from then on the reclaimer can release it.
+
+  A claim taken for a runner dispatch carries a `claim_lease_cap` (#879), and its renewal
+  is the EARLIER of that lease and the cap: renewing a driver-placed claim never moves it
+  past the dispatch deadline.
 
   ## Options
 
@@ -1499,9 +1547,7 @@ defmodule Loopctl.Progress do
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         story
-        |> Ecto.Changeset.change(%{
-          claimed_until: DateTime.add(DateTime.utc_now(), claim_lease_seconds(), :second)
-        })
+        |> Ecto.Changeset.change(%{claimed_until: renewed_lease(story, DateTime.utc_now())})
         |> AdminRepo.update()
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
@@ -1516,6 +1562,7 @@ defmodule Loopctl.Progress do
           old_state: %{"claimed_until" => iso8601_or_nil(old.claimed_until)},
           new_state: %{
             "claimed_until" => DateTime.to_iso8601(updated.claimed_until),
+            "claim_lease_cap" => iso8601_or_nil(updated.claim_lease_cap),
             "claim_epoch" => updated.claim_epoch,
             "agent_id" => agent_id
           }
@@ -1725,6 +1772,10 @@ defmodule Loopctl.Progress do
   `renewal_grace_seconds/0`. A lease already past that point is left alone, and a NULL
   lease stays NULL. Returns how many leases moved.
 
+  A claim with a `claim_lease_cap` (#879) is extended to the EARLIER of that floor and its
+  cap, and one already AT its cap is not touched: this is a renewal, and no renewal moves a
+  lease past the dispatch deadline the runner has already stopped the session at.
+
   Called INSIDE the transaction of each transition that makes renewal possible again —
   `Loopctl.Tenants.clear_custody_halt/1` and `Loopctl.Tenants.activate_tenant/1` — after
   the tenant row is updated: the same tenant-then-story lock order
@@ -1739,9 +1790,21 @@ defmodule Loopctl.Progress do
       from(s in Story,
         where:
           s.tenant_id == ^tenant_id and s.agent_status in ^@claimed_statuses and
-            not is_nil(s.claimed_until) and s.claimed_until < ^floor
+            not is_nil(s.claimed_until) and s.claimed_until < ^floor and
+            (is_nil(s.claim_lease_cap) or s.claimed_until < s.claim_lease_cap),
+        update: [
+          set: [
+            claimed_until:
+              fragment(
+                "least(?, coalesce(?, ?))",
+                type(^floor, :utc_datetime_usec),
+                s.claim_lease_cap,
+                type(^floor, :utc_datetime_usec)
+              )
+          ]
+        ]
       )
-      |> AdminRepo.update_all(set: [claimed_until: floor])
+      |> AdminRepo.update_all([])
 
     if count > 0 do
       Logger.info(

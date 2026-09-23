@@ -37,7 +37,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "78539ce2332df41e890d27ff63a885e04b18d4674affd6a16ff78ed8308bb3d6"
+  @digest "e339e2d8b9f72f839f3a8704f01d76e17def66ed9a3e72a51dcb8c9b9e198c3a"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -71,8 +71,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.15.0"
-      assert schema["x-contract-version"] == "1.15.0"
+      assert RunnerContract.version() == "1.16.0"
+      assert schema["x-contract-version"] == "1.16.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",

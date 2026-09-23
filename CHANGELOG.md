@@ -6,6 +6,21 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A claim placed for a runner dispatch now expires at the dispatch's deadline, not after 24
+  hours (epic 44, US-44.5, #879; runner contract 1.16.0).** `Loopctl.Delivery.Placement` — the
+  dispatch driver and `place_dispatch` — claims with a lease CAPPED at `placed_at +
+  wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS`, stored in the new
+  `stories.claim_lease_cap` column (migration, no manual step, NULL on every existing row; a
+  `stories_claim_lease_within_cap` CHECK is added `NOT VALID` then validated). No renewal —
+  `renew_story_claim`, or the grace granted when a custody halt clears — moves the lease past
+  the cap, so a killed session releases its story within minutes of its wall clock. Every other
+  claim keeps the global `STORY_CLAIM_LEASE_SECONDS` lease, unchanged. The dispatch carries the
+  cap as optional `deadline_at`; RE-VENDOR the contract to adopt it — a 1.15.0 runner ignores it
+  and keeps its wall clock alone. **New env var `DISPATCH_LEASE_GRACE_SECONDS`** (default 900):
+  **the app refuses to boot when it is below 300** (`Capacity.release_grace_seconds/0`), naming
+  both values. A placement whose `wall_clock_seconds` is not an integer from 1 to 86 400 is now
+  refused `invalid_payload` BEFORE anything is claimed, rather than after the claim.
+
 - **Both delivery gates now screen a triaged story BEFORE it is queued (epic 44, US-44.2).**
   An accepted `story` verdict is escalated over `triage_escalate` instead of queued when its
   lens verdicts fail Gate A, when it carries none (a runner on contract 1.14.0), when a drafted

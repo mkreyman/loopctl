@@ -45,6 +45,7 @@ defmodule LoopctlWeb.DispatchPlacementController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Delivery.Placement
   alias OpenApiSpex.Schema
@@ -115,8 +116,10 @@ defmodule LoopctlWeb.DispatchPlacementController do
            :max_turns
          ],
          description:
-           "The dispatch object, as `RunnerDispatch` declares it, minus `claim_epoch` (which " <>
-             "loopctl injects from the claim) and minus `story` (which is REFUSED and built " <>
+           "The dispatch object, as `RunnerDispatch` declares it, minus `claim_epoch` and " <>
+             "`deadline_at` (which loopctl injects from the claim — the deadline is " <>
+             "placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`, and the " <>
+             "claim's lease is capped there) and minus `story` (which is REFUSED and built " <>
              "server-side from loopctl's own rows — see " <>
              "`story_not_accepted` below). Nothing is defaulted: `kind` must be sent and " <>
              "must be one of `x-connection.dispatchable_kinds`.",
@@ -161,7 +164,15 @@ defmodule LoopctlWeb.DispatchPlacementController do
                  "but it is NOT story-unique: every dispatch in the tenant cutting from " <>
                  "`master` is the normal case."
            },
-           wall_clock_seconds: %Schema{type: :integer, minimum: 1},
+           wall_clock_seconds: %Schema{
+             type: :integer,
+             minimum: 1,
+             maximum: RunnerDispatch.max_wall_clock_seconds(),
+             description:
+               "Also sets the claim's lease cap and the dispatch's `deadline_at`. Outside " <>
+                 "1..#{RunnerDispatch.max_wall_clock_seconds()} is 422 `invalid_payload` " <>
+                 "before anything is claimed."
+           },
            max_turns: %Schema{type: :integer, minimum: 1}
          }
        }},

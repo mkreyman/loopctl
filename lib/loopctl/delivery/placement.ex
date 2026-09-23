@@ -167,8 +167,10 @@ defmodule Loopctl.Delivery.Placement do
 
   require Logger
 
+  alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
+  alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.StageMachine
@@ -600,7 +602,10 @@ defmodule Loopctl.Delivery.Placement do
              prefix_policy: :advise
            ),
          {:ok, dispatch} <- rebuild_story(dispatch, story) do
-      {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
+      {:ok,
+       dispatch
+       |> Map.put("claim_epoch", record.claim_epoch)
+       |> put_deadline(story)}
     end
   end
 
@@ -686,6 +691,7 @@ defmodule Loopctl.Delivery.Placement do
            DispatchPayload.fill(tenant_id, dispatch,
              branch_prefixes: declared_branch_prefixes(meta)
            ),
+         {:ok, dispatch} <- lease_capable(dispatch),
          :ok <- claimable(tenant_id, story_id),
          {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
       claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)
@@ -745,7 +751,7 @@ defmodule Loopctl.Delivery.Placement do
   # stays — entries are immutable — which is why the pre-check above is the part that bounds a
   # loop.
   defp claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts) do
-    case claim(tenant_id, story_id, agent_id, session, opts) do
+    case claim(tenant_id, story_id, agent_id, session, dispatch, opts) do
       {:ok, story} ->
         enter_claimed_and_push(tenant_id, runner_id, dispatch, story, session, opts)
 
@@ -848,7 +854,8 @@ defmodule Loopctl.Delivery.Placement do
 
     with {:ok, _row} <- advance,
          {:ok, dispatch} <- attach_story(tenant_id, dispatch, story, session, epoch, opts),
-         :ok <- Runners.dispatch(tenant_id, runner_id, Map.put(dispatch, "claim_epoch", epoch)) do
+         dispatch = dispatch |> Map.put("claim_epoch", epoch) |> put_deadline(story),
+         :ok <- Runners.dispatch(tenant_id, runner_id, dispatch) do
       {:ok,
        %{
          dispatch_id: Map.fetch!(dispatch, "dispatch_id"),
@@ -908,14 +915,72 @@ defmodule Loopctl.Delivery.Placement do
   # The claim carries the session dispatch on it: `:dispatch_id` becomes the story's
   # `implementer_dispatch_id` and `:lineage` is what the `start_cap` is minted for, both
   # inside the claim's own transaction.
-  defp claim(tenant_id, story_id, agent_id, session, opts) do
+  #
+  # AND A LEASE CAPPED AT THE DISPATCH DEADLINE (#879): `:lease_until` is placed_at plus the
+  # dispatch's wall clock plus `DispatchLease.grace_seconds/0`. The runner hard-kills the
+  # session at that same instant (`deadline_at`, attached below), so a claim that outlived it
+  # would hold the story for a session that no longer exists — for most of a day under the
+  # global lease. `placed_at` is taken HERE, immediately before the claim's transaction, so
+  # the cap is measured from the claim and not from whenever the caller built its payload.
+  defp claim(tenant_id, story_id, agent_id, session, dispatch, opts) do
+    placed_at = DateTime.utc_now()
+
     Progress.claim_story(tenant_id, story_id,
       agent_id: agent_id,
       dispatch_id: session.id,
       lineage: session.lineage_path,
-      actor_label: Keyword.get(opts, :actor_label)
+      actor_label: Keyword.get(opts, :actor_label),
+      lease_until: DispatchLease.cap(placed_at, Map.fetch!(dispatch, "wall_clock_seconds"))
     )
   end
+
+  # THE WALL CLOCK THE CAP IS COMPUTED FROM, judged before anything is minted. `claim/6` needs
+  # a positive integer to add to `placed_at`, and before #879 an out-of-range value was only
+  # refused by `Runners.dispatch/3`'s cast — AFTER the mint, the claim and two immutable chain
+  # entries. It accepts what that cast accepts: the contract's bound
+  # (`RunnerDispatch.max_wall_clock_seconds/0`), and a decimal STRING, which the cast coerces
+  # to an integer — so it is normalised here rather than refused, and the cap and the pushed
+  # value are the same number. The refusal has the cast's own `{:invalid, messages}` shape; what
+  # changed for a caller is only that it arrives before anything is spent.
+  defp lease_capable(%{"wall_clock_seconds" => seconds} = dispatch) when is_binary(seconds) do
+    case Integer.parse(seconds) do
+      {parsed, ""} -> lease_capable(Map.put(dispatch, "wall_clock_seconds", parsed))
+      _not_an_integer -> wall_clock_invalid()
+    end
+  end
+
+  defp lease_capable(%{"wall_clock_seconds" => seconds} = dispatch)
+       when is_integer(seconds) and seconds >= 1 do
+    if seconds <= RunnerDispatch.max_wall_clock_seconds(),
+      do: {:ok, dispatch},
+      else: wall_clock_invalid()
+  end
+
+  defp lease_capable(_dispatch), do: wall_clock_invalid()
+
+  defp wall_clock_invalid do
+    {:error,
+     {:invalid,
+      [
+        "wall_clock_seconds must be an integer from 1 to " <>
+          "#{RunnerDispatch.max_wall_clock_seconds()}"
+      ]}}
+  end
+
+  # THE CLAIM'S CAP, ON THE WIRE (`RunnerDispatch.deadline_at`, contract 1.16.0), so an
+  # adopting runner stops the session at the instant control's lease on the story ends. That
+  # shared instant is what keeps a re-contracted story from running under two sessions.
+  # ALWAYS the claim's own value: a caller-supplied `deadline_at` is replaced, exactly as a
+  # caller-supplied `claim_epoch` is, and a claim with no cap sends none.
+  #
+  # A RESUME reads the story fresh and sends ITS cap. When the story is still under the
+  # recorded claim that is this dispatch's deadline; when it is not, the claim has ended and
+  # `DispatchLedger.record_sent/3` refuses the frame `stale_claim_epoch` before it is
+  # broadcast, so another claim's deadline never reaches the wire on it.
+  defp put_deadline(dispatch, %Story{claim_lease_cap: %DateTime{} = cap}),
+    do: Map.put(dispatch, "deadline_at", DateTime.to_iso8601(cap))
+
+  defp put_deadline(dispatch, %Story{}), do: Map.delete(dispatch, "deadline_at")
 
   # Parented on the caller's own leaf, so the session dispatch can only land inside the
   # caller's subtree — the lineage ceiling, applied by this path rather than inherited from a

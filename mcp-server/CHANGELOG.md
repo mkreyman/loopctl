@@ -5,6 +5,15 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.103.1 — 2026-09-23 (a driver-placed claim says where it ends)
+
+### Changed
+
+- **`renew_story_claim`** now says that a driver-placed claim — one a placement took for a
+  runner dispatch — is capped at its dispatch deadline (loopctl epic 44, US-44.5, #879):
+  renewing it never moves `claimed_until` past `claim_lease_cap`. The lease notice on a
+  `claim_story` or `renew_story_claim` result names that cap when the server returns one.
+
 ## 2.103.0 — 2026-09-23 (the merge gate stops trusting its caller)
 
 ### Added

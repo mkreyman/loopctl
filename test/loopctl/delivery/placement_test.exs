@@ -1294,6 +1294,122 @@ defmodule Loopctl.Delivery.PlacementTest do
     end
   end
 
+  describe "the claim's lease is capped at the dispatch deadline (#879, US-44.5)" do
+    # TC-44.5.1: wall clock 3600 (the fixture's) and grace 900 (config/test.exs), so the cap is
+    # placed_at + 4500s. `placed_at` is taken inside `place/4`, so it is bracketed here.
+    test "the placed claim carries the cap, and claimed_until is the cap", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+      assert payload["wall_clock_seconds"] == 3_600
+
+      before = DateTime.utc_now()
+      assert {:ok, _placed} = place(ctx, payload)
+      after_place = DateTime.utc_now()
+
+      claimed = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert %DateTime{} = cap = claimed.claim_lease_cap
+      assert claimed.claimed_until == cap
+
+      assert DateTime.compare(cap, DateTime.add(before, 4_500, :second)) in [:gt, :eq]
+      assert DateTime.compare(cap, DateTime.add(after_place, 4_500, :second)) in [:lt, :eq]
+    end
+
+    # TC-44.5.6: the runner stops the session at the instant control's lease ends.
+    test "the pushed dispatch carries deadline_at equal to the claim's cap", ctx do
+      %{runner: runner, story: story} = ctx
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", pushed, @reply_timeout
+
+      cap = unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+      assert %DateTime{} = cap
+      assert deadline(pushed) == cap
+    end
+
+    test "a caller-supplied deadline_at is REPLACED with the claim's own", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = Map.put(dispatch_payload(story), "deadline_at", "2099-01-01T00:00:00Z")
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+
+      cap = unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+      assert deadline(pushed) == cap
+    end
+
+    test "a RESUME re-sends the claim's deadline, not a caller's", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+
+      # On the shared sandbox connection, for the reason "a RESUME under the same dispatch_id
+      # is still pushed at a machine that went draining" gives.
+      assert {:ok, _resumed} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "deadline_at", "2099-01-01T00:00:00Z"),
+                 api_key: ctx.operator
+               )
+
+      assert_push "dispatch", again, @reply_timeout
+      assert deadline(again) == deadline(first)
+
+      assert deadline(again) ==
+               unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+    end
+
+    test "a wall clock the cap cannot be computed from is refused before anything is minted",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
+      over = Loopctl.ApiSpec.RunnerContract.RunnerDispatch.max_wall_clock_seconds() + 1
+
+      for bad <- [0, over, "60s", 3_600.0, nil] do
+        payload = Map.put(dispatch_payload(story), "wall_clock_seconds", bad)
+
+        assert {:error, {:invalid, ["wall_clock_seconds must be an integer from 1 to " <> _]}} =
+                 place(ctx, payload),
+               "wall_clock_seconds #{inspect(bad)} was not refused before the claim"
+      end
+
+      assert unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end) == before
+      untouched = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert untouched.agent_status == :contracted
+      assert untouched.claim_lease_cap == nil
+      refute_push "dispatch", _pushed, 200
+    end
+
+    # The cast `Runners.dispatch/3` runs coerces a decimal string, so the pre-claim check does
+    # too: the cap and the pushed value are then the same integer.
+    test "a decimal-string wall clock is placed and capped as the integer it names", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = Map.put(dispatch_payload(story), "wall_clock_seconds", "3600")
+
+      before = DateTime.utc_now()
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.wall_clock_seconds == 3_600
+
+      cap = unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+      assert_in_delta DateTime.diff(cap, before), 4_500, 10
+    end
+
+    test "the longest wall clock the contract allows is still placed", ctx do
+      %{runner: runner, story: story} = ctx
+      max = Loopctl.ApiSpec.RunnerContract.RunnerDispatch.max_wall_clock_seconds()
+      payload = Map.put(dispatch_payload(story), "wall_clock_seconds", max)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      claimed = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert_in_delta DateTime.diff(claimed.claim_lease_cap, DateTime.utc_now()), max + 900, 10
+    end
+  end
+
   describe "delete_audit_chain_rows!/1 — what makes the committed-runner sweep possible" do
     test "deletes immutable entries, and leaves the connection's triggers ON", ctx do
       %{runner: runner, story: story} = ctx
@@ -1347,6 +1463,7 @@ defmodule Loopctl.Delivery.PlacementTest do
                :base_branch,
                :branch,
                :claim_epoch,
+               :deadline_at,
                :dispatch_id,
                :kind,
                :max_turns,
@@ -1389,6 +1506,15 @@ defmodule Loopctl.Delivery.PlacementTest do
 
   # `ctx` carries the operator key, so the default caller is the one principal allowed to root
   # a tree. Pass `api_key:` to place as somebody else.
+  # `deadline_at` as the channel pushed it. The cast (`format: :"date-time"`) makes it a
+  # `DateTime`; normalised so the comparison is to an instant, not to one spelling of it.
+  defp deadline(%{deadline_at: %DateTime{} = at}), do: at
+
+  defp deadline(%{deadline_at: at}) when is_binary(at) do
+    {:ok, parsed, 0} = DateTime.from_iso8601(at)
+    parsed
+  end
+
   defp place(ctx, payload, opts \\ []) do
     %{runner: runner, operator: operator} = ctx
     opts = Keyword.merge([api_key: operator], opts)

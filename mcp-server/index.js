@@ -4368,8 +4368,12 @@ const TOOLS = [
     name: "renew_story_claim",
     description:
       "Renew your claim's lease (POST /api/v1/stories/:id/renew-claim): claimed_until becomes " +
-      "now plus the lease length, measured from NOW. Call it well inside the lease on any story " +
-      "you hold longer than it. Uses the AGENT key, the same key as claim_story. Refusals pass " +
+      "now plus the lease length (default 24 hours), measured from NOW. Call it well inside the " +
+      "lease on any story you hold longer than it. A DRIVER-PLACED claim (one a placement took " +
+      "for a runner dispatch) is CAPPED AT ITS DISPATCH DEADLINE (claim_lease_cap, the " +
+      "dispatch's deadline_at): renewing it never moves claimed_until past that instant, " +
+      "because the runner stops the session there. Uses the AGENT key, the same key as " +
+      "claim_story. Refusals pass " +
       "through: 400 claim_epoch missing or not a non-negative integer; 422 not_claimed (the " +
       "story is not assigned or implementing); 409 stale_claim_epoch (the claim has ENDED: it " +
       "expired and was reclaimed, released, or claimed again, so stop working it); 409 " +
