@@ -150,6 +150,15 @@ defmodule Loopctl.Delivery.GateAInput do
        }),
        do: true
 
+  # The triage gate screen's own refusal (US-44.2), when Gate A or the trio's verdict was among
+  # its codes: the human who re-queues it was shown THAT refusal. A screen refusal on Gate B
+  # codes alone put a different question to them.
+  defp gate_a_escalation?(%{
+         edge: "triage_escalate",
+         data: %{"reason" => "triage_verdict:gate_screen(" <> kinds}
+       }),
+       do: String.contains?(kinds, ["gate_a:", "trio_verdict"])
+
   # `Stages` stores a transition's `:event_data` under "payload"; the merge gate sets it only
   # when Gate A was among the reasons it refused.
   defp gate_a_escalation?(%{edge: "merge_gate", data: %{"payload" => %{"gate_a" => true}}}),

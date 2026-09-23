@@ -234,6 +234,23 @@ defmodule Loopctl.Delivery.GateAInputTest do
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :human_resolution
     end
 
+    test "of a gate-screen escalation on Gate A codes satisfies Gate A; on Gate B alone it does not" do
+      for {reason, expected} <- [
+            {"triage_verdict:gate_screen(gate_a:gate_a_inputs_missing,effect_path)",
+             :human_resolution},
+            {"triage_verdict:gate_screen(effect_path)", :missing}
+          ] do
+        ctx = story()
+
+        events(ctx, [
+          {"triaged", "escalated", "triage_escalate", %{"reason" => reason}},
+          {"escalated", "queued", "human_resolution", %{}}
+        ])
+
+        assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == expected, reason
+      end
+    end
+
     test "of a triage escalation for another cause (a flagged draft) does not" do
       ctx = story()
 
