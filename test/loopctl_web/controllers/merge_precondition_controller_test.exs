@@ -252,7 +252,18 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
         |> auth(key)
         |> post("/api/v1/stories/#{ctx.story_id}/merge-precondition", %{
           "claim_epoch" => 0,
-          "trio_outputs" => List.duplicate(%{"verdict" => "story"}, 3)
+          # WELL-FORMED and unanimous, so Gate A would PASS it if it were read: the refusal
+          # below can only come from the persisted, disagreeing lens verdicts.
+          "trio_outputs" =>
+            List.duplicate(
+              %{
+                "verdict" => "story",
+                "escalation_reasons" => [],
+                "contradicts" => [],
+                "confidence" => 0.9
+              },
+              3
+            )
         })
 
       assert %{"data" => data} = json_response(response, 200)

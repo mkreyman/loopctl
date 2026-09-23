@@ -214,6 +214,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   def apply(tenant_id, runner_id, %{} = message) do
     with {:ok, session} <-
            DispatchLedger.accepted_session(tenant_id, runner_id, message.dispatch_id),
+         :ok <- triage_dispatch(session),
          :ok <- epoch_matches(session, message),
          {:ok, transitions} <- route(message) do
       record_and_advance(tenant_id, runner_id, session, message, transitions)
@@ -224,6 +225,14 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # `Loopctl.Delivery.RunnerStages` checks it. The FENCE is the story's epoch read under a
   # lock inside `Stages.advance/4`; this refuses a message that does not even match the
   # dispatch it names, for the cost of a read the caller already made.
+  # A verdict answers a TRIAGE dispatch and nothing else (US-44.1 review). The ledger row is
+  # what says which kind this dispatch is; without the check, the runner holding a story's
+  # IMPLEMENT dispatch could record a triage verdict for it — with lens verdicts of its own
+  # choosing — and the merge gate would then judge that runner's pull request on them.
+  # `unknown_dispatch` because, as a triage dispatch, it does not exist.
+  defp triage_dispatch(%{kind: "triage"}), do: :ok
+  defp triage_dispatch(_session), do: {:error, :unknown_dispatch}
+
   defp epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
   defp epoch_matches(_session, _message), do: {:error, :stale_claim_epoch}
 
@@ -238,7 +247,10 @@ defmodule Loopctl.Delivery.TriageVerdict do
   defp route(_message), do: {:error, {:invalid, ["exactly_one_of_verdict_or_incomplete"]}}
 
   defp record_and_advance(tenant_id, runner_id, session, message, transitions) do
-    digest = TriageVerdictRecord.digest(message)
+    # The lens entries are keyed by lens once stored, so their arrival order is not part of
+    # what was said: sorted before hashing, a resend that rebuilt the list in another order is
+    # still the same verdict rather than a permanent `already_recorded`.
+    digest = message |> sort_lens_verdicts() |> TriageVerdictRecord.digest()
 
     # INSIDE `with_tenant/2`, because `triage_verdicts` is RLS-scoped and a read with no
     # tenant context matches NOTHING under the `Loopctl.Repo` role — `current_tenant_id()` is
@@ -255,7 +267,9 @@ defmodule Loopctl.Delivery.TriageVerdict do
         {:error, :already_recorded}
 
       nil ->
-        fresh(tenant_id, runner_id, session, message, digest, transitions)
+        with :ok <- still_in_triage(tenant_id, session.story_id) do
+          fresh(tenant_id, runner_id, session, message, digest, transitions)
+        end
     end
   end
 
@@ -370,6 +384,24 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
   defp stringify(value), do: value
+
+  defp sort_lens_verdicts(%{lens_verdicts: [_ | _] = lens_verdicts} = message),
+    do: %{message | lens_verdicts: Enum.sort_by(lens_verdicts, & &1.lens)}
+
+  defp sort_lens_verdicts(message), do: message
+
+  # A NEW verdict is recorded only while the story is still in triage (US-44.1 review). One
+  # that arrives after the story has moved on — a zombie triage dispatch reporting late —
+  # would otherwise become the story's "most recent triage" and Gate A would read it at merge,
+  # though it decided nothing. A resend of a verdict already on file never reaches this: it is
+  # answered from the record.
+  defp still_in_triage(tenant_id, story_id) do
+    case Stages.get(tenant_id, story_id) do
+      %StoryStage{stage: stage} when stage in [:detected, :triaged] -> :ok
+      %StoryStage{} -> {:error, :stale_stage}
+      nil -> {:error, :unknown_story_stage}
+    end
+  end
 
   # The cast has already held each lens to exactly one entry, so keying by it loses nothing.
   defp lens_map(nil), do: nil

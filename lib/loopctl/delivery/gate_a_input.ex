@@ -26,7 +26,8 @@ defmodule Loopctl.Delivery.GateAInput do
   "After the most recent triage" is decided inside `story_stage_events` alone: the triage
   verdict's own transition out of `triaged` is an event on the same row as the human
   resolution, so both are ordered by that table's `(inserted_at, lock_version)` — the order
-  `Loopctl.Delivery.Stages` itself reads events in. Comparing `triage_verdicts.inserted_at`
+  `Loopctl.Delivery.Stages.list_events/2` reads them in, and this module reads them through
+  it. Comparing `triage_verdicts.inserted_at`
   with an event's timestamp would compare two clocks written by two transactions.
 
   Every read is tenant-scoped through `Repo.with_tenant/2`, so a tenant's evaluation cannot
@@ -36,7 +37,7 @@ defmodule Loopctl.Delivery.GateAInput do
   import Ecto.Query
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerLensVerdict
-  alias Loopctl.Delivery.StageEvent
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Repo
 
@@ -49,14 +50,9 @@ defmodule Loopctl.Delivery.GateAInput do
   @doc "Gate A's input for one story. See the moduledoc for the three answers."
   @spec for_story(Ecto.UUID.t(), Ecto.UUID.t()) :: t()
   def for_story(tenant_id, story_id) do
-    {:ok, input} =
-      Repo.with_tenant(tenant_id, fn ->
-        if human_resolved?(tenant_id, story_id),
-          do: :human_resolution,
-          else: persisted(tenant_id, story_id)
-      end)
-
-    input
+    if human_resolved?(tenant_id, story_id),
+      do: :human_resolution,
+      else: persisted(tenant_id, story_id)
   end
 
   @doc """
@@ -68,12 +64,18 @@ defmodule Loopctl.Delivery.GateAInput do
   def outputs(%{} = lens_map) do
     lenses = RunnerLensVerdict.lenses()
 
-    if lens_map |> Map.keys() |> Enum.sort() == Enum.sort(lenses),
-      do: Enum.map(lenses, &output(Map.fetch!(lens_map, &1))),
-      else: nil
+    if lens_map |> Map.keys() |> Enum.sort() == Enum.sort(lenses) and
+         Enum.all?(Map.values(lens_map), &entry?/1),
+       do: Enum.map(lenses, &output(Map.fetch!(lens_map, &1))),
+       else: nil
   end
 
   def outputs(_lens_map), do: nil
+
+  # A row written around the cast is read as missing, never crashed on: the gate must refuse,
+  # and a 500 would refuse nothing and record nothing.
+  defp entry?(%{"outcome" => outcome}) when is_binary(outcome), do: true
+  defp entry?(_entry), do: false
 
   defp output(entry) do
     %{
@@ -84,37 +86,39 @@ defmodule Loopctl.Delivery.GateAInput do
     }
   end
 
+  # The NEWEST verdict row, incomplete ones included: a re-triage that produced nothing
+  # supersedes an earlier verdict rather than letting Gate A fall back to it.
   defp persisted(tenant_id, story_id) do
-    latest =
+    Repo.with_tenant(tenant_id, fn ->
       Repo.one(
         from r in TriageVerdictRecord,
           where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
-          where: not is_nil(r.outcome),
           order_by: [desc: r.inserted_at, desc: r.id],
           limit: 1,
           select: r.lens_verdicts
       )
+    end)
+    |> case do
+      {:ok, lens_map} ->
+        case outputs(lens_map) do
+          nil -> :missing
+          outputs -> {:persisted_triage, outputs}
+        end
 
-    case outputs(latest) do
-      nil -> :missing
-      outputs -> {:persisted_triage, outputs}
+      {:error, _reason} ->
+        :missing
     end
   end
 
   # Walks the story's transitions in order, remembering the escalation each human
   # resolution left, and answers whether the LAST human resolution came after the last
   # triage and resolved a Gate A escalation.
+  # `Stages.list_events/2` is the one reader of that history, and its order is the order.
   defp human_resolved?(tenant_id, story_id) do
-    events =
-      Repo.all(
-        from e in StageEvent,
-          where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
-          where: e.event == "transitioned",
-          order_by: [asc: e.inserted_at, asc: e.lock_version],
-          select: %{from: e.from_stage, to: e.to_stage, edge: e.edge, data: e.data}
-      )
-
-    events
+    tenant_id
+    |> Stages.list_events(story_id)
+    |> Enum.filter(&(&1.event == "transitioned"))
+    |> Enum.map(&%{from: &1.from_stage, to: &1.to_stage, edge: &1.edge, data: &1.data})
     |> Enum.reduce(%{escalation: nil, resolved?: false}, &step/2)
     |> Map.fetch!(:resolved?)
   end
@@ -130,8 +134,10 @@ defmodule Loopctl.Delivery.GateAInput do
 
   defp step(%{to: "escalated"} = event, acc), do: %{acc | escalation: event}
 
-  defp step(%{edge: "human_resolution"}, %{escalation: escalation}),
-    do: %{escalation: nil, resolved?: gate_a_escalation?(escalation)}
+  # STICKY until the next triage: a human who answered the Gate A question does not un-answer
+  # it by later re-queueing the story from an unrelated escalation.
+  defp step(%{edge: "human_resolution"}, %{escalation: escalation, resolved?: resolved?}),
+    do: %{escalation: nil, resolved?: resolved? or gate_a_escalation?(escalation)}
 
   defp step(_event, acc), do: acc
 

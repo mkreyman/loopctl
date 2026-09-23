@@ -86,6 +86,55 @@ defmodule Loopctl.Delivery.GateAInputTest do
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end
 
+    test "a newer verdict supersedes an older one" do
+      ctx = story()
+
+      fixture(:triage_verdict, %{
+        tenant_id: ctx.story.tenant_id,
+        story_id: ctx.story.id,
+        lens_verdicts: lenses("story", "story", "story"),
+        inserted_at: ~U[2026-09-23 00:00:01.000000Z]
+      })
+
+      fixture(:triage_verdict, %{
+        tenant_id: ctx.story.tenant_id,
+        story_id: ctx.story.id,
+        lens_verdicts: lenses("reject", "reject", "reject"),
+        inserted_at: ~U[2026-09-23 00:00:02.000000Z]
+      })
+
+      assert {:persisted_triage, [%{"verdict" => "reject"} | _]} =
+               GateAInput.for_story(ctx.story.tenant_id, ctx.story.id)
+    end
+
+    test "a newer INCOMPLETE triage supersedes an older verdict, and is missing" do
+      ctx = story()
+
+      fixture(:triage_verdict, %{
+        tenant_id: ctx.story.tenant_id,
+        story_id: ctx.story.id,
+        inserted_at: ~U[2026-09-23 00:00:01.000000Z]
+      })
+
+      fixture(:triage_verdict, %{
+        tenant_id: ctx.story.tenant_id,
+        story_id: ctx.story.id,
+        incomplete_reason: "session_crashed",
+        inserted_at: ~U[2026-09-23 00:00:02.000000Z]
+      })
+
+      assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
+    end
+
+    test "a lens entry that is not an object is missing, never a crash" do
+      assert GateAInput.outputs(%{
+               "analyst" => "x",
+               "architect" => [],
+               "engineer" => lens("story")
+             }) ==
+               nil
+    end
+
     test "a lens map that does not name each lens once is missing, not a partial trio" do
       assert GateAInput.outputs(%{"analyst" => lens("story"), "architect" => lens("story")}) ==
                nil
@@ -152,6 +201,19 @@ defmodule Loopctl.Delivery.GateAInputTest do
       ])
 
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
+    end
+
+    test "of a Gate A escalation still counts after a later unrelated re-queue" do
+      ctx = story()
+
+      events(ctx, [
+        {"triaged", "escalated", "triage_escalate", %{}},
+        {"escalated", "queued", "human_resolution", %{}},
+        {"queued", "escalated", "attempts_exhausted", %{}},
+        {"escalated", "queued", "human_resolution", %{}}
+      ])
+
+      assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :human_resolution
     end
 
     test "is superseded by a later triage" do

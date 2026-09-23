@@ -2315,25 +2315,43 @@ defmodule Loopctl.Fixtures do
       "contradicts" => []
     }
 
+    # `incomplete_reason:` builds the other shape the table allows: a run that produced no
+    # verdict carries no outcome, confidence, payload or lens verdicts.
+    result =
+      case Map.get(attrs, :incomplete_reason) do
+        nil ->
+          outcome = Map.get(attrs, :outcome, "story")
+
+          %{
+            outcome: outcome,
+            confidence: "high",
+            payload: %{"outcome" => outcome, "confidence" => "high"},
+            lens_verdicts:
+              Map.get(attrs, :lens_verdicts, %{
+                "analyst" => lens,
+                "architect" => lens,
+                "engineer" => lens
+              })
+          }
+
+        reason ->
+          %{incomplete_reason: reason}
+      end
+
     record =
       struct!(
         TriageVerdictRecord,
-        %{
-          tenant_id: tenant_id,
-          story_id: Map.fetch!(attrs, :story_id),
-          dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
-          outcome: Map.get(attrs, :outcome, "story"),
-          confidence: "high",
-          payload: %{"outcome" => Map.get(attrs, :outcome, "story"), "confidence" => "high"},
-          payload_digest: Ecto.UUID.generate(),
-          claim_epoch: 0,
-          lens_verdicts:
-            Map.get(attrs, :lens_verdicts, %{
-              "analyst" => lens,
-              "architect" => lens,
-              "engineer" => lens
-            })
-        }
+        Map.merge(
+          %{
+            tenant_id: tenant_id,
+            story_id: Map.fetch!(attrs, :story_id),
+            dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+            payload_digest: Ecto.UUID.generate(),
+            claim_epoch: 0,
+            inserted_at: Map.get(attrs, :inserted_at)
+          },
+          result
+        )
       )
 
     if repo == Loopctl.Repo do
