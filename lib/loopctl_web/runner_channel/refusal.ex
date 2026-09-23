@@ -97,6 +97,15 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # matching what the HTTP surface answers for the same condition. Do not retry.
   def for_message(:audit_chain_append_failed), do: %{reason: "audit_chain_append_failed"}
 
+  # A `session_ended` release that rolled back for a SERVER-side reason the contract has no
+  # code for (US-44.4, `Loopctl.Delivery.RunnerStages`): the re-contract's audit entry was
+  # invalid, or the release refused with a reason RunnerStages does not name. Both are already
+  # logged where they happened, with the story; the claim is still held and nothing was
+  # written. `internal_error` is the published code for exactly that, and naming them here keeps
+  # the catch-all's "add a clause" log for shapes nobody has decided on.
+  def for_message(reason) when reason in [:recontract_audit_refused, :release_failed],
+    do: %{reason: "internal_error"}
+
   # Reasons whose atom IS the published code.
   #
   # `stale_stage`, `unknown_story_stage` and `effect_conflict` arrived with `stage` (1.4.0) and

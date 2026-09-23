@@ -4589,7 +4589,12 @@ const TOOLS = [
     name: "reject_story",
     description:
       "Orchestrator rejects a story with a reason. " +
-      "Creates a verification_result with result=fail. Uses the ORCH key.",
+      "Creates a verification_result with result=fail. Uses the ORCH key. " +
+      "The reject releases the claim, and a delivery story may be re-contracted or escalated " +
+      "in the same transaction. A 500 `audit_chain_append_failed` (the escalation's chain " +
+      "entry was refused) or `recontract_audit_refused` (the re-contract's audit entry was " +
+      "refused) means the WHOLE call rolled back: the story is unchanged, and a re-run meets " +
+      "the same server-side condition until an operator acts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8258,10 +8263,13 @@ const TOOLS = [
       "epoch is rebound to it (the remedy for a row an older release left behind), an " +
       "in-flight row is requeued, and a row that is then at `queued` — including one that was " +
       "already sitting there — is ESCALATED over `operator_released`, like the first run. A " +
-      "row already escalated, or anywhere else at that epoch, is left exactly as it is. A 500 " +
-      "`force_unclaim_failed` means the whole release rolled back (the story is still " +
-      "claimed; the server log names the step) and the remedy is to call it again. It takes " +
-      "no request body.",
+      "row already escalated, or anywhere else at that epoch, is left exactly as it is. EVERY " +
+      "500 means the whole release rolled back and the story is still claimed: " +
+      "`audit_chain_append_failed` (the escalation's chain entry was refused) and " +
+      "`recontract_audit_refused` (the re-contract's audit entry was refused) are server-side " +
+      "conditions a re-run meets again until an operator acts; `force_unclaim_failed` (the " +
+      "server log names the step) is remedied by calling it again. A 422 means the release " +
+      "write itself was rejected. It takes no request body.",
     inputSchema: {
       type: "object",
       properties: {

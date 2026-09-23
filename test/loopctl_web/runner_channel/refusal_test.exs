@@ -207,6 +207,20 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       refute refusal.reason == "rate_limited"
     end
 
+    # #877 review round 2, findings 7 and 9: a `session_ended` release that rolled back for a
+    # server-side reason the contract has no code for is the published `internal_error` — by a
+    # NAMED clause, so the catch-all's "add a clause" error is kept for undecided shapes.
+    test "a release refused server-side is internal_error, by name rather than the catch-all" do
+      for reason <- [:recontract_audit_refused, :release_failed] do
+        log =
+          capture_log(fn ->
+            assert Refusal.for_message(reason) == %{reason: "internal_error"}
+          end)
+
+        refute log =~ "no clause names"
+      end
+    end
+
     test "a lock this write could not get says retry, with an interval longer than the wait" do
       assert %{reason: "rate_limited", min_interval_ms: ms} = Refusal.for_message(:busy)
       assert ms > 0

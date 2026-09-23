@@ -196,8 +196,9 @@ defmodule LoopctlWeb.StoryEscalationController do
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
         {"`force_unclaim_failed` — the claim release rolled back at a step that cannot " <>
-           "refuse, or the transition's audit-chain entry did not land. Nothing was written.",
-         "application/json", Schemas.ErrorResponse},
+           "refuse; `audit_chain_append_failed` — the transition's audit-chain entry did not " <>
+           "land; `recontract_audit_refused` — the release's re-contract audit entry was " <>
+           "refused. Nothing was written.", "application/json", Schemas.ErrorResponse},
       503 =>
         {"A lock the write needed was not free; nothing was written", "application/json",
          Schemas.ErrorResponse}

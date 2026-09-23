@@ -291,14 +291,14 @@ defmodule LoopctlWeb.StoryStatusController do
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"A write in the release was rejected (the story row, or the re-contract's audit " <>
-           "entry). Nothing was released and the story is unchanged.", "application/json",
-         Schemas.ErrorResponse},
+        {"The release write to the story row was rejected. Nothing was released and the " <>
+           "story is unchanged.", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
         {"`audit_chain_append_failed` — the release reached the retry ceiling and the chain " <>
-           "entry its escalation must carry was refused, so the WHOLE release rolled back: the " <>
-           "story is unchanged.", "application/json", Schemas.ErrorResponse}
+           "entry its escalation must carry was refused — or `recontract_audit_refused` — the " <>
+           "re-contract's audit entry was refused. Either way the WHOLE release rolled back: " <>
+           "the story is unchanged.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -622,9 +622,11 @@ defmodule LoopctlWeb.StoryStatusController do
       {:error, :not_found} ->
         {:error, :not_found}
 
-      # US-44.4: the release's escalation could not append its chain entry, or a later step
-      # refused (`Progress.unclaim_story/3`). The release rolled back; the story is unchanged.
-      {:error, :audit_chain_append_failed} = error ->
+      # US-44.4: the release's escalation could not append its chain entry, or the
+      # re-contract's audit entry was refused (`Progress.unclaim_story/3`). The release rolled
+      # back; the story is unchanged. FallbackController renders each as its own 500.
+      {:error, reason} = error
+      when reason in [:audit_chain_append_failed, :recontract_audit_refused] ->
         error
 
       {:error, %Ecto.Changeset{}} = error ->

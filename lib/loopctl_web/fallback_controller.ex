@@ -33,6 +33,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :invalid_transition}` -> 409 (#803: the stage machine has no such transition; the story-lifecycle `{:invalid_transition, ctx}` above is a different thing)
   - `{:error, :reason_required | :invalid_reason | :invalid_event_data | :invalid_effect | :missing_required_effect | :wrong_stage | :effect_conflict | :human_required}` -> 422 (#803: the stage machine refusing the REQUEST, `code` says which)
   - `{:error, :audit_chain_append_failed}` -> 500 (#803: the transition's chain entry did not land, so it rolled back)
+  - `{:error, :recontract_audit_refused}` -> 500 (US-44.4: a release's re-contract audit entry was invalid, so the whole release rolled back)
   - `{:error, atom}` with no clause above -> 500, the atom LOGGED and never echoed. The last clause, and an atom only: a changeset, an `{:error, reason, message}` triple and every struct clause keep their own rendering.
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
   - `{:error, :self_report_blocked}` -> 409 (implementer tries to report their own work)
@@ -1036,6 +1037,25 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "The audit chain refused this transition's entry, so nothing was written. This " <>
             "is a server-side condition; it has been logged."
+      }
+    })
+  end
+
+  # US-44.4: a claim release that re-contracts the story (unclaim, reject's auto-reset,
+  # force-unclaim) refused because the re-contract's audit entry was invalid, so the WHOLE
+  # release rolled back. A 500 for the same reason as the chain refusal above: the caller did
+  # nothing wrong, and `Loopctl.Progress.recontract_in_transaction/3` has logged it.
+  def call(conn, {:error, :recontract_audit_refused}) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "recontract_audit_refused",
+        message:
+          "The release's re-contract audit entry was refused, so the whole release rolled " <>
+            "back and the story is unchanged. This is a server-side condition; it has been " <>
+            "logged."
       }
     })
   end

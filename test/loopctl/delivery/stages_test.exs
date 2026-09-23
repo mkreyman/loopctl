@@ -1146,6 +1146,72 @@ defmodule Loopctl.Delivery.StagesTest do
              )
     end
 
+    # #877 review round 2, finding 1. The audit entry is checked BEFORE the UPDATE: checked
+    # after, a refused audit left the story `contracted` with no audit entry, and bulk reject —
+    # which logs a re-contract refusal and commits the batch — committed exactly that. Refused
+    # now, NOTHING is written: the story is still `pending`, with no audit entry and no webhook.
+    # A label `AuditLog.create_changeset/1` cannot cast is the one way to make it refuse.
+    test "recontract_in_transaction refuses an invalid audit entry before writing anything" do
+      ctx = claimed_with_stage(:queued)
+      fixture(:webhook, %{tenant_id: ctx.tenant_id, events: ["story.status_changed"]})
+
+      {1, _} =
+        from(s in Story, where: s.id == ^ctx.story.id)
+        |> AdminRepo.update_all(set: [agent_status: :pending])
+
+      pending = %{ctx.story | agent_status: :pending}
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, {:error, :recontract_audit_refused}} =
+                 AdminRepo.transaction(fn ->
+                   Progress.recontract_in_transaction(ctx.tenant_id, pending, %{
+                     "not" => "a label"
+                   })
+                 end)
+      end)
+
+      assert AdminRepo.get!(Story, ctx.story.id).agent_status == :pending
+
+      refute AdminRepo.exists?(
+               from a in AuditLog,
+                 where:
+                   a.entity_id == ^ctx.story.id and a.old_state == ^%{"agent_status" => "pending"}
+             )
+
+      refute AdminRepo.exists?(
+               from e in WebhookEvent,
+                 where:
+                   e.tenant_id == ^ctx.tenant_id and e.event_type == "story.status_changed" and
+                     fragment("?->>'new_status'", e.payload) == "contracted"
+             )
+
+      # The same story with a label that casts IS contracted — the refusal above is the audit.
+      assert {:ok, {:ok, %Story{agent_status: :contracted}}} =
+               AdminRepo.transaction(fn ->
+                 Progress.recontract_in_transaction(ctx.tenant_id, pending, "t")
+               end)
+    end
+
+    # #877 review round 2, finding 6: outside a transaction the UPDATE and the audit insert
+    # would commit separately, so it refuses to run at all — like `follow_release/5`.
+    test "recontract_in_transaction raises outside a transaction and writes nothing" do
+      ctx = claimed_with_stage(:queued)
+
+      {1, _} =
+        from(s in Story, where: s.id == ^ctx.story.id)
+        |> AdminRepo.update_all(set: [agent_status: :pending])
+
+      assert_raise ArgumentError, ~r/inside the releasing transaction/, fn ->
+        Progress.recontract_in_transaction(
+          ctx.tenant_id,
+          %{ctx.story | agent_status: :pending},
+          "t"
+        )
+      end
+
+      assert AdminRepo.get!(Story, ctx.story.id).agent_status == :pending
+    end
+
     # #877 review round 1, findings 1 and 5: a release's escalation writes its chain entry IN
     # the releasing transaction and does not broadcast it — the transaction is the caller's and
     # may still roll back. The caller announces it once it has committed.
@@ -1224,12 +1290,14 @@ defmodule Loopctl.Delivery.StagesTest do
     end
 
     # The operator escalation needs no ceiling: every in-flight force-unclaim takes it. Its
-    # `:stage` refusal is now REACHABLE, and answers the documented `:force_unclaim_failed`.
+    # `:stage` refusal is REACHABLE, and answers what it is — `:audit_chain_append_failed`, as
+    # every other release path does (#877 review round 2, finding 5) — not the
+    # `:force_unclaim_failed` reserved for steps that cannot refuse.
     test "force_unclaim: a refused operator escalation rolls the release back" do
       ctx = claimed_with_stage(:implementing)
 
       ExUnit.CaptureLog.capture_log(fn ->
-        assert {:error, :force_unclaim_failed} =
+        assert {:error, :audit_chain_append_failed} =
                  Progress.force_unclaim_story(ctx.tenant_id, ctx.story.id,
                    actor_lineage: @bad_lineage
                  )
@@ -1286,9 +1354,29 @@ defmodule Loopctl.Delivery.StagesTest do
 
       expire_lease(healthy.story)
 
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert :ok = ReclaimExpiredClaimsWorker.perform(%Oban.Job{args: %{}})
-      end)
+      raised = [:loopctl, :reclaim_expired_claims, :raised]
+      ref = :telemetry_test.attach_event_handlers(self(), [raised])
+
+      # Only what is logged AT ERROR is captured, so the line below is proof of its level.
+      log =
+        ExUnit.CaptureLog.capture_log([level: :error], fn ->
+          assert :ok = ReclaimExpiredClaimsWorker.perform(%Oban.Job{args: %{}})
+        end)
+
+      # #877 review round 2, finding 3. Rescued, the raise never reaches Oban, so the worker is
+      # the only place it is reported: at error, naming the story, with the exception's own
+      # text and stack — not the struct name alone — and as a telemetry event.
+      poisoned_id = poisoned.story.id
+
+      assert_received {^raised, ^ref, %{count: 1},
+                       %{story_id: ^poisoned_id, exception: Postgrex.Error}}
+
+      assert [raised_line] =
+               log |> String.split("\n[") |> Enum.filter(&(&1 =~ "release raised"))
+
+      assert raised_line =~ "story_id=#{poisoned_id}"
+      assert raised_line =~ "** (Postgrex.Error)"
+      assert raised_line =~ "reclaim_expired_claim"
 
       assert AdminRepo.get!(Story, poisoned.story.id).agent_status == :assigned
       assert AdminRepo.get!(StoryStage, poisoned.row.id).stage == :implementing

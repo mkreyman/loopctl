@@ -437,8 +437,11 @@ defmodule Loopctl.BulkOperations do
   # AFTER the reset's audit entry, like the single-story reject (US-44.4): a delivery story
   # whose row went back to `queued` is placeable again, or it was escalated at the retry ceiling
   # and stays `pending` for a human. A re-contract that is refused is logged like a failed
-  # auto-reset and never aborts the batch: the story stays rejected and `pending`, with its row
-  # at `queued`, which is the state an operator resolves.
+  # auto-reset and never aborts the batch. It refuses only when its audit entry is invalid, and
+  # `Progress.recontract_in_transaction/3` checks that BEFORE its UPDATE, so a refusal wrote
+  # nothing: the story stays rejected and `pending`, uncontracted, with its row at `queued` —
+  # the state an operator resolves — and never contracted without its audit entry. A database
+  # error on that insert raises and rolls the whole batch back.
   defp recontract_reset(tenant_id, reset, released) do
     require Logger
 

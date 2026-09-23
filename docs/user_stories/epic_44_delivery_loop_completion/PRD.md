@@ -110,7 +110,7 @@ auto-reset), `bulk_operations.ex:610` (bulk reject).
 
 | release cause | outcome | spends an attempt |
 |---|---|---|
-| placement refusal, runner unavailable (`undo_claim/5`) | re-contract | no — the runner refused before any work, and may be free next pass |
+| placement refusal, runner unavailable or a lost race (`undo_claim/5`) | re-contract | no — the runner refused before any work, and may be free next pass; a race (the claim ended, a concurrent pass sent it first, the runner was revoked mid-push) is not the story's |
 | placement refusal that recurs every pass (`undo_claim/5`) | re-contract, or escalate at the ceiling | yes — uncounted it loops every pass |
 | `usage_exhausted` (44.3) | re-contract | no |
 | lease expiry, `crashed` | re-contract, or escalate at the ceiling | yes |

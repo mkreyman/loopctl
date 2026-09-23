@@ -555,6 +555,39 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end).revoked_at
     end
 
+    # #877 review round 2, findings 4 and 10. The production ceiling is 0, so a refusal counted
+    # by mistake escalates a story to a human on its FIRST occurrence. The table is written HERE,
+    # not read off the module: deleting an entry from `@runner_unavailable` must turn one of
+    # these red, which iterating the module's own list could never do. The call-site halves —
+    # that `release_claim/5` passes this cause on, uncounted or counted — are the
+    # `runner_not_connected` test above and the `{:invalid, _}` test below; what each cause does
+    # to `attempts` is `stages_test.exs`'s.
+    @uncounted_refusals [
+      # the runner, not the story
+      :runner_not_connected,
+      :runner_ambiguous,
+      :runner_at_capacity,
+      :admission_limit_reached,
+      :capacity_busy,
+      :busy,
+      :tenant_halted,
+      # races the next pass does not meet again
+      :stale_claim_epoch,
+      :dispatch_already_replied,
+      :dispatch_id_conflict,
+      :not_authorized
+    ]
+
+    test "every runner-unavailable or race refusal is released uncounted; others count" do
+      for reason <- @uncounted_refusals do
+        assert {reason, Placement.release_cause(reason)} == {reason, :placement_refused}
+      end
+
+      # Unlisted, and deterministic: the runner will refuse this kind on every pass.
+      assert Placement.release_cause(:kind_not_supported) == :attempt
+      assert Placement.release_cause({:invalid, ["wall_clock_seconds is too large"]}) == :attempt
+    end
+
     # #877 review round 1, finding 3. A refusal that RECURS every pass — here a payload the
     # contract rejects, which `Runners.dispatch/3` casts only after the claim committed — is
     # not the runner being unavailable. Uncounted, the driver placed it, was refused and

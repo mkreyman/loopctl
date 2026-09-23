@@ -29,8 +29,17 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
     transaction, so a lease that ran out meanwhile is not reclaimed before its claimant
     has had a full lease to renew.
 
-  Bounded at `@batch` stories per run, oldest lease first, so a backlog drains over
-  successive runs instead of pinning AdminRepo's small pool.
+  Bounded at `@batch` stories per run, so a backlog drains over successive runs instead of
+  pinning AdminRepo's small pool — and ranked oldest lease first WITHIN EACH TENANT, taking
+  every tenant's oldest before any tenant's second (`candidates/2`). Ranked globally, one
+  tenant whose releases keep failing held the head of every run with its oldest leases and
+  starved every other tenant's reclaim (#877 review round 2). Within a tenant, a broken chain
+  blocking its own reclaims is the correct outcome: that tenant's custody transitions are all
+  failing until an operator acts.
+
+  A candidate whose release RAISES is logged at error with its stack trace and emits
+  `[:loopctl, :reclaim_expired_claims, :raised]` (count 1, metadata `tenant_id`, `story_id`,
+  `exception`), then the pass goes on.
   """
 
   use Oban.Worker, queue: :cleanup, max_attempts: 3
@@ -46,6 +55,8 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
 
   @batch 100
 
+  @raised_event [:loopctl, :reclaim_expired_claims, :raised]
+
   # Refusals that mean "not this time", decided under the row lock — not failures.
   @skip_reasons [:claim_not_expired, :custody_halted, :tenant_inactive]
 
@@ -55,7 +66,7 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
 
     results =
       now
-      |> expired_claims()
+      |> candidates(@batch)
       |> Enum.map(fn candidate ->
         result = reclaim(candidate)
         log_candidate(candidate, result)
@@ -78,16 +89,31 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
     :ok
   end
 
-  # ONE STORY CANNOT END THE PASS (#877 review round 1). The sweep is oldest lease first, so a
-  # candidate whose release RAISES — a database error inside its transaction, which rolls that
-  # one release back — would otherwise abort every run at the same story and starve every lease
-  # behind it for good. The raise is turned into that candidate's failure, logged by
-  # `log_candidate/2` like any other, and the pass goes on. Nothing is committed for it: the
-  # raise left its transaction, which rolled back.
+  # ONE STORY CANNOT END THE PASS (#877 review round 1). A candidate whose release RAISES — a
+  # database error inside its transaction, which rolls that one release back — would otherwise
+  # abort the run at that story and, since it is still expired, at the same story next run.
+  # The raise becomes that candidate's failure and the pass goes on. Nothing is committed for
+  # it: the raise left its transaction, which rolled back. Rescued, it is also NOT seen by
+  # Oban, so the full exception and stack trace are logged here and a telemetry event is
+  # emitted — the failure reason alone names only the module and message.
   defp reclaim(candidate) do
     Progress.reclaim_expired_claim(candidate.tenant_id, candidate.id, candidate.claim_epoch)
   rescue
-    error -> {:error, {:raised, error.__struct__}}
+    error ->
+      Logger.error(
+        "ReclaimExpiredClaimsWorker: release raised: tenant_id=#{candidate.tenant_id} " <>
+          "story_id=#{candidate.id}\n" <> Exception.format(:error, error, __STACKTRACE__),
+        tenant_id: candidate.tenant_id,
+        story_id: candidate.id
+      )
+
+      :telemetry.execute(@raised_event, %{count: 1}, %{
+        tenant_id: candidate.tenant_id,
+        story_id: candidate.id,
+        exception: error.__struct__
+      })
+
+      {:error, {:raised, error.__struct__, Exception.message(error)}}
   end
 
   # Issue #815: the summary line only counts. This names every candidate that was not
@@ -127,17 +153,41 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
   @spec batch_size() :: pos_integer()
   def batch_size, do: @batch
 
-  defp expired_claims(now) do
-    from(s in Story,
-      join: t in Tenant,
-      on: t.id == s.tenant_id,
-      where:
-        not is_nil(s.claimed_until) and s.claimed_until < ^now and
-          is_nil(s.review_requested_at) and s.agent_status in [:assigned, :implementing] and
-          t.status == :active and is_nil(t.custody_halted_at),
-      order_by: [asc: s.claimed_until],
-      limit: @batch,
-      select: %{id: s.id, tenant_id: s.tenant_id, claim_epoch: s.claim_epoch}
+  @doc """
+  The expired claims one run releases, at most `limit`: ranked oldest lease first WITHIN each
+  tenant (`row_number()` over the tenant, as `Loopctl.Delivery.TriageDispatcher.candidates/1`
+  ranks), then by that rank — so every tenant's oldest comes before any tenant's second, and
+  one tenant's failing leases cannot fill the batch. Public so the selection is falsifiable.
+  """
+  @spec candidates(DateTime.t(), pos_integer()) :: [
+          %{id: Ecto.UUID.t(), tenant_id: Ecto.UUID.t(), claim_epoch: non_neg_integer()}
+        ]
+  def candidates(now, limit) when is_integer(limit) and limit > 0 do
+    ranked =
+      from(s in Story,
+        join: t in Tenant,
+        on: t.id == s.tenant_id,
+        where:
+          not is_nil(s.claimed_until) and s.claimed_until < ^now and
+            is_nil(s.review_requested_at) and s.agent_status in [:assigned, :implementing] and
+            t.status == :active and is_nil(t.custody_halted_at),
+        select: %{
+          id: s.id,
+          tenant_id: s.tenant_id,
+          claim_epoch: s.claim_epoch,
+          claimed_until: s.claimed_until,
+          rank:
+            over(row_number(),
+              partition_by: s.tenant_id,
+              order_by: [asc: s.claimed_until, asc: s.id]
+            )
+        }
+      )
+
+    from(r in subquery(ranked),
+      order_by: [asc: r.rank, asc: r.claimed_until, asc: r.id],
+      limit: ^limit,
+      select: %{id: r.id, tenant_id: r.tenant_id, claim_epoch: r.claim_epoch}
     )
     |> AdminRepo.all()
   end

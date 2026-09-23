@@ -187,8 +187,9 @@ defmodule Loopctl.Delivery.RunnerStages do
           | :capacity_busy
           | :rejected_by_database
           | :audit_chain_append_failed
+          | :recontract_audit_refused
+          | :release_failed
           | {:release_refused, [atom()]}
-          | atom()
 
   @doc """
   Applies a `session_ended` message — already cast by
@@ -309,12 +310,26 @@ defmodule Loopctl.Delivery.RunnerStages do
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, {:release_refused, Keyword.keys(changeset.errors)}}
 
-      # Anything else the release refuses with is passed through, so no NEW shape can crash the
-      # channel every session on the machine shares: `:audit_chain_append_failed` (the release's
-      # escalation could not append its chain entry, US-44.4) has its own published code, and
-      # an atom no clause of `LoopctlWeb.RunnerChannel.Refusal` names is `internal_error`.
-      {:error, reason} ->
+      # The release rolled back whole (US-44.4): its escalation could not append its chain
+      # entry, or the re-contract's audit entry was invalid. Each is `end_error/0`'s, and
+      # `LoopctlWeb.RunnerChannel.Refusal` names both.
+      {:error, reason} when reason in [:audit_chain_append_failed, :recontract_audit_refused] ->
         {:error, reason}
+
+      # A reason `Progress.release_ended_session/4` gains later must not crash the channel every
+      # session on the machine shares, and must not widen `end_error/0` to `atom()` either —
+      # that is what let this drift unseen. It is logged as it came and answered as the one
+      # enumerated `:release_failed`.
+      {:error, reason} ->
+        Logger.error(
+          "session_ended release refused with a reason RunnerStages does not name: " <>
+            "#{inspect(reason)}; answered :release_failed. tenant_id=#{tenant_id} " <>
+            "story_id=#{session.story_id}",
+          tenant_id: tenant_id,
+          story_id: session.story_id
+        )
+
+        {:error, :release_failed}
     end
   rescue
     # Runs in the runner channel's process: a raise here would take down the socket every

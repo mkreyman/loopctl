@@ -1516,12 +1516,27 @@ defmodule Loopctl.Delivery.Placement do
   # at capacity, the tenant at its admission limit, a lock not granted, the tenant halted — is
   # a state the next pass may not find, so the undo spends nothing (`:placement_refused`) and
   # the story is re-contracted for it. EVERYTHING ELSE recurs on every pass for this story —
-  # a payload the contract rejects, a story that could not be attached, a ledger conflict —
-  # and uncounted it was placed, refused and released every pass for ever, a chain entry each
-  # time. So it counts (`:attempt`) and the retry ceiling puts it in front of a human.
+  # a payload the contract rejects, a story that could not be attached, a kind the runner does
+  # not do — and uncounted it was placed, refused and released every pass for ever, a chain
+  # entry each time. So it counts (`:attempt`) and the retry ceiling puts it in front of a
+  # human.
   #
   # An allowlist of the transient ones, not of the deterministic ones: a refusal nobody has
   # classified yet is bounded by the ceiling rather than looping.
+  #
+  # RACES are transient too, and they are here because the production ceiling is 0: counted,
+  # ONE lost race escalated a story to a human (#877 review round 2). Each is decided by what
+  # happened to the claim or the runner between this pass's claim and its push — never by
+  # anything in the story, so the next pass does not meet it again:
+  #
+  #   * `:stale_claim_epoch` — the claim this dispatch was built for ended under it (a lease
+  #     reclaim, an operator's force-unclaim) before the ledger read the epoch;
+  #   * `:dispatch_already_replied` — the runner already answered this `dispatch_id`, i.e. a
+  #     concurrent pass pushed the same dispatch first;
+  #   * `:dispatch_id_conflict` — the ledger holds this `dispatch_id` for another runner or
+  #     epoch: a concurrent pass placed it first;
+  #   * `:not_authorized` — the runner, its key or its tenant stopped being valid between the
+  #     pool read and the push (revoked, re-enrolled), which says nothing about the story.
   @runner_unavailable [
     :runner_not_connected,
     :runner_ambiguous,
@@ -1529,11 +1544,19 @@ defmodule Loopctl.Delivery.Placement do
     :admission_limit_reached,
     :capacity_busy,
     :busy,
-    :tenant_halted
+    :tenant_halted,
+    :stale_claim_epoch,
+    :dispatch_already_replied,
+    :dispatch_id_conflict,
+    :not_authorized
   ]
 
-  defp release_cause(reason) when reason in @runner_unavailable, do: :placement_refused
-  defp release_cause(_recurs_every_pass), do: :attempt
+  @doc false
+  # Public only so `test/loopctl/delivery/placement_test.exs` can hold every entry of the
+  # allowlist above against a table of its own; `release_claim/5` is the one caller.
+  @spec release_cause(term()) :: :placement_refused | :attempt
+  def release_cause(reason) when reason in @runner_unavailable, do: :placement_refused
+  def release_cause(_recurs_every_pass), do: :attempt
 
   defp log_release_failure(tenant_id, story_id, reason, outcome) do
     Logger.error(
