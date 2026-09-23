@@ -428,12 +428,27 @@ defmodule Loopctl.Delivery.Escalations do
     )
   end
 
-  # `pending -> contracted` is the only transition into the state a placement needs, and a
-  # story that is somehow already `contracted` is left alone rather than refused: the operator
-  # asked for a placeable story and it is one.
-  defp recontract(_tenant_id, %{agent_status: :contracted} = story, _label), do: {:ok, story}
+  @doc """
+  Makes a released story PLACEABLE again: `pending -> contracted`, through
+  `Progress.contract_story/4` with the contract check skipped — the story's ACs were
+  acknowledged when it was first contracted, and nothing about a release changes them.
 
-  defp recontract(tenant_id, story, label) do
+  THE ONE WRITER of that transition for the delivery loop. Two callers: `resolve/3`, when a
+  human sends an escalated story back to `queued`, and every claim release that leaves a
+  delivery story's stage row at `queued` (`Loopctl.Delivery.Stages.recontract_released/4`, US-44.4) —
+  without it the story sits at `queued` + `:pending`, which the dispatch driver never selects.
+
+  A story that is somehow already `contracted` is left alone rather than refused: the caller
+  asked for a placeable story and it is one. Safe inside an `AdminRepo` transaction that holds
+  the story's row lock — `contract_story/4`'s own transaction joins it and re-locks the same
+  row.
+  """
+  @spec recontract(Ecto.UUID.t(), Story.t(), String.t() | nil) ::
+          {:ok, Story.t()}
+          | {:error, atom() | {:contract_mismatch, map()} | {:invalid_transition, map()}}
+  def recontract(_tenant_id, %{agent_status: :contracted} = story, _label), do: {:ok, story}
+
+  def recontract(tenant_id, story, label) do
     Progress.contract_story(tenant_id, story.id, %{},
       actor_label: label,
       skip_contract_check: true

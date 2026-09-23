@@ -69,6 +69,20 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:claim_released` — an in-flight stage -> queued, when the claim is released by
     unclaim, force-unclaim or a reject auto-reset. Also never asked for by a caller; see
     `Loopctl.Delivery.Stages.follow_release/5`.
+  - `:attempts_exhausted` — queued -> escalated, when a release that SPENT an attempt (a lost
+    lease, a `crashed` session, a verifier reject, the claimant giving the story back) brings
+    the story's counted releases to the retry ceiling, `DISPATCH_MAX_ATTEMPTS`
+    (`Loopctl.Delivery.RetryCeiling`, US-44.4). Its own edge, not `:session_escalated`,
+    because the escalated queue has to tell "the loop spent what it was allowed to on this"
+    apart from "the session asked for Mark"; the count is in the reason.
+  - `:operator_released` — queued -> escalated, when an OPERATOR force-unclaims a story the
+    loop was delivering. A human took the story back, so a human decides what it does next
+    — resolved from `escalated` like any other — rather than the loop re-queuing it under
+    them or leaving it `queued` with nothing contracted, which no placement ever takes.
+  - Both are CONTROL-ONLY and are taken in exactly one place: the releasing transaction
+    itself, straight after the release requeued the row
+    (`Loopctl.Delivery.Stages.follow_release/5`). `advance/4` refuses them from every caller,
+    as it refuses the release edges, and neither is runner-reportable.
   - `:human_resolution` — escalated -> queued | done | failed, and ONLY for a human
     principal (see `Loopctl.Delivery.Stages.advance/4`).
 
@@ -119,6 +133,12 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @human_resolution for to <- [:queued, :done, :failed], do: {:escalated, to, :human_resolution}
 
+  # What a release decides AFTER it has requeued the row (US-44.4): the retry ceiling reached,
+  # or an operator's release. From `queued` only, because the release has just put the row
+  # there — and taken by nothing but that releasing transaction (see the moduledoc).
+  @release_escalations [:attempts_exhausted, :operator_released]
+  @release_escalated for edge <- @release_escalations, do: {:queued, :escalated, edge}
+
   # The session's own escalation. From every stage a runner holds the story in, and ALSO from
   # `merged` and `deployed` (#824 round 3, H2/3).
   #
@@ -165,7 +185,8 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:merged, :implementing, :merge_refused}
                  ] ++
                  @budget_exceeded ++
-                 @released ++ @human_resolution ++ @session_escalated ++ @budget_reported
+                 @released ++
+                 @human_resolution ++ @session_escalated ++ @budget_reported ++ @release_escalated
 
   # The part of the machine a RUNNER may report over the channel: one definition, from which
   # `runner_transitions/0`'s doc, the wire enums and the published
@@ -392,6 +413,8 @@ defmodule Loopctl.Delivery.StageMachine do
           | :budget_reported
           | :runner_lost
           | :claim_released
+          | :attempts_exhausted
+          | :operator_released
           | :human_resolution
           | :session_escalated
 
@@ -497,6 +520,13 @@ defmodule Loopctl.Delivery.StageMachine do
   @doc "True when `{from, to, edge}` is in the table."
   @spec allowed?(stage(), stage(), edge()) :: boolean()
   def allowed?(from, to, edge), do: {from, to, edge} in @transitions
+
+  @doc """
+  The edges a claim release takes out of `queued` once it has requeued the row:
+  `:attempts_exhausted` and `:operator_released` (US-44.4). Control-only — see the moduledoc.
+  """
+  @spec release_escalation_edges() :: [edge()]
+  def release_escalation_edges, do: @release_escalations
 
   @doc "True for the edges only a human principal may take."
   @spec human_only?(edge()) :: boolean()

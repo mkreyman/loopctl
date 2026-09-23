@@ -74,7 +74,12 @@ defmodule LoopctlWeb.StoryVerificationController do
   operation(:reject,
     summary: "Reject story",
     description:
-      "Orchestrator rejects a story with reason. Creates verification_result with result=fail.",
+      "Orchestrator rejects a story with reason. Creates verification_result with result=fail. " <>
+        "The auto-reset returns the story to `pending` — except a DELIVERY story whose stage " <>
+        "row was in flight: a reject spent an attempt, so it is re-contracted (`contracted`) " <>
+        "below the retry ceiling `DISPATCH_MAX_ATTEMPTS` and its stage row escalated over " <>
+        "`attempts_exhausted` at it, leaving it `pending` for a human. The story returned is " <>
+        "the story as the reset left it.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body: {"Rejection params", "application/json", Schemas.RejectRequest},
     responses: %{
@@ -155,7 +160,11 @@ defmodule LoopctlWeb.StoryVerificationController do
         "already-pending story, which is the documented remedy for a placement whose " <>
         "compensation could not revoke the story's session credential. It also revokes that " <>
         "credential on its way past, freeing the agent's one-key-per-role slot; it does NOT " <>
-        "clear the story's `implementer_dispatch_id`, which is custody provenance.",
+        "clear the story's `implementer_dispatch_id`, which is custody provenance. A DELIVERY " <>
+        "story whose stage row the release leaves at `queued` is escalated over " <>
+        "`operator_released`: an operator took it back, so an operator decides what it does " <>
+        "next, from `escalated` (`POST /stories/:id/stage/resolve`). It spends no attempt " <>
+        "against the retry ceiling.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},

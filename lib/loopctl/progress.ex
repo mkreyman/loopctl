@@ -1149,11 +1149,18 @@ defmodule Loopctl.Progress do
   Only the assigned agent can unclaim (unless already pending).
   Works from any agent_status except pending.
 
+  A DELIVERY story (one with a stage row the release requeues) does not stay `pending`: giving
+  a claimed story back spent an attempt, so it is re-contracted below the retry ceiling and
+  escalated at it (`Loopctl.Delivery.Stages.follow_release/5`, US-44.4). The story returned is
+  the story as it stands after that.
+
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
-  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`
+  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`, and
+    `:actor_lineage` — the caller's SERVER-resolved lineage, recorded on the chain entry if the
+    release escalates the story; defaults to `[]`, the shape a key no dispatch minted has
 
   ## Returns
 
@@ -1186,8 +1193,11 @@ defmodule Loopctl.Progress do
         |> AdminRepo.update()
       end)
       # #803: the stage row follows the release in this transaction (see follow_release/5).
+      # The claimant giving a claimed story back spent an attempt (US-44.4).
       |> Multi.run(:stage, fn _repo, %{story: updated} ->
         Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+          cause: :attempt,
+          actor_lineage: Keyword.get(opts, :actor_lineage, []),
           actor_label: actor_label
         )
       end)
@@ -1224,12 +1234,17 @@ defmodule Loopctl.Progress do
           }
         }
       end)
+      # AFTER the release's own audit and webhook (see `Stages.recontract_released/4`).
+      |> Multi.run(:recontract, fn _repo, %{story: updated, stage: stage} ->
+        Stages.recontract_released(tenant_id, stage, updated, actor_label)
+      end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
+      {:ok, %{recontract: story}} -> {:ok, story}
       {:error, :lock, reason, _} -> {:error, reason}
       {:error, :validate, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
+      {:error, :recontract, reason, _} -> {:error, reason}
     end
   end
 
@@ -1585,7 +1600,10 @@ defmodule Loopctl.Progress do
   story), lease cleared and epoch bumped. Recorded as a `claim_lease_expired` audit
   entry by the system actor, and announced as `story.force_unclaimed` with
   `reason: "claim_lease_expired"`. A delivery stage row in flight is moved back to
-  `queued` in the same transaction (`Loopctl.Delivery.Stages.follow_release/5`).
+  `queued` in the same transaction (`Loopctl.Delivery.Stages.follow_release/5`), and the lost
+  lease counts as a spent attempt: below `DISPATCH_MAX_ATTEMPTS` the story is re-contracted so
+  the driver places it again, at the ceiling it is escalated over `:attempts_exhausted`
+  (US-44.4). The story returned is the story as it stands after that.
 
   A story with NO lease (`claimed_until` NULL — claimed before leases existed, and
   never renewed since) is never reclaimed: nothing renews those claims, so a lease
@@ -1623,7 +1641,8 @@ defmodule Loopctl.Progress do
       actor_label: "worker:reclaim_expired_claims",
       webhook_reason: "claim_lease_expired",
       new_state: %{},
-      counted?: true
+      # A lease that ran out is an attempt spent and lost (US-44.4).
+      cause: :attempt
     })
   end
 
@@ -1647,7 +1666,9 @@ defmodule Loopctl.Progress do
 
   What the stage row does is `follow_release/5`'s rule, unchanged: an in-flight row goes back
   to `queued` — counted in its `attempts` for `crashed`, NOT for `usage_exhausted`, whose work
-  was never judged — and a row elsewhere is only rebound to the new epoch. A budget kill's row
+  was never judged — and a row elsewhere is only rebound to the new epoch. A requeued story is
+  then re-contracted, or for a `crashed` session that reaches the retry ceiling, escalated over
+  `:attempts_exhausted` (US-44.4). A budget kill's row
   has already been escalated by then (`Loopctl.Delivery.RunnerStages.end_session/3` escalates
   first), so it stays `escalated`: ending the claim never re-queues a story the budget stopped.
 
@@ -1695,7 +1716,10 @@ defmodule Loopctl.Progress do
       actor_label: actor_label,
       webhook_reason: "session_ended:" <> session_reason,
       new_state: %{"session_ended_reason" => session_reason},
-      counted?: session_reason != "usage_exhausted"
+      # An exhausted subscription never had its work judged, so it spends no attempt. Every
+      # other reason here is one (a budget kill's row is already `escalated` by now, so the
+      # release only rebinds it and nothing is decided).
+      cause: if(session_reason == "usage_exhausted", do: :usage_exhausted, else: :attempt)
     })
   end
 
@@ -1705,8 +1729,8 @@ defmodule Loopctl.Progress do
   # only what differs between them — the gate run first (`gate`, a `{:ok, _} | {:error, _}`
   # thunk), the predicate the locked story must satisfy (`held?`) and the refusal when it does
   # not (`not_held`), the action, the actor, the webhook's reason, any keys the audit entry
-  # adds to `new_state` on top of the ones every release records, and whether a requeue of the
-  # stage row is an attempt (`counted?`).
+  # adds to `new_state` on top of the ones every release records, and WHY the claim was
+  # released (`cause`), which decides where the story goes next (`Stages.follow_release/5`).
   defp runner_lost_release(tenant_id, story_id, spec) do
     Multi.new()
     |> Multi.run(:gate, fn _repo, _changes -> spec.gate.() end)
@@ -1724,8 +1748,11 @@ defmodule Loopctl.Progress do
     # would be refused on every advance with nothing able to move it.
     |> Multi.run(:stage, fn _repo, %{story: updated} ->
       Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
-        actor_label: spec.actor_label,
-        counted?: spec.counted?
+        cause: spec.cause,
+        # Both principals behind this release hold no dispatch lineage: the reclaim worker is
+        # the system, and a runner's credential is a plain `api_keys` row no dispatch minted.
+        actor_lineage: [],
+        actor_label: spec.actor_label
       )
     end)
     |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
@@ -1767,9 +1794,13 @@ defmodule Loopctl.Progress do
         }
       }
     end)
+    # AFTER the release's own audit and webhook (see `Stages.recontract_released/4`).
+    |> Multi.run(:recontract, fn _repo, %{story: updated, stage: stage} ->
+      Stages.recontract_released(tenant_id, stage, updated, spec.actor_label)
+    end)
     |> AdminRepo.transaction()
     |> case do
-      {:ok, %{story: updated}} -> {:ok, updated}
+      {:ok, %{recontract: story}} -> {:ok, story}
       # EVERY step, not the four this used to name: a refusal at `:stage`, `:audit` or
       # `:webhook_events` raised `CaseClauseError`, which on the session-end path is inside the
       # runner channel's process. Each step's error is already the caller's reason — an atom, or
@@ -2783,7 +2814,11 @@ defmodule Loopctl.Progress do
             }
           }
         end)
-        |> maybe_auto_reset(tenant_id, orchestrator_agent_id)
+        |> maybe_auto_reset(
+          tenant_id,
+          orchestrator_agent_id,
+          Keyword.get(opts, :verifier_lineage, [])
+        )
 
       unwrap_verification_transaction(multi)
     end
@@ -2897,7 +2932,22 @@ defmodule Loopctl.Progress do
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
   - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`,
-    `:actor_lineage`
+    `:actor_lineage`, `:release_cause`
+
+  `:release_cause` is WHY the claim is being taken back, and it decides where a DELIVERY story
+  goes next (US-44.4, #877) — a story whose stage row the release leaves at `queued`:
+
+  - `:operator` (the default) — a human took the story back, so a human decides what it does
+    next: the row is escalated over `{queued, escalated, :operator_released}` and the story is
+    left `:pending`, resolved from `escalated` like any other. It spends no attempt. Every
+    operator-facing caller (`POST /stories/:id/force-unclaim`, `Loopctl.Delivery.Escalations`)
+    takes the default.
+  - `:placement_refused` — `Loopctl.Delivery.Placement.undo_claim/5` giving back a claim its
+    placement could not push. The runner refused before any work, so it spends no attempt and
+    the story is re-contracted for the driver to place again.
+
+  A story with no delivery stage row, or one whose row is anywhere but `queued` after the
+  release, is released exactly as before either way.
 
   `:actor_lineage` is LOAD-BEARING and defaults to `[]`. Since #862 this function revokes the
   released session's dispatch credential, and that revocation appends a `dispatch_revoked`
@@ -2927,6 +2977,14 @@ defmodule Loopctl.Progress do
   @spec force_unclaim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | Ecto.Changeset.t()}
   def force_unclaim_story(tenant_id, story_id, opts \\ []) do
+    release_cause = Keyword.get(opts, :release_cause, :operator)
+
+    unless release_cause in [:operator, :placement_refused] do
+      raise ArgumentError,
+            "force_unclaim_story/3: :release_cause is :operator or :placement_refused, " <>
+              "not #{inspect(release_cause)}"
+    end
+
     multi = force_unclaim_multi(tenant_id, story_id, opts)
 
     # ONE CLAUSE PER MULTI STEP, and deliberately NO catch-all. The Multi has five steps and
@@ -2962,15 +3020,29 @@ defmodule Loopctl.Progress do
     # added next, and the log line is what tells an operator which one it was — the returned
     # atom names none of them, because `:webhook_events` is not a fact about the story.
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} ->
-        revoke_released_session_credential(tenant_id, updated, opts)
-        {:ok, updated}
+      {:ok, %{recontract: story}} ->
+        revoke_released_session_credential(tenant_id, story, opts)
+        {:ok, story}
 
       {:error, :lock, reason, _} ->
         {:error, reason}
 
       {:error, :story, changeset, _} ->
         {:error, changeset}
+
+      # The re-contract a `:placement_refused` release makes (US-44.4). It CAN refuse — it is
+      # `Progress.contract_story/4` — and a refusal rolls the whole release back, so the story
+      # is still claimed and the caller's remedy is the same re-run as every step below.
+      {:error, :recontract, reason, _} ->
+        Logger.error(
+          "force_unclaim rolled back: the released story could not be re-contracted. The " <>
+            "story is UNCHANGED — still claimed. tenant_id=#{tenant_id} story_id=#{story_id} " <>
+            "reason=#{inspect(reason)}",
+          tenant_id: tenant_id,
+          story_id: story_id
+        )
+
+        {:error, :force_unclaim_failed}
 
       {:error, step, reason, _} when step in [:stage, :audit, :webhook_events] ->
         Logger.error(
@@ -3035,6 +3107,8 @@ defmodule Loopctl.Progress do
     # before follow_release/5 existed — the same operator remedy as the retro-stamp above.
     |> Multi.run(:stage, fn _repo, %{story: updated} ->
       Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+        cause: Keyword.get(opts, :release_cause, :operator),
+        actor_lineage: Keyword.get(opts, :actor_lineage, []),
         actor_label: actor_label
       )
     end)
@@ -3073,6 +3147,11 @@ defmodule Loopctl.Progress do
           "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
         }
       }
+    end)
+    # AFTER the release's own audit and webhook (see `Stages.recontract_released/4`). Only a
+    # `:placement_refused` release leaves the row at `queued`; an operator's escalates it.
+    |> Multi.run(:recontract, fn _repo, %{story: updated, stage: stage} ->
+      Stages.recontract_released(tenant_id, stage, updated, actor_label)
     end)
   end
 
@@ -3670,11 +3749,17 @@ defmodule Loopctl.Progress do
     end
   end
 
-  defp maybe_auto_reset(multi, tenant_id, orchestrator_agent_id) do
+  defp maybe_auto_reset(multi, tenant_id, orchestrator_agent_id, verifier_lineage) do
     Multi.run(multi, :auto_reset, fn _repo, %{lock: old_story, story: rejected_story} ->
       with {:ok, tenant} <- Tenants.get_tenant(tenant_id),
            true <- Tenants.get_tenant_settings(tenant, "auto_reset_on_rejection", true) do
-        perform_auto_reset(rejected_story, old_story, tenant_id, orchestrator_agent_id)
+        perform_auto_reset(
+          rejected_story,
+          old_story,
+          tenant_id,
+          orchestrator_agent_id,
+          verifier_lineage
+        )
       else
         false -> {:ok, nil}
         error -> error
@@ -3682,7 +3767,10 @@ defmodule Loopctl.Progress do
     end)
   end
 
-  defp perform_auto_reset(story, old_story, tenant_id, orchestrator_agent_id) do
+  # A REJECT spent an attempt — the work was judged and was wrong — so an in-flight row is
+  # re-contracted below the retry ceiling and escalated at it (US-44.4). A row already past
+  # `ci` (merged, deployed) is only rebound, as before, and the story stays `pending`.
+  defp perform_auto_reset(story, old_story, tenant_id, orchestrator_agent_id, verifier_lineage) do
     changeset =
       Ecto.Changeset.change(
         story,
@@ -3703,12 +3791,14 @@ defmodule Loopctl.Progress do
 
     with {:ok, reset_story} <- AdminRepo.update(changeset),
          # #803: the stage row follows the release inside the reject's transaction.
-         {:ok, _stage} <-
+         {:ok, stage} <-
            Stages.follow_release(
              tenant_id,
              reset_story.id,
              reset_story.claim_epoch,
              :claim_released,
+             cause: :attempt,
+             actor_lineage: verifier_lineage,
              actor_label: "system:auto_reset"
            ),
          {:ok, _audit} <-
@@ -3734,7 +3824,8 @@ defmodule Loopctl.Progress do
              reset_story,
              orchestrator_agent_id
            ) do
-      {:ok, reset_story}
+      # AFTER the reset's own audit entry and webhook (see `Stages.recontract_released/4`).
+      Stages.recontract_released(tenant_id, stage, reset_story, "system:auto_reset")
     end
   end
 

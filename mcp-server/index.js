@@ -8226,12 +8226,13 @@ const TOOLS = [
       "Two things happen: the story resets to `agent_status: pending` with " +
       "`assigned_agent_id` cleared, AND — in the same transaction — its delivery stage row " +
       "follows the release back to `queued`.\n\n" +
-      "IT FREES THE STAGE; IT DOES NOT MAKE THE STORY PLACEABLE. place_dispatch wants " +
-      "`agent_status: contracted` AND stage `queued` (`Placement.claimable/2`), and the " +
-      "release leaves the story at `pending`, whose only transition is `pending -> " +
-      "contracted`. Run place_dispatch straight after this one and you get back the IDENTICAL " +
-      "409 `invalid_transition`. THE REMEDY IS THREE CALLS, in this order: " +
-      "force_unclaim_story, then contract_story, then place_dispatch.\n\n" +
+      "A DELIVERY STORY THEN GOES TO `escalated`, NOT BACK TO THE QUEUE (loopctl US-44.4). An " +
+      "operator taking a story back is a human decision, so when the release leaves the stage " +
+      "row at `queued` loopctl escalates it over `operator_released` in the same transaction — " +
+      "it never sits at `queued` + `pending`, which no placement takes. It spends no attempt " +
+      "against the retry ceiling. To put it back to work, call resolve_escalation with " +
+      "`to: queued`: that releases (a no-op now) AND re-contracts, so the story is placeable " +
+      "again. A story with no delivery stage row is simply left `pending`, as before.\n\n" +
       "WHEN TO REACH FOR IT. A story sitting at `claimed` with nobody on it is the residue of " +
       "a compensation that did not complete — it is NOT what a refused dispatch normally " +
       "leaves. Placement answers a runner's refusal INLINE by releasing the claim itself " +

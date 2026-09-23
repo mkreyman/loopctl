@@ -1494,10 +1494,17 @@ defmodule Loopctl.Delivery.Placement do
   # the hash chain for the undo path — and `Progress` reads the lineage as
   # `Keyword.get(opts, :actor_lineage, [])`, so omitting it recorded the placement caller's
   # compensation as the tenant operator's act.
+  #
+  # `release_cause: :placement_refused` (US-44.4, #877): the runner refused before any work, so
+  # this release spends no attempt and the story is RE-CONTRACTED in the same transaction —
+  # back in front of the driver. Without it force-unclaim takes its operator default and
+  # escalates the story for a human, and before that default existed the story sat at `queued`
+  # + `:pending`, which no placement ever takes.
   defp release_claim(tenant_id, story_id, reason, actor_lineage, opts) do
     case Progress.force_unclaim_story(tenant_id, story_id,
            actor_label: Keyword.get(opts, :actor_label),
-           actor_lineage: actor_lineage
+           actor_lineage: actor_lineage,
+           release_cause: :placement_refused
          ) do
       {:ok, _story} -> :ok
       other -> log_release_failure(tenant_id, story_id, reason, other)

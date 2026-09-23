@@ -5,6 +5,16 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.103.1 — 2026-09-23 (an operator's force-unclaim escalates a delivery story)
+
+### Changed
+
+- **`force_unclaim_story`'s description** (loopctl epic 44, US-44.4). loopctl now escalates a
+  delivery story an operator force-unclaims — over the control-only `operator_released` edge —
+  instead of leaving it at `queued` + `pending`, which no placement takes. The description said
+  the remedy was `contract_story` then `place_dispatch`; it is now `resolve_escalation` with
+  `to: queued`. No change to the request, the key or the refusals.
+
 ## 2.103.0 — 2026-09-23 (the merge gate stops trusting its caller)
 
 ### Added

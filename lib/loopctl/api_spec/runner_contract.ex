@@ -50,6 +50,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.14.0) A RUNNER DECLARES THE BRANCH PREFIXES IT ACCEPTS (`RunnerJoin.branch_prefixes`), and loopctl DERIVES a conforming branch instead of guessing one. A runner that enforces a prefix and does not declare it refuses every dispatch loopctl sends, which is what happened: the first real placement was refused `branch_not_allowed` because loopctl derived `feature/story-<n>-<id>` while the machine's config accepted `loop/` alone, and the operator could learn the required prefix only by reading a config file on that box. OMITTING THE FIELD IS EXACTLY TODAY'S BEHAVIOUR — no constraint, and the branch is the one loopctl already derived — so an un-upgraded runner is unaffected and nothing on the wire changes for it. RE-VENDOR to send it | | | | |
   | (1.15.0) A triage verdict message may carry `lens_verdicts` (`RunnerLensVerdict`, exactly one per lens, only beside a `verdict`, capped together by `RunnerLensVerdict.max_bytes/0`). Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies; a verdict without them escalates at triage. RE-VENDOR to send them; a 1.14.0 holder keeps working and its verdicts escalate at triage | | | | |
   | (1.16.0) A runner may say WHY an implement session ended, with the new `session_ended` message (`RunnerSessionEnded`: `dispatch_id`, `claim_epoch`, `reason` in `completed`, `wall_clock_exceeded`, `max_turns_exceeded`, `usage_exhausted`, `crashed`). A budget kill escalates the story for a human instead of waiting out the lease and being retried, a crash releases the claim at once, and an exhausted subscription releases it without spending an attempt. Recorded ONCE per dispatch: a byte-identical resend is answered `ok` with the row even after the release it caused, a different `reason` is `already_recorded`. OPTIONAL — a runner that never sends it gets exactly today's behaviour, the lease reclaim. RE-VENDOR to send it: a 1.15.0 copy has no such event, no `RunnerSessionEndedAck` and no `session_ended_burst` | | | | |
+  | (1.18.0) A RELEASED STORY IS NEVER LEFT UNREACHABLE, so the row a `session_ended` ack returns after `crashed` may now be `escalated`. A counted release — a `crashed` session, a lost lease — re-contracts the story for the next placement below the retry ceiling (`DISPATCH_MAX_ATTEMPTS`, counted as `attempts.runner_lost` + `attempts.claim_released`) and escalates it at the ceiling over a new CONTROL-ONLY edge, `attempts_exhausted`, with the count in `escalation_reason`; `usage_exhausted` and a refused placement never count. A second control-only edge, `operator_released`, escalates a story an operator took back. Neither edge is runner-reportable and nothing on the wire changes shape: an `attempts` map may now carry either key. Re-vendoring is worth it for the description, not required for the wire | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -230,9 +231,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     escalated story is held by nobody. Never retried — the same budget would kill it again —
     and never `failed`, which has no way out.
   - `crashed` — the claim is released NOW, as a lease reclaim would release it later: the
-    story goes back to `queued` over `runner_lost` and the slot goes back.
+    story goes back to `queued` over `runner_lost` and the slot goes back. It is a COUNTED
+    release (since 1.18.0): below the retry ceiling the story is re-contracted for the next
+    placement; the release that reaches the ceiling escalates it instead, over the
+    CONTROL-ONLY `attempts_exhausted` edge, so the ack's `stage` is then `escalated`.
   - `usage_exhausted` — released the same way, and NOT counted as an attempt against the
-    story: the subscription ran out and the work was never judged.
+    story: the subscription ran out and the work was never judged. Always re-contracted.
 
   Send it once, after the session has stopped, for an ACCEPTED `implement` dispatch — a triage
   session ends through `triage_verdict`, and naming a triage dispatch here is
@@ -373,7 +377,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.16.0"
+  @version "1.18.0"
   @major 1
 
   defmodule ByteRule do
@@ -2165,7 +2169,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "not a request — control decides the story's next stage from `reason`: " <>
             "`completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` " <>
             "escalate an in-flight story over the control-only `budget_reported` edge and " <>
-            "end its claim, `crashed` releases the claim at once over `runner_lost`, and `usage_exhausted` " <>
+            "end its claim, `crashed` releases the claim at once over `runner_lost` — " <>
+            "re-queued below the retry ceiling, escalated over the control-only " <>
+            "`attempts_exhausted` edge at it (since 1.18.0) — and `usage_exhausted` " <>
             "releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: " <>
             "a byte-identical resend is answered `ok` with the row even after the release it " <>
             "caused moved the claim epoch on, and a different `reason` is `already_recorded`.",

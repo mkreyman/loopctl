@@ -527,14 +527,19 @@ defmodule Loopctl.Delivery.PlacementTest do
 
       refute log =~ "placement undo did not fully undo"
 
+      # TC-44.4.1 (AC-44.4.1, AC-44.4.2): the runner refused before any work, so the undo's
+      # release spends nothing and RE-CONTRACTS the story — back in front of the driver. It
+      # used to leave `queued` + `:pending`, which no placement ever takes (#877).
       released = unboxed(fn -> reload(runner.tenant_id, story.id) end)
-      assert released.agent_status == :pending
+      assert released.agent_status == :contracted
       assert is_nil(released.assigned_agent_id)
 
       row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
       assert row.stage == :queued
       assert is_nil(row.runner_id)
       assert row.claim_epoch == released.claim_epoch
+      assert row.attempts == %{}
+      assert :ok = unboxed(fn -> Placement.claimable(runner.tenant_id, story.id) end)
 
       # The claim's release does NOT clear `implementer_dispatch_id` — correctly, for its own
       # callers — so the undo has to. Left recorded, the next claimant is judged against a

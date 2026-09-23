@@ -127,7 +127,8 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
     assert {:ok, %{row: row, replayed?: false}} = end_session(ctx, "crashed")
 
     released = story(ctx)
-    assert released.agent_status == :pending
+    # Released and, under the retry ceiling, re-contracted for the driver (US-44.4).
+    assert released.agent_status == :contracted
     assert released.assigned_agent_id == nil
     assert released.claim_epoch == ctx.story.claim_epoch + 1
 
@@ -176,7 +177,8 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
     # never judged, so it must not spend an attempt.
     assert requeues(ctx) == [{"implementing", "queued", "runner_lost"}]
     assert row.attempts == %{}
-    assert story(ctx).agent_status == :pending
+    # Spent nothing, so re-contracted whatever the ceiling (US-44.4).
+    assert story(ctx).agent_status == :contracted
     assert [%AuditLog{new_state: %{"session_ended_reason" => "usage_exhausted"}}] = releases(ctx)
 
     recorded = ledger(ctx)
@@ -197,7 +199,29 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
     assert story(ctx).claim_epoch == after_unclaim.claim_epoch
     assert releases(ctx) == []
     assert ledger(ctx).session_ended_reason == nil
-    assert unboxed(fn -> Stages.get(ctx.tenant_id, ctx.story.id) end).stage == :queued
+    # Where the OPERATOR'S release put it — escalated over `operator_released` (US-44.4) — and
+    # not somewhere the refused report moved it.
+    assert unboxed(fn -> Stages.get(ctx.tenant_id, ctx.story.id) end).stage == :escalated
+  end
+
+  # AC-44.4.4 for a COUNTED US-44.3 release: the crash that reaches the retry ceiling
+  # (`config/test.exs` sets 2) escalates instead of re-queuing, and the ack says so.
+  test "a crash that reaches the retry ceiling escalates over attempts_exhausted", ctx do
+    unboxed(fn ->
+      {1, _} =
+        from(s in Loopctl.Delivery.StoryStage,
+          where: s.tenant_id == ^ctx.tenant_id and s.story_id == ^ctx.story.id
+        )
+        |> AdminRepo.update_all(set: [attempts: %{"runner_lost" => 1}])
+    end)
+
+    assert {:ok, %{row: row, replayed?: false}} = end_session(ctx, "crashed")
+
+    assert row.stage == :escalated
+    assert row.attempts["runner_lost"] == 2
+    assert row.escalation_reason =~ "attempts_exhausted: 2 counted releases"
+    assert story(ctx).agent_status == :pending
+    assert runner_in_flight(ctx) == 0
   end
 
   describe "a budget kill (AC-44.3.3)" do
@@ -263,7 +287,7 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
       assert {:ok, %{row: row, replayed?: true}} = end_session(ctx, "crashed")
 
       assert row.stage == :queued
-      assert story(ctx).agent_status == :pending
+      assert story(ctx).agent_status == :contracted
       assert length(releases(ctx)) == 1
       assert runner_in_flight(ctx) == 0
     end

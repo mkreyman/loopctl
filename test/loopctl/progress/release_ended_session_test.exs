@@ -71,7 +71,9 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
 
     assert {:ok, released} = release(ctx)
 
-    assert released.agent_status == :pending
+    # Released, and — a delivery story under the retry ceiling — RE-CONTRACTED in the same
+    # transaction, so the driver places it again rather than it sitting unreachable (US-44.4).
+    assert released.agent_status == :contracted
     assert released.assigned_agent_id == nil
     assert released.claimed_until == nil
     assert released.claim_epoch == ctx.story.claim_epoch + 1

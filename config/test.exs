@@ -971,3 +971,10 @@ config :loopctl, :delivery_github_req_plug, {Req.Test, Loopctl.Delivery.GitHubPu
 # than left to the runtime default so the suite never depends on a developer's shell, and
 # so a test can assert the name that reached the forge call.
 config :loopctl, :delivery_deploy_environment, "production"
+
+# US-44.4: the delivery retry ceiling (`Loopctl.Delivery.RetryCeiling`). Production has NO
+# default — unset, the first counted release escalates. 2 here so the suite exercises both
+# sides of the ceiling (one release re-contracts, the second escalates) without
+# `Application.put_env`; the unset case is tested through `RetryCeiling.max_attempts/1`, the
+# same reader every release calls.
+config :loopctl, :dispatch_max_attempts, 2

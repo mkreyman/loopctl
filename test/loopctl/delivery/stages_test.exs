@@ -141,8 +141,9 @@ defmodule Loopctl.Delivery.StagesTest do
 
         result = Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
 
-        if edge in [:runner_lost, :claim_released] do
-          # Only a releasing transaction takes these (follow_release/5).
+        if edge in ([:runner_lost, :claim_released] ++ StageMachine.release_escalation_edges()) do
+          # Only a releasing transaction takes these (follow_release/5): the release edges,
+          # and the two escalations a release decides (US-44.4).
           assert {:error, :invalid_transition} = result, inspect({from, to, edge})
         else
           assert {:ok, %StoryStage{stage: ^to} = moved} = result, inspect({from, to, edge})
@@ -922,15 +923,12 @@ defmodule Loopctl.Delivery.StagesTest do
       :claim_released
     end
 
-    defp release(:force_unclaim, %{tenant_id: t, story: story}) do
-      {:ok, _} = Progress.force_unclaim_story(t, story.id)
-      :claim_released
-    end
-
     defp release(:reject, %{tenant_id: t, story: story}) do
       report_done(story)
 
-      {:ok, %Story{agent_status: :pending}} =
+      # The story RETURNED is the story as the reject left it — re-contracted, for a delivery
+      # story below the ceiling (US-44.4), which the caller then asserts from the database.
+      {:ok, %Story{}} =
         Progress.reject_story(t, story.id, %{"reason" => "Missing tests"},
           orchestrator_agent_id: orchestrator(t).id
         )
@@ -952,7 +950,10 @@ defmodule Loopctl.Delivery.StagesTest do
       :claim_released
     end
 
-    @release_paths [:reclaim, :unclaim, :force_unclaim, :reject, :bulk_reject]
+    # The releases that SPENT an attempt (US-44.4): each counts, and below the ceiling
+    # (`config/test.exs` sets 2) re-contracts the story so the driver can place it again.
+    # Force-unclaim is an operator's release and is asserted on its own below.
+    @release_paths [:reclaim, :unclaim, :reject, :bulk_reject]
 
     for path <- @release_paths do
       test "#{path}: the in-flight stage row goes back to queued in the same transaction" do
@@ -982,7 +983,184 @@ defmodule Loopctl.Delivery.StagesTest do
 
         assert [%StageEvent{from_stage: "implementing", to_stage: "queued", edge: ^edge_name}] =
                  AdminRepo.all(from e in StageEvent, where: e.story_stage_id == ^ctx.row.id)
+
+        # REACHABLE AGAIN (#877): queued with nothing contracted is a story the driver never
+        # selects. Below the ceiling the release re-contracts it in the same transaction.
+        assert story.agent_status == :contracted
       end
+    end
+
+    # TC-44.4.6 (AC-44.4.7). An operator taking a delivery story back is a human decision, so a
+    # human decides what it does next — never a re-queue under them, never `queued` +
+    # `:pending`. It spends no attempt: the requeue is not counted, and the ceiling never sees
+    # it.
+    test "force_unclaim with no release_cause escalates over operator_released" do
+      ctx =
+        claimed_with_stage(:implementing, %{
+          worktree_path: "/w",
+          head_sha: @sha_a,
+          attempts: %{"ci_red" => 1}
+        })
+
+      {:ok, released} = Progress.force_unclaim_story(ctx.tenant_id, ctx.story.id)
+      assert released.agent_status == :pending
+
+      row = AdminRepo.get!(StoryStage, ctx.row.id)
+      assert row.stage == :escalated
+      assert row.claim_epoch == released.claim_epoch
+      assert row.escalation_reason =~ "operator_released"
+      assert row.attempts == %{"ci_red" => 1, "operator_released" => 1}
+
+      assert [
+               %StageEvent{
+                 from_stage: "implementing",
+                 to_stage: "queued",
+                 edge: "claim_released"
+               },
+               %StageEvent{from_stage: "queued", to_stage: "escalated", edge: "operator_released"}
+             ] =
+               AdminRepo.all(
+                 from e in StageEvent,
+                   where: e.story_stage_id == ^ctx.row.id,
+                   order_by: [asc: e.lock_version]
+               )
+
+      # Entering `escalated` is custody-critical, so the escalation is on the chain — written
+      # inside the release's AdminRepo transaction, so read on that repo.
+      assert [%Entry{payload: %{"edge" => "operator_released", "to" => "escalated"}}] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where:
+                     e.tenant_id == ^ctx.tenant_id and e.entity_id == ^ctx.story.id and
+                       e.action == "story_stage_escalated"
+               )
+    end
+
+    # TC-44.4.1 (AC-44.4.1, AC-44.4.2), at the mechanism: a placement's own undo spends
+    # nothing and puts the story back in front of the driver.
+    test "force_unclaim with release_cause :placement_refused re-contracts, uncounted" do
+      ctx = claimed_with_stage(:claimed, %{attempts: %{"ci_red" => 1}})
+
+      {:ok, released} =
+        Progress.force_unclaim_story(ctx.tenant_id, ctx.story.id,
+          release_cause: :placement_refused
+        )
+
+      assert released.agent_status == :contracted
+      assert AdminRepo.get!(Story, ctx.story.id).agent_status == :contracted
+
+      row = AdminRepo.get!(StoryStage, ctx.row.id)
+      assert {row.stage, row.attempts} == {:queued, %{"ci_red" => 1}}
+    end
+
+    test "force_unclaim refuses a release_cause it does not know" do
+      ctx = claimed_with_stage(:claimed)
+
+      assert_raise ArgumentError, fn ->
+        Progress.force_unclaim_story(ctx.tenant_id, ctx.story.id, release_cause: :attempt)
+      end
+    end
+
+    # TC-44.4.2 / TC-44.4.3 (AC-44.4.3, AC-44.4.4), through the worker the lease runs through.
+    test "a lost lease under the ceiling retries; the one that reaches it escalates" do
+      ctx = claimed_with_stage(:implementing, %{attempts: %{"runner_lost" => 1}})
+      expire_lease(ctx.story)
+
+      assert :ok = ReclaimExpiredClaimsWorker.perform(%Oban.Job{args: %{}})
+
+      row = AdminRepo.get!(StoryStage, ctx.row.id)
+      assert row.stage == :escalated
+      assert row.attempts["runner_lost"] == 2
+      assert row.attempts["attempts_exhausted"] == 1
+      assert row.escalation_reason =~ "attempts_exhausted: 2 counted releases"
+      assert row.escalation_reason =~ "retry ceiling of 2"
+
+      # Escalated, the story is NOT re-contracted: a human decides.
+      assert AdminRepo.get!(Story, ctx.story.id).agent_status == :pending
+
+      assert [_requeue, %StageEvent{from_stage: "queued", edge: "attempts_exhausted"}] =
+               AdminRepo.all(
+                 from e in StageEvent,
+                   where: e.story_stage_id == ^ctx.row.id,
+                   order_by: [asc: e.lock_version]
+               )
+    end
+
+    test "a lost lease under the ceiling re-contracts and counts one runner_lost" do
+      ctx = claimed_with_stage(:implementing)
+      expire_lease(ctx.story)
+
+      assert :ok = ReclaimExpiredClaimsWorker.perform(%Oban.Job{args: %{}})
+
+      row = AdminRepo.get!(StoryStage, ctx.row.id)
+      assert {row.stage, row.attempts} == {:queued, %{"runner_lost" => 1}}
+      assert AdminRepo.get!(Story, ctx.story.id).agent_status == :contracted
+    end
+
+    # The ceiling counts BOTH spent-attempt edges: one crash plus one reject is two.
+    test "a reject that reaches the ceiling after an earlier lost lease escalates" do
+      ctx = claimed_with_stage(:ci, %{attempts: %{"runner_lost" => 1}})
+      release(:reject, ctx)
+
+      row = AdminRepo.get!(StoryStage, ctx.row.id)
+      assert row.stage == :escalated
+      assert row.attempts["claim_released"] == 1
+      assert row.escalation_reason =~ "attempts_exhausted: 2 counted releases"
+      assert AdminRepo.get!(Story, ctx.story.id).agent_status == :pending
+    end
+
+    # TC-44.4.5 (AC-44.4.6): a verifier reject of work reported under a dispatch whose row is
+    # at `ci` — in flight — is a counted release, re-contracted below the ceiling.
+    test "an in-flight reject counts, and re-contracts under the ceiling" do
+      ctx = claimed_with_stage(:ci)
+      release(:reject, ctx)
+
+      row = AdminRepo.get!(StoryStage, ctx.row.id)
+      assert {row.stage, row.attempts} == {:queued, %{"claim_released" => 1}}
+      assert AdminRepo.get!(Story, ctx.story.id).agent_status == :contracted
+    end
+
+    test "follow_release/5 requires a known :cause and a stated :actor_lineage" do
+      ctx = claimed_with_stage(:implementing)
+
+      for opts <- [[actor_lineage: []], [cause: :whatever, actor_lineage: []], [cause: :attempt]] do
+        assert_raise ArgumentError, fn ->
+          AdminRepo.transaction(fn ->
+            Stages.follow_release(ctx.tenant_id, ctx.story.id, 99, :runner_lost, opts)
+          end)
+        end
+      end
+
+      assert AdminRepo.get!(StoryStage, ctx.row.id).stage == :implementing
+    end
+
+    # TC-44.4.7 (AC-44.4.8): no stage row, nothing about the release changes.
+    test "a story with no stage row is released exactly as before" do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      story = fixture(:story, %{tenant_id: tenant.id, agent_status: :contracted})
+      {:ok, claimed} = Progress.claim_story(tenant.id, story.id, agent_id: agent.id)
+
+      {:ok, released} = Progress.force_unclaim_story(tenant.id, claimed.id)
+
+      assert released.agent_status == :pending
+      assert AdminRepo.get!(Story, story.id).agent_status == :pending
+      assert Stages.get(tenant.id, story.id) == nil
+    end
+
+    # A row the release only REBINDS spent nothing, so a counted cause decides nothing there:
+    # a `queued` row is re-contracted even at a ceiling of 0 worth of counts, and nothing else
+    # is touched.
+    test "a release that only rebinds a queued row re-contracts without counting" do
+      ctx = claimed_with_stage(:queued, %{attempts: %{"runner_lost" => 5}})
+      expire_lease(ctx.story)
+
+      {:ok, released} =
+        Progress.reclaim_expired_claim(ctx.tenant_id, ctx.story.id, ctx.story.claim_epoch)
+
+      assert released.agent_status == :contracted
+      row = AdminRepo.get!(StoryStage, ctx.row.id)
+      assert {row.stage, row.attempts} == {:queued, %{"runner_lost" => 5}}
     end
 
     test "every stage: in flight is requeued, done and failed untouched, the rest rebound" do

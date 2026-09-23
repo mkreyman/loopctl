@@ -400,9 +400,14 @@ defmodule Loopctl.BulkOperations do
       audit_rejection(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
       emit_reject_event(tenant_id, updated, orchestrator_agent_id, reason)
 
-      case auto_reset_agent_status(updated) do
-        {:ok, reset} ->
+      case auto_reset_agent_status(updated, ctx.caller_lineage) do
+        {:ok, {reset, stage}} ->
           audit_auto_reset(tenant_id, updated, reset, actor_id, actor_label)
+          # AFTER the reset's audit entry, like the single-story reject (US-44.4): a delivery
+          # story whose row went back to `queued` is placeable again, or it was escalated at
+          # the retry ceiling and stays `pending` for a human.
+          {:ok, _story} =
+            Stages.recontract_released(tenant_id, stage, reset, "system:auto_reset")
 
         {:error, reset_reason} ->
           Logger.warning("Auto-reset failed for story #{story.id}: #{inspect(reset_reason)}")
@@ -586,7 +591,7 @@ defmodule Loopctl.BulkOperations do
     |> AdminRepo.update()
   end
 
-  defp auto_reset_agent_status(story) do
+  defp auto_reset_agent_status(story, caller_lineage) do
     story
     |> Ecto.Changeset.change(
       # The FOURTH site that clears assigned_agent_id on a worked story, and the twin
@@ -607,21 +612,24 @@ defmodule Loopctl.BulkOperations do
       |> Map.merge(Progress.claim_release_change(story))
     )
     |> AdminRepo.update()
-    |> follow_release()
+    |> follow_release(caller_lineage)
   end
 
   # #803: the stage row follows the release inside bulk reject's transaction, like the
-  # single-story auto-reset (Loopctl.Delivery.Stages.follow_release/5).
-  defp follow_release({:ok, reset} = result) do
-    {:ok, _stage} =
+  # single-story auto-reset (Loopctl.Delivery.Stages.follow_release/5). A reject spent an
+  # attempt, so it counts toward the retry ceiling (US-44.4).
+  defp follow_release({:ok, reset}, caller_lineage) do
+    {:ok, stage} =
       Stages.follow_release(reset.tenant_id, reset.id, reset.claim_epoch, :claim_released,
+        cause: :attempt,
+        actor_lineage: caller_lineage,
         actor_label: "system:auto_reset"
       )
 
-    result
+    {:ok, {reset, stage}}
   end
 
-  defp follow_release(error), do: error
+  defp follow_release(error, _caller_lineage), do: error
 
   # ===================================================================
   # Private: Verification/Rejection Result Records
