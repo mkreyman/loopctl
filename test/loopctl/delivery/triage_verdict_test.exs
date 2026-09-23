@@ -529,6 +529,41 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert {:error, :stale_stage} = TriageVerdict.apply(story.tenant_id, runner.id, message)
     end
 
+    test "a resend after a reclaim drafts the story before queueing it, never the stub" do
+      %{story: story, runner: runner, record: record} = session()
+      message = verdict_message(record, story_verdict())
+
+      # The first attempt recorded, bound and took `triaged`, then died before drafting.
+      fixture(:triage_verdict, %{
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        dispatch_id: record.dispatch_id,
+        claim_epoch: record.claim_epoch,
+        payload_digest: TriageVerdictRecord.digest(message)
+      })
+
+      advance_to_triaged(story, dispatch_id: record.dispatch_id)
+      bump_story_epoch(story, true)
+
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :queued
+      assert reload_story(story).title == "Screened story"
+    end
+
+    test "a story triaged by NOBODY (the dispatcher, or before the binding) is not a verdict's to move" do
+      %{story: story, runner: runner, record: record} = session()
+      advance_to_triaged(story)
+
+      assert {:error, :stale_stage} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :triaged
+    end
+
     test "a late verdict for a story another dispatch took further is refused" do
       %{story: story, runner: runner, record: record} = session(stage: :implementing)
 

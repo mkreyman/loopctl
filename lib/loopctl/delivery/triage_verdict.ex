@@ -422,10 +422,14 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # step — before its draft can touch the story row — and every later transition out of
   # `triaged` is fenced to the bound dispatch by `Stages.advance/4` itself.
   defp apply_verdict(tenant_id, runner_id, session, message, transitions) do
-    decision = screen_decision(tenant_id, session, message)
+    fresh_decision = screen_decision(tenant_id, session, message)
     rest = Enum.reject(transitions, &(&1 == @triaged))
 
-    with :ok <- take_triage(tenant_id, runner_id, session, message, decision) do
+    with {:ok, _taken} <- take_triage(tenant_id, runner_id, session, message, fresh_decision) do
+      # ONE SOURCE: the decision the triage step RECORDED, whoever took it — this attempt, or an
+      # earlier one of the same dispatch (a resend, a concurrent duplicate). This attempt's own
+      # screen is only what it offers to record; it never overrides what was.
+      decision = recorded_decision(tenant_id, session, message)
       apply_route(tenant_id, runner_id, session, message, decision, rest)
     end
   end
@@ -543,11 +547,18 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # dispatched, or corrected by an operator over `PATCH /api/v1/stories/:id`. Rewriting then
   # silently reverts a human's correction and writes another audit row saying triage drafted
   # a story nothing re-drafted. `detected` and `triaged` are this verdict's own window.
+  #
+  # THE BINDING, NOT THE EPOCH, SAYS WHOSE DRAFT THIS IS (US-44.1/44.2 review round 2). The
+  # draft is written after `detected -> triaged`, by the dispatch that transition bound; a
+  # reclaim between the two moves the epoch without changing who decided the story, and an
+  # epoch fence here then skipped the draft and let the resend queue the stub row.
   defp draft_if_still_ours(tenant_id, story, draft, message) do
-    cond do
-      story.claim_epoch != message.claim_epoch -> :ok
-      stage_in_transaction(tenant_id, story.id) not in [:detected, :triaged] -> :ok
-      true -> drafted(write_draft(story, draft))
+    case stage_in_transaction(tenant_id, story.id) do
+      {stage, bound} when stage in [:detected, :triaged] and bound == message.dispatch_id ->
+        drafted(write_draft(story, draft))
+
+      _moved_on_or_not_ours ->
+        :ok
     end
   end
 
@@ -561,7 +572,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
     Repo.one(
       from r in StoryStage,
         where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
-        select: r.stage
+        select: {r.stage, r.triage_dispatch_id}
     )
   end
 
@@ -831,8 +842,8 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # would only log a refusal about a story it does not touch.
   # `detected -> triaged`, carrying the binding (`binding/2`) and, when the screen refused,
   # its decision — so a resend of a half-applied verdict reads that decision back rather than
-  # re-screening. Already taken is fine only for the dispatch it is bound to (or a row bound to
-  # nobody, triaged before the binding existed); any other dispatch is `:triage_not_bound`.
+  # re-screening. Taken already is fine only for the dispatch it is bound to — see
+  # `taken_by_this_dispatch/4`.
   defp take_triage(tenant_id, runner_id, session, message, decision) do
     reason = screen_event(decision)
 
@@ -843,7 +854,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
            opts(runner_id, session, message, @triaged, reason)
          ) do
       {:ok, _row} ->
-        :ok
+        {:ok, :fresh}
 
       {:error, reason} when reason in [:stale_stage, :stale_claim_epoch] ->
         taken_by_this_dispatch(tenant_id, session, message, reason)
@@ -856,11 +867,17 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
+  # Already taken. It is this verdict's to continue only when the story is BOUND to this
+  # dispatch. Two layers hold that, and neither is redundant: this one covers a story that has
+  # already moved PAST `triaged` (a late verdict would otherwise answer ok while every stale
+  # transition was skipped), and `Stages.advance/4`'s fence covers a row still AT `triaged`,
+  # whatever path reaches it — a reclaim repair included. A row bound to nobody (the
+  # dispatcher's too-large route, or triaged before the binding) is no verdict's to move.
   defp taken_by_this_dispatch(tenant_id, session, message, reason) do
     case Stages.get(tenant_id, session.story_id) do
       nil -> {:error, :unknown_story_stage}
       %StoryStage{stage: :detected} -> {:error, reason}
-      %StoryStage{triage_dispatch_id: bound} when bound in [nil, message.dispatch_id] -> :ok
+      %StoryStage{triage_dispatch_id: bound} when bound == message.dispatch_id -> {:ok, :already}
       %StoryStage{} -> {:error, :triage_not_bound}
     end
   end
@@ -922,8 +939,24 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # and capped, so the payload stays far inside `Stages.max_event_data_bytes/0`.
   @max_screen_codes 20
 
-  defp screen_codes(reasons),
-    do: reasons |> Enum.map(&screen_code/1) |> Enum.uniq() |> Enum.take(@max_screen_codes)
+  # Capped by COUNT and by BYTES: a path code embeds an operator's trigger pattern, which has
+  # no length bound of its own, and the codes ride the `detected -> triaged` event, which
+  # `Stages` refuses over `max_event_data_bytes/0` — refusing the triage step itself.
+  @max_screen_code_bytes 4_000
+
+  defp screen_codes(reasons) do
+    reasons
+    |> Enum.map(&screen_code/1)
+    |> Enum.uniq()
+    |> Enum.take(@max_screen_codes)
+    |> Enum.reduce_while({[], 0}, fn code, {kept, bytes} ->
+      if bytes + byte_size(code) > @max_screen_code_bytes,
+        do: {:halt, {kept, bytes}},
+        else: {:cont, {[code | kept], bytes + byte_size(code)}}
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+  end
 
   defp screen_code({:gate_a, reason}), do: "gate_a:" <> kind(reason)
   defp screen_code({:trio_verdict, verdict}), do: "trio_verdict:#{verdict}"
@@ -996,6 +1029,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
         project_id ->
           tenant_id
           |> Intake.live_sources_query()
+          |> where([src], src.project_id == ^project_id)
           |> Repo.all()
           |> Intake.select_project_source(project_id)
       end
@@ -1200,7 +1234,8 @@ defmodule Loopctl.Delivery.TriageVerdict do
     ] ++ binding(transition, message)
   end
 
-  # The triage transition names the dispatch that took it (see `continue_after/7`).
+  # The triage transition names the dispatch that took it; `Stages.advance/4` then fences
+  # every transition out of `triaged` to that dispatch, and `take_triage/5` refuses the rest.
   defp binding(@triaged, message), do: [effects: [triage_dispatch_id: message.dispatch_id]]
   defp binding(_transition, _message), do: []
 

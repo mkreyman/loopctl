@@ -13,10 +13,10 @@ defmodule Loopctl.Delivery.GateAInput do
     are runner-authored and untrusted, but they were written by a triage session before any
     implementation existed, which is a different principal from whoever asks for the merge.
   - `:human_resolution` — a human re-queued the story from an escalation that was ABOUT Gate
-    A: a `:triage_escalate` escalation whose reason is the trio's own `escalate` verdict, or a
-    `:merge_gate` one whose event records Gate A among its reasons. A triage escalation for any
-    OTHER cause — a flagged or undispatchable draft, an oversize ticket, an incomplete run —
-    put a different question to the human, who never saw the lens verdicts. A human already made the decision Gate A exists to route to them, and
+    A: a `:triage_escalate` escalation for the trio's own `escalate` verdict, the gate screen's
+    Gate A codes, or the dispatcher's oversize ticket (control found nothing to judge); or a
+    `:merge_gate` one whose event records Gate A among its reasons. A flagged or undispatchable
+    draft and an incomplete run do not count — see `gate_a_escalation?/1`. A human already made the decision Gate A exists to route to them, and
     refusing it again at merge would loop. A human re-queue of any OTHER escalation (a spent
     retry ceiling, a Gate B refusal) says nothing about the request and does not count.
   - `:missing` — neither. The gate refuses, because waiting cannot make a verdict appear.
@@ -46,7 +46,6 @@ defmodule Loopctl.Delivery.GateAInput do
   import Ecto.Query
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerLensVerdict
-  alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdictMessage
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Repo
@@ -143,12 +142,13 @@ defmodule Loopctl.Delivery.GateAInput do
 
   defp step(_event, acc), do: acc
 
-  # A triage escalation a human re-queues answers Gate A when the human either SAW the lens
-  # verdicts' judgement — the trio's own `escalate` — or there WERE none to see: an incomplete
-  # run (`triage_verdict:<incomplete reason>`) and the dispatcher's oversize ticket produce no
-  # lens verdicts, so the human's re-queue is the only Gate A decision that story can ever
-  # have. A flagged or undispatchable DRAFT is the one kind that does not: its lens verdicts
-  # exist, and the human was shown the draft's problem, not them.
+  # A triage escalation a human re-queues answers Gate A when the human SAW the lens
+  # verdicts' judgement — the trio's own `escalate`, or the gate screen's Gate A codes — or when
+  # CONTROL, not a session, found there was nothing to judge: the dispatcher's oversize ticket.
+  # An INCOMPLETE run does not count: a session chooses to report one, so counting it would let
+  # a session that read hostile reporter text avoid lens judgement by reporting a crash. Such a
+  # story is refused at merge (`:missing`). A flagged or undispatchable DRAFT does not count
+  # either: its lens verdicts exist, and the human was shown the draft's problem, not them.
   @unseen_lens_escalations [
     "triage_verdict:draft_flagged",
     "triage_verdict:draft_not_dispatchable"
@@ -178,12 +178,6 @@ defmodule Loopctl.Delivery.GateAInput do
          data: %{"reason" => "triage_verdict:gate_screen(" <> kinds}
        }),
        do: String.contains?(kinds, ["gate_a:", "trio_verdict"])
-
-  defp gate_a_escalation?(%{
-         edge: "triage_escalate",
-         data: %{"reason" => "triage_verdict:" <> incomplete}
-       }),
-       do: incomplete in RunnerTriageVerdictMessage.incomplete_reasons()
 
   # `Stages` stores a transition's `:event_data` under "payload"; the merge gate sets it only
   # when Gate A was among the reasons it refused.

@@ -713,7 +713,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # else is a lens's prose and is replaced by a STRING naming its size, so the result still
   # encodes as JSON and still matches `GateA.Result.t`.
   defp soft_code(code) when is_binary(code) do
-    if Regex.match?(~r/\A[a-z0-9_]{1,60}\z/, code),
+    if Regex.match?(~r/\A[A-Za-z0-9_:.\-]{1,60}\z/, code),
       do: code,
       else: "[prose:#{byte_size(code)}]"
   end

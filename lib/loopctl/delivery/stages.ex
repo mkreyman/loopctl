@@ -313,7 +313,9 @@ defmodule Loopctl.Delivery.Stages do
 
   - `:not_found` — no such story, or no stage row, in the tenant
   - `:triage_not_bound` — a transition out of `triaged` naming a session dispatch that is not
-    the one bound to the story (`triage_dispatch_id`); only that dispatch may take it further
+    the one bound to the story (`triage_dispatch_id`), or a row bound to nobody; only the bound
+    dispatch may take it further. Checked AFTER the story's epoch, so a stale caller hears
+    `:stale_claim_epoch` first
   - `:stale_claim_epoch` — `:claim_epoch` is not the story's current one (the caller's
     claim has ended), or the ROW is behind the story's epoch (the claim that drove it was
     released and nobody re-queued it)
@@ -571,24 +573,26 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
-  # Why the compare-and-set matched nothing.
   # ONLY THE DISPATCH THAT TRIAGED A STORY MAY TAKE IT OUT OF `triaged` (epic 44, US-44.1).
   # `detected -> triaged` records the deciding dispatch as `triage_dispatch_id`; any later
   # transition out of `triaged` that names a session dispatch must name THAT one, whatever
   # path it came by — a fresh verdict, a replay, a reclaim repair. Checked here, on the row
-  # this transaction holds locked, so no caller can forget it. A transition naming no session
-  # dispatch (control's own, e.g. the dispatcher's too-large escalation) and a row bound to
-  # nobody (triaged before the binding existed) are unaffected.
+  # this transaction holds locked, so no caller can forget it. A row bound to NOBODY (the
+  # dispatcher's too-large route, or triaged before the binding existed) is no session's to
+  # move either. Only a transition naming no session dispatch — control's own, such as that
+  # too-large escalation — passes unbound. The story's epoch is checked BEFORE this, so a
+  # caller with a stale epoch hears `:stale_claim_epoch` first.
   defp bound_to_caller!(
          %StoryStage{stage: :triaged, triage_dispatch_id: bound},
          :triaged,
          {id, _}
        )
-       when not is_nil(bound) and bound != id,
+       when bound != id,
        do: Repo.rollback(:triage_not_bound)
 
   defp bound_to_caller!(_row, _from, _session_dispatch), do: :ok
 
+  # Why the compare-and-set matched nothing.
   defp diagnose(tenant_id, story, from) do
     case Repo.one(row_query(tenant_id, story.id)) do
       nil -> :not_found
