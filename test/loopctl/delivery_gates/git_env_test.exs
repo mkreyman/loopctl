@@ -47,7 +47,7 @@ defmodule Loopctl.DeliveryGates.GitEnvTest do
 
   describe "it actually works, not merely looks right" do
     test "a global core.hooksPath does not reach a repository spawned with this environment" do
-      dir = Path.join(System.tmp_dir!(), "gitenv_#{System.unique_integer([:positive])}")
+      dir = Path.join(Loopctl.RealTmpDir.path!(), "gitenv_#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf(dir) end)
 

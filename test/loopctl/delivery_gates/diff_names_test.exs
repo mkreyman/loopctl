@@ -72,7 +72,9 @@ defmodule Loopctl.DeliveryGates.DiffNamesTest do
   defp body(name), do: Enum.map_join(1..20, "\n", &"#{name} line #{&1}") <> "\n"
 
   setup do
-    dir = Path.join(System.tmp_dir!(), "diff_names_#{System.unique_integer([:positive])}")
+    dir =
+      Path.join(Loopctl.RealTmpDir.path!(), "diff_names_#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
