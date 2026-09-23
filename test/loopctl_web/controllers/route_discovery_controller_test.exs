@@ -141,6 +141,46 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
                inspect(MapSet.to_list(missing))
     end
 
+    # The delivery loop's own surface past intake (#878): enrolling a runner, the pool,
+    # placement, revocation and the merge gate. A session that found the intake tools still
+    # could not discover these, which is the rest of wiring the loop up.
+    test "every delivery-loop runner, placement, revoke and merge-gate route is indexed" do
+      indexed =
+        LoopctlWeb.RouteDiscoveryController.curated_routes()
+        |> Enum.map(&{&1.method, &1.path})
+        |> MapSet.new()
+
+      loop? = fn path ->
+        String.starts_with?(path, "/api/v1/runners") or
+          path in ["/api/v1/dispatches/enrolled-keys", "/api/v1/dispatches/:id/revoke"] or
+          String.ends_with?(path, "/merge-precondition")
+      end
+
+      router_loop =
+        LoopctlWeb.Router.__routes__()
+        |> Enum.filter(&(String.starts_with?(&1.path, "/api/v1/") and loop?.(&1.path)))
+        |> Enum.map(&{verb_string(&1.verb), &1.path})
+        |> MapSet.new()
+
+      assert MapSet.size(router_loop) > 0,
+             "the filter matched nothing — it has drifted from the router's shape and this " <>
+               "test is now vacuous"
+
+      missing = MapSet.difference(router_loop, indexed)
+
+      assert MapSet.equal?(missing, MapSet.new()),
+             "delivery-loop routes missing from the curated /routes index: " <>
+               inspect(MapSet.to_list(missing))
+
+      # Each row says who may call it and which tool reaches it: that is what a session reads
+      # instead of the controller.
+      for row <- LoopctlWeb.RouteDiscoveryController.curated_routes(),
+          MapSet.member?(router_loop, {row.method, row.path}) do
+        assert row.description =~ "Role:", "#{row.method} #{row.path} names no role"
+        assert row.description =~ "MCP tool:", "#{row.method} #{row.path} names no MCP tool"
+      end
+    end
+
     # The create row is the one a session acts on, and two of its facts are the expensive
     # ones to learn by probing: a dispatch-minted key can never call it however privileged
     # it is, and the webhook secret is returned once and is then unrecoverable. Asserted on

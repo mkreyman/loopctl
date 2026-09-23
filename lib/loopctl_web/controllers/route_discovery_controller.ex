@@ -928,6 +928,70 @@ defmodule LoopctlWeb.RouteDiscoveryController do
             "Deliveries cannot tell you which."
       },
 
+      # Agent delivery loop — runners, placement and the merge gate (#878, epic 44 US-44.7).
+      # The rest of bringing a runner online once intake exists: enrol it, see it connect,
+      # place work on it, revoke it, and ask the merge gate about the result.
+      %{
+        method: "POST",
+        path: "/api/v1/runners",
+        description:
+          "Enrol a runner (a dev machine that runs sessions); the credential is shown once. " <>
+            "Role: user on a human-anchored tenant, from a key no dispatch minted. " <>
+            "MCP tool: runner_enroll"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/runners",
+        description:
+          "List enrolled runners (enrolment only; connection state is the pool). Role: user. " <>
+            "MCP tool: runner_list"
+      },
+      %{
+        method: "DELETE",
+        path: "/api/v1/runners/:id",
+        description:
+          "Revoke a runner: its credential stops authenticating and its socket is dropped. " <>
+            "Idempotent. Role: user on a human-anchored tenant. MCP tool: runner_revoke"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/runners/pool",
+        description:
+          "The tenant's CONNECTED runners, from Presence: draining, the latest sample, live " <>
+            "sockets. Role: user. MCP tool: runner_pool"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/runners/:runner_id/dispatches",
+        description:
+          "Place a queued, contracted story on a runner: claims it under a fresh custody " <>
+            "dispatch and pushes the work. 409 runner_declines_work when the machine is " <>
+            "draining. Role: orchestrator or above on a human-anchored tenant; an unlineaged " <>
+            "user key roots the lineage. MCP tool: place_dispatch"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/dispatches/enrolled-keys",
+        description:
+          "Agent public keys enrolled under the tenant, reconstructed from the audit chain. " <>
+            "Role: agent or above. MCP tool: list_enrolled_agent_keys"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/dispatches/:id/revoke",
+        description:
+          "Revoke a dispatch AND its subtree, with the keys each minted. 403 when the target " <>
+            "is outside your lineage. Role: orchestrator or above. MCP tool: revoke_dispatch"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/stories/:id/merge-precondition",
+        description:
+          "Run the merge gate over a story's real pull request at stage ci: both gates, " <>
+            "custody, the hard bound. Gate A reads the triage the story persisted, never the " <>
+            "caller. Role: exactly orchestrator or user. MCP tool: merge_precondition"
+      },
+
       # OpenAPI spec
       %{method: "GET", path: "/api/v1/openapi", description: "Full OpenAPI 3.0 spec (Swagger)"},
 
