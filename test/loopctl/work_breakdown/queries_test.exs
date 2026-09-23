@@ -30,35 +30,39 @@ defmodule Loopctl.WorkBreakdown.QueriesTest do
       assert story.id in ids
     end
 
-    test "excludes a pending story whose delivery stage is escalated, in its own tenant only" do
+    test "excludes a pending story whose delivery stage is held, in its own tenant only" do
       %{tenant: tenant, project: project} = setup_project()
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
 
-      escalated =
-        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
+      # Escalated (a human owns it), done and failed (finished with) are held; queued is work.
+      stories =
+        for stage <- [:escalated, :done, :failed, :queued] do
+          story =
+            fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
 
-      queued = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
+          fixture(:story_stage, %{
+            repo: Loopctl.AdminRepo,
+            tenant_id: tenant.id,
+            story_id: story.id,
+            stage: stage,
+            escalation_reason: if(stage == :escalated, do: "a human owns it")
+          })
 
-      for {story, stage} <- [{escalated, :escalated}, {queued, :queued}] do
-        fixture(:story_stage, %{
-          repo: Loopctl.AdminRepo,
-          tenant_id: tenant.id,
-          story_id: story.id,
-          stage: stage,
-          escalation_reason: if(stage == :escalated, do: "a human owns it")
-        })
-      end
+          {stage, story}
+        end
+        |> Map.new()
 
       {:ok, result} = Queries.list_ready_stories(tenant.id, project_id: project.id)
       ids = Enum.map(result.data, & &1.id)
 
-      refute escalated.id in ids
-      assert queued.id in ids
+      for stage <- [:escalated, :done, :failed], do: refute(stories[stage].id in ids)
+      assert stories[:queued].id in ids
       assert result.total == 1
 
-      # Tenant isolation: another tenant's listing names neither.
+      # Tenant isolation: another tenant's listing names none of them.
+      all_ids = stories |> Map.values() |> Enum.map(& &1.id)
       {:ok, other} = Queries.list_ready_stories(fixture(:tenant).id)
-      refute Enum.any?(other.data, &(&1.id in [escalated.id, queued.id]))
+      refute Enum.any?(other.data, &(&1.id in all_ids))
     end
 
     test "excludes stories with unverified dependencies" do

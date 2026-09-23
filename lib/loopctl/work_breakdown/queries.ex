@@ -9,6 +9,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Projects.Project
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.EpicDependency
@@ -22,6 +23,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
   1. agent_status = :pending
   2. ALL story dependencies have verified_status = :verified (or no deps)
   3. ALL parent epic dependencies have ALL their stories verified
+  4. its delivery stage is not held (`Loopctl.Delivery.Stages.held_story_ids_query/1`)
 
   ## Options
 
@@ -85,25 +87,10 @@ defmodule Loopctl.WorkBreakdown.Queries do
         )
       )
 
-      # Exclude stories control has ESCALATED to a human. A budget kill ends the claim, and so
-      # does the lease reclaim after a session escalated itself, so such a story is `pending`
-      # with nothing else to say it is not ready; `Progress.claim_story/3` refuses it too.
-      # Tenant-scoped on the join explicitly, not left to the story's own predicate.
-      |> where(
-        [s],
-        fragment(
-          """
-          NOT EXISTS (
-            SELECT 1 FROM story_stages ss
-            WHERE ss.story_id = ?
-            AND ss.tenant_id = ?
-            AND ss.stage = 'escalated'
-          )
-          """,
-          s.id,
-          s.tenant_id
-        )
-      )
+      # Exclude stories whose delivery stage is HELD — `escalated`, `done` or `failed` — which
+      # can read `pending` once their claim has ended. The one definition, in `Stages`;
+      # contract and claim refuse the same set.
+      |> where([s], s.id not in subquery(Stages.held_story_ids_query(tenant_id)))
 
     # Also exclude stories in epics that depend on empty prerequisite epics
     # (An epic dependency means the prereq epic must have ALL stories verified,

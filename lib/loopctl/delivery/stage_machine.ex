@@ -57,7 +57,7 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:budget_reported` — an in-flight stage -> escalated, when the runner reports that the
     session was KILLED BY ITS BUDGET — its wall clock or its turn limit — in a `session_ended`
     message (contract 1.16.0, US-44.3). CONTROL takes it, from
-    `Loopctl.Delivery.RunnerStages.end_session/3`, never a `stage` message: the runner states a
+    `Loopctl.Delivery.RunnerStages.end_session/4`, never a `stage` message: the runner states a
     FACT about its session and control decides what the story does about it. It lands on
     `escalated`, not `failed`, because the runner's word must never make a story terminal
     with no way out, and it is its own edge rather than `:session_escalated` because the

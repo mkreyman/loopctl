@@ -171,17 +171,8 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     assert AdminRepo.get!(Story, in_review.story.id).agent_status in [:assigned, :implementing]
   end
 
-  test "a session that COMPLETED releases nothing through here, and says so without raising" do
-    # An error, never a raise: the caller runs in the runner channel's process.
-    ctx = claimed_at(:implementing)
-
-    assert {:error, :unsupported_session_reason} = release(ctx, "completed")
-    assert AdminRepo.get!(Story, ctx.story.id).claim_epoch == ctx.story.claim_epoch
-    assert audit_entries(ctx.story) == []
-  end
-
   test "a budget kill ends the claim and leaves its ESCALATED row escalated, only rebound" do
-    # What `RunnerStages.end_session/3` leaves before it calls this: the row already escalated
+    # What `RunnerStages.end_session/4` leaves before it calls this: the row already escalated
     # over `budget_reported`. Ending the claim must never re-queue a story a budget stopped.
     ctx = claimed_at(:escalated)
 

@@ -253,9 +253,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   — is the one retry: send the same bytes, and the resend re-drives the escalation and the
   claim's end. `audit_chain_append_failed` — the tenant's hash chain refused the escalation's
   entry — is PERMANENT, exactly as on `stage`: every chained transition in the tenant is
-  failing until an operator repairs the chain, so do NOT resend. The story stays in flight
-  meanwhile, and its lease is what eventually releases it, as it releases every claim a broken
-  chain strands.
+  failing until an operator repairs the chain, so do NOT resend. A chain whose append trips
+  its own HASH check answers the same code rather than dropping the connection. The claim stays
+  held meanwhile, and the lease reclaim is the re-driver: when the lease runs out it takes the
+  same escalation instead of re-queueing the story, and leaves the claim held while the chain
+  still refuses — so a budget-killed story is never re-queued, and is escalated on the first
+  sweep after the repair.
 
   ## Server-initiated disconnects (since 1.2.0)
 

@@ -82,7 +82,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
   `"session_ended"` (`RunnerSessionEnded`) is why the session under an implement dispatch
   stopped. Cast by the contract, metered by its own bucket (`RunnerContract.session_ended_burst/0`),
-  and applied by `Loopctl.Delivery.RunnerStages.end_session/3`, which records it once on the
+  and applied by `Loopctl.Delivery.RunnerStages.end_session/4`, which records it once on the
   dispatch's ledger row and decides from the reason what the story does — this channel opens
   no path to `story_stages` or to the claim of its own. The reply is the stage row as it then
   stands plus `replayed`, and an identical resend is answered `ok` even after the release its
@@ -426,7 +426,7 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   # Why an implement session ended (contract 1.16.0, US-44.3). The runner states the fact;
-  # `RunnerStages.end_session/3` records it once and decides what it does to the story.
+  # `RunnerStages.end_session/4` records it once and decides what it does to the story.
   #
   # IDEMPOTENT, and the ack says which it was, for the reason `triage_verdict`'s does: the
   # session that ended cannot say it again differently, so a runner refused for anything

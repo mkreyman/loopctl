@@ -1038,25 +1038,53 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
+  # THE STAGES AT WHICH A STORY IS NOT AVAILABLE TO AGENTS, and the one definition of them:
+  # the ready list, contract, claim and bulk claim all read it through `held_story_ids_query/1`
+  # or `held_story_ids/2`, never a copy (US-44.3 review round 3). It is the machine's terminal
+  # set — `escalated`, which only a human moves on, and `done` and `failed`, which nothing
+  # moves on. A story's claim can END at any of the three and leave it `pending` with nothing
+  # else saying it is not work: a budget kill ends its claim at `escalated`, the lease reclaim
+  # ends a claim whose session escalated itself, and a human resolution to `done` or `failed`
+  # leaves the finished session's claim for the lease to end. Before this read, all three were
+  # listed as ready and claimable, so a machine raced the human, or re-did finished work.
+  #
+  # `merged` is NOT held, although its outward effect has happened. A story whose claim ends
+  # at `merged` has a deploy still to do, and the stage row is rebound to the next claim
+  # (`follow_claim/4`) precisely so a new session can take it on from `merged` — holding it
+  # here would strand a merged story with nothing able to deploy it.
+  @held_stages StageMachine.terminal_stages()
+
   @doc """
-  Whether the story's stage row is at `escalated` — a story control has handed to a HUMAN.
-
-  The claim paths ask it (`Loopctl.Progress.claim_story/3` and `Loopctl.BulkOperations`' bulk
-  claim) and refuse such a story `:story_escalated`, and the ready list excludes it
-  (`Loopctl.WorkBreakdown.Queries.list_ready_stories/2`). Without that, an escalated story whose
-  claim ENDED — a budget kill ends it, and so does the lease reclaim after a session escalated
-  itself — sat `pending`, listed as ready and claimable by any agent, so the human it was
-  escalated to was raced by a machine. `Loopctl.Delivery.Escalations.resolve/3` moves the row
-  out of `escalated` first, which is what makes the story claimable again.
-
-  Read on `AdminRepo`, where both claim transactions run, scoped by `tenant_id` explicitly.
+  The ids of the tenant's stories whose delivery stage row is at a HELD stage — `escalated`,
+  `done` or `failed` (`StageMachine.terminal_stages/0`) — as a composable query selecting
+  `story_id`, for a caller that filters a story query in SQL:
+  `where(query, [s], s.id not in subquery(held_story_ids_query(tenant_id)))`
+  (`Loopctl.WorkBreakdown.Queries.list_ready_stories/2`). A story with no stage row is not
+  held. Scoped by `tenant_id` explicitly, because the readers run on `AdminRepo`.
   """
-  @spec escalated?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
-  def escalated?(tenant_id, story_id) do
+  @spec held_story_ids_query(Ecto.UUID.t()) :: Ecto.Query.t()
+  def held_story_ids_query(tenant_id) do
     from(s in StoryStage,
-      where: s.tenant_id == ^tenant_id and s.story_id == ^story_id and s.stage == :escalated
+      where: s.tenant_id == ^tenant_id and s.stage in ^@held_stages,
+      select: s.story_id
     )
-    |> AdminRepo.exists?()
+  end
+
+  @doc """
+  Which of `story_ids` are HELD (`held_story_ids_query/1`), in ONE query on `AdminRepo`, where
+  every claim and contract transaction runs. `Loopctl.Progress.contract_story/4`,
+  `Loopctl.Progress.claim_story/3` and `Loopctl.BulkOperations`' bulk claim refuse a held
+  story `:story_held`, asking once per call — bulk claim once for the whole batch — under
+  the story locks they already hold: every stage transition takes the story `FOR SHARE`
+  first, so none can land between this read and the caller's commit.
+  """
+  @spec held_story_ids(Ecto.UUID.t(), [Ecto.UUID.t()]) :: MapSet.t(Ecto.UUID.t())
+  def held_story_ids(tenant_id, story_ids) do
+    tenant_id
+    |> held_story_ids_query()
+    |> where([s], s.story_id in ^story_ids)
+    |> AdminRepo.all()
+    |> MapSet.new()
   end
 
   @doc """

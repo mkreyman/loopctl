@@ -27,6 +27,7 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
+  alias Loopctl.WorkBreakdown.Queries
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -88,9 +89,9 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       assert :ok = claimable(ctx)
     end
 
-    test "a resolved story is CLAIMABLE: the claim's escalated-stage refusal lets it go", ctx do
-      # While the row sits at `escalated` a claim is refused `:story_escalated` — a human owns
-      # the story. Resolution moves the row out first, so the refusal must not outlive it.
+    test "a resolved story is CLAIMABLE: the claim's held-stage refusal lets it go", ctx do
+      # While the row sits at `escalated` a claim is refused `:story_held` — a human owns the
+      # story. Resolution moves the row out first, so the refusal must not outlive it.
       assert {:ok, %{stage: :queued}} = resolve(ctx, :queued)
 
       agent = unboxed(fn -> fixture(:agent, %{tenant_id: ctx.tenant.id}) end)
@@ -129,6 +130,44 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       story = reload(ctx)
       assert story.claim_epoch == @epoch
       assert story.agent_status == :implementing
+    end
+  end
+
+  for to <- [:done, :failed] do
+    describe "a story resolved to #{to}" do
+      test "is never listed, contracted or claimed again once its claim ends", ctx do
+        assert {:ok, %{stage: unquote(to)}} = resolve(ctx, unquote(to))
+
+        # The finished session's claim ends the way any claim does — the lease reclaim, or an
+        # operator — and leaves the story `pending` with nobody on it: the shape of work.
+        unboxed(fn -> {:ok, _} = Progress.force_unclaim_story(ctx.tenant.id, ctx.story.id) end)
+        assert reload(ctx).agent_status == :pending
+
+        refute ctx.story.id in ready_ids(ctx)
+
+        assert {:error, :story_held} =
+                 unboxed(fn ->
+                   Progress.contract_story(ctx.tenant.id, ctx.story.id, %{},
+                     skip_contract_check: true
+                   )
+                 end)
+
+        # A story already `contracted` when it was finished is refused at the claim too.
+        unboxed(fn ->
+          AdminRepo.update_all(from(s in Story, where: s.id == ^ctx.story.id),
+            set: [agent_status: :contracted]
+          )
+        end)
+
+        agent = unboxed(fn -> fixture(:agent, %{tenant_id: ctx.tenant.id}) end)
+
+        assert {:error, :story_held} =
+                 unboxed(fn ->
+                   Progress.claim_story(ctx.tenant.id, ctx.story.id, agent_id: agent.id)
+                 end)
+
+        assert reload(ctx).assigned_agent_id == nil
+      end
     end
   end
 
@@ -300,6 +339,13 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
   defp claimable(ctx), do: unboxed(fn -> Placement.claimable(ctx.tenant.id, ctx.story.id) end)
 
   defp reload(ctx), do: unboxed(fn -> AdminRepo.get!(Story, ctx.story.id) end)
+
+  defp ready_ids(ctx) do
+    {:ok, %{data: stories}} =
+      unboxed(fn -> Queries.list_ready_stories(ctx.tenant.id, page_size: 500) end)
+
+    Enum.map(stories, & &1.id)
+  end
 
   defp unboxed(fun) do
     Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)

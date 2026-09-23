@@ -1,6 +1,6 @@
 defmodule Loopctl.Delivery.SessionEndTest do
   @moduledoc """
-  US-44.3, contract 1.16.0: `Loopctl.Delivery.RunnerStages.end_session/3` — a runner's
+  US-44.3, contract 1.16.0: `Loopctl.Delivery.RunnerStages.end_session/4` — a runner's
   `session_ended` report, recorded once per dispatch and acted on by control.
 
   `completed`, the budget kills' ESCALATION, and every refusal are here, async, on one sandbox

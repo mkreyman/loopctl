@@ -641,6 +641,45 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
+  The ACCEPTED dispatch that served `story_id`'s claim at `claim_epoch` and whose runner
+  recorded one of `reasons` in `session_ended` (`record_session_end/4`), or `nil`. Returns
+  `session_of/1`'s map plus `:dispatch_id` and `:reason`.
+
+  For the lease reclaim, which must not re-queue a claim a budget kill ended
+  (`Loopctl.Progress.reclaim_expired_claim/3`). A read with no lock: every field it returns is
+  final once the report is recorded, and the reclaim re-checks the claim under the story lock.
+  """
+  @spec session_ended_with(Ecto.UUID.t(), Ecto.UUID.t(), integer(), [String.t()]) ::
+          %{
+            dispatch_id: Ecto.UUID.t(),
+            reason: String.t(),
+            kind: String.t() | nil,
+            story_id: Ecto.UUID.t(),
+            claim_epoch: integer(),
+            slot_generation: integer()
+          }
+          | nil
+  def session_ended_with(tenant_id, story_id, claim_epoch, reasons) do
+    {:ok, record} =
+      in_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+            where: r.claim_epoch == ^claim_epoch and r.status == "accepted",
+            where: r.session_ended_reason in ^reasons,
+            order_by: [asc: r.session_ended_at],
+            limit: 1
+        )
+      end)
+
+    with %DispatchRecord{} <- record do
+      record
+      |> session_of()
+      |> Map.merge(%{dispatch_id: record.dispatch_id, reason: record.session_ended_reason})
+    end
+  end
+
+  @doc """
   Records a runner's `session_ended` report on the dispatch's own row — ONCE — and says whether
   this call recorded it or found it already recorded (US-44.3, contract 1.16.0).
 

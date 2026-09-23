@@ -24,6 +24,13 @@ All notable changes to loopctl are documented here.
   `counts_toward_retry_ceiling` is `true` for `crashed` and `false` for `usage_exhausted`, for
   the retry ceiling US-44.4 adds. **Operator-visible:** escalated stories whose last edge is
   `budget_reported` were stopped by their dispatch budget, not by a session asking for help.
+  A budget kill whose escalation did not land (a lock, or a tenant audit chain refusing the
+  entry) leaves the claim held, and the LEASE RECLAIM re-drives it: it escalates instead of
+  re-queueing, and while the chain still refuses it leaves the claim held and logs at error, so
+  the story is escalated on the first sweep after the chain is repaired. **API:** contract,
+  claim and bulk claim refuse a story whose delivery stage is `escalated`, `done` or `failed`
+  with 409 `story_held`, and the ready list excludes it — such a story can read `pending` once
+  its claim has ended.
 
 - **Both delivery gates now screen a triaged story BEFORE it is queued (epic 44, US-44.2).**
   An accepted `story` verdict is escalated over `triage_escalate` instead of queued when its

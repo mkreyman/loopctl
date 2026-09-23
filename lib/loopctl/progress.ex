@@ -22,6 +22,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
+  alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Runners.Capacity
@@ -56,6 +57,8 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in pending state
+  - `{:error, :story_held}` if its delivery stage row is at a held stage — `escalated`, `done`
+    or `failed` (`Loopctl.Delivery.Stages.held_story_ids/2`)
   - `{:error, :title_mismatch}` if echoed title doesn't match
   - `{:error, :ac_count_mismatch}` if echoed AC count doesn't match
   """
@@ -82,6 +85,7 @@ defmodule Loopctl.Progress do
           {:ok, story}
         end
       end)
+      |> Multi.run(:not_held, fn _repo, %{lock: story} -> not_held(tenant_id, story.id) end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
 
@@ -130,6 +134,7 @@ defmodule Loopctl.Progress do
       {:ok, %{story: updated}} -> {:ok, updated}
       {:error, :lock, reason, _} -> {:error, reason}
       {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :not_held, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
@@ -159,9 +164,10 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in contracted state
-  - `{:error, :story_escalated}` if its delivery stage row is at `escalated`: control handed it
-    to a human, and it is claimable again once `Loopctl.Delivery.Escalations.resolve/3` has
-    moved the row (`Loopctl.Delivery.Stages.escalated?/2`)
+  - `{:error, :story_held}` if its delivery stage row is at a held stage
+    (`Loopctl.Delivery.Stages.held_story_ids/2`): `escalated`, which is claimable again once
+    `Loopctl.Delivery.Escalations.resolve/3` sends it to `queued`, or `done` / `failed`,
+    which never are
   """
   @spec claim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
@@ -181,13 +187,7 @@ defmodule Loopctl.Progress do
           error -> error
         end
       end)
-      # Under the story lock: an escalation takes the story FOR SHARE, so none can land
-      # between this read and the claim's commit.
-      |> Multi.run(:not_escalated, fn _repo, %{lock: story} ->
-        if Stages.escalated?(tenant_id, story.id),
-          do: {:error, :story_escalated},
-          else: {:ok, :not_escalated}
-      end)
+      |> Multi.run(:not_held, fn _repo, %{lock: story} -> not_held(tenant_id, story.id) end)
       |> Multi.run(:check_deps, fn _repo, %{lock: story} ->
         check_claim_dependencies(story)
       end)
@@ -279,6 +279,16 @@ defmodule Loopctl.Progress do
     multi |> AdminRepo.transaction() |> claim_result()
   end
 
+  # Contract's and claim's refusal of a story whose delivery stage is held — `escalated`,
+  # `done` or `failed` — through the one definition in `Loopctl.Delivery.Stages`. Asked under
+  # the story lock each caller already holds: every stage transition takes the story FOR
+  # SHARE first, so none can land between this read and the caller's commit.
+  defp not_held(tenant_id, story_id) do
+    if MapSet.member?(Stages.held_story_ids(tenant_id, [story_id]), story_id),
+      do: {:error, :story_held},
+      else: {:ok, :not_held}
+  end
+
   defp claim_result({:ok, %{story: updated, mint_cap: cap}}) do
     # #621: the token is returned on the struct's virtual :minted_capability
     # field so the caller can present it to POST /start.
@@ -296,11 +306,10 @@ defmodule Loopctl.Progress do
     do: {:error, :capability_mint_failed}
 
   # The steps whose failure IS the caller's answer: the story is not there
-  # (`:lock`), the transition is illegal (`:validate`), it is escalated to a human
-  # (`:not_escalated`), its dependencies are unmet (`:check_deps`), or its own changeset
-  # did not validate (`:story`).
+  # (`:lock`), the transition is illegal (`:validate`), its stage is held (`:not_held`), its
+  # dependencies are unmet (`:check_deps`), or its own changeset did not validate (`:story`).
   defp claim_result({:error, step, reason, _changes})
-       when step in [:lock, :validate, :not_escalated, :check_deps],
+       when step in [:lock, :validate, :not_held, :check_deps],
        do: {:error, reason}
 
   defp claim_result({:error, :story, changeset, _changes}), do: {:error, changeset}
@@ -1612,6 +1621,27 @@ defmodule Loopctl.Progress do
   sweep's read still wins, and the tenant-then-story order matches
   `Loopctl.Tenants.clear_custody_halt/1` and `Loopctl.Tenants.activate_tenant/1`, which
   update the tenant and then the leases.
+
+  ## A budget-killed session's claim is never re-queued here
+
+  THE RECLAIM IS THE RE-DRIVER OF A BUDGET KILL (US-44.3 review round 3). When the claim
+  about to be released ran under an ACCEPTED dispatch whose runner recorded a budget kill in
+  `session_ended` (`runner_dispatches.session_ended_reason` `wall_clock_exceeded` or
+  `max_turns_exceeded`), the channel's own escalation of it did not complete — the lease
+  would not have run out otherwise — so the reclaim takes the SAME escalation first, through
+  the one function the channel uses (`Loopctl.Delivery.RunnerStages.escalate_recorded_budget_kill/4`,
+  in-flight row -> `escalated` over `:budget_reported`), and only then releases the claim.
+  The row is then no longer in flight, so the release only rebinds it: the story is
+  `pending` behind an `escalated` row, which is held (`Loopctl.Delivery.Stages.held_story_ids/2`),
+  and never back in the queue. That release is audited as the session end it is —
+  `claim_session_ended` with the reported `session_ended_reason`, webhook reason
+  `session_ended:<reason>` — by the system actor that ran it, not as a lease expiry.
+
+  If the escalation is REFUSED again — a tenant chain that still refuses appends, a lock that
+  was not free — nothing is released: the claim stays held, the refusal is logged at error,
+  and `{:error, :budget_escalation_refused}` is returned. The next sweep finds the same
+  expired lease and tries again, so the story is escalated once an operator has repaired the
+  chain, and "a budget-killed story is never re-queued" holds on every path.
   """
   @spec reclaim_expired_claim(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) ::
           {:ok, Story.t()}
@@ -1620,22 +1650,54 @@ defmodule Loopctl.Progress do
              | :claim_not_expired
              | :custody_halted
              | :tenant_inactive
+             | :budget_escalation_refused
              | Ecto.Changeset.t()}
   def reclaim_expired_claim(tenant_id, story_id, expected_epoch) do
     now = DateTime.utc_now()
+    label = "worker:reclaim_expired_claims"
 
-    runner_lost_release(tenant_id, story_id, %{
+    lease = %{
       gate: fn -> lock_tenant_if_claims_renewable(tenant_id) end,
       held?: &lease_expired?(&1, expected_epoch, now),
       not_held: :claim_not_expired,
-      action: "claim_lease_expired",
       actor_type: "system",
       actor_id: nil,
-      actor_label: "worker:reclaim_expired_claims",
-      webhook_reason: "claim_lease_expired",
-      new_state: %{},
+      actor_label: label,
       counted?: true
-    })
+    }
+
+    case RunnerStages.escalate_recorded_budget_kill(tenant_id, story_id, expected_epoch, label) do
+      :none ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_lease_expired",
+            webhook_reason: "claim_lease_expired",
+            new_state: %{}
+          })
+        )
+
+      {:ok, reason} ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_session_ended",
+            webhook_reason: "session_ended:" <> reason,
+            new_state: %{"session_ended_reason" => reason}
+          })
+        )
+
+      {:error, refusal} ->
+        Logger.error(
+          "reclaim left a budget-killed claim HELD: its escalation was refused again, and " <>
+            "the next sweep retries it — tenant_id=#{tenant_id} story_id=#{story_id} " <>
+            "claim_epoch=#{expected_epoch} refusal=#{inspect(refusal)}"
+        )
+
+        {:error, :budget_escalation_refused}
+    end
   end
 
   @doc """
@@ -1662,8 +1724,10 @@ defmodule Loopctl.Progress do
   passed as `:counted?` (required), never re-derived here from the reason:
   `Loopctl.Delivery.RunnerStages` decides it from the same function that writes the dispatch
   ledger's `counts_toward_retry_ceiling`, so the two records cannot disagree. A budget kill's row
-  has already been escalated by then (`Loopctl.Delivery.RunnerStages.end_session/3` escalates
-  first), so it stays `escalated`: ending the claim never re-queues a story the budget stopped.
+  has already been escalated by then (`Loopctl.Delivery.RunnerStages.end_session/4` escalates
+  first, and calls this only once that escalation has landed or had nothing to change), so it
+  stays `escalated`: ending the claim never re-queues a story the budget stopped. When the
+  escalation does not land, the claim is left held and `reclaim_expired_claim/3` re-drives it.
 
   THE CLAIM MUST BE THE ONE THE SESSION RAN UNDER: held (`:assigned` or `:implementing`), at
   exactly `expected_epoch` — the reporting dispatch's own — and not handed to review. Anything
@@ -1680,24 +1744,15 @@ defmodule Loopctl.Progress do
   itself reported that its session is gone, so there is nothing to protect, and a halt stops
   custody PROGRESS while a release gives a claim back.
 
-  A `:session_reason` that is not one of those four — `completed` above all, which ends no
-  claim — is `{:error, :unsupported_session_reason}` and nothing is written. An error, not a
-  raise: the caller runs in the runner channel's process, which every session on the machine
-  shares.
+  WHICH reasons end a claim is the caller's decision, not re-checked here:
+  `Loopctl.Delivery.RunnerStages` calls this only from the clauses of its session-end action
+  that end one, and never for `completed`.
   """
   @spec release_ended_session(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer(), keyword()) ::
           {:ok, Story.t()}
-          | {:error,
-             :not_found | :claim_not_held | :unsupported_session_reason | Ecto.Changeset.t()}
+          | {:error, :not_found | :claim_not_held | Ecto.Changeset.t()}
   def release_ended_session(tenant_id, story_id, expected_epoch, opts) do
     session_reason = Keyword.fetch!(opts, :session_reason)
-
-    if session_reason in ~w(crashed usage_exhausted wall_clock_exceeded max_turns_exceeded),
-      do: release_session_claim(tenant_id, story_id, expected_epoch, session_reason, opts),
-      else: {:error, :unsupported_session_reason}
-  end
-
-  defp release_session_claim(tenant_id, story_id, expected_epoch, session_reason, opts) do
     actor_label = Keyword.fetch!(opts, :actor_label)
     actor_id = Keyword.fetch!(opts, :actor_id)
 

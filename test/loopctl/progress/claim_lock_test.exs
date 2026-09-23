@@ -202,6 +202,9 @@ defmodule Loopctl.Progress.ClaimLockTest do
     reclaimer =
       Task.async(fn ->
         :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        # The reclaim first reads the dispatch ledger, on the RLS repo, for a budget kill it
+        # must re-drive rather than re-queue (US-44.3).
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
       end)
 
@@ -228,6 +231,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
     reclaim = fn ->
       Task.async(fn ->
         :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
       end)
     end

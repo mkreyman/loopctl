@@ -16,7 +16,7 @@ defmodule Loopctl.Delivery.RunnerStages do
 
   ## Session end (contract 1.16.0, US-44.3)
 
-  `end_session/3` applies a runner's `session_ended` message: WHY the session under a dispatch
+  `end_session/4` applies a runner's `session_ended` message: WHY the session under a dispatch
   stopped. It is a FACT the runner reports, never a verdict it takes, so what happens to the
   story is decided here from the reason:
 
@@ -28,7 +28,10 @@ defmodule Loopctl.Delivery.RunnerStages do
     must not make a story terminal with no way out. Never retried either — the same budget
     kills it again. An escalation that could not land is answered `:busy` (a lock, or a row
     that kept moving) and the resend re-drives it; one the stage machine REFUSED is answered
-    with that refusal's own permanent code (see `take_budget_edge/6`).
+    with that refusal's own permanent code (see `budget_escalation_refused/4`). Either way the
+    claim is left HELD, and when its lease runs out the reclaim re-drives the same escalation
+    (`escalate_recorded_budget_kill/4`) instead of re-queueing the story, so a budget-killed
+    story is never re-queued on any path.
   - `crashed` — the claim is released NOW rather than at lease expiry, over `:runner_lost`
     with the reclaim's audit shape (`Loopctl.Progress.release_ended_session/4`), and the slot
     goes back.
@@ -159,7 +162,12 @@ defmodule Loopctl.Delivery.RunnerStages do
       session_dispatch: {stage.dispatch_id, session.slot_generation}
     ]
 
-    case Stages.advance(tenant_id, session.story_id, {stage.from, stage.to, stage.edge}, opts) do
+    case advance_answering_broken_chain(
+           tenant_id,
+           session.story_id,
+           {stage.from, stage.to, stage.edge},
+           opts
+         ) do
       {:ok, row} -> {:ok, row}
       {:error, :stale_stage} -> resolve_replay(tenant_id, session, stage)
       {:error, :not_found} -> {:error, :unknown_story_stage}
@@ -191,7 +199,6 @@ defmodule Loopctl.Delivery.RunnerStages do
           | :rejected_by_database
           | {:invalid, [String.t()]}
           | {:release_refused, [atom()]}
-          | :unsupported_session_reason
 
   @doc """
   Applies a `session_ended` message — already cast by
@@ -206,7 +213,8 @@ defmodule Loopctl.Delivery.RunnerStages do
   `:capacity_busy` mean a lock was not free, or a budget escalation's row kept moving: the
   record may or may not have landed, and the resend completes the work either way.
   `:audit_chain_append_failed` is a budget escalation the tenant's hash chain refused — the
-  record HAS landed and a resend cannot help.
+  record HAS landed and a resend cannot help; the claim stays held, and the lease reclaim
+  re-drives the escalation once the chain has been repaired.
 
   `opts` must carry `:actor_id`, the runner's own `api_key_id` — the principal a release is
   attributed to. The channel holds it on its socket; it is never looked up here.
@@ -289,7 +297,14 @@ defmodule Loopctl.Delivery.RunnerStages do
   # `:claim_not_held`.
   defp act_on_session_end(tenant_id, runner_id, actor_id, session, %{reason: reason} = message)
        when reason in @budget_reasons do
-    with :ok <- escalate_budget(tenant_id, runner_id, session, message, @escalation_attempts),
+    with :ok <-
+           escalate_budget(
+             tenant_id,
+             "runner:" <> runner_id,
+             session,
+             message,
+             @escalation_attempts
+           ),
          do: release_claim(tenant_id, runner_id, actor_id, session, reason)
   end
 
@@ -342,13 +357,17 @@ defmodule Loopctl.Delivery.RunnerStages do
   #
   # The reason is built from the ENUM, never from anything the session wrote: entering
   # `escalated` is chained, and the chain cannot be corrected afterwards.
-  defp escalate_budget(tenant_id, runner_id, session, message, attempts_left) do
+  #
+  # ONE FUNCTION FOR BOTH WRITERS of this edge: `end_session/4` (`actor_label` the runner) and
+  # the lease reclaim through `escalate_recorded_budget_kill/4` (the worker), so the two cannot
+  # take different transitions or answer a refusal differently.
+  defp escalate_budget(tenant_id, actor_label, session, message, attempts_left) do
     epoch = message.claim_epoch
 
     case Stages.get(tenant_id, session.story_id) do
       %StoryStage{stage: stage, claim_epoch: ^epoch} = row ->
         if stage in StageMachine.in_flight_stages(),
-          do: take_budget_edge(tenant_id, runner_id, session, message, row, attempts_left),
+          do: take_budget_edge(tenant_id, actor_label, session, message, row, attempts_left),
           else: :ok
 
       _elsewhere ->
@@ -356,11 +375,11 @@ defmodule Loopctl.Delivery.RunnerStages do
     end
   end
 
-  defp take_budget_edge(tenant_id, runner_id, session, message, row, attempts_left) do
+  defp take_budget_edge(tenant_id, actor_label, session, message, row, attempts_left) do
     opts = [
       claim_epoch: message.claim_epoch,
       reason: "session_ended:" <> message.reason,
-      actor_label: "runner:" <> runner_id,
+      actor_label: actor_label,
       # The runner's credential is a plain `api_keys` row no dispatch minted, so its lineage
       # is genuinely empty; stated, because a chained transition refuses an ABSENT lineage.
       actor_role: :agent,
@@ -369,7 +388,7 @@ defmodule Loopctl.Delivery.RunnerStages do
       session_dispatch: {message.dispatch_id, session.slot_generation}
     ]
 
-    case Stages.advance(
+    case advance_answering_broken_chain(
            tenant_id,
            session.story_id,
            {row.stage, :escalated, :budget_reported},
@@ -382,7 +401,7 @@ defmodule Loopctl.Delivery.RunnerStages do
       # Read again; after `@escalation_attempts` tell the runner to resend, which re-drives
       # this — never answer `ok` over an escalation that did not happen.
       {:error, :stale_stage} when attempts_left > 1 ->
-        escalate_budget(tenant_id, runner_id, session, message, attempts_left - 1)
+        escalate_budget(tenant_id, actor_label, session, message, attempts_left - 1)
 
       {:error, :stale_stage} ->
         Logger.warning(
@@ -418,9 +437,11 @@ defmodule Loopctl.Delivery.RunnerStages do
   permanent refusal left is `:audit_chain_append_failed` — a tenant hash chain that refuses
   appends. That blocks EVERY chained transition in the tenant until an operator repairs it, so
   a retry instruction is a resend loop against a broken chain (`classify/1`, #824 round 3).
-  The story stays in flight, and the lease reclaim that eventually re-queues it is the
-  tenant-wide degraded behaviour of a broken chain — the same fate as every other chained
-  transition there, and nothing a resend of this report could change.
+  The story stays in flight with its claim held, and the RE-DRIVER is the lease reclaim, not
+  the runner: when the lease runs out, `Loopctl.Progress.reclaim_expired_claim/3` takes this
+  same escalation (`escalate_recorded_budget_kill/4`) instead of re-queueing, and leaves the
+  claim held again while the chain still refuses — so the story is escalated on the first
+  sweep after the repair, and never re-queued.
   """
   @spec budget_escalation_refused(atom(), Ecto.UUID.t(), map(), map()) :: {:error, end_error()}
   def budget_escalation_refused(:busy, _tenant_id, _session, _message), do: {:error, :busy}
@@ -434,6 +455,76 @@ defmodule Loopctl.Delivery.RunnerStages do
 
     {:error, classify(reason)}
   end
+
+  @doc """
+  The LEASE RECLAIM's half of a budget kill (US-44.3 review round 3): if `story_id`'s claim at
+  `claim_epoch` ran under an ACCEPTED dispatch whose runner recorded a budget kill in
+  `session_ended`, takes that kill's escalation — the SAME function `end_session/4` takes it
+  through, attributed to `actor_label` — before `Loopctl.Progress.reclaim_expired_claim/3`
+  releases the claim.
+
+  - `:none` — no such report: the reclaim is an ordinary lease expiry.
+  - `{:ok, reason}` — the row is escalated, or was already out of flight or under a later
+    epoch (nothing a budget kill should change): release the claim as the session end
+    `reason` names. The release then only rebinds the row, so the story is never re-queued.
+  - `{:error, reason}` — the escalation was refused (`budget_escalation_refused/4`'s codes):
+    do NOT release. A released claim would re-queue a budget-killed story, which is the one
+    thing this path exists to prevent; held, it is retried by the next sweep.
+  """
+  @spec escalate_recorded_budget_kill(Ecto.UUID.t(), Ecto.UUID.t(), integer(), String.t()) ::
+          :none | {:ok, String.t()} | {:error, end_error()}
+  def escalate_recorded_budget_kill(tenant_id, story_id, claim_epoch, actor_label) do
+    case DispatchLedger.session_ended_with(tenant_id, story_id, claim_epoch, @budget_reasons) do
+      nil ->
+        :none
+
+      session ->
+        message = %{
+          dispatch_id: session.dispatch_id,
+          claim_epoch: claim_epoch,
+          reason: session.reason
+        }
+
+        with :ok <-
+               escalate_budget(tenant_id, actor_label, session, message, @escalation_attempts),
+             do: {:ok, session.reason}
+    end
+  end
+
+  # A BROKEN TENANT CHAIN, answered rather than raised, at the runner-message boundary: every
+  # `Stages.advance/4` a runner's message drives (`apply/3` and the budget escalation of
+  # `end_session/4`, which the lease reclaim shares) goes through here. The chain's own
+  # trigger raises `audit_chain_hash_violation` (P0001) on an append whose predecessor hash
+  # does not match, and `Stages.in_tenant/2` deliberately reraises it rather than calling it
+  # `:busy`. Raised here, it took down the runner channel process every session on the
+  # machine shares, and the runner's reconnect-and-resend crash-looped it. The L6 signal is the
+  # chain's own state and this error log, not a dead socket: the answer is the contract's
+  # permanent `audit_chain_append_failed`, which tells the runner not to resend. Every OTHER
+  # database error keeps reraising — this names one condition, not a class.
+  @chain_hash_violation "audit_chain_hash_violation"
+
+  defp advance_answering_broken_chain(tenant_id, story_id, transition, opts) do
+    Stages.advance(tenant_id, story_id, transition, opts)
+  rescue
+    error in Postgrex.Error ->
+      if chain_hash_violation?(error) do
+        Logger.error(
+          "tenant audit chain refused an append as a HASH VIOLATION; the runner's transition " <>
+            "was not applied and is answered audit_chain_append_failed: tenant_id=#{tenant_id} " <>
+            "story_id=#{story_id} transition=#{inspect(transition)}"
+        )
+
+        {:error, :audit_chain_append_failed}
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  defp chain_hash_violation?(%Postgrex.Error{postgres: %{pg_code: "P0001", message: message}})
+       when is_binary(message),
+       do: String.starts_with?(message, @chain_hash_violation)
+
+  defp chain_hash_violation?(%Postgrex.Error{}), do: false
 
   # THE SLOT, released when the session is over by a rule the SERVER can check — never on the
   # runner's word alone, which is the rule `StageMachine.ends_session?/1` exists to hold: a
