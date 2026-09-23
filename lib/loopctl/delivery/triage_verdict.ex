@@ -221,9 +221,18 @@ defmodule Loopctl.Delivery.TriageVerdict do
          :ok <- triage_dispatch(session),
          :ok <- epoch_matches(session, message),
          {:ok, transitions} <- route(message) do
-      record_and_advance(tenant_id, runner_id, session, message, transitions)
+      tenant_id
+      |> record_and_advance(runner_id, session, message, transitions)
+      |> on_the_wire()
     end
   end
+
+  # A dispatch that did not triage the story is refused on the wire exactly as the contract
+  # publishes it — `stale_stage`: the story has left `detected` and this verdict decides
+  # nothing. It is its OWN code until here so that the replay path, which reads a bare
+  # `stale_stage` as "already done", cannot report such a verdict as applied.
+  defp on_the_wire({:error, :triage_not_bound}), do: {:error, :stale_stage}
+  defp on_the_wire(result), do: result
 
   # A verdict answers a TRIAGE dispatch and nothing else (US-44.1 review). The ledger row is
   # what says which kind this dispatch is; without the check, the runner holding a story's
@@ -407,10 +416,24 @@ defmodule Loopctl.Delivery.TriageVerdict do
   #
   # Idempotent by construction — it writes the same values from the same recorded verdict — so
   # the replay path runs it too rather than assuming the first attempt got that far.
+  # THE ORDER IS THE CONTRACT (US-44.1 and US-44.2, after review): screen, take `triaged`
+  # carrying the binding and the screen's decision, and only then write the draft and take
+  # the rest of the route. A dispatch that did not triage the story is refused at the triage
+  # step — before its draft can touch the story row — and every later transition out of
+  # `triaged` is fenced to the bound dispatch by `Stages.advance/4` itself.
   defp apply_verdict(tenant_id, runner_id, session, message, transitions) do
+    decision = screen_decision(tenant_id, session, message)
+    rest = Enum.reject(transitions, &(&1 == @triaged))
+
+    with :ok <- take_triage(tenant_id, runner_id, session, message, decision) do
+      apply_route(tenant_id, runner_id, session, message, decision, rest)
+    end
+  end
+
+  defp apply_route(tenant_id, runner_id, session, message, decision, rest) do
     case apply_draft(tenant_id, session, message) do
       :ok ->
-        advance_screened(tenant_id, runner_id, session, message, transitions)
+        after_screen(tenant_id, runner_id, session, message, decision, rest)
 
       # OUTSIDE the transaction the draft was written in. `Audit.create_log_entry/2` writes on
       # `AdminRepo` — a different pool, three connections wide — and a checkout timeout there
@@ -419,7 +442,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
       # audit row is a record OF a committed write, so it belongs after the commit.
       {:drafted, story} ->
         log_draft(tenant_id, story)
-        advance_screened(tenant_id, runner_id, session, message, transitions)
+        after_screen(tenant_id, runner_id, session, message, decision, rest)
 
       # A DRAFT LOOPCTL CANNOT DISPATCH IS ESCALATED, NOT QUEUED, and the story keeps the stub
       # row it already had. The caps a stored story is judged against are the contract's own
@@ -442,7 +465,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
           runner_id,
           session,
           message,
-          [@triaged, {:triaged, :escalated, :triage_escalate}],
+          [{:triaged, :escalated, :triage_escalate}],
           "triage_verdict:draft_not_dispatchable"
         )
 
@@ -462,7 +485,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
           runner_id,
           session,
           message,
-          [@triaged, {:triaged, :escalated, :triage_escalate}],
+          [{:triaged, :escalated, :triage_escalate}],
           {"triage_verdict:draft_flagged", flagged_event_data(signals)}
         )
 
@@ -806,28 +829,64 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # after either changed could reverse a refusal the first attempt had already reached. A story
   # already past triage is not screened at all: every transition is stale, and a screen then
   # would only log a refusal about a story it does not touch.
-  defp advance_screened(tenant_id, runner_id, session, message, transitions) do
-    case screen_decision(tenant_id, session, message) do
-      :queue ->
-        advance_all(tenant_id, runner_id, session, message, transitions, nil)
+  # `detected -> triaged`, carrying the binding (`binding/2`) and, when the screen refused,
+  # its decision — so a resend of a half-applied verdict reads that decision back rather than
+  # re-screening. Already taken is fine only for the dispatch it is bound to (or a row bound to
+  # nobody, triaged before the binding existed); any other dispatch is `:triage_not_bound`.
+  defp take_triage(tenant_id, runner_id, session, message, decision) do
+    reason = screen_event(decision)
 
-      {:escalate, codes} ->
-        Logger.warning(
-          "triage verdict refused by the gate screen, escalating instead of queueing: " <>
-            "story_id=#{session.story_id} codes=#{inspect(Enum.take(codes, 5))}",
-          tenant_id: tenant_id,
-          story_id: session.story_id
-        )
+    case Stages.advance(
+           tenant_id,
+           session.story_id,
+           @triaged,
+           opts(runner_id, session, message, @triaged, reason)
+         ) do
+      {:ok, _row} ->
+        :ok
 
-        advance_all(
-          tenant_id,
-          runner_id,
-          session,
-          message,
-          [@triaged, {:triaged, :escalated, :triage_escalate}],
-          {screen_reason(codes), %{"gate_screen" => codes}}
-        )
+      {:error, reason} when reason in [:stale_stage, :stale_claim_epoch] ->
+        taken_by_this_dispatch(tenant_id, session, message, reason)
+
+      {:error, :not_found} ->
+        {:error, :unknown_story_stage}
+
+      {:error, other} ->
+        {:error, other}
     end
+  end
+
+  defp taken_by_this_dispatch(tenant_id, session, message, reason) do
+    case Stages.get(tenant_id, session.story_id) do
+      nil -> {:error, :unknown_story_stage}
+      %StoryStage{stage: :detected} -> {:error, reason}
+      %StoryStage{triage_dispatch_id: bound} when bound in [nil, message.dispatch_id] -> :ok
+      %StoryStage{} -> {:error, :triage_not_bound}
+    end
+  end
+
+  defp screen_event(:queue), do: nil
+  defp screen_event({:escalate, codes}), do: {screen_reason(codes), %{"gate_screen" => codes}}
+
+  defp after_screen(tenant_id, runner_id, session, message, :queue, rest),
+    do: advance_all(tenant_id, runner_id, session, message, rest, nil)
+
+  defp after_screen(tenant_id, runner_id, session, message, {:escalate, codes}, _rest) do
+    Logger.warning(
+      "triage verdict refused by the gate screen, escalating instead of queueing: " <>
+        "story_id=#{session.story_id} codes=#{inspect(Enum.take(codes, 5))}",
+      tenant_id: tenant_id,
+      story_id: session.story_id
+    )
+
+    advance_all(
+      tenant_id,
+      runner_id,
+      session,
+      message,
+      [{:triaged, :escalated, :triage_escalate}],
+      screen_event({:escalate, codes})
+    )
   end
 
   defp screen_decision(tenant_id, session, %{verdict: %{outcome: "story"}} = message) do
@@ -947,30 +1006,6 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
-  # ONLY THE DISPATCH THAT TRIAGED THE STORY MAY TAKE IT FURTHER (US-44.1). The triage
-  # transition carries the binding, so once the story has left `detected` the row names the
-  # dispatch that took it out. Any other dispatch — a zombie from a reclaimed placement, a
-  # second delivery racing the first — found `triaged` already taken, and is refused here
-  # before it can take the story's NEXT transition: otherwise it would queue, escalate or
-  # reject a story another verdict decided. A row with no binding (triaged by the dispatcher's
-  # too-large route, or before the binding existed) is left to whoever reaches it, as before;
-  # Gate A reads such a story as `:missing` at merge and refuses.
-  defp continue_after(tenant_id, runner_id, session, message, @triaged, rest, reason) do
-    case Stages.get(tenant_id, session.story_id) do
-      %StoryStage{triage_dispatch_id: bound} when bound in [nil, message.dispatch_id] ->
-        advance_all(tenant_id, runner_id, session, message, rest, reason)
-
-      %StoryStage{} ->
-        {:error, :stale_stage}
-
-      nil ->
-        {:error, :unknown_story_stage}
-    end
-  end
-
-  defp continue_after(tenant_id, runner_id, session, message, _transition, rest, reason),
-    do: advance_all(tenant_id, runner_id, session, message, rest, reason)
-
   defp advance_all(_tenant_id, _runner_id, _session, _message, [], _reason), do: :ok
 
   defp advance_all(tenant_id, runner_id, session, message, [transition | rest], reason) do
@@ -981,7 +1016,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
            opts(runner_id, session, message, transition, reason)
          ) do
       {:ok, _row} ->
-        continue_after(tenant_id, runner_id, session, message, transition, rest, reason)
+        advance_all(tenant_id, runner_id, session, message, rest, reason)
 
       # A STALE TRANSITION IS ONE ALREADY TAKEN, AND THE ROUTE GOES ON. Halting here was safe
       # while every route was one transition and is not now: `story` takes two, in separate
@@ -992,7 +1027,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
       # stop it being dead. Each advance carries its own epoch fence and its own compare-and-
       # set, so continuing past one that no longer applies cannot write anything unfenced.
       {:error, :stale_stage} ->
-        continue_after(tenant_id, runner_id, session, message, transition, rest, reason)
+        advance_all(tenant_id, runner_id, session, message, rest, reason)
 
       {:error, :not_found} ->
         {:error, :unknown_story_stage}

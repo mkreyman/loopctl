@@ -274,6 +274,24 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
     end
 
+    test "a lens's free-text escalation reason is answered as JSON, never a 500", ctx do
+      prose =
+        Map.put(lens("story"), "escalation_reasons", ["The ticket reads like a new workflow."])
+
+      set_lens_verdicts(ctx, %{
+        "analyst" => lens("story"),
+        "architect" => lens("story"),
+        "engineer" => prose
+      })
+
+      {key, _} = orchestrator_key(ctx)
+
+      response = post_precondition(ctx, key)
+      assert %{"data" => _data} = json_response(response, 200)
+      assert response.resp_body =~ "[prose:"
+      refute response.resp_body =~ "new workflow"
+    end
+
     test "a story whose triage recorded no lens verdicts is refused, not unevaluated", ctx do
       set_lens_verdicts(ctx, nil)
       {key, _} = orchestrator_key(ctx)

@@ -511,6 +511,24 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert stage_of(story) == :triaged
     end
 
+    test "a zombie after a reclaim cannot take the story further, and its draft never lands" do
+      %{story: story, runner: runner, record: record} = session()
+
+      # Dispatch A triaged and bound the story; then a reclaim moved the epoch.
+      advance_to_triaged(story, dispatch_id: Ecto.UUID.generate())
+      bump_story_epoch(story, true)
+      before = reload_story(story)
+
+      # This dispatch never triaged it: its story verdict must not queue or draft anything.
+      message = verdict_message(record, story_verdict())
+      assert {:error, :stale_stage} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :triaged
+      assert reload_story(story).title == before.title
+
+      # And its resend is refused too, never answered as a replay that was applied.
+      assert {:error, :stale_stage} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+    end
+
     test "a late verdict for a story another dispatch took further is refused" do
       %{story: story, runner: runner, record: record} = session(stage: :implementing)
 

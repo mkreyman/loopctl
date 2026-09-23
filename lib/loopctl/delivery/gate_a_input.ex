@@ -46,6 +46,7 @@ defmodule Loopctl.Delivery.GateAInput do
   import Ecto.Query
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerLensVerdict
+  alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdictMessage
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Repo
@@ -142,11 +143,30 @@ defmodule Loopctl.Delivery.GateAInput do
 
   defp step(_event, acc), do: acc
 
-  # `Stages` stores a transition's reason under "reason"; the trio's own escalate verdict is the
-  # only triage escalation that put the lens verdicts in front of a human.
+  # A triage escalation a human re-queues answers Gate A when the human either SAW the lens
+  # verdicts' judgement — the trio's own `escalate` — or there WERE none to see: an incomplete
+  # run (`triage_verdict:<incomplete reason>`) and the dispatcher's oversize ticket produce no
+  # lens verdicts, so the human's re-queue is the only Gate A decision that story can ever
+  # have. A flagged or undispatchable DRAFT is the one kind that does not: its lens verdicts
+  # exist, and the human was shown the draft's problem, not them.
+  @unseen_lens_escalations [
+    "triage_verdict:draft_flagged",
+    "triage_verdict:draft_not_dispatchable"
+  ]
+
+  defp gate_a_escalation?(%{edge: "triage_escalate", data: %{"reason" => reason}})
+       when reason in @unseen_lens_escalations,
+       do: false
+
   defp gate_a_escalation?(%{
          edge: "triage_escalate",
          data: %{"reason" => "triage_verdict:escalate"}
+       }),
+       do: true
+
+  defp gate_a_escalation?(%{
+         edge: "triage_escalate",
+         data: %{"reason" => "triage_dispatch:triage_too_large"}
        }),
        do: true
 
@@ -158,6 +178,12 @@ defmodule Loopctl.Delivery.GateAInput do
          data: %{"reason" => "triage_verdict:gate_screen(" <> kinds}
        }),
        do: String.contains?(kinds, ["gate_a:", "trio_verdict"])
+
+  defp gate_a_escalation?(%{
+         edge: "triage_escalate",
+         data: %{"reason" => "triage_verdict:" <> incomplete}
+       }),
+       do: incomplete in RunnerTriageVerdictMessage.incomplete_reasons()
 
   # `Stages` stores a transition's `:event_data` under "payload"; the merge gate sets it only
   # when Gate A was among the reasons it refused.

@@ -696,7 +696,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # names, the validated `kind` enum). They are blanked HERE, where the reasons are built, so
   # every sink downstream — the escalation reason on the audit chain, the log line, the
   # endpoint's `reasons[].detail` — receives the redacted form, while the lens's full text
-  # stays on the triage record and on `verdict.gate_a` for an operator to read as data.
+  # stays on the triage record for an operator to read as data.
   # The whole Gate A result, not only the reasons carried on the verdict: the endpoint renders
   # `verdict.gate_a` too, and a soft signal is a lens's own, unvalidated escalation code.
   defp redact_gate_a(%GateA.Result{} = result) do
@@ -704,9 +704,21 @@ defmodule Loopctl.Delivery.MergePrecondition do
       result
       | reasons: Enum.map(result.reasons, &redact_lens_text/1),
         soft_signals:
-          Enum.map(result.soft_signals, fn {index, code} -> {index, {:text, byte_size(code)}} end)
+          Enum.map(result.soft_signals, fn {index, code} -> {index, soft_code(code)} end)
     }
   end
+
+  # A soft signal is meant to be a CODE, counted so its rate can be measured before it is ever
+  # allowed to gate (`GateA.Result`). A code-shaped string is kept for exactly that; anything
+  # else is a lens's prose and is replaced by a STRING naming its size, so the result still
+  # encodes as JSON and still matches `GateA.Result.t`.
+  defp soft_code(code) when is_binary(code) do
+    if Regex.match?(~r/\A[a-z0-9_]{1,60}\z/, code),
+      do: code,
+      else: "[prose:#{byte_size(code)}]"
+  end
+
+  defp soft_code(_code), do: "[prose]"
 
   defp redact_lens_text({:contradiction, index, contradicts}) when is_list(contradicts),
     do: {:contradiction, index, Enum.map(contradicts, &redact_contradiction/1)}

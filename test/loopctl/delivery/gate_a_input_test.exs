@@ -251,6 +251,20 @@ defmodule Loopctl.Delivery.GateAInputTest do
       end
     end
 
+    test "of an escalation with no lens verdicts to show (incomplete, oversize) satisfies Gate A" do
+      for reason <- ["triage_verdict:session_crashed", "triage_dispatch:triage_too_large"] do
+        ctx = story()
+
+        events(ctx, [
+          {"triaged", "escalated", "triage_escalate", %{"reason" => reason}},
+          {"escalated", "queued", "human_resolution", %{}}
+        ])
+
+        assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :human_resolution,
+               reason
+      end
+    end
+
     test "of a triage escalation for another cause (a flagged draft) does not" do
       ctx = story()
 

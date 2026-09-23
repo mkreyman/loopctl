@@ -2355,9 +2355,9 @@ defmodule Loopctl.Fixtures do
       )
 
     # THE BINDING Gate A reads: the story's stage row naming this verdict's dispatch as its
-    # `triage_dispatch_id`, as `Loopctl.Delivery.TriageVerdict` records it before storing any
-    # verdict — incomplete ones included. Only when the story has a stage row; `bind: false`
-    # for a row that decided nothing (a refused second dispatch's, written around the path).
+    # `triage_dispatch_id`, as the `detected -> triaged` transition that verdict took writes it
+    # — incomplete verdicts included. Only when the story has a stage row, first writer wins;
+    # `bind: false` for a row that decided nothing (a refused dispatch's).
     insert = fn ->
       row = repo.insert!(record)
       if Map.get(attrs, :bind, true), do: bind_triage_dispatch(repo, row)

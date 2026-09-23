@@ -1463,6 +1463,43 @@ defmodule Loopctl.Delivery.StagesTest do
   defp escalation(:escalated), do: %{escalation_reason: "why"}
   defp escalation(_stage), do: %{}
 
+  describe "the triage binding fences every transition out of triaged (US-44.1)" do
+    test "a session dispatch that is not the bound one is refused triage_not_bound" do
+      {story, _row} = at_stage(:detected)
+      bound = Ecto.UUID.generate()
+
+      {:ok, _} =
+        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward},
+          claim_epoch: story.claim_epoch,
+          actor_label: "test",
+          effects: [triage_dispatch_id: bound]
+        )
+
+      opts = [
+        claim_epoch: story.claim_epoch,
+        actor_label: "runner:test",
+        actor_role: :agent,
+        actor_lineage: []
+      ]
+
+      assert {:error, :triage_not_bound} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 {:triaged, :queued, :forward},
+                 Keyword.put(opts, :session_dispatch, {Ecto.UUID.generate(), 0})
+               )
+
+      assert {:ok, %{stage: :queued}} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 {:triaged, :queued, :forward},
+                 Keyword.put(opts, :session_dispatch, {bound, 0})
+               )
+    end
+  end
+
   defp effect_value(:runner_id, tenant_id), do: fixture(:stage_runner, %{tenant_id: tenant_id}).id
   defp effect_value(effect, _tenant_id), do: Map.fetch!(@values, effect)
 

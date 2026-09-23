@@ -97,6 +97,10 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # matching what the HTTP surface answers for the same condition. Do not retry.
   def for_message(:audit_chain_append_failed), do: %{reason: "audit_chain_append_failed"}
 
+  # A transition out of `triaged` by a dispatch the story is not bound to (US-44.1): on the wire
+  # that is `stale_stage` — the story has left `detected` and this dispatch decides nothing.
+  def for_message(:triage_not_bound), do: %{reason: "stale_stage"}
+
   # Reasons whose atom IS the published code.
   #
   # `stale_stage`, `unknown_story_stage` and `effect_conflict` arrived with `stage` (1.4.0) and
