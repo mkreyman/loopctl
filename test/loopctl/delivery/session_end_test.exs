@@ -3,17 +3,18 @@ defmodule Loopctl.Delivery.SessionEndTest do
   US-44.3, contract 1.16.0: `Loopctl.Delivery.RunnerStages.end_session/3` — a runner's
   `session_ended` report, recorded once per dispatch and acted on by control.
 
-  The reasons whose action stays on the RLS `Loopctl.Repo` — `completed` and the two budget
-  kills — and every refusal are here, async, on one sandbox connection. `crashed` and
-  `usage_exhausted` release the CLAIM, which is an `AdminRepo` transaction, and the two sandbox
-  connections cannot see each other's rows; those are in `Loopctl.Delivery.SessionEndReleaseTest`
-  on committed rows.
+  `completed`, the budget kills' ESCALATION, and every refusal are here, async, on one sandbox
+  connection. Ending the CLAIM — what `crashed` and `usage_exhausted` do, and what a budget kill
+  does after it escalates — is an `AdminRepo` transaction, and the two sandbox connections
+  cannot see each other's rows (here the release finds no story and does nothing); those are in
+  `Loopctl.Delivery.SessionEndReleaseTest` on committed rows.
   """
 
   use Loopctl.DataCase, async: true
 
   import Ecto.Query
 
+  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerSessionEnded
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Delivery.RunnerStages
@@ -353,6 +354,78 @@ defmodule Loopctl.Delivery.SessionEndTest do
           session_ended_at: now
         )
       end
+    end
+
+    test "a count with NO reason at all is refused too: the CHECK never evaluates to NULL" do
+      # `NULL IN (...)` is NULL, and a CHECK that evaluates to NULL PASSES — so without the
+      # COALESCE a row with no session end could carry a counted flag. Raw SQL, because what
+      # is under test is the database, not anything a writer in `lib/` would do.
+      ctx = session(:implementing)
+
+      assert_raise Postgrex.Error, ~r/runner_dispatches_session_ended_counted/, fn ->
+        as_tenant(ctx.record.tenant_id, fn ->
+          Repo.query!(
+            "UPDATE runner_dispatches SET counts_toward_retry_ceiling = true WHERE id = $1",
+            [Ecto.UUID.dump!(ctx.record.id)]
+          )
+        end)
+      end
+    end
+  end
+
+  describe "the dispatch id is canonical before it is digested" do
+    test "a resend differing only in the id's CASING is the same report, answered ok" do
+      # The digest is taken over the CAST message, and the cast already writes every uuid in
+      # its one canonical form (`RunnerContract`'s `known_fields/2`). Pinned here because the
+      # digest is where losing that would bite: the same report, refused `already_recorded`
+      # for good.
+      ctx = session(:implementing)
+
+      cast = fn dispatch_id ->
+        {:ok, message} =
+          RunnerContract.cast_session_ended(%{
+            "dispatch_id" => dispatch_id,
+            "claim_epoch" => @epoch,
+            "reason" => "completed"
+          })
+
+        message
+      end
+
+      assert cast.(String.upcase(ctx.record.dispatch_id)).dispatch_id == ctx.record.dispatch_id
+
+      assert {:ok, %{replayed?: false}} =
+               RunnerStages.end_session(
+                 ctx.story.tenant_id,
+                 ctx.runner.id,
+                 cast.(ctx.record.dispatch_id)
+               )
+
+      assert {:ok, %{replayed?: true}} =
+               RunnerStages.end_session(
+                 ctx.story.tenant_id,
+                 ctx.runner.id,
+                 cast.(String.upcase(ctx.record.dispatch_id))
+               )
+    end
+  end
+
+  describe "a budget escalation that fails is a RETRY, never a refusal" do
+    test "nothing in its failure branch hands the reason to classify/1" do
+      # The record is committed before the escalation runs, so a PERMANENT refusal here leaves
+      # the row in flight with nothing to move it but the lease reclaim, which RE-QUEUES a story
+      # a budget kill must never retry. The branch is unreachable from a test (it needs a hash
+      # chain that refuses appends — see `Loopctl.Delivery.RunnerStagesTest`), so what is bound
+      # is the one thing that made it permanent: the function reaching `classify/1`.
+      source = File.read!("lib/loopctl/delivery/runner_stages.ex")
+      [_, from_head] = String.split(source, "defp take_budget_edge(", parts: 2)
+      [body | _] = String.split(from_head, "\n  defp ", parts: 2)
+
+      refute body =~ "classify(",
+             "take_budget_edge must answer a failed escalation as a retry (:busy), because the " <>
+               "resend is what re-drives it"
+
+      assert body =~ "{:error, :busy}"
     end
   end
 end

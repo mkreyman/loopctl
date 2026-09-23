@@ -226,8 +226,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   - `wall_clock_exceeded`, `max_turns_exceeded` — an in-flight story goes to `escalated` over
     `budget_reported`, a CONTROL-ONLY edge that is deliberately absent from
     `x-connection.stage_transitions`: a runner reports the kill, it cannot take the edge. The
-    session's slot goes back in that transition. Never retried — the same budget would kill it
-    again — and never `failed`, which has no way out.
+    session's slot goes back in that transition, and the claim it ran under ENDS, so the
+    escalated story is held by nobody. Never retried — the same budget would kill it again —
+    and never `failed`, which has no way out.
   - `crashed` — the claim is released NOW, as a lease reclaim would release it later: the
     story goes back to `queued` over `runner_lost` and the slot goes back.
   - `usage_exhausted` — released the same way, and NOT counted as an attempt against the
@@ -2163,8 +2164,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, " <>
             "not a request — control decides the story's next stage from `reason`: " <>
             "`completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` " <>
-            "escalate an in-flight story over the control-only `budget_reported` edge, " <>
-            "`crashed` releases the claim at once over `runner_lost`, and `usage_exhausted` " <>
+            "escalate an in-flight story over the control-only `budget_reported` edge and " <>
+            "end its claim, `crashed` releases the claim at once over `runner_lost`, and `usage_exhausted` " <>
             "releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: " <>
             "a byte-identical resend is answered `ok` with the row even after the release it " <>
             "caused moved the claim epoch on, and a different `reason` is `already_recorded`.",

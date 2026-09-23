@@ -635,17 +635,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   @spec held_story(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, Ecto.UUID.t()} | {:error, :unknown_dispatch}
   def held_story(tenant_id, runner_id, dispatch_id) do
-    {:ok, story_id} =
-      in_tenant(tenant_id, fn ->
-        Repo.one(
-          from r in DispatchRecord,
-            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
-            where: r.dispatch_id == ^dispatch_id,
-            select: r.story_id
-        )
-      end)
+    {:ok, held} = in_tenant(tenant_id, fn -> held(tenant_id, runner_id, dispatch_id) end)
 
-    if story_id, do: {:ok, story_id}, else: {:error, :unknown_dispatch}
+    with {:ok, %DispatchRecord{story_id: story_id}} <- held, do: {:ok, story_id}
   end
 
   @doc """
@@ -654,12 +646,15 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   `attrs` carries what the caller derived from the message: `:reason`, `:digest` (the canonical
   digest of the whole message) and `:counts_toward_retry_ceiling` (`nil` for a reason that
-  releases nothing). Returns `{:ok, {:recorded | :replayed, session}}`, where `session` is the
-  map `accepted_session/3` returns.
+  re-queues nothing) — and `:story_id`, the dispatch's story as `held_story/3` returned it, so
+  the story's lock can be taken first without reading the dispatch row twice. A row whose
+  story is not that one is `:unknown_dispatch`. Returns
+  `{:ok, {:recorded | :replayed, session}}`, where `session` is the map `accepted_session/3`
+  returns.
 
   ## THE DIGEST IS COMPARED BEFORE THE EPOCH FENCE, and that order is the feature
 
-  A `crashed` or `usage_exhausted` report RELEASES THE CLAIM, which bumps the story's
+  Every report but `completed` ENDS THE CLAIM, which bumps the story's
   `claim_epoch`. An honest resend of it — its acknowledgement lost to a rolling deploy — then
   presents an epoch the fence would refuse, and `stale_claim_epoch` is published as permanent:
   the runner would be told its own report was refused when it was the report that moved the
@@ -700,7 +695,8 @@ defmodule Loopctl.Runners.DispatchLedger do
     context = %{operation: :record_session_end, dispatch_id: message.dispatch_id, run_id: nil}
 
     runner_write(tenant_id, runner_id, context, fn ->
-      with {:ok, record, current} <- lock_for_session_end(tenant_id, runner_id, message) do
+      with {:ok, record, current} <-
+             lock_for_session_end(tenant_id, runner_id, message, attrs.story_id) do
         session_end(record, message, attrs, current)
       end
     end)
@@ -708,13 +704,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   # The lock order of `fence_then_lock/3` — the story's row under a share lock, then the
-  # dispatch's — but with the fence DEFERRED: the caller compares the digest first.
-  defp lock_for_session_end(tenant_id, runner_id, message) do
-    with {:ok, %DispatchRecord{story_id: story_id}} <-
-           held(tenant_id, runner_id, message.dispatch_id),
-         current = current_claim_epoch(tenant_id, story_id),
-         {:ok, record} <- held(tenant_id, runner_id, message.dispatch_id, true) do
-      {:ok, record, current}
+  # dispatch's — but with the fence DEFERRED: the caller compares the digest first. The story
+  # is the caller's (`held_story/3` read it; a row's `story_id` never changes), checked against
+  # the locked row rather than read from it a second time.
+  defp lock_for_session_end(tenant_id, runner_id, message, story_id) do
+    current = current_claim_epoch(tenant_id, story_id)
+
+    case held(tenant_id, runner_id, message.dispatch_id, true) do
+      {:ok, %DispatchRecord{story_id: ^story_id} = record} -> {:ok, record, current}
+      {:ok, %DispatchRecord{}} -> {:error, :unknown_dispatch}
+      {:error, :unknown_dispatch} = refused -> refused
     end
   end
 

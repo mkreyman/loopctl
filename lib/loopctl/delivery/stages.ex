@@ -991,7 +991,7 @@ defmodule Loopctl.Delivery.Stages do
   What happens to the row:
 
   - in flight (`StageMachine.in_flight_stages/0`) — back to `queued` over `edge`, bound to
-    `new_epoch`, the edge counted in `attempts`, and the identities the released holder
+    `new_epoch`, the edge counted in `attempts` unless `counted?: false`, and the identities the released holder
     held cleared (`StageMachine.clears/3`). Recorded as `transitioned`.
   - any other stage except `done` and `failed` — the stage stays and the row is rebound to
     `new_epoch`, recorded as `rebound`. The effect a merged or deployed story already had
@@ -1014,6 +1014,8 @@ defmodule Loopctl.Delivery.Stages do
   ## Options
 
   - `:actor_label` — recorded on the event
+  - `:counted?` — `false` for a release that is NOT an attempt: a session whose account ran dry
+    (`usage_exhausted`) never had its work judged. Defaults to `true`.
   """
   @spec follow_release(
           Ecto.UUID.t(),
@@ -1084,7 +1086,13 @@ defmodule Loopctl.Delivery.Stages do
 
     {1, [updated]} =
       from(s in StoryStage, where: s.id == ^row.id and s.tenant_id == ^row.tenant_id, select: s)
-      |> transition_update(from, :queued, edge, claim_epoch: new_epoch)
+      |> transition_update(
+        from,
+        :queued,
+        edge,
+        [claim_epoch: new_epoch],
+        Keyword.get(opts, :counted?, true)
+      )
       |> AdminRepo.update_all([])
 
     insert_event(AdminRepo, updated, "transitioned", from, edge, opts[:actor_label], %{
@@ -1120,13 +1128,13 @@ defmodule Loopctl.Delivery.Stages do
 
   # The one UPDATE every transition writes, on either repo: the new stage, the identities the
   # edge clears, `attempts` counted in SQL (never read-modify-write), and `lock_version`.
-  defp transition_update(query, from, to, edge, extra) do
+  defp transition_update(query, from, to, edge, extra, counted? \\ true) do
     clears = Enum.map(StageMachine.clears(from, to, edge), &{&1, nil})
     set = [stage: to, updated_at: DateTime.utc_now()] ++ clears ++ extra
 
     query = update(query, set: ^set, inc: [lock_version: 1])
 
-    if StageMachine.counted?(edge) do
+    if counted? and StageMachine.counted?(edge) do
       name = Atom.to_string(edge)
 
       update(query, [s],

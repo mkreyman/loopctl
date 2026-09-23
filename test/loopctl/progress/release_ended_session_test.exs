@@ -1,7 +1,7 @@
 defmodule Loopctl.Progress.ReleaseEndedSessionTest do
   @moduledoc """
-  US-44.3: `Progress.release_ended_session/4` — the release a runner's `crashed` or
-  `usage_exhausted` report causes. It is the lease reclaim with the lease taken out of the
+  US-44.3: `Progress.release_ended_session/4` — the release a runner's `crashed`,
+  `usage_exhausted` or budget-kill report causes. It is the lease reclaim with the lease taken out of the
   question: the same release, the same `:runner_lost` stage edge, and the same audit entry,
   written by the one private builder both call.
 
@@ -22,6 +22,9 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
 
   setup :verify_on_exit!
 
+  # The runner's key the entry is attributed to. Any id: the audit row does not join it.
+  @actor_id Ecto.UUID.generate()
+
   # A claim with most of its 24h lease left and its stage row in flight — the state a crash
   # report arrives in, and the one a lease reclaim could not touch for another day.
   defp claimed_at(stage) do
@@ -36,7 +39,8 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
         tenant_id: tenant.id,
         story_id: story.id,
         stage: stage,
-        claim_epoch: claimed.claim_epoch
+        claim_epoch: claimed.claim_epoch,
+        escalation_reason: if(stage == :escalated, do: "session_ended:wall_clock_exceeded")
       })
 
     %{tenant_id: tenant.id, story: claimed, row: row}
@@ -48,6 +52,7 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
       ctx.story.id,
       epoch || ctx.story.claim_epoch,
       session_reason: reason,
+      actor_id: @actor_id,
       actor_label: "runner:test"
     )
   end
@@ -100,9 +105,14 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     [ours] = audit_entries(crashed.story)
     [reclaim] = audit_entries(expired.story)
 
-    for field <- [:entity_type, :actor_type, :actor_id] do
-      assert Map.fetch!(ours, field) == Map.fetch!(reclaim, field), inspect(field)
-    end
+    assert ours.entity_type == reclaim.entity_type
+
+    # The ACTOR is the one thing that is not the reclaim's: a worker timed that lease out, and
+    # this claim was ended by the runner's message, so the entry names the runner's key.
+    assert reclaim.actor_type == "system"
+    assert reclaim.actor_id == nil
+    assert ours.actor_type == "api_key"
+    assert ours.actor_id == @actor_id
 
     assert Map.keys(ours.old_state) == Map.keys(reclaim.old_state)
     assert ours.old_state["agent_status"] == "assigned"
@@ -147,11 +157,31 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     assert AdminRepo.get!(Story, in_review.story.id).agent_status in [:assigned, :implementing]
   end
 
-  test "only the two reasons that release a claim are accepted" do
+  test "a session that COMPLETED releases nothing through here" do
     ctx = claimed_at(:implementing)
 
     assert_raise ArgumentError, fn -> release(ctx, "completed") end
     assert AdminRepo.get!(Story, ctx.story.id).claim_epoch == ctx.story.claim_epoch
+  end
+
+  test "a budget kill ends the claim and leaves its ESCALATED row escalated, only rebound" do
+    # What `RunnerStages.end_session/3` leaves before it calls this: the row already escalated
+    # over `budget_reported`. Ending the claim must never re-queue a story a budget stopped.
+    ctx = claimed_at(:escalated)
+
+    assert {:ok, released} = release(ctx, "wall_clock_exceeded")
+
+    assert released.agent_status == :pending
+    assert released.claim_epoch == ctx.story.claim_epoch + 1
+
+    row = AdminRepo.get!(StoryStage, ctx.row.id)
+    assert row.stage == :escalated
+    assert row.claim_epoch == released.claim_epoch
+    assert row.attempts == ctx.row.attempts
+
+    assert [entry] = audit_entries(ctx.story)
+    assert entry.action == "claim_session_ended"
+    assert entry.new_state["session_ended_reason"] == "wall_clock_exceeded"
   end
 
   test "tenant isolation: another tenant's id cannot release the story" do
@@ -161,6 +191,7 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     assert {:error, :not_found} =
              Progress.release_ended_session(other.id, ctx.story.id, ctx.story.claim_epoch,
                session_reason: "crashed",
+               actor_id: @actor_id,
                actor_label: "runner:test"
              )
 

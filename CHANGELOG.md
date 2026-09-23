@@ -12,10 +12,12 @@ All notable changes to loopctl are documented here.
   claim_epoch, reason}`, `reason` one of `completed`, `wall_clock_exceeded`,
   `max_turns_exceeded`, `usage_exhausted`, `crashed`. A budget kill (the first two after
   `completed`) moves an in-flight story to `escalated` over a new CONTROL-ONLY edge,
-  `budget_reported` — never retried, never `failed` — and frees the runner's slot. `crashed`
-  releases the claim at once over `runner_lost`, audited as `claim_session_ended` (the lease
-  reclaim's entry shape, with `new_state.session_ended_reason`), and `usage_exhausted` releases
-  the same way. `completed` changes no stage. Recorded once per dispatch in four new
+  `budget_reported` — never retried, never `failed` — frees the runner's slot, and ends the
+  claim, leaving the escalated story held by nobody. `crashed` releases the claim at once over
+  `runner_lost`, and `usage_exhausted` releases it the same way without counting an attempt on
+  the stage row. Every one of those claim ends is audited as `claim_session_ended` (the lease
+  reclaim's entry shape, with `new_state.session_ended_reason`, attributed to the runner's API
+  key). `completed` changes no stage. Recorded once per dispatch in four new
   `runner_dispatches` columns (`session_ended_reason`, `session_ended_digest`,
   `session_ended_at`, `counts_toward_retry_ceiling` — migration, no manual step, NULL for
   existing rows); an identical resend is answered `ok`, a different reason `already_recorded`.

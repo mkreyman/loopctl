@@ -464,7 +464,7 @@
       "type": "object"
     },
     "RunnerSessionEnded": {
-      "description": "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0). Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, not a request — control decides the story's next stage from `reason`: `completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` escalate an in-flight story over the control-only `budget_reported` edge, `crashed` releases the claim at once over `runner_lost`, and `usage_exhausted` releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: a byte-identical resend is answered `ok` with the row even after the release it caused moved the claim epoch on, and a different `reason` is `already_recorded`.",
+      "description": "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0). Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, not a request — control decides the story's next stage from `reason`: `completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` escalate an in-flight story over the control-only `budget_reported` edge and end its claim, `crashed` releases the claim at once over `runner_lost`, and `usage_exhausted` releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: a byte-identical resend is answered `ok` with the row even after the release it caused moved the claim epoch on, and a different `reason` is `already_recorded`.",
       "properties": {
         "claim_epoch": {
           "description": "The `claim_epoch` of the dispatch, echoed.",

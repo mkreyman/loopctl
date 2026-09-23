@@ -1618,16 +1618,19 @@ defmodule Loopctl.Progress do
       held?: &lease_expired?(&1, expected_epoch, now),
       not_held: :claim_not_expired,
       action: "claim_lease_expired",
+      actor_type: "system",
+      actor_id: nil,
       actor_label: "worker:reclaim_expired_claims",
       webhook_reason: "claim_lease_expired",
-      new_state: %{}
+      new_state: %{},
+      counted?: true
     })
   end
 
   @doc """
-  Releases a claim whose runner REPORTED that its session ended — `crashed` or
-  `usage_exhausted` in a `session_ended` message (US-44.3, runner contract 1.16.0) — without
-  waiting for the lease.
+  Releases a claim whose runner REPORTED that its session ended — `crashed`,
+  `usage_exhausted` or a budget kill (`wall_clock_exceeded`, `max_turns_exceeded`) in a
+  `session_ended` message (US-44.3, runner contract 1.16.0) — without waiting for the lease.
 
   It is `reclaim_expired_claim/3` with the lease taken out of the question and nothing else
   changed: the same release (`release_claim_changes/1` — back to `:pending`, assignment
@@ -1637,7 +1640,16 @@ defmodule Loopctl.Progress do
   the one private function both call. What differs is only what is TRUE: the entry's `action`
   is `claim_session_ended`, not `claim_lease_expired`, because no lease expired, and its
   `new_state` names the reported reason, because a crash and an exhausted subscription are
-  different things to an operator reading the log.
+  different things to an operator reading the log. The entry is attributed to the runner's
+  credential — `actor_type` `"api_key"`, `actor_id` the runner's key (`:actor_id`) — because
+  its label names the runner and it was the runner's message that ended the claim; the
+  reclaim's `"system"` is true only of the worker that times a lease out.
+
+  What the stage row does is `follow_release/5`'s rule, unchanged: an in-flight row goes back
+  to `queued` — counted in its `attempts` for `crashed`, NOT for `usage_exhausted`, whose work
+  was never judged — and a row elsewhere is only rebound to the new epoch. A budget kill's row
+  has already been escalated by then (`Loopctl.Delivery.RunnerStages.end_session/3` escalates
+  first), so it stays `escalated`: ending the claim never re-queues a story the budget stopped.
 
   THE CLAIM MUST BE THE ONE THE SESSION RAN UNDER: held (`:assigned` or `:implementing`), at
   exactly `expected_epoch` — the reporting dispatch's own — and not handed to review. Anything
@@ -1661,9 +1673,11 @@ defmodule Loopctl.Progress do
     session_reason = Keyword.fetch!(opts, :session_reason)
     actor_label = Keyword.fetch!(opts, :actor_label)
 
-    unless session_reason in ~w(crashed usage_exhausted) do
+    actor_id = Keyword.fetch!(opts, :actor_id)
+
+    unless session_reason in ~w(crashed usage_exhausted wall_clock_exceeded max_turns_exceeded) do
       raise ArgumentError,
-            "release_ended_session/4 releases for crashed or usage_exhausted, " <>
+            "release_ended_session/4 releases for a session that ended without completing, " <>
               "not #{inspect(session_reason)}"
     end
 
@@ -1676,9 +1690,12 @@ defmodule Loopctl.Progress do
       held?: &claim_held_at?(&1, expected_epoch),
       not_held: :claim_not_held,
       action: "claim_session_ended",
+      actor_type: "api_key",
+      actor_id: actor_id,
       actor_label: actor_label,
       webhook_reason: "session_ended:" <> session_reason,
-      new_state: %{"session_ended_reason" => session_reason}
+      new_state: %{"session_ended_reason" => session_reason},
+      counted?: session_reason != "usage_exhausted"
     })
   end
 
@@ -1687,8 +1704,9 @@ defmodule Loopctl.Progress do
   # row following in the same transaction, one audit entry and one webhook. `spec` carries
   # only what differs between them — the gate run first (`gate`, a `{:ok, _} | {:error, _}`
   # thunk), the predicate the locked story must satisfy (`held?`) and the refusal when it does
-  # not (`not_held`), the action, the actor, the webhook's reason, and any keys the audit entry
-  # adds to `new_state` on top of the ones every release records.
+  # not (`not_held`), the action, the actor, the webhook's reason, any keys the audit entry
+  # adds to `new_state` on top of the ones every release records, and whether a requeue of the
+  # stage row is an attempt (`counted?`).
   defp runner_lost_release(tenant_id, story_id, spec) do
     Multi.new()
     |> Multi.run(:gate, fn _repo, _changes -> spec.gate.() end)
@@ -1706,7 +1724,8 @@ defmodule Loopctl.Progress do
     # would be refused on every advance with nothing able to move it.
     |> Multi.run(:stage, fn _repo, %{story: updated} ->
       Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
-        actor_label: spec.actor_label
+        actor_label: spec.actor_label,
+        counted?: spec.counted?
       )
     end)
     |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
@@ -1715,8 +1734,8 @@ defmodule Loopctl.Progress do
         entity_type: "story",
         entity_id: updated.id,
         action: spec.action,
-        actor_type: "system",
-        actor_id: nil,
+        actor_type: spec.actor_type,
+        actor_id: spec.actor_id,
         actor_label: spec.actor_label,
         old_state: %{
           "agent_status" => to_string(old.agent_status),
@@ -1751,8 +1770,11 @@ defmodule Loopctl.Progress do
     |> AdminRepo.transaction()
     |> case do
       {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, step, reason, _} when step in [:gate, :lock, :validate] -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
+      # EVERY step, not the four this used to name: a refusal at `:stage`, `:audit` or
+      # `:webhook_events` raised `CaseClauseError`, which on the session-end path is inside the
+      # runner channel's process. Each step's error is already the caller's reason — an atom, or
+      # the changeset `:story` or `:audit` refused.
+      {:error, _step, reason, _changes} -> {:error, reason}
     end
   end
 

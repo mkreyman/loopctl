@@ -1,7 +1,8 @@
 defmodule Loopctl.Delivery.SessionEndReleaseTest do
   @moduledoc """
-  US-44.3: the two `session_ended` reasons that RELEASE THE CLAIM — `crashed` and
-  `usage_exhausted` — end to end through `Loopctl.Delivery.RunnerStages.end_session/3`.
+  US-44.3: the `session_ended` reasons that END THE CLAIM — `crashed` and `usage_exhausted`,
+  which re-queue the story, and the budget kills, which escalate it first — end to end through
+  `Loopctl.Delivery.RunnerStages.end_session/3`.
 
   `async: false`, and COMMITTED rather than sandboxed, for the reason
   `Loopctl.Delivery.PlacementTest` gives: the path spans BOTH repos. The report is recorded on
@@ -136,12 +137,14 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
     assert row.attempts == %{"runner_lost" => 1}
     assert requeues(ctx) == [{"implementing", "queued", "runner_lost"}]
 
-    # The reclaim's audit shape, naming the report rather than a lease that did not expire.
-    assert [%AuditLog{actor_type: "system", actor_label: label, new_state: new_state}] =
+    # The reclaim's audit shape, naming the report rather than a lease that did not expire —
+    # and attributed to the runner's KEY, the principal the label names.
+    assert [%AuditLog{actor_type: "api_key", actor_id: actor_id, actor_label: label} = entry] =
              releases(ctx)
 
+    assert actor_id == ctx.runner.api_key_id
     assert label == "runner:" <> ctx.runner.id
-    assert new_state["session_ended_reason"] == "crashed"
+    assert entry.new_state["session_ended_reason"] == "crashed"
 
     # The claim the session ran under has ended, so its slot goes back now rather than at the
     # heal sweep — and a crash IS an attempt against the retry ceiling.
@@ -169,6 +172,10 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
     assert {:ok, %{row: row}} = end_session(ctx, "usage_exhausted")
 
     assert row.stage == :queued
+    # Re-queued over the same edge a crash takes, and NOT counted on the row: the work was
+    # never judged, so it must not spend an attempt.
+    assert requeues(ctx) == [{"implementing", "queued", "runner_lost"}]
+    assert row.attempts == %{}
     assert story(ctx).agent_status == :pending
     assert [%AuditLog{new_state: %{"session_ended_reason" => "usage_exhausted"}}] = releases(ctx)
 
@@ -193,6 +200,41 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
     assert unboxed(fn -> Stages.get(ctx.tenant_id, ctx.story.id) end).stage == :queued
   end
 
+  describe "a budget kill (AC-44.3.3)" do
+    test "escalates the story, then ENDS its claim as the session end, never re-queueing it",
+         ctx do
+      assert {:ok, %{row: row, replayed?: false}} = end_session(ctx, "wall_clock_exceeded")
+
+      released = story(ctx)
+      assert released.agent_status == :pending
+      assert released.assigned_agent_id == nil
+      assert released.claim_epoch == ctx.story.claim_epoch + 1
+
+      # Escalated and STAYS escalated: the release only rebinds it to the new epoch.
+      assert row.stage == :escalated
+      assert row.claim_epoch == released.claim_epoch
+      assert row.attempts == %{"budget_reported" => 1}
+      assert requeues(ctx) == [{"implementing", "escalated", "budget_reported"}]
+
+      # Audited as the session end it was, not as a lease that expired a day later.
+      assert [%AuditLog{actor_type: "api_key", new_state: new_state}] = releases(ctx)
+      assert new_state["session_ended_reason"] == "wall_clock_exceeded"
+
+      assert runner_in_flight(ctx) == 0
+      assert ledger(ctx).counts_toward_retry_ceiling == nil
+    end
+
+    test "a resend escalates nothing and ends nothing twice", ctx do
+      assert {:ok, %{row: first}} = end_session(ctx, "max_turns_exceeded")
+      assert {:ok, %{row: again, replayed?: true}} = end_session(ctx, "max_turns_exceeded")
+
+      assert again.lock_version == first.lock_version
+      assert length(releases(ctx)) == 1
+      assert length(requeues(ctx)) == 1
+      assert story(ctx).claim_epoch == ctx.story.claim_epoch + 1
+    end
+  end
+
   describe "the record comes first, and a resend RE-DRIVES the action" do
     # What a node dying between the two writes leaves: the report is on the ledger row and the
     # release never ran. Written here the way `end_session/3` writes it, so the resend meets
@@ -208,7 +250,8 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
         DispatchLedger.record_session_end(ctx.tenant_id, ctx.runner.id, message, %{
           reason: reason,
           digest: TriageVerdictRecord.digest(message),
-          counts_toward_retry_ceiling: true
+          counts_toward_retry_ceiling: Map.get(%{"crashed" => true}, reason),
+          story_id: ctx.story.id
         })
       end)
     end
@@ -223,6 +266,46 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
       assert story(ctx).agent_status == :pending
       assert length(releases(ctx)) == 1
       assert runner_in_flight(ctx) == 0
+    end
+
+    test "a recorded budget kill that escalated nothing is escalated and ended by the resend",
+         ctx do
+      # What a permanent-looking failure of the escalation used to strand: the report on the
+      # ledger, the row still in flight, the claim still held. The resend is the only way the
+      # work completes, which is why that failure is now answered as a retry.
+      assert {:ok, {:recorded, _session}} = record_only(ctx, "wall_clock_exceeded")
+
+      assert {:ok, %{row: row, replayed?: true}} = end_session(ctx, "wall_clock_exceeded")
+
+      assert row.stage == :escalated
+      assert story(ctx).agent_status == :pending
+      assert length(releases(ctx)) == 1
+      assert requeues(ctx) == [{"implementing", "escalated", "budget_reported"}]
+    end
+
+    test "an escalation that landed without its release is released once by the resend", ctx do
+      assert {:ok, {:recorded, session}} = record_only(ctx, "wall_clock_exceeded")
+
+      {:ok, _escalated} =
+        unboxed(fn ->
+          Stages.advance(
+            ctx.tenant_id,
+            ctx.story.id,
+            {:implementing, :escalated, :budget_reported},
+            claim_epoch: ctx.record.claim_epoch,
+            reason: "session_ended:wall_clock_exceeded",
+            actor_role: :agent,
+            actor_lineage: [],
+            session_dispatch: {ctx.record.dispatch_id, session.slot_generation}
+          )
+        end)
+
+      assert {:ok, %{row: row, replayed?: true}} = end_session(ctx, "wall_clock_exceeded")
+
+      assert row.stage == :escalated
+      assert row.attempts == %{"budget_reported" => 1}
+      assert story(ctx).agent_status == :pending
+      assert length(releases(ctx)) == 1
     end
 
     test "and never releases a claim that ended some other way in between", ctx do

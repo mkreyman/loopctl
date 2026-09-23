@@ -38,7 +38,7 @@ defmodule Loopctl.Runners.DispatchRecord do
   `session_ended_reason` is the runner's own account of why the session under this dispatch
   stopped, recorded once. `session_ended_digest` decides whether a later copy is the SAME
   report (answered `ok`) or a different one (refused `already_recorded`), and
-  `counts_toward_retry_ceiling` says, for the two reasons that release the claim, whether
+  `counts_toward_retry_ceiling` says, for the two reasons that re-queue the story, whether
   that release is spent against the retry ceiling — `crashed` is, `usage_exhausted` is not.
 
   ## Trust boundary

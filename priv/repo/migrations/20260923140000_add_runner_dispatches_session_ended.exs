@@ -12,15 +12,16 @@ defmodule Loopctl.Repo.Migrations.AddRunnerDispatchesSessionEnded do
     which it is. It is compared BEFORE the claim-epoch fence, because a `crashed` report bumps
     the epoch and an honest resend of it must still be answered `ok`.
   - `session_ended_at` — when the FIRST copy was recorded.
-  - `counts_toward_retry_ceiling` — for the two reasons that release the claim, whether that
+  - `counts_toward_retry_ceiling` — for the two reasons that re-queue the story, whether that
     release is spent against the retry ceiling (US-44.4 builds the ceiling). `crashed` is a
     counted attempt; `usage_exhausted` is not, because the subscription ran out and the work
-    was never judged. NULL for every reason that releases nothing.
+    was never judged. NULL for every other reason — a budget kill ends the claim too, but its
+    story is escalated, never retried.
 
   All four are set together or not at all, and the CHECKs hold that at the database, so a
   writer that bypassed `Loopctl.Runners.DispatchLedger` cannot leave a digest with no reason
   (which would refuse every resend `already_recorded` against nothing) or a counted flag on a
-  report that released nothing.
+  report that re-queued nothing, or on no report at all.
 
   No backfill and no manual step: every existing row starts NULL, which reads as "no session
   end reported", exactly what those rows are. Additive and nullable, so an old instance still
@@ -55,11 +56,13 @@ defmodule Loopctl.Repo.Migrations.AddRunnerDispatchesSessionEnded do
       )
     """)
 
+    # COALESCE, because `NULL IN (...)` is NULL and a CHECK that evaluates NULL PASSES: without
+    # it a row with no reason could carry a counted flag, which is exactly what this forbids.
     execute("""
     ALTER TABLE runner_dispatches
       ADD CONSTRAINT runner_dispatches_session_ended_counted
       CHECK (
-        (session_ended_reason IN (#{quoted(@releasing)}))
+        COALESCE(session_ended_reason IN (#{quoted(@releasing)}), false)
           = (counts_toward_retry_ceiling IS NOT NULL)
       )
     """)
