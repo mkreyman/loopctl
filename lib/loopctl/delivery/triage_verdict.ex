@@ -85,6 +85,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   require Logger
 
   alias Loopctl.Audit
+  alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.InjectionDetector
   alias Loopctl.Delivery.StageMachine
@@ -92,6 +93,10 @@ defmodule Loopctl.Delivery.TriageVerdict do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Delivery.Untrusted
+  alias Loopctl.DeliveryGates
+  alias Loopctl.DeliveryGates.GateA
+  alias Loopctl.DeliveryGates.GateB
+  alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.WorkBreakdown.Story
@@ -389,7 +394,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   defp apply_verdict(tenant_id, runner_id, session, message, transitions) do
     case apply_draft(tenant_id, session, message) do
       :ok ->
-        advance_all(tenant_id, runner_id, session, message, transitions, nil)
+        advance_screened(tenant_id, runner_id, session, message, transitions)
 
       # OUTSIDE the transaction the draft was written in. `Audit.create_log_entry/2` writes on
       # `AdminRepo` — a different pool, three connections wide — and a checkout timeout there
@@ -398,7 +403,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
       # audit row is a record OF a committed write, so it belongs after the commit.
       {:drafted, story} ->
         log_draft(tenant_id, story)
-        advance_all(tenant_id, runner_id, session, message, transitions, nil)
+        advance_screened(tenant_id, runner_id, session, message, transitions)
 
       # A DRAFT LOOPCTL CANNOT DISPATCH IS ESCALATED, NOT QUEUED, and the story keeps the stub
       # row it already had. The caps a stored story is judged against are the contract's own
@@ -772,6 +777,89 @@ defmodule Loopctl.Delivery.TriageVerdict do
   end
 
   defp drafted_criteria(_draft), do: []
+
+  # BOTH GATES, OVER THE PREDICTION, BEFORE ANYTHING IS SPENT (epic 44, US-44.2). Design §5
+  # runs the gates twice; until this only the merge run existed, so with the driver on a story
+  # the gates were certain to refuse was implemented first and refused after. The screen can
+  # only ADD an escalation, and it KEEPS the draft: a human who re-queues the story gets the
+  # drafted story, not the stub. Deterministic over the message and the trigger config, so a
+  # replayed verdict reaches the same answer.
+  defp advance_screened(tenant_id, runner_id, session, message, transitions) do
+    case screen(tenant_id, session, message) do
+      [] ->
+        advance_all(tenant_id, runner_id, session, message, transitions, nil)
+
+      reasons ->
+        Logger.warning(
+          "triage verdict refused by the gate screen, escalating instead of queueing: " <>
+            "story_id=#{session.story_id} reasons=#{inspect(Enum.take(reasons, 5))}",
+          tenant_id: tenant_id,
+          story_id: session.story_id
+        )
+
+        advance_all(
+          tenant_id,
+          runner_id,
+          session,
+          message,
+          [@triaged, {:triaged, :escalated, :triage_escalate}],
+          {"triage_verdict:gate_screen", %{"gate_screen" => Enum.map(reasons, &inspect/1)}}
+        )
+    end
+  end
+
+  # Only a `story` outcome is about to be queued; the other routes already stop for a person
+  # or close the report.
+  defp screen(tenant_id, session, %{verdict: %{outcome: "story"} = verdict} = message) do
+    gate_a_screen(Map.get(message, :lens_verdicts)) ++
+      gate_b_screen(tenant_id, session, verdict)
+  end
+
+  defp screen(_tenant_id, _session, _message), do: []
+
+  # A verdict without lens verdicts cannot be judged by Gate A, and the merge run would refuse
+  # it for the same reason, so queueing it would spend an implementation on a certain refusal.
+  defp gate_a_screen(nil), do: [{:gate_a, :gate_a_inputs_missing}]
+
+  defp gate_a_screen(lens_verdicts) do
+    case lens_verdicts |> lens_map() |> GateAInput.outputs() |> GateA.evaluate() do
+      %GateA.Result{decision: :escalate, reasons: reasons} -> Enum.map(reasons, &{:gate_a, &1})
+      %GateA.Result{verdict: :story} -> []
+      %GateA.Result{verdict: verdict} -> [{:trio_verdict, verdict}]
+    end
+  end
+
+  defp gate_b_screen(tenant_id, session, verdict) do
+    touches = get_in(verdict, [:story, :touches]) || []
+
+    case repo_for_story(tenant_id, session.story_id) do
+      {:ok, repo} -> GateB.triage_screen(DeliveryGates.load_triggers(), repo, touches)
+      {:error, reason} -> [{:repository_unresolved, reason}]
+    end
+  end
+
+  # The story's repository, as `MergePrecondition.repo_for_story/1` resolves it — the project's
+  # one live intake source — but read on `Loopctl.Repo` under `with_tenant/2`, like every other
+  # read this module makes (`intake_sources` is RLS-scoped), rather than through `Intake`'s
+  # AdminRepo pool. Exactly one live source, or the screen cannot say which triggers apply and
+  # fails closed, as the merge run does.
+  defp repo_for_story(tenant_id, story_id) do
+    in_tenant(tenant_id, fn ->
+      Repo.all(
+        from src in Source,
+          join: s in Story,
+          on: s.project_id == src.project_id and s.tenant_id == src.tenant_id,
+          where: s.id == ^story_id and s.tenant_id == ^tenant_id and is_nil(src.revoked_at),
+          select: src.repo_full_name
+      )
+    end)
+    |> case do
+      [repo] -> {:ok, repo}
+      [] -> {:error, :no_intake_source}
+      repos when is_list(repos) -> {:error, {:ambiguous_intake_source, length(repos)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp advance_all(_tenant_id, _runner_id, _session, _message, [], _reason), do: :ok
 

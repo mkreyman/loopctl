@@ -101,6 +101,37 @@ defmodule Loopctl.DeliveryGates.GateB do
   end
 
   @doc """
+  The TRIAGE SCREEN (epic 44, US-44.2): Gate B's trigger matching over a triage session's
+  PREDICTED touches, before a story is queued. `[]` means nothing guarded was predicted.
+
+  Not `evaluate(:triage, …)`, which would escalate every story: that adds a stale-trigger
+  reason without the repository's file list, and a missing-files reason for a draft that
+  predicted none — neither of which triage can supply. So this is deliberately narrower. It
+  can only ADD an escalation, on a POSITIVE signal: a predicted touch matching a `human_paths`
+  or `effect_paths` trigger (an effect path cannot be proved before a diff exists), or
+  trigger configuration that cannot be read for the repository, which fails closed exactly as
+  the merge run does. The merge run remains the gate.
+  """
+  @spec triage_screen(term(), term(), [String.t()]) :: [term()]
+  def triage_screen(triggers, repo, touches) when is_list(touches) do
+    case repo_triggers(triggers, repo) do
+      {:ok, repo_triggers} ->
+        human =
+          for {file, pattern} <- matches(repo_triggers.human_paths, touches),
+              do: {:human_path, file, pattern}
+
+        effect =
+          for {file, pattern} <- matches(repo_triggers.effect_paths, touches),
+              do: {:effect_path, file, pattern}
+
+        human ++ effect
+
+      {:escalate, reason} ->
+        [reason]
+    end
+  end
+
+  @doc """
   Judges an effect proof: the fixture set regenerated against the change, compared with the
   baseline.
 

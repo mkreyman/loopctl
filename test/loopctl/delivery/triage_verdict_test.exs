@@ -46,6 +46,16 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     story = fixture(:stage_story, %{claim_epoch: @epoch, agent_status: :implementing})
     runner = fixture(:stage_runner, %{tenant_id: story.tenant_id})
 
+    # The project's repository, which the triage gate screen (US-44.2) resolves its triggers
+    # by. `acme/widgets` is the repository config/test.exs's synthetic trigger document names.
+    unless Keyword.get(opts, :no_intake_source, false) do
+      fixture(:intake_record, %{
+        tenant_id: story.tenant_id,
+        project_id: story.project_id,
+        repo_full_name: "acme/widgets"
+      })
+    end
+
     fixture(:story_stage, %{
       tenant_id: story.tenant_id,
       story_id: story.id,
@@ -64,8 +74,41 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     %{story: story, runner: runner, record: record}
   end
 
+  # A `story` verdict carries three unanimous lens verdicts, as a 1.15.0 runner sends, so the
+  # triage gate screen (US-44.2) passes it; tests about the screen build their own.
   defp verdict_message(record, verdict) do
-    %{dispatch_id: record.dispatch_id, claim_epoch: record.claim_epoch, verdict: verdict}
+    message = %{
+      dispatch_id: record.dispatch_id,
+      claim_epoch: record.claim_epoch,
+      verdict: verdict
+    }
+
+    if Map.get(verdict, :outcome) == "story",
+      do: Map.put(message, :lens_verdicts, lens_verdicts("story", "story", "story")),
+      else: message
+  end
+
+  defp lens_verdicts(a, b, c) do
+    for {lens, outcome} <- [{"analyst", a}, {"architect", b}, {"engineer", c}],
+        do: %{
+          lens: lens,
+          outcome: outcome,
+          confidence: "high",
+          escalation_reasons: [],
+          contradicts: []
+        }
+  end
+
+  defp story_verdict(story_extra \\ %{}) do
+    %{
+      outcome: "story",
+      confidence: "high",
+      story:
+        Map.merge(
+          %{title: "Screened story", description: "D", acceptance_criteria: ["It works"]},
+          story_extra
+        )
+    }
   end
 
   defp verdict(outcome, extra \\ %{}) do
@@ -237,6 +280,90 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       # The session's own words are RECORDED, not just the field that moved the machine: an
       # operator reading an escalation needs what it actually said.
       assert saved.payload["story"]["title"] == "A title"
+    end
+
+    test "the gate screen escalates a story whose lenses disagree, keeping the draft (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session()
+
+      message =
+        record
+        |> verdict_message(story_verdict())
+        |> Map.put(:lens_verdicts, lens_verdicts("story", "story", "escalate"))
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert stage_of(story) == :escalated
+      assert reload_story(story).title == "Screened story"
+
+      assert [%{"payload" => %{"gate_screen" => reasons}}] =
+               story.tenant_id
+               |> stage_events(story.id)
+               |> Enum.filter(&(&1.edge == "triage_escalate"))
+               |> Enum.map(& &1.data)
+
+      assert Enum.any?(reasons, &(&1 =~ "gate_a"))
+    end
+
+    test "the gate screen escalates a story sent without lens verdicts (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session()
+
+      message = record |> verdict_message(story_verdict()) |> Map.delete(:lens_verdicts)
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :escalated
+    end
+
+    test "the gate screen escalates a predicted touch on a guarded path (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session()
+
+      for touch <- ["priv/rates/2026.csv", "lib/widgets_web/router.ex"] do
+        %{story: story, runner: runner, record: record} = session()
+        verdict = story_verdict(%{touches: [touch]})
+
+        assert {:ok, _} =
+                 TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, verdict))
+
+        assert stage_of(story) == :escalated, "#{touch} was queued"
+      end
+
+      verdict = story_verdict(%{touches: ["lib/widgets/thing.ex"]})
+
+      assert {:ok, _} =
+               TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, verdict))
+
+      assert stage_of(story) == :queued
+    end
+
+    test "the gate screen fails closed on a repository it has no triggers for (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session(no_intake_source: true)
+
+      fixture(:intake_record, %{
+        tenant_id: story.tenant_id,
+        project_id: story.project_id,
+        repo_full_name: "acme/unconfigured"
+      })
+
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :escalated
+    end
+
+    test "the gate screen fails closed on a story with no intake source (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session(no_intake_source: true)
+
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :escalated
     end
 
     test "lens verdicts are recorded keyed by lens, for Gate A to read (US-44.1)" do

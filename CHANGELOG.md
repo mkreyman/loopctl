@@ -6,6 +6,15 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Both delivery gates now screen a triaged story BEFORE it is queued (epic 44, US-44.2).**
+  An accepted `story` verdict is escalated over `triage_escalate` instead of queued when its
+  lens verdicts fail Gate A, when it carries none (a runner on contract 1.14.0), when a drafted
+  `touches` entry matches a `human_paths` or `effect_paths` trigger, or when the project's
+  repository has no single live intake source or no trigger entry. The draft is kept, so a
+  human who re-queues the story gets the drafted story. **Operator-visible:** until every
+  runner sends `lens_verdicts`, every triaged story stops at `escalated`; this is deliberate —
+  the merge gate would refuse each of them after a full implementation run.
+
 - **The merge gate reads Gate A's input from the database, never from the caller (epic 44,
   US-44.1, runner contract 1.15.0). RE-VENDOR the contract to send `lens_verdicts`;
   `loopctl-mcp-server` 2.103.0 adds the `merge_precondition` tool.** `POST
