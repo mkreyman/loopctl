@@ -112,6 +112,8 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # answered `ok` and never reaches here, so seeing this code means the bytes DIFFER from the
   # verdict already recorded for this dispatch. A session cannot restate its verdict by
   # design, so the two sides disagree about what it decided and no retry can settle that.
+  # `session_ended` (1.16.0) uses it with the same meaning: a DIFFERENT report of how a
+  # session ended, for a dispatch whose report is already on the ledger row.
   @verbatim ~w(unknown_dispatch stale_claim_epoch already_replied dispatch_not_accepted
                run_mismatch stale_stage unknown_story_stage effect_conflict
                already_recorded)a

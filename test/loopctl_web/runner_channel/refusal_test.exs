@@ -119,7 +119,12 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
         {"trace", {:batch_too_large, 100, 200}},
         {"trace", {:event_data_too_large, 3, 400, 500}},
         {"stage", {:invalid, ["something"]}},
-        {"stage", :busy}
+        {"stage", :busy},
+        # `session_ended` (1.16.0): the two codes that carry anything, and the permanent one
+        # that carries nothing.
+        {"session_ended", {:invalid, ["something"]}},
+        {"session_ended", :capacity_busy},
+        {"session_ended", :already_recorded}
       ]
 
       for {event, reason} <- produced do

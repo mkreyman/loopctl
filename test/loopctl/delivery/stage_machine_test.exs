@@ -33,6 +33,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
           {:ci, :escalated, :merge_gate},
           {:merged, :implementing, :merge_refused},
           {:implementing, :failed, :budget_exceeded},
+          {:implementing, :escalated, :budget_reported},
           {:implementing, :queued, :runner_lost}
         ] do
       assert triple in StageMachine.transitions(), inspect(triple)
@@ -69,6 +70,27 @@ defmodule Loopctl.Delivery.StageMachineTest do
     refute :triaged in sources
   end
 
+  test "budget_reported leaves exactly the in-flight stages, for escalated, and is control's (US-44.3)" do
+    sources = for {from, to, :budget_reported} <- StageMachine.transitions(), do: {from, to}
+
+    # From every stage a runner holds the story in, and only into `escalated` — never
+    # `failed`, which has no way out, and never from `merged` on, where the outward effect has
+    # already happened and the session's own escalation is the way out.
+    assert Enum.sort(sources) ==
+             Enum.sort(for from <- StageMachine.in_flight_stages(), do: {from, :escalated})
+
+    # The runner REPORTS the kill in `session_ended`; control takes the edge. A `stage`
+    # message can never carry it.
+    refute :budget_reported in StageMachine.runner_reportable_edges()
+    refute Enum.any?(StageMachine.runner_transitions(), &match?({_, _, :budget_reported}, &1))
+    refute StageMachine.runner_reportable?(:implementing, :escalated, :budget_reported)
+
+    # Entering `escalated` is chained and needs a reason, like every escalation.
+    assert StageMachine.chained?(:implementing, :escalated, :budget_reported)
+    assert StageMachine.reason_required?(:escalated, :budget_reported)
+    assert StageMachine.counted?(:budget_reported)
+  end
+
   test "the runner-reportable subset holds back exactly what a runner must not report" do
     reportable = StageMachine.runner_transitions()
 
@@ -83,7 +105,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
     refute Enum.any?(reportable, &match?({_, :claimed, _}, &1))
 
     # And never an edge another principal owns.
-    for edge <- [:runner_lost, :claim_released, :human_resolution] do
+    for edge <- [:runner_lost, :claim_released, :human_resolution, :budget_reported] do
       refute Enum.any?(reportable, &match?({_, _, ^edge}, &1))
     end
 

@@ -24,6 +24,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Capabilities
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Tenants
   alias Loopctl.TokenUsage
   alias Loopctl.Webhooks.EventGenerator
@@ -1612,76 +1613,159 @@ defmodule Loopctl.Progress do
   def reclaim_expired_claim(tenant_id, story_id, expected_epoch) do
     now = DateTime.utc_now()
 
-    multi =
-      Multi.new()
-      |> Multi.run(:tenant_gate, fn _repo, _changes ->
-        lock_tenant_if_claims_renewable(tenant_id)
-      end)
-      |> Multi.run(:lock, fn _repo, _changes ->
-        lock_story(tenant_id, story_id)
-      end)
-      |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        if lease_expired?(story, expected_epoch, now),
-          do: {:ok, story},
-          else: {:error, :claim_not_expired}
-      end)
-      |> Multi.run(:story, fn _repo, %{lock: story} ->
-        story
-        |> Ecto.Changeset.change(release_claim_changes(story))
-        |> AdminRepo.update()
-      end)
-      # #803: the claimant is gone, so its delivery stage row follows the release in THIS
-      # transaction — the two commit together or not at all. A row left behind the new epoch
-      # would be refused on every advance with nothing able to move it.
-      |> Multi.run(:stage, fn _repo, %{story: updated} ->
-        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
-          actor_label: "worker:reclaim_expired_claims"
-        )
-      end)
-      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "story",
-          entity_id: updated.id,
-          action: "claim_lease_expired",
-          actor_type: "system",
-          actor_id: nil,
-          actor_label: "worker:reclaim_expired_claims",
-          old_state: %{
-            "agent_status" => to_string(old.agent_status),
-            "assigned_agent_id" => old.assigned_agent_id,
-            "claimed_until" => iso8601_or_nil(old.claimed_until),
-            "claim_epoch" => old.claim_epoch
-          },
-          new_state: %{"agent_status" => "pending", "claim_epoch" => updated.claim_epoch}
-        }
-      end)
-      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          event_type: "story.force_unclaimed",
-          project_id: updated.project_id,
-          payload: %{
-            "event" => "story.force_unclaimed",
-            "reason" => "claim_lease_expired",
-            "story_id" => updated.id,
-            "project_id" => updated.project_id,
-            "epic_id" => updated.epic_id,
-            "old_status" => to_string(old.agent_status),
-            "new_status" => "pending",
-            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-          }
-        }
-      end)
+    runner_lost_release(tenant_id, story_id, %{
+      gate: fn -> lock_tenant_if_claims_renewable(tenant_id) end,
+      held?: &lease_expired?(&1, expected_epoch, now),
+      not_held: :claim_not_expired,
+      action: "claim_lease_expired",
+      actor_label: "worker:reclaim_expired_claims",
+      webhook_reason: "claim_lease_expired",
+      new_state: %{}
+    })
+  end
 
-    case AdminRepo.transaction(multi) do
+  @doc """
+  Releases a claim whose runner REPORTED that its session ended — `crashed` or
+  `usage_exhausted` in a `session_ended` message (US-44.3, runner contract 1.16.0) — without
+  waiting for the lease.
+
+  It is `reclaim_expired_claim/3` with the lease taken out of the question and nothing else
+  changed: the same release (`release_claim_changes/1` — back to `:pending`, assignment
+  cleared, `lifecycle_entered_at` stamped, lease cleared, epoch bumped), the same
+  `:runner_lost` edge on the delivery stage row in the same transaction
+  (`Loopctl.Delivery.Stages.follow_release/5`), and the same audit entry and webhook, built by
+  the one private function both call. What differs is only what is TRUE: the entry's `action`
+  is `claim_session_ended`, not `claim_lease_expired`, because no lease expired, and its
+  `new_state` names the reported reason, because a crash and an exhausted subscription are
+  different things to an operator reading the log.
+
+  THE CLAIM MUST BE THE ONE THE SESSION RAN UNDER: held (`:assigned` or `:implementing`), at
+  exactly `expected_epoch` — the reporting dispatch's own — and not handed to review. Anything
+  else is `{:error, :claim_not_held}` and nothing is written, because each of those means the
+  claim this report is about has already ended, or was never this session's to give back: a
+  lease reclaim, an operator's unclaim or a re-claim moved the epoch, and a claim whose review
+  was requested stopped being the implementer's when it was handed over. The epoch is what
+  makes a late or replayed report harmless — it can never release a claim that started after
+  the session it describes.
+
+  NO TENANT GATE, unlike the reclaim, and deliberately. The reclaim refuses a halted or
+  inactive tenant because its claimants CANNOT RENEW, and releasing a lease they could not
+  have kept would punish them for the halt. Here nobody is being timed out: the claimant
+  itself reported that its session is gone, so there is nothing to protect, and a halt stops
+  custody PROGRESS while a release gives a claim back.
+  """
+  @spec release_ended_session(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer(), keyword()) ::
+          {:ok, Story.t()}
+          | {:error, :not_found | :claim_not_held | Ecto.Changeset.t()}
+  def release_ended_session(tenant_id, story_id, expected_epoch, opts) do
+    session_reason = Keyword.fetch!(opts, :session_reason)
+    actor_label = Keyword.fetch!(opts, :actor_label)
+
+    unless session_reason in ~w(crashed usage_exhausted) do
+      raise ArgumentError,
+            "release_ended_session/4 releases for crashed or usage_exhausted, " <>
+              "not #{inspect(session_reason)}"
+    end
+
+    runner_lost_release(tenant_id, story_id, %{
+      # BOUNDED, unlike the reclaim's wait: this runs in the runner channel's own process, and
+      # a wait without end behind a story lock would hold the socket every session on that
+      # machine shares. A wait that runs out raises `lock_not_available`, which the caller
+      # answers as a retry — nothing here has committed.
+      gate: fn -> {:ok, Capacity.set_lock_timeout!(AdminRepo)} end,
+      held?: &claim_held_at?(&1, expected_epoch),
+      not_held: :claim_not_held,
+      action: "claim_session_ended",
+      actor_label: actor_label,
+      webhook_reason: "session_ended:" <> session_reason,
+      new_state: %{"session_ended_reason" => session_reason}
+    })
+  end
+
+  # THE ONE `:runner_lost` RELEASE, shared by the lease reclaim and a reported session end so
+  # the two cannot drift: a gate, the story locked and re-checked, then released, its stage
+  # row following in the same transaction, one audit entry and one webhook. `spec` carries
+  # only what differs between them — the gate run first (`gate`, a `{:ok, _} | {:error, _}`
+  # thunk), the predicate the locked story must satisfy (`held?`) and the refusal when it does
+  # not (`not_held`), the action, the actor, the webhook's reason, and any keys the audit entry
+  # adds to `new_state` on top of the ones every release records.
+  defp runner_lost_release(tenant_id, story_id, spec) do
+    Multi.new()
+    |> Multi.run(:gate, fn _repo, _changes -> spec.gate.() end)
+    |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
+    |> Multi.run(:validate, fn _repo, %{lock: story} ->
+      if spec.held?.(story), do: {:ok, story}, else: {:error, spec.not_held}
+    end)
+    |> Multi.run(:story, fn _repo, %{lock: story} ->
+      story
+      |> Ecto.Changeset.change(release_claim_changes(story))
+      |> AdminRepo.update()
+    end)
+    # #803: the claimant is gone, so its delivery stage row follows the release in THIS
+    # transaction — the two commit together or not at all. A row left behind the new epoch
+    # would be refused on every advance with nothing able to move it.
+    |> Multi.run(:stage, fn _repo, %{story: updated} ->
+      Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
+        actor_label: spec.actor_label
+      )
+    end)
+    |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "story",
+        entity_id: updated.id,
+        action: spec.action,
+        actor_type: "system",
+        actor_id: nil,
+        actor_label: spec.actor_label,
+        old_state: %{
+          "agent_status" => to_string(old.agent_status),
+          "assigned_agent_id" => old.assigned_agent_id,
+          "claimed_until" => iso8601_or_nil(old.claimed_until),
+          "claim_epoch" => old.claim_epoch
+        },
+        new_state:
+          Map.merge(
+            %{"agent_status" => "pending", "claim_epoch" => updated.claim_epoch},
+            spec.new_state
+          )
+      }
+    end)
+    |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        event_type: "story.force_unclaimed",
+        project_id: updated.project_id,
+        payload: %{
+          "event" => "story.force_unclaimed",
+          "reason" => spec.webhook_reason,
+          "story_id" => updated.id,
+          "project_id" => updated.project_id,
+          "epic_id" => updated.epic_id,
+          "old_status" => to_string(old.agent_status),
+          "new_status" => "pending",
+          "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+        }
+      }
+    end)
+    |> AdminRepo.transaction()
+    |> case do
       {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :tenant_gate, reason, _} -> {:error, reason}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
+      {:error, step, reason, _} when step in [:gate, :lock, :validate] -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
+
+  # The claim a session ran under, still held: `lease_expired?/3` without the lease. The same
+  # statuses, the same epoch, and the same exclusion of a claim handed to review.
+  defp claim_held_at?(
+         %Story{agent_status: status, claim_epoch: epoch, review_requested_at: nil},
+         expected_epoch
+       )
+       when status in @claimed_statuses,
+       do: epoch == expected_epoch
+
+  defp claim_held_at?(_story, _expected_epoch), do: false
 
   # "Can this tenant's claimants renew right now?" — the one condition every lease release
   # depends on. Two things make the answer no, and both are refused: a custody halt

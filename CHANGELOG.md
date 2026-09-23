@@ -6,6 +6,23 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Runners may report why an implement session ended (epic 44, US-44.3, runner contract
+  1.16.0). RE-VENDOR the contract to send it; a runner that does not gets today's lease
+  reclaim.** The new optional `session_ended` channel message carries `{dispatch_id,
+  claim_epoch, reason}`, `reason` one of `completed`, `wall_clock_exceeded`,
+  `max_turns_exceeded`, `usage_exhausted`, `crashed`. A budget kill (the first two after
+  `completed`) moves an in-flight story to `escalated` over a new CONTROL-ONLY edge,
+  `budget_reported` — never retried, never `failed` — and frees the runner's slot. `crashed`
+  releases the claim at once over `runner_lost`, audited as `claim_session_ended` (the lease
+  reclaim's entry shape, with `new_state.session_ended_reason`), and `usage_exhausted` releases
+  the same way. `completed` changes no stage. Recorded once per dispatch in four new
+  `runner_dispatches` columns (`session_ended_reason`, `session_ended_digest`,
+  `session_ended_at`, `counts_toward_retry_ceiling` — migration, no manual step, NULL for
+  existing rows); an identical resend is answered `ok`, a different reason `already_recorded`.
+  `counts_toward_retry_ceiling` is `true` for `crashed` and `false` for `usage_exhausted`, for
+  the retry ceiling US-44.4 adds. **Operator-visible:** escalated stories whose last edge is
+  `budget_reported` were stopped by their dispatch budget, not by a session asking for help.
+
 - **Both delivery gates now screen a triaged story BEFORE it is queued (epic 44, US-44.2).**
   An accepted `story` verdict is escalated over `triage_escalate` instead of queued when its
   lens verdicts fail Gate A, when it carries none (a runner on contract 1.14.0), when a drafted

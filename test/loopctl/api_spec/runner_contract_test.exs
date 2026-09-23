@@ -9,6 +9,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatchReply
+  alias Loopctl.ApiSpec.RunnerContract.RunnerSessionEnded
   alias Loopctl.ApiSpec.RunnerContract.RunnerStage
   alias Loopctl.ApiSpec.RunnerContract.RunnerStory
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
@@ -37,7 +38,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "78539ce2332df41e890d27ff63a885e04b18d4674affd6a16ff78ed8308bb3d6"
+  @digest "b170015ab53c4b89c0b49860d7e4ce9b1f173e719efb7e60bafce188d91c95f2"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -71,20 +72,22 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.15.0"
-      assert schema["x-contract-version"] == "1.15.0"
+      assert RunnerContract.version() == "1.16.0"
+      assert schema["x-contract-version"] == "1.16.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
                "trace" => "RunnerTraceBatch",
                "trace_cursor" => "RunnerTraceCursor",
-               "stage" => "RunnerStageReport"
+               "stage" => "RunnerStageReport",
+               "session_ended" => "RunnerSessionEnded"
              } = connection["events"]
 
       assert connection["replies"] == %{
                "trace" => "RunnerTraceAck",
                "trace_cursor" => "RunnerTraceAck",
-               "triage_verdict" => "RunnerTriageVerdictAck"
+               "triage_verdict" => "RunnerTriageVerdictAck",
+               "session_ended" => "RunnerSessionEndedAck"
              }
 
       # #803: the kind lists are published so a runner reads them rather than parsing prose.
@@ -131,6 +134,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["limits"]["frame_envelope_bytes"] == RunnerContract.frame_envelope_bytes()
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
       assert connection["limits"]["stage_burst"] == RunnerContract.stage_burst()
+      assert connection["limits"]["session_ended_burst"] == RunnerContract.session_ended_burst()
 
       # #803: the stage transition table is published so a runner can refuse an impossible
       # transition locally. It is DERIVED from the server's machine — asserted here against
@@ -1724,6 +1728,73 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # difference assertion above.
       assert MapSet.size(inbound) >= 5
       assert MapSet.size(permanent) >= 10
+    end
+  end
+
+  describe "cast_session_ended/1 (contract 1.16.0)" do
+    defp session_ended(attrs) do
+      Map.merge(
+        %{"dispatch_id" => Ecto.UUID.generate(), "claim_epoch" => 3, "reason" => "crashed"},
+        attrs
+      )
+    end
+
+    test "accepts every published reason, keeping only the declared fields" do
+      for reason <- RunnerSessionEnded.reasons() do
+        payload = session_ended(%{"reason" => reason, "undeclared" => "dropped"})
+
+        assert {:ok, message} = RunnerContract.cast_session_ended(payload)
+
+        assert message == %{
+                 dispatch_id: payload["dispatch_id"],
+                 claim_epoch: 3,
+                 reason: reason
+               }
+      end
+
+      # The five the story names, and no others — the enum is what `RunnerStages` routes on.
+      assert Enum.sort(RunnerSessionEnded.reasons()) ==
+               Enum.sort(~w(completed wall_clock_exceeded max_turns_exceeded usage_exhausted
+                            crashed))
+    end
+
+    test "any other reason is invalid_payload (AC-44.3.1)" do
+      assert {:error, {:invalid, [_ | _]}} =
+               RunnerContract.cast_session_ended(session_ended(%{"reason" => "bored"}))
+    end
+
+    test "every field is required" do
+      for key <- ~w(dispatch_id claim_epoch reason) do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_session_ended(Map.delete(session_ended(%{}), key)),
+               key
+      end
+    end
+
+    test "the dispatch id is compared in one case, and a NUL is refused" do
+      upper = String.upcase(Ecto.UUID.generate())
+
+      assert {:ok, %{dispatch_id: id}} =
+               RunnerContract.cast_session_ended(session_ended(%{"dispatch_id" => upper}))
+
+      assert id == String.downcase(upper)
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_session_ended(session_ended(%{"reason" => "crash\u0000ed"}))
+    end
+
+    test "is published as an event with a declared reply, refusals and a bucket" do
+      connection = RunnerContract.json_schema()["x-connection"]
+
+      assert "session_ended" in RunnerContract.inbound_events()
+      assert "already_recorded" in connection["errors"]["session_ended"]
+      assert RunnerContract.permanent_error?("session_ended", "already_recorded")
+      refute RunnerContract.permanent_error?("session_ended", "rate_limited")
+
+      # A runner may NOT report the edge a budget kill takes: it reports the kill, and control
+      # takes the edge. Published nowhere a runner could send it from.
+      refute Enum.any?(connection["stage_transitions"], &(&1["edge"] == "budget_reported"))
+      assert {:implementing, :escalated, :budget_reported} in StageMachine.transitions()
     end
   end
 
