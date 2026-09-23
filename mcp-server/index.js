@@ -4592,9 +4592,8 @@ const TOOLS = [
       "Creates a verification_result with result=fail. Uses the ORCH key. " +
       "The reject releases the claim, and a delivery story may be re-contracted or escalated " +
       "in the same transaction. A 500 `audit_chain_append_failed` (the escalation's chain " +
-      "entry was refused) or `recontract_audit_refused` (the re-contract's audit entry was " +
-      "refused) means the WHOLE call rolled back: the story is unchanged, and a re-run meets " +
-      "the same server-side condition until an operator acts.",
+      "entry was refused) means the WHOLE call rolled back: the story is unchanged, and a " +
+      "re-run meets the same server-side condition until an operator acts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8265,9 +8264,9 @@ const TOOLS = [
       "already sitting there — is ESCALATED over `operator_released`, like the first run. A " +
       "row already escalated, or anywhere else at that epoch, is left exactly as it is. EVERY " +
       "500 means the whole release rolled back and the story is still claimed: " +
-      "`audit_chain_append_failed` (the escalation's chain entry was refused) and " +
-      "`recontract_audit_refused` (the re-contract's audit entry was refused) are server-side " +
-      "conditions a re-run meets again until an operator acts; `force_unclaim_failed` (the " +
+      "`audit_chain_append_failed` (the escalation's chain entry was refused) is a " +
+      "server-side condition a re-run meets again until an operator acts; " +
+      "`force_unclaim_failed` (the " +
       "server log names the step) is remedied by calling it again. A 422 means the release " +
       "write itself was rejected. It takes no request body.",
     inputSchema: {

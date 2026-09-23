@@ -1172,7 +1172,7 @@ defmodule Loopctl.Delivery.Stages do
   of what happened. `released` is what `follow_release/5` returned.
   """
   @spec recontract_released(Ecto.UUID.t(), released(), Story.t(), String.t() | nil) ::
-          {:ok, Story.t()} | {:error, :recontract_audit_refused}
+          {:ok, Story.t()}
   def recontract_released(
         tenant_id,
         {%StoryStage{stage: :queued}, _entry},

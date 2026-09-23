@@ -436,22 +436,11 @@ defmodule Loopctl.BulkOperations do
 
   # AFTER the reset's audit entry, like the single-story reject (US-44.4): a delivery story
   # whose row went back to `queued` is placeable again, or it was escalated at the retry ceiling
-  # and stays `pending` for a human. A re-contract that is refused is logged like a failed
-  # auto-reset and never aborts the batch. It refuses only when its audit entry is invalid, and
-  # `Progress.recontract_in_transaction/3` checks that BEFORE its UPDATE, so a refusal wrote
-  # nothing: the story stays rejected and `pending`, uncontracted, with its row at `queued` —
-  # the state an operator resolves — and never contracted without its audit entry. A database
-  # error on that insert raises and rolls the whole batch back.
+  # and stays `pending` for a human. The re-contract has no refusal: a database error on its
+  # audit insert raises and rolls the whole batch back.
   defp recontract_reset(tenant_id, reset, released) do
-    require Logger
-
-    case Stages.recontract_released(tenant_id, released, reset, "system:auto_reset") do
-      {:ok, _story} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("Auto-reset re-contract failed for story #{reset.id}: #{inspect(reason)}")
-    end
+    {:ok, _story} = Stages.recontract_released(tenant_id, released, reset, "system:auto_reset")
+    :ok
   end
 
   # ===================================================================

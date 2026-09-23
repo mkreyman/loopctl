@@ -110,8 +110,8 @@ auto-reset), `bulk_operations.ex:610` (bulk reject).
 
 | release cause | outcome | spends an attempt |
 |---|---|---|
-| placement refusal, runner unavailable or a lost race (`undo_claim/5`) | re-contract | no — the runner refused before any work, and may be free next pass; a race (the claim ended, a concurrent pass sent it first, the runner was revoked mid-push) is not the story's |
-| placement refusal that recurs every pass (`undo_claim/5`) | re-contract, or escalate at the ceiling | yes — uncounted it loops every pass |
+| placement refusal, runner unavailable or the claim ended under it (`undo_claim/5`) | re-contract | no — the runner refused before any work, and may be free next pass; a revoked runner credential is the runner's problem, not the story's, and the channel's authorization recheck drops the runner; a claim that ended is a race the next pass does not meet |
+| any other placement refusal (`undo_claim/5`) | re-contract, or escalate at the ceiling | yes — uncounted it loops every pass; each pass mints a fresh `dispatch_id`, so a ledger fence is never another pass getting there first |
 | `usage_exhausted` (44.3) | re-contract | no |
 | lease expiry, `crashed` | re-contract, or escalate at the ceiling | yes |
 | verifier reject, bulk reject | re-contract, or escalate at the ceiling | yes — the work was wrong |

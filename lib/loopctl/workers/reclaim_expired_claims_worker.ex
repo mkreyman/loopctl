@@ -30,16 +30,22 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
     has had a full lease to renew.
 
   Bounded at `@batch` stories per run, so a backlog drains over successive runs instead of
-  pinning AdminRepo's small pool — and ranked oldest lease first WITHIN EACH TENANT, taking
-  every tenant's oldest before any tenant's second (`candidates/2`). Ranked globally, one
-  tenant whose releases keep failing held the head of every run with its oldest leases and
-  starved every other tenant's reclaim (#877 review round 2). Within a tenant, a broken chain
-  blocking its own reclaims is the correct outcome: that tenant's custody transitions are all
-  failing until an operator acts.
+  pinning AdminRepo's small pool — and ranked WITHIN EACH TENANT, taking every tenant's first
+  before any tenant's second (`candidates/2`). Ranked globally, one tenant whose releases keep
+  failing held the head of every run with its oldest leases and starved every other tenant's
+  reclaim (#877 review round 2).
 
-  A candidate whose release RAISES is logged at error with its stack trace and emits
-  `[:loopctl, :reclaim_expired_claims, :raised]` (count 1, metadata `tenant_id`, `story_id`,
-  `exception`), then the pass goes on.
+  Within a tenant, a lease whose release FAILED OR RAISED is stamped
+  `stories.lease_reclaim_failed_at` after the pass, and ranks behind every lease never stamped
+  (#877 review round 3). Ranked oldest lease first alone, a tenant with more failing leases than
+  its share of the batch — a per-story poison, not a broken chain — gave every one of its slots
+  to them on every run and never reached its healthy leases. The stamp is written by this worker
+  only, never cast, and cleared by every release (`Progress.claim_release_change/1`), so it
+  describes the lease it failed on and never the story's next one.
+
+  A candidate whose release RAISES is logged ONCE, at error, naming the exception's MODULE and
+  its stack trace — never its message, which for a database error can quote the story row — then
+  the pass goes on.
   """
 
   use Oban.Worker, queue: :cleanup, max_attempts: 3
@@ -55,8 +61,6 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
 
   @batch 100
 
-  @raised_event [:loopctl, :reclaim_expired_claims, :raised]
-
   # Refusals that mean "not this time", decided under the row lock — not failures.
   @skip_reasons [:claim_not_expired, :custody_halted, :tenant_inactive]
 
@@ -64,14 +68,19 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
   def perform(%Oban.Job{}) do
     now = DateTime.utc_now()
 
+    candidates = candidates(now, @batch)
+
     results =
-      now
-      |> candidates(@batch)
-      |> Enum.map(fn candidate ->
+      Enum.map(candidates, fn candidate ->
         result = reclaim(candidate)
         log_candidate(candidate, result)
         result
       end)
+
+    candidates
+    |> Enum.zip(results)
+    |> Enum.filter(fn {_candidate, result} -> failed?(result) end)
+    |> Enum.each(fn {candidate, _result} -> mark_failed(candidate, now) end)
 
     reclaimed = Enum.count(results, &match?({:ok, _}, &1))
 
@@ -94,26 +103,38 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
   # abort the run at that story and, since it is still expired, at the same story next run.
   # The raise becomes that candidate's failure and the pass goes on. Nothing is committed for
   # it: the raise left its transaction, which rolled back. Rescued, it is also NOT seen by
-  # Oban, so the full exception and stack trace are logged here and a telemetry event is
-  # emitted — the failure reason alone names only the module and message.
+  # Oban, so it is logged here, ONCE — `log_candidate/2` does not log it again. The MODULE and
+  # the stack, never `Exception.message/1`: a database error's message can quote the row.
   defp reclaim(candidate) do
     Progress.reclaim_expired_claim(candidate.tenant_id, candidate.id, candidate.claim_epoch)
   rescue
     error ->
       Logger.error(
         "ReclaimExpiredClaimsWorker: release raised: tenant_id=#{candidate.tenant_id} " <>
-          "story_id=#{candidate.id}\n" <> Exception.format(:error, error, __STACKTRACE__),
+          "story_id=#{candidate.id} exception=#{inspect(error.__struct__)}\n" <>
+          Exception.format_stacktrace(__STACKTRACE__),
         tenant_id: candidate.tenant_id,
         story_id: candidate.id
       )
 
-      :telemetry.execute(@raised_event, %{count: 1}, %{
-        tenant_id: candidate.tenant_id,
-        story_id: candidate.id,
-        exception: error.__struct__
-      })
+      {:error, {:raised, error.__struct__}}
+  end
 
-      {:error, {:raised, error.__struct__, Exception.message(error)}}
+  defp failed?({:ok, _story}), do: false
+  defp failed?({:error, reason}), do: reason not in @skip_reasons
+
+  # Stamps the lease that failed — at the epoch it was read at, so a lease that was released
+  # and re-claimed meanwhile is not stamped — AFTER the pass, so a stamp that raises cannot cut
+  # the pass short.
+  @doc false
+  # Public only so the epoch fence can be asserted directly.
+  def mark_failed(candidate, now) do
+    from(s in Story,
+      where:
+        s.id == ^candidate.id and s.tenant_id == ^candidate.tenant_id and
+          s.claim_epoch == ^candidate.claim_epoch
+    )
+    |> AdminRepo.update_all(set: [lease_reclaim_failed_at: now])
   end
 
   # Issue #815: the summary line only counts. This names every candidate that was not
@@ -131,6 +152,9 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
   end
 
   defp log_candidate(_candidate, {:error, reason}) when reason in @skip_reasons, do: :ok
+
+  # Already logged at error by `reclaim/1`, with its stack.
+  defp log_candidate(_candidate, {:error, {:raised, _module}}), do: :ok
 
   defp log_candidate(candidate, {:error, reason}) do
     Logger.warning(
@@ -154,10 +178,13 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
   def batch_size, do: @batch
 
   @doc """
-  The expired claims one run releases, at most `limit`: ranked oldest lease first WITHIN each
-  tenant (`row_number()` over the tenant, as `Loopctl.Delivery.TriageDispatcher.candidates/1`
-  ranks), then by that rank — so every tenant's oldest comes before any tenant's second, and
-  one tenant's failing leases cannot fill the batch. Public so the selection is falsifiable.
+  The expired claims one run releases, at most `limit`: ranked WITHIN each tenant
+  (`row_number()` over the tenant, as `Loopctl.Delivery.TriageDispatcher.candidates/1` ranks),
+  then by that rank — so every tenant's first comes before any tenant's second, and one
+  tenant's failing leases cannot fill the batch. Within a tenant, leases never stamped
+  `lease_reclaim_failed_at` come first, oldest lease first, then the stamped ones, so a
+  tenant's failing leases cannot hold its own healthy ones back either. Public so the selection
+  is falsifiable.
   """
   @spec candidates(DateTime.t(), pos_integer()) :: [
           %{id: Ecto.UUID.t(), tenant_id: Ecto.UUID.t(), claim_epoch: non_neg_integer()}
@@ -179,7 +206,11 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
           rank:
             over(row_number(),
               partition_by: s.tenant_id,
-              order_by: [asc: s.claimed_until, asc: s.id]
+              order_by: [
+                asc_nulls_first: s.lease_reclaim_failed_at,
+                asc: s.claimed_until,
+                asc: s.id
+              ]
             )
         }
       )

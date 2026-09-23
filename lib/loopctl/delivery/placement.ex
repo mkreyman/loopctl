@@ -1524,19 +1524,21 @@ defmodule Loopctl.Delivery.Placement do
   # An allowlist of the transient ones, not of the deterministic ones: a refusal nobody has
   # classified yet is bounded by the ceiling rather than looping.
   #
-  # RACES are transient too, and they are here because the production ceiling is 0: counted,
-  # ONE lost race escalated a story to a human (#877 review round 2). Each is decided by what
-  # happened to the claim or the runner between this pass's claim and its push — never by
-  # anything in the story, so the next pass does not meet it again:
+  # Two more are here because the production ceiling is 0, so counted, ONE occurrence
+  # escalates a story to a human (#877 review round 2). Neither is anything in the story:
   #
   #   * `:stale_claim_epoch` — the claim this dispatch was built for ended under it (a lease
-  #     reclaim, an operator's force-unclaim) before the ledger read the epoch;
-  #   * `:dispatch_already_replied` — the runner already answered this `dispatch_id`, i.e. a
-  #     concurrent pass pushed the same dispatch first;
-  #   * `:dispatch_id_conflict` — the ledger holds this `dispatch_id` for another runner or
-  #     epoch: a concurrent pass placed it first;
-  #   * `:not_authorized` — the runner, its key or its tenant stopped being valid between the
-  #     pool read and the push (revoked, re-enrolled), which says nothing about the story.
+  #     reclaim, an operator's force-unclaim) before the ledger read the epoch. A race the next
+  #     pass, claiming afresh, does not meet again.
+  #   * `:not_authorized` — the RUNNER's credential stopped being valid between the pool read
+  #     and the push (revoked, re-enrolled): a problem with the runner, not the story. Bounded
+  #     without counting because the runner channel re-checks its authorization every
+  #     `@recheck_interval_ms` (`LoopctlWeb.RunnerChannel`) and disconnects, which drops the
+  #     runner from Presence, so a later pass meets `:runner_not_connected` instead.
+  #
+  # `:dispatch_already_replied` and `:dispatch_id_conflict` are NOT here: every pass mints a
+  # fresh `dispatch_id`, so neither can be another pass having got there first. They say
+  # something about this dispatch, and they count.
   @runner_unavailable [
     :runner_not_connected,
     :runner_ambiguous,
@@ -1546,8 +1548,6 @@ defmodule Loopctl.Delivery.Placement do
     :busy,
     :tenant_halted,
     :stale_claim_epoch,
-    :dispatch_already_replied,
-    :dispatch_id_conflict,
     :not_authorized
   ]
 

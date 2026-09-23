@@ -6,16 +6,21 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The lease reclaim cannot be starved by leases that keep failing (epic 44, US-44.4).** New
+  nullable `stories.lease_reclaim_failed_at` column (migration, no manual step, NULL for
+  existing rows). The reclaim worker stamps a lease whose reclaim failed or raised, and ranks
+  candidates per tenant with stamped leases last, so neither one tenant's failures nor one
+  story's bad data holds back every other expired lease. Any release clears the stamp.
+
 - **No claim release leaves a delivery story unreachable (epic 44, US-44.4, #877; runner
   contract 1.18.0, `loopctl-mcp-server` 2.103.1).** Every release used to put a delivery
   story's stage row back to `queued` with `agent_status: pending`, which the dispatch driver
   never selects — the story sat there with no alert. Now the release decides, in the same
   transaction: a placement refused because the runner was unavailable (not connected, at
-  capacity, a lock not granted) or because it lost a race (the claim ended under it, a
-  concurrent pass sent the same dispatch first, the runner was revoked mid-push) and a
-  `usage_exhausted` session re-contract the story at no cost; a COUNTED release (a lost lease, a `crashed` session, a verifier reject or bulk reject
-  of an in-flight story, the claimant's own unclaim, a placement refused for a reason that
-  recurs every pass, such as a payload the contract rejects) re-contracts it below the new
+  capacity, a lock not granted, its credential revoked mid-push) or because the claim ended
+  under it, and a `usage_exhausted` session, re-contract the story at no cost; a COUNTED release (a lost lease, a `crashed` session, a verifier reject or bulk reject
+  of an in-flight story, the claimant's own unclaim, a placement refused for any other reason,
+  such as a payload the contract rejects or a dispatch the runner's ledger already holds) re-contracts it below the new
   retry ceiling and escalates it at the ceiling over a new control-only edge,
   `{queued, escalated, attempts_exhausted}`, with the count in `escalation_reason`; an
   operator's force-unclaim escalates it over `{queued, escalated, operator_released}`. **New
@@ -28,9 +33,8 @@ All notable changes to loopctl are documented here.
   `POST /stories/bulk/reject` that is the WHOLE batch, answered `500
   audit_chain_append_failed`; `unclaim`, `reject` and `force-unclaim` answer the same `500
   audit_chain_append_failed` for their one story (force-unclaim answered
-  `force_unclaim_failed` for it before), and a new `500 recontract_audit_refused` when the
-  re-contract's audit entry is refused — the whole release rolled back, the story unchanged.
-  `unclaim`'s `422` now means only the story row write was rejected. **Operator-visible:**
+  `force_unclaim_failed` for it before). `unclaim`'s `422` means the release's story-row write
+  or its audit entry was rejected. **Operator-visible:**
   `POST /stories/:id/force-unclaim` on a delivery story now escalates it — re-queue it with
   `POST /stories/:id/stage/resolve` (`resolve_escalation`, `to: queued`), which re-contracts;
   `unclaim` and `reject` can now return a `contracted` story. A story with no stage row is

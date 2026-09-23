@@ -187,7 +187,6 @@ defmodule Loopctl.Delivery.RunnerStages do
           | :capacity_busy
           | :rejected_by_database
           | :audit_chain_append_failed
-          | :recontract_audit_refused
           | :release_failed
           | {:release_refused, [atom()]}
 
@@ -311,10 +310,9 @@ defmodule Loopctl.Delivery.RunnerStages do
         {:error, {:release_refused, Keyword.keys(changeset.errors)}}
 
       # The release rolled back whole (US-44.4): its escalation could not append its chain
-      # entry, or the re-contract's audit entry was invalid. Each is `end_error/0`'s, and
-      # `LoopctlWeb.RunnerChannel.Refusal` names both.
-      {:error, reason} when reason in [:audit_chain_append_failed, :recontract_audit_refused] ->
-        {:error, reason}
+      # entry. `end_error/0`'s, and `LoopctlWeb.RunnerChannel.Refusal` names it.
+      {:error, :audit_chain_append_failed} ->
+        {:error, :audit_chain_append_failed}
 
       # A reason `Progress.release_ended_session/4` gains later must not crash the channel every
       # session on the machine shares, and must not widen `end_error/0` to `atom()` either —

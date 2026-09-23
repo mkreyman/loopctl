@@ -197,8 +197,7 @@ defmodule LoopctlWeb.StoryEscalationController do
       500 =>
         {"`force_unclaim_failed` — the claim release rolled back at a step that cannot " <>
            "refuse; `audit_chain_append_failed` — the transition's audit-chain entry did not " <>
-           "land; `recontract_audit_refused` — the release's re-contract audit entry was " <>
-           "refused. Nothing was written.", "application/json", Schemas.ErrorResponse},
+           "land. Nothing was written.", "application/json", Schemas.ErrorResponse},
       503 =>
         {"A lock the write needed was not free; nothing was written", "application/json",
          Schemas.ErrorResponse}

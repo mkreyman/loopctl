@@ -90,9 +90,8 @@ defmodule LoopctlWeb.StoryVerificationController do
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
         {"`audit_chain_append_failed` — the release reached the retry ceiling and the chain " <>
-           "entry its escalation must carry was refused — or `recontract_audit_refused` — the " <>
-           "re-contract's audit entry was refused. Either way the WHOLE reject rolled back: " <>
-           "the story is unchanged.", "application/json", Schemas.ErrorResponse}
+           "entry its escalation must carry was refused. The WHOLE reject rolled back: the " <>
+           "story is unchanged.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -189,10 +188,9 @@ defmodule LoopctlWeb.StoryVerificationController do
       500 =>
         {"The release transaction rolled back at a step after the release write, and the " <>
            "story is UNCHANGED — still claimed, still held. `audit_chain_append_failed`: the " <>
-           "escalation's chain entry was refused; `recontract_audit_refused`: the " <>
-           "re-contract's audit entry was refused — both server-side conditions a re-run " <>
-           "meets again until an operator acts. `force_unclaim_failed`: `audit` or " <>
-           "`webhook_events` refused, which they are not supposed to be able to; the step is " <>
+           "escalation's chain entry was refused — a server-side condition a re-run meets " <>
+           "again until an operator acts. `force_unclaim_failed`: a step refused that is not " <>
+           "supposed to be able to; the step is " <>
            "logged server-side and the remedy is to re-run this call.", "application/json",
          Schemas.ErrorResponse}
     }
@@ -398,8 +396,7 @@ defmodule LoopctlWeb.StoryVerificationController do
                    :unresolvable_dispatch_lineage,
                    :missing_assigned_agent,
                    :not_found,
-                   :audit_chain_append_failed,
-                   :recontract_audit_refused
+                   :audit_chain_append_failed
                  ] or is_struct(reason, Ecto.Changeset)
 
   @doc """
@@ -426,10 +423,8 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:ok, story} ->
           json(conn, %{story: story})
 
-        # Forwarded unchanged to FallbackController. `:audit_chain_append_failed` and
-        # `:recontract_audit_refused` are US-44.4's: the release's escalation could not append
-        # its chain entry, or the re-contract's audit entry was refused — either way the reject
-        # rolled back.
+        # Forwarded unchanged to FallbackController. `:audit_chain_append_failed` is US-44.4's:
+        # the release's escalation could not append its chain entry, so the reject rolled back.
         # One guarded clause rather than one each, for the action's complexity budget.
         {:error, reason} = error when is_forwarded_reject_error(reason) ->
           error

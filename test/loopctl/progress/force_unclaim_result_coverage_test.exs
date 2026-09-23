@@ -171,6 +171,26 @@ defmodule Loopctl.Progress.ForceUnclaimResultCoverageTest do
       assert Enum.sort(handled_names(source)) == [:audit, :lock, :stage, :step_2]
     end
 
+    test "a clause PINNING ONE REASON does not cover its step" do
+      # #877 review round 3, finding 1b. `{:error, :stage, :audit_chain_append_failed, _}`
+      # handles one reason; the step's next reason is a `CaseClauseError`. Only a clause that
+      # takes ANY reason covers the step — in the head, and in a guard that reads the reason.
+      source = """
+      defmodule Fake do
+        def force_unclaim_story(_a, _b, _c) do
+          case AdminRepo.transaction(multi) do
+            {:error, :lock, reason, _} -> {:error, reason}
+            {:error, :stage, :audit_chain_append_failed, _} -> {:error, :x}
+            {:error, step, r, _} when step in [:audit] and r == :boom -> {:error, r}
+            {:error, step, _r, _} when step in [:webhook_events] -> {:error, step}
+          end
+        end
+      end
+      """
+
+      assert Enum.sort(handled_names(source)) == [:lock, :webhook_events]
+    end
+
     test "a step named only in a COMMENT does not count as covered" do
       # The repo's own lesson about guard tests going vacuous through prose. The AST drops
       # comments outright, so this is now true by construction rather than by a filter — and

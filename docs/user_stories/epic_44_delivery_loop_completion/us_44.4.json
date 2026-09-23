@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-44.4.1",
-      "description": "force_unclaim_story/3 accepts release_cause: :placement_refused | :attempt | :operator (default :operator), and Placement.undo_claim/5 passes :placement_refused when the runner was unavailable (not connected, at capacity, a lock not granted) or the placement lost a race (stale claim epoch, a dispatch already replied to or already in the ledger, a runner no longer authorized) and :attempt for a refusal that recurs every pass (a payload the contract rejects, a story it could not attach)."
+      "description": "force_unclaim_story/3 accepts release_cause: :placement_refused | :attempt | :operator (default :operator), and Placement.undo_claim/5 passes :placement_refused when the runner was unavailable (not connected, at capacity, a lock not granted, its credential no longer authorized) or the claim ended under the placement (stale claim epoch), and :attempt for every other refusal (a payload the contract rejects, a story it could not attach, a dispatch_id the ledger already holds or already answered — each pass mints a fresh one, so that is never a concurrent pass)."
     },
     {
       "id": "AC-44.4.2",

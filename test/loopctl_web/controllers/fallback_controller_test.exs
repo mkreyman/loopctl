@@ -647,19 +647,5 @@ defmodule LoopctlWeb.FallbackControllerTest do
 
       assert body["error"]["code"] == "audit_chain_append_failed"
     end
-
-    # #877 review round 2, finding 7: a release's re-contract audit refusal is its own atom, so
-    # it is rendered as itself rather than as the story write's 422 or the last clause's
-    # anonymous 500.
-    test "recontract_audit_refused is a named 500: the whole release rolled back" do
-      body =
-        json_response(
-          FallbackController.call(build_conn(), {:error, :recontract_audit_refused}),
-          500
-        )
-
-      assert body["error"]["code"] == "recontract_audit_refused"
-      assert body["error"]["message"] =~ "rolled back"
-    end
   end
 end

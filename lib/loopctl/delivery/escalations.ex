@@ -124,7 +124,6 @@ defmodule Loopctl.Delivery.Escalations do
           # operation's `responses` map, so a new shape that renders an undeclared status
           # fails there.
           | :force_unclaim_failed
-          | :recontract_audit_refused
           | {:contract_mismatch, map()}
           | Ecto.Changeset.t()
 

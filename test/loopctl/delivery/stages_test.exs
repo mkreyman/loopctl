@@ -1146,50 +1146,32 @@ defmodule Loopctl.Delivery.StagesTest do
              )
     end
 
-    # #877 review round 2, finding 1. The audit entry is checked BEFORE the UPDATE: checked
-    # after, a refused audit left the story `contracted` with no audit entry, and bulk reject —
-    # which logs a re-contract refusal and commits the batch — committed exactly that. Refused
-    # now, NOTHING is written: the story is still `pending`, with no audit entry and no webhook.
-    # A label `AuditLog.create_changeset/1` cannot cast is the one way to make it refuse.
-    test "recontract_in_transaction refuses an invalid audit entry before writing anything" do
+    # #877 review round 3, findings 1-3. A story that is not pending is returned exactly as it
+    # stands, and NOTHING is written for it — no row change, no audit entry, no webhook. The
+    # re-contract has no refusal of its own any more: its audit entry is valid by construction
+    # and inserted with `insert!`, so there is no state in which it answers an error.
+    test "recontract_in_transaction writes nothing at all for a story that is not pending" do
       ctx = claimed_with_stage(:queued)
       fixture(:webhook, %{tenant_id: ctx.tenant_id, events: ["story.status_changed"]})
+      before = AdminRepo.get!(Story, ctx.story.id)
 
-      {1, _} =
-        from(s in Story, where: s.id == ^ctx.story.id)
-        |> AdminRepo.update_all(set: [agent_status: :pending])
+      audits =
+        AdminRepo.aggregate(from(a in AuditLog, where: a.entity_id == ^ctx.story.id), :count)
 
-      pending = %{ctx.story | agent_status: :pending}
+      assert {:ok, {:ok, ^before}} =
+               AdminRepo.transaction(fn ->
+                 Progress.recontract_in_transaction(ctx.tenant_id, before, "t")
+               end)
 
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert {:ok, {:error, :recontract_audit_refused}} =
-                 AdminRepo.transaction(fn ->
-                   Progress.recontract_in_transaction(ctx.tenant_id, pending, %{
-                     "not" => "a label"
-                   })
-                 end)
-      end)
+      assert AdminRepo.get!(Story, ctx.story.id) == before
 
-      assert AdminRepo.get!(Story, ctx.story.id).agent_status == :pending
-
-      refute AdminRepo.exists?(
-               from a in AuditLog,
-                 where:
-                   a.entity_id == ^ctx.story.id and a.old_state == ^%{"agent_status" => "pending"}
-             )
+      assert AdminRepo.aggregate(from(a in AuditLog, where: a.entity_id == ^ctx.story.id), :count) ==
+               audits
 
       refute AdminRepo.exists?(
                from e in WebhookEvent,
-                 where:
-                   e.tenant_id == ^ctx.tenant_id and e.event_type == "story.status_changed" and
-                     fragment("?->>'new_status'", e.payload) == "contracted"
+                 where: e.tenant_id == ^ctx.tenant_id and e.event_type == "story.status_changed"
              )
-
-      # The same story with a label that casts IS contracted — the refusal above is the audit.
-      assert {:ok, {:ok, %Story{agent_status: :contracted}}} =
-               AdminRepo.transaction(fn ->
-                 Progress.recontract_in_transaction(ctx.tenant_id, pending, "t")
-               end)
     end
 
     # #877 review round 2, finding 6: outside a transaction the UPDATE and the audit insert
@@ -1354,35 +1336,116 @@ defmodule Loopctl.Delivery.StagesTest do
 
       expire_lease(healthy.story)
 
-      raised = [:loopctl, :reclaim_expired_claims, :raised]
-      ref = :telemetry_test.attach_event_handlers(self(), [raised])
-
-      # Only what is logged AT ERROR is captured, so the line below is proof of its level.
+      # Captured at WARNING, so a second line for the same raise — the per-candidate failure
+      # line — would be caught too.
       log =
-        ExUnit.CaptureLog.capture_log([level: :error], fn ->
+        ExUnit.CaptureLog.capture_log([level: :warning], fn ->
           assert :ok = ReclaimExpiredClaimsWorker.perform(%Oban.Job{args: %{}})
         end)
 
-      # #877 review round 2, finding 3. Rescued, the raise never reaches Oban, so the worker is
-      # the only place it is reported: at error, naming the story, with the exception's own
-      # text and stack — not the struct name alone — and as a telemetry event.
+      # #877 review round 3, finding 4. Rescued, the raise never reaches Oban, so the worker is
+      # the only place it is reported: ONCE, at error, naming the story, the exception's module
+      # and its stack — and never the exception's message, which for a database error can quote
+      # the story row (here, the value the cast refused).
       poisoned_id = poisoned.story.id
 
-      assert_received {^raised, ^ref, %{count: 1},
-                       %{story_id: ^poisoned_id, exception: Postgrex.Error}}
-
+      # One ENTRY per log call: the test formatter writes `<time> <metadata>[<level>] <msg>`,
+      # and a stack trace spans lines, so entries are split at each leading timestamp.
       assert [raised_line] =
-               log |> String.split("\n[") |> Enum.filter(&(&1 =~ "release raised"))
+               log
+               |> String.split(~r/\n(?=\d\d:\d\d:\d\d\.\d{3} )/, trim: true)
+               |> Enum.filter(&(&1 =~ poisoned_id))
 
-      assert raised_line =~ "story_id=#{poisoned_id}"
-      assert raised_line =~ "** (Postgrex.Error)"
+      assert raised_line =~ "[error]"
+      assert raised_line =~ "release raised"
+      assert raised_line =~ "exception=Postgrex.Error"
       assert raised_line =~ "reclaim_expired_claim"
+      refute raised_line =~ ~s("x")
 
-      assert AdminRepo.get!(Story, poisoned.story.id).agent_status == :assigned
+      assert %Story{agent_status: :assigned, lease_reclaim_failed_at: %DateTime{}} =
+               AdminRepo.get!(Story, poisoned.story.id)
+
       assert AdminRepo.get!(StoryStage, poisoned.row.id).stage == :implementing
 
       assert AdminRepo.get!(StoryStage, healthy.row.id).stage == :queued
-      assert AdminRepo.get!(Story, healthy.story.id).agent_status == :contracted
+
+      assert %Story{agent_status: :contracted, lease_reclaim_failed_at: nil} =
+               AdminRepo.get!(Story, healthy.story.id)
+    end
+
+    test "a failed-lease stamp lands only at the epoch the candidate was read at" do
+      story = AdminRepo.get!(Story, claimed_with_stage(:implementing).story.id)
+      now = DateTime.utc_now()
+
+      # Released and re-claimed after the pass read it: the stamp must miss the new lease.
+      stale = %{id: story.id, tenant_id: story.tenant_id, claim_epoch: story.claim_epoch - 1}
+      assert {0, _} = ReclaimExpiredClaimsWorker.mark_failed(stale, now)
+      assert AdminRepo.get!(Story, story.id).lease_reclaim_failed_at == nil
+
+      current = %{stale | claim_epoch: story.claim_epoch}
+      assert {1, _} = ReclaimExpiredClaimsWorker.mark_failed(current, now)
+      assert %DateTime{} = AdminRepo.get!(Story, story.id).lease_reclaim_failed_at
+    end
+
+    # #877 review round 3, finding 5. Ranked oldest lease first within a tenant, a tenant with
+    # more failing leases than its share of the batch gave them every slot on every run, and its
+    # healthy lease was never reached. A lease whose release failed is stamped after the pass
+    # and ranks behind every unstamped one.
+    test "a tenant's failing leases drop behind its healthy one after one failed pass" do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      now = DateTime.utc_now()
+
+      lease = fn attempts, until ->
+        story = fixture(:story, %{tenant_id: tenant.id, agent_status: :contracted})
+        {:ok, claimed} = Progress.claim_story(tenant.id, story.id, agent_id: agent.id)
+
+        fixture(:story_stage, %{
+          repo: AdminRepo,
+          tenant_id: tenant.id,
+          story_id: story.id,
+          stage: :implementing,
+          claim_epoch: claimed.claim_epoch,
+          attempts: attempts
+        })
+
+        {1, _} =
+          from(s in Story, where: s.id == ^story.id)
+          |> AdminRepo.update_all(set: [claimed_until: until])
+
+        story.id
+      end
+
+      poisoned =
+        for age <- [3_600, 3_000, 2_400],
+            do: lease.(%{"runner_lost" => "x"}, DateTime.add(now, -age))
+
+      # Not yet expired when the pass runs, so the pass cannot reclaim it; expired by `later`.
+      healthy = lease.(%{}, DateTime.add(now, 600))
+      later = DateTime.add(now, 1_200)
+
+      ids = fn -> later |> ReclaimExpiredClaimsWorker.candidates(2) |> Enum.map(& &1.id) end
+
+      # Oldest first, the failing leases fill both slots.
+      assert ids.() == Enum.take(poisoned, 2)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = ReclaimExpiredClaimsWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      assert ids.() == [healthy, hd(poisoned)]
+    end
+
+    test "every release clears the lease's reclaim-failure stamp" do
+      ctx = claimed_with_stage(:implementing)
+
+      {1, _} =
+        from(s in Story, where: s.id == ^ctx.story.id)
+        |> AdminRepo.update_all(set: [lease_reclaim_failed_at: DateTime.utc_now()])
+
+      {:ok, _} = Progress.force_unclaim_story(ctx.tenant_id, ctx.story.id)
+
+      assert AdminRepo.get!(Story, ctx.story.id).lease_reclaim_failed_at == nil
     end
 
     defp assert_rolled_back(ctx) do

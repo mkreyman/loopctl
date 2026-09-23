@@ -30,6 +30,11 @@ defmodule Loopctl.MultiResultCoverage do
 
   Nothing in a clause BODY is ever looked at, and a 2- or 3-element tuple is a different node
   from a 4-element one, so the two things a regex kept miscounting are not reachable.
+
+  AND ONLY A CLAUSE THAT TAKES ANY REASON COUNTS (#877 review round 3). The third element must
+  be a variable the guard does not read: `{:error, :stage, :audit_chain_append_failed, _}`
+  covers ONE reason and leaves the step's next one a `CaseClauseError`, so it covers nothing.
+  A guard that constrains the reason is treated the same way, which errs towards reporting.
   """
   @spec handled_names(String.t(), atom()) :: [atom()]
   def handled_names(source, fun) do
@@ -82,16 +87,20 @@ defmodule Loopctl.MultiResultCoverage do
   defp transaction_call?(_), do: false
 
   defp clause_names({:->, _, [[{:when, _, [pattern, guard]}], _body]}) do
-    case error_tuple_second(pattern) do
-      {:var, var} -> guard_atoms(guard, var)
-      {:atom, name} -> [name]
-      :none -> []
+    if any_reason?(pattern, guard) do
+      case error_tuple_second(pattern) do
+        {:var, var} -> guard_atoms(guard, var)
+        {:atom, name} -> [name]
+        :none -> []
+      end
+    else
+      []
     end
   end
 
   defp clause_names({:->, _, [[pattern], _body]}) do
-    case error_tuple_second(pattern) do
-      {:atom, name} -> [name]
+    case {error_tuple_second(pattern), any_reason?(pattern, nil)} do
+      {{:atom, name}, true} -> [name]
       _ -> []
     end
   end
@@ -111,6 +120,23 @@ defmodule Loopctl.MultiResultCoverage do
   end
 
   defp error_tuple_second(_), do: :none
+
+  # The REASON position — the third element — binds any value, and the guard never reads it.
+  defp any_reason?({:{}, _, [:error, _step, {var, _, ctx} | _]}, guard)
+       when is_atom(var) and is_atom(ctx),
+       do: not reads_var?(guard, var)
+
+  defp any_reason?(_pattern, _guard), do: false
+
+  defp reads_var?(guard, var) do
+    {_ast, found} =
+      Macro.prewalk(guard, false, fn
+        {^var, _, ctx} = node, _acc when is_atom(ctx) -> {node, true}
+        node, acc -> {node, acc}
+      end)
+
+    found
+  end
 
   defp guard_atoms({:in, _, [{var, _, _}, list]}, var) when is_list(list),
     do: Enum.filter(list, &is_atom/1)

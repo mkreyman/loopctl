@@ -132,6 +132,10 @@ defmodule Loopctl.WorkBreakdown.Story do
     # so its lease no longer applies and the reclaimer leaves the story alone. Cleared by
     # every release. Same no-cast rule as the two fields above.
     field :review_requested_at, :utc_datetime_usec
+    # Set by `Loopctl.Workers.ReclaimExpiredClaimsWorker` when this lease's release failed or
+    # raised, so the tenant's other expired leases are reclaimed ahead of it (#877 review round
+    # 3). Cleared by every release. Same no-cast rule as the fields above.
+    field :lease_reclaim_failed_at, :utc_datetime_usec
 
     # Issue #621: the capability minted by the lifecycle transition that returned
     # this struct — the credential the caller needs for its NEXT custody op

@@ -18,8 +18,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   means the whole release rolled back and the call should be repeated. No change to the
   request or the key.
 - **`force_unclaim_story`'s and `reject_story`'s refusals.** Both now name `500
-  audit_chain_append_failed` (the release's escalation could not append its chain entry) and
-  `500 recontract_audit_refused` (the re-contract's audit entry was refused): either way the
+  audit_chain_append_failed` (the release's escalation could not append its chain entry): the
   whole call rolled back and the story is unchanged, and a re-run meets the same condition until
   an operator acts. force-unclaim answered `force_unclaim_failed` for the first before.
 

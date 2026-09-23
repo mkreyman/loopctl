@@ -571,16 +571,21 @@ defmodule Loopctl.Delivery.PlacementTest do
       :capacity_busy,
       :busy,
       :tenant_halted,
-      # races the next pass does not meet again
-      :stale_claim_epoch,
-      :dispatch_already_replied,
-      :dispatch_id_conflict,
-      :not_authorized
+      # the runner's credential, bounded by the channel's authorization recheck
+      :not_authorized,
+      # a race the next pass does not meet again
+      :stale_claim_epoch
     ]
 
     test "every runner-unavailable or race refusal is released uncounted; others count" do
       for reason <- @uncounted_refusals do
         assert {reason, Placement.release_cause(reason)} == {reason, :placement_refused}
+      end
+
+      # Every pass mints a fresh `dispatch_id`, so neither ledger fence can be another pass
+      # having got there first (#877 review round 3): they are about THIS dispatch, and count.
+      for reason <- [:dispatch_already_replied, :dispatch_id_conflict] do
+        assert {reason, Placement.release_cause(reason)} == {reason, :attempt}
       end
 
       # Unlisted, and deterministic: the runner will refuse this kind on every pass.
