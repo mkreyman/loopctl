@@ -180,7 +180,7 @@ defmodule Loopctl.Runners.UsageTest do
       assert_in_delta seconds_from_now(Usage.exhausted_until(tenant.id, r1.id)), @eight_days, 5
     end
 
-    test "a peer's REPORTED hold is never shortened" do
+    test "a fresher FUTURE report lowers a peer's reported hold: the latest observation wins" do
       tenant = fixture(:stage_tenant)
       [r1, r2] = for _ <- 1..2, do: runner(tenant.id)
       later = DateTime.add(DateTime.utc_now(), 7_200, :second)
@@ -197,9 +197,47 @@ defmodule Loopctl.Runners.UsageTest do
 
       assert :ok = Usage.record(tenant.id, r1.id, %{exhausted: true, resets_at: soon})
 
-      # r2's report reached r1's row too; neither is lowered by r1's nearer one.
-      assert DateTime.compare(row(r2).usage_exhausted_until, later) == :eq
+      # r1's nearer reset is the newer observation of the same account, so both rows take it.
+      assert DateTime.compare(row(r2).usage_exhausted_until, soon) == :eq
+      assert DateTime.compare(row(r1).usage_exhausted_until, soon) == :eq
+      refute row(r2).usage_hold_provisional
+    end
+
+    test "a reset already PAST neither shortens nor rewrites a live reported hold" do
+      tenant = fixture(:stage_tenant)
+      [r1, r2] = for _ <- 1..2, do: runner(tenant.id)
+      later = DateTime.add(DateTime.utc_now(), 7_200, :second)
+
+      assert :ok = Usage.record(tenant.id, r1.id, %{exhausted: false, account_ref: "a"})
+
+      assert :ok =
+               Usage.record(tenant.id, r2.id, %{
+                 exhausted: true,
+                 resets_at: later,
+                 account_ref: "a"
+               })
+
+      before = {version(r1), version(r2)}
+
+      # r1's clock runs behind: its reset is an hour gone, no evidence against r2's.
+      past = DateTime.add(DateTime.utc_now(), -3_600, :second)
+      assert :ok = Usage.record(tenant.id, r1.id, %{exhausted: true, resets_at: past})
+
+      assert {version(r1), version(r2)} == before
       assert DateTime.compare(row(r1).usage_exhausted_until, later) == :eq
+    end
+
+    test "a reset still ahead but INSIDE the floor is treated like a past one: no live hold " <>
+           "is shortened" do
+      tenant = fixture(:stage_tenant)
+      r = runner(tenant.id)
+      later = DateTime.add(DateTime.utc_now(), 7_200, :second)
+      assert :ok = Usage.record(tenant.id, r.id, %{exhausted: true, resets_at: later})
+
+      five_seconds = DateTime.add(DateTime.utc_now(), 5, :second)
+      assert :ok = Usage.record(tenant.id, r.id, %{exhausted: true, resets_at: five_seconds})
+
+      assert DateTime.compare(row(r).usage_exhausted_until, later) == :eq
     end
 
     test "a report with no reset does not slide a reported hold out to the bound" do
@@ -227,6 +265,21 @@ defmodule Loopctl.Runners.UsageTest do
       assert {version(r1), version(r2)} == before
 
       assert :ok = Usage.record(tenant.id, r1.id, %{exhausted: true})
+      assert {version(r1), version(r2)} == before
+    end
+
+    test "a repeated reset beyond the ceiling (clamped, so it moves every second) writes no row" do
+      tenant = fixture(:stage_tenant)
+      [r1, r2] = for _ <- 1..2, do: runner(tenant.id)
+      far = DateTime.add(DateTime.utc_now(), 365 * 24 * 60 * 60, :second)
+      report = %{exhausted: true, resets_at: far, account_ref: "a"}
+
+      assert :ok = Usage.record(tenant.id, r2.id, %{exhausted: false, account_ref: "a"})
+      assert :ok = Usage.record(tenant.id, r1.id, report)
+      before = {version(r1), version(r2)}
+
+      Process.sleep(1_100)
+      assert :ok = Usage.record(tenant.id, r1.id, report)
       assert {version(r1), version(r2)} == before
     end
 
@@ -603,72 +656,53 @@ defmodule Loopctl.Runners.UsageTest do
     end
   end
 
-  describe "exhausted_for_pass/2" do
-    test "reads the tenant once per pass: a later call answers from the cache" do
-      tenant = fixture(:stage_tenant)
-      r = runner(tenant.id)
-
-      {first, cache} = Usage.exhausted_for_pass(%{}, tenant.id)
-      assert first == %{}
-
-      assert :ok = Usage.record(tenant.id, r.id, %{exhausted: true})
-
-      assert {^first, ^cache} = Usage.exhausted_for_pass(cache, tenant.id)
-      assert {%{} = fresh, _cache} = Usage.exhausted_for_pass(%{}, tenant.id)
-      assert Map.has_key?(fresh, r.id)
-    end
-  end
-
-  describe "recheck_for_pass/3" do
-    test "a runner found dry joins the cached map with its reset; a fresh one leaves it" do
-      tenant = fixture(:stage_tenant)
-      [dry, fresh] = for _ <- 1..2, do: runner(tenant.id)
-      {%{} = before, cache} = Usage.exhausted_for_pass(%{}, tenant.id)
-      refute Map.has_key?(before, dry.id)
-
-      soon = DateTime.add(DateTime.utc_now(), 600, :second)
-      assert :ok = Usage.record(tenant.id, dry.id, %{exhausted: true, resets_at: soon})
-
-      assert {false, ^cache} = Usage.recheck_for_pass(cache, tenant.id, fresh.id)
-      assert {true, cache} = Usage.recheck_for_pass(cache, tenant.id, dry.id)
-
-      assert {%{} = now, _cache} = Usage.exhausted_for_pass(cache, tenant.id)
-      assert DateTime.compare(now[dry.id], soon) == :eq
-    end
-  end
-
-  describe "note_no_runner/4 (AC-44.6.8)" do
-    setup do
-      Logger.put_module_level(Usage, :info)
-      on_exit(fn -> Logger.delete_module_level(Usage) end)
-      :ok
-    end
-
-    test "logs the earliest reset of the runners refused for exhaustion, once per tenant" do
-      candidate = %{tenant_id: Ecto.UUID.generate(), story_id: Ecto.UUID.generate()}
-      soon = DateTime.add(DateTime.utc_now(), 600, :second)
-      later = DateTime.add(soon, 3_600, :second)
-
-      log =
-        ExUnit.CaptureLog.capture_log([level: :info], fn ->
-          cache = Usage.note_no_runner(%{}, "Pass", candidate, [later, soon])
-          assert Usage.note_no_runner(cache, "Pass", candidate, [later]) == cache
+  describe "not_exhausted/2 (AC-44.6.5, the selectors' predicate)" do
+    defp placeable(tenant_id) do
+      {:ok, ids} =
+        Repo.with_tenant(tenant_id, fn ->
+          from(r in Runner, as: :runner, where: r.tenant_id == ^tenant_id, select: r.id)
+          |> Usage.not_exhausted(tenant_id)
+          |> Repo.all()
         end)
 
-      assert [line] = log |> String.split("\n") |> Enum.filter(&(&1 =~ "earliest_usage_reset="))
-      assert line =~ "Pass: "
-      assert line =~ "earliest_usage_reset=#{DateTime.to_iso8601(soon)}:"
+      MapSet.new(ids)
     end
 
-    test "logs nothing, and notes nothing, when no runner was refused for exhaustion" do
-      candidate = %{tenant_id: Ecto.UUID.generate(), story_id: Ecto.UUID.generate()}
+    test "excludes a runner exhausted on its own row or through a peer on its account, and " <>
+           "no other" do
+      tenant = fixture(:stage_tenant)
+      [dry, peer, other, lapsed] = for _ <- 1..4, do: runner(tenant.id)
 
-      log =
-        ExUnit.CaptureLog.capture_log([level: :info], fn ->
-          assert Usage.note_no_runner(%{}, "Pass", candidate, []) == %{}
-        end)
+      assert :ok = Usage.record(tenant.id, peer.id, %{exhausted: false, account_ref: "a"})
+      assert :ok = Usage.record(tenant.id, other.id, %{exhausted: false, account_ref: "b"})
+      assert :ok = Usage.record(tenant.id, dry.id, %{exhausted: true, account_ref: "a"})
+      :ok = put_row(lapsed, usage_exhausted_until: DateTime.add(DateTime.utc_now(), -1, :second))
 
-      refute log =~ "earliest_usage_reset"
+      assert placeable(tenant.id) == MapSet.new([other.id, lapsed.id])
+    end
+
+    test "a revoked peer's hold still excludes the machines left on its account" do
+      tenant = fixture(:stage_tenant)
+      [dry, peer] = for _ <- 1..2, do: runner(tenant.id)
+
+      assert :ok = Usage.record(tenant.id, peer.id, %{exhausted: false, account_ref: "a"})
+      assert :ok = Usage.record(tenant.id, dry.id, %{exhausted: true, account_ref: "a"})
+      :ok = put_row(dry, revoked_at: DateTime.utc_now())
+
+      refute MapSet.member?(placeable(tenant.id), peer.id)
+    end
+
+    test "another tenant's exhausted runner on the same account_ref excludes nothing here " <>
+           "(TC-44.6.8)" do
+      tenant_a = fixture(:stage_tenant)
+      tenant_b = fixture(:stage_tenant)
+      a = runner(tenant_a.id)
+      b = runner(tenant_b.id)
+
+      assert :ok = Usage.record(tenant_a.id, a.id, %{exhausted: false, account_ref: "acct-a"})
+      assert :ok = Usage.record(tenant_b.id, b.id, %{exhausted: true, account_ref: "acct-a"})
+
+      assert placeable(tenant_a.id) == MapSet.new([a.id])
     end
   end
 end

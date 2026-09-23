@@ -451,13 +451,14 @@ defmodule Loopctl.Delivery.Placement do
     if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
   end
 
-  # AN EXHAUSTED SUBSCRIPTION IS NOT CAPACITY (US-44.6). The unattended selectors skip such a
-  # machine through `Runners.accepts?/5`; a placement NAMING the runner reached neither, so an
-  # operator could hand a story to a machine whose every session ends `usage_exhausted` — and
-  # since that release spends no attempt, nothing bounded the round trip. Mounted beside
-  # `runner_accepting_work/1`, on the CLAIM path only, for the reasons given there. Unlike that
-  # gate it does not need the live meta: the state is on the `runners` row, so a machine with
-  # no socket, or two, is judged the same — and `Runners.dispatch/3` still answers the
+  # AN EXHAUSTED SUBSCRIPTION IS NOT CAPACITY (US-44.6). The unattended selectors never select
+  # such a machine (`Loopctl.Runners.Selection`), and `Runners.dispatch/3` refuses a NEW
+  # dispatch to one — but that refusal comes after the claim and the mint, so a placement
+  # NAMING the runner is refused here first, where nothing has been spent. Mounted beside
+  # `runner_accepting_work/1`, on the CLAIM path only, for the reasons given there; the resume
+  # path's push is exempt in `dispatch/3` too, since the ledger already holds its id. Unlike
+  # that gate it does not need the live meta: the state is on the `runners` row, so a machine
+  # with no socket, or two, is judged the same — and `Runners.dispatch/3` still answers the
   # connection question afterwards.
   defp runner_not_exhausted(tenant_id, runner_id) do
     if Runners.usage_exhausted?(tenant_id, runner_id),

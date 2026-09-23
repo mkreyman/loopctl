@@ -329,7 +329,6 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
 
   describe "usage_exhausted marks the RUNNER exhausted (US-44.6, AC-44.6.4)" do
     @eight_days 8 * 24 * 60 * 60
-    @repo "mkreyman/home_care_billing"
 
     test "the runner is held out for eight days, so the re-queued story is not offered back to it",
          ctx do
@@ -339,21 +338,9 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
 
       # THE LOOP THIS CLOSES. The release above re-queued the story WITHOUT spending an
       # attempt, so nothing bounded how often it could be placed straight back on this machine,
-      # whose every session ends the same way. Both placement paths now refuse it — the
-      # selectors' predicate (with a meta that is otherwise accepting everything) and an
-      # operator's placement naming the runner outright.
-      assert {:error, :runner_exhausted} =
-               unboxed(fn ->
-                 Runners.accepts?(ctx.tenant_id, ctx.runner.id, %{}, "implement", @repo)
-               end)
-
-      # A kind it never declared is refused for THAT, not for exhaustion: `:runner_exhausted`
-      # is what the no-runner note turns into "capacity returns at <reset>", so it must only
-      # name a runner that was otherwise eligible (a silent meta implies `implement` alone).
-      assert {:error, :kind_not_supported} =
-               unboxed(fn ->
-                 Runners.accepts?(ctx.tenant_id, ctx.runner.id, %{}, "triage", @repo)
-               end)
+      # whose every session ends the same way. The machine now reads as exhausted — which the
+      # selectors' query excludes — and an operator's placement naming it outright is refused.
+      assert unboxed(fn -> Runners.usage_exhausted?(ctx.tenant_id, ctx.runner.id) end)
 
       unboxed(fn ->
         {1, _} =

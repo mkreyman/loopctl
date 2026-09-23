@@ -29,18 +29,19 @@ defmodule Loopctl.Runners.Usage do
     the one stored when none is) and on the runner's own row; with no account at all, on its
     own row alone. `exhausted: true` carries `resets_at` CLAMPED to `[now + 60s, now + 8 days]`,
     or the upper bound when there is none — never ignored, because ignoring fails open — and
-    what it does to a row depends on what the row already holds:
-      - NO LIVE HOLD (none, or one already past): takes the value.
-      - a PROVISIONAL hold — the 8-day guess below, made knowing no reset: replaced when the
-        report carries a `resets_at` still ahead, which is a real observation of the account
-        and corrects the guess on every machine of it (a stale guess on a peer would otherwise
-        outlive it). A report with no `resets_at`, or one already past, is no better evidence
-        than the guess and leaves it.
-      - a REPORTED hold still ahead: raised to the value when that is later, never lowered —
-        it is another machine's observation of the same account, as good as this one — and not
-        slid out to the bound by a report that carries no `resets_at`.
-    A value from a report with no `resets_at` is itself provisional. Only rows whose value or
-    flag changes are written, so a runner repeating one report writes nothing.
+    what it does depends on the `resets_at` it carries:
+      - a `resets_at` STILL AHEAD beyond the floor: SETS the account's hold to it on every
+        such row, as a REPORT (`usage_hold_provisional: false`). The latest observation of
+        the account wins, later or earlier than what a row holds: it replaces the 8-day guess
+        below, and it replaces an older report whether that was further out or nearer.
+      - a `resets_at` already past, or inside the floor: clamped up to `now + 60s`, and written
+        ONLY on a row with no live hold (none, or one already past). A reset that has been and
+        gone is no evidence against a hold that is still live, so it neither shortens one nor
+        rewrites rows on every status.
+      - no `resets_at`: `now + 8 days`, PROVISIONAL, and again only on a row with no live hold
+        — it knows no reset, so it cannot correct one.
+    Only rows whose value or flag changes are written, so a runner repeating one report writes
+    nothing (except a `resets_at` beyond the ceiling, whose clamp moves with the clock).
     `exhausted: false` CLEARS every such row holding a LIVE hold, and stamps `usage_cleared_at`
     on each one it clears — the account has refilled, so every machine on it has. A hold
     already past is left as it is and stamps nothing: it ended by itself, and the routine
@@ -55,11 +56,12 @@ defmodule Loopctl.Runners.Usage do
   ## Clock skew
 
   `resets_at` is the RUNNER's clock; the clamp is control's. A runner whose clock runs behind
-  can send a reset that is already past. On a row with no live hold it is clamped up to
-  `now + 60s`, so a declared exhaustion is never a no-op; it never replaces a provisional hold,
-  which a past reset is no evidence against, and never lowers a reported one. A runner whose
-  clock runs ahead cannot hold a machine out for longer than 8 days, which is the ceiling a
-  stale or hostile timestamp can buy.
+  can send a reset that is already past. It is clamped up to `now + 60s` and written only
+  where no hold is live, so a declared exhaustion is never a no-op on a machine that had none,
+  and never shortens a live hold — a guess or a report — that a skewed clock is no evidence
+  against. A runner whose clock runs ahead cannot hold a machine out for longer than 8 days,
+  which is the ceiling a stale or hostile timestamp can buy; a FUTURE reset from a peer on the
+  same account can lower it again, since the latest observation wins.
 
   ## Races, and which way each one fails
 
@@ -151,25 +153,12 @@ defmodule Loopctl.Runners.Usage do
     write(tenant_id, fn ->
       account_ref = switch_account_ref(tenant_id, runner_id, usage)
 
-      account =
-        from(r in Runner, where: r.tenant_id == ^tenant_id)
-        |> same_account_or_self(runner_id, account_ref)
-
-      # Every row this matches CHANGES — a missing or past value differs from one in the
-      # future, and a replaced guess flips its flag — so a repeated report writes nothing.
-      account
-      |> where(^replaceable(resets_at, now))
+      from(r in Runner, where: r.tenant_id == ^tenant_id)
+      |> same_account_or_self(runner_id, account_ref)
+      |> where(^rows_to_set(resets_at, until, now))
       |> Repo.update_all(
         set: [usage_exhausted_until: until, usage_hold_provisional: is_nil(resets_at)]
       )
-
-      # A REPORTED hold still ahead is only ever raised; strictly earlier, so again only a
-      # change is written. With no `resets_at` there is nothing to raise it to.
-      if resets_at do
-        account
-        |> where([r], not r.usage_hold_provisional and r.usage_exhausted_until < ^until)
-        |> Repo.update_all(set: [usage_exhausted_until: until])
-      end
 
       :ok
     end)
@@ -196,15 +185,30 @@ defmodule Loopctl.Runners.Usage do
     end)
   end
 
-  # The rows an `exhausted: true` report sets outright: those with no live hold, and — only
-  # when the report knows a reset still ahead — those holding a provisional guess.
-  defp replaceable(resets_at, now) do
-    no_live_hold =
+  # The rows an `exhausted: true` report writes. A `resets_at` still ahead past the floor is
+  # the account's CURRENT observation, so it sets every row it changes — a guess, an older
+  # report later or earlier than it, or no hold — and a row already holding exactly this value
+  # as a report is left alone. Anything else — no `resets_at`, or one already past or inside the
+  # floor, clamped up to it — is no evidence against a hold that is still live, so it only
+  # fills a row with none, and a repeat of it finds no such row.
+  # A value within the floor of the stored one is the same observation: a reset beyond the
+  # 8-day ceiling clamps to `now + ceiling`, which moves every second, and an exact `!=` made
+  # every repeat of that report rewrite the account's rows — the rows every reservation locks.
+  defp rows_to_set(resets_at, until, now) do
+    if resets_at && DateTime.after?(resets_at, DateTime.add(now, @min_hold_seconds, :second)) do
+      dynamic(
+        [r],
+        is_nil(r.usage_exhausted_until) or r.usage_hold_provisional or
+          fragment(
+            "abs(extract(epoch from (? - ?))) > ?",
+            r.usage_exhausted_until,
+            ^until,
+            ^@min_hold_seconds
+          )
+      )
+    else
       dynamic([r], is_nil(r.usage_exhausted_until) or r.usage_exhausted_until <= ^now)
-
-    if resets_at && DateTime.after?(resets_at, now),
-      do: dynamic([r], ^no_live_hold or r.usage_hold_provisional),
-      else: no_live_hold
+    end
   end
 
   @doc """
@@ -312,81 +316,21 @@ defmodule Loopctl.Runners.Usage do
   end
 
   @doc """
-  `exhausted_until_by_runner/1` for `tenant_id`, read ONCE per pass through the pass's `cache`
-  — what the driver and the triage dispatcher hand `Loopctl.Runners.accepts?/6`, so a pass
-  judges every runner for every story on one read rather than a query per runner per story.
-
-  A pass is seconds long, but a machine can run dry during it, so each pass re-reads the ONE
-  runner it is about to hand work to: the driver through `Loopctl.Delivery.Placement.place/4`'s
-  own check, the triage dispatcher — whose `Loopctl.Runners.dispatch/3` checks nothing of the
-  kind — through `recheck_for_pass/3`. Either way a runner found dry joins the cached map, so
-  no later candidate of the pass picks it again.
+  `query` narrowed to the runners that are NOT exhausted at this instant — the selectors'
+  predicate (`Loopctl.Runners.Selection`), on the rows they already read for a free slot. The
+  runner must be bound `as: :runner`. `NOT EXISTS` over the SAME definition
+  `exhausted_until/2` and `exhausted_until_by_runner/1` read, so the pool, the placement gate
+  and the selection cannot disagree about which machine is dry.
   """
-  @spec exhausted_for_pass(map(), Ecto.UUID.t()) :: {%{Ecto.UUID.t() => DateTime.t()}, map()}
-  def exhausted_for_pass(cache, tenant_id) when is_map(cache) and is_binary(tenant_id) do
-    key = {:usage_exhausted, tenant_id}
+  @spec not_exhausted(Ecto.Query.t(), Ecto.UUID.t()) :: Ecto.Query.t()
+  def not_exhausted(query, tenant_id) when is_binary(tenant_id) do
+    held =
+      tenant_id
+      |> effective_query(DateTime.utc_now())
+      |> where([r], r.id == parent_as(:runner).id)
+      |> select(1)
 
-    case Map.fetch(cache, key) do
-      {:ok, exhausted} ->
-        {exhausted, cache}
-
-      :error ->
-        exhausted = exhausted_until_by_runner(tenant_id)
-        {exhausted, Map.put(cache, key, exhausted)}
-    end
-  end
-
-  @doc """
-  Re-reads whether `runner_id` is exhausted NOW, from the rows rather than the pass's map —
-  the one read a pass makes before it commits work to a machine the map may be stale about.
-  When it is, the cached map gains it with its effective reset, so no later candidate of the
-  pass picks it again and the `:no_runner` note can name it. `{exhausted?, cache}`.
-  """
-  @spec recheck_for_pass(map(), Ecto.UUID.t(), Ecto.UUID.t()) :: {boolean(), map()}
-  def recheck_for_pass(cache, tenant_id, runner_id)
-      when is_map(cache) and is_binary(tenant_id) and is_binary(runner_id) do
-    case exhausted_until(tenant_id, runner_id) do
-      nil ->
-        {false, cache}
-
-      until ->
-        {exhausted, cache} = exhausted_for_pass(cache, tenant_id)
-
-        {true,
-         Map.put(cache, {:usage_exhausted, tenant_id}, Map.put(exhausted, runner_id, until))}
-    end
-  end
-
-  @doc """
-  The `:no_runner` note both unattended passes log (AC-44.6.8): `resets` are the effective
-  resets of the connected runners this story was refused with `:runner_exhausted`, and the
-  earliest is logged, ONCE per tenant per pass through `cache`. Nothing when `resets` is empty
-  — a story nobody could take for another reason (a full or draining fleet, a repository no
-  machine accepts, the admission cap) is not waiting on a reset, and saying it is sends an
-  operator after the wrong cause. An empty fleet is the ordinary state and logs nothing either.
-
-  Reads nothing, so it cannot fail and cannot change the candidate's outcome.
-  """
-  @spec note_no_runner(map(), String.t(), %{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}, [
-          DateTime.t()
-        ]) :: map()
-  def note_no_runner(cache, _label, _candidate, []), do: cache
-
-  def note_no_runner(cache, label, %{tenant_id: tenant_id, story_id: story_id}, resets) do
-    key = {:no_runner_noted, tenant_id}
-
-    if Map.has_key?(cache, key) do
-      cache
-    else
-      Logger.info(
-        "#{label}: no runner can take work; the soonest an exhausted runner of this " <>
-          "tenant returns is earliest_usage_reset=" <>
-          "#{resets |> Enum.min(DateTime) |> DateTime.to_iso8601()}: story_id=#{story_id}",
-        tenant_id: tenant_id
-      )
-
-      Map.put(cache, key, true)
-    end
+    where(query, not exists(held))
   end
 
   # THE ONE DEFINITION OF "EXHAUSTED", shared by the per-runner and the per-tenant read so the

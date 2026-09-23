@@ -9,8 +9,8 @@ defmodule Loopctl.Repo.Migrations.AddRunnersUsageExhausted do
     readers compare against now.
   - `usage_hold_provisional` — whether `usage_exhausted_until` is a GUESS: the 8-day bound a
     `session_ended` `usage_exhausted` (or a `status` with no `resets_at`) sets, knowing no
-    reset. A later `status` with a future `resets_at` replaces a guess on every machine of the
-    account, and never shortens a reported hold. NOT NULL, default false.
+    reset. A later `status` with a future `resets_at` replaces the hold on every machine of the
+    account, guess or report, the latest report winning. NOT NULL, default false.
   - `usage_cleared_at` — when a `usage.exhausted: false` last cleared a LIVE hold on this row. A
     `session_ended` `usage_exhausted` whose dispatch was accepted BEFORE it does not re-mark the
     account: the session saw a fact the refill report has since overtaken.

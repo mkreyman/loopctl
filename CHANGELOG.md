@@ -15,16 +15,17 @@ All notable changes to loopctl are documented here.
   `account_ref` — is in the future, the dispatch driver and the triage dispatcher skip it and
   `POST /api/v1/runners/:runner_id/dispatches` refuses it `409 runner_exhausted` with
   `usage_exhausted_until`, nothing claimed. `resets_at` is clamped to between one minute and
-  eight days from control's clock (published as `x-connection.limits.usage_hold_seconds`), and
-  `exhausted: true` without it holds for eight days; either way the value is set on every
-  runner on the `account_ref`. `exhausted: false` clears every runner on the `account_ref`. A
+  eight days from control's clock (published as `x-connection.limits.usage_hold_seconds`) and
+  applies to every runner on the `account_ref`: a `resets_at` still ahead replaces whatever they
+  hold, the latest report winning, while one already past (or none, which holds for eight days)
+  only marks runners that hold no live value. `exhausted: false` clears every runner on the `account_ref`. A
   `session_ended` `usage_exhausted` now marks the runner for eight days BEFORE it releases the
   story, so the re-queued story is no longer placed straight back on the machine that cannot
   run it — unless the account was reported refilled after that session's dispatch was
   accepted. **Operator-visible:** `GET /api/v1/runners/pool` (MCP
   `runner_pool`) shows `usage_exhausted_until` per runner, and a driver or triage pass that
-  finds no runner for a story because a connected runner was refused for exhaustion logs
-  `earliest_usage_reset=` once per tenant.
+  finds no runner for a story logs, once per tenant, how many of the tenant's runners are
+  exhausted and `earliest_usage_reset=`.
 
 - **Runners may report why an implement session ended (epic 44, US-44.3, runner contract
   1.16.0). RE-VENDOR the contract to send it; a runner that does not gets today's lease

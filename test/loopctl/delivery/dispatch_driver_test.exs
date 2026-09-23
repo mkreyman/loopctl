@@ -37,8 +37,8 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   alias Loopctl.Intake.Source
   alias Loopctl.Progress
   alias Loopctl.Runners.Capacity
-  alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Selection
   alias Loopctl.Runners.Usage
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.RunnerSocket
@@ -479,12 +479,12 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   describe "an exhausted subscription is not capacity (US-44.6)" do
     # The reset line is `:info`, below `config/test.exs`'s `:warning` primary level; a module
-    # level lets it past for the module that logs it — `Usage.note_no_runner/4`, which both
+    # level lets it past for the module that logs it — `Selection.note_no_runner/3`, which both
     # passes share — the way `Loopctl.Workers.ReclaimExpiredClaimsLoggingTest` does. VM-global,
     # which this module's `async: false` already covers.
     setup do
-      Logger.put_module_level(Usage, :info)
-      on_exit(fn -> Logger.delete_module_level(Usage) end)
+      Logger.put_module_level(Selection, :info)
+      on_exit(fn -> Logger.delete_module_level(Selection) end)
       :ok
     end
 
@@ -569,120 +569,70 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       [line] =
         log |> String.split("\n") |> Enum.filter(&(&1 =~ "earliest_usage_reset="))
 
-      [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+):/, line)
+      [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, line)
       assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
       assert DateTime.compare(logged, resets_at) == :eq
 
       leave_channel(channel)
     end
 
-    # The reset is the cause only when a connected runner was refused FOR it. Here the one
-    # runner is exhausted, but it has no checkout of the story's repository, so a reset would
-    # send an operator waiting on a refill that places nothing.
-    test "no reset is logged when exhaustion is not why the story found no runner", ctx do
-      bind_repo(ctx, queued_story(ctx))
-      channel = join_runner(ctx)
+    test "a dry runner is never selected, even the least loaded: the story goes to the " <>
+           "fresh one",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
 
+      {r2_key, r2} =
+        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
+
+      dry = join_runner(ctx)
+      fresh = join_as(r2, r2_key, "beelink")
+      # The dry runner is the least loaded, so an order-only selection would try it FIRST.
+      unboxed(fn -> set_in_flight(r2.id, 1) end)
       unboxed(fn -> :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true}) end)
+
+      assert [%Runner{id: id}] =
+               unboxed(fn -> DispatchDriver.available_runners(ctx.tenant.id, @repo) end)
+
+      assert id == r2.id
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:placed]
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :claimed
+      assert unboxed(fn -> AdminRepo.get!(Runner, ctx.runner.id) end).in_flight == 0
+
+      leave_channel(fresh)
+      leave_channel(dry)
+    end
+
+    test "the only runner going dry between selection and placement is :no_runner, with the " <>
+           "note, and nothing is claimed",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+      channel = join_runner(ctx)
 
       log =
         capture_log([level: :info], fn ->
-          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:no_runner]
+          assert exhaust_after_selection(ctx.runner.id, fn ->
+                   unboxed(fn -> DispatchDriver.run_with(20, @budgets) end)
+                 end) == [:no_runner]
         end)
 
-      refute log =~ "earliest_usage_reset"
+      assert log =~ "earliest_usage_reset="
+      refute_push "dispatch", _pushed
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :queued
+      assert unboxed(fn -> AdminRepo.get!(Runner, ctx.runner.id) end).in_flight == 0
 
       leave_channel(channel)
     end
 
-    # ONE read of the tenant's exhausted runners per pass, whatever the number of runners and
-    # stories: the eligibility check used to query per runner per story.
-    test "a pass reads the tenant's exhausted runners once", ctx do
-      repos = [@repo, "mkreyman/cron_books"]
-      for repo <- repos, do: bind_repo(ctx, queued_story(ctx), repo)
-
-      {r2_key, r2} =
-        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
-
-      first = join_runner(ctx, %{"repos" => repos})
-      second = join_as(r2, r2_key, "beelink", %{"repos" => repos})
-
-      unboxed(fn ->
-        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true})
-        :ok = Usage.record(ctx.tenant.id, r2.id, %{exhausted: true})
-      end)
-
-      reads =
-        exhaustion_reads(fn ->
-          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) ==
-                   [:no_runner, :no_runner]
-        end)
-
-      assert reads == 1
-
-      leave_channel(second)
-      leave_channel(first)
-    end
-
-    test "an empty fleet logs no reset: silence stays the ordinary state", ctx do
-      bind_repo(ctx, queued_story(ctx), @repo)
-
-      log =
-        capture_log([level: :info], fn ->
-          # And reads nothing: the tenant's exhausted runners are read only once a connected
-          # runner has passed every other fact.
-          assert exhaustion_reads(fn ->
-                   assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) ==
-                            [:no_runner]
-                 end) == 0
-        end)
-
-      refute log =~ "earliest_usage_reset"
-    end
-
-    test "a runner that ran dry AFTER the pass read the map is passed over, not the story's " <>
-           "end: placed on the next runner, and a later candidate skips the dry one",
+    test "an exhausted runner that is also FULL still names its reset: its slots are held by " <>
+           "sessions about to end",
          ctx do
-      first = bind_repo(ctx, queued_story(ctx), @repo)
-      # The later candidate's repository only the dry runner has checked out, so whether it
-      # was skipped (`:no_runner`, with its reset) or tried again (`:unplaceable`) is visible.
-      second = bind_repo(ctx, queued_story(ctx), "mkreyman/cron_books")
-      unboxed(fn -> backdate(first.id, -120) end)
-
-      {r2_key, r2} =
-        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
-
-      dry = join_runner(ctx, %{"repos" => [@repo, "mkreyman/cron_books"]})
-      other = join_as(r2, r2_key, "beelink")
-      # The dry runner is the least loaded, so it is tried FIRST.
-      unboxed(fn -> set_in_flight(r2.id, 1) end)
-
-      log =
-        capture_log([level: :info], fn ->
-          assert exhaust_mid_pass(ctx.runner.id, fn ->
-                   unboxed(fn -> DispatchDriver.run_with(20, @budgets) end)
-                 end) == [:placed, :no_runner]
-        end)
-
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, first.id) end).stage == :claimed
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, second.id) end).stage == :queued
-      assert unboxed(fn -> AdminRepo.get!(Runner, r2.id) end).in_flight == 2
-      assert unboxed(fn -> AdminRepo.get!(Runner, ctx.runner.id) end).in_flight == 0
-      assert log =~ "earliest_usage_reset="
-
-      leave_channel(other)
-      leave_channel(dry)
-    end
-
-    test "an exhausted runner that is also FULL contributes no reset", ctx do
       bind_repo(ctx, queued_story(ctx), @repo)
       channel = join_runner(ctx)
       resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
 
-      # ONE slot, taken: full, and still under the tenant's admission cap — a full machine at
-      # the cap would stop the pass before any runner is judged, and prove nothing here. On the
-      # row rather than declared at join: a join that lowers `max_sessions` writes through the
-      # sandbox, whose uncommitted row lock the unboxed writes below would wait out.
+      # ONE slot, taken: full, and still under the tenant's admission cap. On the row rather
+      # than declared at join: a join that lowers `max_sessions` writes through the sandbox,
+      # whose uncommitted row lock the unboxed writes below would wait out.
       unboxed(fn ->
         :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
 
@@ -692,44 +642,16 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
           )
       end)
 
-      # Its refill would place nothing — it has no free slot — so naming its reset would send
-      # an operator waiting on the wrong event.
       log =
         capture_log([level: :info], fn ->
-          # The pass DID reach the exhaustion judgement: the map was read.
-          assert exhaustion_reads(fn ->
-                   assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) ==
-                            [:no_runner]
-                 end) == 1
+          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:no_runner]
         end)
 
-      refute log =~ "earliest_usage_reset"
+      [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, log)
+      assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
+      assert DateTime.compare(logged, resets_at) == :eq
 
       leave_channel(channel)
-    end
-
-    test "a candidate that raises after the pass read the map does not throw the read away",
-         ctx do
-      for _ <- 1..2, do: bind_repo(ctx, queued_story(ctx))
-
-      # A pool entry that passes every fact on its meta and whose id is not a UUID, so the row
-      # read AFTER the exhaustion read raises — for every candidate.
-      topic = Loopctl.Runners.pool_topic(ctx.tenant.id)
-
-      {:ok, _ref} =
-        Presence.track(self(), topic, "ghost", %{
-          runner_id: "not-a-uuid",
-          kinds: ["implement"]
-        })
-
-      capture_log(fn ->
-        assert exhaustion_reads(fn ->
-                 assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) ==
-                          [:errored, :errored]
-               end) == 1
-      end)
-
-      Presence.untrack(self(), topic, "ghost")
     end
 
     test "another tenant's exhausted runner on the same account_ref does not hold this " <>
@@ -757,18 +679,20 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
-  # Runs `fun` with `runner_id` exhausted the moment the pass has READ the tenant's exhausted
-  # runners (the grouped read) and before it acts on what it read: a machine running dry
-  # mid-pass. Written on AdminRepo's own connection, so it commits outside the read.
-  defp exhaust_mid_pass(runner_id, fun) do
+  # Runs `fun` with `runner_id` exhausted the moment the pass has SELECTED its runners (the
+  # free-slot query, on AdminRepo) and before it places on one: a machine running dry between
+  # the selection and the push. Written on AdminRepo's own connection, so it commits outside
+  # the read.
+  defp exhaust_after_selection(runner_id, fun) do
     id = {__MODULE__, make_ref()}
 
     :ok =
-      :telemetry.attach(id, [:loopctl, :repo, :query], &__MODULE__.exhaust_after_read/4, %{
-        pid: self(),
-        id: id,
-        runner_id: runner_id
-      })
+      :telemetry.attach(
+        id,
+        [:loopctl, :admin_repo, :query],
+        &__MODULE__.exhaust_after_select/4,
+        %{pid: self(), id: id, runner_id: runner_id}
+      )
 
     try do
       fun.()
@@ -778,10 +702,10 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   end
 
   @doc false
-  def exhaust_after_read(_event, _measurements, %{query: query}, config) do
+  def exhaust_after_select(_event, _measurements, %{query: query}, config) do
     %{pid: pid, id: id, runner_id: runner_id} = config
 
-    if self() == pid and query =~ ~r/^SELECT .*"usage_exhausted_until".* GROUP BY /s do
+    if self() == pid and query =~ ~r/^SELECT .*"in_flight" < .*exists\(/s do
       :telemetry.detach(id)
       until = DateTime.add(DateTime.utc_now(), 3_600, :second)
 
@@ -789,34 +713,6 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
         AdminRepo.update_all(from(r in Runner, where: r.id == ^runner_id),
           set: [usage_exhausted_until: until]
         )
-    end
-  end
-
-  # How many reads of `usage_exhausted_until` THIS process sent while `fun` ran.
-  defp exhaustion_reads(fun) do
-    id = {__MODULE__, make_ref()}
-    :ok = :telemetry.attach(id, [:loopctl, :repo, :query], &__MODULE__.count_read/4, self())
-
-    try do
-      fun.()
-    after
-      :telemetry.detach(id)
-    end
-
-    count_reads(0)
-  end
-
-  @doc false
-  def count_read(_event, _measurements, %{query: query}, pid) do
-    if self() == pid and query =~ ~r/^SELECT .*"usage_exhausted_until"/s,
-      do: send(pid, :exhaustion_read)
-  end
-
-  defp count_reads(n) do
-    receive do
-      :exhaustion_read -> count_reads(n + 1)
-    after
-      0 -> n
     end
   end
 
