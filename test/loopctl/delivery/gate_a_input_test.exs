@@ -119,6 +119,25 @@ defmodule Loopctl.Delivery.GateAInputTest do
                GateAInput.for_story(ctx.story.tenant_id, ctx.story.id)
     end
 
+    test "a second binding verdict never displaces the first (first writer wins)" do
+      ctx = story()
+
+      fixture(:triage_verdict, %{
+        tenant_id: ctx.story.tenant_id,
+        story_id: ctx.story.id,
+        lens_verdicts: lenses("story", "story", "story")
+      })
+
+      fixture(:triage_verdict, %{
+        tenant_id: ctx.story.tenant_id,
+        story_id: ctx.story.id,
+        lens_verdicts: lenses("reject", "reject", "reject")
+      })
+
+      assert {:persisted_triage, [%{"verdict" => "story"} | _]} =
+               GateAInput.for_story(ctx.story.tenant_id, ctx.story.id)
+    end
+
     test "a later INCOMPLETE zombie row does not change the input" do
       ctx = story()
 
@@ -196,7 +215,7 @@ defmodule Loopctl.Delivery.GateAInputTest do
 
       events(ctx, [
         {"detected", "triaged", "forward", %{}},
-        {"triaged", "escalated", "triage_escalate", %{}},
+        {"triaged", "escalated", "triage_escalate", %{"reason" => "triage_verdict:escalate"}},
         {"escalated", "queued", "human_resolution", %{}}
       ])
 
@@ -213,6 +232,18 @@ defmodule Loopctl.Delivery.GateAInputTest do
       ])
 
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :human_resolution
+    end
+
+    test "of a triage escalation for another cause (a flagged draft) does not" do
+      ctx = story()
+
+      events(ctx, [
+        {"triaged", "escalated", "triage_escalate",
+         %{"reason" => "triage_verdict:draft_flagged"}},
+        {"escalated", "queued", "human_resolution", %{}}
+      ])
+
+      assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end
 
     test "of a merge-gate escalation that did NOT name Gate A does not" do
@@ -243,7 +274,7 @@ defmodule Loopctl.Delivery.GateAInputTest do
       ctx = story()
 
       events(ctx, [
-        {"triaged", "escalated", "triage_escalate", %{}},
+        {"triaged", "escalated", "triage_escalate", %{"reason" => "triage_verdict:escalate"}},
         {"escalated", "queued", "human_resolution", %{}},
         {"queued", "escalated", "attempts_exhausted", %{}},
         {"escalated", "queued", "human_resolution", %{}}

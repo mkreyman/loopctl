@@ -63,8 +63,8 @@ disagreement signal is gone by the time it is stored.
 - The triage verdict message gains optional `lens_verdicts` — exactly three entries, one per lens,
   each carrying the same fields Gate A already parses. loopctl persists them with the verdict.
 - At merge, Gate A reads the lens verdicts of the triage dispatch BOUND to the story — a
-  stage-row identity recorded before its verdict is stored, first writer wins — never merely
-  the newest row, which a refused or late dispatch can write. A **`:human_resolution` of a Gate A escalation satisfies Gate A**: a human already decided, and re-escalating their decision at merge would loop.
+  stage-row identity written on the `detected -> triaged` transition that dispatch took —
+  never merely the newest row, which a refused or late dispatch can write. A **`:human_resolution` of a Gate A escalation satisfies Gate A**: a human already decided, and re-escalating their decision at merge would loop.
 - No persisted lens verdicts and no later human resolution → `refuse`, never `unevaluated`:
   waiting cannot make a verdict appear. A caller-supplied `trio_outputs` is ignored, recorded as
   ignored, and dropped from the endpoint's required fields (`merge_precondition_controller.ex:208`).

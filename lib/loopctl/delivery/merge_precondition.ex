@@ -271,6 +271,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @spec judge(facts()) :: Verdict.t()
   def judge(facts) do
     {gate_a, gate_a_inputs} = gate_a(Map.get(facts, :gate_a_input, :missing))
+    gate_a = redact_gate_a(gate_a)
     custody = Map.get(facts, :custody, {:error, :custody_unknown})
     carried = gate_a_reasons(gate_a) ++ custody_reasons(custody)
 
@@ -685,7 +686,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     do: Enum.any?(reasons, &match?({tag, _} when tag in [:gate_a, :trio_verdict], &1))
 
   defp gate_a_reasons(%GateA.Result{decision: :escalate, reasons: reasons}),
-    do: Enum.map(reasons, &{:gate_a, redact_lens_text(&1)})
+    do: Enum.map(reasons, &{:gate_a, &1})
 
   defp gate_a_reasons(%GateA.Result{verdict: :story}), do: []
   defp gate_a_reasons(%GateA.Result{verdict: verdict}), do: [{:trio_verdict, verdict}]
@@ -696,6 +697,17 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # every sink downstream — the escalation reason on the audit chain, the log line, the
   # endpoint's `reasons[].detail` — receives the redacted form, while the lens's full text
   # stays on the triage record and on `verdict.gate_a` for an operator to read as data.
+  # The whole Gate A result, not only the reasons carried on the verdict: the endpoint renders
+  # `verdict.gate_a` too, and a soft signal is a lens's own, unvalidated escalation code.
+  defp redact_gate_a(%GateA.Result{} = result) do
+    %{
+      result
+      | reasons: Enum.map(result.reasons, &redact_lens_text/1),
+        soft_signals:
+          Enum.map(result.soft_signals, fn {index, code} -> {index, {:text, byte_size(code)}} end)
+    }
+  end
+
   defp redact_lens_text({:contradiction, index, contradicts}) when is_list(contradicts),
     do: {:contradiction, index, Enum.map(contradicts, &redact_contradiction/1)}
 

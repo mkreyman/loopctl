@@ -6,32 +6,36 @@ defmodule Loopctl.Delivery.GateAInput do
   Until contract 1.15.0 the merge precondition took the triage trio's outputs from the
   request, so the principal driving a merge also supplied the triage it was judged against
   and a fabricated unanimous trio cleared Gate A. Now the input is one of three facts, each
-  resolved here from the story's own transition history:
+  resolved here from the story's stage row and its transition history:
 
   - `{:persisted_triage, outputs}` — the three lens verdicts of the ONE triage that triaged
     the story, translated to the shape `Loopctl.DeliveryGates.GateA.evaluate/1` reads. They
     are runner-authored and untrusted, but they were written by a triage session before any
     implementation existed, which is a different principal from whoever asks for the merge.
   - `:human_resolution` — a human re-queued the story from an escalation that was ABOUT Gate
-    A: a `:triage_escalate` escalation, or a `:merge_gate` one whose event records Gate A
-    among its reasons. A human already made the decision Gate A exists to route to them, and
+    A: a `:triage_escalate` escalation whose reason is the trio's own `escalate` verdict, or a
+    `:merge_gate` one whose event records Gate A among its reasons. A triage escalation for any
+    OTHER cause — a flagged or undispatchable draft, an oversize ticket, an incomplete run —
+    put a different question to the human, who never saw the lens verdicts. A human already made the decision Gate A exists to route to them, and
     refusing it again at merge would loop. A human re-queue of any OTHER escalation (a spent
     retry ceiling, a Gate B refusal) says nothing about the request and does not count.
   - `:missing` — neither. The gate refuses, because waiting cannot make a verdict appear.
 
   ## Which verdict: the dispatch bound to the story, never the newest row
 
-  The story's stage row carries `triage_dispatch_id`, recorded by
-  `Loopctl.Delivery.TriageVerdict` through `Stages.record_effect/5` at `detected`, BEFORE that
-  dispatch's verdict is stored, and never overwritten: a second dispatch's verdict is refused
-  before any of it is stored. Gate A reads that dispatch's row. "The newest row for the story"
+  The story's stage row carries `triage_dispatch_id`, written ON the `detected -> triaged`
+  transition by the dispatch whose verdict took it (`Loopctl.Delivery.TriageVerdict`), in that
+  transition's own transaction, and cleared by nothing. A dispatch that did not triage the
+  story is refused before it can take any further transition. Gate A reads the bound
+  dispatch's row. "The newest row for the story"
   would be wrong because records and transitions are separate writes, so a later row need not
   be the one that decided anything. A story with no bound dispatch (triaged before the binding
   existed, or escalated by the dispatcher without a triage run) is `:missing`.
 
   ## Where the state lives
 
-  In `story_stage_events` and `triage_verdicts`, both read through `Repo.with_tenant/2` with
+  In `story_stages`, `story_stage_events` and `triage_verdicts`, all read through
+  `Repo.with_tenant/2` with
   an explicit tenant predicate, so a tenant's evaluation cannot reach another tenant's rows.
   The history is walked in `Loopctl.Delivery.Stages.list_transitions/2`'s order, never by
   comparing timestamps across the two tables. A database error RAISES: the merge-precondition
@@ -138,7 +142,13 @@ defmodule Loopctl.Delivery.GateAInput do
 
   defp step(_event, acc), do: acc
 
-  defp gate_a_escalation?(%{edge: "triage_escalate"}), do: true
+  # `Stages` stores a transition's reason under "reason"; the trio's own escalate verdict is the
+  # only triage escalation that put the lens verdicts in front of a human.
+  defp gate_a_escalation?(%{
+         edge: "triage_escalate",
+         data: %{"reason" => "triage_verdict:escalate"}
+       }),
+       do: true
 
   # `Stages` stores a transition's `:event_data` under "payload"; the merge gate sets it only
   # when Gate A was among the reasons it refused.

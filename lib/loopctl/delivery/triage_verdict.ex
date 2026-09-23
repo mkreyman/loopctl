@@ -189,15 +189,13 @@ defmodule Loopctl.Delivery.TriageVerdict do
   verdict had already been recorded — the resend case, which is a success and applies nothing
   a second time.
 
-  ## Recording and transitioning are ONE transaction
+  ## Record first, then transition — and a resend re-drives the transitions
 
-  Neither order works on its own and the failure is asymmetric, which is why they are atomic
-  rather than sequenced. Record first and let the transition fail, and a resend finds the row,
-  concludes it is a replay, and returns ok — leaving the story at `detected` for ever with
-  every resend reporting success. Transition first and let the recording fail, and the resend
-  is refused `stale_stage` because the row already moved, so the verdict can never be
-  recorded at all. In one transaction a failure rolls back both and the resend retries the
-  whole thing, which is exactly what the runner is told to do.
+  They are separate writes. The verdict is recorded first; the transitions follow, each its own
+  compare-and-set. A resend finds the record and RE-DRIVES the route (a transition already
+  taken answers `stale_stage` and the route goes on), so a failure between the writes is
+  completed by the resend rather than reported as done. The `detected -> triaged` transition
+  carries the story's `triage_dispatch_id` in its own transaction — see `continue_after/7`.
 
   ## The escalation reason never carries the session's own words
 
@@ -267,9 +265,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
         {:error, :already_recorded}
 
       nil ->
-        with :ok <- bind_triage(tenant_id, runner_id, session, message) do
-          fresh(tenant_id, runner_id, session, message, digest, transitions)
-        end
+        fresh(tenant_id, runner_id, session, message, digest, transitions)
     end
   end
 
@@ -384,30 +380,6 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
   defp stringify(value), do: value
-
-  # THE BINDING GATE A READS (US-44.1, rewritten after review round 3). Before a fresh verdict
-  # is stored, its dispatch is recorded as the story's `triage_dispatch_id` — a stage-row
-  # identity `Stages.record_effect/5` writes once, at `detected`, under the story's epoch. The
-  # first dispatch to record it decides the story; any OTHER dispatch's verdict (a zombie from
-  # a reclaimed placement, a second delivery racing the first) is refused `stale_stage`
-  # before anything of it is stored, and so is any verdict for a story no longer at
-  # `detected`. A resend of the binding dispatch's own verdict never reaches this: it is
-  # answered from the record, and recording the same identity twice is a no-op anyway.
-  defp bind_triage(tenant_id, runner_id, session, message) do
-    case Stages.record_effect(
-           tenant_id,
-           session.story_id,
-           :triage_dispatch_id,
-           message.dispatch_id,
-           claim_epoch: message.claim_epoch,
-           actor_label: "runner:" <> runner_id
-         ) do
-      {:ok, _row} -> :ok
-      {:error, reason} when reason in [:effect_conflict, :wrong_stage] -> {:error, :stale_stage}
-      {:error, :not_found} -> {:error, :unknown_story_stage}
-      {:error, reason} -> {:error, reason}
-    end
-  end
 
   defp sort_lens_verdicts(%{lens_verdicts: [_ | _] = lens_verdicts} = message),
     do: %{message | lens_verdicts: Enum.sort_by(lens_verdicts, & &1.lens)}
@@ -816,6 +788,30 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   defp drafted_criteria(_draft), do: []
 
+  # ONLY THE DISPATCH THAT TRIAGED THE STORY MAY TAKE IT FURTHER (US-44.1). The triage
+  # transition carries the binding, so once the story has left `detected` the row names the
+  # dispatch that took it out. Any other dispatch — a zombie from a reclaimed placement, a
+  # second delivery racing the first — found `triaged` already taken, and is refused here
+  # before it can take the story's NEXT transition: otherwise it would queue, escalate or
+  # reject a story another verdict decided. A row with no binding (triaged by the dispatcher's
+  # too-large route, or before the binding existed) is left to whoever reaches it, as before;
+  # Gate A reads such a story as `:missing` at merge and refuses.
+  defp continue_after(tenant_id, runner_id, session, message, @triaged, rest, reason) do
+    case Stages.get(tenant_id, session.story_id) do
+      %StoryStage{triage_dispatch_id: bound} when bound in [nil, message.dispatch_id] ->
+        advance_all(tenant_id, runner_id, session, message, rest, reason)
+
+      %StoryStage{} ->
+        {:error, :stale_stage}
+
+      nil ->
+        {:error, :unknown_story_stage}
+    end
+  end
+
+  defp continue_after(tenant_id, runner_id, session, message, _transition, rest, reason),
+    do: advance_all(tenant_id, runner_id, session, message, rest, reason)
+
   defp advance_all(_tenant_id, _runner_id, _session, _message, [], _reason), do: :ok
 
   defp advance_all(tenant_id, runner_id, session, message, [transition | rest], reason) do
@@ -826,7 +822,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
            opts(runner_id, session, message, transition, reason)
          ) do
       {:ok, _row} ->
-        advance_all(tenant_id, runner_id, session, message, rest, reason)
+        continue_after(tenant_id, runner_id, session, message, transition, rest, reason)
 
       # A STALE TRANSITION IS ONE ALREADY TAKEN, AND THE ROUTE GOES ON. Halting here was safe
       # while every route was one transition and is not now: `story` takes two, in separate
@@ -837,7 +833,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
       # stop it being dead. Each advance carries its own epoch fence and its own compare-and-
       # set, so continuing past one that no longer applies cannot write anything unfenced.
       {:error, :stale_stage} ->
-        advance_all(tenant_id, runner_id, session, message, rest, reason)
+        continue_after(tenant_id, runner_id, session, message, transition, rest, reason)
 
       {:error, :not_found} ->
         {:error, :unknown_story_stage}
@@ -981,7 +977,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
     |> Keyword.put(:event_data, event_data)
   end
 
-  defp opts(runner_id, session, message, {_from, to, _edge}, reason_override) do
+  defp opts(runner_id, session, message, {_from, to, _edge} = transition, reason_override) do
     [
       claim_epoch: message.claim_epoch,
       reason: reason_override || reason_for(to, message),
@@ -994,8 +990,12 @@ defmodule Loopctl.Delivery.TriageVerdict do
       actor_role: :agent,
       actor_lineage: [],
       session_dispatch: {message.dispatch_id, session.slot_generation}
-    ]
+    ] ++ binding(transition, message)
   end
+
+  # The triage transition names the dispatch that took it (see `continue_after/7`).
+  defp binding(@triaged, message), do: [effects: [triage_dispatch_id: message.dispatch_id]]
+  defp binding(_transition, _message), do: []
 
   # ENUM VALUES ONLY. See the `apply/3` doc: the verdict's own escalation prose was written
   # by a session that had just read reporter text, and this string lands in an append-only

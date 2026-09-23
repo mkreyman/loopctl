@@ -1,9 +1,9 @@
 defmodule Loopctl.Repo.Migrations.AddStoryStagesTriageDispatchId do
   @moduledoc """
-  Which triage dispatch decides a story (epic 44, US-44.1). A stage-row identity recorded by
-  `Loopctl.Delivery.Stages.record_effect/5` at `detected`, before the verdict is stored, so a
-  second dispatch's verdict is refused and the merge gate's Gate A reads exactly this
-  dispatch's lens verdicts. No backfill and no manual step: NULL on every existing row, which
+  Which triage dispatch decided a story (epic 44, US-44.1). A stage-row identity carried ON the
+  `detected -> triaged` transition by the dispatch whose verdict took it, in that transition's
+  transaction, so the merge gate's Gate A reads exactly this dispatch's lens verdicts and any
+  other dispatch is refused before it can move the story further. No backfill and no manual step: NULL on every existing row, which
   Gate A reads as "no triage verdict" and refuses.
 
   No foreign key, for the reason `triage_verdicts.dispatch_id` has none: the record of what
