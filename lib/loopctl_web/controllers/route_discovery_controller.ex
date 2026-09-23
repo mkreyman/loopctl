@@ -121,13 +121,22 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         path: "/api/v1/dispatches",
         description:
           "Mint a per-dispatch ephemeral, scoped API key carrying its lineage path " <>
-            "(the CoC v2 key-distribution mechanism; replaces long-lived env-var keys). MCP tool: dispatch"
+            "(the CoC v2 key-distribution mechanism; replaces long-lived env-var keys). " <>
+            "Role: orchestrator or above. MCP tool: dispatch"
       },
-      %{method: "GET", path: "/api/v1/dispatches", description: "List dispatches for the tenant"},
+      %{
+        method: "GET",
+        path: "/api/v1/dispatches",
+        description:
+          "List dispatches for the tenant. Role: agent or above. MCP tool: none (a declared " <>
+            "gap in mcp-server/test/route_coverage.test.js)"
+      },
       %{
         method: "GET",
         path: "/api/v1/dispatches/:id",
-        description: "Get a dispatch and its lineage"
+        description:
+          "Get a dispatch and its lineage. Role: agent or above. MCP tool: none (a declared " <>
+            "gap in mcp-server/test/route_coverage.test.js)"
       },
 
       # Audit & change feed
@@ -936,8 +945,8 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         path: "/api/v1/runners",
         description:
           "Enrol a runner (a dev machine that runs sessions); the credential is shown once. " <>
-            "Role: user on a human-anchored tenant, from a key no dispatch minted. " <>
-            "MCP tool: runner_enroll"
+            "Role: user on a human-anchored tenant, from a key no dispatch minted (a " <>
+            "dispatch-minted key is refused 403 api_key_mint_forbidden). MCP tool: runner_enroll"
       },
       %{
         method: "GET",
@@ -966,8 +975,10 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description:
           "Place a queued, contracted story on a runner: claims it under a fresh custody " <>
             "dispatch and pushes the work. 409 runner_declines_work when the machine is " <>
-            "draining. Role: orchestrator or above on a human-anchored tenant; an unlineaged " <>
-            "user key roots the lineage. MCP tool: place_dispatch"
+            "draining. Role: orchestrator or above on a human-anchored tenant, AND either an " <>
+            "unlineaged user key (which roots the custody lineage) or a key inside a dispatch " <>
+            "lineage; an unlineaged key below user, such as a legacy orchestrator env key, is " <>
+            "refused 403 root_dispatch_forbidden. MCP tool: place_dispatch (sends the user key)"
       },
       %{
         method: "GET",
@@ -980,8 +991,10 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         method: "POST",
         path: "/api/v1/dispatches/:id/revoke",
         description:
-          "Revoke a dispatch AND its subtree, with the keys each minted. 403 when the target " <>
-            "is outside your lineage. Role: orchestrator or above. MCP tool: revoke_dispatch"
+          "Revoke a dispatch AND its subtree, with the keys each minted. Role: orchestrator or " <>
+            "above on a human-anchored tenant; 403 dispatch_outside_caller_lineage when the " <>
+            "target is outside your lineage, and 403 unlineaged_revoke_forbidden for an " <>
+            "unlineaged key below user. MCP tool: revoke_dispatch"
       },
       %{
         method: "POST",
@@ -989,7 +1002,8 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description:
           "Run the merge gate over a story's real pull request at stage ci: both gates, " <>
             "custody, the hard bound. Gate A reads the triage the story persisted, never the " <>
-            "caller. Role: exactly orchestrator or user. MCP tool: merge_precondition"
+            "caller. Role: exactly orchestrator or user, on a human-anchored tenant. " <>
+            "MCP tool: merge_precondition"
       },
 
       # OpenAPI spec
