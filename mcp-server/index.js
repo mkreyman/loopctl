@@ -4352,7 +4352,10 @@ const TOOLS = [
       "Transitions contracted -> assigned. Uses the AGENT key. On a loopctl with claim leases " +
       "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
       "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
-      "is released back to pending under you.",
+      "is released back to pending under you. Refused 409 story_escalated when the story's " +
+      "delivery stage is escalated: control handed it to a human, so it is not yours to claim " +
+      "even when it reads pending or contracted — move on; it is claimable again only after " +
+      "resolve_escalation.",
     inputSchema: {
       type: "object",
       properties: {

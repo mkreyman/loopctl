@@ -124,7 +124,10 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Invalid transition or dependencies not met", "application/json", Schemas.ErrorResponse},
+        {"Invalid transition, dependencies not met, or `story_escalated` — the story's " <>
+           "delivery stage is `escalated`, so it waits for a human and is claimable again " <>
+           "only once the escalation is resolved (POST /stories/:id/stage/resolve)",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 =>
         {"The claim's capability could not be minted; nothing was claimed. Retryable only " <>

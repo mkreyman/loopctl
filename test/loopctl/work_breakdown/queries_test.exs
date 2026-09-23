@@ -30,6 +30,37 @@ defmodule Loopctl.WorkBreakdown.QueriesTest do
       assert story.id in ids
     end
 
+    test "excludes a pending story whose delivery stage is escalated, in its own tenant only" do
+      %{tenant: tenant, project: project} = setup_project()
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      escalated =
+        fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
+
+      queued = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, agent_status: :pending})
+
+      for {story, stage} <- [{escalated, :escalated}, {queued, :queued}] do
+        fixture(:story_stage, %{
+          repo: Loopctl.AdminRepo,
+          tenant_id: tenant.id,
+          story_id: story.id,
+          stage: stage,
+          escalation_reason: if(stage == :escalated, do: "a human owns it")
+        })
+      end
+
+      {:ok, result} = Queries.list_ready_stories(tenant.id, project_id: project.id)
+      ids = Enum.map(result.data, & &1.id)
+
+      refute escalated.id in ids
+      assert queued.id in ids
+      assert result.total == 1
+
+      # Tenant isolation: another tenant's listing names neither.
+      {:ok, other} = Queries.list_ready_stories(fixture(:tenant).id)
+      refute Enum.any?(other.data, &(&1.id in [escalated.id, queued.id]))
+    end
+
     test "excludes stories with unverified dependencies" do
       %{tenant: tenant, project: project} = setup_project()
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})

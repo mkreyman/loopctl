@@ -1039,6 +1039,27 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
+  Whether the story's stage row is at `escalated` — a story control has handed to a HUMAN.
+
+  The claim paths ask it (`Loopctl.Progress.claim_story/3` and `Loopctl.BulkOperations`' bulk
+  claim) and refuse such a story `:story_escalated`, and the ready list excludes it
+  (`Loopctl.WorkBreakdown.Queries.list_ready_stories/2`). Without that, an escalated story whose
+  claim ENDED — a budget kill ends it, and so does the lease reclaim after a session escalated
+  itself — sat `pending`, listed as ready and claimable by any agent, so the human it was
+  escalated to was raced by a machine. `Loopctl.Delivery.Escalations.resolve/3` moves the row
+  out of `escalated` first, which is what makes the story claimable again.
+
+  Read on `AdminRepo`, where both claim transactions run, scoped by `tenant_id` explicitly.
+  """
+  @spec escalated?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def escalated?(tenant_id, story_id) do
+    from(s in StoryStage,
+      where: s.tenant_id == ^tenant_id and s.story_id == ^story_id and s.stage == :escalated
+    )
+    |> AdminRepo.exists?()
+  end
+
+  @doc """
   Makes a story's stage row follow a CLAIM, inside the claiming transaction
   (`Loopctl.Progress.claim_story/3` and `Loopctl.BulkOperations`' bulk claim).
 

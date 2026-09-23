@@ -46,12 +46,13 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     %{tenant_id: tenant.id, story: claimed, row: row}
   end
 
-  defp release(ctx, reason \\ "crashed", epoch \\ nil) do
+  defp release(ctx, reason \\ "crashed", epoch \\ nil, counted? \\ true) do
     Progress.release_ended_session(
       ctx.tenant_id,
       ctx.story.id,
       epoch || ctx.story.claim_epoch,
       session_reason: reason,
+      counted?: counted?,
       actor_id: @actor_id,
       actor_label: "runner:test"
     )
@@ -82,6 +83,19 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     assert row.stage == :queued
     assert row.claim_epoch == released.claim_epoch
     assert row.attempts == %{"runner_lost" => 1}
+  end
+
+  test "the CALLER decides whether the re-queue spends an attempt, whatever the reason" do
+    # `counted?: false` is what `RunnerStages` passes for `usage_exhausted`. Asserted on a
+    # `crashed` release on purpose: the flag is the caller's, and nothing here re-derives it
+    # from the reason.
+    ctx = claimed_at(:implementing)
+
+    assert {:ok, _released} = release(ctx, "crashed", nil, false)
+
+    row = AdminRepo.get!(StoryStage, ctx.row.id)
+    assert row.stage == :queued
+    assert row.attempts == %{}
   end
 
   test "writes the SAME audit entry a lease reclaim writes, naming what actually happened" do
@@ -157,11 +171,13 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     assert AdminRepo.get!(Story, in_review.story.id).agent_status in [:assigned, :implementing]
   end
 
-  test "a session that COMPLETED releases nothing through here" do
+  test "a session that COMPLETED releases nothing through here, and says so without raising" do
+    # An error, never a raise: the caller runs in the runner channel's process.
     ctx = claimed_at(:implementing)
 
-    assert_raise ArgumentError, fn -> release(ctx, "completed") end
+    assert {:error, :unsupported_session_reason} = release(ctx, "completed")
     assert AdminRepo.get!(Story, ctx.story.id).claim_epoch == ctx.story.claim_epoch
+    assert audit_entries(ctx.story) == []
   end
 
   test "a budget kill ends the claim and leaves its ESCALATED row escalated, only rebound" do
@@ -191,6 +207,7 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     assert {:error, :not_found} =
              Progress.release_ended_session(other.id, ctx.story.id, ctx.story.claim_epoch,
                session_reason: "crashed",
+               counted?: true,
                actor_id: @actor_id,
                actor_label: "runner:test"
              )

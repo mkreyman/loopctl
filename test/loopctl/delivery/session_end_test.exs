@@ -13,6 +13,7 @@ defmodule Loopctl.Delivery.SessionEndTest do
   use Loopctl.DataCase, async: true
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerSessionEnded
@@ -76,7 +77,8 @@ defmodule Loopctl.Delivery.SessionEndTest do
     RunnerStages.end_session(
       ctx.story.tenant_id,
       ctx.runner.id,
-      message(ctx.record, reason, attrs)
+      message(ctx.record, reason, attrs),
+      actor_id: ctx.runner.api_key_id
     )
   end
 
@@ -277,7 +279,8 @@ defmodule Loopctl.Delivery.SessionEndTest do
                RunnerStages.end_session(
                  ctx.story.tenant_id,
                  other.id,
-                 message(ctx.record, "wall_clock_exceeded")
+                 message(ctx.record, "wall_clock_exceeded"),
+                 actor_id: other.api_key_id
                )
 
       assert stage_of(ctx.story).stage == :implementing
@@ -291,7 +294,8 @@ defmodule Loopctl.Delivery.SessionEndTest do
                RunnerStages.end_session(
                  other.story.tenant_id,
                  other.runner.id,
-                 message(ctx.record, "wall_clock_exceeded")
+                 message(ctx.record, "wall_clock_exceeded"),
+                 actor_id: other.runner.api_key_id
                )
 
       assert stage_of(ctx.story).stage == :implementing
@@ -354,12 +358,33 @@ defmodule Loopctl.Delivery.SessionEndTest do
           session_ended_at: now
         )
       end
+
+      # THE VALUE, not only its presence: an exhausted subscription never spends an attempt
+      # and a crash always does, so each carrying the other's flag is refused too.
+      assert_raise Postgrex.Error, ~r/runner_dispatches_session_ended_counted/, fn ->
+        set_session_end(ctx.record,
+          session_ended_reason: "usage_exhausted",
+          session_ended_digest: "d",
+          session_ended_at: now,
+          counts_toward_retry_ceiling: true
+        )
+      end
+
+      assert_raise Postgrex.Error, ~r/runner_dispatches_session_ended_counted/, fn ->
+        set_session_end(ctx.record,
+          session_ended_reason: "crashed",
+          session_ended_digest: "d",
+          session_ended_at: now,
+          counts_toward_retry_ceiling: false
+        )
+      end
     end
 
     test "a count with NO reason at all is refused too: the CHECK never evaluates to NULL" do
-      # `NULL IN (...)` is NULL, and a CHECK that evaluates to NULL PASSES — so without the
-      # COALESCE a row with no session end could carry a counted flag. Raw SQL, because what
-      # is under test is the database, not anything a writer in `lib/` would do.
+      # A CHECK that evaluates to NULL PASSES, and `=` against the CASE's NULL is NULL — so
+      # without `IS NOT DISTINCT FROM` a row with no session end could carry a counted flag.
+      # Raw SQL, because what is under test is the database, not anything a writer in `lib/`
+      # would do.
       ctx = session(:implementing)
 
       assert_raise Postgrex.Error, ~r/runner_dispatches_session_ended_counted/, fn ->
@@ -398,34 +423,71 @@ defmodule Loopctl.Delivery.SessionEndTest do
                RunnerStages.end_session(
                  ctx.story.tenant_id,
                  ctx.runner.id,
-                 cast.(ctx.record.dispatch_id)
+                 cast.(ctx.record.dispatch_id),
+                 actor_id: ctx.runner.api_key_id
                )
 
       assert {:ok, %{replayed?: true}} =
                RunnerStages.end_session(
                  ctx.story.tenant_id,
                  ctx.runner.id,
-                 cast.(String.upcase(ctx.record.dispatch_id))
+                 cast.(String.upcase(ctx.record.dispatch_id)),
+                 actor_id: ctx.runner.api_key_id
                )
     end
   end
 
-  describe "a budget escalation that fails is a RETRY, never a refusal" do
-    test "nothing in its failure branch hands the reason to classify/1" do
-      # The record is committed before the escalation runs, so a PERMANENT refusal here leaves
-      # the row in flight with nothing to move it but the lease reclaim, which RE-QUEUES a story
-      # a budget kill must never retry. The branch is unreachable from a test (it needs a hash
-      # chain that refuses appends — see `Loopctl.Delivery.RunnerStagesTest`), so what is bound
-      # is the one thing that made it permanent: the function reaching `classify/1`.
-      source = File.read!("lib/loopctl/delivery/runner_stages.ex")
-      [_, from_head] = String.split(source, "defp take_budget_edge(", parts: 2)
-      [body | _] = String.split(from_head, "\n  defp ", parts: 2)
+  describe "a budget escalation the stage machine refused (budget_escalation_refused/4)" do
+    # The escalation's own clause in `take_budget_edge/6` sends every refusal that is not the
+    # row moving or the claim ending through this. A behavioural test of that clause needs a
+    # tenant hash chain that REFUSES an append, and none can be built: the only
+    # `:audit_chain_append_failed` `Stages.advance/4` produces comes from an entry changeset a
+    # caller breaks with a malformed lineage, and the escalation hard-codes an empty one; a
+    # chain the trigger rejects raises instead. So the mapping is asserted here, and the
+    # clause's wiring by the lock-busy test in `Loopctl.Delivery.SessionEndReleaseTest`, which
+    # reaches this function through `end_session/4`.
 
-      refute body =~ "classify(",
-             "take_budget_edge must answer a failed escalation as a retry (:busy), because the " <>
-               "resend is what re-drives it"
+    @refused_session %{story_id: Ecto.UUID.generate()}
+    @refused_msg %{dispatch_id: Ecto.UUID.generate()}
 
-      assert body =~ "{:error, :busy}"
+    test "a chain that refuses appends is answered PERMANENTLY, and logged at error" do
+      log =
+        capture_log([level: :error], fn ->
+          assert {:error, :audit_chain_append_failed} =
+                   RunnerStages.budget_escalation_refused(
+                     :audit_chain_append_failed,
+                     Ecto.UUID.generate(),
+                     @refused_session,
+                     @refused_msg
+                   )
+        end)
+
+      assert log =~ "answered permanently"
+    end
+
+    test "a message fault is answered as the invalid payload it is, not as a retry" do
+      assert {:error, {:invalid, ["invalid_transition"]}} =
+               RunnerStages.budget_escalation_refused(
+                 :invalid_transition,
+                 Ecto.UUID.generate(),
+                 @refused_session,
+                 @refused_msg
+               )
+    end
+
+    test "a lock that was not free is the one retry, and is not logged at error" do
+      log =
+        capture_log([level: :error], fn ->
+          assert {:error, :busy} =
+                   RunnerStages.budget_escalation_refused(
+                     :busy,
+                     Ecto.UUID.generate(),
+                     @refused_session,
+                     @refused_msg
+                   )
+        end)
+
+      assert log == ""
     end
   end
 end

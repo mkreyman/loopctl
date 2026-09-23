@@ -31,7 +31,6 @@ defmodule Loopctl.Repo.Migrations.AddRunnerDispatchesSessionEnded do
   use Ecto.Migration
 
   @reasons ~w(completed wall_clock_exceeded max_turns_exceeded usage_exhausted crashed)
-  @releasing ~w(crashed usage_exhausted)
 
   def up do
     alter table(:runner_dispatches) do
@@ -56,14 +55,22 @@ defmodule Loopctl.Repo.Migrations.AddRunnerDispatchesSessionEnded do
       )
     """)
 
-    # COALESCE, because `NULL IN (...)` is NULL and a CHECK that evaluates NULL PASSES: without
-    # it a row with no reason could carry a counted flag, which is exactly what this forbids.
+    # THE VALUE, not only its presence: a crash is counted and an exhausted subscription is
+    # not, so `usage_exhausted` carrying `true` (or `crashed` carrying `false`) is refused as
+    # surely as a flag on a report that re-queued nothing. `IS NOT DISTINCT FROM`, because a
+    # plain `=` against the CASE's NULL is NULL, and a CHECK that evaluates NULL PASSES — a row
+    # with no reason could then carry any flag at all.
     execute("""
     ALTER TABLE runner_dispatches
       ADD CONSTRAINT runner_dispatches_session_ended_counted
       CHECK (
-        COALESCE(session_ended_reason IN (#{quoted(@releasing)}), false)
-          = (counts_toward_retry_ceiling IS NOT NULL)
+        counts_toward_retry_ceiling IS NOT DISTINCT FROM (
+          CASE session_ended_reason
+            WHEN 'crashed' THEN true
+            WHEN 'usage_exhausted' THEN false
+            ELSE NULL
+          END
+        )
       )
     """)
   end

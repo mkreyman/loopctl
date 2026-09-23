@@ -159,6 +159,9 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in contracted state
+  - `{:error, :story_escalated}` if its delivery stage row is at `escalated`: control handed it
+    to a human, and it is claimable again once `Loopctl.Delivery.Escalations.resolve/3` has
+    moved the row (`Loopctl.Delivery.Stages.escalated?/2`)
   """
   @spec claim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
@@ -177,6 +180,13 @@ defmodule Loopctl.Progress do
           :ok -> {:ok, story}
           error -> error
         end
+      end)
+      # Under the story lock: an escalation takes the story FOR SHARE, so none can land
+      # between this read and the claim's commit.
+      |> Multi.run(:not_escalated, fn _repo, %{lock: story} ->
+        if Stages.escalated?(tenant_id, story.id),
+          do: {:error, :story_escalated},
+          else: {:ok, :not_escalated}
       end)
       |> Multi.run(:check_deps, fn _repo, %{lock: story} ->
         check_claim_dependencies(story)
@@ -286,10 +296,11 @@ defmodule Loopctl.Progress do
     do: {:error, :capability_mint_failed}
 
   # The steps whose failure IS the caller's answer: the story is not there
-  # (`:lock`), the transition is illegal (`:validate`), its dependencies are unmet
-  # (`:check_deps`), or its own changeset did not validate (`:story`).
+  # (`:lock`), the transition is illegal (`:validate`), it is escalated to a human
+  # (`:not_escalated`), its dependencies are unmet (`:check_deps`), or its own changeset
+  # did not validate (`:story`).
   defp claim_result({:error, step, reason, _changes})
-       when step in [:lock, :validate, :check_deps],
+       when step in [:lock, :validate, :not_escalated, :check_deps],
        do: {:error, reason}
 
   defp claim_result({:error, :story, changeset, _changes}), do: {:error, changeset}
@@ -1646,8 +1657,11 @@ defmodule Loopctl.Progress do
   reclaim's `"system"` is true only of the worker that times a lease out.
 
   What the stage row does is `follow_release/5`'s rule, unchanged: an in-flight row goes back
-  to `queued` — counted in its `attempts` for `crashed`, NOT for `usage_exhausted`, whose work
-  was never judged — and a row elsewhere is only rebound to the new epoch. A budget kill's row
+  to `queued` — counted in its `attempts` when `:counted?` is true — and a row elsewhere is
+  only rebound to the new epoch. WHETHER a re-queue is an attempt is the CALLER's decision,
+  passed as `:counted?` (required), never re-derived here from the reason:
+  `Loopctl.Delivery.RunnerStages` decides it from the same function that writes the dispatch
+  ledger's `counts_toward_retry_ceiling`, so the two records cannot disagree. A budget kill's row
   has already been escalated by then (`Loopctl.Delivery.RunnerStages.end_session/3` escalates
   first), so it stays `escalated`: ending the claim never re-queues a story the budget stopped.
 
@@ -1665,21 +1679,27 @@ defmodule Loopctl.Progress do
   have kept would punish them for the halt. Here nobody is being timed out: the claimant
   itself reported that its session is gone, so there is nothing to protect, and a halt stops
   custody PROGRESS while a release gives a claim back.
+
+  A `:session_reason` that is not one of those four — `completed` above all, which ends no
+  claim — is `{:error, :unsupported_session_reason}` and nothing is written. An error, not a
+  raise: the caller runs in the runner channel's process, which every session on the machine
+  shares.
   """
   @spec release_ended_session(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer(), keyword()) ::
           {:ok, Story.t()}
-          | {:error, :not_found | :claim_not_held | Ecto.Changeset.t()}
+          | {:error,
+             :not_found | :claim_not_held | :unsupported_session_reason | Ecto.Changeset.t()}
   def release_ended_session(tenant_id, story_id, expected_epoch, opts) do
     session_reason = Keyword.fetch!(opts, :session_reason)
+
+    if session_reason in ~w(crashed usage_exhausted wall_clock_exceeded max_turns_exceeded),
+      do: release_session_claim(tenant_id, story_id, expected_epoch, session_reason, opts),
+      else: {:error, :unsupported_session_reason}
+  end
+
+  defp release_session_claim(tenant_id, story_id, expected_epoch, session_reason, opts) do
     actor_label = Keyword.fetch!(opts, :actor_label)
-
     actor_id = Keyword.fetch!(opts, :actor_id)
-
-    unless session_reason in ~w(crashed usage_exhausted wall_clock_exceeded max_turns_exceeded) do
-      raise ArgumentError,
-            "release_ended_session/4 releases for a session that ended without completing, " <>
-              "not #{inspect(session_reason)}"
-    end
 
     runner_lost_release(tenant_id, story_id, %{
       # BOUNDED, unlike the reclaim's wait: this runs in the runner channel's own process, and
@@ -1695,7 +1715,7 @@ defmodule Loopctl.Progress do
       actor_label: actor_label,
       webhook_reason: "session_ended:" <> session_reason,
       new_state: %{"session_ended_reason" => session_reason},
-      counted?: session_reason != "usage_exhausted"
+      counted?: Keyword.fetch!(opts, :counted?)
     })
   end
 

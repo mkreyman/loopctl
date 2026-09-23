@@ -246,6 +246,47 @@ defmodule Loopctl.Progress.ClaimLeaseTest do
       assert_in_delta seconds_from_now(claimed.claimed_until), Progress.claim_lease_seconds(), 5
     end
 
+    test "a story whose delivery stage is ESCALATED is refused, single and bulk" do
+      # A human owns it. Its own status says claimable — the claim that escalated it has ended
+      # — so the stage row is the only thing that says it is not.
+      %{agent: agent, story: story, tenant_id: tenant_id} = contracted_story()
+
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: tenant_id,
+        story_id: story.id,
+        stage: :escalated,
+        claim_epoch: story.claim_epoch,
+        escalation_reason: "session_ended:wall_clock_exceeded"
+      })
+
+      assert {:error, :story_escalated} =
+               Progress.claim_story(tenant_id, story.id, agent_id: agent.id)
+
+      assert {:ok, [%{status: "error", reason: reason}]} =
+               Loopctl.BulkOperations.bulk_claim(tenant_id, [story.id], agent.id)
+
+      assert reason =~ "escalated"
+
+      unclaimed = AdminRepo.get!(Story, story.id)
+      assert unclaimed.agent_status == :contracted
+      assert unclaimed.claim_epoch == story.claim_epoch
+    end
+
+    test "a stage row anywhere but escalated does not stand in the claim's way" do
+      %{agent: agent, story: story, tenant_id: tenant_id} = contracted_story()
+
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: tenant_id,
+        story_id: story.id,
+        stage: :queued,
+        claim_epoch: story.claim_epoch
+      })
+
+      assert {:ok, _claimed} = Progress.claim_story(tenant_id, story.id, agent_id: agent.id)
+    end
+
     test "force-unclaim of an already-pending story does not bump" do
       %{story: story, tenant_id: tenant_id} = contracted_story()
       story = force(story, agent_status: :pending)

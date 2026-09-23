@@ -445,7 +445,7 @@ defmodule LoopctlWeb.RunnerChannel do
            ) do
       socket = assign(socket, :session_ended_bucket, bucket)
 
-      case RunnerStages.end_session(tenant_id, runner.id, message) do
+      case RunnerStages.end_session(tenant_id, runner.id, message, actor_id: runner.api_key_id) do
         {:ok, %{row: row, replayed?: replayed?}} ->
           {:reply, {:ok, Map.put(stage_ack(row), :replayed, replayed?)}, socket}
 

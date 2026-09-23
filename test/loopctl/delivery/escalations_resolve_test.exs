@@ -26,6 +26,7 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.Progress
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -85,6 +86,21 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       # what "placeable" means, and a test that listed the conditions itself would pass a
       # story `place/4` still refused.
       assert :ok = claimable(ctx)
+    end
+
+    test "a resolved story is CLAIMABLE: the claim's escalated-stage refusal lets it go", ctx do
+      # While the row sits at `escalated` a claim is refused `:story_escalated` — a human owns
+      # the story. Resolution moves the row out first, so the refusal must not outlive it.
+      assert {:ok, %{stage: :queued}} = resolve(ctx, :queued)
+
+      agent = unboxed(fn -> fixture(:agent, %{tenant_id: ctx.tenant.id}) end)
+
+      assert {:ok, claimed} =
+               unboxed(fn ->
+                 Progress.claim_story(ctx.tenant.id, ctx.story.id, agent_id: agent.id)
+               end)
+
+      assert claimed.agent_status == :assigned
     end
 
     test "the row is bound to the epoch the release produced", ctx do

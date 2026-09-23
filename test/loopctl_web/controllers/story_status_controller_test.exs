@@ -238,6 +238,28 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       assert json_response(conn, 409)
     end
 
+    test "refuses a story escalated to a human: 409 story_escalated, nothing claimed", %{
+      conn: conn
+    } do
+      %{story: story, raw_key: raw_key} = setup_story_with_agent(%{agent_status: :contracted})
+
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        stage: :escalated,
+        escalation_reason: "session_ended:wall_clock_exceeded"
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/claim")
+
+      assert %{"error" => %{"code" => "story_escalated"}} = json_response(conn, 409)
+      assert AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).agent_status == :contracted
+    end
+
     test "rejects claim on already assigned story (409)", %{conn: conn} do
       %{story: story, raw_key: raw_key} =
         setup_story_with_agent(%{agent_status: :assigned})

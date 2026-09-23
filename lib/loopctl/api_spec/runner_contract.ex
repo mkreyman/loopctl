@@ -248,6 +248,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   report whose `claim_epoch` is not the story's current one is `stale_claim_epoch` and changes
   nothing — the claim it is about has already ended some other way.
 
+  **A BUDGET KILL WHOSE ESCALATION DID NOT LAND** is answered by why, AFTER the report was
+  recorded. `rate_limited` — a lock was not free, or the row kept moving under the escalation
+  — is the one retry: send the same bytes, and the resend re-drives the escalation and the
+  claim's end. `audit_chain_append_failed` — the tenant's hash chain refused the escalation's
+  entry — is PERMANENT, exactly as on `stage`: every chained transition in the tenant is
+  failing until an operator repairs the chain, so do NOT resend. The story stays in flight
+  meanwhile, and its lease is what eventually releases it, as it releases every claim a broken
+  chain strands.
+
   ## Server-initiated disconnects (since 1.2.0)
 
   Before loopctl closes a runner's connection itself, it pushes `"disconnecting"` on the
@@ -2457,6 +2466,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # the claim epoch — it is matched on its bytes before the epoch is looked at.
     # `stale_claim_epoch` is therefore about a FIRST report only. No `stale_stage`: where the
     # story is, is what the ok reply carries, and nothing the runner sends names a `from`.
+    # `audit_chain_append_failed` is a budget kill's escalation refused by the tenant's hash
+    # chain, permanent as on `stage`; a budget escalation that merely could not get its lock is
+    # `rate_limited`, and the resend completes it.
     "session_ended" =>
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
          already_recorded unknown_story_stage audit_chain_append_failed internal_error),

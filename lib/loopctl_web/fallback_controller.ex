@@ -24,6 +24,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :ambiguous_resolution}` -> 409 (a fuzzy identifier matched >1 active project)
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
+  - `{:error, :story_escalated}` -> 409 (claim of a story whose delivery stage is `escalated`; claimable again once the escalation is resolved)
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
   - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
   - `{:error, :not_claimed}` -> 422 (#803: renew-claim on a story that is not assigned or implementing)
@@ -343,6 +344,24 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "This story is not held by a claim (it is not assigned or implementing), so " <>
             "there is no lease to renew. Claim it with POST /stories/:id/claim."
+      }
+    })
+  end
+
+  # US-44.3 review round 2: a story control ESCALATED to a human is not claimable, even when
+  # its claim has ended and it reads `pending`/`contracted`. Not `invalid_transition`: the
+  # story's own status allows the claim, and the remedy is a person resolving the escalation.
+  def call(conn, {:error, :story_escalated}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "story_escalated",
+        message:
+          "This story is escalated to a human (its delivery stage is `escalated`), so it " <>
+            "cannot be claimed. It becomes claimable again once the escalation is resolved " <>
+            "(POST /api/v1/stories/:id/stage/resolve). Move on to other work."
       }
     })
   end

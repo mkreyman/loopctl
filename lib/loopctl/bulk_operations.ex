@@ -428,10 +428,16 @@ defmodule Loopctl.BulkOperations do
   end
 
   defp validate_claim_preconditions(story) do
-    if story.agent_status != :contracted do
-      {:error, "Story is not in contracted status (current: #{story.agent_status})"}
-    else
-      check_story_dependencies_satisfied(story)
+    cond do
+      story.agent_status != :contracted ->
+        {:error, "Story is not in contracted status (current: #{story.agent_status})"}
+
+      # The single-story claim's refusal (`Progress.claim_story/3`), for the same reason.
+      Stages.escalated?(story.tenant_id, story.id) ->
+        {:error, :story_escalated}
+
+      true ->
+        check_story_dependencies_satisfied(story)
     end
   end
 
@@ -935,6 +941,11 @@ defmodule Loopctl.BulkOperations do
         "pre-existing done work, so mark-complete does not apply"
 
   defp format_reason(:already_verified), do: "story is already verified"
+
+  defp format_reason(:story_escalated),
+    do:
+      "story is escalated to a human; it is claimable again once the escalation is resolved " <>
+        "(resolve_escalation)"
 
   defp format_reason(:story_rejected),
     do: "story is rejected; investigate instead of marking it complete"

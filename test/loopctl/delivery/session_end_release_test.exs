@@ -20,6 +20,8 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.AuditChain
+  alias Loopctl.BulkOperations
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
@@ -28,6 +30,7 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
+  alias Loopctl.WorkBreakdown.Queries
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -80,11 +83,16 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
 
   defp end_session(ctx, reason) do
     unboxed(fn ->
-      RunnerStages.end_session(ctx.tenant_id, ctx.runner.id, %{
-        dispatch_id: ctx.record.dispatch_id,
-        claim_epoch: ctx.record.claim_epoch,
-        reason: reason
-      })
+      RunnerStages.end_session(
+        ctx.tenant_id,
+        ctx.runner.id,
+        %{
+          dispatch_id: ctx.record.dispatch_id,
+          claim_epoch: ctx.record.claim_epoch,
+          reason: reason
+        },
+        actor_id: ctx.runner.api_key_id
+      )
     end)
   end
 
@@ -106,6 +114,13 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
           where: a.action == "claim_session_ended"
       )
     end)
+  end
+
+  defp ready_ids(ctx) do
+    {:ok, %{data: stories}} =
+      unboxed(fn -> Queries.list_ready_stories(ctx.tenant_id, page_size: 500) end)
+
+    Enum.map(stories, & &1.id)
   end
 
   defp requeues(ctx) do
@@ -224,6 +239,87 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
       assert ledger(ctx).counts_toward_retry_ceiling == nil
     end
 
+    test "the escalated story it leaves `pending` is neither listed as ready nor claimable",
+         ctx do
+      # The claim ended, so the story reads `pending` with nobody on it — exactly the shape of
+      # a story that IS ready. What says it is not is the stage row, and both ways an agent
+      # finds and takes work have to read it: the human it was escalated to must not be raced.
+      assert {:ok, %{row: %{stage: :escalated}}} = end_session(ctx, "wall_clock_exceeded")
+      assert story(ctx).agent_status == :pending
+
+      refute ctx.story.id in ready_ids(ctx)
+
+      {:ok, _} =
+        unboxed(fn ->
+          Progress.contract_story(ctx.tenant_id, ctx.story.id, %{},
+            actor_label: "test",
+            skip_contract_check: true
+          )
+        end)
+
+      assert {:error, :story_escalated} =
+               unboxed(fn ->
+                 Progress.claim_story(ctx.tenant_id, ctx.story.id, agent_id: ctx.runner.agent_id)
+               end)
+
+      assert {:ok, [%{status: "error", reason: reason}]} =
+               unboxed(fn ->
+                 BulkOperations.bulk_claim(ctx.tenant_id, [ctx.story.id], ctx.runner.agent_id)
+               end)
+
+      assert reason =~ "escalated"
+      assert story(ctx).agent_status == :contracted
+      assert story(ctx).assigned_agent_id == nil
+    end
+
+    test "a crash's re-queued story stays ready: only `escalated` is held back", ctx do
+      # The other side of the exclusion, so it cannot pass by hiding every released story.
+      assert {:ok, %{row: %{stage: :queued}}} = end_session(ctx, "crashed")
+      assert ctx.story.id in ready_ids(ctx)
+    end
+
+    test "an escalation whose lock is not free answers busy, and the resend lands it", ctx do
+      # The tenant's hash-chain lock, held by another session: the escalation's chained entry
+      # waits on it, its `lock_timeout` runs out, and `Stages.advance/4` answers `:busy`. That
+      # is the ONE refusal of the escalation that is a retry — nothing landed but the record.
+      parent = self()
+
+      holder =
+        Task.async(fn ->
+          unboxed(fn ->
+            AdminRepo.transaction(fn ->
+              AdminRepo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+                AuditChain.chain_lock_namespace(),
+                ctx.tenant_id
+              ])
+
+              send(parent, :holding)
+
+              receive do
+                :release -> :ok
+              end
+            end)
+          end)
+        end)
+
+      assert_receive :holding, 2_000
+
+      try do
+        assert {:error, :busy} = end_session(ctx, "wall_clock_exceeded")
+      after
+        send(holder.pid, :release)
+        Task.await(holder, 5_000)
+      end
+
+      assert ledger(ctx).session_ended_reason == "wall_clock_exceeded"
+      assert unboxed(fn -> Stages.get(ctx.tenant_id, ctx.story.id) end).stage == :implementing
+      assert releases(ctx) == []
+
+      assert {:ok, %{row: row, replayed?: true}} = end_session(ctx, "wall_clock_exceeded")
+      assert row.stage == :escalated
+      assert length(releases(ctx)) == 1
+    end
+
     test "a resend escalates nothing and ends nothing twice", ctx do
       assert {:ok, %{row: first}} = end_session(ctx, "max_turns_exceeded")
       assert {:ok, %{row: again, replayed?: true}} = end_session(ctx, "max_turns_exceeded")
@@ -270,9 +366,9 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
 
     test "a recorded budget kill that escalated nothing is escalated and ended by the resend",
          ctx do
-      # What a permanent-looking failure of the escalation used to strand: the report on the
-      # ledger, the row still in flight, the claim still held. The resend is the only way the
-      # work completes, which is why that failure is now answered as a retry.
+      # What an escalation that did not land leaves: the report on the ledger, the row still
+      # in flight, the claim still held. The resend is the only way the work completes, which
+      # is why a lock that was not free is answered as a retry.
       assert {:ok, {:recorded, _session}} = record_only(ctx, "wall_clock_exceeded")
 
       assert {:ok, %{row: row, replayed?: true}} = end_session(ctx, "wall_clock_exceeded")

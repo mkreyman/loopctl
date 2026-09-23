@@ -85,6 +85,26 @@ defmodule Loopctl.WorkBreakdown.Queries do
         )
       )
 
+      # Exclude stories control has ESCALATED to a human. A budget kill ends the claim, and so
+      # does the lease reclaim after a session escalated itself, so such a story is `pending`
+      # with nothing else to say it is not ready; `Progress.claim_story/3` refuses it too.
+      # Tenant-scoped on the join explicitly, not left to the story's own predicate.
+      |> where(
+        [s],
+        fragment(
+          """
+          NOT EXISTS (
+            SELECT 1 FROM story_stages ss
+            WHERE ss.story_id = ?
+            AND ss.tenant_id = ?
+            AND ss.stage = 'escalated'
+          )
+          """,
+          s.id,
+          s.tenant_id
+        )
+      )
+
     # Also exclude stories in epics that depend on empty prerequisite epics
     # (An epic dependency means the prereq epic must have ALL stories verified,
     #  which is vacuously true if the epic has no stories. We allow this.)
