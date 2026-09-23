@@ -231,7 +231,6 @@ const DECLARED = {
   "POST /api/v1/stories/:param/artifacts": "gap", // ArtifactReportController.create
   "GET /api/v1/stories/:param/artifacts": "gap", // ArtifactReportController.index
   "GET /api/v1/stories/:param/verifications": "gap", // StoryVerificationController.index
-  "POST /api/v1/stories/:param/merge-precondition": "gap", // MergePreconditionController.create
   "POST /api/v1/agents/register": "gap", // AgentController.register
   "GET /api/v1/agents": "gap", // AgentController.index
   "GET /api/v1/agents/:param": "gap", // AgentController.show

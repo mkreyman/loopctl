@@ -296,6 +296,35 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  * the orchestrator role" (`require_role.ex:112-128`), so the request never reaches the
  * controller and never reaches the custody 409s in `Progress`. The role error names the role.
  */
+export function mergePreconditionPath(storyId) {
+  return `/api/v1/stories/${encodeURIComponent(storyId)}/merge-precondition`;
+}
+
+/**
+ * `merge_precondition` (epic 44, US-44.1): the second run of both delivery gates over the real
+ * pull request. `exact_role: [:orchestrator, :user]`, so it takes the ORCH key the way
+ * `force_unclaim_story` does. It sends no `trio_outputs`: since contract 1.15.0 Gate A reads
+ * the lens verdicts triage persisted, and a trio sent here would be ignored.
+ */
+export async function mergePrecondition(
+  { story_id, claim_epoch, effect_proof } = {},
+  { orchKey, apiCall } = {},
+) {
+  if (!orchKey) return refuse(MISSING_ORCH_KEY);
+
+  const bad = uuid(story_id, "story_id");
+  if (bad) return bad;
+
+  if (!Number.isInteger(claim_epoch) || claim_epoch < 0) {
+    return refuse("claim_epoch must be a non-negative integer: the epoch the caller acts under.");
+  }
+
+  const body = { claim_epoch };
+  if (effect_proof && typeof effect_proof === "object") body.effect_proof = effect_proof;
+
+  return apiCall("POST", mergePreconditionPath(story_id), body);
+}
+
 export async function forceUnclaimStory({ story_id } = {}, { orchKey, apiCall } = {}) {
   if (!orchKey) return refuse(MISSING_ORCH_KEY);
 

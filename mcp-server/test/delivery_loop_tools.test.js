@@ -19,6 +19,7 @@ import path from "node:path";
 import {
   forceUnclaimPath,
   forceUnclaimStory,
+  mergePrecondition,
   placeDispatch,
   placementPath,
   resolveEscalation,
@@ -286,6 +287,56 @@ describe("force_unclaim_story", () => {
   });
 });
 
+describe("merge_precondition (US-44.1)", () => {
+  test("POSTs the epoch and nothing Gate A could read", async () => {
+    const { calls, apiCall } = fakeApi({ data: { decision: "allow" } });
+
+    await mergePrecondition({ story_id: STORY_ID, claim_epoch: 3 }, { orchKey: "orch-key", apiCall });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "POST");
+    assert.equal(calls[0].path, `/api/v1/stories/${STORY_ID}/merge-precondition`);
+    assert.deepEqual(calls[0].body, { claim_epoch: 3 });
+  });
+
+  test("passes an effect proof through when given one", async () => {
+    const { calls, apiCall } = fakeApi();
+    const proof = { intent: "no_output_change" };
+
+    await mergePrecondition(
+      { story_id: STORY_ID, claim_epoch: 0, effect_proof: proof },
+      { orchKey: "orch-key", apiCall },
+    );
+
+    assert.deepEqual(calls[0].body, { claim_epoch: 0, effect_proof: proof });
+  });
+
+  test("refuses a missing or negative claim_epoch before any call", async () => {
+    for (const claim_epoch of [undefined, -1, 1.5, "0"]) {
+      const { calls, apiCall } = fakeApi();
+      const result = await mergePrecondition(
+        { story_id: STORY_ID, claim_epoch },
+        { orchKey: "orch-key", apiCall },
+      );
+
+      assert.equal(result.error, true, `accepted claim_epoch ${claim_epoch}`);
+      assert.equal(calls.length, 0);
+    }
+  });
+
+  test("refuses without an orchestrator key, before any call", async () => {
+    const { calls, apiCall } = fakeApi();
+    const result = await mergePrecondition(
+      { story_id: STORY_ID, claim_epoch: 0 },
+      { orchKey: undefined, apiCall },
+    );
+
+    assert.equal(result.error, true);
+    assert.match(result.body, /LOOPCTL_ORCH_KEY/);
+    assert.equal(calls.length, 0);
+  });
+});
+
 describe("id validation — shared by every verb here", () => {
   // NOT because the server 500s on a malformed id; it does not. `Ecto.Query.CastError` has a
   // deliberate `Plug.Exception` impl returning 404 (`cast_error_handler.ex:32-35` — the
@@ -429,6 +480,7 @@ describe("the wiring in index.js", () => {
       story_stage: "storyStage",
       resolve_escalation: "resolveEscalation",
       force_unclaim_story: "forceUnclaimStory",
+      merge_precondition: "mergePreconditionTool",
     };
 
     for (const [name, handler] of Object.entries(wiring)) {

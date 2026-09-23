@@ -31,14 +31,11 @@ defmodule LoopctlWeb.MergePreconditionController do
   and the custody facts from the database. `claim_epoch` can only get the call refused,
   never accepted, since it fences the write.
 
-  **The two exceptions are named on every verdict, because they are assertions by the same
-  principal that drives the merge.**
+  **The one exception is named on every verdict, because it is an assertion by the same
+  principal that drives the merge.** (`trio_outputs` was the other until US-44.1: Gate A now
+  reads the lens verdicts triage persisted, a caller's `trio_outputs` is ignored and
+  recorded as `trio_outputs_ignored`, and `gate_a_inputs` says what Gate A was judged on.)
 
-  - `trio_outputs` is Gate A's only input and there is nowhere else to read it from yet, so
-    a fabricated trio clears Gate A. Every verdict carries
-    `gate_a_inputs: "caller_asserted"` and every escalation reason begins with it. What
-    closes it: triage persisting its verdict against the story, after which this parameter
-    goes away.
   - `effect_proof` is recorded and judged but can no longer produce an ALLOW — a
     `prove_effect` outcome escalates whatever the proof says, because a fabricated proof
     would otherwise wave through exactly the changes the gate exists for. What closes it:
@@ -148,11 +145,19 @@ defmodule LoopctlWeb.MergePreconditionController do
           custody: %OpenApiSpex.Schema{type: :string, nullable: true},
           gate_a_inputs: %OpenApiSpex.Schema{
             type: :string,
-            enum: ["caller_asserted"],
+            enum: ["persisted_triage", "human_resolution", "missing"],
             description:
-              "How Gate A's inputs reached the gate. `caller_asserted` while the triage " <>
-                "trio's outputs arrive in the request body, so Gate A's verdict is only " <>
-                "as trustworthy as inputs the caller supplied."
+              "What Gate A was judged on, resolved server-side and never from the request: " <>
+                "`persisted_triage` (the lens verdicts recorded with the story's most " <>
+                "recent triage), `human_resolution` (a human re-queued the story from a " <>
+                "Gate A escalation after that triage), or `missing` (neither, so Gate A " <>
+                "refused with `gate_a_inputs_missing`)."
+          },
+          trio_outputs_ignored: %OpenApiSpex.Schema{
+            type: :boolean,
+            description:
+              "True when the request carried `trio_outputs`. It is accepted for callers " <>
+                "written against the old contract and never read."
           },
           retry_after: %OpenApiSpex.Schema{
             type: :integer,
@@ -205,7 +210,7 @@ defmodule LoopctlWeb.MergePreconditionController do
       {"Merge precondition params", "application/json",
        %OpenApiSpex.Schema{
          type: :object,
-         required: [:claim_epoch, :trio_outputs],
+         required: [:claim_epoch],
          properties: %{
            claim_epoch: %OpenApiSpex.Schema{
              type: :integer,
@@ -217,8 +222,10 @@ defmodule LoopctlWeb.MergePreconditionController do
            trio_outputs: %OpenApiSpex.Schema{
              type: :array,
              description:
-               "The triage trio's three output objects, Gate A's only input. Anything " <>
-                 "other than exactly three well-formed outputs escalates.",
+               "IGNORED since US-44.1. Accepted so a caller written against the old " <>
+                 "contract is not refused; its presence is recorded on the verdict as " <>
+                 "`trio_outputs_ignored` and nothing in it is read. Gate A reads the lens " <>
+                 "verdicts triage persisted.",
              items: %OpenApiSpex.Schema{type: :object}
            },
            effect_proof: %OpenApiSpex.Schema{
@@ -267,9 +274,7 @@ defmodule LoopctlWeb.MergePreconditionController do
     tenant_id = api_key.tenant_id
 
     with {:ok, claim_epoch} <- claim_epoch(params),
-         {:ok, trio_outputs} <- trio_outputs(params),
-         {:ok, verdict} <-
-           enforce(tenant_id, story_id, api_key, claim_epoch, trio_outputs, params) do
+         {:ok, verdict} <- enforce(tenant_id, story_id, api_key, claim_epoch, params) do
       conn
       |> put_status(status_for(verdict))
       |> put_retry_after(verdict)
@@ -292,15 +297,15 @@ defmodule LoopctlWeb.MergePreconditionController do
 
   defp put_retry_after(conn, %Verdict{}), do: conn
 
-  defp enforce(tenant_id, story_id, api_key, claim_epoch, trio_outputs, params) do
-    opts = [
-      claim_epoch: claim_epoch,
-      trio_outputs: trio_outputs,
-      effect_proof: effect_proof(params),
-      actor_label: "api_key:#{api_key.id}",
-      actor_role: api_key.role,
-      actor_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
-    ]
+  defp enforce(tenant_id, story_id, api_key, claim_epoch, params) do
+    opts =
+      [
+        claim_epoch: claim_epoch,
+        effect_proof: effect_proof(params),
+        actor_label: "api_key:#{api_key.id}",
+        actor_role: api_key.role,
+        actor_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+      ] ++ ignored_trio(params)
 
     case MergePrecondition.enforce(tenant_id, story_id, opts) do
       {:ok, verdict} -> {:ok, verdict}
@@ -316,14 +321,9 @@ defmodule LoopctlWeb.MergePreconditionController do
   defp claim_epoch(_params),
     do: {:error, :unprocessable_entity, "claim_epoch must be a non-negative integer"}
 
-  # Gate A escalates on anything that is not exactly three well-formed outputs, so this
-  # only insists on a LIST — the gate is what judges its contents, and it must be the one
-  # that does, so a malformed trio is recorded as an escalation rather than a 422 the loop
-  # could retry its way past.
-  defp trio_outputs(%{"trio_outputs" => outputs}) when is_list(outputs), do: {:ok, outputs}
-
-  defp trio_outputs(_params),
-    do: {:error, :unprocessable_entity, "trio_outputs must be an array"}
+  # Presence only: the value is never passed on, so nothing a caller sends can reach Gate A.
+  defp ignored_trio(%{"trio_outputs" => _outputs}), do: [trio_outputs: :ignored]
+  defp ignored_trio(_params), do: []
 
   defp effect_proof(%{"effect_proof" => proof}) when is_map(proof), do: atomize_proof(proof)
   defp effect_proof(_params), do: nil
@@ -379,6 +379,7 @@ defmodule LoopctlWeb.MergePreconditionController do
       self_deploy_excluded_repos: MergePrecondition.self_deploy_excluded_repos(),
       custody: verdict.custody,
       gate_a_inputs: verdict.gate_a_inputs,
+      trio_outputs_ignored: verdict.trio_outputs_ignored,
       retry_after: verdict.retry_after,
       gate_a: gate_a(verdict.gate_a),
       gate_b: gate_b(verdict.gate_b),

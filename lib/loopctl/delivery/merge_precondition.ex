@@ -80,13 +80,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
   session acts on it — so refusing is the whole of the enforcement available, and that is
   precisely why it must never be reachable past a branch that reports `:allow`.
 
-  ## Gate A's inputs are caller-asserted, and every verdict says so
+  ## Gate A's inputs come from the database, never the caller (US-44.1)
 
-  The triage trio's outputs arrive in the request because triage does not persist them yet,
-  so a fabricated trio clears Gate A. `gate_a_inputs: :caller_asserted` is on every verdict
-  and opens every escalation reason. Triage persisting its verdict against the story is
-  what closes it; nothing else here can, and pretending otherwise would be worse than
-  saying it.
+  Until contract 1.15.0 the trio's outputs arrived in the request, so the principal driving
+  the merge also supplied the triage it was judged against and a fabricated trio cleared
+  Gate A. They are now resolved by `Loopctl.Delivery.GateAInput`: the lens verdicts
+  recorded with the story's most recent triage, or a human's re-queue of a Gate A
+  escalation, or neither — which refuses. A caller still sending `trio_outputs` is recorded
+  on the verdict as `trio_outputs_ignored` and nothing it sent is read. The label
+  (`gate_a_inputs`) is on every verdict and opens every escalation reason.
 
   ## Fail closed, everywhere
 
@@ -174,6 +176,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   require Logger
 
+  alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
@@ -215,7 +218,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
           required(:custody) => :ok | {:error, atom()},
           required(:recorded_head_sha) => String.t() | nil,
           required(:recorded_allow_sha) => String.t() | nil,
-          optional(:trio_outputs) => term(),
+          optional(:gate_a_input) => GateAInput.t(),
+          optional(:trio_outputs_ignored) => boolean(),
           optional(:effect_proof) => map() | nil,
           # OPTIONAL, and the fallback behind it is deliberate: a caller of `judge/1` that
           # omits it gets the configured list, because a guard that disappears when a fact is
@@ -266,7 +270,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   """
   @spec judge(facts()) :: Verdict.t()
   def judge(facts) do
-    gate_a = GateA.evaluate(Map.get(facts, :trio_outputs))
+    {gate_a, gate_a_inputs} = gate_a(Map.get(facts, :gate_a_input, :missing))
     custody = Map.get(facts, :custody, {:error, :custody_unknown})
     carried = gate_a_reasons(gate_a) ++ custody_reasons(custody)
 
@@ -274,7 +278,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
       decision: :refuse,
       reasons: [],
       gate_a: gate_a,
-      gate_a_inputs: :caller_asserted,
+      gate_a_inputs: gate_a_inputs,
+      trio_outputs_ignored: Map.get(facts, :trio_outputs_ignored, false),
       custody: custody_code(custody),
       repo: value(facts, :repo),
       pr_number: value(facts, :pr_number),
@@ -407,9 +412,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   ## Options
 
-  - `:trio_outputs` (required in practice) — the triage trio's three decoded output
-    objects, Gate A's only input. Anything that is not exactly three well-formed outputs
-    escalates, which is what makes an absent or forgotten value fail closed rather than pass
+  - `:trio_outputs` — IGNORED since US-44.1. Its presence is recorded on the verdict
+    (`trio_outputs_ignored`) and its value is never read; Gate A's input is resolved from the
+    database by `Loopctl.Delivery.GateAInput`
   - `:effect_proof` — `%{intent: _, fixture_set: _, fixture_results: _, coverage: _}` for a
     change that touches an effect path. Absent, a `:prove_effect` outcome is a refusal
 
@@ -650,6 +655,35 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp open_reasons(%{state: state}), do: [{:pr_not_open, state}]
   defp open_reasons(_pr), do: [:unreadable_pull_request_state]
 
+  # Gate A's input, resolved by `Loopctl.Delivery.GateAInput`, and the label every verdict
+  # carries so a reader can see what Gate A was judged on.
+  defp gate_a({:persisted_triage, outputs}), do: {GateA.evaluate(outputs), :persisted_triage}
+
+  defp gate_a(:human_resolution) do
+    {%GateA.Result{
+       decision: :proceed,
+       verdict: :story,
+       reasons: [],
+       confidences: [],
+       soft_signals: []
+     }, :human_resolution}
+  end
+
+  defp gate_a(_missing) do
+    {%GateA.Result{
+       decision: :escalate,
+       verdict: nil,
+       reasons: [:gate_a_inputs_missing],
+       confidences: [],
+       soft_signals: []
+     }, :missing}
+  end
+
+  # Recorded on the escalation's event so a later human re-queue can be recognised as a
+  # decision ABOUT Gate A (`Loopctl.Delivery.GateAInput`), and a Gate B-only refusal cannot.
+  defp gate_a_refused?(%Verdict{reasons: reasons}),
+    do: Enum.any?(reasons, &match?({tag, _} when tag in [:gate_a, :trio_verdict], &1))
+
   defp gate_a_reasons(%GateA.Result{decision: :escalate, reasons: reasons}),
     do: Enum.map(reasons, &{:gate_a, &1})
 
@@ -834,7 +868,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # granted for. Both are read from the stage row, never from the caller.
       recorded_head_sha: stage.head_sha,
       recorded_allow_sha: stage.merge_gate_allowed_sha,
-      trio_outputs: Keyword.get(opts, :trio_outputs),
+      # Read from the database and NEVER from the caller (US-44.1). A caller that still sends
+      # `trio_outputs` is recorded as having done so, and nothing it sent is read.
+      gate_a_input: GateAInput.for_story(story.tenant_id, story.id),
+      trio_outputs_ignored: Keyword.has_key?(opts, :trio_outputs),
       effect_proof: Keyword.get(opts, :effect_proof)
     }
   end
@@ -1012,6 +1049,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
       opts
       |> Keyword.take([:claim_epoch, :actor_label, :actor_role, :actor_lineage])
       |> Keyword.put(:reason, reason_text(verdict))
+      |> Keyword.put(:event_data, %{"gate_a" => gate_a_refused?(verdict)})
 
     case Stages.advance(tenant_id, story_id, target, advance_opts) do
       {:ok, _row} ->

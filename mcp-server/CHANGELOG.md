@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.103.0 — 2026-09-23 (the merge gate stops trusting its caller)
+
+### Added
+
+- **`merge_precondition`** (loopctl epic 44, US-44.1, `POST /api/v1/stories/:id/merge-precondition`).
+  The merge gate had an endpoint and no tool, so the route sweep declared it a `gap`. It takes
+  `story_id` and `claim_epoch` (plus an optional `effect_proof`) and sends NO trio: since loopctl
+  contract 1.15.0 Gate A reads the lens verdicts triage persisted, and the answer's
+  `gate_a_inputs` says which input it used. Orchestrator key, pinned when `LOOPCTL_ORCH_KEY` is
+  set, exactly as `force_unclaim_story`.
+
 ## 2.102.0 — 2026-09-16 (the delivery loop can finally be given an input)
 
 ### Added

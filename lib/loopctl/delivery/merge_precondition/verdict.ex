@@ -17,9 +17,12 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
   - `reasons` — every reason the decision is what it is, all of them rather than the first,
     so one escalation names the whole list. Empty on `:allow` and on an authorised
     `:already_merged`
-  - `gate_a_inputs` — `:caller_asserted` while the triage trio's outputs arrive in the
-    request. Recorded on every verdict and named in the escalation reason, because Gate A's
-    verdict is only as trustworthy as inputs the same principal supplied
+  - `gate_a_inputs` — what Gate A was judged on, resolved server-side by
+    `Loopctl.Delivery.GateAInput`: `:persisted_triage` (the lens verdicts recorded with the
+    story's most recent triage), `:human_resolution` (a human re-queued it from a Gate A
+    escalation), or `:missing` (neither, so Gate A refused). Never anything a caller sent
+  - `trio_outputs_ignored` — true when the caller still sent `trio_outputs`. Recorded so a
+    caller relying on the old contract can see that nothing it sent was read
   - `recorded_head_sha` — the head the STAGE ROW carries: what CI ran on and the story was
     verified at. Known even when the forge cannot be reached, which is why the
     consecutive-unevaluated count is kept per THIS head rather than the forge's
@@ -64,7 +67,8 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :retry_after,
     :recorded_head_sha,
     custody: nil,
-    gate_a_inputs: :caller_asserted
+    gate_a_inputs: :missing,
+    trio_outputs_ignored: false
   ]
 
   @type decision :: :allow | :refuse | :already_merged | :head_moved | :unevaluated
@@ -82,7 +86,8 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           gate_b: GateB.Result.t() | nil,
           proof: GateB.ProofResult.t() | nil,
           custody: :ok | atom() | nil,
-          gate_a_inputs: :caller_asserted,
+          gate_a_inputs: :persisted_triage | :human_resolution | :missing,
+          trio_outputs_ignored: boolean(),
           retry_after: pos_integer() | nil,
           recorded_head_sha: String.t() | nil
         }

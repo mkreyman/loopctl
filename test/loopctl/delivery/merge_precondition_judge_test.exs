@@ -40,7 +40,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.head_sha == @head
       assert verdict.merge_base_sha == @base
       assert verdict.custody == :ok
-      assert verdict.gate_a_inputs == :caller_asserted
+      assert verdict.gate_a_inputs == :persisted_triage
     end
 
     test "judges the same facts the same way twice" do
@@ -417,7 +417,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
         judge(
           files: ["lib/widgets/thing.ex"],
           diffstat: %{files: 1, changed_lines: 1},
-          trio_outputs: [trio("story"), trio("story"), trio("escalate")]
+          gate_a_input: {:persisted_triage, [trio("story"), trio("story"), trio("escalate")]}
         )
 
       assert verdict.decision == :refuse
@@ -425,16 +425,17 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert Enum.any?(verdict.reasons, &match?({:gate_a, {:verdict_disagreement, _}}, &1))
     end
 
-    test "a MISSING trio escalates — Gate A judges it, and it fails closed" do
+    test "MISSING lens verdicts escalate — Gate A refuses, it fails closed" do
       verdict =
         judge(
           files: ["lib/widgets/thing.ex"],
           diffstat: %{files: 1, changed_lines: 1},
-          trio_outputs: nil
+          gate_a_input: :missing
         )
 
       assert verdict.decision == :refuse
-      assert {:gate_a, {:trio_size, :not_a_list}} in verdict.reasons
+      assert verdict.gate_a_inputs == :missing
+      assert {:gate_a, :gate_a_inputs_missing} in verdict.reasons
     end
 
     test "a unanimous REJECT verdict does not merge" do
@@ -442,7 +443,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
         judge(
           files: ["lib/widgets/thing.ex"],
           diffstat: %{files: 1, changed_lines: 1},
-          trio_outputs: List.duplicate(trio("reject"), 3)
+          gate_a_input: {:persisted_triage, List.duplicate(trio("reject"), 3)}
         )
 
       assert verdict.decision == :refuse
@@ -454,11 +455,13 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
         judge(
           files: ["lib/widgets/thing.ex"],
           diffstat: %{files: 1, changed_lines: 1},
-          trio_outputs: [
-            trio("story"),
-            trio("story"),
-            Map.put(trio("story"), "escalation_reasons", ["workflow_change_not_defect_fix"])
-          ]
+          gate_a_input:
+            {:persisted_triage,
+             [
+               trio("story"),
+               trio("story"),
+               Map.put(trio("story"), "escalation_reasons", ["workflow_change_not_defect_fix"])
+             ]}
         )
 
       assert verdict.decision == :refuse
@@ -586,12 +589,12 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
         judge(
           pull_request: {:error, {:github_unreachable, :timeout}},
           custody: {:error, :not_verified},
-          trio_outputs: nil
+          gate_a_input: :missing
         )
 
       assert verdict.decision == :unevaluated
       assert {:custody, :not_verified} in verdict.reasons
-      assert {:gate_a, {:trio_size, :not_a_list}} in verdict.reasons
+      assert {:gate_a, :gate_a_inputs_missing} in verdict.reasons
     end
 
     test "transient?/1 is narrow: a 404, a 401 and an unreadable body are NOT transient" do
@@ -942,7 +945,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       verdict =
         judge(
           pull_request: {:error, {:github_api_error, 404}},
-          trio_outputs: [trio("story"), trio("story"), trio("escalate")],
+          gate_a_input: {:persisted_triage, [trio("story"), trio("story"), trio("escalate")]},
           custody: {:error, :not_verified}
         )
 
@@ -1002,7 +1005,8 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       custody: Keyword.get(opts, :custody, :ok),
       recorded_head_sha: Keyword.get(opts, :recorded_head_sha, @head),
       recorded_allow_sha: Keyword.get(opts, :recorded_allow_sha),
-      trio_outputs: Keyword.get(opts, :trio_outputs, List.duplicate(trio("story"), 3)),
+      gate_a_input:
+        Keyword.get(opts, :gate_a_input, {:persisted_triage, List.duplicate(trio("story"), 3)}),
       effect_proof: Keyword.get(opts, :effect_proof)
     }
   end

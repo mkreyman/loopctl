@@ -328,7 +328,8 @@ defmodule Loopctl.Delivery.TriageVerdict do
       confidence: verdict && verdict.confidence,
       payload: verdict && stringify(verdict),
       incomplete_reason: Map.get(message, :incomplete),
-      detail: Map.get(message, :detail)
+      detail: Map.get(message, :detail),
+      lens_verdicts: lens_map(Map.get(message, :lens_verdicts))
     }
 
     %TriageVerdictRecord{
@@ -369,6 +370,15 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
   defp stringify(value), do: value
+
+  # The cast has already held each lens to exactly one entry, so keying by it loses nothing.
+  defp lens_map(nil), do: nil
+
+  defp lens_map(lens_verdicts),
+    do:
+      Map.new(lens_verdicts, fn entry ->
+        {entry.lens, entry |> stringify() |> Map.delete("lens")}
+      end)
 
   # THE DRAFT BEFORE THE TRANSITIONS, for the reason the moduledoc gives: a story that reaches
   # `queued` carrying the stub row is work dispatched against a repository name and an issue

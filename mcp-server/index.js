@@ -49,6 +49,7 @@ import { claimLeaseNotice, renewStoryClaim as renewStoryClaimRequest } from "./l
 import { escalateStory as escalateStoryRequest, escalationNotice } from "./lib/escalation.js";
 import {
   forceUnclaimStory as forceUnclaimStoryRequest,
+  mergePrecondition as mergePreconditionRequest,
   placeDispatch as placeDispatchRequest,
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
@@ -3289,6 +3290,19 @@ async function forceUnclaimStory(args) {
 
   return toContent(
     await forceUnclaimStoryRequest(args, {
+      orchKey: orch.resolved,
+      apiCall: (method, path, body) => apiCall(method, path, body, orch.override, orch.options),
+    }),
+  );
+}
+
+// Epic 44, US-44.1: the merge gate's second run. Same key selection as force-unclaim — the
+// action is `exact_role: [:orchestrator, :user]` and LOOPCTL_ORCH_KEY is pinned when set.
+async function mergePreconditionTool(args) {
+  const orch = orchestratorKeyArgs();
+
+  return toContent(
+    await mergePreconditionRequest(args, {
       orchKey: orch.resolved,
       apiCall: (method, path, body) => apiCall(method, path, body, orch.override, orch.options),
     }),
@@ -8166,6 +8180,46 @@ const TOOLS = [
     },
   },
   {
+    name: "merge_precondition",
+    description:
+      "RUN THE MERGE GATE over a story's real pull request " +
+      "(POST /api/v1/stories/:id/merge-precondition). Both delivery gates run again over the " +
+      "diff that exists, plus custody (`verified_status: verified` by a separate lineage), the " +
+      "12-file / 1000-line hard bound, the head-has-not-moved check and the self-deploy " +
+      "exclusion. The story must be at stage `ci`.\n\n" +
+      "GATE A READS WHAT TRIAGE PERSISTED, NEVER YOU. Its input is the lens verdicts recorded " +
+      "with the story's most recent triage, or a human's re-queue of a Gate A escalation; this " +
+      "tool sends no trio. `gate_a_inputs` on the answer says which (`persisted_triage`, " +
+      "`human_resolution`, or `missing` — which refuses with `gate_a_inputs_missing`).\n\n" +
+      "DECISIONS: `allow` (recorded against the head, the only thing that licenses a merge), " +
+      "`refuse` (the story is escalated before this returns), `already_merged`, `head_moved` " +
+      "(back to implementing), `unevaluated` (503 with Retry-After: a transient forge fault; " +
+      "retry after the delay, nothing transitioned).\n\n" +
+      "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
+      "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
+      "else LOOPCTL_API_KEY. 403 `custody_tier_required` on a tenant without a human anchor, " +
+      "404 for an unknown story, 422 when `claim_epoch` is missing or the story is not at `ci` " +
+      "or has no stage row. A `story_id` that is not a UUID or a bad `claim_epoch` is refused " +
+      "here, before any call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The story UUID, at stage `ci`." },
+        claim_epoch: {
+          type: "integer",
+          description: "The claim epoch you act under; it fences the escalation a refusal writes.",
+        },
+        effect_proof: {
+          type: "object",
+          description:
+            "Optional effect proof for a change touching an effect path. Judged and recorded; " +
+            "it cannot turn a `prove_effect` outcome into an allow.",
+        },
+      },
+      required: ["story_id", "claim_epoch"],
+    },
+  },
+  {
     name: "force_unclaim_story",
     description:
       "TAKE A STORY BACK from the agent holding it (POST /api/v1/stories/:id/force-unclaim). " +
@@ -9463,6 +9517,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "force_unclaim_story":
       return await forceUnclaimStory(args);
+
+    case "merge_precondition":
+      return await mergePreconditionTool(args);
 
     case "intake_source_enroll":
       return await intakeSourceEnroll(args);

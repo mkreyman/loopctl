@@ -4,6 +4,25 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Changed
+
+- **The merge gate reads Gate A's input from the database, never from the caller (epic 44,
+  US-44.1, runner contract 1.15.0). RE-VENDOR the contract to send `lens_verdicts`;
+  `loopctl-mcp-server` 2.103.0 adds the `merge_precondition` tool.** `POST
+  /api/v1/stories/:id/merge-precondition` used to judge Gate A on a `trio_outputs` array in the
+  request, so the principal driving a merge also supplied the triage it was judged against, and
+  a fabricated unanimous trio cleared Gate A. A triage verdict message may now carry
+  `lens_verdicts` — one small entry per lens (`analyst`, `architect`, `engineer`), capped
+  together at 9 000 bytes under the byte rule — which loopctl stores in the new
+  `triage_verdicts.lens_verdicts` column (migration, no manual step, NULL for existing rows).
+  Gate A reads the lens verdicts of the story's most recent triage, or accepts a human's
+  re-queue of an escalation that was about Gate A; with neither it REFUSES
+  (`gate_a_inputs_missing`), never retries. `trio_outputs` is no longer required, is ignored when
+  sent, and the answer carries `trio_outputs_ignored: true`; `gate_a_inputs` is now
+  `persisted_triage`, `human_resolution` or `missing` (it was always `caller_asserted`).
+  **Operator-visible:** a story whose triage ran on a runner still on contract 1.14.0 has no lens
+  verdicts, so its merge is refused until a human re-queues it or it is re-triaged.
+
 ### Added
 
 - **The GitHub intake sources of the delivery loop are reachable from an MCP session

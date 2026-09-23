@@ -239,6 +239,29 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert saved.payload["story"]["title"] == "A title"
     end
 
+    test "lens verdicts are recorded keyed by lens, for Gate A to read (US-44.1)" do
+      %{story: story, runner: runner, record: record} = session()
+
+      lens_verdicts =
+        for lens <- ~w(analyst architect engineer),
+            do: %{lens: lens, outcome: "escalate", confidence: "low", escalation_reasons: ["x"]}
+
+      message =
+        record
+        |> verdict_message(verdict("escalate", %{escalation_reasons: ["Needs a person."]}))
+        |> Map.put(:lens_verdicts, lens_verdicts)
+
+      assert {:ok, %{record: saved}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert saved.lens_verdicts |> Map.keys() |> Enum.sort() == ~w(analyst architect engineer)
+
+      assert saved.lens_verdicts["engineer"] == %{
+               "outcome" => "escalate",
+               "confidence" => "low",
+               "escalation_reasons" => ["x"]
+             }
+    end
+
     test "an accepted verdict REPLACES the stub row with the drafted story" do
       %{story: story, runner: runner, record: record} = session()
 

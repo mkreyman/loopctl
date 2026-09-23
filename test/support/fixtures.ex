@@ -23,6 +23,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Intake.Delivery, as: IntakeDelivery
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.Record, as: IntakeRecord
@@ -2294,6 +2295,52 @@ defmodule Loopctl.Fixtures do
       row
     else
       insert.()
+    end
+  end
+
+  # A RECORDED triage verdict (`triage_verdicts`), as `Loopctl.Delivery.TriageVerdict` writes
+  # one after a runner's verdict message, for the readers that judge it (US-44.1). Defaults
+  # to a unanimous `story` verdict with all three lens verdicts; pass `lens_verdicts: nil` for
+  # a verdict recorded without them (a runner on contract 1.14.0). `:repo` as for
+  # `fixture(:story_stage)`.
+  def fixture(:triage_verdict, attrs) do
+    attrs = Enum.into(attrs, %{})
+    repo = Map.get(attrs, :repo, Loopctl.Repo)
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    lens = %{
+      "outcome" => "story",
+      "confidence" => "high",
+      "escalation_reasons" => [],
+      "contradicts" => []
+    }
+
+    record =
+      struct!(
+        TriageVerdictRecord,
+        %{
+          tenant_id: tenant_id,
+          story_id: Map.fetch!(attrs, :story_id),
+          dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+          outcome: Map.get(attrs, :outcome, "story"),
+          confidence: "high",
+          payload: %{"outcome" => Map.get(attrs, :outcome, "story"), "confidence" => "high"},
+          payload_digest: Ecto.UUID.generate(),
+          claim_epoch: 0,
+          lens_verdicts:
+            Map.get(attrs, :lens_verdicts, %{
+              "analyst" => lens,
+              "architect" => lens,
+              "engineer" => lens
+            })
+        }
+      )
+
+    if repo == Loopctl.Repo do
+      {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, fn -> Loopctl.Repo.insert!(record) end)
+      row
+    else
+      repo.insert!(record)
     end
   end
 

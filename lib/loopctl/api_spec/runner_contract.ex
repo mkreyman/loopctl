@@ -47,6 +47,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.12.0) A SECURITY CORRECTION TO WHAT THIS CONTRACT PROMISES. `RunnerTriageVerdict` said loopctl "fences these strings wherever they later reach a prompt — `story` included". It does not and never did: a drafted story becomes loopctl's own story row and reaches a runner as `RunnerStory`, typed and unfenced. What loopctl DOES do is escape invisible characters and SCREEN the draft with its injection detector, escalating a flagged one to a human instead of queueing it, so it never reaches an implement dispatch. RE-VENDOR and re-read: a copy taken at 1.11.0 tells you the implement path is fenced | | | | |
   | (1.13.0) `RunnerJoin.max_sessions` IS AUTHORITATIVE DOWNWARD. loopctl now reserves against the LESSER of the value a runner declares on join and the `max_sessions` it was ENROLLED with, re-read on every join. Until now only the enrolled number counted, written once with no path from any join, so a machine configured for one session was sent two and refused the second `at_capacity` — a refusal that costs the story's claim. A machine may therefore always lower itself; it cannot raise itself past its enrolled ceiling, which is what stops a compromised runner enlarging its own share of the tenant's admission budget. Nothing changes on the wire and no runner has to send anything new. `0` is the same statement as `draining` — the row keeps `1` because its range is 1..64, and loopctl refuses to PLACE on a machine declaring either, while a direct operator push is still delivered for the runner to refuse. Re-vendoring is worth it for the description, not required for the wire | | | | |
   | (1.14.0) A RUNNER DECLARES THE BRANCH PREFIXES IT ACCEPTS (`RunnerJoin.branch_prefixes`), and loopctl DERIVES a conforming branch instead of guessing one. A runner that enforces a prefix and does not declare it refuses every dispatch loopctl sends, which is what happened: the first real placement was refused `branch_not_allowed` because loopctl derived `feature/story-<n>-<id>` while the machine's config accepted `loop/` alone, and the operator could learn the required prefix only by reading a config file on that box. OMITTING THE FIELD IS EXACTLY TODAY'S BEHAVIOUR — no constraint, and the branch is the one loopctl already derived — so an un-upgraded runner is unaffected and nothing on the wire changes for it. RE-VENDOR to send it | | | | |
+  | (1.15.0) A triage verdict message may carry `lens_verdicts` (`RunnerLensVerdict`, exactly one per lens, only beside a `verdict`, capped together by `RunnerLensVerdict.max_bytes/0`). Gate A reads them, at triage and at merge, instead of anything a merge caller supplies; a verdict without them escalates at triage. RE-VENDOR to send them; a 1.14.0 holder keeps working and its verdicts escalate at triage | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -247,14 +248,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     that way, where the lens prompts asked for "one plain sentence per reason" and neither
     code could ever fire.
 
-    **WHAT IT DOES NOT MEAN, stated because the first draft of this line overstated it.** A
-    triage VERDICT's `escalation_reasons` gate nothing today: `Loopctl.Delivery.TriageVerdict`
-    records the field verbatim and routes on `outcome` alone, and `GateA`'s input is a
-    `trio_outputs` fact supplied to `POST /stories/:id/merge-precondition`. The two shapes do
-    not even correspond yet — the gate wants THREE outputs keyed `verdict` with a numeric
-    `confidence`, and a verdict is ONE message keyed `outcome` with an enum. So this list is
-    published to be EMITTED against, not to be relied on as gating from the runner side, and
-    wiring a verdict into that gate is a change that has to reconcile those shapes first.
+    **WHERE THEY GATE (since 1.15.0).** In the `escalation_reasons` of each
+    `RunnerLensVerdict` a triage message carries: `GateA` reads the three lens verdicts,
+    translated by `Loopctl.Delivery.GateAInput` from the wire's `outcome`/enum shape to its
+    own, at triage and again at merge. The MERGED verdict's `escalation_reasons` still gate
+    nothing — they are recorded for the operator. Before 1.15.0 Gate A read a trio a merge
+    caller supplied, which is why this line once said nothing a runner sent could gate.
 
   - `permanent_error_conditions` (`permanent_error_conditions/0`) — the ONE code in the list
     above whose permanence has a condition, published so a runner reads the condition rather
@@ -335,7 +334,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.14.0"
+  @version "1.15.0"
   @major 1
 
   defmodule ByteRule do
@@ -1254,6 +1253,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @spec confidences() :: [String.t()]
     def confidences, do: @confidences
 
+    @doc "The kinds a `contradicts` entry may name."
+    @spec contradict_kinds() :: [String.t()]
+    def contradict_kinds, do: @contradict_kinds
+
     @doc "The largest verdict, under the byte rule."
     @spec max_bytes() :: pos_integer()
     def max_bytes, do: @max_bytes
@@ -1354,13 +1357,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "sentence saying what a lens actually saw is what makes an escalation " <>
                 "actionable, and at least one entry must be prose — a bare code is not words " <>
                 "a person can act on. WHAT LOOPCTL DOES WITH THIS FIELD TODAY: it records it " <>
-                "verbatim on the verdict and routes on `outcome` ALONE. No string here " <>
-                "changes what happens to the story. The codes in " <>
-                "`x-connection.triage_gating_reasons` are matched as whole strings by a " <>
-                "control-side gate that today reads a trio's outputs supplied to " <>
-                "`POST /stories/:id/merge-precondition`, NOT this message — so emit them " <>
-                "verbatim as their own entries to be ready for the day a runner's verdict is " <>
-                "what feeds that gate, and do not read them as gating from here yet."
+                "verbatim on the verdict. No string HERE changes what happens to the story. " <>
+                "The codes in `x-connection.triage_gating_reasons` gate only where Gate A " <>
+                "reads them: in each `RunnerLensVerdict.escalation_reasons` of the message's " <>
+                "`lens_verdicts` (since 1.15.0), matched as whole strings, at triage and at " <>
+                "merge."
           },
           missing_information: %Schema{
             type: :array,
@@ -1412,6 +1413,86 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerLensVerdict do
+    @moduledoc false
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdict
+
+    # ONE LENS'S OWN JUDGEMENT (since 1.15.0, epic 44 US-44.1). The merged `verdict` a triage
+    # session returns hides the one signal Gate A exists to read — three independently
+    # prompted lenses that do not agree — so the three readings travel beside it, on the
+    # MESSAGE rather than inside the verdict. Inside, they would share the verdict's
+    # `max_bytes`, which a verdict at its declared maxima already spends to within 2_120.
+    #
+    # Deliberately SMALL. Gate A reads four things from a lens — its outcome, its gating
+    # codes, whether it saw a contradiction, and a recorded-never-consulted confidence — so
+    # that is all a lens carries. Prose belongs in the merged verdict, which is what an
+    # operator reads; the lens entries are what a gate compares.
+    #
+    # UNTRUSTED like the verdict: runner-authored, recorded and bounded, never executed.
+    @lenses ["analyst", "architect", "engineer"]
+    @max_reasons 3
+    @max_reason_length 60
+    @max_contradicts 1
+    @max_contradict_ref_length 60
+    @max_contradict_why_length 100
+
+    # THE CAP ON ALL THREE TOGETHER, under the byte rule. It is sized from the frame, not from
+    # the fields: the message rides the same 64 KiB socket frame as the verdict, which may
+    # cost up to `RunnerTriageVerdict.max_bytes/0`, so what is left for the lens entries,
+    # the envelope and JSON framing is what this may spend. Three lenses at every declared
+    # maximum are asserted to fit, and the figure is asserted by name.
+    @max_bytes 9_000
+
+    @doc "The three lens names; each appears exactly once in a message."
+    @spec lenses() :: [String.t()]
+    def lenses, do: @lenses
+
+    @doc "The cap on all three lens entries together, under the byte rule."
+    @spec max_bytes() :: pos_integer()
+    def max_bytes, do: @max_bytes
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerLensVerdict",
+        description:
+          "One triage lens's own judgement (since 1.15.0), sent three at a time in " <>
+            "`RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them " <>
+            "with the verdict and Gate A reads them — at triage before a story is queued, and " <>
+            "again at merge — instead of anything a merge caller supplies. SESSION-AUTHORED " <>
+            "AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES " <>
+            "(`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
+        type: :object,
+        required: [:lens, :outcome, :confidence],
+        properties: %{
+          lens: %Schema{type: :string, enum: @lenses},
+          outcome: %Schema{type: :string, enum: RunnerTriageVerdict.outcomes()},
+          confidence: %Schema{type: :string, enum: RunnerTriageVerdict.confidences()},
+          escalation_reasons: %Schema{
+            type: :array,
+            maxItems: @max_reasons,
+            items: %Schema{type: :string, maxLength: @max_reason_length}
+          },
+          contradicts: %Schema{
+            type: :array,
+            maxItems: @max_contradicts,
+            items: %Schema{
+              type: :object,
+              required: [:kind, :ref, :why],
+              properties: %{
+                kind: %Schema{type: :string, enum: RunnerTriageVerdict.contradict_kinds()},
+                ref: %Schema{type: :string, maxLength: @max_contradict_ref_length},
+                why: %Schema{type: :string, maxLength: @max_contradict_why_length}
+              }
+            }
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerTriageVerdictMessage do
     @moduledoc """
     The `triage_verdict` message a runner sends when a triage session is FINISHED (1.9.0).
@@ -1456,6 +1537,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
     require OpenApiSpex
 
+    alias Loopctl.ApiSpec.RunnerContract.RunnerLensVerdict
     alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdict
 
     # The session ended without a usable verdict. Every one escalates; the enum is what lets
@@ -1525,6 +1607,18 @@ defmodule Loopctl.ApiSpec.RunnerContract do
               "Why this run produced no usable verdict. Forbidden when `verdict` is " <>
                 "present. `verdict_invalid` means the session DID write one and the " <>
                 "runner's own validation refused it — a different state from writing none."
+          },
+          lens_verdicts: %Schema{
+            type: :array,
+            maxItems: 3,
+            nullable: true,
+            items: RunnerLensVerdict.schema(),
+            description:
+              "The three triage lenses' own judgements (since 1.15.0), one per lens, each " <>
+                "lens exactly once. Allowed only beside `verdict`. Gate A reads these — " <>
+                "at triage before the story is queued and again at merge — so a verdict " <>
+                "sent WITHOUT them escalates at triage: Gate A cannot be evaluated. At most " <>
+                "#{RunnerLensVerdict.max_bytes()} bytes for all three under the byte rule."
           },
           detail: %Schema{
             type: :string,
@@ -2124,6 +2218,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerStory,
     RunnerTriage,
     RunnerTriageVerdict,
+    RunnerLensVerdict,
     RunnerTriageVerdictMessage,
     RunnerTriageVerdictAck,
     RunnerDispatch,
@@ -2700,9 +2795,35 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     verdict? = not is_nil(Map.get(message, :verdict))
     incomplete? = not is_nil(Map.get(message, :incomplete))
 
-    if verdict? == incomplete?,
-      do: ["exactly_one_of_verdict_or_incomplete"],
-      else: []
+    exactly_one =
+      if verdict? == incomplete?,
+        do: ["exactly_one_of_verdict_or_incomplete"],
+        else: []
+
+    exactly_one ++ lens_verdict_errors(Map.get(message, :lens_verdicts), verdict?)
+  end
+
+  # The three rules JSON Schema cannot state for `lens_verdicts` (1.15.0): they belong to a
+  # verdict and to nothing else, each lens speaks once, and all three together fit the cap.
+  # The count is settled here, not by `minItems`, which the export does not publish: naming
+  # each of the three lenses exactly once is the same rule as "exactly three, all different".
+  defp lens_verdict_errors(nil, _verdict?), do: []
+  defp lens_verdict_errors(_lens_verdicts, false), do: ["lens_verdicts_only_beside_a_verdict"]
+
+  defp lens_verdict_errors(lens_verdicts, true) do
+    lenses = Enum.map(lens_verdicts, &Map.get(&1, :lens))
+
+    distinct =
+      if Enum.sort(lenses) == Enum.sort(RunnerLensVerdict.lenses()),
+        do: [],
+        else: ["lens_verdicts_must_name_each_lens_once"]
+
+    size =
+      if ByteRule.bytes(lens_verdicts) > RunnerLensVerdict.max_bytes(),
+        do: ["lens_verdicts exceed #{RunnerLensVerdict.max_bytes()} bytes under the byte rule"],
+        else: []
+
+    distinct ++ size
   end
 
   # The nested verdict goes through `cast_triage_verdict/1` ITSELF rather than being trusted

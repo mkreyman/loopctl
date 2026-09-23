@@ -123,7 +123,7 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       assert data["head_sha"] == @head
       assert data["merge_base_sha"] == @base
       assert data["custody"] == "ok"
-      assert data["gate_a_inputs"] == "caller_asserted"
+      assert data["gate_a_inputs"] == "persisted_triage"
       assert data["hard_bound"] == %{"max_files" => 12, "max_changed_lines" => 1000}
       assert data["gate_a"]["decision"] == "proceed"
       assert data["gate_b"]["outcome"] == "clear"
@@ -231,15 +231,20 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       response =
         ctx.conn
         |> auth(key)
-        |> post("/api/v1/stories/#{ctx.story_id}/merge-precondition", %{
-          "trio_outputs" => [trio(), trio(), trio()]
-        })
+        |> post("/api/v1/stories/#{ctx.story_id}/merge-precondition", %{})
 
       assert %{status: 422} = response
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
     end
 
-    test "trio_outputs that is not an array is 422", ctx do
+    test "a fabricated unanimous trio in the request cannot clear Gate A (US-44.1)", ctx do
+      # The persisted lens verdicts disagree; the request claims a unanimous story trio.
+      set_lens_verdicts(ctx, %{
+        "analyst" => lens("story"),
+        "architect" => lens("story"),
+        "engineer" => lens("escalate")
+      })
+
       {key, _} = orchestrator_key(ctx)
 
       response =
@@ -247,28 +252,25 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
         |> auth(key)
         |> post("/api/v1/stories/#{ctx.story_id}/merge-precondition", %{
           "claim_epoch" => 0,
-          "trio_outputs" => "three of them"
-        })
-
-      assert %{status: 422} = response
-    end
-
-    test "a MALFORMED trio inside the array reaches Gate A, which escalates it", ctx do
-      # Not a 422: Gate A is what judges the trio, and a malformed one has to be RECORDED
-      # as an escalation rather than handed back as a request error the loop retries past.
-      {key, _} = orchestrator_key(ctx)
-
-      response =
-        ctx.conn
-        |> auth(key)
-        |> post("/api/v1/stories/#{ctx.story_id}/merge-precondition", %{
-          "claim_epoch" => 0,
-          "trio_outputs" => [%{"verdict" => "story"}]
+          "trio_outputs" => List.duplicate(%{"verdict" => "story"}, 3)
         })
 
       assert %{"data" => data} = json_response(response, 200)
       assert data["decision"] == "refuse"
+      assert data["gate_a_inputs"] == "persisted_triage"
+      assert data["trio_outputs_ignored"] == true
       assert Enum.any?(data["reasons"], &(&1["kind"] == "gate_a"))
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "a story whose triage recorded no lens verdicts is refused, not unevaluated", ctx do
+      set_lens_verdicts(ctx, nil)
+      {key, _} = orchestrator_key(ctx)
+
+      assert %{"data" => data} = ctx |> post_precondition(key) |> json_response(200)
+      assert data["decision"] == "refuse"
+      assert data["gate_a_inputs"] == "missing"
+      assert data["trio_outputs_ignored"] == false
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
     end
   end
@@ -321,20 +323,27 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
     |> post("/api/v1/stories/#{ctx.story_id}/merge-precondition", body())
   end
 
-  defp body, do: %{"claim_epoch" => 0, "trio_outputs" => [trio(), trio(), trio()]}
+  defp body, do: %{"claim_epoch" => 0}
+
+  defp set_lens_verdicts(ctx, lens_verdicts) do
+    {:ok, {1, _}} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        from(v in Loopctl.Delivery.TriageVerdictRecord, where: v.story_id == ^ctx.story_id)
+        |> Repo.update_all(set: [lens_verdicts: lens_verdicts])
+      end)
+  end
+
+  defp lens(outcome),
+    do: %{
+      "outcome" => outcome,
+      "confidence" => "high",
+      "escalation_reasons" => [],
+      "contradicts" => []
+    }
 
   defp orchestrator_key(ctx) do
     agent = fixture(:agent, %{tenant_id: ctx.tenant_id, agent_type: :orchestrator})
     fixture(:api_key, %{tenant_id: ctx.tenant_id, role: :orchestrator, agent_id: agent.id})
-  end
-
-  defp trio do
-    %{
-      "verdict" => "story",
-      "escalation_reasons" => [],
-      "contradicts" => [],
-      "confidence" => 0.9
-    }
   end
 
   defp stub_source(opts) do
@@ -391,6 +400,8 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       pr_number: 4242,
       head_sha: @head
     })
+
+    fixture(:triage_verdict, %{tenant_id: tenant.id, story_id: story.id})
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}
   end
