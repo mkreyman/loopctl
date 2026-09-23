@@ -478,12 +478,12 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   describe "an exhausted subscription is not capacity (US-44.6)" do
     # The reset line is `:info`, below `config/test.exs`'s `:warning` primary level; a module
-    # level lets it past for this module alone, the way
-    # `Loopctl.Workers.ReclaimExpiredClaimsLoggingTest` does. VM-global, which this module's
-    # `async: false` already covers.
+    # level lets it past for the module that logs it — `Usage.note_no_runner/4`, which both
+    # passes share — the way `Loopctl.Workers.ReclaimExpiredClaimsLoggingTest` does. VM-global,
+    # which this module's `async: false` already covers.
     setup do
-      Logger.put_module_level(DispatchDriver, :info)
-      on_exit(fn -> Logger.delete_module_level(DispatchDriver) end)
+      Logger.put_module_level(Usage, :info)
+      on_exit(fn -> Logger.delete_module_level(Usage) end)
       :ok
     end
 
@@ -535,10 +535,11 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
            "tenant (TC-44.6.7)",
          ctx do
       bind_repo(ctx, queued_story(ctx), @repo)
-      # A second story the runner cannot take for another reason (no checkout of its repo):
-      # it is `:no_runner` too, and the reset is still logged ONCE for the tenant.
-      bind_repo(ctx, queued_story(ctx))
-      channel = join_runner(ctx)
+      # A second story the same exhausted runner is refused for (a repository is one active
+      # source, so it is the runner's second checkout): `:no_runner` too, and the reset is
+      # still logged ONCE for the tenant.
+      bind_repo(ctx, queued_story(ctx), "mkreyman/cron_books")
+      channel = join_runner(ctx, %{"repos" => [@repo, "mkreyman/cron_books"]})
 
       resets_at = DateTime.utc_now() |> DateTime.add(3_600, :second)
 
@@ -572,6 +573,54 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       assert DateTime.compare(logged, resets_at) == :eq
 
       leave_channel(channel)
+    end
+
+    # The reset is the cause only when a connected runner was refused FOR it. Here the one
+    # runner is exhausted, but it has no checkout of the story's repository, so a reset would
+    # send an operator waiting on a refill that places nothing.
+    test "no reset is logged when exhaustion is not why the story found no runner", ctx do
+      bind_repo(ctx, queued_story(ctx))
+      channel = join_runner(ctx)
+
+      unboxed(fn -> :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true}) end)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:no_runner]
+        end)
+
+      refute log =~ "earliest_usage_reset"
+
+      leave_channel(channel)
+    end
+
+    # ONE read of the tenant's exhausted runners per pass, whatever the number of runners and
+    # stories: the eligibility check used to query per runner per story.
+    test "a pass reads the tenant's exhausted runners once", ctx do
+      repos = [@repo, "mkreyman/cron_books"]
+      for repo <- repos, do: bind_repo(ctx, queued_story(ctx), repo)
+
+      {r2_key, r2} =
+        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
+
+      first = join_runner(ctx, %{"repos" => repos})
+      second = join_as(r2, r2_key, "beelink", %{"repos" => repos})
+
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true})
+        :ok = Usage.record(ctx.tenant.id, r2.id, %{exhausted: true})
+      end)
+
+      reads =
+        exhaustion_reads(fn ->
+          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) ==
+                   [:no_runner, :no_runner]
+        end)
+
+      assert reads == 1
+
+      leave_channel(second)
+      leave_channel(first)
     end
 
     test "an empty fleet logs no reset: silence stays the ordinary state", ctx do
@@ -609,6 +658,34 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   end
 
   # -- helpers ---------------------------------------------------------------------------
+
+  # How many reads of `usage_exhausted_until` THIS process sent while `fun` ran.
+  defp exhaustion_reads(fun) do
+    id = {__MODULE__, make_ref()}
+    :ok = :telemetry.attach(id, [:loopctl, :repo, :query], &__MODULE__.count_read/4, self())
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(id)
+    end
+
+    count_reads(0)
+  end
+
+  @doc false
+  def count_read(_event, _measurements, %{query: query}, pid) do
+    if self() == pid and query =~ ~r/^SELECT .*"usage_exhausted_until"/s,
+      do: send(pid, :exhaustion_read)
+  end
+
+  defp count_reads(n) do
+    receive do
+      :exhaustion_read -> count_reads(n + 1)
+    after
+      0 -> n
+    end
+  end
 
   # BOTH repos on real connections — a placement writes through each of them, and the sandbox
   # gives them separate, mutually invisible transactions.

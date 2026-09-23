@@ -7,6 +7,9 @@ defmodule Loopctl.Repo.Migrations.AddRunnersUsageExhausted do
     `session_ended` `usage_exhausted`; cleared by `usage.exhausted: false`. NULL is "not
     exhausted", and so is a value in the past — nothing sweeps an expired one, because the
     readers compare against now.
+  - `usage_cleared_at` — when a `usage.exhausted: false` last cleared this row. A
+    `session_ended` `usage_exhausted` whose dispatch was accepted BEFORE it does not re-mark the
+    account: the session saw a fact the refill report has since overtaken.
   - `account_ref` — the opaque value a runner derives from the login it runs sessions under.
     Runners sharing one are exhausted TOGETHER: a subscription is per account, not per machine.
 
@@ -28,6 +31,7 @@ defmodule Loopctl.Repo.Migrations.AddRunnersUsageExhausted do
   def up do
     alter table(:runners) do
       add :usage_exhausted_until, :utc_datetime_usec, null: true
+      add :usage_cleared_at, :utc_datetime_usec, null: true
       add :account_ref, :string, null: true
     end
 
@@ -50,6 +54,7 @@ defmodule Loopctl.Repo.Migrations.AddRunnersUsageExhausted do
 
     alter table(:runners) do
       remove :usage_exhausted_until
+      remove :usage_cleared_at
       remove :account_ref
     end
   end

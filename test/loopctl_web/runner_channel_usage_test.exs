@@ -74,6 +74,37 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
       assert meta.in_flight == 1
     end
 
+    # A reset inside the clamp is stored AS SENT, and an ISO 8601 instant with no fraction
+    # parses to second precision. Written unnormalised into the microsecond column it raised
+    # an ArgumentError in this channel's process — the socket every session on the machine
+    # shares — and the exhaustion was never recorded: the fail-open direction.
+    test "an in-window reset with no fractional seconds is stored as sent", ctx do
+      in_window =
+        DateTime.utc_now() |> DateTime.add(2 * 3_600, :second) |> DateTime.truncate(:second)
+
+      ref =
+        push(ctx.channel, "status", %{
+          "usage" => %{"exhausted" => true, "resets_at" => DateTime.to_iso8601(in_window)}
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+      assert DateTime.compare(row(ctx.runner).usage_exhausted_until, in_window) == :eq
+    end
+
+    # A status carrying ONLY `usage` changes nothing in the meta, so it broadcasts no Presence
+    # diff: each one is a message to every node's pool subscribers for nothing.
+    # Read off the channel's `presence_ref`, which every `Presence.update/4` re-issues: the
+    # pool topic's own diffs are batched by the tracker, so the JOIN's diff can land at any
+    # point in a receive window and cannot tell an update apart from it.
+    test "a usage-only status updates no Presence meta", ctx do
+      before = presence_ref(ctx.channel)
+
+      ref = push(ctx.channel, "status", %{"usage" => %{"exhausted" => false}})
+      assert_reply ref, :ok, _, @reply_timeout
+
+      assert presence_ref(ctx.channel) == before
+    end
+
     test "exhausted with no reset holds for eight days (TC-44.6.3)", ctx do
       {raw, other} = fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink"})
       channel = join_as(other, raw, "beelink")
@@ -123,6 +154,8 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
   end
 
   defp seconds_from_now(%DateTime{} = at), do: DateTime.diff(at, DateTime.utc_now(), :second)
+
+  defp presence_ref(channel), do: :sys.get_state(channel.channel_pid).assigns.presence_ref
 
   defp join_as(runner, raw, machine) do
     {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))

@@ -198,7 +198,7 @@
   "technical_notes": [
     "Columns on runners: usage_exhausted_until utc_datetime, account_ref string (migration; set programmatically)",
     "Eligibility: Runners.accepts?/5 (runners.ex:903) for driver and triage; Placement.place/4 checks runner_accepting_work (placement.ex:441-443) and needs the same check",
-    "Contract: usage on the status message (1.15.0); a runner not sending it is unaffected",
+    "Contract: usage on the status message (1.17.0); a runner not sending it is unaffected",
     "Status messages are rate-limited to one per second per runner: tests use separate runners or separate tests rather than two back-to-back pushes"
   ],
   "dependencies": [

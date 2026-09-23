@@ -32,7 +32,7 @@ defmodule Loopctl.Delivery.RunnerStages do
     goes back.
   - `usage_exhausted` — released the same way, and recorded on the ledger row as NOT counting
     toward the retry ceiling: the subscription ran out, the work was never judged. The RUNNER
-    is marked exhausted first (US-44.6, `Loopctl.Runners.Usage.mark_session_exhausted/2`), so
+    is marked exhausted first (US-44.6, `Loopctl.Runners.Usage.mark_session_exhausted/3`), so
     the story the release re-queues is not placed straight back on the machine that cannot run
     it.
 
@@ -221,7 +221,7 @@ defmodule Loopctl.Delivery.RunnerStages do
              session_end_attrs(message, story_id)
            ),
          :ok <- log_recorded(outcome, tenant_id, runner_id, session, message),
-         :ok <- mark_exhausted(outcome, tenant_id, runner_id, message, row),
+         :ok <- mark_exhausted(outcome, tenant_id, runner_id, message, row, session),
          {:ok, row} <- act_on_session_end(tenant_id, runner_id, session, message, row) do
       release_if_session_over(tenant_id, session, message, row)
       {:ok, %{row: row, replayed?: outcome == :replayed}}
@@ -277,14 +277,23 @@ defmodule Loopctl.Delivery.RunnerStages do
   # epoch — the case where the first delivery's mark or release never landed and this one is
   # completing it. After the release the epoch has moved on, and a late resend must not
   # re-exhaust an account a runner has since reported refilled (`usage.exhausted: false`):
-  # that would hold the machine out for 8 days on a days-old fact.
-  defp mark_exhausted(outcome, tenant_id, runner_id, %{reason: "usage_exhausted"} = message, row) do
+  # that would hold the machine out for 8 days on a days-old fact. A LATE FIRST delivery is
+  # the same fact arriving late, and `Usage.mark_session_exhausted/3` skips it when the account
+  # was cleared after the dispatch was accepted.
+  defp mark_exhausted(
+         outcome,
+         tenant_id,
+         runner_id,
+         %{reason: "usage_exhausted"} = message,
+         row,
+         session
+       ) do
     if outcome == :recorded or row.claim_epoch == message.claim_epoch,
-      do: Usage.mark_session_exhausted(tenant_id, runner_id),
+      do: Usage.mark_session_exhausted(tenant_id, runner_id, session.replied_at),
       else: :ok
   end
 
-  defp mark_exhausted(_outcome, _tenant_id, _runner_id, _message, _row), do: :ok
+  defp mark_exhausted(_outcome, _tenant_id, _runner_id, _message, _row, _session), do: :ok
 
   # Each clause returns the stage row as it stands after the action: the row it was handed
   # when nothing moved it, a fresh read when something did.

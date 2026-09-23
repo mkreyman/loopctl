@@ -159,8 +159,8 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
           Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
       end)
 
-      Logger.put_module_level(TriageDispatcher, :info)
-      on_exit(fn -> Logger.delete_module_level(TriageDispatcher) end)
+      Logger.put_module_level(Usage, :info)
+      on_exit(fn -> Logger.delete_module_level(Usage) end)
 
       log =
         capture_log([level: :info], fn ->
@@ -171,6 +171,52 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       assert [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+):/, log)
       assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
       assert DateTime.compare(logged, resets_at) == :eq
+
+      leave_channel(channel)
+    end
+
+    # ONE read of the tenant's exhausted runners per pass, as the driver's: the eligibility
+    # check used to query per runner per story.
+    test "a pass reads the tenant's exhausted runners once", ctx do
+      _first = detected_story(ctx)
+      _second = detected_story(ctx)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+
+      unboxed(fn -> :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true}) end)
+
+      id = {__MODULE__, make_ref()}
+      :ok = :telemetry.attach(id, [:loopctl, :repo, :query], &__MODULE__.count_read/4, self())
+
+      try do
+        assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) ==
+                 [:no_runner, :no_runner]
+      after
+        :telemetry.detach(id)
+      end
+
+      assert_received :exhaustion_read
+      refute_received :exhaustion_read
+
+      leave_channel(channel)
+    end
+
+    test "an exhausted runner refused for ANOTHER reason logs no reset", ctx do
+      _story = detected_story(ctx)
+      # Triage-capable, but with no checkout of the story's repository: exhaustion is not why
+      # nothing was sent, and the reset would name the wrong cause.
+      channel = join_runner(ctx, %{"kinds" => ["triage"], "repos" => ["mkreyman/elsewhere"]})
+
+      unboxed(fn -> :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true}) end)
+
+      Logger.put_module_level(Usage, :info)
+      on_exit(fn -> Logger.delete_module_level(Usage) end)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+        end)
+
+      refute log =~ "earliest_usage_reset"
 
       leave_channel(channel)
     end
@@ -470,6 +516,12 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   defp candidate_ids(limit) do
     unboxed(fn -> Enum.map(TriageDispatcher.candidates(limit), & &1.story_id) end)
+  end
+
+  @doc false
+  def count_read(_event, _measurements, %{query: query}, pid) do
+    if self() == pid and query =~ ~r/^SELECT .*"usage_exhausted_until"/s,
+      do: send(pid, :exhaustion_read)
   end
 
   defp join_runner(ctx, overrides) do

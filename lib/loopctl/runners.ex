@@ -903,24 +903,47 @@ defmodule Loopctl.Runners do
   asked here so that both unattended selectors (the driver and the triage dispatcher) skip an
   exhausted machine instead of placing on it, and `Loopctl.Delivery.Placement` refuses one with
   the same code. Read after the two in-memory facts, which cost nothing, and before `kind`,
-  whose ledger fallback is a read too.
+  whose ledger fallback is a read too. A pass hands in `exhausted` — the tenant's
+  `Loopctl.Runners.Usage.exhausted_until_by_runner/1`, read once per pass
+  (`Loopctl.Runners.Usage.exhausted_for_pass/2`) — and it is looked up rather than queried;
+  `nil` reads this runner's row.
 
   `:ok`, or
   `{:error, :runner_draining | :repo_not_allowed | :runner_exhausted | :kind_not_supported}`.
   """
-  @spec accepts?(Ecto.UUID.t(), Ecto.UUID.t(), map(), String.t(), String.t()) ::
+  @spec accepts?(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          map(),
+          String.t(),
+          String.t(),
+          %{Ecto.UUID.t() => DateTime.t()} | nil
+        ) ::
           :ok
           | {:error,
              :runner_draining | :repo_not_allowed | :runner_exhausted | :kind_not_supported}
-  def accepts?(tenant_id, runner_id, meta, kind, repo)
+  def accepts?(tenant_id, runner_id, meta, kind, repo, exhausted \\ nil)
       when is_binary(kind) and is_binary(repo) do
     cond do
       not accepting_work?(meta) -> {:error, :runner_draining}
       not repo_allowed?(meta, repo) -> {:error, :repo_not_allowed}
-      usage_exhausted?(tenant_id, runner_id) -> {:error, :runner_exhausted}
-      true -> kind_supported(tenant_id, runner_id, meta, kind)
+      true -> kind_then_exhausted(tenant_id, runner_id, meta, kind, exhausted)
     end
   end
+
+  # KIND BEFORE EXHAUSTION: a runner that could never take this kind is refused for that, so
+  # `:runner_exhausted` — which the no-runner note turns into "capacity returns at <reset>" —
+  # only ever names a runner that would otherwise have been eligible.
+  defp kind_then_exhausted(tenant_id, runner_id, meta, kind, exhausted) do
+    with :ok <- kind_supported(tenant_id, runner_id, meta, kind) do
+      if exhausted?(tenant_id, runner_id, exhausted),
+        do: {:error, :runner_exhausted},
+        else: :ok
+    end
+  end
+
+  defp exhausted?(tenant_id, runner_id, nil), do: usage_exhausted?(tenant_id, runner_id)
+  defp exhausted?(_tenant_id, runner_id, exhausted), do: Map.has_key?(exhausted, runner_id)
 
   @doc """
   Whether `runner_id`'s subscription is exhausted right now — its own `usage_exhausted_until`,

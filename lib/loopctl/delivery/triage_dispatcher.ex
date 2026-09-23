@@ -234,81 +234,54 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    {outcomes, _noted} =
+    {outcomes, _cache} =
       limit
       |> candidates()
-      |> Enum.map_reduce(MapSet.new(), fn candidate, noted ->
-        outcome = attempt(candidate, budgets)
-        {outcome, note_no_runner(outcome, candidate, noted)}
-      end)
+      |> Enum.map_reduce(%{}, fn candidate, cache -> attempt(candidate, budgets, cache) end)
 
     outcomes
   end
 
-  # THE EARLIEST RESET, once per tenant per pass (US-44.6) — the same line and the same reason
-  # as `Loopctl.Delivery.DispatchDriver`'s: an empty fleet logs nothing, a fleet held out by an
-  # exhausted subscription has an instant at which capacity returns. A read that fails here is
-  # logged and skipped, because a note about the pass may not end the pass.
-  defp note_no_runner(:no_runner, %{tenant_id: tenant_id} = candidate, noted) do
-    if MapSet.member?(noted, tenant_id) do
-      noted
-    else
-      case Usage.earliest_reset(tenant_id) do
-        nil ->
-          :ok
+  # ONE STORY MAY NOT KILL THE PASS — the read is oldest-first, so a story that raises sits at
+  # the head of every later batch too. The pass cache carries the tenant's exhausted runners
+  # (read once per tenant per pass) and whether its `:no_runner` note has been logged, both
+  # `Loopctl.Runners.Usage`'s, as `Loopctl.Delivery.DispatchDriver`'s does.
+  defp attempt(candidate, budgets, cache) do
+    {result, cache} = send_triage(candidate, budgets, cache)
 
-        %DateTime{} = reset ->
-          Logger.info(
-            "TriageDispatcher: no runner can take work; the soonest an exhausted runner " <>
-              "of this tenant returns is earliest_usage_reset=#{DateTime.to_iso8601(reset)}: " <>
-              "story_id=#{candidate.story_id}",
-            tenant_id: tenant_id
-          )
+    outcome =
+      case result do
+        :ok -> :dispatched
+        {:error, :no_runner} -> :no_runner
+        {:error, :triage_too_large} -> escalate_too_large(candidate)
+        {:error, reason} when reason in @transient -> deferred(candidate, reason)
+        {:error, reason} -> blocked(candidate, reason)
       end
 
-      MapSet.put(noted, tenant_id)
-    end
+    {outcome, cache}
   rescue
-    error ->
-      Logger.warning(
-        "TriageDispatcher: could not read the earliest usage reset: " <>
-          Exception.message(error),
-        tenant_id: tenant_id
-      )
-
-      noted
-  end
-
-  defp note_no_runner(_outcome, _candidate, noted), do: noted
-
-  # ONE STORY MAY NOT KILL THE PASS — the read is oldest-first, so a story that raises sits at
-  # the head of every later batch too.
-  defp attempt(candidate, budgets) do
-    case send_triage(candidate, budgets) do
-      :ok -> :dispatched
-      {:error, :no_runner} -> :no_runner
-      {:error, :triage_too_large} -> escalate_too_large(candidate)
-      {:error, reason} when reason in @transient -> deferred(candidate, reason)
-      {:error, reason} -> blocked(candidate, reason)
-    end
-  rescue
-    error -> errored(candidate, Exception.format(:error, error, __STACKTRACE__))
+    error -> {errored(candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
   catch
-    kind, value -> errored(candidate, Exception.format(kind, value, __STACKTRACE__))
+    kind, value -> {errored(candidate, Exception.format(kind, value, __STACKTRACE__)), cache}
   end
 
-  defp send_triage(%{tenant_id: tenant_id, story_id: story_id}, budgets) do
+  defp send_triage(%{tenant_id: tenant_id, story_id: story_id} = candidate, budgets, cache) do
+    {exhausted, cache} = Usage.exhausted_for_pass(cache, tenant_id)
+
     with {:ok, story} <- fetch_story(tenant_id, story_id),
          {:ok, record} <- Intake.get_record(tenant_id, story.intake_record_id),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
          :ok <- usable_base_branch(source),
          {:ok, triage} <- TriagePayload.build(record),
-         %Runner{} = runner <-
-           available_runner(tenant_id, source.repo_full_name) || {:error, :no_runner} do
-      Runners.dispatch(tenant_id, runner.id, dispatch(story, source, triage, budgets))
+         {%Runner{} = runner, _resets} <-
+           available_runner(tenant_id, source.repo_full_name, exhausted) do
+      {Runners.dispatch(tenant_id, runner.id, dispatch(story, source, triage, budgets)), cache}
     else
-      {:error, reason} -> {:error, reason}
-      nil -> {:error, :no_runner}
+      {nil, resets} ->
+        {{:error, :no_runner}, Usage.note_no_runner(cache, "TriageDispatcher", candidate, resets)}
+
+      {:error, reason} ->
+        {{:error, reason}, cache}
     end
   end
 
@@ -332,26 +305,30 @@ defmodule Loopctl.Delivery.TriageDispatcher do
 
   # The same reader the push itself uses, applied BEFORE the ledger row is written: a refusal
   # discovered after it is a spent `dispatch_id` and a slot returned, once per story per pass.
-  defp available_runner(tenant_id, repo) do
-    ids =
+  # With the effective resets of the connected runners refused `:runner_exhausted`, which is
+  # what the `:no_runner` note needs.
+  defp available_runner(tenant_id, repo, exhausted) do
+    judged =
       for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
           runner_id = Map.get(meta, :runner_id),
           is_binary(runner_id),
-          Runners.accepts?(tenant_id, runner_id, meta, @kind, repo) == :ok,
-          do: runner_id
+          do: {runner_id, Runners.accepts?(tenant_id, runner_id, meta, @kind, repo, exhausted)}
+
+    ids = for {id, :ok} <- judged, do: id
+    resets = for {id, {:error, :runner_exhausted}} <- judged, do: Map.fetch!(exhausted, id)
 
     if ids == [] do
-      nil
+      {nil, resets}
     else
-      Loopctl.AdminRepo.one(
-        from r in Runner,
-          where: r.tenant_id == ^tenant_id,
-          where: is_nil(r.revoked_at),
-          where: r.id in ^ids,
-          where: r.in_flight < r.max_sessions,
-          order_by: [asc: r.in_flight],
-          limit: 1
-      )
+      {Loopctl.AdminRepo.one(
+         from r in Runner,
+           where: r.tenant_id == ^tenant_id,
+           where: is_nil(r.revoked_at),
+           where: r.id in ^ids,
+           where: r.in_flight < r.max_sessions,
+           order_by: [asc: r.in_flight],
+           limit: 1
+       ), resets}
     end
   end
 

@@ -347,6 +347,14 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
                  Runners.accepts?(ctx.tenant_id, ctx.runner.id, %{}, "implement", @repo)
                end)
 
+      # A kind it never declared is refused for THAT, not for exhaustion: `:runner_exhausted`
+      # is what the no-runner note turns into "capacity returns at <reset>", so it must only
+      # name a runner that was otherwise eligible (a silent meta implies `implement` alone).
+      assert {:error, :kind_not_supported} =
+               unboxed(fn ->
+                 Runners.accepts?(ctx.tenant_id, ctx.runner.id, %{}, "triage", @repo)
+               end)
+
       unboxed(fn ->
         {1, _} =
           AdminRepo.update_all(from(t in Tenant, where: t.id == ^ctx.tenant_id),
@@ -385,6 +393,25 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
       assert {:ok, %{replayed?: true}} = end_session(ctx, "usage_exhausted")
 
       assert usage_until(ctx) == nil
+    end
+
+    # The FIRST delivery, but late: a peer on the same account reported it refilled after this
+    # session's dispatch was accepted, so the session's exhaustion is the older fact. The claim
+    # is still released — the session is over either way — but the account is not re-marked.
+    test "a late first report after a peer reported the account refilled does not re-mark it",
+         ctx do
+      {_raw, peer} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id, name: "beelink"})
+
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant_id, ctx.runner.id, %{exhausted: true, account_ref: "a"})
+        :ok = Usage.record(ctx.tenant_id, peer.id, %{exhausted: false, account_ref: "a"})
+      end)
+
+      assert {:ok, %{row: %{stage: :queued}, replayed?: false}} =
+               end_session(ctx, "usage_exhausted")
+
+      assert usage_until(ctx) == nil
+      assert length(releases(ctx)) == 1
     end
 
     test "a recorded report whose mark and release never ran is completed by the resend", ctx do

@@ -322,22 +322,7 @@ defmodule LoopctlWeb.RunnerChannel do
          {:ok, status} <- RunnerContract.cast_status(payload),
          {usage, status} = Map.pop(status, :usage),
          :ok <- record_usage(tenant_id, runner.id, usage) do
-      meta = Map.merge(socket.assigns.meta, status)
-
-      {:ok, ref} =
-        Presence.update(
-          self(),
-          Runners.pool_topic(tenant_id),
-          runner.name,
-          presence_meta(meta, runner)
-        )
-
-      # An update re-issues the meta's phx_ref; keep the current one for sole_live_socket?/1.
-      {:reply, :ok,
-       socket
-       |> assign(:meta, meta)
-       |> assign(:last_status_at, now)
-       |> assign(:presence_ref, ref)}
+      {:reply, :ok, socket |> update_meta(status) |> assign(:last_status_at, now)}
     else
       {:error, :rate_limited} ->
         refuse(socket, "status", %{
@@ -1040,6 +1025,26 @@ defmodule LoopctlWeb.RunnerChannel do
     Logger.info(
       "runner disconnecting: reason=#{reason} runner_id=#{runner.id} runner_name=#{runner.name}"
     )
+  end
+
+  # A status carrying ONLY `usage` leaves nothing to merge, and an update would still broadcast a
+  # Presence diff to every pool subscriber for a meta that did not change.
+  defp update_meta(socket, status) when map_size(status) == 0, do: socket
+
+  defp update_meta(socket, status) do
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+    meta = Map.merge(socket.assigns.meta, status)
+
+    {:ok, ref} =
+      Presence.update(
+        self(),
+        Runners.pool_topic(tenant_id),
+        runner.name,
+        presence_meta(meta, runner)
+      )
+
+    # An update re-issues the meta's phx_ref; keep the current one for sole_live_socket?/1.
+    socket |> assign(:meta, meta) |> assign(:presence_ref, ref)
   end
 
   # THE SUBSCRIPTION WINDOW, which lives on the `runners` row and NOT in the Presence meta

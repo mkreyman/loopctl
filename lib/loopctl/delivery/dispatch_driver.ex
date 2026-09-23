@@ -47,9 +47,10 @@ defmodule Loopctl.Delivery.DispatchDriver do
     * not DRAINING, accepts the story's REPO, and does the dispatch KIND — the three facts on
       its join meta, read through `Runners.accepts?/5`, which is the same rule `dispatch/3`
       applies rather than a second copy of it,
-    * its SUBSCRIPTION is not exhausted (US-44.6) — asked by `Runners.accepts?/5` too, from the
-      `runners` rows rather than the meta; a pass that places nothing for that reason logs the
-      earliest instant capacity returns,
+    * its SUBSCRIPTION is not exhausted (US-44.6) — asked by `Runners.accepts?/6` too, from the
+      `runners` rows read once per tenant per pass rather than the meta; a story left with no
+      runner because a connected one was refused for exhaustion logs the earliest instant
+      capacity returns,
     * has a free slot on its row (`in_flight < max_sessions`), and
     * its TENANT has admission headroom (`Loopctl.Runners.Capacity.admit/2`) — an independent
       limit, and the state `RUNNER_MAX_IN_FLIGHT_SESSIONS` exists to produce is precisely one
@@ -200,18 +201,32 @@ defmodule Loopctl.Delivery.DispatchDriver do
   """
   @spec available_runners(Ecto.UUID.t(), String.t()) :: [Runner.t()]
   def available_runners(tenant_id, repo) when is_binary(tenant_id) and is_binary(repo) do
+    {runners, _exhausted_resets} =
+      select_runners(tenant_id, repo, Usage.exhausted_until_by_runner(tenant_id))
+
+    runners
+  end
+
+  # `available_runners/2` on the pass's one read of the tenant's exhausted runners, with the
+  # effective resets of the connected runners refused `:runner_exhausted` — what the
+  # `:no_runner` note needs to know whether exhaustion is why nothing was found.
+  defp select_runners(tenant_id, repo, exhausted) do
     with :ok <- Capacity.admit(Loopctl.AdminRepo, tenant_id),
-         [_ | _] = ids <- accepting_runner_ids(tenant_id, repo) do
-      Loopctl.AdminRepo.all(
-        from r in Runner,
-          where: r.tenant_id == ^tenant_id,
-          where: is_nil(r.revoked_at),
-          where: r.id in ^ids,
-          where: r.in_flight < r.max_sessions,
-          order_by: [asc: r.in_flight, asc: r.id]
-      )
+         {[_ | _] = ids, resets} <- accepting_runner_ids(tenant_id, repo, exhausted) do
+      runners =
+        Loopctl.AdminRepo.all(
+          from r in Runner,
+            where: r.tenant_id == ^tenant_id,
+            where: is_nil(r.revoked_at),
+            where: r.id in ^ids,
+            where: r.in_flight < r.max_sessions,
+            order_by: [asc: r.in_flight, asc: r.id]
+        )
+
+      {runners, resets}
     else
-      _admission_reached_or_nobody_accepting -> []
+      {[], resets} -> {[], resets}
+      _admission_reached -> {[], []}
     end
   end
 
@@ -219,12 +234,15 @@ defmodule Loopctl.Delivery.DispatchDriver do
   # push would reach. A machine with two live sockets on one credential is skipped rather than
   # guessed at: `Runners.dispatch/3` refuses that as `:runner_ambiguous`, so placing on it
   # would take a claim for a dispatch that cannot be delivered.
-  defp accepting_runner_ids(tenant_id, repo) do
-    for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
-        runner_id = Map.get(meta, :runner_id),
-        is_binary(runner_id),
-        Runners.accepts?(tenant_id, runner_id, meta, @kind, repo) == :ok,
-        do: runner_id
+  defp accepting_runner_ids(tenant_id, repo, exhausted) do
+    judged =
+      for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
+          runner_id = Map.get(meta, :runner_id),
+          is_binary(runner_id),
+          do: {runner_id, Runners.accepts?(tenant_id, runner_id, meta, @kind, repo, exhausted)}
+
+    {for({id, :ok} <- judged, do: id),
+     for({id, {:error, :runner_exhausted}} <- judged, do: Map.fetch!(exhausted, id))}
   end
 
   @doc """
@@ -322,7 +340,10 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   The tenant-level facts a pass resolves are cached ACROSS candidates and the runner facts
   are not, and the split is deliberate: a tenant's operator key does not change while a pass
-  runs, while its runners' free slots change with every story this very pass places.
+  runs, while its runners' free slots change with every story this very pass places. The
+  tenant's exhausted runners are cached too (`Loopctl.Runners.Usage.exhausted_for_pass/2`):
+  this pass places nothing that changes them, and `Placement.place/4` re-checks the one runner
+  it places on.
   """
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
@@ -379,7 +400,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
           unplaceable(candidate, reason)
       end
 
-    {outcome, note_no_runner(outcome, candidate, cache)}
+    {outcome, cache}
   rescue
     error -> {errored(candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
   catch
@@ -388,16 +409,23 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   defp place(candidate, budgets, cache) do
     %{tenant_id: tenant_id, story_id: story_id} = candidate
+    {exhausted, cache} = Usage.exhausted_for_pass(cache, tenant_id)
 
     with {:ok, story} <- fetch_story(tenant_id, story_id),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
-         [_ | _] = runners <- available_runners(tenant_id, source.repo_full_name),
+         {[_ | _] = runners, _resets} <-
+           select_runners(tenant_id, source.repo_full_name, exhausted),
          {{:ok, key}, cache} <- operator_key(tenant_id, cache) do
       {place_on_first_usable(tenant_id, runners, story, source, budgets, key), cache}
     else
-      {{:error, _reason} = error, %{} = cache} -> {error, cache}
-      {:error, reason} -> {{:error, reason}, cache}
-      [] -> {{:error, :no_runner}, cache}
+      {{:error, _reason} = error, %{} = cache} ->
+        {error, cache}
+
+      {:error, reason} ->
+        {{:error, reason}, cache}
+
+      {[], resets} ->
+        {{:error, :no_runner}, Usage.note_no_runner(cache, "DispatchDriver", candidate, resets)}
     end
   end
 
@@ -501,36 +529,6 @@ defmodule Loopctl.Delivery.DispatchDriver do
         result = if key, do: {:ok, key}, else: {:error, :no_operator_key}
         {result, Map.put(cache, {:operator_key, tenant_id}, result)}
     end
-  end
-
-  # `:no_runner` WITH A KNOWN END IS WORTH SAYING (US-44.6, AC-44.6.8). An empty fleet logs
-  # nothing — it is the ordinary state and a line per story per minute would be noise — but a
-  # fleet held out by an exhausted subscription has an instant at which capacity returns, and
-  # an operator watching a queue that does not drain should be able to read it rather than
-  # guess. ONCE PER TENANT PER PASS, through the pass cache, and only when some runner of the
-  # tenant is exhausted: the reset is a fact about the tenant's fleet, not about the story.
-  defp note_no_runner(:no_runner, %{tenant_id: tenant_id} = candidate, cache) do
-    key = {:no_runner_noted, tenant_id}
-
-    if Map.has_key?(cache, key) do
-      cache
-    else
-      log_earliest_reset(candidate, Usage.earliest_reset(tenant_id))
-      Map.put(cache, key, true)
-    end
-  end
-
-  defp note_no_runner(_outcome, _candidate, cache), do: cache
-
-  defp log_earliest_reset(_candidate, nil), do: :ok
-
-  defp log_earliest_reset(candidate, %DateTime{} = reset) do
-    Logger.info(
-      "DispatchDriver: no runner can take work; the soonest an exhausted runner of this " <>
-        "tenant returns is earliest_usage_reset=#{DateTime.to_iso8601(reset)}: " <>
-        "story_id=#{candidate.story_id}",
-      tenant_id: candidate.tenant_id
-    )
   end
 
   defp unplaceable(candidate, reason) do
