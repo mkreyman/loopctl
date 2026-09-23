@@ -1,0 +1,199 @@
+{
+  "id": "US-44.1",
+  "title": "Gate A at merge reads persisted per-lens verdicts, never the caller",
+  "epic": {
+    "id": "epic_44",
+    "name": "Delivery Loop Completion"
+  },
+  "priority": "high",
+  "phase": "delivery_loop",
+  "story": {
+    "as_a": "delivery-loop operator",
+    "i_want_to": "the merge precondition to judge Gate A from the triage verdicts loopctl persisted",
+    "so_that": "a caller cannot clear Gate A by fabricating a unanimous trio"
+  },
+  "rationale": "Today every merge-precondition verdict is stamped gate_a_inputs: caller_asserted: the trio's outputs come from the request, so whoever drives the merge also certifies the triage it depends on. Triage verdicts are persisted now, but as one merged verdict per dispatch, which hides the disagreement Gate A exists to see. Persisting the three lens verdicts and reading them server-side removes the caller from the decision.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-44.1.1",
+      "description": "The triage_verdict message accepts optional lens_verdicts: exactly three entries, each validated by the same parser GateA.evaluate/1 uses; a message with a different count or a malformed entry is refused invalid_payload and records nothing."
+    },
+    {
+      "id": "AC-44.1.2",
+      "description": "Accepted lens_verdicts are persisted with the triage verdict row and returned by the context read of that verdict."
+    },
+    {
+      "id": "AC-44.1.3",
+      "description": "MergePrecondition decides Gate A from the lens verdicts of the story's most recent triage verdict, and the verdict no longer carries gate_a_inputs: caller_asserted."
+    },
+    {
+      "id": "AC-44.1.4",
+      "description": "A {escalated, queued, :human_resolution} transition recorded after the story's most recent triage verdict satisfies Gate A without reading lens verdicts."
+    },
+    {
+      "id": "AC-44.1.5",
+      "description": "A story with no persisted lens verdicts and no later human resolution gets a refuse decision naming gate_a_inputs_missing, never unevaluated."
+    },
+    {
+      "id": "AC-44.1.6",
+      "description": "A request carrying trio_outputs is accepted, the field is ignored, and the verdict records trio_outputs_ignored: true; the OpenAPI spec no longer lists trio_outputs as required."
+    },
+    {
+      "id": "AC-44.1.7",
+      "description": "An MCP tool merge_precondition calls POST /api/v1/stories/:id/merge-precondition, its description names the refusals and the key it needs, and route_coverage.test.js no longer declares the route a gap."
+    },
+    {
+      "id": "AC-44.1.8",
+      "description": "Lens verdicts of tenant A are never read when evaluating a story of tenant B."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-44.1.1",
+      "verifies": [
+        "AC-44.1.1"
+      ],
+      "name": "lens_verdicts of the wrong size is refused and records nothing",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "runner, accepted triage dispatch on a story at triaged"
+      ],
+      "steps": [
+        "push triage_verdict with two lens_verdicts"
+      ],
+      "expected_results": [
+        "reply invalid_payload; triage_verdicts row count unchanged"
+      ]
+    },
+    {
+      "id": "TC-44.1.2",
+      "verifies": [
+        "AC-44.1.2"
+      ],
+      "name": "lens verdicts round-trip through persistence",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "accepted triage dispatch"
+      ],
+      "steps": [
+        "TriageVerdict.apply with three lens verdicts",
+        "read the verdict record"
+      ],
+      "expected_results": [
+        "record.lens_verdicts has three entries in the order sent"
+      ]
+    },
+    {
+      "id": "TC-44.1.3",
+      "verifies": [
+        "AC-44.1.3",
+        "AC-44.1.6"
+      ],
+      "name": "a fabricated unanimous trio in the request cannot clear Gate A",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at ci whose persisted lens verdicts disagree on outcome",
+        "PullRequestSource mock returns a clean PR"
+      ],
+      "steps": [
+        "POST merge-precondition with three unanimous story outputs in trio_outputs"
+      ],
+      "expected_results": [
+        "decision refuse with a Gate A disagreement reason; trio_outputs_ignored true; no caller_asserted key"
+      ]
+    },
+    {
+      "id": "TC-44.1.4",
+      "verifies": [
+        "AC-44.1.4"
+      ],
+      "name": "a human resolution after an escalate verdict satisfies Gate A",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story whose triage verdict escalated, then resolved escalated -> queued over :human_resolution, now at ci with a clean PR"
+      ],
+      "steps": [
+        "MergePrecondition.evaluate"
+      ],
+      "expected_results": [
+        "Gate A contributes no refusal"
+      ]
+    },
+    {
+      "id": "TC-44.1.5",
+      "verifies": [
+        "AC-44.1.5"
+      ],
+      "name": "no lens verdicts refuses, not unevaluated",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at ci with a triage verdict lacking lens_verdicts"
+      ],
+      "steps": [
+        "MergePrecondition.evaluate"
+      ],
+      "expected_results": [
+        "decision refuse, reason gate_a_inputs_missing, no retry_after"
+      ]
+    },
+    {
+      "id": "TC-44.1.6",
+      "verifies": [
+        "AC-44.1.7"
+      ],
+      "name": "MCP tool is declared and dispatched",
+      "type": "unit",
+      "preconditions": [
+        "mcp-server test harness"
+      ],
+      "steps": [
+        "list tools; call merge_precondition with a story id"
+      ],
+      "expected_results": [
+        "tool listed; request is POST /api/v1/stories/<id>/merge-precondition"
+      ]
+    },
+    {
+      "id": "TC-44.1.7",
+      "verifies": [
+        "AC-44.1.8"
+      ],
+      "name": "tenant isolation of lens verdicts",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "tenant_b = fixture(:tenant) with a story carrying unanimous lens verdicts",
+        "tenant A story at ci with no lens verdicts"
+      ],
+      "steps": [
+        "evaluate tenant A story"
+      ],
+      "expected_results": [
+        "refuse gate_a_inputs_missing"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Contract: add lens_verdicts to RunnerTriageVerdictMessage in priv/runner_contract/v1.json, bump x-contract-version to 1.15.0; runner_contract_test.exs binds the schema both ways",
+    "Storage: new jsonb column lens_verdicts on triage_verdicts (migration); set programmatically, never cast from params",
+    "Gate A input today: lib/loopctl/delivery/merge_precondition.ex:277 (caller_asserted); GateA.evaluate/1 requires three outputs (lib/loopctl/delivery_gates/gate_a.ex:57,68)",
+    "Human resolution edge: Escalations (lib/loopctl/delivery/escalations.ex:331-402); compare story_stage_events order, not wall-clock timestamps from different tables",
+    "Controller spec: lib/loopctl_web/controllers/merge_precondition_controller.ex:208; MCP tool follows the lib module + index.js case + README row pattern"
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Does not persist anything for runners on contract 1.14 beyond today's merged verdict",
+    "Does not change Gate B or the hard diff bound",
+    "Does not run the gates at triage (US-44.2)"
+  ],
+  "expected_size": {
+    "insertions": 350,
+    "files": 8
+  },
+  "estimated_tokens": 420000
+}

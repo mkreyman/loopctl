@@ -1,0 +1,146 @@
+{
+  "id": "US-44.2",
+  "title": "Run both gates at triage before a story is queued",
+  "epic": {
+    "id": "epic_44",
+    "name": "Delivery Loop Completion"
+  },
+  "priority": "high",
+  "phase": "delivery_loop",
+  "story": {
+    "as_a": "delivery-loop operator",
+    "i_want_to": "a triaged story that Gate A or Gate B would refuse to be escalated before it is queued",
+    "so_that": "no unattended implementation is spent on work the merge gate will refuse"
+  },
+  "rationale": "Design section 5 runs both gates twice; only the merge-time run exists. With the dispatch driver on, a story predicted to touch the claims path or contradicting a decision is implemented at roughly USD 10-20 and then refused. Running the same gates over the trio's prediction first turns that spend into an escalation that costs nothing.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-44.2.1",
+      "description": "An accepted story verdict whose lens verdicts fail Gate A takes triaged -> escalated over :triage_escalate, with Gate A's reasons in escalation_reason, and is not queued."
+    },
+    {
+      "id": "AC-44.2.2",
+      "description": "An accepted story verdict whose drafted touches make GateB.evaluate(:triage, ...) return anything other than clear takes triaged -> escalated with Gate B's reasons, and is not queued."
+    },
+    {
+      "id": "AC-44.2.3",
+      "description": "An accepted story verdict that clears both gates is queued exactly as today."
+    },
+    {
+      "id": "AC-44.2.4",
+      "description": "A story verdict without lens_verdicts skips the triage Gate A run, logs gate_a_skipped_no_lens_verdicts, and is otherwise judged by Gate B alone."
+    },
+    {
+      "id": "AC-44.2.5",
+      "description": "A missing or unparseable Gate B trigger configuration escalates the story rather than queuing it."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-44.2.1",
+      "verifies": [
+        "AC-44.2.1"
+      ],
+      "name": "disagreeing lenses escalate at triage",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at triaged, accepted triage dispatch"
+      ],
+      "steps": [
+        "apply a story verdict whose lens verdicts disagree"
+      ],
+      "expected_results": [
+        "stage escalated, edge triage_escalate, agent_status unchanged, no queued row"
+      ]
+    },
+    {
+      "id": "TC-44.2.2",
+      "verifies": [
+        "AC-44.2.2"
+      ],
+      "name": "predicted claims-path touch escalates",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "Gate B triggers include lib/home_care_billing/claims/**"
+      ],
+      "steps": [
+        "apply a unanimous story verdict with touches [lib/home_care_billing/claims/x.ex]"
+      ],
+      "expected_results": [
+        "stage escalated naming the Gate B trigger"
+      ]
+    },
+    {
+      "id": "TC-44.2.3",
+      "verifies": [
+        "AC-44.2.3"
+      ],
+      "name": "clean verdict is queued",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "clean triggers"
+      ],
+      "steps": [
+        "apply a unanimous story verdict with harmless touches"
+      ],
+      "expected_results": [
+        "stage queued"
+      ]
+    },
+    {
+      "id": "TC-44.2.4",
+      "verifies": [
+        "AC-44.2.4"
+      ],
+      "name": "1.14 verdict skips Gate A only",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)"
+      ],
+      "steps": [
+        "apply a story verdict without lens_verdicts and harmless touches"
+      ],
+      "expected_results": [
+        "stage queued; log line gate_a_skipped_no_lens_verdicts"
+      ]
+    },
+    {
+      "id": "TC-44.2.5",
+      "verifies": [
+        "AC-44.2.5"
+      ],
+      "name": "broken trigger config fails closed",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "triggers config resolves to {:error, _}"
+      ],
+      "steps": [
+        "apply a unanimous story verdict"
+      ],
+      "expected_results": [
+        "stage escalated, reason names the config error"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Route table: lib/loopctl/delivery/triage_verdict.ex:67 ('story' route); the gates are called inside the same transaction that writes the drafted story",
+    "Gate B: Loopctl.DeliveryGates.GateB.evaluate(:triage, input, triggers) already supports the triage phase (gate_b.ex:83)",
+    "Touches are kept in draft metadata (triage_verdict.ex:698-707)"
+  ],
+  "dependencies": [
+    "US-44.1"
+  ],
+  "non_goals": [
+    "Does not bind the implementer to the predicted touches; the merge-time run remains the one that gates",
+    "Does not add new trigger patterns"
+  ],
+  "expected_size": {
+    "insertions": 160,
+    "files": 3
+  },
+  "estimated_tokens": 260000
+}

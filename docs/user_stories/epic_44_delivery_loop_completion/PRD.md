@@ -109,7 +109,7 @@ auto-reset), `bulk_operations.ex:610` (bulk reject).
 | `usage_exhausted` (44.3) | re-contract | no |
 | lease expiry, `crashed` | re-contract, or escalate at the ceiling | yes |
 | verifier reject, bulk reject | re-contract, or escalate at the ceiling | yes — the work was wrong |
-| operator force-unclaim | escalate | no — a human acted; they resolve it from `escalated` |
+| operator force-unclaim | escalate over `{queued, escalated, :operator_released}` | no — a human acted; they resolve it from `escalated` |
 
 The ceiling is spend, so it follows #875: `DISPATCH_MAX_ATTEMPTS` has **no default**; unset means
 a ceiling of 0 (escalate on the first crash, never spend twice). Attempts count in the stage row's

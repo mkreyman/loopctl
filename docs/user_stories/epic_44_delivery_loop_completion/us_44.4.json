@@ -1,0 +1,177 @@
+{
+  "id": "US-44.4",
+  "title": "No release path leaves a story unreachable (#877)",
+  "epic": {
+    "id": "epic_44",
+    "name": "Delivery Loop Completion"
+  },
+  "priority": "high",
+  "phase": "delivery_loop",
+  "story": {
+    "as_a": "delivery-loop operator",
+    "i_want_to": "every claim release on a delivery story to end somewhere the driver or a human acts on",
+    "so_that": "a crashed or refused dispatch never silently drops its story out of the loop"
+  },
+  "rationale": "Every caller of Stages.follow_release/5 leaves agent_status pending at stage queued, and the driver selects contracted stories only, so the story sits unreachable for ever with no alert. The fix has to be per cause: a refusal is free to retry, a crash costs money, and an operator's release is a human decision. The retry ceiling is spend, so it has no default.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-44.4.1",
+      "description": "A placement refusal (Placement.undo_claim/5) leaves the story queued and contracted, attempts unchanged."
+    },
+    {
+      "id": "AC-44.4.2",
+      "description": "A lease expiry with DISPATCH_MAX_ATTEMPTS set to N and fewer than N counted crash attempts leaves the story queued and contracted with the attempt counted."
+    },
+    {
+      "id": "AC-44.4.3",
+      "description": "A lease expiry that reaches the ceiling takes {queued, escalated, :attempts_exhausted} with the count in escalation_reason."
+    },
+    {
+      "id": "AC-44.4.4",
+      "description": "With DISPATCH_MAX_ATTEMPTS unset, the first lease expiry escalates over :attempts_exhausted."
+    },
+    {
+      "id": "AC-44.4.5",
+      "description": "A verifier-reject auto-reset and a bulk reject count an attempt and follow the same ceiling."
+    },
+    {
+      "id": "AC-44.4.6",
+      "description": "An operator force-unclaim of a delivery story takes {queued, escalated, :operator_released} and spends no attempt."
+    },
+    {
+      "id": "AC-44.4.7",
+      "description": "A story with no delivery stage row is released exactly as today."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-44.4.1",
+      "verifies": [
+        "AC-44.4.1"
+      ],
+      "name": "placement refusal re-contracts for free",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "runner refusing the dispatch",
+        "contracted story at queued"
+      ],
+      "steps": [
+        "DispatchDriver places it; runner replies refused"
+      ],
+      "expected_results": [
+        "stage queued, agent_status contracted, attempts unchanged"
+      ]
+    },
+    {
+      "id": "TC-44.4.2",
+      "verifies": [
+        "AC-44.4.2"
+      ],
+      "name": "crash under the ceiling retries",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "config/test.exs sets the dispatch max-attempts key to 2",
+        "claimed story past its lease"
+      ],
+      "steps": [
+        "run ReclaimExpiredClaimsWorker"
+      ],
+      "expected_results": [
+        "stage queued, agent_status contracted, attempts crash=1"
+      ]
+    },
+    {
+      "id": "TC-44.4.3",
+      "verifies": [
+        "AC-44.4.3",
+        "AC-44.4.4"
+      ],
+      "name": "ceiling reached, and an unset ceiling, escalate",
+      "type": "unit",
+      "preconditions": [
+        "pure release-policy function taking cause, counted attempts and ceiling"
+      ],
+      "steps": [
+        "decide(:lease_expired, 1, 2)",
+        "decide(:lease_expired, 0, nil)"
+      ],
+      "expected_results": [
+        "{:escalate, :attempts_exhausted} in both cases"
+      ]
+    },
+    {
+      "id": "TC-44.4.4",
+      "verifies": [
+        "AC-44.4.5"
+      ],
+      "name": "verifier reject counts an attempt",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story reported done under a dispatch"
+      ],
+      "steps": [
+        "reject_story"
+      ],
+      "expected_results": [
+        "attempts incremented; queued and contracted under the ceiling"
+      ]
+    },
+    {
+      "id": "TC-44.4.5",
+      "verifies": [
+        "AC-44.4.6"
+      ],
+      "name": "operator release escalates",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "claimed delivery story"
+      ],
+      "steps": [
+        "force_unclaim_story as an operator"
+      ],
+      "expected_results": [
+        "stage escalated, edge operator_released, attempts unchanged"
+      ]
+    },
+    {
+      "id": "TC-44.4.6",
+      "verifies": [
+        "AC-44.4.7"
+      ],
+      "name": "non-delivery story untouched",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "claimed story with no stage row"
+      ],
+      "steps": [
+        "force_unclaim_story"
+      ],
+      "expected_results": [
+        "agent_status pending as today; no stage row created"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Callers of follow_release/5: progress.ex:1189, :1637, :2931, :3601; bulk_operations.ex:610. Decide by the release cause each already passes, not by caller identity",
+    "Re-contract through Escalations' existing recontract/3 (escalations.ex:436), made public, never a second writer of agent_status",
+    "New control-only edges in StageMachine: {queued, escalated, :attempts_exhausted} and {queued, escalated, :operator_released}; add both to the contract's stage_transitions table and the escalation reason codes",
+    "DISPATCH_MAX_ATTEMPTS: row in deploy/FLY_SECRETS.md stating it has no default and what unset means; config read with no fallback, mirroring DISPATCH_WALL_CLOCK_SECONDS",
+    "Tests set the config key in config/test.exs; never Application.put_env in a test file",
+    "Put the per-cause decision in a pure function (cause, attempts, ceiling) so the unset-ceiling case is unit-tested without varying application config"
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Does not change the lease length (US-44.5)",
+    "Does not add alerting beyond the escalated queue"
+  ],
+  "expected_size": {
+    "insertions": 280,
+    "files": 7
+  },
+  "estimated_tokens": 420000
+}

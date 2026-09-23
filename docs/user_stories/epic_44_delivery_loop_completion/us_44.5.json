@@ -1,0 +1,166 @@
+{
+  "id": "US-44.5",
+  "title": "Driver-placed claims get a lease capped at the dispatch deadline (#879)",
+  "epic": {
+    "id": "epic_44",
+    "name": "Delivery Loop Completion"
+  },
+  "priority": "high",
+  "phase": "delivery_loop",
+  "story": {
+    "as_a": "delivery-loop operator",
+    "i_want_to": "a claim placed for a runner dispatch to expire at the dispatch's deadline plus a grace",
+    "so_that": "a killed session releases its story within minutes, not 23 hours, and no other claimant is affected"
+  },
+  "rationale": "The lease is one global 24h value against a 3600s wall clock, so a killed session holds its story for most of a day. Lowering the global value breaks every non-runner claimant. A per-claim cap derived from the dispatch fixes the one population the runner hard-kills, and sharing the instant with the runner closes the window where two sessions could work one story.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-44.5.1",
+      "description": "A claim Placement takes for a runner dispatch has claimed_until = placed_at + wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS."
+    },
+    {
+      "id": "AC-44.5.2",
+      "description": "Renewing a driver-placed claim never moves claimed_until past that cap."
+    },
+    {
+      "id": "AC-44.5.3",
+      "description": "A claim taken through claim_story/3 or bulk_claim/4 outside placement keeps claim_lease_seconds/0 exactly as today."
+    },
+    {
+      "id": "AC-44.5.4",
+      "description": "The application refuses to boot with DISPATCH_LEASE_GRACE_SECONDS below Capacity.release_grace_seconds/0."
+    },
+    {
+      "id": "AC-44.5.5",
+      "description": "The implement dispatch payload carries deadline_at equal to the claim's cap minus the grace."
+    },
+    {
+      "id": "AC-44.5.6",
+      "description": "The renew_story_claim tool description and mcp-server/README.md state that driver-placed claims are capped at the dispatch deadline."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-44.5.1",
+      "verifies": [
+        "AC-44.5.1"
+      ],
+      "name": "placed claim carries the cap",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "runner, contracted story, wall clock 3600, grace 900"
+      ],
+      "steps": [
+        "Placement.place"
+      ],
+      "expected_results": [
+        "claimed_until == placed_at + 4500s"
+      ]
+    },
+    {
+      "id": "TC-44.5.2",
+      "verifies": [
+        "AC-44.5.2"
+      ],
+      "name": "renewal cannot extend past the cap",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "driver-placed claim"
+      ],
+      "steps": [
+        "renew the claim twice"
+      ],
+      "expected_results": [
+        "claimed_until unchanged at the cap"
+      ]
+    },
+    {
+      "id": "TC-44.5.3",
+      "verifies": [
+        "AC-44.5.3"
+      ],
+      "name": "hand claim unchanged",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "contracted story"
+      ],
+      "steps": [
+        "Progress.claim_story/3 as an agent"
+      ],
+      "expected_results": [
+        "claimed_until == now + claim_lease_seconds()"
+      ]
+    },
+    {
+      "id": "TC-44.5.4",
+      "verifies": [
+        "AC-44.5.4"
+      ],
+      "name": "grace below release grace refuses boot",
+      "type": "unit",
+      "preconditions": [
+        "config validator"
+      ],
+      "steps": [
+        "validate grace 120"
+      ],
+      "expected_results": [
+        "{:error, _} naming both values"
+      ]
+    },
+    {
+      "id": "TC-44.5.5",
+      "verifies": [
+        "AC-44.5.5"
+      ],
+      "name": "dispatch carries deadline_at",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "placed dispatch"
+      ],
+      "steps": [
+        "build the dispatch payload"
+      ],
+      "expected_results": [
+        "deadline_at == placed_at + wall_clock_seconds"
+      ]
+    },
+    {
+      "id": "TC-44.5.6",
+      "verifies": [
+        "AC-44.5.6"
+      ],
+      "name": "tool text names the cap",
+      "type": "unit",
+      "preconditions": [
+        "mcp-server"
+      ],
+      "steps": [
+        "read renew_story_claim description"
+      ],
+      "expected_results": [
+        "mentions the dispatch deadline cap"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Lease today: Progress.claim_lease_seconds/0 and claim_lease_change/2 (progress.ex:1315,1329), used by claim_story/3 and bulk_claim/4",
+    "Placement: lib/loopctl/delivery/placement.ex; store the cap on the claim so renewal can read it (the dispatch row already carries wall_clock_seconds)",
+    "Contract: optional deadline_at on RunnerDispatch (1.15.0)",
+    "DISPATCH_LEASE_GRACE_SECONDS: default 900, row in deploy/FLY_SECRETS.md"
+  ],
+  "dependencies": [],
+  "non_goals": [
+    "Does not change the global lease",
+    "Does not fence git pushes by epoch (delivery-authority work)"
+  ],
+  "expected_size": {
+    "insertions": 170,
+    "files": 6
+  },
+  "estimated_tokens": 260000
+}

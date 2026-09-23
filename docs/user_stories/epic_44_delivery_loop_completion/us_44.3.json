@@ -1,0 +1,174 @@
+{
+  "id": "US-44.3",
+  "title": "Runners report why an implement session ended, and a budget failure fails",
+  "epic": {
+    "id": "epic_44",
+    "name": "Delivery Loop Completion"
+  },
+  "priority": "high",
+  "phase": "delivery_loop",
+  "story": {
+    "as_a": "delivery-loop operator",
+    "i_want_to": "the runner to report why a session ended and loopctl to act on the reason",
+    "so_that": "a story that fails deterministically ends at failed instead of being re-run in a circle"
+  },
+  "rationale": "Control learns that a session died only through lease expiry, so a wall-clock kill, a turn-budget kill, an exhausted subscription and a crash look identical, and each would be retried. The :budget_exceeded edge exists in the stage machine and has no writer. A reported reason lets each case go where it belongs.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-44.3.1",
+      "description": "The contract accepts an optional session_ended message {dispatch_id, claim_epoch, reason} with reason in completed | wall_clock_exceeded | max_turns_exceeded | usage_exhausted | crashed; any other reason is refused invalid_payload."
+    },
+    {
+      "id": "AC-44.3.2",
+      "description": "wall_clock_exceeded or max_turns_exceeded on an in-flight story takes {stage, failed, :budget_exceeded} and releases the runner's slot."
+    },
+    {
+      "id": "AC-44.3.3",
+      "description": "usage_exhausted releases the claim, re-contracts the story without spending an attempt, and records the runner as exhausted."
+    },
+    {
+      "id": "AC-44.3.4",
+      "description": "crashed releases the claim through the same path lease expiry uses."
+    },
+    {
+      "id": "AC-44.3.5",
+      "description": "A session_ended carrying a stale claim_epoch is refused stale_claim_epoch and changes nothing."
+    },
+    {
+      "id": "AC-44.3.6",
+      "description": "A byte-identical resend of an applied session_ended is answered with the current row and changes nothing."
+    },
+    {
+      "id": "AC-44.3.7",
+      "description": "completed changes no stage."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-44.3.1",
+      "verifies": [
+        "AC-44.3.1"
+      ],
+      "name": "unknown reason refused",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "runner with an accepted implement dispatch"
+      ],
+      "steps": [
+        "push session_ended with reason 'bored'"
+      ],
+      "expected_results": [
+        "invalid_payload"
+      ]
+    },
+    {
+      "id": "TC-44.3.2",
+      "verifies": [
+        "AC-44.3.2"
+      ],
+      "name": "wall clock kill fails the story",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at implementing under the dispatch"
+      ],
+      "steps": [
+        "push session_ended wall_clock_exceeded"
+      ],
+      "expected_results": [
+        "stage failed, edge budget_exceeded, in_flight decremented"
+      ]
+    },
+    {
+      "id": "TC-44.3.3",
+      "verifies": [
+        "AC-44.3.3"
+      ],
+      "name": "exhaustion spends nothing",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at implementing, attempts %{}"
+      ],
+      "steps": [
+        "push session_ended usage_exhausted"
+      ],
+      "expected_results": [
+        "stage queued, agent_status contracted, attempts unchanged, runner marked exhausted"
+      ]
+    },
+    {
+      "id": "TC-44.3.4",
+      "verifies": [
+        "AC-44.3.4"
+      ],
+      "name": "crash follows the lease path",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at implementing"
+      ],
+      "steps": [
+        "push session_ended crashed"
+      ],
+      "expected_results": [
+        "same stage and agent_status as a reclaim_expired_claim of that story"
+      ]
+    },
+    {
+      "id": "TC-44.3.5",
+      "verifies": [
+        "AC-44.3.5"
+      ],
+      "name": "stale epoch refused",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story whose claim_epoch moved past the dispatch's"
+      ],
+      "steps": [
+        "push session_ended wall_clock_exceeded with the old epoch"
+      ],
+      "expected_results": [
+        "stale_claim_epoch; stage unchanged"
+      ]
+    },
+    {
+      "id": "TC-44.3.6",
+      "verifies": [
+        "AC-44.3.6",
+        "AC-44.3.7"
+      ],
+      "name": "replay and completed are no-ops",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at implementing"
+      ],
+      "steps": [
+        "push session_ended completed twice"
+      ],
+      "expected_results": [
+        "stage unchanged both times"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Contract: new message in priv/runner_contract/v1.json (1.15.0), handled in LoopctlWeb.RunnerChannel through Loopctl.Delivery.RunnerStages; never a second writer of story_stages",
+    "Edge: {in_flight, failed, :budget_exceeded} already in StageMachine.transitions/0 with no writer; make it control-writable for this path only",
+    "Runner exhaustion marking is US-44.6's column; until it exists this story records the reason on the dispatch ledger only"
+  ],
+  "dependencies": [
+    "US-44.4"
+  ],
+  "non_goals": [
+    "Does not change what the runner does on its own wall clock",
+    "Does not retry failed stories"
+  ],
+  "expected_size": {
+    "insertions": 260,
+    "files": 5
+  },
+  "estimated_tokens": 380000
+}

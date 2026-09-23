@@ -1,0 +1,81 @@
+{
+  "id": "US-44.7",
+  "title": "The runner and placement routes are in the route index (#878)",
+  "epic": {
+    "id": "epic_44",
+    "name": "Delivery Loop Completion"
+  },
+  "priority": "low",
+  "phase": "delivery_loop",
+  "story": {
+    "as_a": "session wiring up the delivery loop",
+    "i_want_to": "list_routes to show every route needed to bring a runner online",
+    "so_that": "a session can discover enrolment, the pool, placement and dispatch revocation without reading source"
+  },
+  "rationale": "Seven served routes are absent from the curated index, so a session that found the intake tools still cannot find how to enrol a runner or place a dispatch.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-44.7.1",
+      "description": "GET /api/v1/routes lists GET and POST /api/v1/runners, DELETE /api/v1/runners/:id, GET /api/v1/runners/pool, POST /api/v1/runners/:runner_id/dispatches, GET /api/v1/dispatches/enrolled-keys, POST /api/v1/dispatches/:id/revoke and POST /api/v1/stories/:id/merge-precondition."
+    },
+    {
+      "id": "AC-44.7.2",
+      "description": "Each listed row names its required role and the MCP tool that reaches it."
+    },
+    {
+      "id": "AC-44.7.3",
+      "description": "The route-discovery test fails when a route under /api/v1/runners, /api/v1/dispatches or a merge-precondition path is served but not indexed."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-44.7.1",
+      "verifies": [
+        "AC-44.7.1",
+        "AC-44.7.2"
+      ],
+      "name": "index lists the loop's routes",
+      "type": "integration",
+      "preconditions": [
+        "user key"
+      ],
+      "steps": [
+        "GET /api/v1/routes"
+      ],
+      "expected_results": [
+        "each route present with role and tool"
+      ]
+    },
+    {
+      "id": "TC-44.7.2",
+      "verifies": [
+        "AC-44.7.3"
+      ],
+      "name": "drift guard",
+      "type": "unit",
+      "preconditions": [
+        "route table"
+      ],
+      "steps": [
+        "compare served routes under the loop prefixes with the index"
+      ],
+      "expected_results": [
+        "every served route indexed"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Index: lib/loopctl_web/controllers/route_discovery_controller.ex; authoritative list from mix phx.routes"
+  ],
+  "dependencies": [
+    "US-44.1"
+  ],
+  "non_goals": [
+    "Does not index the other unindexed /api/v1 routes (#872)"
+  ],
+  "expected_size": {
+    "insertions": 80,
+    "files": 2
+  },
+  "estimated_tokens": 120000
+}
