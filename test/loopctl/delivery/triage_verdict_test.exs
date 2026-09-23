@@ -150,6 +150,17 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     end)
   end
 
+  # What the first attempt of a verdict does before anything else: bind its dispatch as the
+  # story's triage identity. A half-applied route in production always has it.
+  defp bind_triage(story, dispatch_id) do
+    as_tenant(story.tenant_id, fn ->
+      {:ok, _row} =
+        Stages.record_effect(story.tenant_id, story.id, :triage_dispatch_id, dispatch_id,
+          claim_epoch: story.claim_epoch
+        )
+    end)
+  end
+
   defp as_tenant(tenant_id, fun) do
     {:ok, result} = Repo.with_tenant(tenant_id, fun)
     result
@@ -241,7 +252,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert saved.payload["story"]["title"] == "A title"
     end
 
-    test "the triage writes the binding Gate A reads: its dispatch on the triaged event" do
+    test "the triage binds its dispatch to the story before recording, and Gate A reads it" do
       %{story: story, runner: runner, record: record} = session()
 
       lens_verdicts =
@@ -255,16 +266,50 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
       assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
 
-      assert [%{"payload" => %{"triage_dispatch_id" => dispatch_id}}] =
-               story.tenant_id
-               |> stage_events(story.id)
-               |> Enum.filter(&(&1.from_stage == "detected" and &1.to_stage == "triaged"))
-               |> Enum.map(& &1.data)
-
-      assert dispatch_id == record.dispatch_id
+      bound = as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end)
+      assert bound.triage_dispatch_id == record.dispatch_id
 
       assert {:persisted_triage, [%{"verdict" => "escalate"} | _]} =
                GateAInput.for_story(story.tenant_id, story.id)
+    end
+
+    test "a SECOND dispatch's verdict is refused before anything of it is stored" do
+      %{story: story, runner: runner, record: record} = session()
+
+      # Another triage dispatch bound the story first.
+      assert {:ok, _} =
+               as_tenant(story.tenant_id, fn ->
+                 Stages.record_effect(
+                   story.tenant_id,
+                   story.id,
+                   :triage_dispatch_id,
+                   Ecto.UUID.generate(),
+                   claim_epoch: story.claim_epoch
+                 )
+               end)
+
+      assert {:error, :stale_stage} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, verdict("reject"))
+               )
+
+      assert records(story.tenant_id) == []
+      assert stage_of(story) == :detected
+    end
+
+    test "a verdict for a story that has left detected is refused and records nothing" do
+      %{story: story, runner: runner, record: record} = session(stage: :implementing)
+
+      assert {:error, :stale_stage} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, verdict("reject"))
+               )
+
+      assert records(story.tenant_id) == []
     end
 
     test "a resend with the lens verdicts in another order is the same verdict" do
@@ -692,6 +737,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       # `stale_stage`, return before transition TWO was tried, and answer `ok` — and nothing in
       # `lib/` selects `triaged`, so the story was dead exactly where this module exists to
       # stop it being dead.
+      bind_triage(story, record.dispatch_id)
       advance_to_triaged(story)
       assert stage_of(story) == :triaged
 
@@ -765,10 +811,21 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       # `triaged` is not an in-flight stage — so every later attempt at `triaged -> queued`
       # died on `:stale_claim_epoch` before the compare-and-set, nothing else in `lib/` writes
       # that edge, and `Escalations` cannot escalate a `triaged` row either.
+      #
+      # The first attempt had RECORDED the verdict and bound its dispatch before the transition
+      # landed, so the resend is a replay of it.
+      fixture(:triage_verdict, %{
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        dispatch_id: record.dispatch_id,
+        claim_epoch: record.claim_epoch,
+        payload_digest: TriageVerdictRecord.digest(message)
+      })
+
       advance_to_triaged(story)
       bump_story_epoch(story, true)
 
-      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
       assert stage_of(story) == :queued
     end
 

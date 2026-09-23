@@ -20,7 +20,7 @@
     },
     {
       "id": "AC-44.1.2",
-      "description": "MergePrecondition decides Gate A from triage_verdicts.lens_verdicts of the dispatch named on the story's detected -> triaged event, translated by GateAInput to GateA's output shape, and the verdict carries gate_a_inputs: :persisted_triage."
+      "description": "MergePrecondition decides Gate A from triage_verdicts.lens_verdicts of the triage dispatch bound to the story (story_stages.triage_dispatch_id, recorded before the verdict is stored), translated by GateAInput to GateA's output shape, and the verdict carries gate_a_inputs: :persisted_triage."
     },
     {
       "id": "AC-44.1.3",

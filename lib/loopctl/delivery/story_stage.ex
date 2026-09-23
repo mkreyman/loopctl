@@ -50,6 +50,7 @@ defmodule Loopctl.Delivery.StoryStage do
     field :stage, Ecto.Enum, values: StageMachine.stages()
     field :claim_epoch, :integer
     field :runner_id, :binary_id
+    field :triage_dispatch_id, :binary_id
     field :worktree_path, :string
     field :branch, :string
     field :pr_number, :integer

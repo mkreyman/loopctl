@@ -649,6 +649,7 @@ defmodule Loopctl.Delivery.StagesTest do
 
   describe "record_effect/5" do
     @values %{
+      triage_dispatch_id: "0b6e3a52-7d0e-4b8e-9c55-6a9a1e1f0c01",
       worktree_path: "/home/runner/workspace/app/.claude/worktrees/us-1",
       branch: "feature/us-1",
       head_sha: String.duplicate("c", 40),
@@ -659,6 +660,7 @@ defmodule Loopctl.Delivery.StagesTest do
     }
 
     @others %{
+      triage_dispatch_id: "0b6e3a52-7d0e-4b8e-9c55-6a9a1e1f0c02",
       worktree_path: "/elsewhere",
       branch: "feature/other",
       head_sha: String.duplicate("e", 40),

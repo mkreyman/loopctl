@@ -19,16 +19,15 @@ defmodule Loopctl.Delivery.GateAInput do
     retry ceiling, a Gate B refusal) says nothing about the request and does not count.
   - `:missing` — neither. The gate refuses, because waiting cannot make a verdict appear.
 
-  ## Which verdict: the one that triaged the story, never the newest row
+  ## Which verdict: the dispatch bound to the story, never the newest row
 
-  A story leaves `detected` exactly once — the stage machine has no edge back — and the
-  `detected -> triaged` event names the dispatch whose verdict drove it
-  (`"triage_dispatch_id"`, written by `Loopctl.Delivery.TriageVerdict`). Gate A reads THAT
-  dispatch's row. It cannot take "the newest row for the story": a verdict is recorded before
-  its transitions run, so a zombie triage dispatch reporting late still records a row even
-  though its transitions are refused, and the newest row would then be one that decided
-  nothing. A story whose triaged event names no dispatch (triaged before this binding
-  existed) is `:missing`.
+  The story's stage row carries `triage_dispatch_id`, recorded by
+  `Loopctl.Delivery.TriageVerdict` through `Stages.record_effect/5` at `detected`, BEFORE that
+  dispatch's verdict is stored, and never overwritten: a second dispatch's verdict is refused
+  before any of it is stored. Gate A reads that dispatch's row. "The newest row for the story"
+  would be wrong because records and transitions are separate writes, so a later row need not
+  be the one that decided anything. A story with no bound dispatch (triaged before the binding
+  existed, or escalated by the dispatcher without a triage run) is `:missing`.
 
   ## Where the state lives
 
@@ -56,12 +55,15 @@ defmodule Loopctl.Delivery.GateAInput do
   @doc "Gate A's input for one story. See the moduledoc for the three answers."
   @spec for_story(Ecto.UUID.t(), Ecto.UUID.t()) :: t()
   def for_story(tenant_id, story_id) do
-    walk = tenant_id |> Stages.list_transitions(story_id) |> walk()
-
     cond do
-      walk.resolved? -> :human_resolution
-      walk.triage_dispatch_id -> persisted(tenant_id, story_id, walk.triage_dispatch_id)
-      true -> :missing
+      human_resolved?(tenant_id, story_id) ->
+        :human_resolution
+
+      dispatch_id = bound_dispatch(tenant_id, story_id) ->
+        persisted(tenant_id, story_id, dispatch_id)
+
+      true ->
+        :missing
     end
   end
 
@@ -111,22 +113,23 @@ defmodule Loopctl.Delivery.GateAInput do
     end
   end
 
-  # One pass over the transitions: which dispatch triaged the story, and whether a human has
-  # since resolved an escalation that was about Gate A. A resolution is STICKY — a human who
-  # answered the Gate A question does not un-answer it by later re-queueing the story from an
-  # unrelated escalation — and ANY qualifying resolution counts, not only the last one.
-  defp walk(transitions) do
-    Enum.reduce(
-      transitions,
-      %{triage_dispatch_id: nil, escalation: nil, resolved?: false},
-      &step/2
-    )
+  defp bound_dispatch(tenant_id, story_id) do
+    case Stages.get(tenant_id, story_id) do
+      %{triage_dispatch_id: dispatch_id} -> dispatch_id
+      nil -> nil
+    end
   end
 
-  # The triage event itself; a triage that went straight to `escalated` is also the Gate A
-  # escalation a human may then resolve.
-  defp step(%{from: "detected", to: "triaged", data: data}, acc),
-    do: %{acc | triage_dispatch_id: get_in(data || %{}, ["payload", "triage_dispatch_id"])}
+  # Whether a human has resolved an escalation that was about Gate A. A resolution is STICKY —
+  # a human who answered the Gate A question does not un-answer it by later re-queueing the
+  # story from an unrelated escalation — and ANY qualifying resolution counts, not only the
+  # last one.
+  defp human_resolved?(tenant_id, story_id) do
+    tenant_id
+    |> Stages.list_transitions(story_id)
+    |> Enum.reduce(%{escalation: nil, resolved?: false}, &step/2)
+    |> Map.fetch!(:resolved?)
+  end
 
   defp step(%{to: "escalated"} = event, acc), do: %{acc | escalation: event}
 
