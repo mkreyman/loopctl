@@ -50,6 +50,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.14.0) A RUNNER DECLARES THE BRANCH PREFIXES IT ACCEPTS (`RunnerJoin.branch_prefixes`), and loopctl DERIVES a conforming branch instead of guessing one. A runner that enforces a prefix and does not declare it refuses every dispatch loopctl sends, which is what happened: the first real placement was refused `branch_not_allowed` because loopctl derived `feature/story-<n>-<id>` while the machine's config accepted `loop/` alone, and the operator could learn the required prefix only by reading a config file on that box. OMITTING THE FIELD IS EXACTLY TODAY'S BEHAVIOUR — no constraint, and the branch is the one loopctl already derived — so an un-upgraded runner is unaffected and nothing on the wire changes for it. RE-VENDOR to send it | | | | |
   | (1.15.0) A triage verdict message may carry `lens_verdicts` (`RunnerLensVerdict`, exactly one per lens, only beside a `verdict`, capped together by `RunnerLensVerdict.max_bytes/0`). Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies; a verdict without them escalates at triage. RE-VENDOR to send them; a 1.14.0 holder keeps working and its verdicts escalate at triage | | | | |
   | (1.16.0) A runner may say WHY an implement session ended, with the new `session_ended` message (`RunnerSessionEnded`: `dispatch_id`, `claim_epoch`, `reason` in `completed`, `wall_clock_exceeded`, `max_turns_exceeded`, `usage_exhausted`, `crashed`). A budget kill escalates the story for a human instead of waiting out the lease and being retried, a crash releases the claim at once, and an exhausted subscription releases it without spending an attempt. Recorded ONCE per dispatch: a byte-identical resend is answered `ok` with the row even after the release it caused, a different `reason` is `already_recorded`. OPTIONAL — a runner that never sends it gets exactly today's behaviour, the lease reclaim. RE-VENDOR to send it: a 1.15.0 copy has no such event, no `RunnerSessionEndedAck` and no `session_ended_burst` | | | | |
+  | (1.17.0) AN EXHAUSTED SUBSCRIPTION IS NOT CAPACITY. A `status` message may carry `usage` (`RunnerUsage`: `exhausted`, optional `resets_at` and `account_ref`), and control STORES it: while `exhausted` is true the machine — and every machine sending the same `account_ref` in the tenant — is placed nothing, by the unattended driver, the triage dispatcher and an operator's placement alike (`runner_exhausted`), until `resets_at` clamped to `x-connection.limits.usage_hold_seconds` on control's clock, or the upper bound when `resets_at` is absent. `exhausted: false` clears every machine on that `account_ref`. A `session_ended` with reason `usage_exhausted` now also holds the machine out for the upper bound, which the next `usage` corrects. A `status` carrying `usage` whose write could not land is refused `rate_limited` with `min_interval_ms`, nothing applied. OPTIONAL — a runner that never sends `usage` is never held out, except by its own `usage_exhausted` session ends. RE-VENDOR to send it: a 1.16.0 copy has no `RunnerUsage` and its `RunnerStatus` names no `usage` | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -371,9 +372,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.DeliveryGates.GateA
+  alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
-  @version "1.16.0"
+  @version "1.17.0"
   @major 1
 
   defmodule ByteRule do
@@ -603,6 +605,72 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerUsage do
+    @moduledoc """
+    The `usage` a `status` message may carry (1.17.0, epic 44 US-44.6): whether the account the
+    runner's sessions run on is out of subscription usage, and until when.
+
+    Control keeps an exhausted machine out of every placement until the reset, CLAMPED to
+    `[now + Loopctl.Runners.Usage.min_hold_seconds(), now + Loopctl.Runners.Usage.max_hold_seconds()]`
+    on control's clock. See `Loopctl.Runners.Usage` for what each value does.
+    """
+
+    require OpenApiSpex
+
+    # Mirrors the `runners_account_ref_shape` CHECK: printable ASCII, no whitespace. An opaque
+    # value compared for equality, so nothing about it needs to be readable — only bounded, and
+    # safe to put in a log line and a Postgres text column (no NUL, no control characters).
+    @account_ref_max_length 128
+    @account_ref_pattern "^[!-~]+$"
+
+    @doc "The longest `account_ref` the contract accepts."
+    @spec account_ref_max_length() :: pos_integer()
+    def account_ref_max_length, do: @account_ref_max_length
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerUsage",
+        description:
+          "Whether the account this runner's sessions run on has exhausted its subscription " <>
+            "usage (since 1.17.0). `exhausted: true` keeps the machine — and every machine " <>
+            "sending the same `account_ref` — out of every placement until `resets_at`, held " <>
+            "by control to between one minute and eight days from control's own clock, and to " <>
+            "eight days when `resets_at` is absent: an exhaustion is never ignored. " <>
+            "`exhausted: false` clears it for every machine on that `account_ref`. A " <>
+            "`session_ended` with reason `usage_exhausted` marks the machine for eight days " <>
+            "on its own, which the next `usage` with a `resets_at` corrects. Optional; a " <>
+            "runner that never sends it is never held out.",
+        type: :object,
+        required: [:exhausted],
+        properties: %{
+          exhausted: %Schema{
+            type: :boolean,
+            description: "True while the account cannot start a session."
+          },
+          resets_at: %Schema{
+            type: :string,
+            format: :"date-time",
+            nullable: true,
+            description:
+              "When the account's usage window resets, on the runner's clock. Read only " <>
+                "beside `exhausted: true`. Clamped, never trusted as sent."
+          },
+          account_ref: %Schema{
+            type: :string,
+            minLength: 1,
+            maxLength: @account_ref_max_length,
+            pattern: @account_ref_pattern,
+            description:
+              "An opaque, stable value the runner derives from the login its sessions run " <>
+                "under — a hash, never the credential. Machines sending the same value are " <>
+                "exhausted and cleared together. Omitted, the value last sent is kept."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerJoin do
     @moduledoc false
     require OpenApiSpex
@@ -814,19 +882,23 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.RunnerSample
+    alias Loopctl.ApiSpec.RunnerContract.RunnerUsage
 
     OpenApiSpex.schema(
       %{
         title: "RunnerStatus",
         description:
           "A runner's periodic update, pushed as the `status` event. Any subset of the " <>
-            "fields; at least one.",
+            "fields; at least one. `usage` (since 1.17.0) is stored by control, not merely " <>
+            "echoed into the pool: a status carrying it is refused `rate_limited` with " <>
+            "`min_interval_ms` when that write could not land, and nothing in it was applied.",
         type: :object,
         minProperties: 1,
         properties: %{
           in_flight: %Schema{type: :integer, minimum: 0},
           draining: %Schema{type: :boolean},
-          sample: RunnerSample.schema()
+          sample: RunnerSample.schema(),
+          usage: RunnerUsage.schema()
         }
       },
       struct?: false
@@ -2366,6 +2438,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerJoin,
     RunnerStatus,
     RunnerSample,
+    RunnerUsage,
     RunnerStory,
     RunnerTriage,
     RunnerTriageVerdict,
@@ -3478,6 +3551,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "session_ended_burst" => @session_ended_burst,
           "stage_burst" => @stage_burst,
           "stage_max_reason_length" => RunnerStage.max_reason_length(),
+          # The clamp control applies to `RunnerUsage.resets_at` (since 1.17.0), in seconds from
+          # control's own clock. Not a JSON Schema keyword, so a runner cannot read it anywhere
+          # else.
+          "usage_hold_seconds" => %{
+            "min" => Usage.min_hold_seconds(),
+            "max" => Usage.max_hold_seconds()
+          },
           "story" => RunnerStory.limits(),
           "triage" => RunnerTriage.limits(),
           "triage_verdict" => RunnerTriageVerdict.limits()

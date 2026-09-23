@@ -23,17 +23,22 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   use LoopctlWeb.ChannelCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
+
+  require Logger
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.DispatchDriver
+  alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Source
   alias Loopctl.Progress
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Usage
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.RunnerSocket
 
@@ -468,6 +473,138 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       bind_repo(ctx, ambiguous, "mkreyman/cron_books")
 
       refute ambiguous.id in candidate_ids(50)
+    end
+  end
+
+  describe "an exhausted subscription is not capacity (US-44.6)" do
+    # The reset line is `:info`, below `config/test.exs`'s `:warning` primary level; a module
+    # level lets it past for this module alone, the way
+    # `Loopctl.Workers.ReclaimExpiredClaimsLoggingTest` does. VM-global, which this module's
+    # `async: false` already covers.
+    setup do
+      Logger.put_module_level(DispatchDriver, :info)
+      on_exit(fn -> Logger.delete_module_level(DispatchDriver) end)
+      :ok
+    end
+
+    test "an exhausted account is excluded everywhere: the driver places nothing, and a " <>
+           "placement naming the OTHER machine on that account is refused (TC-44.6.5)",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+
+      {r2_key, r2} =
+        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
+
+      first = join_runner(ctx)
+      second = join_as(r2, r2_key, "beelink")
+
+      # r2 reported the account and NOTHING about it being exhausted; r1 ran it dry.
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant.id, r2.id, %{exhausted: false, account_ref: "a"})
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, account_ref: "a"})
+      end)
+
+      # Two connected machines with free slots, both refused: one ran dry, the other shares
+      # its login. Before this every session placed on either ended `usage_exhausted`.
+      assert unboxed(fn -> DispatchDriver.available_runners(ctx.tenant.id, @repo) end) == []
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:no_runner]
+      refute_push "dispatch", _pushed
+
+      {_raw, operator} = fixture(:committed_operator_key, %{tenant_id: ctx.tenant.id})
+
+      assert {:error, :runner_exhausted} =
+               unboxed(fn ->
+                 Placement.place(
+                   ctx.tenant.id,
+                   r2.id,
+                   %{"dispatch_id" => Ecto.UUID.generate(), "story_id" => story.id},
+                   api_key: operator,
+                   actor_label: "test"
+                 )
+               end)
+
+      # NOTHING WAS CLAIMED — the refusal comes before the mint.
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(ctx.tenant.id, story.id) end).agent_status == :contracted
+
+      leave_channel(second)
+      leave_channel(first)
+    end
+
+    test "the pool shows the reset per runner, and the pass logs the earliest one, once per " <>
+           "tenant (TC-44.6.7)",
+         ctx do
+      bind_repo(ctx, queued_story(ctx), @repo)
+      # A second story the runner cannot take for another reason (no checkout of its repo):
+      # it is `:no_runner` too, and the reset is still logged ONCE for the tenant.
+      bind_repo(ctx, queued_story(ctx))
+      channel = join_runner(ctx)
+
+      resets_at = DateTime.utc_now() |> DateTime.add(3_600, :second)
+
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
+      end)
+
+      {operator_raw, _operator} = fixture(:committed_operator_key, %{tenant_id: ctx.tenant.id})
+
+      assert %{"runners" => [entry]} =
+               Phoenix.ConnTest.build_conn()
+               |> Plug.Conn.put_req_header("authorization", "Bearer #{operator_raw}")
+               |> Phoenix.ConnTest.dispatch(@endpoint, :get, "/api/v1/runners/pool")
+               |> Phoenix.ConnTest.json_response(200)
+
+      assert entry["runner_id"] == ctx.runner.id
+      assert {:ok, shown, 0} = DateTime.from_iso8601(entry["usage_exhausted_until"])
+      assert DateTime.compare(shown, resets_at) == :eq
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) ==
+                   [:no_runner, :no_runner]
+        end)
+
+      [line] =
+        log |> String.split("\n") |> Enum.filter(&(&1 =~ "earliest_usage_reset="))
+
+      [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+):/, line)
+      assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
+      assert DateTime.compare(logged, resets_at) == :eq
+
+      leave_channel(channel)
+    end
+
+    test "an empty fleet logs no reset: silence stays the ordinary state", ctx do
+      bind_repo(ctx, queued_story(ctx), @repo)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:no_runner]
+        end)
+
+      refute log =~ "earliest_usage_reset"
+    end
+
+    test "another tenant's exhausted runner on the same account_ref does not hold this " <>
+           "tenant's runner out (TC-44.6.8)",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+
+      other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+      {_raw, theirs} = fixture(:committed_runner, %{tenant_id: other.id, name: "minis"})
+
+      unboxed(fn ->
+        :ok = Usage.record(other.id, theirs.id, %{exhausted: true, account_ref: "a"})
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: false, account_ref: "a"})
+      end)
+
+      channel = join_runner(ctx)
+
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:placed]
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.story_id == story.id
+
+      leave_channel(channel)
     end
   end
 

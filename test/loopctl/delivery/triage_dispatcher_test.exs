@@ -16,6 +16,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   use LoopctlWeb.ChannelCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
+
+  require Logger
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
@@ -24,6 +27,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageDispatcher
   alias Loopctl.Progress
+  alias Loopctl.Runners.Usage
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
@@ -140,6 +144,35 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # a slot — once per story per minute, for ever.
       assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
       refute_push "dispatch", _pushed
+    end
+
+    # US-44.6: the triage dispatcher selects through the same `Runners.accepts?/5` as the
+    # driver, so an exhausted subscription holds a triage-capable machine out too — and the
+    # pass says when capacity returns, once for the tenant.
+    test "an EXHAUSTED runner is not sent triage, and the pass logs the earliest reset", ctx do
+      _story = detected_story(ctx)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+      resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      unboxed(fn ->
+        :ok =
+          Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
+      end)
+
+      Logger.put_module_level(TriageDispatcher, :info)
+      on_exit(fn -> Logger.delete_module_level(TriageDispatcher) end)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+        end)
+
+      refute_push "dispatch", _pushed
+      assert [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+):/, log)
+      assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
+      assert DateTime.compare(logged, resets_at) == :eq
+
+      leave_channel(channel)
     end
 
     test "a runner that declares NOTHING is not sent triage either", ctx do

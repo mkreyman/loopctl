@@ -40,7 +40,9 @@ defmodule LoopctlWeb.RunnerChannel do
 
   `"status"` updates the runner's Presence meta (`RunnerStatus`). Updates closer
   together than `@min_status_interval_ms` are refused with `rate_limited`, because each
-  one is a Presence diff broadcast across the PubSub.
+  one is a Presence diff broadcast across the PubSub. Its `usage` (contract 1.17.0, US-44.6) is
+  the exception: it is written to the `runners` row by `Loopctl.Runners.Usage.record/3`, never
+  into the meta, and a write that does not land refuses the whole status.
 
   ## Dispatch replies and trace (contract 1.1.0, #803)
 
@@ -118,6 +120,7 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
+  alias Loopctl.Runners.Usage
   alias LoopctlWeb.RunnerChannel.MinInterval
   alias LoopctlWeb.RunnerChannel.Refusal
   alias LoopctlWeb.RunnerChannel.ReplyBucket
@@ -313,10 +316,13 @@ defmodule LoopctlWeb.RunnerChannel do
   defp handle_message("status", payload, socket) do
     now = System.monotonic_time(:millisecond)
 
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
     with :ok <- MinInterval.check(socket.assigns.last_status_at, now, @min_status_interval_ms),
-         {:ok, status} <- RunnerContract.cast_status(payload) do
-      %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
-      meta = Map.merge(meta, status)
+         {:ok, status} <- RunnerContract.cast_status(payload),
+         {usage, status} = Map.pop(status, :usage),
+         :ok <- record_usage(tenant_id, runner.id, usage) do
+      meta = Map.merge(socket.assigns.meta, status)
 
       {:ok, ref} =
         Presence.update(
@@ -338,6 +344,9 @@ defmodule LoopctlWeb.RunnerChannel do
           reason: "rate_limited",
           min_interval_ms: @min_status_interval_ms
         })
+
+      {:error, reason} when reason in [:busy, :rejected_by_database] ->
+        refuse(socket, "status", message_error(reason))
 
       {:error, reason} ->
         refuse(socket, "status", join_error(reason))
@@ -1032,6 +1041,18 @@ defmodule LoopctlWeb.RunnerChannel do
       "runner disconnecting: reason=#{reason} runner_id=#{runner.id} runner_name=#{runner.name}"
     )
   end
+
+  # THE SUBSCRIPTION WINDOW, which lives on the `runners` row and NOT in the Presence meta
+  # (US-44.6): it has to survive this socket, this node and a reconnect elsewhere, and the
+  # placement paths read it from Postgres. Popped off before the meta merge for the same reason
+  # — a copy in the meta would be a second answer nothing decides on.
+  #
+  # Written BEFORE the Presence update, and a write that does not land refuses the whole status:
+  # nothing in it is applied and `last_status_at` is not advanced, so the runner's resend is
+  # admitted at once and carries both halves. Applying the meta and dropping the usage would
+  # answer `ok` for an exhaustion control never recorded, which is the fail-open direction.
+  defp record_usage(_tenant_id, _runner_id, nil), do: :ok
+  defp record_usage(tenant_id, runner_id, usage), do: Usage.record(tenant_id, runner_id, usage)
 
   # The reason -> refusal mapping lives in `LoopctlWeb.RunnerChannel.Refusal`, out of this
   # module and public, so its CATCH-ALL can be called by a test. Private here, the only way to

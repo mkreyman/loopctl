@@ -109,6 +109,7 @@ defmodule Loopctl.Runners do
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Usage
   alias Loopctl.Tenants
   alias Loopctl.Tenants.Tenant
 
@@ -896,18 +897,40 @@ defmodule Loopctl.Runners do
   second copy of the declaration-then-ledger rule is exactly how a pre-check and its
   enforcement drift apart.
 
-  `:ok`, or `{:error, :runner_draining | :repo_not_allowed | :kind_not_supported}`.
+  A FOURTH fact is not on the meta at all: whether the machine's SUBSCRIPTION is exhausted
+  (US-44.6, `Loopctl.Runners.Usage`). It lives on the `runners` row — its own, or any
+  same-tenant row sharing its `account_ref` — because it has to survive a reconnect, and it is
+  asked here so that both unattended selectors (the driver and the triage dispatcher) skip an
+  exhausted machine instead of placing on it, and `Loopctl.Delivery.Placement` refuses one with
+  the same code. Read after the two in-memory facts, which cost nothing, and before `kind`,
+  whose ledger fallback is a read too.
+
+  `:ok`, or
+  `{:error, :runner_draining | :repo_not_allowed | :runner_exhausted | :kind_not_supported}`.
   """
   @spec accepts?(Ecto.UUID.t(), Ecto.UUID.t(), map(), String.t(), String.t()) ::
-          :ok | {:error, :runner_draining | :repo_not_allowed | :kind_not_supported}
+          :ok
+          | {:error,
+             :runner_draining | :repo_not_allowed | :runner_exhausted | :kind_not_supported}
   def accepts?(tenant_id, runner_id, meta, kind, repo)
       when is_binary(kind) and is_binary(repo) do
     cond do
       not accepting_work?(meta) -> {:error, :runner_draining}
       not repo_allowed?(meta, repo) -> {:error, :repo_not_allowed}
+      usage_exhausted?(tenant_id, runner_id) -> {:error, :runner_exhausted}
       true -> kind_supported(tenant_id, runner_id, meta, kind)
     end
   end
+
+  @doc """
+  Whether `runner_id`'s subscription is exhausted right now — its own `usage_exhausted_until`,
+  or that of any same-tenant runner sharing its `account_ref`, is in the future
+  (`Loopctl.Runners.Usage.exhausted_until/2`, US-44.6). The one predicate every placement path
+  asks, so the selectors and `Loopctl.Delivery.Placement` cannot disagree.
+  """
+  @spec usage_exhausted?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def usage_exhausted?(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id),
+    do: Usage.exhausted_until(tenant_id, runner_id) != nil
 
   @doc """
   Whether a runner's live meta says it will take ANY work right now — the question that is

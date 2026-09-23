@@ -14,6 +14,7 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.Runners.Usage
   alias LoopctlWeb.DispatchPlacementController
 
   setup :verify_on_exit!
@@ -157,6 +158,46 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
 
         assert Jason.decode!(conn.resp_body)["error"]["code"] == Atom.to_string(reason)
       end
+    end
+
+    # US-44.6. A drain never clears on its own; an exhausted subscription does, at a known
+    # instant, so the refusal carries it — read for the runner the PATH names, in the tenant the
+    # KEY belongs to. On `Repo`-side rows (`fixture(:stage_tenant)`), which is the connection
+    # `Loopctl.Runners.Usage` reads on.
+    test "runner_exhausted is a 409 that says when the machine comes back" do
+      tenant = fixture(:stage_tenant)
+      runner = fixture(:stage_runner, %{tenant_id: tenant.id})
+      resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      :ok =
+        Usage.record(tenant.id, runner.id, %{
+          exhausted: true,
+          resets_at: resets_at
+        })
+
+      conn =
+        %{
+          Phoenix.ConnTest.build_conn()
+          | path_params: %{"runner_id" => runner.id}
+        }
+        |> Plug.Conn.assign(:current_api_key, %{tenant_id: tenant.id})
+        |> DispatchPlacementController.render_refusal(:runner_exhausted)
+
+      assert conn.status == 409
+      error = Jason.decode!(conn.resp_body)["error"]
+      assert error["code"] == "runner_exhausted"
+      assert {:ok, until, 0} = DateTime.from_iso8601(error["usage_exhausted_until"])
+      assert DateTime.compare(until, resets_at) == :eq
+
+      # A conn carrying no runner — never a request — still renders, with no instant.
+      bare =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          :runner_exhausted
+        )
+
+      assert bare.status == 409
+      assert Jason.decode!(bare.resp_body)["error"]["usage_exhausted_until"] == nil
     end
 
     test "the BUILDER's refusals render too, and they are tuples" do

@@ -20,14 +20,18 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Progress
+  alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Usage
+  alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -250,7 +254,8 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
         DispatchLedger.record_session_end(ctx.tenant_id, ctx.runner.id, message, %{
           reason: reason,
           digest: TriageVerdictRecord.digest(message),
-          counts_toward_retry_ceiling: Map.get(%{"crashed" => true}, reason),
+          counts_toward_retry_ceiling:
+            Map.get(%{"crashed" => true, "usage_exhausted" => false}, reason),
           story_id: ctx.story.id
         })
       end)
@@ -321,4 +326,80 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
       assert runner_in_flight(ctx) == 0
     end
   end
+
+  describe "usage_exhausted marks the RUNNER exhausted (US-44.6, AC-44.6.4)" do
+    @eight_days 8 * 24 * 60 * 60
+    @repo "mkreyman/home_care_billing"
+
+    test "the runner is held out for eight days, so the re-queued story is not offered back to it",
+         ctx do
+      assert {:ok, %{row: %{stage: :queued}}} = end_session(ctx, "usage_exhausted")
+
+      assert_in_delta seconds_from_now(usage_until(ctx)), @eight_days, 5
+
+      # THE LOOP THIS CLOSES. The release above re-queued the story WITHOUT spending an
+      # attempt, so nothing bounded how often it could be placed straight back on this machine,
+      # whose every session ends the same way. Both placement paths now refuse it — the
+      # selectors' predicate (with a meta that is otherwise accepting everything) and an
+      # operator's placement naming the runner outright.
+      assert {:error, :runner_exhausted} =
+               unboxed(fn ->
+                 Runners.accepts?(ctx.tenant_id, ctx.runner.id, %{}, "implement", @repo)
+               end)
+
+      unboxed(fn ->
+        {1, _} =
+          AdminRepo.update_all(from(t in Tenant, where: t.id == ^ctx.tenant_id),
+            set: [trust_tier: :human_anchored]
+          )
+      end)
+
+      {_raw, operator} = fixture(:committed_operator_key, %{tenant_id: ctx.tenant_id})
+
+      assert {:error, :runner_exhausted} =
+               unboxed(fn ->
+                 Placement.place(
+                   ctx.tenant_id,
+                   ctx.runner.id,
+                   %{"dispatch_id" => Ecto.UUID.generate(), "story_id" => ctx.story.id},
+                   api_key: operator,
+                   actor_label: "test"
+                 )
+               end)
+    end
+
+    test "a crash does not mark the runner: the machine is fine, the session was not", ctx do
+      assert {:ok, _} = end_session(ctx, "crashed")
+      assert usage_until(ctx) == nil
+    end
+
+    test "a resend after the account was reported refilled does NOT re-exhaust it", ctx do
+      assert {:ok, %{replayed?: false}} = end_session(ctx, "usage_exhausted")
+
+      assert :ok =
+               unboxed(fn -> Usage.record(ctx.tenant_id, ctx.runner.id, %{exhausted: false}) end)
+
+      # The honest resend of the report that released the claim. Its claim is over — the epoch
+      # has moved on — so it is completing nothing, and re-marking would hold the machine out
+      # for eight days on a fact the runner has since corrected.
+      assert {:ok, %{replayed?: true}} = end_session(ctx, "usage_exhausted")
+
+      assert usage_until(ctx) == nil
+    end
+
+    test "a recorded report whose mark and release never ran is completed by the resend", ctx do
+      assert {:ok, {:recorded, _session}} = record_only(ctx, "usage_exhausted")
+      assert usage_until(ctx) == nil
+
+      assert {:ok, %{row: row, replayed?: true}} = end_session(ctx, "usage_exhausted")
+
+      assert row.stage == :queued
+      assert_in_delta seconds_from_now(usage_until(ctx)), @eight_days, 5
+    end
+  end
+
+  defp usage_until(ctx),
+    do: unboxed(fn -> AdminRepo.get!(Runner, ctx.runner.id).usage_exhausted_until end)
+
+  defp seconds_from_now(%DateTime{} = at), do: DateTime.diff(at, DateTime.utc_now(), :second)
 end

@@ -47,6 +47,9 @@ defmodule Loopctl.Delivery.DispatchDriver do
     * not DRAINING, accepts the story's REPO, and does the dispatch KIND — the three facts on
       its join meta, read through `Runners.accepts?/5`, which is the same rule `dispatch/3`
       applies rather than a second copy of it,
+    * its SUBSCRIPTION is not exhausted (US-44.6) — asked by `Runners.accepts?/5` too, from the
+      `runners` rows rather than the meta; a pass that places nothing for that reason logs the
+      earliest instant capacity returns,
     * has a free slot on its row (`in_flight < max_sessions`), and
     * its TENANT has admission headroom (`Loopctl.Runners.Capacity.admit/2`) — an independent
       limit, and the state `RUNNER_MAX_IN_FLIGHT_SESSIONS` exists to produce is precisely one
@@ -81,6 +84,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Usage
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
@@ -375,7 +379,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
           unplaceable(candidate, reason)
       end
 
-    {outcome, cache}
+    {outcome, note_no_runner(outcome, candidate, cache)}
   rescue
     error -> {errored(candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
   catch
@@ -497,6 +501,36 @@ defmodule Loopctl.Delivery.DispatchDriver do
         result = if key, do: {:ok, key}, else: {:error, :no_operator_key}
         {result, Map.put(cache, {:operator_key, tenant_id}, result)}
     end
+  end
+
+  # `:no_runner` WITH A KNOWN END IS WORTH SAYING (US-44.6, AC-44.6.8). An empty fleet logs
+  # nothing — it is the ordinary state and a line per story per minute would be noise — but a
+  # fleet held out by an exhausted subscription has an instant at which capacity returns, and
+  # an operator watching a queue that does not drain should be able to read it rather than
+  # guess. ONCE PER TENANT PER PASS, through the pass cache, and only when some runner of the
+  # tenant is exhausted: the reset is a fact about the tenant's fleet, not about the story.
+  defp note_no_runner(:no_runner, %{tenant_id: tenant_id} = candidate, cache) do
+    key = {:no_runner_noted, tenant_id}
+
+    if Map.has_key?(cache, key) do
+      cache
+    else
+      log_earliest_reset(candidate, Usage.earliest_reset(tenant_id))
+      Map.put(cache, key, true)
+    end
+  end
+
+  defp note_no_runner(_outcome, _candidate, cache), do: cache
+
+  defp log_earliest_reset(_candidate, nil), do: :ok
+
+  defp log_earliest_reset(candidate, %DateTime{} = reset) do
+    Logger.info(
+      "DispatchDriver: no runner can take work; the soonest an exhausted runner of this " <>
+        "tenant returns is earliest_usage_reset=#{DateTime.to_iso8601(reset)}: " <>
+        "story_id=#{candidate.story_id}",
+      tenant_id: candidate.tenant_id
+    )
   end
 
   defp unplaceable(candidate, reason) do

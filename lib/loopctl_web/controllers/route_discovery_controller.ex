@@ -967,7 +967,7 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         path: "/api/v1/runners/pool",
         description:
           "The tenant's CONNECTED runners, from Presence: draining, the latest sample, live " <>
-            "sockets. Role: user. MCP tool: runner_pool"
+            "sockets, and usage_exhausted_until. Role: user. MCP tool: runner_pool"
       },
       %{
         method: "POST",
@@ -975,7 +975,7 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description:
           "Place a queued, contracted story on a runner: claims it under a fresh custody " <>
             "dispatch and pushes the work. 409 runner_declines_work when the machine is " <>
-            "draining. Role: orchestrator or above on a human-anchored tenant, AND either an " <>
+            "draining, 409 runner_exhausted when its subscription is exhausted. Role: orchestrator or above on a human-anchored tenant, AND either an " <>
             "unlineaged user key (which roots the custody lineage) or a key inside a dispatch " <>
             "lineage; an unlineaged key below user, such as a legacy orchestrator env key, is " <>
             "refused 403 root_dispatch_forbidden. MCP tool: place_dispatch (sends the user key)"

@@ -583,6 +583,24 @@ describe("the wiring in index.js", () => {
       // `branch` cannot earn three of those five.
       assert.match(place, /should not send|OMIT|omit/);
     });
+
+    // US-44.6, contract 1.17.0. An exhausted subscription holds a CONNECTED machine with free
+    // slots out of every placement, and the pool is the only place an operator can read why —
+    // so the field and the refusal must reach both declarations a session reads.
+    test("runner_pool and place_dispatch carry the exhausted-subscription facts", () => {
+      const declaration = (tool) => {
+        const start = INDEX_SRC.indexOf(`name: "${tool}"`);
+        return INDEX_SRC.slice(start, INDEX_SRC.indexOf('name: "', start + 1));
+      };
+
+      assert.match(row("runner_pool"), /usage_exhausted_until/);
+      assert.match(row("runner_pool"), /1\.17\.0/);
+      assert.match(declaration("runner_pool"), /usage_exhausted_until/);
+
+      assert.match(row("place_dispatch"), /runner_exhausted/);
+      assert.match(declaration("place_dispatch"), /runner_exhausted/);
+      assert.match(declaration("place_dispatch"), /usage_exhausted_until/);
+    });
   });
 
   test("the paths the tools build are the routes loopctl serves", () => {

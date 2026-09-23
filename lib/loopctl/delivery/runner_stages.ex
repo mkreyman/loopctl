@@ -31,7 +31,10 @@ defmodule Loopctl.Delivery.RunnerStages do
     with the reclaim's audit shape (`Loopctl.Progress.release_ended_session/4`), and the slot
     goes back.
   - `usage_exhausted` — released the same way, and recorded on the ledger row as NOT counting
-    toward the retry ceiling: the subscription ran out, the work was never judged.
+    toward the retry ceiling: the subscription ran out, the work was never judged. The RUNNER
+    is marked exhausted first (US-44.6, `Loopctl.Runners.Usage.mark_session_exhausted/2`), so
+    the story the release re-queues is not placed straight back on the machine that cannot run
+    it.
 
   RECORDED ONCE PER DISPATCH, first, on the dispatch's ledger row
   (`Loopctl.Runners.DispatchLedger.record_session_end/4`), with a digest compared BEFORE the
@@ -105,6 +108,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
+  alias Loopctl.Runners.Usage
 
   @type error ::
           :unknown_dispatch
@@ -217,6 +221,7 @@ defmodule Loopctl.Delivery.RunnerStages do
              session_end_attrs(message, story_id)
            ),
          :ok <- log_recorded(outcome, tenant_id, runner_id, session, message),
+         :ok <- mark_exhausted(outcome, tenant_id, runner_id, message, row),
          {:ok, row} <- act_on_session_end(tenant_id, runner_id, session, message, row) do
       release_if_session_over(tenant_id, session, message, row)
       {:ok, %{row: row, replayed?: outcome == :replayed}}
@@ -260,6 +265,26 @@ defmodule Loopctl.Delivery.RunnerStages do
   end
 
   defp log_recorded(:replayed, _tenant_id, _runner_id, _session, _message), do: :ok
+
+  # AN EXHAUSTED SUBSCRIPTION MARKS THE RUNNER (US-44.6, AC-44.6.4), and BEFORE the release.
+  # The release re-queues the story without spending an attempt; marked after it, a driver
+  # pass landing between the two would place the story straight back on this machine, whose
+  # next session ends `usage_exhausted` too — the unbounded round trip this closes. Marked
+  # first, a failure here (`:busy`) leaves the claim standing and the resend re-drives both.
+  #
+  # ONLY WHILE THE SESSION'S CLAIM IS STILL THE LIVE ONE, on a resend. The first delivery
+  # always marks. A resend marks only when the stage row is still bound to this session's
+  # epoch — the case where the first delivery's mark or release never landed and this one is
+  # completing it. After the release the epoch has moved on, and a late resend must not
+  # re-exhaust an account a runner has since reported refilled (`usage.exhausted: false`):
+  # that would hold the machine out for 8 days on a days-old fact.
+  defp mark_exhausted(outcome, tenant_id, runner_id, %{reason: "usage_exhausted"} = message, row) do
+    if outcome == :recorded or row.claim_epoch == message.claim_epoch,
+      do: Usage.mark_session_exhausted(tenant_id, runner_id),
+      else: :ok
+  end
+
+  defp mark_exhausted(_outcome, _tenant_id, _runner_id, _message, _row), do: :ok
 
   # Each clause returns the stage row as it stands after the action: the row it was handed
   # when nothing moved it, a fresh read when something did.

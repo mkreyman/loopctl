@@ -696,7 +696,7 @@
       "type": "object"
     },
     "RunnerStatus": {
-      "description": "A runner's periodic update, pushed as the `status` event. Any subset of the fields; at least one.",
+      "description": "A runner's periodic update, pushed as the `status` event. Any subset of the fields; at least one. `usage` (since 1.17.0) is stored by control, not merely echoed into the pool: a status carrying it is refused `rate_limited` with `min_interval_ms` when that write could not land, and nothing in it was applied.",
       "minProperties": 1,
       "properties": {
         "draining": {
@@ -739,6 +739,34 @@
             "loadavg_1m",
             "free_ram_mb",
             "free_disk_mb"
+          ],
+          "type": "object"
+        },
+        "usage": {
+          "description": "Whether the account this runner's sessions run on has exhausted its subscription usage (since 1.17.0). `exhausted: true` keeps the machine — and every machine sending the same `account_ref` — out of every placement until `resets_at`, held by control to between one minute and eight days from control's own clock, and to eight days when `resets_at` is absent: an exhaustion is never ignored. `exhausted: false` clears it for every machine on that `account_ref`. A `session_ended` with reason `usage_exhausted` marks the machine for eight days on its own, which the next `usage` with a `resets_at` corrects. Optional; a runner that never sends it is never held out.",
+          "properties": {
+            "account_ref": {
+              "description": "An opaque, stable value the runner derives from the login its sessions run under — a hash, never the credential. Machines sending the same value are exhausted and cleared together. Omitted, the value last sent is kept.",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[!-~]+$",
+              "type": "string"
+            },
+            "exhausted": {
+              "description": "True while the account cannot start a session.",
+              "type": "boolean"
+            },
+            "resets_at": {
+              "description": "When the account's usage window resets, on the runner's clock. Read only beside `exhausted: true`. Clamped, never trusted as sent.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "exhausted"
           ],
           "type": "object"
         }
@@ -1423,6 +1451,34 @@
         "claim_epoch"
       ],
       "type": "object"
+    },
+    "RunnerUsage": {
+      "description": "Whether the account this runner's sessions run on has exhausted its subscription usage (since 1.17.0). `exhausted: true` keeps the machine — and every machine sending the same `account_ref` — out of every placement until `resets_at`, held by control to between one minute and eight days from control's own clock, and to eight days when `resets_at` is absent: an exhaustion is never ignored. `exhausted: false` clears it for every machine on that `account_ref`. A `session_ended` with reason `usage_exhausted` marks the machine for eight days on its own, which the next `usage` with a `resets_at` corrects. Optional; a runner that never sends it is never held out.",
+      "properties": {
+        "account_ref": {
+          "description": "An opaque, stable value the runner derives from the login its sessions run under — a hash, never the credential. Machines sending the same value are exhausted and cleared together. Omitted, the value last sent is kept.",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[!-~]+$",
+          "type": "string"
+        },
+        "exhausted": {
+          "description": "True while the account cannot start a session.",
+          "type": "boolean"
+        },
+        "resets_at": {
+          "description": "When the account's usage window resets, on the runner's clock. Read only beside `exhausted: true`. Clamped, never trusted as sent.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "exhausted"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://loopctl.com/runner_contract/v1.json",
@@ -1794,6 +1850,10 @@
       "triage_verdict_burst": {
         "capacity": 4,
         "refill_interval_ms": 1000
+      },
+      "usage_hold_seconds": {
+        "max": 691200,
+        "min": 60
       }
     },
     "permanent_error_conditions": {
@@ -1933,5 +1993,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.16.0"
+  "x-contract-version": "1.17.0"
 }

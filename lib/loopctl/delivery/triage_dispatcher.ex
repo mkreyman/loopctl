@@ -68,6 +68,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Usage
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
@@ -233,8 +234,52 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    limit |> candidates() |> Enum.map(&attempt(&1, budgets))
+    {outcomes, _noted} =
+      limit
+      |> candidates()
+      |> Enum.map_reduce(MapSet.new(), fn candidate, noted ->
+        outcome = attempt(candidate, budgets)
+        {outcome, note_no_runner(outcome, candidate, noted)}
+      end)
+
+    outcomes
   end
+
+  # THE EARLIEST RESET, once per tenant per pass (US-44.6) — the same line and the same reason
+  # as `Loopctl.Delivery.DispatchDriver`'s: an empty fleet logs nothing, a fleet held out by an
+  # exhausted subscription has an instant at which capacity returns. A read that fails here is
+  # logged and skipped, because a note about the pass may not end the pass.
+  defp note_no_runner(:no_runner, %{tenant_id: tenant_id} = candidate, noted) do
+    if MapSet.member?(noted, tenant_id) do
+      noted
+    else
+      case Usage.earliest_reset(tenant_id) do
+        nil ->
+          :ok
+
+        %DateTime{} = reset ->
+          Logger.info(
+            "TriageDispatcher: no runner can take work; the soonest an exhausted runner " <>
+              "of this tenant returns is earliest_usage_reset=#{DateTime.to_iso8601(reset)}: " <>
+              "story_id=#{candidate.story_id}",
+            tenant_id: tenant_id
+          )
+      end
+
+      MapSet.put(noted, tenant_id)
+    end
+  rescue
+    error ->
+      Logger.warning(
+        "TriageDispatcher: could not read the earliest usage reset: " <>
+          Exception.message(error),
+        tenant_id: tenant_id
+      )
+
+      noted
+  end
+
+  defp note_no_runner(_outcome, _candidate, noted), do: noted
 
   # ONE STORY MAY NOT KILL THE PASS — the read is oldest-first, so a story that raises sits at
   # the head of every later batch too.

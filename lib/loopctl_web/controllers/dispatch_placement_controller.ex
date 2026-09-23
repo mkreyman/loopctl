@@ -47,6 +47,7 @@ defmodule LoopctlWeb.DispatchPlacementController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Delivery.Placement
+  alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
   action_fallback LoopctlWeb.FallbackController
@@ -192,7 +193,10 @@ defmodule LoopctlWeb.DispatchPlacementController do
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Not placeable; includes `no_conforming_branch` — the runner declares branch " <>
+        {"Not placeable; includes `runner_exhausted` — the runner's subscription (its own, or " <>
+           "that of a runner sharing its `account_ref`) is declared exhausted, so nothing was " <>
+           "claimed and the body carries `usage_exhausted_until`, when it clears on its own; " <>
+           "and `no_conforming_branch` — the runner declares branch " <>
            "prefixes (contract 1.14.0) and none of them can produce a valid branch name " <>
            "carrying the story number and id fragment, so nothing was claimed and an " <>
            "operator has to fix `branch_prefixes` on that machine. The body echoes the " <>
@@ -399,6 +403,21 @@ defmodule LoopctlWeb.DispatchPlacementController do
       message:
         "This runner declares draining (or max_sessions 0), so it is taking no work. " <>
           "Nothing was claimed. Place on another runner, or reconnect this one without it."
+    })
+  end
+
+  # THE MACHINE'S SUBSCRIPTION IS EXHAUSTED (US-44.6, contract 1.17.0). 409 beside
+  # `runner_declines_work` and for the same reason — nothing was claimed, and the remedy is
+  # another machine — but unlike a drain it DOES clear on its own, at a known instant, so the
+  # refusal says when. Read fresh here rather than threaded out of `place/4`: the value can
+  # only move later (a new exhaustion) or clear, and either is the better answer to give.
+  defp refuse(conn, :runner_exhausted) do
+    error(conn, 409, "runner_exhausted", %{
+      message:
+        "This runner's subscription is exhausted — its own, or that of a machine on the same " <>
+          "account — so every session placed on it would end usage_exhausted. Nothing was " <>
+          "claimed. Place on another runner, or wait for usage_exhausted_until.",
+      usage_exhausted_until: exhausted_until(conn)
     })
   end
 
@@ -667,6 +686,18 @@ defmodule LoopctlWeb.DispatchPlacementController do
   defp echoed_ref(value) when is_list(value), do: %{value_type: "array"}
   defp echoed_ref(value) when is_map(value), do: %{value_type: "object"}
   defp echoed_ref(_value), do: %{value_type: "unsupported"}
+
+  # The same effective value placement refused on, for the runner the PATH names in the tenant
+  # the KEY belongs to. `nil` for a conn carrying neither, which is only ever a direct
+  # `render_refusal/2` — never a request, since both are set before `place/4` runs.
+  defp exhausted_until(%{
+         assigns: %{current_api_key: %{tenant_id: tenant_id}},
+         path_params: %{"runner_id" => runner_id}
+       })
+       when is_binary(tenant_id) and is_binary(runner_id),
+       do: Usage.exhausted_until(tenant_id, runner_id)
+
+  defp exhausted_until(_conn), do: nil
 
   defp error(conn, status, code, extra) do
     conn
