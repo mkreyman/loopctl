@@ -140,6 +140,8 @@ defmodule Loopctl.BulkOperations do
   ## Returns
 
   - `{:ok, results}` -- list of per-story results
+  - `{:error, :audit_chain_append_failed}` -- a story's release reached the retry ceiling and
+    its escalation's chain entry was refused; the WHOLE batch rolled back (US-44.4)
   """
   @spec bulk_reject(Ecto.UUID.t(), [map()], Ecto.UUID.t() | nil, keyword()) ::
           {:ok, [map()]} | {:error, atom()}
@@ -170,8 +172,19 @@ defmodule Loopctl.BulkOperations do
         locked_stories = lock_stories_by_ids(tenant_id, sorted_ids)
         process_rejections(sorted_ids, locked_stories, story_params, ctx)
       end)
+      |> announce_committed_releases()
     end
   end
+
+  # The chain entries a release escalation appended inside the batch (US-44.4), broadcast only
+  # once the batch has COMMITTED — never an entry a rollback took back.
+  defp announce_committed_releases({:ok, pairs}) do
+    {results, releases} = Enum.unzip(pairs)
+    Enum.each(releases, &Stages.announce_release/1)
+    {:ok, results}
+  end
+
+  defp announce_committed_releases(error), do: error
 
   # ===================================================================
   # Bulk Mark Complete (API Discoverability Issue 5)
@@ -302,13 +315,15 @@ defmodule Loopctl.BulkOperations do
     end)
   end
 
+  # Each story's result paired with its release (`Stages.follow_release/5`'s value), which
+  # `bulk_reject/4` announces after the commit.
   defp process_rejections(sorted_ids, locked_stories, story_params, ctx) do
     Enum.map(sorted_ids, fn story_id ->
       params = Map.get(story_params, story_id, %{})
 
       case Map.get(locked_stories, story_id) do
         nil ->
-          %{story_id: story_id, status: "error", reason: "Story not found"}
+          {%{story_id: story_id, status: "error", reason: "Story not found"}, {nil, nil}}
 
         story ->
           process_reject(story, params, ctx)
@@ -400,23 +415,39 @@ defmodule Loopctl.BulkOperations do
       audit_rejection(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
       emit_reject_event(tenant_id, updated, orchestrator_agent_id, reason)
 
-      case auto_reset_agent_status(updated, ctx.caller_lineage) do
-        {:ok, {reset, stage}} ->
-          audit_auto_reset(tenant_id, updated, reset, actor_id, actor_label)
-          # AFTER the reset's audit entry, like the single-story reject (US-44.4): a delivery
-          # story whose row went back to `queued` is placeable again, or it was escalated at
-          # the retry ceiling and stays `pending` for a human.
-          {:ok, _story} =
-            Stages.recontract_released(tenant_id, stage, reset, "system:auto_reset")
+      released =
+        case auto_reset_agent_status(updated, ctx.caller_lineage) do
+          {:ok, {reset, released}} ->
+            audit_auto_reset(tenant_id, updated, reset, actor_id, actor_label)
+            recontract_reset(tenant_id, reset, released)
+            released
 
-        {:error, reset_reason} ->
-          Logger.warning("Auto-reset failed for story #{story.id}: #{inspect(reset_reason)}")
-      end
+          {:error, reset_reason} ->
+            Logger.warning("Auto-reset failed for story #{story.id}: #{inspect(reset_reason)}")
+            {nil, nil}
+        end
 
-      %{story_id: story.id, status: "success"}
+      {%{story_id: story.id, status: "success"}, released}
     else
       {:error, reason} ->
-        %{story_id: story.id, status: "error", reason: format_reason(reason)}
+        {%{story_id: story.id, status: "error", reason: format_reason(reason)}, {nil, nil}}
+    end
+  end
+
+  # AFTER the reset's audit entry, like the single-story reject (US-44.4): a delivery story
+  # whose row went back to `queued` is placeable again, or it was escalated at the retry ceiling
+  # and stays `pending` for a human. A re-contract that is refused is logged like a failed
+  # auto-reset and never aborts the batch: the story stays rejected and `pending`, with its row
+  # at `queued`, which is the state an operator resolves.
+  defp recontract_reset(tenant_id, reset, released) do
+    require Logger
+
+    case Stages.recontract_released(tenant_id, released, reset, "system:auto_reset") do
+      {:ok, _story} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Auto-reset re-contract failed for story #{reset.id}: #{inspect(reason)}")
     end
   end
 
@@ -618,15 +649,23 @@ defmodule Loopctl.BulkOperations do
   # #803: the stage row follows the release inside bulk reject's transaction, like the
   # single-story auto-reset (Loopctl.Delivery.Stages.follow_release/5). A reject spent an
   # attempt, so it counts toward the retry ceiling (US-44.4).
+  #
+  # A refusal ROLLS THE BATCH BACK. It is the one refusal `follow_release/5` has — the
+  # escalation at the ceiling could not append its chain entry — and by then the escalation's
+  # row and event are written in this transaction, which has no savepoint to undo only them. A
+  # custody transition whose chain entry did not land must not commit, so the whole batch
+  # answers `{:error, :audit_chain_append_failed}`, exactly as the single-story reject does
+  # for its one story. It is tenant-wide when it happens: every chained transition in the
+  # tenant is refusing.
   defp follow_release({:ok, reset}, caller_lineage) do
-    {:ok, stage} =
-      Stages.follow_release(reset.tenant_id, reset.id, reset.claim_epoch, :claim_released,
-        cause: :attempt,
-        actor_lineage: caller_lineage,
-        actor_label: "system:auto_reset"
-      )
-
-    {:ok, {reset, stage}}
+    case Stages.follow_release(reset.tenant_id, reset.id, reset.claim_epoch, :claim_released,
+           cause: :attempt,
+           actor_lineage: caller_lineage,
+           actor_label: "system:auto_reset"
+         ) do
+      {:ok, released} -> {:ok, {reset, released}}
+      {:error, reason} -> AdminRepo.rollback(reason)
+    end
   end
 
   defp follow_release(error, _caller_lineage), do: error

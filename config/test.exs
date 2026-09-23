@@ -975,6 +975,6 @@ config :loopctl, :delivery_deploy_environment, "production"
 # US-44.4: the delivery retry ceiling (`Loopctl.Delivery.RetryCeiling`). Production has NO
 # default — unset, the first counted release escalates. 2 here so the suite exercises both
 # sides of the ceiling (one release re-contracts, the second escalates) without
-# `Application.put_env`; the unset case is tested through `RetryCeiling.max_attempts/1`, the
-# same reader every release calls.
+# `Application.put_env`; the unset case is tested through `RetryCeiling.ceiling_from/1`, the
+# function every release's read (`max_attempts/0`) goes through.
 config :loopctl, :dispatch_max_attempts, 2

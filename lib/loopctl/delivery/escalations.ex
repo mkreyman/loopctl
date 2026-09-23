@@ -360,7 +360,7 @@ defmodule Loopctl.Delivery.Escalations do
     # route's `role: :user` plug, so a SESSION could POST `to: queued` on any escalated story:
     # the claim was released, the epoch bumped, the implementer's live credential and its
     # whole subtree revoked, the story re-contracted — and only THEN did `Stages.human?/1`
-    # (`lib/loopctl/delivery/stages.ex:1127-1130`, which requires `actor_lineage == []`)
+    # (`lib/loopctl/delivery/stages.ex:1409-1412`, which requires `actor_lineage == []`)
     # refuse it. The caller got a refusal; the implementing agent got a dead key.
     # `LoopctlWeb.StoryEscalationController` publishes that gate's purpose to callers in its
     # `escalate` operation description — "so a session cannot escalate and then resolve its
@@ -433,10 +433,12 @@ defmodule Loopctl.Delivery.Escalations do
   `Progress.contract_story/4` with the contract check skipped — the story's ACs were
   acknowledged when it was first contracted, and nothing about a release changes them.
 
-  THE ONE WRITER of that transition for the delivery loop. Two callers: `resolve/3`, when a
-  human sends an escalated story back to `queued`, and every claim release that leaves a
-  delivery story's stage row at `queued` (`Loopctl.Delivery.Stages.recontract_released/4`, US-44.4) —
-  without it the story sits at `queued` + `:pending`, which the dispatch driver never selects.
+  One caller: `resolve/3`, when a human sends an escalated story back to `queued` — without it
+  the story sits at `queued` + `:pending`, which the dispatch driver never selects. A claim
+  release that leaves a delivery story's row at `queued` re-contracts it too, but INSIDE the
+  release's own transaction (`Loopctl.Delivery.Stages.recontract_released/4` ->
+  `Loopctl.Progress.recontract_in_transaction/3`, US-44.4); the audit entry and webhook the
+  two write are built by the same functions in `Loopctl.Progress`.
 
   A story that is somehow already `contracted` is left alone rather than refused: the caller
   asked for a placeable story and it is one. Safe inside an `AdminRepo` transaction that holds

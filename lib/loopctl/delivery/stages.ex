@@ -78,7 +78,8 @@ defmodule Loopctl.Delivery.Stages do
   transition — the dispatch row and the `runners` row, then, only for a chained transition,
   the tenant's chain advisory lock and its head
   (`Loopctl.AuditChain.append_in_tenant_transaction/2`). `Loopctl.Progress`' release paths
-  take the story `FOR UPDATE` first and the stage row second, the same way round.
+  take the story `FOR UPDATE` first, the stage row second and, for a release's escalation, the
+  chain last, the same way round.
 
   Two consequences worth stating rather than rediscovering:
 
@@ -112,8 +113,10 @@ defmodule Loopctl.Delivery.Stages do
   Only the custody-critical transitions (`StageMachine.chained?/3`: into `claimed`,
   `merged` or `escalated`, out of `escalated`, and the `:merge_refused` retraction of a
   merge) are appended to the hash chain, inside the transition's own transaction via
-  `AuditChain.append_in_tenant_transaction/2`. Every transition and every newly recorded
-  effect is in `story_stage_events`.
+  `AuditChain.append_in_tenant_transaction/2` — or, for the escalation a claim release decides,
+  inside the release's `AdminRepo` transaction via `AuditChain.append_in_admin_transaction/2`.
+  Either way the entry is announced only after that transaction commits. Every transition and
+  every newly recorded effect is in `story_stage_events`.
 
   ## Repo
 
@@ -130,8 +133,8 @@ defmodule Loopctl.Delivery.Stages do
 
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
+  alias Loopctl.AuditChain.Entry
   alias Loopctl.Auth.Role
-  alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.RetryCeiling
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StageMachine
@@ -139,6 +142,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Delivery.Untrusted
   alias Loopctl.Intake.IssueClosures
   alias Loopctl.LocalGuc
+  alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Runner
@@ -179,6 +183,13 @@ defmodule Loopctl.Delivery.Stages do
   # rather than an estimate. It exists because that column is jsonb with no CHECK: an
   # unbounded structured payload from a session is a write amplifier on the event stream.
   @max_event_data_bytes 8_000
+
+  @typedoc """
+  What `follow_release/5` returns inside `{:ok, _}`: the row as the release left it (`nil` for
+  a story with no row) and the chain entry its escalation appended (`nil` when none), which the
+  caller announces after commit (`announce_release/1`).
+  """
+  @type released :: {StoryStage.t() | nil, Entry.t() | nil}
 
   @type advance_error ::
           :invalid_transition
@@ -1021,7 +1032,7 @@ defmodule Loopctl.Delivery.Stages do
     triage-stage or escalated row is not held by the released claim; rebinding keeps every
     one of them advanceable. Left behind the story's epoch, it would be refused on every
     advance with nothing able to move it.
-  - `done`, `failed`, or no row — untouched, `{:ok, nil}`.
+  - `done`, `failed`, or no row — untouched, `{:ok, {nil, nil}}`.
 
   ## Where the story goes next (US-44.4, #877)
 
@@ -1043,17 +1054,22 @@ defmodule Loopctl.Delivery.Stages do
   Only a release that actually REQUEUED an in-flight row is counted and can reach it; a row
   that was already `queued` spent nothing and is left for the caller to re-contract.
 
-  The RE-CONTRACT is the caller's, not this function's, and that split is deliberate: it is
-  `Loopctl.Delivery.Escalations.recontract/3`, the one writer of `pending -> contracted`, and it
-  writes its own audit entry and `story.status_changed` webhook. Run from here it would land
-  BEFORE the release's own audit entry and webhook, so the log and every webhook consumer would
-  read the story as contracted and then pending. Each caller runs it after its own audit, in the
-  same transaction, when this returns a row at `queued` — `recontract_released/4`.
+  The RE-CONTRACT is the caller's, not this function's, and that split is deliberate: it
+  writes its own audit entry and `story.status_changed` webhook
+  (`Loopctl.Progress.recontract_in_transaction/3`). Run from here it would land BEFORE the
+  release's own audit entry and webhook, so the log and every webhook consumer would read the
+  story as contracted and then pending. Each caller runs it after its own audit, as a step of
+  the same transaction, when this returns a row at `queued` — `recontract_released/4`.
 
   The escalation is written HERE, in the same transaction: the row, a `transitioned` event, and
-  the chain entry every transition into `escalated` carries (`AuditChain.append/2`, which joins
-  this `AdminRepo` transaction, as `Loopctl.Progress`' signed-claim append does). The reason is
-  control's own text, the count in it for `:attempts_exhausted`.
+  the chain entry every transition into `escalated` carries
+  (`AuditChain.append_in_admin_transaction/2`). That entry is NOT announced here — this
+  transaction is the caller's and has not committed — so it is returned, and the caller passes
+  the whole result to `announce_release/1` once its transaction has. A chain append that is
+  refused returns `{:error, :audit_chain_append_failed}` and leaves the row and event this
+  function wrote in the caller's transaction, which the caller must roll back: a custody
+  transition whose chain entry did not land must not commit. The reason is control's own text,
+  the count in it for `:attempts_exhausted`.
 
   ## Races, retries and partitions
 
@@ -1087,6 +1103,13 @@ defmodule Loopctl.Delivery.Stages do
     on the chain entry of an escalation. `[]` is an attested absence (a system actor, a key no
     dispatch minted) and must be stated, never defaulted
   - `:actor_label` — recorded on the events
+
+  ## Returns
+
+  `{:ok, {row, chain_entry}}` — the row as the release left it (`nil` when there is none) and
+  the chain entry an escalation appended (`nil` when it escalated nothing), for
+  `recontract_released/4` and `announce_release/1`. `{:error, :audit_chain_append_failed}`
+  when the escalation's chain entry was refused; see above.
   """
   @spec follow_release(
           Ecto.UUID.t(),
@@ -1094,7 +1117,7 @@ defmodule Loopctl.Delivery.Stages do
           non_neg_integer(),
           :runner_lost | :claim_released,
           keyword()
-        ) :: {:ok, StoryStage.t() | nil}
+        ) :: {:ok, released()} | {:error, :audit_chain_append_failed}
   def follow_release(tenant_id, story_id, new_epoch, edge, opts \\ [])
       when edge in [:runner_lost, :claim_released] do
     unless AdminRepo.in_transaction?(),
@@ -1116,7 +1139,7 @@ defmodule Loopctl.Delivery.Stages do
 
     cond do
       is_nil(row) ->
-        {:ok, nil}
+        {:ok, {nil, nil}}
 
       row.stage in StageMachine.in_flight_stages() ->
         counted? = cause == :attempt
@@ -1141,19 +1164,34 @@ defmodule Loopctl.Delivery.Stages do
   `follow_release/5` left anywhere else — escalated for a human, merged, no row at all — says
   who acts next, and the story is left exactly as the release wrote it.
 
-  Through `Loopctl.Delivery.Escalations.recontract/3`, the one writer of `pending ->
-  contracted`, which writes its own audit entry and webhook. So every release path calls this
-  AFTER its own audit entry and webhook, in the same transaction: run earlier, the log and the
-  webhook stream would say contracted and then pending, the opposite of what happened. Joins
-  the caller's `AdminRepo` transaction; `stage` is what `follow_release/5` returned.
+  Through `Loopctl.Progress.recontract_in_transaction/3`: a guarded `pending -> contracted`
+  UPDATE plus the audit entry and `story.status_changed` webhook `Progress.contract_story/4`
+  writes, built by the same functions — a write in the caller's transaction, not a transaction
+  of its own. So every release path calls this AFTER its own audit entry and webhook: run
+  earlier, the log and the webhook stream would say contracted and then pending, the opposite
+  of what happened. `released` is what `follow_release/5` returned.
   """
-  @spec recontract_released(Ecto.UUID.t(), StoryStage.t() | nil, Story.t(), String.t() | nil) ::
-          {:ok, Story.t()}
-          | {:error, atom() | {:contract_mismatch, map()} | {:invalid_transition, map()}}
-  def recontract_released(tenant_id, %StoryStage{stage: :queued}, %Story{} = story, label),
-    do: Escalations.recontract(tenant_id, story, label)
+  @spec recontract_released(Ecto.UUID.t(), released(), Story.t(), String.t() | nil) ::
+          {:ok, Story.t()} | {:error, Ecto.Changeset.t()}
+  def recontract_released(
+        tenant_id,
+        {%StoryStage{stage: :queued}, _entry},
+        %Story{} = story,
+        label
+      ),
+      do: Progress.recontract_in_transaction(tenant_id, story, label)
 
-  def recontract_released(_tenant_id, _stage, %Story{} = story, _label), do: {:ok, story}
+  def recontract_released(_tenant_id, {_row, _entry}, %Story{} = story, _label), do: {:ok, story}
+
+  @doc """
+  Announces the chain entry a release's escalation appended (`follow_release/5`), once the
+  releasing transaction has COMMITTED — the broadcast `AuditChain.announce_entry/1` makes must
+  never name an entry a rollback took back. Nothing to do when the release escalated nothing.
+  `released` is what `follow_release/5` returned.
+  """
+  @spec announce_release(released()) :: :ok
+  def announce_release({_row, nil}), do: :ok
+  def announce_release({_row, %Entry{} = entry}), do: AuditChain.announce_entry(entry)
 
   @doc """
   Makes a story's stage row follow a CLAIM, inside the claiming transaction
@@ -1242,13 +1280,13 @@ defmodule Loopctl.Delivery.Stages do
   defp settle({:ok, %StoryStage{stage: :queued} = row}, :operator, _counted?, opts),
     do: escalate_released(row, :operator_released, @operator_released_reason, opts)
 
-  defp settle({:ok, %StoryStage{stage: :queued} = row} = requeued, :attempt, true, opts) do
+  defp settle({:ok, %StoryStage{stage: :queued} = row}, :attempt, true, opts) do
     count = RetryCeiling.counted_releases(row.attempts)
     ceiling = RetryCeiling.max_attempts()
 
     case RetryCeiling.decide(count, ceiling) do
       :retry ->
-        requeued
+        {:ok, {row, nil}}
 
       {:escalate, :attempts_exhausted} ->
         escalate_released(
@@ -1260,7 +1298,7 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
-  defp settle(result, _cause, _counted?, _opts), do: result
+  defp settle({:ok, row}, _cause, _counted?, _opts), do: {:ok, {row, nil}}
 
   # `queued -> escalated` over a release escalation edge, on `AdminRepo` in the releasing
   # transaction. The same write `compare_and_set/4` makes — the UPDATE, the event, the chain
@@ -1281,22 +1319,33 @@ defmodule Loopctl.Delivery.Stages do
       "reason" => reason
     })
 
-    # A custody transition whose chain entry did not land must not commit. Raising aborts the
-    # releasing transaction, which is the only failure shape `follow_release/5`'s callers
-    # handle (see `Loopctl.Progress.force_unclaim_story/3`'s result `case`).
-    {:ok, _entry} =
-      AuditChain.append(
-        row.tenant_id,
-        chain_attrs(
-          escalated,
-          row,
-          {:queued, :escalated, edge},
-          reason,
-          Keyword.fetch!(opts, :actor_lineage)
-        )
+    # A custody transition whose chain entry did not land must not commit — so the refusal is
+    # RETURNED, and every caller rolls its transaction back on it (see `follow_release/5`).
+    # In this transaction and unannounced: `announce_release/1` broadcasts it after the
+    # caller commits, never before.
+    row.tenant_id
+    |> AuditChain.append_in_admin_transaction(
+      chain_attrs(
+        escalated,
+        row,
+        {:queued, :escalated, edge},
+        reason,
+        Keyword.fetch!(opts, :actor_lineage)
       )
+    )
+    |> case do
+      {:ok, entry} ->
+        {:ok, {escalated, entry}}
 
-    {:ok, escalated}
+      {:error, changeset} ->
+        Logger.error(
+          "release escalation chain append refused; the release must roll back: " <>
+            "tenant_id=#{row.tenant_id} story_id=#{row.story_id} edge=#{edge} " <>
+            "errors=#{inspect(Keyword.keys(changeset.errors))}"
+        )
+
+        {:error, :audit_chain_append_failed}
+    end
   end
 
   # --- transition mechanics -------------------------------------------------------------

@@ -186,7 +186,9 @@ defmodule Loopctl.Delivery.RunnerStages do
           | :busy
           | :capacity_busy
           | :rejected_by_database
+          | :audit_chain_append_failed
           | {:release_refused, [atom()]}
+          | atom()
 
   @doc """
   Applies a `session_ended` message — already cast by
@@ -306,6 +308,13 @@ defmodule Loopctl.Delivery.RunnerStages do
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, {:release_refused, Keyword.keys(changeset.errors)}}
+
+      # Anything else the release refuses with is passed through, so no NEW shape can crash the
+      # channel every session on the machine shares: `:audit_chain_append_failed` (the release's
+      # escalation could not append its chain entry, US-44.4) has its own published code, and
+      # an atom no clause of `LoopctlWeb.RunnerChannel.Refusal` names is `internal_error`.
+      {:error, reason} ->
+        {:error, reason}
     end
   rescue
     # Runs in the runner channel's process: a raise here would take down the socket every

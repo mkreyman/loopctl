@@ -8253,11 +8253,15 @@ const TOOLS = [
       "A REGISTERED AGENT — an unlinked one is refused 400 naming that — and the tenant must be " +
       "human-anchored (403 `custody_tier_required` otherwise). 404 for an unknown story, 429 " +
       "when rate limited. A `story_id` that is not a UUID is refused here, before any call.\n\n" +
-      "It does NOT touch `verified_status`, and it is safe to run twice: on an already-pending " +
-      "story the stage row is written only when it needs to be — a row STRANDED behind the " +
-      "story's claim epoch is rebound to it (the remedy for a row an older release left " +
-      "behind) and an in-flight row is requeued, while a row already at that epoch is left " +
-      "exactly as it is. It takes no request body.",
+      "It does NOT touch `verified_status`. RUN AGAIN on an already-pending story, it is still " +
+      "an operator's release and does what one does: a row STRANDED behind the story's claim " +
+      "epoch is rebound to it (the remedy for a row an older release left behind), an " +
+      "in-flight row is requeued, and a row that is then at `queued` — including one that was " +
+      "already sitting there — is ESCALATED over `operator_released`, like the first run. A " +
+      "row already escalated, or anywhere else at that epoch, is left exactly as it is. A 500 " +
+      "`force_unclaim_failed` means the whole release rolled back (the story is still " +
+      "claimed; the server log names the step) and the remedy is to call it again. It takes " +
+      "no request body.",
     inputSchema: {
       type: "object",
       properties: {

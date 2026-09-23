@@ -1495,16 +1495,14 @@ defmodule Loopctl.Delivery.Placement do
   # `Keyword.get(opts, :actor_lineage, [])`, so omitting it recorded the placement caller's
   # compensation as the tenant operator's act.
   #
-  # `release_cause: :placement_refused` (US-44.4, #877): the runner refused before any work, so
-  # this release spends no attempt and the story is RE-CONTRACTED in the same transaction —
-  # back in front of the driver. Without it force-unclaim takes its operator default and
-  # escalates the story for a human, and before that default existed the story sat at `queued`
-  # + `:pending`, which no placement ever takes.
+  # `release_cause:` (US-44.4, #877) is never the operator default: that escalates the story
+  # for a human, and before it existed the story sat at `queued` + `:pending`, which no
+  # placement ever takes. Which of the two undo causes is `release_cause/1`'s call.
   defp release_claim(tenant_id, story_id, reason, actor_lineage, opts) do
     case Progress.force_unclaim_story(tenant_id, story_id,
            actor_label: Keyword.get(opts, :actor_label),
            actor_lineage: actor_lineage,
-           release_cause: :placement_refused
+           release_cause: release_cause(reason)
          ) do
       {:ok, _story} -> :ok
       other -> log_release_failure(tenant_id, story_id, reason, other)
@@ -1512,6 +1510,30 @@ defmodule Loopctl.Delivery.Placement do
   rescue
     error -> log_release_failure(tenant_id, story_id, reason, error)
   end
+
+  # WHETHER THE REFUSAL SPENT AN ATTEMPT, decided by what refused (#877 review round 1,
+  # finding 3). The RUNNER being unavailable for this dispatch — gone, not the sole socket,
+  # at capacity, the tenant at its admission limit, a lock not granted, the tenant halted — is
+  # a state the next pass may not find, so the undo spends nothing (`:placement_refused`) and
+  # the story is re-contracted for it. EVERYTHING ELSE recurs on every pass for this story —
+  # a payload the contract rejects, a story that could not be attached, a ledger conflict —
+  # and uncounted it was placed, refused and released every pass for ever, a chain entry each
+  # time. So it counts (`:attempt`) and the retry ceiling puts it in front of a human.
+  #
+  # An allowlist of the transient ones, not of the deterministic ones: a refusal nobody has
+  # classified yet is bounded by the ceiling rather than looping.
+  @runner_unavailable [
+    :runner_not_connected,
+    :runner_ambiguous,
+    :runner_at_capacity,
+    :admission_limit_reached,
+    :capacity_busy,
+    :busy,
+    :tenant_halted
+  ]
+
+  defp release_cause(reason) when reason in @runner_unavailable, do: :placement_refused
+  defp release_cause(_recurs_every_pass), do: :attempt
 
   defp log_release_failure(tenant_id, story_id, reason, outcome) do
     Logger.error(

@@ -9,25 +9,26 @@ defmodule Loopctl.Delivery.RetryCeilingTest do
 
   alias Loopctl.Delivery.RetryCeiling
 
-  describe "max_attempts/1 — the reader every release calls" do
-    # TC-44.4.4 (AC-44.4.5): the ceiling is spend, so it has NO default. A config with no key
-    # reads as 0, and one counted release against 0 escalates.
-    test "a config with no max-attempts key is a ceiling of 0, and one counted release escalates" do
-      ceiling = RetryCeiling.max_attempts([])
+  describe "ceiling_from/1 and max_attempts/0 — the reader every release calls" do
+    # TC-44.4.4 (AC-44.4.5): the ceiling is spend, so it has NO default. An unset key (`nil`,
+    # what `Application.get_env/2` answers for it) reads as 0, and one counted release against
+    # 0 escalates.
+    test "an unset max-attempts key is a ceiling of 0, and one counted release escalates" do
+      ceiling = RetryCeiling.ceiling_from(nil)
 
       assert ceiling == 0
       assert RetryCeiling.decide(1, ceiling) == {:escalate, :attempts_exhausted}
     end
 
     test "a configured value is read as it is" do
-      assert RetryCeiling.max_attempts(dispatch_max_attempts: 3) == 3
-      assert RetryCeiling.max_attempts(dispatch_max_attempts: 0) == 0
+      assert RetryCeiling.ceiling_from(3) == 3
+      assert RetryCeiling.ceiling_from(0) == 0
     end
 
     test "a value that is not a non-negative integer reads as 0, never a guess" do
-      assert RetryCeiling.max_attempts(dispatch_max_attempts: -1) == 0
-      assert RetryCeiling.max_attempts(dispatch_max_attempts: "3") == 0
-      assert RetryCeiling.max_attempts(dispatch_max_attempts: nil) == 0
+      assert RetryCeiling.ceiling_from(-1) == 0
+      assert RetryCeiling.ceiling_from("3") == 0
+      assert RetryCeiling.ceiling_from(2.0) == 0
     end
 
     test "with no argument it reads the application env, which config/test.exs sets to 2" do

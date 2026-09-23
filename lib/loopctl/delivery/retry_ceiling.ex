@@ -6,14 +6,15 @@ defmodule Loopctl.Delivery.RetryCeiling do
   ## What is counted
 
   A release COUNTS when it spent an attempt: the lease ran out (`:runner_lost`), a runner
-  reported `crashed`, a verifier rejected the work, or the claimant gave the story back. Those
-  are the two release edges a counted requeue writes into `story_stages.attempts` —
-  `runner_lost` and `claim_released` — and `counted_releases/1` is their sum.
+  reported `crashed`, a verifier rejected the work, the claimant gave the story back, or a
+  placement was refused for a reason that recurs on every pass. Those are the two release
+  edges a counted requeue writes into `story_stages.attempts` — `runner_lost` and
+  `claim_released` — and `counted_releases/1` is their sum.
 
   A release that spent nothing is never written into either key, so it never reaches this
-  sum: a placement the runner refused before any work, a subscription that ran dry
-  (`usage_exhausted`), and an operator's force-unclaim, which is a human decision and goes to
-  `escalated` instead (`Loopctl.Delivery.Stages.follow_release/5`).
+  sum: a placement refused because the runner was unavailable before any work, a subscription
+  that ran dry (`usage_exhausted`), and an operator's force-unclaim, which is a human decision
+  and goes to `escalated` instead (`Loopctl.Delivery.Stages.follow_release/5`).
 
   The count lives on the stage row and is never reset, a human re-queue included — so a story
   a human sent back after it reached the ceiling gets exactly one more attempt before it is in
@@ -26,15 +27,15 @@ defmodule Loopctl.Delivery.RetryCeiling do
   a figure nobody chose must not quietly become the cost policy. Unset, malformed or negative
   reads as a ceiling of `0` — the first counted release escalates, so nothing is ever spent
   twice on a number nobody set. `config/runtime.exs` parses the variable with `parse/1`; every
-  release reads the configured value through `max_attempts/0`, the same reader the unset case
-  is tested through.
+  release reads the configured value through `max_attempts/0`, which hands it to
+  `ceiling_from/1` — the function the unset case is tested through.
   """
 
   @config_key :dispatch_max_attempts
 
-  # The release edges a COUNTED requeue writes into `attempts`. Only a requeue whose cause
-  # spent an attempt increments them (`Stages.follow_release/5` passes `counted?: false`
-  # otherwise), so their sum is the number of attempts this story has cost.
+  # The release edges a COUNTED requeue writes into `attempts`. Only a requeue whose `:cause`
+  # is `:attempt` increments them (`Stages.follow_release/5`), so their sum is the number of
+  # attempts this story has cost.
   @counted_edges ~w(runner_lost claim_released)
 
   @doc """
@@ -54,16 +55,19 @@ defmodule Loopctl.Delivery.RetryCeiling do
 
   @doc """
   The configured ceiling: the most counted releases a story may take and still be re-queued.
-  Read from `config` (the `:loopctl` application env by default); a missing or invalid key is
-  `0`, never a guess.
+  Reads the ONE key from the `:loopctl` application env and hands it to `ceiling_from/1`.
   """
-  @spec max_attempts(keyword()) :: non_neg_integer()
-  def max_attempts(config \\ Application.get_all_env(:loopctl)) do
-    case Keyword.get(config, @config_key) do
-      n when is_integer(n) and n >= 0 -> n
-      _unset -> 0
-    end
-  end
+  @spec max_attempts() :: non_neg_integer()
+  def max_attempts, do: ceiling_from(Application.get_env(:loopctl, @config_key))
+
+  @doc """
+  The ceiling a configured value stands for: a non-negative integer as it is, and anything
+  else — unset (`nil`), negative, not an integer — `0`, never a guess. Pure, so the unset case
+  is tested here without touching the application env.
+  """
+  @spec ceiling_from(term()) :: non_neg_integer()
+  def ceiling_from(n) when is_integer(n) and n >= 0, do: n
+  def ceiling_from(_unset), do: 0
 
   @doc """
   The counted releases recorded in a stage row's `attempts` map (`runner_lost` plus

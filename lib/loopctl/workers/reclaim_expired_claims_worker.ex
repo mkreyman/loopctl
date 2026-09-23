@@ -57,9 +57,7 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
       now
       |> expired_claims()
       |> Enum.map(fn candidate ->
-        result =
-          Progress.reclaim_expired_claim(candidate.tenant_id, candidate.id, candidate.claim_epoch)
-
+        result = reclaim(candidate)
         log_candidate(candidate, result)
         result
       end)
@@ -78,6 +76,18 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
     end
 
     :ok
+  end
+
+  # ONE STORY CANNOT END THE PASS (#877 review round 1). The sweep is oldest lease first, so a
+  # candidate whose release RAISES — a database error inside its transaction, which rolls that
+  # one release back — would otherwise abort every run at the same story and starve every lease
+  # behind it for good. The raise is turned into that candidate's failure, logged by
+  # `log_candidate/2` like any other, and the pass goes on. Nothing is committed for it: the
+  # raise left its transaction, which rolled back.
+  defp reclaim(candidate) do
+    Progress.reclaim_expired_claim(candidate.tenant_id, candidate.id, candidate.claim_epoch)
+  rescue
+    error -> {:error, {:raised, error.__struct__}}
   end
 
   # Issue #815: the summary line only counts. This names every candidate that was not

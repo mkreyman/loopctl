@@ -555,6 +555,26 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end).revoked_at
     end
 
+    # #877 review round 1, finding 3. A refusal that RECURS every pass — here a payload the
+    # contract rejects, which `Runners.dispatch/3` casts only after the claim committed — is
+    # not the runner being unavailable. Uncounted, the driver placed it, was refused and
+    # released it on every pass for ever; counted, the retry ceiling puts it in front of a
+    # human. The `runner_not_connected` test above is the uncounted half (`attempts == %{}`).
+    test "a refusal that recurs every pass COUNTS toward the retry ceiling", ctx do
+      %{runner: runner, story: story} = ctx
+      over = RunnerContract.RunnerDispatch.max_wall_clock_seconds() + 1
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, {:invalid, [_ | _]}} =
+                 place(ctx, Map.put(dispatch_payload(story), "wall_clock_seconds", over))
+      end)
+
+      # Below the ceiling of 2 (config/test.exs): counted once, and back in the queue.
+      row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
+      assert {row.stage, row.attempts} == {:queued, %{"claim_released" => 1}}
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
+    end
+
     test "the undo's revocation is attributed to the PLACEMENT CALLER, not the tenant operator",
          ctx do
       # #862 review round 2, finding 3. `undo_claim/5` releases the claim FIRST, and since

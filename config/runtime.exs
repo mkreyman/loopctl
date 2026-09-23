@@ -196,7 +196,7 @@ end
 # US-44.4: how many counted releases (a lost lease, a crashed session, a verifier reject) a
 # story may take and still be re-queued; reaching it escalates the story for a human. NO
 # DEFAULT, like the budgets above: unset or malformed leaves the key out, which
-# `Loopctl.Delivery.RetryCeiling.max_attempts/1` reads as 0 — escalate on the first counted
+# `Loopctl.Delivery.RetryCeiling.max_attempts/0` reads as 0 — escalate on the first counted
 # release, never spend twice on a number nobody chose. 0 is also a valid explicit value.
 case Loopctl.Delivery.RetryCeiling.parse(System.get_env("DISPATCH_MAX_ATTEMPTS")) do
   {:ok, attempts} -> config :loopctl, :dispatch_max_attempts, attempts

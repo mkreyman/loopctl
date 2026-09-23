@@ -87,7 +87,11 @@ defmodule LoopctlWeb.StoryVerificationController do
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
       422 => {"Reason required", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`audit_chain_append_failed` — the release reached the retry ceiling and the chain " <>
+           "entry its escalation must carry was refused, so the WHOLE release rolled back: the " <>
+           "story is unchanged.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -182,11 +186,12 @@ defmodule LoopctlWeb.StoryVerificationController do
          Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
-        {"`force_unclaim_failed` — the release transaction rolled back at a step that is not " <>
-           "supposed to be able to refuse (`stage`, `audit` or `webhook_events`). The story " <>
-           "is UNCHANGED — still claimed, still held — the cause is logged server-side with " <>
-           "the step name, and the remedy is to re-run this call.", "application/json",
-         Schemas.ErrorResponse}
+        {"`force_unclaim_failed` — the release transaction rolled back at a step after the " <>
+           "release write: `stage` (the escalation's chain entry was refused), `recontract` " <>
+           "(the re-contract's audit entry was refused), or `audit` / `webhook_events`, which " <>
+           "are not supposed to be able to refuse. The story is UNCHANGED — still claimed, " <>
+           "still held — the cause is logged server-side with the step name, and the remedy " <>
+           "is to re-run this call.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -384,6 +389,15 @@ defmodule LoopctlWeb.StoryVerificationController do
       "a lifecycle entry, after which backfill refuses with `story_entered_lifecycle`."
   end
 
+  defguardp is_forwarded_reject_error(reason)
+            when reason in [
+                   :self_verify_blocked,
+                   :unresolvable_dispatch_lineage,
+                   :missing_assigned_agent,
+                   :not_found,
+                   :audit_chain_append_failed
+                 ] or is_struct(reason, Ecto.Changeset)
+
   @doc """
   POST /api/v1/stories/:id/reject
 
@@ -408,14 +422,12 @@ defmodule LoopctlWeb.StoryVerificationController do
         {:ok, story} ->
           json(conn, %{story: story})
 
-        {:error, :self_verify_blocked} ->
-          {:error, :self_verify_blocked}
-
-        {:error, :unresolvable_dispatch_lineage} ->
-          {:error, :unresolvable_dispatch_lineage}
-
-        {:error, :missing_assigned_agent} ->
-          {:error, :missing_assigned_agent}
+        # Forwarded unchanged to FallbackController. `:audit_chain_append_failed` and a
+        # changeset are US-44.4's: the release's escalation could not append its chain entry,
+        # or the re-contract's audit entry was refused — either way the reject rolled back.
+        # One guarded clause rather than one each, for the action's complexity budget.
+        {:error, reason} = error when is_forwarded_reject_error(reason) ->
+          error
 
         {:error, :reason_required} ->
           {:error, :unprocessable_entity, "reason is required and cannot be blank"}
@@ -425,9 +437,6 @@ defmodule LoopctlWeb.StoryVerificationController do
 
         {:error, :invalid_transition} ->
           {:error, :conflict}
-
-        {:error, :not_found} ->
-          {:error, :not_found}
       end
     end
   end

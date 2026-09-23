@@ -290,7 +290,15 @@ defmodule LoopctlWeb.StoryStatusController do
       403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      422 =>
+        {"A write in the release was rejected (the story row, or the re-contract's audit " <>
+           "entry). Nothing was released and the story is unchanged.", "application/json",
+         Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`audit_chain_append_failed` — the release reached the retry ceiling and the chain " <>
+           "entry its escalation must carry was refused, so the WHOLE release rolled back: the " <>
+           "story is unchanged.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -613,6 +621,14 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_found} ->
         {:error, :not_found}
+
+      # US-44.4: the release's escalation could not append its chain entry, or a later step
+      # refused (`Progress.unclaim_story/3`). The release rolled back; the story is unchanged.
+      {:error, :audit_chain_append_failed} = error ->
+        error
+
+      {:error, %Ecto.Changeset{}} = error ->
+        error
     end
   end
 
