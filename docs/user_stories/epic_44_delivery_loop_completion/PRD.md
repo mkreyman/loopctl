@@ -40,8 +40,8 @@ run is spent on work a gate will refuse, and every surface the loop needs is rea
 3. A story Gate A or Gate B would refuse at triage is never queued.
 4. A driver-placed claim expires no later than its placement time plus the dispatch wall clock plus
    a bounded grace, whatever renews it; no other claimant's lease changes.
-5. A deterministic failure (wall clock, turn budget) ends at `failed`, not in a retry loop, and an
-   exhausted subscription spends no attempt.
+5. A reported budget kill (wall clock, turn budget) stops at `escalated` for a human, never in a
+   retry loop and never at a runner-decided `failed`; an exhausted subscription spends no attempt.
 6. An exhausted runner is not offered work until its (clamped) reset.
 7. Every route an operator needs to bring a runner online is in the route index, and the merge
    precondition has an MCP tool.
@@ -75,11 +75,13 @@ disagreement signal is gone by the time it is stored.
 
 Design §5 runs both gates twice. Only the merge run exists: `TriageVerdict` routes on `outcome`
 alone, so with the driver on, a story predicted to touch the claims path is implemented for
-USD 10-20 and refused at merge. **Decision:** the `story` route evaluates Gate A over the lens
-verdicts and `GateB.evaluate(:triage, …)` over the drafted `touches` before `triaged -> queued`;
-a refusal takes `triaged -> escalated` naming the gate's reasons. Lens verdicts absent (a runner
-on 1.14) → today's behaviour, logged, because failing closed here would stop every triage until
-the runner adopts 1.15.
+USD 10-20 and refused at merge. **Decision:** a triage SCREEN, not the full Gate B, because triage has no
+repository file list and `touches` is an optional prediction (`GateB.evaluate/3` would add
+`stale_trigger` and `missing_files` reasons and escalate everything). The `story` route runs Gate A
+over the lens verdicts and escalates when a drafted touch matches a `human_paths` or `effect_paths`
+trigger; it can only ADD an escalation, and the merge run stays the gate. A verdict without lens
+verdicts escalates too: queuing it would certainly be refused at merge (44.1), so the loop stops
+at triage until the runner adopts 1.15 — nothing merges before delivery authority lands anyway.
 
 ### 44.3 A run's end is reported, and a deterministic failure fails
 
@@ -87,11 +89,14 @@ Control learns a session died only through lease expiry: the contract has no imp
 message, and `:budget_exceeded` has no writer. So a story killed at its wall clock, one killed at
 `max_turns` and one whose subscription ran out all look alike. **Decision:** an optional
 `session_ended` message `{dispatch_id, claim_epoch, reason}` with `reason` in
-`completed | wall_clock_exceeded | max_turns_exceeded | usage_exhausted | crashed`. Control maps
-the two budget reasons to `{in_flight, failed, :budget_exceeded}` (never retried — the same story
-fails the same way), `usage_exhausted` to a release that spends no attempt and marks the runner
-exhausted (44.6), and `crashed` to an attempt. Epoch-fenced like every runner message; a replay is
-answered with the row.
+`completed | wall_clock_exceeded | max_turns_exceeded | usage_exhausted | crashed`. A runner's
+word never makes a story terminal (`failed` has no way out, which is why the stage machine withholds
+it from runners), so the two budget reasons take a new control edge
+`{in_flight, escalated, :budget_reported}` — never retried, a human decides. `crashed` releases now
+instead of at lease expiry, over `:runner_lost` with the reclaim's audit shape; `usage_exhausted`
+releases without counting toward the ceiling (44.6 marks the runner). Recorded once per dispatch
+with a payload digest checked BEFORE the epoch fence, because a release bumps the epoch and an
+honest resend must still be answered ok.
 
 ### 44.4 No release parks a story (#877)
 
@@ -111,9 +116,12 @@ auto-reset), `bulk_operations.ex:610` (bulk reject).
 | verifier reject, bulk reject | re-contract, or escalate at the ceiling | yes — the work was wrong |
 | operator force-unclaim | escalate over `{queued, escalated, :operator_released}` | no — a human acted; they resolve it from `escalated` |
 
-The ceiling is spend, so it follows #875: `DISPATCH_MAX_ATTEMPTS` has **no default**; unset means
-a ceiling of 0 (escalate on the first crash, never spend twice). Attempts count in the stage row's
-existing `attempts` map. Escalation takes a NEW control-only edge
+The release paths cannot tell these apart today — placement refusal, operator force-unclaim and
+the reject auto-reset all pass `:claim_released` — so `force_unclaim_story/3` gains
+`release_cause:` and `Placement.undo_claim/5` passes `:placement_refused`. A reject of a row already
+past `ci` only rebinds it (`stages.ex:984-988`) and keeps today's behaviour. The ceiling is spend, so it follows #875: `DISPATCH_MAX_ATTEMPTS` has **no default**; unset means
+a ceiling of 0 (escalate on the first crash, never spend twice). `Stages` already counts attempts per edge (`stages.ex:1080-1093`); the
+ceiling counts `runner_lost` and in-flight rejects only. Escalation takes a NEW control-only edge
 `{queued, escalated, :attempts_exhausted}` with its own reason code, so the escalated queue tells
 a spend ceiling apart from a session asking for Mark (`:session_escalated`). Re-contracting reuses
 `Escalations`' existing re-contract step (`escalations.ex:436`), made public, rather than a second
@@ -123,9 +131,10 @@ writer of `agent_status`.
 
 The lease is one global value (`claim_lease_seconds/0`, 24h) against a 3600s wall clock. Lowering
 the global key is wrong for every non-runner claimant (#879 records it being built and removed).
-**Decision:** a claim `Placement` takes for a runner dispatch gets
-`claimed_until = placed_at + wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS`, and that instant
-is an ABSOLUTE cap: a renewal may never move it later. The grace defaults to 900s and boot refuses
+**Decision:** `claim_story/3` takes `lease_until:`, stored in a new
+`stories.claim_lease_cap` column (never `metadata`, which PATCH replaces wholesale); `Placement`
+passes `placed_at + wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS`, and that instant is an
+ABSOLUTE cap: a renewal may never move it later. The grace defaults to 900s and boot refuses
 a value below `Capacity.release_grace_seconds/0` (300s) — it has to cover the push and the
 worktree setup that run before the runner's own wall clock starts. The dispatch carries the cap as
 optional `deadline_at` so an adopting runner kills its session at the same instant control reclaims
@@ -140,12 +149,13 @@ a requirement on the delivery-authority work (§5), recorded there.
 ### 44.6 An exhausted subscription is not capacity (#858)
 
 `Runners.accepts?/5` checks draining, `repo` and `kind` (`runners.ex:903-909`); nothing sees the
-subscription window. **Decision:** the status message gains optional
+subscription window. `Placement.place/4` checks only `runner_accepting_work` (`placement.ex:441-443`), so operator
+placement needs the same check. **Decision:** the status message gains optional
 `usage: {exhausted, resets_at, account_ref}`. State lives in Postgres on the `runners` row
 (`usage_exhausted_until`, `account_ref`), not in Presence meta, so it survives a node restart and a
 second machine. `resets_at` is CLAMPED to `[now + 60s, now + 8 days]`, and `exhausted: true` with
-no `resets_at` holds for the upper bound — never ignored, because ignoring fails open. A later
-status with `exhausted: false` clears it. Runners sharing an `account_ref` (an opaque value the
+no `resets_at` holds for the upper bound — never ignored, because ignoring fails open. A `session_ended usage_exhausted` (44.3) also
+sets it. `exhausted: false` clears every row sharing the `account_ref`. Runners sharing an `account_ref` (an opaque value the
 runner derives from its login) are exhausted together. The driver's and triage dispatcher's
 `:no_runner` gains the earliest reset, visible in `runner_pool`.
 

@@ -12,7 +12,7 @@
     "i_want_to": "a runner that declares its subscription exhausted to receive no work until its reset",
     "so_that": "dispatches stop burning slots on machines that cannot start a session, and the operator sees when capacity returns"
   },
-  "rationale": "Eligibility checks draining, repo and kind; the scarce resource is the subscription window, which nothing sees. A declared, clamped, persisted reset keeps exhausted machines out of placement without trusting a runner's arbitrary timestamp, and runners on one account are exhausted together.",
+  "rationale": "Eligibility checks draining, repo and kind; the scarce resource is the subscription window, which nothing sees. A declared, clamped, persisted reset keeps exhausted machines out of every placement path without trusting an arbitrary timestamp, and runners on one account are exhausted and cleared together.",
   "acceptance_criteria": [
     {
       "id": "AC-44.6.1",
@@ -20,27 +20,31 @@
     },
     {
       "id": "AC-44.6.2",
-      "description": "exhausted: true persists usage_exhausted_until on the runners row, clamped to between now + 60s and now + 8 days."
+      "description": "exhausted: true stores usage_exhausted_until on the runners row, clamped to between now + 60s and now + 8 days."
     },
     {
       "id": "AC-44.6.3",
-      "description": "exhausted: true without resets_at persists now + 8 days."
+      "description": "exhausted: true without resets_at stores now + 8 days."
     },
     {
       "id": "AC-44.6.4",
-      "description": "A runner with usage_exhausted_until in the future is not selected by the dispatch driver or the triage dispatcher."
+      "description": "A session_ended usage_exhausted stores usage_exhausted_until = now + 8 days for that runner unless a later reset is already stored."
     },
     {
       "id": "AC-44.6.5",
-      "description": "Every runner in the tenant with the same account_ref is treated as exhausted until the latest declared reset for that account."
+      "description": "A runner is exhausted while its own or any same-tenant same-account_ref row has usage_exhausted_until in the future."
     },
     {
       "id": "AC-44.6.6",
-      "description": "A status with exhausted: false clears usage_exhausted_until for that runner."
+      "description": "An exhausted runner is refused by Runners.accepts?/5 and by Placement.place/4 with runner_exhausted."
     },
     {
       "id": "AC-44.6.7",
-      "description": "runner_pool shows usage_exhausted_until per runner and the driver's no_runner log names the earliest reset."
+      "description": "exhausted: false clears usage_exhausted_until on every row in the tenant with that account_ref."
+    },
+    {
+      "id": "AC-44.6.8",
+      "description": "runner_pool shows usage_exhausted_until per runner, and the driver's no_runner log names the earliest reset."
     }
   ],
   "test_cases": [
@@ -65,80 +69,117 @@
     {
       "id": "TC-44.6.2",
       "verifies": [
-        "AC-44.6.2",
-        "AC-44.6.3"
+        "AC-44.6.2"
       ],
-      "name": "reset is clamped",
+      "name": "far reset is clamped",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
         "joined runner"
       ],
       "steps": [
-        "push exhausted with resets_at 30 days out; then exhausted with no resets_at"
+        "push exhausted with resets_at 30 days out"
       ],
       "expected_results": [
-        "usage_exhausted_until == now + 8 days both times"
+        "usage_exhausted_until == now + 8 days"
       ]
     },
     {
       "id": "TC-44.6.3",
       "verifies": [
-        "AC-44.6.4"
+        "AC-44.6.3"
       ],
-      "name": "exhausted runner skipped",
+      "name": "missing reset takes the bound",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "two runners, one exhausted, a queued contracted story"
+        "another joined runner"
       ],
       "steps": [
-        "run the driver"
+        "push exhausted with no resets_at"
       ],
       "expected_results": [
-        "placed on the other runner"
+        "usage_exhausted_until == now + 8 days"
       ]
     },
     {
       "id": "TC-44.6.4",
       "verifies": [
-        "AC-44.6.5"
+        "AC-44.6.4"
       ],
-      "name": "shared account exhausts together",
+      "name": "session_ended marks exhaustion",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "runners r1, r2 with account_ref 'a'"
+        "story at implementing on runner r"
       ],
       "steps": [
-        "r1 declares exhausted"
+        "push session_ended usage_exhausted"
       ],
       "expected_results": [
-        "neither selected"
+        "r.usage_exhausted_until set"
       ]
     },
     {
       "id": "TC-44.6.5",
       "verifies": [
+        "AC-44.6.5",
         "AC-44.6.6"
       ],
-      "name": "clearing",
+      "name": "exhausted account excluded everywhere",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "exhausted runner"
+        "runners r1, r2 with account_ref 'a'; r1 exhausted",
+        "a queued contracted story"
       ],
       "steps": [
-        "push exhausted false"
+        "run the driver; call Placement.place on r2"
       ],
       "expected_results": [
-        "usage_exhausted_until nil; runner selectable"
+        "driver places nothing; place returns runner_exhausted"
       ]
     },
     {
       "id": "TC-44.6.6",
       "verifies": [
         "AC-44.6.7"
+      ],
+      "name": "clearing is account-wide",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "r1 exhausted, r2 same account"
+      ],
+      "steps": [
+        "r2 pushes exhausted false"
+      ],
+      "expected_results": [
+        "both rows nil"
+      ]
+    },
+    {
+      "id": "TC-44.6.7",
+      "verifies": [
+        "AC-44.6.8"
+      ],
+      "name": "pool and log show the reset",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "one exhausted runner, one queued story"
+      ],
+      "steps": [
+        "read runner_pool; run the driver"
+      ],
+      "expected_results": [
+        "pool row carries usage_exhausted_until; log names it"
+      ]
+    },
+    {
+      "id": "TC-44.6.8",
+      "verifies": [
+        "AC-44.6.5"
       ],
       "name": "tenant isolation",
       "type": "integration",
@@ -147,7 +188,7 @@
         "tenant_b runner with account_ref 'a' exhausted"
       ],
       "steps": [
-        "run tenant A's driver with its own runner on account_ref 'a'"
+        "tenant A driver with its own runner on account_ref 'a'"
       ],
       "expected_results": [
         "tenant A runner selected"
@@ -156,19 +197,20 @@
   ],
   "technical_notes": [
     "Columns on runners: usage_exhausted_until utc_datetime, account_ref string (migration; set programmatically)",
-    "Eligibility: Runners.accepts?/5 (runners.ex:903) and the driver's available_runner selection",
-    "Contract: usage on the status message (1.15.0); a runner not sending it is unaffected"
+    "Eligibility: Runners.accepts?/5 (runners.ex:903) for driver and triage; Placement.place/4 checks runner_accepting_work (placement.ex:441-443) and needs the same check",
+    "Contract: usage on the status message (1.15.0); a runner not sending it is unaffected",
+    "Status messages are rate-limited to one per second per runner: tests use separate runners or separate tests rather than two back-to-back pushes"
   ],
   "dependencies": [
     "US-44.3"
   ],
   "non_goals": [
-    "Does not measure subscription usage itself",
+    "Does not measure subscription usage",
     "Does not schedule a wakeup at the reset time"
   ],
   "expected_size": {
-    "insertions": 220,
-    "files": 6
+    "insertions": 240,
+    "files": 7
   },
-  "estimated_tokens": 320000
+  "estimated_tokens": 340000
 }

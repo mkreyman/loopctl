@@ -1,6 +1,6 @@
 {
   "id": "US-44.3",
-  "title": "Runners report why an implement session ended, and a budget failure fails",
+  "title": "Runners report why an implement session ended",
   "epic": {
     "id": "epic_44",
     "name": "Delivery Loop Completion"
@@ -10,33 +10,33 @@
   "story": {
     "as_a": "delivery-loop operator",
     "i_want_to": "the runner to report why a session ended and loopctl to act on the reason",
-    "so_that": "a story that fails deterministically ends at failed instead of being re-run in a circle"
+    "so_that": "a budget kill stops for a human instead of being retried, and a crash releases the story at once"
   },
-  "rationale": "Control learns that a session died only through lease expiry, so a wall-clock kill, a turn-budget kill, an exhausted subscription and a crash look identical, and each would be retried. The :budget_exceeded edge exists in the stage machine and has no writer. A reported reason lets each case go where it belongs.",
+  "rationale": "Control learns that a session died only through lease expiry, so a wall-clock kill, a turn-budget kill, an exhausted subscription and a crash look identical and would each be retried. The runner's report cannot be allowed to make a story terminal: failed has no way out, and the stage machine withholds it from runners for that reason. So a reported budget kill escalates, a crash releases now instead of at lease expiry, and exhaustion releases without counting against the retry ceiling.",
   "acceptance_criteria": [
     {
       "id": "AC-44.3.1",
-      "description": "The contract accepts an optional session_ended message {dispatch_id, claim_epoch, reason} with reason in completed | wall_clock_exceeded | max_turns_exceeded | usage_exhausted | crashed; any other reason is refused invalid_payload."
+      "description": "The contract accepts an optional session_ended message {dispatch_id, claim_epoch, reason}, reason in completed | wall_clock_exceeded | max_turns_exceeded | usage_exhausted | crashed; any other reason is refused invalid_payload."
     },
     {
       "id": "AC-44.3.2",
-      "description": "wall_clock_exceeded or max_turns_exceeded on an in-flight story takes {stage, failed, :budget_exceeded} and releases the runner's slot."
+      "description": "session_ended is recorded once per dispatch; a byte-identical resend is answered ok with the current stage row before any epoch check, and a different reason for the same dispatch is refused already_recorded."
     },
     {
       "id": "AC-44.3.3",
-      "description": "usage_exhausted releases the claim, re-contracts the story without spending an attempt, and records the runner as exhausted."
+      "description": "wall_clock_exceeded or max_turns_exceeded on an in-flight story takes {stage, escalated, :budget_reported} and releases the runner's slot."
     },
     {
       "id": "AC-44.3.4",
-      "description": "crashed releases the claim through the same path lease expiry uses."
+      "description": "crashed releases the claim immediately over :runner_lost with the same audit entry a lease reclaim writes, without waiting for the lease."
     },
     {
       "id": "AC-44.3.5",
-      "description": "A session_ended carrying a stale claim_epoch is refused stale_claim_epoch and changes nothing."
+      "description": "usage_exhausted releases the claim over :runner_lost and records the release as not counting toward the retry ceiling."
     },
     {
       "id": "AC-44.3.6",
-      "description": "A byte-identical resend of an applied session_ended is answered with the current row and changes nothing."
+      "description": "A first session_ended whose claim_epoch is not the story's current epoch is refused stale_claim_epoch and changes nothing."
     },
     {
       "id": "AC-44.3.7",
@@ -67,17 +67,18 @@
       "verifies": [
         "AC-44.3.2"
       ],
-      "name": "wall clock kill fails the story",
+      "name": "resend after a release is answered ok",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "story at implementing under the dispatch"
+        "story at implementing"
       ],
       "steps": [
-        "push session_ended wall_clock_exceeded"
+        "push session_ended crashed",
+        "push the identical message again"
       ],
       "expected_results": [
-        "stage failed, edge budget_exceeded, in_flight decremented"
+        "second reply ok with the row; claim released once"
       ]
     },
     {
@@ -85,17 +86,17 @@
       "verifies": [
         "AC-44.3.3"
       ],
-      "name": "exhaustion spends nothing",
+      "name": "budget kill escalates, never fails",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "story at implementing, attempts %{}"
+        "story at implementing"
       ],
       "steps": [
-        "push session_ended usage_exhausted"
+        "push session_ended wall_clock_exceeded"
       ],
       "expected_results": [
-        "stage queued, agent_status contracted, attempts unchanged, runner marked exhausted"
+        "stage escalated, edge budget_reported; in_flight decremented"
       ]
     },
     {
@@ -103,23 +104,41 @@
       "verifies": [
         "AC-44.3.4"
       ],
-      "name": "crash follows the lease path",
+      "name": "crash releases before lease expiry",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
-        "story at implementing"
+        "story at implementing with 23h of lease left"
       ],
       "steps": [
         "push session_ended crashed"
       ],
       "expected_results": [
-        "same stage and agent_status as a reclaim_expired_claim of that story"
+        "claim released, stage queued over runner_lost, audit entry matches a reclaim's"
       ]
     },
     {
       "id": "TC-44.3.5",
       "verifies": [
         "AC-44.3.5"
+      ],
+      "name": "exhaustion is not a counted attempt",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at implementing"
+      ],
+      "steps": [
+        "push session_ended usage_exhausted"
+      ],
+      "expected_results": [
+        "stage queued; ledger records the release as uncounted"
+      ]
+    },
+    {
+      "id": "TC-44.3.6",
+      "verifies": [
+        "AC-44.3.6"
       ],
       "name": "stale epoch refused",
       "type": "integration",
@@ -128,47 +147,45 @@
         "story whose claim_epoch moved past the dispatch's"
       ],
       "steps": [
-        "push session_ended wall_clock_exceeded with the old epoch"
+        "push session_ended crashed with the old epoch"
       ],
       "expected_results": [
         "stale_claim_epoch; stage unchanged"
       ]
     },
     {
-      "id": "TC-44.3.6",
+      "id": "TC-44.3.7",
       "verifies": [
-        "AC-44.3.6",
         "AC-44.3.7"
       ],
-      "name": "replay and completed are no-ops",
+      "name": "completed is a no-op",
       "type": "integration",
       "preconditions": [
         "tenant = fixture(:tenant)",
         "story at implementing"
       ],
       "steps": [
-        "push session_ended completed twice"
+        "push session_ended completed"
       ],
       "expected_results": [
-        "stage unchanged both times"
+        "stage unchanged"
       ]
     }
   ],
   "technical_notes": [
-    "Contract: new message in priv/runner_contract/v1.json (1.15.0), handled in LoopctlWeb.RunnerChannel through Loopctl.Delivery.RunnerStages; never a second writer of story_stages",
-    "Edge: {in_flight, failed, :budget_exceeded} already in StageMachine.transitions/0 with no writer; make it control-writable for this path only",
-    "Runner exhaustion marking is US-44.6's column; until it exists this story records the reason on the dispatch ledger only"
+    "Record session_ended on the dispatch ledger (Loopctl.Runners.DispatchLedger) with a payload digest, checked before the epoch fence, as triage_verdicts.payload_digest does",
+    "Release path: a variant of reclaim_expired_claim/3 (progress.ex:1620-1650) that skips the expiry check, keeps the :runner_lost edge and audit shape, and requires the dispatch's epoch",
+    "New control-only edge {in_flight, escalated, :budget_reported} in StageMachine and the contract's stage_transitions; :budget_exceeded stays unwritten",
+    "Handled in LoopctlWeb.RunnerChannel via Loopctl.Delivery.RunnerStages; Stages remains the only writer of story_stages"
   ],
-  "dependencies": [
-    "US-44.4"
-  ],
+  "dependencies": [],
   "non_goals": [
-    "Does not change what the runner does on its own wall clock",
-    "Does not retry failed stories"
+    "Does not mark the runner exhausted (US-44.6)",
+    "Does not decide the retry ceiling (US-44.4)"
   ],
   "expected_size": {
-    "insertions": 260,
-    "files": 5
+    "insertions": 300,
+    "files": 6
   },
-  "estimated_tokens": 380000
+  "estimated_tokens": 420000
 }
