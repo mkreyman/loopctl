@@ -1498,6 +1498,25 @@ defmodule Loopctl.Delivery.StagesTest do
                  Keyword.put(opts, :session_dispatch, {bound, 0})
                )
     end
+
+    test "a row bound to NOBODY is no session's to move out of triaged" do
+      {story, _row} = at_stage(:detected)
+
+      {:ok, _} =
+        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward},
+          claim_epoch: story.claim_epoch,
+          actor_label: "test"
+        )
+
+      assert {:error, :triage_not_bound} =
+               Stages.advance(story.tenant_id, story.id, {:triaged, :queued, :forward},
+                 claim_epoch: story.claim_epoch,
+                 actor_label: "runner:test",
+                 actor_role: :agent,
+                 actor_lineage: [],
+                 session_dispatch: {Ecto.UUID.generate(), 0}
+               )
+    end
   end
 
   defp effect_value(:runner_id, tenant_id), do: fixture(:stage_runner, %{tenant_id: tenant_id}).id

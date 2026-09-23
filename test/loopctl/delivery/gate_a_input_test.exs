@@ -251,8 +251,11 @@ defmodule Loopctl.Delivery.GateAInputTest do
       end
     end
 
-    test "of an escalation with no lens verdicts to show (incomplete, oversize) satisfies Gate A" do
-      for reason <- ["triage_verdict:session_crashed", "triage_dispatch:triage_too_large"] do
+    test "of control's oversize escalation satisfies Gate A; of a session's incomplete run does not" do
+      for {reason, expected} <- [
+            {"triage_dispatch:triage_too_large", :human_resolution},
+            {"triage_verdict:session_crashed", :missing}
+          ] do
         ctx = story()
 
         events(ctx, [
@@ -260,8 +263,7 @@ defmodule Loopctl.Delivery.GateAInputTest do
           {"escalated", "queued", "human_resolution", %{}}
         ])
 
-        assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :human_resolution,
-               reason
+        assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == expected, reason
       end
     end
 

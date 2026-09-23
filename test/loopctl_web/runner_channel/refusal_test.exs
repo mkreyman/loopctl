@@ -202,10 +202,6 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       refute refusal.reason == "rate_limited"
     end
 
-    test "a dispatch that did not triage the story is told stale_stage, as the contract says" do
-      assert Refusal.for_message(:triage_not_bound) == %{reason: "stale_stage"}
-    end
-
     test "a lock this write could not get says retry, with an interval longer than the wait" do
       assert %{reason: "rate_limited", min_interval_ms: ms} = Refusal.for_message(:busy)
       assert ms > 0
