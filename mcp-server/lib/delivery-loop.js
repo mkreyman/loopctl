@@ -296,6 +296,15 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  * the orchestrator role" (`require_role.ex:112-128`), so the request never reaches the
  * controller and never reaches the custody 409s in `Progress`. The role error names the role.
  */
+export async function forceUnclaimStory({ story_id } = {}, { orchKey, apiCall } = {}) {
+  if (!orchKey) return refuse(MISSING_ORCH_KEY);
+
+  const bad = uuid(story_id, "story_id");
+  if (bad) return bad;
+
+  return apiCall("POST", forceUnclaimPath(story_id), null);
+}
+
 export function mergePreconditionPath(storyId) {
   return `/api/v1/stories/${encodeURIComponent(storyId)}/merge-precondition`;
 }
@@ -323,13 +332,4 @@ export async function mergePrecondition(
   if (effect_proof && typeof effect_proof === "object") body.effect_proof = effect_proof;
 
   return apiCall("POST", mergePreconditionPath(story_id), body);
-}
-
-export async function forceUnclaimStory({ story_id } = {}, { orchKey, apiCall } = {}) {
-  if (!orchKey) return refuse(MISSING_ORCH_KEY);
-
-  const bad = uuid(story_id, "story_id");
-  if (bad) return bad;
-
-  return apiCall("POST", forceUnclaimPath(story_id), null);
 }

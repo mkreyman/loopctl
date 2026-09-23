@@ -571,8 +571,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
-  The session a runner is running under `dispatch_id`: `{:ok, %{story_id:, claim_epoch:,
-  slot_generation:}}` for an ACCEPTED dispatch this runner holds in this tenant.
+  The session a runner is running under `dispatch_id`: `{:ok, %{kind:, story_id:,
+  claim_epoch:, slot_generation:}}` for an ACCEPTED dispatch this runner holds in this tenant.
+  `kind` is what lets a triage verdict refuse to answer an implement dispatch (US-44.1).
 
   For the `stage` path (#803, contract 1.4.0), which needs the story the dispatch is for and
   the slot generation to release when the session ends. It is a READ and takes no lock: the
@@ -588,7 +589,13 @@ defmodule Loopctl.Runners.DispatchLedger do
   `superseded`: no session is running, so there is no transition to report.
   """
   @spec accepted_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, %{story_id: Ecto.UUID.t(), claim_epoch: integer(), slot_generation: integer()}}
+          {:ok,
+           %{
+             kind: String.t() | nil,
+             story_id: Ecto.UUID.t(),
+             claim_epoch: integer(),
+             slot_generation: integer()
+           }}
           | {:error, :unknown_dispatch | :dispatch_not_accepted}
   def accepted_session(tenant_id, runner_id, dispatch_id) do
     {:ok, result} =
@@ -599,6 +606,7 @@ defmodule Loopctl.Runners.DispatchLedger do
             where: r.dispatch_id == ^dispatch_id,
             select: %{
               status: r.status,
+              kind: r.kind,
               story_id: r.story_id,
               claim_epoch: r.claim_epoch,
               slot_generation: r.slot_generation

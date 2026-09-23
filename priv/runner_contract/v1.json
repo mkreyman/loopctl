@@ -355,7 +355,7 @@
       "type": "object"
     },
     "RunnerLensVerdict": {
-      "description": "One triage lens's own judgement (since 1.15.0), sent three at a time in `RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them with the verdict and Gate A reads them — at triage before a story is queued, and again at merge — instead of anything a merge caller supplies. SESSION-AUTHORED AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES (`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
+      "description": "One triage lens's own judgement (since 1.15.0), sent three at a time in `RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them with the verdict and Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies. SESSION-AUTHORED AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES (`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
       "properties": {
         "confidence": {
           "enum": [
@@ -1095,9 +1095,9 @@
           ]
         },
         "lens_verdicts": {
-          "description": "The three triage lenses' own judgements (since 1.15.0), one per lens, each lens exactly once. Allowed only beside `verdict`. Gate A reads these — at triage before the story is queued and again at merge — so a verdict sent WITHOUT them escalates at triage: Gate A cannot be evaluated. At most 9000 bytes for all three under the byte rule.",
+          "description": "The three triage lenses' own judgements (since 1.15.0), one per lens, each lens exactly once. Allowed only beside `verdict`. Gate A reads these at triage and again at merge, so a verdict sent WITHOUT them escalates at triage: Gate A cannot be evaluated. At most 9000 bytes for all three under the byte rule.",
           "items": {
-            "description": "One triage lens's own judgement (since 1.15.0), sent three at a time in `RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them with the verdict and Gate A reads them — at triage before a story is queued, and again at merge — instead of anything a merge caller supplies. SESSION-AUTHORED AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES (`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
+            "description": "One triage lens's own judgement (since 1.15.0), sent three at a time in `RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them with the verdict and Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies. SESSION-AUTHORED AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES (`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
             "properties": {
               "confidence": {
                 "enum": [

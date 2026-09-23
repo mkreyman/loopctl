@@ -47,7 +47,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.12.0) A SECURITY CORRECTION TO WHAT THIS CONTRACT PROMISES. `RunnerTriageVerdict` said loopctl "fences these strings wherever they later reach a prompt — `story` included". It does not and never did: a drafted story becomes loopctl's own story row and reaches a runner as `RunnerStory`, typed and unfenced. What loopctl DOES do is escape invisible characters and SCREEN the draft with its injection detector, escalating a flagged one to a human instead of queueing it, so it never reaches an implement dispatch. RE-VENDOR and re-read: a copy taken at 1.11.0 tells you the implement path is fenced | | | | |
   | (1.13.0) `RunnerJoin.max_sessions` IS AUTHORITATIVE DOWNWARD. loopctl now reserves against the LESSER of the value a runner declares on join and the `max_sessions` it was ENROLLED with, re-read on every join. Until now only the enrolled number counted, written once with no path from any join, so a machine configured for one session was sent two and refused the second `at_capacity` — a refusal that costs the story's claim. A machine may therefore always lower itself; it cannot raise itself past its enrolled ceiling, which is what stops a compromised runner enlarging its own share of the tenant's admission budget. Nothing changes on the wire and no runner has to send anything new. `0` is the same statement as `draining` — the row keeps `1` because its range is 1..64, and loopctl refuses to PLACE on a machine declaring either, while a direct operator push is still delivered for the runner to refuse. Re-vendoring is worth it for the description, not required for the wire | | | | |
   | (1.14.0) A RUNNER DECLARES THE BRANCH PREFIXES IT ACCEPTS (`RunnerJoin.branch_prefixes`), and loopctl DERIVES a conforming branch instead of guessing one. A runner that enforces a prefix and does not declare it refuses every dispatch loopctl sends, which is what happened: the first real placement was refused `branch_not_allowed` because loopctl derived `feature/story-<n>-<id>` while the machine's config accepted `loop/` alone, and the operator could learn the required prefix only by reading a config file on that box. OMITTING THE FIELD IS EXACTLY TODAY'S BEHAVIOUR — no constraint, and the branch is the one loopctl already derived — so an un-upgraded runner is unaffected and nothing on the wire changes for it. RE-VENDOR to send it | | | | |
-  | (1.15.0) A triage verdict message may carry `lens_verdicts` (`RunnerLensVerdict`, exactly one per lens, only beside a `verdict`, capped together by `RunnerLensVerdict.max_bytes/0`). Gate A reads them, at triage and at merge, instead of anything a merge caller supplies; a verdict without them escalates at triage. RE-VENDOR to send them; a 1.14.0 holder keeps working and its verdicts escalate at triage | | | | |
+  | (1.15.0) A triage verdict message may carry `lens_verdicts` (`RunnerLensVerdict`, exactly one per lens, only beside a `verdict`, capped together by `RunnerLensVerdict.max_bytes/0`). Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies; a verdict without them escalates at triage. RE-VENDOR to send them; a 1.14.0 holder keeps working and its verdicts escalate at triage | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -1459,8 +1459,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         description:
           "One triage lens's own judgement (since 1.15.0), sent three at a time in " <>
             "`RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them " <>
-            "with the verdict and Gate A reads them — at triage before a story is queued, and " <>
-            "again at merge — instead of anything a merge caller supplies. SESSION-AUTHORED " <>
+            "with the verdict and Gate A reads them at triage, before the story is queued, " <>
+            "and again at merge, instead of anything a merge caller supplies. SESSION-AUTHORED " <>
             "AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES " <>
             "(`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
         type: :object,
@@ -1615,9 +1615,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             items: RunnerLensVerdict.schema(),
             description:
               "The three triage lenses' own judgements (since 1.15.0), one per lens, each " <>
-                "lens exactly once. Allowed only beside `verdict`. Gate A reads these — " <>
-                "at triage before the story is queued and again at merge — so a verdict " <>
-                "sent WITHOUT them escalates at triage: Gate A cannot be evaluated. At most " <>
+                "lens exactly once. Allowed only beside `verdict`. Gate A reads these at " <>
+                "triage and again at merge, so a verdict sent WITHOUT them escalates at " <>
+                "triage: Gate A cannot be evaluated. At most " <>
                 "#{RunnerLensVerdict.max_bytes()} bytes for all three under the byte rule."
           },
           detail: %Schema{

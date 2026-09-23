@@ -685,10 +685,19 @@ defmodule Loopctl.Delivery.MergePrecondition do
     do: Enum.any?(reasons, &match?({tag, _} when tag in [:gate_a, :trio_verdict], &1))
 
   defp gate_a_reasons(%GateA.Result{decision: :escalate, reasons: reasons}),
-    do: Enum.map(reasons, &{:gate_a, &1})
+    do: Enum.map(reasons, &{:gate_a, code_only(&1)})
 
   defp gate_a_reasons(%GateA.Result{verdict: :story}), do: []
   defp gate_a_reasons(%GateA.Result{verdict: verdict}), do: [{:trio_verdict, verdict}]
+
+  # A contradiction carries the lens's own `ref` and `why` — runner-authored text written by a
+  # session that had read the reporter's words. These reasons become the escalation reason,
+  # which is appended to the hash-chained audit log, so only its COUNT travels; the text stays
+  # on the verdict record and on `verdict.gate_a`, where an operator reads it as data.
+  defp code_only({:contradiction, index, contradicts}) when is_list(contradicts),
+    do: {:contradiction, index, length(contradicts)}
+
+  defp code_only(reason), do: reason
 
   defp gate_b_reasons(%GateB.Result{outcome: :clear}, _proof), do: []
 

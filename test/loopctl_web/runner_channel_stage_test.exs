@@ -98,6 +98,56 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
     end)
   end
 
+  describe "triage_verdict (US-44.1)" do
+    defp verdict_payload(dispatch_id, lens_verdicts) do
+      %{
+        "dispatch_id" => dispatch_id,
+        "claim_epoch" => @epoch,
+        "verdict" => %{
+          "outcome" => "escalate",
+          "confidence" => "low",
+          "escalation_reasons" => ["Needs a person."]
+        },
+        "lens_verdicts" => lens_verdicts
+      }
+    end
+
+    defp lens(name), do: %{"lens" => name, "outcome" => "escalate", "confidence" => "low"}
+
+    defp verdict_count(tenant_id) do
+      {:ok, count} =
+        Loopctl.Repo.with_tenant(tenant_id, fn ->
+          Loopctl.Repo.aggregate(Loopctl.Delivery.TriageVerdictRecord, :count)
+        end)
+
+      count
+    end
+
+    test "lens verdicts of the wrong shape are refused invalid_payload and record nothing", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+
+      ref =
+        push(
+          channel,
+          "triage_verdict",
+          verdict_payload(dispatch_id, [lens("analyst"), lens("analyst")])
+        )
+
+      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      assert verdict_count(runner.tenant_id) == 0
+    end
+
+    test "a triage verdict on an IMPLEMENT dispatch is refused and records nothing", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+      lenses = Enum.map(~w(analyst architect engineer), &lens/1)
+
+      ref = push(channel, "triage_verdict", verdict_payload(dispatch_id, lenses))
+
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert verdict_count(runner.tenant_id) == 0
+    end
+  end
+
   describe "stage" do
     test "advances the row and replies with it", ctx do
       %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx

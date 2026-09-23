@@ -68,7 +68,8 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
         tenant_id: story.tenant_id,
         runner: runner,
         story_id: story.id,
-        claim_epoch: @epoch
+        claim_epoch: @epoch,
+        kind: "triage"
       })
 
     %{story: story, runner: runner, record: record}
@@ -364,6 +365,39 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
                )
 
       assert stage_of(story) == :escalated
+    end
+
+    test "a verdict arriving after the story left triage is refused and records nothing" do
+      %{story: story, runner: runner, record: record} = session(stage: :implementing)
+
+      assert {:error, :stale_stage} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, verdict("reject"))
+               )
+
+      assert records(story.tenant_id) == []
+    end
+
+    test "a resend with the lens verdicts in another order is the same verdict" do
+      %{story: story, runner: runner, record: record} = session()
+
+      lens_verdicts =
+        for lens <- ~w(analyst architect engineer),
+            do: %{lens: lens, outcome: "escalate", confidence: "low"}
+
+      message =
+        record
+        |> verdict_message(verdict("escalate", %{escalation_reasons: ["Needs a person."]}))
+        |> Map.put(:lens_verdicts, lens_verdicts)
+
+      assert {:ok, %{replayed?: false}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      reordered = %{message | lens_verdicts: Enum.reverse(lens_verdicts)}
+
+      assert {:ok, %{replayed?: true}} =
+               TriageVerdict.apply(story.tenant_id, runner.id, reordered)
     end
 
     test "lens verdicts are recorded keyed by lens, for Gate A to read (US-44.1)" do

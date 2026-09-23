@@ -469,6 +469,25 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     end
   end
 
+  describe "Gate A's reasons carry no runner-authored text (US-44.1 review)" do
+    test "a contradiction reaches the reasons as a count, not as its ref and why" do
+      contradicted =
+        Map.put(trio("story"), "contradicts", [
+          %{"kind" => "kb", "ref" => "INJECTED-REF", "why" => "INJECTED-WHY"}
+        ])
+
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 1},
+          gate_a_input: {:persisted_triage, [trio("story"), trio("story"), contradicted]}
+        )
+
+      assert {:gate_a, {:contradiction, 2, 1}} in verdict.reasons
+      refute inspect(verdict.reasons) =~ "INJECTED"
+    end
+  end
+
   describe "the trigger configuration fails closed" do
     test "a MISSING configuration escalates unconditionally" do
       verdict =
