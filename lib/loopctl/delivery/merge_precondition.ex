@@ -712,8 +712,14 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # allowed to gate (`GateA.Result`). A code-shaped string is kept for exactly that; anything
   # else is a lens's prose and is replaced by a STRING naming its size, so the result still
   # encodes as JSON and still matches `GateA.Result.t`.
+  #
+  # CODE-SHAPED MEANS THE GATING CODES' OWN SHAPE (`GateA.gating_reason_codes/0`: lower-case
+  # words joined by underscores), and nothing wider. Round 2 widened it to capitals, colons,
+  # dots and hyphens, which kept session text such as `IGNORE-ALL.prior:rules` verbatim in the
+  # escalation reason, the log line and the endpoint's body. A lens that wants a soft signal
+  # counted writes it in the shape the gate's own vocabulary has.
   defp soft_code(code) when is_binary(code) do
-    if Regex.match?(~r/\A[A-Za-z0-9_:.\-]{1,60}\z/, code),
+    if Regex.match?(~r/\A[a-z0-9_]{1,60}\z/, code),
       do: code,
       else: "[prose:#{byte_size(code)}]"
   end

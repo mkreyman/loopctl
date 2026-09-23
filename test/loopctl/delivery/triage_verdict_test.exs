@@ -265,6 +265,56 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     end
   end
 
+  describe "screen_codes/1 (pure, US-44.2 round 3)" do
+    # The codes ride the `detected -> triaged` event, which `Stages` refuses over
+    # `max_event_data_bytes/0` measured on the ENCODED payload — refusing the triage step itself.
+    defp encoded(codes), do: byte_size(Jason.encode!(%{"gate_screen" => codes}))
+
+    defp path(pattern), do: {:human_path, "any/file", pattern}
+
+    test "codes that fit are recorded exactly, with no sentinel" do
+      assert TriageVerdict.screen_codes([{:gate_a, :gate_a_inputs_missing}, path("priv/**")]) ==
+               ["gate_a:gate_a_inputs_missing", "human_path:priv/**"]
+    end
+
+    test "an oversized code is SKIPPED, not a stop: the codes after it are still recorded" do
+      huge = String.duplicate("a", Stages.max_event_data_bytes())
+
+      codes =
+        TriageVerdict.screen_codes([{:gate_a, :disagreement}, path(huge), path("lib/after/**")])
+
+      assert codes == ["gate_a:disagreement", "human_path:lib/after/**", "screen_overflow"]
+      assert encoded(codes) <= Stages.max_event_data_bytes()
+    end
+
+    test "a refusal whose every code is too large still records one: the sentinel" do
+      huge = String.duplicate("a", Stages.max_event_data_bytes())
+      assert TriageVerdict.screen_codes([path(huge), path(huge <> "b")]) == ["screen_overflow"]
+    end
+
+    test "the budget is the JSON-ENCODED size, which is what Stages refuses on" do
+      # Each code is under half the bound in raw bytes and over half once encoded, because
+      # every backslash encodes as two. Counted raw, both would be kept and the triage step
+      # refused `:invalid_event_data`.
+      half = div(Stages.max_event_data_bytes(), 2)
+      slashes = String.duplicate("\\", half - 100)
+
+      codes = TriageVerdict.screen_codes([path(slashes <> "1"), path(slashes <> "2")])
+
+      assert length(codes) == 2
+      assert List.last(codes) == "screen_overflow"
+      assert encoded(codes) <= Stages.max_event_data_bytes()
+    end
+
+    test "the count bound keeps the first codes and marks the rest dropped" do
+      codes = TriageVerdict.screen_codes(for i <- 1..30, do: path("p#{i}/**"))
+
+      assert length(codes) == 21
+      assert hd(codes) == "human_path:p1/**"
+      assert List.last(codes) == "screen_overflow"
+    end
+  end
+
   describe "apply/3" do
     test "a story verdict advances detected -> triaged and records what was said" do
       %{story: story, runner: runner, record: record} = session()
@@ -398,6 +448,26 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert stage_of(story) == :escalated
     end
 
+    test "a recorded screen refusal with NO codes is still a refusal, never a queue" do
+      %{story: story, runner: runner, record: record} = session()
+
+      # What the old byte cap could write: every code dropped, the key still present.
+      advance_to_triaged(story,
+        dispatch_id: record.dispatch_id,
+        event_data: %{"gate_screen" => []}
+      )
+
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :escalated
+      assert escalation_reason(story) =~ "screen_overflow"
+    end
+
     test "a half-applied verdict the first attempt QUEUED is not re-screened into an escalation" do
       %{story: story, runner: runner, record: record} = session()
       advance_to_triaged(story, dispatch_id: record.dispatch_id)
@@ -501,7 +571,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       # Another triage dispatch took the story out of `detected` and bound it.
       advance_to_triaged(story, dispatch_id: Ecto.UUID.generate())
 
-      assert {:error, :stale_stage} =
+      assert {:error, :triage_not_bound} =
                TriageVerdict.apply(
                  story.tenant_id,
                  runner.id,
@@ -509,6 +579,10 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
                )
 
       assert stage_of(story) == :triaged
+
+      # Refused off the stage row BEFORE it records, screens or reads anything else: a
+      # stranger's verdict leaves no record for a later reader to mistake for the decider's.
+      assert records(story.tenant_id) == []
     end
 
     test "a zombie after a reclaim cannot take the story further, and its draft never lands" do
@@ -521,12 +595,18 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
       # This dispatch never triaged it: its story verdict must not queue or draft anything.
       message = verdict_message(record, story_verdict())
-      assert {:error, :stale_stage} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert {:error, :triage_not_bound} =
+               TriageVerdict.apply(story.tenant_id, runner.id, message)
+
       assert stage_of(story) == :triaged
       assert reload_story(story).title == before.title
 
       # And its resend is refused too, never answered as a replay that was applied.
-      assert {:error, :stale_stage} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert {:error, :triage_not_bound} =
+               TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert records(story.tenant_id) == []
     end
 
     test "a resend after a reclaim drafts the story before queueing it, never the stub" do
@@ -554,7 +634,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       %{story: story, runner: runner, record: record} = session()
       advance_to_triaged(story)
 
-      assert {:error, :stale_stage} =
+      assert {:error, :triage_not_bound} =
                TriageVerdict.apply(
                  story.tenant_id,
                  runner.id,
@@ -574,7 +654,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
         )
       end)
 
-      assert {:error, :stale_stage} =
+      assert {:error, :triage_not_bound} =
                TriageVerdict.apply(
                  story.tenant_id,
                  runner.id,
