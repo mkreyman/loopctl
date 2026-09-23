@@ -42,6 +42,17 @@ defmodule Loopctl.Runners.UsageTest do
 
   defp seconds_from_now(%DateTime{} = at), do: DateTime.diff(at, DateTime.utc_now(), :second)
 
+  # The physical version of the row. Every UPDATE writes a new one, even an UPDATE that changes
+  # no value, so this is how a write that should not have happened at all is seen.
+  defp version(runner) do
+    {:ok, %{rows: [[ctid]]}} =
+      Repo.with_tenant(runner.tenant_id, fn ->
+        Repo.query!("SELECT ctid::text FROM runners WHERE id = $1", [Ecto.UUID.dump!(runner.id)])
+      end)
+
+    ctid
+  end
+
   # The SQL this process sent while `fun` ran — for a write that changes no row's value, and so
   # can only be seen by whether it was issued at all.
   defp queries_during(fun) do
@@ -135,15 +146,88 @@ defmodule Loopctl.Runners.UsageTest do
       assert_in_delta seconds_from_now(row(r).usage_exhausted_until), @eight_days, 5
     end
 
-    test "SETS rather than keeping the later value, so a real reset corrects the bound" do
+    test "a real reset replaces the bound a report with no reset set" do
       tenant = fixture(:stage_tenant)
       r = runner(tenant.id)
 
       assert :ok = Usage.record(tenant.id, r.id, %{exhausted: true})
+      assert row(r).usage_hold_provisional
       soon = DateTime.add(DateTime.utc_now(), 600, :second)
       assert :ok = Usage.record(tenant.id, r.id, %{exhausted: true, resets_at: soon})
 
       assert DateTime.compare(row(r).usage_exhausted_until, soon) == :eq
+      refute row(r).usage_hold_provisional
+    end
+
+    test "a peer's PROVISIONAL guess is NOT replaced by a reset that is already past" do
+      tenant = fixture(:stage_tenant)
+      [r1, r2] = for _ <- 1..2, do: runner(tenant.id)
+
+      for r <- [r1, r2],
+          do: assert(:ok = Usage.record(tenant.id, r.id, %{exhausted: false, account_ref: "a"}))
+
+      assert :ok = Usage.mark_session_exhausted(tenant.id, r2.id, nil)
+      guess = row(r2).usage_exhausted_until
+
+      # r1's clock runs behind: its reset is an hour gone. Clamped to the floor it is a minute
+      # out — no evidence against r2's session having found the account dry.
+      past = DateTime.add(DateTime.utc_now(), -3_600, :second)
+      assert :ok = Usage.record(tenant.id, r1.id, %{exhausted: true, resets_at: past})
+
+      assert DateTime.compare(row(r2).usage_exhausted_until, guess) == :eq
+      assert row(r2).usage_hold_provisional
+      assert_in_delta seconds_from_now(row(r1).usage_exhausted_until), 60, 5
+      assert_in_delta seconds_from_now(Usage.exhausted_until(tenant.id, r1.id)), @eight_days, 5
+    end
+
+    test "a peer's REPORTED hold is never shortened" do
+      tenant = fixture(:stage_tenant)
+      [r1, r2] = for _ <- 1..2, do: runner(tenant.id)
+      later = DateTime.add(DateTime.utc_now(), 7_200, :second)
+      soon = DateTime.add(DateTime.utc_now(), 600, :second)
+
+      assert :ok = Usage.record(tenant.id, r1.id, %{exhausted: false, account_ref: "a"})
+
+      assert :ok =
+               Usage.record(tenant.id, r2.id, %{
+                 exhausted: true,
+                 resets_at: later,
+                 account_ref: "a"
+               })
+
+      assert :ok = Usage.record(tenant.id, r1.id, %{exhausted: true, resets_at: soon})
+
+      # r2's report reached r1's row too; neither is lowered by r1's nearer one.
+      assert DateTime.compare(row(r2).usage_exhausted_until, later) == :eq
+      assert DateTime.compare(row(r1).usage_exhausted_until, later) == :eq
+    end
+
+    test "a report with no reset does not slide a reported hold out to the bound" do
+      tenant = fixture(:stage_tenant)
+      r = runner(tenant.id)
+      soon = DateTime.add(DateTime.utc_now(), 600, :second)
+
+      assert :ok = Usage.record(tenant.id, r.id, %{exhausted: true, resets_at: soon})
+      assert :ok = Usage.record(tenant.id, r.id, %{exhausted: true})
+
+      assert DateTime.compare(row(r).usage_exhausted_until, soon) == :eq
+    end
+
+    test "a repeated report writes no row, with or without a reset" do
+      tenant = fixture(:stage_tenant)
+      [r1, r2] = for _ <- 1..2, do: runner(tenant.id)
+      soon = DateTime.add(DateTime.utc_now(), 600, :second)
+      report = %{exhausted: true, resets_at: soon, account_ref: "a"}
+
+      assert :ok = Usage.record(tenant.id, r2.id, %{exhausted: false, account_ref: "a"})
+      assert :ok = Usage.record(tenant.id, r1.id, report)
+      before = {version(r1), version(r2)}
+
+      assert :ok = Usage.record(tenant.id, r1.id, report)
+      assert {version(r1), version(r2)} == before
+
+      assert :ok = Usage.record(tenant.id, r1.id, %{exhausted: true})
+      assert {version(r1), version(r2)} == before
     end
 
     test "WITH an account, sets every same-tenant row of that account — a stale peer hold " <>
@@ -276,7 +360,26 @@ defmodule Loopctl.Runners.UsageTest do
       assert row(r1).account_ref == "b"
       assert row(r1).usage_exhausted_until == nil
       assert DateTime.compare(row(r2).usage_exhausted_until, hold) == :eq
+      # Handed over as the GUESS it was, so a report on account a can still correct it.
+      assert row(r2).usage_hold_provisional
       assert DateTime.compare(row(r3).usage_exhausted_until, later) == :eq
+    end
+
+    test "an EXPIRED hold is not cleared or stamped, so a later session end still marks" do
+      tenant = fixture(:stage_tenant)
+      r = runner(tenant.id)
+      accepted_at = DateTime.add(DateTime.utc_now(), -60, :second)
+
+      # The window reset by itself; the runner's next status says so, as routine.
+      :ok = put_row(r, usage_exhausted_until: DateTime.add(DateTime.utc_now(), -1, :second))
+      assert :ok = Usage.record(tenant.id, r.id, %{exhausted: false})
+      assert row(r).usage_cleared_at == nil
+
+      # A session accepted before that status runs the account dry. Stamping the expired hold
+      # as a clear made this look like a report the refill had overtaken, and it was skipped.
+      assert :ok = Usage.mark_session_exhausted(tenant.id, r.id, accepted_at)
+
+      assert_in_delta seconds_from_now(row(r).usage_exhausted_until), @eight_days, 5
     end
 
     test "a switch hands over nothing when the hold is already past" do
@@ -306,13 +409,17 @@ defmodule Loopctl.Runners.UsageTest do
   end
 
   describe "mark_session_exhausted/3 (AC-44.6.4)" do
-    test "holds a runner with no value for eight days" do
+    test "holds a runner with no value for eight days, as a provisional guess a clear ends" do
       tenant = fixture(:stage_tenant)
       r = runner(tenant.id)
 
       assert :ok = Usage.mark_session_exhausted(tenant.id, r.id, nil)
 
       assert_in_delta seconds_from_now(row(r).usage_exhausted_until), @eight_days, 5
+      assert row(r).usage_hold_provisional
+
+      assert :ok = Usage.record(tenant.id, r.id, %{exhausted: false})
+      refute row(r).usage_hold_provisional
     end
 
     test "replaces an EARLIER stored reset with the bound" do
@@ -380,6 +487,8 @@ defmodule Loopctl.Runners.UsageTest do
       assert :ok = Usage.mark_session_exhausted(tenant.id, r.id, nil)
 
       assert DateTime.compare(row(r).usage_exhausted_until, later) == :eq
+      # Still the report it was, not a guess.
+      refute row(r).usage_hold_provisional
     end
   end
 
@@ -507,6 +616,24 @@ defmodule Loopctl.Runners.UsageTest do
       assert {^first, ^cache} = Usage.exhausted_for_pass(cache, tenant.id)
       assert {%{} = fresh, _cache} = Usage.exhausted_for_pass(%{}, tenant.id)
       assert Map.has_key?(fresh, r.id)
+    end
+  end
+
+  describe "recheck_for_pass/3" do
+    test "a runner found dry joins the cached map with its reset; a fresh one leaves it" do
+      tenant = fixture(:stage_tenant)
+      [dry, fresh] = for _ <- 1..2, do: runner(tenant.id)
+      {%{} = before, cache} = Usage.exhausted_for_pass(%{}, tenant.id)
+      refute Map.has_key?(before, dry.id)
+
+      soon = DateTime.add(DateTime.utc_now(), 600, :second)
+      assert :ok = Usage.record(tenant.id, dry.id, %{exhausted: true, resets_at: soon})
+
+      assert {false, ^cache} = Usage.recheck_for_pass(cache, tenant.id, fresh.id)
+      assert {true, cache} = Usage.recheck_for_pass(cache, tenant.id, dry.id)
+
+      assert {%{} = now, _cache} = Usage.exhausted_for_pass(cache, tenant.id)
+      assert DateTime.compare(now[dry.id], soon) == :eq
     end
   end
 

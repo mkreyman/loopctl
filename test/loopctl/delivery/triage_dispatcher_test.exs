@@ -27,6 +27,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageDispatcher
   alias Loopctl.Progress
+  alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Usage
   alias LoopctlWeb.RunnerSocket
 
@@ -219,6 +220,109 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       refute log =~ "earliest_usage_reset"
 
       leave_channel(channel)
+    end
+
+    test "a runner that ran dry AFTER the pass read the map is re-checked before the push, " <>
+           "and the triage goes to the next runner",
+         ctx do
+      story = detected_story(ctx)
+
+      {r2_key, r2} =
+        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
+
+      dry = join_runner(ctx, %{"kinds" => ["triage"]})
+      other = join_as(r2, r2_key, "beelink", %{"kinds" => ["triage"]})
+      # The dry runner is the least loaded, so it is picked FIRST.
+      unboxed(fn -> set_in_flight(r2.id, 1) end)
+
+      # `Runners.dispatch/3` checks nothing about the subscription, so without the re-check the
+      # map read seconds earlier sent this to a machine whose session would end
+      # `usage_exhausted`.
+      assert exhaust_mid_pass(ctx.runner.id, fn ->
+               unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end)
+             end) == [:dispatched]
+
+      assert [runner_id] =
+               unboxed(fn ->
+                 AdminRepo.all(
+                   from r in Loopctl.Runners.DispatchRecord,
+                     where: r.story_id == ^story.id,
+                     select: r.runner_id
+                 )
+               end)
+
+      assert runner_id == r2.id
+
+      leave_channel(other)
+      leave_channel(dry)
+    end
+
+    test "an exhausted runner that is also FULL contributes no reset", ctx do
+      _story = detected_story(ctx)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true})
+        set_in_flight(ctx.runner.id, 9)
+      end)
+
+      Logger.put_module_level(Usage, :info)
+      on_exit(fn -> Logger.delete_module_level(Usage) end)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+        end)
+
+      refute log =~ "earliest_usage_reset"
+
+      leave_channel(channel)
+    end
+
+    test "an empty fleet reads no exhausted runners", ctx do
+      _story = detected_story(ctx)
+
+      id = {__MODULE__, make_ref()}
+      :ok = :telemetry.attach(id, [:loopctl, :repo, :query], &__MODULE__.count_read/4, self())
+
+      try do
+        assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+      after
+        :telemetry.detach(id)
+      end
+
+      refute_received :exhaustion_read
+    end
+
+    test "a candidate that raises after the pass read the map does not throw the read away",
+         ctx do
+      for _ <- 1..2, do: detected_story(ctx)
+
+      # A pool entry that passes every fact on its meta and whose id is not a UUID, so the row
+      # read AFTER the exhaustion read raises — for every candidate.
+      topic = Loopctl.Runners.pool_topic(ctx.tenant.id)
+
+      {:ok, _ref} =
+        Presence.track(self(), topic, "ghost", %{
+          runner_id: "not-a-uuid",
+          kinds: ["triage"]
+        })
+
+      id = {__MODULE__, make_ref()}
+      :ok = :telemetry.attach(id, [:loopctl, :repo, :query], &__MODULE__.count_read/4, self())
+
+      try do
+        capture_log(fn ->
+          assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) ==
+                   [:errored, :errored]
+        end)
+      after
+        :telemetry.detach(id)
+        Presence.untrack(self(), topic, "ghost")
+      end
+
+      assert_received :exhaustion_read
+      refute_received :exhaustion_read
     end
 
     test "a runner that declares NOTHING is not sent triage either", ctx do
@@ -522,6 +626,62 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   def count_read(_event, _measurements, %{query: query}, pid) do
     if self() == pid and query =~ ~r/^SELECT .*"usage_exhausted_until"/s,
       do: send(pid, :exhaustion_read)
+  end
+
+  # Runs `fun` with `runner_id` exhausted the moment the pass has READ the tenant's exhausted
+  # runners (the grouped read) and before it acts on what it read: a machine running dry
+  # mid-pass. Written on AdminRepo's own connection, so it commits outside the read.
+  defp exhaust_mid_pass(runner_id, fun) do
+    id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(id, [:loopctl, :repo, :query], &__MODULE__.exhaust_after_read/4, %{
+        pid: self(),
+        id: id,
+        runner_id: runner_id
+      })
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(id)
+    end
+  end
+
+  @doc false
+  def exhaust_after_read(_event, _measurements, %{query: query}, config) do
+    %{pid: pid, id: id, runner_id: runner_id} = config
+
+    if self() == pid and query =~ ~r/^SELECT .*"usage_exhausted_until".* GROUP BY /s do
+      :telemetry.detach(id)
+      until = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      {1, _} =
+        AdminRepo.update_all(from(r in Loopctl.Runners.Runner, where: r.id == ^runner_id),
+          set: [usage_exhausted_until: until]
+        )
+    end
+  end
+
+  defp set_in_flight(runner_id, count) do
+    {1, _} =
+      AdminRepo.update_all(from(r in Loopctl.Runners.Runner, where: r.id == ^runner_id),
+        set: [in_flight: count]
+      )
+  end
+
+  defp join_as(runner, key, machine, overrides) do
+    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(key))
+
+    {:ok, _reply, channel} =
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        Map.merge(join_payload(machine), overrides)
+      )
+
+    _ = :sys.get_state(channel.channel_pid)
+    channel
   end
 
   defp join_runner(ctx, overrides) do

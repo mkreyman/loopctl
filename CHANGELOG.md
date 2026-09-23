@@ -9,9 +9,9 @@ All notable changes to loopctl are documented here.
 - **An exhausted subscription is not capacity (epic 44, US-44.6, runner contract 1.17.0).
   RE-VENDOR the contract to send `usage`; a runner that does not is never held out, except by
   its own `usage_exhausted` session ends.** A `status` message may carry `usage: {exhausted,
-  resets_at, account_ref}`, stored in three new `runners` columns, `usage_exhausted_until`,
-  `account_ref` and `usage_cleared_at` (migration, no manual step, NULL for existing rows,
-  which reads as not exhausted). While a runner's own value — or that of any runner of the tenant sending the same
+  resets_at, account_ref}`, stored in new `runners` columns, `usage_exhausted_until`,
+  `account_ref`, `usage_cleared_at` and `usage_hold_provisional` (migration, no manual step;
+  existing rows get NULL and `false`, which reads as not exhausted). While a runner's own value — or that of any runner of the tenant sending the same
   `account_ref` — is in the future, the dispatch driver and the triage dispatcher skip it and
   `POST /api/v1/runners/:runner_id/dispatches` refuses it `409 runner_exhausted` with
   `usage_exhausted_until`, nothing claimed. `resets_at` is clamped to between one minute and

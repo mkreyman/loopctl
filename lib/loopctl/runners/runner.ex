@@ -100,6 +100,7 @@ defmodule Loopctl.Runners.Runner do
     # decides on, and a raw per-row value beside it would be a second answer to one question.
     field :usage_exhausted_until, :utc_datetime_usec
     field :usage_cleared_at, :utc_datetime_usec
+    field :usage_hold_provisional, :boolean, default: false
     field :account_ref, :string
 
     timestamps()

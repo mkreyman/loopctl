@@ -902,10 +902,17 @@ defmodule Loopctl.Runners do
   same-tenant row sharing its `account_ref` — because it has to survive a reconnect, and it is
   asked here so that both unattended selectors (the driver and the triage dispatcher) skip an
   exhausted machine instead of placing on it, and `Loopctl.Delivery.Placement` refuses one with
-  the same code. Read after the two in-memory facts, which cost nothing, and before `kind`,
-  whose ledger fallback is a read too. A pass hands in `exhausted` — the tenant's
+  the same code.
+
+  The order is draining, repo, KIND, then EXHAUSTION. The first two are in-memory and cost
+  nothing. Kind comes before exhaustion even though its ledger fallback is a read, because
+  `:runner_exhausted` is not only a refusal: the passes turn it into the no-runner note's
+  "capacity returns at <reset>", and a runner that could never take this kind would name a
+  reset that places nothing. So it is only ever the answer for a runner that is otherwise
+  eligible. A pass hands in `exhausted` — the tenant's
   `Loopctl.Runners.Usage.exhausted_until_by_runner/1`, read once per pass
-  (`Loopctl.Runners.Usage.exhausted_for_pass/2`) — and it is looked up rather than queried;
+  (`Loopctl.Runners.Usage.exhausted_for_pass/2`) — and it is looked up rather than queried; `%{}`
+  answers every fact but that one, which is how a pass asks before it has made the read, and
   `nil` reads this runner's row.
 
   `:ok`, or

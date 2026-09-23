@@ -7,7 +7,11 @@ defmodule Loopctl.Repo.Migrations.AddRunnersUsageExhausted do
     `session_ended` `usage_exhausted`; cleared by `usage.exhausted: false`. NULL is "not
     exhausted", and so is a value in the past — nothing sweeps an expired one, because the
     readers compare against now.
-  - `usage_cleared_at` — when a `usage.exhausted: false` last cleared this row. A
+  - `usage_hold_provisional` — whether `usage_exhausted_until` is a GUESS: the 8-day bound a
+    `session_ended` `usage_exhausted` (or a `status` with no `resets_at`) sets, knowing no
+    reset. A later `status` with a future `resets_at` replaces a guess on every machine of the
+    account, and never shortens a reported hold. NOT NULL, default false.
+  - `usage_cleared_at` — when a `usage.exhausted: false` last cleared a LIVE hold on this row. A
     `session_ended` `usage_exhausted` whose dispatch was accepted BEFORE it does not re-mark the
     account: the session saw a fact the refill report has since overtaken.
   - `account_ref` — the opaque value a runner derives from the login it runs sessions under.
@@ -21,7 +25,7 @@ defmodule Loopctl.Repo.Migrations.AddRunnersUsageExhausted do
   makes and the account-wide clear. Partial, because a runner that never sent `usage` carries no
   account and is never looked up by one.
 
-  No backfill and no manual step. Additive and nullable, so an old instance still serving during
+  No backfill and no manual step. Additive, and nullable or defaulted, so an old instance still serving during
   the rolling deploy writes rows the new code reads correctly — as not exhausted, which is what
   every existing runner is. The table already has RLS enabled; columns inherit it.
   """
@@ -32,6 +36,7 @@ defmodule Loopctl.Repo.Migrations.AddRunnersUsageExhausted do
     alter table(:runners) do
       add :usage_exhausted_until, :utc_datetime_usec, null: true
       add :usage_cleared_at, :utc_datetime_usec, null: true
+      add :usage_hold_provisional, :boolean, null: false, default: false
       add :account_ref, :string, null: true
     end
 
@@ -55,6 +60,7 @@ defmodule Loopctl.Repo.Migrations.AddRunnersUsageExhausted do
     alter table(:runners) do
       remove :usage_exhausted_until
       remove :usage_cleared_at
+      remove :usage_hold_provisional
       remove :account_ref
     end
   end

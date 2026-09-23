@@ -11,7 +11,8 @@ defmodule Loopctl.Runners.Usage do
 
   ## The state, and where it lives
 
-  Two columns on the `runners` row: `usage_exhausted_until` and `account_ref`. Postgres, not
+  Columns on the `runners` row: `usage_exhausted_until`, `usage_hold_provisional` and
+  `account_ref`. Postgres, not
   Presence meta, so it survives a node restart and reads the same from every node — a runner
   that reconnects elsewhere does not come back looking fresh.
 
@@ -26,35 +27,52 @@ defmodule Loopctl.Runners.Usage do
   - `record/3`, from a `status` message's `usage`. The report is about the ACCOUNT, so both
     values act on every row of the tenant sharing the runner's `account_ref` (the one sent, or
     the one stored when none is) and on the runner's own row; with no account at all, on its
-    own row alone. `exhausted: true` SETS the value to `resets_at` CLAMPED to
-    `[now + 60s, now + 8 days]`, and with no `resets_at` to the upper bound — never ignored,
-    because ignoring fails open. It SETS rather than keeping the later value: the report is the
-    freshest observation of the account there is, and it is what corrects the 8-day bound below
-    downward — on every machine of the account, or a stale hold on a peer would outlive it.
-    `exhausted: false` CLEARS every such row that holds a value, and stamps `usage_cleared_at`
-    on each one it clears — the account has refilled, so every machine on it has.
-  - A runner that REPORTS A DIFFERENT `account_ref` first hands a future hold on its own row to
-    the rows still on the old one (where theirs is earlier or absent), then switches: its move
-    to another login does not refill the account it leaves.
-  - `mark_session_exhausted/3`, from a `session_ended` `usage_exhausted`. Sets `now + 8 days`
-    unless a LATER value is already stored. The upper bound because the session carries no
-    reset time; the runner's next `status` carries the real one.
+    own row alone. `exhausted: true` carries `resets_at` CLAMPED to `[now + 60s, now + 8 days]`,
+    or the upper bound when there is none — never ignored, because ignoring fails open — and
+    what it does to a row depends on what the row already holds:
+      - NO LIVE HOLD (none, or one already past): takes the value.
+      - a PROVISIONAL hold — the 8-day guess below, made knowing no reset: replaced when the
+        report carries a `resets_at` still ahead, which is a real observation of the account
+        and corrects the guess on every machine of it (a stale guess on a peer would otherwise
+        outlive it). A report with no `resets_at`, or one already past, is no better evidence
+        than the guess and leaves it.
+      - a REPORTED hold still ahead: raised to the value when that is later, never lowered —
+        it is another machine's observation of the same account, as good as this one — and not
+        slid out to the bound by a report that carries no `resets_at`.
+    A value from a report with no `resets_at` is itself provisional. Only rows whose value or
+    flag changes are written, so a runner repeating one report writes nothing.
+    `exhausted: false` CLEARS every such row holding a LIVE hold, and stamps `usage_cleared_at`
+    on each one it clears — the account has refilled, so every machine on it has. A hold
+    already past is left as it is and stamps nothing: it ended by itself, and the routine
+    `exhausted: false` that follows a reset is no evidence of a refill after any session.
+  - A runner that REPORTS A DIFFERENT `account_ref` first hands a future hold on its own row,
+    provisional or not as it was, to the rows still on the old one (where theirs is earlier or
+    absent), then switches: its move to another login does not refill the account it leaves.
+  - `mark_session_exhausted/3`, from a `session_ended` `usage_exhausted`. Sets `now + 8 days`,
+    PROVISIONAL, unless a LATER value is already stored. The upper bound because the session
+    carries no reset time; the runner's next `status` with a future `resets_at` replaces it.
 
   ## Clock skew
 
   `resets_at` is the RUNNER's clock; the clamp is control's. A runner whose clock runs behind
-  can send a reset that is already past — clamped up to `now + 60s`, so a declared exhaustion
-  is never a no-op — and one whose clock runs ahead cannot hold a machine out for longer than
-  8 days, which is the ceiling a stale or hostile timestamp can buy.
+  can send a reset that is already past. On a row with no live hold it is clamped up to
+  `now + 60s`, so a declared exhaustion is never a no-op; it never replaces a provisional hold,
+  which a past reset is no evidence against, and never lowers a reported one. A runner whose
+  clock runs ahead cannot hold a machine out for longer than 8 days, which is the ceiling a
+  stale or hostile timestamp can buy.
 
   ## Races, and which way each one fails
 
   Every write is ONE statement (or one transaction), so two writers interleave at row
   granularity and last-writer-wins. A `session_ended usage_exhausted` whose dispatch was
   accepted BEFORE the account was last cleared does not mark it: the session observed a fact
-  the refill report has since overtaken (`usage_cleared_at`). A clear that found nothing to
-  clear stamps nothing, so a session end arriving after such a report still marks — for up to
-  8 days, until the next `status` with `usage` clears it: the fail-CLOSED direction, bounded.
+  the refill report has since overtaken (`usage_cleared_at`). A clear that found no LIVE hold
+  stamps nothing — an expired one included — so a session end arriving after such a report
+  still marks, for up to 8 days, until the next `status` with `usage` clears it: the
+  fail-CLOSED direction, bounded. The one residual this accepts: an account refilled (a live
+  hold cleared) and drained again within ONE session is not marked by that session's report,
+  whose dispatch was accepted before the clear. The next session on that runner is accepted
+  after the clear, so its report marks it — at most one wasted placement.
   The opposite order clears an exhaustion a session just observed, and the next session on
   that account ends `usage_exhausted` again and re-marks it: one wasted placement, not a loop.
   A `session_ended` resend after the claim ended must not re-exhaust the account either, which
@@ -126,14 +144,32 @@ defmodule Loopctl.Runners.Usage do
           :ok | {:error, :busy | :rejected_by_database}
   def record(tenant_id, runner_id, %{exhausted: true} = usage)
       when is_binary(tenant_id) and is_binary(runner_id) do
-    until = clamp(Map.get(usage, :resets_at), DateTime.utc_now())
+    now = DateTime.utc_now()
+    resets_at = Map.get(usage, :resets_at)
+    until = clamp(resets_at, now)
 
     write(tenant_id, fn ->
       account_ref = switch_account_ref(tenant_id, runner_id, usage)
 
-      from(r in Runner, where: r.tenant_id == ^tenant_id)
-      |> same_account_or_self(runner_id, account_ref)
-      |> Repo.update_all(set: [usage_exhausted_until: until])
+      account =
+        from(r in Runner, where: r.tenant_id == ^tenant_id)
+        |> same_account_or_self(runner_id, account_ref)
+
+      # Every row this matches CHANGES — a missing or past value differs from one in the
+      # future, and a replaced guess flips its flag — so a repeated report writes nothing.
+      account
+      |> where(^replaceable(resets_at, now))
+      |> Repo.update_all(
+        set: [usage_exhausted_until: until, usage_hold_provisional: is_nil(resets_at)]
+      )
+
+      # A REPORTED hold still ahead is only ever raised; strictly earlier, so again only a
+      # change is written. With no `resets_at` there is nothing to raise it to.
+      if resets_at do
+        account
+        |> where([r], not r.usage_hold_provisional and r.usage_exhausted_until < ^until)
+        |> Repo.update_all(set: [usage_exhausted_until: until])
+      end
 
       :ok
     end)
@@ -146,22 +182,36 @@ defmodule Loopctl.Runners.Usage do
     write(tenant_id, fn ->
       account_ref = switch_account_ref(tenant_id, runner_id, usage)
 
-      # Only the rows that HOLD a value: a runner reporting `exhausted: false` on every status
-      # would otherwise rewrite the whole account each time, on the row every reservation in
-      # the tenant contends on.
-      from(r in Runner, where: r.tenant_id == ^tenant_id and not is_nil(r.usage_exhausted_until))
+      # Only a LIVE hold is cleared and stamped. A runner reporting `exhausted: false` on every
+      # status would otherwise rewrite the whole account each time, on the row every
+      # reservation in the tenant contends on — and stamping a hold that had already expired
+      # made the routine report after a reset suppress the next genuine session mark.
+      from(r in Runner, where: r.tenant_id == ^tenant_id and r.usage_exhausted_until > ^now)
       |> same_account_or_self(runner_id, account_ref)
-      |> Repo.update_all(set: [usage_exhausted_until: nil, usage_cleared_at: now])
+      |> Repo.update_all(
+        set: [usage_exhausted_until: nil, usage_hold_provisional: false, usage_cleared_at: now]
+      )
 
       :ok
     end)
   end
 
+  # The rows an `exhausted: true` report sets outright: those with no live hold, and — only
+  # when the report knows a reset still ahead — those holding a provisional guess.
+  defp replaceable(resets_at, now) do
+    no_live_hold =
+      dynamic([r], is_nil(r.usage_exhausted_until) or r.usage_exhausted_until <= ^now)
+
+    if resets_at && DateTime.after?(resets_at, now),
+      do: dynamic([r], ^no_live_hold or r.usage_hold_provisional),
+      else: no_live_hold
+  end
+
   @doc """
   Marks `runner_id` exhausted for the upper bound, `now + max_hold_seconds`, unless a later
   value is already stored — what a `session_ended` `usage_exhausted` does (AC-44.6.4). The
-  session carries no reset time, so this holds for the bound; the runner's next `status` with a
-  `usage.resets_at` corrects it.
+  session carries no reset time, so this holds for the bound and marks it PROVISIONAL; the
+  runner's next `status` with a future `usage.resets_at` replaces it.
 
   NOT when the account — every same-tenant row sharing the runner's `account_ref`, or its own
   row when it has none — was cleared AFTER `accepted_at`, the instant the session's dispatch
@@ -179,7 +229,16 @@ defmodule Loopctl.Runners.Usage do
         update: [
           set: [
             usage_exhausted_until:
-              fragment("GREATEST(COALESCE(?, ?), ?)", r.usage_exhausted_until, ^until, ^until)
+              fragment("GREATEST(COALESCE(?, ?), ?)", r.usage_exhausted_until, ^until, ^until),
+            # Provisional exactly when the bound is what the row now holds.
+            usage_hold_provisional:
+              fragment(
+                "? IS NULL OR ? <= ? OR ?",
+                r.usage_exhausted_until,
+                r.usage_exhausted_until,
+                ^until,
+                r.usage_hold_provisional
+              )
           ]
         ]
       )
@@ -256,8 +315,12 @@ defmodule Loopctl.Runners.Usage do
   `exhausted_until_by_runner/1` for `tenant_id`, read ONCE per pass through the pass's `cache`
   — what the driver and the triage dispatcher hand `Loopctl.Runners.accepts?/6`, so a pass
   judges every runner for every story on one read rather than a query per runner per story.
-  A pass is seconds long, and a machine that runs dry during it is still refused by
-  `Loopctl.Delivery.Placement.place/4`'s own check.
+
+  A pass is seconds long, but a machine can run dry during it, so each pass re-reads the ONE
+  runner it is about to hand work to: the driver through `Loopctl.Delivery.Placement.place/4`'s
+  own check, the triage dispatcher — whose `Loopctl.Runners.dispatch/3` checks nothing of the
+  kind — through `recheck_for_pass/3`. Either way a runner found dry joins the cached map, so
+  no later candidate of the pass picks it again.
   """
   @spec exhausted_for_pass(map(), Ecto.UUID.t()) :: {%{Ecto.UUID.t() => DateTime.t()}, map()}
   def exhausted_for_pass(cache, tenant_id) when is_map(cache) and is_binary(tenant_id) do
@@ -270,6 +333,27 @@ defmodule Loopctl.Runners.Usage do
       :error ->
         exhausted = exhausted_until_by_runner(tenant_id)
         {exhausted, Map.put(cache, key, exhausted)}
+    end
+  end
+
+  @doc """
+  Re-reads whether `runner_id` is exhausted NOW, from the rows rather than the pass's map —
+  the one read a pass makes before it commits work to a machine the map may be stale about.
+  When it is, the cached map gains it with its effective reset, so no later candidate of the
+  pass picks it again and the `:no_runner` note can name it. `{exhausted?, cache}`.
+  """
+  @spec recheck_for_pass(map(), Ecto.UUID.t(), Ecto.UUID.t()) :: {boolean(), map()}
+  def recheck_for_pass(cache, tenant_id, runner_id)
+      when is_map(cache) and is_binary(tenant_id) and is_binary(runner_id) do
+    case exhausted_until(tenant_id, runner_id) do
+      nil ->
+        {false, cache}
+
+      until ->
+        {exhausted, cache} = exhausted_for_pass(cache, tenant_id)
+
+        {true,
+         Map.put(cache, {:usage_exhausted, tenant_id}, Map.put(exhausted, runner_id, until))}
     end
   end
 
@@ -337,39 +421,40 @@ defmodule Loopctl.Runners.Usage do
   # none: omitting an optional field is not a statement that the machine changed login. Written
   # only when it CHANGED, and a change first hands a future hold on this row to the rows still
   # on the old account, where theirs is earlier or absent — otherwise the switch would take the
-  # old account's only record of its exhaustion with it.
+  # old account's only record of its exhaustion with it. The hold goes over as what it is, a
+  # guess or a report, so a later report on the old account can still correct a guess.
   defp switch_account_ref(tenant_id, runner_id, usage) do
     sent = Map.get(usage, :account_ref)
 
     case Repo.one(
            from r in own_row(tenant_id, runner_id),
-             select: {r.account_ref, r.usage_exhausted_until}
+             select: {r.account_ref, r.usage_exhausted_until, r.usage_hold_provisional}
          ) do
       nil ->
         nil
 
-      {stored, _hold} when is_nil(sent) or sent == stored ->
+      {stored, _hold, _provisional} when is_nil(sent) or sent == stored ->
         stored
 
-      {stored, hold} ->
-        hand_over_hold(tenant_id, runner_id, stored, hold)
+      {stored, hold, provisional} ->
+        hand_over_hold(tenant_id, runner_id, stored, hold, provisional)
         Repo.update_all(own_row(tenant_id, runner_id), set: [account_ref: sent])
         sent
     end
   end
 
-  defp hand_over_hold(tenant_id, runner_id, old_ref, %DateTime{} = hold)
+  defp hand_over_hold(tenant_id, runner_id, old_ref, %DateTime{} = hold, provisional)
        when is_binary(old_ref) do
     if DateTime.after?(hold, DateTime.utc_now()) do
       from(r in Runner,
         where: r.tenant_id == ^tenant_id and r.account_ref == ^old_ref and r.id != ^runner_id,
         where: is_nil(r.usage_exhausted_until) or r.usage_exhausted_until < ^hold
       )
-      |> Repo.update_all(set: [usage_exhausted_until: hold])
+      |> Repo.update_all(set: [usage_exhausted_until: hold, usage_hold_provisional: provisional])
     end
   end
 
-  defp hand_over_hold(_tenant_id, _runner_id, _old_ref, _hold), do: nil
+  defp hand_over_hold(_tenant_id, _runner_id, _old_ref, _hold, _provisional), do: nil
 
   # Every write runs in the runner channel's process, where a raise takes down the socket every
   # session on the machine shares. Bounded like every other write to the runner row (it is the
