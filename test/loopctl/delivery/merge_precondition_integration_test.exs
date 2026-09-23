@@ -140,6 +140,26 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert row.attempts["merge_gate"] == 1
     end
 
+    test "a lens contradiction's text never reaches the chained escalation reason", ctx do
+      contradicted =
+        Map.put(lens("story"), "contradicts", [
+          %{"kind" => "kb", "ref" => "INJECTED-REF", "why" => "INJECTED-WHY"}
+        ])
+
+      set_lens_verdicts(ctx, %{
+        "analyst" => lens("story"),
+        "architect" => lens("story"),
+        "engineer" => contradicted
+      })
+
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+      assert {:ok, %Verdict{decision: :refuse}} = enforce(ctx)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.escalation_reason =~ "contradiction"
+      refute row.escalation_reason =~ "INJECTED"
+    end
+
     test "a human re-queueing a GATE A refusal satisfies Gate A at the next merge", ctx do
       set_lens_verdicts(ctx, %{
         "analyst" => lens("story"),

@@ -56,7 +56,7 @@ defmodule Loopctl.Delivery.GateAInputTest do
   end
 
   describe "persisted lens verdicts" do
-    test "the most recent triage verdict's lenses are the input, in lens order" do
+    test "the triaging dispatch's lenses are the input, in lens order" do
       ctx = story()
 
       fixture(:triage_verdict, %{
@@ -86,42 +86,52 @@ defmodule Loopctl.Delivery.GateAInputTest do
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end
 
-    test "a newer verdict supersedes an older one" do
+    test "the dispatch that TRIAGED the story is read, not a newer zombie row" do
       ctx = story()
 
       fixture(:triage_verdict, %{
         tenant_id: ctx.story.tenant_id,
         story_id: ctx.story.id,
-        lens_verdicts: lenses("story", "story", "story"),
-        inserted_at: ~U[2026-09-23 00:00:01.000000Z]
+        lens_verdicts: lenses("story", "story", "story")
       })
 
+      # A late triage dispatch's row: recorded, its transitions refused, so no triaged event.
       fixture(:triage_verdict, %{
         tenant_id: ctx.story.tenant_id,
         story_id: ctx.story.id,
         lens_verdicts: lenses("reject", "reject", "reject"),
-        inserted_at: ~U[2026-09-23 00:00:02.000000Z]
+        triaged_event: false
       })
 
-      assert {:persisted_triage, [%{"verdict" => "reject"} | _]} =
+      assert {:persisted_triage, [%{"verdict" => "story"} | _]} =
                GateAInput.for_story(ctx.story.tenant_id, ctx.story.id)
     end
 
-    test "a newer INCOMPLETE triage supersedes an older verdict, and is missing" do
+    test "a later INCOMPLETE zombie row does not change the input" do
+      ctx = story()
+
+      fixture(:triage_verdict, %{tenant_id: ctx.story.tenant_id, story_id: ctx.story.id})
+
+      fixture(:triage_verdict, %{
+        tenant_id: ctx.story.tenant_id,
+        story_id: ctx.story.id,
+        incomplete_reason: "session_crashed"
+      })
+
+      assert {:persisted_triage, _outputs} =
+               GateAInput.for_story(ctx.story.tenant_id, ctx.story.id)
+    end
+
+    test "a story whose triaged event names no dispatch is missing" do
       ctx = story()
 
       fixture(:triage_verdict, %{
         tenant_id: ctx.story.tenant_id,
         story_id: ctx.story.id,
-        inserted_at: ~U[2026-09-23 00:00:01.000000Z]
+        triaged_event: false
       })
 
-      fixture(:triage_verdict, %{
-        tenant_id: ctx.story.tenant_id,
-        story_id: ctx.story.id,
-        incomplete_reason: "session_crashed",
-        inserted_at: ~U[2026-09-23 00:00:02.000000Z]
-      })
+      events(ctx, [{"detected", "triaged", "forward", %{}}])
 
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end
@@ -140,15 +150,21 @@ defmodule Loopctl.Delivery.GateAInputTest do
                nil
     end
 
-    test "another tenant's verdict is never read" do
+    test "another tenant's verdict is never read, even when the triaged event names it" do
       ctx = story()
       other = story()
 
-      fixture(:triage_verdict, %{
-        tenant_id: other.story.tenant_id,
-        story_id: ctx.story.id,
-        lens_verdicts: lenses("story", "story", "story")
-      })
+      theirs =
+        fixture(:triage_verdict, %{
+          tenant_id: other.story.tenant_id,
+          story_id: other.story.id,
+          lens_verdicts: lenses("story", "story", "story")
+        })
+
+      events(ctx, [
+        {"detected", "triaged", "forward",
+         %{"payload" => %{"triage_dispatch_id" => theirs.dispatch_id}}}
+      ])
 
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end
@@ -214,18 +230,6 @@ defmodule Loopctl.Delivery.GateAInputTest do
       ])
 
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :human_resolution
-    end
-
-    test "is superseded by a later triage" do
-      ctx = story()
-
-      events(ctx, [
-        {"triaged", "escalated", "triage_escalate", %{}},
-        {"escalated", "queued", "human_resolution", %{}},
-        {"triaged", "queued", "forward", %{}}
-      ])
-
-      assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end
   end
 end

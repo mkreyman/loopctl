@@ -685,19 +685,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
     do: Enum.any?(reasons, &match?({tag, _} when tag in [:gate_a, :trio_verdict], &1))
 
   defp gate_a_reasons(%GateA.Result{decision: :escalate, reasons: reasons}),
-    do: Enum.map(reasons, &{:gate_a, code_only(&1)})
+    do: Enum.map(reasons, &{:gate_a, &1})
 
   defp gate_a_reasons(%GateA.Result{verdict: :story}), do: []
   defp gate_a_reasons(%GateA.Result{verdict: verdict}), do: [{:trio_verdict, verdict}]
-
-  # A contradiction carries the lens's own `ref` and `why` — runner-authored text written by a
-  # session that had read the reporter's words. These reasons become the escalation reason,
-  # which is appended to the hash-chained audit log, so only its COUNT travels; the text stays
-  # on the verdict record and on `verdict.gate_a`, where an operator reads it as data.
-  defp code_only({:contradiction, index, contradicts}) when is_list(contradicts),
-    do: {:contradiction, index, length(contradicts)}
-
-  defp code_only(reason), do: reason
 
   defp gate_b_reasons(%GateB.Result{outcome: :clear}, _proof), do: []
 
@@ -1081,9 +1072,32 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp reason_text(%Verdict{reasons: reasons, gate_a_inputs: gate_a_inputs}) do
     bound_codepoints(
       "merge_gate (gate_a inputs: #{gate_a_inputs}): " <>
-        Enum.map_join(reasons, "; ", &inspect/1)
+        Enum.map_join(reasons, "; ", &(&1 |> redact_gate_a() |> inspect()))
     )
   end
+
+  # THE SINK, not the producer (US-44.1 review round 2). Gate A's reasons are built from the
+  # lens verdicts, and a lens's `contradicts` carries a `ref` and a `why` a triage session
+  # wrote after reading the reporter's words. This text becomes the escalation reason, which
+  # is appended to the hash-chained audit log, so EVERY string inside a Gate A reason is
+  # replaced by its byte size here — whichever reason shape carries it, now or later. The
+  # full reasons stay on the verdict (`verdict.gate_a`) and the triage record, where an
+  # operator reads them as data.
+  defp redact_gate_a({tag, reason}) when tag in [:gate_a, :trio_verdict],
+    do: {tag, redact_strings(reason)}
+
+  defp redact_gate_a(reason), do: reason
+
+  defp redact_strings(value) when is_binary(value), do: {:text, byte_size(value)}
+  defp redact_strings(value) when is_list(value), do: Enum.map(value, &redact_strings/1)
+
+  defp redact_strings(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> redact_strings() |> List.to_tuple()
+
+  defp redact_strings(%{} = value) when not is_struct(value),
+    do: Map.new(value, fn {key, inner} -> {key, redact_strings(inner)} end)
+
+  defp redact_strings(value), do: value
 
   # CODEPOINTS, matching Postgres `char_length` and `Stages`' own bound — see the note on
   # `@reason_budget`. A codepoint prefix can split a grapheme cluster; that is cosmetic and

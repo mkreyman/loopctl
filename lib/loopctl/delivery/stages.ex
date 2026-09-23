@@ -255,6 +255,28 @@ defmodule Loopctl.Delivery.Stages do
     row
   end
 
+  @doc """
+  A story's TRANSITIONS only, oldest first, as `%{from:, to:, edge:, data:}` — filtered and
+  projected in SQL, in the same order `list_events/2` reads. For a caller that walks the
+  transition history on a hot path (the merge gate's Gate A input) and has no use for effect
+  and counter events or the other columns.
+  """
+  @spec list_transitions(Ecto.UUID.t(), Ecto.UUID.t()) :: [map()]
+  def list_transitions(tenant_id, story_id) do
+    {:ok, transitions} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.all(
+          from e in StageEvent,
+            where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
+            where: e.event == "transitioned",
+            order_by: [asc: e.inserted_at, asc: e.lock_version],
+            select: %{from: e.from_stage, to: e.to_stage, edge: e.edge, data: e.data}
+        )
+      end)
+
+    transitions
+  end
+
   @doc "A story's stage events, oldest first."
   @spec list_events(Ecto.UUID.t(), Ecto.UUID.t()) :: [StageEvent.t()]
   def list_events(tenant_id, story_id) do

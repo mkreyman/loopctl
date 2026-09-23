@@ -20,11 +20,11 @@
     },
     {
       "id": "AC-44.1.2",
-      "description": "MergePrecondition decides Gate A from triage_verdicts.lens_verdicts of the story's most recent triage verdict, translated by GateAInput to GateA's output shape, and the verdict carries gate_a_inputs: :persisted_triage."
+      "description": "MergePrecondition decides Gate A from triage_verdicts.lens_verdicts of the dispatch named on the story's detected -> triaged event, translated by GateAInput to GateA's output shape, and the verdict carries gate_a_inputs: :persisted_triage."
     },
     {
       "id": "AC-44.1.3",
-      "description": "A {escalated, queued, :human_resolution} transition that resolves an escalation taken over :triage_escalate, or over :merge_gate with a Gate A reason, and is recorded after that triage verdict, satisfies Gate A with gate_a_inputs: :human_resolution."
+      "description": "A {escalated, queued, :human_resolution} transition that resolves an escalation taken over :triage_escalate, or over :merge_gate with a Gate A reason, satisfies Gate A with gate_a_inputs: :human_resolution."
     },
     {
       "id": "AC-44.1.4",

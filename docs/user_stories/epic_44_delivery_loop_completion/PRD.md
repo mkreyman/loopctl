@@ -62,9 +62,8 @@ disagreement signal is gone by the time it is stored.
 **Decisions.**
 - The triage verdict message gains optional `lens_verdicts` — exactly three entries, one per lens,
   each carrying the same fields Gate A already parses. loopctl persists them with the verdict.
-- At merge, Gate A reads the lens verdicts of the story's MOST RECENT triage verdict (a re-triage
-  supersedes an earlier one). A **`:human_resolution` transition recorded after that verdict
-  satisfies Gate A**: a human already decided, and re-escalating their decision at merge would loop.
+- At merge, Gate A reads the lens verdicts of the dispatch named on the story's one
+  `detected -> triaged` event — never merely the newest row, which a late zombie can write. A **`:human_resolution` of a Gate A escalation satisfies Gate A**: a human already decided, and re-escalating their decision at merge would loop.
 - No persisted lens verdicts and no later human resolution → `refuse`, never `unevaluated`:
   waiting cannot make a verdict appear. A caller-supplied `trio_outputs` is ignored, recorded as
   ignored, and dropped from the endpoint's required fields (`merge_precondition_controller.ex:208`).

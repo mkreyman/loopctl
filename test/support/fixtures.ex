@@ -2354,11 +2354,24 @@ defmodule Loopctl.Fixtures do
         )
       )
 
+    # THE BINDING Gate A reads: the story's `detected -> triaged` event naming this verdict's
+    # dispatch, as `Loopctl.Delivery.TriageVerdict` writes it. Only when the story has a stage
+    # row; `triaged_event: false` to leave the story untriaged.
+    insert = fn ->
+      row = repo.insert!(record)
+
+      if Map.get(attrs, :triaged_event, true) and is_nil(Map.get(attrs, :incomplete_reason)) do
+        insert_triaged_event(repo, row)
+      end
+
+      row
+    end
+
     if repo == Loopctl.Repo do
-      {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, fn -> Loopctl.Repo.insert!(record) end)
+      {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, insert)
       row
     else
-      repo.insert!(record)
+      insert.()
     end
   end
 
@@ -3137,6 +3150,35 @@ defmodule Loopctl.Fixtures do
 
   defp ensure_scope_entity(attrs, _unknown, _tenant_id) do
     {Ecto.UUID.generate(), attrs}
+  end
+
+  defp insert_triaged_event(repo, %TriageVerdictRecord{} = verdict) do
+    case repo.one(
+           from r in StoryStage,
+             where: r.tenant_id == ^verdict.tenant_id and r.story_id == ^verdict.story_id
+         ) do
+      nil ->
+        :ok
+
+      stage_row ->
+        repo.insert_all(Loopctl.Delivery.StageEvent, [
+          %{
+            id: Ecto.UUID.generate(),
+            tenant_id: verdict.tenant_id,
+            story_stage_id: stage_row.id,
+            story_id: verdict.story_id,
+            event: "transitioned",
+            from_stage: "detected",
+            to_stage: "triaged",
+            edge: "forward",
+            claim_epoch: stage_row.claim_epoch,
+            lock_version: 0,
+            actor_label: "fixture",
+            data: %{"payload" => %{"triage_dispatch_id" => verdict.dispatch_id}},
+            inserted_at: ~U[2026-01-01 00:00:00.000000Z]
+          }
+        ])
+    end
   end
 
   defp insert_merged_event(repo, %StoryStage{} = row, merged_at) do

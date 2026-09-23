@@ -24,7 +24,8 @@ All notable changes to loopctl are documented here.
   `lens_verdicts` — one small entry per lens (`analyst`, `architect`, `engineer`), capped
   together at 9 000 bytes under the byte rule — which loopctl stores in the new
   `triage_verdicts.lens_verdicts` column (migration, no manual step, NULL for existing rows).
-  Gate A reads the lens verdicts of the story's most recent triage, or accepts a human's
+  Gate A reads the lens verdicts of the dispatch that triaged the story (named on its
+  `detected -> triaged` event, so a late zombie verdict is never read), or accepts a human's
   re-queue of an escalation that was about Gate A; with neither it REFUSES
   (`gate_a_inputs_missing`), never retries. `trio_outputs` is no longer required, is ignored when
   sent, and the answer carries `trio_outputs_ignored: true`; `gate_a_inputs` is now

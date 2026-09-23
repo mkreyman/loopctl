@@ -32,6 +32,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdict
   alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdictMessage
+  alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdict
@@ -367,17 +368,30 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert stage_of(story) == :escalated
     end
 
-    test "a verdict arriving after the story left triage is refused and records nothing" do
-      %{story: story, runner: runner, record: record} = session(stage: :implementing)
+    test "the triage writes the binding Gate A reads: its dispatch on the triaged event" do
+      %{story: story, runner: runner, record: record} = session()
 
-      assert {:error, :stale_stage} =
-               TriageVerdict.apply(
-                 story.tenant_id,
-                 runner.id,
-                 verdict_message(record, verdict("reject"))
-               )
+      lens_verdicts =
+        for lens <- ~w(analyst architect engineer),
+            do: %{lens: lens, outcome: "escalate", confidence: "low"}
 
-      assert records(story.tenant_id) == []
+      message =
+        record
+        |> verdict_message(verdict("escalate", %{escalation_reasons: ["Needs a person."]}))
+        |> Map.put(:lens_verdicts, lens_verdicts)
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert [%{"payload" => %{"triage_dispatch_id" => dispatch_id}}] =
+               story.tenant_id
+               |> stage_events(story.id)
+               |> Enum.filter(&(&1.from_stage == "detected" and &1.to_stage == "triaged"))
+               |> Enum.map(& &1.data)
+
+      assert dispatch_id == record.dispatch_id
+
+      assert {:persisted_triage, [%{"verdict" => "escalate"} | _]} =
+               GateAInput.for_story(story.tenant_id, story.id)
     end
 
     test "a resend with the lens verdicts in another order is the same verdict" do
