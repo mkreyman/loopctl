@@ -183,15 +183,19 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
   end
 
   # The half-applied route: transition one landed, transition two did not.
-  defp advance_to_triaged(story) do
+  defp advance_to_triaged(story, event_data \\ nil) do
+    opts = [claim_epoch: story.claim_epoch, actor_label: "test"]
+    opts = if event_data, do: Keyword.put(opts, :event_data, event_data), else: opts
+
     as_tenant(story.tenant_id, fn ->
       {:ok, _row} =
-        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward},
-          claim_epoch: story.claim_epoch,
-          actor_label: "test"
-        )
+        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward}, opts)
     end)
   end
+
+  defp escalation_reason(story),
+    do:
+      as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end).escalation_reason
 
   defp as_tenant(tenant_id, fun) do
     {:ok, result} = Repo.with_tenant(tenant_id, fun)
@@ -334,6 +338,75 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
                TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, verdict))
 
       assert stage_of(story) == :queued
+    end
+
+    test "the screen's escalation names its codes, and records patterns, never touched files" do
+      %{story: story, runner: runner, record: record} = session()
+      verdict = story_verdict(%{touches: ["priv/rates/secret-name.csv"]})
+
+      message = record |> verdict_message(verdict) |> Map.delete(:lens_verdicts)
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      reason = escalation_reason(story)
+      assert reason =~ "gate_screen("
+      assert reason =~ "gate_a:gate_a_inputs_missing"
+      assert reason =~ "effect_path"
+
+      [codes] =
+        story.tenant_id
+        |> stage_events(story.id)
+        |> Enum.filter(&(&1.edge == "triage_escalate"))
+        |> Enum.map(& &1.data["payload"]["gate_screen"])
+
+      assert "effect_path:priv/rates/**" in codes
+      refute inspect(codes) =~ "secret-name"
+    end
+
+    test "a resend of a screened verdict is a replay and leaves the story escalated" do
+      %{story: story, runner: runner, record: record} = session()
+      message = record |> verdict_message(story_verdict()) |> Map.delete(:lens_verdicts)
+
+      assert {:ok, %{replayed?: false}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :escalated
+    end
+
+    test "a half-applied screened verdict completes from the recorded decision, not a re-screen" do
+      %{story: story, runner: runner, record: record} = session()
+      advance_to_triaged(story, %{"gate_screen" => ["gate_a:gate_a_inputs_missing"]})
+
+      # Clean on every fact the screen reads NOW; the first attempt decided otherwise.
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :escalated
+    end
+
+    test "a half-applied verdict the first attempt QUEUED is not re-screened into an escalation" do
+      %{story: story, runner: runner, record: record} = session()
+      advance_to_triaged(story)
+
+      message =
+        record
+        |> verdict_message(story_verdict())
+        |> Map.put(:lens_verdicts, lens_verdicts("story", "story", "escalate"))
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :queued
+    end
+
+    test "a reclaim between a screened verdict's two transitions still escalates the story" do
+      %{story: story, runner: runner, record: record} = session()
+      advance_to_triaged(story, %{"gate_screen" => ["gate_a:gate_a_inputs_missing"]})
+      bump_story_epoch(story, true)
+
+      message = record |> verdict_message(story_verdict()) |> Map.delete(:lens_verdicts)
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :escalated
     end
 
     test "the gate screen fails closed on a repository it has no triggers for (US-44.2)" do

@@ -96,6 +96,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   alias Loopctl.DeliveryGates
   alias Loopctl.DeliveryGates.GateA
   alias Loopctl.DeliveryGates.GateB
+  alias Loopctl.Intake
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
@@ -799,17 +800,23 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # runs the gates twice; until this only the merge run existed, so with the driver on a story
   # the gates were certain to refuse was implemented first and refused after. The screen can
   # only ADD an escalation, and it KEEPS the draft: a human who re-queues the story gets the
-  # drafted story, not the stub. Deterministic over the message and the trigger config, so a
-  # replayed verdict reaches the same answer.
+  # drafted story, not the stub.
+  #
+  # THE DECISION IS TAKEN ONCE. It is recorded, as codes, on the `detected -> triaged` event, and
+  # a resend of a half-applied verdict reads it from there rather than screening again — the
+  # screen reads live facts (the intake source, the trigger configuration), and a re-screen
+  # after either changed could reverse a refusal the first attempt had already reached. A story
+  # already past triage is not screened at all: every transition is stale, and a screen then
+  # would only log a refusal about a story it does not touch.
   defp advance_screened(tenant_id, runner_id, session, message, transitions) do
-    case screen(tenant_id, session, message) do
-      [] ->
+    case screen_decision(tenant_id, session, message) do
+      :queue ->
         advance_all(tenant_id, runner_id, session, message, transitions, nil)
 
-      reasons ->
+      {:escalate, codes} ->
         Logger.warning(
           "triage verdict refused by the gate screen, escalating instead of queueing: " <>
-            "story_id=#{session.story_id} reasons=#{inspect(Enum.take(reasons, 5))}",
+            "story_id=#{session.story_id} codes=#{inspect(Enum.take(codes, 5))}",
           tenant_id: tenant_id,
           story_id: session.story_id
         )
@@ -820,10 +827,71 @@ defmodule Loopctl.Delivery.TriageVerdict do
           session,
           message,
           [@triaged, {:triaged, :escalated, :triage_escalate}],
-          {"triage_verdict:gate_screen", %{"gate_screen" => Enum.map(reasons, &inspect/1)}}
+          {screen_reason(codes), %{"gate_screen" => codes}}
         )
     end
   end
+
+  defp screen_decision(tenant_id, session, %{verdict: %{outcome: "story"}} = message) do
+    case Stages.get(tenant_id, session.story_id) do
+      %StoryStage{stage: :detected} -> decide(screen(tenant_id, session, message))
+      %StoryStage{stage: :triaged} -> recorded_decision(tenant_id, session, message)
+      _past_triage_or_missing -> :queue
+    end
+  end
+
+  defp screen_decision(_tenant_id, _session, _message), do: :queue
+
+  defp decide([]), do: :queue
+  defp decide(reasons), do: {:escalate, screen_codes(reasons)}
+
+  # The first attempt's decision, off the triaged event it wrote. A triaged event from before
+  # the screen existed carries none and is read as "queue", which is what that attempt did.
+  defp recorded_decision(tenant_id, session, message) do
+    tenant_id
+    |> Stages.list_transitions(session.story_id)
+    |> Enum.find(&(&1.from == "detected" and &1.to == "triaged"))
+    |> case do
+      %{data: %{"payload" => %{"gate_screen" => [_ | _] = codes}}} -> {:escalate, codes}
+      %{} -> :queue
+      nil -> decide(screen(tenant_id, session, message))
+    end
+  end
+
+  # CODES, NEVER THE SESSION'S TEXT. A Gate A reason can carry a lens's contradiction `ref` and
+  # `why`, and a path reason carries the predicted touch — both written by a session that had
+  # read the reporter's words. What is recorded is loopctl's own vocabulary: the reason's kind,
+  # and for a path the operator's trigger PATTERN, never the file the session named. Deduped
+  # and capped, so the payload stays far inside `Stages.max_event_data_bytes/0`.
+  @max_screen_codes 20
+
+  defp screen_codes(reasons),
+    do: reasons |> Enum.map(&screen_code/1) |> Enum.uniq() |> Enum.take(@max_screen_codes)
+
+  defp screen_code({:gate_a, reason}), do: "gate_a:" <> kind(reason)
+  defp screen_code({:trio_verdict, verdict}), do: "trio_verdict:#{verdict}"
+  defp screen_code({:human_path, _file, pattern}), do: "human_path:" <> pattern
+  defp screen_code({:effect_path, _file, pattern}), do: "effect_path:" <> pattern
+  defp screen_code({:repository_unresolved, reason}), do: "repository_unresolved:" <> kind(reason)
+  defp screen_code(reason), do: kind(reason)
+
+  defp kind(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp kind(reason) when is_tuple(reason) and is_atom(elem(reason, 0)), do: kind(elem(reason, 0))
+  defp kind(_reason), do: "unrecognised"
+
+  # The escalation reason an operator lists escalations by: the kinds, without patterns, so it
+  # stays short and says WHICH gate refused. Enum values only — it lands in the audit chain.
+  defp screen_reason(codes) do
+    kinds =
+      codes
+      |> Enum.map(fn code -> code |> String.split(":") |> Enum.take(2) |> gate_kind() end)
+      |> Enum.uniq()
+
+    "triage_verdict:gate_screen(" <> Enum.join(kinds, ",") <> ")"
+  end
+
+  defp gate_kind(["gate_a", code]), do: "gate_a:" <> code
+  defp gate_kind([kind | _rest]), do: kind
 
   # Only a `story` outcome is about to be queued; the other routes already stop for a person
   # or close the report.
@@ -855,25 +923,28 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end
   end
 
-  # The story's repository, as `MergePrecondition.repo_for_story/1` resolves it — the project's
-  # one live intake source — but read on `Loopctl.Repo` under `with_tenant/2`, like every other
-  # read this module makes (`intake_sources` is RLS-scoped), rather than through `Intake`'s
-  # AdminRepo pool. Exactly one live source, or the screen cannot say which triggers apply and
-  # fails closed, as the merge run does.
+  # The story's repository by the SAME rule the merge gate uses (`Intake.select_project_source/2`
+  # over `Intake.live_sources_query/1`), run on `Loopctl.Repo` under `with_tenant/2` like every
+  # other read here. Exactly one live source, or the screen fails closed, as the merge run does.
   defp repo_for_story(tenant_id, story_id) do
     in_tenant(tenant_id, fn ->
-      Repo.all(
-        from src in Source,
-          join: s in Story,
-          on: s.project_id == src.project_id and s.tenant_id == src.tenant_id,
-          where: s.id == ^story_id and s.tenant_id == ^tenant_id and is_nil(src.revoked_at),
-          select: src.repo_full_name
-      )
+      case Repo.one(
+             from s in Story,
+               where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+               select: s.project_id
+           ) do
+        nil ->
+          {:error, :no_story}
+
+        project_id ->
+          tenant_id
+          |> Intake.live_sources_query()
+          |> Repo.all()
+          |> Intake.select_project_source(project_id)
+      end
     end)
     |> case do
-      [repo] -> {:ok, repo}
-      [] -> {:error, :no_intake_source}
-      repos when is_list(repos) -> {:error, {:ambiguous_intake_source, length(repos)}}
+      {:ok, %Source{repo_full_name: repo}} -> {:ok, repo}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -936,13 +1007,25 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # as for `:stale_stage`. A row sitting at `triaged` with `triaged -> queued` still to make is
   # the reclaim case above — re-attempt it under the story's current epoch. Anything else is a
   # genuine refusal and stands.
-  defp after_reclaim(tenant_id, runner_id, session, message, {from, to, _edge}, rest, reason) do
+  defp after_reclaim(tenant_id, runner_id, session, message, {from, to, edge}, rest, reason) do
     case stage_now(tenant_id, session.story_id) do
       ^to ->
         advance_all(tenant_id, runner_id, session, message, rest, reason)
 
-      :triaged when to == :queued ->
-        requeue_after_reclaim(tenant_id, runner_id, session, message, rest, reason)
+      # EVERY route out of `triaged`, not only the queue: the gate screen sends accepted stories
+      # down `triaged -> escalated` too, and a reclaim landing between the two transitions
+      # stranded them exactly as it once stranded the queue route. Control's conclusion from a
+      # recorded verdict does not depend on which epoch the session held.
+      :triaged when to in [:queued, :escalated, :failed] ->
+        complete_after_reclaim(
+          tenant_id,
+          runner_id,
+          session,
+          message,
+          {from, to, edge},
+          rest,
+          reason
+        )
 
       ^from ->
         {:error, :stale_claim_epoch}
@@ -962,16 +1045,14 @@ defmodule Loopctl.Delivery.TriageVerdict do
     end)
   end
 
-  defp requeue_after_reclaim(tenant_id, runner_id, session, message, rest, reason) do
-    transition = {:triaged, :queued, :forward}
-
+  defp complete_after_reclaim(tenant_id, runner_id, session, message, transition, rest, reason) do
     case moved_epoch(tenant_id, session.story_id, message.claim_epoch) do
       nil ->
         {:error, :stale_claim_epoch}
 
       epoch ->
         fenced = %{message | claim_epoch: epoch}
-        label = reason || "triage_verdict:requeued_after_reclaim"
+        label = reason || reclaim_label(transition)
 
         case Stages.advance(
                tenant_id,
@@ -985,6 +1066,9 @@ defmodule Loopctl.Delivery.TriageVerdict do
         end
     end
   end
+
+  defp reclaim_label({:triaged, :queued, _edge}), do: "triage_verdict:requeued_after_reclaim"
+  defp reclaim_label(_transition), do: nil
 
   # The story's epoch when it has MOVED, `nil` otherwise — a story that is gone, and one whose
   # epoch is the message's own, in which case the refusal was about something other than a

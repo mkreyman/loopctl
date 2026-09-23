@@ -507,12 +507,36 @@ defmodule Loopctl.Intake do
       when is_binary(tenant_id) and is_binary(project_id) do
     tenant_id
     |> list_sources()
+    |> select_project_source(project_id)
+  end
+
+  @doc """
+  The ONE rule by which a project's repository is chosen from a tenant's live intake sources:
+  exactly one, or a refusal naming why. Shared by `source_for_project/2` (on `AdminRepo`) and
+  by the triage gate screen (on `Loopctl.Repo`, alongside every other read that module makes),
+  so the two gates cannot resolve a story to two different repositories (US-44.2).
+  """
+  @spec select_project_source([Source.t()], Ecto.UUID.t()) ::
+          {:ok, Source.t()}
+          | {:error,
+             {:no_intake_source, Ecto.UUID.t()}
+             | {:ambiguous_intake_source, Ecto.UUID.t(), pos_integer()}}
+  def select_project_source(sources, project_id) do
+    sources
     |> Enum.filter(&(&1.project_id == project_id))
     |> case do
       [source] -> {:ok, source}
       [] -> {:error, {:no_intake_source, project_id}}
       sources -> {:error, {:ambiguous_intake_source, project_id, length(sources)}}
     end
+  end
+
+  @doc "The query for a tenant's live (unrevoked) intake sources, for any repo to run."
+  @spec live_sources_query(Ecto.UUID.t()) :: Ecto.Query.t()
+  def live_sources_query(tenant_id) do
+    from s in Source,
+      where: s.tenant_id == ^tenant_id and is_nil(s.revoked_at),
+      order_by: [desc: s.inserted_at]
   end
 
   # The same shape as `repoint/3`, under its own action name: an operator reading the chain
@@ -570,14 +594,9 @@ defmodule Loopctl.Intake do
   @spec list_sources(Ecto.UUID.t(), keyword()) :: [Source.t()]
   def list_sources(tenant_id, opts \\ []) when is_binary(tenant_id) do
     query =
-      from s in Source,
-        where: s.tenant_id == ^tenant_id,
-        order_by: [desc: s.inserted_at]
-
-    query =
       if Keyword.get(opts, :include_revoked, false),
-        do: query,
-        else: where(query, [s], is_nil(s.revoked_at))
+        do: from(s in Source, where: s.tenant_id == ^tenant_id, order_by: [desc: s.inserted_at]),
+        else: live_sources_query(tenant_id)
 
     AdminRepo.all(query)
   end
