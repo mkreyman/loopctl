@@ -253,13 +253,13 @@ defmodule Loopctl.Delivery.StageMachine do
   # the identity its first run wrote; a writer from a stage that does not produce the effect
   # is refused, so a stale stage cannot record an identity for a later one.
   @effect_stages %{
-    # WHICH TRIAGE DISPATCH DECIDES THIS STORY (epic 44, US-44.1). Recorded at `detected`,
-    # BEFORE the verdict is — the design's rule that a stage writes the identity of its effect
-    # before acting — and `record_effect/5`'s first-writer-wins is the whole binding: a second
-    # dispatch's verdict is refused before anything of it is stored, and the merge gate's Gate
-    # A reads this dispatch's lens verdicts and no other's. Control-written: a runner never
-    # reports it.
-    triage_dispatch_id: [:detected],
+    # WHICH TRIAGE DISPATCH DECIDED THIS STORY (epic 44, US-44.1). TRANSITION-ONLY, carried on
+    # the `detected -> triaged` transition itself (`advance/4`'s `:effects`), so the story
+    # leaves `detected` and names its deciding dispatch in ONE transaction: nothing can bind
+    # without triaging, and a dispatch that dies before its transition binds nothing. The
+    # merge gate's Gate A reads this dispatch's lens verdicts and no other's. Control-written:
+    # a runner never reports it.
+    triage_dispatch_id: [:triaged],
     runner_id: [:claimed],
     worktree_path: [:worktree],
     branch: [:worktree],
@@ -380,13 +380,19 @@ defmodule Loopctl.Delivery.StageMachine do
           | :merge_sha
           | :release_id
           | :merge_gate_allowed_sha
+          | :triage_dispatch_id
 
   # `merge_sha` is written ONLY as part of the transition into `merged`, both ways round:
   # it is REQUIRED there (an entry asserting a merge must name it) and it is refused to
   # `record_effect/5` (recorded afterwards it would leave the chain saying the story merged
   # at nothing while the row named a sha the chain never saw). The two halves are one rule
   # and belong together — relaxing either reopens it.
-  @transition_only [:merge_sha]
+  @transition_only [:merge_sha, :triage_dispatch_id]
+
+  # Identities that describe the story for its whole life rather than one attempt at it, and
+  # so survive even a human re-queue. A re-queue does not re-triage — the story does not go
+  # back to `detected` — so the verdict Gate A judges is still the one this dispatch gave.
+  @story_lifetime_effects [:triage_dispatch_id]
   @required_effects %{merged: [:merge_sha]}
 
   @type transition :: {stage(), stage(), edge()}
@@ -625,6 +631,10 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec transition_only?(atom()) :: boolean()
   def transition_only?(effect), do: effect in @transition_only
 
+  @doc "The identities no transition clears, a human re-queue included."
+  @spec story_lifetime_effects() :: [effect()]
+  def story_lifetime_effects, do: @story_lifetime_effects
+
   @doc """
   The identities a transition into `to` MUST carry. Entering `merged` without the sha would
   chain a merge that names nothing.
@@ -646,12 +656,11 @@ defmodule Loopctl.Delivery.StageMachine do
   # include them, and leaving one standing would escalate the resolved story again on the
   # first blip at the same commit.
   #
-  # Except `triage_dispatch_id`: a re-queue does not re-triage — the story does not go back to
-  # `detected` — so the verdict Gate A judges is still the one that dispatch gave.
+  # Except the story-lifetime identities (`story_lifetime_effects/0`).
   def clears(:escalated, :queued, :human_resolution),
     do:
       Enum.uniq(
-        (Map.keys(@effect_stages) -- [:triage_dispatch_id]) ++ @head_keyed ++ @merge_keyed
+        (Map.keys(@effect_stages) -- @story_lifetime_effects) ++ @head_keyed ++ @merge_keyed
       )
 
   # A refused merge never happened, so the identity recorded for it goes with the head —

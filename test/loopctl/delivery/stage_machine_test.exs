@@ -317,10 +317,12 @@ defmodule Loopctl.Delivery.StageMachineTest do
 
     assert MapSet.subset?(MapSet.new(StageMachine.head_keyed()), cleared)
     assert MapSet.subset?(MapSet.new(StageMachine.merge_keyed()), cleared)
-    assert MapSet.subset?(MapSet.new(StageMachine.effects() -- [:triage_dispatch_id]), cleared)
+    lifetime = StageMachine.story_lifetime_effects()
+    assert MapSet.subset?(MapSet.new(StageMachine.effects() -- lifetime), cleared)
 
     # A re-queue does not re-triage, so the dispatch whose verdict Gate A judges stays bound.
-    refute :triage_dispatch_id in cleared
+    assert :triage_dispatch_id in lifetime
+    assert MapSet.disjoint?(MapSet.new(lifetime), cleared)
   end
 
   test "every stage is reachable from detected" do

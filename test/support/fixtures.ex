@@ -3152,7 +3152,10 @@ defmodule Loopctl.Fixtures do
   defp bind_triage_dispatch(repo, %TriageVerdictRecord{} = verdict) do
     repo.update_all(
       from(r in StoryStage,
-        where: r.tenant_id == ^verdict.tenant_id and r.story_id == ^verdict.story_id
+        where: r.tenant_id == ^verdict.tenant_id and r.story_id == ^verdict.story_id,
+        # First writer wins, as in production: the transition that bound the story is the one
+        # that took it out of `detected`, and nothing overwrites it.
+        where: is_nil(r.triage_dispatch_id)
       ),
       set: [triage_dispatch_id: verdict.dispatch_id]
     )

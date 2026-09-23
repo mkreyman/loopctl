@@ -183,30 +183,27 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
   end
 
   # The half-applied route: transition one landed, transition two did not.
-  defp advance_to_triaged(story, event_data \\ nil) do
-    opts = [claim_epoch: story.claim_epoch, actor_label: "test"]
-    opts = if event_data, do: Keyword.put(opts, :event_data, event_data), else: opts
+  # `dispatch_id:` binds the story as the verdict path does, on the transition itself;
+  # `event_data:` is what the first attempt recorded on it (the gate screen's decision).
+  defp advance_to_triaged(story, opts \\ []) do
+    advance_opts =
+      [claim_epoch: story.claim_epoch, actor_label: "test"]
+      |> then(fn o ->
+        if id = opts[:dispatch_id], do: Keyword.put(o, :effects, triage_dispatch_id: id), else: o
+      end)
+      |> then(fn o ->
+        if data = opts[:event_data], do: Keyword.put(o, :event_data, data), else: o
+      end)
 
     as_tenant(story.tenant_id, fn ->
       {:ok, _row} =
-        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward}, opts)
+        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward}, advance_opts)
     end)
   end
 
   defp escalation_reason(story),
     do:
       as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end).escalation_reason
-
-  # What the first attempt of a verdict does before anything else: bind its dispatch as the
-  # story's triage identity. A half-applied route in production always has it.
-  defp bind_triage(story, dispatch_id) do
-    as_tenant(story.tenant_id, fn ->
-      {:ok, _row} =
-        Stages.record_effect(story.tenant_id, story.id, :triage_dispatch_id, dispatch_id,
-          claim_epoch: story.claim_epoch
-        )
-    end)
-  end
 
   defp as_tenant(tenant_id, fun) do
     {:ok, result} = Repo.with_tenant(tenant_id, fun)
@@ -384,8 +381,11 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
     test "a half-applied screened verdict completes from the recorded decision, not a re-screen" do
       %{story: story, runner: runner, record: record} = session()
-      bind_triage(story, record.dispatch_id)
-      advance_to_triaged(story, %{"gate_screen" => ["gate_a:gate_a_inputs_missing"]})
+
+      advance_to_triaged(story,
+        dispatch_id: record.dispatch_id,
+        event_data: %{"gate_screen" => ["gate_a:gate_a_inputs_missing"]}
+      )
 
       # Clean on every fact the screen reads NOW; the first attempt decided otherwise.
       assert {:ok, _} =
@@ -400,8 +400,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
     test "a half-applied verdict the first attempt QUEUED is not re-screened into an escalation" do
       %{story: story, runner: runner, record: record} = session()
-      bind_triage(story, record.dispatch_id)
-      advance_to_triaged(story)
+      advance_to_triaged(story, dispatch_id: record.dispatch_id)
 
       message =
         record
@@ -425,7 +424,11 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
         payload_digest: TriageVerdictRecord.digest(message)
       })
 
-      advance_to_triaged(story, %{"gate_screen" => ["gate_a:gate_a_inputs_missing"]})
+      advance_to_triaged(story,
+        dispatch_id: record.dispatch_id,
+        event_data: %{"gate_screen" => ["gate_a:gate_a_inputs_missing"]}
+      )
+
       bump_story_epoch(story, true)
 
       assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
@@ -481,24 +484,22 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       bound = as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end)
       assert bound.triage_dispatch_id == record.dispatch_id
 
+      # The reason GateAInput matches a Gate A escalation on, exactly as the path stores it.
+      assert [%{"reason" => "triage_verdict:escalate"}] =
+               story.tenant_id
+               |> stage_events(story.id)
+               |> Enum.filter(&(&1.edge == "triage_escalate"))
+               |> Enum.map(& &1.data)
+
       assert {:persisted_triage, [%{"verdict" => "escalate"} | _]} =
                GateAInput.for_story(story.tenant_id, story.id)
     end
 
-    test "a SECOND dispatch's verdict is refused before anything of it is stored" do
+    test "a dispatch that did NOT triage the story is refused before any further transition" do
       %{story: story, runner: runner, record: record} = session()
 
-      # Another triage dispatch bound the story first.
-      assert {:ok, _} =
-               as_tenant(story.tenant_id, fn ->
-                 Stages.record_effect(
-                   story.tenant_id,
-                   story.id,
-                   :triage_dispatch_id,
-                   Ecto.UUID.generate(),
-                   claim_epoch: story.claim_epoch
-                 )
-               end)
+      # Another triage dispatch took the story out of `detected` and bound it.
+      advance_to_triaged(story, dispatch_id: Ecto.UUID.generate())
 
       assert {:error, :stale_stage} =
                TriageVerdict.apply(
@@ -507,12 +508,18 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
                  verdict_message(record, verdict("reject"))
                )
 
-      assert records(story.tenant_id) == []
-      assert stage_of(story) == :detected
+      assert stage_of(story) == :triaged
     end
 
-    test "a verdict for a story that has left detected is refused and records nothing" do
+    test "a late verdict for a story another dispatch took further is refused" do
       %{story: story, runner: runner, record: record} = session(stage: :implementing)
+
+      as_tenant(story.tenant_id, fn ->
+        Repo.update_all(
+          from(r in Loopctl.Delivery.StoryStage, where: r.story_id == ^story.id),
+          set: [triage_dispatch_id: Ecto.UUID.generate()]
+        )
+      end)
 
       assert {:error, :stale_stage} =
                TriageVerdict.apply(
@@ -521,7 +528,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
                  verdict_message(record, verdict("reject"))
                )
 
-      assert records(story.tenant_id) == []
+      assert stage_of(story) == :implementing
     end
 
     test "a resend with the lens verdicts in another order is the same verdict" do
@@ -949,8 +956,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       # `stale_stage`, return before transition TWO was tried, and answer `ok` — and nothing in
       # `lib/` selects `triaged`, so the story was dead exactly where this module exists to
       # stop it being dead.
-      bind_triage(story, record.dispatch_id)
-      advance_to_triaged(story)
+      advance_to_triaged(story, dispatch_id: record.dispatch_id)
       assert stage_of(story) == :triaged
 
       assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
