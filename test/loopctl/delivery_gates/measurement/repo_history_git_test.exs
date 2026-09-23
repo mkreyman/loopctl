@@ -41,7 +41,7 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryGitTest do
   defp warning_repo do
     repo =
       Path.join([
-        System.tmp_dir!(),
+        Loopctl.RealTmpDir.path!(),
         "loopctl-git-fixture-#{System.unique_integer([:positive])}"
       ])
 
@@ -179,7 +179,10 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryGitTest do
       # The incident this file is written around: a directory that is not a repository must
       # FAIL here. It only did not because the fixture used to sit inside one.
       outside =
-        Path.join(System.tmp_dir!(), "loopctl-not-a-repo-#{System.unique_integer([:positive])}")
+        Path.join(
+          Loopctl.RealTmpDir.path!(),
+          "loopctl-not-a-repo-#{System.unique_integer([:positive])}"
+        )
 
       File.mkdir_p!(outside)
       on_exit(fn -> File.rm_rf!(outside) end)
