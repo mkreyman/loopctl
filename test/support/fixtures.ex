@@ -2346,24 +2346,21 @@ defmodule Loopctl.Fixtures do
             tenant_id: tenant_id,
             story_id: Map.fetch!(attrs, :story_id),
             dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
-            payload_digest: Ecto.UUID.generate(),
-            claim_epoch: 0,
+            payload_digest: Map.get_lazy(attrs, :payload_digest, &Ecto.UUID.generate/0),
+            claim_epoch: Map.get(attrs, :claim_epoch, 0),
             inserted_at: Map.get(attrs, :inserted_at)
           },
           result
         )
       )
 
-    # THE BINDING Gate A reads: the story's `detected -> triaged` event naming this verdict's
-    # dispatch, as `Loopctl.Delivery.TriageVerdict` writes it. Only when the story has a stage
-    # row; `triaged_event: false` to leave the story untriaged.
+    # THE BINDING Gate A reads: the story's stage row naming this verdict's dispatch as its
+    # `triage_dispatch_id`, as `Loopctl.Delivery.TriageVerdict` records it before storing any
+    # verdict — incomplete ones included. Only when the story has a stage row; `bind: false`
+    # for a row that decided nothing (a refused second dispatch's, written around the path).
     insert = fn ->
       row = repo.insert!(record)
-
-      if Map.get(attrs, :triaged_event, true) and is_nil(Map.get(attrs, :incomplete_reason)) do
-        insert_triaged_event(repo, row)
-      end
-
+      if Map.get(attrs, :bind, true), do: bind_triage_dispatch(repo, row)
       row
     end
 
@@ -3152,33 +3149,13 @@ defmodule Loopctl.Fixtures do
     {Ecto.UUID.generate(), attrs}
   end
 
-  defp insert_triaged_event(repo, %TriageVerdictRecord{} = verdict) do
-    case repo.one(
-           from r in StoryStage,
-             where: r.tenant_id == ^verdict.tenant_id and r.story_id == ^verdict.story_id
-         ) do
-      nil ->
-        :ok
-
-      stage_row ->
-        repo.insert_all(Loopctl.Delivery.StageEvent, [
-          %{
-            id: Ecto.UUID.generate(),
-            tenant_id: verdict.tenant_id,
-            story_stage_id: stage_row.id,
-            story_id: verdict.story_id,
-            event: "transitioned",
-            from_stage: "detected",
-            to_stage: "triaged",
-            edge: "forward",
-            claim_epoch: stage_row.claim_epoch,
-            lock_version: 0,
-            actor_label: "fixture",
-            data: %{"payload" => %{"triage_dispatch_id" => verdict.dispatch_id}},
-            inserted_at: ~U[2026-01-01 00:00:00.000000Z]
-          }
-        ])
-    end
+  defp bind_triage_dispatch(repo, %TriageVerdictRecord{} = verdict) do
+    repo.update_all(
+      from(r in StoryStage,
+        where: r.tenant_id == ^verdict.tenant_id and r.story_id == ^verdict.story_id
+      ),
+      set: [triage_dispatch_id: verdict.dispatch_id]
+    )
   end
 
   defp insert_merged_event(repo, %StoryStage{} = row, merged_at) do

@@ -253,6 +253,13 @@ defmodule Loopctl.Delivery.StageMachine do
   # the identity its first run wrote; a writer from a stage that does not produce the effect
   # is refused, so a stale stage cannot record an identity for a later one.
   @effect_stages %{
+    # WHICH TRIAGE DISPATCH DECIDES THIS STORY (epic 44, US-44.1). Recorded at `detected`,
+    # BEFORE the verdict is — the design's rule that a stage writes the identity of its effect
+    # before acting — and `record_effect/5`'s first-writer-wins is the whole binding: a second
+    # dispatch's verdict is refused before anything of it is stored, and the merge gate's Gate
+    # A reads this dispatch's lens verdicts and no other's. Control-written: a runner never
+    # reports it.
+    triage_dispatch_id: [:detected],
     runner_id: [:claimed],
     worktree_path: [:worktree],
     branch: [:worktree],
@@ -324,7 +331,7 @@ defmodule Loopctl.Delivery.StageMachine do
   # Anything the gate writes in future goes here as well. The test in
   # `runner_contract_test.exs` binds this list to the wire schema in both directions, so a new
   # effect that belongs on neither side goes red rather than reaching a runner.
-  @control_written_effects [:runner_id, :merge_gate_allowed_sha]
+  @control_written_effects [:runner_id, :merge_gate_allowed_sha, :triage_dispatch_id]
 
   @reportable_effects @effect_stages
                       |> Map.keys()
@@ -638,8 +645,14 @@ defmodule Loopctl.Delivery.StageMachine do
   # fields too — neither counter is an effect, so `Map.keys(@effect_stages)` does not
   # include them, and leaving one standing would escalate the resolved story again on the
   # first blip at the same commit.
+  #
+  # Except `triage_dispatch_id`: a re-queue does not re-triage — the story does not go back to
+  # `detected` — so the verdict Gate A judges is still the one that dispatch gave.
   def clears(:escalated, :queued, :human_resolution),
-    do: Enum.uniq(Map.keys(@effect_stages) ++ @head_keyed ++ @merge_keyed)
+    do:
+      Enum.uniq(
+        (Map.keys(@effect_stages) -- [:triage_dispatch_id]) ++ @head_keyed ++ @merge_keyed
+      )
 
   # A refused merge never happened, so the identity recorded for it goes with the head —
   # and so does everything keyed to that merge.

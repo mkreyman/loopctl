@@ -7,6 +7,8 @@ defmodule Loopctl.Delivery.GateAInputTest do
 
   use Loopctl.DataCase, async: true
 
+  import Ecto.Query
+
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Repo
@@ -27,6 +29,16 @@ defmodule Loopctl.Delivery.GateAInputTest do
   end
 
   defp lenses(a, b, c), do: %{"analyst" => lens(a), "architect" => lens(b), "engineer" => lens(c)}
+
+  defp bind(%{story: story}, dispatch_id) do
+    {:ok, _} =
+      Repo.with_tenant(story.tenant_id, fn ->
+        Repo.update_all(
+          from(r in Loopctl.Delivery.StoryStage, where: r.story_id == ^story.id),
+          set: [triage_dispatch_id: dispatch_id]
+        )
+      end)
+  end
 
   # One `transitioned` event, `lock_version` rising with each so the reader's order is the
   # order written here.
@@ -86,7 +98,7 @@ defmodule Loopctl.Delivery.GateAInputTest do
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end
 
-    test "the dispatch that TRIAGED the story is read, not a newer zombie row" do
+    test "the BOUND dispatch is read, not a newer zombie row" do
       ctx = story()
 
       fixture(:triage_verdict, %{
@@ -100,7 +112,7 @@ defmodule Loopctl.Delivery.GateAInputTest do
         tenant_id: ctx.story.tenant_id,
         story_id: ctx.story.id,
         lens_verdicts: lenses("reject", "reject", "reject"),
-        triaged_event: false
+        bind: false
       })
 
       assert {:persisted_triage, [%{"verdict" => "story"} | _]} =
@@ -115,23 +127,34 @@ defmodule Loopctl.Delivery.GateAInputTest do
       fixture(:triage_verdict, %{
         tenant_id: ctx.story.tenant_id,
         story_id: ctx.story.id,
-        incomplete_reason: "session_crashed"
+        incomplete_reason: "session_crashed",
+        bind: false
       })
 
       assert {:persisted_triage, _outputs} =
                GateAInput.for_story(ctx.story.tenant_id, ctx.story.id)
     end
 
-    test "a story whose triaged event names no dispatch is missing" do
+    test "a story with no bound dispatch is missing" do
       ctx = story()
 
       fixture(:triage_verdict, %{
         tenant_id: ctx.story.tenant_id,
         story_id: ctx.story.id,
-        triaged_event: false
+        bind: false
       })
 
-      events(ctx, [{"detected", "triaged", "forward", %{}}])
+      assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
+    end
+
+    test "a BOUND incomplete triage is missing: it produced no lens verdicts" do
+      ctx = story()
+
+      fixture(:triage_verdict, %{
+        tenant_id: ctx.story.tenant_id,
+        story_id: ctx.story.id,
+        incomplete_reason: "session_crashed"
+      })
 
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end
@@ -161,10 +184,7 @@ defmodule Loopctl.Delivery.GateAInputTest do
           lens_verdicts: lenses("story", "story", "story")
         })
 
-      events(ctx, [
-        {"detected", "triaged", "forward",
-         %{"payload" => %{"triage_dispatch_id" => theirs.dispatch_id}}}
-      ])
+      bind(ctx, theirs.dispatch_id)
 
       assert GateAInput.for_story(ctx.story.tenant_id, ctx.story.id) == :missing
     end

@@ -273,7 +273,9 @@ defmodule Loopctl.Delivery.TriageVerdict do
         {:error, :already_recorded}
 
       nil ->
-        fresh(tenant_id, runner_id, session, message, digest, transitions)
+        with :ok <- bind_triage(tenant_id, runner_id, session, message) do
+          fresh(tenant_id, runner_id, session, message, digest, transitions)
+        end
     end
   end
 
@@ -388,6 +390,30 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
   defp stringify(value), do: value
+
+  # THE BINDING GATE A READS (US-44.1, rewritten after review round 3). Before a fresh verdict
+  # is stored, its dispatch is recorded as the story's `triage_dispatch_id` — a stage-row
+  # identity `Stages.record_effect/5` writes once, at `detected`, under the story's epoch. The
+  # first dispatch to record it decides the story; any OTHER dispatch's verdict (a zombie from
+  # a reclaimed placement, a second delivery racing the first) is refused `stale_stage`
+  # before anything of it is stored, and so is any verdict for a story no longer at
+  # `detected`. A resend of the binding dispatch's own verdict never reaches this: it is
+  # answered from the record, and recording the same identity twice is a no-op anyway.
+  defp bind_triage(tenant_id, runner_id, session, message) do
+    case Stages.record_effect(
+           tenant_id,
+           session.story_id,
+           :triage_dispatch_id,
+           message.dispatch_id,
+           claim_epoch: message.claim_epoch,
+           actor_label: "runner:" <> runner_id
+         ) do
+      {:ok, _row} -> :ok
+      {:error, reason} when reason in [:effect_conflict, :wrong_stage] -> {:error, :stale_stage}
+      {:error, :not_found} -> {:error, :unknown_story_stage}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp sort_lens_verdicts(%{lens_verdicts: [_ | _] = lens_verdicts} = message),
     do: %{message | lens_verdicts: Enum.sort_by(lens_verdicts, & &1.lens)}
@@ -1122,11 +1148,12 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # asking them for. `event_data` is the same channel `StoryPayload` uses for its own
   # refusal's violations, and it takes loopctl's signal CODES, never the drafted prose.
   defp opts(runner_id, session, message, transition, {reason, event_data}) do
-    opts = opts(runner_id, session, message, transition, reason)
-    Keyword.put(opts, :event_data, Map.merge(Keyword.get(opts, :event_data, %{}), event_data))
+    runner_id
+    |> opts(session, message, transition, reason)
+    |> Keyword.put(:event_data, event_data)
   end
 
-  defp opts(runner_id, session, message, {_from, to, _edge} = transition, reason_override) do
+  defp opts(runner_id, session, message, {_from, to, _edge}, reason_override) do
     [
       claim_epoch: message.claim_epoch,
       reason: reason_override || reason_for(to, message),
@@ -1139,19 +1166,8 @@ defmodule Loopctl.Delivery.TriageVerdict do
       actor_role: :agent,
       actor_lineage: [],
       session_dispatch: {message.dispatch_id, session.slot_generation}
-    ] ++ triaged_by(transition, message)
+    ]
   end
-
-  # THE BINDING GATE A READS (US-44.1 review round 2). The one `detected -> triaged` event a
-  # story ever has names the dispatch whose verdict triaged it, so the verdict Gate A judges is
-  # that dispatch's — never merely the newest row. A zombie triage dispatch may still RECORD a
-  # verdict after the story has moved on (records are written before transitions, and nothing
-  # outside a single transaction can stop that), but its transitions are refused, it names no
-  # triaged event, and so nothing reads it.
-  defp triaged_by(@triaged, message),
-    do: [event_data: %{"triage_dispatch_id" => message.dispatch_id}]
-
-  defp triaged_by(_transition, _message), do: []
 
   # ENUM VALUES ONLY. See the `apply/3` doc: the verdict's own escalation prose was written
   # by a session that had just read reporter text, and this string lands in an append-only

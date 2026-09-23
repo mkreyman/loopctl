@@ -158,6 +158,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.escalation_reason =~ "contradiction"
       refute row.escalation_reason =~ "INJECTED"
+      # loopctl's own vocabulary survives: the validated kind enum stays readable.
+      assert row.escalation_reason =~ ~s("kb")
     end
 
     test "a human re-queueing a GATE A refusal satisfies Gate A at the next merge", ctx do
