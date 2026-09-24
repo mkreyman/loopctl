@@ -165,11 +165,15 @@ describe("index.js wiring", () => {
     assert.match(decl, /DRIVER-PLACED claim/);
     assert.match(decl, /CAPPED AT ITS DISPATCH DEADLINE/);
     assert.match(decl, /never moves claimed_until past that instant/);
+    // What the cap IS, truthfully: the claim-time value, moved forward only on a live claim.
+    assert.match(decl, /placed_at \+ wall_clock_seconds \+ DISPATCH_LEASE_GRACE_SECONDS at the claim/);
+    assert.match(decl, /recorded while the claim is " \+\s*"live; never earlier than deadline_at/);
 
     const row = README.split("\n").find((line) => line.startsWith("| `renew_story_claim` |"));
     assert.ok(row, "README must carry a renew_story_claim row");
     assert.match(row, /driver-placed claim/);
     assert.match(row, /capped at its dispatch deadline/);
+    assert.match(row, /recorded while the claim is live; never earlier than `deadline_at`/);
   });
 
   test("renew_story_claim's description and README row name the lease_cap_reached refusal (#879)", () => {

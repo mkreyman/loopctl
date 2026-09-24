@@ -659,14 +659,17 @@ defmodule Loopctl.Runners.Capacity do
     end
   end
 
-  # An accepted session ends at the runner's own wall clock, refreshed on the push that
-  # delivered it, so this is always the clock the session is running under.
+  # An accepted session ends at the runner's own wall clock. A resume may re-push a SHORTER
+  # clock while the session the first frame started is still running under the longer one, so
+  # the bound is the largest clock this dispatch was ever pushed with — the same value the
+  # claim's lease re-anchor uses — never merely the latest.
   defmacrop wall_clock_over(dispatch, now) do
     quote do
       not is_nil(unquote(dispatch).replied_at) and
         fragment(
-          "? + make_interval(secs => ? + ?) < ?",
+          "? + make_interval(secs => coalesce(?, ?) + ?) < ?",
           unquote(dispatch).replied_at,
+          unquote(dispatch).wall_clock_seconds_max,
           unquote(dispatch).wall_clock_seconds,
           type(^unquote(@release_grace_seconds), :integer),
           type(unquote(now), :utc_datetime_usec)

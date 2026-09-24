@@ -125,6 +125,43 @@ defmodule Loopctl.Progress.ClaimLockTest do
     assert elapsed_ms >= 150
   end
 
+  # US-44.5 review round 2, finding 5: a renewal that WAITED on the story lock must judge a
+  # capped claim's cap from after the wait. Read before it, `now` was still ahead of a cap that
+  # passed while the renewal queued, and the renewal answered 200 with a lease in the past.
+  test "a renewal that waited on the story lock past the cap is refused lease_cap_reached" do
+    %{tenant: tenant, story: story, agent_a: agent_a} = contracted_story_with_two_agents()
+    cap = DateTime.add(DateTime.utc_now(), 400, :millisecond)
+
+    {:ok, claimed} =
+      Progress.claim_story(tenant.id, story.id, agent_id: agent_a.id, lease_until: cap)
+
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+
+        AdminRepo.transaction(fn ->
+          lock_row(tenant.id, story.id)
+          send(parent, :locked)
+          # Held until the cap is well past, so the renewal below queues across it.
+          Process.sleep(max(DateTime.diff(cap, DateTime.utc_now(), :millisecond), 0) + 300)
+        end)
+      end)
+
+    assert_receive :locked, 2_000
+    assert DateTime.before?(DateTime.utc_now(), cap)
+
+    assert {:error, :lease_cap_reached} =
+             Progress.renew_claim(tenant.id, story.id,
+               agent_id: agent_a.id,
+               claim_epoch: claimed.claim_epoch
+             )
+
+    Task.await(holder, 5_000)
+    assert AdminRepo.get!(Story, story.id).claimed_until == cap
+  end
+
   test "concurrent claim: exactly one agent wins, the loser is rejected :invalid_transition" do
     %{tenant: tenant, story: story, agent_a: agent_a, agent_b: agent_b} =
       contracted_story_with_two_agents()

@@ -146,6 +146,19 @@ defmodule Loopctl.Progress.ClaimLeaseCapTest do
       assert renewed.claim_lease_cap == cap
     end
 
+    # A placed claim's lease starts AT its cap (the dispatch's deadline_at), and a runner cut
+    # off from control stops by that instant on the promise the claim lasts that long. A
+    # renewal answered with the global lease from now must not pull it earlier.
+    test "never moves a capped claim's lease EARLIER than it already is" do
+      far = Progress.claim_lease_seconds() + 3_600
+      %{story: story, cap: cap} = ctx = capped_story(far)
+      assert reload(story).claimed_until == cap
+
+      assert {:ok, renewed} = renew(ctx)
+      assert renewed.claimed_until == cap
+      assert reload(story).claimed_until == cap
+    end
+
     test "a claim whose cap has passed is refused lease_cap_reached, and nothing moves" do
       %{story: story} = ctx = capped_story(600)
       past = DateTime.add(DateTime.utc_now(), -60, :second)
@@ -172,6 +185,36 @@ defmodule Loopctl.Progress.ClaimLeaseCapTest do
 
       assert {:error, :not_found} = renew(%{ctx | tenant_id: other_tenant.id})
       assert reload(story).claimed_until == before
+    end
+  end
+
+  # The acceptance's move, called directly: the ledger path (`DispatchLedger.record_reply/3`)
+  # fences the epoch before it gets here, so only this call can show the function holds the
+  # claim it is given to that claim.
+  describe "reanchor_dispatch_lease/4" do
+    defp reanchor(%{story: story, tenant_id: tenant_id}, epoch) do
+      Progress.reanchor_dispatch_lease(AdminRepo, tenant_id, story.id, %{
+        claim_epoch: epoch,
+        accepted_at: DateTime.utc_now(),
+        wall_clock_seconds: 3_600,
+        actor_label: "runner:test"
+      })
+    end
+
+    test "moves a live capped claim at its epoch forward" do
+      %{story: story} = ctx = capped_story(600)
+
+      assert {:ok, :reanchored} = reanchor(ctx, story.claim_epoch)
+      assert_in_delta seconds_from_now(reload(story).claim_lease_cap), 3_600 + 900, 5
+      assert reload(story).claimed_until == reload(story).claim_lease_cap
+    end
+
+    test "moves nothing for another claim's epoch" do
+      %{story: story, cap: cap} = ctx = capped_story(600)
+
+      assert {:ok, :unchanged} = reanchor(ctx, story.claim_epoch + 1)
+      assert reload(story).claim_lease_cap == cap
+      assert reload(story).claimed_until == cap
     end
   end
 

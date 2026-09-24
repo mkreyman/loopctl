@@ -570,15 +570,158 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
       assert lease(runner.tenant_id, record.story_id) == {provisional, provisional}
     end
+
+    # A claim whose lease has ended is the reclaim sweep's to release; its session stopped at
+    # deadline_at, so moving the lease would hold the story for nobody.
+    test "a claim whose lease has already ended is not revived", %{runner: runner} do
+      record = sent(runner)
+      past = DateTime.add(DateTime.utc_now(), -60, :second)
+      set_lease(runner.tenant_id, record.story_id, past, past)
+
+      assert {:ok, _updated} = reply(runner, record)
+      assert lease(runner.tenant_id, record.story_id) == {past, past}
+    end
+
+    test "a story no longer in a claimed status is not moved", %{runner: runner} do
+      record = sent(runner)
+      provisional = DateTime.add(DateTime.utc_now(), 60, :second)
+      set_lease(runner.tenant_id, record.story_id, provisional, provisional, :reported_done)
+
+      assert {:ok, _updated} = reply(runner, record)
+      assert lease(runner.tenant_id, record.story_id) == {provisional, provisional}
+    end
+
+    test "the move bumps updated_at and is audited as claim_lease_reanchored",
+         %{runner: runner} do
+      record = sent(runner)
+      provisional = DateTime.add(DateTime.utc_now(), 60, :second)
+      set_lease(runner.tenant_id, record.story_id, provisional, provisional)
+      before = story_updated_at(runner.tenant_id, record.story_id)
+
+      assert {:ok, updated} = reply(runner, record)
+      expected = DispatchLease.cap(updated.replied_at, record.wall_clock_seconds)
+
+      assert DateTime.compare(story_updated_at(runner.tenant_id, record.story_id), before) ==
+               :gt
+
+      assert [entry] =
+               as_tenant(runner.tenant_id, fn ->
+                 Repo.all(
+                   from a in Loopctl.Audit.AuditLog,
+                     where: a.tenant_id == ^runner.tenant_id and a.entity_id == ^record.story_id,
+                     where: a.action == "claim_lease_reanchored"
+                 )
+               end)
+
+      assert entry.actor_type == "system"
+      assert entry.actor_label == "runner:" <> runner.id
+
+      assert entry.old_state == %{
+               "claimed_until" => DateTime.to_iso8601(provisional),
+               "claim_lease_cap" => DateTime.to_iso8601(provisional)
+             }
+
+      assert entry.new_state["claim_lease_cap"] == DateTime.to_iso8601(expected)
+      assert entry.new_state["claimed_until"] == DateTime.to_iso8601(expected)
+    end
   end
 
-  defp set_lease(tenant_id, story_id, claimed_until, cap) do
+  # Finding 6 of US-44.5 review round 2: only the reply that WRITES the story may take it
+  # `FOR NO KEY UPDATE`; every other reply shares it, as a trace does. Observed on the SQL the
+  # reply issues, in this process, because a row lock leaves no trace in `pg_locks`.
+  describe "record_reply/3 takes the story's write lock only when it writes the story" do
+    test "an acceptance of a capped claim locks the story FOR NO KEY UPDATE",
+         %{runner: runner} do
+      record = sent(runner)
+      provisional = DateTime.add(DateTime.utc_now(), 60, :second)
+      set_lease(runner.tenant_id, record.story_id, provisional, provisional)
+
+      # The fence's lock, then `Progress.reanchor_dispatch_lease/4`'s own on the row it writes
+      # (a re-take of a lock this transaction already holds, never an upgrade).
+      locks = story_locks(fn -> assert {:ok, _} = reply(runner, record) end)
+      assert locks == ["FOR NO KEY UPDATE", "FOR NO KEY UPDATE"]
+    end
+
+    test "an acceptance of an uncapped claim only shares the story", %{runner: runner} do
+      record = sent(runner)
+      set_lease(runner.tenant_id, record.story_id, DateTime.add(DateTime.utc_now(), 60), nil)
+
+      locks = story_locks(fn -> assert {:ok, _} = reply(runner, record) end)
+      assert locks == ["FOR SHARE"]
+    end
+
+    test "a refusal of a capped claim only shares the story", %{runner: runner} do
+      record = sent(runner)
+      provisional = DateTime.add(DateTime.utc_now(), 60, :second)
+      set_lease(runner.tenant_id, record.story_id, provisional, provisional)
+
+      locks =
+        story_locks(fn ->
+          assert {:ok, _} =
+                   reply(runner, record, %{
+                     "decision" => "refused",
+                     "reason" => "other",
+                     "detail" => "x"
+                   })
+        end)
+
+      assert locks == ["FOR SHARE"]
+    end
+  end
+
+  # The row-lock clause of every `stories` query `fun` issues on `Repo`, in order.
+  defp story_locks(fun) do
+    test_pid = self()
+    handler = "story-locks-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:loopctl, :repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if self() == test_pid and query =~ ~r/FROM "stories"/,
+          do: send(test_pid, {:story_query, query})
+      end,
+      nil
+    )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(handler)
+    end
+
+    collect_story_locks([])
+  end
+
+  defp collect_story_locks(acc) do
+    receive do
+      {:story_query, query} ->
+        lock = Regex.run(~r/FOR (NO KEY UPDATE|SHARE|UPDATE)/, query)
+        collect_story_locks(if lock, do: [hd(lock) | acc], else: acc)
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp set_lease(tenant_id, story_id, claimed_until, cap, status \\ :assigned) do
     as_tenant(tenant_id, fn ->
       {1, _} =
         from(s in Loopctl.WorkBreakdown.Story,
           where: s.tenant_id == ^tenant_id and s.id == ^story_id
         )
-        |> Repo.update_all(set: [claimed_until: claimed_until, claim_lease_cap: cap])
+        |> Repo.update_all(
+          set: [claimed_until: claimed_until, claim_lease_cap: cap, agent_status: status]
+        )
+    end)
+  end
+
+  defp story_updated_at(tenant_id, story_id) do
+    as_tenant(tenant_id, fn ->
+      Repo.one!(
+        from s in Loopctl.WorkBreakdown.Story,
+          where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+          select: s.updated_at
+      )
     end)
   end
 

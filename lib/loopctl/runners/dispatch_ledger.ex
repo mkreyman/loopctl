@@ -53,13 +53,14 @@ defmodule Loopctl.Runners.DispatchLedger do
   row must still be `sent`. When the story's epoch has moved past the row's — the claim was
   released or reclaimed — the row is marked `superseded` in the same transaction. A repeat of
   the reply already recorded is `:ok`; a different one is `:already_replied`. An acceptance
-  also moves a placed claim's lease cap forward to `replied_at` + the dispatch's wall clock +
-  `Loopctl.Delivery.DispatchLease.grace_seconds/0`, in the same transaction (#879), which is
-  why a reply locks the story `FOR NO KEY UPDATE` where a trace only shares it.
+  of a dispatch whose story holds a CAPPED claim also moves that cap forward, in the same
+  transaction (`Loopctl.Progress.reanchor_dispatch_lease/4`, #879) — and only that reply
+  locks the story `FOR NO KEY UPDATE`; every other reply, like a trace, only shares it.
 
   No audit-chain entry is written for a reply. The chain is kept for custody transitions
   (claim, merge, escalate — design §11), a reply is the runner's own report about its
-  machine, and the ledger row already records it with its time.
+  machine, and the ledger row already records it with its time. A lease the acceptance moves
+  is recorded in the audit LOG, by `Progress`.
 
   ## Trace
 
@@ -132,8 +133,8 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
-  alias Loopctl.Delivery.DispatchLease
   alias Loopctl.LocalGuc
+  alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchRecord
@@ -369,17 +370,27 @@ defmodule Loopctl.Runners.DispatchLedger do
         else: reraise(error, __STACKTRACE__)
   end
 
+  # `wall_clock_seconds_max` only ever grows: it is the longest clock any push of this dispatch
+  # carried, which is what an acceptance re-anchors the claim on (`reanchor_lease/3`).
+  # `GREATEST` ignores the NULL of a row never pushed before.
   defp decide(repo, %DispatchRecord{} = record, "pushed", dispatch, now) do
+    wall_clock_seconds = dispatch.wall_clock_seconds
+
     {1, _} =
-      from(d in DispatchRecord, where: d.id == ^record.id and d.tenant_id == ^record.tenant_id)
-      |> repo.update_all(
-        set: [
-          delivery: "pushed",
-          pushed_at: now,
-          wall_clock_seconds: dispatch.wall_clock_seconds,
-          updated_at: now
+      from(d in DispatchRecord,
+        where: d.id == ^record.id and d.tenant_id == ^record.tenant_id,
+        update: [
+          set: [
+            delivery: "pushed",
+            pushed_at: ^now,
+            wall_clock_seconds: ^wall_clock_seconds,
+            wall_clock_seconds_max:
+              fragment("GREATEST(?, ?)", d.wall_clock_seconds_max, ^wall_clock_seconds),
+            updated_at: ^now
+          ]
         ]
       )
+      |> repo.update_all([])
 
     :pushed
   end
@@ -640,15 +651,13 @@ defmodule Loopctl.Runners.DispatchLedger do
     context = %{operation: :record_reply, dispatch_id: reply.dispatch_id, run_id: nil}
 
     runner_write(tenant_id, runner_id, context, fn ->
-      # The story is locked `FOR NO KEY UPDATE` rather than shared: an acceptance WRITES it
-      # (`reanchor_lease/1`), and upgrading a share lock another reply or trace also holds
-      # would deadlock the two.
-      with {:ok, record} <-
-             fence_then_lock(tenant_id, runner_id, reply.dispatch_id, :no_key_update),
+      story_lock = reply_story_lock(tenant_id, runner_id, reply)
+
+      with {:ok, record} <- fence_then_lock(tenant_id, runner_id, reply.dispatch_id, story_lock),
            :ok <- epoch_matches(record, reply.claim_epoch),
            {:ok, record} <- apply_reply(record, reply) do
         release_if_refused(record)
-        reanchor_lease(record)
+        reanchor_lease(record, story_lock, runner_id)
         record
       end
     end)
@@ -681,37 +690,63 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   defp release_if_refused(%DispatchRecord{}), do: :ok
 
-  # THE ACCEPTANCE RE-ANCHORS A PLACED CLAIM'S LEASE (#879, US-44.5). The claim was taken with
-  # a PROVISIONAL cap, placed_at + wall clock + grace, but the runner's wall clock starts at
-  # its acceptance — which is also what `Capacity` bounds the session by (`replied_at` plus the
-  # wall clock the winning push recorded). So the cap and the lease move to replied_at + that
-  # wall clock + `DispatchLease.grace_seconds/0` here, in the transaction that records the
-  # acceptance: only FORWARD (a cap already later is left alone, so a repeat of the reply is
-  # a no-op), only a CAPPED claim, and only the claim this dispatch serves: the fence above
-  # has just shown, under a lock held to commit, that the story is still at the dispatch's
-  # `claim_epoch`, so no epoch predicate is repeated here. With the grace
-  # at least `Capacity.release_grace_seconds/0` (`DispatchLease.validate!/0`), the claim then
-  # outlives the slot by construction. A resumed dispatch is covered the same way: its push
-  # refreshed `wall_clock_seconds`, and it is accepted at most once.
-  defp reanchor_lease(
-         %DispatchRecord{status: "accepted", replied_at: %DateTime{} = replied_at} = record
-       )
-       when is_integer(record.wall_clock_seconds) and record.wall_clock_seconds > 0 do
-    cap = DispatchLease.cap(replied_at, record.wall_clock_seconds)
+  # THE STORY LOCK A REPLY TAKES, chosen once and before any lock: `FOR NO KEY UPDATE` only
+  # for the reply that WRITES the story — an acceptance of a dispatch whose story holds a
+  # CAPPED claim (`reanchor_lease/3`). Every other reply only reads the epoch and shares the
+  # row, as a trace does, so it never queues behind one it does not conflict with. It cannot
+  # be taken as a share lock and upgraded later: two replies both holding the share lock would
+  # each wait on the other's.
+  #
+  # Decided from an UNLOCKED read, which cannot mislead in the direction that matters: a claim
+  # writes its cap in the transaction that bumps the epoch, before any dispatch row for it
+  # exists, so a story still at this dispatch's epoch when the fence reads it under the lock
+  # had that same cap here. A story released or claimed again since is refused by the fence.
+  defp reply_story_lock(tenant_id, runner_id, %{decision: "accepted", dispatch_id: dispatch_id}) do
+    capped? =
+      Repo.exists?(
+        from r in DispatchRecord,
+          join: s in Story,
+          on: s.id == r.story_id and s.tenant_id == r.tenant_id,
+          where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+          where: r.dispatch_id == ^dispatch_id and not is_nil(s.claim_lease_cap)
+      )
 
-    Repo.update_all(
-      from(s in Story,
-        where: s.tenant_id == ^record.tenant_id and s.id == ^record.story_id,
-        # NULL on an uncapped claim, and `NULL < cap` is not true: an uncapped claim stays so.
-        where: s.claim_lease_cap < ^cap
-      ),
-      set: [claim_lease_cap: cap, claimed_until: cap]
-    )
-
-    :ok
+    if capped?, do: :no_key_update, else: :share
   end
 
-  defp reanchor_lease(%DispatchRecord{}), do: :ok
+  defp reply_story_lock(_tenant_id, _runner_id, _reply), do: :share
+
+  # THE ACCEPTANCE MOVES A PLACED CLAIM'S CAP FORWARD (#879, US-44.5), in the transaction that
+  # records it and only under the write lock `reply_story_lock/3` chose. The rules — live claim
+  # only, forward only, audited — are `Progress.reanchor_dispatch_lease/4`'s; this supplies the
+  # anchor `Capacity` bounds the session by, `replied_at`, and the LARGEST wall clock any push
+  # of this dispatch carried. Not the latest: a resume may push a shorter clock while the
+  # session the first frame started is still running under the longer one, and the reply that
+  # arrives may be that first session's. The write lock is the whole gate: only an accepting
+  # reply takes it, so the record here is always `accepted`.
+  defp reanchor_lease(
+         %DispatchRecord{replied_at: %DateTime{} = replied_at} = record,
+         :no_key_update,
+         runner_id
+       ) do
+    case record.wall_clock_seconds_max || record.wall_clock_seconds do
+      seconds when is_integer(seconds) and seconds > 0 ->
+        {:ok, _moved} =
+          Progress.reanchor_dispatch_lease(Repo, record.tenant_id, record.story_id, %{
+            claim_epoch: record.claim_epoch,
+            accepted_at: replied_at,
+            wall_clock_seconds: seconds,
+            actor_label: "runner:" <> runner_id
+          })
+
+        :ok
+
+      _no_clock ->
+        :ok
+    end
+  end
+
+  defp reanchor_lease(%DispatchRecord{}, _story_lock, _runner_id), do: :ok
 
   @doc """
   Stores a validated `trace` batch from `runner_id` and returns the run's contiguous

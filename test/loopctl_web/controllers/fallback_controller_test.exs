@@ -105,6 +105,9 @@ defmodule LoopctlWeb.FallbackControllerTest do
       body = Jason.decode!(conn.resp_body)
       assert body["error"]["code"] == "lease_cap_reached"
       assert body["error"]["message"] =~ "claim_lease_cap"
+      # The 409 releases nothing — the reclaim sweep does, once the lease has ended at the cap.
+      assert body["error"]["message"] =~ "this refusal releases nothing"
+      assert body["error"]["message"] =~ "the reclaim sweep releases the story"
     end
 
     # A rolled-back mutation (its audit insert failed) must surface as a 5xx, never a

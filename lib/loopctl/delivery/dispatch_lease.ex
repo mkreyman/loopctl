@@ -4,30 +4,36 @@ defmodule Loopctl.Delivery.DispatchLease do
 
   The global claim lease (`Loopctl.Progress.claim_lease_seconds/0`, 24 hours) is sized for a
   human-driven claimant that renews on its own schedule. A runner session is different: the
-  runner stops it at `wall_clock_seconds` from when it ACCEPTED the dispatch, so a session
-  killed early holds its story for most of a day under the global lease. Lowering the global
-  value is wrong for every other claimant (#879 records it being built and removed), so
-  `Loopctl.Delivery.Placement` claims with a per-claim CAP instead, set in two steps:
+  runner stops it at `wall_clock_seconds` from when it starts it, so a session killed early
+  holds its story for most of a day under the global lease. Lowering the global value is wrong
+  for every other claimant (#879 records it being built and removed), so
+  `Loopctl.Delivery.Placement` claims with a per-claim CAP instead:
 
-      at the claim (provisional):   cap = placed_at  + wall_clock_seconds + grace_seconds()
-      at the runner's acceptance:   cap = replied_at + wall_clock_seconds + grace_seconds()
+      at the claim:                  cap = placed_at  + wall_clock_seconds + grace_seconds()
+      at the runner's acceptance:    cap = replied_at + wall_clock_seconds + grace_seconds(),
+                                           if that is later and the claim is still live
 
-  The second is written by `Loopctl.Runners.DispatchLedger.record_reply/3` in the transaction
-  that records the acceptance, only ever FORWARD and only on the claim that dispatch serves
-  (its story at its `claim_epoch`). It is anchored where `Loopctl.Runners.Capacity` anchors
-  its own bound on the session — `replied_at` plus the wall clock the push delivered — so the
-  push, the worktree setup and anything else between placement and acceptance never eat into
-  the session's time, and a RESUMED dispatch that carries a longer wall clock is covered by
-  the clock it actually runs under.
+  The claim-time value travels to the runner as `RunnerDispatch.deadline_at`, and it is a STOP
+  bound: the runner ends the session by the earlier of its own start + `wall_clock_seconds`
+  and `deadline_at`, whether or not it can reach control. Start-up time — the push, the
+  worktree setup — comes out of the grace rather than the wall clock; only a start-up longer
+  than the grace shortens the session. The cap is never earlier than `deadline_at`, so a
+  runner cut off from control never runs on a story control has placed again.
 
-  The claim-time value travels to the runner as `RunnerDispatch.deadline_at`: the EARLIEST
-  the claim can end. The runner budgets its session from its own `wall_clock_seconds`; the
-  claim is held until at least `replied_at + wall_clock_seconds + grace_seconds()`.
+  The acceptance's move is `Loopctl.Progress.reanchor_dispatch_lease/4`, called from
+  `Loopctl.Runners.DispatchLedger.record_reply/3` in the transaction that records the
+  acceptance: only FORWARD, only on a LIVE claim at that dispatch's `claim_epoch` (an expired
+  one is left to the reclaim sweep, never revived), and audited. It is anchored where
+  `Loopctl.Runners.Capacity` anchors its own bound on the session — `replied_at` plus a wall
+  clock — so the claim is not released while capacity still presumes the session running.
+  The wall clock it uses is the LONGEST any push of the dispatch carried, because a resume may
+  push a shorter one while the session an earlier push started is still running.
 
   ## The grace, and why boot refuses a small one
 
   `DISPATCH_LEASE_GRACE_SECONDS` (default 900) is how long the claim outlives the session's
-  wall clock. It must be at least `Loopctl.Runners.Capacity.release_grace_seconds/0`:
+  wall clock, and how much start-up time a session can absorb before its `deadline_at` starts
+  to shorten it. It must be at least `Loopctl.Runners.Capacity.release_grace_seconds/0`:
   capacity presumes the session running until `replied_at + wall_clock_seconds` plus that
   grace, and the accepted cap is measured from the same `replied_at` with the same wall
   clock, so with this grace at least that one the claim is never released while capacity
@@ -51,8 +57,9 @@ defmodule Loopctl.Delivery.DispatchLease do
 
   @doc """
   The lease cap for a dispatch anchored at `at` with `wall_clock_seconds`:
-  `at + wall_clock_seconds + grace_seconds/0`. `at` is `placed_at` for the provisional cap a
-  claim is taken with, and the runner's `replied_at` for the one its acceptance moves it to.
+  `at + wall_clock_seconds + grace_seconds/0`. `at` is `placed_at` for the cap a claim is
+  taken with (the dispatch's `deadline_at`), and the runner's `replied_at` for the later one
+  its acceptance may move it to.
   """
   @spec cap(DateTime.t(), pos_integer()) :: DateTime.t()
   def cap(%DateTime{} = at, wall_clock_seconds)

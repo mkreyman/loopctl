@@ -344,7 +344,8 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "This claim was placed for a runner dispatch and has reached its lease cap " <>
             "(claim_lease_cap). No renewal extends a claim past its cap, so nothing was " <>
-            "renewed: the claim ends at the cap and the story is released. Stop working it."
+            "renewed, and this refusal releases nothing: the claim's lease ended at the cap, " <>
+            "and the reclaim sweep releases the story. Stop working it."
       }
     })
   end

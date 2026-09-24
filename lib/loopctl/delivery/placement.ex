@@ -601,9 +601,10 @@ defmodule Loopctl.Delivery.Placement do
              branch_prefixes: prefixes,
              prefix_policy: :advise
            ),
-         # The same wall clock rule as the claiming path: a resume may carry a new
-         # `wall_clock_seconds`, which the push that wins records and the runner's
-         # acceptance re-anchors the claim's cap on (`DispatchLedger.record_reply/3`).
+         # The same wall clock rule as the claiming path. A resume may carry a new
+         # `wall_clock_seconds`; the push that wins records it, and the acceptance moves the
+         # claim's cap on the LONGEST clock any push carried (`DispatchLedger.record_reply/3`).
+         # The session it starts is still stopped by the claim's `deadline_at`.
          {:ok, dispatch} <- lease_capable(dispatch),
          {:ok, dispatch} <- rebuild_story(dispatch, story) do
       {:ok,
@@ -921,12 +922,12 @@ defmodule Loopctl.Delivery.Placement do
   # inside the claim's own transaction.
   #
   # AND A LEASE CAPPED AT THE DISPATCH DEADLINE (#879): `:lease_until` is placed_at plus the
-  # dispatch's wall clock plus `DispatchLease.grace_seconds/0`. PROVISIONAL: the runner's wall
-  # clock starts when it accepts, not here, so `DispatchLedger.record_reply/3` moves the cap
-  # (and the lease) forward to replied_at + wall clock + grace in the transaction that records
-  # the acceptance — the anchor `Loopctl.Runners.Capacity` bounds the session by. Until then
-  # this cap is what ends a claim whose dispatch is never accepted, instead of the global
-  # lease. `placed_at` is taken HERE, immediately before the claim's transaction.
+  # dispatch's wall clock plus `DispatchLease.grace_seconds/0`, and it is the `deadline_at` the
+  # runner stops the session by (`put_deadline/2`). The runner's acceptance may move the cap
+  # LATER, while the claim is live (`Progress.reanchor_dispatch_lease/4`), never earlier, so
+  # the claim always outlasts the session. Until then this cap is what ends a claim whose
+  # dispatch is never accepted, instead of the global lease. `placed_at` is taken HERE,
+  # immediately before the claim's transaction.
   defp claim(tenant_id, story_id, agent_id, session, dispatch, opts) do
     placed_at = DateTime.utc_now()
 
@@ -964,10 +965,11 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
-  # THE CLAIM'S CAP, ON THE WIRE (`RunnerDispatch.deadline_at`, contract 1.16.0): the
-  # EARLIEST instant the claim can end. The runner budgets its session from its own
-  # `wall_clock_seconds`; its acceptance moves the cap to replied_at + wall clock + grace, so
-  # the claim is held at least that long (`DispatchLedger.record_reply/3`). ALWAYS the claim's
+  # THE CLAIM'S CAP, ON THE WIRE (`RunnerDispatch.deadline_at`, contract 1.16.0): a STOP
+  # BOUND. The runner ends the session by the earlier of its own start + `wall_clock_seconds`
+  # and this instant, reachable or not, and the claim never ends before it (an acceptance only
+  # moves the cap later), so a runner cut off from control never runs on a story placed
+  # again. ALWAYS the claim's
   # own value: a caller-supplied `deadline_at` is replaced, exactly as a caller-supplied
   # `claim_epoch` is, and a claim with no cap sends none.
   #

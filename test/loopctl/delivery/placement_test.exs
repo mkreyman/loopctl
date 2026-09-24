@@ -1407,6 +1407,39 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert claimed_until == cap
     end
 
+    # US-44.5 review round 2, finding 2. A resume may push a SHORTER clock while the session
+    # the first frame started still runs under the longer one — and the acceptance that then
+    # arrives may be that first session's. Re-anchored on the latest push's 600 seconds, the
+    # cap would not move at all (replied_at + 1 500 is before placed_at + 4 500) and the claim
+    # would end with the first session's capacity still presumed busy; on the longest clock
+    # any push carried, it moves to replied_at + 3 600 + grace.
+    test "a RESUME with a SHORTER wall clock re-anchors on the longest clock any push carried",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+
+      assert {:ok, _resumed} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "wall_clock_seconds", 600),
+                 api_key: ctx.operator
+               )
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.wall_clock_seconds == 600
+
+      {record, {claimed_until, cap}} = accept(runner, placed)
+      assert record.wall_clock_seconds == 600
+      assert record.wall_clock_seconds_max == 3_600
+
+      assert cap == DateTime.add(record.replied_at, 3_600 + 900, :second)
+      assert claimed_until == cap
+    end
+
     test "a RESUME runs the same wall clock rule and refuses an out-of-range clock", ctx do
       %{runner: runner, story: story} = ctx
       payload = dispatch_payload(story)

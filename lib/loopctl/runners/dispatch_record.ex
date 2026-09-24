@@ -32,6 +32,9 @@ defmodule Loopctl.Runners.DispatchRecord do
   socket) or `"dropped"` (a channel refused to push it and gave the slot back). It is reset
   with every reservation, and `wall_clock_seconds` is refreshed when a push wins, so the
   bound `Loopctl.Runners.Capacity` applies is always the clock the session is running under.
+  `wall_clock_seconds_max` is the LONGEST clock any winning push carried and only grows: the
+  acceptance re-anchors a placed claim's lease cap on it (#879), because a resume may push a
+  shorter clock while a session an earlier push started is still running.
 
   ## Trust boundary
 
@@ -70,6 +73,7 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :run_id, :binary_id
     field :trace_acked_seq, :integer, default: -1
     field :wall_clock_seconds, :integer
+    field :wall_clock_seconds_max, :integer
     field :released_at, :utc_datetime_usec
     field :reserved_at, :utc_datetime_usec
     field :slot_generation, :integer, default: 0
