@@ -119,12 +119,13 @@ defmodule LoopctlWeb.StoryStatusController do
         "and `claim_epoch` is incremented by this claim and by every release. Keep the " <>
         "epoch: renew-claim requires it, and start/report refuse a stale one with " <>
         "409 `stale_claim_epoch`. The story also carries `claim_lease_cap`: null on a claim " <>
-        "taken here, and on a claim a PLACEMENT took for a runner dispatch the latest " <>
-        "instant `claimed_until` may reach — `claimed_until` on such a claim is bounded by " <>
-        "it and no renewal extends past it (renew-claim answers 409 `lease_cap_reached` " <>
-        "once it has passed). It is placed_at + `wall_clock_seconds` + " <>
-        "`DISPATCH_LEASE_GRACE_SECONDS`, moved forward to the runner's acceptance + " <>
-        "`wall_clock_seconds` + the grace when the runner accepts.",
+        "taken here, and on a claim a PLACEMENT took for a runner dispatch its dispatch " <>
+        "deadline, which such a claim's `claimed_until` always equals: no renewal moves it " <>
+        "(renew-claim answers the claim as it stands, and 409 `lease_cap_reached` once the " <>
+        "cap has passed). It is placed_at + `wall_clock_seconds` + " <>
+        "`DISPATCH_LEASE_GRACE_SECONDS`, and moves only forward, only while the claim is " <>
+        "live: to a resume's time or the runner's acceptance + `wall_clock_seconds` + the " <>
+        "grace.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 =>
@@ -304,8 +305,9 @@ defmodule LoopctlWeb.StoryStatusController do
       "The story's assigned agent extends its claim's lease: `claimed_until` becomes now " <>
         "plus the lease length (default 24 hours, `STORY_CLAIM_LEASE_SECONDS`) — measured " <>
         "from NOW, so renewing often never banks a longer lease. A claim a placement took " <>
-        "for a runner dispatch carries a `claim_lease_cap` (its dispatch deadline): its " <>
-        "renewal is the EARLIER of that lease and the cap, never later. A claim not renewed " <>
+        "for a runner dispatch carries a `claim_lease_cap` (its dispatch deadline), and its " <>
+        "`claimed_until` already IS that cap: renewing it writes nothing and answers 200 " <>
+        "with the claim as it stands. A claim not renewed " <>
         "before `claimed_until` is released back to `pending` by the reclaimer, which " <>
         "bumps `claim_epoch`. The caller must present the `claim_epoch` its claim returned. " <>
         "Refusals: 400 when `claim_epoch` is missing or not a non-negative integer; " <>
@@ -325,7 +327,10 @@ defmodule LoopctlWeb.StoryStatusController do
          properties: %{claim_epoch: @claim_epoch_schema}
        }},
     responses: %{
-      200 => {"Claim renewed", "application/json", Schemas.StoryStatusResponse},
+      200 =>
+        {"Claim renewed — or, for a driver-placed claim, returned as it stands with " <>
+           "`claimed_until` equal to `claim_lease_cap`", "application/json",
+         Schemas.StoryStatusResponse},
       400 => {"claim_epoch missing or malformed", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>

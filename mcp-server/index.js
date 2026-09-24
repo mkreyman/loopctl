@@ -4372,9 +4372,10 @@ const TOOLS = [
       "lease on any story you hold longer than it. A DRIVER-PLACED claim (one a placement took " +
       "for a runner dispatch) is CAPPED AT ITS DISPATCH DEADLINE (claim_lease_cap: " +
       "placed_at + wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS at the claim, which is " +
-      "the dispatch's deadline_at; moved forward to the runner's acceptance + " +
-      "wall_clock_seconds + the grace when that acceptance is recorded while the claim is " +
-      "live; never earlier than deadline_at): renewing it " +
+      "the dispatch's deadline_at; moved forward to a resume's time or the runner's " +
+      "acceptance + wall_clock_seconds + the grace, only while the claim is live; never " +
+      "earlier than a deadline_at already sent), and its claimed_until already IS that cap: " +
+      "renewing it writes nothing and returns the claim as it stands, so renewing " +
       "never moves claimed_until past that instant. " +
       "Uses the AGENT key, the same key as claim_story. Refusals pass " +
       "through: 400 claim_epoch missing or not a non-negative integer; 422 not_claimed (the " +
@@ -8077,7 +8078,13 @@ const TOOLS = [
       "push and re-sent verbatim, because a session may be running on it right now. Neither " +
       "prefix refusal can be raised by a RETRY carrying a dispatch_id loopctl already " +
       "holds: its claim is already standing, so a declaration that changed under you only " +
-      "steers the name and never strands the story.",
+      "steers the name and never strands the story.\n\n" +
+      "A RETRY also moves the claim's deadline: the re-sent dispatch carries deadline_at = now + " +
+      "its wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS (never earlier than the one already " +
+      "sent), so a late or a longer retry gets its whole clock. 409 `dispatch_claim_ended` means " +
+      "the claim that dispatch_id was placed under has ENDED — its lease ran out, or the story " +
+      "left assigned/implementing: nothing was pushed or written and the claim is not revived. " +
+      "Place the story again with a NEW dispatch_id once it is placeable.",
     inputSchema: {
       type: "object",
       properties: {

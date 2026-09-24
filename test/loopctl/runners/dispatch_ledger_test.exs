@@ -636,10 +636,10 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       provisional = DateTime.add(DateTime.utc_now(), 60, :second)
       set_lease(runner.tenant_id, record.story_id, provisional, provisional)
 
-      # The fence's lock, then `Progress.reanchor_dispatch_lease/4`'s own on the row it writes
-      # (a re-take of a lock this transaction already holds, never an upgrade).
+      # The fence's lock ALONE (round 3, finding 9): the re-anchor writes the row the fence
+      # read under it, with no second read of the story.
       locks = story_locks(fn -> assert {:ok, _} = reply(runner, record) end)
-      assert locks == ["FOR NO KEY UPDATE", "FOR NO KEY UPDATE"]
+      assert locks == ["FOR NO KEY UPDATE"]
     end
 
     test "an acceptance of an uncapped claim only shares the story", %{runner: runner} do

@@ -10,24 +10,33 @@ All notable changes to loopctl are documented here.
   hours (epic 44, US-44.5, #879; runner contract 1.16.0).** `Loopctl.Delivery.Placement` — the
   dispatch driver and `place_dispatch` — claims with a lease CAPPED at `placed_at +
   wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS`, stored in the new
-  `stories.claim_lease_cap` column (migration, no manual step, NULL on every existing row; a
-  `stories_claim_lease_within_cap` CHECK is added `NOT VALID` then validated; the same
-  migration adds the nullable `runner_dispatches.wall_clock_seconds_max`). The dispatch carries
-  that cap as optional `deadline_at`, a STOP bound: the runner ends the session by the earlier
-  of its own start + `wall_clock_seconds` and `deadline_at`, so start-up time comes out of the
-  grace, and the claim never ends before it. When the runner ACCEPTS while the claim is live,
-  the cap and the lease move forward to its `replied_at` + the longest wall clock any push of
-  the dispatch carried + the grace — the anchor runner capacity bounds the session by — and the
-  move is recorded in the audit log as `claim_lease_reanchored`. No renewal —
-  `renew_story_claim`, or the grace granted when a custody halt clears — moves the lease past
-  the cap or earlier than it already is, and a renewal once the cap has passed is 409
-  `lease_cap_reached`; a killed session releases its story within minutes of its wall clock.
-  Every other claim keeps the global `STORY_CLAIM_LEASE_SECONDS` lease, unchanged. RE-VENDOR the
-  contract to read `deadline_at` — a 1.15.0 runner ignores it. **New env var `DISPATCH_LEASE_GRACE_SECONDS`** (default 900):
-  **the app refuses to boot when it is below 300** (`Capacity.release_grace_seconds/0`), naming
-  both values, or when it is set to anything but an integer (`15m`, `1800s`, `120.0`). A
-  placement — or a resume — whose `wall_clock_seconds` is not an integer from 1 to 86 400 is now
-  refused `invalid_payload` BEFORE anything is claimed or pushed, rather than after the claim.
+  `stories.claim_lease_cap` column. Two migrations, no manual step: `20260923150500` adds the
+  column (NULL on every existing row) and a `stories_claim_lease_within_cap` CHECK, added `NOT
+  VALID` then validated; `20260923150600` adds the nullable
+  `runner_dispatches.wall_clock_seconds_max`. The dispatch carries that cap as optional
+  `deadline_at`, a STOP bound: the runner ends the session by the earlier of its own start +
+  `wall_clock_seconds` and `deadline_at`, so start-up time comes out of the grace. The cap only
+  ever moves FORWARD and only while the claim is live — to a resume's time, or the runner's
+  `replied_at` + the longest wall clock any push of the dispatch carried, + the grace — and each
+  move is recorded in the audit log as `claim_lease_reanchored`. A RESUME of a dispatch whose
+  claim has ended is now refused 409 `dispatch_claim_ended` instead of being pushed. The lease
+  sweep never releases a capped claim before its cap; an operator's force-unclaim still can. A
+  capped claim's lease already IS its cap, so `renew_story_claim` on one writes nothing and
+  answers the claim as it stands, the renewal grace granted when a custody halt clears passes
+  it by, and a renewal once the cap has passed is 409 `lease_cap_reached`. A killed session
+  releases its story within minutes of its wall clock. Every other claim keeps the global
+  `STORY_CLAIM_LEASE_SECONDS` lease, unchanged. **New env var `DISPATCH_LEASE_GRACE_SECONDS`**
+  (default 900): **the app refuses to boot when it is below 300**
+  (`Capacity.release_grace_seconds/0`), naming both values, or when it is set to anything but
+  an integer (`15m`, `1800s`, `120.0`). A placement — or a resume — whose `wall_clock_seconds`
+  is not an integer from 1 to 86 400 is now refused `invalid_payload` BEFORE anything is
+  claimed or pushed, rather than after the claim.
+
+  **Deploy note — RE-VENDOR the runner contract to 1.16.0.** The claim is capped whether or not
+  the runner reads `deadline_at`, and a 1.15.0 runner ignores it: its session is NOT stopped at
+  the deadline, so one whose start-up takes longer than the grace can still be running when the
+  sweep releases the story and it is placed again. Re-vendoring 1.16.0 on every runner is the
+  remedy; until then, keep `DISPATCH_LEASE_GRACE_SECONDS` above the longest start-up you see.
 
 - **Both delivery gates now screen a triaged story BEFORE it is queued (epic 44, US-44.2).**
   An accepted `story` verdict is escalated over `triage_escalate` instead of queued when its

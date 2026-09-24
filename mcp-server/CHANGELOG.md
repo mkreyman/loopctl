@@ -10,10 +10,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Changed
 
 - **`renew_story_claim`** now says that a driver-placed claim — one a placement took for a
-  runner dispatch — is capped at its dispatch deadline (loopctl epic 44, US-44.5, #879):
-  renewing it never moves `claimed_until` past `claim_lease_cap`, and once the cap has passed
-  the server answers 409 `lease_cap_reached` instead of renewing. The lease notice on a
-  `claim_story` or `renew_story_claim` result names that cap when the server returns one.
+  runner dispatch — is capped at its dispatch deadline (loopctl epic 44, US-44.5, #879): its
+  `claimed_until` already is `claim_lease_cap`, so renewing it writes nothing and returns the
+  claim as it stands, and once the cap has passed the server answers 409 `lease_cap_reached`
+  instead. The lease notice on a `claim_story` or `renew_story_claim` result names that cap
+  when the server returns one.
+- **`place_dispatch`** now says that a retry moves the claim's deadline to now + its
+  `wall_clock_seconds` + the grace, and names the new 409 `dispatch_claim_ended`: a retry of
+  a `dispatch_id` whose claim has ended is refused, nothing pushed, and needs a new
+  `dispatch_id`.
 
 ## 2.103.0 — 2026-09-23 (the merge gate stops trusting its caller)
 

@@ -10,24 +10,30 @@ defmodule Loopctl.Delivery.DispatchLease do
   `Loopctl.Delivery.Placement` claims with a per-claim CAP instead:
 
       at the claim:                  cap = placed_at  + wall_clock_seconds + grace_seconds()
+      at a resume of the dispatch:   cap = now        + wall_clock_seconds + grace_seconds(),
       at the runner's acceptance:    cap = replied_at + wall_clock_seconds + grace_seconds(),
-                                           if that is later and the claim is still live
+                                     each only if later and only while the claim is live
 
-  The claim-time value travels to the runner as `RunnerDispatch.deadline_at`, and it is a STOP
-  bound: the runner ends the session by the earlier of its own start + `wall_clock_seconds`
-  and `deadline_at`, whether or not it can reach control. Start-up time — the push, the
-  worktree setup — comes out of the grace rather than the wall clock; only a start-up longer
-  than the grace shortens the session. The cap is never earlier than `deadline_at`, so a
-  runner cut off from control never runs on a story control has placed again.
+  The cap a push is sent under travels to the runner as `RunnerDispatch.deadline_at`, and it is
+  a STOP bound: a runner on contract 1.16.0 ends the session by the earlier of its own start +
+  `wall_clock_seconds` and `deadline_at`, whether or not it can reach control. Start-up time —
+  the push, the worktree setup — comes out of the grace rather than the wall clock; only a
+  start-up longer than the grace shortens the session. The cap never moves earlier, and the
+  lease sweep never releases the claim before it, so such a runner cut off from control never
+  runs on a story the SWEEP released. Two things are outside that: an operator's release
+  (force-unclaim) ends the claim whenever it is made, by design, and a 1.15.0 runner ignores
+  `deadline_at`, so its session can outrun a start-up longer than the grace.
 
-  The acceptance's move is `Loopctl.Progress.reanchor_dispatch_lease/4`, called from
-  `Loopctl.Runners.DispatchLedger.record_reply/3` in the transaction that records the
-  acceptance: only FORWARD, only on a LIVE claim at that dispatch's `claim_epoch` (an expired
-  one is left to the reclaim sweep, never revived), and audited. It is anchored where
-  `Loopctl.Runners.Capacity` anchors its own bound on the session — `replied_at` plus a wall
-  clock — so the claim is not released while capacity still presumes the session running.
-  The wall clock it uses is the LONGEST any push of the dispatch carried, because a resume may
-  push a shorter one while the session an earlier push started is still running.
+  Both moves are `Loopctl.Progress.reanchor_dispatch_lease/3` — the acceptance's from
+  `Loopctl.Runners.DispatchLedger.record_reply/3`, in the transaction that records it, and the
+  resume's from `Loopctl.Delivery.Placement` before it pushes: only FORWARD, only on a LIVE
+  claim at that dispatch's `claim_epoch` (an ended one is never revived), and audited. The
+  acceptance is anchored where `Loopctl.Runners.Capacity` anchors its own bound on the session
+  — `replied_at` plus a wall clock — so when it is recorded while the claim is live, the lease
+  sweep does not release the claim while capacity still presumes the session running. An
+  acceptance recorded after the lease ran out moves nothing, and then capacity can outlast the
+  claim. The wall clock it uses is the LONGEST any push of the dispatch carried, because a
+  resume may push a shorter one while the session an earlier push started is still running.
 
   ## The grace, and why boot refuses a small one
 
@@ -36,8 +42,9 @@ defmodule Loopctl.Delivery.DispatchLease do
   to shorten it. It must be at least `Loopctl.Runners.Capacity.release_grace_seconds/0`:
   capacity presumes the session running until `replied_at + wall_clock_seconds` plus that
   grace, and the accepted cap is measured from the same `replied_at` with the same wall
-  clock, so with this grace at least that one the claim is never released while capacity
-  still presumes its session running. `validate!/0` is called by
+  clock, so with this grace at least that one the lease sweep never releases a claim whose
+  acceptance moved its cap while capacity still presumes its session running. `validate!/0`
+  is called by
   `Loopctl.Application.start/2`, so a smaller value stops the release from booting, and
   `grace_from_env!/1` refuses one that is set but not an integer.
   """

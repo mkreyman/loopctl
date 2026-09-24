@@ -132,10 +132,10 @@ defmodule Loopctl.WorkBreakdown.Story do
     # #879 (US-44.5): the latest instant `claimed_until` may ever reach, for a claim taken
     # FOR A RUNNER DISPATCH (`Progress.claim_story/3`'s `lease_until:`, passed only by
     # `Loopctl.Delivery.Placement`) — and the dispatch's `deadline_at`, which the runner stops
-    # the session by. Moved only FORWARD, while the claim is live, when the runner accepts
-    # (`Progress.reanchor_dispatch_lease/4`), so it is never earlier than that deadline, and a
-    # renewal that moved the lease past it would hold the story for a session that no longer
-    # exists. NULL on every other claim.
+    # the session by. Moved only FORWARD, while the claim is live, when the runner accepts or
+    # the dispatch is resumed (`Progress.reanchor_dispatch_lease/3`), so it is never earlier
+    # than a deadline already sent, and `claimed_until` always equals it — no renewal moves a
+    # capped claim's lease. NULL on every other claim.
     # Cleared by every release. Same no-cast rule as the fields above — a PATCH that could
     # clear it could lift the cap — and never a `metadata` key, which PATCH replaces wholesale.
     field :claim_lease_cap, :utc_datetime_usec

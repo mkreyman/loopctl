@@ -108,6 +108,8 @@ defmodule LoopctlWeb.FallbackControllerTest do
       # The 409 releases nothing — the reclaim sweep does, once the lease has ended at the cap.
       assert body["error"]["message"] =~ "this refusal releases nothing"
       assert body["error"]["message"] =~ "the reclaim sweep releases the story"
+      # ...except a story with review requested, which the sweep skips (round 3, finding 3).
+      assert body["error"]["message"] =~ "unless review has been requested on it"
     end
 
     # A rolled-back mutation (its audit insert failed) must surface as a 5xx, never a

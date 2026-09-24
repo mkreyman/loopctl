@@ -37,7 +37,7 @@
           "type": "integer"
         },
         "deadline_at": {
-          "description": "Since 1.16.0, OPTIONAL. A STOP BOUND: end the session by the EARLIER of your own start + `wall_clock_seconds` and this instant, whether or not control is reachable. It is placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`, so the time between placement and your start comes out of that grace, not out of `wall_clock_seconds`; only a start-up longer than the grace shortens the session. loopctl's claim on the story never ends before it — your acceptance may move the claim later, never earlier — so a session stopped by it never runs on a story loopctl has placed again. Present on a dispatch control PLACED under a claim; absent otherwise.",
+          "description": "Since 1.16.0, OPTIONAL. A STOP BOUND: end the session by the EARLIER of your own start + `wall_clock_seconds` and this instant, whether or not control is reachable. It is placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS` (a RE-SEND of the dispatch carries the re-send's time + its `wall_clock_seconds` + the grace), so the time between the push and your start comes out of that grace, not out of `wall_clock_seconds`; only a start-up longer than the grace shortens the session. loopctl's lease sweep never releases the claim on the story before it — your acceptance and a re-send may move the claim later, never earlier — so a session stopped by it never runs on a story the sweep released and loopctl placed again. An operator can still release the claim sooner (force-unclaim). Present on a dispatch control PLACED under a claim; absent otherwise.",
           "format": "date-time",
           "type": "string"
         },

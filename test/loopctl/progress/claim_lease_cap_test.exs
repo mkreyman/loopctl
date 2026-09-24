@@ -4,9 +4,10 @@ defmodule Loopctl.Progress.ClaimLeaseCapTest do
   dispatch deadline (`stories.claim_lease_cap`), and every other claim is untouched.
 
   Covers the context API: `claim_story/3` with and without `lease_until:`, `bulk_claim/4`,
-  renewal (`renew_claim/3`) and the renewal grace (`grant_renewal_grace/2`) never passing the
-  cap, every release clearing it, the `stories_claim_lease_within_cap` CHECK, and the column
-  staying out of every `cast` list. That `Loopctl.Delivery.Placement` passes the cap is
+  renewal (`renew_claim/3`) and the renewal grace (`grant_renewal_grace/2`) never moving a
+  capped lease, the forward-only move (`reanchor_dispatch_lease/3`), every release clearing
+  it, the `stories_claim_lease_within_cap` CHECK, and the column staying out of every `cast`
+  list. That `Loopctl.Delivery.Placement` passes the cap is
   proved in `Loopctl.Delivery.PlacementTest`.
   """
 
@@ -125,25 +126,21 @@ defmodule Loopctl.Progress.ClaimLeaseCapTest do
   end
 
   describe "renewing a capped claim (AC-44.5.3)" do
-    test "cannot pass the cap: claimed_until becomes the cap" do
-      %{story: story, cap: cap} = ctx = capped_story(600)
-      force(story, claimed_until: DateTime.add(DateTime.utc_now(), 30, :second))
+    # US-44.5 review round 3, finding 5: a capped claim's lease already IS its cap — the claim
+    # and every move of the cap write the two together — so a renewal has nothing to move. It
+    # writes nothing, logs no `claim_renewed`, and answers the lease as it stands.
+    test "writes nothing and answers the claim as it stands" do
+      %{story: story, cap: cap, tenant_id: tenant_id} = ctx = capped_story(600)
+      before = reload(story)
 
       assert {:ok, renewed} = renew(ctx)
       assert renewed.claimed_until == cap
       assert renewed.claim_lease_cap == cap
-      assert reload(story).claimed_until == cap
-    end
 
-    test "is the global lease from now when that is EARLIER than the cap" do
-      far = Progress.claim_lease_seconds() + 3_600
-      %{story: story, cap: cap} = ctx = capped_story(far)
-      force(story, claimed_until: DateTime.add(DateTime.utc_now(), 30, :second))
-
-      assert {:ok, renewed} = renew(ctx)
-      assert DateTime.compare(renewed.claimed_until, cap) == :lt
-      assert_in_delta seconds_from_now(renewed.claimed_until), Progress.claim_lease_seconds(), 5
-      assert renewed.claim_lease_cap == cap
+      after_renewal = reload(story)
+      assert after_renewal.claimed_until == cap
+      assert after_renewal.updated_at == before.updated_at
+      assert renewal_entries(tenant_id, story.id) == []
     end
 
     # A placed claim's lease starts AT its cap (the dispatch's deadline_at), and a runner cut
@@ -169,13 +166,14 @@ defmodule Loopctl.Progress.ClaimLeaseCapTest do
       assert reload(story).claim_lease_cap == past
     end
 
-    test "an uncapped claim still renews to the full global lease" do
+    test "an uncapped claim still renews to the full global lease, and logs it" do
       %{agent: agent, story: story, tenant_id: tenant_id} = contracted_story()
       {:ok, claimed} = Progress.claim_story(tenant_id, story.id, agent_id: agent.id)
       force(claimed, claimed_until: DateTime.add(DateTime.utc_now(), 30, :second))
 
       assert {:ok, renewed} = renew(%{agent: agent, story: claimed, tenant_id: tenant_id})
       assert_in_delta seconds_from_now(renewed.claimed_until), Progress.claim_lease_seconds(), 5
+      assert [_entry] = renewal_entries(tenant_id, story.id)
     end
 
     test "tenant isolation: another tenant's renewal is not_found and moves nothing" do
@@ -188,60 +186,95 @@ defmodule Loopctl.Progress.ClaimLeaseCapTest do
     end
   end
 
-  # The acceptance's move, called directly: the ledger path (`DispatchLedger.record_reply/3`)
-  # fences the epoch before it gets here, so only this call can show the function holds the
-  # claim it is given to that claim.
-  describe "reanchor_dispatch_lease/4" do
-    defp reanchor(%{story: story, tenant_id: tenant_id}, epoch) do
-      Progress.reanchor_dispatch_lease(AdminRepo, tenant_id, story.id, %{
+  defp renewal_entries(tenant_id, story_id) do
+    AdminRepo.all(
+      from a in Loopctl.Audit.AuditLog,
+        where: a.tenant_id == ^tenant_id and a.entity_id == ^story_id,
+        where: a.action == "claim_renewed"
+    )
+  end
+
+  # Called directly with the row as a caller locks it: the ledger fences the epoch before it
+  # gets here, so only this call can show the function holds the claim it is given to that
+  # claim — and tells an ended claim apart from another claim's.
+  describe "reanchor_dispatch_lease/3" do
+    defp reanchor(%{story: story}, epoch, seconds \\ 3_600) do
+      Progress.reanchor_dispatch_lease(AdminRepo, reload(story), %{
         claim_epoch: epoch,
-        accepted_at: DateTime.utc_now(),
-        wall_clock_seconds: 3_600,
+        anchored_at: DateTime.utc_now(),
+        wall_clock_seconds: seconds,
         actor_label: "runner:test"
       })
     end
 
-    test "moves a live capped claim at its epoch forward" do
+    test "moves a live capped claim at its epoch forward, and returns it" do
       %{story: story} = ctx = capped_story(600)
 
-      assert {:ok, :reanchored} = reanchor(ctx, story.claim_epoch)
-      assert_in_delta seconds_from_now(reload(story).claim_lease_cap), 3_600 + 900, 5
-      assert reload(story).claimed_until == reload(story).claim_lease_cap
+      assert {:ok, moved} = reanchor(ctx, story.claim_epoch)
+      assert_in_delta seconds_from_now(moved.claim_lease_cap), 3_600 + 900, 5
+      assert moved.claimed_until == moved.claim_lease_cap
+      assert reload(story).claim_lease_cap == moved.claim_lease_cap
     end
 
-    test "moves nothing for another claim's epoch" do
+    test "never moves a cap earlier: a later one is returned as it stands" do
+      %{story: story, cap: cap} = ctx = capped_story(86_400)
+
+      assert {:ok, same} = reanchor(ctx, story.claim_epoch, 60)
+      assert same.claim_lease_cap == cap
+      assert reload(story).claim_lease_cap == cap
+    end
+
+    test "another claim's epoch is stale_claim_epoch, and moves nothing" do
       %{story: story, cap: cap} = ctx = capped_story(600)
 
-      assert {:ok, :unchanged} = reanchor(ctx, story.claim_epoch + 1)
+      assert {:error, :stale_claim_epoch} = reanchor(ctx, story.claim_epoch + 1)
       assert reload(story).claim_lease_cap == cap
       assert reload(story).claimed_until == cap
+    end
+
+    test "an ended claim at its epoch is claim_not_live, and is never revived" do
+      for fields <- [
+            [claimed_until: DateTime.add(DateTime.utc_now(), -60, :second)],
+            [agent_status: :reported_done, reported_done_at: DateTime.utc_now()]
+          ] do
+        %{story: story} = ctx = capped_story(600)
+        ended = force(story, fields)
+
+        assert {:error, :claim_not_live} = reanchor(ctx, story.claim_epoch),
+               "#{inspect(fields)} was revived"
+
+        assert reload(story).claim_lease_cap == ended.claim_lease_cap
+        assert reload(story).claimed_until == ended.claimed_until
+      end
+    end
+
+    test "a story that is gone is stale_claim_epoch" do
+      assert {:error, :stale_claim_epoch} =
+               Progress.reanchor_dispatch_lease(AdminRepo, nil, %{
+                 claim_epoch: 1,
+                 anchored_at: DateTime.utc_now(),
+                 wall_clock_seconds: 60,
+                 actor_label: "runner:test"
+               })
     end
   end
 
   describe "grant_renewal_grace/2 is a renewal too" do
-    test "extends a capped claim only to its cap, and an uncapped one to the floor" do
+    test "passes a capped claim by, and extends an uncapped one to the floor" do
       %{story: capped, cap: cap, tenant_id: tenant_id} = capped_story(600)
-      capped = force(capped, claimed_until: DateTime.add(DateTime.utc_now(), 30, :second))
 
       agent = fixture(:agent, %{tenant_id: tenant_id, agent_type: :implementer})
       plain = fixture(:story, %{tenant_id: tenant_id, agent_status: :contracted})
       {:ok, plain} = Progress.claim_story(tenant_id, plain.id, agent_id: agent.id)
       plain = force(plain, claimed_until: DateTime.add(DateTime.utc_now(), 30, :second))
 
-      assert Progress.grant_renewal_grace(tenant_id) == 2
+      assert Progress.grant_renewal_grace(tenant_id) == 1
 
       assert reload(capped).claimed_until == cap
 
       assert_in_delta seconds_from_now(reload(plain).claimed_until),
                       Progress.renewal_grace_seconds(),
                       5
-    end
-
-    test "leaves a claim already AT its cap alone and does not count it" do
-      %{story: story, cap: cap, tenant_id: tenant_id} = capped_story(600)
-
-      assert Progress.grant_renewal_grace(tenant_id) == 0
-      assert reload(story).claimed_until == cap
     end
   end
 
