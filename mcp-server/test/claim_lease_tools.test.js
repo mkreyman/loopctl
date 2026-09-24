@@ -172,6 +172,15 @@ describe("index.js wiring", () => {
     assert.match(row, /capped at its dispatch deadline/);
   });
 
+  test("renew_story_claim's description and README row name the lease_cap_reached refusal (#879)", () => {
+    const start = INDEX_SRC.indexOf('name: "renew_story_claim",');
+    const decl = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+    assert.match(decl, /409 lease_cap_reached/);
+
+    const row = README.split("\n").find((line) => line.startsWith("| `renew_story_claim` |"));
+    assert.match(row, /409 `lease_cap_reached`/);
+  });
+
   test("the handler injects the real apiCall and surfaces the lease", () => {
     assert.match(
       functionSource("renewStoryClaim"),

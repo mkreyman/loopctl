@@ -601,6 +601,10 @@ defmodule Loopctl.Delivery.Placement do
              branch_prefixes: prefixes,
              prefix_policy: :advise
            ),
+         # The same wall clock rule as the claiming path: a resume may carry a new
+         # `wall_clock_seconds`, which the push that wins records and the runner's
+         # acceptance re-anchors the claim's cap on (`DispatchLedger.record_reply/3`).
+         {:ok, dispatch} <- lease_capable(dispatch),
          {:ok, dispatch} <- rebuild_story(dispatch, story) do
       {:ok,
        dispatch
@@ -917,11 +921,12 @@ defmodule Loopctl.Delivery.Placement do
   # inside the claim's own transaction.
   #
   # AND A LEASE CAPPED AT THE DISPATCH DEADLINE (#879): `:lease_until` is placed_at plus the
-  # dispatch's wall clock plus `DispatchLease.grace_seconds/0`. The runner hard-kills the
-  # session at that same instant (`deadline_at`, attached below), so a claim that outlived it
-  # would hold the story for a session that no longer exists — for most of a day under the
-  # global lease. `placed_at` is taken HERE, immediately before the claim's transaction, so
-  # the cap is measured from the claim and not from whenever the caller built its payload.
+  # dispatch's wall clock plus `DispatchLease.grace_seconds/0`. PROVISIONAL: the runner's wall
+  # clock starts when it accepts, not here, so `DispatchLedger.record_reply/3` moves the cap
+  # (and the lease) forward to replied_at + wall clock + grace in the transaction that records
+  # the acceptance — the anchor `Loopctl.Runners.Capacity` bounds the session by. Until then
+  # this cap is what ends a claim whose dispatch is never accepted, instead of the global
+  # lease. `placed_at` is taken HERE, immediately before the claim's transaction.
   defp claim(tenant_id, story_id, agent_id, session, dispatch, opts) do
     placed_at = DateTime.utc_now()
 
@@ -934,47 +939,40 @@ defmodule Loopctl.Delivery.Placement do
     )
   end
 
-  # THE WALL CLOCK THE CAP IS COMPUTED FROM, judged before anything is minted. `claim/6` needs
-  # a positive integer to add to `placed_at`, and before #879 an out-of-range value was only
-  # refused by `Runners.dispatch/3`'s cast — AFTER the mint, the claim and two immutable chain
-  # entries. It accepts what that cast accepts: the contract's bound
-  # (`RunnerDispatch.max_wall_clock_seconds/0`), and a decimal STRING, which the cast coerces
-  # to an integer — so it is normalised here rather than refused, and the cap and the pushed
-  # value are the same number. The refusal has the cast's own `{:invalid, messages}` shape; what
-  # changed for a caller is only that it arrives before anything is spent.
-  defp lease_capable(%{"wall_clock_seconds" => seconds} = dispatch) when is_binary(seconds) do
-    case Integer.parse(seconds) do
-      {parsed, ""} -> lease_capable(Map.put(dispatch, "wall_clock_seconds", parsed))
-      _not_an_integer -> wall_clock_invalid()
+  # THE WALL CLOCK THE CAP IS COMPUTED FROM, judged before anything is minted — by the
+  # CONTRACT'S OWN SCHEMA for the field, the one `Runners.dispatch/3`'s cast applies, so the
+  # two cannot disagree about what is valid (a decimal string is coerced to the integer it
+  # names in both). `claim/6` needs a positive integer to add to `placed_at`, and without this
+  # an out-of-range value was only refused by that cast — AFTER the mint, the claim and two
+  # immutable chain entries. The coerced value is put back, so the cap and the pushed value
+  # are the same number. A resume runs it too (`resume_payload/4`).
+  defp lease_capable(dispatch) do
+    case OpenApiSpex.Cast.cast(
+           RunnerDispatch.schema().properties.wall_clock_seconds,
+           Map.get(dispatch, "wall_clock_seconds")
+         ) do
+      {:ok, seconds} ->
+        {:ok, Map.put(dispatch, "wall_clock_seconds", seconds)}
+
+      {:error, _errors} ->
+        {:error,
+         {:invalid,
+          [
+            "wall_clock_seconds must be an integer from 1 to " <>
+              "#{RunnerDispatch.max_wall_clock_seconds()}"
+          ]}}
     end
   end
 
-  defp lease_capable(%{"wall_clock_seconds" => seconds} = dispatch)
-       when is_integer(seconds) and seconds >= 1 do
-    if seconds <= RunnerDispatch.max_wall_clock_seconds(),
-      do: {:ok, dispatch},
-      else: wall_clock_invalid()
-  end
-
-  defp lease_capable(_dispatch), do: wall_clock_invalid()
-
-  defp wall_clock_invalid do
-    {:error,
-     {:invalid,
-      [
-        "wall_clock_seconds must be an integer from 1 to " <>
-          "#{RunnerDispatch.max_wall_clock_seconds()}"
-      ]}}
-  end
-
-  # THE CLAIM'S CAP, ON THE WIRE (`RunnerDispatch.deadline_at`, contract 1.16.0), so an
-  # adopting runner stops the session at the instant control's lease on the story ends. That
-  # shared instant is what keeps a re-contracted story from running under two sessions.
-  # ALWAYS the claim's own value: a caller-supplied `deadline_at` is replaced, exactly as a
-  # caller-supplied `claim_epoch` is, and a claim with no cap sends none.
+  # THE CLAIM'S CAP, ON THE WIRE (`RunnerDispatch.deadline_at`, contract 1.16.0): the
+  # EARLIEST instant the claim can end. The runner budgets its session from its own
+  # `wall_clock_seconds`; its acceptance moves the cap to replied_at + wall clock + grace, so
+  # the claim is held at least that long (`DispatchLedger.record_reply/3`). ALWAYS the claim's
+  # own value: a caller-supplied `deadline_at` is replaced, exactly as a caller-supplied
+  # `claim_epoch` is, and a claim with no cap sends none.
   #
   # A RESUME reads the story fresh and sends ITS cap. When the story is still under the
-  # recorded claim that is this dispatch's deadline; when it is not, the claim has ended and
+  # recorded claim that is this dispatch's; when it is not, the claim has ended and
   # `DispatchLedger.record_sent/3` refuses the frame `stale_claim_epoch` before it is
   # broadcast, so another claim's deadline never reaches the wire on it.
   defp put_deadline(dispatch, %Story{claim_lease_cap: %DateTime{} = cap}),

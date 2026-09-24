@@ -23,6 +23,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
@@ -518,6 +519,77 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert {:error, :stale_claim_epoch} = reply(runner, record, %{"claim_epoch" => 3})
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).status == "sent"
     end
+  end
+
+  # #879 (US-44.5): a placed claim's cap is provisional (placed_at + wall clock + grace) until
+  # the runner accepts, and the acceptance moves it — and the lease — to replied_at + the
+  # dispatch's wall clock + grace, the anchor `Capacity` bounds the session by.
+  describe "record_reply/3 re-anchors a placed claim's lease on acceptance" do
+    test "an acceptance moves a capped claim to replied_at + wall clock + grace",
+         %{runner: runner} do
+      record = sent(runner)
+      provisional = DateTime.add(DateTime.utc_now(), 60, :second)
+      set_lease(runner.tenant_id, record.story_id, provisional, provisional)
+
+      assert {:ok, updated} = reply(runner, record)
+
+      expected = DispatchLease.cap(updated.replied_at, record.wall_clock_seconds)
+      assert DateTime.compare(expected, provisional) == :gt
+      assert lease(runner.tenant_id, record.story_id) == {expected, expected}
+    end
+
+    test "only forward: a cap already later is left where it is", %{runner: runner} do
+      record = sent(runner)
+      later = DateTime.add(DateTime.utc_now(), 86_400 * 2, :second)
+      set_lease(runner.tenant_id, record.story_id, later, later)
+
+      assert {:ok, _updated} = reply(runner, record)
+      assert lease(runner.tenant_id, record.story_id) == {later, later}
+    end
+
+    test "an uncapped claim is left uncapped, its lease untouched", %{runner: runner} do
+      record = sent(runner)
+      until = DateTime.add(DateTime.utc_now(), 60, :second)
+      set_lease(runner.tenant_id, record.story_id, until, nil)
+
+      assert {:ok, _updated} = reply(runner, record)
+      assert lease(runner.tenant_id, record.story_id) == {until, nil}
+    end
+
+    test "a refusal moves nothing", %{runner: runner} do
+      record = sent(runner)
+      provisional = DateTime.add(DateTime.utc_now(), 60, :second)
+      set_lease(runner.tenant_id, record.story_id, provisional, provisional)
+
+      assert {:ok, _} =
+               reply(runner, record, %{
+                 "decision" => "refused",
+                 "reason" => "other",
+                 "detail" => "x"
+               })
+
+      assert lease(runner.tenant_id, record.story_id) == {provisional, provisional}
+    end
+  end
+
+  defp set_lease(tenant_id, story_id, claimed_until, cap) do
+    as_tenant(tenant_id, fn ->
+      {1, _} =
+        from(s in Loopctl.WorkBreakdown.Story,
+          where: s.tenant_id == ^tenant_id and s.id == ^story_id
+        )
+        |> Repo.update_all(set: [claimed_until: claimed_until, claim_lease_cap: cap])
+    end)
+  end
+
+  defp lease(tenant_id, story_id) do
+    as_tenant(tenant_id, fn ->
+      Repo.one!(
+        from s in Loopctl.WorkBreakdown.Story,
+          where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+          select: {s.claimed_until, s.claim_lease_cap}
+      )
+    end)
   end
 
   describe "record_trace/3" do

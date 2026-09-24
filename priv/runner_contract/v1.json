@@ -37,7 +37,7 @@
           "type": "integer"
         },
         "deadline_at": {
-          "description": "Since 1.16.0, OPTIONAL. The instant loopctl's claim on this story ends: placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`, and no renewal ever moves it later. Stop the session at the EARLIER of its wall clock and this instant — past it control may place the story again, so a session still running would be one of two. Present on a dispatch control PLACED under a claim; absent otherwise, and absent means the wall clock alone, as before 1.16.0.",
+          "description": "Since 1.16.0, OPTIONAL. The EARLIEST instant loopctl's claim on this story can end: placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`. It is not a stop time: budget the session from your own `wall_clock_seconds`, as without it. Your acceptance (`dispatch_reply` `accepted`) moves the claim forward, so the claim is held until at least your `replied_at` + `wall_clock_seconds` + that grace, and no renewal moves it past that. Present on a dispatch control PLACED under a claim; absent otherwise.",
           "format": "date-time",
           "type": "string"
         },

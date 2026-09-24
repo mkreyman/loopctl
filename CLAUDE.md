@@ -176,9 +176,9 @@ in order:
    story that lacks a verifier dispatch.
 
 `verifier_dispatch_id` is written only by the assign-verifier flow
-(`assign_rotating_verifier/3`, `progress.ex:637-684`); that write is checked, and a failure
+(`assign_rotating_verifier/3`, `progress.ex:640-687`); that write is checked, and a failure
 flags `verifier_needed` plus a `verifier_not_assigned` audit event
-(`flag_verifier_needed/5`, `progress.ex:689`) rather than silently leaving the field nil.
+(`flag_verifier_needed/5`, `progress.ex:692`) rather than silently leaving the field nil.
 Because `request-review` is OPTIONAL, a story often reaches verify with no verifier dispatch
 at all — step 3 is what keeps that path lineage-gated instead of a bare agent-id inequality.
 

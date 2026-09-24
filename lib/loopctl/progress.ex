@@ -153,9 +153,12 @@ defmodule Loopctl.Progress do
   `claim_lease_seconds/0`, and the same instant is stored as `claim_lease_cap`: no renewal
   ever moves `claimed_until` past it (`renew_claim/3`, `grant_renewal_grace/2`), and the
   `stories_claim_lease_within_cap` CHECK holds every other writer to it. Only
-  `Loopctl.Delivery.Placement` passes it — the runner hard-kills the session at the same
-  instant, so a claim outliving it would hold the story for a session that no longer exists.
-  Without the option nothing changes: the global lease, and a NULL cap.
+  `Loopctl.Delivery.Placement` passes it, and the runner's ACCEPTANCE of the dispatch is the
+  one thing that moves it — forward, to replied_at + wall clock + grace
+  (`Loopctl.Runners.DispatchLedger.record_reply/3`) — because the runner stops the session
+  at its wall clock, so a claim outliving that by more than the grace would hold the story
+  for a session that no longer exists. Without the option nothing changes: the global lease,
+  and a NULL cap.
 
   ## Parameters
 
@@ -1371,6 +1374,15 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # A capped claim whose cap is not after `now` has nothing left to renew: `renewed_lease/2`
+  # would answer the cap, a lease already in the past, and the caller would read a 200 as
+  # time granted. Refused instead, so the session learns its claim is ending (#879).
+  defp validate_lease_cap_ahead(%Story{claim_lease_cap: %DateTime{} = cap}, now) do
+    if DateTime.after?(cap, now), do: :ok, else: {:error, :lease_cap_reached}
+  end
+
+  defp validate_lease_cap_ahead(%Story{}, _now), do: :ok
+
   @doc """
   The change every RELEASE writes: no lease, no lease cap, and the next epoch.
 
@@ -1506,7 +1518,8 @@ defmodule Loopctl.Progress do
 
   A claim taken for a runner dispatch carries a `claim_lease_cap` (#879), and its renewal
   is the EARLIER of that lease and the cap: renewing a driver-placed claim never moves it
-  past the dispatch deadline.
+  past the dispatch deadline, and once the cap is reached it is refused
+  `:lease_cap_reached` rather than answered with a lease in the past.
 
   ## Options
 
@@ -1522,14 +1535,18 @@ defmodule Loopctl.Progress do
   - `{:error, :stale_claim_epoch}` if the presented epoch is not the current one —
     the caller's claim ended (released, reclaimed, or claimed again)
   - `{:error, :not_claimant}` if the caller is not the story's assigned agent
+  - `{:error, :lease_cap_reached}` if the claim's `claim_lease_cap` is not after now: a
+    renewal could only write a lease already in the past, so none is written
   """
   @spec renew_claim(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()}
-          | {:error, :not_found | :not_claimed | :stale_claim_epoch | :not_claimant}
+          | {:error,
+             :not_found | :not_claimed | :stale_claim_epoch | :not_claimant | :lease_cap_reached}
           | {:error, Ecto.Changeset.t()}
   def renew_claim(tenant_id, story_id, opts \\ []) do
     agent_id = Keyword.get(opts, :agent_id)
     epoch = Keyword.get(opts, :claim_epoch)
+    now = DateTime.utc_now()
 
     multi =
       Multi.new()
@@ -1541,13 +1558,14 @@ defmodule Loopctl.Progress do
         # one fact it can act on, even when a peer now holds the story.
         with :ok <- validate_claimed(story),
              :ok <- validate_claim_epoch(story, epoch),
-             :ok <- validate_claimant(story, agent_id) do
+             :ok <- validate_claimant(story, agent_id),
+             :ok <- validate_lease_cap_ahead(story, now) do
           {:ok, story}
         end
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         story
-        |> Ecto.Changeset.change(%{claimed_until: renewed_lease(story, DateTime.utc_now())})
+        |> Ecto.Changeset.change(%{claimed_until: renewed_lease(story, now)})
         |> AdminRepo.update()
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->

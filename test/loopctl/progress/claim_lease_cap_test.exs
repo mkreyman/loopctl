@@ -146,6 +146,16 @@ defmodule Loopctl.Progress.ClaimLeaseCapTest do
       assert renewed.claim_lease_cap == cap
     end
 
+    test "a claim whose cap has passed is refused lease_cap_reached, and nothing moves" do
+      %{story: story} = ctx = capped_story(600)
+      past = DateTime.add(DateTime.utc_now(), -60, :second)
+      force(story, claimed_until: past, claim_lease_cap: past)
+
+      assert {:error, :lease_cap_reached} = renew(ctx)
+      assert reload(story).claimed_until == past
+      assert reload(story).claim_lease_cap == past
+    end
+
     test "an uncapped claim still renews to the full global lease" do
       %{agent: agent, story: story, tenant_id: tenant_id} = contracted_story()
       {:ok, claimed} = Progress.claim_story(tenant_id, story.id, agent_id: agent.id)

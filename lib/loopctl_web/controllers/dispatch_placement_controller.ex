@@ -117,9 +117,10 @@ defmodule LoopctlWeb.DispatchPlacementController do
          ],
          description:
            "The dispatch object, as `RunnerDispatch` declares it, minus `claim_epoch` and " <>
-             "`deadline_at` (which loopctl injects from the claim — the deadline is " <>
-             "placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`, and the " <>
-             "claim's lease is capped there) and minus `story` (which is REFUSED and built " <>
+             "`deadline_at` (which loopctl injects from the claim — placed_at + " <>
+             "`wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`, the claim's provisional " <>
+             "lease cap, which the runner's acceptance moves forward to its replied_at + " <>
+             "`wall_clock_seconds` + the grace) and minus `story` (which is REFUSED and built " <>
              "server-side from loopctl's own rows — see " <>
              "`story_not_accepted` below). Nothing is defaulted: `kind` must be sent and " <>
              "must be one of `x-connection.dispatchable_kinds`.",

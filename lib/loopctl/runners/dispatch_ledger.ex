@@ -52,7 +52,10 @@ defmodule Loopctl.Runners.DispatchLedger do
   the dispatched one AND the story's current `claim_epoch` (`:stale_claim_epoch`), and the
   row must still be `sent`. When the story's epoch has moved past the row's — the claim was
   released or reclaimed — the row is marked `superseded` in the same transaction. A repeat of
-  the reply already recorded is `:ok`; a different one is `:already_replied`.
+  the reply already recorded is `:ok`; a different one is `:already_replied`. An acceptance
+  also moves a placed claim's lease cap forward to `replied_at` + the dispatch's wall clock +
+  `Loopctl.Delivery.DispatchLease.grace_seconds/0`, in the same transaction (#879), which is
+  why a reply locks the story `FOR NO KEY UPDATE` where a trace only shares it.
 
   No audit-chain entry is written for a reply. The chain is kept for custody transitions
   (claim, merge, escalate — design §11), a reply is the runner's own report about its
@@ -129,6 +132,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
+  alias Loopctl.Delivery.DispatchLease
   alias Loopctl.LocalGuc
   alias Loopctl.Repo
   alias Loopctl.Runners.Capacity
@@ -636,10 +640,15 @@ defmodule Loopctl.Runners.DispatchLedger do
     context = %{operation: :record_reply, dispatch_id: reply.dispatch_id, run_id: nil}
 
     runner_write(tenant_id, runner_id, context, fn ->
-      with {:ok, record} <- fence_then_lock(tenant_id, runner_id, reply.dispatch_id),
+      # The story is locked `FOR NO KEY UPDATE` rather than shared: an acceptance WRITES it
+      # (`reanchor_lease/1`), and upgrading a share lock another reply or trace also holds
+      # would deadlock the two.
+      with {:ok, record} <-
+             fence_then_lock(tenant_id, runner_id, reply.dispatch_id, :no_key_update),
            :ok <- epoch_matches(record, reply.claim_epoch),
            {:ok, record} <- apply_reply(record, reply) do
         release_if_refused(record)
+        reanchor_lease(record)
         record
       end
     end)
@@ -671,6 +680,38 @@ defmodule Loopctl.Runners.DispatchLedger do
     do: Capacity.release(Repo, record, record.slot_generation)
 
   defp release_if_refused(%DispatchRecord{}), do: :ok
+
+  # THE ACCEPTANCE RE-ANCHORS A PLACED CLAIM'S LEASE (#879, US-44.5). The claim was taken with
+  # a PROVISIONAL cap, placed_at + wall clock + grace, but the runner's wall clock starts at
+  # its acceptance — which is also what `Capacity` bounds the session by (`replied_at` plus the
+  # wall clock the winning push recorded). So the cap and the lease move to replied_at + that
+  # wall clock + `DispatchLease.grace_seconds/0` here, in the transaction that records the
+  # acceptance: only FORWARD (a cap already later is left alone, so a repeat of the reply is
+  # a no-op), only a CAPPED claim, and only the claim this dispatch serves: the fence above
+  # has just shown, under a lock held to commit, that the story is still at the dispatch's
+  # `claim_epoch`, so no epoch predicate is repeated here. With the grace
+  # at least `Capacity.release_grace_seconds/0` (`DispatchLease.validate!/0`), the claim then
+  # outlives the slot by construction. A resumed dispatch is covered the same way: its push
+  # refreshed `wall_clock_seconds`, and it is accepted at most once.
+  defp reanchor_lease(
+         %DispatchRecord{status: "accepted", replied_at: %DateTime{} = replied_at} = record
+       )
+       when is_integer(record.wall_clock_seconds) and record.wall_clock_seconds > 0 do
+    cap = DispatchLease.cap(replied_at, record.wall_clock_seconds)
+
+    Repo.update_all(
+      from(s in Story,
+        where: s.tenant_id == ^record.tenant_id and s.id == ^record.story_id,
+        # NULL on an uncapped claim, and `NULL < cap` is not true: an uncapped claim stays so.
+        where: s.claim_lease_cap < ^cap
+      ),
+      set: [claim_lease_cap: cap, claimed_until: cap]
+    )
+
+    :ok
+  end
+
+  defp reanchor_lease(%DispatchRecord{}), do: :ok
 
   @doc """
   Stores a validated `trace` batch from `runner_id` and returns the run's contiguous
@@ -958,9 +999,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   # resolved from an UNLOCKED pre-read, which learns only `story_id` — written once with the
   # row and never changed — and the fence is then decided on the row read UNDER its lock, so
   # nothing is judged on the unlocked copy.
-  defp fence_then_lock(tenant_id, runner_id, dispatch_id) do
+  defp fence_then_lock(tenant_id, runner_id, dispatch_id, story_lock \\ :share) do
     with {:ok, %DispatchRecord{story_id: story_id}} <- held(tenant_id, runner_id, dispatch_id) do
-      current = current_claim_epoch(tenant_id, story_id)
+      current = current_claim_epoch(tenant_id, story_id, story_lock)
 
       with {:ok, record} <- held(tenant_id, runner_id, dispatch_id, true),
            :ok <- story_fence(record, current) do
@@ -987,7 +1028,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   # The fence against a zombie runner (issue #803). The authoritative epoch is the story's
   # (`stories.claim_epoch`, bumped by every claim and every release — `Progress`), not the
-  # epoch this row recorded when it was sent. Read under a share lock BEFORE the row lock
+  # epoch this row recorded when it was sent. Read under a story lock BEFORE the row lock
   # (the lock order), in the same transaction. When the story has moved past the row, the
   # claim this dispatch served is over: the row is marked `superseded` — so it stops reading
   # as a live dispatch — and every message about it is `stale_claim_epoch`. A story that no
@@ -1001,13 +1042,16 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
-  defp current_claim_epoch(tenant_id, story_id) do
-    Repo.one(
+  defp current_claim_epoch(tenant_id, story_id, story_lock \\ :share) do
+    query =
       from s in Story,
         where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-        lock: "FOR SHARE",
         select: s.claim_epoch
-    )
+
+    case story_lock do
+      :share -> query |> lock("FOR SHARE") |> Repo.one()
+      :no_key_update -> query |> lock("FOR NO KEY UPDATE") |> Repo.one()
+    end
   end
 
   # Only a live row: a refused one is already terminal, and its reason must stay. The claim

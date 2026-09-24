@@ -992,6 +992,26 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       assert until == cap
     end
 
+    test "renew-claim on a driver-placed claim past its cap is 409 lease_cap_reached",
+         %{conn: conn} do
+      %{story: story, raw_key: raw_key, agent: agent, tenant: tenant} =
+        setup_story_with_agent(%{agent_status: :contracted})
+
+      past = DateTime.add(DateTime.utc_now(), -60, :second)
+
+      {:ok, _} =
+        Loopctl.Progress.claim_story(tenant.id, story.id, agent_id: agent.id, lease_until: past)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 1})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "lease_cap_reached"
+      assert Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).claimed_until == past
+    end
+
     test "renew-claim without claim_epoch, or with a string, is 400", %{conn: conn} do
       %{story: story, raw_key: raw_key} = claimed_via_api(conn)
 

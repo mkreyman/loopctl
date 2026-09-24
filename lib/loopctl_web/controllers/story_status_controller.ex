@@ -118,10 +118,19 @@ defmodule LoopctlWeb.StoryStatusController do
         "(POST /stories/:id/renew-claim; default lease 24 hours, `STORY_CLAIM_LEASE_SECONDS`), " <>
         "and `claim_epoch` is incremented by this claim and by every release. Keep the " <>
         "epoch: renew-claim requires it, and start/report refuse a stale one with " <>
-        "409 `stale_claim_epoch`.",
+        "409 `stale_claim_epoch`. The story also carries `claim_lease_cap`: null on a claim " <>
+        "taken here, and on a claim a PLACEMENT took for a runner dispatch the latest " <>
+        "instant `claimed_until` may reach — `claimed_until` on such a claim is bounded by " <>
+        "it and no renewal extends past it (renew-claim answers 409 `lease_cap_reached` " <>
+        "once it has passed). It is placed_at + `wall_clock_seconds` + " <>
+        "`DISPATCH_LEASE_GRACE_SECONDS`, moved forward to the runner's acceptance + " <>
+        "`wall_clock_seconds` + the grace when the runner accepts.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
-      200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
+      200 =>
+        {"Story claimed. `story.claimed_until` is the lease, `story.claim_epoch` the fence, " <>
+           "and `story.claim_lease_cap` the cap bounding `claimed_until` on a placed claim " <>
+           "(null otherwise)", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"Invalid transition or dependencies not met", "application/json", Schemas.ErrorResponse},
@@ -302,7 +311,9 @@ defmodule LoopctlWeb.StoryStatusController do
         "Refusals: 400 when `claim_epoch` is missing or not a non-negative integer; " <>
         "422 `not_claimed` when the story is not assigned or implementing; " <>
         "409 `stale_claim_epoch` when the epoch is not current (the claim has ended — " <>
-        "stop working it); 409 `not_claimant` when the caller is not the assigned agent. " <>
+        "stop working it); 409 `not_claimant` when the caller is not the assigned agent; " <>
+        "409 `lease_cap_reached` when the claim's `claim_lease_cap` is not in the future " <>
+        "(nothing is renewed — the claim ends at its cap). " <>
         "A claim made before leases existed has no `claimed_until` and is never reclaimed; " <>
         "renewing it gives it a lease.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
@@ -317,7 +328,9 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Claim renewed", "application/json", Schemas.StoryStatusResponse},
       400 => {"claim_epoch missing or malformed", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"stale_claim_epoch or not_claimant", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"stale_claim_epoch, not_claimant or lease_cap_reached", "application/json",
+         Schemas.ErrorResponse},
       422 => {"not_claimed", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }

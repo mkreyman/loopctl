@@ -161,11 +161,16 @@ end
 # #879 (US-44.5): seconds past a dispatch's wall clock before a driver-placed claim's lease
 # cap. Any INTEGER is taken as given, so a value below the runner capacity release grace
 # reaches Loopctl.Delivery.DispatchLease.validate!/0 and stops the boot instead of being
-# quietly replaced; unset, blank or non-numeric leaves the default (900).
-case System.get_env("DISPATCH_LEASE_GRACE_SECONDS") &&
-       Integer.parse(System.get_env("DISPATCH_LEASE_GRACE_SECONDS")) do
-  {seconds, ""} -> config :loopctl, :dispatch_lease_grace_seconds, seconds
-  _ -> :ok
+# quietly replaced; a value that is set but not an integer ("15m", "1800s", "120.0") stops it
+# here (`DispatchLease.grace_from_env!/1`); unset or blank leaves the default (900). Skipped
+# under :test so the suite reads config/test.exs's pinned value and never a developer's shell.
+if config_env() != :test do
+  if grace =
+       Loopctl.Delivery.DispatchLease.grace_from_env!(
+         System.get_env("DISPATCH_LEASE_GRACE_SECONDS")
+       ) do
+    config :loopctl, :dispatch_lease_grace_seconds, grace
+  end
 end
 
 # #803: the most runner sessions one tenant may have in flight across all its runners

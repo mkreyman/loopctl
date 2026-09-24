@@ -11,15 +11,20 @@ All notable changes to loopctl are documented here.
   dispatch driver and `place_dispatch` — claims with a lease CAPPED at `placed_at +
   wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS`, stored in the new
   `stories.claim_lease_cap` column (migration, no manual step, NULL on every existing row; a
-  `stories_claim_lease_within_cap` CHECK is added `NOT VALID` then validated). No renewal —
+  `stories_claim_lease_within_cap` CHECK is added `NOT VALID` then validated). That cap is
+  provisional: when the runner ACCEPTS the dispatch, the cap and the lease move forward to its
+  `replied_at + wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS` — the anchor runner capacity
+  bounds the session by — so start-up time never eats into the session. No renewal —
   `renew_story_claim`, or the grace granted when a custody halt clears — moves the lease past
-  the cap, so a killed session releases its story within minutes of its wall clock. Every other
-  claim keeps the global `STORY_CLAIM_LEASE_SECONDS` lease, unchanged. The dispatch carries the
-  cap as optional `deadline_at`; RE-VENDOR the contract to adopt it — a 1.15.0 runner ignores it
-  and keeps its wall clock alone. **New env var `DISPATCH_LEASE_GRACE_SECONDS`** (default 900):
+  the cap, and a renewal once the cap has passed is 409 `lease_cap_reached`; a killed session
+  releases its story within minutes of its wall clock. Every other claim keeps the global
+  `STORY_CLAIM_LEASE_SECONDS` lease, unchanged. The dispatch carries the claim-time cap as
+  optional `deadline_at`, the earliest the claim can end; RE-VENDOR the contract to read it — a
+  1.15.0 runner ignores it. **New env var `DISPATCH_LEASE_GRACE_SECONDS`** (default 900):
   **the app refuses to boot when it is below 300** (`Capacity.release_grace_seconds/0`), naming
-  both values. A placement whose `wall_clock_seconds` is not an integer from 1 to 86 400 is now
-  refused `invalid_payload` BEFORE anything is claimed, rather than after the claim.
+  both values, or when it is set to anything but an integer (`15m`, `1800s`, `120.0`). A
+  placement — or a resume — whose `wall_clock_seconds` is not an integer from 1 to 86 400 is now
+  refused `invalid_payload` BEFORE anything is claimed or pushed, rather than after the claim.
 
 - **Both delivery gates now screen a triaged story BEFORE it is queued (epic 44, US-44.2).**
   An accepted `story` verdict is escalated over `triage_escalate` instead of queued when its

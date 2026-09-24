@@ -96,6 +96,17 @@ defmodule LoopctlWeb.FallbackControllerTest do
       assert body["error"]["message"] == "Conflict"
     end
 
+    # #879: a renewal of a driver-placed claim whose cap has passed — a conflict with the
+    # claim's state, never a 200 carrying a lease already in the past.
+    test "renders 409 lease_cap_reached for :lease_cap_reached", %{conn: conn} do
+      conn = call_fallback(conn, {:error, :lease_cap_reached})
+
+      assert conn.status == 409
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["code"] == "lease_cap_reached"
+      assert body["error"]["message"] =~ "claim_lease_cap"
+    end
+
     # A rolled-back mutation (its audit insert failed) must surface as a 5xx, never a
     # masking 404 — the write did not happen, so the caller must retry rather than
     # believe a leaked secret was removed. The message is CALLER-NEUTRAL: this clause

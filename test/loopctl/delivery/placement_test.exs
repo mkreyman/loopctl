@@ -1361,6 +1361,71 @@ defmodule Loopctl.Delivery.PlacementTest do
                unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
     end
 
+    # The claim-time cap is PROVISIONAL: the runner's wall clock starts at its acceptance,
+    # which is also where `Capacity` anchors the session's bound, so the acceptance moves the
+    # cap (and the lease) to replied_at + wall clock + grace.
+    test "the runner's acceptance moves the cap to replied_at + wall clock + grace", ctx do
+      %{runner: runner, story: story} = ctx
+
+      assert {:ok, placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+      provisional = unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+
+      {record, {claimed_until, cap}} = accept(runner, placed)
+      assert record.wall_clock_seconds == 3_600
+
+      assert cap == DateTime.add(record.replied_at, 4_500, :second)
+      assert claimed_until == cap
+      assert DateTime.compare(cap, provisional) == :gt
+    end
+
+    # A resume may carry a different wall clock; the push that wins records it, and the
+    # acceptance re-anchors the cap on THAT clock rather than the one the claim was taken with.
+    test "a RESUME with a longer wall clock, accepted later, is capped on the resumed clock",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+
+      assert {:ok, _resumed} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "wall_clock_seconds", 7_200),
+                 api_key: ctx.operator
+               )
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.wall_clock_seconds == 7_200
+
+      {record, {claimed_until, cap}} = accept(runner, placed)
+      assert record.wall_clock_seconds == 7_200
+
+      assert cap == DateTime.add(record.replied_at, 7_200 + 900, :second)
+      assert claimed_until == cap
+    end
+
+    test "a RESUME runs the same wall clock rule and refuses an out-of-range clock", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+      over = Loopctl.ApiSpec.RunnerContract.RunnerDispatch.max_wall_clock_seconds() + 1
+
+      assert {:error, {:invalid, ["wall_clock_seconds must be an integer from 1 to " <> _]}} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "wall_clock_seconds", over),
+                 api_key: ctx.operator
+               )
+
+      refute_push "dispatch", _pushed, 200
+    end
+
     test "a wall clock the cap cannot be computed from is refused before anything is minted",
          ctx do
       %{runner: runner, story: story} = ctx
@@ -1513,6 +1578,32 @@ defmodule Loopctl.Delivery.PlacementTest do
   defp deadline(%{deadline_at: at}) when is_binary(at) do
     {:ok, parsed, 0} = DateTime.from_iso8601(at)
     parsed
+  end
+
+  # The runner's `accepted` reply, recorded as the channel records it — on the SHARED SANDBOX
+  # `Repo` connection, which is where the channel process stamped the push (its row lock is
+  # held there until the test ends) — and the ledger row and the story's `{claimed_until,
+  # claim_lease_cap}` after it, read on that same connection, where the re-anchor is visible.
+  defp accept(runner, placed) do
+    {:ok, reply} =
+      RunnerContract.cast_dispatch_reply(%{
+        "dispatch_id" => placed.dispatch_id,
+        "claim_epoch" => placed.claim_epoch,
+        "decision" => "accepted"
+      })
+
+    {:ok, record} = DispatchLedger.record_reply(runner.tenant_id, runner.id, reply)
+
+    {:ok, lease} =
+      Loopctl.Repo.with_tenant(runner.tenant_id, fn ->
+        Loopctl.Repo.one!(
+          from s in Story,
+            where: s.tenant_id == ^runner.tenant_id and s.id == ^record.story_id,
+            select: {s.claimed_until, s.claim_lease_cap}
+        )
+      end)
+
+    {DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id), lease}
   end
 
   defp place(ctx, payload, opts \\ []) do

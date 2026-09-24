@@ -15,8 +15,9 @@
  * travels on is testable behaviour rather than a source pattern.
  *
  * Nothing is validated client-side beyond `story_id`: the server's 400 (missing or
- * non-integer epoch), 422 `not_claimed`, 409 `stale_claim_epoch` and 409 `not_claimant`
- * pass through unchanged, because each one tells the agent something different to do.
+ * non-integer epoch), 422 `not_claimed`, 409 `stale_claim_epoch`, 409 `not_claimant` and
+ * 409 `lease_cap_reached` pass through unchanged, because each one tells the agent
+ * something different to do.
  */
 
 export function renewClaimPath(storyId) {
