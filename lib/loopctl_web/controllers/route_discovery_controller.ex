@@ -122,7 +122,12 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         description:
           "Mint a per-dispatch ephemeral, scoped API key carrying its lineage path " <>
             "(the CoC v2 key-distribution mechanism; replaces long-lived env-var keys). " <>
-            "Role: orchestrator or above. MCP tool: dispatch"
+            "Role: orchestrator or above (403 insufficient_role below it) on a human-anchored " <>
+            "tenant (403 custody_tier_required otherwise). The dispatch must sit inside the " <>
+            "caller's own subtree: a parentless create is 403 root_dispatch_forbidden for " <>
+            "anyone but the tenant's operator key (a user key no dispatch minted), and a " <>
+            "parent outside the caller's lineage is 403 parent_outside_caller_lineage. " <>
+            "MCP tool: dispatch"
       },
       %{
         method: "GET",
@@ -978,7 +983,9 @@ defmodule LoopctlWeb.RouteDiscoveryController do
             "draining, 409 runner_exhausted when its subscription is exhausted. Role: orchestrator or above on a human-anchored tenant, AND either an " <>
             "unlineaged user key (which roots the custody lineage) or a key inside a dispatch " <>
             "lineage; an unlineaged key below user, such as a legacy orchestrator env key, is " <>
-            "refused 403 root_dispatch_forbidden. MCP tool: place_dispatch (sends the user key)"
+            "refused 403 root_dispatch_forbidden. MCP tool: place_dispatch, which always " <>
+            "sends LOOPCTL_USER_KEY (pinned, exactKey) — so a lineaged orchestrator key, " <>
+            "which this route accepts, has no MCP path to it"
       },
       %{
         method: "GET",
@@ -994,7 +1001,10 @@ defmodule LoopctlWeb.RouteDiscoveryController do
           "Revoke a dispatch AND its subtree, with the keys each minted. Role: orchestrator or " <>
             "above on a human-anchored tenant; 403 dispatch_outside_caller_lineage when the " <>
             "target is outside your lineage, and 403 unlineaged_revoke_forbidden for an " <>
-            "unlineaged key below user. MCP tool: revoke_dispatch"
+            "unlineaged key below user. MCP tool: revoke_dispatch, which sends " <>
+            "LOOPCTL_USER_KEY as an ordinary override — LOOPCTL_API_KEY wins when it is set, " <>
+            "so a legacy orchestrator LOOPCTL_API_KEY is sent and refused 403 " <>
+            "unlineaged_revoke_forbidden"
       },
       %{
         method: "POST",

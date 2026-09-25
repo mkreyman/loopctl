@@ -9,6 +9,22 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
 
   setup :verify_on_exit!
 
+  # Codes a row may name, and what must produce each. A plug-produced code is bound to the
+  # plug being mounted for the action; any other is bound to a string literal in a function
+  # the action reaches.
+  @plug_codes %{
+    "insufficient_role" => "RequireRole",
+    "custody_tier_required" => "RequireHumanAnchor",
+    "api_key_mint_forbidden" => "RequireUnlineagedCaller"
+  }
+  @refusal_codes Map.keys(@plug_codes) ++
+                   [
+                     "root_dispatch_forbidden",
+                     "parent_outside_caller_lineage",
+                     "dispatch_outside_caller_lineage",
+                     "unlineaged_revoke_forbidden"
+                   ]
+
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
@@ -21,16 +37,13 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
     # the index still listed only stats and audit.
     test "every /api/v1/admin GET route in the router appears in the curated index" do
       router_admin_gets =
-        LoopctlWeb.Router.__routes__()
-        |> Enum.filter(&(&1.verb == :get and String.starts_with?(&1.path, "/api/v1/admin")))
-        |> Enum.map(& &1.path)
+        served_routes()
+        |> Enum.filter(fn {method, path} ->
+          method == "GET" and String.starts_with?(path, "/api/v1/admin")
+        end)
         |> MapSet.new()
 
-      indexed =
-        LoopctlWeb.RouteDiscoveryController.curated_routes()
-        |> Enum.filter(&(&1.method == "GET"))
-        |> Enum.map(& &1.path)
-        |> MapSet.new()
+      indexed = indexed_routes()
 
       missing = MapSet.difference(router_admin_gets, indexed)
 
@@ -52,9 +65,8 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
     # was added; without this test it can silently fall out again.
     test "every /api/v1/channel route in the router appears in the curated index" do
       router_channel =
-        LoopctlWeb.Router.__routes__()
-        |> Enum.filter(&String.starts_with?(&1.path, "/api/v1/channel"))
-        |> Enum.map(&{verb_string(&1.verb), &1.path})
+        served_routes()
+        |> Enum.filter(fn {_method, path} -> String.starts_with?(path, "/api/v1/channel") end)
         |> MapSet.new()
 
       indexed = indexed_routes()
@@ -79,9 +91,8 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
     # if the route shape drifts.
     test "every /api/v1/corpora route in the router appears in the curated index" do
       router_corpora =
-        LoopctlWeb.Router.__routes__()
-        |> Enum.filter(&String.starts_with?(&1.path, "/api/v1/corpora"))
-        |> Enum.map(&{verb_string(&1.verb), &1.path})
+        served_routes()
+        |> Enum.filter(fn {_method, path} -> String.starts_with?(path, "/api/v1/corpora") end)
         |> MapSet.new()
 
       indexed = indexed_routes()
@@ -113,9 +124,8 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
       indexed = indexed_routes()
 
       router_intake =
-        LoopctlWeb.Router.__routes__()
-        |> Enum.filter(&String.starts_with?(&1.path, "/api/v1/intake"))
-        |> Enum.map(&{verb_string(&1.verb), &1.path})
+        served_routes()
+        |> Enum.filter(fn {_method, path} -> String.starts_with?(path, "/api/v1/intake") end)
         |> Enum.reject(fn {method, path} ->
           method == "PUT" and MapSet.member?(indexed, {"PATCH", path})
         end)
@@ -135,10 +145,23 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
     # The delivery loop's own surface past intake (#878): enrolling a runner, the pool,
     # placement, revocation and the merge gate. A session that found the intake tools still
     # could not discover these, which is the rest of wiring the loop up.
+    #
+    # Every fact a row states about its gate is bound to where that gate actually lives, so
+    # the text cannot drift from the code it describes:
+    #
+    #   - "MCP tool: none" <-> a `gap` in mcp-server/test/route_coverage.test.js's DECLARED,
+    #     both directions. That a NAMED tool really sends the row's route is asserted on the
+    #     JS side (mcp-server/test/route_index_tools.test.js), where the call sites are.
+    #   - "human-anchored" <-> the route's controller mounting RequireHumanAnchor FOR THAT
+    #     ACTION, read from the controller source's `when action in [...]` scoping.
+    #   - each refusal code a row names <-> something on the route producing it: a plug
+    #     mounted for the action, or a string literal in a function the action reaches.
     test "every delivery-loop runner, dispatch and merge-gate route is indexed, with a real role and tool" do
       indexed =
         LoopctlWeb.RouteDiscoveryController.curated_routes()
         |> Map.new(&{{&1.method, &1.path}, &1.description})
+
+      gaps = declared_gaps()
 
       # EACH clause must match on its own, or a renamed route drops out of the check silently.
       clauses = [
@@ -147,12 +170,8 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
         merge_gate: &String.ends_with?(&1, "/merge-precondition")
       ]
 
-      served = LoopctlWeb.Router.__routes__() |> Enum.map(&{verb_string(&1.verb), &1.path})
-
-      mcp_source = File.read!("mcp-server/index.js")
-
       for {clause, match?} <- clauses do
-        routes = Enum.filter(served, fn {_method, path} -> match?.(path) end)
+        routes = Enum.filter(served_routes(), fn {_method, path} -> match?.(path) end)
         assert routes != [], "the #{clause} clause matched no served route — it has drifted"
 
         for route <- routes do
@@ -160,18 +179,50 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
           assert description, "#{inspect(route)} is served but not in the curated /routes index"
           assert description =~ "Role:", "#{inspect(route)} names no role"
 
+          gap? = MapSet.member?(gaps, coverage_key(route))
+
           case Regex.run(~r/MCP tool: ([a-z_]+)/, description, capture: :all_but_first) do
             ["none"] ->
-              :ok
+              assert gap?,
+                     "#{inspect(route)} says MCP tool: none, but route_coverage.test.js " <>
+                       "does not declare it a gap"
 
             [tool] ->
-              assert mcp_source =~ ~s(name: "#{tool}"),
-                     "#{inspect(route)} names MCP tool #{tool}, which index.js does not declare"
+              refute gap?,
+                     "#{inspect(route)} is a declared gap in route_coverage.test.js, but its " <>
+                       "row names MCP tool #{tool} — one of the two is wrong"
 
             nil ->
               flunk("#{inspect(route)} names no MCP tool")
           end
+
+          %{plug: controller, plug_opts: action} = router_route(route)
+
+          assert description =~ "human-anchored" ==
+                   mounts_for_action?(controller, "RequireHumanAnchor", action),
+                 "#{inspect(route)}: the row's human-anchored claim disagrees with whether " <>
+                   "#{inspect(controller)} mounts RequireHumanAnchor for :#{action}"
+
+          assert description =~ "api_key_mint_forbidden" ==
+                   mounts_for_action?(controller, "RequireUnlineagedCaller", action),
+                 "#{inspect(route)}: the row's api_key_mint_forbidden claim disagrees with " <>
+                   "whether #{inspect(controller)} mounts RequireUnlineagedCaller for :#{action}"
+
+          for code <- @refusal_codes, description =~ code do
+            assert refusal_produced?(controller, action, code),
+                   "#{inspect(route)} names #{code}, which nothing on " <>
+                     "#{inspect(controller)}.#{action} produces"
+          end
         end
+      end
+
+      # Outside the sections too: a row anywhere that says "none" is a declared gap.
+      for %{method: method, path: path, description: description} <-
+            LoopctlWeb.RouteDiscoveryController.curated_routes(),
+          description =~ "MCP tool: none" do
+        assert MapSet.member?(gaps, coverage_key({method, path})),
+               "#{method} #{path} says MCP tool: none, but route_coverage.test.js does not " <>
+                 "declare it a gap"
       end
     end
 
@@ -195,10 +246,7 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
 
     test "every METHOD and path in the curated index is actually served" do
       # Method AND path: a row with the wrong verb on a served path advertises a 404.
-      served =
-        LoopctlWeb.Router.__routes__()
-        |> Enum.map(&{verb_string(&1.verb), &1.path})
-        |> MapSet.new()
+      served = served_routes()
 
       phantom =
         LoopctlWeb.RouteDiscoveryController.curated_routes()
@@ -210,14 +258,139 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
     end
   end
 
-  # The two sets every router-versus-index check compares, written once.
+  # The two sets every router-versus-index check compares, written once each: what the
+  # curated index advertises, and what the router serves, both as {"METHOD", path}.
   defp indexed_routes do
     LoopctlWeb.RouteDiscoveryController.curated_routes()
     |> Enum.map(&{&1.method, &1.path})
     |> MapSet.new()
   end
 
+  defp served_routes do
+    LoopctlWeb.Router.__routes__()
+    |> Enum.map(&{verb_string(&1.verb), &1.path})
+    |> MapSet.new()
+  end
+
+  defp router_route({method, path}) do
+    Enum.find(
+      LoopctlWeb.Router.__routes__(),
+      &(verb_string(&1.verb) == method and &1.path == path)
+    )
+  end
+
   defp verb_string(verb), do: verb |> to_string() |> String.upcase()
+
+  # The `gap` entries of route_coverage.test.js's DECLARED, keyed the way that file keys them.
+  defp declared_gaps do
+    source = File.read!("mcp-server/test/route_coverage.test.js")
+    [block] = Regex.run(~r/const DECLARED = \{(.*?)\n\};/s, source, capture: :all_but_first)
+
+    gaps =
+      ~r/^\s*"([A-Z]+ \/[^"]*)": "gap",/m
+      |> Regex.scan(block, capture: :all_but_first)
+      |> List.flatten()
+      |> MapSet.new()
+
+    assert MapSet.size(gaps) > 0, "no gap parsed from DECLARED — its shape has drifted"
+    gaps
+  end
+
+  # route_coverage.test.js normalises every path parameter to `:param`.
+  defp coverage_key({method, path}),
+    do: method <> " " <> Regex.replace(~r/:[A-Za-z0-9_]+/, path, ":param")
+
+  defp refusal_produced?(controller, action, code) do
+    case Map.fetch(@plug_codes, code) do
+      {:ok, plug} -> mounts_for_action?(controller, plug, action)
+      :error -> action_emits?(controller, action, code)
+    end
+  end
+
+  defp controller_source(controller) do
+    controller.__info__(:compile)[:source] |> to_string() |> File.read!()
+  end
+
+  # Action-scoped: a `plug <Name>` line with no guard applies to every action, one with
+  # `when action in [...]` to those it names. Any other shape — a
+  # guard this cannot read, or a plug statement wrapped past one line — fails loudly rather
+  # than being guessed at.
+  defp mounts_for_action?(controller, plug, action) do
+    ~r/^\s*plug\s+(?:LoopctlWeb\.Plugs\.)?#{plug}\b([^\n]*)$/m
+    |> Regex.scan(controller_source(controller), capture: :all_but_first)
+    |> Enum.any?(fn [tail] -> plug_scope_includes?(tail, action, controller) end)
+  end
+
+  defp plug_scope_includes?(tail, action, controller) do
+    in_list = Regex.run(~r/when action in \[([^\]]*)\]/, tail, capture: :all_but_first)
+
+    cond do
+      String.ends_with?(String.trim(tail), ",") ->
+        flunk("#{inspect(controller)} wraps a plug statement past one line: #{tail}")
+
+      in_list ->
+        to_string(action) in List.flatten(
+          Regex.scan(~r/:(\w+)/, hd(in_list), capture: :all_but_first)
+        )
+
+      String.contains?(tail, "when") ->
+        flunk("#{inspect(controller)} scopes a plug in a shape this test cannot read: #{tail}")
+
+      true ->
+        true
+    end
+  end
+
+  # Source-read reachability: the action's own clauses plus every function of the module
+  # they name, transitively, comments stripped. A name mentioned is a name reached, so it
+  # errs toward passing a row; the one way it errs the other way is a def head wrapped past
+  # its first line, whose body it does not see — that fails the test loudly, never silently.
+  defp action_emits?(controller, action, code) do
+    bodies = function_bodies(controller_source(controller))
+
+    bodies
+    |> reachable([to_string(action)], MapSet.new())
+    |> Enum.any?(&String.contains?(Map.fetch!(bodies, &1), ~s("#{code}")))
+  end
+
+  defp reachable(_bodies, [], seen), do: seen
+
+  defp reachable(bodies, [name | rest], seen) do
+    if MapSet.member?(seen, name) or not Map.has_key?(bodies, name) do
+      reachable(bodies, rest, seen)
+    else
+      called =
+        ~r/\b([a-z_][a-zA-Z0-9_]*[?!]?)/
+        |> Regex.scan(Map.fetch!(bodies, name), capture: :all_but_first)
+        |> List.flatten()
+        |> Enum.filter(&Map.has_key?(bodies, &1))
+
+      reachable(bodies, called ++ rest, MapSet.put(seen, name))
+    end
+  end
+
+  # Every top-level def/defp's text, clauses of one name concatenated. A function ends at the
+  # next line indented exactly two spaces (its `end`, an attribute, a plug, the next head).
+  defp function_bodies(source) do
+    {bodies, _current} =
+      source
+      |> String.split("\n")
+      |> Enum.reduce({%{}, nil}, &take_line/2)
+
+    bodies
+  end
+
+  defp take_line(line, {acc, current}) do
+    head = Regex.run(~r/^  defp? ([a-z_][a-zA-Z0-9_]*[?!]?)/, line, capture: :all_but_first)
+
+    cond do
+      head -> {Map.update(acc, hd(head), line, &(&1 <> "\n" <> line)), hd(head)}
+      Regex.match?(~r/^  \S/, line) or is_nil(current) -> {acc, nil}
+      true -> {Map.update!(acc, current, &(&1 <> "\n" <> strip_comment(line))), current}
+    end
+  end
+
+  defp strip_comment(line), do: Regex.replace(~r/(^|\s)#(?!\{).*$/, line, "")
 
   describe "GET /api/v1/routes" do
     test "returns list of routes with method, path, description", %{conn: conn} do
