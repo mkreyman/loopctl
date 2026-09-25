@@ -22,8 +22,11 @@ defmodule Loopctl.Delivery.TriageDispatcher do
 
   ## Eligibility, and why triage is stricter about the runner than implement is
 
-  `Runners.accepts?/5` decides, the same reader `Runners.dispatch/3` and the driver use:
-  connected, not draining, the repository declared, the KIND declared. The kind half matters
+  `Loopctl.Runners.Selection.runners/3` decides, the selection the driver makes too: connected,
+  not draining, the repository declared, the KIND declared (`Runners.accepts?/5`, the reader
+  `Runners.dispatch/3` uses), a free slot and a subscription that is not exhausted (US-44.6) —
+  all BEFORE the ledger row is written, since a refusal discovered after it is a spent
+  `dispatch_id` and a slot returned, once per story per pass. The kind half matters
   more here than anywhere else, because `Kinds.implied_by_silence/0` stays `implement` alone —
   a runner built before the `kinds` field existed is never sent triage, and only a machine that
   says `triage` on join receives one. That asymmetry is what makes 1.10.0 safe to deploy ahead
@@ -69,6 +72,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Selection
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
@@ -88,7 +92,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   # A race is transient too, and classing one as `:blocked` is the same lie in the other
   # direction: `:stale_claim_epoch` is the story's epoch moving between `fetch_story/2` and
   # `record_sent/3`, and `:runner_not_connected` / `:runner_ambiguous` are the runner dropping
-  # its socket between the Presence read in `available_runner/2` and the push. Every one of
+  # its socket between the Presence read in `Selection.runners/3` and the push. Every one of
   # them is gone by the next pass and none has an action a person could take. Telling an
   # operator to intervene on the conditions that fix themselves is how the log stops being
   # read at all.
@@ -235,7 +239,13 @@ defmodule Loopctl.Delivery.TriageDispatcher do
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
     finished = limit |> stranded() |> Enum.map(&escalate_too_large/1)
-    finished ++ (limit |> candidates() |> Enum.map(&attempt(&1, budgets)))
+
+    {outcomes, _cache} =
+      limit
+      |> candidates()
+      |> Enum.map_reduce(%{}, fn candidate, cache -> attempt(candidate, budgets, cache) end)
+
+    finished ++ outcomes
   end
 
   @doc """
@@ -270,19 +280,34 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   end
 
   # ONE STORY MAY NOT KILL THE PASS — the read is oldest-first, so a story that raises sits at
-  # the head of every later batch too.
-  defp attempt(candidate, budgets) do
+  # the head of every later batch too. The pass cache carries only whether a tenant's
+  # `:no_runner` note has been logged (`Loopctl.Runners.Selection.note_no_runner/3`), as
+  # `Loopctl.Delivery.DispatchDriver`'s does.
+  #
+  # `:runner_exhausted` is `Runners.dispatch/3` refusing a machine that ran dry after
+  # `Selection.runners/3` chose it: this story found no runner, which is what `:no_runner`
+  # says, and the next pass selects again.
+  defp attempt(candidate, budgets, cache) do
     case send_triage(candidate, budgets) do
-      :ok -> :dispatched
-      {:error, :no_runner} -> :no_runner
-      {:error, :triage_too_large} -> escalate_too_large(candidate)
-      {:error, reason} when reason in @transient -> deferred(candidate, reason)
-      {:error, reason} -> blocked(candidate, reason)
+      :ok ->
+        {:dispatched, cache}
+
+      {:error, reason} when reason in [:no_runner, :runner_exhausted] ->
+        {:no_runner, Selection.note_no_runner(cache, "TriageDispatcher", candidate)}
+
+      {:error, :triage_too_large} ->
+        {escalate_too_large(candidate), cache}
+
+      {:error, reason} when reason in @transient ->
+        {deferred(candidate, reason), cache}
+
+      {:error, reason} ->
+        {blocked(candidate, reason), cache}
     end
   rescue
-    error -> errored(candidate, Exception.format(:error, error, __STACKTRACE__))
+    error -> {errored(candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
   catch
-    kind, value -> errored(candidate, Exception.format(kind, value, __STACKTRACE__))
+    kind, value -> {errored(candidate, Exception.format(kind, value, __STACKTRACE__)), cache}
   end
 
   defp send_triage(%{tenant_id: tenant_id, story_id: story_id}, budgets) do
@@ -291,12 +316,11 @@ defmodule Loopctl.Delivery.TriageDispatcher do
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
          :ok <- usable_base_branch(source),
          {:ok, triage} <- TriagePayload.build(record),
-         %Runner{} = runner <-
-           available_runner(tenant_id, source.repo_full_name) || {:error, :no_runner} do
+         [%Runner{} = runner | _] <- Selection.runners(tenant_id, @kind, source.repo_full_name) do
       Runners.dispatch(tenant_id, runner.id, dispatch(story, source, triage, budgets))
     else
       {:error, reason} -> {:error, reason}
-      nil -> {:error, :no_runner}
+      [] -> {:error, :no_runner}
     end
   end
 
@@ -316,31 +340,6 @@ defmodule Loopctl.Delivery.TriageDispatcher do
     if GitRef.valid_name?(branch) and byte_size(branch) <= 255,
       do: :ok,
       else: {:error, :invalid_base_branch}
-  end
-
-  # The same reader the push itself uses, applied BEFORE the ledger row is written: a refusal
-  # discovered after it is a spent `dispatch_id` and a slot returned, once per story per pass.
-  defp available_runner(tenant_id, repo) do
-    ids =
-      for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
-          runner_id = Map.get(meta, :runner_id),
-          is_binary(runner_id),
-          Runners.accepts?(tenant_id, runner_id, meta, @kind, repo) == :ok,
-          do: runner_id
-
-    if ids == [] do
-      nil
-    else
-      Loopctl.AdminRepo.one(
-        from r in Runner,
-          where: r.tenant_id == ^tenant_id,
-          where: is_nil(r.revoked_at),
-          where: r.id in ^ids,
-          where: r.in_flight < r.max_sessions,
-          order_by: [asc: r.in_flight],
-          limit: 1
-      )
-    end
   end
 
   # FRESH PER ATTEMPT, as `DispatchDriver` generates one. It was derived from the story and its

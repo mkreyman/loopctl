@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.103.3 — 2026-09-23 (an exhausted subscription is not capacity)
+
+### Changed
+
+- **`runner_pool`** now names `usage_exhausted_until` (loopctl epic 44, US-44.6, runner
+  contract 1.17.0): until when a machine's subscription is exhausted, or null. It is the
+  effective value, the latest of the machine's own and every machine's sharing its account,
+  and while it is in the future nothing is placed there.
+- **`place_dispatch`** names the new 409 `runner_exhausted`: nothing was claimed, the body
+  carries `usage_exhausted_until`, and the remedy is another runner. Like
+  `runner_declines_work` it refuses a new placement only.
+
 ## 2.103.2 — 2026-09-23 (a driver-placed claim says where it ends)
 
 ### Changed

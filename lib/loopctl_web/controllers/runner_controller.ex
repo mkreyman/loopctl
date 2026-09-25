@@ -24,6 +24,7 @@ defmodule LoopctlWeb.RunnerController do
   alias Loopctl.Dispatches
   alias Loopctl.Runners
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Usage
   alias Loopctl.Tenants
   alias OpenApiSpex.Schema
 
@@ -269,7 +270,8 @@ defmodule LoopctlWeb.RunnerController do
                    :kinds,
                    :branch_prefixes,
                    :suppressed_kinds,
-                   :unsupported_kinds
+                   :unsupported_kinds,
+                   :usage_exhausted_until
                  ],
                  properties: %{
                    machine: %Schema{type: :string, description: "The enrolled machine name."},
@@ -378,7 +380,24 @@ defmodule LoopctlWeb.RunnerController do
                          "non-empty value is a BUG on the runner — it contradicted itself " <>
                          "— and not a state to recover from by reconnecting."
                    },
-                   unsupported_kinds: @unsupported_kinds_schema
+                   unsupported_kinds: @unsupported_kinds_schema,
+                   usage_exhausted_until: %Schema{
+                     type: :string,
+                     format: :"date-time",
+                     nullable: true,
+                     description:
+                       "Until when this machine's SUBSCRIPTION is exhausted (runner contract " <>
+                         "1.17.0), or null when it is not. While it is in the future no " <>
+                         "placement is made on the machine — the driver and triage skip it and " <>
+                         "`place_dispatch` refuses 409 `runner_exhausted`. The EFFECTIVE " <>
+                         "value: the latest of this machine's own and every same-tenant " <>
+                         "machine's sharing its `account_ref`, because a subscription belongs to " <>
+                         "an account, so a machine that never reported anything can show one. " <>
+                         "Set from the runner's `status.usage` (its `resets_at`, held to " <>
+                         "between one minute and eight days) and by a `session_ended " <>
+                         "usage_exhausted` (eight days); cleared by `usage.exhausted: false`. " <>
+                         "Capacity returns at this instant with nothing further to do."
+                   }
                  }
                }
              }
@@ -446,11 +465,12 @@ defmodule LoopctlWeb.RunnerController do
     # Presence says who is connected; Postgres says what they carry.
     capacity = Runners.capacity(tenant.id)
     barred = Runners.unsupported_kinds(tenant.id)
+    exhausted = Usage.exhausted_until_by_runner(tenant.id)
 
     runners =
       tenant.id
       |> Runners.pool()
-      |> Enum.map(&pool_entry(&1, capacity, barred))
+      |> Enum.map(&pool_entry(&1, capacity, barred, exhausted))
       |> Enum.sort_by(& &1.machine)
 
     json(conn, %{runners: runners})
@@ -468,7 +488,7 @@ defmodule LoopctlWeb.RunnerController do
     end
   end
 
-  defp pool_entry({machine, %{metas: metas}}, capacity, barred) do
+  defp pool_entry({machine, %{metas: metas}}, capacity, barred, exhausted) do
     meta = Enum.max_by(metas, &Map.get(&1, :joined_at), &joined_no_later?/2)
     held = Map.get(capacity, Map.get(meta, :runner_id), %{})
 
@@ -503,7 +523,10 @@ defmodule LoopctlWeb.RunnerController do
       # pool cannot show one thing while a placement does another.
       branch_prefixes: Runners.declared_branch_prefixes(meta),
       suppressed_kinds: Runners.suppressed_kinds(meta),
-      unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), [])
+      unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), []),
+      # The SAME effective value placement decides on (`Loopctl.Runners.Usage`), so a machine
+      # that is connected, has free slots and is placed nothing is explained here.
+      usage_exhausted_until: Map.get(exhausted, Map.get(meta, :runner_id))
     }
   end
 

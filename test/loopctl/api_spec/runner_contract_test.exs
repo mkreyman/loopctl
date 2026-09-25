@@ -16,6 +16,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.DeliveryGates.GateA
+  alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
   @join %{
@@ -38,7 +39,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "186e8431f9361a0cfdcae3146e5fc9aef3e8c31609e470f005ca33272616f5b7"
+  @digest "e329766f232d25234ecc2ff6d4b1ff4c3d83aa51b794a8cf3e875d8198af241a"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -2028,6 +2029,63 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "refuses a status carrying no declared field" do
       assert {:error, {:invalid, _}} = RunnerContract.cast_status(%{})
       assert {:error, {:invalid, _}} = RunnerContract.cast_status(%{"machine" => "mac-mini"})
+    end
+  end
+
+  describe "cast_status/1 — usage (contract 1.17.0, AC-44.6.1)" do
+    test "a usage object alone is a status, cast with atom keys and a DateTime reset" do
+      assert {:ok, %{usage: usage}} =
+               RunnerContract.cast_status(%{
+                 "usage" => %{
+                   "exhausted" => true,
+                   "resets_at" => "2026-09-24T09:00:00Z",
+                   "account_ref" => "acct-7f3a"
+                 }
+               })
+
+      assert usage == %{
+               exhausted: true,
+               resets_at: ~U[2026-09-24 09:00:00Z],
+               account_ref: "acct-7f3a"
+             }
+
+      # Only `exhausted` is required: a runner that knows neither when nor which account says
+      # just that, and control holds it for the upper bound.
+      assert {:ok, %{usage: %{exhausted: false}}} =
+               RunnerContract.cast_status(%{"usage" => %{"exhausted" => false}})
+    end
+
+    test "a malformed usage object is refused" do
+      for usage <- [
+            %{"exhausted" => "yes"},
+            %{},
+            %{"exhausted" => true, "resets_at" => "tomorrow"},
+            %{"exhausted" => true, "account_ref" => ""},
+            %{"exhausted" => true, "account_ref" => "has space"},
+            %{"exhausted" => true, "account_ref" => "nul\u0000byte"},
+            %{"exhausted" => true, "account_ref" => String.duplicate("a", 129)},
+            "exhausted"
+          ] do
+        assert {:error, {:invalid, _}} = RunnerContract.cast_status(%{"usage" => usage}),
+               "accepted #{inspect(usage)}"
+      end
+
+      # At the bound is fine; one past it is the case above.
+      assert {:ok, _} =
+               RunnerContract.cast_status(%{
+                 "usage" => %{"exhausted" => true, "account_ref" => String.duplicate("a", 128)}
+               })
+    end
+
+    test "the clamp is published, read from the module that applies it" do
+      limits = RunnerContract.json_schema()["x-connection"]["limits"]
+
+      assert limits["usage_hold_seconds"] == %{
+               "min" => Usage.min_hold_seconds(),
+               "max" => Usage.max_hold_seconds()
+             }
+
+      assert limits["usage_hold_seconds"] == %{"min" => 60, "max" => 8 * 24 * 60 * 60}
     end
   end
 

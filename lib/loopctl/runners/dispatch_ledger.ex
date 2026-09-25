@@ -739,7 +739,8 @@ defmodule Loopctl.Runners.DispatchLedger do
               kind: String.t() | nil,
               story_id: Ecto.UUID.t(),
               claim_epoch: integer(),
-              slot_generation: integer()
+              slot_generation: integer(),
+              replied_at: DateTime.t() | nil
             }}}
           | {:error,
              :unknown_dispatch
@@ -811,7 +812,10 @@ defmodule Loopctl.Runners.DispatchLedger do
       kind: record.kind,
       story_id: record.story_id,
       claim_epoch: record.claim_epoch,
-      slot_generation: record.slot_generation
+      slot_generation: record.slot_generation,
+      # When the runner ACCEPTED it — `accepted/1` holds every session end to an accepted row,
+      # and only `apply_reply/2` accepts, stamping this.
+      replied_at: record.replied_at
     }
   end
 

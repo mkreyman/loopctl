@@ -16,6 +16,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   use LoopctlWeb.ChannelCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
+
+  require Logger
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
@@ -24,6 +27,8 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageDispatcher
   alias Loopctl.Progress
+  alias Loopctl.Runners.Selection
+  alias Loopctl.Runners.Usage
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
@@ -140,6 +145,59 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # a slot — once per story per minute, for ever.
       assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
       refute_push "dispatch", _pushed
+    end
+
+    # US-44.6: the triage dispatcher selects through `Loopctl.Runners.Selection` as the driver
+    # does, so an exhausted subscription holds a triage-capable machine out too — and the pass
+    # names the tenant's earliest reset, once for the tenant.
+    test "an EXHAUSTED runner is not sent triage, and the pass logs the earliest reset", ctx do
+      _story = detected_story(ctx)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+      resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      unboxed(fn ->
+        :ok =
+          Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
+      end)
+
+      Logger.put_module_level(Selection, :info)
+      on_exit(fn -> Logger.delete_module_level(Selection) end)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+        end)
+
+      refute_push "dispatch", _pushed
+      assert [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, log)
+      assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
+      assert DateTime.compare(logged, resets_at) == :eq
+
+      leave_channel(channel)
+    end
+
+    test "the only runner going dry between selection and the push is :no_runner, and " <>
+           "Runners.dispatch/3 records nothing",
+         ctx do
+      story = detected_story(ctx)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+
+      assert exhaust_after_selection(ctx.runner.id, fn ->
+               unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end)
+             end) == [:no_runner]
+
+      refute_push "dispatch", _pushed
+
+      assert [] =
+               unboxed(fn ->
+                 AdminRepo.all(
+                   from r in Loopctl.Runners.DispatchRecord,
+                     where: r.story_id == ^story.id,
+                     select: r.id
+                 )
+               end)
+
+      leave_channel(channel)
     end
 
     test "a runner that declares NOTHING is not sent triage either", ctx do
@@ -462,6 +520,43 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   defp candidate_ids(limit) do
     unboxed(fn -> Enum.map(TriageDispatcher.candidates(limit), & &1.story_id) end)
+  end
+
+  # Runs `fun` with `runner_id` exhausted the moment the pass has SELECTED its runner (the
+  # free-slot query, on AdminRepo) and before it pushes: a machine running dry between the
+  # selection and `Runners.dispatch/3`. Written on AdminRepo's own connection, so it commits
+  # outside the read.
+  defp exhaust_after_selection(runner_id, fun) do
+    id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:loopctl, :admin_repo, :query],
+        &__MODULE__.exhaust_after_select/4,
+        %{pid: self(), id: id, runner_id: runner_id}
+      )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(id)
+    end
+  end
+
+  @doc false
+  def exhaust_after_select(_event, _measurements, %{query: query}, config) do
+    %{pid: pid, id: id, runner_id: runner_id} = config
+
+    if self() == pid and query =~ ~r/^SELECT .*"in_flight" < .*exists\(/s do
+      :telemetry.detach(id)
+      until = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      {1, _} =
+        AdminRepo.update_all(from(r in Loopctl.Runners.Runner, where: r.id == ^runner_id),
+          set: [usage_exhausted_until: until]
+        )
+    end
   end
 
   defp join_runner(ctx, overrides) do

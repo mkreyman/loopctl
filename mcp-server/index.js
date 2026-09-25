@@ -8037,6 +8037,11 @@ const TOOLS = [
       "no_conforming_branch, and when a machine refuses dispatches with branch_not_allowed — a " +
       "runner that ENFORCES a prefix and declares none shows [] here, which is that " +
       "misconfiguration made visible. Per-CONNECTION, like kinds. " +
+      "usage_exhausted_until (runner contract 1.17.0) is until when the machine's SUBSCRIPTION " +
+      "is exhausted, or null: while it is in the future nothing is placed on the machine and " +
+      "place_dispatch refuses 409 runner_exhausted. It is the EFFECTIVE value — the latest of " +
+      "the machine's own and every machine's sharing its account — so a machine that never " +
+      "reported anything can show one; capacity returns at that instant on its own. " +
       "live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +
@@ -8071,6 +8076,11 @@ const TOOLS = [
       "choosing a machine. It refuses a NEW placement only: retrying with a dispatch_id " +
       "loopctl already holds still re-sends that dispatch, because its claim is already " +
       "standing and a draining machine is asked to finish what it holds, not to take more.\n\n" +
+      "409 `runner_exhausted` means the machine's subscription (its own, or one it shares an " +
+      "account with) is exhausted, so every session placed there would end usage_exhausted. " +
+      "NOTHING WAS CLAIMED; the body carries `usage_exhausted_until`, when it clears on its " +
+      "own. Place on another runner — runner_pool shows `usage_exhausted_until` per machine. " +
+      "Like `runner_declines_work` it refuses a NEW placement only.\n\n" +
       "409 `no_conforming_branch` means the machine declares `branch_prefixes` (runner " +
       "contract 1.14.0) and none of them can produce a valid branch name carrying the story " +
       "number and id fragment that keeps two stories off one branch. NOTHING WAS CLAIMED. " +

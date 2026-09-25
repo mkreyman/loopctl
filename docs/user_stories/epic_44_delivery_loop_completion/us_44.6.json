@@ -36,7 +36,7 @@
     },
     {
       "id": "AC-44.6.6",
-      "description": "An exhausted runner is refused by Runners.accepts?/5 and by Placement.place/4 with runner_exhausted."
+      "description": "An exhausted runner is never selected by the driver or triage (the free-slot runner query excludes it), and is refused runner_exhausted by Runners.dispatch/3 (for a dispatch_id the ledger does not already hold) and by Placement.place/4."
     },
     {
       "id": "AC-44.6.7",
@@ -197,8 +197,8 @@
   ],
   "technical_notes": [
     "Columns on runners: usage_exhausted_until utc_datetime, account_ref string (migration; set programmatically)",
-    "Eligibility: Runners.accepts?/5 (runners.ex:903) for driver and triage; Placement.place/4 checks runner_accepting_work (placement.ex:441-443) and needs the same check",
-    "Contract: usage on the status message (1.15.0); a runner not sending it is unaffected",
+    "Eligibility: the driver and triage select through Loopctl.Runners.Selection, whose free-slot runner query carries the exhaustion predicate; Runners.dispatch/3 and Placement.place/4 each refuse an exhausted runner beside the push",
+    "Contract: usage on the status message (1.17.0); a runner not sending it is unaffected",
     "Status messages are rate-limited to one per second per runner: tests use separate runners or separate tests rather than two back-to-back pushes"
   ],
   "dependencies": [

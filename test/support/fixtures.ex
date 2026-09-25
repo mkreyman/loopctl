@@ -2176,6 +2176,16 @@ defmodule Loopctl.Fixtures do
   # `Repo`, sees it inside an async test's sandbox without committing anything. Pass
   # `:tenant_id` to add a story to a tenant made by an earlier call. Accepts `:claim_epoch`
   # and `:agent_status`.
+  # A tenant on the RLS `Loopctl.Repo` sandbox connection, for an async test whose code under
+  # test reads and writes through `Repo` alone — `fixture(:tenant)` inserts on `AdminRepo`,
+  # which is a different sandbox connection, so a `fixture(:stage_runner)` under it would fail
+  # its foreign key. The same insert `fixture(:stage_story)` makes for its own tenant.
+  def fixture(:stage_tenant, attrs) do
+    %Tenant{}
+    |> Tenant.create_changeset(build(:tenant, Enum.into(attrs, %{})))
+    |> Loopctl.Repo.insert!()
+  end
+
   def fixture(:stage_story, attrs) do
     attrs = Enum.into(attrs, %{})
 

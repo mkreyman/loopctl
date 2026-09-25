@@ -23,17 +23,23 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   use LoopctlWeb.ChannelCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
+
+  require Logger
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.DispatchDriver
+  alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Source
   alias Loopctl.Progress
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Selection
+  alias Loopctl.Runners.Usage
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.RunnerSocket
 
@@ -490,7 +496,244 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     end
   end
 
+  describe "an exhausted subscription is not capacity (US-44.6)" do
+    # The reset line is `:info`, below `config/test.exs`'s `:warning` primary level; a module
+    # level lets it past for the module that logs it — `Selection.note_no_runner/3`, which both
+    # passes share — the way `Loopctl.Workers.ReclaimExpiredClaimsLoggingTest` does. VM-global,
+    # which this module's `async: false` already covers.
+    setup do
+      Logger.put_module_level(Selection, :info)
+      on_exit(fn -> Logger.delete_module_level(Selection) end)
+      :ok
+    end
+
+    test "an exhausted account is excluded everywhere: the driver places nothing, and a " <>
+           "placement naming the OTHER machine on that account is refused (TC-44.6.5)",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+
+      {r2_key, r2} =
+        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
+
+      first = join_runner(ctx)
+      second = join_as(r2, r2_key, "beelink")
+
+      # r2 reported the account and NOTHING about it being exhausted; r1 ran it dry.
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant.id, r2.id, %{exhausted: false, account_ref: "a"})
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, account_ref: "a"})
+      end)
+
+      # Two connected machines with free slots, both refused: one ran dry, the other shares
+      # its login. Before this every session placed on either ended `usage_exhausted`.
+      assert unboxed(fn -> DispatchDriver.available_runners(ctx.tenant.id, @repo) end) == []
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:no_runner]
+      refute_push "dispatch", _pushed
+
+      {_raw, operator} = fixture(:committed_operator_key, %{tenant_id: ctx.tenant.id})
+
+      assert {:error, :runner_exhausted} =
+               unboxed(fn ->
+                 Placement.place(
+                   ctx.tenant.id,
+                   r2.id,
+                   %{"dispatch_id" => Ecto.UUID.generate(), "story_id" => story.id},
+                   api_key: operator,
+                   actor_label: "test"
+                 )
+               end)
+
+      # NOTHING WAS CLAIMED — the refusal comes before the mint.
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(ctx.tenant.id, story.id) end).agent_status == :contracted
+
+      leave_channel(second)
+      leave_channel(first)
+    end
+
+    test "the pool shows the reset per runner, and the pass logs the earliest one, once per " <>
+           "tenant (TC-44.6.7)",
+         ctx do
+      bind_repo(ctx, queued_story(ctx), @repo)
+      # A second story the same exhausted runner is refused for (a repository is one active
+      # source, so it is the runner's second checkout): `:no_runner` too, and the reset is
+      # still logged ONCE for the tenant.
+      bind_repo(ctx, queued_story(ctx), "mkreyman/cron_books")
+      channel = join_runner(ctx, %{"repos" => [@repo, "mkreyman/cron_books"]})
+
+      resets_at = DateTime.utc_now() |> DateTime.add(3_600, :second)
+
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
+      end)
+
+      {operator_raw, _operator} = fixture(:committed_operator_key, %{tenant_id: ctx.tenant.id})
+
+      assert %{"runners" => [entry]} =
+               Phoenix.ConnTest.build_conn()
+               |> Plug.Conn.put_req_header("authorization", "Bearer #{operator_raw}")
+               |> Phoenix.ConnTest.dispatch(@endpoint, :get, "/api/v1/runners/pool")
+               |> Phoenix.ConnTest.json_response(200)
+
+      assert entry["runner_id"] == ctx.runner.id
+      assert {:ok, shown, 0} = DateTime.from_iso8601(entry["usage_exhausted_until"])
+      assert DateTime.compare(shown, resets_at) == :eq
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) ==
+                   [:no_runner, :no_runner]
+        end)
+
+      [line] =
+        log |> String.split("\n") |> Enum.filter(&(&1 =~ "earliest_usage_reset="))
+
+      [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, line)
+      assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
+      assert DateTime.compare(logged, resets_at) == :eq
+
+      leave_channel(channel)
+    end
+
+    test "a dry runner is never selected, even the least loaded: the story goes to the " <>
+           "fresh one",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+
+      {r2_key, r2} =
+        fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink", max_sessions: 9})
+
+      dry = join_runner(ctx)
+      fresh = join_as(r2, r2_key, "beelink")
+      # The dry runner is the least loaded, so an order-only selection would try it FIRST.
+      unboxed(fn -> set_in_flight(r2.id, 1) end)
+      unboxed(fn -> :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true}) end)
+
+      assert [%Runner{id: id}] =
+               unboxed(fn -> DispatchDriver.available_runners(ctx.tenant.id, @repo) end)
+
+      assert id == r2.id
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:placed]
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :claimed
+      assert unboxed(fn -> AdminRepo.get!(Runner, ctx.runner.id) end).in_flight == 0
+
+      leave_channel(fresh)
+      leave_channel(dry)
+    end
+
+    test "the only runner going dry between selection and placement is :no_runner, with the " <>
+           "note, and nothing is claimed",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+      channel = join_runner(ctx)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert exhaust_after_selection(ctx.runner.id, fn ->
+                   unboxed(fn -> DispatchDriver.run_with(20, @budgets) end)
+                 end) == [:no_runner]
+        end)
+
+      assert log =~ "earliest_usage_reset="
+      refute_push "dispatch", _pushed
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :queued
+      assert unboxed(fn -> AdminRepo.get!(Runner, ctx.runner.id) end).in_flight == 0
+
+      leave_channel(channel)
+    end
+
+    test "an exhausted runner that is also FULL still names its reset: its slots are held by " <>
+           "sessions about to end",
+         ctx do
+      bind_repo(ctx, queued_story(ctx), @repo)
+      channel = join_runner(ctx)
+      resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      # ONE slot, taken: full, and still under the tenant's admission cap. On the row rather
+      # than declared at join: a join that lowers `max_sessions` writes through the sandbox,
+      # whose uncommitted row lock the unboxed writes below would wait out.
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
+
+        {1, _} =
+          AdminRepo.update_all(from(r in Runner, where: r.id == ^ctx.runner.id),
+            set: [max_sessions: 1, in_flight: 1]
+          )
+      end)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:no_runner]
+        end)
+
+      [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, log)
+      assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
+      assert DateTime.compare(logged, resets_at) == :eq
+
+      leave_channel(channel)
+    end
+
+    test "another tenant's exhausted runner on the same account_ref does not hold this " <>
+           "tenant's runner out (TC-44.6.8)",
+         ctx do
+      story = bind_repo(ctx, queued_story(ctx), @repo)
+
+      other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+      {_raw, theirs} = fixture(:committed_runner, %{tenant_id: other.id, name: "minis"})
+
+      unboxed(fn ->
+        :ok = Usage.record(other.id, theirs.id, %{exhausted: true, account_ref: "a"})
+        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: false, account_ref: "a"})
+      end)
+
+      channel = join_runner(ctx)
+
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:placed]
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.story_id == story.id
+
+      leave_channel(channel)
+    end
+  end
+
   # -- helpers ---------------------------------------------------------------------------
+
+  # Runs `fun` with `runner_id` exhausted the moment the pass has SELECTED its runners (the
+  # free-slot query, on AdminRepo) and before it places on one: a machine running dry between
+  # the selection and the push. Written on AdminRepo's own connection, so it commits outside
+  # the read.
+  defp exhaust_after_selection(runner_id, fun) do
+    id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:loopctl, :admin_repo, :query],
+        &__MODULE__.exhaust_after_select/4,
+        %{pid: self(), id: id, runner_id: runner_id}
+      )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(id)
+    end
+  end
+
+  @doc false
+  def exhaust_after_select(_event, _measurements, %{query: query}, config) do
+    %{pid: pid, id: id, runner_id: runner_id} = config
+
+    if self() == pid and query =~ ~r/^SELECT .*"in_flight" < .*exists\(/s do
+      :telemetry.detach(id)
+      until = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      {1, _} =
+        AdminRepo.update_all(from(r in Runner, where: r.id == ^runner_id),
+          set: [usage_exhausted_until: until]
+        )
+    end
+  end
 
   # BOTH repos on real connections — a placement writes through each of them, and the sandbox
   # gives them separate, mutually invisible transactions.

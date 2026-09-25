@@ -48,7 +48,10 @@ defmodule Loopctl.Delivery.DispatchDriver do
     * not DRAINING, accepts the story's REPO, and does the dispatch KIND — the three facts on
       its join meta, read through `Runners.accepts?/5`, which is the same rule `dispatch/3`
       applies rather than a second copy of it,
-    * has a free slot on its row (`in_flight < max_sessions`), and
+    * has a free slot on its row (`in_flight < max_sessions`) and its SUBSCRIPTION is not
+      exhausted (US-44.6) — one query over the `runners` rows, `Loopctl.Runners.Selection`,
+      which the triage dispatcher shares; a story left with no runner logs the tenant's
+      exhausted runners and their earliest reset, once per tenant per pass, and
     * its TENANT has admission headroom (`Loopctl.Runners.Capacity.admit/2`) — an independent
       limit, and the state `RUNNER_MAX_IN_FLIGHT_SESSIONS` exists to produce is precisely one
       where runners sit idle with free slots.
@@ -79,9 +82,9 @@ defmodule Loopctl.Delivery.DispatchDriver do
   alias Loopctl.Intake
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
-  alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Selection
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
@@ -177,8 +180,9 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   Every half of the moduledoc's eligibility rule, in the order that costs least: the tenant's
   admission headroom is one aggregate read and gates the whole pass for that tenant; the
-  presence metas answer draining, repos and kind with no database at all; the row read is what
-  answers capacity. Fewest slots first, so a fleet spreads rather than filling one machine.
+  presence metas answer draining, repos and kind with no database at all; ONE row read answers
+  capacity and exhaustion together (`Loopctl.Runners.Selection.runners/3`). Fewest slots
+  first, so a fleet spreads rather than filling one machine.
 
   ## Why the PASS needs the list and not the head (846.2 review round 2, finding 3)
 
@@ -197,31 +201,10 @@ defmodule Loopctl.Delivery.DispatchDriver do
   """
   @spec available_runners(Ecto.UUID.t(), String.t()) :: [Runner.t()]
   def available_runners(tenant_id, repo) when is_binary(tenant_id) and is_binary(repo) do
-    with :ok <- Capacity.admit(Loopctl.AdminRepo, tenant_id),
-         [_ | _] = ids <- accepting_runner_ids(tenant_id, repo) do
-      Loopctl.AdminRepo.all(
-        from r in Runner,
-          where: r.tenant_id == ^tenant_id,
-          where: is_nil(r.revoked_at),
-          where: r.id in ^ids,
-          where: r.in_flight < r.max_sessions,
-          order_by: [asc: r.in_flight, asc: r.id]
-      )
-    else
-      _admission_reached_or_nobody_accepting -> []
+    case Capacity.admit(Loopctl.AdminRepo, tenant_id) do
+      :ok -> Selection.runners(tenant_id, @kind, repo)
+      _admission_reached -> []
     end
-  end
-
-  # The runners whose OWN declaration admits this dispatch, read from the meta of the socket a
-  # push would reach. A machine with two live sockets on one credential is skipped rather than
-  # guessed at: `Runners.dispatch/3` refuses that as `:runner_ambiguous`, so placing on it
-  # would take a claim for a dispatch that cannot be delivered.
-  defp accepting_runner_ids(tenant_id, repo) do
-    for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
-        runner_id = Map.get(meta, :runner_id),
-        is_binary(runner_id),
-        Runners.accepts?(tenant_id, runner_id, meta, @kind, repo) == :ok,
-        do: runner_id
   end
 
   @doc """
@@ -319,7 +302,10 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   The tenant-level facts a pass resolves are cached ACROSS candidates and the runner facts
   are not, and the split is deliberate: a tenant's operator key does not change while a pass
-  runs, while its runners' free slots change with every story this very pass places.
+  runs, while its runners' free slots change with every story this very pass places. So is
+  whether the tenant's `:no_runner` note has been logged (`Loopctl.Runners.Selection`). A
+  runner's exhaustion is NOT cached: it is part of the row read that selects each story's
+  runners, so a machine that runs dry mid-pass is not selected by the next story.
   """
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
@@ -346,7 +332,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
         {:error, :no_runner} ->
           :no_runner
 
-        {:error, reason} when reason in [:no_operator_key, :tenant_halted] ->
+        {:error, reason}
+        when reason in [:no_operator_key, :tenant_halted, :custody_tier_required] ->
           blocked(candidate, reason)
 
         {:error, {:no_intake_source, _} = reason} ->
@@ -354,9 +341,6 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
         {:error, {:ambiguous_intake_source, _, _} = reason} ->
           blocked(candidate, reason)
-
-        {:error, :custody_tier_required} ->
-          blocked(candidate, :custody_tier_required)
 
         # THE RUNNER'S OWN DECLARATION LEAVES NO ROOM FOR A BRANCH, so its remedy is
         # `branch_prefixes` on that machine's configuration and a reconnect — a state that
@@ -376,7 +360,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
           unplaceable(candidate, reason)
       end
 
-    {outcome, cache}
+    {outcome, note_if_no_runner(outcome, candidate, cache)}
   rescue
     error -> {errored(candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
   catch
@@ -398,25 +382,42 @@ defmodule Loopctl.Delivery.DispatchDriver do
     end
   end
 
+  defp note_if_no_runner(:no_runner, candidate, cache),
+    do: Selection.note_no_runner(cache, "DispatchDriver", candidate)
+
+  defp note_if_no_runner(_outcome, _candidate, cache), do: cache
+
   # ONE MISCONFIGURED MACHINE MAY NOT STOP A REPOSITORY (846.2 review round 2, finding 3). A
   # runner whose `branch_prefixes` can produce no valid branch is still "accepting" to
   # `Runners.accepts?/5`, and is selected FIRST because it is idle, so every story for that
   # repository was refused `{:no_conforming_branch, _}` and the healthy second runner was never
   # tried.
   #
-  # ONLY THAT REFUSAL ADVANCES, and the reason is what makes this safe rather than a retry
-  # loop. `{:no_conforming_branch, _}` is decided inside `DispatchPayload.fill/3`, which runs
-  # BEFORE `claimable/2` and before the mint, so a refused attempt has written nothing at all —
-  # no dispatch row, no ephemeral key, no chain entry, no claim. Every other refusal either
-  # concerns the STORY (`invalid_transition`, `story_not_dispatchable`, the tenant's halt and
-  # tier), which the next machine would answer identically, or has already spent something, so
-  # advancing on it would either loop pointlessly or compensate once per candidate.
+  # ONLY TWO REFUSALS ADVANCE, and the reason is what makes this safe rather than a retry
+  # loop. `{:no_conforming_branch, _}` is decided inside `DispatchPayload.fill/3`, and
+  # `:runner_exhausted` by `Placement`'s own check just ahead of it — both BEFORE `claimable/2`
+  # and before the mint, so a refused attempt has written nothing at all: no dispatch row, no
+  # ephemeral key, no chain entry, no claim. And both concern the MACHINE. Every other refusal
+  # either concerns the STORY (`invalid_transition`, `story_not_dispatchable`, the tenant's
+  # halt and tier), which the next machine would answer identically, or has already spent
+  # something, so advancing on it would either loop pointlessly or compensate once per
+  # candidate.
   #
-  # The LAST refusal is the one returned, so a pass on which every machine is misconfigured
-  # still reports `{:no_conforming_branch, _}` and `attempt/3` still classifies it `:blocked` —
-  # an operator sees the state that needs them, not a `:no_runner` that reads as "wait".
+  # `:runner_exhausted` arrives only for a machine that ran dry after `available_runners/2`
+  # selected it (US-44.6): a dry runner is one this pass would not have selected, so it is
+  # passed over WITHOUT becoming the answer — a story every selected machine turned out to be
+  # dry for is `:no_runner`, which is what it is, and the next pass selects again. In the
+  # narrower window between `Placement`'s check and the push it comes from `Runners.dispatch/3`
+  # AFTER the claim instead; `place/4` has undone that claim (`undo_claim/5` requeues the
+  # story) before it returns, so advancing costs one more mint on the next machine, bounded
+  # by the list.
+  #
+  # The LAST other refusal is the one returned, so a pass on which every machine is
+  # misconfigured still reports `{:no_conforming_branch, _}` and `attempt/3` still classifies
+  # it `:blocked` — an operator sees the state that needs them, not a `:no_runner` that reads
+  # as "wait".
   defp place_on_first_usable(tenant_id, runners, story, source, budgets, key) do
-    Enum.reduce_while(runners, {:error, :no_runner}, fn runner, _last ->
+    Enum.reduce_while(runners, {:error, :no_runner}, fn runner, last ->
       result =
         Placement.place(tenant_id, runner.id, dispatch(story, source, budgets),
           api_key: key,
@@ -424,6 +425,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
         )
 
       case result do
+        {:error, :runner_exhausted} -> {:cont, last}
         {:error, {:no_conforming_branch, _}} -> {:cont, result}
         _placed_or_refused_for_another_reason -> {:halt, result}
       end

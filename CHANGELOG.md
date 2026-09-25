@@ -6,6 +6,27 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **An exhausted subscription is not capacity (epic 44, US-44.6, runner contract 1.17.0).
+  RE-VENDOR the contract to send `usage`; a runner that does not is never held out, except by
+  its own `usage_exhausted` session ends.** A `status` message may carry `usage: {exhausted,
+  resets_at, account_ref}`, stored in new `runners` columns, `usage_exhausted_until`,
+  `account_ref`, `usage_cleared_at` and `usage_hold_provisional` (migration, no manual step;
+  existing rows get NULL and `false`, which reads as not exhausted). While a runner's own value — or that of any runner of the tenant sending the same
+  `account_ref` — is in the future, the dispatch driver and the triage dispatcher skip it and
+  `POST /api/v1/runners/:runner_id/dispatches` refuses it `409 runner_exhausted` with
+  `usage_exhausted_until`, nothing claimed. `resets_at` is clamped to between one minute and
+  eight days from control's clock (published as `x-connection.limits.usage_hold_seconds`) and
+  applies to every runner on the `account_ref`: a `resets_at` still ahead replaces whatever they
+  hold, the latest report winning, while one already past (or none, which holds for eight days)
+  only marks runners that hold no live value. `exhausted: false` clears every runner on the `account_ref`. A
+  `session_ended` `usage_exhausted` now marks the runner for eight days BEFORE it releases the
+  story, so the re-queued story is no longer placed straight back on the machine that cannot
+  run it — unless the account was reported refilled after that session's dispatch was
+  accepted. **Operator-visible:** `GET /api/v1/runners/pool` (MCP
+  `runner_pool`) shows `usage_exhausted_until` per runner, and a driver or triage pass that
+  finds no runner for a story logs, once per tenant, how many of the tenant's runners are
+  exhausted and `earliest_usage_reset=`.
+
 - **A claim placed for a runner dispatch now expires at the dispatch's deadline, not after 24
   hours (epic 44, US-44.5, #879; runner contract 1.19.0).** `Loopctl.Delivery.Placement` — the
   dispatch driver and `place_dispatch` — claims with a lease CAPPED at `placed_at +

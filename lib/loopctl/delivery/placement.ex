@@ -224,6 +224,7 @@ defmodule Loopctl.Delivery.Placement do
           | :not_authorized
           | :runner_not_provisioned
           | :runner_declines_work
+          | :runner_exhausted
           | :invalid_transition
           | :wrong_stage
           | :busy
@@ -310,6 +311,12 @@ defmodule Loopctl.Delivery.Placement do
     because it claims nothing and the claim it re-pushes under is live: refusing it would
     strand that claim at `claimed` until its lease expired, which is what the gate exists to
     prevent
+  - `:runner_exhausted` — the machine's subscription is declared exhausted: its own
+    `usage_exhausted_until`, or that of a same-tenant runner sharing its `account_ref`, is in
+    the future (US-44.6, `Loopctl.Runners.usage_exhausted?/2`). Refused BEFORE the claim and
+    on the CLAIM path only, like `:runner_declines_work` and for the same reason: every
+    session placed there would end `usage_exhausted`, and a resume re-sends work the machine
+    already holds.
   - `{:no_conforming_branch, prefixes}` — the machine declared branch prefixes
     (`RunnerJoin.branch_prefixes`, contract 1.14.0) and none of them can produce a valid
     branch name carrying the story number and id fragment. Refused BEFORE the claim, like
@@ -450,6 +457,21 @@ defmodule Loopctl.Delivery.Placement do
 
   defp runner_accepting_work(meta) do
     if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
+  end
+
+  # AN EXHAUSTED SUBSCRIPTION IS NOT CAPACITY (US-44.6). The unattended selectors never select
+  # such a machine (`Loopctl.Runners.Selection`), and `Runners.dispatch/3` refuses a NEW
+  # dispatch to one — but that refusal comes after the claim and the mint, so a placement
+  # NAMING the runner is refused here first, where nothing has been spent. Mounted beside
+  # `runner_accepting_work/1`, on the CLAIM path only, for the reasons given there; the resume
+  # path's push is exempt in `dispatch/3` too, since the ledger already holds its id. Unlike
+  # that gate it does not need the live meta: the state is on the `runners` row, so a machine
+  # with no socket, or two, is judged the same — and `Runners.dispatch/3` still answers the
+  # connection question afterwards.
+  defp runner_not_exhausted(tenant_id, runner_id) do
+    if Runners.usage_exhausted?(tenant_id, runner_id),
+      do: {:error, :runner_exhausted},
+      else: :ok
   end
 
   # WHAT THIS MACHINE SAID IT ACCEPTS, off the meta of the ONE socket a push would reach
@@ -729,6 +751,7 @@ defmodule Loopctl.Delivery.Placement do
     meta = sole_live_meta(tenant_id, runner_id)
 
     with :ok <- runner_accepting_work(meta),
+         :ok <- runner_not_exhausted(tenant_id, runner_id),
          {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
          {:ok, dispatch} <-
            DispatchPayload.fill(tenant_id, dispatch,

@@ -39,6 +39,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Usage
   alias Loopctl.Tenants
   alias LoopctlWeb.RunnerSocket
 
@@ -575,6 +576,35 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       refute Map.has_key?(pushed, :prompt)
       refute Enum.any?(Map.keys(pushed), &is_binary/1)
       assert pushed.token_budget == 1_000
+    end
+
+    # US-44.6: the gate beside the push, so every caller of `dispatch/3` is covered — not only
+    # the selectors, which never pick such a machine, and `Placement`, which asks before it
+    # claims. On the RLS connection the ledger and the read share, so no lock is crossed.
+    test "an EXHAUSTED runner is refused a new dispatch, and nothing is recorded or pushed",
+         %{runner: runner} do
+      :ok = Usage.record(runner.tenant_id, runner.id, %{exhausted: true})
+      payload = dispatch_payload(runner.tenant_id)
+
+      assert {:error, :runner_exhausted} =
+               Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+      refute_push "dispatch", _
+      assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
+    end
+
+    test "a re-send of a dispatch the ledger already holds is NOT refused for exhaustion",
+         %{runner: runner} do
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      :ok = Usage.record(runner.tenant_id, runner.id, %{exhausted: true})
+
+      # The resume path: work the machine was already handed, under a claim that is live.
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      # A new one is new work, and is refused.
+      assert {:error, :runner_exhausted} = dispatch_to(runner)
     end
 
     test "a halted tenant is refused and nothing is pushed", %{runner: runner} do
