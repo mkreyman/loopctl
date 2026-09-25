@@ -152,10 +152,31 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
         mark_deactivated(event)
       end
     else
-      {:error, :not_found} ->
-        Logger.warning("WebhookDeliveryWorker: event or webhook not found (event_id=#{event_id})")
-        :ok
+      {:error, :not_found} -> not_found(job, event_id)
     end
+  end
+
+  # AN EVENT NOT THERE YET IS NOT AN EVENT THAT IS GONE. Some writers insert the event on
+  # `AdminRepo` inside a transaction and enqueue this job with `Oban.insert/1`, which commits on
+  # Oban's own repo at once (a claim release's re-contract, `Progress.recontract_in_transaction/3`,
+  # US-44.4). The job can then run before the event's transaction commits; answered `:ok` here,
+  # that webhook was lost although its event committed a moment later. So a YOUNG job whose
+  # event is missing snoozes, and one older than `@event_visibility_seconds` gives up as
+  # before: its event was rolled back, or cleaned up.
+  @event_visibility_seconds 120
+
+  defp not_found(%Oban.Job{inserted_at: %DateTime{} = inserted_at}, event_id) do
+    if DateTime.diff(DateTime.utc_now(), inserted_at, :second) < @event_visibility_seconds do
+      {:snooze, 5}
+    else
+      Logger.warning("WebhookDeliveryWorker: event or webhook not found (event_id=#{event_id})")
+      :ok
+    end
+  end
+
+  defp not_found(_job, event_id) do
+    Logger.warning("WebhookDeliveryWorker: event or webhook not found (event_id=#{event_id})")
+    :ok
   end
 
   defp attempt_delivery(job, event, webhook) do

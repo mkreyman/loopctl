@@ -315,6 +315,45 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       assert unboxed(fn -> Stages.get(ctx.tenant.id, broken.id) end).stage == :triaged
     end
 
+    test "failing stranded rows do not hold every slot: a later one is still finished", ctx do
+      broken = detected_story(ctx)
+      half_take(ctx, broken)
+      fine = detected_story(ctx)
+      half_take(ctx, fine)
+
+      name = "test_stranded_hol_" <> String.replace(broken.id, "-", "")
+
+      unboxed(fn ->
+        AdminRepo.query!("""
+        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'some_other_fault: injected by test';
+        END
+        $$
+        """)
+
+        AdminRepo.query!("""
+        CREATE TRIGGER #{name} BEFORE UPDATE ON story_stages FOR EACH ROW
+        WHEN (NEW.story_id = '#{broken.id}') EXECUTE FUNCTION #{name}()
+        """)
+      end)
+
+      on_exit(fn ->
+        unboxed(fn ->
+          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON story_stages")
+          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+        end)
+      end)
+
+      # A pass limit of ONE, and the failing row is the older: bounded by the pass's limit, the
+      # sweep would take only it, every pass, and never reach `fine`.
+      ExUnit.CaptureLog.with_log(fn ->
+        unboxed(fn -> TriageDispatcher.run_with(1, @budgets) end)
+      end)
+
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, fine.id) end).stage == :escalated
+    end
+
     test "an unbound triaged row WITH a recorded verdict is not swept", ctx do
       story = detected_story(ctx)
       half_take(ctx, story)

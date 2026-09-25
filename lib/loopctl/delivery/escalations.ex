@@ -396,10 +396,10 @@ defmodule Loopctl.Delivery.Escalations do
   #
   # So the claim goes back BEFORE the transition, whose epoch is read after the release —
   # releasing bumps it — and the story is re-contracted AFTER it. That second order is not a
-  # preference: re-contracted first, a transition that then failed would leave a CONTRACTED
-  # story behind an `escalated` row. Re-contracted after, a failed transition leaves it
-  # `pending` behind the escalated row, which is held (`Stages.held_story_ids/2`) — never
-  # contracted and claimable while a human owns it.
+  # preference: `Progress.contract_story/4` refuses a story whose stage is held, and `escalated`
+  # is held (`Stages.held_story_ids/2`), so the re-contract can only land once the row has
+  # left `escalated`. A transition that fails leaves the story `pending` behind an escalated
+  # row, which is still held — never contracted and claimable while a human owns it.
   #
   # `done` and `failed` prepare nothing: the story is finished with, and re-contracting it
   # would be inventing work.
@@ -434,18 +434,27 @@ defmodule Loopctl.Delivery.Escalations do
     )
   end
 
-  # THE SAME RE-CONTRACT EVERY RELEASE WRITES (`Progress.recontract_in_transaction/3`), not a
-  # second implementation of it: one writer of `pending -> contracted` after a release, so the
-  # audit attribution and the guard cannot drift apart. It runs in a transaction of its own
-  # with the story locked, AFTER the transition — `Stages.advance/4` commits on
-  # `Loopctl.Repo`, a different connection, so the two cannot share one transaction. The
-  # UPDATE is guarded on `pending`: a story an agent contracted in between is left as it is,
-  # contracted, which is what the resolution asked for. `nil` is a resolution that released
-  # nothing (`done`, `failed`).
+  # A claim release that leaves a delivery story's row at `queued` re-contracts it too, but
+  # INSIDE the release's own transaction (`Loopctl.Delivery.Stages.recontract_released/4` ->
+  # `Loopctl.Progress.recontract_in_transaction/3`, US-44.4); this path is `resolve/3`'s only.
+  # `pending -> contracted` is the only transition into the state a placement needs, and a
+  # story that is somehow already `contracted` is left alone rather than refused: the operator
+  # asked for a placeable story and it is one. `nil` is a resolution that released nothing.
   defp recontract(_tenant_id, nil, _label), do: {:ok, nil}
+  defp recontract(_tenant_id, %{agent_status: :contracted} = story, _label), do: {:ok, story}
 
-  defp recontract(tenant_id, story, label),
-    do: Progress.recontract_released_story(tenant_id, story.id, label)
+  defp recontract(tenant_id, story, label) do
+    case Progress.contract_story(tenant_id, story.id, %{},
+           actor_label: label,
+           skip_contract_check: true
+         ) do
+      # An agent contracted it between the transition and this call: the row left `escalated`
+      # first, so for that instant the story was listed as ready. It is contracted, which is
+      # what the resolution asked for — not a failure of a resolution that already committed.
+      {:error, {:invalid_transition, %{current_agent_status: :contracted}}} -> {:ok, story}
+      result -> result
+    end
+  end
 
   defp resolvable(to) do
     if {:escalated, to, :human_resolution} in StageMachine.transitions(),

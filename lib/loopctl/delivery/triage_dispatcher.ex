@@ -234,11 +234,19 @@ defmodule Loopctl.Delivery.TriageDispatcher do
     end
   end
 
+  # THE STRANDED SWEEP IS NOT BOUND BY THE PASS'S `limit`. A stranded row whose escalation
+  # keeps failing is not touched, so it keeps its place at the head of the oldest-first
+  # ranking; with the pass's own `limit` (a handful of candidates), that many failing rows held
+  # every stranded slot for ever and no later half-taken story was finished. A row is stranded
+  # only when the SECOND transaction of the too-large route failed, so the set is small by
+  # construction; the cap only bounds a pathological pass.
+  @stranded_sweep 500
+
   @doc "The pass itself, on budgets already decided — the seam a test can reach."
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    finished = limit |> stranded() |> Enum.map(&finish_stranded/1)
+    finished = @stranded_sweep |> stranded() |> Enum.map(&finish_stranded/1)
 
     {outcomes, _cache} =
       limit

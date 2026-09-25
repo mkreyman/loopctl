@@ -207,30 +207,6 @@ defmodule Loopctl.Progress do
   end
 
   @doc """
-  `recontract_in_transaction/3` in a transaction of its own, with the story locked
-  `FOR UPDATE`: for a caller that released the story in an EARLIER transaction and moved its
-  stage in another (`Loopctl.Delivery.Escalations.resolve/3`). The same guarded write, audit
-  entry and webhook as every release's re-contract, so the two cannot drift apart.
-
-  `{:ok, story}` as it now stands — re-contracted, or as it was when it was no longer pending.
-  """
-  @spec recontract_released_story(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil) ::
-          {:ok, Story.t()}
-  def recontract_released_story(tenant_id, story_id, actor_label) do
-    AdminRepo.transaction(fn ->
-      story =
-        AdminRepo.one!(
-          from s in Story,
-            where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-            lock: "FOR UPDATE"
-        )
-
-      {:ok, recontracted} = recontract_in_transaction(tenant_id, story, actor_label)
-      recontracted
-    end)
-  end
-
-  @doc """
   Claims a story: assigns the agent to a contracted story.
 
   Transitions agent_status from `contracted` to `assigned`.
@@ -1991,9 +1967,8 @@ defmodule Loopctl.Progress do
       actor_type: "system",
       actor_id: nil,
       actor_label: label,
-      # A lease that ran out is an attempt spent and lost (US-44.4) — unless the runner had
-      # reported `usage_exhausted` for this claim and that release never landed.
-      cause: RunnerStages.reclaim_release_cause(tenant_id, story_id, expected_epoch)
+      # A lease that ran out is an attempt spent and lost (US-44.4).
+      cause: :attempt
     }
 
     case RunnerStages.escalate_recorded_budget_kill(tenant_id, story_id, expected_epoch, label) do
@@ -4282,9 +4257,8 @@ defmodule Loopctl.Progress do
            |> WebhookEvent.create_changeset(%{event_type: event_type, payload: payload})
            |> AdminRepo.insert(),
          {:ok, _job} <-
-           enqueue_delivery(
-             WebhookDeliveryWorker.new(%{webhook_event_id: event.id, tenant_id: tenant_id})
-           ) do
+           WebhookDeliveryWorker.new(%{webhook_event_id: event.id, tenant_id: tenant_id})
+           |> Oban.insert() do
       :ok
     else
       {:error, reason} ->
@@ -4292,16 +4266,6 @@ defmodule Loopctl.Progress do
           "Failed webhook event/delivery for webhook #{webhook.id}: #{inspect(reason)}"
         )
     end
-  end
-
-  # THE JOB COMMITS WITH ITS EVENT. `Oban.insert/1` writes on Oban's own repo (`Loopctl.Repo`),
-  # a different connection from the `AdminRepo` transaction the event row above was written
-  # in — so inside a release (`recontract_in_transaction/3`) the job committed at once, ran
-  # before its event existed, and survived a rollback of the whole release. Inside an
-  # `AdminRepo` transaction it is inserted on that connection instead, and commits or rolls
-  # back with the event; outside one the two autocommit either way.
-  defp enqueue_delivery(job) do
-    if AdminRepo.in_transaction?(), do: AdminRepo.insert(job), else: Oban.insert(job)
   end
 
   defp extract_verification_params(params) do
