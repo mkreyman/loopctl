@@ -310,7 +310,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         end)
         |> elem(0)
 
-      assert Enum.sort(outcomes) == [:errored, :escalated]
+      # `:stranded_errored`, so a pass of failing stranded rows is not judged all-errored and
+      # retried whole.
+      assert Enum.sort(outcomes) == [:escalated, :stranded_errored]
       assert unboxed(fn -> Stages.get(ctx.tenant.id, fine.id) end).stage == :escalated
       assert unboxed(fn -> Stages.get(ctx.tenant.id, broken.id) end).stage == :triaged
     end
@@ -352,6 +354,25 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       end)
 
       assert unboxed(fn -> Stages.get(ctx.tenant.id, fine.id) end).stage == :escalated
+    end
+
+    test "stranded rows are ranked per tenant: one tenant's backlog does not starve another",
+         ctx do
+      first = detected_story(ctx, intake_record: false)
+      half_take(ctx, first)
+      second = detected_story(ctx, intake_record: false)
+      half_take(ctx, second)
+
+      other = %{ctx | tenant: fixture(:committed_tenant, %{trust_tier: :human_anchored})}
+      theirs = detected_story(other, intake_record: false)
+      half_take(other, theirs)
+
+      ids = unboxed(fn -> TriageDispatcher.stranded(500) end) |> Enum.map(& &1.story_id)
+
+      # Oldest-first across ALL tenants would put both of this tenant's rows ahead of the other
+      # tenant's newer one; ranked per tenant, each tenant's first row comes before any second.
+      assert Enum.find_index(ids, &(&1 == theirs.id)) <
+               Enum.find_index(ids, &(&1 == second.id))
     end
 
     test "an unbound triaged row WITH a recorded verdict is not swept", ctx do

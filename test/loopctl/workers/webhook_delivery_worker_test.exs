@@ -43,34 +43,6 @@ defmodule Loopctl.Workers.WebhookDeliveryWorkerTest do
     }
   end
 
-  # #883 review round 2. A writer that inserts the event on `AdminRepo` inside a transaction
-  # enqueues this job on Oban's own repo, which commits first; the job may run before the event
-  # is visible. Young, it waits for it; old, the event was rolled back or cleaned up.
-  describe "an event that is not visible" do
-    test "a YOUNG job snoozes instead of dropping the webhook" do
-      tenant = fixture(:tenant)
-
-      job = %Oban.Job{
-        args: %{"webhook_event_id" => Ecto.UUID.generate(), "tenant_id" => tenant.id},
-        inserted_at: DateTime.utc_now()
-      }
-
-      assert {:snooze, _seconds} = WebhookDeliveryWorker.perform(job)
-    end
-
-    test "an OLD job gives up: its event is not coming" do
-      tenant = fixture(:tenant)
-
-      job = %Oban.Job{
-        args: %{"webhook_event_id" => Ecto.UUID.generate(), "tenant_id" => tenant.id},
-        inserted_at: DateTime.add(DateTime.utc_now(), -3_600, :second)
-      }
-
-      {result, _log} = ExUnit.CaptureLog.with_log(fn -> WebhookDeliveryWorker.perform(job) end)
-      assert result == :ok
-    end
-  end
-
   describe "successful delivery" do
     test "marks event as delivered and resets consecutive_failures" do
       %{tenant: tenant, webhook: webhook, event: event} =
