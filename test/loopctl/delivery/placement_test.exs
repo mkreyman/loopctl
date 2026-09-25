@@ -527,14 +527,19 @@ defmodule Loopctl.Delivery.PlacementTest do
 
       refute log =~ "placement undo did not fully undo"
 
+      # TC-44.4.1 (AC-44.4.1, AC-44.4.2): the runner refused before any work, so the undo's
+      # release spends nothing and RE-CONTRACTS the story — back in front of the driver. It
+      # used to leave `queued` + `:pending`, which no placement ever takes (#877).
       released = unboxed(fn -> reload(runner.tenant_id, story.id) end)
-      assert released.agent_status == :pending
+      assert released.agent_status == :contracted
       assert is_nil(released.assigned_agent_id)
 
       row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
       assert row.stage == :queued
       assert is_nil(row.runner_id)
       assert row.claim_epoch == released.claim_epoch
+      assert row.attempts == %{}
+      assert :ok = unboxed(fn -> Placement.claimable(runner.tenant_id, story.id) end)
 
       # The claim's release does NOT clear `implementer_dispatch_id` — correctly, for its own
       # callers — so the undo has to. Left recorded, the next claimant is judged against a
@@ -548,6 +553,64 @@ defmodule Loopctl.Delivery.PlacementTest do
       # to use it — a credential-hygiene property, not a custody-gate one.
       assert is_nil(released.implementer_dispatch_id)
       assert unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end).revoked_at
+    end
+
+    # #877 review round 2, findings 4 and 10. The production ceiling is 0, so a refusal counted
+    # by mistake escalates a story to a human on its FIRST occurrence. The table is written HERE,
+    # not read off the module: deleting an entry from `@runner_unavailable` must turn one of
+    # these red, which iterating the module's own list could never do. The call-site halves —
+    # that `release_claim/5` passes this cause on, uncounted or counted — are the
+    # `runner_not_connected` test above and the `{:invalid, _}` test below; what each cause does
+    # to `attempts` is `stages_test.exs`'s.
+    @uncounted_refusals [
+      # the runner, not the story
+      :runner_not_connected,
+      :runner_ambiguous,
+      :runner_at_capacity,
+      :admission_limit_reached,
+      :capacity_busy,
+      :busy,
+      :tenant_halted,
+      # the runner's credential, bounded by the channel's authorization recheck
+      :not_authorized,
+      # a race the next pass does not meet again
+      :stale_claim_epoch
+    ]
+
+    test "every runner-unavailable or race refusal is released uncounted; others count" do
+      for reason <- @uncounted_refusals do
+        assert {reason, Placement.release_cause(reason)} == {reason, :placement_refused}
+      end
+
+      # Every pass mints a fresh `dispatch_id`, so neither ledger fence can be another pass
+      # having got there first (#877 review round 3): they are about THIS dispatch, and count.
+      for reason <- [:dispatch_already_replied, :dispatch_id_conflict] do
+        assert {reason, Placement.release_cause(reason)} == {reason, :attempt}
+      end
+
+      # Unlisted, and deterministic: the runner will refuse this kind on every pass.
+      assert Placement.release_cause(:kind_not_supported) == :attempt
+      assert Placement.release_cause({:invalid, ["wall_clock_seconds is too large"]}) == :attempt
+    end
+
+    # #877 review round 1, finding 3. A refusal that RECURS every pass — here a payload the
+    # contract rejects, which `Runners.dispatch/3` casts only after the claim committed — is
+    # not the runner being unavailable. Uncounted, the driver placed it, was refused and
+    # released it on every pass for ever; counted, the retry ceiling puts it in front of a
+    # human. The `runner_not_connected` test above is the uncounted half (`attempts == %{}`).
+    test "a refusal that recurs every pass COUNTS toward the retry ceiling", ctx do
+      %{runner: runner, story: story} = ctx
+      over = RunnerContract.RunnerDispatch.max_wall_clock_seconds() + 1
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, {:invalid, [_ | _]}} =
+                 place(ctx, Map.put(dispatch_payload(story), "wall_clock_seconds", over))
+      end)
+
+      # Below the ceiling of 2 (config/test.exs): counted once, and back in the queue.
+      row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
+      assert {row.stage, row.attempts} == {:queued, %{"claim_released" => 1}}
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
     end
 
     test "the undo's revocation is attributed to the PLACEMENT CALLER, not the tenant operator",

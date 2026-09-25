@@ -361,7 +361,7 @@ defmodule Loopctl.Delivery.Escalations do
     # route's `role: :user` plug, so a SESSION could POST `to: queued` on any escalated story:
     # the claim was released, the epoch bumped, the implementer's live credential and its
     # whole subtree revoked, the story re-contracted — and only THEN did `Stages.human?/1`
-    # (`lib/loopctl/delivery/stages.ex:1127-1130`, which requires `actor_lineage == []`)
+    # (`lib/loopctl/delivery/stages.ex:1409-1412`, which requires `actor_lineage == []`)
     # refuse it. The caller got a refusal; the implementing agent got a dead key.
     # `LoopctlWeb.StoryEscalationController` publishes that gate's purpose to callers in its
     # `escalate` operation description — "so a session cannot escalate and then resolve its
@@ -434,6 +434,9 @@ defmodule Loopctl.Delivery.Escalations do
     )
   end
 
+  # A claim release that leaves a delivery story's row at `queued` re-contracts it too, but
+  # INSIDE the release's own transaction (`Loopctl.Delivery.Stages.recontract_released/4` ->
+  # `Loopctl.Progress.recontract_in_transaction/3`, US-44.4); this path is `resolve/3`'s only.
   # `pending -> contracted` is the only transition into the state a placement needs, and a
   # story that is somehow already `contracted` is left alone rather than refused: the operator
   # asked for a placeable story and it is one. `nil` is a resolution that released nothing.

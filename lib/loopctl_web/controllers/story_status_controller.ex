@@ -287,14 +287,26 @@ defmodule LoopctlWeb.StoryStatusController do
 
   operation(:unclaim,
     summary: "Unclaim story",
-    description: "Agent releases a story back to pending.",
+    description:
+      "Agent releases a story back to pending. A DELIVERY story whose stage row was in flight " <>
+        "does not stay pending: giving it back spent an attempt, so it is re-contracted " <>
+        "(`contracted`) below the retry ceiling `DISPATCH_MAX_ATTEMPTS`, and at the ceiling its " <>
+        "stage row is escalated over `attempts_exhausted` for a human. The story returned is " <>
+        "the story as the release left it.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story unclaimed", "application/json", Schemas.StoryStatusResponse},
       403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      422 =>
+        {"The release's story-row write or its audit entry was rejected. Nothing was " <>
+           "released and the story is unchanged.", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`audit_chain_append_failed` — the release reached the retry ceiling and the chain " <>
+           "entry its escalation must carry was refused. The WHOLE release rolled back: the " <>
+           "story is unchanged.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -595,7 +607,14 @@ defmodule LoopctlWeb.StoryStatusController do
   def unclaim(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
+    # `:actor_lineage` reaches the chain entry of an escalation the release may decide
+    # (US-44.4), so it is resolved SERVER-SIDE from the authenticating key, like every other
+    # lineage on this surface.
+    opts =
+      Keyword.merge(AuditContext.from_conn(conn),
+        agent_id: api_key.agent_id,
+        actor_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+      )
 
     case Progress.unclaim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
@@ -613,6 +632,15 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, :not_found} ->
         {:error, :not_found}
+
+      # US-44.4: the release's escalation could not append its chain entry
+      # (`Progress.unclaim_story/3`). The release rolled back; the story is unchanged.
+      # FallbackController renders it as its own 500.
+      {:error, :audit_chain_append_failed} = error ->
+        error
+
+      {:error, %Ecto.Changeset{}} = error ->
+        error
     end
   end
 

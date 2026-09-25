@@ -28,20 +28,21 @@ defmodule Loopctl.Delivery.DispatchDriver do
   is the part that cannot starve a story, and it is what
   `Loopctl.Workers.TriageTriggerWorker.candidates/0` already uses.
 
-  A candidate must also be `contracted`. The stage row alone is not enough: every release
-  path — the lease's `:runner_lost`, `place/4`'s own undo — puts the row back to `queued`
-  while setting `agent_status: :pending`, and `Placement.place/4` refuses anything that is not
-  `contracted`. Selecting on the stage alone meant a released story was selected for ever,
-  with its `updated_at` frozen at the moment of release and therefore permanently near the
-  head of an oldest-first queue: twenty of them and the driver never reached a placeable story
-  again, while every pass still reported a clean run.
+  A candidate must also be `contracted`, because `Placement.place/4` refuses anything else.
+  Every release that puts a story's row back to `queued` now re-contracts it in the same
+  transaction or escalates it (`Loopctl.Delivery.Stages.follow_release/5`, US-44.4), so a
+  released story is either a candidate again or in front of a human. The filter stays: a
+  `queued` + `:pending` story (one released before that, or by a path that has not learned it)
+  selected on the stage alone would be picked for ever, its `updated_at` frozen at the release
+  and so permanently near the head of an oldest-first queue.
 
   ## Eligibility is decided BEFORE the claim, on all four facts
 
   A placement CLAIMS the story first and `Runners.dispatch/3` answers `:ok` the moment it
   broadcasts, so anything discovered after that point is not a refusal the driver can undo —
-  it is a story stranded at `claimed` until its lease expires, and then `queued` +
-  `:pending`, which nothing re-contracts. So a runner is eligible only when it is
+  it is a story stranded at `claimed` until its lease expires — a counted release that spends
+  one of the story's attempts on a run that never happened. So a runner is eligible only when
+  it is
 
     * CONNECTED (Phoenix Presence, keyed by machine name),
     * not DRAINING, accepts the story's REPO, and does the dispatch KIND — the three facts on

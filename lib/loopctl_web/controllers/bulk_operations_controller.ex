@@ -66,7 +66,11 @@ defmodule LoopctlWeb.BulkOperationsController do
     responses: %{
       200 => {"Results", "application/json", Schemas.BulkResultResponse},
       422 => {"Invalid input", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`audit_chain_append_failed` — a story's release reached the retry ceiling and the " <>
+           "chain entry its escalation must carry was refused, so the WHOLE batch rolled " <>
+           "back: no story in it changed.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -200,6 +204,11 @@ defmodule LoopctlWeb.BulkOperationsController do
 
         {:error, :batch_too_large} ->
           {:error, :unprocessable_entity, "Maximum batch size is 50 stories"}
+
+        # The batch rolled back: a release's escalation could not append its chain entry
+        # (US-44.4). FallbackController renders it, as it does for the single-story reject.
+        {:error, :audit_chain_append_failed} = error ->
+          error
       end
     end
   end

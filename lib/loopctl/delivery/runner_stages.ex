@@ -198,6 +198,7 @@ defmodule Loopctl.Delivery.RunnerStages do
           | :capacity_busy
           | :rejected_by_database
           | {:invalid, [String.t()]}
+          | :release_failed
           | {:release_refused, [atom()]}
 
   @doc """
@@ -274,6 +275,12 @@ defmodule Loopctl.Delivery.RunnerStages do
   defp counts_toward_retry_ceiling("usage_exhausted"), do: false
   defp counts_toward_retry_ceiling(_reason), do: nil
 
+  # The release's `:cause`, from the SAME function as the ledger's flag. Only a `false` spends
+  # nothing; a budget kill's `nil` is moot, its row already escalated.
+  defp release_cause(reason) do
+    if counts_toward_retry_ceiling(reason) == false, do: :usage_exhausted, else: :attempt
+  end
+
   defp log_recorded(:recorded, tenant_id, runner_id, session, message) do
     Logger.info(
       "runner session ended: reason=#{message.reason} tenant_id=#{tenant_id} " <>
@@ -323,7 +330,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   defp release_claim(tenant_id, runner_id, actor_id, session, reason) do
     case Progress.release_ended_session(tenant_id, session.story_id, session.claim_epoch,
            session_reason: reason,
-           counted?: counts_toward_retry_ceiling(reason) != false,
+           cause: release_cause(reason),
            actor_id: actor_id,
            actor_label: "runner:" <> runner_id
          ) do
@@ -338,8 +345,25 @@ defmodule Loopctl.Delivery.RunnerStages do
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, {:release_refused, Keyword.keys(changeset.errors)}}
 
+      # The release rolled back whole (US-44.4): its escalation could not append its chain
+      # entry. `end_error/0`'s, and `LoopctlWeb.RunnerChannel.Refusal` names it.
+      {:error, :audit_chain_append_failed} ->
+        {:error, :audit_chain_append_failed}
+
+      # A reason `Progress.release_ended_session/4` gains later must not crash the channel every
+      # session on the machine shares, and must not widen `end_error/0` to `atom()` either —
+      # that is what let this drift unseen. It is logged as it came and answered as the one
+      # enumerated `:release_failed`.
       {:error, reason} ->
-        {:error, reason}
+        Logger.error(
+          "session_ended release refused with a reason RunnerStages does not name: " <>
+            "#{inspect(reason)}; answered :release_failed. tenant_id=#{tenant_id} " <>
+            "story_id=#{session.story_id}",
+          tenant_id: tenant_id,
+          story_id: session.story_id
+        )
+
+        {:error, :release_failed}
     end
   rescue
     # Runs in the runner channel's process: a raise here would take down the socket every

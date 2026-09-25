@@ -186,6 +186,38 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorkerTest do
     end
   end
 
+  describe "candidates/2" do
+    # #877 review round 2, finding 2. Ranked oldest lease first ACROSS tenants, a tenant whose
+    # releases keep failing (a broken chain refuses every one) kept its oldest leases at the
+    # head of every run, and with more of them than the batch it starved every other tenant's
+    # reclaim for good. Ranked within each tenant, every tenant's oldest is taken before any
+    # tenant's second.
+    test "one tenant's older leases cannot fill the batch ahead of another tenant's" do
+      stuck = fixture(:tenant)
+      other = fixture(:tenant)
+      now = DateTime.utc_now()
+
+      stuck_ids =
+        for age <- [3_600, 3_000, 2_400] do
+          %{story: story} = claimed_story(stuck)
+          force(story, claimed_until: DateTime.add(now, -age, :second)).id
+        end
+
+      %{story: waiting} = claimed_story(other)
+      waiting = force(waiting, claimed_until: DateTime.add(now, -60, :second))
+
+      # A limit smaller than the stuck tenant's backlog: ranked globally, both slots are its.
+      assert [first, second] =
+               now
+               |> ReclaimExpiredClaimsWorker.candidates(2)
+               |> Enum.filter(&(&1.tenant_id in [stuck.id, other.id]))
+
+      assert {first.tenant_id, first.id} == {stuck.id, hd(stuck_ids)}
+      assert {second.tenant_id, second.id} == {other.id, waiting.id}
+      assert second.claim_epoch == waiting.claim_epoch
+    end
+  end
+
   describe "a story handed to review" do
     defp in_review(tenant) do
       %{story: story, agent: agent} = claimed_story(tenant)

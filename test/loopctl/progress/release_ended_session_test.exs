@@ -46,13 +46,13 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     %{tenant_id: tenant.id, story: claimed, row: row}
   end
 
-  defp release(ctx, reason \\ "crashed", epoch \\ nil, counted? \\ true) do
+  defp release(ctx, reason \\ "crashed", epoch \\ nil, cause \\ :attempt) do
     Progress.release_ended_session(
       ctx.tenant_id,
       ctx.story.id,
       epoch || ctx.story.claim_epoch,
       session_reason: reason,
-      counted?: counted?,
+      cause: cause,
       actor_id: @actor_id,
       actor_label: "runner:test"
     )
@@ -72,7 +72,9 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
 
     assert {:ok, released} = release(ctx)
 
-    assert released.agent_status == :pending
+    # Released, and — a delivery story under the retry ceiling — RE-CONTRACTED in the same
+    # transaction, so the driver places it again rather than it sitting unreachable (US-44.4).
+    assert released.agent_status == :contracted
     assert released.assigned_agent_id == nil
     assert released.claimed_until == nil
     assert released.claim_epoch == ctx.story.claim_epoch + 1
@@ -86,12 +88,12 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
   end
 
   test "the CALLER decides whether the re-queue spends an attempt, whatever the reason" do
-    # `counted?: false` is what `RunnerStages` passes for `usage_exhausted`. Asserted on a
-    # `crashed` release on purpose: the flag is the caller's, and nothing here re-derives it
+    # `cause: :usage_exhausted` is what `RunnerStages` passes for `usage_exhausted`. Asserted on a
+    # `crashed` release on purpose: the cause is the caller's, and nothing here re-derives it
     # from the reason.
     ctx = claimed_at(:implementing)
 
-    assert {:ok, _released} = release(ctx, "crashed", nil, false)
+    assert {:ok, _released} = release(ctx, "crashed", nil, :usage_exhausted)
 
     row = AdminRepo.get!(StoryStage, ctx.row.id)
     assert row.stage == :queued
@@ -198,7 +200,7 @@ defmodule Loopctl.Progress.ReleaseEndedSessionTest do
     assert {:error, :not_found} =
              Progress.release_ended_session(other.id, ctx.story.id, ctx.story.claim_epoch,
                session_reason: "crashed",
-               counted?: true,
+               cause: :attempt,
                actor_id: @actor_id,
                actor_label: "runner:test"
              )

@@ -975,7 +975,9 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
         {:error, :bad_request, "orchestrator key is not linked to an agent"},
         {:error, :not_found},
         {:error, invalid_story_changeset()},
-        {:error, :force_unclaim_failed}
+        {:error, :force_unclaim_failed},
+        # #877 review round 2, finding 5: the `:stage` refusal.
+        {:error, :audit_chain_append_failed}
       ]
 
       rendered = Enum.map(shapes, &LoopctlWeb.FallbackController.call(build_conn(), &1))
@@ -992,7 +994,13 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
 
       # The shapes really do reach four DIFFERENT statuses — otherwise one undocumented
       # number could hide behind three documented ones.
-      assert Enum.sort(statuses) == [400, 404, 422, 500]
+      assert statuses |> Enum.uniq() |> Enum.sort() == [400, 404, 422, 500]
+
+      # Each 500 is its OWN code, not the last clause's anonymous `internal_error`.
+      assert rendered
+             |> Enum.filter(&(&1.status == 500))
+             |> Enum.map(&Jason.decode!(&1.resp_body)["error"]["code"]) ==
+               ~w(force_unclaim_failed audit_chain_append_failed)
 
       for status <- statuses do
         assert status in documented,

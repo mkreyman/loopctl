@@ -110,7 +110,8 @@ auto-reset), `bulk_operations.ex:610` (bulk reject).
 
 | release cause | outcome | spends an attempt |
 |---|---|---|
-| placement refusal (`undo_claim/5`) | re-contract | no — the runner refused before any work |
+| placement refusal, runner unavailable or the claim ended under it (`undo_claim/5`) | re-contract | no — the runner refused before any work, and may be free next pass; a revoked runner credential is the runner's problem, not the story's, and the channel's authorization recheck drops the runner; a claim that ended is a race the next pass does not meet |
+| any other placement refusal (`undo_claim/5`) | re-contract, or escalate at the ceiling | yes — uncounted it loops every pass; each pass mints a fresh `dispatch_id`, so a ledger fence is never another pass getting there first |
 | `usage_exhausted` (44.3) | re-contract | no |
 | lease expiry, `crashed` | re-contract, or escalate at the ceiling | yes |
 | verifier reject, bulk reject | re-contract, or escalate at the ceiling | yes — the work was wrong |
@@ -118,14 +119,14 @@ auto-reset), `bulk_operations.ex:610` (bulk reject).
 
 The release paths cannot tell these apart today — placement refusal, operator force-unclaim and
 the reject auto-reset all pass `:claim_released` — so `force_unclaim_story/3` gains
-`release_cause:` and `Placement.undo_claim/5` passes `:placement_refused`. A reject of a row already
+`release_cause:` and `Placement.undo_claim/5` passes `:placement_refused` or `:attempt` by what refused. A reject of a row already
 past `ci` only rebinds it (`stages.ex:984-988`) and keeps today's behaviour. The ceiling is spend, so it follows #875: `DISPATCH_MAX_ATTEMPTS` has **no default**; unset means
 a ceiling of 0 (escalate on the first crash, never spend twice). `Stages` already counts attempts per edge (`stages.ex:1080-1093`); the
 ceiling counts `runner_lost` and in-flight rejects only. Escalation takes a NEW control-only edge
 `{queued, escalated, :attempts_exhausted}` with its own reason code, so the escalated queue tells
-a spend ceiling apart from a session asking for Mark (`:session_escalated`). Re-contracting reuses
-`Escalations`' existing re-contract step (`escalations.ex:436`), made public, rather than a second
-writer of `agent_status`.
+a spend ceiling apart from a session asking for Mark (`:session_escalated`). Re-contracting is a
+guarded step inside the release's own transaction (`Progress.recontract_in_transaction/3`), writing
+the audit entry and webhook `contract_story/4` writes from the same builders.
 
 ### 44.5 The claim lease follows the dispatch, with an absolute cap (#879)
 

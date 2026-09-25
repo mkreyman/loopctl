@@ -4596,7 +4596,11 @@ const TOOLS = [
     name: "reject_story",
     description:
       "Orchestrator rejects a story with a reason. " +
-      "Creates a verification_result with result=fail. Uses the ORCH key.",
+      "Creates a verification_result with result=fail. Uses the ORCH key. " +
+      "The reject releases the claim, and a delivery story may be re-contracted or escalated " +
+      "in the same transaction. A 500 `audit_chain_append_failed` (the escalation's chain " +
+      "entry was refused) means the WHOLE call rolled back: the story is unchanged, and a " +
+      "re-run meets the same server-side condition until an operator acts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8233,12 +8237,13 @@ const TOOLS = [
       "Two things happen: the story resets to `agent_status: pending` with " +
       "`assigned_agent_id` cleared, AND — in the same transaction — its delivery stage row " +
       "follows the release back to `queued`.\n\n" +
-      "IT FREES THE STAGE; IT DOES NOT MAKE THE STORY PLACEABLE. place_dispatch wants " +
-      "`agent_status: contracted` AND stage `queued` (`Placement.claimable/2`), and the " +
-      "release leaves the story at `pending`, whose only transition is `pending -> " +
-      "contracted`. Run place_dispatch straight after this one and you get back the IDENTICAL " +
-      "409 `invalid_transition`. THE REMEDY IS THREE CALLS, in this order: " +
-      "force_unclaim_story, then contract_story, then place_dispatch.\n\n" +
+      "A DELIVERY STORY THEN GOES TO `escalated`, NOT BACK TO THE QUEUE (loopctl US-44.4). An " +
+      "operator taking a story back is a human decision, so when the release leaves the stage " +
+      "row at `queued` loopctl escalates it over `operator_released` in the same transaction — " +
+      "it never sits at `queued` + `pending`, which no placement takes. It spends no attempt " +
+      "against the retry ceiling. To put it back to work, call resolve_escalation with " +
+      "`to: queued`: that releases (a no-op now) AND re-contracts, so the story is placeable " +
+      "again. A story with no delivery stage row is simply left `pending`, as before.\n\n" +
       "WHEN TO REACH FOR IT. A story sitting at `claimed` with nobody on it is the residue of " +
       "a compensation that did not complete — it is NOT what a refused dispatch normally " +
       "leaves. Placement answers a runner's refusal INLINE by releasing the claim itself " +
@@ -8259,11 +8264,18 @@ const TOOLS = [
       "A REGISTERED AGENT — an unlinked one is refused 400 naming that — and the tenant must be " +
       "human-anchored (403 `custody_tier_required` otherwise). 404 for an unknown story, 429 " +
       "when rate limited. A `story_id` that is not a UUID is refused here, before any call.\n\n" +
-      "It does NOT touch `verified_status`, and it is safe to run twice: on an already-pending " +
-      "story the stage row is written only when it needs to be — a row STRANDED behind the " +
-      "story's claim epoch is rebound to it (the remedy for a row an older release left " +
-      "behind) and an in-flight row is requeued, while a row already at that epoch is left " +
-      "exactly as it is. It takes no request body.",
+      "It does NOT touch `verified_status`. RUN AGAIN on an already-pending story, it is still " +
+      "an operator's release and does what one does: a row STRANDED behind the story's claim " +
+      "epoch is rebound to it (the remedy for a row an older release left behind), an " +
+      "in-flight row is requeued, and a row that is then at `queued` — including one that was " +
+      "already sitting there — is ESCALATED over `operator_released`, like the first run. A " +
+      "row already escalated, or anywhere else at that epoch, is left exactly as it is. EVERY " +
+      "500 means the whole release rolled back and the story is still claimed: " +
+      "`audit_chain_append_failed` (the escalation's chain entry was refused) is a " +
+      "server-side condition a re-run meets again until an operator acts; " +
+      "`force_unclaim_failed` (the " +
+      "server log names the step) is remedied by calling it again. A 422 means the release " +
+      "write itself was rejected. It takes no request body.",
     inputSchema: {
       type: "object",
       properties: {

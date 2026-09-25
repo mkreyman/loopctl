@@ -193,6 +193,16 @@ case System.get_env("DISPATCH_MAX_TURNS") && Integer.parse(System.get_env("DISPA
   _ -> :ok
 end
 
+# US-44.4: how many counted releases (a lost lease, a crashed session, a verifier reject) a
+# story may take and still be re-queued; reaching it escalates the story for a human. NO
+# DEFAULT, like the budgets above: unset or malformed leaves the key out, which
+# `Loopctl.Delivery.RetryCeiling.max_attempts/0` reads as 0 — escalate on the first counted
+# release, never spend twice on a number nobody chose. 0 is also a valid explicit value.
+case Loopctl.Delivery.RetryCeiling.parse(System.get_env("DISPATCH_MAX_ATTEMPTS")) do
+  {:ok, attempts} -> config :loopctl, :dispatch_max_attempts, attempts
+  :unset -> :ok
+end
+
 # #803 §4: the TRIAGE session's own budgets, separate from the implement ones because a triage
 # session reads a ticket and answers — a fraction of an implement run — and inheriting the
 # implement numbers would hand a reading session a day of wall clock. No default, same policy.

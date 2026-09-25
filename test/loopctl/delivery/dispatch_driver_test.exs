@@ -95,24 +95,43 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   end
 
   describe "candidates/1 — the states a stage row alone cannot tell apart" do
-    test "a RELEASED story is not a candidate, however long it sits at queued", ctx do
+    test "a released story is never left queued and uncontracted (#877)", ctx do
       story = bind_repo(ctx, queued_story(ctx))
       assert story.id in candidate_ids(50)
 
-      # What every release does — the lease's `:runner_lost`, and `place/4`'s own undo on a
-      # push refusal: the stage row goes back to `queued` and `agent_status` becomes
-      # `:pending`. `Placement.place/4` refuses anything that is not `contracted`, and nothing
-      # in lib/ re-contracts a story, so on the stage row alone this story was selected for
-      # ever — with its `updated_at` frozen at the release, i.e. permanently at the head of an
-      # oldest-first queue. Twenty of them and the driver never reached a placeable story
-      # again, while every pass still reported a clean run.
+      # Before US-44.4 every release — the lease's `:runner_lost`, `place/4`'s own undo on a
+      # push refusal, an operator's force-unclaim — put the stage row back at `queued` with
+      # `agent_status: :pending`. `Placement.place/4` refuses anything that is not
+      # `contracted`, and nothing re-contracted it, so the story was unreachable: never a
+      # candidate, never an alert.
+      #
+      # An OPERATOR'S release is a human decision, so the story goes in front of a human —
+      # escalated, and so not a candidate, for a reason the escalated queue names.
       unboxed(fn ->
         {:ok, _} = Progress.force_unclaim_story(ctx.tenant.id, story.id, actor_label: "test")
       end)
 
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :queued
-      assert unboxed(fn -> reload(ctx.tenant.id, story.id) end).agent_status == :pending
+      row = unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end)
+      assert {row.stage, row.attempts["operator_released"]} == {:escalated, 1}
       refute story.id in candidate_ids(50)
+    end
+
+    test "a placement the runner refused puts the story straight back in the queue", ctx do
+      story = bind_repo(ctx, queued_story(ctx))
+
+      # `Placement.undo_claim/5`'s release: nothing was spent, so it is re-contracted and is a
+      # candidate again on the very next pass.
+      unboxed(fn ->
+        {:ok, _} =
+          Progress.force_unclaim_story(ctx.tenant.id, story.id,
+            actor_label: "test",
+            release_cause: :placement_refused
+          )
+      end)
+
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(ctx.tenant.id, story.id) end).agent_status == :contracted
+      assert story.id in candidate_ids(50)
     end
 
     test "the bound is shared FAIRLY: every tenant's oldest before any tenant's second", ctx do

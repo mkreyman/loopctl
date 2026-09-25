@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-44.4.1",
-      "description": "force_unclaim_story/3 accepts release_cause: :placement_refused | :operator (default :operator), and Placement.undo_claim/5 passes :placement_refused."
+      "description": "force_unclaim_story/3 accepts release_cause: :placement_refused | :attempt | :operator (default :operator), and Placement.undo_claim/5 passes :placement_refused when the runner was unavailable (not connected, at capacity, a lock not granted, its credential no longer authorized) or the claim ended under the placement (stale claim epoch), and :attempt for every other refusal (a payload the contract rejects, a story it could not attach, a dispatch_id the ledger already holds or already answered — each pass mints a fresh one, so that is never a concurrent pass)."
     },
     {
       "id": "AC-44.4.2",
@@ -180,9 +180,9 @@
   ],
   "technical_notes": [
     "follow_release/5 callers: progress.ex:1189, :1637, :2931, :3601; bulk_operations.ex:610. force_unclaim_multi and the reject auto-reset both pass :claim_released today, so the cause must be threaded in",
-    "Counting: Stages.transition_update already counts attempts per edge (stages.ex:1080-1093); the ceiling counts runner_lost plus in-flight rejects, never placement_refused or operator releases",
+    "Counting: Stages.transition_update already counts attempts per edge (stages.ex:1080-1093); the ceiling counts runner_lost plus claim_released from in-flight rejects, the claimant's own unclaim (a session that always gives the story back must not loop for ever, and sending it to a human is not a custody bypass) and a placement refusal that recurs every pass; never a placement the runner was unavailable for, or an operator release",
     "A reject whose row is past ci (merged, deployed) only rebinds the row (stages.ex:984-988); that path keeps today's behaviour and is out of scope",
-    "Re-contract through Escalations' recontract step (escalations.ex:436), made public; never a second writer of agent_status",
+    "Re-contract as a guarded pending -> contracted step inside the release's own transaction (Progress.recontract_in_transaction/3), writing the audit entry and webhook contract_story/4 writes from the same builders; contract_story/4 itself is unchanged",
     "New control-only edges {queued, escalated, :attempts_exhausted} and {queued, escalated, :operator_released} in StageMachine and the contract",
     "DISPATCH_MAX_ATTEMPTS: row in deploy/FLY_SECRETS.md, no default; one reader function used by runtime config and by the worker, so the unset case is tested through the same reader the worker calls",
     "Tests never Application.put_env; the configured value in config/test.exs is 2"

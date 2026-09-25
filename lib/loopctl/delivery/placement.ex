@@ -1494,10 +1494,15 @@ defmodule Loopctl.Delivery.Placement do
   # the hash chain for the undo path — and `Progress` reads the lineage as
   # `Keyword.get(opts, :actor_lineage, [])`, so omitting it recorded the placement caller's
   # compensation as the tenant operator's act.
+  #
+  # `release_cause:` (US-44.4, #877) is never the operator default: that escalates the story
+  # for a human, and before it existed the story sat at `queued` + `:pending`, which no
+  # placement ever takes. Which of the two undo causes is `release_cause/1`'s call.
   defp release_claim(tenant_id, story_id, reason, actor_lineage, opts) do
     case Progress.force_unclaim_story(tenant_id, story_id,
            actor_label: Keyword.get(opts, :actor_label),
-           actor_lineage: actor_lineage
+           actor_lineage: actor_lineage,
+           release_cause: release_cause(reason)
          ) do
       {:ok, _story} -> :ok
       other -> log_release_failure(tenant_id, story_id, reason, other)
@@ -1505,6 +1510,53 @@ defmodule Loopctl.Delivery.Placement do
   rescue
     error -> log_release_failure(tenant_id, story_id, reason, error)
   end
+
+  # WHETHER THE REFUSAL SPENT AN ATTEMPT, decided by what refused (#877 review round 1,
+  # finding 3). The RUNNER being unavailable for this dispatch — gone, not the sole socket,
+  # at capacity, the tenant at its admission limit, a lock not granted, the tenant halted — is
+  # a state the next pass may not find, so the undo spends nothing (`:placement_refused`) and
+  # the story is re-contracted for it. EVERYTHING ELSE recurs on every pass for this story —
+  # a payload the contract rejects, a story that could not be attached, a kind the runner does
+  # not do — and uncounted it was placed, refused and released every pass for ever, a chain
+  # entry each time. So it counts (`:attempt`) and the retry ceiling puts it in front of a
+  # human.
+  #
+  # An allowlist of the transient ones, not of the deterministic ones: a refusal nobody has
+  # classified yet is bounded by the ceiling rather than looping.
+  #
+  # Two more are here because the production ceiling is 0, so counted, ONE occurrence
+  # escalates a story to a human (#877 review round 2). Neither is anything in the story:
+  #
+  #   * `:stale_claim_epoch` — the claim this dispatch was built for ended under it (a lease
+  #     reclaim, an operator's force-unclaim) before the ledger read the epoch. A race the next
+  #     pass, claiming afresh, does not meet again.
+  #   * `:not_authorized` — the RUNNER's credential stopped being valid between the pool read
+  #     and the push (revoked, re-enrolled): a problem with the runner, not the story. Bounded
+  #     without counting because the runner channel re-checks its authorization every
+  #     `@recheck_interval_ms` (`LoopctlWeb.RunnerChannel`) and disconnects, which drops the
+  #     runner from Presence, so a later pass meets `:runner_not_connected` instead.
+  #
+  # `:dispatch_already_replied` and `:dispatch_id_conflict` are NOT here: every pass mints a
+  # fresh `dispatch_id`, so neither can be another pass having got there first. They say
+  # something about this dispatch, and they count.
+  @runner_unavailable [
+    :runner_not_connected,
+    :runner_ambiguous,
+    :runner_at_capacity,
+    :admission_limit_reached,
+    :capacity_busy,
+    :busy,
+    :tenant_halted,
+    :stale_claim_epoch,
+    :not_authorized
+  ]
+
+  @doc false
+  # Public only so `test/loopctl/delivery/placement_test.exs` can hold every entry of the
+  # allowlist above against a table of its own; `release_claim/5` is the one caller.
+  @spec release_cause(term()) :: :placement_refused | :attempt
+  def release_cause(reason) when reason in @runner_unavailable, do: :placement_refused
+  def release_cause(_recurs_every_pass), do: :attempt
 
   defp log_release_failure(tenant_id, story_id, reason, outcome) do
     Logger.error(

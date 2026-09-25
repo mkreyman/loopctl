@@ -247,20 +247,17 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  * from any stage a claim holds (`claimed`, `worktree`, `implementing`, `reviewing`, `pr_open`,
  * `ci`) back to `queued`, rebound to the new claim epoch.
  *
- * ## IT FREES THE STAGE. IT DOES NOT MAKE THE STORY PLACEABLE.
+ * ## A DELIVERY STORY GOES TO `escalated`, NOT BACK TO THE QUEUE
  *
- * This comment used to say the second half was "what makes the story PLACEABLE again", and
- * that is false. `Placement.claimable/2` (`placement.ex:482-490`) wants `agent_status ==
- * :contracted` AND stage `queued`; the release leaves the story at `:pending`, and
- * `@valid_transitions` (`progress.ex:3480`) has `pending: :contracted` and nothing else — so
- * `place_dispatch` run straight afterwards answers the IDENTICAL 409 `invalid_transition`.
+ * An operator taking a story back is a human decision (loopctl US-44.4, #877), so when the
+ * release leaves the delivery stage row at `queued`, `Stages.follow_release/5` escalates it over
+ * the control-only `{queued, escalated, operator_released}` edge in the same transaction. It
+ * spends no attempt against the retry ceiling. The story is never left at `queued` + `pending`,
+ * which `Placement.claimable/2` refuses and nothing re-contracted.
  *
- * The remedy is THREE CALLS, in this order, and the tool descriptions say so:
- * `force_unclaim_story`, then `contract_story`, then `place_dispatch`. (An earlier draft called
- * it "two steps" and then named three, which is worse than saying nothing: an operator counting
- * steps runs two of the three and takes the 409 this copy exists to prevent.)
- * (`resolve_escalation` is the one that does both for you: `Escalations.prepare_story/5`
- * releases AND re-contracts on the `queued` route, `escalations.ex:335-342`.)
+ * To put it back to work: `resolve_escalation` with `to: queued`, which releases (a no-op by
+ * then) AND re-contracts (`Escalations.prepare_story/6`). A story with no stage row is simply
+ * left `pending`, exactly as before.
  *
  * ## WHEN A STORY IS ACTUALLY PARKED
  *
