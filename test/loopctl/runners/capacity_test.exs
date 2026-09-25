@@ -1303,6 +1303,32 @@ defmodule Loopctl.Runners.CapacityTest do
       assert record(runner, live.dispatch_id).released_at == nil
     end
 
+    test "a SHORTER resumed push does not free the slot of the session the longer one started" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 3_600})
+      {:ok, _} = send_dispatch(runner, d)
+      assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, d) end) == {:ok, :pushed}
+
+      # A resume: re-sent, which clears the delivery, then pushed with a shorter clock.
+      shorter = %{d | wall_clock_seconds: 600}
+      {:ok, _} = send_dispatch(runner, shorter)
+
+      assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, shorter) end) ==
+               {:ok, :pushed}
+
+      assert record(runner, d.dispatch_id).wall_clock_seconds == 600
+      {:ok, _} = reply(runner, d, %{})
+
+      # Past the SHORTER clock and the grace, well inside the longer one.
+      grace = Capacity.release_grace_seconds()
+
+      force_dispatch(runner, d.dispatch_id,
+        replied_at: DateTime.add(DateTime.utc_now(), -(600 + grace + 60))
+      )
+
+      assert heal(runner) == {:ok, %{released: 0, in_flight: 1}}
+    end
+
     test "releases a PUSHED dispatch the runner never answered, on the reply grace" do
       runner = runner(%{max_sessions: 3})
       # A wall clock far longer than the reply grace: a push that did not land — a stamp whose

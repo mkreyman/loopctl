@@ -144,6 +144,19 @@ describe("place_dispatch", () => {
     assert.equal(declared[1], '["implement"]');
   });
 
+  // #879 (US-44.5 review round 3): a retry moves the claim's deadline, and a retry of a
+  // dispatch whose claim has ended is refused — the description is where a session learns both.
+  test("the description names the retry's deadline move and 409 dispatch_claim_ended", () => {
+    const start = INDEX_SRC.indexOf('name: "place_dispatch"');
+    const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+    assert.match(declaration, /A RETRY also moves the claim's deadline/);
+    assert.match(declaration, /409 `dispatch_claim_ended`/);
+
+    const row = README.split("\n").find((line) => line.startsWith("| `place_dispatch` |"));
+    assert.match(row, /409 `dispatch_claim_ended`/);
+  });
+
   test("refuses without a user key, and without either id — before any call", async () => {
     // The endpoint mints a custody dispatch and claims a story, so an agent key is refused
     // `insufficient_role` by the server anyway; saying so here costs no round trip and says

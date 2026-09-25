@@ -159,6 +159,21 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
       end
     end
 
+    # #879 (US-44.5 review round 3): a RESUME of a dispatch whose claim has ended is refused by
+    # `Placement` itself, before any push — a conflict with the claim's state, never a 500.
+    test "a resume of an ended claim renders 409 dispatch_claim_ended" do
+      conn =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          :dispatch_claim_ended
+        )
+
+      assert conn.status == 409
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["code"] == "dispatch_claim_ended"
+      assert body["error"]["message"] =~ "NEW dispatch_id"
+    end
+
     test "the BUILDER's refusals render too, and they are tuples" do
       # The shape the fallback cannot render at all. Its catch-all is
       # `{:error, reason} when is_atom(reason)`, so a TUPLE matches no clause and the request

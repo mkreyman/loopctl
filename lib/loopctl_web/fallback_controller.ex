@@ -28,6 +28,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
   - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
   - `{:error, :not_claimed}` -> 422 (#803: renew-claim on a story that is not assigned or implementing)
+  - `{:error, :lease_cap_reached}` -> 409 (#879: renew-claim on a driver-placed claim whose `claim_lease_cap` has passed; no renewal can extend it)
   - `{:error, :stale_stage}` -> 409 (#803: the delivery stage row is not where the caller believed; the CLAIM is still good, unlike `stale_claim_epoch`)
   - `{:error, :unknown_story_stage}` -> 404 (#803: the story has no `story_stages` row, so it is not in the delivery loop)
   - `{:error, :busy}` -> 503 with `Retry-After` (#803: a delivery-stage write gave up waiting on a lock; nothing was written)
@@ -330,6 +331,23 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "Only the story's assigned agent can do this, and your key's agent is not it. " <>
             "Renewing a claim and escalating a story are both the claimant's."
+      }
+    })
+  end
+
+  def call(conn, {:error, :lease_cap_reached}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "lease_cap_reached",
+        message:
+          "This claim was placed for a runner dispatch and has reached its lease cap " <>
+            "(claim_lease_cap). No renewal extends a claim past its cap, so nothing was " <>
+            "renewed, and this refusal releases nothing: the claim's lease ended at the cap, " <>
+            "and the reclaim sweep releases the story — unless review has been requested on " <>
+            "it, which the sweep skips. Stop working it."
       }
     })
   end

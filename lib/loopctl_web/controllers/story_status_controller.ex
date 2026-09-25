@@ -123,10 +123,20 @@ defmodule LoopctlWeb.StoryStatusController do
         "(POST /stories/:id/renew-claim; default lease 24 hours, `STORY_CLAIM_LEASE_SECONDS`), " <>
         "and `claim_epoch` is incremented by this claim and by every release. Keep the " <>
         "epoch: renew-claim requires it, and start/report refuse a stale one with " <>
-        "409 `stale_claim_epoch`.",
+        "409 `stale_claim_epoch`. The story also carries `claim_lease_cap`: null on a claim " <>
+        "taken here, and on a claim a PLACEMENT took for a runner dispatch its dispatch " <>
+        "deadline, which such a claim's `claimed_until` always equals: no renewal moves it " <>
+        "(renew-claim answers the claim as it stands, and 409 `lease_cap_reached` once the " <>
+        "cap has passed). It is placed_at + `wall_clock_seconds` + " <>
+        "`DISPATCH_LEASE_GRACE_SECONDS`, and moves only forward, only while the claim is " <>
+        "live: to a resume's time or the runner's acceptance + `wall_clock_seconds` + the " <>
+        "grace.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
-      200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
+      200 =>
+        {"Story claimed. `story.claimed_until` is the lease, `story.claim_epoch` the fence, " <>
+           "and `story.claim_lease_cap` the cap bounding `claimed_until` on a placed claim " <>
+           "(null otherwise)", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"Invalid transition, dependencies not met, or `story_held` — the story's delivery " <>
@@ -315,13 +325,18 @@ defmodule LoopctlWeb.StoryStatusController do
     description:
       "The story's assigned agent extends its claim's lease: `claimed_until` becomes now " <>
         "plus the lease length (default 24 hours, `STORY_CLAIM_LEASE_SECONDS`) — measured " <>
-        "from NOW, so renewing often never banks a longer lease. A claim not renewed " <>
+        "from NOW, so renewing often never banks a longer lease. A claim a placement took " <>
+        "for a runner dispatch carries a `claim_lease_cap` (its dispatch deadline), and its " <>
+        "`claimed_until` already IS that cap: renewing it writes nothing and answers 200 " <>
+        "with the claim as it stands. A claim not renewed " <>
         "before `claimed_until` is released back to `pending` by the reclaimer, which " <>
         "bumps `claim_epoch`. The caller must present the `claim_epoch` its claim returned. " <>
         "Refusals: 400 when `claim_epoch` is missing or not a non-negative integer; " <>
         "422 `not_claimed` when the story is not assigned or implementing; " <>
         "409 `stale_claim_epoch` when the epoch is not current (the claim has ended — " <>
-        "stop working it); 409 `not_claimant` when the caller is not the assigned agent. " <>
+        "stop working it); 409 `not_claimant` when the caller is not the assigned agent; " <>
+        "409 `lease_cap_reached` when the claim's `claim_lease_cap` is not in the future " <>
+        "(nothing is renewed — the claim ends at its cap). " <>
         "A claim made before leases existed has no `claimed_until` and is never reclaimed; " <>
         "renewing it gives it a lease.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
@@ -333,10 +348,15 @@ defmodule LoopctlWeb.StoryStatusController do
          properties: %{claim_epoch: @claim_epoch_schema}
        }},
     responses: %{
-      200 => {"Claim renewed", "application/json", Schemas.StoryStatusResponse},
+      200 =>
+        {"Claim renewed — or, for a driver-placed claim, returned as it stands with " <>
+           "`claimed_until` equal to `claim_lease_cap`", "application/json",
+         Schemas.StoryStatusResponse},
       400 => {"claim_epoch missing or malformed", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"stale_claim_epoch or not_claimant", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"stale_claim_epoch, not_claimant or lease_cap_reached", "application/json",
+         Schemas.ErrorResponse},
       422 => {"not_claimed", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }

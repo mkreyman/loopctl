@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.103.2 — 2026-09-23 (a driver-placed claim says where it ends)
+
+### Changed
+
+- **`renew_story_claim`** now says that a driver-placed claim — one a placement took for a
+  runner dispatch — is capped at its dispatch deadline (loopctl epic 44, US-44.5, #879): its
+  `claimed_until` already is `claim_lease_cap`, so renewing it writes nothing and returns the
+  claim as it stands, and once the cap has passed the server answers 409 `lease_cap_reached`
+  instead. The lease notice on a `claim_story` or `renew_story_claim` result names that cap
+  when the server returns one.
+- **`place_dispatch`** now says that a retry moves the claim's deadline to now + its
+  `wall_clock_seconds` + the grace, and names the new 409 `dispatch_claim_ended`: a retry of
+  a `dispatch_id` whose claim has ended is refused, nothing pushed, and needs a new
+  `dispatch_id`.
+
 ## 2.103.1 — 2026-09-23 (an operator's force-unclaim escalates a delivery story)
 
 ### Changed

@@ -30,8 +30,12 @@ defmodule Loopctl.Runners.DispatchRecord do
   `delivery` is the reservation's ONE decision, taken under the row lock by whichever of the
   two processes a broadcast wakes gets there first: `"pushed"` (the dispatch went to a
   socket) or `"dropped"` (a channel refused to push it and gave the slot back). It is reset
-  with every reservation, and `wall_clock_seconds` is refreshed when a push wins, so the
-  bound `Loopctl.Runners.Capacity` applies is always the clock the session is running under.
+  with every reservation, and `wall_clock_seconds` is refreshed when a push wins.
+  `wall_clock_seconds_max` is the LONGEST clock any winning push carried and only grows, and it
+  is the bound: `Loopctl.Runners.Capacity` presumes an accepted session running until
+  `replied_at` plus it (falling back to `wall_clock_seconds` on a row that has none), and the
+  acceptance re-anchors a placed claim's lease cap on the same value (#879) — because a resume
+  may push a shorter clock while a session an earlier push started is still running.
 
   ## Session end (since contract 1.16.0)
 
@@ -78,6 +82,7 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :run_id, :binary_id
     field :trace_acked_seq, :integer, default: -1
     field :wall_clock_seconds, :integer
+    field :wall_clock_seconds_max, :integer
     field :released_at, :utc_datetime_usec
     field :reserved_at, :utc_datetime_usec
     field :slot_generation, :integer, default: 0

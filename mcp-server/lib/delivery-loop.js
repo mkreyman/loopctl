@@ -60,7 +60,7 @@ function refuse(body) {
  *
  * NOT on `place_dispatch`'s `dispatch_id`, which is an id and is forwarded unchecked. That is a
  * decision and not an omission: it travels in the request BODY, and `Placement.place/4` casts it
- * with `fetch_uuid/2` (`lib/loopctl/delivery/placement.ex:786-791`) as the second clause of its
+ * with `fetch_uuid/2` (`lib/loopctl/delivery/placement.ex:1631-1636`) as the second clause of its
  * `with` — before the caller is resolved, before anything is minted and before the claim — so a
  * malformed one answers `422 invalid_payload` with `details: ["dispatch_id: must be a UUID"]`
  * (`lib/loopctl_web/controllers/dispatch_placement_controller.ex:321-326`). That names the
@@ -87,7 +87,7 @@ function refuse(body) {
  * go find the right story. The check here can tell them apart, and does it without a round trip.
  *
  * SCOPE OF THAT TRACE. The path read end to end is force-unclaim:
- * `Progress.force_unclaim_story/3` reaches `lock_story/2` (`lib/loopctl/progress.ex:3467-3470`),
+ * `Progress.force_unclaim_story/3` reaches `lock_story/2` (`lib/loopctl/progress.ex:3902-3912`),
  * which puts `story_id` straight into a `where` against a `:binary_id` column with no cast. The
  * other verbs are NOT claimed to reach that same code. They do not need to: a shape check is
  * worth its line on any argument that is interpolated into a URL path and must be a UUID,
@@ -242,7 +242,7 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  * `POST /api/v1/stories/:id/force-unclaim`: take a story back off the agent holding it.
  *
  * TWO things happen. `force_unclaim_story/3` resets `agent_status` to `pending` and clears
- * `assigned_agent_id` (`release_claim_changes/1`, `progress.ex:1438`); then, in the SAME
+ * `assigned_agent_id` (`release_claim_changes/1`, `progress.ex:1607`); then, in the SAME
  * transaction, `Stages.follow_release/5` makes the delivery stage row follow the release —
  * from any stage a claim holds (`claimed`, `worktree`, `implementing`, `reviewing`, `pr_open`,
  * `ci`) back to `queued`, rebound to the new claim epoch.
@@ -262,10 +262,10 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  * ## WHEN A STORY IS ACTUALLY PARKED
  *
  * Not on an ordinary refusal — that path self-heals. `Placement.place/4` answers a
- * `Runners.dispatch/3` refusal INLINE with `undo_claim/5` (`placement.ex:562`, `:706-711`),
+ * `Runners.dispatch/3` refusal INLINE with `undo_claim/5` (`placement.ex:917`, `:1211`),
  * which releases the claim through this same function, unrecords the session dispatch and
  * revokes it. If that release itself fails, the claim lease is a further backstop:
- * `Progress.reclaim_expired_claim/3` (`progress.ex:1612`) releases over `:runner_lost` and
+ * `Progress.reclaim_expired_claim/3` (`progress.ex:1805`) releases over `:runner_lost` and
  * requeues the stage, swept by `ReclaimExpiredClaimsWorker` every five minutes once
  * `claimed_until` has passed.
  *

@@ -51,6 +51,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.15.0) A triage verdict message may carry `lens_verdicts` (`RunnerLensVerdict`, exactly one per lens, only beside a `verdict`, capped together by `RunnerLensVerdict.max_bytes/0`). Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies; a verdict without them escalates at triage. RE-VENDOR to send them; a 1.14.0 holder keeps working and its verdicts escalate at triage | | | | |
   | (1.16.0) A runner may say WHY an implement session ended, with the new `session_ended` message (`RunnerSessionEnded`: `dispatch_id`, `claim_epoch`, `reason` in `completed`, `wall_clock_exceeded`, `max_turns_exceeded`, `usage_exhausted`, `crashed`). A budget kill escalates the story for a human instead of waiting out the lease and being retried, a crash releases the claim at once, and an exhausted subscription releases it without spending an attempt. Recorded ONCE per dispatch: a byte-identical resend is answered `ok` with the row even after the release it caused, a different `reason` is `already_recorded`. OPTIONAL — a runner that never sends it gets exactly today's behaviour, the lease reclaim. RE-VENDOR to send it: a 1.15.0 copy has no such event, no `RunnerSessionEndedAck` and no `session_ended_burst` | | | | |
   | (1.18.0) A RELEASED STORY IS NEVER LEFT UNREACHABLE, so the row a `session_ended` ack returns after `crashed` may now be `escalated`. A counted release — a `crashed` session, a lost lease — re-contracts the story for the next placement below the retry ceiling (`DISPATCH_MAX_ATTEMPTS`, counted as `attempts.runner_lost` + `attempts.claim_released`) and escalates it at the ceiling over a new CONTROL-ONLY edge, `attempts_exhausted`, with the count in `escalation_reason`; `usage_exhausted` and a refused placement never count. A second control-only edge, `operator_released`, escalates a story an operator took back. Neither edge is runner-reportable and nothing on the wire changes shape: an `attempts` map may now carry either key. Re-vendoring is worth it for the description, not required for the wire | | | | |
+  | (1.19.0) A dispatch control PLACES may carry `deadline_at` (`RunnerDispatch.deadline_at`): an instant the runner must END THE SESSION BY — the EARLIER of its own start + `wall_clock_seconds` and `deadline_at`. It is placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS` (#879) — a RE-SEND moves it to the re-send's time + its `wall_clock_seconds` + the grace — so the time before the session starts comes out of the grace, not the wall clock; only a start-up longer than the grace shortens the session. loopctl's lease sweep never releases the claim on the story before it (an operator's force-unclaim can), so a runner that stops by it — even one cut off from control — never runs on a story the sweep released and loopctl placed again. OPTIONAL on the wire, and a 1.15.0 holder ignores it (undeclared keys are dropped) — but it is NOT PROTECTED by it: the claim is now capped at this instant whether or not the runner reads it, so a 1.15.0 runner whose start-up takes longer than the grace can still be running when the sweep releases the story. RE-VENDOR to read it | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -389,7 +390,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.18.0"
+  @version "1.19.0"
   @major 1
 
   defmodule ByteRule do
@@ -1799,9 +1800,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @ref_fields [branch: :story_unique, base_branch: :shared]
 
     # NOT refs, each for a reason that is checked elsewhere: `dispatch_id` and `story_id` are
-    # UUIDs (`format: :uuid`), `kind` is closed by an `enum`, and `repo` carries its own
-    # `owner/name` pattern. None of them reaches a git ref argument.
-    @non_ref_string_fields [:dispatch_id, :story_id, :kind, :repo]
+    # UUIDs (`format: :uuid`), `kind` is closed by an `enum`, `repo` carries its own
+    # `owner/name` pattern, and `deadline_at` is a `date-time` loopctl writes from the claim
+    # and never takes from a caller. None of them reaches a git ref argument.
+    @non_ref_string_fields [:dispatch_id, :story_id, :kind, :repo, :deadline_at]
 
     @doc """
     The fields of a dispatch whose value becomes a GIT REF, and what each one must satisfy.
@@ -1876,6 +1878,24 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           },
           max_turns: %Schema{type: :integer, minimum: 1},
           token_budget: %Schema{type: :integer, minimum: 1, nullable: true},
+          deadline_at: %Schema{
+            type: :string,
+            format: :"date-time",
+            description:
+              "Since 1.19.0, OPTIONAL. A STOP BOUND: end the session by the EARLIER of " <>
+                "your own start + `wall_clock_seconds` and this instant, whether or not " <>
+                "control is reachable. It is placed_at + `wall_clock_seconds` + " <>
+                "`DISPATCH_LEASE_GRACE_SECONDS` (a RE-SEND of the dispatch carries the " <>
+                "re-send's time + its `wall_clock_seconds` + the grace), so the time between " <>
+                "the push and your start comes out of that grace, not out of " <>
+                "`wall_clock_seconds`; only a start-up longer than the grace shortens the " <>
+                "session. loopctl's lease sweep never releases the claim on the story before " <>
+                "it — your acceptance and a re-send may move the claim later, never earlier " <>
+                "— so a session stopped by it never runs on a story the sweep released and " <>
+                "loopctl placed again. An operator can still release the claim sooner " <>
+                "(force-unclaim). Present on a dispatch control PLACED under a claim; " <>
+                "absent otherwise."
+          },
           story: RunnerStory.schema(),
           triage: RunnerTriage.schema()
         }

@@ -59,16 +59,20 @@ defmodule Loopctl.Audit do
 
   - `{:ok, %AuditLog{}}` on success
   - `{:error, changeset}` on validation failure
+
+  `repo` is `AdminRepo` unless the entry must commit or roll back with a transaction the
+  caller already holds open on another repo — `Loopctl.Repo` inside `Repo.with_tenant/2`,
+  where an `AdminRepo` insert would be a second connection outside that transaction.
   """
-  @spec create_log_entry(Ecto.UUID.t() | nil, map()) ::
+  @spec create_log_entry(Ecto.UUID.t() | nil, map(), Ecto.Repo.t()) ::
           {:ok, AuditLog.t()} | {:error, Ecto.Changeset.t()}
-  def create_log_entry(tenant_id, attrs) do
+  def create_log_entry(tenant_id, attrs, repo \\ AdminRepo) do
     changeset =
       attrs
       |> AuditLog.create_changeset()
       |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
 
-    AdminRepo.insert(changeset)
+    repo.insert(changeset)
   end
 
   @doc """

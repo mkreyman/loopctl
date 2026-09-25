@@ -595,16 +595,17 @@ defmodule Loopctl.Delivery.PlacementTest do
 
     # #877 review round 1, finding 3. A refusal that RECURS every pass — here a payload the
     # contract rejects, which `Runners.dispatch/3` casts only after the claim committed — is
-    # not the runner being unavailable. Uncounted, the driver placed it, was refused and
-    # released it on every pass for ever; counted, the retry ceiling puts it in front of a
-    # human. The `runner_not_connected` test above is the uncounted half (`attempts == %{}`).
+    # not the runner being unavailable. (`max_turns`, not `wall_clock_seconds`: US-44.5 checks
+    # the wall clock BEFORE the claim, so an oversized one never reaches a release at all.)
+    # Uncounted, the driver placed it, was refused and released it on every pass for ever;
+    # counted, the retry ceiling puts it in front of a human. The `runner_not_connected` test
+    # above is the uncounted half (`attempts == %{}`).
     test "a refusal that recurs every pass COUNTS toward the retry ceiling", ctx do
       %{runner: runner, story: story} = ctx
-      over = RunnerContract.RunnerDispatch.max_wall_clock_seconds() + 1
 
       ExUnit.CaptureLog.capture_log(fn ->
         assert {:error, {:invalid, [_ | _]}} =
-                 place(ctx, Map.put(dispatch_payload(story), "wall_clock_seconds", over))
+                 place(ctx, Map.put(dispatch_payload(story), "max_turns", 0))
       end)
 
       # Below the ceiling of 2 (config/test.exs): counted once, and back in the queue.
@@ -1359,6 +1360,278 @@ defmodule Loopctl.Delivery.PlacementTest do
     end
   end
 
+  describe "the claim's lease is capped at the dispatch deadline (#879, US-44.5)" do
+    # TC-44.5.1: wall clock 3600 (the fixture's) and grace 900 (config/test.exs), so the cap is
+    # placed_at + 4500s. `placed_at` is taken inside `place/4`, so it is bracketed here.
+    test "the placed claim carries the cap, and claimed_until is the cap", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+      assert payload["wall_clock_seconds"] == 3_600
+
+      before = DateTime.utc_now()
+      assert {:ok, _placed} = place(ctx, payload)
+      after_place = DateTime.utc_now()
+
+      claimed = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert %DateTime{} = cap = claimed.claim_lease_cap
+      assert claimed.claimed_until == cap
+
+      assert DateTime.compare(cap, DateTime.add(before, 4_500, :second)) in [:gt, :eq]
+      assert DateTime.compare(cap, DateTime.add(after_place, 4_500, :second)) in [:lt, :eq]
+    end
+
+    # TC-44.5.6: the runner stops the session at the instant control's lease ends.
+    test "the pushed dispatch carries deadline_at equal to the claim's cap", ctx do
+      %{runner: runner, story: story} = ctx
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", pushed, @reply_timeout
+
+      cap = unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+      assert %DateTime{} = cap
+      assert deadline(pushed) == cap
+    end
+
+    test "a caller-supplied deadline_at is REPLACED with the claim's own", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = Map.put(dispatch_payload(story), "deadline_at", "2099-01-01T00:00:00Z")
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+
+      cap = unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+      assert deadline(pushed) == cap
+    end
+
+    test "a RESUME re-sends the claim's own deadline, never a caller's", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+
+      # On the shared sandbox connection, for the reason "a RESUME under the same dispatch_id
+      # is still pushed at a machine that went draining" gives.
+      assert {:ok, _resumed} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "deadline_at", "2099-01-01T00:00:00Z"),
+                 api_key: ctx.operator
+               )
+
+      assert_push "dispatch", again, @reply_timeout
+      assert DateTime.compare(deadline(again), deadline(first)) in [:gt, :eq]
+      assert {cap, cap} = sandboxed_lease(runner.tenant_id, story.id)
+      assert deadline(again) == cap
+    end
+
+    # US-44.5 review round 3, finding 1. A resume sent the cap as it stood, so a LATE resume —
+    # most of the claim-time cap already spent — carried a deadline that cut its session short.
+    # It now moves the cap to now + wall clock + grace before pushing, and audits the move.
+    test "a LATE resume carries a deadline from now, and the move is audited", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+      nearly_spent = DateTime.add(DateTime.utc_now(), 60, :second)
+      unboxed(fn -> force_lease(runner.tenant_id, story.id, nearly_spent) end)
+
+      before = DateTime.utc_now()
+      assert {:ok, _resumed} = resume(ctx, payload)
+      after_resume = DateTime.utc_now()
+
+      assert_push "dispatch", again, @reply_timeout
+      assert_between(deadline(again), before, after_resume, 3_600 + 900)
+      assert sandboxed_lease(runner.tenant_id, story.id) == {deadline(again), deadline(again)}
+
+      assert [entry] = sandboxed_reanchors(runner.tenant_id, story.id)
+      assert entry.old_state["claim_lease_cap"] == DateTime.to_iso8601(nearly_spent)
+      assert entry.new_state["claim_lease_cap"] == DateTime.to_iso8601(deadline(again))
+    end
+
+    # ...and a LONGER resume gets its whole clock rather than the first push's.
+    test "a LONGER resume carries a deadline on its own wall clock", ctx do
+      %{story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+
+      before = DateTime.utc_now()
+      assert {:ok, _resumed} = resume(ctx, Map.put(payload, "wall_clock_seconds", 7_200))
+      after_resume = DateTime.utc_now()
+
+      assert_push "dispatch", again, @reply_timeout
+      assert_between(deadline(again), before, after_resume, 7_200 + 900)
+      assert DateTime.compare(deadline(again), deadline(first)) == :gt
+    end
+
+    # A claim that has ENDED is not revived by a resume: refused, nothing pushed, nothing moved.
+    test "a resume after the claim's lease ran out is refused dispatch_claim_ended", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+      spent = DateTime.add(DateTime.utc_now(), -60, :second)
+      unboxed(fn -> force_lease(runner.tenant_id, story.id, spent) end)
+
+      assert {:error, :dispatch_claim_ended} = resume(ctx, payload)
+
+      refute_push "dispatch", _pushed, 200
+      assert sandboxed_lease(runner.tenant_id, story.id) == {spent, spent}
+      assert sandboxed_reanchors(runner.tenant_id, story.id) == []
+    end
+
+    # The claim-time cap is PROVISIONAL: the runner's wall clock starts at its acceptance,
+    # which is also where `Capacity` anchors the session's bound, so the acceptance moves the
+    # cap (and the lease) to replied_at + wall clock + grace.
+    test "the runner's acceptance moves the cap to replied_at + wall clock + grace", ctx do
+      %{runner: runner, story: story} = ctx
+
+      assert {:ok, placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+      provisional = unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+
+      {record, {claimed_until, cap}} = accept(runner, placed)
+      assert record.wall_clock_seconds == 3_600
+
+      assert cap == DateTime.add(record.replied_at, 4_500, :second)
+      assert claimed_until == cap
+      assert DateTime.compare(cap, provisional) == :gt
+    end
+
+    # A resume may carry a different wall clock; the push that wins records it, and the
+    # acceptance re-anchors the cap on THAT clock rather than the one the claim was taken with.
+    test "a RESUME with a longer wall clock, accepted later, is capped on the resumed clock",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+
+      assert {:ok, _resumed} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "wall_clock_seconds", 7_200),
+                 api_key: ctx.operator
+               )
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.wall_clock_seconds == 7_200
+
+      {record, {claimed_until, cap}} = accept(runner, placed)
+      assert record.wall_clock_seconds == 7_200
+
+      assert cap == DateTime.add(record.replied_at, 7_200 + 900, :second)
+      assert claimed_until == cap
+    end
+
+    # US-44.5 review round 2, finding 2. A resume may push a SHORTER clock while the session
+    # the first frame started still runs under the longer one — and the acceptance that then
+    # arrives may be that first session's. Re-anchored on the latest push's 600 seconds, the
+    # cap would not move at all (replied_at + 1 500 is before placed_at + 4 500) and the claim
+    # would end with the first session's capacity still presumed busy; on the longest clock
+    # any push carried, it moves to replied_at + 3 600 + grace.
+    test "a RESUME with a SHORTER wall clock re-anchors on the longest clock any push carried",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+
+      assert {:ok, _resumed} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "wall_clock_seconds", 600),
+                 api_key: ctx.operator
+               )
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.wall_clock_seconds == 600
+
+      {record, {claimed_until, cap}} = accept(runner, placed)
+      assert record.wall_clock_seconds == 600
+      assert record.wall_clock_seconds_max == 3_600
+
+      assert cap == DateTime.add(record.replied_at, 3_600 + 900, :second)
+      assert claimed_until == cap
+    end
+
+    test "a RESUME runs the same wall clock rule and refuses an out-of-range clock", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+      over = Loopctl.ApiSpec.RunnerContract.RunnerDispatch.max_wall_clock_seconds() + 1
+
+      assert {:error, {:invalid, ["wall_clock_seconds must be an integer from 1 to " <> _]}} =
+               Placement.place(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.put(payload, "wall_clock_seconds", over),
+                 api_key: ctx.operator
+               )
+
+      refute_push "dispatch", _pushed, 200
+    end
+
+    test "a wall clock the cap cannot be computed from is refused before anything is minted",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
+      over = Loopctl.ApiSpec.RunnerContract.RunnerDispatch.max_wall_clock_seconds() + 1
+
+      for bad <- [0, over, "60s", 3_600.0, nil] do
+        payload = Map.put(dispatch_payload(story), "wall_clock_seconds", bad)
+
+        assert {:error, {:invalid, ["wall_clock_seconds must be an integer from 1 to " <> _]}} =
+                 place(ctx, payload),
+               "wall_clock_seconds #{inspect(bad)} was not refused before the claim"
+      end
+
+      assert unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end) == before
+      untouched = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert untouched.agent_status == :contracted
+      assert untouched.claim_lease_cap == nil
+      refute_push "dispatch", _pushed, 200
+    end
+
+    # The cast `Runners.dispatch/3` runs coerces a decimal string, so the pre-claim check does
+    # too: the cap and the pushed value are then the same integer.
+    test "a decimal-string wall clock is placed and capped as the integer it names", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = Map.put(dispatch_payload(story), "wall_clock_seconds", "3600")
+
+      before = DateTime.utc_now()
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.wall_clock_seconds == 3_600
+
+      cap = unboxed(fn -> reload(runner.tenant_id, story.id) end).claim_lease_cap
+      assert_in_delta DateTime.diff(cap, before), 4_500, 10
+    end
+
+    test "the longest wall clock the contract allows is still placed", ctx do
+      %{runner: runner, story: story} = ctx
+      max = Loopctl.ApiSpec.RunnerContract.RunnerDispatch.max_wall_clock_seconds()
+      payload = Map.put(dispatch_payload(story), "wall_clock_seconds", max)
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      claimed = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert_in_delta DateTime.diff(claimed.claim_lease_cap, DateTime.utc_now()), max + 900, 10
+    end
+  end
+
   describe "delete_audit_chain_rows!/1 — what makes the committed-runner sweep possible" do
     test "deletes immutable entries, and leaves the connection's triggers ON", ctx do
       %{runner: runner, story: story} = ctx
@@ -1412,6 +1685,7 @@ defmodule Loopctl.Delivery.PlacementTest do
                :base_branch,
                :branch,
                :claim_epoch,
+               :deadline_at,
                :dispatch_id,
                :kind,
                :max_turns,
@@ -1454,6 +1728,87 @@ defmodule Loopctl.Delivery.PlacementTest do
 
   # `ctx` carries the operator key, so the default caller is the one principal allowed to root
   # a tree. Pass `api_key:` to place as somebody else.
+  # `deadline_at` as the channel pushed it. The cast (`format: :"date-time"`) makes it a
+  # `DateTime`; normalised so the comparison is to an instant, not to one spelling of it.
+  defp deadline(%{deadline_at: %DateTime{} = at}), do: at
+
+  defp deadline(%{deadline_at: at}) when is_binary(at) do
+    {:ok, parsed, 0} = DateTime.from_iso8601(at)
+    parsed
+  end
+
+  # A RESUME, on the shared sandbox connection for the reason the draining-resume test gives.
+  defp resume(ctx, payload) do
+    Placement.place(ctx.runner.tenant_id, ctx.runner.id, payload, api_key: ctx.operator)
+  end
+
+  # A committed claim's lease and cap, both set to `at` (the CHECK requires the lease within
+  # the cap, and a capped claim's lease always equals it).
+  defp force_lease(tenant_id, story_id, at) do
+    {1, _} =
+      from(s in Story, where: s.tenant_id == ^tenant_id and s.id == ^story_id)
+      |> AdminRepo.update_all(set: [claimed_until: at, claim_lease_cap: at])
+  end
+
+  # Read on the SHARED SANDBOX `Repo` connection, where a resume's re-anchor wrote.
+  defp sandboxed_lease(tenant_id, story_id) do
+    {:ok, lease} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        Loopctl.Repo.one!(
+          from s in Story,
+            where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+            select: {s.claimed_until, s.claim_lease_cap}
+        )
+      end)
+
+    lease
+  end
+
+  defp sandboxed_reanchors(tenant_id, story_id) do
+    {:ok, entries} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        Loopctl.Repo.all(
+          from a in Loopctl.Audit.AuditLog,
+            where: a.tenant_id == ^tenant_id and a.entity_id == ^story_id,
+            where: a.action == "claim_lease_reanchored"
+        )
+      end)
+
+    entries
+  end
+
+  # `at` is `seconds` after some instant in [from, to].
+  defp assert_between(%DateTime{} = at, from, to, seconds) do
+    assert DateTime.compare(at, DateTime.add(from, seconds, :second)) in [:gt, :eq]
+    assert DateTime.compare(at, DateTime.add(to, seconds, :second)) in [:lt, :eq]
+  end
+
+  # The runner's `accepted` reply, recorded as the channel records it — on the SHARED SANDBOX
+  # `Repo` connection, which is where the channel process stamped the push (its row lock is
+  # held there until the test ends) — and the ledger row and the story's `{claimed_until,
+  # claim_lease_cap}` after it, read on that same connection, where the re-anchor is visible.
+  defp accept(runner, placed) do
+    {:ok, reply} =
+      RunnerContract.cast_dispatch_reply(%{
+        "dispatch_id" => placed.dispatch_id,
+        "claim_epoch" => placed.claim_epoch,
+        "decision" => "accepted"
+      })
+
+    {:ok, record} = DispatchLedger.record_reply(runner.tenant_id, runner.id, reply)
+
+    {:ok, lease} =
+      Loopctl.Repo.with_tenant(runner.tenant_id, fn ->
+        Loopctl.Repo.one!(
+          from s in Story,
+            where: s.tenant_id == ^runner.tenant_id and s.id == ^record.story_id,
+            select: {s.claimed_until, s.claim_lease_cap}
+        )
+      end)
+
+    {DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id), lease}
+  end
+
   defp place(ctx, payload, opts \\ []) do
     %{runner: runner, operator: operator} = ctx
     opts = Keyword.merge([api_key: operator], opts)
