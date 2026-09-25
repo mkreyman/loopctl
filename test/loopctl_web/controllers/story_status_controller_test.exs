@@ -91,6 +91,18 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
     version
   end
 
+  # A delivery stage row at a HELD stage: what a budget kill, a session's own escalation or a
+  # human resolution to done / failed leaves once the claim has ended.
+  defp held_stage(story, stage) do
+    fixture(:story_stage, %{
+      repo: AdminRepo,
+      tenant_id: story.tenant_id,
+      story_id: story.id,
+      stage: stage,
+      escalation_reason: if(stage == :escalated, do: "session_ended:wall_clock_exceeded")
+    })
+  end
+
   defp setup_story_with_agent(attrs \\ %{}) do
     tenant = fixture(:tenant)
     project = fixture(:project, %{tenant_id: tenant.id})
@@ -144,6 +156,26 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       body = json_response(conn, 200)
       assert body["story"]["agent_status"] == "contracted"
       assert body["story"]["id"] == story.id
+    end
+
+    test "refuses a story whose delivery stage is held: 409 story_held, nothing contracted", %{
+      conn: conn
+    } do
+      for stage <- [:escalated, :done, :failed] do
+        %{story: story, raw_key: raw_key} = setup_story_with_agent()
+        held_stage(story, stage)
+
+        conn =
+          conn
+          |> auth_conn(raw_key)
+          |> post(~p"/api/v1/stories/#{story.id}/contract", %{
+            "story_title" => "Phoenix scaffold",
+            "ac_count" => 2
+          })
+
+        assert %{"error" => %{"code" => "story_held"}} = json_response(conn, 409)
+        assert AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).agent_status == :pending
+      end
     end
 
     test "rejects with wrong title (422)", %{conn: conn} do
@@ -236,6 +268,23 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
         |> post(~p"/api/v1/stories/#{story.id}/claim")
 
       assert json_response(conn, 409)
+    end
+
+    test "refuses a story whose delivery stage is held: 409 story_held, nothing claimed", %{
+      conn: conn
+    } do
+      for stage <- [:escalated, :done, :failed] do
+        %{story: story, raw_key: raw_key} = setup_story_with_agent(%{agent_status: :contracted})
+        held_stage(story, stage)
+
+        conn =
+          conn
+          |> auth_conn(raw_key)
+          |> post(~p"/api/v1/stories/#{story.id}/claim")
+
+        assert %{"error" => %{"code" => "story_held"}} = json_response(conn, 409)
+        assert AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).agent_status == :contracted
+      end
     end
 
     test "rejects claim on already assigned story (409)", %{conn: conn} do

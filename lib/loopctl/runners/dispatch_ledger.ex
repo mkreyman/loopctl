@@ -622,6 +622,182 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
+  The story a dispatch `runner_id` holds in this tenant is for, WHATEVER its status: `{:ok,
+  story_id}`, or `{:error, :unknown_dispatch}` for a row another runner or tenant holds, exactly
+  as for none.
+
+  A read with no lock, for the `session_ended` path (US-44.3), which has to know the story
+  BEFORE it records anything and cannot use `accepted_session/3` to learn it: a resend of a
+  `crashed` report arrives after the release it caused, by which time a reply or trace may have
+  marked the row `superseded`, and that resend must still be answered `ok`. `story_id` is written
+  with the row and never changed, so the unlocked read cannot be stale.
+  """
+  @spec held_story(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, Ecto.UUID.t()} | {:error, :unknown_dispatch}
+  def held_story(tenant_id, runner_id, dispatch_id) do
+    {:ok, held} = in_tenant(tenant_id, fn -> held(tenant_id, runner_id, dispatch_id) end)
+
+    with {:ok, %DispatchRecord{story_id: story_id}} <- held, do: {:ok, story_id}
+  end
+
+  @doc """
+  The ACCEPTED dispatch that served `story_id`'s claim at `claim_epoch` and whose runner
+  recorded one of `reasons` in `session_ended` (`record_session_end/4`), or `nil`. Returns
+  `session_of/1`'s map plus `:dispatch_id` and `:reason`.
+
+  For the lease reclaim, which must not re-queue a claim a budget kill ended
+  (`Loopctl.Progress.reclaim_expired_claim/3`). A read with no lock: every field it returns is
+  final once the report is recorded, and the reclaim re-checks the claim under the story lock.
+  """
+  @spec session_ended_with(Ecto.UUID.t(), Ecto.UUID.t(), integer(), [String.t()]) ::
+          %{
+            dispatch_id: Ecto.UUID.t(),
+            reason: String.t(),
+            kind: String.t() | nil,
+            story_id: Ecto.UUID.t(),
+            claim_epoch: integer(),
+            slot_generation: integer()
+          }
+          | nil
+  def session_ended_with(tenant_id, story_id, claim_epoch, reasons) do
+    {:ok, record} =
+      in_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+            where: r.claim_epoch == ^claim_epoch and r.status == "accepted",
+            where: r.session_ended_reason in ^reasons,
+            order_by: [asc: r.session_ended_at],
+            limit: 1
+        )
+      end)
+
+    with %DispatchRecord{} <- record do
+      record
+      |> session_of()
+      |> Map.merge(%{dispatch_id: record.dispatch_id, reason: record.session_ended_reason})
+    end
+  end
+
+  @doc """
+  Records a runner's `session_ended` report on the dispatch's own row — ONCE — and says whether
+  this call recorded it or found it already recorded (US-44.3, contract 1.16.0).
+
+  `attrs` carries what the caller derived from the message: `:reason`, `:digest` (the canonical
+  digest of the whole message) and `:counts_toward_retry_ceiling` (`nil` for a reason that
+  re-queues nothing) — and `:story_id`, the dispatch's story as `held_story/3` returned it, so
+  the story's lock can be taken first without reading the dispatch row twice. A row whose
+  story is not that one is `:unknown_dispatch`. Returns
+  `{:ok, {:recorded | :replayed, session}}`, where `session` is the map `accepted_session/3`
+  returns.
+
+  ## THE DIGEST IS COMPARED BEFORE THE EPOCH FENCE, and that order is the feature
+
+  Every report but `completed` ENDS THE CLAIM, which bumps the story's
+  `claim_epoch`. An honest resend of it — its acknowledgement lost to a rolling deploy — then
+  presents an epoch the fence would refuse, and `stale_claim_epoch` is published as permanent:
+  the runner would be told its own report was refused when it was the report that moved the
+  epoch. So a row that already holds a report is judged on the digest alone, first: the same
+  digest is `:replayed` whatever has happened to the epoch or the row's status since, and a
+  DIFFERENT one is `:already_recorded` — the two sides disagree about how the session ended and
+  no resend can settle that.
+
+  ## A FIRST report is fenced like every other runner message
+
+  In order: an `implement` dispatch (a triage session ends through `triage_verdict`, and a
+  triage dispatch holds no claim a `crashed` could release — so, as a dispatch this message can
+  be about, it does not exist: `:unknown_dispatch`); the message's epoch is the dispatch's and
+  the story's, read under a share lock in this transaction (`:stale_claim_epoch`, and a row
+  whose story moved on is marked `superseded` exactly as a reply or trace would mark it); and
+  the dispatch was ACCEPTED (`:dispatch_not_accepted` — no session ran, so none ended).
+
+  A value Postgres refuses is `:rejected_by_database` and a lock that could not be had is
+  `:capacity_busy`, as for a reply.
+  """
+  @spec record_session_end(Ecto.UUID.t(), Ecto.UUID.t(), map(), map()) ::
+          {:ok,
+           {:recorded | :replayed,
+            %{
+              kind: String.t() | nil,
+              story_id: Ecto.UUID.t(),
+              claim_epoch: integer(),
+              slot_generation: integer()
+            }}}
+          | {:error,
+             :unknown_dispatch
+             | :stale_claim_epoch
+             | :dispatch_not_accepted
+             | :already_recorded
+             | :rejected_by_database
+             | :capacity_busy}
+  def record_session_end(tenant_id, runner_id, message, attrs) do
+    context = %{operation: :record_session_end, dispatch_id: message.dispatch_id, run_id: nil}
+
+    runner_write(tenant_id, runner_id, context, fn ->
+      with {:ok, record, current} <-
+             lock_for_session_end(tenant_id, runner_id, message, attrs.story_id) do
+        session_end(record, message, attrs, current)
+      end
+    end)
+    |> flatten()
+  end
+
+  # The lock order of `fence_then_lock/3` — the story's row under a share lock, then the
+  # dispatch's — but with the fence DEFERRED: the caller compares the digest first. The story
+  # is the caller's (`held_story/3` read it; a row's `story_id` never changes), checked against
+  # the locked row rather than read from it a second time.
+  defp lock_for_session_end(tenant_id, runner_id, message, story_id) do
+    current = current_claim_epoch(tenant_id, story_id)
+
+    case held(tenant_id, runner_id, message.dispatch_id, true) do
+      {:ok, %DispatchRecord{story_id: ^story_id} = record} -> {:ok, record, current}
+      {:ok, %DispatchRecord{}} -> {:error, :unknown_dispatch}
+      {:error, :unknown_dispatch} = refused -> refused
+    end
+  end
+
+  # Each clause returns its result BARE: `runner_write/4` wraps the function's value in the
+  # transaction's `{:ok, _}`, and `flatten/1` lifts a returned `{:error, _}` back out.
+  #
+  # An identical resend, whatever has happened to the epoch or the row's status since.
+  defp session_end(%DispatchRecord{session_ended_digest: digest} = record, _msg, attrs, _current)
+       when is_binary(digest) do
+    if digest == attrs.digest,
+      do: {:replayed, session_of(record)},
+      else: {:error, :already_recorded}
+  end
+
+  defp session_end(%DispatchRecord{} = record, message, attrs, current) do
+    with :ok <- implement_dispatch(record),
+         :ok <- epoch_matches(record, message.claim_epoch),
+         :ok <- story_fence(record, current),
+         :ok <- accepted(record) do
+      record
+      |> Ecto.Changeset.change(
+        session_ended_reason: attrs.reason,
+        session_ended_digest: attrs.digest,
+        session_ended_at: DateTime.utc_now(),
+        counts_toward_retry_ceiling: attrs.counts_toward_retry_ceiling
+      )
+      |> Repo.update!()
+      |> then(&{:recorded, session_of(&1)})
+    end
+  end
+
+  # `nil` is a row written before `kind` existed, when `implement` was the only kind sent.
+  defp implement_dispatch(%DispatchRecord{kind: kind}) when kind in ["implement", nil], do: :ok
+  defp implement_dispatch(%DispatchRecord{}), do: {:error, :unknown_dispatch}
+
+  defp session_of(%DispatchRecord{} = record) do
+    %{
+      kind: record.kind,
+      story_id: record.story_id,
+      claim_epoch: record.claim_epoch,
+      slot_generation: record.slot_generation
+    }
+  end
+
+  @doc """
   Applies a validated `dispatch_reply` from `runner_id`. See the moduledoc for the rules.
   """
   @spec record_reply(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::

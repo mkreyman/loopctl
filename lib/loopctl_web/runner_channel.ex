@@ -78,6 +78,17 @@ defmodule LoopctlWeb.RunnerChannel do
   Like the three above it, `stage` does not check the custody halt: it records a transition
   a session already made.
 
+  ## Session end (contract 1.16.0, US-44.3)
+
+  `"session_ended"` (`RunnerSessionEnded`) is why the session under an implement dispatch
+  stopped. Cast by the contract, metered by its own bucket (`RunnerContract.session_ended_burst/0`),
+  and applied by `Loopctl.Delivery.RunnerStages.end_session/4`, which records it once on the
+  dispatch's ledger row and decides from the reason what the story does — this channel opens
+  no path to `story_stages` or to the claim of its own. The reply is the stage row as it then
+  stands plus `replayed`, and an identical resend is answered `ok` even after the release its
+  first copy caused. Like `stage`, it does not check the custody halt: it records what a
+  session already did.
+
   ## What an operator can see (issue #815)
 
   - The channel process carries `runner_id`, `runner_name`, `tenant_id`, `node` and
@@ -122,6 +133,9 @@ defmodule LoopctlWeb.RunnerChannel do
 
   @verdict_capacity RunnerContract.triage_verdict_burst() |> Map.fetch!("capacity")
   @verdict_refill_ms RunnerContract.triage_verdict_burst() |> Map.fetch!("refill_interval_ms")
+  @session_ended_capacity RunnerContract.session_ended_burst() |> Map.fetch!("capacity")
+  @session_ended_refill_ms RunnerContract.session_ended_burst()
+                           |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -160,6 +174,7 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:reply_bucket, :full)
        |> assign(:stage_bucket, :full)
        |> assign(:verdict_bucket, :full)
+       |> assign(:session_ended_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -407,6 +422,39 @@ defmodule LoopctlWeb.RunnerChannel do
     else
       {:error, :rate_limited} -> rate_limited(socket, "triage_verdict", @verdict_refill_ms)
       {:error, reason} -> refuse(socket, "triage_verdict", message_error(reason))
+    end
+  end
+
+  # Why an implement session ended (contract 1.16.0, US-44.3). The runner states the fact;
+  # `RunnerStages.end_session/4` records it once and decides what it does to the story.
+  #
+  # IDEMPOTENT, and the ack says which it was, for the reason `triage_verdict`'s does: the
+  # session that ended cannot say it again differently, so a runner refused for anything
+  # transient has no move except resending the same bytes.
+  defp handle_message("session_ended", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with {:ok, message} <- RunnerContract.cast_session_ended(payload),
+         {:ok, bucket} <-
+           ReplyBucket.take(
+             socket.assigns.session_ended_bucket,
+             now,
+             @session_ended_capacity,
+             @session_ended_refill_ms
+           ) do
+      socket = assign(socket, :session_ended_bucket, bucket)
+
+      case RunnerStages.end_session(tenant_id, runner.id, message, actor_id: runner.api_key_id) do
+        {:ok, %{row: row, replayed?: replayed?}} ->
+          {:reply, {:ok, Map.put(stage_ack(row), :replayed, replayed?)}, socket}
+
+        {:error, reason} ->
+          refuse(socket, "session_ended", message_error(reason))
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, "session_ended", @session_ended_refill_ms)
+      {:error, reason} -> refuse(socket, "session_ended", message_error(reason))
     end
   end
 

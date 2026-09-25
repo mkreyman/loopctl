@@ -4325,7 +4325,11 @@ const TOOLS = [
     description:
       "Agent acknowledges a story's acceptance criteria to claim the contract. " +
       "Transitions the story from pending to contracted. " +
-      "story_title and ac_count must match the actual story to prevent silent misclaims.",
+      "story_title and ac_count must match the actual story to prevent silent misclaims. " +
+      "Refused 409 story_held when the story's delivery stage is escalated, done or failed: " +
+      "it is not available to agents even when it reads pending — move on. An escalated " +
+      "story becomes available again only after resolve_escalation sends it to queued; a " +
+      "done or failed one never does.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4352,7 +4356,10 @@ const TOOLS = [
       "Transitions contracted -> assigned. Uses the AGENT key. On a loopctl with claim leases " +
       "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
       "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
-      "is released back to pending under you.",
+      "is released back to pending under you. Refused 409 story_held when the story's " +
+      "delivery stage is escalated, done or failed: it is not yours to claim even when it " +
+      "reads pending or contracted — move on. An escalated story is claimable again only " +
+      "after resolve_escalation sends it to queued; a done or failed one never is.",
     inputSchema: {
       type: "object",
       properties: {

@@ -24,6 +24,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :ambiguous_resolution}` -> 409 (a fuzzy identifier matched >1 active project)
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
+  - `{:error, :story_held}` -> 409 (contract or claim of a story whose delivery stage is `escalated`, `done` or `failed`; an escalated one is claimable again once a human resolves it to `queued`)
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
   - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
   - `{:error, :not_claimed}` -> 422 (#803: renew-claim on a story that is not assigned or implementing)
@@ -343,6 +344,27 @@ defmodule LoopctlWeb.FallbackController do
         message:
           "This story is not held by a claim (it is not assigned or implementing), so " <>
             "there is no lease to renew. Claim it with POST /stories/:id/claim."
+      }
+    })
+  end
+
+  # US-44.3: a story whose delivery stage is HELD — `escalated`, `done` or `failed`
+  # (`Loopctl.Delivery.Stages.held_story_ids/2`) — cannot be contracted or claimed, even when
+  # its claim has ended and it reads `pending`/`contracted`. Not `invalid_transition`: the
+  # story's own status allows the call; the stage is what refuses it.
+  def call(conn, {:error, :story_held}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "story_held",
+        message:
+          "This story's delivery stage is `escalated`, `done` or `failed`, so it cannot be " <>
+            "contracted or claimed. An escalated story waits for a human and becomes " <>
+            "available again only once it is resolved to `queued` " <>
+            "(POST /api/v1/stories/:id/stage/resolve); a done or failed one never does. " <>
+            "Move on to other work."
       }
     })
   end

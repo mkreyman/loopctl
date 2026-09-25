@@ -908,8 +908,10 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert row.stage == :escalated
       assert row.claim_epoch == freed.claim_epoch
 
-      # SO CONTRACTING IT IS NOT ENOUGH, which is exactly what the old wording promised it was.
-      assert {:ok, _contracted} =
+      # SO CONTRACTING IT IS NOT A WAY BACK, which is exactly what the old wording promised it
+      # was: an escalated stage is HELD (`Stages.held_story_ids/2`), so the contract itself is
+      # refused, and only a human resolution to `queued` makes the story placeable again.
+      assert {:error, :story_held} =
                unboxed(fn ->
                  Progress.contract_story(runner.tenant_id, story.id, %{},
                    actor_label: "test",
@@ -917,7 +919,7 @@ defmodule Loopctl.Delivery.PlacementTest do
                  )
                end)
 
-      assert {:error, :wrong_stage} =
+      assert {:error, :invalid_transition} =
                unboxed(fn -> Placement.claimable(runner.tenant_id, story.id) end)
     end
 

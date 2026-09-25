@@ -33,6 +33,14 @@ defmodule Loopctl.Runners.DispatchRecord do
   with every reservation, and `wall_clock_seconds` is refreshed when a push wins, so the
   bound `Loopctl.Runners.Capacity` applies is always the clock the session is running under.
 
+  ## Session end (since contract 1.16.0)
+
+  `session_ended_reason` is the runner's own account of why the session under this dispatch
+  stopped, recorded once. `session_ended_digest` decides whether a later copy is the SAME
+  report (answered `ok`) or a different one (refused `already_recorded`), and
+  `counts_toward_retry_ceiling` says, for the two reasons that re-queue the story, whether
+  that release is spent against the retry ceiling — `crashed` is, `usage_exhausted` is not.
+
   ## Trust boundary
 
   Every field is set programmatically in `Loopctl.Runners`; there is no caller changeset.
@@ -74,6 +82,13 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :reserved_at, :utc_datetime_usec
     field :slot_generation, :integer, default: 0
     field :delivery, :string
+    # Why the session ended, as the runner reported it (`session_ended`, contract 1.16.0,
+    # US-44.3). Written once, with the digest a resend is compared against, by
+    # `Loopctl.Runners.DispatchLedger.record_session_end/4`; all four NULL until then.
+    field :session_ended_reason, :string
+    field :session_ended_digest, :string
+    field :session_ended_at, :utc_datetime_usec
+    field :counts_toward_retry_ceiling, :boolean
 
     timestamps()
   end

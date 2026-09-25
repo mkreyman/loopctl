@@ -121,13 +121,22 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         path: "/api/v1/dispatches",
         description:
           "Mint a per-dispatch ephemeral, scoped API key carrying its lineage path " <>
-            "(the CoC v2 key-distribution mechanism; replaces long-lived env-var keys). MCP tool: dispatch"
+            "(the CoC v2 key-distribution mechanism; replaces long-lived env-var keys). " <>
+            "Role: orchestrator or above. MCP tool: dispatch"
       },
-      %{method: "GET", path: "/api/v1/dispatches", description: "List dispatches for the tenant"},
+      %{
+        method: "GET",
+        path: "/api/v1/dispatches",
+        description:
+          "List dispatches for the tenant. Role: agent or above. MCP tool: none (a declared " <>
+            "gap in mcp-server/test/route_coverage.test.js)"
+      },
       %{
         method: "GET",
         path: "/api/v1/dispatches/:id",
-        description: "Get a dispatch and its lineage"
+        description:
+          "Get a dispatch and its lineage. Role: agent or above. MCP tool: none (a declared " <>
+            "gap in mcp-server/test/route_coverage.test.js)"
       },
 
       # Audit & change feed
@@ -926,6 +935,75 @@ defmodule LoopctlWeb.RouteDiscoveryController do
             "invalid_signature — unknown or revoked source, suspended tenant, missing or wrong " <>
             "signature, or a payload whose repository.full_name does not match — so Recent " <>
             "Deliveries cannot tell you which."
+      },
+
+      # Agent delivery loop — runners, placement and the merge gate (#878, epic 44 US-44.7).
+      # The rest of bringing a runner online once intake exists: enrol it, see it connect,
+      # place work on it, revoke it, and ask the merge gate about the result.
+      %{
+        method: "POST",
+        path: "/api/v1/runners",
+        description:
+          "Enrol a runner (a dev machine that runs sessions); the credential is shown once. " <>
+            "Role: user on a human-anchored tenant, from a key no dispatch minted (a " <>
+            "dispatch-minted key is refused 403 api_key_mint_forbidden). MCP tool: runner_enroll"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/runners",
+        description:
+          "List enrolled runners (enrolment only; connection state is the pool). Role: user. " <>
+            "MCP tool: runner_list"
+      },
+      %{
+        method: "DELETE",
+        path: "/api/v1/runners/:id",
+        description:
+          "Revoke a runner: its credential stops authenticating and its socket is dropped. " <>
+            "Idempotent. Role: user on a human-anchored tenant. MCP tool: runner_revoke"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/runners/pool",
+        description:
+          "The tenant's CONNECTED runners, from Presence: draining, the latest sample, live " <>
+            "sockets. Role: user. MCP tool: runner_pool"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/runners/:runner_id/dispatches",
+        description:
+          "Place a queued, contracted story on a runner: claims it under a fresh custody " <>
+            "dispatch and pushes the work. 409 runner_declines_work when the machine is " <>
+            "draining. Role: orchestrator or above on a human-anchored tenant, AND either an " <>
+            "unlineaged user key (which roots the custody lineage) or a key inside a dispatch " <>
+            "lineage; an unlineaged key below user, such as a legacy orchestrator env key, is " <>
+            "refused 403 root_dispatch_forbidden. MCP tool: place_dispatch (sends the user key)"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/dispatches/enrolled-keys",
+        description:
+          "Agent public keys enrolled under the tenant, reconstructed from the audit chain. " <>
+            "Role: agent or above. MCP tool: list_enrolled_agent_keys"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/dispatches/:id/revoke",
+        description:
+          "Revoke a dispatch AND its subtree, with the keys each minted. Role: orchestrator or " <>
+            "above on a human-anchored tenant; 403 dispatch_outside_caller_lineage when the " <>
+            "target is outside your lineage, and 403 unlineaged_revoke_forbidden for an " <>
+            "unlineaged key below user. MCP tool: revoke_dispatch"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/stories/:id/merge-precondition",
+        description:
+          "Run the merge gate over a story's real pull request at stage ci: both gates, " <>
+            "custody, the hard bound. Gate A reads the triage the story persisted, never the " <>
+            "caller. Role: exactly orchestrator or user, on a human-anchored tenant. " <>
+            "MCP tool: merge_precondition"
       },
 
       # OpenAPI spec

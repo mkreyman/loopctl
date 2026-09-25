@@ -93,7 +93,12 @@ defmodule LoopctlWeb.StoryStatusController do
     responses: %{
       200 => {"Story contracted", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Invalid transition, or `story_held` — the story's delivery stage is `escalated`, " <>
+           "`done` or `failed`, so it is not available to agents. An escalated story is " <>
+           "available again only once a human resolves it to `queued` " <>
+           "(POST /stories/:id/stage/resolve); a done or failed one never is", "application/json",
+         Schemas.ErrorResponse},
       422 => {"Mismatch", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -124,7 +129,11 @@ defmodule LoopctlWeb.StoryStatusController do
       200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Invalid transition or dependencies not met", "application/json", Schemas.ErrorResponse},
+        {"Invalid transition, dependencies not met, or `story_held` — the story's delivery " <>
+           "stage is `escalated`, `done` or `failed`, so it is not available to agents. An " <>
+           "escalated story is claimable again only once a human resolves it to `queued` " <>
+           "(POST /stories/:id/stage/resolve); a done or failed one never is", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 =>
         {"The claim's capability could not be minted; nothing was claimed. Retryable only " <>
@@ -350,6 +359,9 @@ defmodule LoopctlWeb.StoryStatusController do
 
       {:error, {:contract_mismatch, _ctx} = err} ->
         {:error, err}
+
+      {:error, :story_held} ->
+        {:error, :story_held}
 
       {:error, {:invalid_transition, _ctx} = err} ->
         {:error, err}

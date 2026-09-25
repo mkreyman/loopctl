@@ -463,6 +463,106 @@
       ],
       "type": "object"
     },
+    "RunnerSessionEnded": {
+      "description": "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0). Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, not a request — control decides the story's next stage from `reason`: `completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` escalate an in-flight story over the control-only `budget_reported` edge and end its claim, `crashed` releases the claim at once over `runner_lost`, and `usage_exhausted` releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: a byte-identical resend is answered `ok` with the row even after the release it caused moved the claim epoch on, and a different `reason` is `already_recorded`.",
+      "properties": {
+        "claim_epoch": {
+          "description": "The `claim_epoch` of the dispatch, echoed.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "description": "The ACCEPTED implement dispatch whose session ended. It names the story; a story id is never taken from the wire.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why the session stopped. `usage_exhausted` means the account the session ran on hit its usage limit; `crashed` is any end the runner did not choose and that is not one of the others.",
+          "enum": [
+            "completed",
+            "wall_clock_exceeded",
+            "max_turns_exceeded",
+            "usage_exhausted",
+            "crashed"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "RunnerSessionEndedAck": {
+      "description": "The reply to an accepted `session_ended`: where the story now is, and whether this was a resend. The row fields are the ones a `stage` ack carries.",
+      "properties": {
+        "attempts": {
+          "description": "How many times each counted edge has been taken, keyed by edge.",
+          "type": "object"
+        },
+        "claim_epoch": {
+          "description": "The epoch the row is bound to now. Past the dispatch's after a `crashed` or `usage_exhausted` release: the claim the session ran under has ended.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "effects": {
+          "description": "The identities the row holds, as a `stage` ack reports them.",
+          "properties": {
+            "branch": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "head_sha": {
+              "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+              "type": "string"
+            },
+            "merge_sha": {
+              "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+              "type": "string"
+            },
+            "pr_number": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "release_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "worktree_path": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "lock_version": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replayed": {
+          "description": "False on the delivery that recorded this report, true on any resend of it. A resend changes nothing a second time.",
+          "type": "boolean"
+        },
+        "stage": {
+          "description": "The stage the story is at now.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stage",
+        "claim_epoch",
+        "lock_version",
+        "attempts",
+        "effects",
+        "replayed"
+      ],
+      "type": "object"
+    },
     "RunnerStageEffects": {
       "description": "The identities a transition produced, recorded on the story's stage row before the effect is repeated. Each is writable only by the stage that produces it, and only once: the same value again is accepted (a replay finds what its first run recorded), a different one is refused. `merge_sha` is the one that cannot be written before its effect, because the merge commit does not exist until GitHub makes it, so it is REQUIRED on the transition into `merged` and accepted nowhere else. `runner_id` is deliberately absent: which machine holds a story is control's to record, not a runner's to assert.",
       "properties": {
@@ -1368,6 +1468,21 @@
           "supported"
         ]
       },
+      "session_ended": {
+        "already_recorded": [],
+        "audit_chain_append_failed": [],
+        "dispatch_not_accepted": [],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "stale_claim_epoch": [],
+        "unknown_dispatch": [],
+        "unknown_story_stage": []
+      },
       "stage": {
         "audit_chain_append_failed": [],
         "dispatch_not_accepted": [],
@@ -1470,6 +1585,17 @@
         "forbidden_topic",
         "unknown_topic"
       ],
+      "session_ended": [
+        "rate_limited",
+        "invalid_payload",
+        "unknown_dispatch",
+        "dispatch_not_accepted",
+        "stale_claim_epoch",
+        "already_recorded",
+        "unknown_story_stage",
+        "audit_chain_append_failed",
+        "internal_error"
+      ],
       "stage": [
         "rate_limited",
         "invalid_payload",
@@ -1524,6 +1650,7 @@
       "dispatch": "RunnerDispatch",
       "dispatch_reply": "RunnerDispatchReply",
       "join": "RunnerJoin",
+      "session_ended": "RunnerSessionEnded",
       "stage": "RunnerStageReport",
       "status": "RunnerStatus",
       "story": "RunnerStory",
@@ -1556,6 +1683,10 @@
         "trace_cursor": 50
       },
       "refusal_max_detail_length": 500,
+      "session_ended_burst": {
+        "capacity": 4,
+        "refill_interval_ms": 1000
+      },
       "stage_burst": {
         "capacity": 12,
         "refill_interval_ms": 250
@@ -1693,6 +1824,7 @@
       ]
     },
     "replies": {
+      "session_ended": "RunnerSessionEndedAck",
       "trace": "RunnerTraceAck",
       "trace_cursor": "RunnerTraceAck",
       "triage_verdict": "RunnerTriageVerdictAck"
@@ -1801,5 +1933,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.15.0"
+  "x-contract-version": "1.16.0"
 }

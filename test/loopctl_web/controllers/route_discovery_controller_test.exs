@@ -57,10 +57,7 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
         |> Enum.map(&{verb_string(&1.verb), &1.path})
         |> MapSet.new()
 
-      indexed =
-        LoopctlWeb.RouteDiscoveryController.curated_routes()
-        |> Enum.map(&{&1.method, &1.path})
-        |> MapSet.new()
+      indexed = indexed_routes()
 
       assert MapSet.size(router_channel) > 0,
              "the filter matched nothing — it has drifted from the router's shape and this " <>
@@ -87,10 +84,7 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
         |> Enum.map(&{verb_string(&1.verb), &1.path})
         |> MapSet.new()
 
-      indexed =
-        LoopctlWeb.RouteDiscoveryController.curated_routes()
-        |> Enum.map(&{&1.method, &1.path})
-        |> MapSet.new()
+      indexed = indexed_routes()
 
       assert MapSet.size(router_corpora) > 0,
              "the filter matched nothing — it has drifted from the router's shape and this " <>
@@ -116,10 +110,7 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
     # row for the same endpoint would be noise in a hand-curated index. A PUT-only route
     # would still be required, so this cannot hide a whole endpoint.
     test "every /api/v1/intake route in the router appears in the curated index" do
-      indexed =
-        LoopctlWeb.RouteDiscoveryController.curated_routes()
-        |> Enum.map(&{&1.method, &1.path})
-        |> MapSet.new()
+      indexed = indexed_routes()
 
       router_intake =
         LoopctlWeb.Router.__routes__()
@@ -141,6 +132,49 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
                inspect(MapSet.to_list(missing))
     end
 
+    # The delivery loop's own surface past intake (#878): enrolling a runner, the pool,
+    # placement, revocation and the merge gate. A session that found the intake tools still
+    # could not discover these, which is the rest of wiring the loop up.
+    test "every delivery-loop runner, dispatch and merge-gate route is indexed, with a real role and tool" do
+      indexed =
+        LoopctlWeb.RouteDiscoveryController.curated_routes()
+        |> Map.new(&{{&1.method, &1.path}, &1.description})
+
+      # EACH clause must match on its own, or a renamed route drops out of the check silently.
+      clauses = [
+        runners: &String.starts_with?(&1, "/api/v1/runners"),
+        dispatches: &String.starts_with?(&1, "/api/v1/dispatches"),
+        merge_gate: &String.ends_with?(&1, "/merge-precondition")
+      ]
+
+      served = LoopctlWeb.Router.__routes__() |> Enum.map(&{verb_string(&1.verb), &1.path})
+
+      mcp_source = File.read!("mcp-server/index.js")
+
+      for {clause, match?} <- clauses do
+        routes = Enum.filter(served, fn {_method, path} -> match?.(path) end)
+        assert routes != [], "the #{clause} clause matched no served route — it has drifted"
+
+        for route <- routes do
+          description = Map.get(indexed, route)
+          assert description, "#{inspect(route)} is served but not in the curated /routes index"
+          assert description =~ "Role:", "#{inspect(route)} names no role"
+
+          case Regex.run(~r/MCP tool: ([a-z_]+)/, description, capture: :all_but_first) do
+            ["none"] ->
+              :ok
+
+            [tool] ->
+              assert mcp_source =~ ~s(name: "#{tool}"),
+                     "#{inspect(route)} names MCP tool #{tool}, which index.js does not declare"
+
+            nil ->
+              flunk("#{inspect(route)} names no MCP tool")
+          end
+        end
+      end
+    end
+
     # The create row is the one a session acts on, and two of its facts are the expensive
     # ones to learn by probing: a dispatch-minted key can never call it however privileged
     # it is, and the webhook secret is returned once and is then unrecoverable. Asserted on
@@ -159,18 +193,28 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
       assert row.description =~ "intake_source_enroll"
     end
 
-    test "every path in the curated index actually exists in the router" do
-      router_paths =
-        LoopctlWeb.Router.__routes__() |> Enum.map(& &1.path) |> MapSet.new()
+    test "every METHOD and path in the curated index is actually served" do
+      # Method AND path: a row with the wrong verb on a served path advertises a 404.
+      served =
+        LoopctlWeb.Router.__routes__()
+        |> Enum.map(&{verb_string(&1.verb), &1.path})
+        |> MapSet.new()
 
       phantom =
         LoopctlWeb.RouteDiscoveryController.curated_routes()
-        |> Enum.map(& &1.path)
-        |> Enum.reject(&MapSet.member?(router_paths, &1))
+        |> Enum.map(&{&1.method, &1.path})
+        |> Enum.reject(&MapSet.member?(served, &1))
 
       assert phantom == [],
              "the index advertises routes the router does not serve: " <> inspect(phantom)
     end
+  end
+
+  # The two sets every router-versus-index check compares, written once.
+  defp indexed_routes do
+    LoopctlWeb.RouteDiscoveryController.curated_routes()
+    |> Enum.map(&{&1.method, &1.path})
+    |> MapSet.new()
   end
 
   defp verb_string(verb), do: verb |> to_string() |> String.upcase()

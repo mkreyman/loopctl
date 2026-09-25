@@ -146,6 +146,16 @@ describe("index.js wiring", () => {
     );
   });
 
+  for (const tool of ["claim_story", "contract_story"]) {
+    test(`${tool}'s description names the story_held refusal and its remedy`, () => {
+      const decl = INDEX_SRC.slice(INDEX_SRC.indexOf(`name: "${tool}"`));
+      const description = decl.slice(0, decl.indexOf("inputSchema"));
+      assert.match(description, /409 story_held/);
+      assert.match(description, /resolve_escalation/);
+      assert.match(README, new RegExp(`\\| \`${tool}\` \\|[^\\n]*409 \`story_held\``));
+    });
+  }
+
   test("claim_story surfaces the lease notice ahead of the JSON", () => {
     assert.match(functionSource("claimStory"), /return withClaimLeaseNotice\(result\);/);
     const wrap = functionSource("withClaimLeaseNotice");

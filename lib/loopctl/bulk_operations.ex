@@ -64,7 +64,19 @@ defmodule Loopctl.BulkOperations do
 
       AdminRepo.transaction(fn ->
         locked_stories = lock_stories_by_ids(tenant_id, sorted_ids)
-        process_claims(sorted_ids, locked_stories, agent_id, tenant_id, actor_id, actor_label)
+        # ONE read for the whole batch, under the story locks just taken — the single-story
+        # claim's refusal of a held stage (`Progress.claim_story/3`), asked once, not per story.
+        held = Stages.held_story_ids(tenant_id, Map.keys(locked_stories))
+
+        process_claims(
+          sorted_ids,
+          locked_stories,
+          held,
+          agent_id,
+          tenant_id,
+          actor_id,
+          actor_label
+        )
       end)
     end
   end
@@ -279,11 +291,19 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
-  defp process_claims(sorted_ids, locked_stories, agent_id, tenant_id, actor_id, actor_label) do
+  defp process_claims(
+         sorted_ids,
+         locked_stories,
+         held,
+         agent_id,
+         tenant_id,
+         actor_id,
+         actor_label
+       ) do
     Enum.map(sorted_ids, fn story_id ->
       case Map.get(locked_stories, story_id) do
         nil -> %{story_id: story_id, status: "error", reason: "Story not found"}
-        story -> process_claim(story, agent_id, tenant_id, actor_id, actor_label)
+        story -> process_claim(story, held, agent_id, tenant_id, actor_id, actor_label)
       end
     end)
   end
@@ -340,8 +360,8 @@ defmodule Loopctl.BulkOperations do
   # Private: Individual Story Processing
   # ===================================================================
 
-  defp process_claim(story, agent_id, tenant_id, actor_id, actor_label) do
-    with :ok <- validate_claim_preconditions(story),
+  defp process_claim(story, held, agent_id, tenant_id, actor_id, actor_label) do
+    with :ok <- validate_claim_preconditions(story, held),
          {:ok, updated} <- apply_claim(story, agent_id) do
       audit_claim(tenant_id, story, updated, actor_id, actor_label)
       emit_claim_event(tenant_id, story, updated, agent_id)
@@ -427,11 +447,16 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
-  defp validate_claim_preconditions(story) do
-    if story.agent_status != :contracted do
-      {:error, "Story is not in contracted status (current: #{story.agent_status})"}
-    else
-      check_story_dependencies_satisfied(story)
+  defp validate_claim_preconditions(story, held) do
+    cond do
+      story.agent_status != :contracted ->
+        {:error, "Story is not in contracted status (current: #{story.agent_status})"}
+
+      MapSet.member?(held, story.id) ->
+        {:error, :story_held}
+
+      true ->
+        check_story_dependencies_satisfied(story)
     end
   end
 
@@ -935,6 +960,12 @@ defmodule Loopctl.BulkOperations do
         "pre-existing done work, so mark-complete does not apply"
 
   defp format_reason(:already_verified), do: "story is already verified"
+
+  defp format_reason(:story_held),
+    do:
+      "story_held: its delivery stage is escalated, done or failed. An escalated story is " <>
+        "claimable again once a human resolves it to queued (resolve_escalation); a done or " <>
+        "failed one never is"
 
   defp format_reason(:story_rejected),
     do: "story is rejected; investigate instead of marking it complete"

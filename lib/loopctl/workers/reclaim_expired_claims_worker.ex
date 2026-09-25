@@ -87,7 +87,8 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
     Logger.info(
       "ReclaimExpiredClaimsWorker: reclaimed: tenant_id=#{candidate.tenant_id} " <>
         "story_id=#{candidate.id} claim_epoch=#{candidate.claim_epoch} " <>
-        "new_claim_epoch=#{story.claim_epoch} reason=:claim_lease_expired",
+        "new_claim_epoch=#{story.claim_epoch} (the audit entry names why: a lease expiry, " <>
+        "or a recorded budget kill the reclaim escalated)",
       tenant_id: candidate.tenant_id,
       story_id: candidate.id,
       claim_epoch: candidate.claim_epoch

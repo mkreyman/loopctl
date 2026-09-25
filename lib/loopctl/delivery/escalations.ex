@@ -108,9 +108,10 @@ defmodule Loopctl.Delivery.Escalations do
           | {:not_escalated, StageMachine.stage()}
           | {:unresolvable_target, term()}
           | Stages.advance_error()
-          # PROPAGATED VERBATIM by `prepare_story/6`'s `with`, which has no `else` (846.8
-          # review round 2). `resolve/3`'s `:queued` path calls
-          # `Progress.force_unclaim_story/3` and then `Progress.contract_story/4`, and every
+          # PROPAGATED VERBATIM by `resolve/3`'s `with`, which has no `else` (846.8 review
+          # round 2). `resolve/3`'s `:queued` path calls `Progress.force_unclaim_story/3`
+          # (`prepare_story/6`) and, after the transition, `Progress.contract_story/4`
+          # (`recontract/3`), and every
           # refusal either returns is this function's refusal too. The three below are the
           # shapes those two specs admit that nothing above already covers — and the
           # changeset is the one that matters, because it is not an atom at all, so a caller
@@ -376,8 +377,12 @@ defmodule Loopctl.Delivery.Escalations do
          {:ok, row} <- live_row(tenant_id, story_id),
          :ok <- at_escalated(row),
          :ok <- Stages.precheck(transition, advance_opts),
-         {:ok, epoch} <- prepare_story(tenant_id, story_id, to, row, opts, actor_lineage) do
-      Stages.advance(tenant_id, story_id, transition, [claim_epoch: epoch] ++ advance_opts)
+         {:ok, epoch, released} <-
+           prepare_story(tenant_id, story_id, to, row, opts, actor_lineage),
+         {:ok, resolved} <-
+           Stages.advance(tenant_id, story_id, transition, [claim_epoch: epoch] ++ advance_opts),
+         {:ok, _story} <- recontract(tenant_id, released, Keyword.get(opts, :actor_label)) do
+      {:ok, resolved}
     end
   end
 
@@ -389,22 +394,23 @@ defmodule Loopctl.Delivery.Escalations do
   # take, and no lease recovers it either: the release sets `:pending`, which is not
   # `:contracted` either.
   #
-  # So the claim goes back and the story is re-contracted, in that order, and the epoch the
-  # transition is fenced on is read AFTER both — releasing bumps it.
+  # So the claim goes back BEFORE the transition, whose epoch is read after the release —
+  # releasing bumps it — and the story is re-contracted AFTER it. That second order is not a
+  # preference: `Progress.contract_story/4` refuses a story whose stage is held, and `escalated`
+  # is held (`Stages.held_story_ids/2`), so the re-contract can only land once the row has
+  # left `escalated`. A transition that fails leaves the story `pending` behind an escalated
+  # row, which is still held — never contracted and claimable while a human owns it.
   #
   # `done` and `failed` prepare nothing: the story is finished with, and re-contracting it
   # would be inventing work.
   defp prepare_story(tenant_id, story_id, :queued, _row, opts, actor_lineage) do
-    label = Keyword.get(opts, :actor_label)
-
-    with {:ok, story} <- release_claim(tenant_id, story_id, label, actor_lineage),
-         {:ok, story} <- recontract(tenant_id, story, label) do
-      {:ok, story.claim_epoch}
-    end
+    with {:ok, story} <-
+           release_claim(tenant_id, story_id, Keyword.get(opts, :actor_label), actor_lineage),
+         do: {:ok, story.claim_epoch, story}
   end
 
   defp prepare_story(_tenant_id, _story_id, _to, row, _opts, _actor_lineage),
-    do: {:ok, row.claim_epoch}
+    do: {:ok, row.claim_epoch, nil}
 
   # Idempotent by `force_unclaim_story/3`'s own design: a story already at `:pending` — its
   # claim released by the lease while it sat escalated — passes through with its current epoch.
@@ -430,14 +436,21 @@ defmodule Loopctl.Delivery.Escalations do
 
   # `pending -> contracted` is the only transition into the state a placement needs, and a
   # story that is somehow already `contracted` is left alone rather than refused: the operator
-  # asked for a placeable story and it is one.
+  # asked for a placeable story and it is one. `nil` is a resolution that released nothing.
+  defp recontract(_tenant_id, nil, _label), do: {:ok, nil}
   defp recontract(_tenant_id, %{agent_status: :contracted} = story, _label), do: {:ok, story}
 
   defp recontract(tenant_id, story, label) do
-    Progress.contract_story(tenant_id, story.id, %{},
-      actor_label: label,
-      skip_contract_check: true
-    )
+    case Progress.contract_story(tenant_id, story.id, %{},
+           actor_label: label,
+           skip_contract_check: true
+         ) do
+      # An agent contracted it between the transition and this call: the row left `escalated`
+      # first, so for that instant the story was listed as ready. It is contracted, which is
+      # what the resolution asked for — not a failure of a resolution that already committed.
+      {:error, {:invalid_transition, %{current_agent_status: :contracted}}} -> {:ok, story}
+      result -> result
+    end
   end
 
   defp resolvable(to) do

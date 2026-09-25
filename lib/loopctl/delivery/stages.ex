@@ -991,7 +991,7 @@ defmodule Loopctl.Delivery.Stages do
   What happens to the row:
 
   - in flight (`StageMachine.in_flight_stages/0`) — back to `queued` over `edge`, bound to
-    `new_epoch`, the edge counted in `attempts`, and the identities the released holder
+    `new_epoch`, the edge counted in `attempts` unless `counted?: false`, and the identities the released holder
     held cleared (`StageMachine.clears/3`). Recorded as `transitioned`.
   - any other stage except `done` and `failed` — the stage stays and the row is rebound to
     `new_epoch`, recorded as `rebound`. The effect a merged or deployed story already had
@@ -1014,6 +1014,8 @@ defmodule Loopctl.Delivery.Stages do
   ## Options
 
   - `:actor_label` — recorded on the event
+  - `:counted?` — `false` for a release that is NOT an attempt: a session whose account ran dry
+    (`usage_exhausted`) never had its work judged. Defaults to `true`.
   """
   @spec follow_release(
           Ecto.UUID.t(),
@@ -1034,6 +1036,55 @@ defmodule Loopctl.Delivery.Stages do
       row.stage in StageMachine.in_flight_stages() -> requeue(row, new_epoch, edge, opts)
       true -> rebind(row, new_epoch, opts)
     end
+  end
+
+  # THE STAGES AT WHICH A STORY IS NOT AVAILABLE TO AGENTS, and the one definition of them:
+  # the ready list, contract, claim and bulk claim all read it through `held_story_ids_query/1`
+  # or `held_story_ids/2`, never a copy (US-44.3 review round 3). It is the machine's terminal
+  # set — `escalated`, which only a human moves on, and `done` and `failed`, which nothing
+  # moves on. A story's claim can END at any of the three and leave it `pending` with nothing
+  # else saying it is not work: a budget kill ends its claim at `escalated`, the lease reclaim
+  # ends a claim whose session escalated itself, and a human resolution to `done` or `failed`
+  # leaves the finished session's claim for the lease to end. Before this read, all three were
+  # listed as ready and claimable, so a machine raced the human, or re-did finished work.
+  #
+  # `merged` is NOT held, although its outward effect has happened. A story whose claim ends
+  # at `merged` has a deploy still to do, and the stage row is rebound to the next claim
+  # (`follow_claim/4`) precisely so a new session can take it on from `merged` — holding it
+  # here would strand a merged story with nothing able to deploy it.
+  @held_stages StageMachine.terminal_stages()
+
+  @doc """
+  The ids of the tenant's stories whose delivery stage row is at a HELD stage — `escalated`,
+  `done` or `failed` (`StageMachine.terminal_stages/0`) — as a composable query selecting
+  `story_id`, for a caller that filters a story query in SQL:
+  `where(query, [s], s.id not in subquery(held_story_ids_query(tenant_id)))`
+  (`Loopctl.WorkBreakdown.Queries.list_ready_stories/2`). A story with no stage row is not
+  held. Scoped by `tenant_id` explicitly, because the readers run on `AdminRepo`.
+  """
+  @spec held_story_ids_query(Ecto.UUID.t()) :: Ecto.Query.t()
+  def held_story_ids_query(tenant_id) do
+    from(s in StoryStage,
+      where: s.tenant_id == ^tenant_id and s.stage in ^@held_stages,
+      select: s.story_id
+    )
+  end
+
+  @doc """
+  Which of `story_ids` are HELD (`held_story_ids_query/1`), in ONE query on `AdminRepo`, where
+  every claim and contract transaction runs. `Loopctl.Progress.contract_story/4`,
+  `Loopctl.Progress.claim_story/3` and `Loopctl.BulkOperations`' bulk claim refuse a held
+  story `:story_held`, asking once per call — bulk claim once for the whole batch — under
+  the story locks they already hold: every stage transition takes the story `FOR SHARE`
+  first, so none can land between this read and the caller's commit.
+  """
+  @spec held_story_ids(Ecto.UUID.t(), [Ecto.UUID.t()]) :: MapSet.t(Ecto.UUID.t())
+  def held_story_ids(tenant_id, story_ids) do
+    tenant_id
+    |> held_story_ids_query()
+    |> where([s], s.story_id in ^story_ids)
+    |> AdminRepo.all()
+    |> MapSet.new()
   end
 
   @doc """
@@ -1084,7 +1135,13 @@ defmodule Loopctl.Delivery.Stages do
 
     {1, [updated]} =
       from(s in StoryStage, where: s.id == ^row.id and s.tenant_id == ^row.tenant_id, select: s)
-      |> transition_update(from, :queued, edge, claim_epoch: new_epoch)
+      |> transition_update(
+        from,
+        :queued,
+        edge,
+        [claim_epoch: new_epoch],
+        Keyword.get(opts, :counted?, true)
+      )
       |> AdminRepo.update_all([])
 
     insert_event(AdminRepo, updated, "transitioned", from, edge, opts[:actor_label], %{
@@ -1120,13 +1177,13 @@ defmodule Loopctl.Delivery.Stages do
 
   # The one UPDATE every transition writes, on either repo: the new stage, the identities the
   # edge clears, `attempts` counted in SQL (never read-modify-write), and `lock_version`.
-  defp transition_update(query, from, to, edge, extra) do
+  defp transition_update(query, from, to, edge, extra, counted? \\ true) do
     clears = Enum.map(StageMachine.clears(from, to, edge), &{&1, nil})
     set = [stage: to, updated_at: DateTime.utc_now()] ++ clears ++ extra
 
     query = update(query, set: ^set, inc: [lock_version: 1])
 
-    if StageMachine.counted?(edge) do
+    if counted? and StageMachine.counted?(edge) do
       name = Atom.to_string(edge)
 
       update(query, [s],

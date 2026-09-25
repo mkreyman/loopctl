@@ -51,7 +51,18 @@ defmodule Loopctl.Delivery.StageMachine do
     along with the head, and it is CHAINED — the entry into `merged` is a custody fact, so
     retracting it writes a counter-entry rather than leaving the chain saying the story
     merged at a sha it did not
-  - `:budget_exceeded` — any live stage -> failed
+  - `:budget_exceeded` — any live stage -> failed. In the table and WRITTEN BY NOTHING in
+    `lib/` today. `failed` has no way out, so a runner's word must never be what takes a story
+    there (see `:budget_reported`)
+  - `:budget_reported` — an in-flight stage -> escalated, when the runner reports that the
+    session was KILLED BY ITS BUDGET — its wall clock or its turn limit — in a `session_ended`
+    message (contract 1.16.0, US-44.3). CONTROL takes it, from
+    `Loopctl.Delivery.RunnerStages.end_session/4`, never a `stage` message: the runner states a
+    FACT about its session and control decides what the story does about it. It lands on
+    `escalated`, not `failed`, because the runner's word must never make a story terminal
+    with no way out, and it is its own edge rather than `:session_escalated` because the
+    escalated queue has to tell "the loop spent its budget on this" apart from "the session
+    asked for Mark". Never retried: a budget kill retried is the same kill again, paid twice.
   - `:runner_lost` — an in-flight stage -> queued. Taken by the claim reclaimer
     (`Loopctl.Progress.reclaim_expired_claim/3`), never asked for by a runner: a runner
     that could report itself lost is not lost.
@@ -136,6 +147,11 @@ defmodule Loopctl.Delivery.StageMachine do
   @session_escalated for from <- @in_flight ++ [:merged, :deployed],
                          do: {from, :escalated, :session_escalated}
 
+  # A reported budget kill (US-44.3). From the stages a runner holds the story in and nowhere
+  # else: a kill reported after `merged` names a session whose outward effect already happened,
+  # and there the session's own `:session_escalated` is the way out. See the moduledoc entry.
+  @budget_reported for from <- @in_flight, do: {from, :escalated, :budget_reported}
+
   @transitions @forward ++
                  [
                    {:ci, :implementing, :ci_red},
@@ -147,7 +163,9 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
                    {:merged, :implementing, :merge_refused}
-                 ] ++ @budget_exceeded ++ @released ++ @human_resolution ++ @session_escalated
+                 ] ++
+                 @budget_exceeded ++
+                 @released ++ @human_resolution ++ @session_escalated ++ @budget_reported
 
   # The part of the machine a RUNNER may report over the channel: one definition, from which
   # `runner_transitions/0`'s doc, the wire enums and the published
@@ -181,6 +199,11 @@ defmodule Loopctl.Delivery.StageMachine do
   #   terminal with NO way out, `:human_resolution` included. A runner able to report it can
   #   park a story for good with no path back. A session that has run out of budget escalates
   #   instead; control decides whether that is `failed`.
+  #
+  # `:budget_reported` is held back for the same reason, one step removed: it is what control
+  # DECIDES when a runner reports a budget kill in `session_ended`. The runner reports the
+  # fact; the edge is the verdict, and it stays off this list so that a `stage` message can
+  # never take it.
   #
   # THE SOURCE FILTER STOPS AT `merged`, and that is the other half of the rule (#824 round 2,
   # H1). With `deployed` and `verified` as sources the edge allowlist admitted
@@ -366,6 +389,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :merge_gate
           | :merge_refused
           | :budget_exceeded
+          | :budget_reported
           | :runner_lost
           | :claim_released
           | :human_resolution

@@ -31,6 +31,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
   | runner -> control | `"stage"` | `RunnerStageReport` (since 1.4.0) | `{stage, claim_epoch, lock_version, attempts, effects}` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `stale_stage`, `unknown_story_stage`, `effect_conflict` |
+  | runner -> control | `"session_ended"` | `RunnerSessionEnded` (since 1.16.0) | `RunnerSessionEndedAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `audit_chain_append_failed` |
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
@@ -48,6 +49,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.13.0) `RunnerJoin.max_sessions` IS AUTHORITATIVE DOWNWARD. loopctl now reserves against the LESSER of the value a runner declares on join and the `max_sessions` it was ENROLLED with, re-read on every join. Until now only the enrolled number counted, written once with no path from any join, so a machine configured for one session was sent two and refused the second `at_capacity` — a refusal that costs the story's claim. A machine may therefore always lower itself; it cannot raise itself past its enrolled ceiling, which is what stops a compromised runner enlarging its own share of the tenant's admission budget. Nothing changes on the wire and no runner has to send anything new. `0` is the same statement as `draining` — the row keeps `1` because its range is 1..64, and loopctl refuses to PLACE on a machine declaring either, while a direct operator push is still delivered for the runner to refuse. Re-vendoring is worth it for the description, not required for the wire | | | | |
   | (1.14.0) A RUNNER DECLARES THE BRANCH PREFIXES IT ACCEPTS (`RunnerJoin.branch_prefixes`), and loopctl DERIVES a conforming branch instead of guessing one. A runner that enforces a prefix and does not declare it refuses every dispatch loopctl sends, which is what happened: the first real placement was refused `branch_not_allowed` because loopctl derived `feature/story-<n>-<id>` while the machine's config accepted `loop/` alone, and the operator could learn the required prefix only by reading a config file on that box. OMITTING THE FIELD IS EXACTLY TODAY'S BEHAVIOUR — no constraint, and the branch is the one loopctl already derived — so an un-upgraded runner is unaffected and nothing on the wire changes for it. RE-VENDOR to send it | | | | |
   | (1.15.0) A triage verdict message may carry `lens_verdicts` (`RunnerLensVerdict`, exactly one per lens, only beside a `verdict`, capped together by `RunnerLensVerdict.max_bytes/0`). Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies; a verdict without them escalates at triage. RE-VENDOR to send them; a 1.14.0 holder keeps working and its verdicts escalate at triage | | | | |
+  | (1.16.0) A runner may say WHY an implement session ended, with the new `session_ended` message (`RunnerSessionEnded`: `dispatch_id`, `claim_epoch`, `reason` in `completed`, `wall_clock_exceeded`, `max_turns_exceeded`, `usage_exhausted`, `crashed`). A budget kill escalates the story for a human instead of waiting out the lease and being retried, a crash releases the claim at once, and an exhausted subscription releases it without spending an attempt. Recorded ONCE per dispatch: a byte-identical resend is answered `ok` with the row even after the release it caused, a different `reason` is `already_recorded`. OPTIONAL — a runner that never sends it gets exactly today's behaviour, the lease reclaim. RE-VENDOR to send it: a 1.15.0 copy has no such event, no `RunnerSessionEndedAck` and no `session_ended_burst` | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -212,6 +214,52 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   runner can see which value survived and reconcile against it. Do not re-send after an
   `effect_conflict`.
 
+  ## Session end (since 1.16.0)
+
+  `session_ended` tells control WHY the session under an implement dispatch stopped. Before it,
+  control learned a session had died only when its claim lease ran out, so a wall-clock kill, a
+  turn-budget kill, a subscription that ran dry and a crash all looked the same and would all
+  have been retried. **The message states a FACT; control decides what the story does about
+  it**, and a runner's word never makes a story terminal:
+
+  - `completed` — nothing changes. Where the session got to is what its `stage` messages said.
+  - `wall_clock_exceeded`, `max_turns_exceeded` — an in-flight story goes to `escalated` over
+    `budget_reported`, a CONTROL-ONLY edge that is deliberately absent from
+    `x-connection.stage_transitions`: a runner reports the kill, it cannot take the edge. The
+    session's slot goes back in that transition, and the claim it ran under ENDS, so the
+    escalated story is held by nobody. Never retried — the same budget would kill it again —
+    and never `failed`, which has no way out.
+  - `crashed` — the claim is released NOW, as a lease reclaim would release it later: the
+    story goes back to `queued` over `runner_lost` and the slot goes back.
+  - `usage_exhausted` — released the same way, and NOT counted as an attempt against the
+    story: the subscription ran out and the work was never judged.
+
+  Send it once, after the session has stopped, for an ACCEPTED `implement` dispatch — a triage
+  session ends through `triage_verdict`, and naming a triage dispatch here is
+  `unknown_dispatch`. It is optional: a runner that never sends it gets exactly the behaviour
+  before 1.16.0.
+
+  **RECORDED ONCE PER DISPATCH, AND RESENDING IS SAFE.** A byte-identical resend is answered
+  `ok` with `replayed: true` and the row as it now stands — EVEN AFTER the release its first
+  copy caused has moved the story's `claim_epoch` on, because the resend is matched on its
+  bytes BEFORE the epoch is checked. So on any refusal outside `permanent_errors`, and on a
+  lost acknowledgement, send the same bytes again. A resend carrying a DIFFERENT `reason` is
+  `already_recorded`, permanently: the two sides disagree about how the session ended. A FIRST
+  report whose `claim_epoch` is not the story's current one is `stale_claim_epoch` and changes
+  nothing — the claim it is about has already ended some other way.
+
+  **A BUDGET KILL WHOSE ESCALATION DID NOT LAND** is answered by why, AFTER the report was
+  recorded. `rate_limited` — a lock was not free, or the row kept moving under the escalation
+  — is the one retry: send the same bytes, and the resend re-drives the escalation and the
+  claim's end. `audit_chain_append_failed` — the tenant's hash chain refused the escalation's
+  entry — is PERMANENT, exactly as on `stage`: every chained transition in the tenant is
+  failing until an operator repairs the chain, so do NOT resend. A chain whose append trips
+  its own HASH check answers the same code rather than dropping the connection. The claim stays
+  held meanwhile, and the lease reclaim is the re-driver: when the lease runs out it takes the
+  same escalation instead of re-queueing the story, and leaves the claim held while the chain
+  still refuses — so a budget-killed story is never re-queued, and is escalated on the first
+  sweep after the repair.
+
   ## Server-initiated disconnects (since 1.2.0)
 
   Before loopctl closes a runner's connection itself, it pushes `"disconnecting"` on the
@@ -237,6 +285,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     second. A verdict is produced ONCE per run and cannot be re-derived once the session has
     stopped, so this is sized against losing a run's whole output to a token bucket rather
     than against a flood.
+  - `session_ended_burst` (`session_ended_burst/0`, since 1.16.0) — a bucket of 4 that
+    refills one a second, for the same reason as the verdict's: one message per session, and a
+    report refused by a token bucket is a report the runner must hold and resend.
   - `permanent_errors` (`permanent_errors/0`) — the refusal codes no resend can clear.
     Branch on this rather than on a list copied into a runner's own source; everything not
     in it is worth resending unchanged.
@@ -334,7 +385,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.15.0"
+  @version "1.16.0"
   @major 1
 
   defmodule ByteRule do
@@ -2096,6 +2147,118 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerSessionEnded do
+    @moduledoc """
+    The `session_ended` message: why the session under an implement dispatch stopped (1.16.0,
+    epic 44 US-44.3). See "Session end" in `Loopctl.ApiSpec.RunnerContract` for what each
+    reason does to the story.
+
+    Three fields and no free text, deliberately. Everything control does with it is decided from
+    the `reason` ENUM, and entering `escalated` writes a chained entry that cannot be corrected
+    afterwards — so there is no field a session's prose could reach it through.
+    """
+
+    require OpenApiSpex
+
+    # Why a session stops, as far as control needs to tell apart: it finished, its budget
+    # killed it (two ways), the account it runs on ran dry, or it died.
+    @reasons ~w(completed wall_clock_exceeded max_turns_exceeded usage_exhausted crashed)
+
+    @doc "Every reason a runner may give for a session ending."
+    @spec reasons() :: [String.t()]
+    def reasons, do: @reasons
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerSessionEnded",
+        description:
+          "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0). " <>
+            "Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, " <>
+            "not a request — control decides the story's next stage from `reason`: " <>
+            "`completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` " <>
+            "escalate an in-flight story over the control-only `budget_reported` edge and " <>
+            "end its claim, `crashed` releases the claim at once over `runner_lost`, and `usage_exhausted` " <>
+            "releases it the same way without counting an attempt. RECORDED ONCE PER DISPATCH: " <>
+            "a byte-identical resend is answered `ok` with the row even after the release it " <>
+            "caused moved the claim epoch on, and a different `reason` is `already_recorded`.",
+        type: :object,
+        required: [:dispatch_id, :claim_epoch, :reason],
+        properties: %{
+          dispatch_id: %Schema{
+            type: :string,
+            format: :uuid,
+            description:
+              "The ACCEPTED implement dispatch whose session ended. It names the story; a " <>
+                "story id is never taken from the wire."
+          },
+          claim_epoch: %Schema{
+            type: :integer,
+            minimum: 0,
+            description: "The `claim_epoch` of the dispatch, echoed."
+          },
+          reason: %Schema{
+            type: :string,
+            enum: @reasons,
+            description:
+              "Why the session stopped. `usage_exhausted` means the account the session ran " <>
+                "on hit its usage limit; `crashed` is any end the runner did not choose and " <>
+                "that is not one of the others."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
+  defmodule RunnerSessionEndedAck do
+    @moduledoc """
+    The reply to a `session_ended` (1.16.0): the story's stage row as it stands AFTER control
+    acted on the report — the same fields a `stage` ack carries — and whether this delivery was
+    a resend of one already recorded.
+    """
+
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.RunnerStage
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerSessionEndedAck",
+        description:
+          "The reply to an accepted `session_ended`: where the story now is, and whether this " <>
+            "was a resend. The row fields are the ones a `stage` ack carries.",
+        type: :object,
+        required: [:stage, :claim_epoch, :lock_version, :attempts, :effects, :replayed],
+        properties: %{
+          stage: %Schema{type: :string, description: "The stage the story is at now."},
+          claim_epoch: %Schema{
+            type: :integer,
+            minimum: 0,
+            description:
+              "The epoch the row is bound to now. Past the dispatch's after a `crashed` or " <>
+                "`usage_exhausted` release: the claim the session ran under has ended."
+          },
+          lock_version: %Schema{type: :integer, minimum: 0},
+          attempts: %Schema{
+            type: :object,
+            description: "How many times each counted edge has been taken, keyed by edge."
+          },
+          effects: %{
+            RunnerStage.schema()
+            | description: "The identities the row holds, as a `stage` ack reports them."
+          },
+          replayed: %Schema{
+            type: :boolean,
+            description:
+              "False on the delivery that recorded this report, true on any resend of it. A " <>
+                "resend changes nothing a second time."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerTraceBatch do
     @moduledoc false
     require OpenApiSpex
@@ -2221,6 +2384,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerLensVerdict,
     RunnerTriageVerdictMessage,
     RunnerTriageVerdictAck,
+    RunnerSessionEnded,
+    RunnerSessionEndedAck,
     RunnerDispatch,
     RunnerDispatchReply,
     RunnerTraceEvent,
@@ -2298,6 +2463,18 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
          already_recorded unknown_story_stage stale_stage audit_chain_append_failed
          internal_error),
+    # Since 1.16.0. `already_recorded` means what it means on `triage_verdict`: this dispatch
+    # already has a session-end report and the bytes just sent are NOT the same ones. An
+    # identical resend is never refused, even after the release its first copy caused moved
+    # the claim epoch — it is matched on its bytes before the epoch is looked at.
+    # `stale_claim_epoch` is therefore about a FIRST report only. No `stale_stage`: where the
+    # story is, is what the ok reply carries, and nothing the runner sends names a `from`.
+    # `audit_chain_append_failed` is a budget kill's escalation refused by the tenant's hash
+    # chain, permanent as on `stage`; a budget escalation that merely could not get its lock is
+    # `rate_limited`, and the resend completes it.
+    "session_ended" =>
+      ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
+         already_recorded unknown_story_stage audit_chain_append_failed internal_error),
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
@@ -2361,6 +2538,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       "rate_limited" => ~w(min_interval_ms),
       "invalid_payload" => ~w(details)
     },
+    "session_ended" => %{
+      "rate_limited" => ~w(min_interval_ms),
+      "invalid_payload" => ~w(details)
+    },
     "unknown_event" => %{}
   }
 
@@ -2370,7 +2551,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 end)
 
   # The runner-to-control events `LoopctlWeb.RunnerChannel.handle_in/3` acts on.
-  @inbound_events ~w(status dispatch_reply trace trace_cursor stage triage_verdict)
+  @inbound_events ~w(status dispatch_reply trace trace_cursor stage triage_verdict
+                     session_ended)
 
   # The minimum spacing, per channel, between two acted-on messages of one event. A message
   # inside it is refused with `rate_limited` and `min_interval_ms`. Each event has its OWN
@@ -2392,6 +2574,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # always lands well inside a run's remaining wall clock, and generous enough that a runner
   # answering several finished triage sessions at once is never made to hold one.
   @triage_verdict_burst %{"capacity" => 4, "refill_interval_ms" => 1_000}
+
+  # One report per session, like a verdict, and for the same reason sized against losing it
+  # rather than against a flood: a runner reconnecting after a deploy may have several
+  # finished sessions to report at once, and each one refused is one it has to hold.
+  @session_ended_burst %{"capacity" => 4, "refill_interval_ms" => 1_000}
 
   # THE REFUSALS NO RESEND CAN CLEAR, published so a runner branches on the contract rather
   # than on a list it copied into its own source. Asked for by the `loopctl-runner`
@@ -2500,6 +2687,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec triage_verdict_burst() :: %{String.t() => pos_integer()}
   def triage_verdict_burst, do: @triage_verdict_burst
+
+  @doc """
+  The `session_ended` bucket (1.16.0). See the note above `@session_ended_burst`.
+  """
+  @spec session_ended_burst() :: %{String.t() => pos_integer()}
+  def session_ended_burst, do: @session_ended_burst
 
   @doc """
   The refusal codes no resend can clear, per event (1.9.0).
@@ -3131,6 +3324,19 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       else: []
   end
 
+  @doc """
+  Validates a `session_ended` payload (1.16.0). Returns the declared fields only, with atom
+  keys and `reason` left a string — every reason is one of `RunnerSessionEnded.reasons/0`,
+  and the schema's enum refuses anything else as `invalid_payload`.
+  """
+  @spec cast_session_ended(term()) :: {:ok, map()} | {:error, term()}
+  def cast_session_ended(payload) do
+    with :ok <- values_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerSessionEnded.schema()) do
+      {:ok, known_fields(cast, RunnerSessionEnded.schema())}
+    end
+  end
+
   @doc "Validates a `trace_cursor` payload. Returns `{:ok, %{run_id: run_id}}`."
   @spec cast_trace_cursor(term()) :: {:ok, map()} | {:error, term()}
   def cast_trace_cursor(payload) do
@@ -3253,6 +3459,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "disconnecting" => "RunnerDisconnecting",
           "stage" => "RunnerStageReport",
           "triage_verdict" => "RunnerTriageVerdictMessage",
+          "session_ended" => "RunnerSessionEnded",
           "story" => "RunnerStory"
         },
         # The kinds loopctl will actually send. `RunnerDispatch.kind`'s enum is the
@@ -3267,7 +3474,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         "replies" => %{
           "trace" => "RunnerTraceAck",
           "trace_cursor" => "RunnerTraceAck",
-          "triage_verdict" => "RunnerTriageVerdictAck"
+          "triage_verdict" => "RunnerTriageVerdictAck",
+          "session_ended" => "RunnerSessionEndedAck"
         },
         "errors" => @error_reasons,
         "limits" => %{
@@ -3282,6 +3490,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "min_interval_ms" => @min_interval_ms,
           "dispatch_reply_burst" => @dispatch_reply_burst,
           "triage_verdict_burst" => @triage_verdict_burst,
+          "session_ended_burst" => @session_ended_burst,
           "stage_burst" => @stage_burst,
           "stage_max_reason_length" => RunnerStage.max_reason_length(),
           "story" => RunnerStory.limits(),
