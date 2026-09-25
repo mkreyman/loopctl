@@ -60,6 +60,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `gate_a_inputs` says which input it used. Orchestrator key, pinned when `LOOPCTL_ORCH_KEY` is
   set, exactly as `force_unclaim_story`.
 
+### Changed
+
+- **`contract_story` and `claim_story`** name the new 409 `story_held`
+  (loopctl epic 44, US-44.3): a story whose delivery stage is `escalated`, `done` or `failed`
+  is refused even when it reads `pending` or `contracted`; an escalated one becomes available
+  again only after `resolve_escalation` sends it to `queued`.
+
 ## 2.102.0 — 2026-09-16 (the delivery loop can finally be given an input)
 
 ### Added
