@@ -271,6 +271,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @spec judge(facts()) :: Verdict.t()
   def judge(facts) do
     {gate_a, gate_a_inputs} = gate_a(Map.get(facts, :gate_a_input, :missing))
+    gate_a = redact_gate_a(gate_a)
     custody = Map.get(facts, :custody, {:error, :custody_unknown})
     carried = gate_a_reasons(gate_a) ++ custody_reasons(custody)
 
@@ -685,19 +686,61 @@ defmodule Loopctl.Delivery.MergePrecondition do
     do: Enum.any?(reasons, &match?({tag, _} when tag in [:gate_a, :trio_verdict], &1))
 
   defp gate_a_reasons(%GateA.Result{decision: :escalate, reasons: reasons}),
-    do: Enum.map(reasons, &{:gate_a, code_only(&1)})
+    do: Enum.map(reasons, &{:gate_a, &1})
 
   defp gate_a_reasons(%GateA.Result{verdict: :story}), do: []
   defp gate_a_reasons(%GateA.Result{verdict: verdict}), do: [{:trio_verdict, verdict}]
 
-  # A contradiction carries the lens's own `ref` and `why` — runner-authored text written by a
-  # session that had read the reporter's words. These reasons become the escalation reason,
-  # which is appended to the hash-chained audit log, so only its COUNT travels; the text stays
-  # on the verdict record and on `verdict.gate_a`, where an operator reads it as data.
-  defp code_only({:contradiction, index, contradicts}) when is_list(contradicts),
-    do: {:contradiction, index, length(contradicts)}
+  # A contradiction's `ref` and `why` are the ONLY runner prose a Gate A reason can carry —
+  # everything else in one is loopctl's own vocabulary (a reason atom, a field name `GateA`
+  # names, the validated `kind` enum). They are blanked HERE, where the reasons are built, so
+  # every sink downstream — the escalation reason on the audit chain, the log line, the
+  # endpoint's `reasons[].detail` — receives the redacted form, while the lens's full text
+  # stays on the triage record for an operator to read as data.
+  # The whole Gate A result, not only the reasons carried on the verdict: the endpoint renders
+  # `verdict.gate_a` too, and a soft signal is a lens's own, unvalidated escalation code.
+  defp redact_gate_a(%GateA.Result{} = result) do
+    %{
+      result
+      | reasons: Enum.map(result.reasons, &redact_lens_text/1),
+        soft_signals:
+          Enum.map(result.soft_signals, fn {index, code} -> {index, soft_code(code)} end)
+    }
+  end
 
-  defp code_only(reason), do: reason
+  # A soft signal is meant to be a CODE, counted so its rate can be measured before it is ever
+  # allowed to gate (`GateA.Result`). A code-shaped string is kept for exactly that; anything
+  # else is a lens's prose and is replaced by a STRING naming its size, so the result still
+  # encodes as JSON and still matches `GateA.Result.t`.
+  #
+  # CODE-SHAPED MEANS THE GATING CODES' OWN SHAPE (`GateA.gating_reason_codes/0`: lower-case
+  # words joined by underscores), and nothing wider. Round 2 widened it to capitals, colons,
+  # dots and hyphens, which kept session text such as `IGNORE-ALL.prior:rules` verbatim in the
+  # escalation reason, the log line and the endpoint's body. A lens that wants a soft signal
+  # counted writes it in the shape the gate's own vocabulary has.
+  defp soft_code(code) when is_binary(code) do
+    if Regex.match?(~r/\A[a-z0-9_]{1,60}\z/, code),
+      do: code,
+      else: "[prose:#{byte_size(code)}]"
+  end
+
+  defp soft_code(_code), do: "[prose]"
+
+  defp redact_lens_text({:contradiction, index, contradicts}) when is_list(contradicts),
+    do: {:contradiction, index, Enum.map(contradicts, &redact_contradiction/1)}
+
+  defp redact_lens_text(reason), do: reason
+
+  defp redact_contradiction(%{} = contradiction) do
+    Enum.reduce(["ref", "why"], contradiction, fn key, acc ->
+      case Map.get(acc, key) do
+        text when is_binary(text) -> Map.put(acc, key, {:text, byte_size(text)})
+        _other -> acc
+      end
+    end)
+  end
+
+  defp redact_contradiction(other), do: other
 
   defp gate_b_reasons(%GateB.Result{outcome: :clear}, _proof), do: []
 

@@ -84,12 +84,19 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # deployed runner did the only thing left — brute-forced three `from` values in turn, all
   # refused, none of them naming where the row was.
   #
-  # The BARE atom keeps its clause below: `triage_verdict` is refused `stale_stage` too, from
-  # `Loopctl.Delivery.TriageVerdict`, where it means the story left `detected` and no
-  # transition applies at all. That one has nothing to hand back and is PERMANENT for that
-  # message, so carrying a row there would suggest a retry the contract refuses.
+  # The BARE atom keeps its clause below, for a caller with no row to hand back.
   def for_message({:stale_stage, %StoryStage{} = row}),
     do: Map.put(RunnerStages.row_state(row), :reason, "stale_stage")
+
+  # A DISPATCH THAT DID NOT TRIAGE THIS STORY (epic 44, US-44.1): `Stages.advance/4` refusing a
+  # transition out of `triaged` that names another dispatch, and `Loopctl.Delivery.TriageVerdict`
+  # refusing that dispatch's verdict. Its own code inside loopctl, so no internal caller can
+  # read it as the ordinary "already done" `stale_stage`; on the wire it IS `stale_stage` as the
+  # contract publishes it — the story has moved on and this message decides nothing — with no
+  # row, because it is PERMANENT for that message and a row would suggest a retry. Mapped HERE,
+  # at the one wire boundary, so every caller that reaches it is answered the same way rather
+  # than `internal_error` from the catch-all.
+  def for_message(:triage_not_bound), do: %{reason: "stale_stage"}
 
   # The tenant's hash chain refused this transition's entry, so nothing was written. NOT
   # `rate_limited`: it is deterministic, the next attempt fails the same way, and every

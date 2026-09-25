@@ -355,7 +355,7 @@
       "type": "object"
     },
     "RunnerLensVerdict": {
-      "description": "One triage lens's own judgement (since 1.15.0), sent three at a time in `RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them with the verdict and Gate A reads them at merge instead of anything a merge caller supplies. SESSION-AUTHORED AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES (`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
+      "description": "One triage lens's own judgement (since 1.15.0), sent three at a time in `RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them with the verdict and Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies. SESSION-AUTHORED AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES (`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
       "properties": {
         "confidence": {
           "enum": [
@@ -952,7 +952,7 @@
           ]
         },
         "escalation_reasons": {
-          "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM: a sentence saying what a lens actually saw is what makes an escalation actionable, and at least one entry must be prose — a bare code is not words a person can act on. WHAT LOOPCTL DOES WITH THIS FIELD TODAY: it records it verbatim on the verdict. No string HERE changes what happens to the story. The codes in `x-connection.triage_gating_reasons` gate only where Gate A reads them: in each `RunnerLensVerdict.escalation_reasons` of the message's `lens_verdicts` (since 1.15.0), matched as whole strings, at merge.",
+          "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM: a sentence saying what a lens actually saw is what makes an escalation actionable, and at least one entry must be prose — a bare code is not words a person can act on. WHAT LOOPCTL DOES WITH THIS FIELD TODAY: it records it verbatim on the verdict. No string HERE changes what happens to the story. The codes in `x-connection.triage_gating_reasons` gate only where Gate A reads them: in each `RunnerLensVerdict.escalation_reasons` of the message's `lens_verdicts` (since 1.15.0), matched as whole strings, at triage and at merge.",
           "items": {
             "maxLength": 150,
             "type": "string"
@@ -1095,9 +1095,9 @@
           ]
         },
         "lens_verdicts": {
-          "description": "The three triage lenses' own judgements (since 1.15.0), one per lens, each lens exactly once. Allowed only beside `verdict`. Gate A reads these at merge, so a story whose triage sent none is refused there: Gate A cannot be evaluated. At most 9000 bytes for all three under the byte rule.",
+          "description": "The three triage lenses' own judgements (since 1.15.0), one per lens, each lens exactly once. Allowed only beside `verdict`. Gate A reads these at triage and again at merge, so a verdict sent WITHOUT them escalates at triage: Gate A cannot be evaluated. At most 9000 bytes for all three under the byte rule.",
           "items": {
-            "description": "One triage lens's own judgement (since 1.15.0), sent three at a time in `RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them with the verdict and Gate A reads them at merge instead of anything a merge caller supplies. SESSION-AUTHORED AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES (`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
+            "description": "One triage lens's own judgement (since 1.15.0), sent three at a time in `RunnerTriageVerdictMessage.lens_verdicts`, one per lens. loopctl persists them with the verdict and Gate A reads them at triage, before the story is queued, and again at merge, instead of anything a merge caller supplies. SESSION-AUTHORED AND UNTRUSTED, like the verdict. `escalation_reasons` here is for CODES (`x-connection.triage_gating_reasons`); prose belongs in the merged verdict.",
             "properties": {
               "confidence": {
                 "enum": [
@@ -1226,7 +1226,7 @@
               ]
             },
             "escalation_reasons": {
-              "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM: a sentence saying what a lens actually saw is what makes an escalation actionable, and at least one entry must be prose — a bare code is not words a person can act on. WHAT LOOPCTL DOES WITH THIS FIELD TODAY: it records it verbatim on the verdict. No string HERE changes what happens to the story. The codes in `x-connection.triage_gating_reasons` gate only where Gate A reads them: in each `RunnerLensVerdict.escalation_reasons` of the message's `lens_verdicts` (since 1.15.0), matched as whole strings, at merge.",
+              "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM: a sentence saying what a lens actually saw is what makes an escalation actionable, and at least one entry must be prose — a bare code is not words a person can act on. WHAT LOOPCTL DOES WITH THIS FIELD TODAY: it records it verbatim on the verdict. No string HERE changes what happens to the story. The codes in `x-connection.triage_gating_reasons` gate only where Gate A reads them: in each `RunnerLensVerdict.escalation_reasons` of the message's `lens_verdicts` (since 1.15.0), matched as whole strings, at triage and at merge.",
               "items": {
                 "maxLength": 150,
                 "type": "string"

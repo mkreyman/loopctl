@@ -203,6 +203,31 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       refute story.id in candidate_ids(50)
     end
 
+    test "a too-large route that stopped HALFWAY is finished by the next pass", ctx do
+      story = detected_story(ctx)
+      half_take(ctx, story)
+
+      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:escalated]
+
+      row = unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end)
+      assert row.stage == :escalated
+      assert row.escalation_reason == "triage_dispatch:triage_too_large"
+    end
+
+    test "an unbound triaged row WITH a recorded verdict is not swept", ctx do
+      story = detected_story(ctx)
+      half_take(ctx, story)
+
+      # A row triaged before the binding existed: it has a verdict, so this module's route did
+      # not leave it here and escalating it as too large would misreport it.
+      unboxed(fn ->
+        fixture(:triage_verdict, tenant_id: ctx.tenant.id, story_id: story.id, bind: false)
+      end)
+
+      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == []
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :triaged
+    end
+
     test "a LEGACY source whose base_branch is not a git ref name is blocked, not pushed", ctx do
       story = detected_story(ctx)
       join_runner(ctx, %{"kinds" => ["triage"]})
@@ -479,5 +504,20 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       "in_flight" => 0,
       "draining" => false
     }
+  end
+
+  # The FIRST half of the too-large route alone: `triaged`, nothing bound, no verdict.
+  defp half_take(ctx, story) do
+    unboxed(fn ->
+      row = Stages.get(ctx.tenant.id, story.id)
+
+      {:ok, _row} =
+        Stages.advance(ctx.tenant.id, story.id, {:detected, :triaged, :forward},
+          claim_epoch: row.claim_epoch,
+          actor_label: "worker:triage_dispatcher",
+          actor_role: :agent,
+          actor_lineage: []
+        )
+    end)
   end
 end

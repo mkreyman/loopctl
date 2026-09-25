@@ -17,8 +17,10 @@ defmodule Loopctl.DeliveryGates.GateB do
 
   ## Run twice
 
-  `evaluate(:triage, ...)` runs over the story's PREDICTED touches and decides only whether
-  to dispatch. `evaluate(:merge, ...)` runs over the real diff — every added, modified and
+  At triage the gate runs as `triage_screen/3` over the story's PREDICTED touches and decides
+  only whether to dispatch. It is NOT `evaluate(:triage, ...)`: that would add stale-trigger
+  and missing-files reasons triage can never satisfy, and escalate every story. See
+  `triage_screen/3`. `evaluate(:merge, ...)` runs over the real diff — every added, modified and
   DELETED path (a deletion under a guarded path is a change to it), plus both names of every
   rename — and the real diffstat, applies the size bound, and is the one that gates. Only the `:merge` result
   carries `merge_precondition?: true`.
@@ -98,6 +100,44 @@ defmodule Loopctl.DeliveryGates.GateB do
       reasons: reasons,
       effect_matches: effect_matches
     }
+  end
+
+  @doc """
+  The TRIAGE SCREEN (epic 44, US-44.2): Gate B's trigger matching over a triage session's
+  PREDICTED touches, before a story is queued. `[]` means nothing guarded was predicted.
+
+  Not `evaluate(:triage, …)`, which would escalate every story: that adds a stale-trigger
+  reason without the repository's file list, and a missing-files reason for a draft that
+  predicted none — neither of which triage can supply. So this is deliberately narrower. It
+  can only ADD an escalation, on a POSITIVE signal: a predicted touch matching a `human_paths`
+  or `effect_paths` trigger, or
+  trigger configuration that cannot be read for the repository, which fails closed exactly as
+  the merge run does. The merge run remains the gate.
+
+  An effect-path match escalates here although `evaluate(:merge, ...)` answers `:prove_effect`
+  for it rather than refusing outright: the merge precondition turns EVERY `:prove_effect` into
+  a refusal today, whatever proof the call carries (`Loopctl.Delivery.MergePrecondition`,
+  "What has to be true to merge", item 2), because the proof is a caller assertion. So an
+  effect-path story IS certain to be refused at merge until the server-side proof harness
+  exists — and when it does, this clause is the one to revisit.
+  """
+  @spec triage_screen(term(), term(), [String.t()]) :: [term()]
+  def triage_screen(triggers, repo, touches) when is_list(touches) do
+    case repo_triggers(triggers, repo) do
+      {:ok, repo_triggers} ->
+        human =
+          for {file, pattern} <- matches(repo_triggers.human_paths, touches),
+              do: {:human_path, file, pattern}
+
+        effect =
+          for {file, pattern} <- matches(repo_triggers.effect_paths, touches),
+              do: {:effect_path, file, pattern}
+
+        human ++ effect
+
+      {:escalate, reason} ->
+        [reason]
+    end
   end
 
   @doc """

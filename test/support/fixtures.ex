@@ -2346,19 +2346,29 @@ defmodule Loopctl.Fixtures do
             tenant_id: tenant_id,
             story_id: Map.fetch!(attrs, :story_id),
             dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
-            payload_digest: Ecto.UUID.generate(),
-            claim_epoch: 0,
+            payload_digest: Map.get_lazy(attrs, :payload_digest, &Ecto.UUID.generate/0),
+            claim_epoch: Map.get(attrs, :claim_epoch, 0),
             inserted_at: Map.get(attrs, :inserted_at)
           },
           result
         )
       )
 
+    # THE BINDING Gate A reads: the story's stage row naming this verdict's dispatch as its
+    # `triage_dispatch_id`, as the `detected -> triaged` transition that verdict took writes it
+    # — incomplete verdicts included. Only when the story has a stage row, first writer wins;
+    # `bind: false` for a row that decided nothing (a refused dispatch's).
+    insert = fn ->
+      row = repo.insert!(record)
+      if Map.get(attrs, :bind, true), do: bind_triage_dispatch(repo, row)
+      row
+    end
+
     if repo == Loopctl.Repo do
-      {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, fn -> Loopctl.Repo.insert!(record) end)
+      {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, insert)
       row
     else
-      repo.insert!(record)
+      insert.()
     end
   end
 
@@ -3137,6 +3147,18 @@ defmodule Loopctl.Fixtures do
 
   defp ensure_scope_entity(attrs, _unknown, _tenant_id) do
     {Ecto.UUID.generate(), attrs}
+  end
+
+  defp bind_triage_dispatch(repo, %TriageVerdictRecord{} = verdict) do
+    repo.update_all(
+      from(r in StoryStage,
+        where: r.tenant_id == ^verdict.tenant_id and r.story_id == ^verdict.story_id,
+        # First writer wins, as in production: the transition that bound the story is the one
+        # that took it out of `detected`, and nothing overwrites it.
+        where: is_nil(r.triage_dispatch_id)
+      ),
+      set: [triage_dispatch_id: verdict.dispatch_id]
+    )
   end
 
   defp insert_merged_event(repo, %StoryStage{} = row, merged_at) do

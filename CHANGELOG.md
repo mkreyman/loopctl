@@ -6,6 +6,15 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Both delivery gates now screen a triaged story BEFORE it is queued (epic 44, US-44.2).**
+  An accepted `story` verdict is escalated over `triage_escalate` instead of queued when its
+  lens verdicts fail Gate A, when it carries none (a runner on contract 1.14.0), when a drafted
+  `touches` entry matches a `human_paths` or `effect_paths` trigger, or when the project's
+  repository has no single live intake source or no trigger entry. The draft is kept, so a
+  human who re-queues the story gets the drafted story. **Operator-visible:** until every
+  runner sends `lens_verdicts`, every triaged story stops at `escalated`; this is deliberate —
+  the merge gate would refuse each of them after a full implementation run.
+
 - **The merge gate reads Gate A's input from the database, never from the caller (epic 44,
   US-44.1, runner contract 1.15.0). RE-VENDOR the contract to send `lens_verdicts`;
   `loopctl-mcp-server` 2.103.0 adds the `merge_precondition` tool.** `POST
@@ -15,13 +24,20 @@ All notable changes to loopctl are documented here.
   `lens_verdicts` — one small entry per lens (`analyst`, `architect`, `engineer`), capped
   together at 9 000 bytes under the byte rule — which loopctl stores in the new
   `triage_verdicts.lens_verdicts` column (migration, no manual step, NULL for existing rows).
-  Gate A reads the lens verdicts of the story's most recent triage, or accepts a human's
+  Gate A reads the lens verdicts of the triage dispatch BOUND to the story — written to the
+  new `story_stages.triage_dispatch_id` column (migration, no backfill) on the `detected ->
+  triaged` transition that dispatch took, so any other dispatch's verdict is refused
+  `stale_stage` before it moves the story further — or accepts a human's
   re-queue of an escalation that was about Gate A; with neither it REFUSES
   (`gate_a_inputs_missing`), never retries. `trio_outputs` is no longer required, is ignored when
   sent, and the answer carries `trio_outputs_ignored: true`; `gate_a_inputs` is now
   `persisted_triage`, `human_resolution` or `missing` (it was always `caller_asserted`).
   **Operator-visible:** a story whose triage ran on a runner still on contract 1.14.0 has no lens
-  verdicts, so its merge is refused until a human re-queues it or it is re-triaged.
+  verdicts, so its merge is refused until a human re-queues it or it is re-triaged. The same
+  holds for EVERY story already past triage when this deploys — none has a bound dispatch or
+  lens verdicts — so each one reaching the merge gate escalates with `gate_a_inputs_missing`
+  and needs a human re-queue. Nothing merges unattended today, so the count is whatever is in
+  flight.
 
 ### Added
 

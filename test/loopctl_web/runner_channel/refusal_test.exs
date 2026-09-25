@@ -32,6 +32,7 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
     :not_found,
     :not_claimed,
     :stale_claim_epoch,
+    :triage_not_bound,
     :stale_stage,
     :actor_lineage_required,
     :invalid_reason,
@@ -43,6 +44,12 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
     :invalid_event_data,
     :busy
   ]
+
+  describe "triage_not_bound (epic 44, US-44.1)" do
+    test "is published as stale_stage, with no row, never internal_error" do
+      assert Refusal.for_message(:triage_not_bound) == %{reason: "stale_stage"}
+    end
+  end
 
   describe "the catch-all" do
     test "answers internal_error and logs the reason, which is never sent" do

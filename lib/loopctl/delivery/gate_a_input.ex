@@ -6,32 +6,41 @@ defmodule Loopctl.Delivery.GateAInput do
   Until contract 1.15.0 the merge precondition took the triage trio's outputs from the
   request, so the principal driving a merge also supplied the triage it was judged against
   and a fabricated unanimous trio cleared Gate A. Now the input is one of three facts, each
-  resolved here:
+  resolved here from the story's stage row and its transition history:
 
-  - `{:persisted_triage, outputs}` — the three lens verdicts recorded with the story's MOST
-    RECENT triage verdict (a re-triage supersedes an earlier one), translated to the shape
-    `Loopctl.DeliveryGates.GateA.evaluate/1` reads. They are runner-authored and untrusted,
-    but they were written by a triage session before any implementation existed, which is a
-    different principal from whoever asks for the merge.
+  - `{:persisted_triage, outputs}` — the three lens verdicts of the ONE triage that triaged
+    the story, translated to the shape `Loopctl.DeliveryGates.GateA.evaluate/1` reads. They
+    are runner-authored and untrusted, but they were written by a triage session before any
+    implementation existed, which is a different principal from whoever asks for the merge.
   - `:human_resolution` — a human re-queued the story from an escalation that was ABOUT Gate
-    A, after the most recent triage: a `:triage_escalate` escalation, or a `:merge_gate` one
-    whose event records Gate A among its reasons. A human already made the decision Gate A
-    exists to route to them, and refusing it again at merge would loop. A human re-queue of
-    any OTHER escalation (a spent retry ceiling, a Gate B refusal) says nothing about the
-    request and does not count.
+    A: a `:triage_escalate` escalation for the trio's own `escalate` verdict, the gate screen's
+    Gate A codes, or the dispatcher's oversize ticket (control found nothing to judge); or a
+    `:merge_gate` one whose event records Gate A among its reasons. A flagged or undispatchable
+    draft and an incomplete run do not count — see `gate_a_escalation?/1`. A human already made the decision Gate A exists to route to them, and
+    refusing it again at merge would loop. A human re-queue of any OTHER escalation (a spent
+    retry ceiling, a Gate B refusal) says nothing about the request and does not count.
   - `:missing` — neither. The gate refuses, because waiting cannot make a verdict appear.
 
-  ## Where the state lives, and why ordering never crosses tables
+  ## Which verdict: the dispatch bound to the story, never the newest row
 
-  "After the most recent triage" is decided inside `story_stage_events` alone: the triage
-  verdict's own transition out of `triaged` is an event on the same row as the human
-  resolution, so both are ordered by that table's `(inserted_at, lock_version)` — the order
-  `Loopctl.Delivery.Stages.list_events/2` reads them in, and this module reads them through
-  it. Comparing `triage_verdicts.inserted_at`
-  with an event's timestamp would compare two clocks written by two transactions.
+  The story's stage row carries `triage_dispatch_id`, written ON the `detected -> triaged`
+  transition by the dispatch whose verdict took it (`Loopctl.Delivery.TriageVerdict`), in that
+  transition's own transaction, and cleared by nothing. A dispatch that did not triage the
+  story is refused before it can take any further transition. Gate A reads the bound
+  dispatch's row. "The newest row for the story"
+  would be wrong because records and transitions are separate writes, so a later row need not
+  be the one that decided anything. A story with no bound dispatch (triaged before the binding
+  existed, or escalated by the dispatcher without a triage run) is `:missing`.
 
-  Every read is tenant-scoped through `Repo.with_tenant/2`, so a tenant's evaluation cannot
-  reach another tenant's verdict or events.
+  ## Where the state lives
+
+  In `story_stages`, `story_stage_events` and `triage_verdicts`, all read through
+  `Repo.with_tenant/2` with
+  an explicit tenant predicate, so a tenant's evaluation cannot reach another tenant's rows.
+  The history is walked in `Loopctl.Delivery.Stages.list_transitions/2`'s order, never by
+  comparing timestamps across the two tables. A database error RAISES: the merge-precondition
+  request then fails having written nothing, and the caller retries — a transient fault must
+  not become an escalation a human has to clear.
   """
 
   import Ecto.Query
@@ -50,15 +59,22 @@ defmodule Loopctl.Delivery.GateAInput do
   @doc "Gate A's input for one story. See the moduledoc for the three answers."
   @spec for_story(Ecto.UUID.t(), Ecto.UUID.t()) :: t()
   def for_story(tenant_id, story_id) do
-    if human_resolved?(tenant_id, story_id),
-      do: :human_resolution,
-      else: persisted(tenant_id, story_id)
+    cond do
+      human_resolved?(tenant_id, story_id) ->
+        :human_resolution
+
+      dispatch_id = bound_dispatch(tenant_id, story_id) ->
+        persisted(tenant_id, story_id, dispatch_id)
+
+      true ->
+        :missing
+    end
   end
 
   @doc """
   The stored lens map as Gate A's three outputs, in the contract's lens order. `nil` for a
-  map that does not name each lens exactly once — a verdict recorded before 1.15.0, or a
-  row written around the cast.
+  map that does not name each lens exactly once with an object for each — a verdict recorded
+  before 1.15.0, or a row written around the cast. Read as missing, never crashed on.
   """
   @spec outputs(map() | nil) :: [map()] | nil
   def outputs(%{} = lens_map) do
@@ -72,8 +88,6 @@ defmodule Loopctl.Delivery.GateAInput do
 
   def outputs(_lens_map), do: nil
 
-  # A row written around the cast is read as missing, never crashed on: the gate must refuse,
-  # and a 500 would refuse nothing and record nothing.
   defp entry?(%{"outcome" => outcome}) when is_binary(outcome), do: true
   defp entry?(_entry), do: false
 
@@ -86,62 +100,85 @@ defmodule Loopctl.Delivery.GateAInput do
     }
   end
 
-  # The NEWEST verdict row, incomplete ones included: a re-triage that produced nothing
-  # supersedes an earlier verdict rather than letting Gate A fall back to it.
-  defp persisted(tenant_id, story_id) do
-    Repo.with_tenant(tenant_id, fn ->
-      Repo.one(
-        from r in TriageVerdictRecord,
-          where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
-          order_by: [desc: r.inserted_at, desc: r.id],
-          limit: 1,
-          select: r.lens_verdicts
-      )
-    end)
-    |> case do
-      {:ok, lens_map} ->
-        case outputs(lens_map) do
-          nil -> :missing
-          outputs -> {:persisted_triage, outputs}
-        end
+  defp persisted(tenant_id, story_id, dispatch_id) do
+    {:ok, lens_map} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in TriageVerdictRecord,
+            where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+            where: r.dispatch_id == ^dispatch_id,
+            select: r.lens_verdicts
+        )
+      end)
 
-      {:error, _reason} ->
-        :missing
+    case outputs(lens_map) do
+      nil -> :missing
+      outputs -> {:persisted_triage, outputs}
     end
   end
 
-  # Walks the story's transitions in order, remembering the escalation each human
-  # resolution left, and answers whether the LAST human resolution came after the last
-  # triage and resolved a Gate A escalation.
-  # `Stages.list_events/2` is the one reader of that history, and its order is the order.
+  defp bound_dispatch(tenant_id, story_id) do
+    case Stages.get(tenant_id, story_id) do
+      %{triage_dispatch_id: dispatch_id} -> dispatch_id
+      nil -> nil
+    end
+  end
+
+  # Whether a human has resolved an escalation that was about Gate A. A resolution is STICKY —
+  # a human who answered the Gate A question does not un-answer it by later re-queueing the
+  # story from an unrelated escalation — and ANY qualifying resolution counts, not only the
+  # last one.
   defp human_resolved?(tenant_id, story_id) do
     tenant_id
-    |> Stages.list_events(story_id)
-    |> Enum.filter(&(&1.event == "transitioned"))
-    |> Enum.map(&%{from: &1.from_stage, to: &1.to_stage, edge: &1.edge, data: &1.data})
+    |> Stages.list_transitions(story_id)
     |> Enum.reduce(%{escalation: nil, resolved?: false}, &step/2)
     |> Map.fetch!(:resolved?)
   end
 
-  # A new triage outcome starts the question over: a human decision about an EARLIER
-  # triage is not a decision about this one.
-  # A triage escalation is both at once — a new triage outcome AND the escalation a human
-  # may then resolve — so it resets and is remembered in the same step.
-  defp step(%{from: "triaged", to: "escalated"} = event, _acc),
-    do: %{escalation: event, resolved?: false}
-
-  defp step(%{from: "triaged"}, _acc), do: %{escalation: nil, resolved?: false}
-
   defp step(%{to: "escalated"} = event, acc), do: %{acc | escalation: event}
 
-  # STICKY until the next triage: a human who answered the Gate A question does not un-answer
-  # it by later re-queueing the story from an unrelated escalation.
-  defp step(%{edge: "human_resolution"}, %{escalation: escalation, resolved?: resolved?}),
-    do: %{escalation: nil, resolved?: resolved? or gate_a_escalation?(escalation)}
+  defp step(%{edge: "human_resolution"}, %{escalation: escalation} = acc),
+    do: %{acc | escalation: nil, resolved?: acc.resolved? or gate_a_escalation?(escalation)}
 
   defp step(_event, acc), do: acc
 
-  defp gate_a_escalation?(%{edge: "triage_escalate"}), do: true
+  # A triage escalation a human re-queues answers Gate A when the human SAW the lens
+  # verdicts' judgement — the trio's own `escalate`, or the gate screen's Gate A codes — or when
+  # CONTROL, not a session, found there was nothing to judge: the dispatcher's oversize ticket.
+  # An INCOMPLETE run does not count: a session chooses to report one, so counting it would let
+  # a session that read hostile reporter text avoid lens judgement by reporting a crash. Such a
+  # story is refused at merge (`:missing`). A flagged or undispatchable DRAFT does not count
+  # either: its lens verdicts exist, and the human was shown the draft's problem, not them.
+  @unseen_lens_escalations [
+    "triage_verdict:draft_flagged",
+    "triage_verdict:draft_not_dispatchable"
+  ]
+
+  defp gate_a_escalation?(%{edge: "triage_escalate", data: %{"reason" => reason}})
+       when reason in @unseen_lens_escalations,
+       do: false
+
+  defp gate_a_escalation?(%{
+         edge: "triage_escalate",
+         data: %{"reason" => "triage_verdict:escalate"}
+       }),
+       do: true
+
+  defp gate_a_escalation?(%{
+         edge: "triage_escalate",
+         data: %{"reason" => "triage_dispatch:triage_too_large"}
+       }),
+       do: true
+
+  # The triage gate screen's own refusal (US-44.2), when Gate A or the trio's verdict was among
+  # its codes: the human who re-queues it was shown THAT refusal. A screen refusal on Gate B
+  # codes alone put a different question to them.
+  defp gate_a_escalation?(%{
+         edge: "triage_escalate",
+         data: %{"reason" => "triage_verdict:gate_screen(" <> kinds}
+       }),
+       do: String.contains?(kinds, ["gate_a:", "trio_verdict"])
+
   # `Stages` stores a transition's `:event_data` under "payload"; the merge gate sets it only
   # when Gate A was among the reasons it refused.
   defp gate_a_escalation?(%{edge: "merge_gate", data: %{"payload" => %{"gate_a" => true}}}),

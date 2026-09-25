@@ -61,6 +61,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriagePayload
+  alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Intake.Source
@@ -233,7 +234,39 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    limit |> candidates() |> Enum.map(&attempt(&1, budgets))
+    finished = limit |> stranded() |> Enum.map(&escalate_too_large/1)
+    finished ++ (limit |> candidates() |> Enum.map(&attempt(&1, budgets)))
+  end
+
+  @doc """
+  Stories this module's own too-large route left HALF-TAKEN: at `triaged` with no triage
+  dispatch bound, no live triage dispatch, and no triage verdict ever recorded. "No verdict"
+  implies "nothing bound": only a verdict's own step, and the migration's backfill from a
+  recorded verdict, ever write `triage_dispatch_id`, so the query reads the verdict alone.
+
+  The route is two transitions in two transactions (`Stages` refuses to nest them), so a
+  failure of the second leaves the row at `triaged`. Nothing else reaches `triaged` without a
+  verdict — a verdict's own step binds its dispatch in the same transaction — and
+  `candidates/1` reads only `detected`, so without this the row stayed there for ever. Each pass
+  finishes such a row over the same route; its first transition answers `:stale_stage` and the
+  second applies.
+  """
+  @spec stranded(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
+  def stranded(limit) when is_integer(limit) and limit > 0 do
+    Loopctl.AdminRepo.all(
+      from s in StoryStage,
+        left_join: d in DispatchRecord,
+        on:
+          d.tenant_id == s.tenant_id and d.story_id == s.story_id and d.kind == ^@kind and
+            is_nil(d.released_at),
+        left_join: v in TriageVerdictRecord,
+        on: v.tenant_id == s.tenant_id and v.story_id == s.story_id,
+        where: s.stage == :triaged,
+        where: is_nil(d.id) and is_nil(v.id),
+        order_by: [asc: s.updated_at, asc: s.story_id],
+        limit: ^limit,
+        select: %{tenant_id: s.tenant_id, story_id: s.story_id}
+    )
   end
 
   # ONE STORY MAY NOT KILL THE PASS — the read is oldest-first, so a story that raises sits at
@@ -350,6 +383,11 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   # at `triaged` — where nothing re-dispatches it, which is correct: this pass never sends a
   # triaged story, and an operator reading `triaged` with no verdict is looking at a story that
   # needs them either way.
+  #
+  # IT BINDS NO DISPATCH, deliberately (epic 44, US-44.1): no verdict decided this story, so
+  # `triage_dispatch_id` stays NULL — no session may take it out of `triaged`, and this route,
+  # which names no session dispatch, still may. The migration that added the column leaves these
+  # rows NULL for the same reason (`20260923130000_add_story_stages_triage_dispatch_id.exs`).
   #
   # `actor_role: :agent` with an EMPTY lineage, stated: this is a worker holding no credential,
   # and `:agent` keeps the human-only edges out of reach whatever the default becomes.

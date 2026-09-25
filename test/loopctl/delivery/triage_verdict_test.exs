@@ -32,6 +32,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdict
   alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdictMessage
+  alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdict
@@ -45,6 +46,16 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
   defp session(opts \\ []) do
     story = fixture(:stage_story, %{claim_epoch: @epoch, agent_status: :implementing})
     runner = fixture(:stage_runner, %{tenant_id: story.tenant_id})
+
+    # The project's repository, which the triage gate screen (US-44.2) resolves its triggers
+    # by. `acme/widgets` is the repository config/test.exs's synthetic trigger document names.
+    unless Keyword.get(opts, :no_intake_source, false) do
+      fixture(:intake_record, %{
+        tenant_id: story.tenant_id,
+        project_id: story.project_id,
+        repo_full_name: "acme/widgets"
+      })
+    end
 
     fixture(:story_stage, %{
       tenant_id: story.tenant_id,
@@ -65,8 +76,41 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     %{story: story, runner: runner, record: record}
   end
 
+  # A `story` verdict carries three unanimous lens verdicts, as a 1.15.0 runner sends, so the
+  # triage gate screen (US-44.2) passes it; tests about the screen build their own.
   defp verdict_message(record, verdict) do
-    %{dispatch_id: record.dispatch_id, claim_epoch: record.claim_epoch, verdict: verdict}
+    message = %{
+      dispatch_id: record.dispatch_id,
+      claim_epoch: record.claim_epoch,
+      verdict: verdict
+    }
+
+    if Map.get(verdict, :outcome) == "story",
+      do: Map.put(message, :lens_verdicts, lens_verdicts("story", "story", "story")),
+      else: message
+  end
+
+  defp lens_verdicts(a, b, c) do
+    for {lens, outcome} <- [{"analyst", a}, {"architect", b}, {"engineer", c}],
+        do: %{
+          lens: lens,
+          outcome: outcome,
+          confidence: "high",
+          escalation_reasons: [],
+          contradicts: []
+        }
+  end
+
+  defp story_verdict(story_extra \\ %{}) do
+    %{
+      outcome: "story",
+      confidence: "high",
+      story:
+        Map.merge(
+          %{title: "Screened story", description: "D", acceptance_criteria: ["It works"]},
+          story_extra
+        )
+    }
   end
 
   defp verdict(outcome, extra \\ %{}) do
@@ -139,15 +183,27 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
   end
 
   # The half-applied route: transition one landed, transition two did not.
-  defp advance_to_triaged(story) do
+  # `dispatch_id:` binds the story as the verdict path does, on the transition itself;
+  # `event_data:` is what the first attempt recorded on it (the gate screen's decision).
+  defp advance_to_triaged(story, opts \\ []) do
+    advance_opts =
+      [claim_epoch: story.claim_epoch, actor_label: "test"]
+      |> then(fn o ->
+        if id = opts[:dispatch_id], do: Keyword.put(o, :effects, triage_dispatch_id: id), else: o
+      end)
+      |> then(fn o ->
+        if data = opts[:event_data], do: Keyword.put(o, :event_data, data), else: o
+      end)
+
     as_tenant(story.tenant_id, fn ->
       {:ok, _row} =
-        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward},
-          claim_epoch: story.claim_epoch,
-          actor_label: "test"
-        )
+        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward}, advance_opts)
     end)
   end
+
+  defp escalation_reason(story),
+    do:
+      as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end).escalation_reason
 
   defp as_tenant(tenant_id, fun) do
     {:ok, result} = Repo.with_tenant(tenant_id, fun)
@@ -209,6 +265,56 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     end
   end
 
+  describe "screen_codes/1 (pure, US-44.2 round 3)" do
+    # The codes ride the `detected -> triaged` event, which `Stages` refuses over
+    # `max_event_data_bytes/0` measured on the ENCODED payload — refusing the triage step itself.
+    defp encoded(codes), do: byte_size(Jason.encode!(%{"gate_screen" => codes}))
+
+    defp path(pattern), do: {:human_path, "any/file", pattern}
+
+    test "codes that fit are recorded exactly, with no sentinel" do
+      assert TriageVerdict.screen_codes([{:gate_a, :gate_a_inputs_missing}, path("priv/**")]) ==
+               ["gate_a:gate_a_inputs_missing", "human_path:priv/**"]
+    end
+
+    test "an oversized code is SKIPPED, not a stop: the codes after it are still recorded" do
+      huge = String.duplicate("a", Stages.max_event_data_bytes())
+
+      codes =
+        TriageVerdict.screen_codes([{:gate_a, :disagreement}, path(huge), path("lib/after/**")])
+
+      assert codes == ["gate_a:disagreement", "human_path:lib/after/**", "screen_overflow"]
+      assert encoded(codes) <= Stages.max_event_data_bytes()
+    end
+
+    test "a refusal whose every code is too large still records one: the sentinel" do
+      huge = String.duplicate("a", Stages.max_event_data_bytes())
+      assert TriageVerdict.screen_codes([path(huge), path(huge <> "b")]) == ["screen_overflow"]
+    end
+
+    test "the budget is the JSON-ENCODED size, which is what Stages refuses on" do
+      # Each code is under half the bound in raw bytes and over half once encoded, because
+      # every backslash encodes as two. Counted raw, both would be kept and the triage step
+      # refused `:invalid_event_data`.
+      half = div(Stages.max_event_data_bytes(), 2)
+      slashes = String.duplicate("\\", half - 100)
+
+      codes = TriageVerdict.screen_codes([path(slashes <> "1"), path(slashes <> "2")])
+
+      assert length(codes) == 2
+      assert List.last(codes) == "screen_overflow"
+      assert encoded(codes) <= Stages.max_event_data_bytes()
+    end
+
+    test "the count bound keeps the first codes and marks the rest dropped" do
+      codes = TriageVerdict.screen_codes(for i <- 1..30, do: path("p#{i}/**"))
+
+      assert length(codes) == 21
+      assert hd(codes) == "human_path:p1/**"
+      assert List.last(codes) == "screen_overflow"
+    end
+  end
+
   describe "apply/3" do
     test "a story verdict advances detected -> triaged and records what was said" do
       %{story: story, runner: runner, record: record} = session()
@@ -240,17 +346,322 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert saved.payload["story"]["title"] == "A title"
     end
 
-    test "a verdict arriving after the story left triage is refused and records nothing" do
-      %{story: story, runner: runner, record: record} = session(stage: :implementing)
+    test "the gate screen escalates a story whose lenses disagree, keeping the draft (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session()
 
-      assert {:error, :stale_stage} =
+      message =
+        record
+        |> verdict_message(story_verdict())
+        |> Map.put(:lens_verdicts, lens_verdicts("story", "story", "escalate"))
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert stage_of(story) == :escalated
+      assert reload_story(story).title == "Screened story"
+
+      assert [%{"payload" => %{"gate_screen" => reasons}}] =
+               story.tenant_id
+               |> stage_events(story.id)
+               |> Enum.filter(&(&1.edge == "triage_escalate"))
+               |> Enum.map(& &1.data)
+
+      assert Enum.any?(reasons, &(&1 =~ "gate_a"))
+    end
+
+    test "the gate screen escalates a story sent without lens verdicts (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session()
+
+      message = record |> verdict_message(story_verdict()) |> Map.delete(:lens_verdicts)
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :escalated
+    end
+
+    test "the gate screen escalates a predicted touch on a guarded path (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session()
+
+      for touch <- ["priv/rates/2026.csv", "lib/widgets_web/router.ex"] do
+        %{story: story, runner: runner, record: record} = session()
+        verdict = story_verdict(%{touches: [touch]})
+
+        assert {:ok, _} =
+                 TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, verdict))
+
+        assert stage_of(story) == :escalated, "#{touch} was queued"
+      end
+
+      verdict = story_verdict(%{touches: ["lib/widgets/thing.ex"]})
+
+      assert {:ok, _} =
+               TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, verdict))
+
+      assert stage_of(story) == :queued
+    end
+
+    test "the screen's escalation names its codes, and records patterns, never touched files" do
+      %{story: story, runner: runner, record: record} = session()
+      verdict = story_verdict(%{touches: ["priv/rates/secret-name.csv"]})
+
+      message = record |> verdict_message(verdict) |> Map.delete(:lens_verdicts)
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      reason = escalation_reason(story)
+      assert reason =~ "gate_screen("
+      assert reason =~ "gate_a:gate_a_inputs_missing"
+      assert reason =~ "effect_path"
+
+      [codes] =
+        story.tenant_id
+        |> stage_events(story.id)
+        |> Enum.filter(&(&1.edge == "triage_escalate"))
+        |> Enum.map(& &1.data["payload"]["gate_screen"])
+
+      assert "effect_path:priv/rates/**" in codes
+      refute inspect(codes) =~ "secret-name"
+    end
+
+    test "a resend of a screened verdict is a replay and leaves the story escalated" do
+      %{story: story, runner: runner, record: record} = session()
+      message = record |> verdict_message(story_verdict()) |> Map.delete(:lens_verdicts)
+
+      assert {:ok, %{replayed?: false}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :escalated
+    end
+
+    test "a half-applied screened verdict completes from the recorded decision, not a re-screen" do
+      %{story: story, runner: runner, record: record} = session()
+
+      advance_to_triaged(story,
+        dispatch_id: record.dispatch_id,
+        event_data: %{"gate_screen" => ["gate_a:gate_a_inputs_missing"]}
+      )
+
+      # Clean on every fact the screen reads NOW; the first attempt decided otherwise.
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :escalated
+    end
+
+    test "a recorded screen refusal with NO codes is still a refusal, never a queue" do
+      %{story: story, runner: runner, record: record} = session()
+
+      # What the old byte cap could write: every code dropped, the key still present.
+      advance_to_triaged(story,
+        dispatch_id: record.dispatch_id,
+        event_data: %{"gate_screen" => []}
+      )
+
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :escalated
+      assert escalation_reason(story) =~ "screen_overflow"
+    end
+
+    test "a half-applied verdict the first attempt QUEUED is not re-screened into an escalation" do
+      %{story: story, runner: runner, record: record} = session()
+      advance_to_triaged(story, dispatch_id: record.dispatch_id)
+
+      message =
+        record
+        |> verdict_message(story_verdict())
+        |> Map.put(:lens_verdicts, lens_verdicts("story", "story", "escalate"))
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :queued
+    end
+
+    test "a reclaim between a screened verdict's two transitions still escalates the story" do
+      %{story: story, runner: runner, record: record} = session()
+      message = record |> verdict_message(story_verdict()) |> Map.delete(:lens_verdicts)
+
+      # The first attempt bound, recorded and took `detected -> triaged`; the resend replays it.
+      fixture(:triage_verdict, %{
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        dispatch_id: record.dispatch_id,
+        claim_epoch: record.claim_epoch,
+        payload_digest: TriageVerdictRecord.digest(message)
+      })
+
+      advance_to_triaged(story,
+        dispatch_id: record.dispatch_id,
+        event_data: %{"gate_screen" => ["gate_a:gate_a_inputs_missing"]}
+      )
+
+      bump_story_epoch(story, true)
+
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :escalated
+    end
+
+    test "the gate screen fails closed on a repository it has no triggers for (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session(no_intake_source: true)
+
+      fixture(:intake_record, %{
+        tenant_id: story.tenant_id,
+        project_id: story.project_id,
+        repo_full_name: "acme/unconfigured"
+      })
+
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :escalated
+    end
+
+    test "the gate screen fails closed on a story with no intake source (US-44.2)" do
+      %{story: story, runner: runner, record: record} = session(no_intake_source: true)
+
+      assert {:ok, _} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :escalated
+    end
+
+    test "the triage binds its dispatch to the story before recording, and Gate A reads it" do
+      %{story: story, runner: runner, record: record} = session()
+
+      lens_verdicts =
+        for lens <- ~w(analyst architect engineer),
+            do: %{lens: lens, outcome: "escalate", confidence: "low"}
+
+      message =
+        record
+        |> verdict_message(verdict("escalate", %{escalation_reasons: ["Needs a person."]}))
+        |> Map.put(:lens_verdicts, lens_verdicts)
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      bound = as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end)
+      assert bound.triage_dispatch_id == record.dispatch_id
+
+      # The reason GateAInput matches a Gate A escalation on, exactly as the path stores it.
+      assert [%{"reason" => "triage_verdict:escalate"}] =
+               story.tenant_id
+               |> stage_events(story.id)
+               |> Enum.filter(&(&1.edge == "triage_escalate"))
+               |> Enum.map(& &1.data)
+
+      assert {:persisted_triage, [%{"verdict" => "escalate"} | _]} =
+               GateAInput.for_story(story.tenant_id, story.id)
+    end
+
+    test "a dispatch that did NOT triage the story is refused before any further transition" do
+      %{story: story, runner: runner, record: record} = session()
+
+      # Another triage dispatch took the story out of `detected` and bound it.
+      advance_to_triaged(story, dispatch_id: Ecto.UUID.generate())
+
+      assert {:error, :triage_not_bound} =
                TriageVerdict.apply(
                  story.tenant_id,
                  runner.id,
                  verdict_message(record, verdict("reject"))
                )
 
+      assert stage_of(story) == :triaged
+
+      # Refused off the stage row BEFORE it records, screens or reads anything else: a
+      # stranger's verdict leaves no record for a later reader to mistake for the decider's.
       assert records(story.tenant_id) == []
+    end
+
+    test "a zombie after a reclaim cannot take the story further, and its draft never lands" do
+      %{story: story, runner: runner, record: record} = session()
+
+      # Dispatch A triaged and bound the story; then a reclaim moved the epoch.
+      advance_to_triaged(story, dispatch_id: Ecto.UUID.generate())
+      bump_story_epoch(story, true)
+      before = reload_story(story)
+
+      # This dispatch never triaged it: its story verdict must not queue or draft anything.
+      message = verdict_message(record, story_verdict())
+
+      assert {:error, :triage_not_bound} =
+               TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert stage_of(story) == :triaged
+      assert reload_story(story).title == before.title
+
+      # And its resend is refused too, never answered as a replay that was applied.
+      assert {:error, :triage_not_bound} =
+               TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert records(story.tenant_id) == []
+    end
+
+    test "a resend after a reclaim drafts the story before queueing it, never the stub" do
+      %{story: story, runner: runner, record: record} = session()
+      message = verdict_message(record, story_verdict())
+
+      # The first attempt recorded, bound and took `triaged`, then died before drafting.
+      fixture(:triage_verdict, %{
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        dispatch_id: record.dispatch_id,
+        claim_epoch: record.claim_epoch,
+        payload_digest: TriageVerdictRecord.digest(message)
+      })
+
+      advance_to_triaged(story, dispatch_id: record.dispatch_id)
+      bump_story_epoch(story, true)
+
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :queued
+      assert reload_story(story).title == "Screened story"
+    end
+
+    test "a story triaged by NOBODY (the dispatcher, or before the binding) is not a verdict's to move" do
+      %{story: story, runner: runner, record: record} = session()
+      advance_to_triaged(story)
+
+      assert {:error, :triage_not_bound} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, story_verdict())
+               )
+
+      assert stage_of(story) == :triaged
+    end
+
+    test "a late verdict for a story another dispatch took further is refused" do
+      %{story: story, runner: runner, record: record} = session(stage: :implementing)
+
+      as_tenant(story.tenant_id, fn ->
+        Repo.update_all(
+          from(r in Loopctl.Delivery.StoryStage, where: r.story_id == ^story.id),
+          set: [triage_dispatch_id: Ecto.UUID.generate()]
+        )
+      end)
+
+      assert {:error, :triage_not_bound} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, verdict("reject"))
+               )
+
+      assert stage_of(story) == :implementing
     end
 
     test "a resend with the lens verdicts in another order is the same verdict" do
@@ -678,7 +1089,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       # `stale_stage`, return before transition TWO was tried, and answer `ok` — and nothing in
       # `lib/` selects `triaged`, so the story was dead exactly where this module exists to
       # stop it being dead.
-      advance_to_triaged(story)
+      advance_to_triaged(story, dispatch_id: record.dispatch_id)
       assert stage_of(story) == :triaged
 
       assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
@@ -751,10 +1162,21 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       # `triaged` is not an in-flight stage — so every later attempt at `triaged -> queued`
       # died on `:stale_claim_epoch` before the compare-and-set, nothing else in `lib/` writes
       # that edge, and `Escalations` cannot escalate a `triaged` row either.
+      #
+      # The first attempt had RECORDED the verdict and bound its dispatch before the transition
+      # landed, so the resend is a replay of it.
+      fixture(:triage_verdict, %{
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        dispatch_id: record.dispatch_id,
+        claim_epoch: record.claim_epoch,
+        payload_digest: TriageVerdictRecord.digest(message)
+      })
+
       advance_to_triaged(story)
       bump_story_epoch(story, true)
 
-      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
       assert stage_of(story) == :queued
     end
 

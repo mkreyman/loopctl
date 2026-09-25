@@ -169,6 +169,7 @@ defmodule Loopctl.Delivery.Stages do
           | :not_found
           | :not_claimed
           | :stale_claim_epoch
+          | :triage_not_bound
           | :stale_stage
           | :actor_lineage_required
           | :invalid_reason
@@ -255,6 +256,28 @@ defmodule Loopctl.Delivery.Stages do
     row
   end
 
+  @doc """
+  A story's TRANSITIONS only, oldest first, as `%{from:, to:, edge:, data:}` — filtered and
+  projected in SQL, in the same order `list_events/2` reads. For a caller that walks the
+  transition history on a hot path (the merge gate's Gate A input) and has no use for effect
+  and counter events or the other columns.
+  """
+  @spec list_transitions(Ecto.UUID.t(), Ecto.UUID.t()) :: [map()]
+  def list_transitions(tenant_id, story_id) do
+    {:ok, transitions} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.all(
+          from e in StageEvent,
+            where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
+            where: e.event == "transitioned",
+            order_by: [asc: e.inserted_at, asc: e.lock_version],
+            select: %{from: e.from_stage, to: e.to_stage, edge: e.edge, data: e.data}
+        )
+      end)
+
+    transitions
+  end
+
   @doc "A story's stage events, oldest first."
   @spec list_events(Ecto.UUID.t(), Ecto.UUID.t()) :: [StageEvent.t()]
   def list_events(tenant_id, story_id) do
@@ -289,6 +312,10 @@ defmodule Loopctl.Delivery.Stages do
   Refused in the transaction, in this order:
 
   - `:not_found` — no such story, or no stage row, in the tenant
+  - `:triage_not_bound` — a transition out of `triaged` naming a session dispatch that is not
+    the one bound to the story (`triage_dispatch_id`), or a row bound to nobody; only the bound
+    dispatch may take it further. Checked AFTER the story's epoch, so a stale caller hears
+    `:stale_claim_epoch` first
   - `:stale_claim_epoch` — `:claim_epoch` is not the story's current one (the caller's
     claim has ended), or the ROW is behind the story's epoch (the claim that drove it was
     released and nobody re-queued it)
@@ -436,6 +463,7 @@ defmodule Loopctl.Delivery.Stages do
     # `record_effect/5` could set the value between this read and the clear, and the chain
     # would say nothing was retracted.
     previous = lock_row(tenant_id, story_id)
+    bound_to_caller!(previous, from, Keyword.get(opts, :session_dispatch))
 
     row = compare_and_set(tenant_id, story, transition, reason)
     insert_event(Repo, row, "transitioned", from, edge, opts[:actor_label], note(reason, opts))
@@ -544,6 +572,25 @@ defmodule Loopctl.Delivery.Stages do
       {0, _} -> Repo.rollback(diagnose(tenant_id, story, from))
     end
   end
+
+  # ONLY THE DISPATCH THAT TRIAGED A STORY MAY TAKE IT OUT OF `triaged` (epic 44, US-44.1).
+  # `detected -> triaged` records the deciding dispatch as `triage_dispatch_id`; any later
+  # transition out of `triaged` that names a session dispatch must name THAT one, whatever
+  # path it came by — a fresh verdict, a replay, a reclaim repair. Checked here, on the row
+  # this transaction holds locked, so no caller can forget it. A row bound to NOBODY (the
+  # dispatcher's too-large route, or triaged before the binding existed) is no session's to
+  # move either. Only a transition naming no session dispatch — control's own, such as that
+  # too-large escalation — passes unbound. The story's epoch is checked BEFORE this, so a
+  # caller with a stale epoch hears `:stale_claim_epoch` first.
+  defp bound_to_caller!(
+         %StoryStage{stage: :triaged, triage_dispatch_id: bound},
+         :triaged,
+         {id, _}
+       )
+       when bound != id,
+       do: Repo.rollback(:triage_not_bound)
+
+  defp bound_to_caller!(_row, _from, _session_dispatch), do: :ok
 
   # Why the compare-and-set matched nothing.
   defp diagnose(tenant_id, story, from) do
@@ -826,7 +873,9 @@ defmodule Loopctl.Delivery.Stages do
     (`StageMachine.effect_stages/1`)
   - `:effect_conflict` — the identity is already set to a DIFFERENT value
   - `:transition_only_effect` — `:merge_sha`, which only the transition into `merged` may
-    write (`advance/4`'s `:effects`), so that its chained entry names the merge
+    write (`advance/4`'s `:effects`), so that its chained entry names the merge; and
+    `:triage_dispatch_id`, which only `detected -> triaged` writes, so the story leaves
+    `detected` and names its deciding dispatch in one transaction
 
   ## Options
 
@@ -1379,6 +1428,8 @@ defmodule Loopctl.Delivery.Stages do
       do: :ok,
       else: {:error, :missing_required_effect}
   end
+
+  defp validate_effect(:triage_dispatch_id, value), do: validate_effect(:runner_id, value)
 
   defp validate_effect(:runner_id, value) do
     case Ecto.UUID.cast(value) do
