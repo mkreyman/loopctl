@@ -1646,7 +1646,7 @@ defmodule Loopctl.Delivery.Placement do
   # An allowlist of the transient ones, not of the deterministic ones: a refusal nobody has
   # classified yet is bounded by the ceiling rather than looping.
   #
-  # Two more are here because the production ceiling is 0, so counted, ONE occurrence
+  # Three more are here because the production ceiling is 0, so counted, ONE occurrence
   # escalates a story to a human (#877 review round 2). Neither is anything in the story:
   #
   #   * `:stale_claim_epoch` — the claim this dispatch was built for ended under it (a lease
@@ -1657,6 +1657,11 @@ defmodule Loopctl.Delivery.Placement do
   #     without counting because the runner channel re-checks its authorization every
   #     `@recheck_interval_ms` (`LoopctlWeb.RunnerChannel`) and disconnects, which drops the
   #     runner from Presence, so a later pass meets `:runner_not_connected` instead.
+  #
+  #   * `:runner_exhausted` — the machine's subscription ran dry between the pre-claim check and
+  #     the push (US-44.6). The same fact a `usage_exhausted` session end reports, and that one
+  #     spends no attempt either; the runner is held out until its reset, so a later pass places
+  #     elsewhere.
   #
   # `:dispatch_already_replied` and `:dispatch_id_conflict` are NOT here: every pass mints a
   # fresh `dispatch_id`, so neither can be another pass having got there first. They say
@@ -1670,7 +1675,8 @@ defmodule Loopctl.Delivery.Placement do
     :busy,
     :tenant_halted,
     :stale_claim_epoch,
-    :not_authorized
+    :not_authorized,
+    :runner_exhausted
   ]
 
   @doc false

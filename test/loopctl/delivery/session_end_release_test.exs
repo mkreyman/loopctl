@@ -655,6 +655,22 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
       assert releases(ctx) == []
     end
 
+    test "a recorded usage_exhausted whose release never ran is reclaimed WITHOUT an attempt",
+         ctx do
+      # The report is on the ledger and its release was refused, so the claim waited for its
+      # lease. The reclaim decides the cause from that report, as the session end would have:
+      # an exhausted subscription never had its work judged, and spends nothing.
+      assert {:ok, {:recorded, _session}} = record_only(ctx, "usage_exhausted")
+      expire_lease(ctx)
+
+      assert {:ok, _released} = reclaim(ctx)
+
+      row = stage_row(ctx)
+      assert row.stage == :queued
+      assert row.attempts == %{}
+      assert story(ctx).agent_status == :contracted
+    end
+
     test "a claim whose session CRASHED is still re-queued as a lease expiry", ctx do
       # Only a BUDGET reason is re-driven; a recorded crash whose release never ran is an
       # ordinary expired lease.
@@ -701,6 +717,43 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
                    actor_label: "test"
                  )
                end)
+    end
+
+    test "a hold the database REFUSES does not strand the claim: it is released anyway", ctx do
+      # A permanent refusal of the mark answered `invalid_payload`, which the runner does not
+      # resend, left the claim held until its lease. Only `:busy` may hold the release back.
+      name = "test_usage_refused_" <> String.replace(ctx.runner.id, "-", "")
+
+      unboxed(fn ->
+        AdminRepo.query!("""
+        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'refused by test' USING ERRCODE = '22023';
+        END
+        $$
+        """)
+
+        AdminRepo.query!("""
+        CREATE TRIGGER #{name} BEFORE UPDATE ON runners FOR EACH ROW
+        WHEN (NEW.id = '#{ctx.runner.id}' AND
+              NEW.usage_exhausted_until IS DISTINCT FROM OLD.usage_exhausted_until)
+        EXECUTE FUNCTION #{name}()
+        """)
+      end)
+
+      on_exit(fn ->
+        unboxed(fn ->
+          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON runners")
+          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+        end)
+      end)
+
+      {result, _log} = ExUnit.CaptureLog.with_log(fn -> end_session(ctx, "usage_exhausted") end)
+
+      assert {:ok, %{row: %{stage: :queued, attempts: attempts}}} = result
+      assert attempts == %{}
+      assert story(ctx).claim_epoch == ctx.story.claim_epoch + 1
+      assert usage_until(ctx) == nil
     end
 
     test "a crash does not mark the runner: the machine is fine, the session was not", ctx do

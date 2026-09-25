@@ -1150,6 +1150,47 @@ defmodule Loopctl.Delivery.StagesTest do
     # stands, and NOTHING is written for it — no row change, no audit entry, no webhook. The
     # re-contract has no refusal of its own any more: its audit entry is valid by construction
     # and inserted with `insert!`, so there is no state in which it answers an error.
+    # #883 review round 1, finding 5. The webhook event row is written on the releasing
+    # AdminRepo transaction; the delivery job must be too, or it commits on Oban's own repo at
+    # once, before its event exists and whether or not the release does.
+    test "recontract_in_transaction's delivery job commits and rolls back with the release" do
+      ctx = claimed_with_stage(:queued)
+      fixture(:webhook, %{tenant_id: ctx.tenant_id, events: ["story.status_changed"]})
+
+      AdminRepo.update_all(from(s in Story, where: s.id == ^ctx.story.id),
+        set: [agent_status: :pending]
+      )
+
+      pending = AdminRepo.get!(Story, ctx.story.id)
+
+      jobs = fn ->
+        AdminRepo.aggregate(
+          from(j in Oban.Job,
+            where: j.worker == "Loopctl.Workers.WebhookDeliveryWorker",
+            where: fragment("?->>'tenant_id' = ?", j.args, ^ctx.tenant_id)
+          ),
+          :count
+        )
+      end
+
+      assert {:error, :undone} =
+               AdminRepo.transaction(fn ->
+                 {:ok, _} = Progress.recontract_in_transaction(ctx.tenant_id, pending, "t")
+                 AdminRepo.rollback(:undone)
+               end)
+
+      assert jobs.() == 0
+
+      assert {:ok, {:ok, %{agent_status: :contracted}}} =
+               AdminRepo.transaction(fn ->
+                 Progress.recontract_in_transaction(ctx.tenant_id, pending, "t")
+               end)
+
+      # Written on the release's own connection: a row in `oban_jobs`, pointing at an event
+      # that committed with it.
+      assert jobs.() == 1
+    end
+
     test "recontract_in_transaction writes nothing at all for a story that is not pending" do
       ctx = claimed_with_stage(:queued)
       fixture(:webhook, %{tenant_id: ctx.tenant_id, events: ["story.status_changed"]})

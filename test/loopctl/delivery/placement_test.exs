@@ -574,7 +574,9 @@ defmodule Loopctl.Delivery.PlacementTest do
       # the runner's credential, bounded by the channel's authorization recheck
       :not_authorized,
       # a race the next pass does not meet again
-      :stale_claim_epoch
+      :stale_claim_epoch,
+      # the machine's subscription ran dry after the pre-claim check (US-44.6)
+      :runner_exhausted
     ]
 
     test "every runner-unavailable or race refusal is released uncounted; others count" do

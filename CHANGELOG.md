@@ -70,7 +70,7 @@ All notable changes to loopctl are documented here.
   story's stage row back to `queued` with `agent_status: pending`, which the dispatch driver
   never selects — the story sat there with no alert. Now the release decides, in the same
   transaction: a placement refused because the runner was unavailable (not connected, at
-  capacity, a lock not granted, its credential revoked mid-push) or because the claim ended
+  capacity, a lock not granted, its credential revoked mid-push, its subscription exhausted) or because the claim ended
   under it, and a `usage_exhausted` session, re-contract the story at no cost; a COUNTED release (a lost lease, a `crashed` session, a verifier reject or bulk reject
   of an in-flight story, the claimant's own unclaim, a placement refused for any other reason,
   such as a payload the contract rejects or a dispatch the runner's ledger already holds) re-contracts it below the new

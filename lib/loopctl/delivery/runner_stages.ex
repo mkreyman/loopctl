@@ -319,11 +319,28 @@ defmodule Loopctl.Delivery.RunnerStages do
          session
        ) do
     if outcome == :recorded or row.claim_epoch == message.claim_epoch,
-      do: Usage.mark_session_exhausted(tenant_id, runner_id, session.replied_at),
+      do: tenant_id |> Usage.mark_session_exhausted(runner_id, session.replied_at) |> marked(),
       else: :ok
   end
 
   defp mark_exhausted(_outcome, _tenant_id, _runner_id, _message, _row, _session), do: :ok
+
+  # Only `:busy` holds the release back: the resend re-drives both. A PERMANENT refusal of the
+  # hold must not strand the claim until its lease runs out — the runner is told
+  # `invalid_payload` and stops resending — so it is logged and the release still runs. The
+  # machine is then not held out, and a later session there ends `usage_exhausted` again.
+  defp marked({:error, :busy}), do: {:error, :busy}
+
+  defp marked({:error, reason}) do
+    Logger.error(
+      "usage_exhausted: the runner's exhaustion hold was refused; releasing the claim anyway: " <>
+        "reason=#{inspect(reason)}"
+    )
+
+    :ok
+  end
+
+  defp marked(:ok), do: :ok
 
   # `completed` changes no stage: the session reported where it got to with `stage` messages,
   # and "it finished" adds nothing a transition could record.
@@ -546,6 +563,22 @@ defmodule Loopctl.Delivery.RunnerStages do
         with :ok <-
                escalate_budget(tenant_id, actor_label, session, message, @escalation_attempts),
              do: {:ok, session.reason}
+    end
+  end
+
+  @doc """
+  The LEASE RECLAIM's `:cause` for an ordinary expiry of `story_id`'s claim at `claim_epoch`,
+  decided by the same function a reported session end is: `:usage_exhausted` when the runner
+  recorded `usage_exhausted` for that claim and its release never landed (the report was
+  recorded, then the mark or the release was refused), so an exhausted subscription spends no
+  attempt on this path either; `:attempt` otherwise — a lease that ran out.
+  """
+  @spec reclaim_release_cause(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+          :attempt | :usage_exhausted
+  def reclaim_release_cause(tenant_id, story_id, claim_epoch) do
+    case DispatchLedger.session_ended_with(tenant_id, story_id, claim_epoch, ["usage_exhausted"]) do
+      nil -> :attempt
+      session -> release_cause(session.reason)
     end
   end
 

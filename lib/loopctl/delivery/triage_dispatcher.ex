@@ -238,7 +238,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    finished = limit |> stranded() |> Enum.map(&escalate_too_large/1)
+    finished = limit |> stranded() |> Enum.map(&finish_stranded/1)
 
     {outcomes, _cache} =
       limit
@@ -390,6 +390,17 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   #
   # `actor_role: :agent` with an EMPTY lineage, stated: this is a worker holding no credential,
   # and `:agent` keeps the human-only edges out of reach whatever the default becomes.
+  # ONE STRANDED ROW MAY NOT KILL THE PASS either: `stranded/1` ranks oldest-first, so a row
+  # whose escalation raises would head every later pass and no detected story would ever be
+  # triaged again. The same rescue `attempt/3` gives a candidate.
+  defp finish_stranded(row) do
+    escalate_too_large(row)
+  rescue
+    error -> errored(row, Exception.format(:error, error, __STACKTRACE__))
+  catch
+    kind, value -> errored(row, Exception.format(kind, value, __STACKTRACE__))
+  end
+
   defp escalate_too_large(%{tenant_id: tenant_id, story_id: story_id}) do
     case fetch_story(tenant_id, story_id) do
       {:ok, story} -> escalate_route(tenant_id, story)
