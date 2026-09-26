@@ -1073,21 +1073,28 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       end
     end
 
-    test "a base update whose forge parents are not exactly [allowed, base head] is refused" do
+    test "a MALFORMED base update (wrong first parent, or not two parents) is refused" do
       other = String.duplicate("9", 40)
 
       for parents <- [
             [@allowed],
-            [@allowed, other],
             [other, @base_head],
             [@allowed, @base_head, other]
           ] do
         verdict = judge_thread(Keyword.put(base_update_facts(), :parent_shas, parents))
 
         assert verdict.decision == :refuse, inspect(parents)
-
         assert {:base_update_parents_mismatch, parents, [@allowed, @base_head]} in verdict.reasons
       end
+    end
+
+    test "a STALE base update (master moved again) is unevaluated, never refused" do
+      moved = String.duplicate("9", 40)
+      verdict = judge_thread(Keyword.put(base_update_facts(), :parent_shas, [@allowed, moved]))
+
+      assert verdict.decision == :unevaluated
+      assert {:base_update_stale, moved, @base_head} in verdict.reasons
+      refute Enum.any?(verdict.reasons, &match?({:base_update_parents_mismatch, _, _}, &1))
     end
 
     test "pr mode never takes the base_updated edge" do

@@ -237,9 +237,11 @@ defmodule LoopctlWeb.MergePreconditionController do
         "latest checkpoint is a control-recorded `base_update` of the checkpoint last " <>
         "allowed, with exactly two parents on the forge (that checkpoint, then the base's " <>
         "current head), answers `base_updated`: it stays at `ci` on the `base_updated` edge, " <>
-        "keeps its review verdict, and the NEXT call judges the new head. Parents that do " <>
-        "not match refuse `base_update_parents_mismatch`. A `base_updated` edge that cannot " <>
-        "be written counts as unevaluated.\n\n" <>
+        "keeps its review verdict, and the NEXT call judges the new head. A wrong first " <>
+        "parent or any count but two refuses `base_update_parents_mismatch`; a second " <>
+        "parent that is no longer the base head (master moved again) is `unevaluated` " <>
+        "(503) with `base_update_stale`. Both that and a `base_updated` edge that cannot be " <>
+        "written count toward the consecutive-unevaluated bound.\n\n" <>
         "A `refuse` decision escalates the story on the `merge_gate` edge before " <>
         "responding, and returns 200: a refusal is an answer, not a request error. An " <>
         "`already_merged` decision reports a pull request GitHub already merged, with its " <>

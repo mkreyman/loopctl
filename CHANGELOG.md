@@ -16,7 +16,8 @@ All notable changes to loopctl are documented here.
   `POST /stories/:id/merge-precondition` judges the story's latest RECORDED checkpoint
   (`pr_number` is null) and adds refusals `empty_change` (the checkpoint's tree equals the
   base branch's, or no file changed), `checkpoint_tree_mismatch`, `no_checkpoint_recorded`
-  and `base_update_parents_mismatch`. A thread branch `loop/<story_id>` naming a commit
+  and `base_update_parents_mismatch` (a malformed base update; one that is merely stale
+  because master moved again is `unevaluated` with `base_update_stale`). A thread branch `loop/<story_id>` naming a commit
   nobody reported is `head_moved` with reason `branch_head_unrecorded`, back to
   `implementing`. The verdict carries `mode`, `checkpoint_id` and `checkpoint_sha`, and a
   thread-mode allow is recorded naming the checkpoint id and sha. A new stage edge, `ci -> ci`

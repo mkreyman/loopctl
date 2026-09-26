@@ -72,8 +72,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
   control plane recorded (`Loopctl.Threads.record_base_update/3`), its ledger parent is the
   checkpoint the gate last allowed, and the stage row still stands at that allowed head. The
   commit must then have EXACTLY two parents as the forge reports them — the allowed checkpoint
-  first and the base branch's current head second — or the gate refuses
-  `:base_update_parents_mismatch`. Its TREE is not recomputed: US-45.5's executor makes the
+  first and the base branch's current head second. Any other parent SHAPE is malformed and
+  refuses `:base_update_parents_mismatch`; the right shape with a second parent that is no
+  longer the base head is `:unevaluated` with `base_update_stale` — master moved again, which
+  is a race that retries, counted toward `max_consecutive_unevaluated` so it escalates only if
+  it persists. Its TREE is not recomputed: US-45.5's executor makes the
   commit with GitHub's own merge of the base into the checkpoint, so the tree is that merge by
   construction. When all of that holds the decision is `:base_updated`: `enforce/3` takes
   `{:ci, :ci, :base_updated}` through `Loopctl.Delivery.Stages.follow_base_update/4` and stops.
@@ -668,6 +671,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
         case base_update(facts, pr) do
           :follow -> %{verdict | decision: :base_updated, reasons: []}
           {:refuse, reasons} -> refuse(verdict, reasons ++ carried)
+          {:stale, reasons} -> %{verdict | decision: :unevaluated, reasons: reasons ++ carried}
           :none -> %{verdict | decision: :head_moved, reasons: Enum.uniq(moved ++ carried)}
         end
     end
@@ -694,13 +698,28 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
+  # Two different failures, split so a race is not a human's problem:
+  #
+  # - MALFORMED: not exactly two parents, or a first parent that is not the allowed checkpoint.
+  #   The commit is not the base update the ledger says it is, so it is refused.
+  # - STALE: the shape is right but the second parent is not the base head the forge reports
+  #   NOW — master moved again after the update was made. That is an ordinary race, answered
+  #   `:unevaluated` with `base_update_stale`: no transition, 503, and counted toward
+  #   `max_consecutive_unevaluated`, so it retries and escalates only if it persists.
   defp base_update_parents(pr, allowed) do
-    expected = [allowed, Map.get(pr, :base_head_sha)]
-    parents = Map.get(pr, :parent_shas)
+    base_head = Map.get(pr, :base_head_sha)
+    expected = [allowed, base_head]
 
-    if is_binary(Map.get(pr, :base_head_sha)) and parents == expected,
-      do: :follow,
-      else: {:refuse, [{:base_update_parents_mismatch, parents, expected}]}
+    case Map.get(pr, :parent_shas) do
+      ^expected when is_binary(base_head) ->
+        :follow
+
+      [^allowed, second] when is_binary(second) ->
+        {:stale, [{:base_update_stale, second, base_head}]}
+
+      parents ->
+        {:refuse, [{:base_update_parents_mismatch, parents, expected}]}
+    end
   end
 
   defp gated(verdict, facts, pr, carried) do

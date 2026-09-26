@@ -534,7 +534,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert story.agent_status == :reported_done
     end
 
-    test "a base update whose second parent is not the base head is refused, named", ctx do
+    test "a STALE base update (master moved again) is unevaluated and counted, not escalated",
+         ctx do
       stub_thread(ctx)
       assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
 
@@ -542,8 +543,25 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stale = String.duplicate("7", 40)
       stub_thread(ctx, head: @update, tree: @update_tree, parents: [@head, stale])
 
+      assert {:ok, %Verdict{decision: :unevaluated, reasons: reasons}} = enforce(ctx)
+      assert {:base_update_stale, stale, @base_head} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert row.head_sha == @head
+      assert row.merge_gate_unevaluated["count"] == 1
+    end
+
+    test "a MALFORMED base update (wrong first parent) is refused, named", ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      record_update(ctx)
+      wrong = String.duplicate("7", 40)
+      stub_thread(ctx, head: @update, tree: @update_tree, parents: [wrong, @base_head])
+
       assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
-      assert {:base_update_parents_mismatch, [@head, stale], [@head, @base_head]} in reasons
+      assert {:base_update_parents_mismatch, [wrong, @base_head], [@head, @base_head]} in reasons
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
     end
 

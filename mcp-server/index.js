@@ -8388,8 +8388,11 @@ const TOOLS = [
       "recorded a base update of the checkpoint last allowed, and the forge shows it with " +
       "exactly two parents (that checkpoint, then the base's current head), the answer is " +
       "`base_updated`: the story stays at `ci`, keeps its review verdict, and NOTHING is " +
-      "allowed yet — call again once CI has run on the new head. Other parents refuse " +
-      "`base_update_parents_mismatch`. The answer carries `mode`, `checkpoint_id` and " +
+      "allowed yet — call again once CI has run on the new head. A wrong first parent or " +
+      "any count but two refuses `base_update_parents_mismatch`; a second parent that is no " +
+      "longer the base head (master moved again) is `unevaluated` (503) with " +
+      "`base_update_stale` — retry after the delay; it escalates only if it persists. The " +
+      "answer carries `mode`, `checkpoint_id` and " +
       "`checkpoint_sha`; an allow is recorded naming the checkpoint.\n\n" +
       "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
       "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
