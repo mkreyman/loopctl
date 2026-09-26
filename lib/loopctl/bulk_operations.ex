@@ -26,6 +26,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.Progress
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.WebhookDeliveryWorker
 
@@ -488,39 +489,11 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
+  # The claim's own definition (`Dependencies`), so bulk and single claim cannot disagree.
   defp check_story_dependencies_satisfied(story) do
-    unmet_count =
-      from(sd in Loopctl.WorkBreakdown.StoryDependency,
-        join: dep in Story,
-        on: dep.id == sd.depends_on_story_id,
-        where: sd.story_id == ^story.id and dep.verified_status != :verified,
-        select: count(sd.id)
-      )
-      |> AdminRepo.one()
-
-    if unmet_count > 0 do
-      {:error, "Story has #{unmet_count} unverified dependency(ies)"}
-    else
-      check_epic_dependencies_satisfied(story)
-    end
-  end
-
-  defp check_epic_dependencies_satisfied(story) do
-    unmet_count =
-      from(ed in Loopctl.WorkBreakdown.EpicDependency,
-        where: ed.epic_id == ^story.epic_id,
-        join: prereq_story in Story,
-        on: prereq_story.epic_id == ed.depends_on_epic_id,
-        where: prereq_story.verified_status != :verified,
-        select: count(prereq_story.id)
-      )
-      |> AdminRepo.one()
-
-    if unmet_count > 0 do
-      {:error, "Parent epic has #{unmet_count} unverified prerequisite story(ies)"}
-    else
-      :ok
-    end
+    if Dependencies.dependencies_unmet?(story.tenant_id, story.id),
+      do: {:error, "Story has an unverified dependency (its own, or one of its epic's)"},
+      else: :ok
   end
 
   defp validate_verify_preconditions(story) do

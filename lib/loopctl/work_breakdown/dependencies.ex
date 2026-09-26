@@ -58,15 +58,22 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
       select: 1
   end
 
-  @doc "Whether `story_id` in `tenant_id` has a story-level or epic-level dependency unmet."
+  @doc """
+  Whether `story_id` in `tenant_id` has a story-level or epic-level dependency unmet.
+
+  FAILS CLOSED: a story that is not in `tenant_id` (another tenant's id, or a row deleted since
+  it was read) answers `true`, so nothing claims or places it on the strength of a check that
+  found no row to judge.
+  """
   @spec dependencies_unmet?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
   def dependencies_unmet?(tenant_id, story_id) do
     from(s in Story,
       as: :story,
       where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-      where: exists(unmet_story_dependencies()) or exists(unmet_epic_dependencies())
+      select: exists(unmet_story_dependencies()) or exists(unmet_epic_dependencies())
     )
-    |> AdminRepo.exists?()
+    |> AdminRepo.one()
+    |> Kernel.!=(false)
   end
 
   # ===================================================================

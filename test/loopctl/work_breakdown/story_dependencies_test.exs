@@ -9,7 +9,7 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
 
   describe "dependencies_unmet?/2" do
     # #887 review round 2: the one definition the claim and the dispatch driver share.
-    test "an unverified prerequisite is unmet, a verified one is not, and only in its tenant" do
+    test "an unverified prerequisite is unmet, a verified one is not, and another tenant fails closed" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
@@ -24,8 +24,9 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
 
       assert Dependencies.dependencies_unmet?(tenant.id, story.id)
 
-      # Tenant isolation: asked as another tenant, the story and its dependency are not there.
-      refute Dependencies.dependencies_unmet?(fixture(:tenant).id, story.id)
+      # Tenant isolation, FAIL-CLOSED: asked as another tenant the story is not there, and a
+      # check with no row to judge must not report its dependencies satisfied.
+      assert Dependencies.dependencies_unmet?(fixture(:tenant).id, story.id)
 
       Loopctl.AdminRepo.update_all(
         from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^blocker.id),
