@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.105.0 — 2026-09-26 (change threads)
+
+### Added
+
+- **`thread_get`, `thread_checkpoint`, `thread_entry`** (loopctl US-45.1): read a story's
+  change thread, record a checkpoint as the story's claimant, and write messages and review
+  requests on it. Bodies are untrusted, and a credential in one is refused.
+
 ## 2.104.2 — 2026-09-26 (system-corpus materialization says what it does)
 
 ### Changed

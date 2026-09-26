@@ -1581,12 +1581,18 @@ defmodule Loopctl.Progress do
     end)
   end
 
-  # A NULL lease is a claim made before leases existed, which nothing expires.
-  defp live_claim?(%Story{agent_status: status, claimed_until: until}, now)
-       when status in @claimed_statuses,
-       do: is_nil(until) or DateTime.after?(until, now)
+  @doc """
+  True while the story's claim is live: it is in a claimed status and its lease has not
+  passed. A NULL lease is a claim made before leases existed, which nothing expires.
+  """
+  @spec live_claim?(Story.t(), DateTime.t()) :: boolean()
+  def live_claim?(%Story{agent_status: status, claimed_until: until}, now)
+      when status in @claimed_statuses,
+      # Live until the lease is strictly in the past, the boundary `lease_expired?/3` uses
+      # (`compare(until, now) == :lt`), so the two never disagree about the same instant.
+      do: is_nil(until) or not DateTime.before?(until, now)
 
-  defp live_claim?(%Story{}, _now), do: false
+  def live_claim?(%Story{}, _now), do: false
 
   defp move_cap_forward(repo, %Story{claim_lease_cap: %DateTime{} = current} = story, cap, label) do
     if DateTime.after?(cap, current) do
