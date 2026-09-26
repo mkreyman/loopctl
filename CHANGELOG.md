@@ -24,7 +24,9 @@ All notable changes to loopctl are documented here.
   included) is picked up by the next semantic search on the side-table path, and a write that
   changes neither title nor body queues nothing. Materialization is single-flight per tenant
   and dimension: a run already queued, executing or backing off answers `in_flight`, and an
-  orchestrator-or-higher key re-schedules a waiting run to now instead of starting another.
+  orchestrator-or-higher key re-schedules a run backing off after an error to now instead of
+  starting another. A run left `executing` by a crashed node holds until Oban's Lifeline
+  rescues it (30 minutes).
   The terminal gate reads the tenant's LATEST run, where it used to block on any retained
   discarded or cancelled job. On the first search after deploy, a tenant whose system rows
   carry no content hash re-embeds those articles once.

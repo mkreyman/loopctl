@@ -92,8 +92,10 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
         "embedding credential. It embeds system articles this tenant has not embedded and " <>
         "re-embeds ones whose text changed since. 200 already_materialized when nothing is " <>
         "missing or changed; 202 in_flight when a run is already queued, executing or " <>
-        "backing off (one run at a time; an orchestrator+ key re-schedules a queued or " <>
-        "backed-off one to now); 409 materialization_terminal when the LATEST run was " <>
+        "backing off (one run at a time; an orchestrator+ key re-schedules a run backing " <>
+        "off after an error to now; a run left executing by a crashed node holds until " <>
+        "Oban's Lifeline rescues it, up to 30 minutes); 409 materialization_terminal when " <>
+        "the LATEST run was " <>
         "discarded or cancelled and the key is below orchestrator, whose key forces a new " <>
         "run. Role: agent+.",
     responses: %{
@@ -115,7 +117,7 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
     # `force: true` bypasses the terminal-job gate that stops a cost-bearing
     # materialization from being re-driven forever (review). A PLAIN AGENT key does NOT
     # get it: a tenant whose materialization terminated permanently could otherwise be
-    # re-driven by any agent every 300s. Only an orchestrator+ (a deliberate operator
+    # re-driven by any agent on every call. Only an orchestrator+ (a deliberate operator
     # decision) clears a terminal state — the retry is exactly how it is meant to be
     # cleared; a bare agent honours the gate.
     force? = Role.role_at_least?(api_key.role, :orchestrator)
@@ -134,7 +136,7 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
 
       {:ok, :in_flight} ->
         # A run for this (tenant, dimension) is already queued, executing or backing off;
-        # one run at a time. Forced, a queued or backed-off job was re-scheduled to now.
+        # one run at a time. Forced, a run backing off after an error was re-scheduled to now.
         conn
         |> put_status(:accepted)
         |> json(%{enqueued: false, in_flight: true, dimension: dimension})

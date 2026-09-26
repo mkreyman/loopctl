@@ -655,20 +655,8 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
     test "a TERMINAL job stops the read path re-enqueuing forever" do
       tenant = tenant_at(1536)
 
-      # The suite runs Oban in `testing: :inline`, which executes jobs WITHOUT
-      # persisting them — so the terminal row is written directly, exactly as a real
-      # `{:discard, {:no_embedding_key, _}}` would leave it. Through OBAN's repo:
-      # `AdminRepo` is a separate sandbox connection.
-      Loopctl.Repo.query!(
-        """
-        INSERT INTO oban_jobs (state, queue, worker, args, inserted_at, scheduled_at)
-        VALUES ('discarded', 'embeddings', $1, $2, NOW(), NOW())
-        """,
-        [
-          "Loopctl.Workers.SystemCorpusEmbeddingWorker",
-          %{"tenant_id" => tenant.id, "dim" => 1536}
-        ]
-      )
+      # As a real `{:discard, {:no_embedding_key, _}}` would leave it.
+      fixture(:system_corpus_job, %{tenant_id: tenant.id, state: "discarded"})
 
       assert Embeddings.system_corpus_terminal?(tenant.id, 1536)
 
@@ -684,7 +672,8 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       tenant = tenant_at(1536)
       system_article()
 
-      for state <- ["discarded", "completed"], do: insert_corpus_job(tenant.id, state)
+      for state <- ["discarded", "completed"],
+          do: fixture(:system_corpus_job, %{tenant_id: tenant.id, state: state})
 
       refute Embeddings.system_corpus_terminal?(tenant.id, 1536)
 
@@ -702,7 +691,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert {:ok, :already_materialized} =
                Embeddings.enqueue_system_corpus_materialization(tenant.id)
 
-      AdminRepo.query!("UPDATE articles SET title = $1 WHERE id = $2", [
+      AdminRepo.query!("UPDATE articles SET title = $1, updated_at = NOW() WHERE id = $2", [
         "A corrected title",
         Ecto.UUID.dump!(article.id)
       ])
@@ -720,7 +709,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
     test "one run at a time: a run executing, or backing off long after it was queued, is in flight" do
       tenant = tenant_at(1536)
       system_article()
-      insert_corpus_job(tenant.id, "executing")
+      fixture(:system_corpus_job, %{tenant_id: tenant.id, state: "executing"})
 
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert {:ok, :in_flight} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
@@ -736,7 +725,12 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       system_article()
 
       job_id =
-        insert_corpus_job(tenant.id, "retryable", inserted_ago_s: 3600, due_in_s: 600)
+        fixture(:system_corpus_job, %{
+          tenant_id: tenant.id,
+          state: "retryable",
+          inserted_ago_s: 3600,
+          due_in_s: 600
+        })
 
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert {:ok, :in_flight} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
@@ -751,12 +745,30 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert NaiveDateTime.compare(scheduled_at, NaiveDateTime.utc_now()) != :gt
     end
 
-    test "an edit landing during a run leaves it stale, and the worker snoozes to do it next" do
+    test "forcing never pulls forward a run snoozed for a provider's Retry-After" do
+      tenant = tenant_at(1536)
+      system_article()
+
+      job_id =
+        fixture(:system_corpus_job, %{tenant_id: tenant.id, state: "scheduled", due_in_s: 120})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, :in_flight} =
+                 Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
+      end)
+
+      %{rows: [[scheduled_at]]} =
+        Loopctl.Repo.query!("SELECT scheduled_at FROM oban_jobs WHERE id = $1", [job_id])
+
+      assert NaiveDateTime.compare(scheduled_at, NaiveDateTime.utc_now()) == :gt
+    end
+
+    test "an edit landing during a run leaves it stale, and the worker queues the next batch" do
       tenant = tenant_at(1536)
       article = system_article()
 
       Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts ->
-        AdminRepo.query!("UPDATE articles SET body = $1 WHERE id = $2", [
+        AdminRepo.query!("UPDATE articles SET body = $1, updated_at = NOW() WHERE id = $2", [
           "edited mid-run",
           Ecto.UUID.dump!(article.id)
         ])
@@ -764,8 +776,19 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
         {:ok, Enum.map(texts, fn _ -> vec(1536) end)}
       end)
 
-      assert {:snooze, 1} =
-               perform_job(SystemCorpusEmbeddingWorker, %{"tenant_id" => tenant.id, "dim" => 1536})
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok =
+                 perform_job(SystemCorpusEmbeddingWorker, %{
+                   "tenant_id" => tenant.id,
+                   "dim" => 1536
+                 })
+
+        # A FRESH job continues it (attempt 1), not a snooze of this one.
+        assert_enqueued(
+          worker: SystemCorpusEmbeddingWorker,
+          args: %{"tenant_id" => tenant.id, "dim" => 1536}
+        )
+      end)
 
       assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)
     end
@@ -881,33 +904,6 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   # materialized state has to embed it.
   defp by_id(articles, %{id: id} = wanted),
     do: articles |> Enum.filter(&(&1.id == id)) |> Enum.map(fn _ -> wanted end)
-
-  # Oban runs `testing: :inline` in this suite, which never persists a job, so a job in a
-  # given state is written directly — through OBAN's repo, since AdminRepo is a separate
-  # sandbox connection.
-  defp insert_corpus_job(tenant_id, state, opts \\ []) do
-    inserted_ago = Keyword.get(opts, :inserted_ago_s, 0)
-    due_in = Keyword.get(opts, :due_in_s, 0)
-
-    %{rows: [[id]]} =
-      Loopctl.Repo.query!(
-        """
-        INSERT INTO oban_jobs (state, queue, worker, args, inserted_at, scheduled_at)
-        VALUES ($1, 'embeddings', $2, $3,
-                NOW() - make_interval(secs => $4), NOW() + make_interval(secs => $5))
-        RETURNING id
-        """,
-        [
-          state,
-          "Loopctl.Workers.SystemCorpusEmbeddingWorker",
-          %{"tenant_id" => tenant_id, "dim" => 1536},
-          inserted_ago,
-          due_in
-        ]
-      )
-
-    id
-  end
 
   defp materialize_published_system_corpus(tenant_id, dim) do
     Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts ->

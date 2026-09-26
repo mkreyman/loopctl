@@ -1460,33 +1460,75 @@ defmodule Loopctl.Embeddings do
   row, and the ones whose row was embedded from different text than the article's now.
 
   Decided by CONTENT, the worker's own test: the stored hash against the hash of the text
-  `system_article_embedding_text/1` would embed today. Not by `updated_at`, which any write
-  bumps (a suppression flip, a status or metadata write) and which is stamped by whichever
-  clock did the write: a timestamp comparison made every tenant re-queue a job for an edit
-  that changed nothing it embeds, and could mark a row current whose vector was of an
-  older body. A title change counts, because the title is part of the embedded text.
+  `article_embedding_text/1` would embed today. Not by `updated_at`, which any write bumps
+  (a suppression flip, a status or metadata write) and which is stamped by whichever clock
+  did the write: a timestamp comparison made every tenant re-queue a job for an edit that
+  changed nothing it embeds, and could mark a row current whose vector was of an older
+  body. A title change counts, because the title is part of the embedded text. A row with
+  no stored hash is stale, since nothing can vouch for what it was made from.
 
-  Computed in Elixir over the whole system corpus, which is small (tens of articles); a
-  row with no stored hash is stale, since nothing can vouch for what it was made from.
+  Cost, since this runs on every disclosure-cache fill: one query for the corpus's ids and
+  `updated_at`s and one for this tenant's stored hashes, neither reading a body. An
+  article's text hash is memoised per `(id, updated_at)` in `:persistent_term`, which is
+  written only when an article changes, so bodies are read only then. That relies on every
+  write of a title or body moving `updated_at`, as the changesets and the seeding upserts
+  do; a raw write that changed the text and not `updated_at` would go unseen by a node
+  that had already memoised the old version.
   """
   @spec stale_system_articles(Ecto.UUID.t(), pos_integer(), keyword()) :: [Article.t()]
   def stale_system_articles(tenant_id, dimension, opts \\ [])
       when is_binary(tenant_id) and is_integer(dimension) do
     limit = Keyword.get(opts, :limit, @default_batch_size)
-    articles = AdminRepo.all(from(a in system_articles_query(), order_by: a.id))
-    stored = article_embedded_hashes(tenant_id, Enum.map(articles, & &1.id), dimension)
 
-    articles
-    |> Enum.filter(fn article ->
-      case Map.get(stored, article.id) do
-        hash when is_binary(hash) ->
-          ShrinkLadder.whole_hash(hash) != system_article_content_hash(article)
+    versions =
+      AdminRepo.all(
+        from(a in system_articles_query(), order_by: a.id, select: {a.id, a.updated_at})
+      )
 
-        _missing_or_unhashed ->
-          true
-      end
-    end)
-    |> Enum.take(limit)
+    stored = article_embedded_hashes(tenant_id, Enum.map(versions, &elem(&1, 0)), dimension)
+    current = current_text_hashes(versions)
+
+    stale_ids =
+      versions
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.filter(fn id ->
+        case Map.get(stored, id) do
+          hash when is_binary(hash) -> ShrinkLadder.whole_hash(hash) != Map.fetch!(current, id)
+          _missing_or_unhashed -> true
+        end
+      end)
+      |> Enum.take(limit)
+
+    case stale_ids do
+      [] -> []
+      ids -> AdminRepo.all(from(a in Article, where: a.id in ^ids, order_by: a.id))
+    end
+  end
+
+  # `{id => hash of the text embedded for that version}`, reading bodies only for
+  # versions not memoised on this node yet.
+  defp current_text_hashes(versions) do
+    {known, misses} =
+      Enum.reduce(versions, {%{}, []}, fn {id, updated_at}, {known, misses} ->
+        case :persistent_term.get({__MODULE__, :text_hash, id}, nil) do
+          {^updated_at, hash} -> {Map.put(known, id, hash), misses}
+          _ -> {known, [{id, updated_at} | misses]}
+        end
+      end)
+
+    case misses do
+      [] ->
+        known
+
+      _ ->
+        from(a in Article, where: a.id in ^Enum.map(misses, &elem(&1, 0)))
+        |> AdminRepo.all()
+        |> Enum.reduce(known, fn article, acc ->
+          hash = article |> article_embedding_text() |> text_content_hash()
+          :persistent_term.put({__MODULE__, :text_hash, article.id}, {article.updated_at, hash})
+          Map.put(acc, article.id, hash)
+        end)
+    end
   end
 
   @doc "Whether any system article is missing or embedded from different text for this tenant."
@@ -1495,54 +1537,17 @@ defmodule Loopctl.Embeddings do
     do: stale_system_articles(tenant_id, dimension, limit: 1) != []
 
   @doc """
-  The text a system article is embedded from. The materialization worker embeds exactly
-  this, and staleness is judged against its hash, so the two cannot drift apart.
+  The text an article is embedded from. The system-corpus worker and the re-embed backfill
+  embed exactly this, and system-corpus staleness is judged against its hash, so none of
+  the three can drift from the others.
   """
-  @spec system_article_embedding_text(Article.t()) :: String.t()
-  def system_article_embedding_text(%Article{} = article),
+  @spec article_embedding_text(Article.t()) :: String.t()
+  def article_embedding_text(article),
     do: TextBudget.initial("#{article.title}\n\n#{article.body}")
 
   @doc "The content hash stored beside a vector made from `text`."
   @spec text_content_hash(String.t()) :: String.t()
   def text_content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
-
-  defp system_article_content_hash(article),
-    do: article |> system_article_embedding_text() |> text_content_hash()
-
-  @doc """
-  Marks a system article's materialization as CURRENT without re-embedding it — the
-  cheap branch of `stale_system_articles/3` for an article whose `updated_at` moved
-  but whose content hash did not.
-  """
-  @spec touch_system_article_embedding(Ecto.UUID.t(), Ecto.UUID.t(), pos_integer()) ::
-          {:ok, non_neg_integer()}
-  def touch_system_article_embedding(tenant_id, article_id, dimension),
-    do: touch_system_article_embeddings(tenant_id, [article_id], dimension)
-
-  @doc """
-  Batch form: touches EVERY `article_id` at `dimension` in ONE `update_all`.
-
-  The materialization path de-N+1s its hash reads (AC-41.1.11) but touched each
-  unchanged article with its own UPDATE — up to `embedding_batch_max/0` (~100) writes
-  per run (review). One `article_id in ^ids` update replaces the per-item loop.
-  """
-  @spec touch_system_article_embeddings(Ecto.UUID.t(), [Ecto.UUID.t()], pos_integer()) ::
-          {:ok, non_neg_integer()}
-  def touch_system_article_embeddings(_tenant_id, [], _dimension), do: {:ok, 0}
-
-  def touch_system_article_embeddings(tenant_id, article_ids, dimension)
-      when is_list(article_ids) do
-    {n, _} =
-      AdminRepo.update_all(
-        from(ae in ArticleEmbedding,
-          where:
-            ae.tenant_id == ^tenant_id and ae.article_id in ^article_ids and ae.dim == ^dimension
-        ),
-        set: [updated_at: DateTime.utc_now()]
-      )
-
-    {:ok, n}
-  end
 
   defp system_articles_query do
     from(a in Article,
@@ -1598,35 +1603,48 @@ defmodule Loopctl.Embeddings do
     dimension = Keyword.get(opts, :dimension) || active_dimension(tenant_id)
     force? = Keyword.get(opts, :force, false)
 
-    cond do
-      # Already fully materialized ⇒ NO job (review, finding 11). The worker's Oban
-      # uniqueness covers only UNFINISHED states, so a COMPLETED corpus is not deduped:
-      # without this short-circuit every repeated agent-role POST inserted and ran a fresh
-      # job with nothing to do — an agent key could loop the endpoint to flood the embeddings queue for
-      # its own tenant. The staleness probe (the worker's own content-hash test) returns a
-      # 200-shaped `:already_materialized` with no job created. Checked BEFORE the terminal
-      # gate so a done-but-terminal corpus reports done, not a conflict.
-      not system_corpus_stale?(tenant_id, dimension) ->
-        {:ok, :already_materialized}
+    # Already fully materialized ⇒ NO job (review, finding 11). The worker's Oban
+    # uniqueness covers only UNFINISHED states, so a COMPLETED corpus is not deduped:
+    # without this short-circuit every repeated agent-role POST inserted and ran a fresh
+    # job with nothing to do, and an agent key could loop the endpoint to flood the
+    # embeddings queue for its own tenant. The staleness probe (the worker's own
+    # content-hash test) returns a 200-shaped `:already_materialized` with no job created.
+    # Checked BEFORE the job gates so a done-but-terminal corpus reports done.
+    if system_corpus_stale?(tenant_id, dimension),
+      do: gate_materialization(tenant_id, dimension, force?),
+      else: {:ok, :already_materialized}
+  end
 
-      not force? and system_corpus_terminal?(tenant_id, dimension) ->
+  # Reads the tenant's LATEST run once. An executing run is in flight, forced or not: the
+  # worker's uniqueness leaves `:executing` out so its own continuation can be inserted,
+  # so this is the check that keeps a second run from starting beside it. A run orphaned
+  # in `executing` by a crashed node therefore holds for up to Oban's Lifeline rescue
+  # window (`rescue_after` in `Loopctl.ObanConfig`), and the endpoint says so.
+  defp gate_materialization(tenant_id, dimension, force?) do
+    case latest_system_corpus_run_state(tenant_id, dimension) do
+      "executing" ->
+        {:ok, :in_flight}
+
+      state when state in ["discarded", "cancelled"] and not force? ->
         {:error, :materialization_terminal}
 
-      true ->
+      _ ->
         insert_materialization(tenant_id, dimension, force?)
     end
   end
 
-  # One run per (tenant, dim): the worker is unique across every unfinished state, so a
-  # run already queued, executing or waiting out a backoff is a conflict, answered
-  # `{:ok, :in_flight}`. Forced (an orchestrator-or-higher POST), a queued or backed-off
-  # job is re-scheduled to run now; an executing one is left alone, never doubled.
+  # A run already queued or backing off is a uniqueness conflict, answered
+  # `{:ok, :in_flight}`. Forced (an orchestrator-or-higher POST), a run backing off after
+  # an ERROR is re-scheduled to now; a `scheduled` one is left alone, because the worker
+  # snoozes itself into `scheduled` for a provider's Retry-After, an open circuit or a
+  # local rate limit, and forcing past those would bill failed calls the snooze exists to
+  # avoid.
   defp insert_materialization(tenant_id, dimension, force?) do
     opts =
       if force?,
         do: [
           scheduled_at: DateTime.utc_now(),
-          replace: [scheduled: [:scheduled_at], retryable: [:scheduled_at]]
+          replace: [retryable: [:scheduled_at]]
         ],
         else: []
 
@@ -1648,7 +1666,10 @@ defmodule Loopctl.Embeddings do
   tenant's automatic materialization until the old job was pruned.
   """
   @spec system_corpus_terminal?(Ecto.UUID.t(), pos_integer()) :: boolean()
-  def system_corpus_terminal?(tenant_id, dimension) do
+  def system_corpus_terminal?(tenant_id, dimension),
+    do: latest_system_corpus_run_state(tenant_id, dimension) in ["discarded", "cancelled"]
+
+  defp latest_system_corpus_run_state(tenant_id, dimension) do
     # OBAN's repo, not `AdminRepo`: `oban_jobs` is Oban's own, non-RLS table, and
     # reading it through the same repo that WRITES it keeps the two consistent. Filtered
     # by JSONB containment so Oban's GIN index on `args` serves it.
@@ -1665,7 +1686,7 @@ defmodule Loopctl.Embeddings do
         limit: 1,
         select: j.state
       )
-    ) in ["discarded", "cancelled"]
+    )
   end
 
   @doc """
@@ -2112,11 +2133,11 @@ defmodule Loopctl.Embeddings do
   AC-41.1.7 system-corpus state merged with the AC-41.1.10 re-embed state —
   MEMOIZED for a short TTL.
 
-  This runs on every semantic response, and in the steady state its three queries
-  (a system-corpus anti-join that qualifies no rows, plus two re-embed existence
-  probes) always answer the same thing: the answer changes only when the
-  materialization worker runs, a system article is published, or a re-embed makes
-  progress — never as a function of the request. See
+  This runs on every semantic response, and in the steady state its queries (the
+  system-corpus missing and staleness probes, plus two re-embed existence probes) always
+  answer the same thing: the answer changes only when the materialization worker runs, a
+  system article is published or edited, or a re-embed makes progress — never as a
+  function of the request. See
   `Loopctl.Embeddings.DisclosureCache` (TTL `0` disables it).
   """
   @spec search_disclosure_meta(Ecto.UUID.t(), pos_integer()) :: map()
@@ -2130,7 +2151,8 @@ defmodule Loopctl.Embeddings do
       # memoized fill (review): it was previously called on EVERY semantic response,
       # so an unmaterialized tenant paid an unindexed `oban_jobs` JSONB scan plus an
       # Oban insert on every search. Firing it only on a cache MISS bounds it to once
-      # per DisclosureCache TTL, and the anti-join/uniqueness make repeat inserts no-ops.
+      # per DisclosureCache TTL; the enqueue's staleness probe, its executing-run check and
+      # the worker's uniqueness make a repeat a no-op rather than a second run.
       maybe_trigger_system_corpus(tenant_id, dimension, meta)
 
       meta

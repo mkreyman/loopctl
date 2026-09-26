@@ -791,7 +791,7 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
       for article <- Embeddings.unmaterialized_system_articles(tenant.id, 1536, limit: 1000) do
         hash =
-          article |> Embeddings.system_article_embedding_text() |> Embeddings.text_content_hash()
+          article |> Embeddings.article_embedding_text() |> Embeddings.text_content_hash()
 
         {:ok, _} =
           Embeddings.materialize_system_article_embedding(
@@ -1047,14 +1047,15 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       assert :scheduled in states
     end
 
-    # The system-corpus worker continues by SNOOZING the same job, so its uniqueness can
-    # and must cover :executing: otherwise a read-path fill during a run inserts a second
-    # run that embeds the same batch and bills the tenant twice (#896).
-    test "the system-corpus worker is single-flight across every unfinished state" do
+    # The system-corpus worker also continues by insert, so :executing stays out of its
+    # unique states (the enqueue refuses an executing run itself). Its period is unbounded:
+    # with 300 s a job queued or backing off for longer no longer deduplicated, and a
+    # second run embedded the same batch and billed the tenant twice (#896).
+    test "the system-corpus worker excludes :executing and dedupes for as long as a run waits" do
       unique = SystemCorpusEmbeddingWorker.__opts__() |> Keyword.fetch!(:unique)
 
       assert Enum.sort(Keyword.fetch!(unique, :states)) ==
-               Enum.sort([:available, :scheduled, :executing, :retryable])
+               Enum.sort([:available, :scheduled, :retryable])
 
       assert Keyword.fetch!(unique, :period) == :infinity
     end

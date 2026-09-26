@@ -453,7 +453,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
         # is stale, and the search re-embeds it with the mock's vector mid-test.
         embedding_content_hash:
           canonical
-          |> Embeddings.system_article_embedding_text()
+          |> Embeddings.article_embedding_text()
           |> Embeddings.text_content_hash(),
         live_denorm: true
       })

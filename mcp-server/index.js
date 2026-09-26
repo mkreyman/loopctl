@@ -5108,8 +5108,9 @@ const TOOLS = [
       "and re-embeds ones whose text changed since; on the side-table read path your searches " +
       "trigger the same thing, so this is for doing it now. Answers already_materialized when " +
       "nothing is missing or changed, and in_flight when a run is already queued, executing " +
-      "or backing off (one run at a time; an orchestrator-or-higher key re-schedules a queued " +
-      "or backed-off run to now). Refused 409 materialization_terminal when your latest run " +
+      "or backing off (one run at a time; an orchestrator-or-higher key re-schedules a run " +
+      "backing off after an error to now, and a run left executing by a crashed node holds " +
+      "for up to 30 minutes). Refused 409 materialization_terminal when your latest run " +
       "was discarded or cancelled (e.g. no embedding key) and the key is agent-role; an " +
       "orchestrator-or-higher key forces a new run.",
     inputSchema: { type: "object", properties: {}, required: [] },
