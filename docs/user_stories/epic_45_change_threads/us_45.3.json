@@ -1,0 +1,106 @@
+{
+  "id": "US-45.3",
+  "title": "Review dispatch: checkpoint-bound findings and a server-side round ceiling",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "high",
+  "phase": "change_threads",
+  "story": {
+    "as_a": "orchestrator running a thread's review",
+    "i_want_to": "place a review as its own dispatch that reads the thread and records findings against a checkpoint",
+    "so_that": "review rounds carry each fix's reasoning, and the round ceiling is enforced from data rather than a per-machine plugin"
+  },
+  "rationale": "PRD \u00a76: round 2 mostly finds defects round 1's fixes introduced; the reviewer lacked the reasoning.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.3.1",
+      "description": "A review dispatch kind exists; it is minted as a sibling of the implementer's dispatch under the orchestrator's root, never on the implementer's chain, and every finding and verdict it writes passes the US-45.1 self-review rule again at write time."
+    },
+    {
+      "id": "AC-45.3.2",
+      "description": "The review payload carries the story, the checkpoint diff reference, reasoning entries, and every fix entry with the findings it answers."
+    },
+    {
+      "id": "AC-45.3.3",
+      "description": "A completed round is a verdict entry written by a non-implementer principal on the thread; a review dispatch that ends without one uses no round, and review_records rows from the custody lifecycle are not counted."
+    },
+    {
+      "id": "AC-45.3.4",
+      "description": "A third round is placeable only when a round-2 finding's introduced_by names a checkpoint that a round-1 fix entry references; otherwise, when a round-2 finding of severity critical, high or medium remains, the story escalates with review_ceiling at the end of round 2, and no round 4 is ever placeable."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.3.1",
+      "verifies": [
+        "AC-45.3.1"
+      ],
+      "name": "self-review refused",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "place a review under the implementer's lineage"
+      ],
+      "expected_results": [
+        "refused"
+      ]
+    },
+    {
+      "id": "TC-45.3.2",
+      "verifies": [
+        "AC-45.3.3"
+      ],
+      "name": "crashed review does not count",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "review dispatch released without a record"
+      ],
+      "expected_results": [
+        "round count unchanged"
+      ]
+    },
+    {
+      "id": "TC-45.3.3",
+      "verifies": [
+        "AC-45.3.4"
+      ],
+      "name": "ceiling from data",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "round 2 findings with and without introduced_by on a fix checkpoint"
+      ],
+      "expected_results": [
+        "round 3 placeable only in the first case; round 4 never"
+      ]
+    },
+    {
+      "id": "TC-45.3.4",
+      "verifies": [
+        "AC-45.3.2"
+      ],
+      "name": "review payload",
+      "type": "integration",
+      "preconditions": [
+        "thread with a round-1 finding and its fix"
+      ],
+      "steps": [
+        "build the review payload"
+      ],
+      "expected_results": [
+        "story, checkpoint diff ref, reasoning entries, and each fix with the findings it answers"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "The round count and the ceiling are computed from thread_entries alone.",
+    "Material means severity critical, high or medium."
+  ],
+  "dependencies": [
+    "US-45.1",
+    "US-45.2"
+  ]
+}

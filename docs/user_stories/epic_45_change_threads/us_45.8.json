@@ -1,0 +1,113 @@
+{
+  "id": "US-45.8",
+  "title": "Pilot wiring on mkreyman/infra",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "medium",
+  "phase": "change_threads",
+  "story": {
+    "as_a": "operator",
+    "i_want_to": "put infra in thread mode",
+    "so_that": "the pilot's 20 changes run with no pull request"
+  },
+  "rationale": "PRD \u00a72 success criteria and \u00a79 decisions, approved 2026-09-26.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.8.1",
+      "description": "infra's master ruleset restricts updates to the loopctl App, requires linear history and blocks force pushes and deletion; a test push by a person is refused."
+    },
+    {
+      "id": "AC-45.8.2",
+      "description": "A loop/** ruleset blocks force pushes and deletion."
+    },
+    {
+      "id": "AC-45.8.3",
+      "description": "infra's workflows run on push to loop/**."
+    },
+    {
+      "id": "AC-45.8.4",
+      "description": "The fleet hooks that are PR-shaped (gate-unmerged-pr, ci-status, wait-for-checks, review-round-counter) have thread-aware behaviour for a thread-mode repository."
+    },
+    {
+      "id": "AC-45.8.5",
+      "description": "The pilot's success criteria are measured and reported after 20 changes."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.8.1",
+      "verifies": [
+        "AC-45.8.1",
+        "AC-45.8.2"
+      ],
+      "name": "rulesets",
+      "type": "manual",
+      "preconditions": [],
+      "steps": [
+        "push to master as a person; force push to loop/x"
+      ],
+      "expected_results": [
+        "both refused"
+      ]
+    },
+    {
+      "id": "TC-45.8.2",
+      "verifies": [
+        "AC-45.8.3"
+      ],
+      "name": "workflows",
+      "type": "manual",
+      "preconditions": [],
+      "steps": [
+        "push loop/x"
+      ],
+      "expected_results": [
+        "checks run on the SHA"
+      ]
+    },
+    {
+      "id": "TC-45.8.3",
+      "verifies": [
+        "AC-45.8.4"
+      ],
+      "name": "thread-aware hooks",
+      "type": "manual",
+      "preconditions": [
+        "infra in thread mode"
+      ],
+      "steps": [
+        "run gate-unmerged-pr, ci-status, wait-for-checks and review-round-counter against a thread"
+      ],
+      "expected_results": [
+        "each reads the thread, none demands a PR"
+      ]
+    },
+    {
+      "id": "TC-45.8.4",
+      "verifies": [
+        "AC-45.8.5"
+      ],
+      "name": "pilot report",
+      "type": "manual",
+      "preconditions": [
+        "20 changes merged"
+      ],
+      "steps": [
+        "measure the four success criteria"
+      ],
+      "expected_results": [
+        "a report on the PRD's criteria, with the decision to widen or stop"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Enable only after US-45.5 is green on a scratch branch."
+  ],
+  "dependencies": [
+    "US-45.5",
+    "US-45.6",
+    "US-45.7"
+  ]
+}
