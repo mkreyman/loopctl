@@ -84,7 +84,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
           | :blocked
           | :escalated
           | :errored
-          | :stranded_errored
+          | {:stranded, :escalated | :blocked | :errored}
 
   @kind "triage"
 
@@ -427,21 +427,16 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   # whose escalation raises would head every later pass and no detected story would ever be
   # triaged again. The same rescue `attempt/3` gives a candidate.
   #
-  # Answered `:stranded_errored`, not `:errored`: `TriageDispatchWorker.run_result/1` fails a
-  # pass whose every outcome is `:errored` so Oban retries it, which is right for a candidate
-  # but only re-runs the same doomed escalations for a stranded row. The next pass retries it
-  # anyway.
+  # Every outcome is TAGGED `{:stranded, outcome}`: `TriageDispatchWorker.run_result/1` judges
+  # the pass by its CANDIDATES, and a stranded row that keeps failing — raising or refused —
+  # reappears every pass, so counted among them it either hid a pass whose every candidate
+  # errored or failed passes that only re-ran the same escalation.
   defp finish_stranded(row) do
-    escalate_too_large(row)
+    {:stranded, escalate_too_large(row)}
   rescue
-    error -> stranded_errored(row, Exception.format(:error, error, __STACKTRACE__))
+    error -> {:stranded, errored(row, Exception.format(:error, error, __STACKTRACE__))}
   catch
-    kind, value -> stranded_errored(row, Exception.format(kind, value, __STACKTRACE__))
-  end
-
-  defp stranded_errored(row, detail) do
-    :errored = errored(row, detail)
-    :stranded_errored
+    kind, value -> {:stranded, errored(row, Exception.format(kind, value, __STACKTRACE__))}
   end
 
   defp escalate_too_large(%{tenant_id: tenant_id, story_id: story_id}) do

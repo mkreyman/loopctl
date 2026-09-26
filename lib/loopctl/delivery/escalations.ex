@@ -451,9 +451,9 @@ defmodule Loopctl.Delivery.Escalations do
       # An agent contracted it — or contracted AND claimed it — between the transition and
       # this call: the row left `escalated` first, so for that instant the story was listed as
       # ready. It is past `pending`, which is what the resolution asked for — not a failure of
-      # a resolution that already committed. Any OTHER failure leaves the story `pending` at
-      # `queued`: the state a freshly triaged story awaits its contract in, which
-      # `contract_story` takes from there.
+      # a resolution that already committed. Any OTHER failure is returned AFTER the transition
+      # committed: the story is left `pending` at `queued`, which no placement takes until an
+      # orchestrator key re-contracts it (`contract_story`; the resolving `:user` key cannot).
       {:error, {:invalid_transition, %{current_agent_status: status}}} when status != :pending ->
         {:ok, story}
 

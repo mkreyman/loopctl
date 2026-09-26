@@ -1954,6 +1954,7 @@ defmodule Loopctl.Progress do
              | :custody_halted
              | :tenant_inactive
              | :budget_escalation_refused
+             | :usage_hold_busy
              | :audit_chain_append_failed
              | Ecto.Changeset.t()}
   def reclaim_expired_claim(tenant_id, story_id, expected_epoch) do
@@ -1973,15 +1974,7 @@ defmodule Loopctl.Progress do
 
     case RunnerStages.escalate_recorded_budget_kill(tenant_id, story_id, expected_epoch, label) do
       :none ->
-        runner_lost_release(
-          tenant_id,
-          story_id,
-          Map.merge(lease, %{
-            action: "claim_lease_expired",
-            webhook_reason: "claim_lease_expired",
-            new_state: %{}
-          })
-        )
+        reclaim_unless_exhausted(tenant_id, story_id, expected_epoch, lease)
 
       {:ok, reason} ->
         runner_lost_release(
@@ -2002,6 +1995,44 @@ defmodule Loopctl.Progress do
         )
 
         {:error, :budget_escalation_refused}
+    end
+  end
+
+  # A RECORDED `usage_exhausted` IS FINISHED, NOT EXPIRED (#884 review round 2): its report
+  # was recorded and the node died, or the runner went quiet, before the hold and the release
+  # ran. The reclaim completes that session end as the resend would have — the machine held out
+  # first (`RunnerStages.redrive_recorded_usage_exhausted/3`), then the claim released WITHOUT
+  # spending an attempt. A hold the database refuses permanently is not re-driven: with the
+  # machine not held out, the counted expiry is the only bound on the story returning to it.
+  defp reclaim_unless_exhausted(tenant_id, story_id, expected_epoch, lease) do
+    case RunnerStages.redrive_recorded_usage_exhausted(tenant_id, story_id, expected_epoch) do
+      :none ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_lease_expired",
+            webhook_reason: "claim_lease_expired",
+            new_state: %{}
+          })
+        )
+
+      {:ok, reason} ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_session_ended",
+            webhook_reason: "session_ended:" <> reason,
+            new_state: %{"session_ended_reason" => reason},
+            cause: :usage_exhausted
+          })
+        )
+
+      # The hold could not be written for want of a lock: nothing released, the next sweep
+      # tries again, as a budget kill's refused escalation does.
+      {:error, :busy} ->
+        {:error, :usage_hold_busy}
     end
   end
 

@@ -265,7 +265,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       story = detected_story(ctx)
       half_take(ctx, story)
 
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:escalated]
+      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [stranded: :escalated]
 
       row = unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end)
       assert row.stage == :escalated
@@ -310,9 +310,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         end)
         |> elem(0)
 
-      # `:stranded_errored`, so a pass of failing stranded rows is not judged all-errored and
+      # Tagged `{:stranded, _}`, so a pass of failing stranded rows is not judged all-errored and
       # retried whole.
-      assert Enum.sort(outcomes) == [:escalated, :stranded_errored]
+      assert Enum.sort(outcomes) == [stranded: :errored, stranded: :escalated]
       assert unboxed(fn -> Stages.get(ctx.tenant.id, fine.id) end).stage == :escalated
       assert unboxed(fn -> Stages.get(ctx.tenant.id, broken.id) end).stage == :triaged
     end
