@@ -46,7 +46,6 @@ defmodule Loopctl.TokenUsage do
   alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report
   alias Loopctl.Webhooks
-  alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
 
@@ -1044,16 +1043,7 @@ defmodule Loopctl.TokenUsage do
   # project-scoped webhooks also receive budget alerts. Errors are caught to
   # avoid crashing the report creation flow (the report is already committed).
   defp fire_budget_event(tenant_id, event_type, project_id, payload) do
-    webhooks = EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
-
-    Enum.each(webhooks, fn webhook ->
-      with {:error, reason} <-
-             Webhooks.insert_event_with_delivery(tenant_id, webhook.id, event_type, payload) do
-        Logger.warning(
-          "Failed to create #{event_type} webhook event for tenant #{tenant_id}: #{inspect(reason)}"
-        )
-      end
-    end)
+    Webhooks.emit(tenant_id, event_type, project_id, payload)
   end
 
   # Finds all budgets applicable to a report: story-level, epic-level, project-level.

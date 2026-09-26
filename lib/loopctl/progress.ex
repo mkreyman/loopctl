@@ -2415,14 +2415,20 @@ defmodule Loopctl.Progress do
   end
 
   defp enqueue_knowledge_extraction(multi, tenant_id) do
-    Multi.run(multi, :enqueue_knowledge_worker, fn _repo, %{review_record: rr} ->
+    # Merged, so the Multi-aware Oban.insert writes the job on the review's own AdminRepo
+    # connection. A bare Oban.insert/1 wrote it on Loopctl.Repo, where it committed at once,
+    # apart from the review record it reads (#885).
+    Multi.merge(multi, fn %{review_record: rr} ->
       tenant = AdminRepo.get(Tenants.Tenant, tenant_id)
 
       if knowledge_auto_extract_enabled?(tenant) do
-        ReviewKnowledgeWorker.new(%{review_record_id: rr.id, tenant_id: tenant_id})
-        |> Oban.insert()
+        Oban.insert(
+          Multi.new(),
+          :enqueue_knowledge_worker,
+          ReviewKnowledgeWorker.new(%{review_record_id: rr.id, tenant_id: tenant_id})
+        )
       else
-        {:ok, :skipped}
+        Multi.new()
       end
     end)
   end
@@ -4262,19 +4268,7 @@ defmodule Loopctl.Progress do
   end
 
   defp insert_events_with_delivery(tenant_id, event_type, project_id, payload) do
-    require Logger
-
-    EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
-    |> Enum.each(fn webhook ->
-      insert_single_event_with_delivery(tenant_id, webhook, event_type, payload)
-    end)
-  end
-
-  defp insert_single_event_with_delivery(tenant_id, webhook, event_type, payload) do
-    with {:error, reason} <-
-           Webhooks.insert_event_with_delivery(tenant_id, webhook.id, event_type, payload) do
-      Logger.warning("Failed webhook event for webhook #{webhook.id}: #{inspect(reason)}")
-    end
+    Webhooks.emit(tenant_id, event_type, project_id, payload)
   end
 
   defp extract_verification_params(params) do

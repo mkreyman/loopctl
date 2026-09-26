@@ -41,7 +41,7 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
 
   defp payload, do: %{"event" => "story.status_changed"}
 
-  describe "Webhooks.insert_event_with_delivery/4" do
+  describe "Webhooks.insert_events_with_delivery/4" do
     setup do
       webhook = fixture(:webhook, %{})
       %{webhook: webhook}
@@ -53,10 +53,10 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
       Oban.Testing.with_testing_mode(:manual, fn ->
         {:ok, event} =
           AdminRepo.transaction(fn ->
-            {:ok, event} =
-              Webhooks.insert_event_with_delivery(
+            {:ok, [event]} =
+              Webhooks.insert_events_with_delivery(
                 webhook.tenant_id,
-                webhook.id,
+                [webhook],
                 "story.status_changed",
                 payload()
               )
@@ -77,10 +77,10 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
       Oban.Testing.with_testing_mode(:manual, fn ->
         {:error, {:rolled_back, event_id}} =
           AdminRepo.transaction(fn ->
-            {:ok, event} =
-              Webhooks.insert_event_with_delivery(
+            {:ok, [event]} =
+              Webhooks.insert_events_with_delivery(
                 webhook.tenant_id,
-                webhook.id,
+                [webhook],
                 "story.status_changed",
                 payload()
               )
@@ -97,10 +97,10 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
       webhook: webhook
     } do
       Oban.Testing.with_testing_mode(:manual, fn ->
-        {:ok, event} =
-          Webhooks.insert_event_with_delivery(
+        {:ok, [event]} =
+          Webhooks.insert_events_with_delivery(
             webhook.tenant_id,
-            webhook.id,
+            [webhook],
             "story.status_changed",
             payload()
           )
@@ -116,18 +116,18 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
         {:ok, {refusal, event}} =
           AdminRepo.transaction(fn ->
             refusal =
-              Webhooks.insert_event_with_delivery(
+              Webhooks.insert_events_with_delivery(
                 webhook.tenant_id,
-                webhook.id,
+                [webhook],
                 "story.status_changed",
                 nil
               )
 
             # The caller logs the refusal and carries on: its next write still commits.
-            {:ok, event} =
-              Webhooks.insert_event_with_delivery(
+            {:ok, [event]} =
+              Webhooks.insert_events_with_delivery(
                 webhook.tenant_id,
-                webhook.id,
+                [webhook],
                 "story.status_changed",
                 payload()
               )
@@ -145,11 +145,11 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
       missing_webhook_id = Ecto.UUID.generate()
 
       Oban.Testing.with_testing_mode(:manual, fn ->
-        assert_raise RuntimeError, ~r/webhook event write refused/, fn ->
+        assert_raise RuntimeError, ~r/webhook \{:event, 0\} write refused/, fn ->
           AdminRepo.transaction(fn ->
-            Webhooks.insert_event_with_delivery(
+            Webhooks.insert_events_with_delivery(
               webhook.tenant_id,
-              missing_webhook_id,
+              [%{webhook | id: missing_webhook_id}],
               "story.status_changed",
               payload()
             )
@@ -165,9 +165,9 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
 
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert {:error, %Ecto.Changeset{}} =
-                 Webhooks.insert_event_with_delivery(
+                 Webhooks.insert_events_with_delivery(
                    webhook.tenant_id,
-                   missing_webhook_id,
+                   [%{webhook | id: missing_webhook_id}],
                    "story.status_changed",
                    payload()
                  )
@@ -177,6 +177,77 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
                  :count
                ) == 0
       end)
+    end
+
+    test "writes every webhook's event and job in one transaction, in webhook order", %{
+      webhook: webhook
+    } do
+      second = fixture(:webhook, %{tenant_id: webhook.tenant_id})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        {:ok, [first_event, second_event]} =
+          Webhooks.insert_events_with_delivery(
+            webhook.tenant_id,
+            [webhook, second],
+            "story.status_changed",
+            payload()
+          )
+
+        assert first_event.webhook_id == webhook.id
+        assert second_event.webhook_id == second.id
+        assert %Oban.Job{} = job_for(first_event.id)
+        assert %Oban.Job{} = job_for(second_event.id)
+      end)
+    end
+
+    test "a refused write rolls back every webhook's event, not only its own", %{
+      webhook: webhook
+    } do
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:error, %Ecto.Changeset{}} =
+                 Webhooks.insert_events_with_delivery(
+                   webhook.tenant_id,
+                   [webhook, %{webhook | id: Ecto.UUID.generate()}],
+                   "story.status_changed",
+                   payload()
+                 )
+
+        assert AdminRepo.aggregate(
+                 from(e in WebhookEvent, where: e.webhook_id == ^webhook.id),
+                 :count
+               ) == 0
+      end)
+    end
+
+    test "refuses another tenant's webhook before writing anything", %{webhook: webhook} do
+      other = fixture(:webhook, %{})
+
+      assert_raise ArgumentError, ~r/does not belong to tenant/, fn ->
+        Webhooks.insert_events_with_delivery(
+          webhook.tenant_id,
+          [webhook, other],
+          "story.status_changed",
+          payload()
+        )
+      end
+
+      assert AdminRepo.aggregate(
+               from(e in WebhookEvent, where: e.webhook_id in ^[webhook.id, other.id]),
+               :count
+             ) == 0
+    end
+
+    test "refuses to run inside a Loopctl.Repo transaction", %{webhook: webhook} do
+      assert_raise ArgumentError, ~r/not in a Repo transaction/, fn ->
+        Repo.transaction(fn ->
+          Webhooks.insert_events_with_delivery(
+            webhook.tenant_id,
+            [webhook],
+            "story.status_changed",
+            payload()
+          )
+        end)
+      end
     end
   end
 
@@ -194,11 +265,17 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
       assert_raise ArgumentError, ~r/AdminRepo transaction/, fn ->
         Repo.transaction(multi)
       end
+
+      # Inside an enclosing AdminRepo transaction too: the Multi still runs on Loopctl.Repo,
+      # so its state change would commit apart from the events.
+      assert_raise ArgumentError, ~r/AdminRepo transaction/, fn ->
+        AdminRepo.transaction(fn -> Repo.transaction(multi) end)
+      end
     end
   end
 
   describe "enqueue guard" do
-    # Every writer must go through Webhooks.insert_event_with_delivery/4. A job built any
+    # Every writer must go through Webhooks.insert_events_with_delivery/4. A job built any
     # other way is inserted through Oban's configured Loopctl.Repo and reopens #885 without a
     # failing test. Reads the AST, so docs that name the worker do not count and code that
     # reaches it indirectly does.
@@ -229,6 +306,43 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
 
       assert count(body, &local_new?/1) == 1
       assert count(body, &oban_insert?/1) == 1
+    end
+
+    # The general #885 defect: a bare Oban.insert inside a Multi step or a transaction body
+    # writes on Oban's Loopctl.Repo, not on the connection running the transaction. The
+    # Multi-aware Oban.insert(multi, name, job) runs on the Multi's own repo.
+    test "no module under lib/ inserts a job with a bare Oban.insert inside a transaction" do
+      offenders =
+        "lib/**/*.ex"
+        |> Path.wildcard()
+        |> Enum.flat_map(fn path ->
+          path
+          |> File.read!()
+          |> Code.string_to_quoted!()
+          |> bare_inserts_in_transactions()
+          |> Enum.map(&"#{path}: #{&1}")
+        end)
+
+      assert offenders == []
+    end
+
+    test "the transaction guard flags a bare insert and passes a Multi-aware one" do
+      bad = [
+        "Multi.run(m, :j, fn _r, _c -> W.new(%{}) |> Oban.insert() end)",
+        "AdminRepo.transaction(fn -> Oban.insert!(W.new(%{})) end)"
+      ]
+
+      good = [
+        "Multi.merge(m, fn _ -> Oban.insert(Multi.new(), :j, W.new(%{})) end)",
+        "Multi.new() |> Oban.insert(:j, W.new(%{})) |> AdminRepo.transaction()",
+        "W.new(%{}) |> Oban.insert()"
+      ]
+
+      for source <- bad,
+          do: assert([_] = bare_inserts_in_transactions(Code.string_to_quoted!(source)), source)
+
+      for source <- good,
+          do: assert([] = bare_inserts_in_transactions(Code.string_to_quoted!(source)), source)
     end
 
     test "flags every way of building the job" do
@@ -287,6 +401,35 @@ defmodule Loopctl.Webhooks.EnqueueDeliveryTest do
   defp worker_ref?({:__aliases__, _, parts}), do: List.last(parts) == :WebhookDeliveryWorker
   defp worker_ref?(string) when is_binary(string), do: string in @module_names
   defp worker_ref?(_), do: false
+
+  defp bare_inserts_in_transactions(ast) do
+    ast
+    |> collect(fn node -> if transaction_scope?(node), do: node end)
+    |> Enum.flat_map(&collect(&1, fn node -> bare_insert_source(node) end))
+    |> Enum.uniq()
+  end
+
+  defp bare_insert_source(node), do: if(bare_oban_insert?(node), do: Macro.to_string(node))
+
+  defp transaction_scope?({{:., _, [{:__aliases__, _, parts}, :run]}, _, _}),
+    do: List.last(parts) == :Multi
+
+  defp transaction_scope?({{:., _, [{:__aliases__, _, _}, :transaction]}, _, [fun | _]}),
+    do: match?({:fn, _, _}, fun)
+
+  defp transaction_scope?(_), do: false
+
+  # Oban.insert(job), job |> Oban.insert(), and the insert!/insert_all forms. The Multi form
+  # takes a Multi and a step name first, so it always has two or more arguments.
+  defp bare_oban_insert?({:|>, _, [_, {{:., _, [{:__aliases__, _, [:Oban]}, f]}, _, []}]})
+       when f in [:insert, :insert!, :insert_all],
+       do: true
+
+  defp bare_oban_insert?({{:., _, [{:__aliases__, _, [:Oban]}, f]}, _, [_]})
+       when f in [:insert, :insert!, :insert_all],
+       do: true
+
+  defp bare_oban_insert?(_), do: false
 
   defp local_new?({:new, _, [_ | _]}), do: true
   defp local_new?({{:., _, [{:__MODULE__, _, _}, :new]}, _, _}), do: true

@@ -60,28 +60,26 @@ defmodule Loopctl.Webhooks.EventGenerator do
   end
 
   def generate_events(multi, name, event_params_fn) when is_function(event_params_fn, 1) do
-    Multi.run(multi, name, fn _repo, changes ->
+    Multi.run(multi, name, fn repo, changes ->
       # The events and their jobs are written on AdminRepo. Atomicity with the state change
-      # holds only when the caller runs this Multi on AdminRepo too; run on Loopctl.Repo,
-      # they would each commit at once and announce a change that may roll back (#885).
-      unless AdminRepo.in_transaction?(),
+      # holds only when this Multi runs on AdminRepo too; run on Loopctl.Repo, they would
+      # commit apart from it and could announce a change that rolls back (#885).
+      unless repo == AdminRepo,
         do: raise(ArgumentError, "generate_events/3 runs in an AdminRepo transaction")
 
       params = event_params_fn.(changes)
       tenant_id = Map.fetch!(params, :tenant_id)
       event_type = Map.fetch!(params, :event_type)
-      project_id = Map.get(params, :project_id)
-      payload = Map.fetch!(params, :payload)
 
-      events =
-        tenant_id
-        |> matching_webhooks(event_type, project_id)
-        |> Enum.map(fn webhook ->
-          {:ok, event} =
-            Webhooks.insert_event_with_delivery(tenant_id, webhook.id, event_type, payload)
+      webhooks = matching_webhooks(tenant_id, event_type, Map.get(params, :project_id))
 
-          event
-        end)
+      {:ok, events} =
+        Webhooks.insert_events_with_delivery(
+          tenant_id,
+          webhooks,
+          event_type,
+          Map.fetch!(params, :payload)
+        )
 
       {:ok, events}
     end)

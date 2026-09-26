@@ -13650,12 +13650,18 @@ defmodule Loopctl.Knowledge do
   defp maybe_enqueue_embedding(multi, _tenant_id, false), do: multi
 
   defp maybe_enqueue_embedding(multi, tenant_id, true) do
-    Multi.run(multi, :embedding_job, fn _repo, %{article: article} ->
+    # Merged, so the Multi-aware Oban.insert writes the job on the article's own connection.
+    # A bare Oban.insert/1 wrote it on Loopctl.Repo, where it committed at once, apart from
+    # the article it embeds (#885).
+    Multi.merge(multi, fn %{article: article} ->
       if article.status == :published do
-        ArticleEmbeddingWorker.new(%{article_id: article.id, tenant_id: tenant_id})
-        |> Oban.insert()
+        Oban.insert(
+          Multi.new(),
+          :embedding_job,
+          ArticleEmbeddingWorker.new(%{article_id: article.id, tenant_id: tenant_id})
+        )
       else
-        {:ok, :skipped}
+        Multi.new()
       end
     end)
   end

@@ -314,23 +314,7 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
         "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
       }
 
-      Enum.each(webhooks, &deliver_anomaly_event(tenant_id, &1, payload, anomaly.id))
-    end
-  end
-
-  # Delivers a single anomaly webhook event. Errors are logged, not raised.
-  defp deliver_anomaly_event(tenant_id, webhook, payload, anomaly_id) do
-    with {:error, reason} <-
-           Webhooks.insert_event_with_delivery(
-             tenant_id,
-             webhook.id,
-             "token.anomaly_detected",
-             payload
-           ) do
-      Logger.warning(
-        "Failed to create token.anomaly_detected webhook event " <>
-          "for anomaly #{anomaly_id}: #{inspect(reason)}"
-      )
+      Webhooks.emit_to(tenant_id, webhooks, "token.anomaly_detected", payload)
     end
   end
 

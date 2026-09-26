@@ -25,7 +25,6 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Webhooks
-  alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
 
@@ -899,21 +898,7 @@ defmodule Loopctl.BulkOperations do
   end
 
   defp emit_story_event(tenant_id, event_type, story, payload) do
-    require Logger
-    webhooks = EventGenerator.matching_webhooks(tenant_id, event_type, story.project_id)
-
-    Enum.each(webhooks, fn webhook ->
-      emit_single_webhook_event(tenant_id, webhook, event_type, payload)
-    end)
-  end
-
-  defp emit_single_webhook_event(tenant_id, webhook, event_type, payload) do
-    require Logger
-
-    with {:error, reason} <-
-           Webhooks.insert_event_with_delivery(tenant_id, webhook.id, event_type, payload) do
-      Logger.warning("Failed webhook event for webhook #{webhook.id}: #{inspect(reason)}")
-    end
+    Webhooks.emit(tenant_id, event_type, story.project_id, payload)
   end
 
   # ===================================================================

@@ -147,9 +147,12 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
   The anomaly row + `detected` audit are inserted atomically, but the operator alert
   + webhook events run POST-commit, after the anomaly transaction rather than inside it.
-  The operator alert is an Oban job inserted through Oban's configured `Loopctl.Repo`, so it
-  cannot join the anomaly's `AdminRepo` transaction; the webhook events stay beside it so
-  one `alerted` flip, made after both, covers the pair. A crash between commit and alert
+  That is a choice, not a limit of Oban: a Multi-aware `Oban.insert` could write either job
+  inside the anomaly's `AdminRepo` transaction. The stall anomalies (`:sweep_stalled`, the
+  `pass` consumer) send ONE operator alert per run across every tenant, after all their
+  transactions, so there is no single anomaly transaction for that alert to join; every
+  anomaly type therefore notifies post-commit through one path, and one `alerted` flip,
+  made after the alert and the webhook events, covers them. A crash between commit and alert
   would leave an unresolved row with `alerted: false`; the next run detects that and
   re-fires the notifications rather than silently losing them on the no-notify update path.
 
@@ -1420,10 +1423,7 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     if webhooks != [] do
       payload = anomaly_webhook_payload(anomaly)
 
-      Enum.each(
-        webhooks,
-        &deliver_anomaly_event(tenant_id, &1, event_type, payload, anomaly.id)
-      )
+      Webhooks.emit_to(tenant_id, webhooks, event_type, payload)
     end
   end
 
@@ -1487,16 +1487,6 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       "sample_count" => anomaly.sample_count,
       "last_event_at" => iso8601(anomaly.last_event_at)
     }
-  end
-
-  defp deliver_anomaly_event(tenant_id, webhook, event_type, payload, anomaly_id) do
-    with {:error, reason} <-
-           Webhooks.insert_event_with_delivery(tenant_id, webhook.id, event_type, payload) do
-      Logger.warning(
-        "IngestionHealthWorker: failed to create #{event_type} webhook event " <>
-          "for anomaly #{anomaly_id}: #{inspect(reason)}"
-      )
-    end
   end
 
   defp iso8601(nil), do: nil
