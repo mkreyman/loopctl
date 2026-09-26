@@ -89,7 +89,6 @@ defmodule Loopctl.Intake do
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.InjectionDetector
-  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Delivery
   alias Loopctl.Intake.GithubPayload
@@ -371,7 +370,7 @@ defmodule Loopctl.Intake do
   `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it),
   `:base_branch` (NOT nullable) and `:mode` (`"pr"` or `"thread"`, NOT nullable; US-45.4). A
   mode CHANGE is `{:error, :stories_in_flight}` while any story of the source's project is
-  past intake and not terminal. A key that is ABSENT is left alone, which is why this
+  past intake and not `done` or `failed` (an escalated story counts: it can be re-queued). A key that is ABSENT is left alone, which is why this
   takes a map rather than two positional arguments: "absent" and "explicitly null" are
   different requests for the epic, and only the map can carry that difference.
 
@@ -426,8 +425,8 @@ defmodule Loopctl.Intake do
   # gate reads — a pull request or a recorded checkpoint — so flipping it mid-delivery would
   # judge a story on a route it was never built for: a pr-mode story has no checkpoints, and a
   # thread-mode story has no pull request. In flight is every stage past intake (`detected`)
-  # that is not terminal (`StageMachine.terminal_stages/0`). Naming the mode it already has is
-  # not a change and is never refused.
+  # except `done` and `failed`. `escalated` IS in flight: a human resolution re-queues it into
+  # the same loop. Naming the mode it already has is not a change and is never refused.
   #
   # Read, not locked: a story entering the loop between this read and the commit is judged
   # under the new mode. Closing that would need a lock every placement takes, for an operator
@@ -441,7 +440,7 @@ defmodule Loopctl.Intake do
   end
 
   defp stories_in_flight?(tenant_id, project_id) do
-    settled = [:detected | StageMachine.terminal_stages()]
+    settled = [:detected, :done, :failed]
 
     AdminRepo.exists?(
       from st in StoryStage,

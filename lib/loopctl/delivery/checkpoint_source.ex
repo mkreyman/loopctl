@@ -7,17 +7,23 @@ defmodule Loopctl.Delivery.CheckpointSource do
   request path does, so Gate B, the hard bound, custody and the head comparison run over it
   unchanged, plus the thread facts the gate judges:
 
-  - `:branch_head_sha` — the commit the thread branch `loop/<story_id>` names now. While it
-    is not the checkpoint the gate answers `branch_head_unrecorded` and sends the story back
-    to `implementing`: git cannot see a claim, so a reclaimed runner can still push, and
-    loopctl never adopts a head nobody reported
+  - `:branch_head_sha` — the commit the story's branch names now, or `:missing` when the
+    forge has no such branch (a 404). The branch is the one the story was DISPATCHED on
+    (`Loopctl.Delivery.DispatchPayload.story_branch/2`), never a name derived here. While it
+    is not the checkpoint the gate answers `branch_head_unrecorded` — or `branch_missing` —
+    and sends the story back to `implementing`: git cannot see a claim, so a reclaimed runner
+    can still push, and loopctl never adopts a head nobody reported
   - `:head_tree_sha` — the checkpoint commit's tree AS THE FORGE READS IT. The recorded
     `tree_sha` is the claimant's report; a disagreement is refused rather than believed
   - `:base_head_sha`, `:base_tree_sha` — the base branch's head and tree now. A tree equal to
     the checkpoint's is `empty_change`: there is nothing to merge, and that is never read as
     merged
   - `:parent_shas` — the checkpoint commit's parents in order. A `base_update` checkpoint must
-    have exactly two: the checkpoint the gate last allowed, then the base head
+    have exactly two: its ledger parent, then the base head
+  - `:second_parent_on_base?` — for a `base_update` whose second parent is NOT the base head
+    now: whether that parent is on the base branch at all (`contains?/3`). True is a stale
+    update (master moved again); false is a merge of something other than the base. `nil`
+    when the question does not arise
 
   The three reads are SEQUENTIAL. Each is bounded by the adapter's timeouts, and running them
   concurrently would save at most two round trips on a call a session makes once per head,
@@ -50,28 +56,23 @@ defmodule Loopctl.Delivery.CheckpointSource do
   alias Loopctl.Threads.Checkpoint
 
   @doc """
-  The thread branch a story's checkpoints are pushed to (PRD §4 item 2).
-  """
-  @spec thread_branch(Ecto.UUID.t()) :: String.t()
-  def thread_branch(story_id), do: "loop/" <> story_id
-
-  @doc """
   The facts of `checkpoint`, in `PullRequestSource.pull_request/0`'s shape plus the thread
-  facts listed in the moduledoc. `base_branch` is the intake source's.
+  facts listed in the moduledoc. `base_branch` is the intake source's; `branch` is the one
+  the story was dispatched on.
   """
   @spec pull_request(String.t(), String.t(), Ecto.UUID.t(), Checkpoint.t()) ::
           {:ok, map()} | {:error, term()}
-  def pull_request(repo, base_branch, story_id, %Checkpoint{merge_commit_sha: merged} = cp)
+  def pull_request(repo, base_branch, branch, %Checkpoint{merge_commit_sha: merged} = cp)
       when is_binary(merged) do
     case source().contains?(repo, merged, base_branch) do
       {:ok, true} -> {:ok, merged_facts(cp, merged)}
-      {:ok, false} -> open_facts(repo, base_branch, story_id, cp)
+      {:ok, false} -> open_facts(repo, base_branch, branch, cp)
       {:error, _reason} = error -> error
     end
   end
 
-  def pull_request(repo, base_branch, story_id, %Checkpoint{} = checkpoint),
-    do: open_facts(repo, base_branch, story_id, checkpoint)
+  def pull_request(repo, base_branch, branch, %Checkpoint{} = checkpoint),
+    do: open_facts(repo, base_branch, branch, checkpoint)
 
   defp merged_facts(checkpoint, merged) do
     %{
@@ -85,12 +86,14 @@ defmodule Loopctl.Delivery.CheckpointSource do
     }
   end
 
-  defp open_facts(repo, base_branch, story_id, %Checkpoint{} = checkpoint) do
+  defp open_facts(repo, base_branch, branch, %Checkpoint{} = checkpoint) do
     sha = checkpoint.commit_sha
 
-    with {:ok, branch_head} <- source().branch_head(repo, thread_branch(story_id)),
+    with {:ok, branch_head} <- branch_head(repo, branch),
          {:ok, commit} <- source().commit(repo, sha),
-         {:ok, comparison} <- source().compare(repo, base_branch, sha) do
+         {:ok, comparison} <- source().compare(repo, base_branch, sha),
+         {:ok, on_base} <-
+           second_parent_on_base(repo, base_branch, checkpoint, commit, comparison) do
       {:ok,
        %{
          state: "open",
@@ -104,10 +107,33 @@ defmodule Loopctl.Delivery.CheckpointSource do
          head_tree_sha: commit.tree_sha,
          base_head_sha: comparison.base_head_sha,
          base_tree_sha: comparison.base_tree_sha,
-         parent_shas: commit.parent_shas
+         parent_shas: commit.parent_shas,
+         second_parent_on_base?: on_base
        }}
     end
   end
+
+  # A branch the forge does not have is a FACT about the thread — nothing was pushed, or it
+  # was deleted — not a forge failure, so it is `:missing` rather than an error that would
+  # escalate. Every other failure keeps its classification.
+  defp branch_head(repo, branch) do
+    case source().branch_head(repo, branch) do
+      {:error, {:github_api_error, 404}} -> {:ok, :missing}
+      other -> other
+    end
+  end
+
+  defp second_parent_on_base(repo, base_branch, %Checkpoint{kind: :base_update}, commit, cmp) do
+    case commit.parent_shas do
+      [_ledger_parent, second] when second != cmp.base_head_sha ->
+        source().contains?(repo, second, base_branch)
+
+      _other ->
+        {:ok, nil}
+    end
+  end
+
+  defp second_parent_on_base(_repo, _base_branch, _checkpoint, _commit, _cmp), do: {:ok, nil}
 
   defp source, do: PullRequestSource.impl()
 end

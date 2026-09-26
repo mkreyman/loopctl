@@ -61,29 +61,37 @@ defmodule Loopctl.Delivery.MergePrecondition do
     commit is not the tree the claimant reported, so the record is not what it describes
   - `{:base_update_parents_mismatch, parents, expected}` — see below
 
-  Two things go back to `implementing` over `:base_moved`, as a moved pull request head does,
-  because each is ordinary work rather than something for a human: a latest checkpoint that
-  is not the head the stage row recorded, and `{:branch_head_unrecorded, branch, checkpoint}`
-  — the thread branch names a commit nobody reported (a push that has not been recorded yet,
-  or a reclaimed runner's). loopctl never adopts a head nobody reported, and the merge
-  executor squashes the RECORDED checkpoint's tree, never the branch head (PRD §4 item 2).
+  Three things go back to `implementing` over `:base_moved`, as a moved pull request head
+  does, because each is ordinary work rather than something for a human: a latest checkpoint
+  that is not the head the stage row recorded; `{:branch_head_unrecorded, branch, checkpoint}`
+  — the story's branch names a commit nobody reported (a push not recorded yet, or a
+  reclaimed runner's); and `{:branch_missing, checkpoint}` — the forge has no such branch.
+  The branch is the one the story was DISPATCHED on (`DispatchPayload.story_branch/2`), never
+  a name derived here. loopctl never adopts a head nobody reported, and the merge executor
+  squashes the RECORDED checkpoint's tree, never the branch head (PRD §4 item 2).
 
   ONE head movement is not `:base_moved`: the latest checkpoint is a `base_update` the
-  control plane recorded (`Loopctl.Threads.record_base_update/3`), its ledger parent is the
-  checkpoint the gate last allowed, and the stage row still stands at that allowed head. The
-  commit must then have EXACTLY two parents as the forge reports them — the allowed checkpoint
-  first and the base branch's current head second. Any other parent SHAPE is malformed and
-  refuses `:base_update_parents_mismatch`; the right shape with a second parent that is no
-  longer the base head is `:unevaluated` with `base_update_stale` — master moved again, which
-  is a race that retries, counted toward `max_consecutive_unevaluated` so it escalates only if
-  it persists. Its TREE is not recomputed: US-45.5's executor makes the
-  commit with GitHub's own merge of the base into the checkpoint, so the tree is that merge by
-  construction. When all of that holds the decision is `:base_updated`: `enforce/3` takes
-  `{:ci, :ci, :base_updated}` through `Loopctl.Delivery.Stages.follow_base_update/4` and stops.
-  The story stays at `ci` with its review verdict and custody binding; the next call judges
-  the new head as every head is judged. A transition that cannot be written counts toward
-  `max_consecutive_unevaluated`, so it escalates once the bound passes rather than repeating
-  for ever.
+  control plane recorded (`Loopctl.Threads.record_base_update/3`), its ledger ancestry —
+  walked through `base_update` checkpoints only — reaches the checkpoint the gate last
+  allowed, and the stage row still stands at that allowed head. A CHAIN is followable, so a
+  base update recorded on top of a stale one is how a stale one is recovered. The forge then
+  classifies the commit's parents:
+
+  - exactly `[ledger parent, base head now]` — `:base_updated`. `enforce/3` takes
+    `{:ci, :ci, :base_updated}` through `Loopctl.Delivery.Stages.follow_base_update/4` and
+    stops: the story stays at `ci` with its review verdict and custody binding, and the next
+    call judges the new head as every head is judged
+  - `[ledger parent, S]` with `S` on the base branch but not its head — `:unevaluated` with
+    `base_update_stale`. Master moved again; the remedy is the control plane recording a new
+    base update on top (US-45.5's executor), and it escalates once
+    `max_consecutive_unevaluated` passes if nothing does
+  - anything else, a second parent NOT on the base branch included — refused
+    `:base_update_parents_mismatch`
+
+  The TREE is not recomputed: US-45.5's executor makes the commit with GitHub's own merge of
+  the base into its parent, so the tree is that merge by construction. An edge that cannot
+  be taken is `:unevaluated`, counted against the head the row holds at that moment; a
+  concurrent call that already took the same edge is answered `:base_updated`.
 
   A thread-mode allow is recorded naming the checkpoint id and its sha, on the
   `effect_recorded` event of `merge_gate_allowed_sha`.
@@ -218,6 +226,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   require Logger
 
   alias Loopctl.Delivery.CheckpointSource
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.PullRequestSource
@@ -687,37 +696,42 @@ defmodule Loopctl.Delivery.MergePrecondition do
     allowed = Map.get(facts, :recorded_allow_sha)
 
     case value(facts, :checkpoint) do
-      %{kind: :base_update, parent_sha: ^allowed}
+      %{kind: :base_update, ancestry_shas: [ledger_parent | _] = ancestry}
       when is_binary(allowed) ->
-        if mode(facts) == :thread and Map.get(facts, :recorded_head_sha) == allowed,
-          do: base_update_parents(pr, allowed),
-          else: :none
+        if mode(facts) == :thread and Map.get(facts, :recorded_head_sha) == allowed and
+             allowed in ancestry,
+           do: base_update_parents(pr, ledger_parent),
+           else: :none
 
       _other ->
         :none
     end
   end
 
-  # Two different failures, split so a race is not a human's problem:
+  # Three outcomes, classified by what the forge says the second parent IS:
   #
-  # - MALFORMED: not exactly two parents, or a first parent that is not the allowed checkpoint.
-  #   The commit is not the base update the ledger says it is, so it is refused.
-  # - STALE: the shape is right but the second parent is not the base head the forge reports
-  #   NOW — master moved again after the update was made. That is an ordinary race, answered
-  #   `:unevaluated` with `base_update_stale`: no transition, 503, and counted toward
-  #   `max_consecutive_unevaluated`, so it retries and escalates only if it persists.
-  defp base_update_parents(pr, allowed) do
+  # - FOLLOW: exactly [ledger parent, the base head now].
+  # - STALE: [ledger parent, S] where S is ON the base branch but is not its head any more —
+  #   master moved again after the update was made. An ordinary race, answered `:unevaluated`
+  #   with `base_update_stale` (503, no transition, counted toward
+  #   `max_consecutive_unevaluated`). It does not clear by waiting: the remedy is the control
+  #   plane recording a NEW base update on top of this one (US-45.5's executor), which the
+  #   chain rule above then follows. Persisting past the bound escalates.
+  # - MALFORMED: any other shape, a first parent that is not the ledger parent, or a second
+  #   parent that is not on the base branch at all — a merge of something other than the base.
+  #   Refused `base_update_parents_mismatch`.
+  defp base_update_parents(pr, ledger_parent) do
     base_head = Map.get(pr, :base_head_sha)
-    expected = [allowed, base_head]
+    expected = [ledger_parent, base_head]
 
-    case Map.get(pr, :parent_shas) do
-      ^expected when is_binary(base_head) ->
+    case {Map.get(pr, :parent_shas), Map.get(pr, :second_parent_on_base?)} do
+      {^expected, _on_base} when is_binary(base_head) ->
         :follow
 
-      [^allowed, second] when is_binary(second) ->
+      {[^ledger_parent, second], true} when is_binary(second) ->
         {:stale, [{:base_update_stale, second, base_head}]}
 
-      parents ->
+      {parents, _on_base} ->
         {:refuse, [{:base_update_parents_mismatch, parents, expected}]}
     end
   end
@@ -791,6 +805,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
     case {mode(facts), Map.get(pr, :branch_head_sha)} do
       {:thread, ^head} -> []
+      {:thread, :missing} -> [{:branch_missing, head}]
       {:thread, branch_head} -> [{:branch_head_unrecorded, branch_head, head}]
       {_mode, _branch_head} -> []
     end
@@ -1127,35 +1142,33 @@ defmodule Loopctl.Delivery.MergePrecondition do
     {pr_number, {:ok, nil}, pull_request(repo, pr_number)}
   end
 
-  # The latest RECORDED checkpoint, never the branch head (PRD §4 item 2), with the commit of
-  # the checkpoint it was recorded on top of — which `base_update/2` compares with
-  # the recorded allow.
+  # The latest RECORDED checkpoint, never the branch head (PRD §4 item 2), with its ledger
+  # ancestry — read in ONE query (`Threads.checkpoint_lineage/2`) so the checkpoint and the
+  # parents `base_update/2` judges it against come from one snapshot. The branch is the one the
+  # story was DISPATCHED on, never re-derived here.
   defp thread_facts(story, {:ok, source}, {:ok, repo}) do
-    case Threads.latest_recorded_checkpoint(story.tenant_id, story.id) do
+    case Threads.checkpoint_lineage(story.tenant_id, story.id) do
       nil ->
         {{:ok, nil}, {:error, :none}, {:error, :not_attempted}}
 
-      %Checkpoint{} = checkpoint ->
-        fact = checkpoint_fact(story, checkpoint)
+      %{latest: %Checkpoint{} = checkpoint, ancestry: ancestry} ->
+        branch = DispatchPayload.story_branch(story.tenant_id, story)
 
         pull_request =
-          CheckpointSource.pull_request(repo, source.base_branch, story.id, checkpoint)
+          CheckpointSource.pull_request(repo, source.base_branch, branch, checkpoint)
 
-        {{:ok, nil}, {:ok, fact}, pull_request}
+        {{:ok, nil}, {:ok, checkpoint_fact(checkpoint, ancestry)}, pull_request}
     end
   end
 
-  defp checkpoint_fact(story, %Checkpoint{} = checkpoint) do
-    parent =
-      checkpoint.parent_checkpoint_id &&
-        Threads.get_checkpoint(story.tenant_id, story.id, checkpoint.parent_checkpoint_id)
-
+  defp checkpoint_fact(%Checkpoint{} = checkpoint, ancestry) do
     %{
       id: checkpoint.id,
       kind: checkpoint.kind,
       commit_sha: checkpoint.commit_sha,
       tree_sha: checkpoint.tree_sha,
-      parent_sha: parent && parent.commit_sha
+      # The ledger parent first, then its parents for as long as they are base updates.
+      ancestry_shas: Enum.map(ancestry, & &1.commit_sha)
     }
   end
 
@@ -1243,7 +1256,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # A transition that cannot be written is an unevaluated result: it counts toward the same
   # bound, so it escalates rather than repeating for ever.
   defp act(tenant_id, story_id, %Verdict{decision: :base_updated} = verdict, opts) do
-    follow_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+    follow_opts = Keyword.take(opts, [:claim_epoch, :actor_label, :actor_lineage])
 
     case Stages.follow_base_update(tenant_id, story_id, verdict.checkpoint_id, follow_opts) do
       {:ok, _row} ->
@@ -1255,8 +1268,17 @@ defmodule Loopctl.Delivery.MergePrecondition do
             "tenant_id=#{tenant_id} reason=#{inspect(reason)}"
         )
 
-        failed = [{:transition_failed, :ci, :base_updated, reason}]
-        act(tenant_id, story_id, %{verdict | decision: :unevaluated, reasons: failed}, opts)
+        # Counted against the head the row holds NOW, not the one this evaluation read: a
+        # concurrent writer may have moved it, and a count keyed to a head the row no longer
+        # has would be a count for nothing.
+        unevaluated = %{
+          verdict
+          | decision: :unevaluated,
+            reasons: [{:transition_failed, :ci, :base_updated, reason}],
+            recorded_head_sha: current_head(tenant_id, story_id, verdict)
+        }
+
+        act(tenant_id, story_id, unevaluated, opts)
     end
   end
 
@@ -1266,6 +1288,13 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp act(tenant_id, story_id, %Verdict{decision: :refuse} = verdict, opts) do
     transition(tenant_id, story_id, verdict, escalation_transition(), opts)
+  end
+
+  defp current_head(tenant_id, story_id, %Verdict{recorded_head_sha: read}) do
+    case Stages.get(tenant_id, story_id) do
+      %{head_sha: head} -> head
+      nil -> read
+    end
   end
 
   # An allow is a RECORDED fact or it is not an allow. Without this the gate's authorisation

@@ -142,45 +142,69 @@ defmodule Loopctl.Threads do
     end
   end
 
-  @doc """
-  The story's latest recorded checkpoint, whatever its kind, or `nil` when it has none. What
-  the merge gate judges for a THREAD-mode story (US-45.4): loopctl never adopts a branch head
-  nobody reported, so the latest RECORD is the head, and the gate refuses
-  `branch_head_unrecorded` while the branch says otherwise. Takes no lock.
+  @typedoc """
+  The story's latest recorded checkpoint and its LEDGER ANCESTRY: its parent, then — for as
+  long as the checkpoint just reached is a `base_update` — that one's parent, and so on. The
+  walk stops at the first claimant checkpoint, which is where a chain of base updates starts.
   """
-  @spec latest_recorded_checkpoint(Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
-  def latest_recorded_checkpoint(tenant_id, story_id) do
-    {:ok, checkpoint} =
-      Repo.with_tenant(tenant_id, fn -> latest_checkpoint(tenant_id, story_id) end)
+  @type lineage :: %{latest: Checkpoint.t(), ancestry: [Checkpoint.t()]}
 
-    checkpoint
+  @doc """
+  The story's latest recorded checkpoint with its ledger ancestry (`t:lineage/0`), or `nil`
+  when it has none. What the merge gate judges for a THREAD-mode story (US-45.4): loopctl
+  never adopts a branch head nobody reported, so the latest RECORD is the head.
+
+  ONE query in one tenant transaction, so the latest checkpoint and the parents it is judged
+  against are read from the same snapshot. Takes no lock.
+  """
+  @spec checkpoint_lineage(Ecto.UUID.t(), Ecto.UUID.t()) :: lineage() | nil
+  def checkpoint_lineage(tenant_id, story_id) do
+    {:ok, lineage} =
+      Repo.with_tenant(tenant_id, fn -> lineage_in_transaction(tenant_id, story_id) end)
+
+    lineage
   end
 
   @doc """
-  The checkpoint `checkpoint_id` of this story, or `nil`. Takes no lock.
+  `checkpoint_lineage/2` for a caller ALREADY inside a tenant transaction
+  (`Loopctl.Delivery.Stages.follow_base_update/4`, which must read it under its own locks and
+  must not open a second transaction).
   """
-  @spec get_checkpoint(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
-  def get_checkpoint(tenant_id, story_id, checkpoint_id) do
-    {:ok, checkpoint} =
-      Repo.with_tenant(tenant_id, fn ->
-        Repo.one(checkpoint_query(tenant_id, story_id, checkpoint_id))
-      end)
+  @spec lineage_in_transaction(Ecto.UUID.t(), Ecto.UUID.t()) :: lineage() | nil
+  def lineage_in_transaction(tenant_id, story_id) do
+    # The latest page of the thread, newest first — the page `get_thread/3` returns. A chain
+    # of base updates longer than that is not something a gate should follow anyway.
+    rows =
+      Repo.all(
+        from c in Checkpoint,
+          where: c.tenant_id == ^tenant_id and c.story_id == ^story_id,
+          order_by: [desc: c.seq],
+          limit: ^@max_entry_page
+      )
 
-    checkpoint
+    case rows do
+      [] ->
+        nil
+
+      [latest | _older] ->
+        by_id = Map.new(rows, &{&1.id, &1})
+        %{latest: latest, ancestry: ancestry(latest, by_id, length(rows))}
+    end
   end
 
-  @doc """
-  The query `get_checkpoint/3` runs, for a caller already inside a tenant transaction
-  (`Loopctl.Delivery.Stages.follow_base_update/4`), which must not open another. A
-  `checkpoint_id` that is not a UUID matches nothing.
-  """
-  @spec checkpoint_query(Ecto.UUID.t(), Ecto.UUID.t(), term()) :: Ecto.Query.t()
-  def checkpoint_query(tenant_id, story_id, checkpoint_id) do
-    query = from c in Checkpoint, where: c.tenant_id == ^tenant_id and c.story_id == ^story_id
+  # Bounded by the number of rows read, so a malformed parent link can never loop.
+  defp ancestry(_checkpoint, _by_id, 0), do: []
 
-    case Ecto.UUID.cast(checkpoint_id) do
-      {:ok, id} -> where(query, [c], c.id == ^id)
-      :error -> where(query, false)
+  defp ancestry(%Checkpoint{parent_checkpoint_id: parent_id}, by_id, budget) do
+    case Map.fetch(by_id, parent_id) do
+      {:ok, %Checkpoint{kind: :base_update} = parent} ->
+        [parent | ancestry(parent, by_id, budget - 1)]
+
+      {:ok, %Checkpoint{} = parent} ->
+        [parent]
+
+      :error ->
+        []
     end
   end
 

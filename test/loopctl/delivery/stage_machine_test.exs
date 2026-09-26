@@ -48,7 +48,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
            ]
 
     refute :base_updated in StageMachine.runner_edges()
-    refute StageMachine.chained?(:ci, :ci, :base_updated)
+    assert StageMachine.chained?(:ci, :ci, :base_updated)
     assert StageMachine.clears(:ci, :ci, :base_updated) == StageMachine.head_keyed()
     # base_moved is still the edge for every other head movement.
     assert StageMachine.allowed?(:ci, :implementing, :base_moved)
@@ -371,7 +371,8 @@ defmodule Loopctl.Delivery.StageMachineTest do
       for {f, t, e} <- StageMachine.transitions(), StageMachine.chained?(f, t, e), do: {f, t, e}
 
     assert Enum.all?(chained, fn {f, t, e} ->
-             t in [:claimed, :merged, :escalated] or f == :escalated or e == :merge_refused
+             t in [:claimed, :merged, :escalated] or f == :escalated or
+               e in [:merge_refused, :base_updated]
            end)
 
     refute StageMachine.chained?(:implementing, :reviewing, :forward)

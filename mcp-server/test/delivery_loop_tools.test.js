@@ -317,6 +317,9 @@ describe("merge_precondition (US-44.1)", () => {
         "no_checkpoint_recorded",
         "base_update_parents_mismatch",
         "base_update_stale",
+        "branch_missing",
+        "not_latest_checkpoint",
+        "checkpoint_of_ended_claim",
       ]) {
         assert.ok(source.includes(name), `merge_precondition never names ${name}`);
       }

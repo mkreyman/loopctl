@@ -551,8 +551,19 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "pr"})
       |> json_response(200)
 
-      # A terminal story is not in flight, and neither is one still at intake.
-      for settled <- [:done, :detected] do
+      # An ESCALATED story is still in flight: a human resolution re-queues it into the loop.
+      {1, _} =
+        from(r in Loopctl.Delivery.StoryStage, where: r.id == ^stage.id)
+        |> AdminRepo.update_all(set: [stage: :escalated, escalation_reason: "why"])
+
+      assert conn
+             |> auth(ctx.operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "thread"})
+             |> json_response(409)
+             |> get_in(["error", "code"]) == "stories_in_flight"
+
+      # A finished story is not in flight, and neither is one still at intake.
+      for settled <- [:done, :failed, :detected] do
         {1, _} =
           from(r in Loopctl.Delivery.StoryStage, where: r.id == ^stage.id)
           |> AdminRepo.update_all(set: [stage: settled])

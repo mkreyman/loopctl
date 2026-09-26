@@ -2168,14 +2168,114 @@ defmodule Loopctl.Delivery.StagesTest do
                )
     end
 
-    test "another tenant's checkpoint is not found (tenant isolation)" do
+    test "another tenant's checkpoint is never the story's latest (tenant isolation)" do
       {story, _row, _update} = allowed_with_base_update()
       {_other, _other_row, foreign} = allowed_with_base_update()
 
-      assert {:error, :checkpoint_not_found} =
+      assert {:error, :not_latest_checkpoint} =
                Stages.follow_base_update(story.tenant_id, story.id, foreign.id,
                  claim_epoch: story.claim_epoch
                )
+
+      assert Stages.get(story.tenant_id, story.id).head_sha == @allowed
+    end
+
+    test "a base update that is no longer the LATEST checkpoint is refused, nothing moves" do
+      {story, _row, update} = allowed_with_base_update()
+
+      fixture(:thread_checkpoint, %{
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        seq: 3,
+        commit_sha: String.duplicate("7", 40),
+        parent_checkpoint_id: update.id,
+        claim_epoch: story.claim_epoch
+      })
+
+      assert {:error, :not_latest_checkpoint} =
+               Stages.follow_base_update(story.tenant_id, story.id, update.id,
+                 claim_epoch: story.claim_epoch
+               )
+
+      assert Stages.get(story.tenant_id, story.id).head_sha == @allowed
+    end
+
+    test "a base update recorded under an ENDED claim epoch is refused, nothing moves" do
+      {story, _row, update} = allowed_with_base_update()
+
+      {:ok, {1, _}} =
+        Repo.with_tenant(story.tenant_id, fn ->
+          from(c in Loopctl.Threads.Checkpoint, where: c.id == ^update.id)
+          |> Repo.update_all(set: [claim_epoch: story.claim_epoch - 1])
+        end)
+
+      assert {:error, :checkpoint_of_ended_claim} =
+               Stages.follow_base_update(story.tenant_id, story.id, update.id,
+                 claim_epoch: story.claim_epoch
+               )
+
+      assert Stages.get(story.tenant_id, story.id).head_sha == @allowed
+    end
+
+    test "following the same checkpoint twice is idempotent: one transition, then success" do
+      {story, _row, update} = allowed_with_base_update()
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, first} = Stages.follow_base_update(story.tenant_id, story.id, update.id, opts)
+      assert {:ok, second} = Stages.follow_base_update(story.tenant_id, story.id, update.id, opts)
+
+      assert second.head_sha == @update
+      assert second.lock_version == first.lock_version
+
+      assert [_one] =
+               story.tenant_id
+               |> transition_events(story.id)
+               |> Enum.filter(&(&1.edge == "base_updated"))
+    end
+
+    test "a CHAIN of base updates reaching the allowed checkpoint is followed" do
+      {story, _row, first_update} = allowed_with_base_update()
+      second_sha = String.duplicate("5", 40)
+
+      second =
+        fixture(:thread_checkpoint, %{
+          tenant_id: story.tenant_id,
+          story_id: story.id,
+          seq: 3,
+          kind: :base_update,
+          commit_sha: second_sha,
+          parent_checkpoint_id: first_update.id,
+          claim_epoch: story.claim_epoch
+        })
+
+      assert {:ok, moved} =
+               Stages.follow_base_update(story.tenant_id, story.id, second.id,
+                 claim_epoch: story.claim_epoch
+               )
+
+      assert moved.head_sha == second_sha
+    end
+
+    test "the edge is CHAINED, naming the checkpoint, both heads and the retracted allow" do
+      {story, _row, update} = allowed_with_base_update()
+
+      {:ok, _moved} =
+        Stages.follow_base_update(story.tenant_id, story.id, update.id,
+          claim_epoch: story.claim_epoch
+        )
+
+      [entry] =
+        as_tenant(story.tenant_id, fn ->
+          Repo.all(
+            from e in Entry,
+              where: e.tenant_id == ^story.tenant_id and e.action == "story_stage_base_updated"
+          )
+        end)
+
+      assert entry.payload["checkpoint_id"] == update.id
+      assert entry.payload["head_sha"] == @update
+      assert entry.payload["retracted"]["head_sha"] == @allowed
+      assert entry.payload["retracted"]["merge_gate_allowed_sha"] == @allowed
     end
 
     test "advance/4 never takes the edge, from any caller" do

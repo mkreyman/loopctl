@@ -1064,7 +1064,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     test "every LEDGER premise of the base_updated edge is required; otherwise head_moved" do
       for {label, overrides} <- [
             not_a_base_update: [kind: :checkpoint],
-            parent_not_allowed: [parent_sha: String.duplicate("9", 40)],
+            ancestry_misses_allowed: [ancestry_shas: [String.duplicate("9", 40)]],
             no_recorded_allow: [recorded_allow_sha: nil],
             head_not_allowed: [recorded_head_sha: String.duplicate("9", 40)]
           ] do
@@ -1088,13 +1088,74 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       end
     end
 
-    test "a STALE base update (master moved again) is unevaluated, never refused" do
+    test "a STALE base update (second parent ON the base, not its head) is unevaluated" do
       moved = String.duplicate("9", 40)
-      verdict = judge_thread(Keyword.put(base_update_facts(), :parent_shas, [@allowed, moved]))
+
+      verdict =
+        judge_thread(
+          Keyword.merge(base_update_facts(),
+            parent_shas: [@allowed, moved],
+            second_parent_on_base?: true
+          )
+        )
 
       assert verdict.decision == :unevaluated
       assert {:base_update_stale, moved, @base_head} in verdict.reasons
       refute Enum.any?(verdict.reasons, &match?({:base_update_parents_mismatch, _, _}, &1))
+    end
+
+    test "a second parent NOT on the base branch is a malformed update, refused" do
+      elsewhere = String.duplicate("9", 40)
+
+      verdict =
+        judge_thread(
+          Keyword.merge(base_update_facts(),
+            parent_shas: [@allowed, elsewhere],
+            second_parent_on_base?: false
+          )
+        )
+
+      assert verdict.decision == :refuse
+
+      assert {:base_update_parents_mismatch, [@allowed, elsewhere], [@allowed, @base_head]} in verdict.reasons
+    end
+
+    test "a wrong first parent is malformed even when the second parent is on the base" do
+      other = String.duplicate("9", 40)
+      moved = String.duplicate("7", 40)
+
+      verdict =
+        judge_thread(
+          Keyword.merge(base_update_facts(),
+            parent_shas: [other, moved],
+            second_parent_on_base?: true
+          )
+        )
+
+      assert verdict.decision == :refuse
+
+      assert {:base_update_parents_mismatch, [other, moved], [@allowed, @base_head]} in verdict.reasons
+    end
+
+    test "a CHAIN of base updates reaching the allowed checkpoint is followed" do
+      first_update = String.duplicate("4", 40)
+
+      verdict =
+        judge_thread(
+          Keyword.merge(base_update_facts(),
+            ancestry_shas: [first_update, @allowed],
+            parent_shas: [first_update, @base_head]
+          )
+        )
+
+      assert verdict.decision == :base_updated
+    end
+
+    test "a branch the forge does not have goes back to implementing as branch_missing" do
+      verdict = judge_thread(branch_head_sha: :missing)
+
+      assert verdict.decision == :head_moved
+      assert {:branch_missing, @head} in verdict.reasons
     end
 
     test "pr mode never takes the base_updated edge" do
@@ -1112,7 +1173,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       kind: Keyword.get(overrides, :kind, :checkpoint),
       commit_sha: @head,
       tree_sha: @tree,
-      parent_sha: Keyword.get(overrides, :parent_sha)
+      ancestry_shas: Keyword.get(overrides, :ancestry_shas, [])
     }
 
     pr =
@@ -1126,7 +1187,8 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
         head_tree_sha: Keyword.get(overrides, :head_tree_sha, @tree),
         base_head_sha: @base_head,
         base_tree_sha: Keyword.get(overrides, :base_tree_sha, @base_tree),
-        parent_shas: Keyword.get(overrides, :parent_shas, [@allowed, @base_head])
+        parent_shas: Keyword.get(overrides, :parent_shas, [@allowed, @base_head]),
+        second_parent_on_base?: Keyword.get(overrides, :second_parent_on_base?)
       })
 
     [
@@ -1146,7 +1208,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
   defp base_update_facts do
     [
       kind: :base_update,
-      parent_sha: @allowed,
+      ancestry_shas: [@allowed],
       recorded_head_sha: @allowed,
       recorded_allow_sha: @allowed
     ]

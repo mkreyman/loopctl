@@ -234,7 +234,11 @@ defmodule Loopctl.ThreadsTest do
       assert update.seq == parent.seq + 1
       assert update.claim_epoch == @epoch
 
-      assert Threads.latest_recorded_checkpoint(ctx.tenant_id, ctx.story.id).id == update.id
+      assert %{latest: latest, ancestry: [ancestor]} =
+               Threads.checkpoint_lineage(ctx.tenant_id, ctx.story.id)
+
+      assert latest.id == update.id
+      assert ancestor.id == parent.id
 
       actions =
         Repo.all(
@@ -254,7 +258,29 @@ defmodule Loopctl.ThreadsTest do
                base_update(ctx, first_parent_sha: @sha2)
 
       assert message =~ "latest recorded checkpoint"
-      assert Threads.latest_recorded_checkpoint(ctx.tenant_id, ctx.story.id).kind == :checkpoint
+      assert Threads.checkpoint_lineage(ctx.tenant_id, ctx.story.id).latest.kind == :checkpoint
+    end
+
+    test "the lineage walks through base updates and stops at the first claimant checkpoint" do
+      ctx = claimed_story()
+      {:ok, first, :created} = checkpoint(ctx, @sha1)
+      {:ok, second, :created} = checkpoint(ctx, @sha2)
+      {:ok, update, :created} = base_update(ctx, first_parent_sha: @sha2)
+
+      {:ok, chained, :created} =
+        base_update(ctx,
+          commit_sha: String.duplicate("9", 40),
+          tree_sha: @merge_tree,
+          first_parent_sha: @merge
+        )
+
+      assert %{latest: latest, ancestry: ancestry} =
+               Threads.checkpoint_lineage(ctx.tenant_id, ctx.story.id)
+
+      assert latest.id == chained.id
+      # update (a base update) then second (a claimant checkpoint), and NOT first beyond it.
+      assert Enum.map(ancestry, & &1.id) == [update.id, second.id]
+      refute first.id in Enum.map(ancestry, & &1.id)
     end
 
     test "a thread with no checkpoint has nothing to update" do
@@ -287,9 +313,7 @@ defmodule Loopctl.ThreadsTest do
                  first_parent_sha: @sha1
                )
 
-      assert Threads.latest_recorded_checkpoint(other.tenant_id, ctx.story.id) == nil
-      assert Threads.get_checkpoint(other.tenant_id, ctx.story.id, Ecto.UUID.generate()) == nil
-      assert Threads.get_checkpoint(ctx.tenant_id, ctx.story.id, "not-a-uuid") == nil
+      assert Threads.checkpoint_lineage(other.tenant_id, ctx.story.id) == nil
     end
   end
 

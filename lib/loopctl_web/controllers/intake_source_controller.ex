@@ -229,7 +229,8 @@ defmodule LoopctlWeb.IntakeSourceController do
                  "pull request (see `POST /stories/:id/merge-precondition`). NOT " <>
                  "nullable: an explicit null or any other value is a 422. A CHANGE is " <>
                  "409 `stories_in_flight` while any story of this source's project is past " <>
-                 "intake and not terminal, because the mode decides what its merge gate reads."
+                 "intake and not done or failed (escalated counts), because the mode decides " <>
+                 "what its merge gate reads."
            },
            target_epic_id: %Schema{
              type: :string,
@@ -266,8 +267,8 @@ defmodule LoopctlWeb.IntakeSourceController do
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"`stories_in_flight`: a mode change while a story of this source's project is past " <>
-           "intake and not terminal. Nothing is changed, the other fields included.",
-         "application/json", Schemas.ErrorResponse},
+           "intake and not done or failed (escalated counts). Nothing is changed, the " <>
+           "other fields included.", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -358,7 +359,7 @@ defmodule LoopctlWeb.IntakeSourceController do
             code: "stories_in_flight",
             message:
               "This source's project has a story in the delivery loop (past intake and not " <>
-                "terminal), and the mode decides what its merge gate reads. Change the mode " <>
+                "done or failed), and the mode decides what its merge gate reads. Change the mode " <>
                 "once no story is in flight. Nothing was changed."
           }
         })

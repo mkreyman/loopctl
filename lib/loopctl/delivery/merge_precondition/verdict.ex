@@ -2,7 +2,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
   @moduledoc """
   One merge-precondition evaluation (issue #803, design §5 "Both gates run twice" and §9).
 
-  - `decision` — one of six:
+  - `decision` — one of:
     - `:allow` — and only from `enforce/3`, which records the allow against the head it
       judged. Nothing else licenses a merge
     - `:refuse` — a gate verdict. The story is escalated

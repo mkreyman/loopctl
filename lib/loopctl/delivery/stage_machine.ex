@@ -41,9 +41,10 @@ defmodule Loopctl.Delivery.StageMachine do
     custody binding, and only its head moves: `head_sha` becomes the `base_update` sha and
     every head-keyed identity (the recorded allow first) is cleared with the old head. Taken
     ONLY by `Loopctl.Delivery.Stages.follow_base_update/4`, which checks under the row's lock
-    that the checkpoint is a control-recorded `base_update` whose first parent is the
-    checkpoint the gate last allowed; `advance/4` refuses it from every caller and it is not
-    runner-reportable. Any other head movement is still `:base_moved`.
+    that the checkpoint is the story's latest, a control-recorded `base_update` of the current
+    claim, whose ledger ancestry through base updates reaches the checkpoint the gate last
+    allowed; `advance/4` refuses it from every caller and it is not runner-reportable. CHAINED:
+    it retracts an allow and rebinds the head. Any other head movement is still `:base_moved`.
   - `:merge_gate` — ci -> escalated, the merge-precondition gate refusing (design §5:
     a clean result merges with no human, anything else routes to Gate A)
   - `:session_escalated` — any in-flight stage, `merged` or `deployed` -> escalated: the
@@ -302,7 +303,9 @@ defmodule Loopctl.Delivery.StageMachine do
   # every writer in the tenant on its head row, so putting every stage change there would
   # serialise every concurrent story on that one row.
   @chained_targets [:claimed, :merged, :escalated]
-  @chained_edges [:merge_refused]
+  # `:base_updated` retracts an allow and rebinds the head, which the chain must be able to
+  # show — the next allow is granted for a head the chain would otherwise never have named.
+  @chained_edges [:merge_refused, :base_updated]
 
   # Side-effect identities, and the stages allowed to write each one. A replayed stage finds
   # the identity its first run wrote; a writer from a stage that does not produce the effect
@@ -644,8 +647,8 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @doc """
   True when the transition is custody-critical and is appended to the audit chain: into
-  `claimed`, `merged` or `escalated`, out of `escalated`, or the `:merge_refused`
-  retraction of a merge.
+  `claimed`, `merged` or `escalated`, out of `escalated`, the `:merge_refused`
+  retraction of a merge, or the `:base_updated` retraction of an allow.
   """
   @spec chained?(stage(), stage(), edge()) :: boolean()
   def chained?(from, to, edge),

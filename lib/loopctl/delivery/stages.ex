@@ -111,8 +111,8 @@ defmodule Loopctl.Delivery.Stages do
   ## The audit chain
 
   Only the custody-critical transitions (`StageMachine.chained?/3`: into `claimed`,
-  `merged` or `escalated`, out of `escalated`, and the `:merge_refused` retraction of a
-  merge) are appended to the hash chain, inside the transition's own transaction via
+  `merged` or `escalated`, out of `escalated`, the `:merge_refused` retraction of a merge,
+  and the `:base_updated` retraction of an allow) are appended to the hash chain, inside the transition's own transaction via
   `AuditChain.append_in_tenant_transaction/2` — or, for the escalation a claim release decides,
   inside the release's `AdminRepo` transaction via `AuditChain.append_in_admin_transaction/2`.
   Either way the entry is announced only after that transaction commits. Every transition and
@@ -147,7 +147,6 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Runner
   alias Loopctl.Threads
-  alias Loopctl.Threads.Checkpoint
   alias Loopctl.WorkBreakdown.Story
 
   @lock_timeout "2000ms"
@@ -428,10 +427,13 @@ defmodule Loopctl.Delivery.Stages do
           | :stale_claim_epoch
           | :stale_stage
           | :checkpoint_not_found
+          | :not_latest_checkpoint
           | :not_a_base_update
+          | :checkpoint_of_ended_claim
           | :no_recorded_allow
           | :base_update_not_of_allowed
           | :effect_conflict
+          | :audit_chain_append_failed
           | :busy
 
   @doc """
@@ -439,36 +441,43 @@ defmodule Loopctl.Delivery.Stages do
   checkpoint (US-45.4, Epic 45 PRD §4 item 4): `head_sha` becomes the `base_update`
   checkpoint's commit, every head-keyed identity of the old head is cleared (the recorded
   allow first), and the story stays at `ci` — its review verdict and custody binding are
-  untouched, so the gate re-judges the new head without a new review round.
+  untouched. The edge is CHAINED: it retracts an allow and rebinds the head, so its audit
+  entry names the checkpoint, the new head and, under `retracted`, the old head and the allow.
 
   The ONLY way to take the edge; `advance/4` refuses it. Everything the edge asserts is
-  checked HERE, under the story's share lock and the stage row's update lock, in the
-  transaction that writes it:
+  checked HERE, under the story's share lock and the stage row's update lock, against the
+  ledger read in the same transaction (`Loopctl.Threads.lineage_in_transaction/2`):
 
-  - `:checkpoint_not_found` — `checkpoint_id` is not a checkpoint of this story in the tenant
+  - `:checkpoint_not_found` — the story has no checkpoint at all
+  - `:not_latest_checkpoint` — `checkpoint_id` is not the story's LATEST checkpoint (another
+    was recorded since, or it is not this story's)
   - `:not_a_base_update` — it is a claimant's checkpoint, not one the control plane recorded
     (`Loopctl.Threads.record_base_update/3` is the only writer of that kind)
+  - `:checkpoint_of_ended_claim` — it was recorded under a claim epoch that is no longer the
+    story's
   - `:stale_stage` — the row is not at `ci`
-  - `:no_recorded_allow` — the gate has allowed nothing at this head, so there is no
-    checkpoint the base could have moved under
-  - `:base_update_not_of_allowed` — the checkpoint's parent is not the checkpoint the gate
-    last allowed, or the row's head is no longer that checkpoint. Any other movement of the
-    head is ordinary work and goes over `:base_moved`
-  - `:stale_claim_epoch`, `:not_found`, `:busy` — as for `advance/4`
+  - `:no_recorded_allow` — the gate has allowed nothing at this head
+  - `:base_update_not_of_allowed` — walking the checkpoint's ledger parents through
+    `base_update` checkpoints only does not reach the checkpoint the gate last allowed, or the
+    row's head is no longer that checkpoint. A CHAIN is followable: a base update recorded on
+    a stale one reaches the allowed checkpoint through it
+  - `:stale_claim_epoch`, `:not_found`, `:busy`, `:audit_chain_append_failed` — as for
+    `advance/4`
 
-  The LEDGER is what this checks. The commit's parents as the forge reports them — exactly the
-  allowed checkpoint and the base head — are checked by the merge gate before it asks for this
-  edge (`Loopctl.Delivery.MergePrecondition`), and its tree is GitHub's merge of the base into
-  the checkpoint by construction (US-45.5's executor makes it through GitHub's merge API), so
-  neither is recomputed here.
+  IDEMPOTENT: a row already standing at this checkpoint's commit — a concurrent call took the
+  edge first — answers `{:ok, row}` and writes nothing.
 
-  A replay after the edge committed finds the allow cleared and answers
-  `:no_recorded_allow`; the caller reads `get/2`, where `head_sha` already names the update.
+  The LEDGER is what this checks. The commit's parents as the forge reports them are checked
+  by the merge gate before it asks for this edge (`Loopctl.Delivery.MergePrecondition`), and
+  its tree is GitHub's merge of the base into its parent by construction (US-45.5's executor
+  makes it through GitHub's merge API), so neither is recomputed here.
 
   ## Options
 
   - `:claim_epoch` (required) — the epoch the caller acts under
   - `:actor_label` — attribution on the transition event
+  - `:actor_lineage` — attribution on the chain entry, server-resolved by the caller; `[]`
+    when absent (the control plane acting under no dispatch)
   """
   @spec follow_base_update(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, StoryStage.t()} | {:error, base_update_error()}
@@ -483,52 +492,64 @@ defmodule Loopctl.Delivery.Stages do
       story = share_lock_story(tenant_id, story_id)
       if story.claim_epoch != epoch, do: Repo.rollback(:stale_claim_epoch)
       row = lock_row(tenant_id, story_id) || Repo.rollback(:not_found)
-      checkpoint = base_update_checkpoint!(tenant_id, story_id, checkpoint_id, row)
+      lineage = Threads.lineage_in_transaction(tenant_id, story_id)
 
-      event_data = %{
-        "checkpoint_id" => checkpoint.id,
-        "base_update_sha" => checkpoint.commit_sha,
-        "previous_head_sha" => row.head_sha
-      }
+      case base_update_to_follow(lineage, checkpoint_id, row, story) do
+        :already_followed ->
+          {row, nil}
 
-      transition(
-        tenant_id,
-        story_id,
-        transition,
-        epoch,
-        [head_sha: checkpoint.commit_sha],
-        opts |> Keyword.take([:actor_label]) |> Keyword.put(:event_data, event_data)
-      )
+        {:follow, checkpoint} ->
+          event_data = %{
+            "checkpoint_id" => checkpoint.id,
+            "base_update_sha" => checkpoint.commit_sha,
+            "previous_head_sha" => row.head_sha
+          }
+
+          transition(
+            tenant_id,
+            story_id,
+            transition,
+            epoch,
+            [head_sha: checkpoint.commit_sha],
+            opts
+            |> Keyword.take([:actor_label])
+            |> Keyword.put(:actor_lineage, Keyword.get(opts, :actor_lineage, []))
+            |> Keyword.put(:event_data, event_data)
+            |> Keyword.put(:chain_payload, %{"checkpoint_id" => checkpoint.id})
+          )
+      end
     end)
   end
 
-  defp base_update_checkpoint!(tenant_id, story_id, checkpoint_id, row) do
-    checkpoint = story_checkpoint(tenant_id, story_id, checkpoint_id)
+  defp base_update_to_follow(nil, _checkpoint_id, _row, _story),
+    do: Repo.rollback(:checkpoint_not_found)
 
-    parent =
-      checkpoint && checkpoint.parent_checkpoint_id &&
-        story_checkpoint(tenant_id, story_id, checkpoint.parent_checkpoint_id)
-
+  defp base_update_to_follow(%{latest: latest, ancestry: ancestry}, checkpoint_id, row, story) do
     cond do
-      is_nil(checkpoint) -> Repo.rollback(:checkpoint_not_found)
-      checkpoint.kind != :base_update -> Repo.rollback(:not_a_base_update)
-      row.stage != :ci -> Repo.rollback(:stale_stage)
-      is_nil(row.merge_gate_allowed_sha) -> Repo.rollback(:no_recorded_allow)
-      not of_allowed?(parent, row) -> Repo.rollback(:base_update_not_of_allowed)
-      true -> checkpoint
+      latest.id != checkpoint_id -> Repo.rollback(:not_latest_checkpoint)
+      latest.kind != :base_update -> Repo.rollback(:not_a_base_update)
+      row.stage == :ci and row.head_sha == latest.commit_sha -> :already_followed
+      true -> followable(latest, ancestry, row, story)
     end
   end
 
-  # The base update's first parent is the checkpoint the gate ALLOWED, and the row still
-  # stands at that head. Either half false is some other head movement, and that is
-  # `:base_moved`'s, never this edge's.
-  defp of_allowed?(nil, _row), do: false
+  # The checkpoint IS the story's latest base update and the row has not taken it yet; what is
+  # left is whether the row and the claim still stand where the edge assumes.
+  defp followable(latest, ancestry, row, story) do
+    cond do
+      latest.claim_epoch != story.claim_epoch -> Repo.rollback(:checkpoint_of_ended_claim)
+      row.stage != :ci -> Repo.rollback(:stale_stage)
+      is_nil(row.merge_gate_allowed_sha) -> Repo.rollback(:no_recorded_allow)
+      not of_allowed?(ancestry, row) -> Repo.rollback(:base_update_not_of_allowed)
+      true -> {:follow, latest}
+    end
+  end
 
-  defp of_allowed?(%Checkpoint{commit_sha: sha}, %StoryStage{} = row),
-    do: row.merge_gate_allowed_sha == sha and row.head_sha == sha
-
-  defp story_checkpoint(tenant_id, story_id, checkpoint_id),
-    do: Repo.one(Threads.checkpoint_query(tenant_id, story_id, checkpoint_id))
+  # The ledger ancestry reaches the checkpoint the gate ALLOWED, and the row still stands at
+  # that head. Either half false is some other head movement, and that is `:base_moved`'s,
+  # never this edge's.
+  defp of_allowed?(ancestry, %StoryStage{merge_gate_allowed_sha: allowed, head_sha: head}),
+    do: head == allowed and Enum.any?(ancestry, &(&1.commit_sha == allowed))
 
   @doc """
   Every refusal `advance/4` decides BEFORE it opens a transaction, asked WITHOUT advancing
@@ -1748,10 +1769,13 @@ defmodule Loopctl.Delivery.Stages do
       # caller did not state one, so this never records an unattributed custody entry.
       lineage = Keyword.fetch!(opts, :actor_lineage)
 
+      attrs =
+        row
+        |> chain_attrs(previous, transition, reason, lineage)
+        |> Map.update!(:payload, &Map.merge(&1, Keyword.get(opts, :chain_payload, %{})))
+
       row.tenant_id
-      |> AuditChain.append_in_tenant_transaction(
-        chain_attrs(row, previous, transition, reason, lineage)
-      )
+      |> AuditChain.append_in_tenant_transaction(attrs)
       |> chained_entry(row, to)
     end
   end
@@ -1810,6 +1834,7 @@ defmodule Loopctl.Delivery.Stages do
   # A retraction is named for what it retracts, not for where the story went next.
   defp chain_action(:merged, :implementing, :merge_refused), do: "story_stage_merge_retracted"
   defp chain_action(:escalated, _to, _edge), do: "story_stage_escalation_resolved"
+  defp chain_action(:ci, :ci, :base_updated), do: "story_stage_base_updated"
   defp chain_action(_from, to, _edge), do: "story_stage_" <> Atom.to_string(to)
 
   # --- effects ------------------------------------------------------------------------------

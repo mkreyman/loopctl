@@ -228,20 +228,26 @@ defmodule LoopctlWeb.MergePreconditionController do
         "either the head or the merge base, and an unverified or custody-unattributed " <>
         "story all REFUSE.\n\n" <>
         "THREAD MODE (the story's intake source has `mode: thread`) needs no pull request: " <>
-        "the gate judges the story's latest RECORDED checkpoint on the thread branch " <>
-        "`loop/<story_id>` and refuses `empty_change` (its tree equals the base branch's, or " <>
-        "no file changed), `checkpoint_tree_mismatch` (the forge's tree for it is not the " <>
-        "one recorded), `no_checkpoint_recorded` and `base_update_parents_mismatch` (below). " <>
-        "A branch head that is not the recorded checkpoint is `head_moved` with reason " <>
-        "`branch_head_unrecorded`: back to `implementing`, not escalated. A thread whose " <>
-        "latest checkpoint is a control-recorded `base_update` of the checkpoint last " <>
-        "allowed, with exactly two parents on the forge (that checkpoint, then the base's " <>
-        "current head), answers `base_updated`: it stays at `ci` on the `base_updated` edge, " <>
-        "keeps its review verdict, and the NEXT call judges the new head. A wrong first " <>
-        "parent or any count but two refuses `base_update_parents_mismatch`; a second " <>
-        "parent that is no longer the base head (master moved again) is `unevaluated` " <>
-        "(503) with `base_update_stale`. Both that and a `base_updated` edge that cannot be " <>
-        "written count toward the consecutive-unevaluated bound.\n\n" <>
+        "the gate judges the story's latest RECORDED checkpoint on the branch the story was " <>
+        "DISPATCHED on (pinned in the dispatch ledger), and `pr_number` is null. It refuses " <>
+        "`empty_change` (the checkpoint's tree equals the base branch's, or no file changed), " <>
+        "`checkpoint_tree_mismatch` (the forge's tree for it is not the one recorded), " <>
+        "`no_checkpoint_recorded` and `base_update_parents_mismatch` (below). A branch head " <>
+        "that is not the recorded checkpoint (`branch_head_unrecorded`) or a branch the " <>
+        "forge does not have (`branch_missing`) is `head_moved`: back to `implementing`, not " <>
+        "escalated. When the latest checkpoint is a control-recorded `base_update` whose " <>
+        "ledger ancestry, through base updates only, reaches the checkpoint last allowed (so a " <>
+        "CHAIN of base updates is followable) and the forge shows exactly two parents — its " <>
+        "ledger parent, then the base's current head — the answer is `base_updated`: the " <>
+        "story takes the chained `ci -> ci` `base_updated` edge, keeps its review verdict, " <>
+        "nothing is allowed, and the NEXT call judges the new head. A second parent that is " <>
+        "on the base branch but no longer its head is `unevaluated` (503) with " <>
+        "`base_update_stale`; the remedy is the control plane recording a new base update on " <>
+        "top of it. A second parent not on the base branch, a wrong first parent, or any " <>
+        "count but two refuses `base_update_parents_mismatch`. An edge that cannot be taken " <>
+        "is `unevaluated` naming `transition_failed` and why (`not_latest_checkpoint`, " <>
+        "`checkpoint_of_ended_claim`, `base_update_not_of_allowed`, ...). Both count toward " <>
+        "the consecutive-unevaluated bound.\n\n" <>
         "A `refuse` decision escalates the story on the `merge_gate` edge before " <>
         "responding, and returns 200: a refusal is an answer, not a request error. An " <>
         "`already_merged` decision reports a pull request GitHub already merged, with its " <>

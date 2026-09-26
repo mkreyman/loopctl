@@ -27,6 +27,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition
@@ -542,6 +543,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       record_update(ctx)
       stale = String.duplicate("7", 40)
       stub_thread(ctx, head: @update, tree: @update_tree, parents: [@head, stale])
+      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^stale, "master" -> {:ok, true} end)
 
       assert {:ok, %Verdict{decision: :unevaluated, reasons: reasons}} = enforce(ctx)
       assert {:base_update_stale, stale, @base_head} in reasons
@@ -550,6 +552,91 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert row.stage == :ci
       assert row.head_sha == @head
       assert row.merge_gate_unevaluated["count"] == 1
+    end
+
+    test "a second parent NOT on the base branch is malformed: refused, not stale", ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      record_update(ctx)
+      elsewhere = String.duplicate("7", 40)
+      stub_thread(ctx, head: @update, tree: @update_tree, parents: [@head, elsewhere])
+
+      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^elsewhere, "master" ->
+        {:ok, false}
+      end)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:base_update_parents_mismatch, [@head, elsewhere], [@head, @base_head]} in reasons
+    end
+
+    test "a stale update is recovered by a base update recorded ON it: the CHAIN is followed",
+         ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+      record_update(ctx)
+
+      second = String.duplicate("5", 40)
+
+      {:ok, chained, :created} =
+        Loopctl.Threads.record_base_update(ctx.tenant_id, ctx.story_id,
+          commit_sha: second,
+          tree_sha: @update_tree,
+          first_parent_sha: @update
+        )
+
+      stub_thread(ctx, head: second, tree: @update_tree, parents: [@update, @base_head])
+
+      assert {:ok, %Verdict{decision: :base_updated, checkpoint_id: id}} = enforce(ctx)
+      assert id == chained.id
+      assert Stages.get(ctx.tenant_id, ctx.story_id).head_sha == second
+    end
+
+    test "a thread branch the forge does not have goes back to implementing, branch_missing",
+         ctx do
+      stub_thread(ctx)
+
+      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, _branch ->
+        {:error, {:github_api_error, 404}}
+      end)
+
+      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
+      assert {:branch_missing, @head} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :implementing
+      assert row.escalation_reason == nil
+    end
+
+    test "the gate reads EXACTLY the branch the story's dispatch named", ctx do
+      {_raw_key, runner} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id})
+      # The fixture's unboxed run gives up this process's AdminRepo checkout; take it back.
+      checkout_admin()
+      dispatched = "agent/story-4242-dispatched"
+
+      {:ok, _record} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.insert!(%Loopctl.Runners.DispatchRecord{
+            tenant_id: ctx.tenant_id,
+            runner_id: runner.id,
+            dispatch_id: Ecto.UUID.generate(),
+            story_id: ctx.story_id,
+            claim_epoch: 0,
+            kind: "implement",
+            branch: dispatched,
+            # Released, so the row holds no slot and `runner_dispatches_unreleased_bounded`
+            # has nothing to bound: only its branch matters here.
+            status: "accepted",
+            wall_clock_seconds: 3_600,
+            released_at: DateTime.utc_now()
+          })
+        end)
+
+      stub_thread(ctx)
+
+      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^dispatched -> {:ok, @head} end)
+
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
     end
 
     test "a MALFORMED base update (wrong first parent) is refused, named", ctx do
@@ -571,13 +658,16 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       record_update(ctx)
       stub_thread(ctx, head: @update, tree: @update_tree, parents: [@head, @base_head])
 
-      # A concurrent writer clears the allow AFTER the gate read the stage row and before it
-      # takes the edge, so `follow_base_update/4` refuses what the verdict decided.
+      # A concurrent writer clears the allow AND moves the head AFTER the gate read the stage
+      # row and before it takes the edge, so `follow_base_update/4` refuses what the verdict
+      # decided — and the count must be keyed to the head the row holds NOW.
+      moved = String.duplicate("3", 40)
+
       Mox.stub(MockPullRequestSource, :compare, fn @repo, "master", @update ->
         {:ok, {1, _}} =
           Repo.with_tenant(ctx.tenant_id, fn ->
             from(r in StoryStage, where: r.story_id == ^ctx.story_id)
-            |> Repo.update_all(set: [merge_gate_allowed_sha: nil])
+            |> Repo.update_all(set: [merge_gate_allowed_sha: nil, head_sha: moved])
           end)
 
         {:ok, comparison(@base_tree)}
@@ -589,6 +679,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :ci
       assert row.merge_gate_unevaluated["count"] == 1
+      assert row.merge_gate_unevaluated["head_sha"] == moved
     end
 
     test "a merge_commit_sha the base does not contain is NOT already_merged", ctx do
@@ -648,7 +739,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   # wrong branch or comparing against the wrong base fails here rather than passing.
   defp stub_thread(ctx, opts \\ []) do
     head = Keyword.get(opts, :head, @head)
-    branch = "loop/" <> ctx.story_id
+    branch = DispatchPayload.story_branch(ctx.tenant_id, AdminRepo.get!(Story, ctx.story_id))
 
     Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^branch ->
       {:ok, Keyword.get(opts, :branch_head, head)}
