@@ -51,7 +51,7 @@ env:
   # mix.exs `~> 1.18`); only the OTP line moves forward to a working, current patch.
   OTP_VERSION: "28.5.0.2"
 
-# SELF-HOSTED SPLIT (nuc since 2026-08-07, beelink before it). lint / test /
+# SELF-HOSTED SPLIT (runners on beelink). lint / test /
 # security / dialyzer / scale-test moved; the rest
 # stay on ubuntu-latest for specific reasons, not by omission. Measured job times
 # (2026-07-30) are recorded per entry, because the whole point of the split is
@@ -295,7 +295,8 @@ jobs:
   test:
     name: Test
     runs-on: [self-hosted, beelink]
-    # NO `services:` block on self-hosted. nuc already runs a long-lived
+    # NO `services:` block on a FIXED host port on self-hosted (scale-test's container binds a
+    # loopback port Docker picks, so it cannot collide). nuc already runs a long-lived
     # Postgres 16 bound to 127.0.0.1:5432 — reachable because the job runs ON that
     # host — the same database local `mix test`
     # uses — so a service container declaring 5432:5432 cannot bind and the job
@@ -923,13 +924,17 @@ jobs:
       github.event_name == 'pull_request'
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.2), so
+        # the job never pulls a floating tag from Docker Hub: a present digest is not re-pulled.
+        image: pgvector/pgvector@sha256:fce8fb583b92ef8af5150b373a96415d46a8cd38ba09b38efeea17c8b4c7d782
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: loopctl_test
         ports:
-          - 5432
+          # Loopback only, on a port Docker picks: postgres/postgres must not be offered to the
+          # LAN, and a fixed 5432 would collide with the host's own Postgres.
+          - 127.0.0.1::5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -941,37 +946,14 @@ jobs:
         with:
           clean: false
 
+      # The Test job's clean, without its PLT and toolchain-cache notes, which do not apply
+      # here: keep _build and deps warm for the slot's other jobs, drop everything else.
       - name: Clean the workspace, keeping the compiled tree
         run: |
-          # Patterns are ANCHORED. Without a leading slash a pattern matches at any
-          # depth, so a future fixture directory named `deps` or `_build` would become
-          # immortal on every runner. The PLT exception names the two artifacts rather
-          # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
-          # restores it anyway) and untracked cruft in priv/plts is still cleaned.
-          # The PLT is deliberately NOT excepted, and that is a correction. mix.exs:49
-          # pins `plt_file` to a fixed filename with no toolchain in it, and dialyxir's
-          # staleness gate is a hash of mix.lock plus the app list and nothing else
-          # (deps/dialyxir/lib/mix/tasks/dialyzer.ex:423) -- on a match it prints "PLT is
-          # up to date!" and skips Plt.check entirely. So a PLT surviving an OTP or
-          # Elixir bump gets used against the wrong toolchain: either the "File not
-          # found: ... dialyzer-<old>/ebin/erl_bif_types.beam" this file already
-          # documents, or a silent pass against stale specs. Its own actions/cache key
-          # DOES embed both versions, so letting the cache own it is what keeps it
-          # honest, and deleting it here costs a cache restore rather than a rebuild.
-          #
-          # `-e /mcp-server/node_modules` is gone too: it was inert. Only
-          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
           git clean -ffdx -e /_build -e /deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
-          # ...but NOT the asset toolchain binaries, even though they live under _build.
-          # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
-          # only by RUNNING the file and reading its version string. Under the old
-          # `clean: true` these were scrubbed every job; retaining _build would let a
-          # binary written by a pull_request job be executed by the next push-to-master
-          # job on the same slot, with none of the ref scoping GitHub's cache gives.
-          # They have their own dedicated cache below, so deleting them costs nothing.
           rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
           git reset --hard HEAD
 
@@ -1313,7 +1295,8 @@ jobs:
           - test/loopctl/knowledge/vector_endpoint_e2e_latency_scale_test.exs
           - test/loopctl/knowledge/remediation_matrix_scale_test.exs
           - test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
-    # NO `services:` block on self-hosted. nuc already runs a long-lived Postgres 16
+    # NO `services:` block on a FIXED host port on self-hosted (scale-test's container binds a
+    # loopback port Docker picks, so it cannot collide). nuc already runs a long-lived Postgres 16
     # bound to 127.0.0.1:5432, so a service container declaring 5432:5432 cannot bind and
     # the job dies at "Initialize containers" before its first step. That host instance
     # has pgvector 0.8.2 available, which is what the pgvector/pgvector:pg16 image was
