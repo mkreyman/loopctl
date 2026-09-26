@@ -795,6 +795,21 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       refute empty.id in stale_ids
     end
 
+    test "only system rows record source_md5; a tenant row's writer may hold a newer version" do
+      tenant = tenant_at(1536)
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      {:ok, _} = Embeddings.upsert_article_embedding(tenant.id, article, vec(1536), "h", 1536)
+
+      assert [nil] =
+               AdminRepo.all(
+                 from(ae in ArticleEmbedding,
+                   where: ae.article_id == ^article.id,
+                   select: ae.source_md5
+                 )
+               )
+    end
+
     test "a text change is seen however it was written, updated_at or not" do
       tenant = tenant_at(1536)
       article = system_article()

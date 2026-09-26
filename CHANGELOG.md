@@ -19,13 +19,15 @@ All notable changes to loopctl are documented here.
   (an agent key is refused 409 `materialization_terminal`).
 - **A system article whose text changed is re-embedded, one run at a time (#896).** A system
   article corrected after a tenant embedded it used to keep that tenant's vector of the old
-  text for good. Each `article_embeddings` row now records `source_md5`, the md5 of the title
-  and body it was made from (migration `20260926090000`, a nullable column, no backfill), and
-  staleness is the SQL comparison of that against the article's current title and body. A
-  correction, a seeding migration's upsert included, is picked up by the next semantic search
-  on the side-table path; a write that changes neither title nor body queues nothing. Rows
-  written before this release read stale once and are only stamped, with no provider call,
-  where their stored content hash still matches. Materialization is single-flight per tenant
+  text for good. Migration `20260926090000` adds `article_embeddings.source_md5`, the md5 of
+  the title and body a row was made from, and `articles.text_md5`, the same md5 of the current
+  text, kept by a trigger for system-scope rows however they are written; staleness compares
+  the two. A correction, a seeding migration's upsert included, is picked up by the next
+  semantic search on the side-table path; a write that changes neither title nor body queues
+  nothing. No manual step: the migration backfills both columns in SQL, stamping each existing
+  system row whose stored content hash still matches its article, so the release does not make
+  corpora read stale. A row it cannot vouch for is stamped by the worker with no provider call
+  when its hash matches, and re-embedded when it does not. Materialization is single-flight per tenant
   and dimension: a run already queued, executing or backing off answers `in_flight`, and an
   orchestrator-or-higher key re-schedules a run backing off after an error to now instead of
   starting another. A run left `executing` by a crashed node holds until Oban's Lifeline

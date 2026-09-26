@@ -16,9 +16,9 @@ defmodule Loopctl.Embeddings.DisclosureCache do
       product;
     * `reembed_meta/2` adds two more `exists?` probes;
     * the fill also asks whether any system article has no row made from its current
-      text (`Embeddings.system_corpus_stale?/2`, an `EXISTS` that computes an md5 over each
-      article's title and body until it finds one), to decide whether to queue a
-      materialization.
+      text (`Embeddings.system_corpus_stale?/2`, an `EXISTS` comparing the stored
+      `article_embeddings.source_md5` with the trigger-kept `articles.text_md5`), to decide
+      whether to queue a materialization.
 
   The answer only changes when the materialization worker runs, a system article is
   added/published, or a re-embed makes progress — none of which is request-driven.

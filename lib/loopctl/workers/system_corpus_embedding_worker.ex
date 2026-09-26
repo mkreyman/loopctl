@@ -110,9 +110,15 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       |> Enum.map(fn a -> {a, embedding_text(a)} end)
       |> split_unchanged(tenant_id, dim)
 
-    Enum.each(unchanged, fn {article, _text} ->
-      Embeddings.stamp_article_source(tenant_id, article, dim)
-    end)
+    to_stamp = Enum.map(unchanged, fn {article, _text} -> article end)
+    {:ok, stamped} = Embeddings.stamp_article_sources(tenant_id, to_stamp, dim)
+
+    if stamped != length(to_stamp) do
+      Logger.warning(
+        "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} dim=#{dim} stamped #{stamped} of " <>
+          "#{length(to_stamp)} unchanged rows; the rest are re-checked next run"
+      )
+    end
 
     embed_entries(tenant_id, dim, entries, Enum.map(articles, & &1.id))
   end
@@ -283,29 +289,16 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
   # Self-continuation: more stale rows means another batch, as a FRESH job (attempt 1).
   # See the `unique:` comment above for why this is an insert and not a snooze.
-  # Continue while a stale article remains that this batch did not just handle. When the
-  # only stale articles left are ones it just stored or stamped, they were edited while it
-  # ran (legitimately stale again) or their md5 disagrees between Elixir and Postgres; a
-  # continuation would handle them in a loop, so stop and let the read path's next fill
-  # start a fresh run, which picks up a real edit. Stopping never strands other articles:
-  # any article this batch did not touch keeps the run going.
+  # Continue while a stale article remains that this batch did not just handle, probed
+  # directly (a page of the stale set capped at the batch size would be exactly this batch
+  # again when all of it went stale during the run, and stop with others still waiting).
+  # When the only stale articles left are ones this batch just stored or stamped, they were
+  # edited while it ran; a continuation would handle them in a loop, so stop and let the
+  # read path's next fill start a fresh run, which picks the edit up.
   defp continue(tenant_id, dim, processed_ids) do
-    remaining = Embeddings.stale_system_articles(tenant_id, dim, limit: batch_size())
-
-    cond do
-      remaining == [] ->
-        :ok
-
-      Enum.all?(remaining, &(&1.id in processed_ids)) ->
-        Logger.warning(
-          "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} dim=#{dim} stopping: only " <>
-            "articles this batch just handled are still stale"
-        )
-
-        :ok
-
-      true ->
-        insert_continuation(tenant_id, dim)
+    case Embeddings.stale_system_articles(tenant_id, dim, limit: 1, exclude_ids: processed_ids) do
+      [] -> :ok
+      [_ | _] -> insert_continuation(tenant_id, dim)
     end
   end
 

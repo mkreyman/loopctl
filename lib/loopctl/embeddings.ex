@@ -966,7 +966,10 @@ defmodule Loopctl.Embeddings do
     )
   end
 
-  defp source_md5_of(%{title: _, body: _} = article), do: article_source_md5(article)
+  # System rows only: their writers (the materialization worker, the re-embed backfill)
+  # pass the struct they embedded. The per-article tenant worker re-reads its article at
+  # write time, so for a tenant row the md5 could name a newer version than the vector.
+  defp source_md5_of(%{scope: :system} = article), do: article_source_md5(article)
   defp source_md5_of(_article), do: nil
 
   @doc """
@@ -1442,20 +1445,7 @@ defmodule Loopctl.Embeddings do
     limit = Keyword.get(opts, :limit, @default_batch_size)
 
     AdminRepo.all(
-      from(a in system_articles_query(),
-        as: :article,
-        where:
-          not exists(
-            from(ae in ArticleEmbedding,
-              where:
-                ae.article_id == parent_as(:article).id and
-                  ae.tenant_id == ^tenant_id and
-                  ae.dim == ^dimension,
-              select: 1
-            )
-          ),
-        limit: ^limit
-      )
+      from(a in system_articles_without_row(tenant_id, dimension, :any), limit: ^limit)
     )
   end
 
@@ -1464,8 +1454,9 @@ defmodule Loopctl.Embeddings do
   made from their CURRENT text.
 
   Decided by content, in SQL: a row is current when its `source_md5` (the md5 of the title
-  and body its writer read) equals the md5 Postgres computes over the article's title and
-  body now. No clock and no `updated_at` is involved, so a write that changes neither
+  and body its writer read) equals `articles.text_md5`, the md5 of the article's title and
+  body now, which a trigger keeps for every system-scope write however it is made. Two
+  stored columns are compared; nothing is hashed on the search path. No clock and no `updated_at` is involved, so a write that changes neither
   title nor body (a suppression flip, a status or metadata write) is not an edit, a title
   change is, and an edit made while a run was embedding stays stale, however either write
   was made. A row with no `source_md5` (written before it existed) reads stale; the worker
@@ -1475,12 +1466,14 @@ defmodule Loopctl.Embeddings do
   def stale_system_articles(tenant_id, dimension, opts \\ [])
       when is_binary(tenant_id) and is_integer(dimension) do
     limit = Keyword.get(opts, :limit, @default_batch_size)
+    exclude = Keyword.get(opts, :exclude_ids, [])
 
     AdminRepo.all(
       from(a in stale_system_articles_query(tenant_id, dimension),
+        where: a.id not in ^exclude,
         order_by: a.id,
         limit: ^limit,
-        select: struct(a, [:id, :tenant_id, :scope, :status, :title, :body, :updated_at])
+        select: struct(a, [:id, :tenant_id, :scope, :status, :title, :body, :text_md5])
       )
     )
   end
@@ -1490,25 +1483,29 @@ defmodule Loopctl.Embeddings do
   def system_corpus_stale?(tenant_id, dimension),
     do: AdminRepo.exists?(stale_system_articles_query(tenant_id, dimension))
 
-  defp stale_system_articles_query(tenant_id, dimension) do
-    from(a in system_articles_query(),
-      as: :article,
-      where:
-        not exists(
-          from(ae in ArticleEmbedding,
-            where:
-              ae.article_id == parent_as(:article).id and ae.tenant_id == ^tenant_id and
-                ae.dim == ^dimension and
-                ae.source_md5 ==
-                  fragment(
-                    "md5(coalesce(?, '') || E'\\n\\n' || coalesce(?, ''))",
-                    parent_as(:article).title,
-                    parent_as(:article).body
-                  ),
-            select: 1
-          )
-        )
-    )
+  defp stale_system_articles_query(tenant_id, dimension),
+    do: system_articles_without_row(tenant_id, dimension, :current)
+
+  # System articles with no row for this tenant at `dimension` (`:any`), or with no row
+  # made from their current text (`:current`: `source_md5` equal to the trigger-kept
+  # `articles.text_md5`). One builder for the meta's missing probe and the staleness probe,
+  # so the two cannot drift; `:current` covers `:any`.
+  defp system_articles_without_row(tenant_id, dimension, which) do
+    row =
+      from(ae in ArticleEmbedding,
+        where:
+          ae.article_id == parent_as(:article).id and ae.tenant_id == ^tenant_id and
+            ae.dim == ^dimension,
+        select: 1
+      )
+
+    row =
+      case which do
+        :any -> row
+        :current -> where(row, [ae], ae.source_md5 == parent_as(:article).text_md5)
+      end
+
+    from(a in system_articles_query(), as: :article, where: not exists(row))
   end
 
   @doc """
@@ -1522,20 +1519,29 @@ defmodule Loopctl.Embeddings do
   end
 
   @doc """
-  Records that `article`'s row was made from the version passed in, without re-embedding:
-  for a row whose stored content hash already matches that version's text. The md5 is of
-  the struct the caller compared, so an edit made since leaves the row stale.
+  Records that each article's row was made from the version passed in, without
+  re-embedding: for rows whose stored content hash already matches that version's text.
+  The md5 is of the struct the caller compared, so an edit made since leaves the row stale.
+  One statement for the batch. Returns how many rows it stamped.
   """
-  @spec stamp_article_source(Ecto.UUID.t(), Article.t(), pos_integer()) ::
+  @spec stamp_article_sources(Ecto.UUID.t(), [Article.t()], pos_integer()) ::
           {:ok, non_neg_integer()}
-  def stamp_article_source(tenant_id, %Article{} = article, dimension) do
-    {n, _} =
-      AdminRepo.update_all(
-        from(ae in ArticleEmbedding,
-          where:
-            ae.tenant_id == ^tenant_id and ae.article_id == ^article.id and ae.dim == ^dimension
-        ),
-        set: [source_md5: article_source_md5(article)]
+  def stamp_article_sources(_tenant_id, [], _dimension), do: {:ok, 0}
+
+  def stamp_article_sources(tenant_id, articles, dimension) do
+    %{num_rows: n} =
+      AdminRepo.query!(
+        """
+        UPDATE article_embeddings AS ae SET source_md5 = v.md5
+        FROM unnest($2::uuid[], $3::text[]) AS v(article_id, md5)
+        WHERE ae.tenant_id = $1 AND ae.article_id = v.article_id AND ae.dim = $4
+        """,
+        [
+          Ecto.UUID.dump!(tenant_id),
+          Enum.map(articles, &Ecto.UUID.dump!(&1.id)),
+          Enum.map(articles, &article_source_md5/1),
+          dimension
+        ]
       )
 
     {:ok, n}
@@ -1623,7 +1629,8 @@ defmodule Loopctl.Embeddings do
 
   # Decided under a per-(tenant, dim) transaction advisory lock, so two concurrent callers
   # (two disclosure fills missing the cache at once, a fill and a POST) cannot both read
-  # "nothing running" and both insert: the second waits, then sees the first's job. The
+  # "nothing running" and both insert: the second fails to take the lock and answers
+  # in flight, without waiting (a wait would hold a connection on the search path). The
   # worker's uniqueness cannot do this alone, because it leaves `:executing` out so its own
   # continuation can be inserted; a job dispatched between another caller's read and insert
   # would not dedupe. The insert joins the lock's transaction (`Oban.insert/1` writes on
@@ -1631,17 +1638,23 @@ defmodule Loopctl.Embeddings do
   #
   # Under the lock, the LATEST run decides: queued, scheduled or executing is in flight,
   # forced or not (a run orphaned in `executing` by a crashed node holds until Oban's
-  # Lifeline rescues it, `rescue_after` in `Loopctl.ObanConfig`); discarded or cancelled
+  # Lifeline rescues it, `Loopctl.ObanConfig.lifeline_rescue_after_ms/0`); discarded or cancelled
   # is the terminal gate unless forced; anything else, including a run backing off,
   # inserts, which Oban's uniqueness answers as a conflict.
   defp gate_materialization(tenant_id, dimension, force?) do
     {:ok, result} =
       Repo.transaction(fn ->
-        Repo.query!("SELECT pg_advisory_xact_lock(hashtext($1))", [
-          "system_corpus:#{tenant_id}:#{dimension}"
-        ])
+        %{rows: [[locked?]]} =
+          Repo.query!("SELECT pg_try_advisory_xact_lock(hashtext($1))", [
+            "system_corpus:#{tenant_id}:#{dimension}"
+          ])
 
-        case latest_system_corpus_run_state(tenant_id, dimension) do
+        case locked? && latest_system_corpus_run_state(tenant_id, dimension) do
+          # Another caller holds the gate right now and is deciding; waiting for it would
+          # hold a connection on the search path for nothing.
+          false ->
+            {:ok, :in_flight}
+
           state when state in ["available", "scheduled", "executing"] ->
             {:ok, :in_flight}
 
