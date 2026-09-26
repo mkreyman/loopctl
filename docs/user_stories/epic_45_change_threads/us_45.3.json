@@ -41,6 +41,10 @@
     {
       "id": "AC-45.3.7",
       "description": "Refusals on this path never use self_review_blocked, which feeds the L6 custody halt; the judgement kinds' refusals have their own codes."
+    },
+    {
+      "id": "AC-45.3.8",
+      "description": "The runner contract takes a minor bump that adds review to x-connection.dispatchable_kinds and publishes the review dispatch's payload and messages, so a runner learns from the contract alone that the kind is dispatchable. US-45.2 moved this here from its own contract bump."
     }
   ],
   "test_cases": [

@@ -390,8 +390,11 @@ defmodule Loopctl.ThreadsTest do
 
     assert_receive :held, 5_000
     on_exit(fn -> send(holder, :release) end)
+    ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :threads, :busy]])
 
     assert {:error, :busy} = entry(ctx, message("blocked"))
+    tenant_id = ctx.tenant_id
+    assert_receive {[:loopctl, :threads, :busy], ^ref, _, %{tenant_id: ^tenant_id}}
     send(holder, :release)
   end
 

@@ -145,8 +145,9 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   def for_message(:rejected_by_database),
     do: %{reason: "invalid_payload", details: ["a value was refused by the database"]}
 
-  # A lock this write could not get in time, or a deadlock Postgres broke by choosing it.
-  # Nothing was written and the message is fine, so the runner is told to SEND IT AGAIN —
+  # A lock this write could not get in time, a deadlock Postgres broke by choosing it, or a
+  # lost connection. The message is fine, so the runner is told to SEND IT AGAIN — a write
+  # that did commit before the connection was lost is answered as already recorded —
   # never `invalid_payload`, which tells it to stop. The interval is LONGER than the wait that
   # just ran out: retrying after exactly that wait puts the runner back in the same queue with
   # no backoff. `:capacity_busy` is the ledger's name and `:busy` is

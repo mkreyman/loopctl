@@ -295,8 +295,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   Both name an ACCEPTED `implement` dispatch; any other kind is `unknown_dispatch`, as on
   `session_ended`, and a dispatch no longer accepted is `dispatch_not_accepted` — except for
   a RESEND, below. The story is never taken off the wire. A write that could not
-  get its locks in time is refused `rate_limited` with `min_interval_ms`; nothing was
-  written, so resend after that interval.
+  get its locks in time, or lost its connection, is refused `rate_limited` with
+  `min_interval_ms`: resend after that interval, and a write that did commit is answered
+  `replayed: true`.
 
   **RESENDING IS SAFE, AND IS THE ANSWER TO A LOST ACK.** A byte-identical checkpoint, or a
   `thread_entry` with the same `client_seq` and the same content, is answered `ok` with
@@ -2888,7 +2889,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     "session_ended" =>
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
          already_recorded unknown_story_stage audit_chain_append_failed internal_error),
-    # Since 1.20.0 (US-45.2), the change thread. Four codes are NEW, each because nothing
+    # Since 1.20.0 (US-45.2), the change thread. The codes below are NEW, each because nothing
     # already published carries its remedy:
     #
     # - `not_claimant` — the story's claim is not this runner's agent (or the story is not

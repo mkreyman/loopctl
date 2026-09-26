@@ -17,7 +17,9 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
   import Ecto.Query
 
   alias Loopctl.AuditChain.Entry, as: ChainEntry
+  alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.RunnerThreads
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchRecord
@@ -287,6 +289,15 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
       assert thread(ctx).checkpoints == []
     end
 
+    test "the lineage is the one the story names when the write runs, read under its lock" do
+      ctx = session()
+      other = custody_dispatch(ctx.story, ctx.runner)
+      set_story(ctx.story, implementer_dispatch_id: other.id)
+
+      {:ok, _} = checkpoint(ctx)
+      assert List.last(chain_lineages(ctx)) == other.lineage_path
+    end
+
     test "a claim no placement made carries no lineage, because it genuinely has none" do
       ctx = session()
       set_story(ctx.story, implementer_dispatch_id: nil)
@@ -384,39 +395,43 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
   describe "database failures" do
     @describetag :capture_log
 
-    setup do
-      %{message: %{dispatch_id: Ecto.UUID.generate()}}
-    end
+    test "contention is busy through the one shared policy, counted; anything else raises" do
+      ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :threads, :busy]])
+      tenant_id = Ecto.UUID.generate()
 
-    test "a deadlock, a lock timeout and a pool timeout are busy, not a raise", %{message: m} do
       for error <- [
             %Postgrex.Error{postgres: pg_error(:deadlock_detected, "40P01")},
             %Postgrex.Error{postgres: pg_error(:lock_not_available, "55P03")},
             DBConnection.ConnectionError.exception("checkout timed out")
           ] do
         assert {:error, :busy} =
-                 RunnerThreads.answering_database(Ecto.UUID.generate(), m, "t", fn ->
+                 Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "t", fn ->
                    raise error
                  end)
+
+        assert_receive {[:loopctl, :threads, :busy], ^ref, %{count: 1}, %{tenant_id: ^tenant_id}}
       end
-    end
-
-    test "a hash-chain violation is audit_chain_append_failed; anything else raises",
-         %{message: m} do
-      violation = %Postgrex.Error{
-        postgres: %{pg_code: "P0001", message: "audit_chain_hash_violation: broken"}
-      }
-
-      assert {:error, :audit_chain_append_failed} =
-               RunnerThreads.answering_database(Ecto.UUID.generate(), m, "t", fn ->
-                 raise violation
-               end)
 
       assert_raise Postgrex.Error, fn ->
-        RunnerThreads.answering_database(Ecto.UUID.generate(), m, "t", fn ->
+        Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "t", fn ->
           raise %Postgrex.Error{postgres: pg_error(:unique_violation, "23505")}
         end)
       end
+    end
+
+    test "a hash-chain violation is audit_chain_append_failed" do
+      violation = %Postgrex.Error{
+        postgres: %{
+          pg_code: "P0001",
+          severity: "ERROR",
+          message: "audit_chain_hash_violation: broken"
+        }
+      }
+
+      assert {:error, :audit_chain_append_failed} =
+               RunnerStages.answering_broken_chain(Ecto.UUID.generate(), fn -> "t" end, fn ->
+                 raise violation
+               end)
     end
   end
 

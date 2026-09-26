@@ -16,8 +16,8 @@ defmodule Loopctl.Delivery.RunnerThreads do
   3. resolve WHO is writing, from the server's own rows, never from the message;
   4. translate `Loopctl.Threads`' refusals into the reasons the contract publishes.
 
-  Steps 1 and 3 are ONE read in one tenant transaction: the ledger row, its story's current
-  epoch, and the custody dispatch's lineage.
+  Step 1 is one read of the ledger row; step 3's lineage is resolved by `Loopctl.Threads`
+  itself (`actor_lineage: :custody`), inside the write's transaction.
 
   ## A dispatch no longer accepted
 
@@ -41,38 +41,26 @@ defmodule Loopctl.Delivery.RunnerThreads do
   authenticates with its ENROLLMENT key, which no dispatch minted, so its own lineage is `[]`
   (`RunnerStages` states that, correctly, for its writes). A checkpoint attributed to `[]`
   would name no dispatch on the thread or on its audit-chain entry, on work a dispatch did.
-
-  It is taken only while the story's `claim_epoch` is still the message's. After that,
-  `implementer_dispatch_id` belongs to whichever claim came next, so the lineage is not this
-  session's to take; it resolves to `[]`, and nothing NEW is written under it:
-
-  - a `checkpoint` meets the claimant fence, which refuses a new write at an ended epoch;
-  - a `thread_entry` carries the message's epoch into `Loopctl.Threads.record_entry/4`
-    (`:claim_epoch`), which refuses a new one `:stale_claim_epoch` UNDER the story's lock, so
-    a claim that moves between this read and the write is refused there, never written past.
-    Because `implementer_dispatch_id` only changes with a claim, which bumps the epoch, a
-    lineage read at epoch E is still E's once the lock confirms E.
-
-  Either one's resend is answered from its row, and writes nothing.
-
-  A claim with no custody dispatch (a legacy claim no placement made) resolves to `[]`, which
-  is what that claim genuinely has.
+  `Loopctl.Threads` reads it on the story row it holds FOR SHARE, under the same lock as the
+  fence, so it is always the lineage of the claim the write was fenced on. That claim must
+  still be the message's for anything new to be written: a `checkpoint` meets the claimant
+  fence, and a `thread_entry` carries its epoch in (`:claim_epoch`), refused
+  `:stale_claim_epoch` under the lock once the claim moved. Either one's RESEND is answered
+  from its row and writes nothing.
 
   ## Database failures, answered rather than raised
 
   Anything raised here is raised inside the runner channel's `handle_in`, where it takes down
-  every session on the socket, and the runner's resend on rejoin crash-loops it. So the whole
-  of both functions — the read as well as the write — runs inside two answers:
+  every session on the socket, and the runner's resend on rejoin crash-loops it. So:
 
-  - a lock wait that ran out, a deadlock Postgres broke by choosing this write, or a pool
-    checkout that timed out is `:busy` (`Loopctl.Delivery.Stages.retryable_error?/1`): nothing
-    was written and the same message will do. `Loopctl.Threads` answers the same conditions
-    `:busy` for its own locks, for the HTTP surface;
+  - contention on the ledger read is `:busy` (`Loopctl.Delivery.Stages.answering_busy/4`, the
+    one copy of that policy), as `Loopctl.Threads` answers it on the write;
   - the tenant's audit chain refusing the append as a HASH violation is
     `:audit_chain_append_failed` (`RunnerStages.answering_broken_chain/3`, the one copy of
     that policy), exactly as a `stage` is.
 
-  Every other database error still raises.
+  `:busy` asks for the same message again, which is safe: a write that did land before the
+  connection was lost is answered from its row. Every other database error still raises.
 
   ## The custody halt
 
@@ -89,18 +77,14 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   import Ecto.Query
 
-  require Logger
-
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
-  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
-  alias Loopctl.WorkBreakdown.Story
   alias LoopctlWeb.ActorLabel
 
   @type error ::
@@ -126,22 +110,21 @@ defmodule Loopctl.Delivery.RunnerThreads do
   @spec record_checkpoint(Ecto.UUID.t(), runner(), map()) ::
           {:ok, %{checkpoint: Checkpoint.t(), replayed?: boolean()}} | {:error, error() | term()}
   def record_checkpoint(tenant_id, runner, %{} = message) do
-    answering_database(tenant_id, message, "checkpoint", fn ->
-      with {:ok, session} <- session(tenant_id, runner.id, message) do
-        tenant_id
-        |> Threads.record_checkpoint(session.story_id,
+    with {:ok, session} <- session(tenant_id, runner.id, message) do
+      answering_broken_chain(tenant_id, message, "checkpoint", fn ->
+        Threads.record_checkpoint(tenant_id, session.story_id,
           agent_id: runner.agent_id,
           claim_epoch: message.claim_epoch,
           commit_sha: message.commit_sha,
           tree_sha: message.tree_sha,
           note: Map.get(message, :note),
           author_principal: principal(runner),
-          actor_lineage: session.lineage,
+          actor_lineage: :custody,
           replay_only: not session.accepted?
         )
-        |> answer(:checkpoint)
-      end
-    end)
+      end)
+      |> answer(:checkpoint)
+    end
   end
 
   @doc """
@@ -152,26 +135,25 @@ defmodule Loopctl.Delivery.RunnerThreads do
   @spec record_entry(Ecto.UUID.t(), runner(), map()) ::
           {:ok, %{entry: Entry.t(), replayed?: boolean()}} | {:error, error() | term()}
   def record_entry(tenant_id, runner, %{} = message) do
-    answering_database(tenant_id, message, "thread_entry", fn ->
-      with {:ok, session} <- session(tenant_id, runner.id, message) do
-        attrs =
-          %{
-            "kind" => "message",
-            "idempotency_key" => idempotency_key(message),
-            "body" => message.body
-          }
-          |> put_checkpoint(Map.get(message, :checkpoint_id))
+    with {:ok, session} <- session(tenant_id, runner.id, message) do
+      attrs =
+        %{
+          "kind" => "message",
+          "idempotency_key" => idempotency_key(message),
+          "body" => message.body
+        }
+        |> put_checkpoint(Map.get(message, :checkpoint_id))
 
-        tenant_id
-        |> Threads.record_entry(session.story_id, attrs,
+      answering_broken_chain(tenant_id, message, "thread_entry", fn ->
+        Threads.record_entry(tenant_id, session.story_id, attrs,
           author_principal: principal(runner),
-          actor_lineage: session.lineage,
+          actor_lineage: :custody,
           claim_epoch: message.claim_epoch,
           replay_only: not session.accepted?
         )
-        |> answer(:entry)
-      end
-    end)
+      end)
+      |> answer(:entry)
+    end
   end
 
   @doc "The idempotency key of a `thread_entry`: `<dispatch_id>:<client_seq>`."
@@ -186,49 +168,44 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   # --- the session -----------------------------------------------------------------------
 
-  # The ledger row `runner_id` holds for the message's dispatch, whatever its status, with its
-  # story's current epoch and the custody dispatch's lineage, in one read. A row another
-  # runner or tenant holds reads as none. The ledger holds no foreign key to the story, so a
-  # deleted story leaves a dispatch naming nothing — `unknown_dispatch`, permanently.
-  # `implementer_dispatch_id` is a foreign key with no delete, so a declared dispatch always
-  # resolves.
+  # The ledger row `runner_id` holds for the message's dispatch, whatever its status. A row
+  # another runner or tenant holds reads as none. Contention on the read is `:busy`.
   defp session(tenant_id, runner_id, message) do
-    {:ok, row} =
-      Repo.with_tenant(tenant_id, fn ->
-        Repo.one(
-          from r in DispatchRecord,
-            left_join: s in Story,
-            on: s.id == r.story_id and s.tenant_id == r.tenant_id,
-            left_join: d in Dispatch,
-            on: d.id == s.implementer_dispatch_id and d.tenant_id == s.tenant_id,
-            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
-            where: r.dispatch_id == ^message.dispatch_id,
-            select: %{
-              status: r.status,
-              kind: r.kind,
-              story_id: r.story_id,
-              claim_epoch: r.claim_epoch,
-              story_found?: not is_nil(s.id),
-              story_epoch: s.claim_epoch,
-              lineage: d.lineage_path
-            }
-        )
-      end)
+    read = fn ->
+      {:ok, row} =
+        Repo.with_tenant(tenant_id, fn ->
+          Repo.one(
+            from r in DispatchRecord,
+              where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+              where: r.dispatch_id == ^message.dispatch_id,
+              select: %{
+                status: r.status,
+                kind: r.kind,
+                story_id: r.story_id,
+                claim_epoch: r.claim_epoch
+              }
+          )
+        end)
 
-    with {:ok, row} <- found(row),
+      {:ok, row}
+    end
+
+    with {:ok, row} <-
+           Stages.answering_busy(
+             tenant_id,
+             [:loopctl, :threads, :busy],
+             "runner thread read",
+             read
+           ),
+         {:ok, row} <- found(row),
          :ok <- implement_kind(row),
          :ok <- dispatch_epoch_matches(row, message) do
-      {:ok,
-       %{
-         story_id: row.story_id,
-         accepted?: row.status == "accepted",
-         lineage: lineage(row, message.claim_epoch)
-       }}
+      {:ok, %{story_id: row.story_id, accepted?: row.status == "accepted"}}
     end
   end
 
-  defp found(%{story_found?: true} = row), do: {:ok, row}
-  defp found(_none), do: {:error, :unknown_dispatch}
+  defp found(nil), do: {:error, :unknown_dispatch}
+  defp found(row), do: {:ok, row}
 
   defp implement_kind(%{kind: kind}) do
     if DispatchLedger.implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
@@ -239,11 +216,6 @@ defmodule Loopctl.Delivery.RunnerThreads do
   # cost of the read already made.
   defp dispatch_epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
   defp dispatch_epoch_matches(_row, _message), do: {:error, :stale_claim_epoch}
-
-  # The custody dispatch's lineage while the story's claim is still the message's, `[]` once
-  # it is not; see the moduledoc for why nothing new is written under the latter.
-  defp lineage(%{story_epoch: epoch, lineage: lineage}, epoch), do: lineage || []
-  defp lineage(_row, _epoch), do: []
 
   defp put_checkpoint(attrs, nil), do: attrs
   defp put_checkpoint(attrs, checkpoint_id), do: Map.put(attrs, "checkpoint_id", checkpoint_id)
@@ -259,6 +231,10 @@ defmodule Loopctl.Delivery.RunnerThreads do
   defp classify({:conflict, "checkpoint_conflict", _message}), do: :checkpoint_conflict
   defp classify({:conflict, "idempotency_key_reused", _message}), do: :idempotency_key_reused
 
+  # The ledger holds no foreign key to the story, so a deleted story leaves a dispatch naming
+  # nothing — which is what `unknown_dispatch` says, permanently.
+  defp classify(:not_found), do: :unknown_dispatch
+
   defp classify(%Ecto.Changeset{data: %Entry{}} = changeset),
     do: {:invalid, changeset_messages(changeset)}
 
@@ -266,8 +242,7 @@ defmodule Loopctl.Delivery.RunnerThreads do
   # `:not_claimant`, `:stale_claim_epoch`, `:claim_not_live`, `:dispatch_not_accepted` and
   # `:audit_chain_append_failed` under their own names and `:busy` as `rate_limited` with a
   # retry interval. Anything it does not name reaches its catch-all, which logs it and answers
-  # `internal_error` — `Loopctl.Threads`' `:not_found` among them, which only a story deleted
-  # between `session/3` and the write can produce.
+  # `internal_error`.
   defp classify(reason), do: reason
 
   # Total, because a clause missing here raises inside the channel: a structured 422 this
@@ -292,36 +267,13 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   defp to_string_safe(value), do: inspect(value)
 
-  # --- database failures -----------------------------------------------------------------
+  # --- a broken chain -------------------------------------------------------------------
 
-  # See the moduledoc. The broken-chain answer is outermost: a hash violation is not
-  # retryable, so the inner rescue reraises it to the policy's one copy.
-  @doc false
-  @spec answering_database(Ecto.UUID.t(), %{dispatch_id: Ecto.UUID.t()}, String.t(), (-> r)) ::
-          r | {:error, :busy | :audit_chain_append_failed}
-        when r: term()
-  def answering_database(tenant_id, message, write, fun) do
+  defp answering_broken_chain(tenant_id, message, write, fun) do
     RunnerStages.answering_broken_chain(
       tenant_id,
       fn -> "write=#{write} dispatch_id=#{message.dispatch_id}" end,
-      fn -> answering_busy(tenant_id, message, write, fun) end
+      fun
     )
-  end
-
-  defp answering_busy(tenant_id, message, write, fun) do
-    fun.()
-  rescue
-    error in [Postgrex.Error, DBConnection.ConnectionError] ->
-      if Stages.retryable_error?(error) do
-        Logger.warning(
-          "runner thread write gave up on the database and is answered busy: " <>
-            "tenant_id=#{tenant_id} write=#{write} dispatch_id=#{message.dispatch_id} " <>
-            "error=#{Exception.message(error)}"
-        )
-
-        {:error, :busy}
-      else
-        reraise error, __STACKTRACE__
-      end
   end
 end

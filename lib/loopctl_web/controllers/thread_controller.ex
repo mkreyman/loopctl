@@ -110,8 +110,9 @@ defmodule LoopctlWeb.ThreadController do
          Schemas.ErrorResponse},
       503 =>
         {"`busy`: a lock the write needed (the story's thread lock, the story row, or the " <>
-           "tenant's audit-chain lock) was held past the wait bound, or the database gave up " <>
-           "on it; nothing written", "application/json", Schemas.ErrorResponse},
+           "tenant's audit-chain lock) was held past the wait bound, or the connection was " <>
+           "lost. Resend: a write that did commit is answered from its row", "application/json",
+         Schemas.ErrorResponse},
       422 =>
         {"A sha is not 40 or 64 lowercase hex characters, `note` is over the bound, or " <>
            "`note` carries a credential (`secret_blocked`)", "application/json",
@@ -161,8 +162,9 @@ defmodule LoopctlWeb.ThreadController do
          "application/json", Schemas.ErrorResponse},
       503 =>
         {"`busy`: a lock the write needed (the story's thread lock, the story row, or the " <>
-           "tenant's audit-chain lock) was held past the wait bound, or the database gave up " <>
-           "on it; nothing written", "application/json", Schemas.ErrorResponse},
+           "tenant's audit-chain lock) was held past the wait bound, or the connection was " <>
+           "lost. Resend: a write that did commit is answered from its row", "application/json",
+         Schemas.ErrorResponse},
       422 =>
         {"A field is invalid (a non-UUID `checkpoint_id` included), the kind is not " <>
            "writable here, the key is reserved, the body carries a credential " <>

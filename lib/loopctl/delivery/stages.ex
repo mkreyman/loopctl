@@ -1768,6 +1768,12 @@ defmodule Loopctl.Delivery.Stages do
   # statement timeouts. The body returns `{row, chain_entry | nil}` or rolls back with a
   # reason; a committed chain entry is announced only after the commit.
   defp in_tenant(tenant_id, fun) do
+    answering_busy(tenant_id, [:loopctl, :delivery, :stage_busy], "story stage write", fn ->
+      in_tenant_transaction(tenant_id, fun)
+    end)
+  end
+
+  defp in_tenant_transaction(tenant_id, fun) do
     result =
       Repo.with_tenant(tenant_id, fn ->
         LocalGuc.scoped(Repo, ["lock_timeout", "statement_timeout"], fn ->
@@ -1791,18 +1797,32 @@ defmodule Loopctl.Delivery.Stages do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  @doc """
+  Runs `fun`, answering database CONTENTION it raises (`retryable_error?/1`) as
+  `{:error, :busy}` rather than raising, with a warning naming `what` and one `event`
+  telemetry count carrying `tenant_id` and the `reason`. Everything else reraises.
+
+  The ONE copy of that policy: stage writes (`[:loopctl, :delivery, :stage_busy]`) and change
+  thread writes (`[:loopctl, :threads, :busy]`, `Loopctl.Threads` and
+  `Loopctl.Delivery.RunnerThreads`). `:busy` does NOT promise nothing was written: a
+  connection lost while the write committed is contention by this classification and may have
+  committed, so every caller answering it must be safe to resend.
+  """
+  @spec answering_busy(Ecto.UUID.t(), [atom()], String.t(), (-> result)) ::
+          result | {:error, :busy}
+        when result: term()
+  def answering_busy(tenant_id, event, what, fun) do
+    fun.()
   rescue
     error in [Postgrex.Error, DBConnection.ConnectionError] ->
       if retryable_error?(error) do
         Logger.warning(
-          "story stage write gave up waiting: tenant_id=#{tenant_id} " <>
-            "error=#{inspect(busy_code(error))}"
+          "#{what} gave up waiting: tenant_id=#{tenant_id} error=#{inspect(busy_code(error))}"
         )
 
-        :telemetry.execute([:loopctl, :delivery, :stage_busy], %{count: 1}, %{
-          tenant_id: tenant_id,
-          reason: busy_code(error)
-        })
+        :telemetry.execute(event, %{count: 1}, %{tenant_id: tenant_id, reason: busy_code(error)})
 
         {:error, :busy}
       else
@@ -1812,13 +1832,14 @@ defmodule Loopctl.Delivery.Stages do
 
   @doc """
   Whether a database error is CONTENTION this caller can retry out of, rather than a fault
-  in the transition. `in_tenant/2` answers `{:error, :busy}` for these and reraises
+  in the transition. `answering_busy/4` answers `{:error, :busy}` for these and reraises
   everything else, so an unclassified error LOSES the transition — which is why the audit
   chain's own `P0001` is classified even though its advisory lock makes it unreachable
   from here.
 
-  Public only so the classes can be asserted directly; nothing outside this module and its
-  test should call it.
+  Public only so the classes can be asserted directly; a caller outside this module goes
+  through `answering_busy/4`, so the classification, its log line and its telemetry stay one
+  copy.
   """
   @spec retryable_error?(Exception.t()) :: boolean()
   # Contention this caller can retry out of, none of which is a fault in the transition:
