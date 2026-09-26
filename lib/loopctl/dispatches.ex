@@ -841,6 +841,37 @@ defmodule Loopctl.Dispatches do
   def lineage_shares_prefix?(_, _), do: false
 
   @doc """
+  LINEAGE CEILING (parent half): whether a dispatch may be minted under a parent whose
+  lineage is `parent_lineage`, by a caller whose lineage is `caller_lineage`. The ONE copy,
+  called by `LoopctlWeb.DispatchController` and `Loopctl.Threads.Reviews.place/4`.
+
+  Rejecting only the parentless case would leave the
+  same escape open one step further out: any dispatch in the tenant is enumerable
+  via GET /api/v1/dispatches, so a caller could name a parent under a DIFFERENT root
+  and mint itself into that unrelated tree. A minted dispatch must therefore descend
+  from the caller's own dispatch — `parent.lineage_path` must have the caller's
+  lineage as a prefix.
+
+  The OPERATOR key may parent anywhere in its tenant: it is not inside any tree, so
+  it cannot escape one. The same reasoning covers a []-lineage NON-operator (a legacy
+  env-var key): it has no subtree to step outside of, and the ceiling exists to stop a
+  principal escaping ITS OWN tree. Refusing it here closed the only remaining mint it
+  had — root minting is already operator-only — leaving a legacy `:orchestrator` key
+  unable to obtain a lineage by any request at all, against the documented deprecation
+  window. Naming a parent gives it a lineage, which SUBJECTS it to the custody gates.
+  A caller that IS inside a tree must stay inside it.
+  """
+  @spec lineage_within_caller?(list(), list(), boolean()) :: boolean()
+  def lineage_within_caller?(_parent_lineage, _caller_lineage, true), do: true
+  def lineage_within_caller?(_parent_lineage, [], false), do: true
+
+  def lineage_within_caller?(parent_lineage, [_ | _] = caller_lineage, false)
+      when is_list(parent_lineage),
+      do: List.starts_with?(parent_lineage, caller_lineage)
+
+  def lineage_within_caller?(_parent_lineage, _caller_lineage, false), do: false
+
+  @doc """
   True when the two dispatches lie on ONE root-to-leaf chain — identical, or one
   an ancestor of the other. Siblings are NOT a match.
 

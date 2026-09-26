@@ -55,6 +55,25 @@ defmodule Loopctl.Repo.Migrations.CreateThreadReviews do
 
     create index(:thread_entries, [:review_id])
 
+    # A judgement's idempotency key is scoped to its REVIEW, not its author: one reviewer agent
+    # placed for two rounds may reuse a key, and its round-2 verdict is not a replay of round
+    # 1's. Every other entry keeps the per-author scope US-45.1 gave it.
+    drop index(:thread_entries, [:tenant_id, :story_id, :author_principal, :idempotency_key],
+           name: :thread_entries_idempotency_uidx
+         )
+
+    create unique_index(
+             :thread_entries,
+             [:tenant_id, :story_id, :author_principal, :idempotency_key],
+             where: "review_id IS NULL",
+             name: :thread_entries_idempotency_uidx
+           )
+
+    create unique_index(:thread_entries, [:tenant_id, :review_id, :idempotency_key],
+             where: "review_id IS NOT NULL",
+             name: :thread_entries_review_idempotency_uidx
+           )
+
     # ONE verdict per review dispatch: the verdict IS the completed round.
     create unique_index(:thread_entries, [:review_id],
              where: "kind = 'verdict'",
@@ -80,7 +99,7 @@ defmodule Loopctl.Repo.Migrations.CreateThreadReviews do
                WHEN 'verdict' THEN review_id IS NOT NULL AND checkpoint_id IS NOT NULL
                  AND severity IS NULL AND introduced_by IS NULL AND finding_ids IS NULL
                WHEN 'fix' THEN review_id IS NULL AND checkpoint_id IS NOT NULL
-                 AND cardinality(finding_ids) >= 1 AND severity IS NULL
+                 AND finding_ids IS NOT NULL AND cardinality(finding_ids) >= 1 AND severity IS NULL
                  AND introduced_by IS NULL
                WHEN 'escalation' THEN severity IS NULL AND introduced_by IS NULL
                  AND finding_ids IS NULL
@@ -110,6 +129,21 @@ defmodule Loopctl.Repo.Migrations.CreateThreadReviews do
     drop constraint(:thread_entries, :thread_entries_introduced_by)
     drop constraint(:thread_entries, :thread_entries_severity)
     drop index(:thread_entries, [:review_id], name: :thread_entries_one_verdict_per_review_uidx)
+
+    drop index(:thread_entries, [:tenant_id, :review_id, :idempotency_key],
+           name: :thread_entries_review_idempotency_uidx
+         )
+
+    drop index(:thread_entries, [:tenant_id, :story_id, :author_principal, :idempotency_key],
+           name: :thread_entries_idempotency_uidx
+         )
+
+    create unique_index(
+             :thread_entries,
+             [:tenant_id, :story_id, :author_principal, :idempotency_key],
+             name: :thread_entries_idempotency_uidx
+           )
+
     drop index(:thread_entries, [:review_id])
 
     alter table(:thread_entries) do

@@ -554,17 +554,34 @@ defmodule Loopctl.Threads do
   defp epoch_current(_story, _epoch), do: {:error, :stale_claim_epoch}
 
   @doc false
-  # `nil` when `author` has written nothing under the changeset's key; otherwise the answer to
-  # a resend — the row when it is the SAME write, `idempotency_key_reused` when it is not.
+  # `nil` when nothing is written under the changeset's key in its scope; otherwise the answer
+  # to a resend — the row when it is the SAME write, `idempotency_key_reused` when it is not.
+  # A judgement's key is scoped to its REVIEW (`thread_entries_review_idempotency_uidx`), so
+  # one reviewer agent may reuse a key in a later round; every other entry's to its author.
   @spec replayed(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), Ecto.Changeset.t()) ::
           nil | {:ok, Entry.t(), :existing, []} | {:error, {:conflict, String.t(), String.t()}}
   def replayed(tenant_id, story_id, author, changeset) do
     key = Ecto.Changeset.get_field(changeset, :idempotency_key)
 
-    case entry_by_key(tenant_id, story_id, author, key) do
+    existing =
+      case Ecto.Changeset.get_field(changeset, :review_id) do
+        nil -> entry_by_key(tenant_id, story_id, author, key)
+        review_id -> entry_by_review_key(tenant_id, review_id, key)
+      end
+
+    case existing do
       nil -> nil
       existing -> replay(existing, changeset)
     end
+  end
+
+  defp entry_by_review_key(tenant_id, review_id, key) do
+    Repo.one(
+      from e in Entry,
+        where:
+          e.tenant_id == ^tenant_id and e.review_id == ^review_id and
+            e.idempotency_key == ^key
+    )
   end
 
   defp entry_by_key(tenant_id, story_id, author, key) do
@@ -584,7 +601,6 @@ defmodule Loopctl.Threads do
     :kind,
     :body,
     :checkpoint_id,
-    :review_id,
     :severity,
     :location,
     :introduced_by,

@@ -21,8 +21,9 @@ defmodule Loopctl.Threads.Reviews do
   A SIBLING of the implementer's dispatch: its parent is the implementer's parent, so it is
   under the same orchestrator root and never on the implementer's chain (neither its ancestor
   nor its descendant, which is what `Dispatches.lineage_same_chain?/2` compares). The caller
-  placing it must hold that parent in its own lineage, the lineage ceiling
-  `LoopctlWeb.DispatchController` applies, and must not itself be on the implementer's chain.
+  placing it must be that parent or an ancestor of it: `Dispatches.lineage_within_caller?/3`,
+  the one copy of the ceiling `LoopctlWeb.DispatchController` applies, so the review lands in
+  the caller's own subtree and never under a caller on the implementer's chain.
   Its agent must not be a principal that recorded a checkpoint of the thread, nor the story's
   claimant, which is checked again on every judgement write because a claim can move to the
   reviewer's agent after placement.
@@ -30,7 +31,9 @@ defmodule Loopctl.Threads.Reviews do
   An implementer's parent that has been revoked or has expired cannot parent a new dispatch
   (`Dispatches.create_dispatch/3` refuses an inactive parent), so no review can be placed as
   its sibling: `review_parent_inactive`. A story whose claim no dispatch minted has no
-  implementer lineage to be separate from, and is refused `implementer_dispatch_required`.
+  implementer lineage to be separate from, and is refused `implementer_dispatch_required`; one
+  whose implementer dispatch does not resolve in the tenant fails closed
+  `unresolvable_dispatch_lineage`, as the other custody gates do.
 
   ## Rounds and the ceiling
 
@@ -39,14 +42,22 @@ defmodule Loopctl.Threads.Reviews do
   complete, so two reviews placed for the same round cannot both complete it
   (`review_round_superseded`), and a dispatch that ends without a verdict uses no round.
   Round 2 is always placeable after round 1. Round 3 is placeable only when a round-2 finding's
-  `introduced_by` names a checkpoint a round-1 fix is carried by. Round 4 never is.
+  `introduced_by` names a checkpoint a round-1 fix is carried by, counting only fixes written
+  before the round-2 verdict, so the decision is made once and a later fix cannot reopen it.
+  Round 4 never is.
+
+  A review is over when its verdict commits, and so is every other review placed for that round
+  or an earlier one; all of their dispatches and keys are revoked then, and a verdict refused
+  `review_round_superseded` revokes its own. The one-active-key-per-agent index
+  (`api_keys_one_role_per_agent_idx`) is why: a live key left behind would block the agent's
+  next placement.
 
   When the ceiling is reached with a material finding (severity critical, high or medium) in
   the round that reached it, that round's verdict also writes an `escalation` entry
-  (`review_ceiling`) in the same transaction, and after the commit the story's delivery stage,
-  when it has one at a stage a session may escalate from, is moved to `escalated`. The stage
-  move is best-effort: the placement refusal is computed from the entries and does not depend
-  on it, and a failure is logged.
+  (`review_ceiling`) in the same transaction, and after the commit the story's delivery stage
+  is escalated through `Loopctl.Delivery.Escalations.escalate_as_control/3`. The stage move is
+  best-effort: the placement refusal is computed from the entries and does not depend on it,
+  and a failure is logged.
 
   ## Refusal codes
 
@@ -56,12 +67,13 @@ defmodule Loopctl.Threads.Reviews do
 
   ## Retries
 
-  Every write is idempotent per author on `idempotency_key` when it is the SAME write, as a
-  thread entry is (`Loopctl.Threads`). A resend is answered from its row before any other
-  check, so a verdict whose acknowledgement was lost is answered rather than refused
-  `review_closed`. `place/4` is NOT idempotent: it mints a credential, and a retried placement
-  mints a second review dispatch for the same round, which is harmless because only one of
-  them can complete the round.
+  A finding or verdict is idempotent on `idempotency_key` within its REVIEW, a fix per author, when
+  it is the SAME write; a resend is answered from its row before any other check. A verdict is
+  the exception in practice: its commit revokes the review's key, so a resend after a lost
+  response is refused at authentication (401) and the caller reads the thread instead. The
+  answer-from-the-row path is reached only when that revocation failed. `place/4` is NOT
+  idempotent: it mints a credential, and a retried placement mints a second review dispatch for
+  the same round, which is harmless because only one of them can complete the round.
   """
 
   import Ecto.Query
@@ -72,9 +84,7 @@ defmodule Loopctl.Threads.Reviews do
   alias Loopctl.AuditChain
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
-  alias Loopctl.Delivery.StageMachine
-  alias Loopctl.Delivery.Stages
-  alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Delivery.Escalations
   alias Loopctl.Dispatches
   alias Loopctl.Repo
   alias Loopctl.Runners
@@ -89,6 +99,8 @@ defmodule Loopctl.Threads.Reviews do
   @max_rounds 3
   @material [:critical, :high, :medium]
   @max_location_bytes 1024
+  # The most fixes a review payload carries, the latest ones; `fixes_truncated` says more exist.
+  @max_payload_fixes 100
   @escalation_principal "control:review_ceiling"
 
   @type refusal ::
@@ -103,6 +115,10 @@ defmodule Loopctl.Threads.Reviews do
   @doc "The most rounds a story's review may take."
   @spec max_rounds() :: pos_integer()
   def max_rounds, do: @max_rounds
+
+  @doc "The most fixes a review payload carries."
+  @spec max_payload_fixes() :: pos_integer()
+  def max_payload_fixes, do: @max_payload_fixes
 
   @doc "The largest `location`, in bytes, a finding may carry."
   @spec max_location_bytes() :: pos_integer()
@@ -268,18 +284,18 @@ defmodule Loopctl.Threads.Reviews do
     end
   end
 
-  # The implementer's parent, which the review shares. The caller must not be on the
-  # implementer's chain, and must hold that parent in its lineage — the ceiling
-  # `LoopctlWeb.DispatchController` applies, including its two unlineaged cases: the tenant's
-  # operator key may parent anywhere, a root included, and a legacy unlineaged key may parent
-  # under an existing dispatch but never start a root.
+  # The implementer's parent, which the review shares. The caller must be that parent or an
+  # ancestor of it: `Dispatches.lineage_within_caller?/3`, the ceiling
+  # `LoopctlWeb.DispatchController` applies, so the review lands inside the caller's own
+  # subtree. That also keeps the implementer and anything below it out: neither is on the
+  # parent's lineage. A root implementer's sibling is a root, which only the tenant's operator
+  # key may mint, as on the controller.
   defp review_parent(tenant_id, story, caller, caller_lineage) do
-    implementer_id = story.implementer_dispatch_id
     operator? = caller_lineage == [] and Role.role_at_least?(caller.role, :user)
 
-    with :ok <- off_implementer_chain(implementer_id, caller_lineage),
-         {:ok, implementer} <- implementer_dispatch(tenant_id, implementer_id) do
+    with {:ok, implementer} <- implementer_dispatch(tenant_id, story.implementer_dispatch_id) do
       parent_id = implementer.parent_dispatch_id
+      parent_lineage = Enum.drop(implementer.lineage_path, -1)
 
       cond do
         is_nil(parent_id) and not operator? ->
@@ -290,34 +306,33 @@ defmodule Loopctl.Threads.Reviews do
               "tenant's operator key may mint"
           )
 
-        is_nil(parent_id) or caller_lineage == [] or parent_id in caller_lineage ->
+        Dispatches.lineage_within_caller?(parent_lineage, caller_lineage, operator?) ->
           {:ok, parent_id}
 
         true ->
           refuse(
             :forbidden,
             "parent_outside_caller_lineage",
-            "the implementer's parent dispatch is not in the caller's lineage"
+            "the implementer's parent dispatch is not inside the caller's lineage"
           )
       end
     end
   end
 
-  defp off_implementer_chain(implementer_id, caller_lineage) do
-    if implementer_id in caller_lineage,
-      do:
-        refuse(
-          :forbidden,
-          "review_placer_on_implementer_chain",
-          "the caller is the implementer's dispatch or one of its descendants"
-        ),
-      else: :ok
-  end
-
+  # `implementer_dispatch_id` is a foreign key, so a row that does not resolve is one of
+  # another tenant's: the lineage cannot be read, and like every other custody gate this
+  # fails closed with its own code rather than a 404 that reads as a missing story.
   defp implementer_dispatch(tenant_id, implementer_id) do
     case Dispatches.get_dispatch(tenant_id, implementer_id) do
-      {:ok, dispatch} -> {:ok, dispatch}
-      {:error, :not_found} -> {:error, :not_found}
+      {:ok, dispatch} ->
+        {:ok, dispatch}
+
+      {:error, :not_found} ->
+        refuse(
+          :conflict,
+          "unresolvable_dispatch_lineage",
+          "the story's implementer dispatch does not resolve, so its lineage cannot be read"
+        )
     end
   end
 
@@ -487,14 +502,29 @@ defmodule Loopctl.Threads.Reviews do
          :ok <- Threads.screen(changeset, tenant_id, story_id),
          {:ok, dispatch} <- review_dispatch(tenant_id, key) do
       case judge(tenant_id, story_id, key, dispatch, changeset, &verdict_locked/5) do
-        {:ok, written, :created} = ok ->
-          close_review_dispatch(tenant_id, dispatch)
-          escalate_stage(tenant_id, story_id, dispatch.lineage_path, written.escalation)
-          ok
+        {:ok, written, :created} ->
+          close_dispatches(tenant_id, [dispatch.id | written.superseded], dispatch.lineage_path)
 
-        # A resend is answered from the verdict's row, and its escalation already happened.
+          escalate_stage(
+            tenant_id,
+            story_id,
+            written.claim_epoch,
+            dispatch.lineage_path,
+            written.escalation
+          )
+
+          {:ok, Map.take(written, [:entry, :escalation]), :created}
+
+        # Reachable only when the revocation after the first verdict FAILED, so the key still
+        # authenticates: the resend is answered from the row. Otherwise the key is revoked at
+        # the verdict's commit and a resend is refused at authentication (401).
         {:ok, %Entry{} = verdict, :existing} ->
           {:ok, %{entry: verdict, escalation: nil}, :existing}
+
+        # A review that can no longer complete its round is over: its key is revoked too.
+        {:error, {:conflict, "review_round_superseded", _message}} = superseded ->
+          close_dispatches(tenant_id, [dispatch.id], dispatch.lineage_path)
+          superseded
 
         other ->
           other
@@ -654,8 +684,30 @@ defmodule Loopctl.Threads.Reviews do
            ),
          {:ok, escalation, escalation_chained} <-
            ceiling_escalation(tenant_id, story.id, review, dispatch) do
-      {:ok, %{entry: verdict, escalation: escalation}, :created, chained ++ escalation_chained}
+      written = %{
+        entry: verdict,
+        escalation: escalation,
+        claim_epoch: story.claim_epoch,
+        superseded: open_reviews_through(tenant_id, story.id, review)
+      }
+
+      {:ok, written, :created, chained ++ escalation_chained}
     end
+  end
+
+  # Every OTHER review of this story placed for this round or an earlier one that has no
+  # verdict: none of them can complete a round any more, so their keys are revoked with this
+  # one's rather than left live until their TTL.
+  defp open_reviews_through(tenant_id, story_id, review) do
+    Repo.all(
+      from r in Review,
+        left_join: v in Entry,
+        on: v.review_id == r.id and v.kind == :verdict,
+        where:
+          r.tenant_id == ^tenant_id and r.story_id == ^story_id and r.id != ^review.id and
+            r.round <= ^review.round and is_nil(v.id),
+        select: r.dispatch_id
+    )
   end
 
   # A review placed for round N completes it only while N - 1 rounds are complete: two reviews
@@ -716,44 +768,46 @@ defmodule Loopctl.Threads.Reviews do
     )
   end
 
-  # After the commit: the review is over, so its dispatch and key are revoked. Left live, the
+  # After the commit: a review that is over has its dispatch and key revoked. Left live, the
   # key would hold its agent's one active agent-role key (`api_keys_one_role_per_agent_idx`)
   # until its TTL, and the next round could not be placed for that agent. A resend of the
-  # verdict after this is refused at authentication; the thread shows the verdict landed.
-  defp close_review_dispatch(tenant_id, dispatch) do
-    case Dispatches.revoke(tenant_id, dispatch.id, actor_lineage: dispatch.lineage_path) do
-      {:ok, _count} ->
-        :ok
+  # verdict after this is refused at authentication (401); the thread shows the verdict landed.
+  defp close_dispatches(tenant_id, dispatch_ids, lineage) do
+    for dispatch_id <- dispatch_ids do
+      case Dispatches.revoke(tenant_id, dispatch_id, actor_lineage: lineage) do
+        {:ok, _count} ->
+          :ok
 
-      error ->
-        Logger.warning(
-          "review verdict recorded but its dispatch was not revoked: #{inspect(error)} " <>
-            "tenant_id=#{tenant_id} dispatch_id=#{dispatch.id}",
-          tenant_id: tenant_id
-        )
-
-        :ok
+        error ->
+          Logger.warning(
+            "review over but its dispatch was not revoked: #{inspect(error)} " <>
+              "tenant_id=#{tenant_id} dispatch_id=#{dispatch_id}",
+            tenant_id: tenant_id
+          )
+      end
     end
+
+    :ok
   end
 
-  # After the commit: move the story's delivery stage to `escalated` when it has one at a
-  # stage a session may escalate from. The entry is the record; this is the stage machine
-  # catching up with it, and a failure is logged rather than raised into the verdict's reply.
-  defp escalate_stage(_tenant_id, _story_id, _lineage, nil), do: :ok
+  # After the commit: move the story's delivery stage to `escalated`, through
+  # `Loopctl.Delivery.Escalations` so the transition, its replay and its `:stale_stage`
+  # recovery have one copy. The entry is the record; this is the stage machine catching up
+  # with it, so a story with no stage row is fine and any other failure is logged rather than
+  # raised into the verdict's reply.
+  defp escalate_stage(_tenant_id, _story_id, _epoch, _lineage, nil), do: :ok
 
-  defp escalate_stage(tenant_id, story_id, lineage, %Entry{body: reason}) do
-    with {:ok, %StoryStage{stage: stage}, epoch} <- stage_and_epoch(tenant_id, story_id),
-         {:ok, transition} <- escalation_edge(stage),
-         {:ok, _row} <-
-           Stages.advance(tenant_id, story_id, transition,
-             claim_epoch: epoch,
-             actor_lineage: lineage,
-             actor_label: @escalation_principal,
-             reason: reason
-           ) do
-      :ok
-    else
-      :no_stage ->
+  defp escalate_stage(tenant_id, story_id, epoch, lineage, %Entry{body: reason}) do
+    case Escalations.escalate_as_control(tenant_id, story_id,
+           claim_epoch: epoch,
+           reason: reason,
+           actor_label: @escalation_principal,
+           actor_lineage: lineage
+         ) do
+      {:ok, _row} ->
+        :ok
+
+      {:error, :unknown_story_stage} ->
         :ok
 
       error ->
@@ -765,33 +819,6 @@ defmodule Loopctl.Threads.Reviews do
         )
 
         :ok
-    end
-  end
-
-  defp escalation_edge(stage) do
-    transition = {stage, :escalated, :session_escalated}
-
-    if transition in StageMachine.transitions(),
-      do: {:ok, transition},
-      else: {:error, {:no_escalation_edge, stage}}
-  end
-
-  defp stage_and_epoch(tenant_id, story_id) do
-    {:ok, found} =
-      Repo.with_tenant(tenant_id, fn ->
-        {Repo.one(
-           from r in StoryStage, where: r.tenant_id == ^tenant_id and r.story_id == ^story_id
-         ),
-         Repo.one(
-           from s in Story,
-             where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-             select: s.claim_epoch
-         )}
-      end)
-
-    case found do
-      {nil, _epoch} -> :no_stage
-      {stage, epoch} -> {:ok, stage, epoch}
     end
   end
 
@@ -955,14 +982,14 @@ defmodule Loopctl.Threads.Reviews do
   defp completed_rounds(tenant_id, story_id),
     do: map_size(completed_reviews(tenant_id, story_id))
 
-  # `%{round => review_id}` for every review with a verdict. The verdict check in
-  # `current_round/3` makes the rounds exactly 1..N.
+  # `%{round => {review_id, verdict_seq}}` for every review with a verdict. The verdict check
+  # in `current_round/3` makes the rounds exactly 1..N.
   defp completed_reviews(tenant_id, story_id) do
     from(e in Entry,
       join: r in Review,
       on: r.id == e.review_id,
       where: e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.kind == :verdict,
-      select: {r.round, r.id}
+      select: {r.round, {r.id, e.seq}}
     )
     |> Repo.all()
     |> Map.new()
@@ -976,11 +1003,17 @@ defmodule Loopctl.Threads.Reviews do
   # names only findings of COMPLETED rounds, and a fix of a round-2 finding must come after
   # the checkpoint that finding was found in. A filter was written and removed when
   # `bin/mutate.sh` showed nothing could reach it.
-  defp third_round_warranted?(tenant_id, story_id, %{2 => round2}) do
+  #
+  # DECIDED ONCE, AT THE ROUND-2 VERDICT: only fixes written before it (by thread `seq`) count.
+  # A fix attached afterwards would otherwise let the implementer unlock a third round after
+  # the fact, for a finding round 2 had already judged.
+  defp third_round_warranted?(tenant_id, story_id, %{2 => {round2, verdict_seq}}) do
     fix_checkpoints =
       Repo.all(
         from e in Entry,
-          where: e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.kind == :fix,
+          where:
+            e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.kind == :fix and
+              e.seq < ^verdict_seq,
           select: e.checkpoint_id
       )
 
@@ -999,8 +1032,9 @@ defmodule Loopctl.Threads.Reviews do
 
   @doc """
   What a review dispatch reads (PRD §6): the story, the checkpoint diff reference, the
-  thread's entries (the latest page), and every fix with the findings it answers. Entry
-  bodies are UNTRUSTED text.
+  thread's entries (the latest page), and the latest #{@max_payload_fixes} fixes with the
+  findings each answers (`fixes_truncated` when there are more). Entry bodies are UNTRUSTED
+  text.
   """
   @spec payload(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, map()} | {:error, :not_found}
@@ -1039,6 +1073,7 @@ defmodule Loopctl.Threads.Reviews do
       )
 
     {page, rest} = Enum.split(latest, max)
+    {fixes, fixes_truncated} = fixes_with_findings(tenant_id, story.id)
 
     %{
       review: %{
@@ -1065,34 +1100,52 @@ defmodule Loopctl.Threads.Reviews do
       },
       entries: Enum.reverse(page),
       entries_truncated: rest != [],
-      fixes: fixes_with_findings(tenant_id, story.id),
+      fixes: fixes,
+      fixes_truncated: fixes_truncated,
       rounds: compute_rounds(tenant_id, story.id)
     }
   end
 
+  # The LATEST page of fixes, oldest first, and the findings they answer. Bounded like the
+  # entries: a thread grows with every round and the payload lands in a reviewer's context.
+  # The findings are read by joining the page's fixes (`= ANY(finding_ids)`), so no id list
+  # travels as a parameter however many a fix names.
   defp fixes_with_findings(tenant_id, story_id) do
-    fixes =
+    latest =
       Repo.all(
         from e in Entry,
           where: e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.kind == :fix,
-          order_by: e.seq
+          order_by: [desc: e.seq],
+          limit: ^(@max_payload_fixes + 1)
       )
 
-    findings =
-      fixes
-      |> Enum.flat_map(& &1.finding_ids)
-      |> Enum.uniq()
-      |> then(fn ids ->
-        Repo.all(from e in Entry, where: e.tenant_id == ^tenant_id and e.id in ^ids)
-      end)
-      |> Map.new(&{&1.id, &1})
+    {page, rest} = Enum.split(latest, @max_payload_fixes)
+    fixes = Enum.reverse(page)
 
-    Enum.map(fixes, fn fix ->
-      %{
-        fix: fix,
-        findings: fix.finding_ids |> Enum.map(&Map.get(findings, &1)) |> Enum.reject(&is_nil/1)
-      }
-    end)
+    findings =
+      case fixes do
+        [] -> %{}
+        [oldest | _] -> answered_findings(tenant_id, story_id, oldest.seq)
+      end
+
+    {Enum.map(fixes, fn fix ->
+       %{fix: fix, findings: fix.finding_ids |> Enum.map(&findings[&1]) |> Enum.reject(&is_nil/1)}
+     end), rest != []}
+  end
+
+  defp answered_findings(tenant_id, story_id, from_seq) do
+    from(f in Entry,
+      join: x in Entry,
+      on: x.tenant_id == f.tenant_id and x.story_id == f.story_id,
+      where:
+        x.tenant_id == ^tenant_id and x.story_id == ^story_id and x.kind == :fix and
+          x.seq >= ^from_seq and f.kind == :finding and
+          fragment("? = ANY(?)", f.id, x.finding_ids),
+      distinct: true,
+      select: f
+    )
+    |> Repo.all()
+    |> Map.new(&{&1.id, &1})
   end
 
   # ---------------------------------------------------------------------------

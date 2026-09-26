@@ -78,6 +78,7 @@ defmodule Loopctl.Threads.Entry do
     |> validate_length(:idempotency_key, min: 1, max: 255)
     |> validate_length(:body, min: 1, max: @max_body_bytes, count: :bytes)
     |> unique_constraint(:idempotency_key, name: :thread_entries_idempotency_uidx)
+    |> unique_constraint(:idempotency_key, name: :thread_entries_review_idempotency_uidx)
   end
 
   @doc "The same validation, for an entry loopctl writes itself (a checkpoint's)."

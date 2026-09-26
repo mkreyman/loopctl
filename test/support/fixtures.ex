@@ -2465,6 +2465,9 @@ defmodule Loopctl.Fixtures do
   # `Loopctl.Delivery.Placement` leaves: an orchestrator ROOT dispatch, and the implementer's
   # session dispatch as its child.
   #
+  # `middle: true` puts an orchestrator dispatch between the root and the implementer, so the
+  # implementer's PARENT is not the root; it is returned as `:middle` with its `:middle_key`.
+  #
   # Returns the story, the orchestrator's `%ApiKey{}` and raw key, the implementer's, and three
   # agents: the implementer, a reviewer and a spare.
   def fixture(:review_story, attrs) do
@@ -2474,8 +2477,8 @@ defmodule Loopctl.Fixtures do
 
     committed =
       Sandbox.unboxed_run(AdminRepo, fn ->
-        [orchestrator, implementer, reviewer, spare] =
-          for type <- [:orchestrator, :implementer, :implementer, :implementer] do
+        [orchestrator, implementer, reviewer, spare, coordinator] =
+          for type <- [:orchestrator, :implementer, :implementer, :implementer, :orchestrator] do
             %Agent{tenant_id: tenant_id}
             |> Agent.register_changeset(build(:agent, %{agent_type: type}))
             |> AdminRepo.insert!()
@@ -2487,9 +2490,21 @@ defmodule Loopctl.Fixtures do
             agent_id: orchestrator.id
           })
 
+        middle =
+          if Map.get(attrs, :middle, false) do
+            {:ok, %{dispatch: middle}} =
+              Loopctl.Dispatches.create_dispatch(tenant_id, %{
+                parent_dispatch_id: root.id,
+                role: :orchestrator,
+                agent_id: coordinator.id
+              })
+
+            middle
+          end
+
         {:ok, %{dispatch: session, raw_key: impl_raw}} =
           Loopctl.Dispatches.create_dispatch(tenant_id, %{
-            parent_dispatch_id: root.id,
+            parent_dispatch_id: (middle || root).id,
             role: :agent,
             agent_id: implementer.id
           })
@@ -2503,7 +2518,9 @@ defmodule Loopctl.Fixtures do
           impl_key: AdminRepo.get!(ApiKey, session.api_key_id),
           implementer: implementer,
           reviewer: reviewer,
-          spare: spare
+          spare: spare,
+          middle: middle,
+          middle_key: middle && AdminRepo.get!(ApiKey, middle.api_key_id)
         }
       end)
 

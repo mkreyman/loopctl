@@ -49,7 +49,7 @@ defmodule LoopctlWeb.DispatchController do
     parent_id = params["parent_dispatch_id"]
 
     # The CALLER's own lineage, resolved SERVER-SIDE from the authenticating key —
-    # never taken from the request body. See lineage_within_caller?/3.
+    # never taken from the request body. See Dispatches.lineage_within_caller?/3.
     caller_lineage = Dispatches.lineage_for_api_key(tenant_id, api_key.id)
 
     # The operator privilege — starting a NEW tree, and parenting anywhere in the
@@ -144,7 +144,7 @@ defmodule LoopctlWeb.DispatchController do
               }
             })
 
-          not lineage_within_caller?(parent.lineage_path, caller_lineage, operator?) ->
+          not Dispatches.lineage_within_caller?(parent.lineage_path, caller_lineage, operator?) ->
             reject_lineage_escape(conn, conn.assigns.current_api_key, caller_lineage, parent_id)
 
           true ->
@@ -157,30 +157,6 @@ defmodule LoopctlWeb.DispatchController do
         |> json(%{error: %{message: "Parent dispatch not found", status: 404}})
     end
   end
-
-  # LINEAGE CEILING (parent half). Rejecting only the parentless case would leave the
-  # same escape open one step further out: any dispatch in the tenant is enumerable
-  # via GET /api/v1/dispatches, so a caller could name a parent under a DIFFERENT root
-  # and mint itself into that unrelated tree. A minted dispatch must therefore descend
-  # from the caller's own dispatch — `parent.lineage_path` must have the caller's
-  # lineage as a prefix.
-  #
-  # The OPERATOR key may parent anywhere in its tenant: it is not inside any tree, so
-  # it cannot escape one. The same reasoning covers a []-lineage NON-operator (a legacy
-  # env-var key): it has no subtree to step outside of, and the ceiling exists to stop a
-  # principal escaping ITS OWN tree. Refusing it here closed the only remaining mint it
-  # had — root minting is already operator-only — leaving a legacy `:orchestrator` key
-  # unable to obtain a lineage by any request at all, against the documented deprecation
-  # window. Naming a parent gives it a lineage, which SUBJECTS it to the custody gates.
-  # A caller that IS inside a tree must stay inside it.
-  defp lineage_within_caller?(_parent_lineage, _caller_lineage, true), do: true
-  defp lineage_within_caller?(_parent_lineage, [], false), do: true
-
-  defp lineage_within_caller?(parent_lineage, [_ | _] = caller_lineage, false)
-       when is_list(parent_lineage),
-       do: List.starts_with?(parent_lineage, caller_lineage)
-
-  defp lineage_within_caller?(_parent_lineage, _caller_lineage, false), do: false
 
   defp reject_root_mint(conn, api_key, caller_lineage) do
     log_ceiling_refusal("root_dispatch_forbidden", api_key, caller_lineage, nil)
@@ -455,7 +431,7 @@ defmodule LoopctlWeb.DispatchController do
   end
 
   # THE CEILING `create` APPLIES, MINUS THE ONE CLAUSE THAT MUST NOT BE INHERITED —
-  # `lineage_within_caller?(_, [], false)`, which admits an unlineaged NON-operator.
+  # `Dispatches.lineage_within_caller?(_, [], false)`, which admits an unlineaged NON-operator.
   #
   # On `create` that clause is paid for: naming a parent GIVES the caller a lineage and
   # therefore SUBJECTS it to every custody gate, and refusing it closed the only mint a legacy

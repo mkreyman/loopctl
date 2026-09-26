@@ -41,11 +41,24 @@ defmodule Loopctl.Threads.ReviewsTest do
     Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Repo, fun) end)
   end
 
-  setup do
+  setup tags do
     tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
     ctx = fixture(:review_story, %{tenant_id: tenant.id, claim_epoch: 2})
     {_raw, operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
-    {:ok, Map.put(ctx, :operator, operator)}
+    ctx = Map.put(ctx, :operator, operator)
+
+    # A second story whose implementer sits under a middle dispatch, made here rather than
+    # inside a test body: its dispatches append to the tenant's chain, and a nested unboxed
+    # run of that waits on the body's own connection.
+    if tags[:middle],
+      do:
+        {:ok,
+         Map.put(
+           ctx,
+           :middle_story,
+           fixture(:review_story, %{tenant_id: tenant.id, middle: true})
+         )},
+      else: {:ok, ctx}
   end
 
   # --- helpers ---------------------------------------------------------------------------
@@ -236,21 +249,55 @@ defmodule Loopctl.Threads.ReviewsTest do
       end)
     end
 
-    test "never by a caller on the implementer's chain, nor outside its parent", ctx do
+    @tag :middle
+    test "the caller must be the implementer's parent or an ancestor of it (the ceiling)", ctx do
       unboxed(fn ->
-        checkpoint(ctx, 1)
+        # root -> middle -> implementer: the review's parent is `middle`.
+        mctx = Map.merge(ctx, ctx.middle_story)
+        checkpoint(mctx, 1)
 
-        below =
+        # A caller BELOW the parent: the parent is its ANCESTOR, outside its subtree. Minting
+        # there would put the review outside the caller's own tree.
+        beside =
           mint!(ctx.tenant_id, %{
-            parent_dispatch_id: ctx.session.id,
+            parent_dispatch_id: mctx.middle.id,
             role: :orchestrator,
             agent_id: ctx.spare.id
           })
 
-        assert "review_placer_on_implementer_chain" == code(place(ctx, caller: below))
+        assert "parent_outside_caller_lineage" == code(place(mctx, caller: beside))
 
-        elsewhere = mint!(ctx.tenant_id, %{role: :orchestrator, agent_id: ctx.reviewer.id})
-        assert "parent_outside_caller_lineage" == code(place(ctx, caller: elsewhere))
+        # The implementer itself, and anything below it, is below the parent too.
+        below =
+          mint!(ctx.tenant_id, %{
+            parent_dispatch_id: mctx.session.id,
+            role: :orchestrator,
+            agent_id: ctx.reviewer.id
+          })
+
+        assert "parent_outside_caller_lineage" == code(place(mctx, caller: below))
+
+        # Another root entirely.
+        elsewhere = mint!(ctx.tenant_id, %{role: :orchestrator, agent_id: ctx.implementer.id})
+        assert "parent_outside_caller_lineage" == code(place(mctx, caller: elsewhere))
+
+        # The parent in the caller's subtree: the parent itself, and its ancestor the root.
+        assert {:ok, %{review: review}} = place(mctx, caller: mctx.middle_key)
+        {:ok, dispatch} = Dispatches.get_dispatch(ctx.tenant_id, review.dispatch_id)
+        assert dispatch.lineage_path == [mctx.root.id, mctx.middle.id, dispatch.id]
+
+        assert {:ok, _} = place(mctx, caller: mctx.orch_key, agent_id: mctx.spare.id)
+      end)
+    end
+
+    test "an implementer dispatch that does not resolve fails closed", ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+        other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+        other_ctx = fixture(:review_story, %{tenant_id: other.id})
+        set_story(ctx, implementer_dispatch_id: other_ctx.session.id)
+
+        assert "unresolvable_dispatch_lineage" == code(place(ctx))
       end)
     end
 
@@ -511,16 +558,66 @@ defmodule Loopctl.Threads.ReviewsTest do
       end)
     end
 
-    test "a verdict key reused by the same agent in a later round is not that round's replay",
-         ctx do
+    test "one agent, two rounds, the same idempotency_key: both verdicts are accepted", ctx do
       unboxed(fn ->
         checkpoint(ctx, 1)
         %{key: r1} = placed!(ctx)
-        verdict!(ctx, r1, "same-key")
+        {:ok, one, :created} = finding(ctx, r1, %{"idempotency_key" => "same-f"})
+        %{entry: v1} = verdict!(ctx, r1, "same-key")
         %{key: r2} = placed!(ctx)
 
-        assert "idempotency_key_reused" == code(verdict(ctx, r2, "same-key"))
-        assert %{completed: 1} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
+        assert {:ok, two, :created} =
+                 finding(ctx, r2, %{"idempotency_key" => "same-f", "introduced_by" => "none"})
+
+        assert two.id != one.id
+        assert {:ok, %{entry: v2}, :created} = verdict(ctx, r2, "same-key")
+        assert v2.id != v1.id
+        assert %{completed: 2} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
+      end)
+    end
+
+    test "completing a round revokes every other open review of it; a superseded one is freed",
+         ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+        %{key: first} = placed!(ctx)
+        %{key: second, review: second_review} = placed!(ctx, agent_id: ctx.spare.id)
+
+        verdict!(ctx, first)
+
+        # The superseded review's key is revoked with the verdict, so its agent can be placed.
+        assert :none == Dispatches.dispatch_for_api_key(ctx.tenant_id, second.id)
+        assert {:ok, %{review: %{round: 2}}} = place(ctx, agent_id: ctx.spare.id)
+
+        # Were that revocation to fail, the superseded verdict's refusal revokes it itself.
+        AdminRepo.update_all(
+          from(d in Loopctl.Dispatches.Dispatch, where: d.id == ^second_review.dispatch_id),
+          set: [revoked_at: nil]
+        )
+
+        assert "review_round_superseded" == code(verdict(ctx, second))
+        assert :none == Dispatches.dispatch_for_api_key(ctx.tenant_id, second.id)
+      end)
+    end
+
+    test "the database refuses a fix that names no findings, NULL included", ctx do
+      unboxed(fn ->
+        cp = checkpoint(ctx, 1)
+
+        fix_row =
+          %{kind: :fix, idempotency_key: "raw-fix", body: "b", checkpoint_id: cp.id}
+          |> Entry.system_changeset()
+          |> Ecto.Changeset.change(
+            tenant_id: ctx.tenant_id,
+            story_id: ctx.story.id,
+            seq: 1_000,
+            author_principal: "agent:#{ctx.implementer.id}",
+            finding_ids: nil
+          )
+
+        assert_raise Ecto.ConstraintError, ~r/thread_entries_judgement_shape/, fn ->
+          Repo.with_tenant(ctx.tenant_id, fn -> Repo.insert(fix_row) end)
+        end
       end)
     end
 
@@ -556,12 +653,19 @@ defmodule Loopctl.Threads.ReviewsTest do
       unboxed(fn ->
         checkpoint(ctx, 1)
         %{key: first} = placed!(ctx)
-        %{key: second} = placed!(ctx, agent_id: ctx.spare.id)
+        %{key: second, review: second_review} = placed!(ctx, agent_id: ctx.spare.id)
         assert "reviewer_agent_busy" == code(place(ctx))
 
         verdict!(ctx, first)
-        assert "review_round_superseded" == code(verdict(ctx, second))
+
+        # The verdict revoked the second review; undo that to reach the round guard itself.
+        AdminRepo.update_all(
+          from(d in Loopctl.Dispatches.Dispatch, where: d.id == ^second_review.dispatch_id),
+          set: [revoked_at: nil]
+        )
+
         assert "review_round_superseded" == code(finding(ctx, second, %{}))
+        assert "review_round_superseded" == code(verdict(ctx, second))
         assert %{completed: 1} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
       end)
     end
@@ -666,6 +770,27 @@ defmodule Loopctl.Threads.ReviewsTest do
   # --- AC-45.3.6 / AC-45.3.7: the ceiling -------------------------------------------------
 
   describe "the round ceiling (TC-45.3.5)" do
+    test "a fix attached AFTER the round-2 verdict does not make round 3 placeable", ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+        %{key: r1} = placed!(ctx)
+        f1 = finding!(ctx, r1, %{"severity" => "low"})
+        verdict!(ctx, r1)
+        cp2 = checkpoint(ctx, 2)
+
+        # Round 2 blames cp2 while no fix is on it yet.
+        %{key: r2} = placed!(ctx, checkpoint_id: cp2.id)
+        finding!(ctx, r2, %{"introduced_by" => cp2.id, "severity" => "low"})
+        verdict!(ctx, r2)
+        assert %{next_round: nil} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
+
+        # The implementer now hangs a round-1 fix on cp2: round 3 stays closed.
+        assert {:ok, _fix, :created} = fix(ctx, cp2, [f1.id])
+        assert %{next_round: nil} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
+        assert "review_ceiling_reached" == code(place(ctx))
+      end)
+    end
+
     test "a round-2 finding introduced by a round-1 fix checkpoint opens round 3, never 4",
          ctx do
       unboxed(fn ->
@@ -785,6 +910,24 @@ defmodule Loopctl.Threads.ReviewsTest do
         assert finding_id == f1.id
 
         assert %{completed: 1, next_round: 2} = payload.rounds
+      end)
+    end
+
+    test "the payload carries the latest fixes only, and says when it cut older ones", ctx do
+      unboxed(fn ->
+        %{cp2: cp2, f1: f1} = round_one_fixed(ctx)
+        %{review: review} = placed!(ctx, checkpoint_id: cp2.id)
+
+        {:ok, first} = Reviews.payload(ctx.tenant_id, ctx.story.id, review.id)
+        refute first.fixes_truncated
+
+        for _ <- 1..Reviews.max_payload_fixes(), do: {:ok, _, :created} = fix(ctx, cp2, [f1.id])
+
+        {:ok, payload} = Reviews.payload(ctx.tenant_id, ctx.story.id, review.id)
+        assert payload.fixes_truncated
+        assert length(payload.fixes) == Reviews.max_payload_fixes()
+        assert Enum.all?(payload.fixes, &(hd(&1.findings).id == f1.id))
+        refute Enum.any?(payload.fixes, &(&1.fix.seq < hd(payload.fixes).fix.seq))
       end)
     end
 

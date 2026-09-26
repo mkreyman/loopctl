@@ -153,6 +153,13 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
     assert entry["body_untrusted"] == true
     assert entry["location_untrusted"] == true
 
+    # The thread read renders it through the same function: the location is untrusted there too.
+    %{"entries" => entries} =
+      ctx.orch_raw |> get_as("/api/v1/stories/#{ctx.story.id}/thread") |> json_response(200)
+
+    assert %{"location" => "a.ex:1", "location_untrusted" => true} =
+             Enum.find(entries, &(&1["kind"] == "finding"))
+
     assert %{"entry" => %{"id" => same}} =
              ctx |> finding(raw, %{"location" => "a.ex:1"}) |> json_response(200)
 

@@ -21,6 +21,7 @@ defmodule LoopctlWeb.ThreadReviewController do
   alias Loopctl.Threads.Entry
   alias Loopctl.Threads.Reviews
   alias LoopctlWeb.ClaimEpochParam
+  alias LoopctlWeb.ThreadHTTP
   alias OpenApiSpex.Schema
   alias Plug.Conn.Status
 
@@ -112,15 +113,17 @@ defmodule LoopctlWeb.ThreadReviewController do
       201 => {"Placed. `raw_key` is shown once", "application/json", %Schema{type: :object}},
       403 =>
         {"Not an orchestrator key, the tenant is not human-anchored, " <>
-           "`review_placer_on_implementer_chain` (the caller is the implementer or its " <>
-           "descendant), `parent_outside_caller_lineage`, or `root_dispatch_forbidden`",
-         "application/json", Schemas.ErrorResponse},
+           "`parent_outside_caller_lineage` (the caller is not the implementer's parent " <>
+           "dispatch or an ancestor of it), or `root_dispatch_forbidden`", "application/json",
+         Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"`implementer_dispatch_required` (no dispatch made the claim), `reviewer_not_separate` " <>
            "(the agent is the claimant or recorded a checkpoint), `no_checkpoint`, " <>
-           "`review_ceiling_reached`, or `review_parent_inactive` (the implementer's parent " <>
-           "dispatch is revoked or expired)", "application/json", Schemas.ErrorResponse},
+           "`review_ceiling_reached`, `review_parent_inactive` (the implementer's parent " <>
+           "dispatch is revoked or expired), `reviewer_agent_busy` (the agent holds a live " <>
+           "agent-role key), or `unresolvable_dispatch_lineage` (the story's implementer " <>
+           "dispatch does not resolve)", "application/json", Schemas.ErrorResponse},
       422 =>
         {"`invalid_agent_id`, `invalid_checkpoint_id`, `invalid_expires_in_seconds`, " <>
            "`unknown_agent` or `unknown_checkpoint`", "application/json", Schemas.ErrorResponse},
@@ -135,8 +138,9 @@ defmodule LoopctlWeb.ThreadReviewController do
     description:
       "What the review dispatch reads: the story, the checkpoint diff reference (the " <>
         "thread branch, the checkpoint's commit and its parent checkpoint's commit), the " <>
-        "thread's latest page of entries, every fix with the findings it answers, and the " <>
-        "rounds. Every entry `body` is UNTRUSTED.",
+        "thread's latest page of entries, the latest #{Reviews.max_payload_fixes()} fixes " <>
+        "with the findings each answers (`fixes_truncated` is true when older ones exist), " <>
+        "and the rounds. Every entry `body` and `location` is UNTRUSTED.",
     parameters: [
       id: [in: :path, type: :string, description: "Story UUID"],
       review_id: [in: :path, type: :string, description: "Review UUID"]
@@ -242,7 +246,7 @@ defmodule LoopctlWeb.ThreadReviewController do
   def place(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
 
-    with {:ok, story_id} <- story_uuid(story_id),
+    with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
          {:ok, %{review: review, raw_key: raw_key}} <-
            Reviews.place(api_key.tenant_id, story_id, api_key,
              agent_id: params["agent_id"],
@@ -261,8 +265,8 @@ defmodule LoopctlWeb.ThreadReviewController do
   def show(conn, %{"id" => story_id, "review_id" => review_id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with {:ok, story_id} <- story_uuid(story_id),
-         {:ok, review_id} <- story_uuid(review_id),
+    with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
+         {:ok, review_id} <- ThreadHTTP.uuid(review_id),
          {:ok, payload} <- Reviews.payload(tenant_id, story_id, review_id) do
       json(conn, render_payload(payload))
     end
@@ -273,10 +277,10 @@ defmodule LoopctlWeb.ThreadReviewController do
     api_key = conn.assigns.current_api_key
     attrs = Map.take(params, ~w(idempotency_key body severity location introduced_by))
 
-    with {:ok, story_id} <- story_uuid(story_id),
+    with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
          {:ok, entry, status} <-
            Reviews.record_finding(api_key.tenant_id, story_id, api_key, attrs) do
-      conn |> put_status(created_or_ok(status)) |> json(%{entry: render_entry(entry)})
+      conn |> put_status(ThreadHTTP.status(status)) |> json(%{entry: ThreadHTTP.entry(entry)})
     else
       other -> refusal(conn, other)
     end
@@ -287,12 +291,15 @@ defmodule LoopctlWeb.ThreadReviewController do
     api_key = conn.assigns.current_api_key
     attrs = Map.take(params, ~w(idempotency_key body))
 
-    with {:ok, story_id} <- story_uuid(story_id),
+    with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
          {:ok, %{entry: entry, escalation: escalation}, status} <-
            Reviews.record_verdict(api_key.tenant_id, story_id, api_key, attrs) do
       conn
-      |> put_status(created_or_ok(status))
-      |> json(%{entry: render_entry(entry), escalation: escalation && render_entry(escalation)})
+      |> put_status(ThreadHTTP.status(status))
+      |> json(%{
+        entry: ThreadHTTP.entry(entry),
+        escalation: escalation && ThreadHTTP.entry(escalation)
+      })
     else
       other -> refusal(conn, other)
     end
@@ -302,14 +309,14 @@ defmodule LoopctlWeb.ThreadReviewController do
   def fix(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
 
-    with {:ok, story_id} <- story_uuid(story_id),
-         {:ok, epoch} <- claim_epoch(params),
+    with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
+         {:ok, epoch} <- ThreadHTTP.claim_epoch(params),
          attrs =
            params
            |> Map.take(~w(checkpoint_id finding_ids idempotency_key body))
            |> Map.put("claim_epoch", epoch),
          {:ok, entry, status} <- Reviews.record_fix(api_key.tenant_id, story_id, api_key, attrs) do
-      conn |> put_status(created_or_ok(status)) |> json(%{entry: render_entry(entry)})
+      conn |> put_status(ThreadHTTP.status(status)) |> json(%{entry: ThreadHTTP.entry(entry)})
     else
       other -> refusal(conn, other)
     end
@@ -338,23 +345,6 @@ defmodule LoopctlWeb.ThreadReviewController do
 
   defp refusal(_conn, other), do: other
 
-  defp story_uuid(id) do
-    case Ecto.UUID.cast(id) do
-      {:ok, uuid} -> {:ok, uuid}
-      :error -> {:error, :not_found}
-    end
-  end
-
-  defp claim_epoch(params) do
-    case ClaimEpochParam.fetch(params) do
-      {:ok, epoch} -> {:ok, epoch}
-      _ -> {:error, :bad_request, "claim_epoch must be a non-negative integer"}
-    end
-  end
-
-  defp created_or_ok(:created), do: :created
-  defp created_or_ok(:existing), do: :ok
-
   defp render_review(review) do
     %{
       id: review.id,
@@ -373,34 +363,14 @@ defmodule LoopctlWeb.ThreadReviewController do
       review: payload.review,
       story: payload.story,
       checkpoint: payload.checkpoint,
-      entries: Enum.map(payload.entries, &render_entry/1),
+      entries: Enum.map(payload.entries, &ThreadHTTP.entry/1),
       entries_truncated: payload.entries_truncated,
       fixes:
         Enum.map(payload.fixes, fn %{fix: fix, findings: findings} ->
-          %{fix: render_entry(fix), findings: Enum.map(findings, &render_entry/1)}
+          %{fix: ThreadHTTP.entry(fix), findings: Enum.map(findings, &ThreadHTTP.entry/1)}
         end),
+      fixes_truncated: payload.fixes_truncated,
       rounds: payload.rounds
-    }
-  end
-
-  defp render_entry(entry) do
-    %{
-      id: entry.id,
-      seq: entry.seq,
-      kind: entry.kind,
-      author_principal: entry.author_principal,
-      dispatch_id: entry.dispatch_id,
-      idempotency_key: entry.idempotency_key,
-      body: entry.body,
-      body_untrusted: true,
-      checkpoint_id: entry.checkpoint_id,
-      review_id: entry.review_id,
-      severity: entry.severity,
-      location: entry.location,
-      location_untrusted: true,
-      introduced_by: entry.introduced_by,
-      finding_ids: entry.finding_ids,
-      inserted_at: entry.inserted_at
     }
   end
 end

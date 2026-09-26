@@ -21,7 +21,7 @@ All notable changes to loopctl are documented here.
   `introduced_by` and `finding_ids` columns on `thread_entries`. New refusal codes, none of
   them `self_review_blocked`: `review_dispatch_required`, `review_closed`,
   `review_round_superseded`, `review_ceiling_reached`, `reviewer_not_separate`,
-  `reviewer_agent_busy`, `review_placer_on_implementer_chain`, `review_parent_inactive`,
+  `reviewer_agent_busy`, `review_parent_inactive`, `unresolvable_dispatch_lineage`,
   `implementer_dispatch_required`, `no_checkpoint`, and the `introduced_by_*`, `fix_*` and
   `invalid_*` validation codes. MCP 2.106.0 ships the matching tools. The runner contract is
   not bumped yet: `review` is not a dispatchable kind (AC-45.3.8 remains).
