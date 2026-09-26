@@ -2,7 +2,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
-  import ExUnit.CaptureLog
+  import Loopctl.OwnLog, only: [capture_own_log: 1]
 
   setup :verify_on_exit!
 
@@ -782,7 +782,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       end)
 
       log =
-        capture_log(fn ->
+        capture_own_log(fn ->
           assert :ok =
                    ArticleLinkingWorker.perform(%Oban.Job{
                      args: %{"article_id" => source.id, "tenant_id" => tenant.id}
@@ -791,11 +791,13 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
 
       # The observational signal is the ONLY casualty...
       refute_received {^ref, :corpus_size, _measurements, _metadata}
-      assert log =~ "corpus-size count exited"
 
       # ...tagged, not swallowed anonymously: a bounded class, never the raw exit reason
       # (which carries the whole DBConnection call tuple).
-      assert log =~ "(noproc)"
+      #
+      # capture_own_log keeps only what THIS process logged: a concurrent async test's own
+      # DBConnection lines would otherwise land in the capture and fail the refute.
+      assert log =~ "corpus-size count exited (noproc)"
       refute log =~ "DBConnection"
 
       # ...and the linking it merely observes still happened. That is the whole point.
@@ -819,7 +821,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       end)
 
       log =
-        capture_log(fn ->
+        capture_own_log(fn ->
           assert :ok =
                    ArticleLinkingWorker.perform(%Oban.Job{
                      args: %{"article_id" => source.id, "tenant_id" => tenant.id}
@@ -845,7 +847,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       end)
 
       log =
-        capture_log(fn ->
+        capture_own_log(fn ->
           assert :ok =
                    ArticleLinkingWorker.perform(%Oban.Job{
                      args: %{"article_id" => source.id, "tenant_id" => tenant.id}
