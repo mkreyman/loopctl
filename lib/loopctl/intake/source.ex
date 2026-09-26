@@ -41,6 +41,7 @@ defmodule Loopctl.Intake.Source do
              :project_id,
              :repo_full_name,
              :base_branch,
+             :mode,
              :target_epic_id,
              :revoked_at,
              :inserted_at,
@@ -65,6 +66,12 @@ defmodule Loopctl.Intake.Source do
     # existed; a repository whose default branch is `main` — GitHub's default since 2020 —
     # is repointed through `PATCH /api/v1/intake/sources/:id` rather than by guessing.
     field :base_branch, :string, default: "master"
+
+    # HOW THIS REPOSITORY'S CHANGES REACH ITS BASE (US-45.4). `:pr` is the route every source
+    # took before the column existed: the merge gate reads a pull request by number. `:thread`
+    # is the change-thread route, where the gate reads the story's latest RECORDED checkpoint
+    # and no pull request exists. NOT NULL, default `:pr`, so an existing source is unchanged.
+    field :mode, Ecto.Enum, values: [:pr, :thread], default: :pr
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
     field :revoked_at, :utc_datetime_usec
 
@@ -94,7 +101,11 @@ defmodule Loopctl.Intake.Source do
     # stands and `validate_required/2` below is satisfied by it. That is what keeps an
     # enrolment that names no branch working exactly as it did before the field was offered.
     |> cast(attrs, [:base_branch], empty_values: [])
+    # By PRESENCE, as the branch is: absent keeps the `:pr` default, and a caller that names
+    # the field gets its value validated rather than a silent substitution.
+    |> cast(attrs, [:mode], empty_values: [])
     |> validate_required([:repo_full_name])
+    |> validate_mode()
     |> validate_base_branch()
     |> validate_format(:repo_full_name, @repo_format, message: "must be owner/name")
     |> check_constraint(:repo_full_name, name: :intake_sources_repo_shape)
@@ -135,6 +146,22 @@ defmodule Loopctl.Intake.Source do
         else: [base_branch: {GitRef.refusal_message(), [validation: :git_ref_name]}]
     end)
   end
+
+  @doc """
+  Everything `mode` must satisfy, for every path that writes it: present (the column is NOT
+  NULL, so there is no cleared state) and one of `pr` or `thread`, which the `Ecto.Enum` cast
+  already refuses otherwise. `intake_sources_mode` is the database's copy of the same rule.
+  """
+  @spec validate_mode(Ecto.Changeset.t()) :: Ecto.Changeset.t()
+  def validate_mode(%Ecto.Changeset{} = changeset) do
+    changeset
+    |> validate_required([:mode])
+    |> check_constraint(:mode, name: :intake_sources_mode)
+  end
+
+  @doc "The modes a source may take."
+  @spec modes() :: [atom()]
+  def modes, do: Ecto.Enum.values(__MODULE__, :mode)
 
   @doc "Changeset that revokes a source."
   @spec revoke_changeset(t(), DateTime.t()) :: Ecto.Changeset.t()

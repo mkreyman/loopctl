@@ -11,6 +11,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   and one `GET /repos/:repo/git/trees/:ref?recursive=1` per `repo_files/2` call.
 
+  A THREAD-mode story (US-45.4) has no pull request, and its three reads replace the three
+  above:
+
+  - `GET /repos/:repo/git/ref/heads/:branch` — the thread branch head. `ref`, singular: the
+    plural endpoint matches by PREFIX, so `loop/1` would answer with `loop/10` too
+  - `GET /repos/:repo/git/commits/:sha` — a checkpoint's tree and its parents, in order
+  - `GET /repos/:repo/compare/:base...:head` — the merge base, the base's CURRENT tree, and
+    the changed files. The comparison lists at most `@compare_file_cap` files and carries no
+    total of its own, so a list that reaches the cap is refused as truncated rather than
+    presented as the whole diff
+
   Post-deploy verification (#803 §9) adds three more, each bounded the same way:
 
   4. `GET /repos/:repo/deployments?environment=:env&per_page=…` — a small page
@@ -145,6 +156,92 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   def pull_request(_repo, number), do: {:error, {:invalid_pr_number, number}}
+
+  # GitHub's compare endpoint lists at most this many files and says nothing about the rest.
+  @compare_file_cap 300
+
+  @impl true
+  def branch_head(repo, branch) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, branch} <- ref(branch),
+         {:ok, body} <- get(repo, "/git/ref/heads/#{branch}") do
+      case body do
+        %{"object" => %{"sha" => sha, "type" => "commit"}} when is_binary(sha) -> {:ok, sha}
+        _other -> {:error, {:unreadable_ref, shape(body)}}
+      end
+    end
+  end
+
+  @impl true
+  def commit(repo, sha) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, sha} <- ref(sha),
+         {:ok, body} <- get(repo, "/git/commits/#{sha}") do
+      commit_facts(body)
+    end
+  end
+
+  @impl true
+  def compare(repo, base, head) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, base} <- ref(base),
+         {:ok, head} <- ref(head),
+         {:ok, body} <- get(repo, "/compare/#{base}...#{head}") do
+      comparison(body)
+    end
+  end
+
+  defp commit_facts(%{"tree" => %{"sha" => tree}, "parents" => parents})
+       when is_binary(tree) and is_list(parents) do
+    shas = for %{"sha" => sha} <- parents, is_binary(sha), do: sha
+
+    if length(shas) == length(parents),
+      do: {:ok, %{tree_sha: tree, parent_shas: shas}},
+      else: {:error, {:unreadable_commit, :invalid_parents}}
+  end
+
+  defp commit_facts(body), do: {:error, {:unreadable_commit, shape(body)}}
+
+  defp comparison(%{
+         "merge_base_commit" => %{"sha" => merge_base},
+         "base_commit" => %{"sha" => base_head, "commit" => %{"tree" => %{"sha" => base_tree}}},
+         "files" => files
+       })
+       when is_binary(merge_base) and is_binary(base_head) and is_binary(base_tree) and
+              is_list(files) do
+    with {:ok, lines} <- changed_lines(files) do
+      {:ok,
+       %{
+         merge_base_sha: merge_base,
+         base_head_sha: base_head,
+         base_tree_sha: base_tree,
+         diffstat: %{files: length(files), changed_lines: lines},
+         diff: compare_diff(files)
+       }}
+    end
+  end
+
+  defp comparison(body), do: {:error, {:unreadable_compare, shape(body)}}
+
+  # At the cap the list may be hiding files, and there is no total to tell. Refused as the
+  # pull-request path refuses a truncated list: a short list is never presented as the diff.
+  defp compare_diff(files) when length(files) >= @compare_file_cap,
+    do: {:error, {:file_list_truncated, length(files)}}
+
+  defp compare_diff(files), do: collect(files, length(files))
+
+  # EVERY file must carry its counts. Skipping one that does not would shrink the diffstat the
+  # hard bound judges, which is the one number that must never come out smaller than the diff.
+  defp changed_lines(files) do
+    Enum.reduce_while(files, {:ok, 0}, fn
+      %{"additions" => a, "deletions" => d}, {:ok, acc}
+      when is_integer(a) and is_integer(d) and a >= 0 and d >= 0 ->
+        {:cont, {:ok, acc + a + d}}
+
+      file, _acc ->
+        {:halt, {:error, {:unreadable_file_entry, shape(file)}}}
+    end)
+  end
 
   @impl true
   def repo_files(repo, ref) do

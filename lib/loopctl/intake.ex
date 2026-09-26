@@ -89,6 +89,8 @@ defmodule Loopctl.Intake do
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.InjectionDetector
+  alias Loopctl.Delivery.StageMachine
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Delivery
   alias Loopctl.Intake.GithubPayload
   alias Loopctl.Intake.Record
@@ -99,6 +101,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.Story
 
   # The largest webhook body the intake route reads. An `issues` payload with a maximal
   # 65,536-character body, escaped, plus its repository and user objects, stays well under
@@ -155,7 +158,8 @@ defmodule Loopctl.Intake do
 
   Returns `{:ok, %{source: source, webhook_secret: secret}}`. The secret is returned once.
 
-  `attrs` may also carry `:target_epic_id` (optional, and `nil` means "not answered") and
+  `attrs` may also carry `:mode` (`"pr"` or `"thread"`, read by PRESENCE and defaulting to
+  `pr`, US-45.4), `:target_epic_id` (optional, and `nil` means "not answered") and
   `:base_branch` (optional, and read by PRESENCE: omit it for the `master` default, or name
   the branch this repository's dispatches are cut from — `main` for a repository created on
   GitHub since 2020. It is NOT nullable, so an explicit `nil` or `""` is a validation error
@@ -200,10 +204,12 @@ defmodule Loopctl.Intake do
   defp create_attrs(repo, attrs) do
     base = %{repo_full_name: repo}
 
-    case fetch_either(attrs, :base_branch, "base_branch") do
-      {:ok, branch} -> Map.put(base, :base_branch, branch)
-      :error -> base
-    end
+    Enum.reduce([base_branch: "base_branch", mode: "mode"], base, fn {key, string_key}, acc ->
+      case fetch_either(attrs, key, string_key) do
+        {:ok, value} -> Map.put(acc, key, value)
+        :error -> acc
+      end
+    end)
   end
 
   defp fetch_either(attrs, atom_key, string_key) do
@@ -310,7 +316,10 @@ defmodule Loopctl.Intake do
                  # appends `intake_source_base_branch_set` carrying the new value, so without
                  # this the chain could say what a branch was changed TO and never what it
                  # started as.
-                 "base_branch" => source.base_branch
+                 "base_branch" => source.base_branch,
+                 # US-45.4: which route the merge gate reads, recorded for the same reason
+                 # as the branch — a later `intake_source_mode_set` says what it changed TO.
+                 "mode" => Atom.to_string(source.mode)
                }
              }) do
         source
@@ -359,8 +368,10 @@ defmodule Loopctl.Intake do
   @doc """
   Updates an ACTIVE source's mutable fields in ONE transaction (#803 round 2).
 
-  `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it)
-  and `:base_branch` (NOT nullable). A key that is ABSENT is left alone, which is why this
+  `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it),
+  `:base_branch` (NOT nullable) and `:mode` (`"pr"` or `"thread"`, NOT nullable; US-45.4). A
+  mode CHANGE is `{:error, :stories_in_flight}` while any story of the source's project is
+  past intake and not terminal. A key that is ABSENT is left alone, which is why this
   takes a map rather than two positional arguments: "absent" and "explicitly null" are
   different requests for the epic, and only the map can carry that difference.
 
@@ -373,23 +384,26 @@ defmodule Loopctl.Intake do
   operator reading the chain still sees a repoint as a repoint and a rebase as a rebase.
   """
   @spec update_source(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Source.t()} | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update}
+          {:ok, Source.t()}
+          | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update | :stories_in_flight}
   def update_source(tenant_id, source_id, attrs, opts \\ [])
       when is_binary(tenant_id) and is_binary(source_id) and is_map(attrs) do
-    epic? = Map.has_key?(attrs, :target_epic_id)
-    branch? = Map.has_key?(attrs, :base_branch)
+    fields = for key <- [:target_epic_id, :base_branch, :mode], Map.has_key?(attrs, key), do: key
 
-    if epic? or branch? do
+    if fields == [] do
+      {:error, :nothing_to_update}
+    else
       case active_source_of(tenant_id, source_id) do
         nil -> {:error, :not_found}
-        %Source{} = source -> apply_update(tenant_id, source, attrs, epic?, branch?, opts)
+        %Source{} = source -> apply_update(tenant_id, source, attrs, fields, opts)
       end
-    else
-      {:error, :nothing_to_update}
     end
   end
 
-  defp apply_update(tenant_id, source, attrs, epic?, branch?, opts) do
+  defp apply_update(tenant_id, source, attrs, fields, opts) do
+    epic? = :target_epic_id in fields
+    branch? = :base_branch in fields
+    mode? = :mode in fields
     changeset = Ecto.Changeset.change(source)
 
     changeset =
@@ -400,9 +414,50 @@ defmodule Loopctl.Intake do
     changeset =
       if branch?, do: cast_base_branch(changeset, Map.get(attrs, :base_branch)), else: changeset
 
-    with {:ok, changeset} <- valid(changeset) do
-      write_update(tenant_id, changeset, epic?, branch?, opts)
+    changeset = if mode?, do: cast_mode(changeset, Map.get(attrs, :mode)), else: changeset
+
+    with {:ok, changeset} <- valid(changeset),
+         :ok <- mode_change_allowed(tenant_id, source, changeset) do
+      write_update(tenant_id, changeset, fields, opts)
     end
+  end
+
+  # A MODE CHANGE UNDER A STORY IN FLIGHT IS REFUSED (US-45.4). The mode decides what the merge
+  # gate reads — a pull request or a recorded checkpoint — so flipping it mid-delivery would
+  # judge a story on a route it was never built for: a pr-mode story has no checkpoints, and a
+  # thread-mode story has no pull request. In flight is every stage past intake (`detected`)
+  # that is not terminal (`StageMachine.terminal_stages/0`). Naming the mode it already has is
+  # not a change and is never refused.
+  #
+  # Read, not locked: a story entering the loop between this read and the commit is judged
+  # under the new mode. Closing that would need a lock every placement takes, for an operator
+  # act that happens once per repository.
+  defp mode_change_allowed(tenant_id, source, changeset) do
+    cond do
+      is_nil(Ecto.Changeset.get_change(changeset, :mode)) -> :ok
+      stories_in_flight?(tenant_id, source.project_id) -> {:error, :stories_in_flight}
+      true -> :ok
+    end
+  end
+
+  defp stories_in_flight?(tenant_id, project_id) do
+    settled = [:detected | StageMachine.terminal_stages()]
+
+    AdminRepo.exists?(
+      from st in StoryStage,
+        join: s in Story,
+        on: s.id == st.story_id and s.tenant_id == st.tenant_id,
+        where: st.tenant_id == ^tenant_id and s.project_id == ^project_id,
+        where: st.stage not in ^settled
+    )
+  end
+
+  # `empty_values: []` for the reason `cast_base_branch/2` gives: a caller that SENT a value
+  # gets an answer about it, so an explicit null or `""` is a 422, never a kept old value.
+  defp cast_mode(changeset, value) do
+    changeset
+    |> Ecto.Changeset.cast(%{mode: value}, [:mode], empty_values: [])
+    |> Source.validate_mode()
   end
 
   # `empty_values: []`, which is NOT the default and matters here: Ecto's default treats `""`
@@ -423,11 +478,12 @@ defmodule Loopctl.Intake do
   # ONE transaction for the row and BOTH chain entries: a rebase recorded without its repoint,
   # or either recorded against an update that did not commit, is a chain that disagrees with
   # the table it describes.
-  defp write_update(tenant_id, changeset, epic?, branch?, opts) do
+  defp write_update(tenant_id, changeset, fields, opts) do
     AdminRepo.transaction(fn ->
       with {:ok, source} <- AdminRepo.update(changeset),
-           :ok <- append_if(epic?, tenant_id, source, "intake_source_repointed", opts),
-           :ok <- append_if(branch?, tenant_id, source, "intake_source_base_branch_set", opts) do
+           :ok <- append_if(fields, :target_epic_id, tenant_id, source, opts),
+           :ok <- append_if(fields, :base_branch, tenant_id, source, opts),
+           :ok <- append_if(fields, :mode, tenant_id, source, opts) do
         source
       else
         {:error, reason} -> AdminRepo.rollback(reason)
@@ -435,13 +491,22 @@ defmodule Loopctl.Intake do
     end)
   end
 
-  defp append_if(false, _tenant_id, _source, _action, _opts), do: :ok
+  # One chain entry per field the update NAMED, under the action that names that field.
+  defp append_if(fields, field, tenant_id, source, opts) do
+    if field in fields, do: append_update(field, tenant_id, source, opts), else: :ok
+  end
 
-  defp append_if(true, tenant_id, source, action, opts) do
-    payload =
-      case action do
-        "intake_source_repointed" -> %{"target_epic_id" => source.target_epic_id}
-        "intake_source_base_branch_set" -> %{"base_branch" => source.base_branch}
+  defp append_update(field, tenant_id, source, opts) do
+    {action, payload} =
+      case field do
+        :target_epic_id ->
+          {"intake_source_repointed", %{"target_epic_id" => source.target_epic_id}}
+
+        :base_branch ->
+          {"intake_source_base_branch_set", %{"base_branch" => source.base_branch}}
+
+        :mode ->
+          {"intake_source_mode_set", %{"mode" => Atom.to_string(source.mode)}}
       end
 
     case AuditChain.append(tenant_id, %{

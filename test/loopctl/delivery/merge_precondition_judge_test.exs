@@ -986,6 +986,165 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
+  describe "thread mode (US-45.4)" do
+    @tree String.duplicate("e", 40)
+    @base_tree String.duplicate("f", 40)
+    @allowed String.duplicate("c", 40)
+    @checkpoint_id "00000000-0000-4000-8000-000000000045"
+    @base_head String.duplicate("8", 40)
+
+    test "allows the recorded checkpoint with no pull request number, naming it" do
+      verdict = judge_thread([])
+
+      assert %Verdict{decision: :allow, reasons: []} = verdict
+      assert verdict.mode == :thread
+      assert verdict.pr_number == nil
+      assert verdict.checkpoint_id == @checkpoint_id
+      assert verdict.checkpoint_sha == @head
+      assert verdict.head_sha == @head
+    end
+
+    test "a branch naming a commit nobody recorded goes back to implementing, not to a human" do
+      other = String.duplicate("9", 40)
+      verdict = judge_thread(branch_head_sha: other)
+
+      assert verdict.decision == :head_moved
+      assert {:branch_head_unrecorded, other, @head} in verdict.reasons
+    end
+
+    test "refuses empty_change when the checkpoint's tree is the base's" do
+      verdict = judge_thread(base_tree_sha: @tree)
+
+      assert verdict.decision == :refuse
+      assert {:empty_change, @tree} in verdict.reasons
+    end
+
+    test "refuses empty_change when the comparison lists no changed file" do
+      verdict = judge_thread(diffstat: %{files: 0, changed_lines: 0})
+
+      assert verdict.decision == :refuse
+      assert {:empty_change, :no_changed_files} in verdict.reasons
+    end
+
+    test "refuses a checkpoint whose forge tree is not the tree recorded" do
+      forge = String.duplicate("7", 40)
+      verdict = judge_thread(head_tree_sha: forge)
+
+      assert verdict.decision == :refuse
+      assert {:checkpoint_tree_mismatch, forge, @tree} in verdict.reasons
+    end
+
+    test "a thread with no recorded checkpoint is refused, never judged from the branch" do
+      verdict =
+        judge_thread([],
+          checkpoint: {:error, :none},
+          pull_request: {:error, :not_attempted}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:no_checkpoint_recorded, :none} in verdict.reasons
+      refute Enum.any?(verdict.reasons, &match?({:no_pull_request_recorded, _}, &1))
+    end
+
+    test "a pr-mode story still needs its pull request number" do
+      verdict =
+        judge(pr_number: {:error, {:not_recorded, nil}}, pull_request: {:error, :not_attempted})
+
+      assert {:no_pull_request_recorded, {:not_recorded, nil}} in verdict.reasons
+    end
+
+    test "a control-recorded base update of the ALLOWED checkpoint is base_updated" do
+      verdict = judge_thread(base_update_facts())
+
+      assert verdict.decision == :base_updated
+      assert verdict.reasons == []
+      assert verdict.checkpoint_id == @checkpoint_id
+    end
+
+    test "every LEDGER premise of the base_updated edge is required; otherwise head_moved" do
+      for {label, overrides} <- [
+            not_a_base_update: [kind: :checkpoint],
+            parent_not_allowed: [parent_sha: String.duplicate("9", 40)],
+            no_recorded_allow: [recorded_allow_sha: nil],
+            head_not_allowed: [recorded_head_sha: String.duplicate("9", 40)]
+          ] do
+        verdict = judge_thread(Keyword.merge(base_update_facts(), overrides))
+        assert verdict.decision == :head_moved, inspect(label)
+      end
+    end
+
+    test "a base update whose forge parents are not exactly [allowed, base head] is refused" do
+      other = String.duplicate("9", 40)
+
+      for parents <- [
+            [@allowed],
+            [@allowed, other],
+            [other, @base_head],
+            [@allowed, @base_head, other]
+          ] do
+        verdict = judge_thread(Keyword.put(base_update_facts(), :parent_shas, parents))
+
+        assert verdict.decision == :refuse, inspect(parents)
+
+        assert {:base_update_parents_mismatch, parents, [@allowed, @base_head]} in verdict.reasons
+      end
+    end
+
+    test "pr mode never takes the base_updated edge" do
+      verdict = judge_thread(Keyword.put(base_update_facts(), :mode, :pr))
+
+      assert verdict.decision == :head_moved
+    end
+  end
+
+  # The facts of a thread story at its latest recorded checkpoint, as `gather/3` resolves them
+  # through `Loopctl.Delivery.CheckpointSource`.
+  defp judge_thread(overrides, fact_overrides \\ []) do
+    checkpoint = %{
+      id: @checkpoint_id,
+      kind: Keyword.get(overrides, :kind, :checkpoint),
+      commit_sha: @head,
+      tree_sha: @tree,
+      parent_sha: Keyword.get(overrides, :parent_sha)
+    }
+
+    pr =
+      [
+        files: ["lib/widgets/thing.ex"],
+        diffstat: Keyword.get(overrides, :diffstat, %{files: 1, changed_lines: 10})
+      ]
+      |> pull_request()
+      |> Map.merge(%{
+        branch_head_sha: Keyword.get(overrides, :branch_head_sha, @head),
+        head_tree_sha: Keyword.get(overrides, :head_tree_sha, @tree),
+        base_head_sha: @base_head,
+        base_tree_sha: Keyword.get(overrides, :base_tree_sha, @base_tree),
+        parent_shas: Keyword.get(overrides, :parent_shas, [@allowed, @base_head])
+      })
+
+    [
+      pr_number: {:ok, nil},
+      pull_request: {:ok, pr},
+      recorded_head_sha: Keyword.get(overrides, :recorded_head_sha, @head),
+      recorded_allow_sha: Keyword.get(overrides, :recorded_allow_sha)
+    ]
+    |> facts()
+    |> Map.merge(%{mode: Keyword.get(overrides, :mode, :thread), checkpoint: {:ok, checkpoint}})
+    |> Map.merge(Map.new(fact_overrides))
+    |> MergePrecondition.judge()
+  end
+
+  # The latest checkpoint (at @head) is a base update whose parent is the allowed checkpoint,
+  # and the stage row still stands at that allowed head.
+  defp base_update_facts do
+    [
+      kind: :base_update,
+      parent_sha: @allowed,
+      recorded_head_sha: @allowed,
+      recorded_allow_sha: @allowed
+    ]
+  end
+
   defp judge(opts), do: opts |> facts() |> MergePrecondition.judge()
 
   defp facts(opts) do

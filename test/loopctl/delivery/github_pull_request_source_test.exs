@@ -335,6 +335,111 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
   end
 
+  describe "the thread-mode reads (US-45.4)" do
+    test "branch_head/2 reads the EXACT ref, never the prefix-matching list" do
+      stub(fn conn ->
+        assert conn.request_path == "/repos/acme/widgets/git/ref/heads/loop/abc"
+
+        json(conn, %{
+          "ref" => "refs/heads/loop/abc",
+          "object" => %{"type" => "commit", "sha" => @head}
+        })
+      end)
+
+      assert {:ok, @head} = Source.branch_head(@repo, "loop/abc")
+    end
+
+    test "branch_head/2 refuses a ref that is not a commit, and a missing branch is an api error" do
+      stub(fn conn -> json(conn, %{"object" => %{"type" => "tag", "sha" => @head}}) end)
+      assert {:error, {:unreadable_ref, _}} = Source.branch_head(@repo, "loop/abc")
+
+      stub(fn conn -> Plug.Conn.resp(conn, 404, "{}") end)
+      assert {:error, {:github_api_error, 404}} = Source.branch_head(@repo, "loop/abc")
+    end
+
+    test "commit/2 returns the tree and the parents IN ORDER" do
+      stub(fn conn ->
+        assert conn.request_path == "/repos/acme/widgets/git/commits/#{@head}"
+
+        json(conn, %{
+          "tree" => %{"sha" => "t1"},
+          "parents" => [%{"sha" => "p1"}, %{"sha" => "p2"}]
+        })
+      end)
+
+      assert {:ok, %{tree_sha: "t1", parent_shas: ["p1", "p2"]}} = Source.commit(@repo, @head)
+    end
+
+    test "compare/3 reads the merge base, the base's tree and a diffstat over every file" do
+      stub(fn conn ->
+        assert conn.request_path == "/repos/acme/widgets/compare/master...#{@head}"
+
+        json(conn, %{
+          "merge_base_commit" => %{"sha" => @merge_base},
+          "base_commit" => %{"sha" => "basehead", "commit" => %{"tree" => %{"sha" => "basetree"}}},
+          "files" => [
+            %{
+              "status" => "modified",
+              "filename" => "lib/a.ex",
+              "additions" => 3,
+              "deletions" => 1
+            },
+            %{
+              "status" => "renamed",
+              "filename" => "lib/new.ex",
+              "previous_filename" => "lib/old.ex",
+              "additions" => 0,
+              "deletions" => 0
+            }
+          ]
+        })
+      end)
+
+      assert {:ok, cmp} = Source.compare(@repo, "master", @head)
+      assert cmp.merge_base_sha == @merge_base
+      assert cmp.base_head_sha == "basehead"
+      assert cmp.base_tree_sha == "basetree"
+      assert cmp.diffstat == %{files: 2, changed_lines: 4}
+
+      assert {:ok, %{files: ["lib/a.ex", "lib/new.ex"], renames: [{"lib/old.ex", "lib/new.ex"}]}} =
+               cmp.diff
+    end
+
+    test "compare/3 refuses a file entry without counts rather than shrinking the diffstat" do
+      stub(fn conn ->
+        json(conn, %{
+          "merge_base_commit" => %{"sha" => @merge_base},
+          "base_commit" => %{"sha" => "basehead", "commit" => %{"tree" => %{"sha" => "basetree"}}},
+          "files" => [%{"status" => "modified", "filename" => "lib/a.ex"}]
+        })
+      end)
+
+      assert {:error, {:unreadable_file_entry, _}} = Source.compare(@repo, "master", @head)
+    end
+
+    test "compare/3 reports a list at GitHub's cap as truncated, never as the whole diff" do
+      files =
+        for i <- 1..300,
+            do: %{
+              "status" => "modified",
+              "filename" => "f#{i}",
+              "additions" => 1,
+              "deletions" => 0
+            }
+
+      stub(fn conn ->
+        json(conn, %{
+          "merge_base_commit" => %{"sha" => @merge_base},
+          "base_commit" => %{"sha" => "basehead", "commit" => %{"tree" => %{"sha" => "basetree"}}},
+          "files" => files
+        })
+      end)
+
+      assert {:ok, %{diff: {:error, {:file_list_truncated, 300}}}} =
+               Source.compare(@repo, "master", @head)
+    end
+  end
+
   describe "deployments_since/3 — the DEPLOYMENT, never a workflow run" do
     test "reads a page of the environment's deployments and each one's latest state" do
       # Design §9: the deployment's own `sha` is what the deploying job recorded. The

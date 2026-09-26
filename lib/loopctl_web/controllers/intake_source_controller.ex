@@ -37,6 +37,7 @@ defmodule LoopctlWeb.IntakeSourceController do
       :project_id,
       :repo_full_name,
       :base_branch,
+      :mode,
       :target_epic_id,
       :revoked_at,
       :inserted_at
@@ -66,6 +67,15 @@ defmodule LoopctlWeb.IntakeSourceController do
           "The branch every dispatch for this repository is cut FROM. `master` unless the " <>
             "source named or was repointed to another."
       },
+      mode: %Schema{
+        type: :string,
+        enum: ["pr", "thread"],
+        description:
+          "How this repository's changes reach its base branch. `pr` (the default, and " <>
+            "what every source did before the field existed): the merge gate reads a pull " <>
+            "request by number. `thread`: the merge gate reads the story's latest RECORDED " <>
+            "thread checkpoint and needs no pull request (Epic 45 change threads)."
+      },
       revoked_at: %Schema{type: :string, format: :"date-time", nullable: true},
       inserted_at: %Schema{type: :string, format: :"date-time"},
       updated_at: %Schema{type: :string, format: :"date-time"}
@@ -85,7 +95,7 @@ defmodule LoopctlWeb.IntakeSourceController do
         "`owner/name`, an active source already binds it, or the project is missing, not a " <>
         "work project, or archived, or `target_epic_id` names an epic that is not in that " <>
         "project. The secret is encrypted at rest. `base_branch` defaults to `master` when " <>
-        "the body does not name it.",
+        "the body does not name it, and `mode` to `pr`.",
     request_body:
       {"Intake source", "application/json",
        %Schema{
@@ -98,6 +108,15 @@ defmodule LoopctlWeb.IntakeSourceController do
              description: "The repository, e.g. `mkreyman/home_care_billing`."
            },
            project_id: %Schema{type: :string, format: :uuid},
+           mode: %Schema{
+             type: :string,
+             enum: ["pr", "thread"],
+             description:
+               "Optional. `pr` (the default when omitted) or `thread`. A `thread` source's " <>
+                 "merge gate evaluates the story's latest recorded checkpoint instead of a " <>
+                 "pull request (see `POST /stories/:id/merge-precondition`). NOT " <>
+                 "nullable: an explicit null or any other value is a 422."
+           },
            target_epic_id: %Schema{
              type: :string,
              format: :uuid,
@@ -184,8 +203,9 @@ defmodule LoopctlWeb.IntakeSourceController do
     summary: "Repoint a GitHub intake source at an epic",
     description:
       "Sets `target_epic_id` on an ACTIVE source, or clears it with an explicit null, and/or " <>
-        "`base_branch`. BOTH ARE OPTIONAL AND A FIELD YOU DO NOT SEND IS LEFT ALONE — " <>
-        "clearing the epic takes an explicit null, and a body naming neither field is a 422. " <>
+        "`base_branch`, and/or `mode`. EVERY FIELD IS OPTIONAL AND ONE YOU DO NOT SEND IS " <>
+        "LEFT ALONE — clearing the epic takes an explicit null, and a body naming none of " <>
+        "them is a 422 `nothing_to_update`. " <>
         "The " <>
         "epic must belong to this source\'s project. This is the remedy for a source enrolled " <>
         "before the field existed, or one whose reports are being retried because it names no " <>
@@ -200,6 +220,17 @@ defmodule LoopctlWeb.IntakeSourceController do
        %Schema{
          type: :object,
          properties: %{
+           mode: %Schema{
+             type: :string,
+             enum: ["pr", "thread"],
+             description:
+               "Optional; omitted leaves it as it is. `pr` or `thread`. A `thread` source's " <>
+                 "merge gate evaluates the story's latest recorded checkpoint instead of a " <>
+                 "pull request (see `POST /stories/:id/merge-precondition`). NOT " <>
+                 "nullable: an explicit null or any other value is a 422. A CHANGE is " <>
+                 "409 `stories_in_flight` while any story of this source's project is past " <>
+                 "intake and not terminal, because the mode decides what its merge gate reads."
+           },
            target_epic_id: %Schema{
              type: :string,
              format: :uuid,
@@ -233,6 +264,10 @@ defmodule LoopctlWeb.IntakeSourceController do
          %Schema{type: :object, properties: %{source: @source_schema}}},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"`stories_in_flight`: a mode change while a story of this source's project is past " <>
+           "intake and not terminal. Nothing is changed, the other fields included.",
+         "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -260,6 +295,7 @@ defmodule LoopctlWeb.IntakeSourceController do
         target_epic_id: params["target_epic_id"]
       }
       |> put_if_present(params, "base_branch", :base_branch)
+      |> put_if_present(params, "mode", :mode)
 
     with {:ok, %{source: source, webhook_secret: secret}} <-
            Intake.create_source(tenant.id, attrs, actor_lineage: actor_lineage(conn)) do
@@ -291,6 +327,7 @@ defmodule LoopctlWeb.IntakeSourceController do
       %{}
       |> put_if_present(params, "target_epic_id", :target_epic_id)
       |> put_if_present(params, "base_branch", :base_branch)
+      |> put_if_present(params, "mode", :mode)
 
     case Intake.update_source(tenant.id, source_id, attrs, actor_lineage: actor_lineage(conn)) do
       {:ok, source} ->
@@ -307,8 +344,22 @@ defmodule LoopctlWeb.IntakeSourceController do
             status: 422,
             code: "nothing_to_update",
             message:
-              "Name at least one of target_epic_id (null clears it) or base_branch. A field " <>
-                "you do not send is left exactly as it was."
+              "Name at least one of target_epic_id (null clears it), base_branch or mode. A " <>
+                "field you do not send is left exactly as it was."
+          }
+        })
+
+      {:error, :stories_in_flight} ->
+        conn
+        |> put_status(409)
+        |> json(%{
+          error: %{
+            status: 409,
+            code: "stories_in_flight",
+            message:
+              "This source's project has a story in the delivery loop (past intake and not " <>
+                "terminal), and the mode decides what its merge gate reads. Change the mode " <>
+                "once no story is in flight. Nothing was changed."
           }
         })
 

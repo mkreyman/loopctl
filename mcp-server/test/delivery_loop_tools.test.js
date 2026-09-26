@@ -301,6 +301,27 @@ describe("force_unclaim_story", () => {
 });
 
 describe("merge_precondition (US-44.1)", () => {
+  test("its description and README row name thread mode and every thread answer (US-45.4)", () => {
+    // A session reads this instead of the controller, so an answer it is not told about is one
+    // it treats as an error: `base_updated` in particular allows NOTHING and must be re-asked.
+    const at = INDEX_SRC.indexOf('name: "merge_precondition"');
+    const text = INDEX_SRC.slice(at, INDEX_SRC.indexOf("inputSchema", at));
+    const row = README.split("\n").find((line) => line.startsWith("| `merge_precondition` |")) ?? "";
+
+    for (const source of [text, row]) {
+      for (const name of [
+        "base_updated",
+        "branch_head_unrecorded",
+        "empty_change",
+        "checkpoint_tree_mismatch",
+        "no_checkpoint_recorded",
+        "base_update_parents_mismatch",
+      ]) {
+        assert.ok(source.includes(name), `merge_precondition never names ${name}`);
+      }
+    }
+  });
+
   test("POSTs the epoch and nothing Gate A could read", async () => {
     const { calls, apiCall } = fakeApi({ data: { decision: "allow" } });
 

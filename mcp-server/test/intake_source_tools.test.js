@@ -37,7 +37,7 @@ import {
   updateIntakeSource,
   webhookUrl,
 } from "../lib/intake-sources.js";
-import { stripComments } from "./tool-surface.js";
+import { loadTools, stripComments } from "./tool-surface.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
@@ -165,6 +165,7 @@ describe("intake_source_enroll", () => {
       "base_branch",
       "id",
       "inserted_at",
+      "mode",
       "project_id",
       "repo_full_name",
       "revoked_at",
@@ -324,6 +325,47 @@ describe("intake_source_enroll", () => {
       deps({ apiCall }),
     );
     assert.equal(calls[1].body.base_branch, "main");
+  });
+
+  test("sends mode only when given, so an omitted one takes the server's pr default (US-45.4)", async () => {
+    const { calls, apiCall } = fakeApi(created(), created());
+
+    await enrollIntakeSource(
+      { repo_full_name: REPO, project_id: PROJECT_ID, secret_file: secretFileIn("m-a") },
+      deps({ apiCall }),
+    );
+    assert.ok(!("mode" in calls[0].body), "an unnamed mode reached the server");
+
+    await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        mode: "thread",
+        secret_file: secretFileIn("m-b"),
+      },
+      deps({ apiCall }),
+    );
+    assert.equal(calls[1].body.mode, "thread");
+  });
+
+  test("an unknown or null mode is refused locally, without enrolling anything", async () => {
+    for (const [i, bad] of [null, "", "merge"].entries()) {
+      const { calls, apiCall } = fakeApi(created());
+
+      const result = await enrollIntakeSource(
+        {
+          repo_full_name: REPO,
+          project_id: PROJECT_ID,
+          mode: bad,
+          secret_file: secretFileIn(`mode-${i}.secret`),
+        },
+        deps({ apiCall }),
+      );
+
+      assert.equal(result.error, true);
+      assert.match(result.body, /`mode` must be `pr` or `thread`/);
+      assert.equal(calls.length, 0, "a refused enrolment must not reach the API");
+    }
   });
 
   test("a null or blank base_branch is refused locally, without enrolling anything", async () => {
@@ -696,6 +738,30 @@ describe("intake_source_update", () => {
     assert.equal(calls.length, 0);
   });
 
+  test("mode alone is a complete update, and is forwarded as named (US-45.4)", async () => {
+    const { calls, apiCall } = fakeApi({ source: { ...created().source, mode: "thread" } });
+
+    const result = await updateIntakeSource(
+      { source_id: SOURCE_ID, mode: "thread" },
+      deps({ apiCall }),
+    );
+
+    assert.deepEqual(calls[0].body, { mode: "thread" });
+    assert.equal(result.source.mode, "thread");
+  });
+
+  test("a null mode is refused locally on update, naming the reason", async () => {
+    const { calls, apiCall } = fakeApi({ source: {} });
+
+    const result = await updateIntakeSource(
+      { source_id: SOURCE_ID, mode: null },
+      deps({ apiCall }),
+    );
+
+    assert.match(result.body, /`mode` must be `pr` or `thread`/);
+    assert.equal(calls.length, 0);
+  });
+
   test("naming neither field is refused locally, naming the server's code", async () => {
     const { calls, apiCall } = fakeApi({ source: {} });
 
@@ -943,6 +1009,24 @@ describe("the descriptions carry what a caller needs instead of the controller",
         !/(always starts|enrolment always|second half of enrolling)/i.test(text),
         "it still says enrolment cannot name the branch",
       );
+    }
+  });
+
+  test("both write tools declare mode with exactly the two values the server accepts", () => {
+    for (const name of ["intake_source_enroll", "intake_source_update"]) {
+      const tool = loadTools().find((t) => t.name === name);
+      // Copied out of the vm realm the declarations were evaluated in, so deepEqual compares
+      // values and not array prototypes.
+      assert.deepEqual([...(tool.inputSchema.properties.mode?.enum ?? [])], ["pr", "thread"], name);
+    }
+    for (const text of [description("intake_source_enroll"), row("intake_source_enroll")]) {
+      assert.match(text, /thread/, "it never says what thread mode does");
+    }
+  });
+
+  test("intake_source_update names the 409 a mode change meets with stories in flight", () => {
+    for (const text of [description("intake_source_update"), row("intake_source_update")]) {
+      assert.match(text, /stories_in_flight/, "it never names the refusal");
     }
   });
 

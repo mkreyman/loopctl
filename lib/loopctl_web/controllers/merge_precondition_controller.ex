@@ -88,14 +88,25 @@ defmodule LoopctlWeb.MergePreconditionController do
         properties: %{
           decision: %OpenApiSpex.Schema{
             type: :string,
-            enum: ["allow", "refuse", "already_merged", "head_moved", "unevaluated"],
+            enum: [
+              "allow",
+              "refuse",
+              "already_merged",
+              "head_moved",
+              "base_updated",
+              "unevaluated"
+            ],
             description:
               "`allow` licenses the merge, and the allow has been RECORDED against the " <>
                 "head it judged. `refuse` has already escalated the story. " <>
                 "`already_merged` reports a merge GitHub had already performed AND a " <>
                 "recorded allow authorised — one nobody authorised is a `refuse` naming " <>
                 "the sha. `head_moved` sends the story back to `implementing` because the " <>
-                "pull request's head is not the one CI ran on. `unevaluated` (HTTP 503) is " <>
+                "pull request's head is not the one CI ran on (in thread mode, also a " <>
+                "thread branch naming a commit nobody recorded). `base_updated` (thread " <>
+                "mode only): the story stayed at `ci` and its head is now the control-" <>
+                "recorded base update; nothing was allowed, so ask again once CI has run " <>
+                "on that head. `unevaluated` (HTTP 503) is " <>
                 "a transient forge fault: nothing was decided, nothing transitioned, retry."
           },
           reasons: %OpenApiSpex.Schema{
@@ -104,6 +115,22 @@ defmodule LoopctlWeb.MergePreconditionController do
             items: @reason_schema
           },
           repo: %OpenApiSpex.Schema{type: :string, nullable: true},
+          mode: %OpenApiSpex.Schema{
+            type: :string,
+            enum: ["pr", "thread"],
+            description:
+              "The story's intake source's mode. `thread` judges the latest RECORDED " <>
+                "checkpoint instead of a pull request, so `pr_number` is null."
+          },
+          checkpoint_id: %OpenApiSpex.Schema{
+            type: :string,
+            format: :uuid,
+            nullable: true,
+            description:
+              "Thread mode: the recorded checkpoint judged. A thread-mode allow is recorded " <>
+                "naming it and `checkpoint_sha`."
+          },
+          checkpoint_sha: %OpenApiSpex.Schema{type: :string, nullable: true},
           pr_number: %OpenApiSpex.Schema{type: :integer, nullable: true},
           head_sha: %OpenApiSpex.Schema{
             type: :string,
@@ -200,6 +227,19 @@ defmodule LoopctlWeb.MergePreconditionController do
         "GitHub, a truncated file list, a diff that does not parse, a stale trigger at " <>
         "either the head or the merge base, and an unverified or custody-unattributed " <>
         "story all REFUSE.\n\n" <>
+        "THREAD MODE (the story's intake source has `mode: thread`) needs no pull request: " <>
+        "the gate judges the story's latest RECORDED checkpoint on the thread branch " <>
+        "`loop/<story_id>` and refuses `empty_change` (its tree equals the base branch's, or " <>
+        "no file changed), `checkpoint_tree_mismatch` (the forge's tree for it is not the " <>
+        "one recorded), `no_checkpoint_recorded` and `base_update_parents_mismatch` (below). " <>
+        "A branch head that is not the recorded checkpoint is `head_moved` with reason " <>
+        "`branch_head_unrecorded`: back to `implementing`, not escalated. A thread whose " <>
+        "latest checkpoint is a control-recorded `base_update` of the checkpoint last " <>
+        "allowed, with exactly two parents on the forge (that checkpoint, then the base's " <>
+        "current head), answers `base_updated`: it stays at `ci` on the `base_updated` edge, " <>
+        "keeps its review verdict, and the NEXT call judges the new head. Parents that do " <>
+        "not match refuse `base_update_parents_mismatch`. A `base_updated` edge that cannot " <>
+        "be written counts as unevaluated.\n\n" <>
         "A `refuse` decision escalates the story on the `merge_gate` edge before " <>
         "responding, and returns 200: a refusal is an answer, not a request error. An " <>
         "`already_merged` decision reports a pull request GitHub already merged, with its " <>
@@ -368,6 +408,9 @@ defmodule LoopctlWeb.MergePreconditionController do
       decision: verdict.decision,
       reasons: Enum.map(verdict.reasons, &reason/1),
       repo: verdict.repo,
+      mode: verdict.mode,
+      checkpoint_id: verdict.checkpoint_id,
+      checkpoint_sha: verdict.checkpoint_sha,
       pr_number: verdict.pr_number,
       head_sha: verdict.head_sha,
       recorded_head_sha: verdict.recorded_head_sha,

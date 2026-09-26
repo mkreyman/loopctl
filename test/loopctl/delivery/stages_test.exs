@@ -145,9 +145,11 @@ defmodule Loopctl.Delivery.StagesTest do
 
         result = Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
 
-        if edge in ([:runner_lost, :claim_released] ++ StageMachine.release_escalation_edges()) do
+        if edge in ([:runner_lost, :claim_released, :base_updated] ++
+                      StageMachine.release_escalation_edges()) do
           # Only a releasing transaction takes these (follow_release/5): the release edges,
-          # and the two escalations a release decides (US-44.4).
+          # and the two escalations a release decides (US-44.4). And `:base_updated`, which
+          # only `follow_base_update/4` takes, after checking what the edge asserts (US-45.4).
           assert {:error, :invalid_transition} = result, inspect({from, to, edge})
         else
           assert {:ok, %StoryStage{stage: ^to} = moved} = result, inspect({from, to, edge})
@@ -2046,6 +2048,148 @@ defmodule Loopctl.Delivery.StagesTest do
 
   defp escalation(:escalated), do: %{escalation_reason: "why"}
   defp escalation(_stage), do: %{}
+
+  describe "follow_base_update/4 (US-45.4)" do
+    @allowed String.duplicate("c", 40)
+    @update String.duplicate("d", 40)
+
+    # A story allowed at checkpoint C, with a control-recorded base update of C on top.
+    defp allowed_with_base_update(kind \\ :base_update, parent_sha \\ @allowed) do
+      {story, row} =
+        at_stage(:ci, %{
+          head_sha: @allowed,
+          merge_gate_allowed_sha: @allowed,
+          merge_gate_unevaluated: %{"head_sha" => @allowed, "count" => 2}
+        })
+
+      parent =
+        fixture(:thread_checkpoint, %{
+          tenant_id: story.tenant_id,
+          story_id: story.id,
+          seq: 1,
+          commit_sha: parent_sha,
+          claim_epoch: story.claim_epoch
+        })
+
+      update =
+        fixture(:thread_checkpoint, %{
+          tenant_id: story.tenant_id,
+          story_id: story.id,
+          seq: 2,
+          kind: kind,
+          commit_sha: @update,
+          parent_checkpoint_id: parent.id,
+          claim_epoch: story.claim_epoch
+        })
+
+      {story, row, update}
+    end
+
+    test "stays at ci, moves the head to the base update and clears the old head's allow" do
+      {story, _row, update} = allowed_with_base_update()
+
+      assert {:ok, moved} =
+               Stages.follow_base_update(story.tenant_id, story.id, update.id,
+                 claim_epoch: story.claim_epoch,
+                 actor_label: "test:gate"
+               )
+
+      assert moved.stage == :ci
+      assert moved.head_sha == @update
+      assert moved.merge_gate_allowed_sha == nil
+      assert moved.merge_gate_unevaluated == nil
+      assert moved.attempts == %{"base_updated" => 1}
+
+      [event] =
+        story.tenant_id
+        |> transition_events(story.id)
+        |> Enum.filter(&(&1.edge == "base_updated"))
+
+      assert event.data["payload"]["checkpoint_id"] == update.id
+      assert event.data["payload"]["previous_head_sha"] == @allowed
+    end
+
+    test "a claimant's checkpoint is not a base update, whatever its parent" do
+      {story, _row, update} = allowed_with_base_update(:checkpoint)
+
+      assert {:error, :not_a_base_update} =
+               Stages.follow_base_update(story.tenant_id, story.id, update.id,
+                 claim_epoch: story.claim_epoch
+               )
+
+      assert Stages.get(story.tenant_id, story.id).head_sha == @allowed
+    end
+
+    test "a base update of a checkpoint the gate did not allow is refused" do
+      {story, _row, update} = allowed_with_base_update(:base_update, String.duplicate("9", 40))
+
+      assert {:error, :base_update_not_of_allowed} =
+               Stages.follow_base_update(story.tenant_id, story.id, update.id,
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "no recorded allow, no base update to follow" do
+      {story, _row, update} = allowed_with_base_update()
+
+      {:ok, {1, _}} =
+        Repo.with_tenant(story.tenant_id, fn ->
+          from(r in StoryStage, where: r.story_id == ^story.id)
+          |> Repo.update_all(set: [merge_gate_allowed_sha: nil])
+        end)
+
+      assert {:error, :no_recorded_allow} =
+               Stages.follow_base_update(story.tenant_id, story.id, update.id,
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "a row that is not at ci is refused stale_stage" do
+      {story, _row, update} = allowed_with_base_update()
+
+      {:ok, {1, _}} =
+        Repo.with_tenant(story.tenant_id, fn ->
+          from(r in StoryStage, where: r.story_id == ^story.id)
+          |> Repo.update_all(set: [stage: :pr_open])
+        end)
+
+      assert {:error, :stale_stage} =
+               Stages.follow_base_update(story.tenant_id, story.id, update.id,
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "a stale claim epoch is fenced" do
+      {story, _row, update} = allowed_with_base_update()
+
+      assert {:error, :stale_claim_epoch} =
+               Stages.follow_base_update(story.tenant_id, story.id, update.id,
+                 claim_epoch: story.claim_epoch + 1
+               )
+    end
+
+    test "another tenant's checkpoint is not found (tenant isolation)" do
+      {story, _row, _update} = allowed_with_base_update()
+      {_other, _other_row, foreign} = allowed_with_base_update()
+
+      assert {:error, :checkpoint_not_found} =
+               Stages.follow_base_update(story.tenant_id, story.id, foreign.id,
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "advance/4 never takes the edge, from any caller" do
+      {story, _row, _update} = allowed_with_base_update()
+
+      assert {:error, :invalid_transition} =
+               Stages.advance(story.tenant_id, story.id, {:ci, :ci, :base_updated},
+                 claim_epoch: story.claim_epoch,
+                 actor_role: :user,
+                 actor_lineage: [],
+                 effects: [head_sha: @update]
+               )
+    end
+  end
 
   describe "the triage binding fences every transition out of triaged (US-44.1)" do
     test "a session dispatch that is not the bound one is refused triage_not_bound" do

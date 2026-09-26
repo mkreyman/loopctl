@@ -225,6 +225,17 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # US-45.4: the thread-mode reads, on the same fail-closed default.
+    Mox.stub(Loopctl.MockPullRequestSource, :branch_head, fn _repo, _branch ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :commit, fn _repo, _sha -> {:error, :not_stubbed} end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :compare, fn _repo, _base, _head ->
+      {:error, :not_stubbed}
+    end)
+
     # #803 §9: the post-deploy half of the same source, on the same fail-closed default.
     # `{:error, :not_stubbed}` is NOT transient, so a test that reaches the forge without
     # saying so escalates the story rather than verifying it — the same direction the merge
