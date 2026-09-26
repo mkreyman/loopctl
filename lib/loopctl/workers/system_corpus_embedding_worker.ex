@@ -132,7 +132,7 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       end
     end)
     |> case do
-      :ok -> continue(tenant_id, dim)
+      :ok -> continue(tenant_id, dim, Enum.map(entries, fn {a, _text} -> a.id end))
       other -> other
     end
   end
@@ -259,17 +259,37 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
   # Self-continuation: more stale rows means another batch, as a FRESH job (attempt 1).
   # See the `unique:` comment above for why this is an insert and not a snooze.
-  defp continue(tenant_id, dim) do
-    if Embeddings.stale_system_articles(tenant_id, dim, limit: 1) == [] do
-      :ok
-    else
-      %{tenant_id: tenant_id, dim: dim}
-      |> __MODULE__.new(schedule_in: 1)
-      |> Oban.insert()
-      |> case do
-        {:ok, _job} -> :ok
-        {:error, reason} -> {:error, {:system_corpus_continuation_failed, reason}}
-      end
+  defp continue(tenant_id, dim, embedded_ids) do
+    case Embeddings.stale_system_articles(tenant_id, dim, limit: batch_size()) do
+      [] -> :ok
+      remaining -> continue_unless_stuck(tenant_id, dim, remaining, embedded_ids)
+    end
+  end
+
+  # Something just stored that still reads stale means another batch would only pay again
+  # for the same result. Stop; the read path's next fill starts a fresh run.
+  defp continue_unless_stuck(tenant_id, dim, remaining, embedded_ids) do
+    case for a <- remaining, a.id in embedded_ids, do: a.id do
+      [] ->
+        insert_continuation(tenant_id, dim)
+
+      stuck ->
+        Logger.error(
+          "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} dim=#{dim} articles still " <>
+            "stale after being embedded: #{inspect(stuck)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp insert_continuation(tenant_id, dim) do
+    %{tenant_id: tenant_id, dim: dim}
+    |> __MODULE__.new(schedule_in: 1)
+    |> Oban.insert()
+    |> case do
+      {:ok, _job} -> :ok
+      {:error, reason} -> {:error, {:system_corpus_continuation_failed, reason}}
     end
   end
 

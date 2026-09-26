@@ -1468,73 +1468,101 @@ defmodule Loopctl.Embeddings do
   no stored hash is stale, since nothing can vouch for what it was made from.
 
   Cost, since this runs on every disclosure-cache fill: one query for the corpus's ids and
-  `updated_at`s and one for this tenant's stored hashes, neither reading a body. An
-  article's text hash is memoised per `(id, updated_at)` in `:persistent_term`, which is
-  written only when an article changes, so bodies are read only then. That relies on every
-  write of a title or body moving `updated_at`, as the changesets and the seeding upserts
-  do; a raw write that changed the text and not `updated_at` would go unseen by a node
-  that had already memoised the old version.
+  an md5 of each title and body computed IN Postgres (no body leaves the database), and one
+  for this tenant's stored hashes. The hash of the embedded text needs `TextBudget`, so it is
+  computed here, memoised per `(id, md5)` in the node's `DisclosureCache` memo; a body is
+  read only for an article whose md5 the node has not seen. Keyed on the text itself, the
+  memo cannot go stale: any change to a title or body changes the key, however it was
+  written.
   """
   @spec stale_system_articles(Ecto.UUID.t(), pos_integer(), keyword()) :: [Article.t()]
   def stale_system_articles(tenant_id, dimension, opts \\ [])
       when is_binary(tenant_id) and is_integer(dimension) do
     limit = Keyword.get(opts, :limit, @default_batch_size)
 
-    versions =
-      AdminRepo.all(
-        from(a in system_articles_query(), order_by: a.id, select: {a.id, a.updated_at})
-      )
-
-    stored = article_embedded_hashes(tenant_id, Enum.map(versions, &elem(&1, 0)), dimension)
-    current = current_text_hashes(versions)
-
-    stale_ids =
-      versions
-      |> Enum.map(&elem(&1, 0))
-      |> Enum.filter(fn id ->
-        case Map.get(stored, id) do
-          hash when is_binary(hash) -> ShrinkLadder.whole_hash(hash) != Map.fetch!(current, id)
-          _missing_or_unhashed -> true
-        end
-      end)
-      |> Enum.take(limit)
-
-    case stale_ids do
+    case tenant_id |> stale_system_article_ids(dimension) |> Enum.take(limit) do
       [] -> []
       ids -> AdminRepo.all(from(a in Article, where: a.id in ^ids, order_by: a.id))
-    end
-  end
-
-  # `{id => hash of the text embedded for that version}`, reading bodies only for
-  # versions not memoised on this node yet.
-  defp current_text_hashes(versions) do
-    {known, misses} =
-      Enum.reduce(versions, {%{}, []}, fn {id, updated_at}, {known, misses} ->
-        case :persistent_term.get({__MODULE__, :text_hash, id}, nil) do
-          {^updated_at, hash} -> {Map.put(known, id, hash), misses}
-          _ -> {known, [{id, updated_at} | misses]}
-        end
-      end)
-
-    case misses do
-      [] ->
-        known
-
-      _ ->
-        from(a in Article, where: a.id in ^Enum.map(misses, &elem(&1, 0)))
-        |> AdminRepo.all()
-        |> Enum.reduce(known, fn article, acc ->
-          hash = article |> article_embedding_text() |> text_content_hash()
-          :persistent_term.put({__MODULE__, :text_hash, article.id}, {article.updated_at, hash})
-          Map.put(acc, article.id, hash)
-        end)
     end
   end
 
   @doc "Whether any system article is missing or embedded from different text for this tenant."
   @spec system_corpus_stale?(Ecto.UUID.t(), pos_integer()) :: boolean()
   def system_corpus_stale?(tenant_id, dimension),
-    do: stale_system_articles(tenant_id, dimension, limit: 1) != []
+    do: stale_system_article_ids(tenant_id, dimension) != []
+
+  defp stale_system_article_ids(tenant_id, dimension) do
+    versions =
+      AdminRepo.all(
+        from(a in system_articles_query(),
+          order_by: a.id,
+          select:
+            {a.id,
+             fragment("md5(coalesce(?, '') || E'\\n\\n' || coalesce(?, ''))", a.title, a.body)}
+        )
+      )
+
+    stored = article_embedded_hashes(tenant_id, Enum.map(versions, &elem(&1, 0)), dimension)
+    current = current_text_hashes(versions)
+
+    versions
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.filter(fn id ->
+      case {Map.get(stored, id), Map.get(current, id)} do
+        # Deleted between the two reads: nothing to embed.
+        {_, nil} -> false
+        {hash, now} when is_binary(hash) -> ShrinkLadder.whole_hash(hash) != now
+        {_missing_or_unhashed, _} -> true
+      end
+    end)
+  end
+
+  # `{id => hash of the text embedded for that version}`, reading bodies only for
+  # versions this node has not memoised. Misses are filled under a node-local lock and
+  # re-checked inside it: after a deploy every tenant's first fill misses at once, and
+  # without the lock each would read the whole canonical corpus on the small AdminRepo
+  # pool; with it the first reads, and the rest find the memo warm.
+  defp current_text_hashes(versions) do
+    case split_memoised(versions) do
+      {known, []} ->
+        known
+
+      {_known, _misses} ->
+        :global.trans(
+          {{__MODULE__, :system_text_hash_fill}, self()},
+          fn ->
+            {known, misses} = split_memoised(versions)
+            fill_text_hashes(known, misses)
+          end,
+          [node()]
+        )
+    end
+  end
+
+  defp split_memoised(versions) do
+    Enum.reduce(versions, {%{}, []}, fn {id, md5}, {known, misses} ->
+      case DisclosureCache.memo_get({:system_text_hash, id}) do
+        {^md5, hash} -> {Map.put(known, id, hash), misses}
+        _ -> {known, [id | misses]}
+      end
+    end)
+  end
+
+  defp fill_text_hashes(known, []), do: known
+
+  defp fill_text_hashes(known, ids) do
+    from(a in Article,
+      where: a.id in ^ids,
+      select:
+        {a, fragment("md5(coalesce(?, '') || E'\\n\\n' || coalesce(?, ''))", a.title, a.body)}
+    )
+    |> AdminRepo.all()
+    |> Enum.reduce(known, fn {article, md5}, acc ->
+      hash = article |> article_embedding_text() |> text_content_hash()
+      DisclosureCache.memo_put({:system_text_hash, article.id}, {md5, hash})
+      Map.put(acc, article.id, hash)
+    end)
+  end
 
   @doc """
   The text an article is embedded from. The system-corpus worker and the re-embed backfill
@@ -1581,8 +1609,9 @@ defmodule Loopctl.Embeddings do
   tenant's ACTIVE dimension (AC-41.1.7).
 
   Idempotent: a corpus with nothing missing or changed (`system_corpus_stale?/2`) creates
-  no job, and the worker is `unique` per `(tenant_id, dim)` across every unfinished state,
-  so a run already queued, executing or backing off answers `{:ok, :in_flight}`.
+  no job, and a run already queued, executing or backing off answers `{:ok, :in_flight}`:
+  the gate below decides that under an advisory lock, since the worker's own uniqueness
+  leaves `:executing` out.
 
   ## Terminal-state gate (review)
 
@@ -1615,22 +1644,39 @@ defmodule Loopctl.Embeddings do
       else: {:ok, :already_materialized}
   end
 
-  # Reads the tenant's LATEST run once. An executing run is in flight, forced or not: the
-  # worker's uniqueness leaves `:executing` out so its own continuation can be inserted,
-  # so this is the check that keeps a second run from starting beside it. A run orphaned
-  # in `executing` by a crashed node therefore holds for up to Oban's Lifeline rescue
-  # window (`rescue_after` in `Loopctl.ObanConfig`), and the endpoint says so.
+  # Decided under a per-(tenant, dim) transaction advisory lock, so two concurrent callers
+  # (two disclosure fills missing the cache at once, a fill and a POST) cannot both read
+  # "nothing running" and both insert: the second waits, then sees the first's job. The
+  # worker's uniqueness cannot do this alone, because it leaves `:executing` out so its own
+  # continuation can be inserted; a job dispatched between another caller's read and insert
+  # would not dedupe. The insert joins the lock's transaction (`Oban.insert/1` writes on
+  # `Repo`), so the job is visible the moment the lock is released.
+  #
+  # Under the lock, the LATEST run decides: queued, scheduled or executing is in flight,
+  # forced or not (a run orphaned in `executing` by a crashed node holds until Oban's
+  # Lifeline rescues it, `rescue_after` in `Loopctl.ObanConfig`); discarded or cancelled
+  # is the terminal gate unless forced; anything else, including a run backing off,
+  # inserts, which Oban's uniqueness answers as a conflict.
   defp gate_materialization(tenant_id, dimension, force?) do
-    case latest_system_corpus_run_state(tenant_id, dimension) do
-      "executing" ->
-        {:ok, :in_flight}
+    {:ok, result} =
+      Repo.transaction(fn ->
+        Repo.query!("SELECT pg_advisory_xact_lock(hashtext($1))", [
+          "system_corpus:#{tenant_id}:#{dimension}"
+        ])
 
-      state when state in ["discarded", "cancelled"] and not force? ->
-        {:error, :materialization_terminal}
+        case latest_system_corpus_run_state(tenant_id, dimension) do
+          state when state in ["available", "scheduled", "executing"] ->
+            {:ok, :in_flight}
 
-      _ ->
-        insert_materialization(tenant_id, dimension, force?)
-    end
+          state when state in ["discarded", "cancelled"] and not force? ->
+            {:error, :materialization_terminal}
+
+          _ ->
+            insert_materialization(tenant_id, dimension, force?)
+        end
+      end)
+
+    result
   end
 
   # A run already queued or backing off is a uniqueness conflict, answered
@@ -1655,19 +1701,6 @@ defmodule Loopctl.Embeddings do
       other -> other
     end
   end
-
-  @doc """
-  Whether the LATEST system-corpus materialization for `(tenant_id, dimension)`
-  terminated permanently (`discarded` / `cancelled`).
-
-  The latest, not any: Oban retains a terminal job until the pruner removes it, and a
-  tenant whose first run was discarded (no embedding key yet) and whose forced retry then
-  completed is healthy. Asking whether ANY retained job was terminal kept blocking that
-  tenant's automatic materialization until the old job was pruned.
-  """
-  @spec system_corpus_terminal?(Ecto.UUID.t(), pos_integer()) :: boolean()
-  def system_corpus_terminal?(tenant_id, dimension),
-    do: latest_system_corpus_run_state(tenant_id, dimension) in ["discarded", "cancelled"]
 
   defp latest_system_corpus_run_state(tenant_id, dimension) do
     # OBAN's repo, not `AdminRepo`: `oban_jobs` is Oban's own, non-RLS table, and
@@ -2153,7 +2186,7 @@ defmodule Loopctl.Embeddings do
       # Oban insert on every search. Firing it only on a cache MISS bounds it to once
       # per DisclosureCache TTL; the enqueue's staleness probe, its executing-run check and
       # the worker's uniqueness make a repeat a no-op rather than a second run.
-      maybe_trigger_system_corpus(tenant_id, dimension, meta)
+      maybe_trigger_system_corpus(tenant_id, dimension)
 
       meta
     end)
@@ -2164,7 +2197,7 @@ defmodule Loopctl.Embeddings do
   # vector is of the old text. The enqueue's own first check is that staleness, so a
   # current corpus queues nothing, and a run in progress is a conflict, never a second
   # run. Its failure must not fail the search that noticed: the next fill tries again.
-  defp maybe_trigger_system_corpus(tenant_id, dimension, _meta) do
+  defp maybe_trigger_system_corpus(tenant_id, dimension) do
     enqueue_system_corpus_materialization(tenant_id, dimension: dimension)
     :ok
   rescue

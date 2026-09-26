@@ -658,8 +658,6 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       # As a real `{:discard, {:no_embedding_key, _}}` would leave it.
       fixture(:system_corpus_job, %{tenant_id: tenant.id, state: "discarded"})
 
-      assert Embeddings.system_corpus_terminal?(tenant.id, 1536)
-
       assert {:error, :materialization_terminal} =
                Embeddings.enqueue_system_corpus_materialization(tenant.id)
 
@@ -674,8 +672,6 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
       for state <- ["discarded", "completed"],
           do: fixture(:system_corpus_job, %{tenant_id: tenant.id, state: state})
-
-      refute Embeddings.system_corpus_terminal?(tenant.id, 1536)
 
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert {:ok, %Oban.Job{conflict?: false}} =
@@ -763,7 +759,23 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert NaiveDateTime.compare(scheduled_at, NaiveDateTime.utc_now()) == :gt
     end
 
-    test "an edit landing during a run leaves it stale, and the worker queues the next batch" do
+    test "a text change is seen however it was written, updated_at or not" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      # Memoise the current version on this node first.
+      assert Embeddings.stale_system_articles(tenant.id, 1536) == []
+
+      AdminRepo.query!("UPDATE articles SET body = $1 WHERE id = $2", [
+        "a raw fix that left updated_at alone",
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)
+    end
+
+    test "an edit landing during a run stays stale, and the worker does not loop on it" do
       tenant = tenant_at(1536)
       article = system_article()
 
@@ -783,11 +795,9 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
                    "dim" => 1536
                  })
 
-        # A FRESH job continues it (attempt 1), not a snooze of this one.
-        assert_enqueued(
-          worker: SystemCorpusEmbeddingWorker,
-          args: %{"tenant_id" => tenant.id, "dim" => 1536}
-        )
+        # It was just embedded and still reads stale, so another batch would pay again for
+        # the same result: the worker stops, and the read path's next fill starts afresh.
+        refute_enqueued(worker: SystemCorpusEmbeddingWorker)
       end)
 
       assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)

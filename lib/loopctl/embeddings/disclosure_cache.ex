@@ -128,6 +128,30 @@ defmodule Loopctl.Embeddings.DisclosureCache do
   def ttl_ms, do: Application.get_env(:loopctl, :embedding_disclosure_cache_ms, @default_ttl_ms)
 
   @doc """
+  A node-local memo that the TTL sweep never evicts (`expires_at` is `:infinity`, which
+  sorts above every integer), for values that change only when their key does. `nil` when
+  the key is absent or the table is not up.
+  """
+  @spec memo_get(term()) :: term() | nil
+  def memo_get(key) do
+    if :ets.whereis(@table) != :undefined do
+      case :ets.lookup(@table, {:memo, key}) do
+        [{_, value, :infinity}] -> value
+        _ -> nil
+      end
+    end
+  end
+
+  @doc "Stores `value` under `key` in the memo; a no-op when the table is not up."
+  @spec memo_put(term(), term()) :: :ok
+  def memo_put(key, value) do
+    if :ets.whereis(@table) != :undefined,
+      do: :ets.insert(@table, {{:memo, key}, value, :infinity})
+
+    :ok
+  end
+
+  @doc """
   Returns the cached value for `key`, or computes it with `fun`, caches it and
   returns it. With a `0` TTL `fun` is always called and nothing is stored.
   """
