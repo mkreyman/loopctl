@@ -17,16 +17,18 @@ defmodule Loopctl.Threads.Entry do
   # One bound, read by the changeset AND the OpenAPI operation, so the two cannot drift.
   @max_body_bytes 16_384
 
-  # What a caller writes through the API. `checkpoint` entries are written beside the
-  # checkpoint they describe; `finding`, `fix` and `verdict` belong to the review dispatch
-  # (US-45.3); `escalation` and `merge` to the flows that perform those acts. The kind column
-  # admits all of them so those stories need no migration to start writing.
+  # What a caller writes through the entries API. `checkpoint` entries are written beside the
+  # checkpoint they describe; `finding`, `fix` and `verdict` through `Loopctl.Threads.Reviews`
+  # (US-45.3), whose author checks the entries API cannot make; `escalation` and `merge` by
+  # the flows that perform those acts.
   # `review_requested` is written by the request-review flow alongside
   # `stories.review_requested_at`, never by a caller: a caller-written one could claim a
   # request the implementer never made, or disagree with the story.
   @caller_kinds [:message]
   @kinds @caller_kinds ++
            [:checkpoint, :review_requested, :finding, :fix, :verdict, :escalation, :merge]
+
+  @severities [:critical, :high, :medium, :low]
 
   schema "thread_entries" do
     tenant_field()
@@ -42,12 +44,26 @@ defmodule Loopctl.Threads.Entry do
     # (and refuses a non-UUID at the changeset), so a stored id and a resent one compare equal.
     field :checkpoint_id, Ecto.UUID
 
+    # The judgement kinds' fields (US-45.3), every one set by `Loopctl.Threads.Reviews` after
+    # it has validated and canonicalised it, never cast here. `review_id` is the review
+    # dispatch a `finding` or `verdict` came from; `introduced_by` is a canonical checkpoint
+    # id or `"none"`; `finding_ids` are the findings a `fix` answers.
+    field :review_id, :binary_id
+    field :severity, Ecto.Enum, values: @severities
+    field :location, :string
+    field :introduced_by, :string
+    field :finding_ids, {:array, Ecto.UUID}
+
     timestamps(updated_at: false)
   end
 
   @doc "The largest `body`, in bytes, any entry may carry."
   @spec max_body_bytes() :: pos_integer()
   def max_body_bytes, do: @max_body_bytes
+
+  @doc "A finding's severities, most severe first."
+  @spec severities() :: [atom()]
+  def severities, do: @severities
 
   @doc "The entry kinds a caller may write through the API."
   @spec caller_kinds() :: [atom()]

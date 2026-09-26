@@ -5,12 +5,13 @@ defmodule Loopctl.Threads do
 
   ## What this module owns, and what it deliberately does not
 
-  It owns the RECORD: checkpoints, and `message` / `review_requested` entries. It does not own
-  JUDGEMENT. Findings, verdicts and the fixes that answer them decide what may merge, so they
-  need an author loopctl can prove is not the implementer, and inferring that from the
-  calling key — its agent, its lineage, whether it wrote a checkpoint — was reviewed three
-  times and circumvented each time (#901). Those kinds arrive with US-45.3, where the author
-  is a review dispatch loopctl itself placed for the thread.
+  It owns the RECORD: checkpoints and `message` entries, and the write path every entry takes.
+  It does not own JUDGEMENT. Findings, verdicts and the fixes that answer them decide what may
+  merge, so they need an author loopctl can prove is not the implementer, and inferring that
+  from the calling key — its agent, its lineage, whether it wrote a checkpoint — was reviewed
+  three times and circumvented each time (#901). `Loopctl.Threads.Reviews` writes those kinds
+  (US-45.3), through the `@doc false` helpers below, and its author is a review dispatch
+  loopctl itself placed for the thread.
 
   ## The checkpoint fence
 
@@ -172,15 +173,7 @@ defmodule Loopctl.Threads do
     changeset = Entry.changeset(%Entry{}, attrs)
 
     with :ok <- caller_kind(changeset),
-         :ok <- reserved_key(changeset),
-         :ok <- no_secret(Ecto.Changeset.get_field(changeset, :body), :body, tenant_id, story_id),
-         :ok <-
-           no_secret(
-             Ecto.Changeset.get_field(changeset, :idempotency_key),
-             :idempotency_key,
-             tenant_id,
-             story_id
-           ) do
+         :ok <- screen(changeset, tenant_id, story_id) do
       in_story_lock(tenant_id, story_id, fn ->
         entry_locked(tenant_id, story_id, changeset, opts)
       end)
@@ -246,7 +239,10 @@ defmodule Loopctl.Threads do
       select: struct(s, ^@story_fields)
   end
 
-  defp locked_story(tenant_id, story_id),
+  @doc false
+  # The story row, FOR SHARE, inside a `write_locked/3` transaction.
+  @spec locked_story(Ecto.UUID.t(), Ecto.UUID.t()) :: Story.t() | nil
+  def locked_story(tenant_id, story_id),
     do: Repo.one(story_query(tenant_id, story_id) |> lock("FOR SHARE"))
 
   # ---------------------------------------------------------------------------
@@ -302,12 +298,18 @@ defmodule Loopctl.Threads do
 
   # Decided on the story row this transaction already holds FOR SHARE.
   defp fence(story, opts, epoch) do
-    if Keyword.get(opts, :replay_only, false) do
-      {:error, :dispatch_not_accepted}
-    else
-      with :ok <- Claimant.check(story, Keyword.fetch!(opts, :agent_id), epoch),
-           do: lease(story)
-    end
+    if Keyword.get(opts, :replay_only, false),
+      do: {:error, :dispatch_not_accepted},
+      else: claimant_fence(story, Keyword.fetch!(opts, :agent_id), epoch)
+  end
+
+  @doc false
+  # The checkpoint fence, for a `fix` (`Loopctl.Threads.Reviews`): the current claimant under
+  # the current epoch with a live lease, decided on a story row held FOR SHARE.
+  @spec claimant_fence(Story.t(), Ecto.UUID.t() | nil, term()) ::
+          :ok | {:error, :not_claimant | :stale_claim_epoch | :claim_not_live}
+  def claimant_fence(story, agent_id, epoch) do
+    with :ok <- Claimant.check(story, agent_id, epoch), do: lease(story)
   end
 
   # `:custody` is resolved HERE, on the row held FOR SHARE, so the lineage is the one the
@@ -457,9 +459,14 @@ defmodule Loopctl.Threads do
       kind in Entry.caller_kinds() ->
         :ok
 
-      kind in [:finding, :fix, :verdict, :review_requested] ->
+      kind in [:finding, :fix, :verdict] ->
         {:error, :unprocessable_entity,
-         "kind #{kind} is written by the review flow (US-45.3), not through this endpoint"}
+         "kind #{kind} is written by the review flow (the thread's #{kind} endpoint), " <>
+           "not as an entry"}
+
+      kind == :review_requested ->
+        {:error, :unprocessable_entity,
+         "kind review_requested is written by the request-review flow, not a caller"}
 
       true ->
         {:error, :unprocessable_entity, "kind #{kind} is written by loopctl, not a caller"}
@@ -474,6 +481,24 @@ defmodule Loopctl.Threads do
         {:error, :unprocessable_entity,
          "idempotency_key may not start with #{@reserved_key_prefix}"},
       else: :ok
+  end
+
+  @doc false
+  # The screen every caller-written entry passes before its transaction opens: the reserved
+  # key prefix, and the secret scan of its body and key.
+  @spec screen(Ecto.Changeset.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          :ok | {:error, :unprocessable_entity, String.t() | map()}
+  def screen(changeset, tenant_id, story_id) do
+    with :ok <- reserved_key(changeset),
+         :ok <-
+           no_secret(Ecto.Changeset.get_field(changeset, :body), :body, tenant_id, story_id) do
+      no_secret(
+        Ecto.Changeset.get_field(changeset, :idempotency_key),
+        :idempotency_key,
+        tenant_id,
+        story_id
+      )
+    end
   end
 
   defp no_secret(value, field, tenant_id, story_id) do
@@ -528,6 +553,20 @@ defmodule Loopctl.Threads do
   defp epoch_current(%Story{claim_epoch: epoch}, epoch), do: :ok
   defp epoch_current(_story, _epoch), do: {:error, :stale_claim_epoch}
 
+  @doc false
+  # `nil` when `author` has written nothing under the changeset's key; otherwise the answer to
+  # a resend — the row when it is the SAME write, `idempotency_key_reused` when it is not.
+  @spec replayed(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), Ecto.Changeset.t()) ::
+          nil | {:ok, Entry.t(), :existing, []} | {:error, {:conflict, String.t(), String.t()}}
+  def replayed(tenant_id, story_id, author, changeset) do
+    key = Ecto.Changeset.get_field(changeset, :idempotency_key)
+
+    case entry_by_key(tenant_id, story_id, author, key) do
+      nil -> nil
+      existing -> replay(existing, changeset)
+    end
+  end
+
   defp entry_by_key(tenant_id, story_id, author, key) do
     Repo.one(
       from e in Entry,
@@ -541,7 +580,16 @@ defmodule Loopctl.Threads do
   # write reusing a key is refused rather than acknowledged with the old row, which would tell
   # the caller its new entry was recorded when it was not. `checkpoint_id` is an `Ecto.UUID`,
   # so the caller's value and the stored one are compared in one canonical form.
-  @replayed_fields [:kind, :body, :checkpoint_id]
+  @replayed_fields [
+    :kind,
+    :body,
+    :checkpoint_id,
+    :review_id,
+    :severity,
+    :location,
+    :introduced_by,
+    :finding_ids
+  ]
 
   defp replay(existing, changeset) do
     same? =
@@ -576,7 +624,13 @@ defmodule Loopctl.Threads do
     end
   end
 
-  defp insert_entry(tenant_id, story_id, changeset, opts) do
+  @doc false
+  # Inserts `changeset` as the thread's next entry and appends it to the audit chain, inside a
+  # `write_locked/3` transaction. `opts` carries `:author_principal` and a resolved
+  # `:actor_lineage` list.
+  @spec insert_entry(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.Changeset.t(), keyword()) ::
+          {:ok, Entry.t(), :created, list()} | {:error, term()}
+  def insert_entry(tenant_id, story_id, changeset, opts) do
     lineage = Keyword.fetch!(opts, :actor_lineage)
 
     changeset =
@@ -611,9 +665,22 @@ defmodule Loopctl.Threads do
             "author_principal" => entry.author_principal,
             "checkpoint_id" => entry.checkpoint_id
           },
-          adopted
+          Map.merge(judgement(entry), adopted)
         )
     })
+  end
+
+  # A judgement's event pins what the round count and the ceiling are computed from: which
+  # review wrote it, its severity and origin, and the findings a fix answers. A message or a
+  # checkpoint carries none of these, and its event carries none of the keys.
+  defp judgement(entry) do
+    %{
+      "review_id" => entry.review_id,
+      "severity" => entry.severity && to_string(entry.severity),
+      "introduced_by" => entry.introduced_by,
+      "finding_ids" => entry.finding_ids
+    }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
   end
 
   defp conflict(code, message), do: {:error, {:conflict, code, message}}
@@ -637,6 +704,12 @@ defmodule Loopctl.Threads do
   # committed may have committed it — and both writes are safe to resend: the resend of one
   # that landed is answered from its row. A chain HASH violation is not contention and still
   # raises, for the caller to answer.
+  @doc false
+  # The one write transaction, for `Loopctl.Threads.Reviews`: `fun` runs under the per-story
+  # lock and answers `{:ok, value, status, chain_entries}` or an error that rolls it back.
+  @spec write_locked(Ecto.UUID.t(), Ecto.UUID.t(), (-> term())) :: {:ok, term(), atom()} | term()
+  def write_locked(tenant_id, story_id, fun), do: in_story_lock(tenant_id, story_id, fun)
+
   defp in_story_lock(tenant_id, story_id, fun) do
     Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "thread write", fn ->
       tenant_id

@@ -419,6 +419,14 @@ defmodule LoopctlWeb.Router do
     get "/stories/:id/thread", ThreadController, :show
     post "/stories/:id/thread/checkpoints", ThreadController, :checkpoint
     post "/stories/:id/thread/entries", ThreadController, :entry
+    # US-45.3: review on the thread. An orchestrator places a review, which mints the
+    # reviewer's dispatch; findings and verdicts are accepted only on that dispatch's key; the
+    # claimant records the fixes that answer them. Refusals never use self_review_blocked.
+    post "/stories/:id/thread/reviews", ThreadReviewController, :place
+    get "/stories/:id/thread/reviews/:review_id", ThreadReviewController, :show
+    post "/stories/:id/thread/findings", ThreadReviewController, :finding
+    post "/stories/:id/thread/verdicts", ThreadReviewController, :verdict
+    post "/stories/:id/thread/fixes", ThreadReviewController, :fix
     # Discoverability aliases — same actions, alternate URL patterns agents tend to guess
     post "/stories/:id/report-done", StoryStatusController, :report
     post "/stories/:id/start-work", StoryStatusController, :start

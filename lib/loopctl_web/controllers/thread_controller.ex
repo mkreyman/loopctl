@@ -5,9 +5,10 @@ defmodule LoopctlWeb.ThreadController do
 
   - `checkpoint` is `exact_role: :agent`, as `claim`/`escalate` are: only the claiming
     agent's key may say a commit is part of the thread.
-  - `entry` is `role: :agent` and takes `message` and `review_requested` from any principal.
-    Findings, fixes and verdicts are NOT written here: their author must be a review dispatch
-    loopctl placed (US-45.3), never a key whose separation from the implementer is inferred.
+  - `entry` is `role: :agent` and takes `message` from any principal. Findings, verdicts and
+    fixes are NOT written here but through `LoopctlWeb.ThreadReviewController`: a finding's or
+    verdict's author must be a review dispatch loopctl placed (US-45.3), never a key whose
+    separation from the implementer is inferred.
   - Both writes are behind `RequireHumanAnchor`, mounted before the role gate, because a
     story is work-breakdown data.
   - Reads stay open to every role.
@@ -125,10 +126,10 @@ defmodule LoopctlWeb.ThreadController do
     summary: "Record an entry on a story's thread",
     description:
       "Any principal of the tenant writes a `message`, optionally " <>
-        "naming a `checkpoint_id` of this story. `checkpoint` entries are loopctl's own, and " <>
-        "`review_requested`, `finding`, `fix` and `verdict` belong to the review flow " <>
-        "(US-45.3), so all of " <>
-        "those are refused here. The author is derived from the key. IDEMPOTENT per author " <>
+        "naming a `checkpoint_id` of this story. `checkpoint` entries are loopctl's own, " <>
+        "`review_requested` belongs to the request-review flow, and `finding`, `fix` and " <>
+        "`verdict` are written through `/thread/findings`, `/thread/fixes` and " <>
+        "`/thread/verdicts`, so all of those are refused here. The author is derived from the key. IDEMPOTENT per author " <>
         "on `idempotency_key` when the write is the same; reusing a key for a different " <>
         "entry is refused, and keys starting `loopctl:` are reserved. `body` is capped at " <>
         "#{@max_body_bytes} bytes, refused when it carries a credential, and is UNTRUSTED.",
@@ -321,6 +322,11 @@ defmodule LoopctlWeb.ThreadController do
       body: entry.body,
       body_untrusted: true,
       checkpoint_id: entry.checkpoint_id,
+      review_id: entry.review_id,
+      severity: entry.severity,
+      location: entry.location,
+      introduced_by: entry.introduced_by,
+      finding_ids: entry.finding_ids,
       inserted_at: entry.inserted_at
     }
   end

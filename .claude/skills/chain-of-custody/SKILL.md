@@ -145,6 +145,19 @@ column and not a `metadata` key on purpose**: `metadata` is cast by `Story.updat
 REPLACED wholesale by `PATCH /api/v1/stories/:id`, so one ordinary orchestrator request erased the
 marker and handed the launder path back. Never add `:lifecycle_entered_at` to a `cast` list.
 
+## Review on a change thread (US-45.3) — the judge is a PLACED dispatch, never an inferred key
+
+`Loopctl.Threads.Reviews` decides who may write a `finding` or `verdict` without inferring
+separation from the calling key, which #901 tried and had circumvented in three review rounds.
+`place/4` mints the reviewer's dispatch as a SIBLING of `implementer_dispatch_id` (same parent)
+and records it in `thread_reviews`; a judgement is accepted only when
+`Dispatches.dispatch_for_api_key/2` resolves the calling key to that exact row. Do not widen
+this to a lineage or agent comparison. Its refusals have their own codes
+(`review_dispatch_required`, `reviewer_not_separate`, ...) and never `self_review_blocked`,
+which escalates to the L6 halt. The round count and ceiling are computed from
+`thread_entries`; a verdict revokes the review's dispatch so its agent's one agent-role key
+slot (`api_keys_one_role_per_agent_idx`) frees for the next round.
+
 ## Claim lease and epoch fence (#803)
 
 A claim is not held forever. `claim_story/3` (and `BulkOperations.bulk_claim/4`, via
