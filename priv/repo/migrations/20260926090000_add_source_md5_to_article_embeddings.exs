@@ -10,12 +10,16 @@ defmodule Loopctl.Repo.Migrations.AddSourceMd5ToArticleEmbeddings do
   columns, with no clock, no `updated_at` and no hashing on the search path.
   `embedding_content_hash` cannot serve: it hashes the `TextBudget`-cut text.
 
-  Backfill, in SQL, so the release does not make every tenant's corpus read stale at once:
-  system articles get `text_md5`, and each existing system row gets `source_md5` where its
-  stored content hash is the sha256 of the article's text as it stands (below the
-  `TextBudget` cap, where the cut is a no-op and the two hashes are the same). A row it
-  cannot vouch for stays NULL and reads stale; the worker then stamps it with no provider
-  call if its hash matches, or re-embeds it if it does not.
+  The md5 formula lives ONLY in the trigger: writers copy `articles.text_md5` from the row
+  they read, and the backfill below fires the trigger rather than repeating the expression.
+
+  Backfill, in SQL, so the release does not make corpora read stale: system articles get
+  `text_md5`, and each existing system row gets `source_md5` when EITHER the currency test
+  it replaces passed (the row is no older than its article, which is what "current" meant
+  until now) OR its stored content hash is the sha256 of the article's text as it stands
+  (below the `TextBudget` cap, where the cut is a no-op). A row neither vouches for stays
+  NULL and reads stale; the worker stamps it with no provider call when its hash matches,
+  and re-embeds it when it does not, which is what the old test would also have done.
   """
   use Ecto.Migration
 
@@ -46,15 +50,21 @@ defmodule Loopctl.Repo.Migrations.AddSourceMd5ToArticleEmbeddings do
     EXECUTE FUNCTION articles_set_text_md5()
     """
 
-    execute "UPDATE articles SET text_md5 = md5(#{@text}) WHERE scope = 'system'"
+    # Fires the trigger (an UPDATE OF title), so the formula is written once.
+    execute "UPDATE articles SET title = title WHERE scope = 'system'"
 
     execute """
     UPDATE article_embeddings AS ae SET source_md5 = a.text_md5
     FROM articles AS a
     WHERE ae.article_id = a.id AND a.scope = 'system' AND ae.source_md5 IS NULL
-      AND char_length(#{@text}) < 32000
-      AND ae.embedding_content_hash =
-            encode(sha256(convert_to(#{@text}, 'UTF8')), 'hex')
+      AND (
+        ae.updated_at >= a.updated_at
+        OR (
+          char_length(#{@text}) < 32000
+          AND ae.embedding_content_hash =
+                encode(sha256(convert_to(#{@text}, 'UTF8')), 'hex')
+        )
+      )
     """
   end
 

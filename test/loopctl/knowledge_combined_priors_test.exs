@@ -455,7 +455,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
           canonical
           |> Embeddings.article_embedding_text()
           |> Embeddings.text_content_hash(),
-        source_md5: Embeddings.article_source_md5(canonical),
+        source_md5: canonical.text_md5,
         live_denorm: true
       })
 

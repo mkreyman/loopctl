@@ -110,32 +110,41 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       |> Enum.map(fn a -> {a, embedding_text(a)} end)
       |> split_unchanged(tenant_id, dim)
 
-    to_stamp = Enum.map(unchanged, fn {article, _text} -> article end)
-    {:ok, stamped} = Embeddings.stamp_article_sources(tenant_id, to_stamp, dim)
+    {:ok, stamped} = Embeddings.stamp_article_sources(tenant_id, unchanged, dim)
 
-    if stamped != length(to_stamp) do
+    if stamped != length(unchanged) do
       Logger.warning(
         "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} dim=#{dim} stamped #{stamped} of " <>
-          "#{length(to_stamp)} unchanged rows; the rest are re-checked next run"
+          "#{length(unchanged)} unchanged rows; the rest are re-checked next run"
       )
     end
 
     embed_entries(tenant_id, dim, entries, Enum.map(articles, & &1.id))
   end
 
+  # ONE batched hash read for the whole batch (AC-41.1.11: no per-item query). Returns
+  # `{unchanged, entries}`: `unchanged` as `{article, stored_hash}`, the hash compared, which
+  # the stamp re-checks; `entries` as `{article, text}` to embed.
   defp split_unchanged(entries, tenant_id, dim) do
     hashes =
       Embeddings.article_embedded_hashes(tenant_id, Enum.map(entries, fn {a, _} -> a.id end), dim)
 
-    Enum.split_with(entries, fn {article, text} ->
-      case Map.get(hashes, article.id) do
-        # `whole_hash/1`: a truncation-marked hash still identifies the FULL text, so an
-        # article whose vector is a prefix is UNCHANGED and must not be re-billed.
-        stored when is_binary(stored) -> ShrinkLadder.whole_hash(stored) == content_hash(text)
-        _ -> false
+    Enum.reduce(entries, {[], []}, fn {article, text} = entry, {unchanged, to_embed} ->
+      case unchanged_hash(Map.get(hashes, article.id), text) do
+        nil -> {unchanged, [entry | to_embed]}
+        stored -> {[{article, stored} | unchanged], to_embed}
       end
     end)
+    |> then(fn {unchanged, to_embed} -> {Enum.reverse(unchanged), Enum.reverse(to_embed)} end)
   end
+
+  # The stored hash when it vouches for `text`, else nil. `whole_hash/1`: a
+  # truncation-marked hash still identifies the FULL text, so an article whose vector is a
+  # prefix is UNCHANGED and must not be re-billed.
+  defp unchanged_hash(stored, text) when is_binary(stored),
+    do: if(ShrinkLadder.whole_hash(stored) == content_hash(text), do: stored)
+
+  defp unchanged_hash(_stored, _text), do: nil
 
   # Through `ShrinkLadder.embed_batch/3` (#617). An input-too-long rejection used to
   # reach `handle_error/2`, where `permanent_provider_error?/1` is `true` for any 4xx —
@@ -238,7 +247,6 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       :ok
   end
 
-  # ONE batched hash read for the whole batch (AC-41.1.11: no per-item query).
   # Vectors are written only after the WHOLE array call succeeded, so a provider
   # failure means zero writes and the batch retries as a unit. The batch's vector
   # LENGTH is checked once, before the first write, so a model that does not emit
@@ -260,8 +268,8 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     end)
   end
 
-  # Returns `:ok` WITHOUT continuing: `embed_entries/3` drives the sub-batches and calls
-  # `continue/2` once, after the last one — continuing here would enqueue the next page
+  # Returns `:ok` WITHOUT continuing: `embed_entries/4` drives the sub-batches and calls
+  # `continue/3` once, after the last one — continuing here would enqueue the next page
   # per sub-batch.
   defp do_store_all(tenant_id, dim, triples) do
     Enum.reduce_while(triples, :ok, fn {article, vector, hash}, :ok ->
@@ -296,10 +304,9 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   # edited while it ran; a continuation would handle them in a loop, so stop and let the
   # read path's next fill start a fresh run, which picks the edit up.
   defp continue(tenant_id, dim, processed_ids) do
-    case Embeddings.stale_system_articles(tenant_id, dim, limit: 1, exclude_ids: processed_ids) do
-      [] -> :ok
-      [_ | _] -> insert_continuation(tenant_id, dim)
-    end
+    if Embeddings.system_corpus_stale?(tenant_id, dim, exclude_ids: processed_ids),
+      do: insert_continuation(tenant_id, dim),
+      else: :ok
   end
 
   defp insert_continuation(tenant_id, dim) do

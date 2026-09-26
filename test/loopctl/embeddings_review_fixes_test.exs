@@ -781,7 +781,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert Embeddings.stale_system_articles(tenant.id, 1536) == []
     end
 
-    test "the md5 Elixir records is the md5 Postgres computes, unicode and empty text included" do
+    test "rows record the trigger's md5, so unicode and empty text read current once embedded" do
       tenant = tenant_at(1536)
 
       article =
@@ -808,6 +808,53 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
                    select: ae.source_md5
                  )
                )
+    end
+
+    test "a stamp leaves a row whose hash changed since it was compared" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      AdminRepo.query!(
+        "UPDATE article_embeddings SET source_md5 = NULL, embedding_content_hash = 'other' " <>
+          "WHERE tenant_id = $1 AND article_id = $2",
+        [Ecto.UUID.dump!(tenant.id), Ecto.UUID.dump!(article.id)]
+      )
+
+      assert {:ok, 0} =
+               Embeddings.stamp_article_sources(tenant.id, [{article, "compared-hash"}], 1536)
+
+      assert {:ok, 1} = Embeddings.stamp_article_sources(tenant.id, [{article, "other"}], 1536)
+    end
+
+    test "a search inside a caller's Repo transaction queues nothing" do
+      tenant = tenant_at(1536)
+      system_article()
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        {:ok, _} =
+          Loopctl.Repo.transaction(fn -> Embeddings.search_disclosure_meta(tenant.id, 1536) end)
+
+        refute_enqueued(worker: SystemCorpusEmbeddingWorker)
+      end)
+    end
+
+    test "an edited system article is queued again by the enqueue, without force" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      assert {:ok, :already_materialized} =
+               Embeddings.enqueue_system_corpus_materialization(tenant.id)
+
+      AdminRepo.query!("UPDATE articles SET body = $1 WHERE id = $2", [
+        "a corrected body",
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, %Oban.Job{}} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
+      end)
     end
 
     test "a text change is seen however it was written, updated_at or not" do

@@ -84,16 +84,6 @@ defmodule Loopctl.ObanConfig do
   # runtime-overridden key at compile time defeats the entire feature; hardcoding
   # (or reading via `Application.get_env/2` at call time) avoids recording that
   # dependency in the first place.
-  @lifeline_rescue_after_ms :timer.minutes(30)
-
-  @doc """
-  How long Oban's Lifeline leaves a job in `executing` before rescuing it as orphaned. One
-  value for the plugin and for every place that tells a caller how long an orphaned run
-  holds (the system-corpus materialization endpoint's contract).
-  """
-  @spec lifeline_rescue_after_ms() :: pos_integer()
-  def lifeline_rescue_after_ms, do: @lifeline_rescue_after_ms
-
   @default_queues [
     default: 9,
     webhooks: 5,
@@ -119,6 +109,16 @@ defmodule Loopctl.ObanConfig do
       {queue, queue_size(System.get_env(env_var), default)}
     end)
   end
+
+  @lifeline_rescue_after_ms :timer.minutes(30)
+
+  @doc """
+  How long Oban's Lifeline leaves a job in `executing` before rescuing it as orphaned. One
+  value for the plugin and for every place that tells a caller how long an orphaned run
+  holds (the system-corpus materialization endpoint's contract).
+  """
+  @spec lifeline_rescue_after_ms() :: pos_integer()
+  def lifeline_rescue_after_ms, do: @lifeline_rescue_after_ms
 
   @doc """
   Parses a queue-width env value, falling back to `default` when `value` is `nil`.

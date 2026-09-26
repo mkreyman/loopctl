@@ -952,9 +952,12 @@ defmodule Loopctl.Embeddings do
           pos_integer()
         ) :: {:ok, ArticleEmbedding.t()} | {:error, Ecto.Changeset.t()}
   def upsert_article_embedding_row(repo, tenant_id, article, embedding, content_hash, dimension) do
-    # `source_md5` names the article version the vector was made from; only when the
-    # caller passed the text it embedded (an id-only map leaves it nil, which reads stale).
-    %ArticleEmbedding{tenant_id: tenant_id, source_md5: source_md5_of(article)}
+    # `source_md5` names the article version the vector was made from: the trigger-kept
+    # `articles.text_md5` of the row the writer read, so the md5 formula exists once, in the
+    # trigger. It is set only for system-scope articles; a tenant article's is NULL, which is
+    # right, because the per-article tenant worker re-reads its article at write time and
+    # could otherwise name a newer version than its vector.
+    %ArticleEmbedding{tenant_id: tenant_id, source_md5: Map.get(article, :text_md5)}
     |> ArticleEmbedding.changeset(
       %{article_id: article.id, embedding: embedding, embedding_content_hash: content_hash},
       dimension
@@ -965,12 +968,6 @@ defmodule Loopctl.Embeddings do
       returning: [:id, :live_denorm, :inserted_at, :updated_at]
     )
   end
-
-  # System rows only: their writers (the materialization worker, the re-embed backfill)
-  # pass the struct they embedded. The per-article tenant worker re-reads its article at
-  # write time, so for a tenant row the md5 could name a newer version than the vector.
-  defp source_md5_of(%{scope: :system} = article), do: article_source_md5(article)
-  defp source_md5_of(_article), do: nil
 
   @doc """
   The stored content hash for `article_id` at `dimension`, or `nil` when there is no
@@ -1466,11 +1463,9 @@ defmodule Loopctl.Embeddings do
   def stale_system_articles(tenant_id, dimension, opts \\ [])
       when is_binary(tenant_id) and is_integer(dimension) do
     limit = Keyword.get(opts, :limit, @default_batch_size)
-    exclude = Keyword.get(opts, :exclude_ids, [])
 
     AdminRepo.all(
       from(a in stale_system_articles_query(tenant_id, dimension),
-        where: a.id not in ^exclude,
         order_by: a.id,
         limit: ^limit,
         select: struct(a, [:id, :tenant_id, :scope, :status, :title, :body, :text_md5])
@@ -1478,10 +1473,19 @@ defmodule Loopctl.Embeddings do
     )
   end
 
-  @doc "Whether any system article has no row made from its current text for this tenant."
-  @spec system_corpus_stale?(Ecto.UUID.t(), pos_integer()) :: boolean()
-  def system_corpus_stale?(tenant_id, dimension),
-    do: AdminRepo.exists?(stale_system_articles_query(tenant_id, dimension))
+  @doc """
+  Whether any system article has no row made from its current text for this tenant, an
+  `EXISTS` that loads no row. `exclude_ids:` leaves those articles out (the worker asking
+  whether anything remains beyond the batch it just handled).
+  """
+  @spec system_corpus_stale?(Ecto.UUID.t(), pos_integer(), keyword()) :: boolean()
+  def system_corpus_stale?(tenant_id, dimension, opts \\ []) do
+    exclude = Keyword.get(opts, :exclude_ids, [])
+
+    AdminRepo.exists?(
+      from(a in stale_system_articles_query(tenant_id, dimension), where: a.id not in ^exclude)
+    )
+  end
 
   defp stale_system_articles_query(tenant_id, dimension),
     do: system_articles_without_row(tenant_id, dimension, :current)
@@ -1509,37 +1513,31 @@ defmodule Loopctl.Embeddings do
   end
 
   @doc """
-  The md5 `source_md5` records: of `title <> "\\n\\n" <> body` as read, `nil` as empty, the
-  expression `stale_system_articles_query/2` computes in Postgres.
-  """
-  @spec article_source_md5(map()) :: String.t()
-  def article_source_md5(article) do
-    text = "#{Map.get(article, :title) || ""}\n\n#{Map.get(article, :body) || ""}"
-    :md5 |> :crypto.hash(text) |> Base.encode16(case: :lower)
-  end
-
-  @doc """
   Records that each article's row was made from the version passed in, without
   re-embedding: for rows whose stored content hash already matches that version's text.
-  The md5 is of the struct the caller compared, so an edit made since leaves the row stale.
-  One statement for the batch. Returns how many rows it stamped.
+  Each entry is `{article, compared_hash}`, the stored hash the caller compared; a row
+  whose hash changed since (another writer stored a different vector) is left alone. The
+  md5 is the `text_md5` of the struct the caller read, so an edit made since leaves the
+  row stale. One statement for the batch; returns how many rows it stamped.
   """
-  @spec stamp_article_sources(Ecto.UUID.t(), [Article.t()], pos_integer()) ::
+  @spec stamp_article_sources(Ecto.UUID.t(), [{Article.t(), String.t()}], pos_integer()) ::
           {:ok, non_neg_integer()}
   def stamp_article_sources(_tenant_id, [], _dimension), do: {:ok, 0}
 
-  def stamp_article_sources(tenant_id, articles, dimension) do
+  def stamp_article_sources(tenant_id, entries, dimension) do
     %{num_rows: n} =
       AdminRepo.query!(
         """
         UPDATE article_embeddings AS ae SET source_md5 = v.md5
-        FROM unnest($2::uuid[], $3::text[]) AS v(article_id, md5)
-        WHERE ae.tenant_id = $1 AND ae.article_id = v.article_id AND ae.dim = $4
+        FROM unnest($2::uuid[], $3::text[], $4::text[]) AS v(article_id, md5, compared_hash)
+        WHERE ae.tenant_id = $1 AND ae.article_id = v.article_id AND ae.dim = $5
+          AND ae.embedding_content_hash = v.compared_hash
         """,
         [
           Ecto.UUID.dump!(tenant_id),
-          Enum.map(articles, &Ecto.UUID.dump!(&1.id)),
-          Enum.map(articles, &article_source_md5/1),
+          Enum.map(entries, fn {a, _} -> Ecto.UUID.dump!(a.id) end),
+          Enum.map(entries, fn {a, _} -> a.text_md5 end),
+          Enum.map(entries, fn {_, hash} -> hash end),
           dimension
         ]
       )
@@ -1629,8 +1627,8 @@ defmodule Loopctl.Embeddings do
 
   # Decided under a per-(tenant, dim) transaction advisory lock, so two concurrent callers
   # (two disclosure fills missing the cache at once, a fill and a POST) cannot both read
-  # "nothing running" and both insert: the second fails to take the lock and answers
-  # in flight, without waiting (a wait would hold a connection on the search path). The
+  # "nothing running" and both insert (see `take_gate_lock/2` for who waits and who does
+  # not). The
   # worker's uniqueness cannot do this alone, because it leaves `:executing` out so its own
   # continuation can be inserted; a job dispatched between another caller's read and insert
   # would not dedupe. The insert joins the lock's transaction (`Oban.insert/1` writes on
@@ -1644,10 +1642,7 @@ defmodule Loopctl.Embeddings do
   defp gate_materialization(tenant_id, dimension, force?) do
     {:ok, result} =
       Repo.transaction(fn ->
-        %{rows: [[locked?]]} =
-          Repo.query!("SELECT pg_try_advisory_xact_lock(hashtext($1))", [
-            "system_corpus:#{tenant_id}:#{dimension}"
-          ])
+        locked? = take_gate_lock("system_corpus:#{tenant_id}:#{dimension}", force?)
 
         case locked? && latest_system_corpus_run_state(tenant_id, dimension) do
           # Another caller holds the gate right now and is deciding; waiting for it would
@@ -1667,6 +1662,21 @@ defmodule Loopctl.Embeddings do
       end)
 
     result
+  end
+
+  # Unforced callers (the read path, an agent POST) TRY the lock and answer in flight when
+  # another caller holds it, never waiting on a search. A forced call (an orchestrator's
+  # deliberate retry) WAITS for it: answering in flight there could be false, since the
+  # holder may have been an unforced call that the terminal gate refused, leaving nothing
+  # queued while the operator was told a run was underway.
+  defp take_gate_lock(key, true) do
+    Repo.query!("SELECT pg_advisory_xact_lock(hashtext($1))", [key])
+    true
+  end
+
+  defp take_gate_lock(key, false) do
+    %{rows: [[locked?]]} = Repo.query!("SELECT pg_try_advisory_xact_lock(hashtext($1))", [key])
+    locked?
   end
 
   # A run already queued or backing off is a uniqueness conflict, answered
@@ -2167,16 +2177,24 @@ defmodule Loopctl.Embeddings do
   def search_disclosure_meta(tenant_id, dimension)
       when is_binary(tenant_id) and is_integer(dimension) do
     DisclosureCache.fetch({:disclosure, tenant_id, dimension}, fn ->
-      meta =
-        Map.merge(system_corpus_meta(tenant_id, dimension), reembed_meta(tenant_id, dimension))
+      # The staleness probe first: a corpus with every article current has none missing,
+      # so the steady state pays ONE anti-join and the missing probe runs only when needed.
+      stale? = system_corpus_stale?(tenant_id, dimension)
+
+      corpus_meta =
+        if stale?,
+          do: system_corpus_meta(tenant_id, dimension),
+          else: %{system_corpus_recall: "semantic", system_corpus_dimension: dimension}
+
+      meta = Map.merge(corpus_meta, reembed_meta(tenant_id, dimension))
 
       # AC-41.1.7's "on demand" read-path materialization trigger lives INSIDE the
       # memoized fill (review): it was previously called on EVERY semantic response,
       # so an unmaterialized tenant paid an unindexed `oban_jobs` JSONB scan plus an
       # Oban insert on every search. Firing it only on a cache MISS bounds it to once
-      # per DisclosureCache TTL; the enqueue's staleness probe, its executing-run check and
-      # the worker's uniqueness make a repeat a no-op rather than a second run.
-      maybe_trigger_system_corpus(tenant_id, dimension)
+      # per DisclosureCache TTL; the gate's executing-run check and the worker's
+      # uniqueness make a repeat a no-op rather than a second run.
+      if stale?, do: maybe_trigger_system_corpus(tenant_id, dimension)
 
       meta
     end)
@@ -2187,8 +2205,12 @@ defmodule Loopctl.Embeddings do
   # vector is of the old text. The enqueue's own first check is that staleness, so a
   # current corpus queues nothing, and a run in progress is a conflict, never a second
   # run. Its failure must not fail the search that noticed: the next fill tries again.
+  # Skipped when the search runs inside a caller's `Repo` transaction: the gate's own
+  # transaction would join it, holding the advisory lock until the caller commits, and a
+  # failure inside it would abort the caller's transaction under a rescue it cannot see.
+  # The next fill outside one queues the run.
   defp maybe_trigger_system_corpus(tenant_id, dimension) do
-    enqueue_system_corpus_materialization(tenant_id, dimension: dimension)
+    unless Repo.in_transaction?(), do: gate_materialization(tenant_id, dimension, false)
     :ok
   rescue
     e ->
