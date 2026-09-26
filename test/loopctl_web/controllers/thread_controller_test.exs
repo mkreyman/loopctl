@@ -73,6 +73,10 @@ defmodule LoopctlWeb.ThreadControllerTest do
     assert build_conn()
            |> post_checkpoint(key, story, Map.delete(@checkpoint, "claim_epoch"))
            |> json_response(400)
+
+    assert build_conn()
+           |> post_checkpoint(key, story, %{@checkpoint | "claim_epoch" => 4_294_967_296})
+           |> json_response(400)
   end
 
   test "any principal writes a message; the thread marks bodies untrusted", %{conn: conn} do
@@ -121,6 +125,11 @@ defmodule LoopctlWeb.ThreadControllerTest do
     assert build_conn()
            |> auth(key)
            |> get(~p"/api/v1/stories/#{story.id}/thread?limit=0")
+           |> json_response(400)
+
+    assert build_conn()
+           |> auth(key)
+           |> get("/api/v1/stories/#{story.id}/thread?after_seq[x]=1")
            |> json_response(400)
   end
 

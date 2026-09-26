@@ -24,7 +24,7 @@
     },
     {
       "id": "AC-45.1.3",
-      "description": "Recording a checkpoint is refused with 409 not_claimant, stale_claim_epoch or claim_not_live unless the caller is the story's current claimant (Delivery.Claimant) under the current claim_epoch with a live lease; the lease alone decides liveness, so a claimant that reported done is still the claimant. The same (commit_sha, claim_epoch) resent with the same tree and note returns the recorded checkpoint with 200; another tree or note is 409 checkpoint_conflict; the same commit under a new claim is recorded again."
+      "description": "Recording a checkpoint is refused with 409 not_claimant, stale_claim_epoch or claim_not_live unless the caller is the story's current claimant (Delivery.Claimant) under the current claim_epoch while the claim is live: a claimed status, a lease not passed, and no review requested (Progress.live_claim? plus the review marker). The recorder's resend of the same (commit_sha, claim_epoch) with the same tree and note returns the recorded checkpoint with 200 even after the claim ends; another tree or note is 409 checkpoint_conflict; the same commit under a new claim is recorded again, with no parent from the ended claim; commit and tree must share one object format. Each checkpoint's audit-chain event records its commit_sha, tree_sha and claim_epoch."
     },
     {
       "id": "AC-45.1.4",
@@ -63,10 +63,10 @@
         "claimed story"
       ],
       "steps": [
-        "stale epoch; other agent; lapsed lease; reported-done claimant"
+        "stale epoch; other agent; lapsed lease; review requested; reported done"
       ],
       "expected_results": [
-        "409 stale_claim_epoch; 409 not_claimant; 409 claim_not_live; 201"
+        "409 stale_claim_epoch; 409 not_claimant; 409 claim_not_live for the last three"
       ]
     },
     {

@@ -58,7 +58,15 @@ defmodule Loopctl.Threads do
   @default_entry_page 200
   @max_entry_page 500
 
-  @story_fields [:id, :tenant_id, :assigned_agent_id, :claim_epoch, :claimed_until]
+  @story_fields [
+    :id,
+    :tenant_id,
+    :assigned_agent_id,
+    :claim_epoch,
+    :agent_status,
+    :claimed_until,
+    :review_requested_at
+  ]
 
   @type thread :: %{
           checkpoints: [Checkpoint.t()],
@@ -67,8 +75,8 @@ defmodule Loopctl.Threads do
         }
 
   @doc """
-  The story's thread: all of its checkpoints, and one page of its entries, each in `seq`
-  order. `:after_seq` starts the page after that entry; `:limit` is capped at
+  The story's thread: its most recent checkpoints (at most #{@max_entry_page}), and one page of
+  its entries, each in `seq` order. `:after_seq` starts the page after that entry; `:limit` is capped at
   #{@max_entry_page}. `next_after_seq` is the `after_seq` for the next page, or nil on the
   last. `{:error, :not_found}` when the story is not visible to the tenant.
   """
@@ -107,6 +115,7 @@ defmodule Loopctl.Threads do
 
     with :ok <- valid_sha(commit_sha, "commit_sha"),
          :ok <- valid_sha(tree_sha, "tree_sha"),
+         :ok <- same_object_format(commit_sha, tree_sha),
          :ok <- valid_note(note),
          :ok <- no_secret(note, :note, tenant_id, story_id) do
       in_story_lock(tenant_id, story_id, fn ->
@@ -167,13 +176,25 @@ defmodule Loopctl.Threads do
 
       {:ok,
        %{
-         checkpoints: Repo.all(in_story(Checkpoint, tenant_id, story_id)),
+         checkpoints: latest_checkpoints(tenant_id, story_id),
          entries: page,
          next_after_seq: if(rest == [], do: nil, else: List.last(page).seq)
        }}
     else
       {:error, :not_found}
     end
+  end
+
+  # The most recent checkpoints, oldest first. A thread that recorded more than a page's worth
+  # returns only the latest page: the merge gate and a reviewer need the current head and
+  # what led to it, never the whole history on every poll.
+  defp latest_checkpoints(tenant_id, story_id) do
+    Checkpoint
+    |> where([c], c.tenant_id == ^tenant_id and c.story_id == ^story_id)
+    |> order_by([c], desc: c.seq)
+    |> limit(^@max_entry_page)
+    |> Repo.all()
+    |> Enum.reverse()
   end
 
   defp in_story(schema, tenant_id, story_id) do
@@ -214,6 +235,9 @@ defmodule Loopctl.Threads do
     end
   end
 
+  # Only the recorder replays. Anyone else meets the fence, which is there to NAME the refusal
+  # (an ended claim, a stranger): a checkpoint under epoch E was recorded by E's claimant, so
+  # nobody but its recorder can pass it.
   defp replay_allowed(checkpoint, author, fence) do
     if recorded_by?(checkpoint, author), do: :ok, else: fence.()
   end
@@ -238,7 +262,7 @@ defmodule Loopctl.Threads do
   end
 
   defp lease(story) do
-    if Claimant.lease_live?(story, DateTime.utc_now()),
+    if Claimant.live?(story, DateTime.utc_now()),
       do: :ok,
       else: {:error, :claim_not_live}
   end
@@ -291,7 +315,15 @@ defmodule Loopctl.Threads do
         checkpoint_id: checkpoint.id
       })
 
-    with {:ok, _entry, :created, chained} <- insert_entry(tenant_id, story_id, entry, opts) do
+    adopted = %{
+      "commit_sha" => commit_sha,
+      "tree_sha" => tree_sha,
+      "claim_epoch" => epoch,
+      "checkpoint_seq" => checkpoint.seq
+    }
+
+    with {:ok, _entry, :created, chained} <-
+           insert_entry(tenant_id, story_id, entry, Keyword.put(opts, :adopted, adopted)) do
       {:ok, checkpoint, :created, chained}
     end
   end
@@ -314,6 +346,15 @@ defmodule Loopctl.Threads do
 
     query = if epoch == :any, do: query, else: where(query, [c], c.claim_epoch == ^epoch)
     Repo.one(query)
+  end
+
+  # One repository uses one object format: a SHA-1 commit has a SHA-1 tree.
+  defp same_object_format(commit_sha, tree_sha) do
+    if byte_size(commit_sha) == byte_size(tree_sha),
+      do: :ok,
+      else:
+        {:error, :unprocessable_entity,
+         "commit_sha and tree_sha must be the same object format (both 40 or both 64)"}
   end
 
   defp valid_sha(value, field) do
@@ -473,24 +514,31 @@ defmodule Loopctl.Threads do
       |> Ecto.Changeset.put_change(:dispatch_id, List.last(lineage))
 
     with {:ok, entry} <- Repo.insert(changeset),
-         {:ok, chain_entry} <- chain(tenant_id, story_id, entry, lineage) do
+         {:ok, chain_entry} <-
+           chain(tenant_id, story_id, entry, lineage, Keyword.get(opts, :adopted, %{})) do
       {:ok, entry, :created, [chain_entry]}
     end
   end
 
-  defp chain(tenant_id, story_id, entry, lineage) do
+  # A checkpoint's event pins WHICH commit was adopted, under which claim, so the chain can
+  # show the merge gate's record is the commit the claimant reported.
+  defp chain(tenant_id, story_id, entry, lineage, adopted) do
     AuditChain.append_in_tenant_transaction(tenant_id, %{
       action: "thread_#{entry.kind}_recorded",
       actor_lineage: lineage,
       entity_type: "story",
       entity_id: story_id,
-      payload: %{
-        "thread_entry_id" => entry.id,
-        "seq" => entry.seq,
-        "kind" => to_string(entry.kind),
-        "author_principal" => entry.author_principal,
-        "checkpoint_id" => entry.checkpoint_id
-      }
+      payload:
+        Map.merge(
+          %{
+            "thread_entry_id" => entry.id,
+            "seq" => entry.seq,
+            "kind" => to_string(entry.kind),
+            "author_principal" => entry.author_principal,
+            "checkpoint_id" => entry.checkpoint_id
+          },
+          adopted
+        )
     })
   end
 

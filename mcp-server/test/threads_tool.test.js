@@ -56,6 +56,17 @@ describe("thread_checkpoint", () => {
     ]);
   });
 
+  test("refuses client-side without claim_epoch, calling nothing", async () => {
+    const { calls, apiCall } = fakeApi();
+    const res = await recordCheckpoint(
+      { story_id: STORY_ID, commit_sha: SHA, tree_sha: TREE },
+      { apiCall, env: ENV },
+    );
+    assert.equal(res.error, true);
+    assert.match(res.body, /claim_epoch/);
+    assert.equal(calls.length, 0);
+  });
+
   test("refuses client-side without a sha, calling nothing", async () => {
     const { calls, apiCall } = fakeApi();
     const res = await recordCheckpoint(

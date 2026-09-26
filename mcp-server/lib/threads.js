@@ -83,6 +83,13 @@ export async function recordCheckpoint(
   if (!present(story_id)) return missing("story_id");
   if (!present(commit_sha)) return missing("commit_sha");
   if (!present(tree_sha)) return missing("tree_sha");
+  if (!Number.isInteger(claim_epoch) || claim_epoch < 0) {
+    return {
+      error: true,
+      status: 0,
+      body: "`claim_epoch` is required: the non-negative integer your claim returned.",
+    };
+  }
 
   return apiCall(
     "POST",

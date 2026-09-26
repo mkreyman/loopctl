@@ -27,6 +27,15 @@ defmodule Loopctl.ThreadsTest do
     ctx
   end
 
+  defp dump_ids(row) do
+    %{
+      row
+      | id: Ecto.UUID.dump!(row.id),
+        tenant_id: Ecto.UUID.dump!(row.tenant_id),
+        story_id: Ecto.UUID.dump!(row.story_id)
+    }
+  end
+
   defp set_story(ctx, fields) do
     {:ok, _} =
       Repo.with_tenant(ctx.tenant_id, fn ->
@@ -94,17 +103,21 @@ defmodule Loopctl.ThreadsTest do
       assert {:error, :not_claimant} = checkpoint(ctx, @sha1, agent_id: nil)
     end
 
-    test "a lapsed lease has ended the claim; a reported-done claimant is still the claimant" do
+    test "a claim is live only while claimed, unexpired and not handed to review" do
       ctx = claimed_story()
+      future = DateTime.add(DateTime.utc_now(), 600)
 
       set_story(ctx, claimed_until: DateTime.add(DateTime.utc_now(), -60))
       assert {:error, :claim_not_live} = checkpoint(ctx)
 
-      set_story(ctx,
-        claimed_until: DateTime.add(DateTime.utc_now(), 600),
-        agent_status: :reported_done
-      )
+      set_story(ctx, claimed_until: future, review_requested_at: DateTime.utc_now())
+      assert {:error, :claim_not_live} = checkpoint(ctx)
 
+      set_story(ctx, review_requested_at: nil, agent_status: :reported_done)
+      assert {:error, :claim_not_live} = checkpoint(ctx)
+
+      # A NULL lease is a pre-lease claim: live while claimed, never once it is not.
+      set_story(ctx, agent_status: :implementing, claimed_until: nil)
       assert {:ok, _, :created} = checkpoint(ctx)
     end
 
@@ -163,6 +176,11 @@ defmodule Loopctl.ThreadsTest do
 
       assert {:error, :unprocessable_entity, _} = checkpoint(ctx, "HEAD")
       assert {:error, :unprocessable_entity, _} = checkpoint(ctx, @sha1, tree_sha: "abc")
+
+      assert {:error, :unprocessable_entity, msg} =
+               checkpoint(ctx, @sha1, tree_sha: String.duplicate("c", 64))
+
+      assert msg =~ "object format"
       assert {:error, :unprocessable_entity, msg} = checkpoint(ctx, @sha1, note: "")
       assert msg =~ "note"
       assert {:error, :unprocessable_entity, msg} = checkpoint(ctx, @sha1, note: "   ")
@@ -281,6 +299,38 @@ defmodule Loopctl.ThreadsTest do
       assert_receive {:blocked, %{field: :idempotency_key, story_id: ^story_id}}
     end
 
+    test "a thread returns only its latest page of checkpoints" do
+      ctx = claimed_story()
+      max = Threads.max_entry_page()
+      now = DateTime.utc_now()
+
+      rows =
+        for seq <- 1..(max + 1) do
+          %{
+            id: Ecto.UUID.generate(),
+            tenant_id: ctx.tenant_id,
+            story_id: ctx.story.id,
+            seq: seq,
+            kind: "checkpoint",
+            commit_sha: String.pad_leading(Integer.to_string(seq, 16), 40, "0"),
+            tree_sha: @tree,
+            claim_epoch: @epoch,
+            gate_evidence: %{},
+            inserted_at: now,
+            updated_at: now
+          }
+        end
+
+      {:ok, _} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.insert_all("thread_checkpoints", Enum.map(rows, &dump_ids/1))
+        end)
+
+      {:ok, thread} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
+      assert length(thread.checkpoints) == max
+      assert hd(thread.checkpoints).seq == 2 and List.last(thread.checkpoints).seq == max + 1
+    end
+
     test "entries are paged" do
       ctx = claimed_story()
       for i <- 1..5, do: {:ok, _, :created} = entry(ctx, message("m#{i}", "#{i}"))
@@ -309,6 +359,16 @@ defmodule Loopctl.ThreadsTest do
       )
 
     assert actions == ["thread_checkpoint_recorded", "thread_message_recorded"]
+
+    [payload | _] =
+      Repo.all(
+        from e in ChainEntry,
+          where: e.tenant_id == ^ctx.tenant_id and e.entity_id == ^ctx.story.id,
+          order_by: e.chain_position,
+          select: e.payload
+      )
+
+    assert %{"commit_sha" => @sha1, "tree_sha" => @tree, "claim_epoch" => @epoch} = payload
   end
 
   test "tenant B cannot read or write tenant A's thread" do

@@ -7,9 +7,10 @@ defmodule Loopctl.Delivery.Claimant do
   check by matching that nil: an unclaimed story is refused before any comparison, so a nil
   agent can only ever be compared against a real one, and never equals it.
 
-  `lease_live?/2` is the lease half: a claim whose `claimed_until` has passed has ended even
-  before the reclaimer runs. It reads the lease only, never `agent_status`, so a claimant
-  that has reported its story done is still the claimant while its lease runs.
+  `live?/2` is the liveness half, and it is `Loopctl.Progress.live_claim?/2` (a claimed status
+  and a lease not yet passed) plus the review marker: once review is requested the
+  implementer's lease has stopped applying, exactly as the reclaimer reads it. A reported,
+  released or verified story is not live, so its implementer can no longer add to it.
   """
 
   @doc """
@@ -27,8 +28,12 @@ defmodule Loopctl.Delivery.Claimant do
     end
   end
 
-  @doc "True while the story's lease has not passed; a nil lease never expires."
-  @spec lease_live?(map(), DateTime.t()) :: boolean()
-  def lease_live?(%{claimed_until: nil}, _now), do: true
-  def lease_live?(%{claimed_until: until}, now), do: DateTime.after?(until, now)
+  @doc """
+  True while the claim still accepts the implementer's work: live by
+  `Loopctl.Progress.live_claim?/2` and no review requested. `story` must carry
+  `agent_status`, `claimed_until` and `review_requested_at`.
+  """
+  @spec live?(Loopctl.WorkBreakdown.Story.t(), DateTime.t()) :: boolean()
+  def live?(story, now),
+    do: is_nil(story.review_requested_at) and Loopctl.Progress.live_claim?(story, now)
 end

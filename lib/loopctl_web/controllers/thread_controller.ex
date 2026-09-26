@@ -57,8 +57,8 @@ defmodule LoopctlWeb.ThreadController do
     responses: %{
       200 => {"The thread", "application/json", %Schema{type: :object}},
       400 =>
-        {"after_seq is not a non-negative integer, or limit is not between 1 and the cap",
-         "application/json", Schemas.ErrorResponse},
+        {"after_seq or limit is not a non-negative integer, or limit is 0. A limit above " <>
+           "the cap is clamped to it, not refused", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -179,12 +179,15 @@ defmodule LoopctlWeb.ThreadController do
       nil ->
         {:ok, nil}
 
-      value ->
-        case Integer.parse(to_string(value)) do
+      value when is_binary(value) ->
+        case Integer.parse(value) do
           # Bounded to int4: `seq` is an integer column, and a larger value fails to encode.
           {int, ""} when int >= 0 and int <= @max_int4 -> {:ok, int}
           _ -> {:error, :bad_request, "#{name} must be a non-negative integer"}
         end
+
+      _map_or_list ->
+        {:error, :bad_request, "#{name} must be a non-negative integer"}
     end
   end
 
