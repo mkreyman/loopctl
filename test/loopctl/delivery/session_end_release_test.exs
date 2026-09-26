@@ -673,6 +673,24 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
                releases(ctx)
     end
 
+    # #884 review round 3, finding 7. A hold already in place — here the runner's own precise
+    # reset, two hours out — is not rewritten to the provisional eight days, and a sweep that
+    # retries does not keep pushing it forward.
+    test "a runner already held out keeps its own hold when the reclaim finishes", ctx do
+      assert {:ok, {:recorded, _session}} = record_only(ctx, "usage_exhausted")
+      resets_at = DateTime.add(DateTime.utc_now(), 7_200, :second)
+
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant_id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
+      end)
+
+      expire_lease(ctx)
+      assert {:ok, _released} = reclaim(ctx)
+
+      assert stage_row(ctx).attempts == %{}
+      assert_in_delta seconds_from_now(usage_until(ctx)), 7_200, 5
+    end
+
     # With the machine NOT held out, the counted expiry is the only bound on the story being
     # placed straight back on it (#883 review round 2, finding 1).
     test "a recorded usage_exhausted whose hold the database refuses is reclaimed COUNTED",

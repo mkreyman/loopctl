@@ -10,8 +10,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Changed
 
 - **`force_unclaim_story`'s description** no longer says a story at `queued` + `pending` is
-  one no placement takes: loopctl's placement now contracts such a story inside its own claim
-  (loopctl epic 44, #884). No change to the request or the key.
+  one no placement takes. **`place_dispatch`** now says a `pending` story is placeable: loopctl
+  contracts it before minting, and refuses a story whose dependencies are unmet before anything
+  is minted (loopctl epic 44, #884). No change to the request or the key.
 
 ## 2.103.3 — 2026-09-23 (an exhausted subscription is not capacity)
 

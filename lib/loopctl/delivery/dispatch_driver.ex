@@ -28,13 +28,12 @@ defmodule Loopctl.Delivery.DispatchDriver do
   is the part that cannot starve a story, and it is what
   `Loopctl.Workers.TriageTriggerWorker.candidates/0` already uses.
 
-  A candidate must also be `contracted`, because `Placement.place/4` refuses anything else.
-  Every release that puts a story's row back to `queued` now re-contracts it in the same
-  transaction or escalates it (`Loopctl.Delivery.Stages.follow_release/5`, US-44.4), so a
-  released story is either a candidate again or in front of a human. The filter stays: a
-  `queued` + `:pending` story (one released before that, or by a path that has not learned it)
-  selected on the stage alone would be picked for ever, its `updated_at` frozen at the release
-  and so permanently near the head of an oldest-first queue.
+  A candidate must also be `pending` or `contracted` (#884): `Placement.place/4` contracts a
+  `pending` one before it mints, so a triage-accepted story, a release whose re-contract did
+  not land, and an escalation resolved to `queued` are all placed without an orchestrator.
+  Any OTHER status behind a `queued` row (a stale row under a claimed story) is left out:
+  selected on the stage alone it would be refused on every pass, its `updated_at` frozen and
+  so permanently near the head of an oldest-first queue.
 
   ## Eligibility is decided BEFORE the claim, on all four facts
 
@@ -103,7 +102,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   @doc """
   The stories this pass will attempt, at most `limit`, fairly across tenants.
 
-  `queued` AND `contracted` AND under a project bound to exactly ONE active intake source —
+  `queued` AND `pending` or `contracted` AND under a project bound to exactly ONE active intake source —
   see the moduledoc on why the stage row alone selected released stories for ever, and why an
   unaddressable project is the same trap wearing the driver's own `:blocked` label. Ranked per
   tenant and ordered by that rank first, so a tenant with one queued story is reached in the

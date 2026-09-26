@@ -79,8 +79,9 @@ defmodule LoopctlWeb.DispatchPlacementController do
         "pushes the dispatch to the runner — the three steps `Loopctl.Delivery.Placement` " <>
         "performs as one. A TRIGGER and not a scheduler: the caller names the story and the " <>
         "runner, and nothing here selects work or runs on a cadence.\n\n" <>
-        "The story must be `contracted` and its stage row at `queued`; both are checked " <>
-        "BEFORE anything is minted, so a not-ready story costs no dispatch row, no ephemeral " <>
+        "The story must be `pending` or `contracted`, its dependencies met, and its stage " <>
+        "row at `queued`; a `pending` story is contracted by the placement. All of that is " <>
+        "checked BEFORE anything is minted, so a not-ready story costs no dispatch row, no ephemeral " <>
         "key and no audit-chain entry.\n\n" <>
         "REPEATING is safe under the same claim — a repeat with the same `dispatch_id` " <>
         "resumes and re-pushes. Once that claim has ended the recorded epoch is stale for " <>

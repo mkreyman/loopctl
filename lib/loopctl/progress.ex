@@ -1932,7 +1932,7 @@ defmodule Loopctl.Progress do
   `session_ended` (`runner_dispatches.session_ended_reason` `wall_clock_exceeded` or
   `max_turns_exceeded`), the channel's own escalation of it did not complete — the lease
   would not have run out otherwise — so the reclaim takes the SAME escalation first, through
-  the one function the channel uses (`Loopctl.Delivery.RunnerStages.escalate_recorded_budget_kill/4`,
+  the one function the channel uses (`Loopctl.Delivery.RunnerStages.redrive_recorded_session_end/4`,
   in-flight row -> `escalated` over `:budget_reported`), and only then releases the claim.
   The row is then no longer in flight, so the release only rebinds it: the story is
   `pending` behind an `escalated` row, which is held (`Loopctl.Delivery.Stages.held_story_ids/2`),
@@ -1972,9 +1972,35 @@ defmodule Loopctl.Progress do
       cause: :attempt
     }
 
-    case RunnerStages.escalate_recorded_budget_kill(tenant_id, story_id, expected_epoch, label) do
+    case RunnerStages.redrive_recorded_session_end(tenant_id, story_id, expected_epoch, label) do
       :none ->
-        reclaim_unless_exhausted(tenant_id, story_id, expected_epoch, lease)
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_lease_expired",
+            webhook_reason: "claim_lease_expired",
+            new_state: %{}
+          })
+        )
+
+      # An exhausted subscription, its machine held out: released as that session end, and
+      # spending no attempt.
+      {:ok, "usage_exhausted" = reason} ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_session_ended",
+            webhook_reason: "session_ended:" <> reason,
+            new_state: %{"session_ended_reason" => reason},
+            cause: :usage_exhausted
+          })
+        )
+
+      # The hold needs a lock: nothing released, the next sweep retries.
+      {:error, {:usage_hold, :busy}} ->
+        {:error, :usage_hold_busy}
 
       {:ok, reason} ->
         runner_lost_release(
@@ -1995,44 +2021,6 @@ defmodule Loopctl.Progress do
         )
 
         {:error, :budget_escalation_refused}
-    end
-  end
-
-  # A RECORDED `usage_exhausted` IS FINISHED, NOT EXPIRED (#884 review round 2): its report
-  # was recorded and the node died, or the runner went quiet, before the hold and the release
-  # ran. The reclaim completes that session end as the resend would have — the machine held out
-  # first (`RunnerStages.redrive_recorded_usage_exhausted/3`), then the claim released WITHOUT
-  # spending an attempt. A hold the database refuses permanently is not re-driven: with the
-  # machine not held out, the counted expiry is the only bound on the story returning to it.
-  defp reclaim_unless_exhausted(tenant_id, story_id, expected_epoch, lease) do
-    case RunnerStages.redrive_recorded_usage_exhausted(tenant_id, story_id, expected_epoch) do
-      :none ->
-        runner_lost_release(
-          tenant_id,
-          story_id,
-          Map.merge(lease, %{
-            action: "claim_lease_expired",
-            webhook_reason: "claim_lease_expired",
-            new_state: %{}
-          })
-        )
-
-      {:ok, reason} ->
-        runner_lost_release(
-          tenant_id,
-          story_id,
-          Map.merge(lease, %{
-            action: "claim_session_ended",
-            webhook_reason: "session_ended:" <> reason,
-            new_state: %{"session_ended_reason" => reason},
-            cause: :usage_exhausted
-          })
-        )
-
-      # The hold could not be written for want of a lock: nothing released, the next sweep
-      # tries again, as a budget kill's refused escalation does.
-      {:error, :busy} ->
-        {:error, :usage_hold_busy}
     end
   end
 
@@ -4550,7 +4538,14 @@ defmodule Loopctl.Progress do
       }}}
   end
 
-  defp check_claim_dependencies(story) do
+  @doc """
+  Whether `story`'s dependencies — its own and its epic's — are all verified: the check a claim
+  makes under its lock. Also read by `Loopctl.Delivery.Placement` BEFORE it mints, so a story
+  that cannot be claimed spends no dispatch.
+  """
+  @spec check_claim_dependencies(Story.t()) ::
+          {:ok, :deps_satisfied} | {:error, :dependencies_not_met}
+  def check_claim_dependencies(story) do
     # Check story-level dependencies: all depends_on stories must be verified
     story_deps_unmet =
       from(sd in StoryDependency,

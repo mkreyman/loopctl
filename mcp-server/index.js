@@ -8057,7 +8057,8 @@ const TOOLS = [
       "push the work (POST /api/v1/runners/:runner_id/dispatches). This is the control-side " +
       "trigger of the agent delivery loop — the verb that turns a story the loop has decided " +
       "to build into a session running on a machine. Get `runner_id` and its free slots from " +
-      "runner_pool; the story must be `contracted` with its delivery stage at `queued` " +
+      "runner_pool; the story must be `pending` or `contracted` (a pending one is contracted " +
+      "by the placement), its dependencies met, with its delivery stage at `queued` " +
       "(story_stage shows where it is).\n\n" +
       "The STORY OBJECT is not a parameter: loopctl builds it from its own rows and refuses a " +
       "caller-supplied one, because a control plane able to hand a runner prose is able to " +

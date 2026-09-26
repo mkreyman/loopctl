@@ -30,7 +30,7 @@ defmodule Loopctl.Delivery.RunnerStages do
     that kept moving) and the resend re-drives it; one the stage machine REFUSED is answered
     with that refusal's own permanent code (see `budget_escalation_refused/4`). Either way the
     claim is left HELD, and when its lease runs out the reclaim re-drives the same escalation
-    (`escalate_recorded_budget_kill/4`) instead of re-queueing the story, so a budget-killed
+    (`redrive_recorded_session_end/4`) instead of re-queueing the story, so a budget-killed
     story is never re-queued on any path.
   - `crashed` — the claim is released NOW rather than at lease expiry, over `:runner_lost`
     with the reclaim's audit shape (`Loopctl.Progress.release_ended_session/4`), and the slot
@@ -417,7 +417,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   # `escalated` is chained, and the chain cannot be corrected afterwards.
   #
   # ONE FUNCTION FOR BOTH WRITERS of this edge: `end_session/4` (`actor_label` the runner) and
-  # the lease reclaim through `escalate_recorded_budget_kill/4` (the worker), so the two cannot
+  # the lease reclaim through `redrive_recorded_session_end/4` (the worker), so the two cannot
   # take different transitions or answer a refusal differently.
   defp escalate_budget(tenant_id, actor_label, session, message, attempts_left) do
     epoch = message.claim_epoch
@@ -497,7 +497,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   a retry instruction is a resend loop against a broken chain (`classify/1`, #824 round 3).
   The story stays in flight with its claim held, and the RE-DRIVER is the lease reclaim, not
   the runner: when the lease runs out, `Loopctl.Progress.reclaim_expired_claim/3` takes this
-  same escalation (`escalate_recorded_budget_kill/4`) instead of re-queueing, and leaves the
+  same escalation (`redrive_recorded_session_end/4`) instead of re-queueing, and leaves the
   claim held again while the chain still refuses — so the story is escalated on the first
   sweep after the repair, and never re-queued.
   """
@@ -529,12 +529,25 @@ defmodule Loopctl.Delivery.RunnerStages do
     do NOT release. A released claim would re-queue a budget-killed story, which is the one
     thing this path exists to prevent; held, it is retried by the next sweep.
   """
-  @spec escalate_recorded_budget_kill(Ecto.UUID.t(), Ecto.UUID.t(), integer(), String.t()) ::
-          :none | {:ok, String.t()} | {:error, end_error()}
-  def escalate_recorded_budget_kill(tenant_id, story_id, claim_epoch, actor_label) do
-    case DispatchLedger.session_ended_with(tenant_id, story_id, claim_epoch, @budget_reasons) do
+  #
+  # ONE READ serves both re-drives (#884 review round 3): the report is a budget kill or an
+  # exhausted subscription, never both, so a single ledger read branches on its reason.
+  # `usage_exhausted`: see `hold_recorded_exhaustion/3`; `{:error, {:usage_hold, :busy}}` leaves
+  # the claim held for the next sweep, like a refused budget escalation.
+  @spec redrive_recorded_session_end(Ecto.UUID.t(), Ecto.UUID.t(), integer(), String.t()) ::
+          :none | {:ok, String.t()} | {:error, end_error() | {:usage_hold, :busy}}
+  def redrive_recorded_session_end(tenant_id, story_id, claim_epoch, actor_label) do
+    case DispatchLedger.session_ended_with(
+           tenant_id,
+           story_id,
+           claim_epoch,
+           ["usage_exhausted" | @budget_reasons]
+         ) do
       nil ->
         :none
+
+      %{reason: "usage_exhausted"} = session ->
+        hold_recorded_exhaustion(tenant_id, story_id, session)
 
       session ->
         message = %{
@@ -549,33 +562,38 @@ defmodule Loopctl.Delivery.RunnerStages do
     end
   end
 
-  @doc """
-  The LEASE RECLAIM's half of an exhausted subscription: if `story_id`'s claim at `claim_epoch`
-  ran under an ACCEPTED dispatch whose runner recorded `usage_exhausted`, writes that runner's
-  hold — the same `Usage.mark_session_exhausted/3` the session end runs — before
-  `Loopctl.Progress.reclaim_expired_claim/3` releases the claim uncounted.
+  # THE LEASE RECLAIM's half of an exhausted subscription: the runner recorded
+  # `usage_exhausted` for this claim and its hold and release never ran. The machine is held
+  # out first, as the session end would have held it, then the claim is released uncounted.
+  #
+  # - A machine ALREADY held out is not written again (#884 review round 3): each sweep that
+  #   retried a failing release pushed the provisional eight-day hold forward, and a precise
+  #   `resets_at` the runner reported since was overwritten by it.
+  # - `:ok` from the mark also covers an account reported REFILLED after the session was
+  #   accepted: nothing is held, and nothing needs to be — the machine is not exhausted.
+  # - A hold the database refuses permanently is logged and answered `:none`: the counted
+  #   expiry is then the only bound on the story returning to a machine not held out.
+  defp hold_recorded_exhaustion(tenant_id, story_id, session) do
+    held? = Runners.usage_exhausted?(tenant_id, session.runner_id)
 
-  - `:none` — no such report, or a hold the database refuses permanently: an ordinary, counted
-    lease expiry. Counted because, with the machine not held out, the count is the only bound.
-  - `{:ok, "usage_exhausted"}` — the machine is held out: release it as that session end.
-  - `{:error, :busy}` — the hold needs a lock: release nothing, the next sweep retries.
+    case if(held?,
+           do: :ok,
+           else: Usage.mark_session_exhausted(tenant_id, session.runner_id, session.replied_at)
+         ) do
+      :ok ->
+        {:ok, session.reason}
 
-  Read before the release transaction, like `escalate_recorded_budget_kill/4`: a report
-  recorded between this read and the release's lock is released counted.
-  """
-  @spec redrive_recorded_usage_exhausted(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
-          :none | {:ok, String.t()} | {:error, :busy}
-  def redrive_recorded_usage_exhausted(tenant_id, story_id, claim_epoch) do
-    case DispatchLedger.session_ended_with(tenant_id, story_id, claim_epoch, ["usage_exhausted"]) do
-      nil ->
+      {:error, :busy} ->
+        {:error, {:usage_hold, :busy}}
+
+      {:error, reason} ->
+        Logger.error(
+          "lease reclaim: the runner's exhaustion hold was refused; the expiry is counted: " <>
+            "tenant_id=#{tenant_id} story_id=#{story_id} runner_id=#{session.runner_id} " <>
+            "reason=#{inspect(reason)}"
+        )
+
         :none
-
-      session ->
-        case Usage.mark_session_exhausted(tenant_id, session.runner_id, session.replied_at) do
-          :ok -> {:ok, session.reason}
-          {:error, :busy} -> {:error, :busy}
-          {:error, _refused} -> :none
-        end
     end
   end
 
