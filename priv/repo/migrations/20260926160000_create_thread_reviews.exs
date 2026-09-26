@@ -125,6 +125,27 @@ defmodule Loopctl.Repo.Migrations.CreateThreadReviews do
   end
 
   def down do
+    # Down folds judgements back into the per-AUTHOR key index, which up split them out of on
+    # purpose: one reviewer agent may use the same key in two reviews. When it has, that index
+    # cannot be rebuilt, and the rollback refuses rather than drop or rewrite a thread entry,
+    # which is append-only and hash-chained.
+    %{rows: [[collisions]]} =
+      repo().query!("""
+      SELECT count(*) FROM (
+        SELECT 1 FROM thread_entries
+        GROUP BY tenant_id, story_id, author_principal, idempotency_key
+        HAVING count(*) > 1
+      ) AS duplicated
+      """)
+
+    if collisions > 0 do
+      raise Ecto.MigrationError,
+        message:
+          "cannot roll back #{__MODULE__}: #{collisions} (author, idempotency_key) pair(s) " <>
+            "are used by judgements in more than one review, so the per-author unique index " <>
+            "it restores cannot be built. Thread entries are append-only and are not rewritten."
+    end
+
     drop constraint(:thread_entries, :thread_entries_judgement_shape)
     drop constraint(:thread_entries, :thread_entries_introduced_by)
     drop constraint(:thread_entries, :thread_entries_severity)

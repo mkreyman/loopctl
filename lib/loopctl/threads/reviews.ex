@@ -23,10 +23,28 @@ defmodule Loopctl.Threads.Reviews do
   nor its descendant, which is what `Dispatches.lineage_same_chain?/2` compares). The caller
   placing it must be that parent or an ancestor of it: `Dispatches.lineage_within_caller?/3`,
   the one copy of the ceiling `LoopctlWeb.DispatchController` applies, so the review lands in
-  the caller's own subtree and never under a caller on the implementer's chain.
-  Its agent must not be a principal that recorded a checkpoint of the thread, nor the story's
-  claimant, which is checked again on every judgement write because a claim can move to the
-  reviewer's agent after placement.
+  the caller's own subtree and never under a caller on the implementer's chain. A caller with
+  an EMPTY lineage places only as the tenant's operator, decided by
+  `Loopctl.Delivery.Placement.may_mint_session_dispatch/2`; a legacy unlineaged key is
+  refused `caller_lineage_required`, because placing a review would hand it the reviewer's key
+  while giving it no lineage the custody gates could read.
+
+  Its agent must not be the story's claimant, a principal that recorded a checkpoint of the
+  thread, nor the agent of any dispatch on the implementer's lineage or on the review's own
+  ancestry, which holds the placer's. That is checked when
+  placing, again under the thread lock that records the review, and on every judgement write,
+  because a claim or an implementer dispatch can move to the reviewer's agent afterwards.
+
+  ## Placing is two steps, and the second re-decides
+
+  The mint commits on `AdminRepo` before the review row is written on `Repo`, so the round and
+  the separation are decided again under the thread lock at the record
+  (`review_round_superseded` when a verdict landed in between). Every way the record can fail
+  to follow the mint revokes the minted dispatch: a refusal, a raise (revoked, then re-raised),
+  and `:busy` unless the review row turns out to have committed anyway, when it is answered.
+
+  A judgement refused `review_round_superseded` or `reviewer_not_separate` can never succeed
+  under that review, so the refusal revokes the review's dispatch and frees its agent.
 
   An implementer's parent that has been revoked or has expired cannot parent a new dispatch
   (`Dispatches.create_dispatch/3` refuses an inactive parent), so no review can be placed as
@@ -85,7 +103,9 @@ defmodule Loopctl.Threads.Reviews do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
   alias Loopctl.Delivery.Escalations
+  alias Loopctl.Delivery.Placement
   alias Loopctl.Dispatches
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Tenants
@@ -148,29 +168,80 @@ defmodule Loopctl.Threads.Reviews do
           {:ok, %{review: Review.t(), raw_key: String.t()}}
           | {:error, :not_found | :not_authorized | :tenant_halted | :custody_tier_required}
           | refusal()
-  def place(tenant_id, story_id, %ApiKey{tenant_id: tenant_id} = caller, opts) do
+  def place(tenant_id, story_id, caller, opts) do
+    with {:ok, prepared} <- prepare(tenant_id, story_id, caller, opts),
+         do: commit_placement(tenant_id, prepared, opts)
+  end
+
+  @doc false
+  # Everything decided BEFORE the mint, split from `commit_placement/3` so a test can land a
+  # verdict between the two: `record_review/3` re-decides the round and the separation under
+  # the thread lock, and that is the check the split lets a test reach.
+  @spec prepare(Ecto.UUID.t(), Ecto.UUID.t(), ApiKey.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def prepare(tenant_id, story_id, %ApiKey{tenant_id: tenant_id} = caller, opts) do
+    caller_lineage = Dispatches.lineage_for_api_key(tenant_id, caller.id)
+
     with {:ok, agent_id} <- required_uuid(Keyword.get(opts, :agent_id), "agent_id"),
          :ok <- valid_expiry(Keyword.get(opts, :expires_in_seconds)),
          {:ok, checkpoint_ref} <-
            optional_uuid(Keyword.get(opts, :checkpoint_id), "checkpoint_id"),
-         :ok <- placer_role(caller),
+         :ok <- may_place(caller_lineage, caller.role),
          :ok <- not_halted(tenant_id),
          :ok <- Tenants.require_human_anchor(tenant_id),
          {:ok, target} <- review_target(tenant_id, story_id, agent_id, checkpoint_ref),
-         caller_lineage = Dispatches.lineage_for_api_key(tenant_id, caller.id),
-         {:ok, parent_id} <- review_parent(tenant_id, target.story, caller, caller_lineage),
-         {:ok, minted} <-
-           mint(tenant_id, story_id, parent_id, agent_id, caller_lineage, opts) do
-      record_review(tenant_id, target, minted, caller, caller_lineage)
+         {:ok, parent_id, parent_lineage} <-
+           review_parent(tenant_id, target.story, caller, caller_lineage) do
+      {:ok,
+       Map.merge(target, %{
+         caller: caller,
+         caller_lineage: caller_lineage,
+         parent_id: parent_id,
+         parent_lineage: parent_lineage
+       })}
     end
   end
 
-  def place(_tenant_id, _story_id, _caller, _opts), do: {:error, :not_authorized}
+  def prepare(_tenant_id, _story_id, _caller, _opts), do: {:error, :not_authorized}
 
-  defp placer_role(%ApiKey{role: role}) do
-    if Role.role_at_least?(role, :orchestrator),
-      do: :ok,
-      else: refuse(:forbidden, "insufficient_role", "placing a review needs an orchestrator key")
+  @doc false
+  # The mint and the record, for a `prepare/4` result.
+  @spec commit_placement(Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, %{review: Review.t(), raw_key: String.t()}} | {:error, term()}
+  def commit_placement(tenant_id, prepared, opts) do
+    with {:ok, minted} <-
+           mint(
+             tenant_id,
+             prepared.story.id,
+             prepared.parent_id,
+             prepared.agent_id,
+             prepared.caller_lineage,
+             opts
+           ),
+         do: record_review(tenant_id, prepared, minted)
+  end
+
+  # The positive operator test `Loopctl.Delivery.Placement` mints under, reused rather than
+  # restated: an EMPTY lineage places only as the tenant's operator (a `:user` key no dispatch
+  # minted). A legacy unlineaged `:orchestrator` key could otherwise sit in the implementer's
+  # own process and be handed the reviewer's key; unlike `POST /dispatches`, placing a review
+  # gives that caller no lineage of its own that the custody gates could then read.
+  defp may_place(caller_lineage, role) do
+    case Placement.may_mint_session_dispatch(caller_lineage, role) do
+      :ok ->
+        :ok
+
+      {:error, :root_dispatch_forbidden} ->
+        refuse(
+          :conflict,
+          "caller_lineage_required",
+          "a key no dispatch minted may place a review only as the tenant's operator " <>
+            "(a user key); place it from a dispatch-minted orchestrator key"
+        )
+
+      {:error, :insufficient_role} ->
+        refuse(:forbidden, "insufficient_role", "placing a review needs an orchestrator key")
+    end
   end
 
   # Read FRESH, as `Loopctl.Delivery.Placement` does: a placement mints a credential, which is
@@ -185,7 +256,7 @@ defmodule Loopctl.Threads.Reviews do
         with {:ok, story} <- story(tenant_id, story_id),
              :ok <- implementer_dispatched(story),
              :ok <- tenant_agent(tenant_id, agent_id),
-             :ok <- reviewer_separate(tenant_id, story, agent_id),
+             :ok <- reviewer_separate(tenant_id, story, agent_id, []),
              {:ok, checkpoint} <- target_checkpoint(tenant_id, story_id, checkpoint_ref),
              {:ok, round} <- placeable_round(tenant_id, story_id) do
           {:ok, %{story: story, agent_id: agent_id, checkpoint: checkpoint, round: round}}
@@ -196,7 +267,7 @@ defmodule Loopctl.Threads.Reviews do
   end
 
   defp story(tenant_id, story_id) do
-    case Repo.one(from s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id) do
+    case Threads.story(tenant_id, story_id) do
       nil -> {:error, :not_found}
       story -> {:ok, story}
     end
@@ -221,26 +292,58 @@ defmodule Loopctl.Threads.Reviews do
   end
 
   # The reviewer's principal is `agent:<agent_id>`, the label every key with that agent writes
-  # under (`LoopctlWeb.ActorLabel`). It may not be the story's claimant, and it may not be a
-  # principal that recorded a checkpoint of this thread under any claim.
-  defp reviewer_separate(tenant_id, story, agent_id) do
-    recorded_checkpoint? =
-      Repo.exists?(
-        from e in Entry,
-          where:
-            e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :checkpoint and
-              e.author_principal == ^ActorLabel.agent(agent_id)
-      )
-
-    if story.assigned_agent_id == agent_id or recorded_checkpoint?,
-      do:
-        refuse(
-          :conflict,
-          "reviewer_not_separate",
-          "the review's agent is the story's claimant or recorded a checkpoint of this thread"
-        ),
-      else: :ok
+  # under (`LoopctlWeb.ActorLabel`). It may not be the story's claimant, a principal that
+  # recorded a checkpoint of this thread under any claim, nor the agent of ANY dispatch on the
+  # implementer's lineage: the implementer, the orchestrator that placed it, every ancestor.
+  # That covers the PLACER: the ceiling makes the placing key's dispatch the implementer's
+  # parent or an ancestor of it, so its agent is on that lineage; the only key with no dispatch
+  # that may place is the operator's, which carries no agent. `extra_lineage` adds the review's
+  # own ancestry, read again so the check does not rest on the ceiling alone.
+  # Runs at placement, under the lock that records the review, and on every judgement write.
+  defp reviewer_separate(tenant_id, story, agent_id, extra_lineage) do
+    if story.assigned_agent_id == agent_id or
+         recorded_checkpoint?(tenant_id, story, agent_id) or
+         on_lineage?(tenant_id, implementer_lineage(tenant_id, story) ++ extra_lineage, agent_id),
+       do: not_separate(),
+       else: :ok
   end
+
+  defp recorded_checkpoint?(tenant_id, story, agent_id) do
+    Repo.exists?(
+      from e in Entry,
+        where:
+          e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :checkpoint and
+            e.author_principal == ^ActorLabel.agent(agent_id)
+    )
+  end
+
+  defp on_lineage?(_tenant_id, [], _agent_id), do: false
+
+  defp on_lineage?(tenant_id, lineage, agent_id) do
+    Repo.exists?(
+      from d in Dispatch,
+        where: d.tenant_id == ^tenant_id and d.id in ^lineage and d.agent_id == ^agent_id
+    )
+  end
+
+  defp implementer_lineage(_tenant_id, %Story{implementer_dispatch_id: nil}), do: []
+
+  defp implementer_lineage(tenant_id, %Story{implementer_dispatch_id: implementer_id}) do
+    Repo.one(
+      from d in Dispatch,
+        where: d.id == ^implementer_id and d.tenant_id == ^tenant_id,
+        select: d.lineage_path
+    ) || []
+  end
+
+  defp not_separate,
+    do:
+      refuse(
+        :conflict,
+        "reviewer_not_separate",
+        "the review's agent is the story's claimant, recorded a checkpoint of this thread, " <>
+          "or is the agent of a dispatch on the implementer's or the placer's lineage"
+      )
 
   defp target_checkpoint(tenant_id, story_id, nil) do
     case Repo.one(
@@ -255,7 +358,7 @@ defmodule Loopctl.Threads.Reviews do
   end
 
   defp target_checkpoint(tenant_id, story_id, checkpoint_id) do
-    case checkpoint_of_story(tenant_id, story_id, checkpoint_id) do
+    case Threads.checkpoint_of(tenant_id, story_id, checkpoint_id) do
       nil ->
         refuse(
           :unprocessable_entity,
@@ -307,7 +410,7 @@ defmodule Loopctl.Threads.Reviews do
           )
 
         Dispatches.lineage_within_caller?(parent_lineage, caller_lineage, operator?) ->
-          {:ok, parent_id}
+          {:ok, parent_id, parent_lineage}
 
         true ->
           refuse(
@@ -394,28 +497,89 @@ defmodule Loopctl.Threads.Reviews do
   defp put_expiry(attrs, nil), do: attrs
   defp put_expiry(attrs, seconds), do: Map.put(attrs, :expires_in_seconds, seconds)
 
-  defp record_review(tenant_id, target, %{dispatch: dispatch, raw_key: raw_key}, caller, lineage) do
-    story_id = target.story.id
+  # The dispatch committed on `AdminRepo` before this transaction opens, so every way the
+  # record can fail to follow it revokes it: a live key nothing accepts a judgement from would
+  # hold its agent's one agent-role key slot for its whole TTL.
+  #
+  # - a refusal (the round or the separation changed since `prepare/4`): revoked;
+  # - `:busy`, which can follow a COMMITTED row (the connection lost after the commit): the row
+  #   is looked for first, and a review that did land is answered, not revoked;
+  # - a raise: revoked, then re-raised.
+  defp record_review(tenant_id, prepared, %{dispatch: dispatch, raw_key: raw_key}) do
+    lineage = prepared.caller_lineage
 
     result =
-      Threads.write_locked(tenant_id, story_id, fn ->
-        case Threads.locked_story(tenant_id, story_id) do
-          nil -> {:error, :not_found}
-          _story -> insert_review(tenant_id, target, dispatch, caller, lineage)
-        end
-      end)
+      try do
+        Threads.write_locked(tenant_id, prepared.story.id, fn ->
+          record_locked(tenant_id, prepared, dispatch)
+        end)
+      rescue
+        error ->
+          _ = Dispatches.revoke(tenant_id, dispatch.id, actor_lineage: lineage)
+          reraise error, __STACKTRACE__
+      end
 
     case result do
       {:ok, review, :created} ->
         {:ok, %{review: review, raw_key: raw_key}}
 
+      {:error, :busy} = busy ->
+        case review_by_dispatch(tenant_id, dispatch.id) do
+          %Review{} = review ->
+            {:ok, %{review: review, raw_key: raw_key}}
+
+          nil ->
+            _ = Dispatches.revoke(tenant_id, dispatch.id, actor_lineage: lineage)
+            busy
+        end
+
       error ->
-        # The dispatch committed on `AdminRepo` before this transaction opened. A review row
-        # that did not follow leaves a live key nothing will accept a judgement from, so it
-        # is revoked rather than left to expire.
         _ = Dispatches.revoke(tenant_id, dispatch.id, actor_lineage: lineage)
         error
     end
+  end
+
+  # Re-decided under the thread lock, where a verdict cannot land in between: `prepare/4`
+  # read the round and the separation before the mint and outside any lock.
+  defp record_locked(tenant_id, prepared, dispatch) do
+    story_id = prepared.story.id
+
+    with {:story, %Story{} = story} <- {:story, Threads.locked_story(tenant_id, story_id)},
+         :ok <- same_round(tenant_id, story_id, prepared.round),
+         :ok <- reviewer_separate(tenant_id, story, prepared.agent_id, prepared.parent_lineage) do
+      insert_review(tenant_id, prepared, dispatch, prepared.caller, prepared.caller_lineage)
+    else
+      {:story, nil} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  defp same_round(tenant_id, story_id, round) do
+    case placeable_round(tenant_id, story_id) do
+      {:ok, ^round} ->
+        :ok
+
+      {:ok, _other} ->
+        refuse(
+          :conflict,
+          "review_round_superseded",
+          "round #{round} completed while this review was being placed"
+        )
+
+      refusal ->
+        refusal
+    end
+  end
+
+  defp review_by_dispatch(tenant_id, dispatch_id) do
+    {:ok, review} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in Review, where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id
+        )
+      end)
+
+    review
   end
 
   defp insert_review(tenant_id, target, dispatch, caller, lineage) do
@@ -469,13 +633,15 @@ defmodule Loopctl.Threads.Reviews do
   def record_finding(tenant_id, story_id, %ApiKey{} = key, attrs) do
     changeset = Entry.changeset(%Entry{}, entry_attrs(attrs, "finding"))
 
-    with :ok <- valid(changeset),
+    # WHO first: a key that is not a review dispatch's is told so before anything about its
+    # payload, for every judgement kind.
+    with {:ok, dispatch} <- review_dispatch(tenant_id, story_id, key),
+         :ok <- valid(changeset),
          {:ok, severity} <- severity(attr(attrs, "severity")),
          {:ok, location} <- location(attr(attrs, "location")),
          {:ok, introduced_by} <- canonical_introduced_by(attr(attrs, "introduced_by")),
          :ok <- Threads.screen(changeset, tenant_id, story_id),
-         :ok <- no_secret_location(location, tenant_id, story_id),
-         {:ok, dispatch} <- review_dispatch(tenant_id, key) do
+         :ok <- no_secret_location(location, tenant_id, story_id) do
       changeset =
         Ecto.Changeset.change(changeset,
           severity: severity,
@@ -483,7 +649,9 @@ defmodule Loopctl.Threads.Reviews do
           introduced_by: introduced_by
         )
 
-      judge(tenant_id, story_id, key, dispatch, changeset, &finding_locked/5)
+      tenant_id
+      |> judge(story_id, key, dispatch, changeset, &finding_locked/5)
+      |> closing_if_final(tenant_id, dispatch)
     end
   end
 
@@ -498,10 +666,13 @@ defmodule Loopctl.Threads.Reviews do
   def record_verdict(tenant_id, story_id, %ApiKey{} = key, attrs) do
     changeset = Entry.changeset(%Entry{}, entry_attrs(attrs, "verdict"))
 
-    with :ok <- valid(changeset),
-         :ok <- Threads.screen(changeset, tenant_id, story_id),
-         {:ok, dispatch} <- review_dispatch(tenant_id, key) do
-      case judge(tenant_id, story_id, key, dispatch, changeset, &verdict_locked/5) do
+    with {:ok, dispatch} <- review_dispatch(tenant_id, story_id, key),
+         :ok <- valid(changeset),
+         :ok <- Threads.screen(changeset, tenant_id, story_id) do
+      tenant_id
+      |> judge(story_id, key, dispatch, changeset, &verdict_locked/5)
+      |> closing_if_final(tenant_id, dispatch)
+      |> case do
         {:ok, written, :created} ->
           close_dispatches(tenant_id, [dispatch.id | written.superseded], dispatch.lineage_path)
 
@@ -521,16 +692,25 @@ defmodule Loopctl.Threads.Reviews do
         {:ok, %Entry{} = verdict, :existing} ->
           {:ok, %{entry: verdict, escalation: nil}, :existing}
 
-        # A review that can no longer complete its round is over: its key is revoked too.
-        {:error, {:conflict, "review_round_superseded", _message}} = superseded ->
-          close_dispatches(tenant_id, [dispatch.id], dispatch.lineage_path)
-          superseded
-
         other ->
           other
       end
     end
   end
+
+  # A refusal that no later write by this review can get past ends the review: its dispatch
+  # and key are revoked, so its agent's one agent-role key slot is free for another placement.
+  # A superseded round never reopens, and a reviewer that stopped being separate cannot become
+  # separate again under this review.
+  @final_refusals ["review_round_superseded", "reviewer_not_separate"]
+
+  defp closing_if_final({:error, {_status, code, _message}} = refusal, tenant_id, dispatch)
+       when code in @final_refusals do
+    close_dispatches(tenant_id, [dispatch.id], dispatch.lineage_path)
+    refusal
+  end
+
+  defp closing_if_final(result, _tenant_id, _dispatch), do: result
 
   defp entry_attrs(attrs, kind) do
     %{
@@ -545,16 +725,21 @@ defmodule Loopctl.Threads.Reviews do
   defp valid(%Ecto.Changeset{valid?: true}), do: :ok
   defp valid(changeset), do: {:error, changeset}
 
-  # The dispatch that minted `key`, exactly: not a lineage, not an agent. `:none` for a key
-  # no dispatch minted (an operator's, a legacy one) or whose dispatch was revoked.
-  defp review_dispatch(tenant_id, %ApiKey{tenant_id: tenant_id, id: key_id}) do
-    case Dispatches.dispatch_for_api_key(tenant_id, key_id) do
-      {:ok, dispatch} -> {:ok, dispatch}
-      :none -> not_a_review()
+  # The dispatch that minted `key`, exactly — not a lineage, not an agent — and only when it is
+  # a review placed for THIS story. Decided before anything about the payload. `:none` is a
+  # key no dispatch minted (an operator's, a legacy one) or whose dispatch was revoked. The
+  # write re-reads the review under the thread lock; this read only answers who is asking.
+  defp review_dispatch(tenant_id, story_id, %ApiKey{tenant_id: tenant_id, id: key_id}) do
+    with {:ok, dispatch} <- Dispatches.dispatch_for_api_key(tenant_id, key_id),
+         {:ok, %Review{}} <-
+           Repo.with_tenant(tenant_id, fn -> review_for(tenant_id, story_id, dispatch.id) end) do
+      {:ok, dispatch}
+    else
+      _none -> not_a_review()
     end
   end
 
-  defp review_dispatch(_tenant_id, _key), do: not_a_review()
+  defp review_dispatch(_tenant_id, _story_id, _key), do: not_a_review()
 
   defp not_a_review,
     do:
@@ -591,7 +776,13 @@ defmodule Loopctl.Threads.Reviews do
 
   defp judge_new(story, review, changeset, author, dispatch, locked_fun) do
     with :ok <- review_open(review.tenant_id, review),
-         :ok <- reviewer_separate(review.tenant_id, story, review.agent_id) do
+         :ok <-
+           reviewer_separate(
+             review.tenant_id,
+             story,
+             review.agent_id,
+             Enum.drop(dispatch.lineage_path, -1)
+           ) do
       locked_fun.(story, review, changeset, author, dispatch)
     end
   end
@@ -659,7 +850,7 @@ defmodule Loopctl.Threads.Reviews do
   defp introduced_by_allowed(%Review{} = review, checkpoint_id) do
     found_in = Repo.get!(Checkpoint, review.checkpoint_id)
 
-    case checkpoint_of_story(review.tenant_id, review.story_id, checkpoint_id) do
+    case Threads.checkpoint_of(review.tenant_id, review.story_id, checkpoint_id) do
       %Checkpoint{seq: seq} when seq <= found_in.seq ->
         :ok
 
@@ -901,7 +1092,7 @@ defmodule Loopctl.Threads.Reviews do
   defp fix_checkpoint(tenant_id, story, changeset) do
     checkpoint_id = Ecto.Changeset.get_field(changeset, :checkpoint_id)
 
-    case checkpoint_of_story(tenant_id, story.id, checkpoint_id) do
+    case Threads.checkpoint_of(tenant_id, story.id, checkpoint_id) do
       %Checkpoint{claim_epoch: epoch} = checkpoint when epoch == story.claim_epoch ->
         {:ok, checkpoint}
 
@@ -1151,13 +1342,6 @@ defmodule Loopctl.Threads.Reviews do
   # ---------------------------------------------------------------------------
   # Validation and canonical forms
   # ---------------------------------------------------------------------------
-
-  defp checkpoint_of_story(tenant_id, story_id, checkpoint_id) do
-    Repo.one(
-      from c in Checkpoint,
-        where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id and c.story_id == ^story_id
-    )
-  end
 
   defp severity(value) when is_binary(value) do
     case Enum.find(Entry.severities(), &(to_string(&1) == String.downcase(String.trim(value)))) do

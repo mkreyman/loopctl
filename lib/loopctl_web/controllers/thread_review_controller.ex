@@ -64,7 +64,8 @@ defmodule LoopctlWeb.ThreadReviewController do
     409 =>
       {"`review_closed` (this review recorded its verdict), `review_round_superseded` " <>
          "(another review completed this round), `reviewer_not_separate`, or " <>
-         "`idempotency_key_reused`", "application/json", Schemas.ErrorResponse},
+         "`idempotency_key_reused`. The first two after `review_closed` END the review: its " <>
+         "dispatch and key are revoked", "application/json", Schemas.ErrorResponse},
     422 =>
       {"`invalid_severity`, `invalid_location`, `introduced_by_not_allowed`, " <>
          "`introduced_by_required`, `introduced_by_invalid`, an invalid field, or " <>
@@ -118,8 +119,12 @@ defmodule LoopctlWeb.ThreadReviewController do
          Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"`implementer_dispatch_required` (no dispatch made the claim), `reviewer_not_separate` " <>
-           "(the agent is the claimant or recorded a checkpoint), `no_checkpoint`, " <>
+        {"`caller_lineage_required` (a key no dispatch minted that is not the operator's), " <>
+           "`implementer_dispatch_required` (no dispatch made the claim), " <>
+           "`reviewer_not_separate` (the agent is the claimant, recorded a checkpoint, is the " <>
+           "placing key's own agent, or is the agent of a dispatch on the implementer's " <>
+           "lineage), `review_round_superseded` (a round completed while this one was placed; " <>
+           "the minted key is revoked), `no_checkpoint`, " <>
            "`review_ceiling_reached`, `review_parent_inactive` (the implementer's parent " <>
            "dispatch is revoked or expired), `reviewer_agent_busy` (the agent holds a live " <>
            "agent-role key), or `unresolvable_dispatch_lineage` (the story's implementer " <>

@@ -1130,7 +1130,16 @@ defmodule Loopctl.Delivery.Placement do
   # unreachable clause that reads as a guard is worse than no clause — and if `resolve_caller/2`
   # ever hands this something else, that is a broken invariant inside this module and a crash
   # is the right answer, not a `:root_dispatch_forbidden` that hides it.
-  defp may_mint_session_dispatch([], role) do
+  @doc """
+  Whether a caller with this server-resolved `lineage` and key `role` may mint a custody
+  dispatch for someone else: an EMPTY lineage only for the tenant's operator (a `:user`-or-
+  higher key no dispatch minted), a lineaged caller from `:orchestrator` up. The ONE copy of
+  that positive operator test for every context path that mints without a controller
+  (`Loopctl.Threads.Reviews` too).
+  """
+  @spec may_mint_session_dispatch([Ecto.UUID.t()], atom()) ::
+          :ok | {:error, :root_dispatch_forbidden | :insufficient_role}
+  def may_mint_session_dispatch([], role) do
     if Role.role_at_least?(role, :user), do: :ok, else: {:error, :root_dispatch_forbidden}
   end
 
@@ -1140,7 +1149,7 @@ defmodule Loopctl.Delivery.Placement do
   # lineaged AGENT-role key, which the HTTP surface 403s, minted a child custody dispatch and a
   # live ephemeral key through this path until this clause tested the role too. `:user` clears
   # `:orchestrator` by hierarchy, so the clause above is strictly stronger and the two agree.
-  defp may_mint_session_dispatch([_ | _], role) do
+  def may_mint_session_dispatch([_ | _], role) do
     if Role.role_at_least?(role, :orchestrator), do: :ok, else: {:error, :insufficient_role}
   end
 

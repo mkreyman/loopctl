@@ -135,6 +135,10 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
     cp = checkpoint(ctx, 1)
     {raw, review} = placed!(ctx)
 
+    # Who is asking is decided before the payload: a bad severity on a non-review key is 403.
+    assert %{"error" => %{"code" => "review_dispatch_required"}} =
+             ctx |> finding(ctx.impl_raw, %{"severity" => "bogus"}) |> json_response(403)
+
     refused = ctx |> finding(ctx.impl_raw) |> json_response(403)
     assert %{"error" => %{"code" => "review_dispatch_required"}} = refused
     refute inspect(refused) =~ "self_review_blocked"

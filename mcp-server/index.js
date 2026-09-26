@@ -8353,8 +8353,12 @@ const TOOLS = [
       "never round 4. Needs LOOPCTL_ORCH_KEY (principal user: LOOPCTL_USER_KEY). Refusals: " +
       "403 for an agent key, `parent_outside_caller_lineage` (you are not the implementer's " +
       "parent dispatch or an ancestor of it), `root_dispatch_forbidden`; 409 " +
+      "`caller_lineage_required` (a key no dispatch minted that is not the operator's user " +
+      "key), `review_round_superseded` (a round completed while placing; nothing is left " +
+      "live), " +
       "`implementer_dispatch_required` (no dispatch made the claim), `reviewer_not_separate` " +
-      "(agent_id is the claimant or recorded a checkpoint), `reviewer_agent_busy` (that " +
+      "(agent_id is the claimant, recorded a checkpoint, is your own key's agent, or is the " +
+      "agent of a dispatch on the implementer's lineage), `reviewer_agent_busy` (that " +
       "agent already holds a live agent key), `no_checkpoint`, `review_ceiling_reached`, " +
       "`review_parent_inactive`, `unresolvable_dispatch_lineage`; 422 `unknown_agent` / `unknown_checkpoint`; 503 " +
       "`tenant_halted`.",
@@ -8409,7 +8413,8 @@ const TOOLS = [
       "checkpoint id of this story at or before the reviewed one, or `none`. Refusals: 403 " +
       "`review_dispatch_required` (not a review dispatch's key for this story); 409 " +
       "`review_closed` (your verdict is recorded), `review_round_superseded`, " +
-      "`reviewer_not_separate`, `idempotency_key_reused`; 422 `invalid_severity`, " +
+      "`reviewer_not_separate` (either one ENDS your review: its key is revoked), " +
+      "`idempotency_key_reused`; 422 `invalid_severity`, " +
       "`invalid_location`, `introduced_by_not_allowed`, `introduced_by_required`, " +
       "`introduced_by_invalid`, `secret_blocked`. Idempotent on `idempotency_key` for the " +
       "same write.",
@@ -8440,7 +8445,7 @@ const TOOLS = [
       "medium finding, the response carries a `review_ceiling` escalation. Refusals: 401 " +
       "after the verdict (the key is revoked); 403 `review_dispatch_required`; 409 " +
       "`review_closed`, `review_round_superseded` (another review completed this round), " +
-      "`reviewer_not_separate`.",
+      "`reviewer_not_separate`; the last two end your review and revoke its key.",
     inputSchema: {
       type: "object",
       properties: {

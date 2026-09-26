@@ -16,12 +16,14 @@ All notable changes to loopctl are documented here.
   its round and revokes the review's dispatch and key, round 3 is placeable only when a
   round-2 finding's `introduced_by` names a checkpoint a round-1 fix is carried by, and there
   is never a round 4; a ceiling reached with a critical, high or medium finding records a
-  `review_ceiling` escalation and escalates the story's delivery stage. The migration adds
+  `review_ceiling` escalation and escalates the story's delivery stage over a new control-only
+  `review_ceiling` stage edge (not runner-reportable; the runner contract is unchanged). The migration adds
   the `thread_reviews` table and nullable `review_id`, `severity`, `location`,
   `introduced_by` and `finding_ids` columns on `thread_entries`. New refusal codes, none of
   them `self_review_blocked`: `review_dispatch_required`, `review_closed`,
   `review_round_superseded`, `review_ceiling_reached`, `reviewer_not_separate`,
   `reviewer_agent_busy`, `review_parent_inactive`, `unresolvable_dispatch_lineage`,
+  `caller_lineage_required` (a key no dispatch minted places a review only as the operator),
   `implementer_dispatch_required`, `no_checkpoint`, and the `introduced_by_*`, `fix_*` and
   `invalid_*` validation codes. MCP 2.106.0 ships the matching tools. The runner contract is
   not bumped yet: `review` is not a dispatchable kind (AC-45.3.8 remains).

@@ -157,14 +157,19 @@ defmodule Loopctl.Delivery.Escalations do
 
   @doc """
   Escalates `story_id` on loopctl's own decision rather than on behalf of its claimant: a
-  `review_ceiling` reached by the thread's review (`Loopctl.Threads.Reviews`). The same
-  transition, replay and `:stale_stage` recovery as `escalate/3`, without the claimant check,
-  because the principal deciding is not the claimant. Takes `escalate/3`'s options except
-  `:agent_id`; `:claim_epoch` is the story's current epoch, which the fence still checks.
+  review ceiling reached by the thread's review (`Loopctl.Threads.Reviews`). The same replay
+  and `:stale_stage` recovery as `escalate/3`, without the claimant check, because the
+  principal deciding is not the claimant, and over the control-only `:review_ceiling` edge
+  rather than the session's `:session_escalated`. The actor is recorded as control does
+  elsewhere (`Loopctl.Delivery.TriageDispatcher`): a `control:` label and `actor_role: :agent`,
+  which keeps every human-only edge out of reach; there is no system role. Takes `escalate/3`'s
+  options except `:agent_id`; `:claim_epoch` is the story's current epoch, which the fence
+  still checks.
   """
   @spec escalate_as_control(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, StoryStage.t()} | {:error, error()}
-  def escalate_as_control(tenant_id, story_id, opts), do: escalate_row(tenant_id, story_id, opts)
+  def escalate_as_control(tenant_id, story_id, opts),
+    do: escalate_row(tenant_id, story_id, Keyword.put(opts, :edge, :review_ceiling))
 
   defp escalate_row(tenant_id, story_id, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
@@ -231,7 +236,8 @@ defmodule Loopctl.Delivery.Escalations do
   # cannot re-enter the recovery: with the recovery inside the only attempt function, a story
   # a runner keeps advancing would have recursed without bound.
   defp attempt(tenant_id, story_id, row, opts) do
-    transition = {row.stage, :escalated, :session_escalated}
+    # `:session_escalated` for a claimant; `escalate_as_control/3` names its own control edge.
+    transition = {row.stage, :escalated, Keyword.get(opts, :edge, :session_escalated)}
 
     advance_opts = [
       claim_epoch: Keyword.fetch!(opts, :claim_epoch),

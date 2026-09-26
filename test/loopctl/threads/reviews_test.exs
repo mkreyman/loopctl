@@ -50,15 +50,24 @@ defmodule Loopctl.Threads.ReviewsTest do
     # A second story whose implementer sits under a middle dispatch, made here rather than
     # inside a test body: its dispatches append to the tenant's chain, and a nested unboxed
     # run of that waits on the body's own connection.
-    if tags[:middle],
-      do:
-        {:ok,
-         Map.put(
-           ctx,
-           :middle_story,
-           fixture(:review_story, %{tenant_id: tenant.id, middle: true})
-         )},
-      else: {:ok, ctx}
+    ctx =
+      if tags[:middle],
+        do:
+          Map.put(
+            ctx,
+            :middle_story,
+            fixture(:review_story, %{tenant_id: tenant.id, middle: true})
+          ),
+        else: ctx
+
+    if tags[:legacy] do
+      {_raw, legacy} =
+        fixture(:committed_operator_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      {:ok, Map.put(ctx, :legacy, legacy)}
+    else
+      {:ok, ctx}
+    end
   end
 
   # --- helpers ---------------------------------------------------------------------------
@@ -301,6 +310,108 @@ defmodule Loopctl.Threads.ReviewsTest do
       end)
     end
 
+    @tag :legacy
+    test "an EMPTY caller lineage places only as the operator: a legacy key is refused", ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+
+        refusal = place(ctx, caller: ctx.legacy)
+        assert "caller_lineage_required" == code(refusal)
+        assert {:error, {:conflict, _, _}} = refusal
+
+        assert {:ok, %{review: %{round: 1}}} = place(ctx, caller: ctx.operator)
+      end)
+    end
+
+    @tag :middle
+    test "never for the placer's own agent, nor an ancestor's", ctx do
+      unboxed(fn ->
+        mctx = Map.merge(ctx, ctx.middle_story)
+        checkpoint(mctx, 1)
+
+        # The placing key's own agent (its dispatch, `middle`, is on the implementer's lineage).
+        assert "reviewer_not_separate" ==
+                 code(place(mctx, caller: mctx.middle_key, agent_id: mctx.middle.agent_id))
+
+        # The root's agent, an ancestor of the implementer, placed by the root key.
+        assert "reviewer_not_separate" == code(place(mctx, agent_id: mctx.root.agent_id))
+
+        assert {:ok, _} = place(mctx, caller: mctx.middle_key, agent_id: mctx.reviewer.id)
+      end)
+    end
+
+    test "the round is re-decided under the lock: a verdict landing before the record wins",
+         ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+        %{key: first} = placed!(ctx)
+
+        {:ok, prepared} =
+          Reviews.prepare(ctx.tenant_id, ctx.story.id, ctx.orch_key, agent_id: ctx.spare.id)
+
+        assert prepared.round == 1
+
+        verdict!(ctx, first)
+
+        assert "review_round_superseded" ==
+                 code(Reviews.commit_placement(ctx.tenant_id, prepared, []))
+
+        # Its freshly minted dispatch was revoked, so the agent is free for round 2.
+        assert {:ok, %{review: %{round: 2}}} = place(ctx, agent_id: ctx.spare.id)
+      end)
+    end
+
+    test "separation is re-decided under the lock too", ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+
+        {:ok, prepared} =
+          Reviews.prepare(ctx.tenant_id, ctx.story.id, ctx.orch_key, agent_id: ctx.spare.id)
+
+        # The claim moves to the reviewer's agent between the decision and the record.
+        set_story(ctx, assigned_agent_id: ctx.spare.id)
+
+        assert "reviewer_not_separate" ==
+                 code(Reviews.commit_placement(ctx.tenant_id, prepared, []))
+
+        set_story(ctx, assigned_agent_id: ctx.implementer.id)
+        assert {:ok, %{review: %{round: 1}}} = place(ctx, agent_id: ctx.spare.id)
+      end)
+    end
+
+    test "a busy record revokes the minted dispatch when no review row landed", ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+
+        {:ok, prepared} =
+          Reviews.prepare(ctx.tenant_id, ctx.story.id, ctx.orch_key, agent_id: ctx.spare.id)
+
+        holder = hold_thread_lock(ctx)
+        assert {:error, :busy} = Reviews.commit_placement(ctx.tenant_id, prepared, [])
+        send(holder, :release)
+
+        assert {:ok, %{review: %{round: 1}}} = place(ctx, agent_id: ctx.spare.id)
+      end)
+    end
+
+    test "a record that raises revokes the minted dispatch, then re-raises", ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+
+        {:ok, prepared} =
+          Reviews.prepare(ctx.tenant_id, ctx.story.id, ctx.orch_key, agent_id: ctx.spare.id)
+
+        # A checkpoint that does not exist fails the review row's foreign key inside the record.
+        broken = %{prepared | checkpoint: %{prepared.checkpoint | id: Ecto.UUID.generate()}}
+
+        assert_raise Ecto.ConstraintError, fn ->
+          Reviews.commit_placement(ctx.tenant_id, broken, [])
+        end
+
+        assert {:ok, %{review: %{round: 1}}} = place(ctx, agent_id: ctx.spare.id)
+      end)
+    end
+
     test "an agent-role key may not place one", ctx do
       unboxed(fn ->
         checkpoint(ctx, 1)
@@ -504,6 +615,67 @@ defmodule Loopctl.Threads.ReviewsTest do
       end)
     end
 
+    test "a reviewer that stops being separate is refused, and its review is closed", ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+        %{key: key} = placed!(ctx)
+
+        # The story's implementer moves to a dispatch whose agent is the reviewer's.
+        on_lineage =
+          mint!(ctx.tenant_id, %{
+            parent_dispatch_id: ctx.root.id,
+            role: :orchestrator,
+            agent_id: ctx.reviewer.id
+          })
+
+        {:ok, moved} = Dispatches.dispatch_for_api_key(ctx.tenant_id, on_lineage.id)
+        set_story(ctx, implementer_dispatch_id: moved.id)
+
+        assert "reviewer_not_separate" == code(finding(ctx, key, %{}))
+
+        # The refusal can never clear under this review, so its key is revoked.
+        assert :none == Dispatches.dispatch_for_api_key(ctx.tenant_id, key.id)
+      end)
+    end
+
+    test "a key reused across two reviews does not collide with the same agent's message",
+         ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+        %{key: r1} = placed!(ctx)
+        finding!(ctx, r1, %{"idempotency_key" => "k"})
+        verdict!(ctx, r1)
+        %{key: r2} = placed!(ctx)
+        finding!(ctx, r2, %{"idempotency_key" => "k", "introduced_by" => "none"})
+
+        assert {:ok, %Entry{kind: :message}, :created} =
+                 Threads.record_entry(
+                   ctx.tenant_id,
+                   ctx.story.id,
+                   %{"kind" => "message", "idempotency_key" => "k", "body" => "note"},
+                   author_principal: "agent:#{ctx.reviewer.id}",
+                   actor_lineage: []
+                 )
+      end)
+    end
+
+    test "WHO is decided before WHAT: a bad payload on a non-review key is still 403", ctx do
+      unboxed(fn ->
+        checkpoint(ctx, 1)
+
+        assert "review_dispatch_required" ==
+                 code(finding(ctx, ctx.impl_key, %{"severity" => "bogus", "body" => ""}))
+
+        assert "review_dispatch_required" ==
+                 code(
+                   Reviews.record_verdict(ctx.tenant_id, ctx.story.id, ctx.impl_key, %{
+                     "idempotency_key" => "",
+                     "body" => ""
+                   })
+                 )
+      end)
+    end
+
     test "the reviewer's agent becoming the claimant stops its judgements", ctx do
       unboxed(fn ->
         checkpoint(ctx, 1)
@@ -664,8 +836,9 @@ defmodule Loopctl.Threads.ReviewsTest do
           set: [revoked_at: nil]
         )
 
+        # A superseded finding closes the review too.
         assert "review_round_superseded" == code(finding(ctx, second, %{}))
-        assert "review_round_superseded" == code(verdict(ctx, second))
+        assert :none == Dispatches.dispatch_for_api_key(ctx.tenant_id, second.id)
         assert %{completed: 1} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
       end)
     end
@@ -851,6 +1024,17 @@ defmodule Loopctl.Threads.ReviewsTest do
           end)
 
         assert row.stage == :escalated
+
+        {:ok, event} =
+          Repo.with_tenant(ctx.tenant_id, fn ->
+            Repo.one(
+              from e in Loopctl.Delivery.StageEvent,
+                where: e.story_id == ^ctx.story.id and e.to_stage == "escalated"
+            )
+          end)
+
+        assert event.edge == "review_ceiling"
+        assert event.actor_label == "control:review_ceiling"
       end)
     end
 
@@ -953,6 +1137,30 @@ defmodule Loopctl.Threads.ReviewsTest do
       end)
 
     round
+  end
+
+  # Holds the story's thread lock on its own connection until told to release it.
+  defp hold_thread_lock(ctx) do
+    test = self()
+
+    holder = spawn(fn -> Sandbox.unboxed_run(Repo, fn -> lock_until_released(ctx, test) end) end)
+    assert_receive :locked, 5_000
+    holder
+  end
+
+  defp lock_until_released(ctx, test) do
+    Repo.transaction(fn ->
+      Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+        Threads.lock_namespace(),
+        ctx.story.id
+      ])
+
+      send(test, :locked)
+
+      receive do
+        :release -> :ok
+      end
+    end)
   end
 
   defp mint!(tenant_id, attrs) do

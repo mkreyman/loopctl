@@ -2116,6 +2116,9 @@ defmodule Loopctl.Fixtures do
   # lineage and role from the key itself rather than taking them as options. It is also the
   # tenant's OPERATOR principal — `role: :user`, minted by no dispatch, so its lineage resolves
   # to `[]` — which is the one principal allowed to root a lineage tree.
+  #
+  # `role: :orchestrator` makes the LEGACY shape instead: a long-lived key no dispatch minted,
+  # whose empty lineage is NOT the operator's.
   def fixture(:committed_operator_key, attrs) do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
@@ -2125,7 +2128,7 @@ defmodule Loopctl.Fixtures do
         Auth.generate_api_key(%{
           tenant_id: tenant_id,
           name: "operator-#{System.unique_integer([:positive])}",
-          role: :user
+          role: Map.get(attrs, :role, :user)
         })
 
       {raw_key, api_key}

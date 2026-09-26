@@ -134,6 +134,50 @@ defmodule LoopctlWeb.DispatchLineageCeilingTest do
       assert json_response(conn, 403)["error"]["code"] == "parent_outside_caller_lineage"
     end
 
+    test "the parent must be the caller's own dispatch or BELOW it, never an ancestor" do
+      ctx = operator_ctx()
+      %{"dispatch" => root, "api_key" => %{"raw_key" => root_key}} = mint_root(ctx)
+      child_agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      %{"dispatch" => child, "api_key" => %{"raw_key" => child_key}} =
+        build_conn()
+        |> auth(root_key)
+        |> post(~p"/api/v1/dispatches", %{
+          "role" => "orchestrator",
+          "agent_id" => child_agent.id,
+          "parent_dispatch_id" => root["id"]
+        })
+        |> json_response(201)
+        |> Map.fetch!("data")
+
+      leaf_agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :implementer})
+
+      # The child naming its ANCESTOR as parent would mint outside its own subtree.
+      conn =
+        build_conn()
+        |> auth(child_key)
+        |> post(~p"/api/v1/dispatches", %{
+          "role" => "agent",
+          "agent_id" => leaf_agent.id,
+          "parent_dispatch_id" => root["id"]
+        })
+
+      assert json_response(conn, 403)["error"]["code"] == "parent_outside_caller_lineage"
+
+      # The root naming its DESCENDANT as parent stays inside its subtree.
+      conn =
+        build_conn()
+        |> auth(root_key)
+        |> post(~p"/api/v1/dispatches", %{
+          "role" => "agent",
+          "agent_id" => leaf_agent.id,
+          "parent_dispatch_id" => child["id"]
+        })
+
+      assert json_response(conn, 201)["data"]["dispatch"]["lineage_path"] ==
+               [root["id"], child["id"], json_response(conn, 201)["data"]["dispatch"]["id"]]
+    end
+
     test "a LEGACY orchestrator key may still mint BENEATH an existing dispatch" do
       # The ceiling stops a principal escaping ITS OWN tree; a key with no lineage has
       # none to escape. Refusing it here left a legacy key unable to obtain a lineage by

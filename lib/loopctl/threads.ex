@@ -234,9 +234,26 @@ defmodule Loopctl.Threads do
   end
 
   defp story_query(tenant_id, story_id) do
-    from s in Story,
-      where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-      select: struct(s, ^@story_fields)
+    tenant_id |> story_row(story_id) |> select([s], struct(s, ^@story_fields))
+  end
+
+  defp story_row(tenant_id, story_id),
+    do: from(s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id)
+
+  @doc false
+  # The story's whole row, or nil, under the caller's `Repo.with_tenant/2`
+  # (`Loopctl.Threads.Reviews` reads its title and criteria for a review payload).
+  @spec story(Ecto.UUID.t(), Ecto.UUID.t()) :: Story.t() | nil
+  def story(tenant_id, story_id), do: Repo.one(story_row(tenant_id, story_id))
+
+  @doc false
+  # The checkpoint `checkpoint_id` of THIS story, or nil: another story's is none.
+  @spec checkpoint_of(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
+  def checkpoint_of(tenant_id, story_id, checkpoint_id) do
+    Repo.one(
+      from c in Checkpoint,
+        where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id and c.story_id == ^story_id
+    )
   end
 
   @doc false
@@ -584,12 +601,15 @@ defmodule Loopctl.Threads do
     )
   end
 
+  # Matches `thread_entries_idempotency_uidx`, which is partial on `review_id IS NULL`: a
+  # judgement's key belongs to its review, so an author's message may reuse it.
   defp entry_by_key(tenant_id, story_id, author, key) do
     Repo.one(
       from e in Entry,
         where:
           e.tenant_id == ^tenant_id and e.story_id == ^story_id and
-            e.author_principal == ^author and e.idempotency_key == ^key
+            e.author_principal == ^author and e.idempotency_key == ^key and
+            is_nil(e.review_id)
     )
   end
 
@@ -628,15 +648,9 @@ defmodule Loopctl.Threads do
         :ok
 
       checkpoint_id ->
-        if Repo.exists?(
-             from c in Checkpoint,
-               where:
-                 c.id == ^checkpoint_id and c.tenant_id == ^tenant_id and
-                   c.story_id == ^story_id
-           ),
-           do: :ok,
-           else:
-             {:error, :unprocessable_entity, "checkpoint_id is not a checkpoint of this story"}
+        if checkpoint_of(tenant_id, story_id, checkpoint_id),
+          do: :ok,
+          else: {:error, :unprocessable_entity, "checkpoint_id is not a checkpoint of this story"}
     end
   end
 
