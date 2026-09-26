@@ -20,6 +20,7 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
   alias Loopctl.Delivery.RunnerThreads
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Threads
   alias Loopctl.WorkBreakdown.Story
   alias LoopctlWeb.ActorLabel
@@ -81,6 +82,13 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
   defp set_story(story, fields) do
     as_tenant(story.tenant_id, fn ->
       from(s in Story, where: s.id == ^story.id) |> Repo.update_all(set: fields)
+    end)
+  end
+
+  defp set_status(ctx, status) do
+    as_tenant(ctx.story.tenant_id, fn ->
+      from(r in DispatchRecord, where: r.id == ^ctx.record.id)
+      |> Repo.update_all(set: [status: status])
     end)
   end
 
@@ -238,6 +246,32 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
       # A lost ack re-sent after the claim ended must not read as "never recorded".
       assert {:ok, %{checkpoint: again, replayed?: true}} = checkpoint(ctx)
       assert again.id == recorded.id
+    end
+
+    test "once the ledger row is superseded, the resend is answered and nothing new is written" do
+      ctx = session()
+      {:ok, %{checkpoint: recorded}} = checkpoint(ctx)
+
+      # The release bumped the epoch, and a reply or trace then marked the row superseded.
+      set_story(ctx.story, claim_epoch: @epoch + 1)
+      set_status(ctx, "superseded")
+
+      assert {:ok, %{checkpoint: again, replayed?: true}} = checkpoint(ctx)
+      assert again.id == recorded.id
+
+      assert {:error, :dispatch_not_accepted} =
+               checkpoint(ctx, %{commit_sha: @sha2, tree_sha: @tree2})
+
+      assert {:error, :dispatch_not_accepted} = entry(ctx)
+      assert length(thread(ctx).checkpoints) == 1
+    end
+
+    test "a row that is not accepted records no checkpoint, though the claim is still live" do
+      ctx = session()
+      set_status(ctx, "superseded")
+
+      assert {:error, :dispatch_not_accepted} = checkpoint(ctx)
+      assert thread(ctx).checkpoints == []
     end
 
     test "a claim no placement made carries no lineage, because it genuinely has none" do

@@ -40,7 +40,9 @@ defmodule Loopctl.Threads do
 
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.Claimant
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
@@ -90,6 +92,11 @@ defmodule Loopctl.Threads do
     result
   end
 
+  @doc false
+  # The advisory-lock namespace every write takes, for a test that holds the lock itself.
+  @spec lock_namespace() :: integer()
+  def lock_namespace, do: @thread_lock_namespace
+
   @doc "The largest page of entries `get_thread/3` returns."
   @spec max_entry_page() :: pos_integer()
   def max_entry_page, do: @max_entry_page
@@ -104,6 +111,10 @@ defmodule Loopctl.Threads do
   - `:commit_sha`, `:tree_sha` (required) — lowercase hex, 40 or 64 characters
   - `:note` — the claimant's reasoning, stored as the checkpoint entry's body. Untrusted.
   - `:author_principal` (required), `:actor_lineage` (required) — SERVER-resolved from the key
+  - `:replay_only` — answer only the recorder's resend of a checkpoint already recorded, and
+    refuse anything else `:dispatch_not_accepted`. For a runner whose dispatch is no longer
+    accepted (`Loopctl.Delivery.RunnerThreads`): it may be told its earlier write landed, and
+    may write nothing new.
 
   Returns `{:ok, checkpoint, :created | :existing}`.
   """
@@ -135,6 +146,10 @@ defmodule Loopctl.Threads do
   ## Options
 
   - `:author_principal` (required), `:actor_lineage` (required) — SERVER-resolved from the key
+  - `:claim_epoch` — when given, the story's `claim_epoch` must still be this one, read under
+    the story's lock, or the write (a resend included) is `{:error, :stale_claim_epoch}`. A
+    runner's note is lineage-attributed to the claim it ran under, and that claim's lineage is
+    only its own while its epoch is current.
 
   Returns `{:ok, entry, :created | :existing}`.
   """
@@ -233,7 +248,11 @@ defmodule Loopctl.Threads do
   # else, and every new write, goes through the fence.
   defp checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
-    fence = fn -> claimant(tenant_id, story_id, Keyword.fetch!(opts, :agent_id), epoch) end
+
+    fence =
+      if Keyword.get(opts, :replay_only, false),
+        do: fn -> {:error, :dispatch_not_accepted} end,
+        else: fn -> claimant(tenant_id, story_id, Keyword.fetch!(opts, :agent_id), epoch) end
 
     case {locked_story(tenant_id, story_id),
           checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch)} do
@@ -451,7 +470,8 @@ defmodule Loopctl.Threads do
     author = Keyword.fetch!(opts, :author_principal)
     key = Ecto.Changeset.get_field(changeset, :idempotency_key)
 
-    with {:story, %Story{}} <- {:story, locked_story(tenant_id, story_id)},
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
+         :ok <- epoch_current(story, Keyword.get(opts, :claim_epoch)),
          nil <- entry_by_key(tenant_id, story_id, author, key),
          :ok <- checkpoint_of_story(changeset, tenant_id, story_id) do
       insert_entry(tenant_id, story_id, changeset, opts)
@@ -461,6 +481,10 @@ defmodule Loopctl.Threads do
       error -> error
     end
   end
+
+  defp epoch_current(_story, nil), do: :ok
+  defp epoch_current(%Story{claim_epoch: epoch}, epoch), do: :ok
+  defp epoch_current(_story, _epoch), do: {:error, :stale_claim_epoch}
 
   defp entry_by_key(tenant_id, story_id, author, key) do
     Repo.one(
@@ -559,15 +583,20 @@ defmodule Loopctl.Threads do
   # `fun` answers `{:ok, value, status, chain_entries}`; the chain entries are announced only
   # once the transaction that wrote them has committed.
   #
-  # A write waits for the per-story lock (and the story's FOR SHARE) at most `lock_timeout_ms/0`
-  # and is then answered `{:error, :busy}`, nothing written. Unbounded, a write stuck behind a
-  # slow holder raised a connection timeout inside the runner channel's `handle_in` and took
-  # down every session on that socket; over HTTP it was a 500.
+  # EVERY lock the write waits for — the per-story lock, the story's FOR SHARE, and the
+  # tenant's audit-chain lock the append takes — is bounded by `Capacity.lock_timeout_ms/0`,
+  # the wait `Capacity.busy_retry_ms/0` (every `:busy` refusal's retry interval) is derived
+  # from, so the retry a caller is told is always longer than the wait that just ran out.
+  # A contended wait, a deadlock Postgres broke by choosing this write, and a pool checkout
+  # that timed out are all answered `{:error, :busy}`, nothing written
+  # (`Stages.retryable_error?/1`). Unanswered, each raised inside the runner channel's
+  # `handle_in` and took down every session on that socket; over HTTP it was a 500. A chain
+  # HASH violation is not retryable and still raises, for the caller to answer.
   defp in_story_lock(tenant_id, story_id, fun) do
     result =
       try do
         Repo.with_tenant(tenant_id, fn ->
-          Repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{lock_timeout_ms()}ms"])
+          Capacity.set_lock_timeout!()
 
           Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
             @thread_lock_namespace,
@@ -580,10 +609,17 @@ defmodule Loopctl.Threads do
           end
         end)
       rescue
-        error in Postgrex.Error ->
-          if error.postgres[:code] == :lock_not_available,
-            do: {:error, {:error, :busy}},
-            else: reraise(error, __STACKTRACE__)
+        error in [Postgrex.Error, DBConnection.ConnectionError] ->
+          if Stages.retryable_error?(error) do
+            Logger.warning(
+              "thread write gave up on a lock and is answered busy: tenant_id=#{tenant_id} " <>
+                "story_id=#{story_id} error=#{Exception.message(error)}"
+            )
+
+            {:error, {:error, :busy}}
+          else
+            reraise(error, __STACKTRACE__)
+          end
       end
 
     case result do
@@ -595,10 +631,6 @@ defmodule Loopctl.Threads do
         error
     end
   end
-
-  # How long a write waits for its locks before answering `:busy`. Config, so tests can make
-  # the wait short without `Application.put_env`.
-  defp lock_timeout_ms, do: Application.get_env(:loopctl, :thread_lock_timeout_ms, 5_000)
 
   defp next_entry_seq(tenant_id, story_id) do
     Repo.one(

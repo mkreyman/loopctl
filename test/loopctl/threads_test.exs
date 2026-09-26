@@ -366,20 +366,26 @@ defmodule Loopctl.ThreadsTest do
     ctx = claimed_story()
     test_pid = self()
 
+    # The holder takes the TRANSACTION-scoped lock the write takes, so the checkin's rollback
+    # releases it; a session-level lock would outlive the test on a pooled connection.
     holder =
       spawn(fn ->
         :ok = Sandbox.checkout(Repo)
 
-        Repo.query!("SELECT pg_advisory_lock($1::int, hashtext($2))", [
-          :erlang.phash2(:loopctl_thread_ledger),
-          ctx.story.id
-        ])
+        Repo.transaction(fn ->
+          Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+            Threads.lock_namespace(),
+            ctx.story.id
+          ])
 
-        send(test_pid, :held)
+          send(test_pid, :held)
 
-        receive do
-          :release -> Sandbox.checkin(Repo)
-        end
+          receive do
+            :release -> :ok
+          end
+        end)
+
+        Sandbox.checkin(Repo)
       end)
 
     assert_receive :held, 5_000
@@ -387,6 +393,25 @@ defmodule Loopctl.ThreadsTest do
 
     assert {:error, :busy} = entry(ctx, message("blocked"))
     send(holder, :release)
+  end
+
+  test "an entry fenced on a claim_epoch is refused once the story's epoch is another" do
+    ctx = claimed_story()
+
+    fenced = fn key ->
+      Threads.record_entry(ctx.tenant_id, ctx.story.id, message(key),
+        author_principal: "agent:runner",
+        actor_lineage: [],
+        claim_epoch: @epoch
+      )
+    end
+
+    assert {:ok, _, :created} = fenced.("k1")
+    set_story(ctx, claim_epoch: @epoch + 1)
+
+    assert {:error, :stale_claim_epoch} = fenced.("k2")
+    # The resend of the write made under the old claim is refused too: that claim is over.
+    assert {:error, :stale_claim_epoch} = fenced.("k1")
   end
 
   test "every write appends an audit-chain entry on the story" do

@@ -293,13 +293,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     past the message's epoch.
 
   Both name an ACCEPTED `implement` dispatch; any other kind is `unknown_dispatch`, as on
-  `session_ended`. The story is never taken off the wire.
+  `session_ended`, and a dispatch no longer accepted is `dispatch_not_accepted` — except a
+  checkpoint's RESEND, below. The story is never taken off the wire. A write that could not
+  get its locks in time is refused `rate_limited` with `min_interval_ms`; nothing was
+  written, so resend after that interval.
 
   **RESENDING IS SAFE, AND IS THE ANSWER TO A LOST ACK.** A byte-identical checkpoint, or a
   `thread_entry` with the same `client_seq` and the same content, is answered `ok` with
   `replayed: true` and the id it was first recorded under. A checkpoint's resend is answered
-  from the row even after the claim's lease has lapsed, because the write happened while it
-  was live. A DIFFERENT write reusing either identity is refused — `checkpoint_conflict` (the
+  from the row even after the claim's lease has lapsed or the claim has moved, and whatever
+  the dispatch's status by then, because the write happened while it was live. A DIFFERENT write reusing either identity is refused — `checkpoint_conflict` (the
   same commit under this claim with another tree or note) and `idempotency_key_reused` (the
   same `client_seq` with other content) — permanently, because acknowledging it would tell the
   runner its new content was recorded when it was not.

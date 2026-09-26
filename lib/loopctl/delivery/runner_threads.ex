@@ -8,18 +8,23 @@ defmodule Loopctl.Delivery.RunnerThreads do
   surface calls the same two functions with the same fence. What happens here is what the
   channel process should not carry:
 
-  1. resolve the runner's ACCEPTED dispatch to its story
-     (`Loopctl.Runners.DispatchLedger.accepted_session/3`) — the story is NEVER taken off the
-     wire — and refuse any kind but `implement` as `:unknown_dispatch`, as `session_ended`
-     does: a triage session has no claim to report on;
+  1. resolve the runner's dispatch to its story (`Loopctl.Runners.DispatchLedger`) — the
+     story is NEVER taken off the wire — and refuse any kind but `implement` as
+     `:unknown_dispatch`, as `session_ended` does: a triage session has no claim to report
+     on. An entry needs the dispatch ACCEPTED. A checkpoint needs it accepted to write, but a
+     RESEND of one is answered whatever the row's status, because the release that ends a
+     claim lets a reply or trace mark the row `superseded` before the resend of a lost ack
+     arrives, and the contract answers that resend from the row
+     (`Loopctl.Threads.record_checkpoint/3`'s `:replay_only`);
   2. refuse an epoch that is not even the dispatch's, before a transaction is opened;
   3. resolve WHO is writing, from the server's own rows, never from the message;
   4. translate `Loopctl.Threads`' refusals into the reasons the contract publishes.
 
   ## Who the write is attributed to
 
-  The principal is the runner's AGENT (`runners.agent_id`), written `agent:<id>` as
-  `LoopctlWeb.ActorLabel.of/1` writes it for a key with an agent. It has to be that agent:
+  The principal is the runner's AGENT (`runners.agent_id`), spelled by
+  `LoopctlWeb.ActorLabel.agent/1`, the same function `LoopctlWeb.ActorLabel.of/1` spells a
+  key with an agent through. It has to be that agent:
   a placement claims the story AS the runner's agent (`Loopctl.Delivery.Placement`), so it is
   the identity `Loopctl.Delivery.Claimant` compares against `assigned_agent_id`, and it is the
   one a resend must repeat for `Loopctl.Threads` to recognise its own earlier write.
@@ -32,13 +37,17 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   It is read on the RLS `Loopctl.Repo` in the tenant's transaction, and only while the story's
   `claim_epoch` is still the message's. After that, `implementer_dispatch_id` belongs to
-  whichever claim came next, so the lineage is not this session's to take:
+  whichever claim came next, so the lineage is not this session's to take, and
 
-  - a `checkpoint` carries `[]` into `Loopctl.Threads`, which is safe because nothing is
-    written under it — the claimant fence refuses a new write at an ended epoch, and the one
-    thing that passes is the recorder's own resend, which writes nothing;
-  - a `thread_entry` is refused `:stale_claim_epoch`. Entries have no claimant fence, so a
-    lineage taken from the wrong claim would be written. Its resend after the claim moved is
+  it resolves to `[]`, and nothing is written under that:
+
+  - a `checkpoint` meets the claimant fence, which refuses a new write at an ended epoch; the
+    one thing that passes is the recorder's own resend, which writes nothing;
+  - a `thread_entry` carries the message's epoch into `Loopctl.Threads.record_entry/4`
+    (`:claim_epoch`), which refuses it `:stale_claim_epoch` UNDER the story's lock, so a claim
+    that moves between this read and the write is refused there, never written past. Because
+    `implementer_dispatch_id` only changes with a claim, which bumps the epoch, a lineage read
+    at epoch E is still E's once the lock confirms E. Its resend after the claim moved is
     refused too, and that is the right answer: the claim it reported on is over.
 
   A claim with no custody dispatch (a legacy claim no placement made) resolves to `[]`, which
@@ -49,8 +58,9 @@ defmodule Loopctl.Delivery.RunnerThreads do
   Every write appends to the tenant's audit chain in its own transaction. A chain whose append
   trips its own HASH check raises, and raised inside the channel it would take the runner's
   socket down, every session on it with it, and the runner's resend would crash-loop it. It is
-  answered `:audit_chain_append_failed` instead (`RunnerStages.chain_hash_violation?/1`),
-  exactly as a `stage` is. Every other database error still raises.
+  answered `:audit_chain_append_failed` instead (`RunnerStages.answering_broken_chain/4`, the
+  one copy of that policy), exactly as a `stage` is. Lock contention, a deadlock and a pool
+  timeout never reach it: `Loopctl.Threads` answers those `:busy`.
 
   ## Retries
 
@@ -61,8 +71,6 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   import Ecto.Query
 
-  require Logger
-
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
@@ -71,6 +79,7 @@ defmodule Loopctl.Delivery.RunnerThreads do
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
   alias Loopctl.WorkBreakdown.Story
+  alias LoopctlWeb.ActorLabel
 
   @type error ::
           :unknown_dispatch
@@ -82,6 +91,7 @@ defmodule Loopctl.Delivery.RunnerThreads do
           | :idempotency_key_reused
           | :secret_blocked
           | :audit_chain_append_failed
+          | :busy
           | {:invalid, [String.t()]}
 
   @typedoc "The runner the socket authenticated: its id and the agent its sessions work as."
@@ -94,9 +104,9 @@ defmodule Loopctl.Delivery.RunnerThreads do
   @spec record_checkpoint(Ecto.UUID.t(), runner(), map()) ::
           {:ok, %{checkpoint: Checkpoint.t(), replayed?: boolean()}} | {:error, error() | term()}
   def record_checkpoint(tenant_id, runner, %{} = message) do
-    with {:ok, session} <- implement_session(tenant_id, runner.id, message),
-         {:ok, lineage} <- checkpoint_lineage(tenant_id, session.story_id, message.claim_epoch) do
-      answering_broken_chain(tenant_id, session.story_id, fn ->
+    with {:ok, session} <- checkpoint_session(tenant_id, runner.id, message),
+         {:ok, lineage} <- lineage(tenant_id, session.story_id, message.claim_epoch) do
+      RunnerStages.answering_broken_chain(tenant_id, session.story_id, "write=checkpoint", fn ->
         Threads.record_checkpoint(tenant_id, session.story_id,
           agent_id: runner.agent_id,
           claim_epoch: message.claim_epoch,
@@ -104,7 +114,8 @@ defmodule Loopctl.Delivery.RunnerThreads do
           tree_sha: message.tree_sha,
           note: Map.get(message, :note),
           author_principal: principal(runner),
-          actor_lineage: lineage
+          actor_lineage: lineage,
+          replay_only: session.status != "accepted"
         )
       end)
       |> answer(:checkpoint)
@@ -119,8 +130,8 @@ defmodule Loopctl.Delivery.RunnerThreads do
   @spec record_entry(Ecto.UUID.t(), runner(), map()) ::
           {:ok, %{entry: Entry.t(), replayed?: boolean()}} | {:error, error() | term()}
   def record_entry(tenant_id, runner, %{} = message) do
-    with {:ok, session} <- implement_session(tenant_id, runner.id, message),
-         {:ok, lineage} <- entry_lineage(tenant_id, session.story_id, message.claim_epoch) do
+    with {:ok, session} <- entry_session(tenant_id, runner.id, message),
+         {:ok, lineage} <- lineage(tenant_id, session.story_id, message.claim_epoch) do
       attrs =
         %{
           "kind" => "message",
@@ -129,10 +140,11 @@ defmodule Loopctl.Delivery.RunnerThreads do
         }
         |> put_checkpoint(Map.get(message, :checkpoint_id))
 
-      answering_broken_chain(tenant_id, session.story_id, fn ->
+      RunnerStages.answering_broken_chain(tenant_id, session.story_id, "write=thread_entry", fn ->
         Threads.record_entry(tenant_id, session.story_id, attrs,
           author_principal: principal(runner),
-          actor_lineage: lineage
+          actor_lineage: lineage,
+          claim_epoch: message.claim_epoch
         )
       end)
       |> answer(:entry)
@@ -145,23 +157,35 @@ defmodule Loopctl.Delivery.RunnerThreads do
   def idempotency_key(%{dispatch_id: dispatch_id, client_seq: client_seq}),
     do: "#{dispatch_id}:#{client_seq}"
 
-  @doc """
-  The principal a runner's thread writes carry: its agent, spelled as
-  `LoopctlWeb.ActorLabel.of/1` spells a key with an agent.
-  """
+  @doc "The principal a runner's thread writes carry: its agent (`ActorLabel.agent/1`)."
   @spec principal(runner()) :: String.t()
-  def principal(%{agent_id: agent_id}), do: "agent:" <> agent_id
+  def principal(%{agent_id: agent_id}), do: ActorLabel.agent(agent_id)
 
   # --- the session -----------------------------------------------------------------------
 
-  defp implement_session(tenant_id, runner_id, message) do
-    with {:ok, session} <-
-           DispatchLedger.accepted_session(tenant_id, runner_id, message.dispatch_id),
-         :ok <- implement_kind(session),
-         :ok <- dispatch_epoch_matches(session, message) do
-      {:ok, session}
-    end
+  # A note needs the dispatch accepted, resend or not: the claim it reports on is over once the
+  # row has moved on, and the contract refuses it.
+  defp entry_session(tenant_id, runner_id, message) do
+    tenant_id
+    |> DispatchLedger.accepted_session(runner_id, message.dispatch_id)
+    |> implement_session(message)
   end
+
+  # A checkpoint takes the row whatever its status; a row that is not `accepted` may only be
+  # answered a resend (`:replay_only`), which writes nothing.
+  defp checkpoint_session(tenant_id, runner_id, message) do
+    tenant_id
+    |> DispatchLedger.held_session(runner_id, message.dispatch_id)
+    |> implement_session(message)
+  end
+
+  defp implement_session({:ok, session}, message) do
+    with :ok <- implement_kind(session),
+         :ok <- dispatch_epoch_matches(session, message),
+         do: {:ok, session}
+  end
+
+  defp implement_session(error, _message), do: error
 
   # `nil` is a ledger row written before `kind` existed, when `implement` was the only kind
   # sent — the same reading `DispatchLedger`'s own implement check makes.
@@ -176,24 +200,11 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   # --- the lineage -----------------------------------------------------------------------
 
-  defp checkpoint_lineage(tenant_id, story_id, epoch) do
-    case custody_lineage(tenant_id, story_id, epoch) do
-      :claim_moved -> {:ok, []}
-      resolved -> resolved
-    end
-  end
-
-  defp entry_lineage(tenant_id, story_id, epoch) do
-    case custody_lineage(tenant_id, story_id, epoch) do
-      :claim_moved -> {:error, :stale_claim_epoch}
-      resolved -> resolved
-    end
-  end
-
-  # The custody dispatch's lineage while the story's claim is still the message's; see the
-  # moduledoc for what each caller does once it is not. `implementer_dispatch_id` is a foreign
-  # key with no delete, so a declared dispatch always resolves.
-  defp custody_lineage(tenant_id, story_id, epoch) do
+  # The custody dispatch's lineage while the story's claim is still the message's, `[]` once it
+  # is not; see the moduledoc for why nothing is written under the latter.
+  # `implementer_dispatch_id` is a foreign key with no delete, so a declared dispatch always
+  # resolves.
+  defp lineage(tenant_id, story_id, epoch) do
     {:ok, row} =
       Repo.with_tenant(tenant_id, fn ->
         Repo.one(
@@ -207,7 +218,7 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
     case row do
       {^epoch, lineage} -> {:ok, lineage || []}
-      {_moved, _lineage} -> :claim_moved
+      {_moved, _lineage} -> {:ok, []}
       # The ledger holds no foreign key to the story, so a deleted story leaves a dispatch
       # naming nothing — which is what `unknown_dispatch` says, permanently.
       nil -> {:error, :unknown_dispatch}
@@ -231,8 +242,8 @@ defmodule Loopctl.Delivery.RunnerThreads do
   defp classify(%Ecto.Changeset{data: %Entry{}} = changeset),
     do: {:invalid, changeset_messages(changeset)}
 
-  # `:not_claimant`, `:stale_claim_epoch`, `:claim_not_live` and
-  # `:audit_chain_append_failed` are published under their own names. Anything else reaches
+  # `:not_claimant`, `:stale_claim_epoch`, `:claim_not_live`, `:dispatch_not_accepted`,
+  # `:busy` and `:audit_chain_append_failed` are published under their own names. Anything else reaches
   # `LoopctlWeb.RunnerChannel.Refusal`'s catch-all, which logs it and answers
   # `internal_error` — `Loopctl.Threads`' `:not_found` among them, which only a story deleted
   # between `custody_lineage/3` and the write can produce.
@@ -255,23 +266,4 @@ defmodule Loopctl.Delivery.RunnerThreads do
     do: to_string(value)
 
   defp to_string_safe(value), do: inspect(value)
-
-  # --- a broken chain --------------------------------------------------------------------
-
-  defp answering_broken_chain(tenant_id, story_id, fun) do
-    fun.()
-  rescue
-    error in Postgrex.Error ->
-      if RunnerStages.chain_hash_violation?(error) do
-        Logger.error(
-          "tenant audit chain refused an append as a HASH VIOLATION; the runner's thread " <>
-            "write was not recorded and is answered audit_chain_append_failed: " <>
-            "tenant_id=#{tenant_id} story_id=#{story_id}"
-        )
-
-        {:error, :audit_chain_append_failed}
-      else
-        reraise error, __STACKTRACE__
-      end
-  end
 end

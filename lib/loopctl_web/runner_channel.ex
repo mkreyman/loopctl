@@ -384,22 +384,18 @@ defmodule LoopctlWeb.RunnerChannel do
   # `Loopctl.Delivery.Stages.advance/4` — the ONE writer of `story_stages` — so the channel
   # never opens a second write path to the delivery state.
   defp handle_message("stage", payload, socket) do
-    now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with {:ok, stage} <- RunnerContract.cast_stage(payload),
-         {:ok, bucket} <-
-           ReplyBucket.take(socket.assigns.stage_bucket, now, @stage_capacity, @stage_refill_ms) do
-      socket = assign(socket, :stage_bucket, bucket)
-
-      case RunnerStages.apply(tenant_id, runner.id, stage) do
-        {:ok, row} -> {:reply, {:ok, stage_ack(row)}, socket}
-        {:error, reason} -> refuse(socket, "stage", message_error(reason))
+    bucketed(
+      socket,
+      "stage",
+      RunnerContract.cast_stage(payload),
+      {:stage_bucket, @stage_capacity, @stage_refill_ms},
+      fn stage ->
+        with {:ok, row} <- RunnerStages.apply(tenant_id, runner.id, stage),
+             do: {:ok, stage_ack(row)}
       end
-    else
-      {:error, :rate_limited} -> rate_limited(socket, "stage", @stage_refill_ms)
-      {:error, reason} -> refuse(socket, "stage", message_error(reason))
-    end
+    )
   end
 
   # What a triage session concluded (contract 1.9.0, #803). A separate message from `stage`
@@ -412,30 +408,19 @@ defmodule LoopctlWeb.RunnerChannel do
   # move except resending the same bytes; `replayed: true` tells it the resend landed on the
   # verdict already recorded rather than applying anything twice.
   defp handle_message("triage_verdict", payload, socket) do
-    now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with {:ok, message} <- RunnerContract.cast_triage_verdict_message(payload),
-         {:ok, bucket} <-
-           ReplyBucket.take(
-             socket.assigns.verdict_bucket,
-             now,
-             @verdict_capacity,
-             @verdict_refill_ms
-           ) do
-      socket = assign(socket, :verdict_bucket, bucket)
-
-      case TriageVerdict.apply(tenant_id, runner.id, message) do
-        {:ok, %{record: record, replayed?: replayed?}} ->
-          {:reply, {:ok, %{recorded_at: record.inserted_at, replayed: replayed?}}, socket}
-
-        {:error, reason} ->
-          refuse(socket, "triage_verdict", message_error(reason))
+    bucketed(
+      socket,
+      "triage_verdict",
+      RunnerContract.cast_triage_verdict_message(payload),
+      {:verdict_bucket, @verdict_capacity, @verdict_refill_ms},
+      fn message ->
+        with {:ok, %{record: record, replayed?: replayed?}} <-
+               TriageVerdict.apply(tenant_id, runner.id, message),
+             do: {:ok, %{recorded_at: record.inserted_at, replayed: replayed?}}
       end
-    else
-      {:error, :rate_limited} -> rate_limited(socket, "triage_verdict", @verdict_refill_ms)
-      {:error, reason} -> refuse(socket, "triage_verdict", message_error(reason))
-    end
+    )
   end
 
   # Why an implement session ended (contract 1.16.0, US-44.3). The runner states the fact;
@@ -445,91 +430,58 @@ defmodule LoopctlWeb.RunnerChannel do
   # session that ended cannot say it again differently, so a runner refused for anything
   # transient has no move except resending the same bytes.
   defp handle_message("session_ended", payload, socket) do
-    now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with {:ok, message} <- RunnerContract.cast_session_ended(payload),
-         {:ok, bucket} <-
-           ReplyBucket.take(
-             socket.assigns.session_ended_bucket,
-             now,
-             @session_ended_capacity,
-             @session_ended_refill_ms
-           ) do
-      socket = assign(socket, :session_ended_bucket, bucket)
-
-      case RunnerStages.end_session(tenant_id, runner.id, message, actor_id: runner.api_key_id) do
-        {:ok, %{row: row, replayed?: replayed?}} ->
-          {:reply, {:ok, Map.put(stage_ack(row), :replayed, replayed?)}, socket}
-
-        {:error, reason} ->
-          refuse(socket, "session_ended", message_error(reason))
+    bucketed(
+      socket,
+      "session_ended",
+      RunnerContract.cast_session_ended(payload),
+      {:session_ended_bucket, @session_ended_capacity, @session_ended_refill_ms},
+      fn message ->
+        with {:ok, %{row: row, replayed?: replayed?}} <-
+               RunnerStages.end_session(tenant_id, runner.id, message,
+                 actor_id: runner.api_key_id
+               ),
+             do: {:ok, Map.put(stage_ack(row), :replayed, replayed?)}
       end
-    else
-      {:error, :rate_limited} -> rate_limited(socket, "session_ended", @session_ended_refill_ms)
-      {:error, reason} -> refuse(socket, "session_ended", message_error(reason))
-    end
+    )
   end
 
   # A commit the session pushed (contract 1.20.0, US-45.2). `RunnerThreads` resolves the
   # dispatch to its story and records it through `Loopctl.Threads`, fenced on the claim.
   # IDEMPOTENT, and the ack says which it was: a resend after a lost ack is the same bytes.
   defp handle_message("checkpoint", payload, socket) do
-    now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with {:ok, message} <- RunnerContract.cast_checkpoint(payload),
-         {:ok, bucket} <-
-           ReplyBucket.take(
-             socket.assigns.checkpoint_bucket,
-             now,
-             @checkpoint_capacity,
-             @checkpoint_refill_ms
-           ) do
-      socket = assign(socket, :checkpoint_bucket, bucket)
-
-      case RunnerThreads.record_checkpoint(tenant_id, runner, message) do
-        {:ok, %{checkpoint: checkpoint, replayed?: replayed?}} ->
-          {:reply,
-           {:ok, %{checkpoint_id: checkpoint.id, seq: checkpoint.seq, replayed: replayed?}},
-           socket}
-
-        {:error, reason} ->
-          refuse(socket, "checkpoint", message_error(reason))
+    bucketed(
+      socket,
+      "checkpoint",
+      RunnerContract.cast_checkpoint(payload),
+      {:checkpoint_bucket, @checkpoint_capacity, @checkpoint_refill_ms},
+      fn message ->
+        with {:ok, %{checkpoint: checkpoint, replayed?: replayed?}} <-
+               RunnerThreads.record_checkpoint(tenant_id, runner, message),
+             do: {:ok, %{checkpoint_id: checkpoint.id, seq: checkpoint.seq, replayed: replayed?}}
       end
-    else
-      {:error, :rate_limited} -> rate_limited(socket, "checkpoint", @checkpoint_refill_ms)
-      {:error, reason} -> refuse(socket, "checkpoint", message_error(reason))
-    end
+    )
   end
 
   # A note the session puts on the story's thread (contract 1.20.0, US-45.2), keyed
   # `<dispatch_id>:<client_seq>` so a resend is recognised as the same note.
   defp handle_message("thread_entry", payload, socket) do
-    now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with {:ok, message} <- RunnerContract.cast_thread_entry(payload),
-         {:ok, bucket} <-
-           ReplyBucket.take(
-             socket.assigns.thread_entry_bucket,
-             now,
-             @entry_capacity,
-             @entry_refill_ms
-           ) do
-      socket = assign(socket, :thread_entry_bucket, bucket)
-
-      case RunnerThreads.record_entry(tenant_id, runner, message) do
-        {:ok, %{entry: entry, replayed?: replayed?}} ->
-          {:reply, {:ok, %{entry_id: entry.id, seq: entry.seq, replayed: replayed?}}, socket}
-
-        {:error, reason} ->
-          refuse(socket, "thread_entry", message_error(reason))
+    bucketed(
+      socket,
+      "thread_entry",
+      RunnerContract.cast_thread_entry(payload),
+      {:thread_entry_bucket, @entry_capacity, @entry_refill_ms},
+      fn message ->
+        with {:ok, %{entry: entry, replayed?: replayed?}} <-
+               RunnerThreads.record_entry(tenant_id, runner, message),
+             do: {:ok, %{entry_id: entry.id, seq: entry.seq, replayed: replayed?}}
       end
-    else
-      {:error, :rate_limited} -> rate_limited(socket, "thread_entry", @entry_refill_ms)
-      {:error, reason} -> refuse(socket, "thread_entry", message_error(reason))
-    end
+    )
   end
 
   defp handle_message("trace", payload, socket) do
@@ -580,6 +532,29 @@ defmodule LoopctlWeb.RunnerChannel do
 
     report_refusal(socket, "unknown", "unknown_event", log?)
     {:reply, {:error, %{reason: "unknown_event"}}, socket}
+  end
+
+  # The shape every token-bucketed message shares: the contract cast, then a token from the
+  # message's bucket — spent only once the message is VALID, because only then does it cost a
+  # database round trip — then `apply`, whose `{:ok, ack}` is the reply and whose
+  # `{:error, reason}` is refused through `Refusal`. `bucket` is the socket assign holding the
+  # bucket, and the capacity and refill it is taken at.
+  defp bucketed(socket, event, cast, {bucket_key, capacity, refill_ms}, apply) do
+    now = System.monotonic_time(:millisecond)
+
+    with {:ok, message} <- cast,
+         {:ok, bucket} <-
+           ReplyBucket.take(Map.fetch!(socket.assigns, bucket_key), now, capacity, refill_ms) do
+      socket = assign(socket, bucket_key, bucket)
+
+      case apply.(message) do
+        {:ok, ack} -> {:reply, {:ok, ack}, socket}
+        {:error, reason} -> refuse(socket, event, message_error(reason))
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, event, refill_ms)
+      {:error, reason} -> refuse(socket, event, message_error(reason))
+    end
   end
 
   @impl true
