@@ -1,0 +1,126 @@
+{
+  "id": "US-45.4",
+  "title": "Merge gate and stage machine speak checkpoints",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "critical",
+  "phase": "change_threads",
+  "story": {
+    "as_a": "orchestrator evaluating a thread for merge",
+    "i_want_to": "run the merge precondition against a recorded checkpoint with no pull request",
+    "so_that": "a thread-mode repository can reach an allow at all"
+  },
+  "rationale": "MergePrecondition requires pr_number and a pull_request fact today; PRD \u00a73 and \u00a77 story 4.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.4.1",
+      "description": "An intake source carries a mode, pr or thread, defaulting to pr; existing sources behave exactly as before; intake_source_update and intake_source_enroll set the mode through their MCP tools."
+    },
+    {
+      "id": "AC-45.4.2",
+      "description": "For a thread-mode story, MergePrecondition evaluates the latest recorded checkpoint through a checkpoint implementation of the PullRequestSource facts, needing no pr_number."
+    },
+    {
+      "id": "AC-45.4.3",
+      "description": "The gate refuses branch_head_unrecorded when the thread branch head is not the latest recorded checkpoint, and empty_change when the checkpoint tree equals the base tree."
+    },
+    {
+      "id": "AC-45.4.4",
+      "description": "The stage machine has a ci to ci base_updated edge taken only for a base_update checkpoint the control plane recorded, whose first parent is the checkpoint the gate last allowed and whose tree is GitHub's clean merge of the base into it. The edge replaces head_sha with the base_update SHA and clears merge_gate_allowed_sha, keeps the story's review verdict and custody binding, and does not send the story to implementing; any other head movement still goes over base_moved."
+    },
+    {
+      "id": "AC-45.4.5",
+      "description": "A recorded allow names the checkpoint id and its SHA."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.4.1",
+      "verifies": [
+        "AC-45.4.1"
+      ],
+      "name": "pr-mode unchanged",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "run the existing merge precondition suite"
+      ],
+      "expected_results": [
+        "green"
+      ]
+    },
+    {
+      "id": "TC-45.4.2",
+      "verifies": [
+        "AC-45.4.2",
+        "AC-45.4.5"
+      ],
+      "name": "thread allow",
+      "type": "integration",
+      "preconditions": [
+        "thread story at ci with passing checks"
+      ],
+      "steps": [
+        "merge precondition"
+      ],
+      "expected_results": [
+        "allow naming the checkpoint"
+      ]
+    },
+    {
+      "id": "TC-45.4.3",
+      "verifies": [
+        "AC-45.4.3"
+      ],
+      "name": "refusals",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "unrecorded head; empty change"
+      ],
+      "expected_results": [
+        "each refusal code"
+      ]
+    },
+    {
+      "id": "TC-45.4.4",
+      "verifies": [
+        "AC-45.4.4"
+      ],
+      "name": "base_updated edge",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "transition ci to ci over base_updated"
+      ],
+      "expected_results": [
+        "allowed"
+      ]
+    },
+    {
+      "id": "TC-45.4.5",
+      "verifies": [
+        "AC-45.4.4"
+      ],
+      "name": "base_updated keeps review",
+      "type": "integration",
+      "preconditions": [
+        "thread story allowed at checkpoint C"
+      ],
+      "steps": [
+        "record a base_update merge of master into C; re-run the gate"
+      ],
+      "expected_results": [
+        "story stays at ci; allow on the new head without a new review round"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Largest change in the epic."
+  ],
+  "dependencies": [
+    "US-45.1"
+  ]
+}
