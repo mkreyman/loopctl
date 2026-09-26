@@ -52,7 +52,7 @@ env:
   OTP_VERSION: "28.5.0.2"
 
 # SELF-HOSTED SPLIT (nuc since 2026-08-07, beelink before it). lint / test /
-# security / dialyzer moved; the rest
+# security / dialyzer / scale-test moved; the rest
 # stay on ubuntu-latest for specific reasons, not by omission. Measured job times
 # (2026-07-30) are recorded per entry, because the whole point of the split is
 # billed minutes and an unmeasured "it is rare" claim is how cost hides:
@@ -61,8 +61,8 @@ env:
 #                   Postgres; the port topology has to be reworked for a shared
 #                   host DB. Also GATES deploy, so it cannot simply be dropped.
 #   scale-test      MOVED to beelink 2026-09-26: 3.1-5.1 min on EVERY push and PR
-#                   (its `if:` is schedule || push || pull_request) had spent the
-#                   account's included minutes. Its own database per run and attempt.
+#                   had spent the account's included minutes. It brings its own
+#                   Postgres service container on a Docker-picked host port.
 #   scale-nightly   ZERO billed hosted minutes: it moved self-hosted (the port is
 #                   DONE -- see the per-matrix-file database note on the job) and
 #                   it no longer runs nightly. ~143 min of wall clock per full
@@ -158,7 +158,7 @@ jobs:
           # honest, and deleting it here costs a cache restore rather than a rebuild.
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
-          # mcp-server-ci.yml runs `npm ci`, and it reinstalls on every run.
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
           git clean -ffdx -e /_build -e /deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
@@ -347,7 +347,7 @@ jobs:
           # honest, and deleting it here costs a cache restore rather than a rebuild.
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
-          # mcp-server-ci.yml runs `npm ci`, and it reinstalls on every run.
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
           git clean -ffdx -e /_build -e /deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
@@ -401,16 +401,10 @@ jobs:
             DO \$\$
             BEGIN
               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_app') THEN
-                BEGIN
-                  CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
-                EXCEPTION WHEN duplicate_object THEN NULL;
-                END;
+                CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
               END IF;
               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_admin') THEN
-                BEGIN
-                  CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
-                EXCEPTION WHEN duplicate_object THEN NULL;
-                END;
+                CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
               END IF;
             END \$\$;
           "
@@ -554,7 +548,7 @@ jobs:
           # honest, and deleting it here costs a cache restore rather than a rebuild.
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
-          # mcp-server-ci.yml runs `npm ci`, and it reinstalls on every run.
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
           git clean -ffdx -e /_build -e /deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
@@ -629,16 +623,10 @@ jobs:
             DO \$\$
             BEGIN
               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_app') THEN
-                BEGIN
-                  CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
-                EXCEPTION WHEN duplicate_object THEN NULL;
-                END;
+                CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
               END IF;
               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_admin') THEN
-                BEGIN
-                  CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
-                EXCEPTION WHEN duplicate_object THEN NULL;
-                END;
+                CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
               END IF;
             END \$\$;
           "
@@ -767,7 +755,7 @@ jobs:
           # honest, and deleting it here costs a cache restore rather than a rebuild.
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
-          # mcp-server-ci.yml runs `npm ci`, and it reinstalls on every run.
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
           git clean -ffdx -e /_build -e /deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
@@ -855,7 +843,7 @@ jobs:
           # honest, and deleting it here costs a cache restore rather than a rebuild.
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
-          # mcp-server-ci.yml runs `npm ci`, and it reinstalls on every run.
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
           git clean -ffdx -e /_build -e /deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
@@ -920,41 +908,77 @@ jobs:
 
   scale-test:
     name: Scale Tests (US-27.1)
-    # Run on push to master and PRs touching scale-related paths, plus nightly
-    # schedule. This ensures the scale suite (which commits real rows and runs
+    # Runs on EVERY push and PR, plus the nightly schedule (the `if:` below). This ensures the scale suite (which commits real rows and runs
     # ANALYZE) is executed in CI and that the DBConnection.OwnershipError or
     # other regressions are caught before they reach production.
-    # On beelink, like the Test job and for the same reason: a required check on every PR, and
-    # GitHub-hosted minutes on it spent the account's included allowance (2026-09-26). The
-    # database is this run's own, on the host Postgres the Test job uses, and is dropped at
-    # the end.
+    # On beelink since 2026-09-26: 3-5 minutes on every push and PR had spent the account's
+    # included GitHub-hosted minutes. It keeps its OWN Postgres service container, on a host
+    # port Docker picks, so its committed corpus, its role bootstrap and its index builds
+    # never touch the CI Postgres the Test job runs against.
     runs-on: [self-hosted, beelink]
-    # Bounded: a hung HNSW seed on the shared CI Postgres would otherwise hold a beelink slot
-    # for the 360-minute default.
     timeout-minutes: 30
     if: >
       github.event_name == 'schedule' ||
       github.event_name == 'push' ||
       github.event_name == 'pull_request'
-    env:
-      # Run AND attempt: a re-run keeps the run id, and the suite COMMITS its corpus.
-      MIX_TEST_PARTITION: scale${{ github.run_id }}a${{ github.run_attempt }}
-      TEST_DB_PORT: "5433"
-      PGPORT: "5433"
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: loopctl_test
+        ports:
+          - 5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
         with:
           clean: false
 
-      # The slot's workspace is shared with Test, Lint and Dialyzer, which keep _build and deps
-      # warm on purpose (see "KEEPING THE COMPILED TREE"); the default checkout clean would wipe
-      # them for every one of those jobs.
       - name: Clean the workspace, keeping the compiled tree
         run: |
+          # Patterns are ANCHORED. Without a leading slash a pattern matches at any
+          # depth, so a future fixture directory named `deps` or `_build` would become
+          # immortal on every runner. The PLT exception names the two artifacts rather
+          # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
+          # restores it anyway) and untracked cruft in priv/plts is still cleaned.
+          # The PLT is deliberately NOT excepted, and that is a correction. mix.exs:49
+          # pins `plt_file` to a fixed filename with no toolchain in it, and dialyxir's
+          # staleness gate is a hash of mix.lock plus the app list and nothing else
+          # (deps/dialyxir/lib/mix/tasks/dialyzer.ex:423) -- on a match it prints "PLT is
+          # up to date!" and skips Plt.check entirely. So a PLT surviving an OTP or
+          # Elixir bump gets used against the wrong toolchain: either the "File not
+          # found: ... dialyzer-<old>/ebin/erl_bif_types.beam" this file already
+          # documents, or a silent pass against stale specs. Its own actions/cache key
+          # DOES embed both versions, so letting the cache own it is what keeps it
+          # honest, and deleting it here costs a cache restore rather than a rebuild.
+          #
+          # `-e /mcp-server/node_modules` is gone too: it was inert. Only
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
           git clean -ffdx -e /_build -e /deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
           }
+          # ...but NOT the asset toolchain binaries, even though they live under _build.
+          # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
+          # only by RUNNING the file and reading its version string. Under the old
+          # `clean: true` these were scrubbed every job; retaining _build would let a
+          # binary written by a pull_request job be executed by the next push-to-master
+          # job on the same slot, with none of the ref scoping GitHub's cache gives.
+          # They have their own dedicated cache below, so deleting them costs nothing.
+          rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
+          git reset --hard HEAD
+
+      - name: Point the suite and psql at this job's Postgres container
+        run: |
+          echo "TEST_DB_PORT=${{ job.services.postgres.ports['5432'] }}" >> "$GITHUB_ENV"
+          echo "PGPORT=${{ job.services.postgres.ports['5432'] }}" >> "$GITHUB_ENV"
 
       - uses: erlef/setup-beam@v1
         with:
@@ -995,37 +1019,27 @@ jobs:
             DO \$\$
             BEGIN
               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_app') THEN
-                BEGIN
-                  CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
-                EXCEPTION WHEN duplicate_object THEN NULL;
-                END;
+                CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
               END IF;
               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_admin') THEN
-                BEGIN
-                  CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
-                EXCEPTION WHEN duplicate_object THEN NULL;
-                END;
+                CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
               END IF;
             END \$\$;
           "
-
-      - name: Create the database
-        run: mix ecto.create
-
-      - name: Grant RLS roles on the schema, before any table exists
-        run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d "loopctl_test${MIX_TEST_PARTITION}" -c "
+          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
+            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
+            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
             GRANT USAGE, CREATE ON SCHEMA public TO loopctl_app;
             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO loopctl_app;
             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO loopctl_app;
           "
 
-      - name: Migrate
-        run: mix ecto.migrate
+      - name: Setup database
+        run: mix ecto.create && mix ecto.migrate
 
       - name: Grant RLS roles access to tables
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d "loopctl_test${MIX_TEST_PARTITION}" -c "
+          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
             GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
             GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
           "
@@ -1053,19 +1067,6 @@ jobs:
             test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
         env:
           EMBEDDING_PLAN_GATE_DIMENSIONS: "1536"
-
-      # Loud, and FORCE, as the scale-nightly drop is: this suite commits a real corpus, and a
-      # database a hung connection kept alive would otherwise be stranded without a word.
-      - name: Drop this run's test database
-        if: always()
-        run: |
-          db="loopctl_test${MIX_TEST_PARTITION}"
-          if PGPASSWORD=postgres psql -h localhost -U postgres -c \
-               "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE);"; then
-            echo "Dropped $db."
-          else
-            echo "::warning::could not drop $db — reclaim it by hand."
-          fi
 
   pgbouncer-e2e:
     name: Pgbouncer e2e (US-27.13)
@@ -1344,7 +1345,7 @@ jobs:
           # honest, and deleting it here costs a cache restore rather than a rebuild.
           #
           # `-e /mcp-server/node_modules` is gone too: it was inert. Only
-          # mcp-server-ci.yml runs `npm ci`, and it reinstalls on every run.
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
           git clean -ffdx -e /_build -e /deps || {
             echo "clean failed; wiping the workspace so the next run re-clones"
             find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
@@ -1427,16 +1428,10 @@ jobs:
             DO \$\$
             BEGIN
               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_app') THEN
-                BEGIN
-                  CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
-                EXCEPTION WHEN duplicate_object THEN NULL;
-                END;
+                CREATE ROLE loopctl_app LOGIN PASSWORD 'loopctl_app';
               END IF;
               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'loopctl_admin') THEN
-                BEGIN
-                  CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
-                EXCEPTION WHEN duplicate_object THEN NULL;
-                END;
+                CREATE ROLE loopctl_admin LOGIN PASSWORD 'loopctl_admin' BYPASSRLS;
               END IF;
             END \$\$;
           "
