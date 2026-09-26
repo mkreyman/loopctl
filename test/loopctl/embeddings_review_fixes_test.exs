@@ -678,6 +678,89 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert {:ok, _} =
                Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
     end
+
+    test "only the LATEST job's state gates: a completed run after a discarded one does not" do
+      tenant = tenant_at(1536)
+
+      for state <- ["discarded", "completed"] do
+        Loopctl.Repo.query!(
+          """
+          INSERT INTO oban_jobs (state, queue, worker, args, inserted_at, scheduled_at)
+          VALUES ($1, 'embeddings', $2, $3, NOW(), NOW())
+          """,
+          [
+            state,
+            "Loopctl.Workers.SystemCorpusEmbeddingWorker",
+            %{"tenant_id" => tenant.id, "dim" => 1536}
+          ]
+        )
+      end
+
+      refute Embeddings.system_corpus_terminal?(tenant.id, 1536)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, %Oban.Job{}} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
+      end)
+    end
+
+    test "a system article edited after materialization is queued again without force" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      assert {:ok, :already_materialized} =
+               Embeddings.enqueue_system_corpus_materialization(tenant.id)
+
+      stamp_article_newer(article.id, body: "a corrected body")
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, %Oban.Job{}} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
+      end)
+    end
+
+    test "the search read path re-embeds an edited system article while the corpus reads semantic" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+      stamp_article_newer(article.id)
+
+      assert %{system_corpus_recall: "semantic"} = Embeddings.system_corpus_meta(tenant.id, 1536)
+      assert [_ | _] = Embeddings.stale_system_articles(tenant.id, 1536)
+
+      # Oban runs inline here, so the job the read path queues has already run.
+      Embeddings.search_disclosure_meta(tenant.id, 1536)
+
+      assert Embeddings.stale_system_articles(tenant.id, 1536) == []
+    end
+
+    test "a row is never stamped earlier than its article, whichever clock stamped the edit" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      ahead = DateTime.add(DateTime.utc_now(), 60, :second)
+
+      AdminRepo.query!("UPDATE articles SET updated_at = $1 WHERE id = $2", [
+        ahead,
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      article = AdminRepo.get!(Loopctl.Knowledge.Article, article.id)
+
+      {:ok, _} =
+        Embeddings.materialize_system_article_embedding(tenant.id, article, vec(1536), "h", 1536)
+
+      refute article.id in system_article_ids(Embeddings.stale_system_articles(tenant.id, 1536))
+
+      AdminRepo.query!("UPDATE articles SET updated_at = $1 WHERE id = $2", [
+        DateTime.add(ahead, 60, :second),
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      assert article.id in system_article_ids(Embeddings.stale_system_articles(tenant.id, 1536))
+
+      {:ok, 1} = Embeddings.touch_system_article_embeddings(tenant.id, [article.id], 1536)
+
+      refute article.id in system_article_ids(Embeddings.stale_system_articles(tenant.id, 1536))
+    end
   end
 
   # ---------------------------------------------------------------------------

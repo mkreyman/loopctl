@@ -89,8 +89,18 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
     description:
       "Enqueues the AC-41.1.7 on-demand per-tenant materialization of the SYSTEM-scoped " <>
         "article corpus at this tenant's active dimension, using this tenant's own " <>
-        "embedding credential. Idempotent. Role: agent+.",
-    responses: %{202 => {"Enqueued", "application/json", %OpenApiSpex.Schema{type: :object}}}
+        "embedding credential. It embeds system articles this tenant has not embedded and " <>
+        "re-embeds ones edited since. Idempotent: 200 with already_materialized when " <>
+        "nothing is missing or stale, and no job is created. 409 materialization_terminal " <>
+        "when this tenant's LATEST materialization job was discarded or cancelled and the " <>
+        "key is below orchestrator; an orchestrator+ key forces a new job. Role: agent+.",
+    responses: %{
+      200 => {"Nothing missing or stale", "application/json", %OpenApiSpex.Schema{type: :object}},
+      202 => {"Enqueued", "application/json", %OpenApiSpex.Schema{type: :object}},
+      409 =>
+        {"Latest job terminal (agent key)", "application/json",
+         %OpenApiSpex.Schema{type: :object}}
+    }
   )
 
   def system_corpus(conn, _params) do
@@ -131,7 +141,7 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
         |> json(%{
           error: "materialization_terminal",
           detail:
-            "a prior system-corpus materialization for this tenant and dimension " <>
+            "this tenant's latest system-corpus materialization at this dimension " <>
               "terminated permanently (e.g. no embedding key). Retry requires an " <>
               "orchestrator+ key.",
           dimension: dimension

@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.104.2 — 2026-09-26 (system-corpus materialization says what it does)
+
+### Changed
+
+- **`embedding_materialize_system_corpus`** says that it also re-embeds system articles
+  edited since this tenant embedded them, that it queues nothing when nothing is missing or
+  stale, and when it is refused 409 `materialization_terminal` (the tenant's latest job was
+  discarded or cancelled, and the key is agent-role). loopctl changed to match: it used to
+  re-embed an edited system article only incidentally, and to block on any retained
+  terminal job rather than the latest.
+
 ## 2.104.1 — 2026-09-26 (the delivery loop has a reference)
 
 ### Changed

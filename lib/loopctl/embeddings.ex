@@ -950,8 +950,16 @@ defmodule Loopctl.Embeddings do
           String.t() | nil,
           pos_integer()
         ) :: {:ok, ArticleEmbedding.t()} | {:error, Ecto.Changeset.t()}
-  def upsert_article_embedding_row(repo, tenant_id, article, embedding, content_hash, dimension) do
-    %ArticleEmbedding{tenant_id: tenant_id}
+  def upsert_article_embedding_row(
+        repo,
+        tenant_id,
+        article,
+        embedding,
+        content_hash,
+        dimension,
+        opts \\ []
+      ) do
+    %ArticleEmbedding{tenant_id: tenant_id, updated_at: Keyword.get(opts, :updated_at)}
     |> ArticleEmbedding.changeset(
       %{article_id: article.id, embedding: embedding, embedding_content_hash: content_hash},
       dimension
@@ -1478,31 +1486,42 @@ defmodule Loopctl.Embeddings do
       when is_binary(tenant_id) and is_integer(dimension) do
     limit = Keyword.get(opts, :limit, @default_batch_size)
 
-    AdminRepo.all(
-      from(a in system_articles_query(),
-        as: :article,
-        where:
-          not exists(
+    AdminRepo.all(from(a in stale_system_articles_query(tenant_id, dimension), limit: ^limit))
+  end
+
+  @doc """
+  Whether ANY system article is missing or stale for this tenant at `dimension` — the
+  predicate of `stale_system_articles/3` as an `EXISTS`, without loading a row.
+  """
+  @spec system_corpus_stale?(Ecto.UUID.t(), pos_integer()) :: boolean()
+  def system_corpus_stale?(tenant_id, dimension)
+      when is_binary(tenant_id) and is_integer(dimension) do
+    AdminRepo.exists?(stale_system_articles_query(tenant_id, dimension))
+  end
+
+  defp stale_system_articles_query(tenant_id, dimension) do
+    from(a in system_articles_query(),
+      as: :article,
+      where:
+        not exists(
+          from(ae in ArticleEmbedding,
+            where:
+              ae.article_id == parent_as(:article).id and
+                ae.tenant_id == ^tenant_id and
+                ae.dim == ^dimension,
+            select: 1
+          )
+        ) or
+          exists(
             from(ae in ArticleEmbedding,
               where:
                 ae.article_id == parent_as(:article).id and
                   ae.tenant_id == ^tenant_id and
-                  ae.dim == ^dimension,
+                  ae.dim == ^dimension and
+                  ae.updated_at < parent_as(:article).updated_at,
               select: 1
             )
-          ) or
-            exists(
-              from(ae in ArticleEmbedding,
-                where:
-                  ae.article_id == parent_as(:article).id and
-                    ae.tenant_id == ^tenant_id and
-                    ae.dim == ^dimension and
-                    ae.updated_at < parent_as(:article).updated_at,
-                select: 1
-              )
-            ),
-        limit: ^limit
-      )
+          )
     )
   end
 
@@ -1532,10 +1551,18 @@ defmodule Loopctl.Embeddings do
     {n, _} =
       AdminRepo.update_all(
         from(ae in ArticleEmbedding,
+          join: a in Article,
+          on: a.id == ae.article_id,
           where:
-            ae.tenant_id == ^tenant_id and ae.article_id in ^article_ids and ae.dim == ^dimension
+            ae.tenant_id == ^tenant_id and ae.article_id in ^article_ids and ae.dim == ^dimension,
+          # Never earlier than the article's own `updated_at`: an edit is stamped by the
+          # DATABASE clock (a seeding migration's NOW()), this by the app's, and a row left
+          # older than its article stays stale and re-runs the worker until the clocks cross.
+          update: [
+            set: [updated_at: fragment("GREATEST(?, ?)", ^DateTime.utc_now(), a.updated_at)]
+          ]
         ),
-        set: [updated_at: DateTime.utc_now()]
+        []
       )
 
     {:ok, n}
@@ -1565,16 +1592,24 @@ defmodule Loopctl.Embeddings do
         ) :: {:ok, ArticleEmbedding.t()} | {:error, term()}
   def materialize_system_article_embedding(tenant_id, %Article{} = article, embedding, hash, dim)
       when is_binary(tenant_id) and is_integer(dim) do
-    upsert_article_embedding_row(AdminRepo, tenant_id, article, embedding, hash, dim)
+    # Stamped no earlier than the article's `updated_at`, for the reason
+    # `touch_system_article_embeddings/3` gives: otherwise a DB clock ahead of the app's
+    # leaves the fresh row stale and the worker re-embeds it, paying the provider again.
+    stamp = Enum.max([DateTime.utc_now(), article.updated_at], DateTime)
+
+    upsert_article_embedding_row(AdminRepo, tenant_id, article, embedding, hash, dim,
+      updated_at: stamp
+    )
   end
 
   @doc """
   Enqueues the on-demand per-tenant materialization of the system corpus at the
   tenant's ACTIVE dimension (AC-41.1.7).
 
-  Idempotent: the worker is `unique` per `(tenant_id, dim)` and its batch query is
-  an anti-join, so re-enqueuing while a run is in flight is a no-op and a completed
-  corpus makes the job an immediate `:ok`.
+  Idempotent: the worker is `unique` per `(tenant_id, dim)`, and a corpus with nothing
+  missing or stale (`system_corpus_stale?/2`) creates no job at all. "Stale" is a system
+  article edited after this tenant embedded it; the job re-embeds it, or only re-stamps
+  it when its content hash did not change.
 
   ## Terminal-state gate (review)
 
@@ -1603,10 +1638,12 @@ defmodule Loopctl.Embeddings do
       # itself), so a COMPLETED corpus is not deduped: without this short-circuit every
       # repeated agent-role POST inserted and ran a fresh job that the anti-join makes a
       # no-op — an agent key could loop the endpoint to flood the embeddings queue for
-      # its own tenant. A limit-1 anti-join probe is cheap and returns a 200-shaped
-      # `:already_materialized` with no job created. Checked BEFORE the terminal gate so
-      # a done-but-terminal corpus reports done, not a conflict.
-      unmaterialized_system_articles(tenant_id, dimension, limit: 1) == [] ->
+      # its own tenant. An EXISTS probe over the worker's own predicate (missing OR
+      # stale) returns a 200-shaped `:already_materialized` with no job created; probing
+      # missing rows alone left an edited system article embedded from its old body for
+      # good. Checked BEFORE the terminal gate so a done-but-terminal corpus reports
+      # done, not a conflict.
+      not system_corpus_stale?(tenant_id, dimension) ->
         {:ok, :already_materialized}
 
       not force? and system_corpus_terminal?(tenant_id, dimension) ->
@@ -1620,8 +1657,13 @@ defmodule Loopctl.Embeddings do
   end
 
   @doc """
-  Whether a system-corpus materialization for `(tenant_id, dimension)` has already
+  Whether the LATEST system-corpus materialization for `(tenant_id, dimension)`
   terminated permanently (`discarded` / `cancelled`).
+
+  The latest, not any: Oban retains a terminal job until the pruner removes it, and a
+  tenant whose first run was discarded (no embedding key yet) and whose forced retry then
+  completed is healthy. Asking whether ANY retained job was terminal kept blocking that
+  tenant's automatic materialization until the old job was pruned.
   """
   @spec system_corpus_terminal?(Ecto.UUID.t(), pos_integer()) :: boolean()
   def system_corpus_terminal?(tenant_id, dimension) do
@@ -1629,15 +1671,17 @@ defmodule Loopctl.Embeddings do
 
     # OBAN's repo, not `AdminRepo`: `oban_jobs` is Oban's own, non-RLS table, and
     # reading it through the same repo that WRITES it keeps the two consistent.
-    Repo.exists?(
+    Repo.one(
       from(j in "oban_jobs",
         where:
-          j.worker == ^worker and j.state in ["discarded", "cancelled"] and
+          j.worker == ^worker and
             fragment("?->>'tenant_id' = ?", j.args, ^tenant_id) and
             fragment("(?->>'dim')::int = ?", j.args, ^dimension),
-        limit: 1
+        order_by: [desc: j.id],
+        limit: 1,
+        select: j.state
       )
-    )
+    ) in ["discarded", "cancelled"]
   end
 
   @doc """
@@ -2102,21 +2146,21 @@ defmodule Loopctl.Embeddings do
       # memoized fill (review): it was previously called on EVERY semantic response,
       # so an unmaterialized tenant paid an unindexed `oban_jobs` JSONB scan plus an
       # Oban insert on every search. Firing it only on a cache MISS bounds it to once
-      # per DisclosureCache TTL, and the anti-join/uniqueness make repeat inserts no-ops.
-      maybe_trigger_system_corpus(tenant_id, dimension, meta)
+      # per DisclosureCache TTL, and the stale probe/uniqueness make repeat inserts no-ops.
+      maybe_trigger_system_corpus(tenant_id, dimension)
 
       meta
     end)
   end
 
-  defp maybe_trigger_system_corpus(tenant_id, dimension, %{
-         system_corpus_recall: "keyword_only"
-       }) do
+  # Asked on every fill, not only when the corpus reports keyword_only: a system article
+  # edited after this tenant embedded it leaves the corpus "semantic" while its vector is
+  # of the old body. The enqueue's own first check is the missing-or-stale EXISTS probe,
+  # so a current corpus costs one query and creates no job.
+  defp maybe_trigger_system_corpus(tenant_id, dimension) do
     enqueue_system_corpus_materialization(tenant_id, dimension: dimension)
     :ok
   end
-
-  defp maybe_trigger_system_corpus(_tenant_id, _dimension, _meta), do: :ok
 
   @doc """
   Completes a re-embed onto `target_dim` ATOMICALLY: verify completeness, re-pin the

@@ -13,11 +13,18 @@ All notable changes to loopctl are documented here.
   `meta.system_corpus_recall` in search responses says. On the side-table path, a tenant's
   semantic search that finds a system article unembedded queues a materialization job for
   that tenant, and the article turns semantic once the job has run; the search that queued it
-  still answers `keyword_only`. The one manual case: while any discarded or cancelled
-  materialization job for that tenant is still retained by Oban, no job is queued
-  automatically, and `embedding_materialize_system_corpus` called with an
-  orchestrator-or-higher key forces one (an agent key is refused 409
-  `materialization_terminal`).
+  still answers `keyword_only`. The one manual case: when that tenant's latest
+  materialization job was discarded or cancelled, no job is queued automatically, and
+  `embedding_materialize_system_corpus` called with an orchestrator-or-higher key forces one
+  (an agent key is refused 409 `materialization_terminal`).
+- **An edited system article is re-embedded (side-table read path).** A system article
+  corrected after a tenant embedded it used to keep that tenant's vector of the old body for
+  good: the search path queued materialization only for MISSING embeddings, and the on-demand
+  call answered `already_materialized`. Both now also act on an article edited since, and a
+  re-embed only re-stamps the row when the content hash did not change. The terminal gate
+  above reads the tenant's LATEST job, where it used to block on any discarded or cancelled
+  job Oban still retained, which kept a tenant that had since recovered from ever being
+  queued automatically.
 
 ### Changed
 
