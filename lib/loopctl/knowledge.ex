@@ -9688,9 +9688,10 @@ defmodule Loopctl.Knowledge do
   # AC-41.1.7's "on demand" read-path materialization trigger now lives INSIDE
   # `Embeddings.search_disclosure_meta/2`'s memoized cache fill (review #11), so it
   # fires only on a DisclosureCache MISS rather than on every semantic response — the
-  # per-request unindexed `oban_jobs` scan + Oban insert it used to cost is gone. The
-  # worker is unique per `(tenant_id, dim)`, its batch query is an anti-join, and the
-  # enqueue refuses to re-drive a permanently-terminated materialization.
+  # per-request `oban_jobs` scan + Oban insert it used to cost is gone. It fires when the
+  # corpus is missing OR embedded from text that has since changed; the worker is unique
+  # per `(tenant_id, dim)` across every unfinished state, so a run in progress is never
+  # doubled, and the enqueue refuses to re-drive a permanently-terminated one.
   defp semantic_disclosure_meta(tenant_id, dimension) when is_integer(dimension) do
     Embeddings.search_disclosure_meta(tenant_id, dimension)
   end

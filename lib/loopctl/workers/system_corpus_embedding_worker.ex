@@ -43,20 +43,21 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   and everything else retries.
   """
 
-  # UNIQUE STATES, load-bearing (review #2): Oban's DEFAULT unique states include
-  # `:executing` and `:completed`, so this worker's self-continuation conflicted with
-  # the very job performing it — `Oban.insert/1` returned the executing job, no
-  # continuation was created, and `replace: [scheduled: …]` could not fire because
-  # the conflict was not in `:scheduled`. A system corpus larger than one batch then
-  # stayed partially materialized while `system_corpus_meta/2` kept reporting
-  # `keyword_only` forever.
+  # UNIQUE STATES, load-bearing: one materialization per (tenant, dim) at a time, for as
+  # long as it is anywhere short of finished. `:executing` is IN the set and `period` is
+  # unbounded, so a read-path fill or a POST during a run, or long after a retryable job
+  # was inserted, conflicts instead of starting a second run that embeds the same batch
+  # and bills the tenant twice. The worker continues a corpus larger than one batch by
+  # SNOOZING itself (`continue/2`), which re-schedules this same job; an inserted
+  # continuation would conflict with the job performing it, which is why these states
+  # once left `:executing` out.
   use Oban.Worker,
     queue: :embeddings,
     max_attempts: 5,
     unique: [
       keys: [:tenant_id, :dim],
-      period: 300,
-      states: [:available, :scheduled, :retryable]
+      period: :infinity,
+      states: [:available, :scheduled, :executing, :retryable]
     ],
     replace: [scheduled: [:args, :scheduled_at]]
 
@@ -68,7 +69,6 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Embeddings.ShrinkLadder
-  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Llm
@@ -292,21 +292,13 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     {:discard, {:dimension_mismatch, expected, actual}}
   end
 
-  # Self-continuation: more unmaterialized rows means another batch. See the
-  # `unique:` states comment above — with the default states this insert was
-  # swallowed by the currently EXECUTING job and the run stopped after one batch.
+  # Self-continuation: more stale rows means another batch. A snooze re-schedules THIS
+  # job rather than inserting a new one, so the uniqueness above can include `:executing`
+  # and still let a corpus larger than one batch finish.
   defp continue(tenant_id, dim) do
-    if Embeddings.stale_system_articles(tenant_id, dim, limit: 1) == [] do
-      :ok
-    else
-      %{tenant_id: tenant_id, dim: dim}
-      |> __MODULE__.new(schedule_in: 1)
-      |> Oban.insert()
-      |> case do
-        {:ok, _job} -> :ok
-        {:error, reason} -> {:error, {:system_corpus_continuation_failed, reason}}
-      end
-    end
+    if Embeddings.stale_system_articles(tenant_id, dim, limit: 1) == [],
+      do: :ok,
+      else: {:snooze, 1}
   end
 
   defp handle_error(tenant_id, :no_api_key) do
@@ -350,11 +342,9 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   # The same 32,000-CHARACTER first attempt as before, named once (#617) so it cannot
   # drift from the rung `ShrinkLadder` starts below. The hash in `split_unchanged/3`
   # is computed over exactly this text, so the cut must not change silently.
-  defp embedding_text(article) do
-    TextBudget.initial("#{article.title}\n\n#{article.body}")
-  end
+  defp embedding_text(article), do: Embeddings.system_article_embedding_text(article)
 
-  defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
+  defp content_hash(text), do: Embeddings.text_content_hash(text)
 
   defp hash_for(text, false), do: content_hash(text)
   defp hash_for(text, true), do: text |> content_hash() |> ShrinkLadder.truncated_hash()

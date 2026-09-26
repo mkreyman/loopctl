@@ -441,7 +441,7 @@ that extends it. The structural ripple is there; what is missing is the TYPED ju
 | `derived_from` | **0** | — |
 
 Three of the five declared link types have never been written by anything, ever. And
-`find_contradiction_clusters/2` (`knowledge.ex:12119`) reads `:contradicts` — **a consumer
+`find_contradiction_clusters/2` (`knowledge.ex:13979`) reads `:contradicts` — **a consumer
 with no producer**, so that lint report can only ever return empty. That is Karpathy #5's gap
 exactly, and Phase 6 is to build the missing producer.
 

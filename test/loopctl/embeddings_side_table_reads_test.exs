@@ -172,6 +172,8 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Memory.Scope
   alias Loopctl.VectorRecallDiagnostics
+  alias Loopctl.Workers.ReembedWorker
+  alias Loopctl.Workers.SystemCorpusEmbeddingWorker
 
   setup :verify_on_exit!
 
@@ -788,12 +790,15 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       tenant = fixture(:tenant)
 
       for article <- Embeddings.unmaterialized_system_articles(tenant.id, 1536, limit: 1000) do
+        hash =
+          article |> Embeddings.system_article_embedding_text() |> Embeddings.text_content_hash()
+
         {:ok, _} =
           Embeddings.materialize_system_article_embedding(
             tenant.id,
             article,
             vec(1536, :close),
-            "sys",
+            hash,
             1536
           )
       end
@@ -1030,20 +1035,28 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
     # REVIEW #2: Oban's DEFAULT unique states include `:executing`, so a job
     # re-enqueuing ITSELF conflicts with the job doing the enqueueing and the
     # continuation is silently swallowed — a multi-batch corpus stalls after batch 1.
-    test "both self-continuing workers exclude :executing from their unique states" do
-      for worker <- [
-            Loopctl.Workers.ReembedWorker,
-            Loopctl.Workers.SystemCorpusEmbeddingWorker
-          ] do
-        states = worker.__opts__() |> Keyword.fetch!(:unique) |> Keyword.fetch!(:states)
+    test "the re-embed worker, which continues by insert, excludes :executing" do
+      states =
+        ReembedWorker.__opts__()
+        |> Keyword.fetch!(:unique)
+        |> Keyword.fetch!(:states)
 
-        refute :executing in states,
-               "#{inspect(worker)} would swallow its own self-continuation"
+      refute :executing in states, "ReembedWorker would swallow its own self-continuation"
+      refute :completed in states
+      assert :available in states
+      assert :scheduled in states
+    end
 
-        refute :completed in states
-        assert :available in states
-        assert :scheduled in states
-      end
+    # The system-corpus worker continues by SNOOZING the same job, so its uniqueness can
+    # and must cover :executing: otherwise a read-path fill during a run inserts a second
+    # run that embeds the same batch and bills the tenant twice (#896).
+    test "the system-corpus worker is single-flight across every unfinished state" do
+      unique = SystemCorpusEmbeddingWorker.__opts__() |> Keyword.fetch!(:unique)
+
+      assert Enum.sort(Keyword.fetch!(unique, :states)) ==
+               Enum.sort([:available, :scheduled, :executing, :retryable])
+
+      assert Keyword.fetch!(unique, :period) == :infinity
     end
 
     test "the worker DISCARDS an unsupported target rather than seq-scanning forever" do

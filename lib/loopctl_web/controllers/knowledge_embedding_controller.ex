@@ -89,8 +89,22 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
     description:
       "Enqueues the AC-41.1.7 on-demand per-tenant materialization of the SYSTEM-scoped " <>
         "article corpus at this tenant's active dimension, using this tenant's own " <>
-        "embedding credential. Idempotent. Role: agent+.",
-    responses: %{202 => {"Enqueued", "application/json", %OpenApiSpex.Schema{type: :object}}}
+        "embedding credential. It embeds system articles this tenant has not embedded and " <>
+        "re-embeds ones whose text changed since. 200 already_materialized when nothing is " <>
+        "missing or changed; 202 in_flight when a run is already queued, executing or " <>
+        "backing off (one run at a time; an orchestrator+ key re-schedules a queued or " <>
+        "backed-off one to now); 409 materialization_terminal when the LATEST run was " <>
+        "discarded or cancelled and the key is below orchestrator, whose key forces a new " <>
+        "run. Role: agent+.",
+    responses: %{
+      200 =>
+        {"Nothing missing or changed", "application/json", %OpenApiSpex.Schema{type: :object}},
+      202 =>
+        {"Enqueued, or already in flight", "application/json", %OpenApiSpex.Schema{type: :object}},
+      409 =>
+        {"Latest run terminal (agent key)", "application/json",
+         %OpenApiSpex.Schema{type: :object}}
+    }
   )
 
   def system_corpus(conn, _params) do
@@ -118,6 +132,13 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
         |> put_status(:ok)
         |> json(%{enqueued: false, already_materialized: true, dimension: dimension})
 
+      {:ok, :in_flight} ->
+        # A run for this (tenant, dimension) is already queued, executing or backing off;
+        # one run at a time. Forced, a queued or backed-off job was re-scheduled to now.
+        conn
+        |> put_status(:accepted)
+        |> json(%{enqueued: false, in_flight: true, dimension: dimension})
+
       {:ok, _job} ->
         conn
         |> put_status(:accepted)
@@ -131,7 +152,7 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
         |> json(%{
           error: "materialization_terminal",
           detail:
-            "a prior system-corpus materialization for this tenant and dimension " <>
+            "the latest system-corpus materialization for this tenant and dimension " <>
               "terminated permanently (e.g. no embedding key). Retry requires an " <>
               "orchestrator+ key.",
           dimension: dimension

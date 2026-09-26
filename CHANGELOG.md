@@ -13,11 +13,21 @@ All notable changes to loopctl are documented here.
   `meta.system_corpus_recall` in search responses says. On the side-table path, a tenant's
   semantic search that finds a system article unembedded queues a materialization job for
   that tenant, and the article turns semantic once the job has run; the search that queued it
-  still answers `keyword_only`. The one manual case: while any discarded or cancelled
-  materialization job for that tenant is still retained by Oban, no job is queued
-  automatically, and `embedding_materialize_system_corpus` called with an
-  orchestrator-or-higher key forces one (an agent key is refused 409
-  `materialization_terminal`).
+  still answers `keyword_only`. The one manual case: when that tenant's latest
+  materialization run was discarded or cancelled, no job is queued automatically, and
+  `embedding_materialize_system_corpus` called with an orchestrator-or-higher key forces one
+  (an agent key is refused 409 `materialization_terminal`).
+- **A system article whose text changed is re-embedded, one run at a time (#896).** A system
+  article corrected after a tenant embedded it used to keep that tenant's vector of the old
+  text for good. Staleness is now decided by content: the stored hash against the hash of the
+  title and body the worker would embed today, so a correction (a seeding migration's upsert
+  included) is picked up by the next semantic search on the side-table path, and a write that
+  changes neither title nor body queues nothing. Materialization is single-flight per tenant
+  and dimension: a run already queued, executing or backing off answers `in_flight`, and an
+  orchestrator-or-higher key re-schedules a waiting run to now instead of starting another.
+  The terminal gate reads the tenant's LATEST run, where it used to block on any retained
+  discarded or cancelled job. On the first search after deploy, a tenant whose system rows
+  carry no content hash re-embeds those articles once.
 
 ### Changed
 
