@@ -30,13 +30,12 @@ defmodule Loopctl.Progress do
   alias Loopctl.Runners.Capacity
   alias Loopctl.Tenants
   alias Loopctl.TokenUsage
+  alias Loopctl.Webhooks
   alias Loopctl.Webhooks.EventGenerator
-  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.ReviewKnowledgeWorker
-  alias Loopctl.Workers.WebhookDeliveryWorker
 
   # --- Agent Status Transitions (US-7.1) ---
 
@@ -169,9 +168,11 @@ defmodule Loopctl.Progress do
   Returns `{:ok, story}` as it now stands — re-contracted, or untouched when it was not
   pending. There is no refusal to return: the audit entry is built from literals and
   `story.id`, so its changeset is valid by construction, and it is inserted with `insert!` —
-  a database refusal raises and rolls back the caller's transaction, every caller's alike. A
-  webhook row that cannot be written is logged and skipped, as for every non-`Multi` event
-  writer here (`insert_events_with_delivery/4`).
+  a database refusal raises and rolls back the caller's transaction, every caller's alike. The
+  webhook event and its delivery job join the same transaction
+  (`Webhooks.insert_event_with_delivery/4`): an event changeset that is invalid is refused
+  before any write, logged and skipped, while a database refusal of either row raises like
+  the audit insert, since Postgres has already aborted the transaction by then.
 
   Raises `ArgumentError` outside a transaction, like `Stages.follow_release/5`: on its own the
   UPDATE and the audit insert would commit separately.
@@ -2414,14 +2415,20 @@ defmodule Loopctl.Progress do
   end
 
   defp enqueue_knowledge_extraction(multi, tenant_id) do
-    Multi.run(multi, :enqueue_knowledge_worker, fn _repo, %{review_record: rr} ->
+    # Merged, so the Multi-aware Oban.insert writes the job on the review's own AdminRepo
+    # connection. A bare Oban.insert/1 wrote it on Loopctl.Repo, where it committed at once,
+    # apart from the review record it reads (#885).
+    Multi.merge(multi, fn %{review_record: rr} ->
       tenant = AdminRepo.get(Tenants.Tenant, tenant_id)
 
       if knowledge_auto_extract_enabled?(tenant) do
-        ReviewKnowledgeWorker.new(%{review_record_id: rr.id, tenant_id: tenant_id})
-        |> Oban.insert()
+        Oban.insert(
+          Multi.new(),
+          :enqueue_knowledge_worker,
+          ReviewKnowledgeWorker.new(%{review_record_id: rr.id, tenant_id: tenant_id})
+        )
       else
-        {:ok, :skipped}
+        Multi.new()
       end
     end)
   end
@@ -4261,31 +4268,7 @@ defmodule Loopctl.Progress do
   end
 
   defp insert_events_with_delivery(tenant_id, event_type, project_id, payload) do
-    require Logger
-
-    EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
-    |> Enum.each(fn webhook ->
-      insert_single_event_with_delivery(tenant_id, webhook, event_type, payload)
-    end)
-  end
-
-  defp insert_single_event_with_delivery(tenant_id, webhook, event_type, payload) do
-    require Logger
-
-    with {:ok, event} <-
-           %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
-           |> WebhookEvent.create_changeset(%{event_type: event_type, payload: payload})
-           |> AdminRepo.insert(),
-         {:ok, _job} <-
-           WebhookDeliveryWorker.new(%{webhook_event_id: event.id, tenant_id: tenant_id})
-           |> Oban.insert() do
-      :ok
-    else
-      {:error, reason} ->
-        Logger.warning(
-          "Failed webhook event/delivery for webhook #{webhook.id}: #{inspect(reason)}"
-        )
-    end
+    Webhooks.emit(tenant_id, event_type, project_id, payload)
   end
 
   defp extract_verification_params(params) do

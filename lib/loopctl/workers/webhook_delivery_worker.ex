@@ -58,6 +58,7 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
 
   require Logger
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Egress
   alias Loopctl.Egress.Scope
@@ -115,6 +116,28 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   end
 
   def backoff_seconds(_attempt), do: List.last(@backoff_schedule)
+
+  @doc """
+  Appends the delivery job for the webhook event at `event_step` to `multi`.
+
+  Use it through `Loopctl.Webhooks.insert_event_with_delivery/4`, which writes the event and
+  this job in one `AdminRepo` transaction. The Multi-aware `Oban.insert/4` runs its insert on
+  the repo the Multi executes on, so the job is written on the event's own connection and
+  commits or rolls back with it. A bare `Oban.insert/1` writes through Oban's configured
+  `Loopctl.Repo`, a different connection: the job committed at once, could run before the
+  event was visible (the worker then found nothing and dropped the webhook), and survived
+  the event's transaction rolling back (#885).
+
+  `test/loopctl/webhooks/enqueue_delivery_test.exs` refuses any other enqueue of this worker
+  under `lib/`.
+  """
+  @spec enqueue(Multi.t(), Multi.name(), Multi.name()) :: Multi.t()
+  def enqueue(%Multi{} = multi, name, event_step) do
+    Oban.insert(multi, name, fn changes ->
+      event = Map.fetch!(changes, event_step)
+      new(%{webhook_event_id: event.id, tenant_id: event.tenant_id})
+    end)
+  end
 
   # Hard per-job wall-clock cap (backstop to the bounded DNS resolve in the egress
   # guard + Req receive_timeout). A hostile/slow webhook target can't pin a

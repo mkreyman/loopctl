@@ -36,10 +36,9 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report
+  alias Loopctl.Webhooks
   alias Loopctl.Webhooks.EventGenerator
-  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Story
-  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @high_cost_threshold Decimal.new("3.0")
   @low_cost_threshold Decimal.new("0.1")
@@ -315,29 +314,7 @@ defmodule Loopctl.Workers.CostAnomalyWorker do
         "deviation_factor" => Decimal.to_string(anomaly.deviation_factor)
       }
 
-      Enum.each(webhooks, &deliver_anomaly_event(tenant_id, &1, payload, anomaly.id))
-    end
-  end
-
-  # Delivers a single anomaly webhook event. Errors are logged, not raised.
-  defp deliver_anomaly_event(tenant_id, webhook, payload, anomaly_id) do
-    with {:ok, event} <-
-           %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
-           |> WebhookEvent.create_changeset(%{
-             event_type: "token.anomaly_detected",
-             payload: payload
-           })
-           |> AdminRepo.insert(),
-         {:ok, _job} <-
-           WebhookDeliveryWorker.new(%{webhook_event_id: event.id, tenant_id: tenant_id})
-           |> Oban.insert() do
-      :ok
-    else
-      {:error, reason} ->
-        Logger.warning(
-          "Failed to create token.anomaly_detected webhook event " <>
-            "for anomaly #{anomaly_id}: #{inspect(reason)}"
-        )
+      Webhooks.emit_to(tenant_id, webhooks, "token.anomaly_detected", payload)
     end
   end
 

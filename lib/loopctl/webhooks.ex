@@ -25,6 +25,8 @@ defmodule Loopctl.Webhooks do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
@@ -32,6 +34,7 @@ defmodule Loopctl.Webhooks do
   alias Loopctl.Egress.Scope
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants
+  alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.Workers.WebhookDeliveryWorker
@@ -364,38 +367,114 @@ defmodule Loopctl.Webhooks do
     with {:ok, webhook} <- get_webhook(tenant_id, webhook_id) do
       now = DateTime.utc_now()
 
-      changeset =
-        %WebhookEvent{
-          tenant_id: tenant_id,
-          webhook_id: webhook.id
-        }
-        |> WebhookEvent.create_changeset(%{
-          event_type: "webhook.test",
-          payload: %{
-            "event" => "webhook.test",
-            "data" => %{
-              "message" => "This is a test event",
-              "webhook_id" => webhook.id
-            },
-            "timestamp" => DateTime.to_iso8601(now)
-          }
-        })
+      payload = %{
+        "event" => "webhook.test",
+        "data" => %{
+          "message" => "This is a test event",
+          "webhook_id" => webhook.id
+        },
+        "timestamp" => DateTime.to_iso8601(now)
+      }
 
-      multi =
-        Multi.new()
-        |> Multi.insert(:event, changeset)
-        |> Multi.run(:oban_job, fn _repo, %{event: event} ->
-          WebhookDeliveryWorker.new(%{
-            webhook_event_id: event.id,
-            tenant_id: tenant_id
-          })
-          |> Oban.insert()
-        end)
+      with {:ok, [event]} <-
+             insert_events_with_delivery(tenant_id, [webhook], "webhook.test", payload),
+           do: {:ok, event}
+    end
+  end
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{event: event}} -> {:ok, event}
-        {:error, _step, reason, _changes} -> {:error, reason}
-      end
+  @doc """
+  Writes `event_type` to every active webhook of the tenant that matches it (see
+  `EventGenerator.matching_webhooks/3`), with delivery, through `emit_to/4`. For writers that
+  run outside a `Multi`; a `Multi` pipeline uses `EventGenerator.generate_events/3`.
+  """
+  @spec emit(Ecto.UUID.t(), String.t(), Ecto.UUID.t() | nil, map()) :: :ok | {:error, term()}
+  def emit(tenant_id, event_type, project_id, payload) do
+    webhooks = EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
+    emit_to(tenant_id, webhooks, event_type, payload)
+  end
+
+  @doc """
+  `insert_events_with_delivery/4` for writers that must not fail on a webhook: a refusal is
+  logged here, once for every such writer, and returned for a caller that wants it.
+  """
+  @spec emit_to(Ecto.UUID.t(), [Webhook.t()], String.t(), map()) :: :ok | {:error, term()}
+  def emit_to(tenant_id, webhooks, event_type, payload) do
+    case insert_events_with_delivery(tenant_id, webhooks, event_type, payload) do
+      {:ok, _events} ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.warning(
+          "Failed #{event_type} webhook events for tenant #{tenant_id}: #{inspect(reason)}"
+        )
+
+        error
+    end
+  end
+
+  @doc """
+  Writes one `event_type` event per webhook in `webhooks`, and each event's delivery job, in
+  ONE `AdminRepo` transaction: one checkout for the whole fan-out, and no event commits
+  without its job or a job without its event (#885). Every webhook event is written here.
+
+  Inside a caller's `AdminRepo` transaction it joins that transaction, so the events commit
+  or roll back with the caller's state change. It refuses to run inside a `Loopctl.Repo`
+  transaction: its rows would commit on `AdminRepo` at once, apart from the caller's change.
+  A webhook of another tenant is refused too, since `AdminRepo` bypasses RLS and nothing else
+  would stop a cross-tenant event. Both refusals raise, before anything is written.
+
+  Returns `{:ok, events}` in webhook order, or `{:error, changeset}` for an invalid event,
+  refused before anything is written, so the caller may log it and carry on, inside a
+  transaction or not. A write the DATABASE refuses is different inside a caller's
+  transaction: Postgres has already aborted that transaction, so this raises rather than
+  hand back an error the caller would log and carry on past. Outside one, every row rolls
+  back and the error is returned.
+  """
+  @spec insert_events_with_delivery(Ecto.UUID.t(), [Webhook.t()], String.t(), map()) ::
+          {:ok, [WebhookEvent.t()]} | {:error, term()}
+  def insert_events_with_delivery(_tenant_id, [], _event_type, _payload), do: {:ok, []}
+
+  def insert_events_with_delivery(tenant_id, webhooks, event_type, payload) do
+    if Loopctl.Repo.in_transaction?(),
+      do:
+        raise(ArgumentError, "webhook events are written on AdminRepo, not in a Repo transaction")
+
+    changesets =
+      Enum.map(webhooks, fn %Webhook{} = webhook ->
+        unless webhook.tenant_id == tenant_id,
+          do: raise(ArgumentError, "webhook #{webhook.id} does not belong to tenant #{tenant_id}")
+
+        %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
+        |> WebhookEvent.create_changeset(%{event_type: event_type, payload: payload})
+      end)
+
+    case Enum.find(changesets, &(not &1.valid?)) do
+      nil -> insert_event_changesets(changesets)
+      invalid -> {:error, invalid}
+    end
+  end
+
+  defp insert_event_changesets(changesets) do
+    in_caller_transaction? = AdminRepo.in_transaction?()
+    steps = Enum.with_index(changesets)
+
+    steps
+    |> Enum.reduce(Multi.new(), fn {changeset, i}, multi ->
+      multi
+      |> Multi.insert({:event, i}, changeset)
+      |> WebhookDeliveryWorker.enqueue({:job, i}, {:event, i})
+    end)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, changes} ->
+        {:ok, Enum.map(steps, fn {_changeset, i} -> Map.fetch!(changes, {:event, i}) end)}
+
+      {:error, step, reason, _changes} when in_caller_transaction? ->
+        raise "webhook #{inspect(step)} write refused inside the caller's transaction: " <>
+                inspect(reason)
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
     end
   end
 

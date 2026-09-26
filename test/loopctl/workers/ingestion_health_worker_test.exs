@@ -233,7 +233,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
 
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
-        assert_enqueued(worker: WebhookDeliveryWorker, args: %{tenant_id: tenant.id})
+        assert_webhook_enqueued(tenant.id)
       end)
 
       events =
@@ -467,7 +467,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
         assert_enqueued(worker: ScaleAlertDeliveryWorker)
-        assert_enqueued(worker: WebhookDeliveryWorker, args: %{tenant_id: tenant.id})
+        assert_webhook_enqueued(tenant.id)
       end)
 
       [anomaly] = anomalies_for(tenant.id)
@@ -949,7 +949,7 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
 
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
-        assert_enqueued(worker: WebhookDeliveryWorker, args: %{tenant_id: tenant.id})
+        assert_webhook_enqueued(tenant.id)
       end)
 
       events =
@@ -1077,5 +1077,16 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
 
       assert Enum.any?(anomalies_for(tenant.id), &(&1.resolved == false))
     end
+  end
+
+  # Webhooks.insert_event_with_delivery/4 writes the job in an AdminRepo transaction, so the
+  # row is on AdminRepo's sandbox connection, which the Loopctl.Repo default above cannot
+  # see (#885).
+  defp assert_webhook_enqueued(tenant_id) do
+    Oban.Testing.assert_enqueued(
+      repo: Loopctl.AdminRepo,
+      worker: WebhookDeliveryWorker,
+      args: %{tenant_id: tenant_id}
+    )
   end
 end

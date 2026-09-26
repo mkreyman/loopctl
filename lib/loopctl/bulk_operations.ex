@@ -24,11 +24,9 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Progress
-  alias Loopctl.Webhooks.EventGenerator
-  alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.Webhooks
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
-  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @max_batch_size 50
 
@@ -900,31 +898,7 @@ defmodule Loopctl.BulkOperations do
   end
 
   defp emit_story_event(tenant_id, event_type, story, payload) do
-    require Logger
-    webhooks = EventGenerator.matching_webhooks(tenant_id, event_type, story.project_id)
-
-    Enum.each(webhooks, fn webhook ->
-      emit_single_webhook_event(tenant_id, webhook, event_type, payload)
-    end)
-  end
-
-  defp emit_single_webhook_event(tenant_id, webhook, event_type, payload) do
-    require Logger
-
-    with {:ok, event} <-
-           %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
-           |> WebhookEvent.create_changeset(%{event_type: event_type, payload: payload})
-           |> AdminRepo.insert(),
-         {:ok, _job} <-
-           WebhookDeliveryWorker.new(%{webhook_event_id: event.id, tenant_id: tenant_id})
-           |> Oban.insert() do
-      :ok
-    else
-      {:error, reason} ->
-        Logger.warning(
-          "Failed webhook event/delivery for webhook #{webhook.id}: #{inspect(reason)}"
-        )
-    end
+    Webhooks.emit(tenant_id, event_type, story.project_id, payload)
   end
 
   # ===================================================================

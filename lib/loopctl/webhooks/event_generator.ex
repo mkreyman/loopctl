@@ -31,9 +31,8 @@ defmodule Loopctl.Webhooks.EventGenerator do
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Webhooks
   alias Loopctl.Webhooks.Webhook
-  alias Loopctl.Webhooks.WebhookEvent
-  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @doc """
   Appends webhook event generation steps to an Ecto.Multi pipeline.
@@ -61,33 +60,26 @@ defmodule Loopctl.Webhooks.EventGenerator do
   end
 
   def generate_events(multi, name, event_params_fn) when is_function(event_params_fn, 1) do
-    Multi.run(multi, name, fn _repo, changes ->
+    Multi.run(multi, name, fn repo, changes ->
+      # The events and their jobs are written on AdminRepo. Atomicity with the state change
+      # holds only when this Multi runs on AdminRepo too; run on Loopctl.Repo, they would
+      # commit apart from it and could announce a change that rolls back (#885).
+      unless repo == AdminRepo,
+        do: raise(ArgumentError, "generate_events/3 runs in an AdminRepo transaction")
+
       params = event_params_fn.(changes)
       tenant_id = Map.fetch!(params, :tenant_id)
       event_type = Map.fetch!(params, :event_type)
-      project_id = Map.get(params, :project_id)
-      payload = Map.fetch!(params, :payload)
 
-      webhooks = matching_webhooks(tenant_id, event_type, project_id)
+      webhooks = matching_webhooks(tenant_id, event_type, Map.get(params, :project_id))
 
-      events =
-        Enum.map(webhooks, fn webhook ->
-          {:ok, event} = insert_webhook_event(tenant_id, webhook.id, event_type, payload)
-
-          # NOTE: Oban.insert/1 is safe inside Multi.run because Ecto checks
-          # out one connection per process — all Repo operations within this
-          # process (including Oban's internal Repo.insert) reuse the Multi's
-          # transaction connection. If the Multi rolls back, the Oban job row
-          # is also rolled back.
-          {:ok, _job} =
-            WebhookDeliveryWorker.new(%{
-              webhook_event_id: event.id,
-              tenant_id: tenant_id
-            })
-            |> Oban.insert()
-
-          event
-        end)
+      {:ok, events} =
+        Webhooks.insert_events_with_delivery(
+          tenant_id,
+          webhooks,
+          event_type,
+          Map.fetch!(params, :payload)
+        )
 
       {:ok, events}
     end)
@@ -120,17 +112,5 @@ defmodule Loopctl.Webhooks.EventGenerator do
   defp filter_by_project(query, project_id) do
     # Match webhooks with this project_id OR global webhooks (project_id IS NULL)
     where(query, [w], is_nil(w.project_id) or w.project_id == ^project_id)
-  end
-
-  defp insert_webhook_event(tenant_id, webhook_id, event_type, payload) do
-    %WebhookEvent{
-      tenant_id: tenant_id,
-      webhook_id: webhook_id
-    }
-    |> WebhookEvent.create_changeset(%{
-      event_type: event_type,
-      payload: payload
-    })
-    |> AdminRepo.insert()
   end
 end
