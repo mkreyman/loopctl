@@ -270,7 +270,7 @@ defmodule Loopctl.Progress do
       end)
       |> Multi.run(:not_held, fn _repo, %{lock: story} -> not_held(tenant_id, story.id) end)
       |> Multi.run(:check_deps, fn _repo, %{lock: story} ->
-        check_claim_dependencies(story)
+        check_claim_dependencies(tenant_id, story)
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
@@ -4543,14 +4543,15 @@ defmodule Loopctl.Progress do
   makes under its lock. Also read by `Loopctl.Delivery.Placement` BEFORE it mints, so a story
   that cannot be claimed spends no dispatch.
   """
-  @spec check_claim_dependencies(Story.t()) ::
+  @spec check_claim_dependencies(Ecto.UUID.t(), Story.t()) ::
           {:ok, :deps_satisfied} | {:error, :dependencies_not_met}
-  def check_claim_dependencies(story) do
+  def check_claim_dependencies(tenant_id, %Story{tenant_id: tenant_id} = story) do
     # Check story-level dependencies: all depends_on stories must be verified
     story_deps_unmet =
       from(sd in StoryDependency,
         join: dep in Story,
         on: dep.id == sd.depends_on_story_id,
+        where: sd.tenant_id == ^tenant_id and dep.tenant_id == ^tenant_id,
         where: sd.story_id == ^story.id and dep.verified_status != :verified,
         select: count(sd.id)
       )
@@ -4562,9 +4563,10 @@ defmodule Loopctl.Progress do
       # Check epic-level dependencies: all stories in prerequisite epics must be verified
       epic_deps_unmet =
         from(ed in EpicDependency,
-          where: ed.epic_id == ^story.epic_id,
+          where: ed.tenant_id == ^tenant_id and ed.epic_id == ^story.epic_id,
           join: prereq_story in Story,
-          on: prereq_story.epic_id == ed.depends_on_epic_id,
+          on:
+            prereq_story.epic_id == ed.depends_on_epic_id and prereq_story.tenant_id == ^tenant_id,
           where: prereq_story.verified_status != :verified,
           select: count(prereq_story.id)
         )

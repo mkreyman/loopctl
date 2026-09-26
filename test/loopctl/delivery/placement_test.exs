@@ -363,11 +363,14 @@ defmodule Loopctl.Delivery.PlacementTest do
               where: a.entity_id == ^story.id and a.action == "status_changed",
               where: fragment("?->>'agent_status' = 'contracted'", a.new_state),
               where: a.actor_id == ^ctx.operator.id,
-              select: a.actor_id
+              select: {a.actor_id, a.new_state}
           )
         end)
 
-      assert contracted_by == ctx.operator.id
+      assert {actor_id, new_state} = contracted_by
+      assert actor_id == ctx.operator.id
+      # And names the runner's agent it was contracted for (#887 review round 1).
+      assert new_state["agent_id"] == runner.agent_id
     end
 
     test "a story that is neither pending nor contracted is refused before anything is minted",

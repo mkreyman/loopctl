@@ -403,7 +403,7 @@ defmodule Loopctl.Delivery.Placement do
   # a caller passing a bare id or a map gets a refusal rather than a lineage of `[]`, which
   # would have read as "an operator" to the clause below.
   defp resolve_caller(tenant_id, %ApiKey{tenant_id: tenant_id, id: id, role: role}) do
-    {:ok, %{lineage: Dispatches.lineage_for_api_key(tenant_id, id), role: role}}
+    {:ok, %{id: id, lineage: Dispatches.lineage_for_api_key(tenant_id, id), role: role}}
   end
 
   defp resolve_caller(_tenant_id, _api_key), do: {:error, :not_authorized}
@@ -760,7 +760,7 @@ defmodule Loopctl.Delivery.Placement do
            ),
          {:ok, dispatch} <- lease_capable(dispatch),
          {:ok, story} <- ready_story(tenant_id, story_id),
-         :ok <- contract_if_pending(tenant_id, story, opts),
+         :ok <- contract_if_pending(tenant_id, story, caller.id, agent_id, opts),
          {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
       claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)
     end
@@ -772,8 +772,8 @@ defmodule Loopctl.Delivery.Placement do
   # Minting is not free and it is not undoable. Every mint writes a `dispatches` row, an
   # `api_keys` row, and an IMMUTABLE, STH-covered `dispatch_created` entry appended under the
   # tenant's chain advisory lock — the row every writer in the tenant contends on. Nothing
-  # deletes a chain entry, by design. So a caller looping over a story that is not ready (still
-  # `pending`, already claimed, its stage row not at `queued`) would have written a permanent
+  # deletes a chain entry, by design. So a caller looping over a story that is not ready (already
+  # claimed, its dependencies unmet, its stage row not at `queued`) would have written a permanent
   # chain entry and taken the chain lock once per attempt, for an outcome that was never going
   # to succeed. Reading two rows first turns that into two SELECTs.
   #
@@ -782,7 +782,7 @@ defmodule Loopctl.Delivery.Placement do
   # the dispatch minted for it. This bounds the COMMON case; that bounds the race.
   @doc """
   Whether a story is in a state a placement can take: `pending` or `contracted`, with its stage
-  row at `queued`. A `pending` one is contracted by the placement itself, inside `claim/6`
+  row at `queued`. A `pending` one is contracted by the placement itself, before it mints
   (#884): a triage-accepted story, a release whose re-contract did not land, and an
   escalation resolved back to `queued` all leave `pending` at `queued`, and nothing unattended
   contracted any of them.
@@ -807,7 +807,7 @@ defmodule Loopctl.Delivery.Placement do
     with {:ok, story} <- Stories.get_story(tenant_id, story_id),
          :ok <- placeable_status(story),
          :ok <- at_queued(tenant_id, story_id),
-         {:ok, _} <- Progress.check_claim_dependencies(story) do
+         {:ok, _} <- Progress.check_claim_dependencies(tenant_id, story) do
       {:ok, story}
     end
   end
@@ -828,9 +828,16 @@ defmodule Loopctl.Delivery.Placement do
   # acting on a story its own stage machine queued. Attributed to the placing key and label.
   # A contract that lands and a mint or claim that then fails leaves a `contracted` story at
   # `queued`, which is placeable. A `contracted` story costs nothing here.
-  defp contract_if_pending(tenant_id, %Story{agent_status: :pending} = story, opts) do
+  defp contract_if_pending(
+         tenant_id,
+         %Story{agent_status: :pending} = story,
+         key_id,
+         agent_id,
+         opts
+       ) do
     case Progress.contract_story(tenant_id, story.id, %{},
-           actor_id: api_key_id(opts),
+           actor_id: key_id,
+           agent_id: agent_id,
            actor_label: Keyword.get(opts, :actor_label),
            skip_contract_check: true
          ) do
@@ -841,14 +848,7 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
-  defp contract_if_pending(_tenant_id, _story, _opts), do: :ok
-
-  defp api_key_id(opts) do
-    case Keyword.get(opts, :api_key) do
-      %{id: id} -> id
-      _ -> nil
-    end
-  end
+  defp contract_if_pending(_tenant_id, _story, _key_id, _agent_id, _opts), do: :ok
 
   defp stage_of(tenant_id, story_id) do
     case Stages.get(tenant_id, story_id) do

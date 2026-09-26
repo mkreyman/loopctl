@@ -216,7 +216,9 @@ defmodule LoopctlWeb.DispatchPlacementController do
            "declared prefixes; or `dispatch_claim_ended` — a RETRY of a recorded " <>
            "dispatch_id whose claim has ended (its lease ran out, or the story left " <>
            "assigned/implementing): nothing was pushed or written and the claim is not " <>
-           "revived, so place the story again with a new dispatch_id once it is placeable",
+           "revived, so place the story again with a new dispatch_id once it is placeable; " <>
+           "or `dependencies_not_met` — a story it depends on (or one in an epic its epic " <>
+           "depends on) is not verified, and nothing was minted, claimed or pushed",
          "application/json", Schemas.ErrorResponse},
       422 =>
         {"Validation error; `branch_not_allowed` — the `branch` you named does not start " <>
@@ -557,6 +559,16 @@ defmodule LoopctlWeb.DispatchPlacementController do
       message:
         "This dispatch_id is already recorded against a different story or runner. A " <>
           "dispatch_id names one placement; use a new one."
+    })
+  end
+
+  # #887 review round 1. Refused BEFORE the mint by the placement's own pre-check (#884); the
+  # fallback has no clause for the atom and answered 500.
+  defp refuse(conn, :dependencies_not_met) do
+    error(conn, 409, "dependencies_not_met", %{
+      message:
+        "A story this one depends on, or a story in an epic its epic depends on, is not " <>
+          "verified yet. Nothing was minted, claimed or pushed; place it once they are."
     })
   end
 

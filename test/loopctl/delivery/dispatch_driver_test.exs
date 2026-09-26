@@ -117,6 +117,40 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       assert story.id in candidate_ids(50)
     end
 
+    # #887 review round 1. Placement refuses a story with unmet dependencies before it mints,
+    # so selected it would be refused on every pass, frozen at the head of the queue.
+    test "a story with an unmet STORY dependency is not a candidate", ctx do
+      story = bind_repo(ctx, queued_story(ctx))
+      blocker = fixture(:committed_story, %{tenant_id: ctx.tenant.id})
+      assert story.id in candidate_ids(50)
+
+      unboxed(fn ->
+        fixture(:story_dependency, %{
+          tenant_id: ctx.tenant.id,
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+      end)
+
+      refute story.id in candidate_ids(50)
+    end
+
+    test "a story whose EPIC depends on an unverified epic is not a candidate", ctx do
+      story = bind_repo(ctx, queued_story(ctx))
+      blocker = fixture(:committed_story, %{tenant_id: ctx.tenant.id})
+      assert story.id in candidate_ids(50)
+
+      unboxed(fn ->
+        fixture(:epic_dependency, %{
+          tenant_id: ctx.tenant.id,
+          epic_id: story.epic_id,
+          depends_on_epic_id: blocker.epic_id
+        })
+      end)
+
+      refute story.id in candidate_ids(50)
+    end
+
     test "a released story is never left queued and uncontracted (#877)", ctx do
       story = bind_repo(ctx, queued_story(ctx))
       assert story.id in candidate_ids(50)

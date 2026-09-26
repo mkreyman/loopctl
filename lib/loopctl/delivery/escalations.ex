@@ -450,7 +450,7 @@ defmodule Loopctl.Delivery.Escalations do
       # ready. It is past `pending`, which is what the resolution asked for — not a failure of
       # a resolution that already committed. Any OTHER failure is returned AFTER the transition
       # committed: the story is left `pending` at `queued`, which the next placement contracts
-      # inside its claim (#884). Nothing is stranded.
+      # before it mints (#884). Nothing is stranded.
       {:error, {:invalid_transition, %{current_agent_status: status}}} when status != :pending ->
         {:ok, story}
 

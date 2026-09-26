@@ -84,7 +84,9 @@ defmodule Loopctl.Delivery.DispatchDriver do
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
   alias Loopctl.Runners.Selection
+  alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
+  alias Loopctl.WorkBreakdown.StoryDependency
 
   require Logger
 
@@ -131,15 +133,41 @@ defmodule Loopctl.Delivery.DispatchDriver do
         having: count(src.id) == 1,
         select: %{tenant_id: src.tenant_id, project_id: src.project_id}
 
+    # A story whose dependencies are unmet is NOT a candidate: `Placement` refuses it before it
+    # mints, so selected it would be refused on every pass, its `updated_at` frozen at the head
+    # of the oldest-first ranking. The same two reads `Progress.check_claim_dependencies/2`
+    # makes: an unverified story it depends on, or an unverified story in an epic its epic
+    # depends on.
+    unmet_story_deps =
+      from sd in StoryDependency,
+        join: dep in Story,
+        on: dep.id == sd.depends_on_story_id and dep.tenant_id == sd.tenant_id,
+        where:
+          sd.story_id == parent_as(:story).id and sd.tenant_id == parent_as(:story).tenant_id,
+        where: dep.verified_status != :verified,
+        select: 1
+
+    unmet_epic_deps =
+      from ed in EpicDependency,
+        join: prereq in Story,
+        on: prereq.epic_id == ed.depends_on_epic_id and prereq.tenant_id == ed.tenant_id,
+        where:
+          ed.epic_id == parent_as(:story).epic_id and ed.tenant_id == parent_as(:story).tenant_id,
+        where: prereq.verified_status != :verified,
+        select: 1
+
     ranked =
       from s in StoryStage,
         join: st in Story,
+        as: :story,
         on: st.id == s.story_id and st.tenant_id == s.tenant_id,
         join: b in subquery(bound_projects),
         on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
         where: s.stage == :queued,
-        # `pending` too: `Placement` contracts a pending story inside its claim (#884).
+        # `pending` too: `Placement` contracts a pending story before it mints (#884).
         where: st.agent_status in [:pending, :contracted],
+        where: not exists(unmet_story_deps),
+        where: not exists(unmet_epic_deps),
         select: %{
           tenant_id: s.tenant_id,
           story_id: s.story_id,
@@ -395,7 +423,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   #
   # ONLY TWO REFUSALS ADVANCE, and the reason is what makes this safe rather than a retry
   # loop. `{:no_conforming_branch, _}` is decided inside `DispatchPayload.fill/3`, and
-  # `:runner_exhausted` by `Placement`'s own check just ahead of it — both BEFORE `claimable/2`
+  # `:runner_exhausted` by `Placement`'s own check just ahead of it — both BEFORE the story pre-check
   # and before the mint, so a refused attempt has written nothing at all: no dispatch row, no
   # ephemeral key, no chain entry, no claim. And both concern the MACHINE. Every other refusal
   # either concerns the STORY (`invalid_transition`, `story_not_dispatchable`, the tenant's

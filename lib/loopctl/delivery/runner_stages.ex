@@ -515,25 +515,29 @@ defmodule Loopctl.Delivery.RunnerStages do
   end
 
   @doc """
-  The LEASE RECLAIM's half of a budget kill (US-44.3 review round 3): if `story_id`'s claim at
-  `claim_epoch` ran under an ACCEPTED dispatch whose runner recorded a budget kill in
-  `session_ended`, takes that kill's escalation — the SAME function `end_session/4` takes it
-  through, attributed to `actor_label` — before `Loopctl.Progress.reclaim_expired_claim/3`
-  releases the claim.
+  The LEASE RECLAIM's half of a recorded session end: if `story_id`'s claim at `claim_epoch` ran
+  under an ACCEPTED dispatch whose runner recorded a budget kill or `usage_exhausted` in
+  `session_ended`, finishes that session end before `Loopctl.Progress.reclaim_expired_claim/3`
+  releases the claim. One ledger read serves both, since a claim's report is one or the other.
 
-  - `:none` — no such report: the reclaim is an ordinary lease expiry.
-  - `{:ok, reason}` — the row is escalated, or was already out of flight or under a later
-    epoch (nothing a budget kill should change): release the claim as the session end
-    `reason` names. The release then only rebinds the row, so the story is never re-queued.
-  - `{:error, reason}` — the escalation was refused (`budget_escalation_refused/4`'s codes):
-    do NOT release. A released claim would re-queue a budget-killed story, which is the one
-    thing this path exists to prevent; held, it is retried by the next sweep.
+  A BUDGET KILL (US-44.3 review round 3) takes its escalation through the SAME function
+  `end_session/4` uses, attributed to `actor_label`. An EXHAUSTED SUBSCRIPTION (#884) holds its
+  machine out first (`hold_recorded_exhaustion/3`), then the claim is released uncounted.
+
+  - `:none` — no such report, or a `usage_exhausted` whose hold the database refused
+    permanently (logged): an ordinary, counted lease expiry.
+  - `{:ok, reason}` — release the claim as the session end `reason` names. For a budget kill,
+    the row is escalated (or already out of flight or under a later epoch), so the release only
+    rebinds it and the story is never re-queued. For `usage_exhausted`, the machine is held out
+    (or its account was reported refilled since the session was accepted: nothing to hold), and
+    the release spends no attempt.
+  - `{:error, {:usage_hold, :busy}}` — the hold needs a lock: release nothing, the next sweep
+    retries.
+  - `{:error, reason}` — a budget kill's escalation was refused
+    (`budget_escalation_refused/4`'s codes): do NOT release. A released claim would re-queue a
+    budget-killed story, which is the one thing this path exists to prevent; held, it is
+    retried by the next sweep.
   """
-  #
-  # ONE READ serves both re-drives (#884 review round 3): the report is a budget kill or an
-  # exhausted subscription, never both, so a single ledger read branches on its reason.
-  # `usage_exhausted`: see `hold_recorded_exhaustion/3`; `{:error, {:usage_hold, :busy}}` leaves
-  # the claim held for the next sweep, like a refused budget escalation.
   @spec redrive_recorded_session_end(Ecto.UUID.t(), Ecto.UUID.t(), integer(), String.t()) ::
           :none | {:ok, String.t()} | {:error, end_error() | {:usage_hold, :busy}}
   def redrive_recorded_session_end(tenant_id, story_id, claim_epoch, actor_label) do
