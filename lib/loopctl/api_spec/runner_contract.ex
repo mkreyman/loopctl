@@ -32,6 +32,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
   | runner -> control | `"stage"` | `RunnerStageReport` (since 1.4.0) | `{stage, claim_epoch, lock_version, attempts, effects}` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `stale_stage`, `unknown_story_stage`, `effect_conflict` |
   | runner -> control | `"session_ended"` | `RunnerSessionEnded` (since 1.16.0) | `RunnerSessionEndedAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `audit_chain_append_failed` |
+  | runner -> control | `"triage_verdict"` | `RunnerTriageVerdictMessage` (since 1.9.0) | `RunnerTriageVerdictAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `stale_stage`, `audit_chain_append_failed`, `internal_error` |
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |

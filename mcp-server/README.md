@@ -504,6 +504,8 @@ The generated-tool count per tenant is bounded by the per-tenant entity cap.
 
 Enroll the dev machines that run the agent delivery loop, see which are connected (issue #809), bind the repositories whose issues feed it, place work on them and recover a story a runner would not take. The `runner_*` and `intake_source_*` tools require `LOOPCTL_USER_KEY`, and their writes additionally require a human-anchored tenant. The delivery-loop verbs below do NOT share one key — each row names the key its endpoint's gate demands, and a higher-privileged key does not substitute for an `exact_role` one.
 
+The order to wire it up, the stage machine these tools move a story through, and every operator setting the loop reads are in loopctl's [`docs/agent-delivery-loop.md`](https://github.com/mkreyman/loopctl/blob/master/docs/agent-delivery-loop.md). In short: `runner_enroll`, `intake_source_enroll` plus the GitHub webhook, confirm the machine in `runner_pool`, `place_dispatch` one story and watch it with `story_stage`, then turn on the unattended driver server-side.
+
 **A loop with no intake source has no input.** `intake_source_enroll` is the step that points a GitHub repository at loopctl, and the same row is where `place_dispatch` reads `repo` and `base_branch` from — its 409 `no_intake_source` names exactly this. The webhook secret it returns is written to a file and never appears in a tool result; see that row.
 
 | Tool | Description |

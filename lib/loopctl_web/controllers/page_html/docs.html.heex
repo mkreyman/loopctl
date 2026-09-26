@@ -178,6 +178,14 @@
             </li>
             <li>
               <a
+                href="#delivery-loop"
+                class="text-slate-400 hover:text-slate-200 transition-colors"
+              >
+                Delivery Loop
+              </a>
+            </li>
+            <li>
+              <a
                 href="#endpoints"
                 class="text-slate-400 hover:text-slate-200 transition-colors"
               >
@@ -687,6 +695,105 @@
         <%!-- ============================================================ --%>
         <%!-- 7. API Endpoints --%>
         <%!-- ============================================================ --%>
+        <section id="delivery-loop" class="mt-14 scroll-mt-20">
+          <h2 class="font-display text-xl font-semibold text-slate-100">Agent Delivery Loop</h2>
+          <div class="mt-4 space-y-4 text-sm text-slate-400">
+            <p>
+              loopctl can take a GitHub issue through triage, implementation, review, CI, merge and post-deploy verification. Agent sessions do the work on <span class="font-mono text-slate-300">runners</span>, which are machines you enroll. loopctl holds the queue, the stage of every story and the gates, and it parks a story for a human wherever a gate refuses.
+            </p>
+            <p>
+              Set it up in this order: enroll a runner, enroll the repository as an intake source and add its webhook, set the gate config and the dispatch budgets, place one story by hand, then turn on the unattended driver (<span class="font-mono text-slate-300">DISPATCH_DRIVER_ENABLED</span>). The full reference, including every refusal and how to recover a stuck story, is <a
+                href="https://github.com/mkreyman/loopctl/blob/master/docs/agent-delivery-loop.md"
+                class="text-accent-400 hover:text-accent-300 transition-colors"
+                target="_blank"
+                rel="noopener noreferrer"
+              >docs/agent-delivery-loop.md</a>.
+            </p>
+          </div>
+          <div class="mt-6 space-y-3">
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/intake/sources
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Bind a GitHub repository to a work project and mint its webhook secret, which is returned once. User key on a human-anchored tenant. Name the target epic and the base branch here. MCP: intake_source_enroll.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/intake/github/:source_id
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                The GitHub webhook, authenticated by HMAC rather than an API key. Configure it for the Issues event only. Every authentication failure answers the same 401 invalid_signature.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/runners
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Enroll a runner machine. The credential is returned once, and max_sessions is its concurrency ceiling. MCP: runner_enroll, which writes the token to a file.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">GET</span> /api/v1/runners/pool
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Connected runners: capacity, in-flight sessions, draining, subscription exhaustion and declared branch prefixes. MCP: runner_pool.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/runners/:runner_id/dispatches
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Place a queued story on a runner under a fresh custody dispatch. dispatch_id is the idempotency key, and loopctl derives the branch. Refusals name what to fix, such as no_intake_source, runner_exhausted or no_conforming_branch. MCP: place_dispatch.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">GET</span> /api/v1/stories/:id/stage
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                A story&#x27;s delivery stage, claim epoch, attempts and escalation reason. MCP: story_stage.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/stories/:id/escalate
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                The claimant session parks its own story for a human. Agent key. MCP: escalate_story.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/stories/:id/stage/resolve
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Move an escalated story to queued, done or failed. It needs a user key no dispatch minted, so a session cannot resolve its own escalation. MCP: resolve_escalation.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/stories/:id/merge-precondition
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                The merge gate over the real pull request: both delivery gates, custody, the size bound and an unmoved head. Only allow licenses a merge, and refuse escalates the story. MCP: merge_precondition.
+              </p>
+            </div>
+            <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
+              <p class="font-mono text-xs text-slate-300">
+                <span class="text-accent-400">POST</span> /api/v1/stories/:id/renew-claim
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Renew a claim&#x27;s lease, fenced by claim_epoch. Agent key. MCP: renew_story_claim.
+              </p>
+            </div>
+          </div>
+        </section>
+
         <section id="endpoints" class="mt-14 scroll-mt-20">
           <h2 class="font-display text-xl font-semibold text-slate-100">API Endpoints</h2>
           <div class="mt-4 space-y-4 text-sm text-slate-400">
@@ -1135,7 +1242,7 @@
                 <span class="text-accent-400">knowledge_agent_usage</span>
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                <span class="font-mono text-slate-300">
+                <span class="font-mono text-slate-300 break-all">
                   GET /api/v1/knowledge/analytics/agents/:agent_id
                 </span>
                 — What a specific api_key reads: total reads, unique articles,

@@ -70,7 +70,7 @@ defmodule LoopctlWeb.WikiShowLive do
       </nav>
 
       <%!-- Main content --%>
-      <main class="flex-1 px-6 py-8 lg:px-12">
+      <main class="flex-1 min-w-0 px-6 py-8 lg:px-12">
         <%= if @article do %>
           <article class="mx-auto max-w-3xl" id="wiki-article">
             <header class="mb-8">
@@ -87,7 +87,7 @@ defmodule LoopctlWeb.WikiShowLive do
             </header>
 
             <div
-              class="prose prose-invert prose-slate max-w-none prose-headings:font-display prose-code:font-mono prose-code:text-accent-300 prose-pre:rounded-md prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950"
+              class="prose prose-invert prose-slate max-w-none [&>h1:first-child]:hidden prose-code:before:content-none prose-code:after:content-none prose-headings:font-display prose-code:font-mono prose-code:text-accent-300 prose-pre:rounded-md prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950"
               id="wiki-body"
             >
               {Phoenix.HTML.raw(@rendered_html)}

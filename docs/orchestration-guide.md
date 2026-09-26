@@ -49,6 +49,12 @@ unblocks dependent stories. A rejection sets `verified_status = rejected`; when 
 `pending` so the story can be re-worked, and the cycle count increments. If the orchestrator was
 also the implementer, verify returns `409 self_verify_blocked`.
 
+This loop is driven by an orchestrator session. loopctl can also run it with no session
+driving it: the **agent delivery loop** takes GitHub issues through triage, placement on
+runner machines you enroll, review, a merge gate and post-deploy verification, and parks a
+story for a human wherever a gate refuses. It is set up and operated differently; see
+[agent-delivery-loop.md](agent-delivery-loop.md).
+
 ---
 
 ## Why the Chain-of-Custody Matters

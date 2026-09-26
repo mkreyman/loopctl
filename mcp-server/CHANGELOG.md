@@ -5,6 +5,13 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.104.1 — 2026-09-26 (the delivery loop has a reference)
+
+### Changed
+
+- The runner and delivery-loop section of the README points at loopctl's new
+  `docs/agent-delivery-loop.md` and gives the order the tools are used in. No tool changed.
+
 ## 2.104.0 — 2026-09-26 (a stalled queue can say why)
 
 ### Added

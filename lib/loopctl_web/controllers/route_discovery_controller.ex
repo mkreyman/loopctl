@@ -287,6 +287,27 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{method: "POST", path: "/api/v1/stories/:id/claim", description: "Claim story"},
       %{
         method: "POST",
+        path: "/api/v1/stories/:id/renew-claim",
+        description: "Renew a claim's lease (agent key; body: claim_epoch)"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/stories/:id/escalate",
+        description: "Escalate a claimed delivery story to a human (agent key; claimant only)"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/stories/:id/stage",
+        description: "Read a story's delivery stage row (stage, claim_epoch, attempts)"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/stories/:id/stage/resolve",
+        description:
+          "Resolve an escalated story to queued, done or failed (user key, no dispatch)"
+      },
+      %{
+        method: "POST",
         path: "/api/v1/stories/:id/start",
         description: "Start implementation (alias: /start-work)"
       },
@@ -359,7 +380,7 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{
         method: "POST",
         path: "/api/v1/stories/:id/force-unclaim",
-        description: "Force-unclaim a story (orchestrator/user only)"
+        description: "Force-unclaim a story (orchestrator key only; exact role)"
       },
 
       # Artifact reports
