@@ -23,6 +23,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Intake.Delivery, as: IntakeDelivery
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.Record, as: IntakeRecord
@@ -2175,6 +2176,16 @@ defmodule Loopctl.Fixtures do
   # `Repo`, sees it inside an async test's sandbox without committing anything. Pass
   # `:tenant_id` to add a story to a tenant made by an earlier call. Accepts `:claim_epoch`
   # and `:agent_status`.
+  # A tenant on the RLS `Loopctl.Repo` sandbox connection, for an async test whose code under
+  # test reads and writes through `Repo` alone — `fixture(:tenant)` inserts on `AdminRepo`,
+  # which is a different sandbox connection, so a `fixture(:stage_runner)` under it would fail
+  # its foreign key. The same insert `fixture(:stage_story)` makes for its own tenant.
+  def fixture(:stage_tenant, attrs) do
+    %Tenant{}
+    |> Tenant.create_changeset(build(:tenant, Enum.into(attrs, %{})))
+    |> Loopctl.Repo.insert!()
+  end
+
   def fixture(:stage_story, attrs) do
     attrs = Enum.into(attrs, %{})
 
@@ -2287,6 +2298,80 @@ defmodule Loopctl.Fixtures do
       inserted = repo.insert!(row)
       if merged_at, do: insert_merged_event(repo, inserted, merged_at)
       inserted
+    end
+
+    if repo == Loopctl.Repo do
+      {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, insert)
+      row
+    else
+      insert.()
+    end
+  end
+
+  # A RECORDED triage verdict (`triage_verdicts`), as `Loopctl.Delivery.TriageVerdict` writes
+  # one after a runner's verdict message, for the readers that judge it (US-44.1). Defaults
+  # to a unanimous `story` verdict with all three lens verdicts; pass `lens_verdicts: nil` for
+  # a verdict recorded without them (a runner on contract 1.14.0). `:repo` as for
+  # `fixture(:story_stage)`.
+  def fixture(:triage_verdict, attrs) do
+    attrs = Enum.into(attrs, %{})
+    repo = Map.get(attrs, :repo, Loopctl.Repo)
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    lens = %{
+      "outcome" => "story",
+      "confidence" => "high",
+      "escalation_reasons" => [],
+      "contradicts" => []
+    }
+
+    # `incomplete_reason:` builds the other shape the table allows: a run that produced no
+    # verdict carries no outcome, confidence, payload or lens verdicts.
+    result =
+      case Map.get(attrs, :incomplete_reason) do
+        nil ->
+          outcome = Map.get(attrs, :outcome, "story")
+
+          %{
+            outcome: outcome,
+            confidence: "high",
+            payload: %{"outcome" => outcome, "confidence" => "high"},
+            lens_verdicts:
+              Map.get(attrs, :lens_verdicts, %{
+                "analyst" => lens,
+                "architect" => lens,
+                "engineer" => lens
+              })
+          }
+
+        reason ->
+          %{incomplete_reason: reason}
+      end
+
+    record =
+      struct!(
+        TriageVerdictRecord,
+        Map.merge(
+          %{
+            tenant_id: tenant_id,
+            story_id: Map.fetch!(attrs, :story_id),
+            dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+            payload_digest: Map.get_lazy(attrs, :payload_digest, &Ecto.UUID.generate/0),
+            claim_epoch: Map.get(attrs, :claim_epoch, 0),
+            inserted_at: Map.get(attrs, :inserted_at)
+          },
+          result
+        )
+      )
+
+    # THE BINDING Gate A reads: the story's stage row naming this verdict's dispatch as its
+    # `triage_dispatch_id`, as the `detected -> triaged` transition that verdict took writes it
+    # — incomplete verdicts included. Only when the story has a stage row, first writer wins;
+    # `bind: false` for a row that decided nothing (a refused dispatch's).
+    insert = fn ->
+      row = repo.insert!(record)
+      if Map.get(attrs, :bind, true), do: bind_triage_dispatch(repo, row)
+      row
     end
 
     if repo == Loopctl.Repo do
@@ -3072,6 +3157,18 @@ defmodule Loopctl.Fixtures do
 
   defp ensure_scope_entity(attrs, _unknown, _tenant_id) do
     {Ecto.UUID.generate(), attrs}
+  end
+
+  defp bind_triage_dispatch(repo, %TriageVerdictRecord{} = verdict) do
+    repo.update_all(
+      from(r in StoryStage,
+        where: r.tenant_id == ^verdict.tenant_id and r.story_id == ^verdict.story_id,
+        # First writer wins, as in production: the transition that bound the story is the one
+        # that took it out of `detected`, and nothing overwrites it.
+        where: is_nil(r.triage_dispatch_id)
+      ),
+      set: [triage_dispatch_id: verdict.dispatch_id]
+    )
   end
 
   defp insert_merged_event(repo, %StoryStage{} = row, merged_at) do

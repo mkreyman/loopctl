@@ -1,0 +1,203 @@
+{
+  "id": "US-44.4",
+  "title": "No release path leaves a story unreachable (#877)",
+  "epic": {
+    "id": "epic_44",
+    "name": "Delivery Loop Completion"
+  },
+  "priority": "high",
+  "phase": "delivery_loop",
+  "story": {
+    "as_a": "delivery-loop operator",
+    "i_want_to": "every claim release on a delivery story to end somewhere the driver or a human acts on",
+    "so_that": "a crashed or refused dispatch never silently drops its story out of the loop"
+  },
+  "rationale": "Every caller of Stages.follow_release/5 leaves agent_status pending at stage queued, and the driver selects contracted stories only, so the story sits unreachable with no alert. The disposition has to depend on the cause, which the release paths do not currently carry: a refusal is free to retry, a crash costs money, and an operator's release is a human decision. The retry ceiling is spend, so it has no default.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-44.4.1",
+      "description": "force_unclaim_story/3 accepts release_cause: :placement_refused | :attempt | :operator (default :operator), and Placement.undo_claim/5 passes :placement_refused when the runner was unavailable (not connected, at capacity, a lock not granted, its credential no longer authorized) or the claim ended under the placement (stale claim epoch), and :attempt for every other refusal (a payload the contract rejects, a story it could not attach, a dispatch_id the ledger already holds or already answered — each pass mints a fresh one, so that is never a concurrent pass)."
+    },
+    {
+      "id": "AC-44.4.2",
+      "description": "A :placement_refused release leaves the story queued and contracted."
+    },
+    {
+      "id": "AC-44.4.3",
+      "description": "A lease reclaim or a counted US-44.3 release with fewer than DISPATCH_MAX_ATTEMPTS counted releases leaves the story queued and contracted."
+    },
+    {
+      "id": "AC-44.4.4",
+      "description": "A lease reclaim or counted release that reaches the ceiling takes {queued, escalated, :attempts_exhausted} with the count in escalation_reason."
+    },
+    {
+      "id": "AC-44.4.5",
+      "description": "With DISPATCH_MAX_ATTEMPTS unset, the first counted release takes {queued, escalated, :attempts_exhausted}."
+    },
+    {
+      "id": "AC-44.4.6",
+      "description": "A verifier-reject auto-reset or bulk reject of a story whose stage row is in flight counts toward the ceiling and follows the same rule."
+    },
+    {
+      "id": "AC-44.4.7",
+      "description": "An :operator force-unclaim of a delivery story takes {queued, escalated, :operator_released}."
+    },
+    {
+      "id": "AC-44.4.8",
+      "description": "A story with no delivery stage row is released exactly as today."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-44.4.1",
+      "verifies": [
+        "AC-44.4.1",
+        "AC-44.4.2"
+      ],
+      "name": "placement refusal re-contracts",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "runner refusing the dispatch",
+        "contracted story at queued"
+      ],
+      "steps": [
+        "DispatchDriver places it; runner replies refused"
+      ],
+      "expected_results": [
+        "stage queued, agent_status contracted"
+      ]
+    },
+    {
+      "id": "TC-44.4.2",
+      "verifies": [
+        "AC-44.4.3"
+      ],
+      "name": "crash under the ceiling retries",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "config/test.exs sets the max-attempts key to 2",
+        "claimed delivery story past its lease"
+      ],
+      "steps": [
+        "run ReclaimExpiredClaimsWorker"
+      ],
+      "expected_results": [
+        "stage queued, agent_status contracted, attempts runner_lost 1"
+      ]
+    },
+    {
+      "id": "TC-44.4.3",
+      "verifies": [
+        "AC-44.4.4"
+      ],
+      "name": "ceiling reached escalates through the worker",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "max-attempts 2",
+        "story whose attempts runner_lost is 1, claimed past its lease"
+      ],
+      "steps": [
+        "run ReclaimExpiredClaimsWorker"
+      ],
+      "expected_results": [
+        "stage escalated, edge attempts_exhausted, count 2 in reason"
+      ]
+    },
+    {
+      "id": "TC-44.4.4",
+      "verifies": [
+        "AC-44.4.5"
+      ],
+      "name": "unset ceiling escalates on the first release",
+      "type": "unit",
+      "preconditions": [
+        "the config reader over a config with no max-attempts key"
+      ],
+      "steps": [
+        "read the ceiling; decide for one counted release"
+      ],
+      "expected_results": [
+        "ceiling 0; decision escalate attempts_exhausted"
+      ]
+    },
+    {
+      "id": "TC-44.4.5",
+      "verifies": [
+        "AC-44.4.6"
+      ],
+      "name": "in-flight reject counts",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story reported done under a dispatch, row at ci"
+      ],
+      "steps": [
+        "reject_story"
+      ],
+      "expected_results": [
+        "queued and contracted under the ceiling; counted"
+      ]
+    },
+    {
+      "id": "TC-44.4.6",
+      "verifies": [
+        "AC-44.4.7"
+      ],
+      "name": "operator release escalates",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "claimed delivery story"
+      ],
+      "steps": [
+        "force_unclaim_story with no release_cause"
+      ],
+      "expected_results": [
+        "stage escalated, edge operator_released"
+      ]
+    },
+    {
+      "id": "TC-44.4.7",
+      "verifies": [
+        "AC-44.4.8"
+      ],
+      "name": "non-delivery story untouched",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "claimed story with no stage row"
+      ],
+      "steps": [
+        "force_unclaim_story"
+      ],
+      "expected_results": [
+        "agent_status pending as today; no stage row"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "follow_release/5 callers: progress.ex:1189, :1637, :2931, :3601; bulk_operations.ex:610. force_unclaim_multi and the reject auto-reset both pass :claim_released today, so the cause must be threaded in",
+    "Counting: Stages.transition_update already counts attempts per edge (stages.ex:1080-1093); the ceiling counts runner_lost plus claim_released from in-flight rejects, the claimant's own unclaim (a session that always gives the story back must not loop for ever, and sending it to a human is not a custody bypass) and a placement refusal that recurs every pass; never a placement the runner was unavailable for, or an operator release",
+    "A reject whose row is past ci (merged, deployed) only rebinds the row (stages.ex:984-988); that path keeps today's behaviour and is out of scope",
+    "Re-contract as a guarded pending -> contracted step inside the release's own transaction (Progress.recontract_in_transaction/3), writing the audit entry and webhook contract_story/4 writes from the same builders; contract_story/4 itself is unchanged",
+    "New control-only edges {queued, escalated, :attempts_exhausted} and {queued, escalated, :operator_released} in StageMachine and the contract",
+    "DISPATCH_MAX_ATTEMPTS: row in deploy/FLY_SECRETS.md, no default; one reader function used by runtime config and by the worker, so the unset case is tested through the same reader the worker calls",
+    "Tests never Application.put_env; the configured value in config/test.exs is 2"
+  ],
+  "dependencies": [
+    "US-44.3"
+  ],
+  "non_goals": [
+    "Does not change the lease length (US-44.5)",
+    "Does not change post-merge reject behaviour",
+    "Does not add alerting beyond the escalated queue"
+  ],
+  "expected_size": {
+    "insertions": 320,
+    "files": 8
+  },
+  "estimated_tokens": 450000
+}

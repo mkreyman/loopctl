@@ -158,6 +158,21 @@ case System.get_env("STORY_CLAIM_LEASE_SECONDS") &&
   _ -> :ok
 end
 
+# #879 (US-44.5): seconds past a dispatch's wall clock before a driver-placed claim's lease
+# cap. Any INTEGER is taken as given, so a value below the runner capacity release grace
+# reaches Loopctl.Delivery.DispatchLease.validate!/0 and stops the boot instead of being
+# quietly replaced; a value that is set but not an integer ("15m", "1800s", "120.0") stops it
+# here (`DispatchLease.grace_from_env!/1`); unset or blank leaves the default (900). Skipped
+# under :test so the suite reads config/test.exs's pinned value and never a developer's shell.
+if config_env() != :test do
+  if grace =
+       Loopctl.Delivery.DispatchLease.grace_from_env!(
+         System.get_env("DISPATCH_LEASE_GRACE_SECONDS")
+       ) do
+    config :loopctl, :dispatch_lease_grace_seconds, grace
+  end
+end
+
 # #803: the most runner sessions one tenant may have in flight across all its runners
 # (admission control). Positive integer; anything else leaves the default in
 # Loopctl.Runners.Capacity.limit/0.
@@ -191,6 +206,16 @@ end
 case System.get_env("DISPATCH_MAX_TURNS") && Integer.parse(System.get_env("DISPATCH_MAX_TURNS")) do
   {turns, ""} when turns > 0 -> config :loopctl, :dispatch_max_turns, turns
   _ -> :ok
+end
+
+# US-44.4: how many counted releases (a lost lease, a crashed session, a verifier reject) a
+# story may take and still be re-queued; reaching it escalates the story for a human. NO
+# DEFAULT, like the budgets above: unset or malformed leaves the key out, which
+# `Loopctl.Delivery.RetryCeiling.max_attempts/0` reads as 0 — escalate on the first counted
+# release, never spend twice on a number nobody chose. 0 is also a valid explicit value.
+case Loopctl.Delivery.RetryCeiling.parse(System.get_env("DISPATCH_MAX_ATTEMPTS")) do
+  {:ok, attempts} -> config :loopctl, :dispatch_max_attempts, attempts
+  :unset -> :ok
 end
 
 # #803 §4: the TRIAGE session's own budgets, separate from the implement ones because a triage

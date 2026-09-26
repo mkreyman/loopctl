@@ -42,6 +42,9 @@ defmodule Loopctl.Delivery.TriageVerdictRecord do
     field :incomplete_reason, :string
     field :confidence, :string
     field :payload, :map
+    # The three lenses' own judgements, keyed by lens (contract 1.15.0), or nil for a verdict
+    # sent without them. Gate A reads this and nothing a caller supplies (US-44.1).
+    field :lens_verdicts, :map
     field :detail, :string
     field :payload_digest, :string
     field :claim_epoch, :integer
@@ -106,7 +109,7 @@ defmodule Loopctl.Delivery.TriageVerdictRecord do
   @spec create_changeset(t(), map()) :: Ecto.Changeset.t()
   def create_changeset(%__MODULE__{} = record, attrs) do
     record
-    |> cast(attrs, [:outcome, :incomplete_reason, :confidence, :payload, :detail])
+    |> cast(attrs, [:outcome, :incomplete_reason, :confidence, :payload, :detail, :lens_verdicts])
     |> validate_inclusion(:outcome, RunnerTriageVerdict.outcomes())
     |> validate_inclusion(
       :incomplete_reason,
@@ -122,6 +125,10 @@ defmodule Loopctl.Delivery.TriageVerdictRecord do
       name: :triage_verdicts_verdict_shape,
       message:
         "a verdict carries a payload and a confidence; an incomplete report carries neither"
+    )
+    |> check_constraint(:lens_verdicts,
+      name: :triage_verdicts_lens_verdicts_shape,
+      message: "lens_verdicts is an object keyed by lens"
     )
     |> unique_constraint([:tenant_id, :dispatch_id],
       name: :triage_verdicts_dispatch_uidx,

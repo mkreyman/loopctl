@@ -32,6 +32,7 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
     :not_found,
     :not_claimed,
     :stale_claim_epoch,
+    :triage_not_bound,
     :stale_stage,
     :actor_lineage_required,
     :invalid_reason,
@@ -43,6 +44,12 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
     :invalid_event_data,
     :busy
   ]
+
+  describe "triage_not_bound (epic 44, US-44.1)" do
+    test "is published as stale_stage, with no row, never internal_error" do
+      assert Refusal.for_message(:triage_not_bound) == %{reason: "stale_stage"}
+    end
+  end
 
   describe "the catch-all" do
     test "answers internal_error and logs the reason, which is never sent" do
@@ -118,7 +125,12 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
         {"trace", {:batch_too_large, 100, 200}},
         {"trace", {:event_data_too_large, 3, 400, 500}},
         {"stage", {:invalid, ["something"]}},
-        {"stage", :busy}
+        {"stage", :busy},
+        # `session_ended` (1.16.0): the two codes that carry anything, and the permanent one
+        # that carries nothing.
+        {"session_ended", {:invalid, ["something"]}},
+        {"session_ended", :capacity_busy},
+        {"session_ended", :already_recorded}
       ]
 
       for {event, reason} <- produced do
@@ -199,6 +211,18 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       assert refusal == %{reason: "audit_chain_append_failed"}
       refute Map.has_key?(refusal, :min_interval_ms)
       refute refusal.reason == "rate_limited"
+    end
+
+    # #877 review round 2, findings 7 and 9: a `session_ended` release that rolled back for a
+    # server-side reason the contract has no code for is the published `internal_error` — by a
+    # NAMED clause, so the catch-all's "add a clause" error is kept for undecided shapes.
+    test "a release refused server-side is internal_error, by name rather than the catch-all" do
+      log =
+        capture_log(fn ->
+          assert Refusal.for_message(:release_failed) == %{reason: "internal_error"}
+        end)
+
+      refute log =~ "no clause names"
     end
 
     test "a lock this write could not get says retry, with an interval longer than the wait" do

@@ -426,4 +426,15 @@ defmodule Loopctl.DeliveryGates.GateBTest do
       end
     end
   end
+
+  describe "triage_screen/3 (US-44.2)" do
+    test "a trigger configuration that cannot be loaded fails closed" do
+      assert [{:config_error, :unreadable}] =
+               GateB.triage_screen(
+                 {:error, :unreadable},
+                 "acme/widgets",
+                 []
+               )
+    end
+  end
 end

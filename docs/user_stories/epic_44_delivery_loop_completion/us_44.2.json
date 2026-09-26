@@ -1,0 +1,147 @@
+{
+  "id": "US-44.2",
+  "title": "Screen a triaged story against both gates before it is queued",
+  "epic": {
+    "id": "epic_44",
+    "name": "Delivery Loop Completion"
+  },
+  "priority": "high",
+  "phase": "delivery_loop",
+  "story": {
+    "as_a": "delivery-loop operator",
+    "i_want_to": "a triaged story that Gate A refuses, or whose predicted touches hit a guarded path, to be escalated instead of queued",
+    "so_that": "no unattended implementation is spent on work the merge gate is certain to refuse"
+  },
+  "rationale": "Design section 5 runs both gates twice; only the merge run exists, so with the driver on, a story predicted to touch the claims path or carrying disagreeing lenses is implemented at roughly USD 10-20 and then refused. The triage run cannot be the full Gate B: it has no repository file list and the trio's touches are a prediction. So it is a screen that can only ADD an escalation on a positive signal, and the merge run stays the gate.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-44.2.1",
+      "description": "An accepted story verdict whose lens verdicts fail GateA.evaluate/1 takes triaged -> escalated over :triage_escalate with Gate A's reasons, and is not queued."
+    },
+    {
+      "id": "AC-44.2.2",
+      "description": "An accepted story verdict without lens_verdicts takes triaged -> escalated with reason gate_a_inputs_missing, and is not queued."
+    },
+    {
+      "id": "AC-44.2.3",
+      "description": "An accepted story verdict with a drafted touch matching a human_paths or effect_paths trigger takes triaged -> escalated naming the path and pattern, and is not queued."
+    },
+    {
+      "id": "AC-44.2.4",
+      "description": "An accepted story verdict with passing lens verdicts and no touch matching a guarded trigger is queued as today, including when touches is absent."
+    },
+    {
+      "id": "AC-44.2.5",
+      "description": "A trigger configuration that cannot be loaded escalates the story rather than queuing it."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-44.2.1",
+      "verifies": [
+        "AC-44.2.1"
+      ],
+      "name": "disagreeing lenses escalate at triage",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at triaged, accepted triage dispatch"
+      ],
+      "steps": [
+        "apply a story verdict whose lens verdicts disagree"
+      ],
+      "expected_results": [
+        "stage escalated, edge triage_escalate, no queued transition"
+      ]
+    },
+    {
+      "id": "TC-44.2.2",
+      "verifies": [
+        "AC-44.2.2"
+      ],
+      "name": "no lens verdicts escalates",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "story at triaged"
+      ],
+      "steps": [
+        "apply a story verdict without lens_verdicts"
+      ],
+      "expected_results": [
+        "stage escalated, reason gate_a_inputs_missing"
+      ]
+    },
+    {
+      "id": "TC-44.2.3",
+      "verifies": [
+        "AC-44.2.3"
+      ],
+      "name": "predicted claims-path touch escalates",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "triggers with effect_paths lib/home_care_billing/claims/**"
+      ],
+      "steps": [
+        "apply a unanimous story verdict with touches [lib/home_care_billing/claims/x.ex]"
+      ],
+      "expected_results": [
+        "stage escalated naming the file and pattern"
+      ]
+    },
+    {
+      "id": "TC-44.2.4",
+      "verifies": [
+        "AC-44.2.4"
+      ],
+      "name": "clean verdict is queued with and without touches",
+      "type": "integration",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "clean triggers"
+      ],
+      "steps": [
+        "apply a unanimous verdict with harmless touches; on a second story apply one with no touches"
+      ],
+      "expected_results": [
+        "both stories queued"
+      ]
+    },
+    {
+      "id": "TC-44.2.5",
+      "verifies": [
+        "AC-44.2.5"
+      ],
+      "name": "unloadable trigger config fails closed",
+      "type": "unit",
+      "preconditions": [
+        "tenant = fixture(:tenant)",
+        "trigger config for the repo missing"
+      ],
+      "steps": [
+        "apply a unanimous story verdict"
+      ],
+      "expected_results": [
+        "stage escalated, reason names the config error"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Route: the 'story' route in lib/loopctl/delivery/triage_verdict.ex:110; the screen runs in the transaction that writes the drafted story",
+    "Add GateB.triage_screen/2 (repo_triggers, touches) returning the human_path and effect_path matches only; GateB.evaluate(:triage, ...) is not usable here because it adds stale_trigger and missing_files reasons without repo_files (gate_b.ex:141-160,237-241)",
+    "Touches live in draft metadata (triage_verdict.ex:698-707) and are optional on the wire (runner_contract.ex:1326)"
+  ],
+  "dependencies": [
+    "US-44.1"
+  ],
+  "non_goals": [
+    "Does not bind the implementer to the predicted touches; the merge run still gates",
+    "Does not add trigger patterns"
+  ],
+  "expected_size": {
+    "insertions": 170,
+    "files": 4
+  },
+  "estimated_tokens": 280000
+}

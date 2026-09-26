@@ -26,6 +26,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.Progress
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.WebhookDeliveryWorker
 
@@ -64,7 +65,22 @@ defmodule Loopctl.BulkOperations do
 
       AdminRepo.transaction(fn ->
         locked_stories = lock_stories_by_ids(tenant_id, sorted_ids)
-        process_claims(sorted_ids, locked_stories, agent_id, tenant_id, actor_id, actor_label)
+        # ONE read for the whole batch, under the story locks just taken — the single-story
+        # claim's refusal of a held stage (`Progress.claim_story/3`), asked once, not per story.
+        held = Stages.held_story_ids(tenant_id, Map.keys(locked_stories))
+        # And ONE read for the dependencies, for the same reason (#890): per story, it would
+        # lengthen how long every lock in the batch is held.
+        blocked = Dependencies.unmet_story_ids(tenant_id, Map.keys(locked_stories))
+
+        process_claims(
+          sorted_ids,
+          locked_stories,
+          %{held: held, blocked: blocked},
+          agent_id,
+          tenant_id,
+          actor_id,
+          actor_label
+        )
       end)
     end
   end
@@ -140,6 +156,8 @@ defmodule Loopctl.BulkOperations do
   ## Returns
 
   - `{:ok, results}` -- list of per-story results
+  - `{:error, :audit_chain_append_failed}` -- a story's release reached the retry ceiling and
+    its escalation's chain entry was refused; the WHOLE batch rolled back (US-44.4)
   """
   @spec bulk_reject(Ecto.UUID.t(), [map()], Ecto.UUID.t() | nil, keyword()) ::
           {:ok, [map()]} | {:error, atom()}
@@ -170,8 +188,19 @@ defmodule Loopctl.BulkOperations do
         locked_stories = lock_stories_by_ids(tenant_id, sorted_ids)
         process_rejections(sorted_ids, locked_stories, story_params, ctx)
       end)
+      |> announce_committed_releases()
     end
   end
+
+  # The chain entries a release escalation appended inside the batch (US-44.4), broadcast only
+  # once the batch has COMMITTED — never an entry a rollback took back.
+  defp announce_committed_releases({:ok, pairs}) do
+    {results, releases} = Enum.unzip(pairs)
+    Enum.each(releases, &Stages.announce_release/1)
+    {:ok, results}
+  end
+
+  defp announce_committed_releases(error), do: error
 
   # ===================================================================
   # Bulk Mark Complete (API Discoverability Issue 5)
@@ -279,11 +308,19 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
-  defp process_claims(sorted_ids, locked_stories, agent_id, tenant_id, actor_id, actor_label) do
+  defp process_claims(
+         sorted_ids,
+         locked_stories,
+         batch_reads,
+         agent_id,
+         tenant_id,
+         actor_id,
+         actor_label
+       ) do
     Enum.map(sorted_ids, fn story_id ->
       case Map.get(locked_stories, story_id) do
         nil -> %{story_id: story_id, status: "error", reason: "Story not found"}
-        story -> process_claim(story, agent_id, tenant_id, actor_id, actor_label)
+        story -> process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label)
       end
     end)
   end
@@ -302,13 +339,15 @@ defmodule Loopctl.BulkOperations do
     end)
   end
 
+  # Each story's result paired with its release (`Stages.follow_release/5`'s value), which
+  # `bulk_reject/4` announces after the commit.
   defp process_rejections(sorted_ids, locked_stories, story_params, ctx) do
     Enum.map(sorted_ids, fn story_id ->
       params = Map.get(story_params, story_id, %{})
 
       case Map.get(locked_stories, story_id) do
         nil ->
-          %{story_id: story_id, status: "error", reason: "Story not found"}
+          {%{story_id: story_id, status: "error", reason: "Story not found"}, {nil, nil}}
 
         story ->
           process_reject(story, params, ctx)
@@ -340,8 +379,8 @@ defmodule Loopctl.BulkOperations do
   # Private: Individual Story Processing
   # ===================================================================
 
-  defp process_claim(story, agent_id, tenant_id, actor_id, actor_label) do
-    with :ok <- validate_claim_preconditions(story),
+  defp process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label) do
+    with :ok <- validate_claim_preconditions(story, batch_reads),
          {:ok, updated} <- apply_claim(story, agent_id) do
       audit_claim(tenant_id, story, updated, actor_id, actor_label)
       emit_claim_event(tenant_id, story, updated, agent_id)
@@ -400,19 +439,32 @@ defmodule Loopctl.BulkOperations do
       audit_rejection(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
       emit_reject_event(tenant_id, updated, orchestrator_agent_id, reason)
 
-      case auto_reset_agent_status(updated) do
-        {:ok, reset} ->
-          audit_auto_reset(tenant_id, updated, reset, actor_id, actor_label)
+      released =
+        case auto_reset_agent_status(updated, ctx.caller_lineage) do
+          {:ok, {reset, released}} ->
+            audit_auto_reset(tenant_id, updated, reset, actor_id, actor_label)
+            recontract_reset(tenant_id, reset, released)
+            released
 
-        {:error, reset_reason} ->
-          Logger.warning("Auto-reset failed for story #{story.id}: #{inspect(reset_reason)}")
-      end
+          {:error, reset_reason} ->
+            Logger.warning("Auto-reset failed for story #{story.id}: #{inspect(reset_reason)}")
+            {nil, nil}
+        end
 
-      %{story_id: story.id, status: "success"}
+      {%{story_id: story.id, status: "success"}, released}
     else
       {:error, reason} ->
-        %{story_id: story.id, status: "error", reason: format_reason(reason)}
+        {%{story_id: story.id, status: "error", reason: format_reason(reason)}, {nil, nil}}
     end
+  end
+
+  # AFTER the reset's audit entry, like the single-story reject (US-44.4): a delivery story
+  # whose row went back to `queued` is placeable again, or it was escalated at the retry ceiling
+  # and stays `pending` for a human. The re-contract has no refusal: a database error on its
+  # audit insert raises and rolls the whole batch back.
+  defp recontract_reset(tenant_id, reset, released) do
+    {:ok, _story} = Stages.recontract_released(tenant_id, released, reset, "system:auto_reset")
+    :ok
   end
 
   # ===================================================================
@@ -427,46 +479,20 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
-  defp validate_claim_preconditions(story) do
-    if story.agent_status != :contracted do
-      {:error, "Story is not in contracted status (current: #{story.agent_status})"}
-    else
-      check_story_dependencies_satisfied(story)
-    end
-  end
+  # `held` and `blocked` are each ONE read for the whole batch (`bulk_claim/4`).
+  defp validate_claim_preconditions(story, %{held: held, blocked: blocked}) do
+    cond do
+      story.agent_status != :contracted ->
+        {:error, "Story is not in contracted status (current: #{story.agent_status})"}
 
-  defp check_story_dependencies_satisfied(story) do
-    unmet_count =
-      from(sd in Loopctl.WorkBreakdown.StoryDependency,
-        join: dep in Story,
-        on: dep.id == sd.depends_on_story_id,
-        where: sd.story_id == ^story.id and dep.verified_status != :verified,
-        select: count(sd.id)
-      )
-      |> AdminRepo.one()
+      MapSet.member?(held, story.id) ->
+        {:error, :story_held}
 
-    if unmet_count > 0 do
-      {:error, "Story has #{unmet_count} unverified dependency(ies)"}
-    else
-      check_epic_dependencies_satisfied(story)
-    end
-  end
+      MapSet.member?(blocked, story.id) ->
+        {:error, :dependencies_not_met}
 
-  defp check_epic_dependencies_satisfied(story) do
-    unmet_count =
-      from(ed in Loopctl.WorkBreakdown.EpicDependency,
-        where: ed.epic_id == ^story.epic_id,
-        join: prereq_story in Story,
-        on: prereq_story.epic_id == ed.depends_on_epic_id,
-        where: prereq_story.verified_status != :verified,
-        select: count(prereq_story.id)
-      )
-      |> AdminRepo.one()
-
-    if unmet_count > 0 do
-      {:error, "Parent epic has #{unmet_count} unverified prerequisite story(ies)"}
-    else
-      :ok
+      true ->
+        :ok
     end
   end
 
@@ -586,7 +612,7 @@ defmodule Loopctl.BulkOperations do
     |> AdminRepo.update()
   end
 
-  defp auto_reset_agent_status(story) do
+  defp auto_reset_agent_status(story, caller_lineage) do
     story
     |> Ecto.Changeset.change(
       # The FOURTH site that clears assigned_agent_id on a worked story, and the twin
@@ -607,21 +633,32 @@ defmodule Loopctl.BulkOperations do
       |> Map.merge(Progress.claim_release_change(story))
     )
     |> AdminRepo.update()
-    |> follow_release()
+    |> follow_release(caller_lineage)
   end
 
   # #803: the stage row follows the release inside bulk reject's transaction, like the
-  # single-story auto-reset (Loopctl.Delivery.Stages.follow_release/5).
-  defp follow_release({:ok, reset} = result) do
-    {:ok, _stage} =
-      Stages.follow_release(reset.tenant_id, reset.id, reset.claim_epoch, :claim_released,
-        actor_label: "system:auto_reset"
-      )
-
-    result
+  # single-story auto-reset (Loopctl.Delivery.Stages.follow_release/5). A reject spent an
+  # attempt, so it counts toward the retry ceiling (US-44.4).
+  #
+  # A refusal ROLLS THE BATCH BACK. It is the one refusal `follow_release/5` has — the
+  # escalation at the ceiling could not append its chain entry — and by then the escalation's
+  # row and event are written in this transaction, which has no savepoint to undo only them. A
+  # custody transition whose chain entry did not land must not commit, so the whole batch
+  # answers `{:error, :audit_chain_append_failed}`, exactly as the single-story reject does
+  # for its one story. It is tenant-wide when it happens: every chained transition in the
+  # tenant is refusing.
+  defp follow_release({:ok, reset}, caller_lineage) do
+    case Stages.follow_release(reset.tenant_id, reset.id, reset.claim_epoch, :claim_released,
+           cause: :attempt,
+           actor_lineage: caller_lineage,
+           actor_label: "system:auto_reset"
+         ) do
+      {:ok, released} -> {:ok, {reset, released}}
+      {:error, reason} -> AdminRepo.rollback(reason)
+    end
   end
 
-  defp follow_release(error), do: error
+  defp follow_release(error, _caller_lineage), do: error
 
   # ===================================================================
   # Private: Verification/Rejection Result Records
@@ -935,6 +972,18 @@ defmodule Loopctl.BulkOperations do
         "pre-existing done work, so mark-complete does not apply"
 
   defp format_reason(:already_verified), do: "story is already verified"
+
+  # Leads with its code, as `:story_held` does, so a bulk caller can branch on it.
+  defp format_reason(:dependencies_not_met),
+    do:
+      "dependencies_not_met: Story has an unverified dependency (its own, or one of its " <>
+        "epic's); GET /api/v1/stories/blocked (MCP list_blocked_stories) names what blocks it"
+
+  defp format_reason(:story_held),
+    do:
+      "story_held: its delivery stage is escalated, done or failed. An escalated story is " <>
+        "claimable again once a human resolves it to queued (resolve_escalation); a done or " <>
+        "failed one never is"
 
   defp format_reason(:story_rejected),
     do: "story is rejected; investigate instead of marking it complete"

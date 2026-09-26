@@ -51,13 +51,38 @@ defmodule Loopctl.Delivery.StageMachine do
     along with the head, and it is CHAINED — the entry into `merged` is a custody fact, so
     retracting it writes a counter-entry rather than leaving the chain saying the story
     merged at a sha it did not
-  - `:budget_exceeded` — any live stage -> failed
+  - `:budget_exceeded` — any live stage -> failed. In the table and WRITTEN BY NOTHING in
+    `lib/` today. `failed` has no way out, so a runner's word must never be what takes a story
+    there (see `:budget_reported`)
+  - `:budget_reported` — an in-flight stage -> escalated, when the runner reports that the
+    session was KILLED BY ITS BUDGET — its wall clock or its turn limit — in a `session_ended`
+    message (contract 1.16.0, US-44.3). CONTROL takes it, from
+    `Loopctl.Delivery.RunnerStages.end_session/4`, never a `stage` message: the runner states a
+    FACT about its session and control decides what the story does about it. It lands on
+    `escalated`, not `failed`, because the runner's word must never make a story terminal
+    with no way out, and it is its own edge rather than `:session_escalated` because the
+    escalated queue has to tell "the loop spent its budget on this" apart from "the session
+    asked for Mark". Never retried: a budget kill retried is the same kill again, paid twice.
   - `:runner_lost` — an in-flight stage -> queued. Taken by the claim reclaimer
     (`Loopctl.Progress.reclaim_expired_claim/3`), never asked for by a runner: a runner
     that could report itself lost is not lost.
   - `:claim_released` — an in-flight stage -> queued, when the claim is released by
     unclaim, force-unclaim or a reject auto-reset. Also never asked for by a caller; see
     `Loopctl.Delivery.Stages.follow_release/5`.
+  - `:attempts_exhausted` — queued -> escalated, when a release that SPENT an attempt (a lost
+    lease, a `crashed` session, a verifier reject, the claimant giving the story back) brings
+    the story's counted releases to the retry ceiling, `DISPATCH_MAX_ATTEMPTS`
+    (`Loopctl.Delivery.RetryCeiling`, US-44.4). Its own edge, not `:session_escalated`,
+    because the escalated queue has to tell "the loop spent what it was allowed to on this"
+    apart from "the session asked for Mark"; the count is in the reason.
+  - `:operator_released` — queued -> escalated, when an OPERATOR force-unclaims a story the
+    loop was delivering. A human took the story back, so a human decides what it does next
+    — resolved from `escalated` like any other — rather than the loop re-queuing it under
+    them or leaving it `queued` for the next placement to take.
+  - Both are CONTROL-ONLY and are taken in exactly one place: the releasing transaction
+    itself, straight after the release requeued the row
+    (`Loopctl.Delivery.Stages.follow_release/5`). `advance/4` refuses them from every caller,
+    as it refuses the release edges, and neither is runner-reportable.
   - `:human_resolution` — escalated -> queued | done | failed, and ONLY for a human
     principal (see `Loopctl.Delivery.Stages.advance/4`).
 
@@ -108,6 +133,12 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @human_resolution for to <- [:queued, :done, :failed], do: {:escalated, to, :human_resolution}
 
+  # What a release decides AFTER it has requeued the row (US-44.4): the retry ceiling reached,
+  # or an operator's release. From `queued` only, because the release has just put the row
+  # there — and taken by nothing but that releasing transaction (see the moduledoc).
+  @release_escalations [:attempts_exhausted, :operator_released]
+  @release_escalated for edge <- @release_escalations, do: {:queued, :escalated, edge}
+
   # The session's own escalation. From every stage a runner holds the story in, and ALSO from
   # `merged` and `deployed` (#824 round 3, H2/3).
   #
@@ -136,6 +167,11 @@ defmodule Loopctl.Delivery.StageMachine do
   @session_escalated for from <- @in_flight ++ [:merged, :deployed],
                          do: {from, :escalated, :session_escalated}
 
+  # A reported budget kill (US-44.3). From the stages a runner holds the story in and nowhere
+  # else: a kill reported after `merged` names a session whose outward effect already happened,
+  # and there the session's own `:session_escalated` is the way out. See the moduledoc entry.
+  @budget_reported for from <- @in_flight, do: {from, :escalated, :budget_reported}
+
   @transitions @forward ++
                  [
                    {:ci, :implementing, :ci_red},
@@ -147,7 +183,10 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
                    {:merged, :implementing, :merge_refused}
-                 ] ++ @budget_exceeded ++ @released ++ @human_resolution ++ @session_escalated
+                 ] ++
+                 @budget_exceeded ++
+                 @released ++
+                 @human_resolution ++ @session_escalated ++ @budget_reported ++ @release_escalated
 
   # The part of the machine a RUNNER may report over the channel: one definition, from which
   # `runner_transitions/0`'s doc, the wire enums and the published
@@ -181,6 +220,11 @@ defmodule Loopctl.Delivery.StageMachine do
   #   terminal with NO way out, `:human_resolution` included. A runner able to report it can
   #   park a story for good with no path back. A session that has run out of budget escalates
   #   instead; control decides whether that is `failed`.
+  #
+  # `:budget_reported` is held back for the same reason, one step removed: it is what control
+  # DECIDES when a runner reports a budget kill in `session_ended`. The runner reports the
+  # fact; the edge is the verdict, and it stays off this list so that a `stage` message can
+  # never take it.
   #
   # THE SOURCE FILTER STOPS AT `merged`, and that is the other half of the rule (#824 round 2,
   # H1). With `deployed` and `verified` as sources the edge allowlist admitted
@@ -253,6 +297,13 @@ defmodule Loopctl.Delivery.StageMachine do
   # the identity its first run wrote; a writer from a stage that does not produce the effect
   # is refused, so a stale stage cannot record an identity for a later one.
   @effect_stages %{
+    # WHICH TRIAGE DISPATCH DECIDED THIS STORY (epic 44, US-44.1). TRANSITION-ONLY, carried on
+    # the `detected -> triaged` transition itself (`advance/4`'s `:effects`), so the story
+    # leaves `detected` and names its deciding dispatch in ONE transaction: nothing can bind
+    # without triaging, and a dispatch that dies before its transition binds nothing. The
+    # merge gate's Gate A reads this dispatch's lens verdicts and no other's. Control-written:
+    # a runner never reports it.
+    triage_dispatch_id: [:triaged],
     runner_id: [:claimed],
     worktree_path: [:worktree],
     branch: [:worktree],
@@ -324,7 +375,7 @@ defmodule Loopctl.Delivery.StageMachine do
   # Anything the gate writes in future goes here as well. The test in
   # `runner_contract_test.exs` binds this list to the wire schema in both directions, so a new
   # effect that belongs on neither side goes red rather than reaching a runner.
-  @control_written_effects [:runner_id, :merge_gate_allowed_sha]
+  @control_written_effects [:runner_id, :merge_gate_allowed_sha, :triage_dispatch_id]
 
   @reportable_effects @effect_stages
                       |> Map.keys()
@@ -359,8 +410,11 @@ defmodule Loopctl.Delivery.StageMachine do
           | :merge_gate
           | :merge_refused
           | :budget_exceeded
+          | :budget_reported
           | :runner_lost
           | :claim_released
+          | :attempts_exhausted
+          | :operator_released
           | :human_resolution
           | :session_escalated
 
@@ -373,13 +427,19 @@ defmodule Loopctl.Delivery.StageMachine do
           | :merge_sha
           | :release_id
           | :merge_gate_allowed_sha
+          | :triage_dispatch_id
 
   # `merge_sha` is written ONLY as part of the transition into `merged`, both ways round:
   # it is REQUIRED there (an entry asserting a merge must name it) and it is refused to
   # `record_effect/5` (recorded afterwards it would leave the chain saying the story merged
   # at nothing while the row named a sha the chain never saw). The two halves are one rule
   # and belong together — relaxing either reopens it.
-  @transition_only [:merge_sha]
+  @transition_only [:merge_sha, :triage_dispatch_id]
+
+  # Identities that describe the story for its whole life rather than one attempt at it, and
+  # so survive even a human re-queue. A re-queue does not re-triage — the story does not go
+  # back to `detected` — so the verdict Gate A judges is still the one this dispatch gave.
+  @story_lifetime_effects [:triage_dispatch_id]
   @required_effects %{merged: [:merge_sha]}
 
   @type transition :: {stage(), stage(), edge()}
@@ -460,6 +520,13 @@ defmodule Loopctl.Delivery.StageMachine do
   @doc "True when `{from, to, edge}` is in the table."
   @spec allowed?(stage(), stage(), edge()) :: boolean()
   def allowed?(from, to, edge), do: {from, to, edge} in @transitions
+
+  @doc """
+  The edges a claim release takes out of `queued` once it has requeued the row:
+  `:attempts_exhausted` and `:operator_released` (US-44.4). Control-only — see the moduledoc.
+  """
+  @spec release_escalation_edges() :: [edge()]
+  def release_escalation_edges, do: @release_escalations
 
   @doc "True for the edges only a human principal may take."
   @spec human_only?(edge()) :: boolean()
@@ -618,6 +685,10 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec transition_only?(atom()) :: boolean()
   def transition_only?(effect), do: effect in @transition_only
 
+  @doc "The identities no transition clears, a human re-queue included."
+  @spec story_lifetime_effects() :: [effect()]
+  def story_lifetime_effects, do: @story_lifetime_effects
+
   @doc """
   The identities a transition into `to` MUST carry. Entering `merged` without the sha would
   chain a merge that names nothing.
@@ -638,8 +709,13 @@ defmodule Loopctl.Delivery.StageMachine do
   # fields too — neither counter is an effect, so `Map.keys(@effect_stages)` does not
   # include them, and leaving one standing would escalate the resolved story again on the
   # first blip at the same commit.
+  #
+  # Except the story-lifetime identities (`story_lifetime_effects/0`).
   def clears(:escalated, :queued, :human_resolution),
-    do: Enum.uniq(Map.keys(@effect_stages) ++ @head_keyed ++ @merge_keyed)
+    do:
+      Enum.uniq(
+        (Map.keys(@effect_stages) -- @story_lifetime_effects) ++ @head_keyed ++ @merge_keyed
+      )
 
   # A refused merge never happened, so the identity recorded for it goes with the head —
   # and so does everything keyed to that merge.

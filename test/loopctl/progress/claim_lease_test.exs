@@ -17,6 +17,7 @@ defmodule Loopctl.Progress.ClaimLeaseTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Progress
   alias Loopctl.WorkBreakdown.Story
 
@@ -48,6 +49,17 @@ defmodule Loopctl.Progress.ClaimLeaseTest do
   end
 
   defp seconds_from_now(%DateTime{} = at), do: DateTime.diff(at, DateTime.utc_now(), :second)
+
+  defp held_stage(tenant_id, story, stage) do
+    fixture(:story_stage, %{
+      repo: AdminRepo,
+      tenant_id: tenant_id,
+      story_id: story.id,
+      stage: stage,
+      claim_epoch: story.claim_epoch,
+      escalation_reason: if(stage == :escalated, do: "session_ended:wall_clock_exceeded")
+    })
+  end
 
   describe "claim_story/3" do
     test "sets a lease of claim_lease_seconds/0 and increments the epoch" do
@@ -244,6 +256,83 @@ defmodule Loopctl.Progress.ClaimLeaseTest do
       claimed = AdminRepo.get!(Story, story.id)
       assert claimed.claim_epoch == 1
       assert_in_delta seconds_from_now(claimed.claimed_until), Progress.claim_lease_seconds(), 5
+    end
+
+    test "a story whose delivery stage is HELD is refused by claim" do
+      # Escalated (a human owns it), done or failed (finished with). Its own status says
+      # claimable — the claim that left it there has ended — so the stage row is the only thing
+      # that says it is not.
+      for stage <- [:escalated, :done, :failed] do
+        %{agent: agent, story: story, tenant_id: tenant_id} = contracted_story()
+        held_stage(tenant_id, story, stage)
+
+        assert {:error, :story_held} =
+                 Progress.claim_story(tenant_id, story.id, agent_id: agent.id)
+
+        unclaimed = AdminRepo.get!(Story, story.id)
+        assert unclaimed.agent_status == :contracted
+        assert unclaimed.claim_epoch == story.claim_epoch
+      end
+    end
+
+    test "a story whose delivery stage is HELD is refused by contract" do
+      for stage <- [:escalated, :done, :failed] do
+        agent = fixture(:agent, %{agent_type: :implementer})
+        story = fixture(:story, %{tenant_id: agent.tenant_id, agent_status: :pending})
+        held_stage(agent.tenant_id, story, stage)
+
+        assert {:error, :story_held} =
+                 Progress.contract_story(agent.tenant_id, story.id, %{},
+                   skip_contract_check: true
+                 )
+
+        assert AdminRepo.get!(Story, story.id).agent_status == :pending
+      end
+    end
+
+    test "bulk claim refuses the held ids of a batch and claims the rest" do
+      %{agent: agent, story: held, tenant_id: tenant_id} = contracted_story()
+      free = fixture(:story, %{tenant_id: tenant_id, agent_status: :contracted})
+      held_stage(tenant_id, held, :done)
+
+      assert {:ok, results} =
+               Loopctl.BulkOperations.bulk_claim(tenant_id, [held.id, free.id], agent.id)
+
+      by_id = Map.new(results, &{&1.story_id, &1})
+      assert %{status: "error", reason: "story_held" <> _} = by_id[held.id]
+      assert %{status: "success"} = by_id[free.id]
+      assert AdminRepo.get!(Story, held.id).agent_status == :contracted
+      assert AdminRepo.get!(Story, free.id).agent_status == :assigned
+    end
+
+    test "tenant isolation: another tenant's held stage row does not hold this story" do
+      # The held read is scoped by tenant explicitly (it runs on AdminRepo). A row for the same
+      # story id under ANOTHER tenant is not this story's stage.
+      %{agent: agent, story: story, tenant_id: tenant_id} = contracted_story()
+      other = fixture(:tenant)
+
+      assert MapSet.new() == Stages.held_story_ids(other.id, [story.id])
+      held_stage(tenant_id, story, :escalated)
+      assert MapSet.new() == Stages.held_story_ids(other.id, [story.id])
+
+      assert MapSet.new([story.id]) ==
+               Stages.held_story_ids(tenant_id, [story.id])
+
+      assert {:error, :story_held} = Progress.claim_story(tenant_id, story.id, agent_id: agent.id)
+    end
+
+    test "a stage row anywhere but a held stage does not stand in the claim's way" do
+      %{agent: agent, story: story, tenant_id: tenant_id} = contracted_story()
+
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: tenant_id,
+        story_id: story.id,
+        stage: :queued,
+        claim_epoch: story.claim_epoch
+      })
+
+      assert {:ok, _claimed} = Progress.claim_story(tenant_id, story.id, agent_id: agent.id)
     end
 
     test "force-unclaim of an already-pending story does not bump" do

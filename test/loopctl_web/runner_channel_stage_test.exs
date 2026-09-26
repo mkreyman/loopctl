@@ -16,6 +16,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
   use LoopctlWeb.ChannelCase, async: false
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
@@ -96,6 +97,56 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
     :sys.replace_state(channel.channel_pid, fn socket ->
       %{socket | assigns: %{socket.assigns | stage_bucket: :full}}
     end)
+  end
+
+  describe "triage_verdict (US-44.1)" do
+    defp verdict_payload(dispatch_id, lens_verdicts) do
+      %{
+        "dispatch_id" => dispatch_id,
+        "claim_epoch" => @epoch,
+        "verdict" => %{
+          "outcome" => "escalate",
+          "confidence" => "low",
+          "escalation_reasons" => ["Needs a person."]
+        },
+        "lens_verdicts" => lens_verdicts
+      }
+    end
+
+    defp lens(name), do: %{"lens" => name, "outcome" => "escalate", "confidence" => "low"}
+
+    defp verdict_count(tenant_id) do
+      {:ok, count} =
+        Loopctl.Repo.with_tenant(tenant_id, fn ->
+          Loopctl.Repo.aggregate(Loopctl.Delivery.TriageVerdictRecord, :count)
+        end)
+
+      count
+    end
+
+    test "lens verdicts of the wrong shape are refused invalid_payload and record nothing", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+
+      ref =
+        push(
+          channel,
+          "triage_verdict",
+          verdict_payload(dispatch_id, [lens("analyst"), lens("analyst")])
+        )
+
+      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      assert verdict_count(runner.tenant_id) == 0
+    end
+
+    test "a triage verdict on an IMPLEMENT dispatch is refused and records nothing", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+      lenses = Enum.map(~w(analyst architect engineer), &lens/1)
+
+      ref = push(channel, "triage_verdict", verdict_payload(dispatch_id, lenses))
+
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert verdict_count(runner.tenant_id) == 0
+    end
   end
 
   describe "stage" do
@@ -475,6 +526,138 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
       # And nothing was written: a message refused by the bucket never reaches the machine.
       assert Stages.get(ctx.runner.tenant_id, ctx.story.id).stage == :implementing
+    end
+  end
+
+  describe "session_ended (US-44.3, contract 1.16.0)" do
+    # The mechanism — every reason, the record, the epoch fence and the release — is covered
+    # without a socket in `Loopctl.Delivery.SessionEndTest` and `SessionEndReleaseTest`. What
+    # is here is the WIRING: the event is routed, cast through the contract, metered by its own
+    # bucket, answered with the row plus `replayed`, and each refusal reaches the wire as the
+    # contract's published code.
+    defp ended(dispatch_id, reason, attrs \\ %{}),
+      do: stage_message(dispatch_id, Map.merge(%{"reason" => reason}, attrs))
+
+    defp recorded_reason(tenant_id, dispatch_id),
+      do: DispatchLedger.get_record(tenant_id, dispatch_id).session_ended_reason
+
+    test "an unknown reason is refused invalid_payload and records nothing (AC-44.3.1)", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+
+      ref = push(channel, "session_ended", ended(dispatch_id, "bored"))
+
+      assert_reply ref, :error, %{reason: "invalid_payload", details: [_ | _]}, @reply_timeout
+      assert recorded_reason(runner.tenant_id, dispatch_id) == nil
+
+      # Refused at the cast, before the database, so it spent nothing of the bucket.
+      assert :sys.get_state(channel.channel_pid).assigns.session_ended_bucket == :full
+    end
+
+    test "is answered with the row and replayed, and a resend with replayed: true", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx
+
+      ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
+      assert_reply ref, :ok, reply, @reply_timeout
+
+      assert reply.stage == "implementing"
+      assert reply.claim_epoch == @epoch
+      assert reply.replayed == false
+
+      assert Map.delete(reply, :replayed) ==
+               RunnerStages.row_state(Stages.get(runner.tenant_id, story.id))
+
+      assert recorded_reason(runner.tenant_id, dispatch_id) == "completed"
+
+      ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
+      assert_reply ref, :ok, %{replayed: true, stage: "implementing"}, @reply_timeout
+    end
+
+    test "the channel hands its runner's OWN key to end_session, for the release's audit", ctx do
+      # The release a report causes is attributed to the runner's `api_key_id`, and the channel
+      # is the one place that holds it (`socket.assigns.runner`). A release cannot be observed
+      # from here — the ledger's lock on the sandbox connection would hold `AdminRepo`'s — so
+      # the CALL is observed instead, traced on the channel process alone.
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+      mfa = {RunnerStages, :end_session, 4}
+      {:module, _} = Code.ensure_loaded(RunnerStages)
+
+      :erlang.trace(channel.channel_pid, true, [:call, {:tracer, self()}])
+      assert :erlang.trace_pattern(mfa, true, [:local]) == 1
+
+      try do
+        ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
+        assert_reply ref, :ok, _, @reply_timeout
+      after
+        :erlang.trace(channel.channel_pid, false, [:call])
+        :erlang.trace_pattern(mfa, false, [:local])
+      end
+
+      assert_received {:trace, _pid, :call, {RunnerStages, :end_session, [_, _, _, opts]}}
+      assert Keyword.fetch!(opts, :actor_id) == runner.api_key_id
+      refute is_nil(runner.api_key_id)
+    end
+
+    test "a budget kill reaches the machine: the story escalates (AC-44.3.3)", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx
+
+      ref = push(channel, "session_ended", ended(dispatch_id, "max_turns_exceeded"))
+      assert_reply ref, :ok, %{stage: "escalated", replayed: false}, @reply_timeout
+
+      assert Stages.get(runner.tenant_id, story.id).stage == :escalated
+    end
+
+    test "each refusal reaches the wire as the contract's code", ctx do
+      %{channel: channel, dispatch_id: dispatch_id} = ctx
+
+      ref =
+        push(
+          channel,
+          "session_ended",
+          ended(dispatch_id, "completed", %{"claim_epoch" => @epoch + 1})
+        )
+
+      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+
+      ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
+      assert_reply ref, :ok, _, @reply_timeout
+
+      ref = push(channel, "session_ended", ended(dispatch_id, "crashed"))
+      assert_reply ref, :error, %{reason: "already_recorded"}, @reply_timeout
+
+      ref = push(channel, "session_ended", ended(Ecto.UUID.generate(), "completed"))
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+
+      for reason <- ~w(stale_claim_epoch already_recorded unknown_dispatch) do
+        assert reason in RunnerContract.error_reasons()["session_ended"]
+      end
+    end
+
+    test "an exhausted bucket refuses with the contract's interval and writes nothing", ctx do
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
+
+      :sys.replace_state(channel.channel_pid, fn socket ->
+        future = System.monotonic_time(:millisecond) + 3_600_000
+        %{socket | assigns: %{socket.assigns | session_ended_bucket: {0, future}}}
+      end)
+
+      ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
+
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
+      assert ms == RunnerContract.session_ended_burst() |> Map.fetch!("refill_interval_ms")
+      assert recorded_reason(runner.tenant_id, dispatch_id) == nil
+    end
+
+    test "one push against a full bucket leaves exactly capacity - 1", ctx do
+      %{channel: channel, dispatch_id: dispatch_id} = ctx
+      capacity = RunnerContract.session_ended_burst() |> Map.fetch!("capacity")
+
+      ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
+      assert_reply ref, :ok, _, @reply_timeout
+
+      assert {tokens, _refilled_at} =
+               :sys.get_state(channel.channel_pid).assigns.session_ended_bucket
+
+      assert tokens == capacity - 1
     end
   end
 end

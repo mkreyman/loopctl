@@ -95,6 +95,13 @@ defmodule Loopctl.Runners.Runner do
     field :enrolled_max_sessions, :integer, default: @default_max_sessions
     field :in_flight, :integer, default: 0
     field :revoked_at, :utc_datetime_usec
+    # US-44.6: written only by `Loopctl.Runners.Usage`, never cast. Not in `@public_fields`:
+    # the pool renders the EFFECTIVE value (own or account-wide), which is what placement
+    # decides on, and a raw per-row value beside it would be a second answer to one question.
+    field :usage_exhausted_until, :utc_datetime_usec
+    field :usage_cleared_at, :utc_datetime_usec
+    field :usage_hold_provisional, :boolean, default: false
+    field :account_ref, :string
 
     timestamps()
   end

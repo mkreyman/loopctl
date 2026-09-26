@@ -40,7 +40,9 @@ defmodule LoopctlWeb.RunnerChannel do
 
   `"status"` updates the runner's Presence meta (`RunnerStatus`). Updates closer
   together than `@min_status_interval_ms` are refused with `rate_limited`, because each
-  one is a Presence diff broadcast across the PubSub.
+  one is a Presence diff broadcast across the PubSub. Its `usage` (contract 1.17.0, US-44.6) is
+  the exception: it is written to the `runners` row by `Loopctl.Runners.Usage.record/3`, never
+  into the meta, and a write that does not land refuses the whole status.
 
   ## Dispatch replies and trace (contract 1.1.0, #803)
 
@@ -78,6 +80,17 @@ defmodule LoopctlWeb.RunnerChannel do
   Like the three above it, `stage` does not check the custody halt: it records a transition
   a session already made.
 
+  ## Session end (contract 1.16.0, US-44.3)
+
+  `"session_ended"` (`RunnerSessionEnded`) is why the session under an implement dispatch
+  stopped. Cast by the contract, metered by its own bucket (`RunnerContract.session_ended_burst/0`),
+  and applied by `Loopctl.Delivery.RunnerStages.end_session/4`, which records it once on the
+  dispatch's ledger row and decides from the reason what the story does — this channel opens
+  no path to `story_stages` or to the claim of its own. The reply is the stage row as it then
+  stands plus `replayed`, and an identical resend is answered `ok` even after the release its
+  first copy caused. Like `stage`, it does not check the custody halt: it records what a
+  session already did.
+
   ## What an operator can see (issue #815)
 
   - The channel process carries `runner_id`, `runner_name`, `tenant_id`, `node` and
@@ -107,6 +120,7 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
+  alias Loopctl.Runners.Usage
   alias LoopctlWeb.RunnerChannel.MinInterval
   alias LoopctlWeb.RunnerChannel.Refusal
   alias LoopctlWeb.RunnerChannel.ReplyBucket
@@ -122,6 +136,9 @@ defmodule LoopctlWeb.RunnerChannel do
 
   @verdict_capacity RunnerContract.triage_verdict_burst() |> Map.fetch!("capacity")
   @verdict_refill_ms RunnerContract.triage_verdict_burst() |> Map.fetch!("refill_interval_ms")
+  @session_ended_capacity RunnerContract.session_ended_burst() |> Map.fetch!("capacity")
+  @session_ended_refill_ms RunnerContract.session_ended_burst()
+                           |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -160,6 +177,7 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:reply_bucket, :full)
        |> assign(:stage_bucket, :full)
        |> assign(:verdict_bucket, :full)
+       |> assign(:session_ended_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -298,31 +316,22 @@ defmodule LoopctlWeb.RunnerChannel do
   defp handle_message("status", payload, socket) do
     now = System.monotonic_time(:millisecond)
 
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
     with :ok <- MinInterval.check(socket.assigns.last_status_at, now, @min_status_interval_ms),
-         {:ok, status} <- RunnerContract.cast_status(payload) do
-      %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
-      meta = Map.merge(meta, status)
-
-      {:ok, ref} =
-        Presence.update(
-          self(),
-          Runners.pool_topic(tenant_id),
-          runner.name,
-          presence_meta(meta, runner)
-        )
-
-      # An update re-issues the meta's phx_ref; keep the current one for sole_live_socket?/1.
-      {:reply, :ok,
-       socket
-       |> assign(:meta, meta)
-       |> assign(:last_status_at, now)
-       |> assign(:presence_ref, ref)}
+         {:ok, status} <- RunnerContract.cast_status(payload),
+         {usage, status} = Map.pop(status, :usage),
+         :ok <- record_usage(tenant_id, runner.id, usage) do
+      {:reply, :ok, socket |> update_meta(status) |> assign(:last_status_at, now)}
     else
       {:error, :rate_limited} ->
         refuse(socket, "status", %{
           reason: "rate_limited",
           min_interval_ms: @min_status_interval_ms
         })
+
+      {:error, reason} when reason in [:busy, :rejected_by_database] ->
+        refuse(socket, "status", message_error(reason))
 
       {:error, reason} ->
         refuse(socket, "status", join_error(reason))
@@ -407,6 +416,39 @@ defmodule LoopctlWeb.RunnerChannel do
     else
       {:error, :rate_limited} -> rate_limited(socket, "triage_verdict", @verdict_refill_ms)
       {:error, reason} -> refuse(socket, "triage_verdict", message_error(reason))
+    end
+  end
+
+  # Why an implement session ended (contract 1.16.0, US-44.3). The runner states the fact;
+  # `RunnerStages.end_session/4` records it once and decides what it does to the story.
+  #
+  # IDEMPOTENT, and the ack says which it was, for the reason `triage_verdict`'s does: the
+  # session that ended cannot say it again differently, so a runner refused for anything
+  # transient has no move except resending the same bytes.
+  defp handle_message("session_ended", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with {:ok, message} <- RunnerContract.cast_session_ended(payload),
+         {:ok, bucket} <-
+           ReplyBucket.take(
+             socket.assigns.session_ended_bucket,
+             now,
+             @session_ended_capacity,
+             @session_ended_refill_ms
+           ) do
+      socket = assign(socket, :session_ended_bucket, bucket)
+
+      case RunnerStages.end_session(tenant_id, runner.id, message, actor_id: runner.api_key_id) do
+        {:ok, %{row: row, replayed?: replayed?}} ->
+          {:reply, {:ok, Map.put(stage_ack(row), :replayed, replayed?)}, socket}
+
+        {:error, reason} ->
+          refuse(socket, "session_ended", message_error(reason))
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, "session_ended", @session_ended_refill_ms)
+      {:error, reason} -> refuse(socket, "session_ended", message_error(reason))
     end
   end
 
@@ -984,6 +1026,38 @@ defmodule LoopctlWeb.RunnerChannel do
       "runner disconnecting: reason=#{reason} runner_id=#{runner.id} runner_name=#{runner.name}"
     )
   end
+
+  # A status carrying ONLY `usage` leaves nothing to merge, and an update would still broadcast a
+  # Presence diff to every pool subscriber for a meta that did not change.
+  defp update_meta(socket, status) when map_size(status) == 0, do: socket
+
+  defp update_meta(socket, status) do
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+    meta = Map.merge(socket.assigns.meta, status)
+
+    {:ok, ref} =
+      Presence.update(
+        self(),
+        Runners.pool_topic(tenant_id),
+        runner.name,
+        presence_meta(meta, runner)
+      )
+
+    # An update re-issues the meta's phx_ref; keep the current one for sole_live_socket?/1.
+    socket |> assign(:meta, meta) |> assign(:presence_ref, ref)
+  end
+
+  # THE SUBSCRIPTION WINDOW, which lives on the `runners` row and NOT in the Presence meta
+  # (US-44.6): it has to survive this socket, this node and a reconnect elsewhere, and the
+  # placement paths read it from Postgres. Popped off before the meta merge for the same reason
+  # — a copy in the meta would be a second answer nothing decides on.
+  #
+  # Written BEFORE the Presence update, and a write that does not land refuses the whole status:
+  # nothing in it is applied and `last_status_at` is not advanced, so the runner's resend is
+  # admitted at once and carries both halves. Applying the meta and dropping the usage would
+  # answer `ok` for an exhaustion control never recorded, which is the fail-open direction.
+  defp record_usage(_tenant_id, _runner_id, nil), do: :ok
+  defp record_usage(tenant_id, runner_id, usage), do: Usage.record(tenant_id, runner_id, usage)
 
   # The reason -> refusal mapping lives in `LoopctlWeb.RunnerChannel.Refusal`, out of this
   # module and public, so its CATCH-ALL can be called by a test. Private here, the only way to

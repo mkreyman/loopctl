@@ -109,6 +109,7 @@ defmodule Loopctl.Runners do
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Usage
   alias Loopctl.Tenants
   alias Loopctl.Tenants.Tenant
 
@@ -517,21 +518,29 @@ defmodule Loopctl.Runners do
      unsupported kind racing can both pass this read, which costs one extra refusal and no
      slot; for an undeclaring runner the memory the first reply writes settles every dispatch
      after it.
-  7. `{:error, :dispatch_id_conflict}` — the tenant's ledger already holds this `dispatch_id`
+  7. `{:error, :runner_exhausted}` — the machine's subscription is exhausted: its own
+     `usage_exhausted_until`, or that of a same-tenant runner sharing its `account_ref`, is in
+     the future (`usage_exhausted?/2`, US-44.6). Every session sent there would end
+     `usage_exhausted`, so it is refused here, beside the push, where every caller — an
+     unattended pass, a placement — passes. EXCEPT a `dispatch_id` the tenant's ledger already
+     holds: that is a re-send of work the machine was already handed (`Placement.resume/4`),
+     not new work, and refusing it would strand the claim it runs under. The ledger is read
+     only for an exhausted machine, so the ordinary path costs the one exhaustion read.
+  8. `{:error, :dispatch_id_conflict}` — the tenant's ledger already holds this `dispatch_id`
      for a different runner, story, `claim_epoch` or kind.
-  8. `{:error, :dispatch_already_replied}` — the runner already accepted or refused this
+  9. `{:error, :dispatch_already_replied}` — the runner already accepted or refused this
      `dispatch_id`; sending it again would start a second session.
-  9. `{:error, :stale_claim_epoch}` — the dispatch's `claim_epoch` is not the story's current
-     one (or the story does not exist): the claim it was built for has already ended.
-  10. `{:error, :admission_limit_reached}` — the tenant's runners already hold
+  10. `{:error, :stale_claim_epoch}` — the dispatch's `claim_epoch` is not the story's current
+      one (or the story does not exist): the claim it was built for has already ended.
+  11. `{:error, :admission_limit_reached}` — the tenant's runners already hold
       `Capacity.limit/0` slots between them. All of a tenant's sessions run on one Anthropic
       account, and its rate limit is what bites.
-  11. `{:error, :runner_at_capacity}` — this runner already holds `max_sessions` slots (or
+  12. `{:error, :runner_at_capacity}` — this runner already holds `max_sessions` slots (or
       was revoked since step 3).
-  12. `{:error, :capacity_busy}` — a lock the reservation waits on was not granted within
+  13. `{:error, :capacity_busy}` — a lock the reservation waits on was not granted within
       `Capacity.lock_timeout_ms/0`. Nothing was recorded or reserved; retry.
 
-  Steps 7-12 run in ONE transaction: the ledger row and its slot commit together or not at
+  Steps 8-13 run in ONE transaction: the ledger row and its slot commit together or not at
   all, and a re-send of a `dispatch_id` whose row still holds its slot takes no second one.
 
   Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/3`) — or
@@ -563,6 +572,7 @@ defmodule Loopctl.Runners do
              | :runner_not_connected
              | :runner_ambiguous
              | :kind_not_supported
+             | :runner_exhausted
              | :dispatch_id_conflict
              | :dispatch_already_replied
              | :stale_claim_epoch
@@ -612,9 +622,17 @@ defmodule Loopctl.Runners do
          :ok <- runner_authorized(tenant_id, runner_id),
          {:ok, meta} <- single_live_socket(tenant_id, runner_id),
          :ok <- kind_supported(tenant_id, runner_id, meta, dispatch.kind),
+         :ok <- not_exhausted(tenant_id, runner_id, dispatch.dispatch_id),
          {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
       broadcast_dispatch(tenant_id, runner_id, dispatch)
     end
+  end
+
+  defp not_exhausted(tenant_id, runner_id, dispatch_id) do
+    if usage_exhausted?(tenant_id, runner_id) and
+         is_nil(DispatchLedger.get_record(tenant_id, dispatch_id)),
+       do: {:error, :runner_exhausted},
+       else: :ok
   end
 
   # The two-element message every deployed node understands. A node of the PREVIOUS release
@@ -896,6 +914,11 @@ defmodule Loopctl.Runners do
   second copy of the declaration-then-ledger rule is exactly how a pre-check and its
   enforcement drift apart.
 
+  Whether the machine's SUBSCRIPTION is exhausted (US-44.6) is not asked here: it lives on
+  the `runners` row, not the meta, and the unattended selectors ask it in the same query that
+  finds a free slot (`Loopctl.Runners.Selection`), while `dispatch/3` and
+  `Loopctl.Delivery.Placement` refuse an exhausted machine beside the push.
+
   `:ok`, or `{:error, :runner_draining | :repo_not_allowed | :kind_not_supported}`.
   """
   @spec accepts?(Ecto.UUID.t(), Ecto.UUID.t(), map(), String.t(), String.t()) ::
@@ -908,6 +931,18 @@ defmodule Loopctl.Runners do
       true -> kind_supported(tenant_id, runner_id, meta, kind)
     end
   end
+
+  @doc """
+  Whether `runner_id`'s subscription is exhausted right now — its own `usage_exhausted_until`,
+  or that of any same-tenant runner sharing its `account_ref`, is in the future
+  (`Loopctl.Runners.Usage.exhausted_until/2`, US-44.6). What `dispatch/3` and
+  `Loopctl.Delivery.Placement` ask of the one runner they are about to hand work to; the
+  selectors ask the same definition of every candidate row at once
+  (`Loopctl.Runners.Usage.not_exhausted/2`), so the two cannot disagree.
+  """
+  @spec usage_exhausted?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def usage_exhausted?(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id),
+    do: Usage.exhausted_until(tenant_id, runner_id) != nil
 
   @doc """
   Whether a runner's live meta says it will take ANY work right now — the question that is

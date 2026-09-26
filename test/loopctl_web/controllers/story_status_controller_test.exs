@@ -91,6 +91,18 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
     version
   end
 
+  # A delivery stage row at a HELD stage: what a budget kill, a session's own escalation or a
+  # human resolution to done / failed leaves once the claim has ended.
+  defp held_stage(story, stage) do
+    fixture(:story_stage, %{
+      repo: AdminRepo,
+      tenant_id: story.tenant_id,
+      story_id: story.id,
+      stage: stage,
+      escalation_reason: if(stage == :escalated, do: "session_ended:wall_clock_exceeded")
+    })
+  end
+
   defp setup_story_with_agent(attrs \\ %{}) do
     tenant = fixture(:tenant)
     project = fixture(:project, %{tenant_id: tenant.id})
@@ -144,6 +156,26 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       body = json_response(conn, 200)
       assert body["story"]["agent_status"] == "contracted"
       assert body["story"]["id"] == story.id
+    end
+
+    test "refuses a story whose delivery stage is held: 409 story_held, nothing contracted", %{
+      conn: conn
+    } do
+      for stage <- [:escalated, :done, :failed] do
+        %{story: story, raw_key: raw_key} = setup_story_with_agent()
+        held_stage(story, stage)
+
+        conn =
+          conn
+          |> auth_conn(raw_key)
+          |> post(~p"/api/v1/stories/#{story.id}/contract", %{
+            "story_title" => "Phoenix scaffold",
+            "ac_count" => 2
+          })
+
+        assert %{"error" => %{"code" => "story_held"}} = json_response(conn, 409)
+        assert AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).agent_status == :pending
+      end
     end
 
     test "rejects with wrong title (422)", %{conn: conn} do
@@ -236,6 +268,46 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
         |> post(~p"/api/v1/stories/#{story.id}/claim")
 
       assert json_response(conn, 409)
+    end
+
+    test "refuses a story whose delivery stage is held: 409 story_held, nothing claimed", %{
+      conn: conn
+    } do
+      for stage <- [:escalated, :done, :failed] do
+        %{story: story, raw_key: raw_key} = setup_story_with_agent(%{agent_status: :contracted})
+        held_stage(story, stage)
+
+        conn =
+          conn
+          |> auth_conn(raw_key)
+          |> post(~p"/api/v1/stories/#{story.id}/claim")
+
+        assert %{"error" => %{"code" => "story_held"}} = json_response(conn, 409)
+        assert AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).agent_status == :contracted
+      end
+    end
+
+    # #890 review round 2: named, so an agent can tell it from a lost race or a wrong status.
+    test "refuses a story with an unverified prerequisite: 409 dependencies_not_met", %{
+      conn: conn
+    } do
+      %{story: story, raw_key: raw_key} = setup_story_with_agent(%{agent_status: :contracted})
+
+      blocker =
+        fixture(:story, %{tenant_id: story.tenant_id, epic_id: story.epic_id, number: "99.1"})
+
+      fixture(:story_dependency, %{
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        depends_on_story_id: blocker.id
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/claim")
+
+      assert %{"error" => %{"code" => "dependencies_not_met"}} = json_response(conn, 409)
     end
 
     test "rejects claim on already assigned story (409)", %{conn: conn} do
@@ -960,6 +1032,56 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
 
       assert body["story"]["claim_epoch"] == 1
       assert body["story"]["claimed_until"] >= claimed["claimed_until"]
+    end
+
+    test "the claim response carries a nil claim_lease_cap on an ordinary claim", %{conn: conn} do
+      %{claimed: claimed} = claimed_via_api(conn)
+
+      assert Map.has_key?(claimed, "claim_lease_cap")
+      assert claimed["claim_lease_cap"] == nil
+    end
+
+    # #879 (US-44.5): a claim a placement took is capped at its dispatch deadline, and the
+    # renewal the claimant sees says so — the MCP lease notice reads this field.
+    test "renew-claim on a driver-placed claim stops at the cap and returns it", %{conn: conn} do
+      %{story: story, raw_key: raw_key, agent: agent, tenant: tenant} =
+        setup_story_with_agent(%{agent_status: :contracted})
+
+      cap = DateTime.add(DateTime.utc_now(), 600, :second)
+
+      {:ok, _} =
+        Loopctl.Progress.claim_story(tenant.id, story.id, agent_id: agent.id, lease_until: cap)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 1})
+        |> json_response(200)
+
+      assert {:ok, returned_cap, 0} = DateTime.from_iso8601(body["story"]["claim_lease_cap"])
+      assert {:ok, until, 0} = DateTime.from_iso8601(body["story"]["claimed_until"])
+      assert returned_cap == cap
+      assert until == cap
+    end
+
+    test "renew-claim on a driver-placed claim past its cap is 409 lease_cap_reached",
+         %{conn: conn} do
+      %{story: story, raw_key: raw_key, agent: agent, tenant: tenant} =
+        setup_story_with_agent(%{agent_status: :contracted})
+
+      past = DateTime.add(DateTime.utc_now(), -60, :second)
+
+      {:ok, _} =
+        Loopctl.Progress.claim_story(tenant.id, story.id, agent_id: agent.id, lease_until: past)
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 1})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "lease_cap_reached"
+      assert Loopctl.AdminRepo.get!(Loopctl.WorkBreakdown.Story, story.id).claimed_until == past
     end
 
     test "renew-claim without claim_epoch, or with a string, is 400", %{conn: conn} do

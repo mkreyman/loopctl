@@ -124,7 +124,9 @@ defmodule LoopctlWeb.StoryEscalationController do
         {"The transition's audit-chain entry did not land, so nothing was written",
          "application/json", Schemas.ErrorResponse},
       503 =>
-        {"A lock the write needed was not free; nothing was written", "application/json",
+        {"A lock the write needed was not free. Nothing was written, unless it was the " <>
+           "re-contract's lock: then, as for a 422 re-contract refusal, the story was " <>
+           "released and moved to `queued` and is left `pending` there.", "application/json",
          Schemas.ErrorResponse}
     }
   )
@@ -191,15 +193,19 @@ defmodule LoopctlWeb.StoryEscalationController do
       # the 400 above and the 503 below.
       422 =>
         {"The release or re-contract write was rejected (a changeset error, or " <>
-           "`contract_mismatch`), or `unresolvable_target`", "application/json",
-         Schemas.ErrorResponse},
+           "`contract_mismatch`), or `unresolvable_target`. A re-contract refusal arrives " <>
+           "AFTER the story was released and moved to `queued`: it is left `pending` there, " <>
+           "and the next placement contracts it before it mints (a retried " <>
+           "resolve answers 409 `not_escalated`).", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
         {"`force_unclaim_failed` — the claim release rolled back at a step that cannot " <>
-           "refuse, or the transition's audit-chain entry did not land. Nothing was written.",
-         "application/json", Schemas.ErrorResponse},
+           "refuse; `audit_chain_append_failed` — the transition's audit-chain entry did not " <>
+           "land. Nothing was written.", "application/json", Schemas.ErrorResponse},
       503 =>
-        {"A lock the write needed was not free; nothing was written", "application/json",
+        {"A lock the write needed was not free. Nothing was written, unless it was the " <>
+           "re-contract's lock: then, as for a 422 re-contract refusal, the story was " <>
+           "released and moved to `queued` and is left `pending` there.", "application/json",
          Schemas.ErrorResponse}
     }
   )

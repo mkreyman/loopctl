@@ -124,13 +124,37 @@ defmodule Loopctl.AuditChain do
     unless Loopctl.Repo.in_transaction?(),
       do: raise(ArgumentError, "append_in_tenant_transaction/2 needs a Loopctl.Repo transaction")
 
-    {:ok, :locked} = lock_tenant_chain(Loopctl.Repo, tenant_id)
-    {:ok, {position, prev_hash}} = lock_and_read_previous(Loopctl.Repo, tenant_id)
+    append_in_transaction(Loopctl.Repo, tenant_id, attrs)
+  end
+
+  @doc """
+  `append_in_tenant_transaction/2` for a caller already inside an `AdminRepo` transaction: the
+  entry commits or rolls back with the state change it records, and it is NOT broadcast — the
+  caller passes it to `announce_entry/1` after its own transaction commits. `append/2` is
+  neither: it runs a transaction of its own, which inside a caller's joins it, and announces
+  the entry when that inner block returns — before the caller has committed anything.
+
+  Written for `Loopctl.Delivery.Stages.follow_release/5`'s escalation, which runs inside every
+  claim release's `AdminRepo` transaction (US-44.4). Raises outside an `AdminRepo` transaction.
+  """
+  @spec append_in_admin_transaction(Ecto.UUID.t(), map()) ::
+          {:ok, Entry.t()} | {:error, Ecto.Changeset.t()}
+  def append_in_admin_transaction(tenant_id, attrs)
+      when is_binary(tenant_id) and is_map(attrs) do
+    unless AdminRepo.in_transaction?(),
+      do: raise(ArgumentError, "append_in_admin_transaction/2 needs an AdminRepo transaction")
+
+    append_in_transaction(AdminRepo, tenant_id, attrs)
+  end
+
+  defp append_in_transaction(repo, tenant_id, attrs) do
+    {:ok, :locked} = lock_tenant_chain(repo, tenant_id)
+    {:ok, {position, prev_hash}} = lock_and_read_previous(repo, tenant_id)
     entry_attrs = build_entry_attrs(tenant_id, position, prev_hash, attrs, DateTime.utc_now())
 
     %Entry{tenant_id: tenant_id}
     |> Entry.changeset(entry_attrs)
-    |> Loopctl.Repo.insert()
+    |> repo.insert()
   end
 
   @doc """

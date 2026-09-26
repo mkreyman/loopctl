@@ -415,7 +415,7 @@ export function apiCallSites() {
       continue;
     }
 
-    for (const route of paths) resolved.push({ verb, path: route, expr });
+    for (const route of paths) resolved.push({ verb, path: route, expr, offset: m.index });
   }
 
   return { resolved, unresolved };
@@ -425,6 +425,62 @@ export function apiCallSites() {
 export function reachedRoutes() {
   const { resolved } = apiCallSites();
   return new Set(resolved.map((c) => `${c.verb} ${c.path}`));
+}
+
+const FUNCTION_HEAD = /\b(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(/g;
+const CALLED_NAME = /\b([A-Za-z_$][\w$]*)\s*\(/g;
+
+/**
+ * The `"VERB /path"` strings ONE tool sends: `reachedRoutes()` narrowed to the call sites
+ * inside the functions its `case "<tool>":` reaches.
+ *
+ * A function is the text from its `function NAME(` head to the next such head, and every
+ * same-named function in the package (index.js and lib/ share names) is one node; an
+ * `import { a as b }` alias is an edge from b to a. Reaching is by NAME — a declared
+ * function named anywhere in a reached body is reached — so it errs toward crediting a tool
+ * with a route. The one way it errs the other way is a handler that is not a `function`
+ * declaration (an arrow or a method): its call sites are invisible and the route reads as
+ * NOT sent, which fails a caller's assertion loudly. An unknown tool, or a case whose
+ * handler resolves to nothing, returns an empty set rather than throwing.
+ */
+export function toolRoutes(tool) {
+  const src = packageSource();
+  const caseAt = src.indexOf(`case "${tool}":`);
+  if (caseAt === -1) return new Set();
+
+  const heads = [...src.matchAll(FUNCTION_HEAD)];
+  const spans = new Map();
+  heads.forEach((m, i) => {
+    const end = i + 1 < heads.length ? heads[i + 1].index : src.length;
+    spans.set(m[1], [...(spans.get(m[1]) ?? []), [m.index, end]]);
+  });
+
+  const aliases = new Map();
+  for (const block of src.matchAll(/import\s*\{([^}]*)\}\s*from/g)) {
+    for (const [, original, local] of block[1].matchAll(/([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g)) {
+      aliases.set(local, [...(aliases.get(local) ?? []), original]);
+    }
+  }
+
+  const callees = (text) =>
+    [...text.matchAll(CALLED_NAME)].flatMap(([, name]) => [name, ...(aliases.get(name) ?? [])]);
+
+  const caseEnd = src.indexOf("case \"", caseAt + 1);
+  const queue = callees(src.slice(caseAt, caseEnd === -1 ? src.length : caseEnd));
+  const seen = new Set();
+
+  while (queue.length > 0) {
+    const name = queue.shift();
+    if (seen.has(name) || !spans.has(name)) continue;
+    seen.add(name);
+    for (const [start, end] of spans.get(name)) queue.push(...callees(src.slice(start, end)));
+  }
+
+  const inside = (offset) =>
+    [...seen].some((name) => spans.get(name).some(([start, end]) => offset >= start && offset < end));
+
+  const { resolved } = apiCallSites();
+  return new Set(resolved.filter((c) => inside(c.offset)).map((c) => `${c.verb} ${c.path}`));
 }
 
 // ---------------------------------------------------------------------------

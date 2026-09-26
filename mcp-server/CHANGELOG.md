@@ -5,6 +5,99 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.104.0 — 2026-09-26 (a stalled queue can say why)
+
+### Added
+
+- **`list_blocked_stories`** (`GET /api/v1/stories/blocked`, which had no tool and sat on the
+  route sweep's gap list): every story with an unverified dependency, whatever its own status,
+  with what blocks it. Those whose delivery stage is `queued` are what loopctl's dispatch
+  driver skips and `place_dispatch` refuses (loopctl epic 44, #890).
+
+### Changed
+
+- **`claim_story`** names the 409 `dependencies_not_met` that loopctl's single-story claim now
+  answers with a code, and points at `list_blocked_stories`.
+
+## 2.103.5 — 2026-09-26 (place_dispatch names its dependency refusal)
+
+### Changed
+
+- **`place_dispatch`** names the new 409 `dependencies_not_met` (loopctl epic 44, #887): a
+  story it depends on, or one in an epic its epic depends on, is not verified, and nothing was
+  minted, claimed or pushed. Remedy: verify the prerequisites, then place again.
+
+## 2.103.4 — 2026-09-26 (a queued delivery story is placeable while still pending)
+
+### Changed
+
+- **`force_unclaim_story`'s description** no longer says a story at `queued` + `pending` is
+  one no placement takes. **`place_dispatch`** now says a `pending` story is placeable: loopctl
+  contracts it before minting, and refuses a story whose dependencies are unmet before anything
+  is minted (loopctl epic 44, #884). No change to the request or the key.
+
+## 2.103.3 — 2026-09-23 (an exhausted subscription is not capacity)
+
+### Changed
+
+- **`runner_pool`** now names `usage_exhausted_until` (loopctl epic 44, US-44.6, runner
+  contract 1.17.0): until when a machine's subscription is exhausted, or null. It is the
+  effective value, the latest of the machine's own and every machine's sharing its account,
+  and while it is in the future nothing is placed there.
+- **`place_dispatch`** names the new 409 `runner_exhausted`: nothing was claimed, the body
+  carries `usage_exhausted_until`, and the remedy is another runner. Like
+  `runner_declines_work` it refuses a new placement only.
+
+## 2.103.2 — 2026-09-23 (a driver-placed claim says where it ends)
+
+### Changed
+
+- **`renew_story_claim`** now says that a driver-placed claim — one a placement took for a
+  runner dispatch — is capped at its dispatch deadline (loopctl epic 44, US-44.5, #879): its
+  `claimed_until` already is `claim_lease_cap`, so renewing it writes nothing and returns the
+  claim as it stands, and once the cap has passed the server answers 409 `lease_cap_reached`
+  instead. The lease notice on a `claim_story` or `renew_story_claim` result names that cap
+  when the server returns one.
+- **`place_dispatch`** now says that a retry moves the claim's deadline to now + its
+  `wall_clock_seconds` + the grace, and names the new 409 `dispatch_claim_ended`: a retry of
+  a `dispatch_id` whose claim has ended is refused, nothing pushed, and needs a new
+  `dispatch_id`.
+
+## 2.103.1 — 2026-09-23 (an operator's force-unclaim escalates a delivery story)
+
+### Changed
+
+- **`force_unclaim_story`'s description** (loopctl epic 44, US-44.4). loopctl now escalates a
+  delivery story an operator force-unclaims — over the control-only `operator_released` edge —
+  instead of leaving it at `queued` + `pending`, which no placement takes. The description said
+  the remedy was `contract_story` then `place_dispatch`; it is now `resolve_escalation` with
+  `to: queued`. It no longer calls a re-run "safe to run twice": run on an already-pending
+  story whose row is at `queued`, it escalates that row too, and a `500 force_unclaim_failed`
+  means the whole release rolled back and the call should be repeated. No change to the
+  request or the key.
+- **`force_unclaim_story`'s and `reject_story`'s refusals.** Both now name `500
+  audit_chain_append_failed` (the release's escalation could not append its chain entry): the
+  whole call rolled back and the story is unchanged, and a re-run meets the same condition until
+  an operator acts. force-unclaim answered `force_unclaim_failed` for the first before.
+
+## 2.103.0 — 2026-09-23 (the merge gate stops trusting its caller)
+
+### Added
+
+- **`merge_precondition`** (loopctl epic 44, US-44.1, `POST /api/v1/stories/:id/merge-precondition`).
+  The merge gate had an endpoint and no tool, so the route sweep declared it a `gap`. It takes
+  `story_id` and `claim_epoch` (plus an optional `effect_proof`) and sends NO trio: since loopctl
+  contract 1.15.0 Gate A reads the lens verdicts triage persisted, and the answer's
+  `gate_a_inputs` says which input it used. Orchestrator key, pinned when `LOOPCTL_ORCH_KEY` is
+  set, exactly as `force_unclaim_story`.
+
+### Changed
+
+- **`contract_story` and `claim_story`** name the new 409 `story_held`
+  (loopctl epic 44, US-44.3): a story whose delivery stage is `escalated`, `done` or `failed`
+  is refused even when it reads `pending` or `contracted`; an escalated one becomes available
+  again only after `resolve_escalation` sends it to `queued`.
+
 ## 2.102.0 — 2026-09-16 (the delivery loop can finally be given an input)
 
 ### Added

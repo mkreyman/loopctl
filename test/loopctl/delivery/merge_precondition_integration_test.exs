@@ -27,6 +27,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.Escalations
+  alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.Stages
@@ -136,6 +138,52 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert row.escalation_reason =~ "merge_gate"
       assert row.escalation_reason =~ "human_path"
       assert row.attempts["merge_gate"] == 1
+    end
+
+    test "a lens contradiction's text never reaches the chained escalation reason", ctx do
+      contradicted =
+        Map.put(lens("story"), "contradicts", [
+          %{"kind" => "kb", "ref" => "INJECTED-REF", "why" => "INJECTED-WHY"}
+        ])
+
+      set_lens_verdicts(ctx, %{
+        "analyst" => lens("story"),
+        "architect" => lens("story"),
+        "engineer" => contradicted
+      })
+
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+      assert {:ok, %Verdict{decision: :refuse}} = enforce(ctx)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.escalation_reason =~ "contradiction"
+      refute row.escalation_reason =~ "INJECTED"
+      # loopctl's own vocabulary survives: the validated kind enum stays readable.
+      assert row.escalation_reason =~ ~s("kb")
+    end
+
+    test "a human re-queueing a GATE A refusal satisfies Gate A at the next merge", ctx do
+      set_lens_verdicts(ctx, %{
+        "analyst" => lens("story"),
+        "architect" => lens("story"),
+        "engineer" => lens("escalate")
+      })
+
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+      assert {:ok, %Verdict{decision: :refuse, gate_a_inputs: :persisted_triage}} = enforce(ctx)
+
+      {:ok, _row} = resolve_to_queued(ctx)
+
+      assert GateAInput.for_story(ctx.tenant_id, ctx.story_id) == :human_resolution
+    end
+
+    test "a human re-queueing a refusal Gate A took no part in does not satisfy it", ctx do
+      stub_source(files: ["lib/widgets_web/router.ex"], diffstat: %{files: 1, changed_lines: 3})
+      assert {:ok, %Verdict{decision: :refuse}} = enforce(ctx)
+
+      {:ok, _row} = resolve_to_queued(ctx)
+
+      assert {:persisted_triage, _outputs} = GateAInput.for_story(ctx.tenant_id, ctx.story_id)
     end
 
     test "an allow does not transition, and RECORDS itself against the head it judged", ctx do
@@ -391,7 +439,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   defp opts do
     [
       claim_epoch: 0,
-      trio_outputs: List.duplicate(trio(), 3),
       actor_label: "test",
       # Entering `escalated` is a CHAINED transition, and `Stages.advance/4` refuses one
       # that does not declare the actor's lineage. An operator key legitimately has none.
@@ -399,14 +446,30 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     ]
   end
 
-  defp trio do
-    %{
-      "verdict" => "story",
-      "escalation_reasons" => [],
-      "contradicts" => [],
-      "confidence" => 0.9
-    }
+  defp resolve_to_queued(ctx) do
+    Escalations.resolve(ctx.tenant_id, ctx.story_id,
+      to: :queued,
+      actor_label: "test:operator",
+      actor_role: :user,
+      actor_lineage: []
+    )
   end
+
+  defp set_lens_verdicts(ctx, lens_verdicts) do
+    {:ok, {1, _}} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        from(v in Loopctl.Delivery.TriageVerdictRecord, where: v.story_id == ^ctx.story_id)
+        |> Repo.update_all(set: [lens_verdicts: lens_verdicts])
+      end)
+  end
+
+  defp lens(outcome),
+    do: %{
+      "outcome" => outcome,
+      "confidence" => "high",
+      "escalation_reasons" => [],
+      "contradicts" => []
+    }
 
   defp stub_source(opts) do
     head = Keyword.get(opts, :head, @head)
@@ -491,6 +554,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       pr_number: 4242,
       head_sha: @head
     })
+
+    fixture(:triage_verdict, %{tenant_id: tenant.id, story_id: story.id})
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}
   end

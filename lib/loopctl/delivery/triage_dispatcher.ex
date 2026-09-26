@@ -22,8 +22,11 @@ defmodule Loopctl.Delivery.TriageDispatcher do
 
   ## Eligibility, and why triage is stricter about the runner than implement is
 
-  `Runners.accepts?/5` decides, the same reader `Runners.dispatch/3` and the driver use:
-  connected, not draining, the repository declared, the KIND declared. The kind half matters
+  `Loopctl.Runners.Selection.runners/3` decides, the selection the driver makes too: connected,
+  not draining, the repository declared, the KIND declared (`Runners.accepts?/5`, the reader
+  `Runners.dispatch/3` uses), a free slot and a subscription that is not exhausted (US-44.6) —
+  all BEFORE the ledger row is written, since a refusal discovered after it is a spent
+  `dispatch_id` and a slot returned, once per story per pass. The kind half matters
   more here than anywhere else, because `Kinds.implied_by_silence/0` stays `implement` alone —
   a runner built before the `kinds` field existed is never sent triage, and only a machine that
   says `triage` on join receives one. That asymmetry is what makes 1.10.0 safe to deploy ahead
@@ -61,6 +64,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriagePayload
+  alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Intake.Source
@@ -68,11 +72,19 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.Selection
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
 
-  @type outcome :: :dispatched | :no_runner | :deferred | :blocked | :escalated | :errored
+  @type outcome ::
+          :dispatched
+          | :no_runner
+          | :deferred
+          | :blocked
+          | :escalated
+          | :errored
+          | {:stranded, :escalated | :blocked | :errored}
 
   @kind "triage"
 
@@ -87,7 +99,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   # A race is transient too, and classing one as `:blocked` is the same lie in the other
   # direction: `:stale_claim_epoch` is the story's epoch moving between `fetch_story/2` and
   # `record_sent/3`, and `:runner_not_connected` / `:runner_ambiguous` are the runner dropping
-  # its socket between the Presence read in `available_runner/2` and the push. Every one of
+  # its socket between the Presence read in `Selection.runners/3` and the push. Every one of
   # them is gone by the next pass and none has an action a person could take. Telling an
   # operator to intervene on the conditions that fix themselves is how the log stops being
   # read at all.
@@ -229,27 +241,106 @@ defmodule Loopctl.Delivery.TriageDispatcher do
     end
   end
 
+  # THE STRANDED SWEEP IS NOT BOUND BY THE PASS'S `limit`. A stranded row whose escalation
+  # keeps failing is not touched, so it keeps its place at the head of the oldest-first
+  # ranking; with the pass's own `limit` (a handful of candidates), that many failing rows held
+  # every stranded slot for ever and no later half-taken story was finished. A row is stranded
+  # only when the SECOND transaction of the too-large route failed, so the set is small by
+  # construction; the cap only bounds a pathological pass.
+  @stranded_sweep 500
+
   @doc "The pass itself, on budgets already decided — the seam a test can reach."
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    limit |> candidates() |> Enum.map(&attempt(&1, budgets))
+    finished = @stranded_sweep |> stranded() |> Enum.map(&finish_stranded/1)
+
+    {outcomes, _cache} =
+      limit
+      |> candidates()
+      |> Enum.map_reduce(%{}, fn candidate, cache -> attempt(candidate, budgets, cache) end)
+
+    finished ++ outcomes
+  end
+
+  @doc """
+  Stories this module's own too-large route left HALF-TAKEN: at `triaged` with no triage
+  dispatch bound, no live triage dispatch, and no triage verdict ever recorded. "No verdict"
+  implies "nothing bound": only a verdict's own step, and the migration's backfill from a
+  recorded verdict, ever write `triage_dispatch_id`, so the query reads the verdict alone.
+
+  The route is two transitions in two transactions (`Stages` refuses to nest them), so a
+  failure of the second leaves the row at `triaged`. Nothing else reaches `triaged` without a
+  verdict — a verdict's own step binds its dispatch in the same transaction — and
+  `candidates/1` reads only `detected`, so without this the row stayed there for ever. Each pass
+  finishes such a row over the same route; its first transition answers `:stale_stage` and the
+  second applies.
+  """
+  @spec stranded(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
+  def stranded(limit) when is_integer(limit) and limit > 0 do
+    # RANKED PER TENANT, oldest first within each: the first row of EVERY tenant before any
+    # tenant's second. Rows whose escalation keeps failing are not touched, so they keep their
+    # place; ranked across all tenants at once, one tenant's failures held every slot and no
+    # other tenant's stranded row was ever finished (`ReclaimExpiredClaimsWorker` ranks its
+    # candidates the same way, for the same reason).
+    ranked =
+      from s in StoryStage,
+        left_join: d in DispatchRecord,
+        on:
+          d.tenant_id == s.tenant_id and d.story_id == s.story_id and d.kind == ^@kind and
+            is_nil(d.released_at),
+        left_join: v in TriageVerdictRecord,
+        on: v.tenant_id == s.tenant_id and v.story_id == s.story_id,
+        where: s.stage == :triaged,
+        where: is_nil(d.id) and is_nil(v.id),
+        select: %{
+          tenant_id: s.tenant_id,
+          story_id: s.story_id,
+          updated_at: s.updated_at,
+          rank:
+            over(row_number(),
+              partition_by: s.tenant_id,
+              order_by: [asc: s.updated_at, asc: s.story_id]
+            )
+        }
+
+    Loopctl.AdminRepo.all(
+      from r in subquery(ranked),
+        order_by: [asc: r.rank, asc: r.updated_at, asc: r.story_id],
+        limit: ^limit,
+        select: %{tenant_id: r.tenant_id, story_id: r.story_id}
+    )
   end
 
   # ONE STORY MAY NOT KILL THE PASS — the read is oldest-first, so a story that raises sits at
-  # the head of every later batch too.
-  defp attempt(candidate, budgets) do
+  # the head of every later batch too. The pass cache carries only whether a tenant's
+  # `:no_runner` note has been logged (`Loopctl.Runners.Selection.note_no_runner/3`), as
+  # `Loopctl.Delivery.DispatchDriver`'s does.
+  #
+  # `:runner_exhausted` is `Runners.dispatch/3` refusing a machine that ran dry after
+  # `Selection.runners/3` chose it: this story found no runner, which is what `:no_runner`
+  # says, and the next pass selects again.
+  defp attempt(candidate, budgets, cache) do
     case send_triage(candidate, budgets) do
-      :ok -> :dispatched
-      {:error, :no_runner} -> :no_runner
-      {:error, :triage_too_large} -> escalate_too_large(candidate)
-      {:error, reason} when reason in @transient -> deferred(candidate, reason)
-      {:error, reason} -> blocked(candidate, reason)
+      :ok ->
+        {:dispatched, cache}
+
+      {:error, reason} when reason in [:no_runner, :runner_exhausted] ->
+        {:no_runner, Selection.note_no_runner(cache, "TriageDispatcher", candidate)}
+
+      {:error, :triage_too_large} ->
+        {escalate_too_large(candidate), cache}
+
+      {:error, reason} when reason in @transient ->
+        {deferred(candidate, reason), cache}
+
+      {:error, reason} ->
+        {blocked(candidate, reason), cache}
     end
   rescue
-    error -> errored(candidate, Exception.format(:error, error, __STACKTRACE__))
+    error -> {errored(candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
   catch
-    kind, value -> errored(candidate, Exception.format(kind, value, __STACKTRACE__))
+    kind, value -> {errored(candidate, Exception.format(kind, value, __STACKTRACE__)), cache}
   end
 
   defp send_triage(%{tenant_id: tenant_id, story_id: story_id}, budgets) do
@@ -258,12 +349,11 @@ defmodule Loopctl.Delivery.TriageDispatcher do
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
          :ok <- usable_base_branch(source),
          {:ok, triage} <- TriagePayload.build(record),
-         %Runner{} = runner <-
-           available_runner(tenant_id, source.repo_full_name) || {:error, :no_runner} do
+         [%Runner{} = runner | _] <- Selection.runners(tenant_id, @kind, source.repo_full_name) do
       Runners.dispatch(tenant_id, runner.id, dispatch(story, source, triage, budgets))
     else
       {:error, reason} -> {:error, reason}
-      nil -> {:error, :no_runner}
+      [] -> {:error, :no_runner}
     end
   end
 
@@ -283,31 +373,6 @@ defmodule Loopctl.Delivery.TriageDispatcher do
     if GitRef.valid_name?(branch) and byte_size(branch) <= 255,
       do: :ok,
       else: {:error, :invalid_base_branch}
-  end
-
-  # The same reader the push itself uses, applied BEFORE the ledger row is written: a refusal
-  # discovered after it is a spent `dispatch_id` and a slot returned, once per story per pass.
-  defp available_runner(tenant_id, repo) do
-    ids =
-      for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
-          runner_id = Map.get(meta, :runner_id),
-          is_binary(runner_id),
-          Runners.accepts?(tenant_id, runner_id, meta, @kind, repo) == :ok,
-          do: runner_id
-
-    if ids == [] do
-      nil
-    else
-      Loopctl.AdminRepo.one(
-        from r in Runner,
-          where: r.tenant_id == ^tenant_id,
-          where: is_nil(r.revoked_at),
-          where: r.id in ^ids,
-          where: r.in_flight < r.max_sessions,
-          order_by: [asc: r.in_flight],
-          limit: 1
-      )
-    end
   end
 
   # FRESH PER ATTEMPT, as `DispatchDriver` generates one. It was derived from the story and its
@@ -351,8 +416,29 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   # triaged story, and an operator reading `triaged` with no verdict is looking at a story that
   # needs them either way.
   #
+  # IT BINDS NO DISPATCH, deliberately (epic 44, US-44.1): no verdict decided this story, so
+  # `triage_dispatch_id` stays NULL — no session may take it out of `triaged`, and this route,
+  # which names no session dispatch, still may. The migration that added the column leaves these
+  # rows NULL for the same reason (`20260923130000_add_story_stages_triage_dispatch_id.exs`).
+  #
   # `actor_role: :agent` with an EMPTY lineage, stated: this is a worker holding no credential,
   # and `:agent` keeps the human-only edges out of reach whatever the default becomes.
+  # ONE STRANDED ROW MAY NOT KILL THE PASS either: `stranded/1` ranks oldest-first, so a row
+  # whose escalation raises would head every later pass and no detected story would ever be
+  # triaged again. The same rescue `attempt/3` gives a candidate.
+  #
+  # Every outcome is TAGGED `{:stranded, outcome}`: `TriageDispatchWorker.run_result/1` judges
+  # the pass by its CANDIDATES, and a stranded row that keeps failing — raising or refused —
+  # reappears every pass, so counted among them it either hid a pass whose every candidate
+  # errored or failed passes that only re-ran the same escalation.
+  defp finish_stranded(row) do
+    {:stranded, escalate_too_large(row)}
+  rescue
+    error -> {:stranded, errored(row, Exception.format(:error, error, __STACKTRACE__))}
+  catch
+    kind, value -> {:stranded, errored(row, Exception.format(kind, value, __STACKTRACE__))}
+  end
+
   defp escalate_too_large(%{tenant_id: tenant_id, story_id: story_id}) do
     case fetch_story(tenant_id, story_id) do
       {:ok, story} -> escalate_route(tenant_id, story)

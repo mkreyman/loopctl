@@ -30,8 +30,20 @@ defmodule Loopctl.Runners.DispatchRecord do
   `delivery` is the reservation's ONE decision, taken under the row lock by whichever of the
   two processes a broadcast wakes gets there first: `"pushed"` (the dispatch went to a
   socket) or `"dropped"` (a channel refused to push it and gave the slot back). It is reset
-  with every reservation, and `wall_clock_seconds` is refreshed when a push wins, so the
-  bound `Loopctl.Runners.Capacity` applies is always the clock the session is running under.
+  with every reservation, and `wall_clock_seconds` is refreshed when a push wins.
+  `wall_clock_seconds_max` is the LONGEST clock any winning push carried and only grows, and it
+  is the bound: `Loopctl.Runners.Capacity` presumes an accepted session running until
+  `replied_at` plus it (falling back to `wall_clock_seconds` on a row that has none), and the
+  acceptance re-anchors a placed claim's lease cap on the same value (#879) — because a resume
+  may push a shorter clock while a session an earlier push started is still running.
+
+  ## Session end (since contract 1.16.0)
+
+  `session_ended_reason` is the runner's own account of why the session under this dispatch
+  stopped, recorded once. `session_ended_digest` decides whether a later copy is the SAME
+  report (answered `ok`) or a different one (refused `already_recorded`), and
+  `counts_toward_retry_ceiling` says, for the two reasons that re-queue the story, whether
+  that release is spent against the retry ceiling — `crashed` is, `usage_exhausted` is not.
 
   ## Trust boundary
 
@@ -70,10 +82,18 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :run_id, :binary_id
     field :trace_acked_seq, :integer, default: -1
     field :wall_clock_seconds, :integer
+    field :wall_clock_seconds_max, :integer
     field :released_at, :utc_datetime_usec
     field :reserved_at, :utc_datetime_usec
     field :slot_generation, :integer, default: 0
     field :delivery, :string
+    # Why the session ended, as the runner reported it (`session_ended`, contract 1.16.0,
+    # US-44.3). Written once, with the digest a resend is compared against, by
+    # `Loopctl.Runners.DispatchLedger.record_session_end/4`; all four NULL until then.
+    field :session_ended_reason, :string
+    field :session_ended_digest, :string
+    field :session_ended_at, :utc_datetime_usec
+    field :counts_toward_retry_ceiling, :boolean
 
     timestamps()
   end

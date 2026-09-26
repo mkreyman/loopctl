@@ -19,6 +19,7 @@ import path from "node:path";
 import {
   forceUnclaimPath,
   forceUnclaimStory,
+  mergePrecondition,
   placeDispatch,
   placementPath,
   resolveEscalation,
@@ -141,6 +142,19 @@ describe("place_dispatch", () => {
 
     assert.ok(declared, "place_dispatch declares no `kind` enum");
     assert.equal(declared[1], '["implement"]');
+  });
+
+  // #879 (US-44.5 review round 3): a retry moves the claim's deadline, and a retry of a
+  // dispatch whose claim has ended is refused — the description is where a session learns both.
+  test("the description names the retry's deadline move and 409 dispatch_claim_ended", () => {
+    const start = INDEX_SRC.indexOf('name: "place_dispatch"');
+    const declaration = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+
+    assert.match(declaration, /A RETRY also moves the claim's deadline/);
+    assert.match(declaration, /409 `dispatch_claim_ended`/);
+
+    const row = README.split("\n").find((line) => line.startsWith("| `place_dispatch` |"));
+    assert.match(row, /409 `dispatch_claim_ended`/);
   });
 
   test("refuses without a user key, and without either id — before any call", async () => {
@@ -282,6 +296,56 @@ describe("force_unclaim_story", () => {
 
     assert.equal(result.error, true);
     assert.match(result.body, /story_id/);
+    assert.equal(calls.length, 0);
+  });
+});
+
+describe("merge_precondition (US-44.1)", () => {
+  test("POSTs the epoch and nothing Gate A could read", async () => {
+    const { calls, apiCall } = fakeApi({ data: { decision: "allow" } });
+
+    await mergePrecondition({ story_id: STORY_ID, claim_epoch: 3 }, { orchKey: "orch-key", apiCall });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "POST");
+    assert.equal(calls[0].path, `/api/v1/stories/${STORY_ID}/merge-precondition`);
+    assert.deepEqual(calls[0].body, { claim_epoch: 3 });
+  });
+
+  test("passes an effect proof through when given one", async () => {
+    const { calls, apiCall } = fakeApi();
+    const proof = { intent: "no_output_change" };
+
+    await mergePrecondition(
+      { story_id: STORY_ID, claim_epoch: 0, effect_proof: proof },
+      { orchKey: "orch-key", apiCall },
+    );
+
+    assert.deepEqual(calls[0].body, { claim_epoch: 0, effect_proof: proof });
+  });
+
+  test("refuses a missing or negative claim_epoch before any call", async () => {
+    for (const claim_epoch of [undefined, -1, 1.5, "0"]) {
+      const { calls, apiCall } = fakeApi();
+      const result = await mergePrecondition(
+        { story_id: STORY_ID, claim_epoch },
+        { orchKey: "orch-key", apiCall },
+      );
+
+      assert.equal(result.error, true, `accepted claim_epoch ${claim_epoch}`);
+      assert.equal(calls.length, 0);
+    }
+  });
+
+  test("refuses without an orchestrator key, before any call", async () => {
+    const { calls, apiCall } = fakeApi();
+    const result = await mergePrecondition(
+      { story_id: STORY_ID, claim_epoch: 0 },
+      { orchKey: undefined, apiCall },
+    );
+
+    assert.equal(result.error, true);
+    assert.match(result.body, /LOOPCTL_ORCH_KEY/);
     assert.equal(calls.length, 0);
   });
 });
@@ -429,6 +493,7 @@ describe("the wiring in index.js", () => {
       story_stage: "storyStage",
       resolve_escalation: "resolveEscalation",
       force_unclaim_story: "forceUnclaimStory",
+      merge_precondition: "mergePreconditionTool",
     };
 
     for (const [name, handler] of Object.entries(wiring)) {
@@ -530,6 +595,24 @@ describe("the wiring in index.js", () => {
       // The steer is the point of the row, not the refusal list: a caller that never sends
       // `branch` cannot earn three of those five.
       assert.match(place, /should not send|OMIT|omit/);
+    });
+
+    // US-44.6, contract 1.17.0. An exhausted subscription holds a CONNECTED machine with free
+    // slots out of every placement, and the pool is the only place an operator can read why —
+    // so the field and the refusal must reach both declarations a session reads.
+    test("runner_pool and place_dispatch carry the exhausted-subscription facts", () => {
+      const declaration = (tool) => {
+        const start = INDEX_SRC.indexOf(`name: "${tool}"`);
+        return INDEX_SRC.slice(start, INDEX_SRC.indexOf('name: "', start + 1));
+      };
+
+      assert.match(row("runner_pool"), /usage_exhausted_until/);
+      assert.match(row("runner_pool"), /1\.17\.0/);
+      assert.match(declaration("runner_pool"), /usage_exhausted_until/);
+
+      assert.match(row("place_dispatch"), /runner_exhausted/);
+      assert.match(declaration("place_dispatch"), /runner_exhausted/);
+      assert.match(declaration("place_dispatch"), /usage_exhausted_until/);
     });
   });
 

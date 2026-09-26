@@ -45,8 +45,10 @@ defmodule LoopctlWeb.DispatchPlacementController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
+  alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Delivery.Placement
+  alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
   action_fallback LoopctlWeb.FallbackController
@@ -77,8 +79,9 @@ defmodule LoopctlWeb.DispatchPlacementController do
         "pushes the dispatch to the runner — the three steps `Loopctl.Delivery.Placement` " <>
         "performs as one. A TRIGGER and not a scheduler: the caller names the story and the " <>
         "runner, and nothing here selects work or runs on a cadence.\n\n" <>
-        "The story must be `contracted` and its stage row at `queued`; both are checked " <>
-        "BEFORE anything is minted, so a not-ready story costs no dispatch row, no ephemeral " <>
+        "The story must be `pending` or `contracted`, its dependencies met, and its stage " <>
+        "row at `queued`; a `pending` story is contracted by the placement. All of that is " <>
+        "checked BEFORE anything is minted, so a not-ready story costs no dispatch row, no ephemeral " <>
         "key and no audit-chain entry.\n\n" <>
         "REPEATING is safe under the same claim — a repeat with the same `dispatch_id` " <>
         "resumes and re-pushes. Once that claim has ended the recorded epoch is stale for " <>
@@ -115,8 +118,11 @@ defmodule LoopctlWeb.DispatchPlacementController do
            :max_turns
          ],
          description:
-           "The dispatch object, as `RunnerDispatch` declares it, minus `claim_epoch` (which " <>
-             "loopctl injects from the claim) and minus `story` (which is REFUSED and built " <>
+           "The dispatch object, as `RunnerDispatch` declares it, minus `claim_epoch` and " <>
+             "`deadline_at` (which loopctl injects from the claim — placed_at + " <>
+             "`wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS`, the claim's lease cap and " <>
+             "the instant the runner stops the session by; the runner's acceptance may move " <>
+             "the cap later, never earlier) and minus `story` (which is REFUSED and built " <>
              "server-side from loopctl's own rows — see " <>
              "`story_not_accepted` below). Nothing is defaulted: `kind` must be sent and " <>
              "must be one of `x-connection.dispatchable_kinds`.",
@@ -161,7 +167,15 @@ defmodule LoopctlWeb.DispatchPlacementController do
                  "but it is NOT story-unique: every dispatch in the tenant cutting from " <>
                  "`master` is the normal case."
            },
-           wall_clock_seconds: %Schema{type: :integer, minimum: 1},
+           wall_clock_seconds: %Schema{
+             type: :integer,
+             minimum: 1,
+             maximum: RunnerDispatch.max_wall_clock_seconds(),
+             description:
+               "Also sets the claim's lease cap and the dispatch's `deadline_at`. Outside " <>
+                 "1..#{RunnerDispatch.max_wall_clock_seconds()} is 422 `invalid_payload` " <>
+                 "before anything is claimed."
+           },
            max_turns: %Schema{type: :integer, minimum: 1}
          }
        }},
@@ -192,11 +206,20 @@ defmodule LoopctlWeb.DispatchPlacementController do
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Not placeable; includes `no_conforming_branch` — the runner declares branch " <>
+        {"Not placeable; includes `runner_exhausted` — the runner's subscription (its own, or " <>
+           "that of a runner sharing its `account_ref`) is declared exhausted, so nothing was " <>
+           "claimed and the body carries `usage_exhausted_until`, when it clears on its own; " <>
+           "and `no_conforming_branch` — the runner declares branch " <>
            "prefixes (contract 1.14.0) and none of them can produce a valid branch name " <>
            "carrying the story number and id fragment, so nothing was claimed and an " <>
            "operator has to fix `branch_prefixes` on that machine. The body echoes the " <>
-           "declared prefixes", "application/json", Schemas.ErrorResponse},
+           "declared prefixes; or `dispatch_claim_ended` — a RETRY of a recorded " <>
+           "dispatch_id whose claim has ended (its lease ran out, or the story left " <>
+           "assigned/implementing): nothing was pushed or written and the claim is not " <>
+           "revived, so place the story again with a new dispatch_id once it is placeable; " <>
+           "or `dependencies_not_met` — a story it depends on (or one in an epic its epic " <>
+           "depends on) is not verified, and nothing was minted, claimed or pushed",
+         "application/json", Schemas.ErrorResponse},
       422 =>
         {"Validation error; `branch_not_allowed` — the `branch` you named does not start " <>
            "with any prefix the runner declared, so the machine would refuse the dispatch; " <>
@@ -402,6 +425,21 @@ defmodule LoopctlWeb.DispatchPlacementController do
     })
   end
 
+  # THE MACHINE'S SUBSCRIPTION IS EXHAUSTED (US-44.6, contract 1.17.0). 409 beside
+  # `runner_declines_work` and for the same reason — nothing was claimed, and the remedy is
+  # another machine — but unlike a drain it DOES clear on its own, at a known instant, so the
+  # refusal says when. Read fresh here rather than threaded out of `place/4`: the value can
+  # only move later (a new exhaustion) or clear, and either is the better answer to give.
+  defp refuse(conn, :runner_exhausted) do
+    error(conn, 409, "runner_exhausted", %{
+      message:
+        "This runner's subscription is exhausted — its own, or that of a machine on the same " <>
+          "account — so every session placed on it would end usage_exhausted. Nothing was " <>
+          "claimed. Place on another runner, or wait for usage_exhausted_until.",
+      usage_exhausted_until: exhausted_until(conn)
+    })
+  end
+
   # THE MACHINE'S OWN DECLARATION LEAVES NO ROOM FOR A UNIQUE BRANCH (contract 1.14.0). 409
   # and beside `runner_declines_work` for the same reason: a state the machine chose, which
   # does not clear on its own and which an operator fixes on that box. The prefixes are echoed
@@ -521,6 +559,26 @@ defmodule LoopctlWeb.DispatchPlacementController do
       message:
         "This dispatch_id is already recorded against a different story or runner. A " <>
           "dispatch_id names one placement; use a new one."
+    })
+  end
+
+  # #887 review round 1. Refused BEFORE the mint by the placement's own pre-check (#884); the
+  # fallback has no clause for the atom and answered 500.
+  defp refuse(conn, :dependencies_not_met) do
+    error(conn, 409, "dependencies_not_met", %{
+      message:
+        "A story this one depends on, or a story in an epic its epic depends on, is not " <>
+          "verified yet. Nothing was minted, claimed or pushed; place it once they are."
+    })
+  end
+
+  defp refuse(conn, :dispatch_claim_ended) do
+    error(conn, 409, "dispatch_claim_ended", %{
+      message:
+        "This dispatch_id is already recorded, and the claim it was placed under has ended: " <>
+          "its lease ran out, or the story is no longer assigned or implementing. Nothing " <>
+          "was pushed and nothing was written — a resume never revives an ended claim. " <>
+          "Place the story again with a NEW dispatch_id once it is placeable."
     })
   end
 
@@ -667,6 +725,18 @@ defmodule LoopctlWeb.DispatchPlacementController do
   defp echoed_ref(value) when is_list(value), do: %{value_type: "array"}
   defp echoed_ref(value) when is_map(value), do: %{value_type: "object"}
   defp echoed_ref(_value), do: %{value_type: "unsupported"}
+
+  # The same effective value placement refused on, for the runner the PATH names in the tenant
+  # the KEY belongs to. `nil` for a conn carrying neither, which is only ever a direct
+  # `render_refusal/2` — never a request, since both are set before `place/4` runs.
+  defp exhausted_until(%{
+         assigns: %{current_api_key: %{tenant_id: tenant_id}},
+         path_params: %{"runner_id" => runner_id}
+       })
+       when is_binary(tenant_id) and is_binary(runner_id),
+       do: Usage.exhausted_until(tenant_id, runner_id)
+
+  defp exhausted_until(_conn), do: nil
 
   defp error(conn, status, code, extra) do
     conn

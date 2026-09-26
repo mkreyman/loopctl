@@ -109,6 +109,26 @@ describe("claimLeaseNotice", () => {
     assert.match(notice, /renew_story_claim/);
   });
 
+  test("names the dispatch-deadline cap when the claim carries one (#879)", () => {
+    const notice = claimLeaseNotice({
+      story: {
+        id: STORY_ID,
+        claim_epoch: 2,
+        claimed_until: "2026-09-23T11:15:00Z",
+        claim_lease_cap: "2026-09-23T11:15:00Z",
+      },
+    });
+    assert.match(notice, /CAPPED at its dispatch deadline 2026-09-23T11:15:00Z/);
+    assert.match(notice, /never moves claimed_until past it/);
+  });
+
+  test("says nothing about a cap on an uncapped claim", () => {
+    const notice = claimLeaseNotice({
+      story: { claim_epoch: 1, claimed_until: "2026-09-13T10:00:00Z", claim_lease_cap: null },
+    });
+    assert.doesNotMatch(notice, /CAPPED/);
+  });
+
   test("says there is no lease when claimed_until is null", () => {
     assert.match(claimLeaseNotice({ story: { claim_epoch: 0, claimed_until: null } }), /no lease/);
   });
@@ -139,12 +159,50 @@ describe("index.js wiring", () => {
     assert.ok(README.includes("`renew_story_claim`"));
   });
 
+  test("renew_story_claim's description and README row say a driver-placed claim is capped at its dispatch deadline (#879)", () => {
+    const start = INDEX_SRC.indexOf('name: "renew_story_claim",');
+    const decl = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+    assert.match(decl, /DRIVER-PLACED claim/);
+    assert.match(decl, /CAPPED AT ITS DISPATCH DEADLINE/);
+    assert.match(decl, /never moves claimed_until past that instant/);
+    // What the cap IS, truthfully: the claim-time value, moved forward only on a live claim.
+    assert.match(decl, /placed_at \+ wall_clock_seconds \+ DISPATCH_LEASE_GRACE_SECONDS at the claim/);
+    assert.match(decl, /only while the claim is live; never " \+\s*"earlier than a deadline_at already sent/);
+    assert.match(decl, /renewing it writes nothing and returns the claim as it stands/);
+
+    const row = README.split("\n").find((line) => line.startsWith("| `renew_story_claim` |"));
+    assert.ok(row, "README must carry a renew_story_claim row");
+    assert.match(row, /driver-placed claim/);
+    assert.match(row, /capped at its dispatch deadline/);
+    assert.match(row, /only while the claim is live; never earlier than a `deadline_at` already sent/);
+    assert.match(row, /renewing it writes nothing and returns the claim as it stands/);
+  });
+
+  test("renew_story_claim's description and README row name the lease_cap_reached refusal (#879)", () => {
+    const start = INDEX_SRC.indexOf('name: "renew_story_claim",');
+    const decl = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema:", start));
+    assert.match(decl, /409 lease_cap_reached/);
+
+    const row = README.split("\n").find((line) => line.startsWith("| `renew_story_claim` |"));
+    assert.match(row, /409 `lease_cap_reached`/);
+  });
+
   test("the handler injects the real apiCall and surfaces the lease", () => {
     assert.match(
       functionSource("renewStoryClaim"),
       /withClaimLeaseNotice\(await renewStoryClaimRequest\(args, \{ apiCall \}\)\)/,
     );
   });
+
+  for (const tool of ["claim_story", "contract_story"]) {
+    test(`${tool}'s description names the story_held refusal and its remedy`, () => {
+      const decl = INDEX_SRC.slice(INDEX_SRC.indexOf(`name: "${tool}"`));
+      const description = decl.slice(0, decl.indexOf("inputSchema"));
+      assert.match(description, /409 story_held/);
+      assert.match(description, /resolve_escalation/);
+      assert.match(README, new RegExp(`\\| \`${tool}\` \\|[^\\n]*409 \`story_held\``));
+    });
+  }
 
   test("claim_story surfaces the lease notice ahead of the JSON", () => {
     assert.match(functionSource("claimStory"), /return withClaimLeaseNotice\(result\);/);

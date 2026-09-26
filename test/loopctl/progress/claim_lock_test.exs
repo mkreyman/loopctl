@@ -125,6 +125,95 @@ defmodule Loopctl.Progress.ClaimLockTest do
     assert elapsed_ms >= 150
   end
 
+  # US-44.5 review round 2, finding 5: a renewal that WAITED on the story lock must judge a
+  # capped claim's cap from after the wait. Read before it, `now` was still ahead of a cap that
+  # passed while the renewal queued, and the renewal answered 200 for a claim already ended.
+  #
+  # ORDERED BY EVENTS, NOT BY A WALL-CLOCK MARGIN (round 3, finding 10). The holder takes the
+  # lock, waits until Postgres shows the renewal's backend BLOCKED on it, and only then writes
+  # the cap as its own now — an instant after the renewal began and before it can take the
+  # lock — and commits once the clock is past that cap. A renewal that read `now` before the
+  # lock therefore sees the cap ahead; one that reads it after sees it passed. Nothing depends
+  # on how long any step takes.
+  test "a renewal that waited on the story lock past the cap is refused lease_cap_reached" do
+    %{tenant: tenant, story: story, agent_a: agent_a} = contracted_story_with_two_agents()
+    far = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+    {:ok, claimed} =
+      Progress.claim_story(tenant.id, story.id, agent_id: agent_a.id, lease_until: far)
+
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+
+        AdminRepo.transaction(fn ->
+          lock_row(tenant.id, story.id)
+          send(parent, :locked)
+
+          receive do
+            {:renewer_backend, backend} -> wait_until_blocked(backend)
+          end
+
+          cap = DateTime.utc_now()
+
+          {1, _} =
+            from(s in Story, where: s.id == ^story.id)
+            |> AdminRepo.update_all(set: [claimed_until: cap, claim_lease_cap: cap])
+
+          wait_past(cap)
+          cap
+        end)
+      end)
+
+    assert_receive :locked, 2_000
+
+    renewer =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        %{rows: [[backend]]} = AdminRepo.query!("SELECT pg_backend_pid()")
+        send(holder.pid, {:renewer_backend, backend})
+
+        Progress.renew_claim(tenant.id, story.id,
+          agent_id: agent_a.id,
+          claim_epoch: claimed.claim_epoch
+        )
+      end)
+
+    assert {:ok, cap} = Task.await(holder, 10_000)
+    assert {:error, :lease_cap_reached} = Task.await(renewer, 10_000)
+    assert AdminRepo.get!(Story, story.id).claimed_until == cap
+  end
+
+  # Polls `pg_locks` until `backend` holds a lock it has NOT been granted — it is queued behind
+  # the caller's. Bounded, so a renewal that never blocks fails the test instead of hanging it.
+  defp wait_until_blocked(backend, attempts \\ 1_000) do
+    %{rows: [[waiting]]} =
+      AdminRepo.query!("SELECT count(*) FROM pg_locks WHERE pid = $1 AND NOT granted", [backend])
+
+    cond do
+      waiting > 0 ->
+        :ok
+
+      attempts == 0 ->
+        raise "backend #{backend} never blocked on the story lock"
+
+      true ->
+        Process.sleep(5)
+        wait_until_blocked(backend, attempts - 1)
+    end
+  end
+
+  defp wait_past(%DateTime{} = at) do
+    if DateTime.after?(DateTime.utc_now(), at) do
+      :ok
+    else
+      Process.sleep(1)
+      wait_past(at)
+    end
+  end
+
   test "concurrent claim: exactly one agent wins, the loser is rejected :invalid_transition" do
     %{tenant: tenant, story: story, agent_a: agent_a, agent_b: agent_b} =
       contracted_story_with_two_agents()
@@ -202,6 +291,9 @@ defmodule Loopctl.Progress.ClaimLockTest do
     reclaimer =
       Task.async(fn ->
         :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        # The reclaim first reads the dispatch ledger, on the RLS repo, for a budget kill it
+        # must re-drive rather than re-queue (US-44.3).
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
       end)
 
@@ -228,6 +320,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
     reclaim = fn ->
       Task.async(fn ->
         :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
       end)
     end

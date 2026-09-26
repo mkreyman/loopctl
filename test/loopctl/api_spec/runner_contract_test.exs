@@ -9,12 +9,14 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatchReply
+  alias Loopctl.ApiSpec.RunnerContract.RunnerSessionEnded
   alias Loopctl.ApiSpec.RunnerContract.RunnerStage
   alias Loopctl.ApiSpec.RunnerContract.RunnerStory
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.DeliveryGates.GateA
+  alias Loopctl.Runners.Usage
   alias OpenApiSpex.Schema
 
   @join %{
@@ -37,7 +39,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "d9674007beaec7b658efd19bbd338a8ed5189995d8f51db569f94d1f9884881d"
+  @digest "e329766f232d25234ecc2ff6d4b1ff4c3d83aa51b794a8cf3e875d8198af241a"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -71,20 +73,22 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.14.0"
-      assert schema["x-contract-version"] == "1.14.0"
+      assert RunnerContract.version() == "1.19.0"
+      assert schema["x-contract-version"] == "1.19.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
                "trace" => "RunnerTraceBatch",
                "trace_cursor" => "RunnerTraceCursor",
-               "stage" => "RunnerStageReport"
+               "stage" => "RunnerStageReport",
+               "session_ended" => "RunnerSessionEnded"
              } = connection["events"]
 
       assert connection["replies"] == %{
                "trace" => "RunnerTraceAck",
                "trace_cursor" => "RunnerTraceAck",
-               "triage_verdict" => "RunnerTriageVerdictAck"
+               "triage_verdict" => "RunnerTriageVerdictAck",
+               "session_ended" => "RunnerSessionEndedAck"
              }
 
       # #803: the kind lists are published so a runner reads them rather than parsing prose.
@@ -131,6 +135,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["limits"]["frame_envelope_bytes"] == RunnerContract.frame_envelope_bytes()
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
       assert connection["limits"]["stage_burst"] == RunnerContract.stage_burst()
+      assert connection["limits"]["session_ended_burst"] == RunnerContract.session_ended_burst()
 
       # #803: the stage transition table is published so a runner can refuse an impossible
       # transition locally. It is DERIVED from the server's machine — asserted here against
@@ -1727,6 +1732,73 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     end
   end
 
+  describe "cast_session_ended/1 (contract 1.16.0)" do
+    defp session_ended(attrs) do
+      Map.merge(
+        %{"dispatch_id" => Ecto.UUID.generate(), "claim_epoch" => 3, "reason" => "crashed"},
+        attrs
+      )
+    end
+
+    test "accepts every published reason, keeping only the declared fields" do
+      for reason <- RunnerSessionEnded.reasons() do
+        payload = session_ended(%{"reason" => reason, "undeclared" => "dropped"})
+
+        assert {:ok, message} = RunnerContract.cast_session_ended(payload)
+
+        assert message == %{
+                 dispatch_id: payload["dispatch_id"],
+                 claim_epoch: 3,
+                 reason: reason
+               }
+      end
+
+      # The five the story names, and no others — the enum is what `RunnerStages` routes on.
+      assert Enum.sort(RunnerSessionEnded.reasons()) ==
+               Enum.sort(~w(completed wall_clock_exceeded max_turns_exceeded usage_exhausted
+                            crashed))
+    end
+
+    test "any other reason is invalid_payload (AC-44.3.1)" do
+      assert {:error, {:invalid, [_ | _]}} =
+               RunnerContract.cast_session_ended(session_ended(%{"reason" => "bored"}))
+    end
+
+    test "every field is required" do
+      for key <- ~w(dispatch_id claim_epoch reason) do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_session_ended(Map.delete(session_ended(%{}), key)),
+               key
+      end
+    end
+
+    test "the dispatch id is compared in one case, and a NUL is refused" do
+      upper = String.upcase(Ecto.UUID.generate())
+
+      assert {:ok, %{dispatch_id: id}} =
+               RunnerContract.cast_session_ended(session_ended(%{"dispatch_id" => upper}))
+
+      assert id == String.downcase(upper)
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_session_ended(session_ended(%{"reason" => "crash\u0000ed"}))
+    end
+
+    test "is published as an event with a declared reply, refusals and a bucket" do
+      connection = RunnerContract.json_schema()["x-connection"]
+
+      assert "session_ended" in RunnerContract.inbound_events()
+      assert "already_recorded" in connection["errors"]["session_ended"]
+      assert RunnerContract.permanent_error?("session_ended", "already_recorded")
+      refute RunnerContract.permanent_error?("session_ended", "rate_limited")
+
+      # A runner may NOT report the edge a budget kill takes: it reports the kill, and control
+      # takes the edge. Published nowhere a runner could send it from.
+      refute Enum.any?(connection["stage_transitions"], &(&1["edge"] == "budget_reported"))
+      assert {:implementing, :escalated, :budget_reported} in StageMachine.transitions()
+    end
+  end
+
   describe "the triage verdict message (1.9.0)" do
     defp verdict_msg(attrs) do
       Map.merge(
@@ -1957,6 +2029,63 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "refuses a status carrying no declared field" do
       assert {:error, {:invalid, _}} = RunnerContract.cast_status(%{})
       assert {:error, {:invalid, _}} = RunnerContract.cast_status(%{"machine" => "mac-mini"})
+    end
+  end
+
+  describe "cast_status/1 — usage (contract 1.17.0, AC-44.6.1)" do
+    test "a usage object alone is a status, cast with atom keys and a DateTime reset" do
+      assert {:ok, %{usage: usage}} =
+               RunnerContract.cast_status(%{
+                 "usage" => %{
+                   "exhausted" => true,
+                   "resets_at" => "2026-09-24T09:00:00Z",
+                   "account_ref" => "acct-7f3a"
+                 }
+               })
+
+      assert usage == %{
+               exhausted: true,
+               resets_at: ~U[2026-09-24 09:00:00Z],
+               account_ref: "acct-7f3a"
+             }
+
+      # Only `exhausted` is required: a runner that knows neither when nor which account says
+      # just that, and control holds it for the upper bound.
+      assert {:ok, %{usage: %{exhausted: false}}} =
+               RunnerContract.cast_status(%{"usage" => %{"exhausted" => false}})
+    end
+
+    test "a malformed usage object is refused" do
+      for usage <- [
+            %{"exhausted" => "yes"},
+            %{},
+            %{"exhausted" => true, "resets_at" => "tomorrow"},
+            %{"exhausted" => true, "account_ref" => ""},
+            %{"exhausted" => true, "account_ref" => "has space"},
+            %{"exhausted" => true, "account_ref" => "nul\u0000byte"},
+            %{"exhausted" => true, "account_ref" => String.duplicate("a", 129)},
+            "exhausted"
+          ] do
+        assert {:error, {:invalid, _}} = RunnerContract.cast_status(%{"usage" => usage}),
+               "accepted #{inspect(usage)}"
+      end
+
+      # At the bound is fine; one past it is the case above.
+      assert {:ok, _} =
+               RunnerContract.cast_status(%{
+                 "usage" => %{"exhausted" => true, "account_ref" => String.duplicate("a", 128)}
+               })
+    end
+
+    test "the clamp is published, read from the module that applies it" do
+      limits = RunnerContract.json_schema()["x-connection"]["limits"]
+
+      assert limits["usage_hold_seconds"] == %{
+               "min" => Usage.min_hold_seconds(),
+               "max" => Usage.max_hold_seconds()
+             }
+
+      assert limits["usage_hold_seconds"] == %{"min" => 60, "max" => 8 * 24 * 60 * 60}
     end
   end
 

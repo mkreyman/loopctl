@@ -4,6 +4,165 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Changed
+
+- **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**
+  A triage-accepted story, a release whose re-contract did not land, and an escalation resolved
+  back to `queued` all leave a story `pending` at `queued`, which the dispatch driver used to
+  skip until an orchestrator key contracted it. The driver now selects it, and the placement
+  contracts it before minting its dispatch, attributed to the placing key and the runner's agent,
+  with the contract check skipped as every release re-contract
+  already skips it. `place_dispatch` on such a story is no longer refused `invalid_transition`.
+  A story whose dependencies are unmet (its own, or its epic's) is no longer selected, and
+  `place_dispatch` refuses it `409 dependencies_not_met` before anything is minted. No new
+  setting, no migration.
+
+- **An exhausted subscription is not capacity (epic 44, US-44.6, runner contract 1.17.0).
+  RE-VENDOR the contract to send `usage`; a runner that does not is never held out, except by
+  its own `usage_exhausted` session ends.** A `status` message may carry `usage: {exhausted,
+  resets_at, account_ref}`, stored in new `runners` columns, `usage_exhausted_until`,
+  `account_ref`, `usage_cleared_at` and `usage_hold_provisional` (migration, no manual step;
+  existing rows get NULL and `false`, which reads as not exhausted). While a runner's own value — or that of any runner of the tenant sending the same
+  `account_ref` — is in the future, the dispatch driver and the triage dispatcher skip it and
+  `POST /api/v1/runners/:runner_id/dispatches` refuses it `409 runner_exhausted` with
+  `usage_exhausted_until`, nothing claimed. `resets_at` is clamped to between one minute and
+  eight days from control's clock (published as `x-connection.limits.usage_hold_seconds`) and
+  applies to every runner on the `account_ref`: a `resets_at` still ahead replaces whatever they
+  hold, the latest report winning, while one already past (or none, which holds for eight days)
+  only marks runners that hold no live value. `exhausted: false` clears every runner on the `account_ref`. A
+  `session_ended` `usage_exhausted` now marks the runner for eight days BEFORE it releases the
+  story, so the re-queued story is no longer placed straight back on the machine that cannot
+  run it — unless the account was reported refilled after that session's dispatch was
+  accepted. **Operator-visible:** `GET /api/v1/runners/pool` (MCP
+  `runner_pool`) shows `usage_exhausted_until` per runner, and a driver or triage pass that
+  finds no runner for a story logs, once per tenant, how many of the tenant's runners are
+  exhausted and `earliest_usage_reset=`.
+
+- **A claim placed for a runner dispatch now expires at the dispatch's deadline, not after 24
+  hours (epic 44, US-44.5, #879; runner contract 1.19.0).** `Loopctl.Delivery.Placement` — the
+  dispatch driver and `place_dispatch` — claims with a lease CAPPED at `placed_at +
+  wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS`, stored in the new
+  `stories.claim_lease_cap` column. Two migrations, no manual step: `20260923150500` adds the
+  column (NULL on every existing row) and a `stories_claim_lease_within_cap` CHECK, added `NOT
+  VALID` then validated; `20260923150600` adds the nullable
+  `runner_dispatches.wall_clock_seconds_max`. The dispatch carries that cap as optional
+  `deadline_at`, a STOP bound: the runner ends the session by the earlier of its own start +
+  `wall_clock_seconds` and `deadline_at`, so start-up time comes out of the grace. The cap only
+  ever moves FORWARD and only while the claim is live — to a resume's time, or the runner's
+  `replied_at` + the longest wall clock any push of the dispatch carried, + the grace — and each
+  move is recorded in the audit log as `claim_lease_reanchored`. A RESUME of a dispatch whose
+  claim has ended is now refused 409 `dispatch_claim_ended` instead of being pushed. The lease
+  sweep never releases a capped claim before its cap; an operator's force-unclaim still can. A
+  capped claim's lease already IS its cap, so `renew_story_claim` on one writes nothing and
+  answers the claim as it stands, the renewal grace granted when a custody halt clears passes
+  it by, and a renewal once the cap has passed is 409 `lease_cap_reached`. A killed session
+  releases its story within minutes of its wall clock. Every other claim keeps the global
+  `STORY_CLAIM_LEASE_SECONDS` lease, unchanged. **New env var `DISPATCH_LEASE_GRACE_SECONDS`**
+  (default 900): **the app refuses to boot when it is below 300**
+  (`Capacity.release_grace_seconds/0`), naming both values, or when it is set to anything but
+  an integer (`15m`, `1800s`, `120.0`). A placement — or a resume — whose `wall_clock_seconds`
+  is not an integer from 1 to 86 400 is now refused `invalid_payload` BEFORE anything is
+  claimed or pushed, rather than after the claim.
+
+  **Deploy note — RE-VENDOR the runner contract to 1.19.0.** The claim is capped whether or not
+  the runner reads `deadline_at`, and a runner on an earlier contract ignores it: its session is NOT stopped at
+  the deadline, so one whose start-up takes longer than the grace can still be running when the
+  sweep releases the story and it is placed again. Re-vendoring 1.19.0 on every runner is the
+  remedy; until then, keep `DISPATCH_LEASE_GRACE_SECONDS` above the longest start-up you see.
+
+- **The lease reclaim cannot be starved by leases that keep failing (epic 44, US-44.4).** New
+  nullable `stories.lease_reclaim_failed_at` column (migration, no manual step, NULL for
+  existing rows). The reclaim worker stamps a lease whose reclaim failed or raised, and ranks
+  candidates per tenant with stamped leases last, so neither one tenant's failures nor one
+  story's bad data holds back every other expired lease. Any release clears the stamp.
+
+- **No claim release leaves a delivery story unreachable (epic 44, US-44.4, #877; runner
+  contract 1.18.0, `loopctl-mcp-server` 2.103.1).** Every release used to put a delivery
+  story's stage row back to `queued` with `agent_status: pending`, which the dispatch driver
+  never selects — the story sat there with no alert. Now the release decides, in the same
+  transaction: a placement refused because the runner was unavailable (not connected, at
+  capacity, a lock not granted, its credential revoked mid-push, its subscription exhausted) or because the claim ended
+  under it, and a `usage_exhausted` session, re-contract the story at no cost; a COUNTED release (a lost lease, a `crashed` session, a verifier reject or bulk reject
+  of an in-flight story, the claimant's own unclaim, a placement refused for any other reason,
+  such as a payload the contract rejects or a dispatch the runner's ledger already holds) re-contracts it below the new
+  retry ceiling and escalates it at the ceiling over a new control-only edge,
+  `{queued, escalated, attempts_exhausted}`, with the count in `escalation_reason`; an
+  operator's force-unclaim escalates it over `{queued, escalated, operator_released}`. **New
+  env var `DISPATCH_MAX_ATTEMPTS`, NO DEFAULT: unset, the first crash or reject escalates the
+  story for a human** — set it (see `deploy/FLY_SECRETS.md`) to allow retries. The count is
+  `attempts.runner_lost + attempts.claim_released` on the stage row, never reset, so rows that
+  predate this deploy carry their earlier releases into it (force-unclaims and placement
+  refusals included; force-unclaims and runner-unavailable refusals are no longer counted from
+  now on). An escalation's chain entry that is refused rolls the release back — for
+  `POST /stories/bulk/reject` that is the WHOLE batch, answered `500
+  audit_chain_append_failed`; `unclaim`, `reject` and `force-unclaim` answer the same `500
+  audit_chain_append_failed` for their one story (force-unclaim answered
+  `force_unclaim_failed` for it before). `unclaim`'s `422` means the release's story-row write
+  or its audit entry was rejected. **Operator-visible:**
+  `POST /stories/:id/force-unclaim` on a delivery story now escalates it — re-queue it with
+  `POST /stories/:id/stage/resolve` (`resolve_escalation`, `to: queued`), which re-contracts;
+  `unclaim` and `reject` can now return a `contracted` story. A story with no stage row is
+  released exactly as before.
+
+- **Runners may report why an implement session ended (epic 44, US-44.3, runner contract
+  1.16.0). RE-VENDOR the contract to send it; a runner that does not gets today's lease
+  reclaim.** The new optional `session_ended` channel message carries `{dispatch_id,
+  claim_epoch, reason}`, `reason` one of `completed`, `wall_clock_exceeded`,
+  `max_turns_exceeded`, `usage_exhausted`, `crashed`. A budget kill (the first two after
+  `completed`) moves an in-flight story to `escalated` over a new CONTROL-ONLY edge,
+  `budget_reported` — never retried, never `failed` — frees the runner's slot, and ends the
+  claim, leaving the escalated story held by nobody. `crashed` releases the claim at once over
+  `runner_lost`, and `usage_exhausted` releases it the same way without counting an attempt on
+  the stage row. Every one of those claim ends is audited as `claim_session_ended` (the lease
+  reclaim's entry shape, with `new_state.session_ended_reason`, attributed to the runner's API
+  key). `completed` changes no stage. Recorded once per dispatch in four new
+  `runner_dispatches` columns (`session_ended_reason`, `session_ended_digest`,
+  `session_ended_at`, `counts_toward_retry_ceiling` — migration, no manual step, NULL for
+  existing rows); an identical resend is answered `ok`, a different reason `already_recorded`.
+  `counts_toward_retry_ceiling` is `true` for `crashed` and `false` for `usage_exhausted`, for
+  the retry ceiling US-44.4 adds. **Operator-visible:** escalated stories whose last edge is
+  `budget_reported` were stopped by their dispatch budget, not by a session asking for help.
+  A budget kill whose escalation did not land (a lock, or a tenant audit chain refusing the
+  entry) leaves the claim held, and the LEASE RECLAIM re-drives it: it escalates instead of
+  re-queueing, and while the chain still refuses it leaves the claim held and logs at error, so
+  the story is escalated on the first sweep after the chain is repaired. **API:** contract,
+  claim and bulk claim refuse a story whose delivery stage is `escalated`, `done` or `failed`
+  with 409 `story_held`, and the ready list excludes it — such a story can read `pending` once
+  its claim has ended.
+
+- **Both delivery gates now screen a triaged story BEFORE it is queued (epic 44, US-44.2).**
+  An accepted `story` verdict is escalated over `triage_escalate` instead of queued when its
+  lens verdicts fail Gate A, when it carries none (a runner on contract 1.14.0), when a drafted
+  `touches` entry matches a `human_paths` or `effect_paths` trigger, or when the project's
+  repository has no single live intake source or no trigger entry. The draft is kept, so a
+  human who re-queues the story gets the drafted story. **Operator-visible:** until every
+  runner sends `lens_verdicts`, every triaged story stops at `escalated`; this is deliberate —
+  the merge gate would refuse each of them after a full implementation run.
+
+- **The merge gate reads Gate A's input from the database, never from the caller (epic 44,
+  US-44.1, runner contract 1.15.0). RE-VENDOR the contract to send `lens_verdicts`;
+  `loopctl-mcp-server` 2.103.0 adds the `merge_precondition` tool.** `POST
+  /api/v1/stories/:id/merge-precondition` used to judge Gate A on a `trio_outputs` array in the
+  request, so the principal driving a merge also supplied the triage it was judged against, and
+  a fabricated unanimous trio cleared Gate A. A triage verdict message may now carry
+  `lens_verdicts` — one small entry per lens (`analyst`, `architect`, `engineer`), capped
+  together at 9 000 bytes under the byte rule — which loopctl stores in the new
+  `triage_verdicts.lens_verdicts` column (migration, no manual step, NULL for existing rows).
+  Gate A reads the lens verdicts of the triage dispatch BOUND to the story — written to the
+  new `story_stages.triage_dispatch_id` column (migration, no backfill) on the `detected ->
+  triaged` transition that dispatch took, so any other dispatch's verdict is refused
+  `stale_stage` before it moves the story further — or accepts a human's
+  re-queue of an escalation that was about Gate A; with neither it REFUSES
+  (`gate_a_inputs_missing`), never retries. `trio_outputs` is no longer required, is ignored when
+  sent, and the answer carries `trio_outputs_ignored: true`; `gate_a_inputs` is now
+  `persisted_triage`, `human_resolution` or `missing` (it was always `caller_asserted`).
+  **Operator-visible:** a story whose triage ran on a runner still on contract 1.14.0 has no lens
+  verdicts, so its merge is refused until a human re-queues it or it is re-triaged. The same
+  holds for EVERY story already past triage when this deploys — none has a bound dispatch or
+  lens verdicts — so each one reaching the merge gate escalates with `gate_a_inputs_missing`
+  and needs a human re-queue. Nothing merges unattended today, so the count is whatever is in
+  flight.
+
 ### Added
 
 - **The GitHub intake sources of the delivery loop are reachable from an MCP session

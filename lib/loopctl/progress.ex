@@ -22,16 +22,19 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
+  alias Loopctl.Delivery.DispatchLease
+  alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
+  alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Tenants
   alias Loopctl.TokenUsage
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epic
-  alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
-  alias Loopctl.WorkBreakdown.StoryDependency
   alias Loopctl.Workers.ReviewKnowledgeWorker
   alias Loopctl.Workers.WebhookDeliveryWorker
 
@@ -55,6 +58,8 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in pending state
+  - `{:error, :story_held}` if its delivery stage row is at a held stage — `escalated`, `done`
+    or `failed` (`Loopctl.Delivery.Stages.held_story_ids/2`)
   - `{:error, :title_mismatch}` if echoed title doesn't match
   - `{:error, :ac_count_mismatch}` if echoed AC count doesn't match
   """
@@ -81,6 +86,7 @@ defmodule Loopctl.Progress do
           {:ok, story}
         end
       end)
+      |> Multi.run(:not_held, fn _repo, %{lock: story} -> not_held(tenant_id, story.id) end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
 
@@ -92,44 +98,110 @@ defmodule Loopctl.Progress do
         |> AdminRepo.update()
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "story",
-          entity_id: updated.id,
-          action: "status_changed",
-          actor_type: "api_key",
-          actor_id: actor_id,
-          actor_label: actor_label,
-          old_state: %{"agent_status" => to_string(old.agent_status)},
-          new_state: %{
-            "agent_status" => to_string(updated.agent_status),
-            "agent_id" => agent_id
-          }
-        }
+        contract_audit_attrs(tenant_id, updated, old, actor_id, actor_label, agent_id)
       end)
       |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          event_type: "story.status_changed",
-          project_id: updated.project_id,
-          payload: %{
-            "event" => "story.status_changed",
-            "story_id" => updated.id,
-            "project_id" => updated.project_id,
-            "epic_id" => updated.epic_id,
-            "old_status" => to_string(old.agent_status),
-            "new_status" => to_string(updated.agent_status),
-            "agent_id" => agent_id,
-            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-          }
-        }
+        contract_event_params(tenant_id, updated, old, agent_id)
       end)
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} -> {:ok, updated}
       {:error, :lock, reason, _} -> {:error, reason}
       {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :not_held, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
+    end
+  end
+
+  # The audit entry and webhook a `pending -> contracted` writes, built in ONE place for both
+  # writers of it: `contract_story/4` and `recontract_in_transaction/3`.
+  defp contract_audit_attrs(tenant_id, updated, old, actor_id, actor_label, agent_id) do
+    %{
+      tenant_id: tenant_id,
+      entity_type: "story",
+      entity_id: updated.id,
+      action: "status_changed",
+      actor_type: "api_key",
+      actor_id: actor_id,
+      actor_label: actor_label,
+      old_state: %{"agent_status" => to_string(old.agent_status)},
+      new_state: %{
+        "agent_status" => to_string(updated.agent_status),
+        "agent_id" => agent_id
+      }
+    }
+  end
+
+  defp contract_event_params(tenant_id, updated, old, agent_id) do
+    %{
+      tenant_id: tenant_id,
+      event_type: "story.status_changed",
+      project_id: updated.project_id,
+      payload: %{
+        "event" => "story.status_changed",
+        "story_id" => updated.id,
+        "project_id" => updated.project_id,
+        "epic_id" => updated.epic_id,
+        "old_status" => to_string(old.agent_status),
+        "new_status" => to_string(updated.agent_status),
+        "agent_id" => agent_id,
+        "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+      }
+    }
+  end
+
+  @doc """
+  Re-contracts a RELEASED story — `pending -> contracted` — as a write inside the caller's
+  `AdminRepo` transaction (US-44.4, #877). `Loopctl.Delivery.Stages.recontract_released/4` is
+  the caller: every claim release that leaves a delivery story's stage row at `queued`, as a
+  step of the release's own transaction, so the release and the re-contract commit together or
+  not at all.
+
+  NOT `contract_story/4`, which is a transaction of its own with its own lock, its own refusals
+  and its own error shapes, and which nested inside a release was one more set of shapes every
+  release's result `case` had to know. This takes no lock (the release already holds the
+  story `FOR UPDATE`), and opens no transaction. The UPDATE is GUARDED on
+  `agent_status = pending`: a story that is not pending is left exactly as it is and
+  returned. It writes the same audit entry and `story.status_changed` webhook
+  `contract_story/4` writes, from the same builders, attributed to `actor_label` with no key
+  or agent — the release's system act, as it was when this went through `contract_story/4`.
+
+  Returns `{:ok, story}` as it now stands — re-contracted, or untouched when it was not
+  pending. There is no refusal to return: the audit entry is built from literals and
+  `story.id`, so its changeset is valid by construction, and it is inserted with `insert!` —
+  a database refusal raises and rolls back the caller's transaction, every caller's alike. A
+  webhook row that cannot be written is logged and skipped, as for every non-`Multi` event
+  writer here (`insert_events_with_delivery/4`).
+
+  Raises `ArgumentError` outside a transaction, like `Stages.follow_release/5`: on its own the
+  UPDATE and the audit insert would commit separately.
+  """
+  @spec recontract_in_transaction(Ecto.UUID.t(), Story.t(), String.t() | nil) :: {:ok, Story.t()}
+  def recontract_in_transaction(tenant_id, %Story{} = story, actor_label) do
+    unless AdminRepo.in_transaction?(),
+      do:
+        raise(ArgumentError, "recontract_in_transaction/3 runs inside the releasing transaction")
+
+    from(s in Story,
+      where: s.id == ^story.id and s.tenant_id == ^tenant_id and s.agent_status == :pending,
+      select: s
+    )
+    |> AdminRepo.update_all(set: [agent_status: :contracted, updated_at: DateTime.utc_now()])
+    |> case do
+      {1, [contracted]} ->
+        tenant_id
+        |> contract_audit_attrs(contracted, story, nil, actor_label, nil)
+        |> Map.delete(:tenant_id)
+        |> AuditLog.create_changeset()
+        |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
+        |> AdminRepo.insert!()
+
+        event = contract_event_params(tenant_id, contracted, story, nil)
+        insert_events_with_delivery(tenant_id, event.event_type, event.project_id, event.payload)
+        {:ok, contracted}
+
+      {0, []} ->
+        {:ok, story}
     end
   end
 
@@ -147,17 +219,37 @@ defmodule Loopctl.Progress do
   The returned story carries both, and the claimant echoes `claim_epoch` on later
   calls so a message from a claim that has since ended is refused.
 
+  ## A lease capped at a dispatch deadline (#879)
+
+  With `lease_until:` the claim's lease is that instant instead of now plus
+  `claim_lease_seconds/0`, and the same instant is stored as `claim_lease_cap`: no renewal
+  moves `claimed_until` (`renew_claim/3`, `grant_renewal_grace/2`), and the
+  `stories_claim_lease_within_cap` CHECK holds every other writer to it. Only
+  `Loopctl.Delivery.Placement` passes it, and it is the dispatch's `deadline_at`: the runner
+  stops the session by it, so a claim outliving it would hold the story for a session that no
+  longer exists. The cap moves only forward, only while the claim is live, and only on the
+  dispatch's own events — the runner's ACCEPTANCE and a RESUME of the dispatch
+  (`reanchor_dispatch_lease/3`). Without the option nothing changes: the global lease, and a
+  NULL cap.
+
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
-  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`
+  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`, and optionally
+    `:lease_until` (a `DateTime`, see above)
 
   ## Returns
 
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in contracted state
+  - `{:error, :dependencies_not_met}` if a story it depends on, or one in an epic its epic
+    depends on, is not verified (`check_claim_dependencies/2`)
+  - `{:error, :story_held}` if its delivery stage row is at a held stage
+    (`Loopctl.Delivery.Stages.held_story_ids/2`): `escalated`, which is claimable again once
+    `Loopctl.Delivery.Escalations.resolve/3` sends it to `queued`, or `done` / `failed`,
+    which never are
   """
   @spec claim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
@@ -177,8 +269,9 @@ defmodule Loopctl.Progress do
           error -> error
         end
       end)
+      |> Multi.run(:not_held, fn _repo, %{lock: story} -> not_held(tenant_id, story.id) end)
       |> Multi.run(:check_deps, fn _repo, %{lock: story} ->
-        check_claim_dependencies(story)
+        check_claim_dependencies(tenant_id, story)
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
@@ -191,7 +284,7 @@ defmodule Loopctl.Progress do
               assigned_agent_id: agent_id,
               assigned_at: now
             },
-            claim_lease_change(story, now)
+            claim_lease_change(story, now, Keyword.get(opts, :lease_until))
           )
 
         # US-26.2.2 AC-3: record implementer's dispatch at claim time
@@ -243,6 +336,7 @@ defmodule Loopctl.Progress do
             "assigned_agent_id" => agent_id,
             "agent_id" => agent_id,
             "claimed_until" => DateTime.to_iso8601(updated.claimed_until),
+            "claim_lease_cap" => iso8601_or_nil(updated.claim_lease_cap),
             "claim_epoch" => updated.claim_epoch
           }
         }
@@ -268,6 +362,16 @@ defmodule Loopctl.Progress do
     multi |> AdminRepo.transaction() |> claim_result()
   end
 
+  # Contract's and claim's refusal of a story whose delivery stage is held — `escalated`,
+  # `done` or `failed` — through the one definition in `Loopctl.Delivery.Stages`. Asked under
+  # the story lock each caller already holds: every stage transition takes the story FOR
+  # SHARE first, so none can land between this read and the caller's commit.
+  defp not_held(tenant_id, story_id) do
+    if MapSet.member?(Stages.held_story_ids(tenant_id, [story_id]), story_id),
+      do: {:error, :story_held},
+      else: {:ok, :not_held}
+  end
+
   defp claim_result({:ok, %{story: updated, mint_cap: cap}}) do
     # #621: the token is returned on the struct's virtual :minted_capability
     # field so the caller can present it to POST /start.
@@ -285,10 +389,10 @@ defmodule Loopctl.Progress do
     do: {:error, :capability_mint_failed}
 
   # The steps whose failure IS the caller's answer: the story is not there
-  # (`:lock`), the transition is illegal (`:validate`), its dependencies are unmet
-  # (`:check_deps`), or its own changeset did not validate (`:story`).
+  # (`:lock`), the transition is illegal (`:validate`), its stage is held (`:not_held`), its
+  # dependencies are unmet (`:check_deps`), or its own changeset did not validate (`:story`).
   defp claim_result({:error, step, reason, _changes})
-       when step in [:lock, :validate, :check_deps],
+       when step in [:lock, :validate, :not_held, :check_deps],
        do: {:error, reason}
 
   defp claim_result({:error, :story, changeset, _changes}), do: {:error, changeset}
@@ -1148,11 +1252,18 @@ defmodule Loopctl.Progress do
   Only the assigned agent can unclaim (unless already pending).
   Works from any agent_status except pending.
 
+  A DELIVERY story (one with a stage row the release requeues) does not stay `pending`: giving
+  a claimed story back spent an attempt, so it is re-contracted below the retry ceiling and
+  escalated at it (`Loopctl.Delivery.Stages.follow_release/5`, US-44.4). The story returned is
+  the story as it stands after that.
+
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
-  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`
+  - `opts` -- keyword list with `:agent_id`, `:actor_id`, `:actor_label`, and
+    `:actor_lineage` — the caller's SERVER-resolved lineage, recorded on the chain entry if the
+    release escalates the story; defaults to `[]`, the shape a key no dispatch minted has
 
   ## Returns
 
@@ -1162,74 +1273,107 @@ defmodule Loopctl.Progress do
   - `{:error, :not_assigned_agent}` if calling agent is not the assigned agent
   """
   @spec unclaim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()} | {:error, atom() | Ecto.Changeset.t()}
   def unclaim_story(tenant_id, story_id, opts \\ []) do
+    # ONE CLAUSE PER MULTI STEP and no catch-all, as in `force_unclaim_story/3`: a step added to
+    # `unclaim_multi/3` without a clause here is caught by
+    # `test/loopctl/progress/unclaim_result_coverage_test.exs`, not by a CaseClauseError out of
+    # the agent's unclaim. `:stage` refuses `:audit_chain_append_failed` when a release's
+    # escalation could not append its chain entry, which rolls the whole release back, so the
+    # story is still claimed.
+    case AdminRepo.transaction(unclaim_multi(tenant_id, story_id, opts)) do
+      {:ok, %{recontract: story, stage: released}} ->
+        Stages.announce_release(released)
+        {:ok, story}
+
+      {:error, :lock, reason, _} ->
+        {:error, reason}
+
+      {:error, :validate, reason, _} ->
+        {:error, reason}
+
+      {:error, :story, changeset, _} ->
+        {:error, changeset}
+
+      {:error, step, reason, _} when step in [:stage, :audit, :webhook_events, :recontract] ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  The `Ecto.Multi` `unclaim_story/3` runs. Builds nothing and executes no query.
+
+  Public for the same reason as `force_unclaim_multi/3`, and for nothing else: so
+  `test/loopctl/progress/unclaim_result_coverage_test.exs` can read the steps off the value the
+  transaction runs and fail when one has no clause in `unclaim_story/3`'s result `case`.
+  """
+  @spec unclaim_multi(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: Multi.t()
+  def unclaim_multi(tenant_id, story_id, opts \\ []) do
     agent_id = Keyword.get(opts, :agent_id)
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
-    multi =
-      Multi.new()
-      |> Multi.run(:lock, fn _repo, _changes ->
-        lock_story(tenant_id, story_id)
-      end)
-      |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        case validate_unclaim(story, agent_id) do
-          :ok -> {:ok, story}
-          error -> error
-        end
-      end)
-      |> Multi.run(:story, fn _repo, %{lock: story} ->
-        story
-        |> Ecto.Changeset.change(release_claim_changes(story))
-        |> AdminRepo.update()
-      end)
-      # #803: the stage row follows the release in this transaction (see follow_release/5).
-      |> Multi.run(:stage, fn _repo, %{story: updated} ->
-        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
-          actor_label: actor_label
-        )
-      end)
-      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "story",
-          entity_id: updated.id,
-          action: "status_changed",
-          actor_type: "api_key",
-          actor_id: actor_id,
-          actor_label: actor_label,
-          old_state: %{
-            "agent_status" => to_string(old.agent_status),
-            "assigned_agent_id" => old.assigned_agent_id
-          },
-          new_state: %{"agent_status" => "pending", "agent_id" => agent_id}
+    Multi.new()
+    |> Multi.run(:lock, fn _repo, _changes ->
+      lock_story(tenant_id, story_id)
+    end)
+    |> Multi.run(:validate, fn _repo, %{lock: story} ->
+      case validate_unclaim(story, agent_id) do
+        :ok -> {:ok, story}
+        error -> error
+      end
+    end)
+    |> Multi.run(:story, fn _repo, %{lock: story} ->
+      story
+      |> Ecto.Changeset.change(release_claim_changes(story))
+      |> AdminRepo.update()
+    end)
+    # #803: the stage row follows the release in this transaction (see follow_release/5).
+    # The claimant giving a claimed story back spent an attempt (US-44.4).
+    |> Multi.run(:stage, fn _repo, %{story: updated} ->
+      Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+        cause: :attempt,
+        actor_lineage: Keyword.get(opts, :actor_lineage, []),
+        actor_label: actor_label
+      )
+    end)
+    |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "story",
+        entity_id: updated.id,
+        action: "status_changed",
+        actor_type: "api_key",
+        actor_id: actor_id,
+        actor_label: actor_label,
+        old_state: %{
+          "agent_status" => to_string(old.agent_status),
+          "assigned_agent_id" => old.assigned_agent_id
+        },
+        new_state: %{"agent_status" => "pending", "agent_id" => agent_id}
+      }
+    end)
+    |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        event_type: "story.status_changed",
+        project_id: updated.project_id,
+        payload: %{
+          "event" => "story.status_changed",
+          "story_id" => updated.id,
+          "project_id" => updated.project_id,
+          "epic_id" => updated.epic_id,
+          "old_status" => to_string(old.agent_status),
+          "new_status" => "pending",
+          "agent_id" => agent_id,
+          "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
         }
-      end)
-      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          event_type: "story.status_changed",
-          project_id: updated.project_id,
-          payload: %{
-            "event" => "story.status_changed",
-            "story_id" => updated.id,
-            "project_id" => updated.project_id,
-            "epic_id" => updated.epic_id,
-            "old_status" => to_string(old.agent_status),
-            "new_status" => "pending",
-            "agent_id" => agent_id,
-            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-          }
-        }
-      end)
-
-    case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
-    end
+      }
+    end)
+    # AFTER the release's own audit and webhook (see `Stages.recontract_released/4`).
+    |> Multi.run(:recontract, fn _repo, %{story: updated, stage: released} ->
+      Stages.recontract_released(tenant_id, released, updated, actor_label)
+    end)
   end
 
   # #803: requesting review ENDS the implementer's lease. The story stays `implementing`
@@ -1322,19 +1466,167 @@ defmodule Loopctl.Progress do
   @doc """
   The lease-and-epoch change a CLAIM writes: a fresh lease from `now` and the next epoch.
 
+  With a `lease_until` (#879) the lease IS that instant and it is recorded as the claim's
+  `claim_lease_cap`; with `nil` the lease is now plus `claim_lease_seconds/0` and the cap is
+  written NULL — explicitly, so a stale cap can never ride into an uncapped claim.
+
   Public because `Loopctl.BulkOperations.bulk_claim/4` claims too and must write the
-  identical change.
+  identical change (it never passes a cap).
   """
-  @spec claim_lease_change(Story.t(), DateTime.t()) :: map()
-  def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{} = now) do
+  @spec claim_lease_change(Story.t(), DateTime.t(), DateTime.t() | nil) :: map()
+  def claim_lease_change(story, now, lease_until \\ nil)
+
+  def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{} = now, nil) do
     %{
       claimed_until: DateTime.add(now, claim_lease_seconds(), :second),
+      claim_lease_cap: nil,
       claim_epoch: epoch + 1
     }
   end
 
+  def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{}, %DateTime{} = lease_until) do
+    %{claimed_until: lease_until, claim_lease_cap: lease_until, claim_epoch: epoch + 1}
+  end
+
+  # A capped claim whose cap is not after `now` has nothing left to renew, and a 200 would
+  # read as time granted. Refused instead, so the session learns its claim is ending (#879).
+  defp validate_lease_cap_ahead(%Story{claim_lease_cap: %DateTime{} = cap}, now) do
+    if DateTime.after?(cap, now), do: :ok, else: {:error, :lease_cap_reached}
+  end
+
+  defp validate_lease_cap_ahead(%Story{}, _now), do: :ok
+
   @doc """
-  The change every RELEASE writes: no lease, and the next epoch.
+  Moves a driver-placed claim's cap FORWARD to `anchored_at + wall_clock_seconds +
+  Loopctl.Delivery.DispatchLease.grace_seconds/0`, with `claimed_until` moved to the same
+  instant (#879, US-44.5). Two callers, each inside a transaction it owns on `repo`:
+
+  - `Loopctl.Runners.DispatchLedger.record_reply/3`, anchored at the runner's `replied_at`
+    for an ACCEPTANCE — where `Loopctl.Runners.Capacity` anchors its own bound on the
+    session — so the move commits or rolls back with the acceptance.
+  - `reanchor_resumed_dispatch_lease/3`, anchored at NOW for a RESUME of the dispatch
+    (`Loopctl.Delivery.Placement`), before the frame is pushed, so the `deadline_at` it
+    carries leaves the resumed session its whole wall clock.
+
+  `story` is the row as the caller read it IN THAT TRANSACTION under `FOR NO KEY UPDATE` (or
+  stronger), or `nil` when there was none. Nothing here takes a lock, so the row judged is
+  the row written.
+
+  - `{:ok, story}` for a LIVE claim at `claim_epoch` — in a claimed status, its lease not run
+    out. Moved when it carries a cap and the new cap is later; otherwise returned as it is (an
+    uncapped claim, or a cap already later: never moved earlier).
+  - `{:error, :stale_claim_epoch}` when the story is gone or at another epoch.
+  - `{:error, :claim_not_live}` when the claim at that epoch has ended — no longer in a
+    claimed status, or its lease past. It is never revived.
+  - `{:error, changeset}` when the write or its audit entry is refused. Nothing here raises;
+    the caller rolls its transaction back.
+
+  A move bumps `updated_at` and writes a `claim_lease_reanchored` audit-log entry with both
+  leases and both caps.
+  """
+  @spec reanchor_dispatch_lease(Ecto.Repo.t(), Story.t() | nil, %{
+          claim_epoch: non_neg_integer(),
+          anchored_at: DateTime.t(),
+          wall_clock_seconds: pos_integer(),
+          actor_label: String.t()
+        }) ::
+          {:ok, Story.t()}
+          | {:error, :stale_claim_epoch | :claim_not_live | Ecto.Changeset.t()}
+  def reanchor_dispatch_lease(repo, story, %{
+        claim_epoch: epoch,
+        anchored_at: %DateTime{} = anchored_at,
+        wall_clock_seconds: wall_clock_seconds,
+        actor_label: actor_label
+      }) do
+    case story do
+      %Story{claim_epoch: ^epoch} ->
+        if live_claim?(story, DateTime.utc_now()),
+          do:
+            move_cap_forward(
+              repo,
+              story,
+              DispatchLease.cap(anchored_at, wall_clock_seconds),
+              actor_label
+            ),
+          else: {:error, :claim_not_live}
+
+      _gone_or_another_claim ->
+        {:error, :stale_claim_epoch}
+    end
+  end
+
+  @doc """
+  `reanchor_dispatch_lease/3` for a RESUME, in a transaction of its own: the story locked
+  `FOR NO KEY UPDATE`, then moved. On `Loopctl.Repo` under the tenant's RLS context, the repo
+  the resume's push is recorded on next. Every error rolls the transaction back, so a refused
+  audit entry leaves the lease where it was.
+  """
+  @spec reanchor_resumed_dispatch_lease(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+          {:ok, Story.t()}
+          | {:error, :stale_claim_epoch | :claim_not_live | Ecto.Changeset.t()}
+  def reanchor_resumed_dispatch_lease(tenant_id, story_id, attrs) do
+    Repo.with_tenant(tenant_id, fn ->
+      story =
+        Repo.one(
+          from s in Story,
+            where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+            lock: "FOR NO KEY UPDATE"
+        )
+
+      case reanchor_dispatch_lease(Repo, story, attrs) do
+        {:ok, story} -> story
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  # A NULL lease is a claim made before leases existed, which nothing expires.
+  defp live_claim?(%Story{agent_status: status, claimed_until: until}, now)
+       when status in @claimed_statuses,
+       do: is_nil(until) or DateTime.after?(until, now)
+
+  defp live_claim?(%Story{}, _now), do: false
+
+  defp move_cap_forward(repo, %Story{claim_lease_cap: %DateTime{} = current} = story, cap, label) do
+    if DateTime.after?(cap, current) do
+      with {:ok, updated} <-
+             story
+             |> Ecto.Changeset.change(claim_lease_cap: cap, claimed_until: cap)
+             |> repo.update(),
+           {:ok, _entry} <-
+             Audit.create_log_entry(
+               story.tenant_id,
+               %{
+                 entity_type: "story",
+                 entity_id: story.id,
+                 action: "claim_lease_reanchored",
+                 actor_type: "system",
+                 actor_label: label,
+                 old_state: %{
+                   "claimed_until" => iso8601_or_nil(story.claimed_until),
+                   "claim_lease_cap" => DateTime.to_iso8601(current)
+                 },
+                 new_state: %{
+                   "claimed_until" => DateTime.to_iso8601(updated.claimed_until),
+                   "claim_lease_cap" => DateTime.to_iso8601(updated.claim_lease_cap),
+                   "claim_epoch" => updated.claim_epoch
+                 }
+               },
+               repo
+             ) do
+        {:ok, updated}
+      end
+    else
+      {:ok, story}
+    end
+  end
+
+  # An uncapped claim — one not taken for a runner dispatch — has no cap to move.
+  defp move_cap_forward(_repo, %Story{} = story, _cap, _label), do: {:ok, story}
+
+  @doc """
+  The change every RELEASE writes: no lease, no lease cap, and the next epoch. And no
+  `lease_reclaim_failed_at`: that stamp describes the lease that ended, not the next claim's.
 
   The bump is what fences the released claimant. Were a release to leave the epoch
   alone, a session still holding it would pass `check_claim_epoch/3` on a story it no
@@ -1343,7 +1635,13 @@ defmodule Loopctl.Progress do
   """
   @spec claim_release_change(Story.t()) :: map()
   def claim_release_change(%Story{claim_epoch: epoch}),
-    do: %{claimed_until: nil, claim_epoch: epoch + 1, review_requested_at: nil}
+    do: %{
+      claimed_until: nil,
+      claim_lease_cap: nil,
+      claim_epoch: epoch + 1,
+      review_requested_at: nil,
+      lease_reclaim_failed_at: nil
+    }
 
   @doc """
   Clears a story's `implementer_dispatch_id` when the dispatch it names NEVER IMPLEMENTED
@@ -1460,6 +1758,12 @@ defmodule Loopctl.Progress do
   cannot bank an unbounded lease. Renewing a claim made before leases existed (NULL
   `claimed_until`) gives it one, and from then on the reclaimer can release it.
 
+  A claim taken for a runner dispatch carries a `claim_lease_cap` (#879), and its lease
+  already IS that cap: the claim, and every move of the cap (`reanchor_dispatch_lease/3`),
+  write the two together. So renewing a driver-placed claim writes NOTHING — no lease and no
+  `claim_renewed` entry — and answers the story with its lease as it stands, which is the
+  dispatch deadline. Once the cap has passed it is refused `:lease_cap_reached` instead.
+
   ## Options
 
   - `:agent_id` -- the caller's agent (must be the story's assigned agent)
@@ -1468,16 +1772,19 @@ defmodule Loopctl.Progress do
 
   ## Returns
 
-  - `{:ok, %Story{}}` on success
+  - `{:ok, %Story{}}` on success — renewed, or for a capped claim as it stands
   - `{:error, :not_found}` if the story is not in the tenant
   - `{:error, :not_claimed}` if the story is not `assigned` or `implementing`
   - `{:error, :stale_claim_epoch}` if the presented epoch is not the current one —
     the caller's claim ended (released, reclaimed, or claimed again)
   - `{:error, :not_claimant}` if the caller is not the story's assigned agent
+  - `{:error, :lease_cap_reached}` if the claim's `claim_lease_cap` is not after now: a
+    renewal could only write a lease already in the past, so none is written
   """
   @spec renew_claim(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()}
-          | {:error, :not_found | :not_claimed | :stale_claim_epoch | :not_claimant}
+          | {:error,
+             :not_found | :not_claimed | :stale_claim_epoch | :not_claimant | :lease_cap_reached}
           | {:error, Ecto.Changeset.t()}
   def renew_claim(tenant_id, story_id, opts \\ []) do
     agent_id = Keyword.get(opts, :agent_id)
@@ -1489,38 +1796,21 @@ defmodule Loopctl.Progress do
         lock_story(tenant_id, story_id)
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
+        # `now` is read AFTER the lock: a renewal that waited on it (behind an acceptance's
+        # re-anchor, say) would otherwise judge the cap, and write the lease, from the instant
+        # it started waiting. The one value serves both, so they cannot disagree.
+        now = DateTime.utc_now()
+
         # Epoch before identity: a session whose claim ended learns THAT, which is the
         # one fact it can act on, even when a peer now holds the story.
         with :ok <- validate_claimed(story),
              :ok <- validate_claim_epoch(story, epoch),
-             :ok <- validate_claimant(story, agent_id) do
-          {:ok, story}
+             :ok <- validate_claimant(story, agent_id),
+             :ok <- validate_lease_cap_ahead(story, now) do
+          {:ok, {story, now}}
         end
       end)
-      |> Multi.run(:story, fn _repo, %{lock: story} ->
-        story
-        |> Ecto.Changeset.change(%{
-          claimed_until: DateTime.add(DateTime.utc_now(), claim_lease_seconds(), :second)
-        })
-        |> AdminRepo.update()
-      end)
-      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "story",
-          entity_id: updated.id,
-          action: "claim_renewed",
-          actor_type: "api_key",
-          actor_id: Keyword.get(opts, :actor_id),
-          actor_label: Keyword.get(opts, :actor_label),
-          old_state: %{"claimed_until" => iso8601_or_nil(old.claimed_until)},
-          new_state: %{
-            "claimed_until" => DateTime.to_iso8601(updated.claimed_until),
-            "claim_epoch" => updated.claim_epoch,
-            "agent_id" => agent_id
-          }
-        }
-      end)
+      |> Multi.merge(fn %{validate: {story, now}} -> renewal(tenant_id, story, now, opts) end)
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} -> {:ok, updated}
@@ -1528,6 +1818,38 @@ defmodule Loopctl.Progress do
       {:error, :validate, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
     end
+  end
+
+  # A CAPPED claim has nothing to renew: its lease already is its cap (see `renew_claim/3`),
+  # so it is answered as it stands, with no write and no `claim_renewed` entry.
+  defp renewal(_tenant_id, %Story{claim_lease_cap: %DateTime{}} = story, _now, _opts),
+    do: Multi.put(Multi.new(), :story, story)
+
+  defp renewal(tenant_id, %Story{} = old, now, opts) do
+    agent_id = Keyword.get(opts, :agent_id)
+
+    Multi.new()
+    |> Multi.update(
+      :story,
+      Ecto.Changeset.change(old, claimed_until: DateTime.add(now, claim_lease_seconds(), :second))
+    )
+    |> Audit.log_in_multi(:audit, fn %{story: updated} ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "story",
+        entity_id: updated.id,
+        action: "claim_renewed",
+        actor_type: "api_key",
+        actor_id: Keyword.get(opts, :actor_id),
+        actor_label: Keyword.get(opts, :actor_label),
+        old_state: %{"claimed_until" => iso8601_or_nil(old.claimed_until)},
+        new_state: %{
+          "claimed_until" => DateTime.to_iso8601(updated.claimed_until),
+          "claim_epoch" => updated.claim_epoch,
+          "agent_id" => agent_id
+        }
+      }
+    end)
   end
 
   @doc "A story's current `claim_epoch`, or nil when it does not exist in the tenant."
@@ -1584,7 +1906,10 @@ defmodule Loopctl.Progress do
   story), lease cleared and epoch bumped. Recorded as a `claim_lease_expired` audit
   entry by the system actor, and announced as `story.force_unclaimed` with
   `reason: "claim_lease_expired"`. A delivery stage row in flight is moved back to
-  `queued` in the same transaction (`Loopctl.Delivery.Stages.follow_release/5`).
+  `queued` in the same transaction (`Loopctl.Delivery.Stages.follow_release/5`), and the lost
+  lease counts as a spent attempt: below `DISPATCH_MAX_ATTEMPTS` the story is re-contracted so
+  the driver places it again, at the ceiling it is escalated over `:attempts_exhausted`
+  (US-44.4). The story returned is the story as it stands after that.
 
   A story with NO lease (`claimed_until` NULL — claimed before leases existed, and
   never renewed since) is never reclaimed: nothing renews those claims, so a lease
@@ -1600,6 +1925,27 @@ defmodule Loopctl.Progress do
   sweep's read still wins, and the tenant-then-story order matches
   `Loopctl.Tenants.clear_custody_halt/1` and `Loopctl.Tenants.activate_tenant/1`, which
   update the tenant and then the leases.
+
+  ## A budget-killed session's claim is never re-queued here
+
+  THE RECLAIM IS THE RE-DRIVER OF A BUDGET KILL (US-44.3 review round 3). When the claim
+  about to be released ran under an ACCEPTED dispatch whose runner recorded a budget kill in
+  `session_ended` (`runner_dispatches.session_ended_reason` `wall_clock_exceeded` or
+  `max_turns_exceeded`), the channel's own escalation of it did not complete — the lease
+  would not have run out otherwise — so the reclaim takes the SAME escalation first, through
+  the one function the channel uses (`Loopctl.Delivery.RunnerStages.redrive_recorded_session_end/4`,
+  in-flight row -> `escalated` over `:budget_reported`), and only then releases the claim.
+  The row is then no longer in flight, so the release only rebinds it: the story is
+  `pending` behind an `escalated` row, which is held (`Loopctl.Delivery.Stages.held_story_ids/2`),
+  and never back in the queue. That release is audited as the session end it is —
+  `claim_session_ended` with the reported `session_ended_reason`, webhook reason
+  `session_ended:<reason>` — by the system actor that ran it, not as a lease expiry.
+
+  If the escalation is REFUSED again — a tenant chain that still refuses appends, a lock that
+  was not free — nothing is released: the claim stays held, the refusal is logged at error,
+  and `{:error, :budget_escalation_refused}` is returned. The next sweep finds the same
+  expired lease and tries again, so the story is escalated once an operator has repaired the
+  chain, and "a budget-killed story is never re-queued" holds on every path.
   """
   @spec reclaim_expired_claim(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) ::
           {:ok, Story.t()}
@@ -1608,80 +1954,258 @@ defmodule Loopctl.Progress do
              | :claim_not_expired
              | :custody_halted
              | :tenant_inactive
+             | :budget_escalation_refused
+             | :usage_hold_busy
+             | :audit_chain_append_failed
              | Ecto.Changeset.t()}
   def reclaim_expired_claim(tenant_id, story_id, expected_epoch) do
     now = DateTime.utc_now()
+    label = "worker:reclaim_expired_claims"
 
-    multi =
-      Multi.new()
-      |> Multi.run(:tenant_gate, fn _repo, _changes ->
-        lock_tenant_if_claims_renewable(tenant_id)
-      end)
-      |> Multi.run(:lock, fn _repo, _changes ->
-        lock_story(tenant_id, story_id)
-      end)
-      |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        if lease_expired?(story, expected_epoch, now),
-          do: {:ok, story},
-          else: {:error, :claim_not_expired}
-      end)
-      |> Multi.run(:story, fn _repo, %{lock: story} ->
-        story
-        |> Ecto.Changeset.change(release_claim_changes(story))
-        |> AdminRepo.update()
-      end)
-      # #803: the claimant is gone, so its delivery stage row follows the release in THIS
-      # transaction — the two commit together or not at all. A row left behind the new epoch
-      # would be refused on every advance with nothing able to move it.
-      |> Multi.run(:stage, fn _repo, %{story: updated} ->
-        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
-          actor_label: "worker:reclaim_expired_claims"
+    lease = %{
+      gate: fn -> lock_tenant_if_claims_renewable(tenant_id) end,
+      held?: &lease_expired?(&1, expected_epoch, now),
+      not_held: :claim_not_expired,
+      actor_type: "system",
+      actor_id: nil,
+      actor_label: label,
+      # A lease that ran out is an attempt spent and lost (US-44.4).
+      cause: :attempt
+    }
+
+    case RunnerStages.redrive_recorded_session_end(tenant_id, story_id, expected_epoch, label) do
+      :none ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_lease_expired",
+            webhook_reason: "claim_lease_expired",
+            new_state: %{}
+          })
         )
-      end)
-      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "story",
-          entity_id: updated.id,
-          action: "claim_lease_expired",
-          actor_type: "system",
-          actor_id: nil,
-          actor_label: "worker:reclaim_expired_claims",
-          old_state: %{
-            "agent_status" => to_string(old.agent_status),
-            "assigned_agent_id" => old.assigned_agent_id,
-            "claimed_until" => iso8601_or_nil(old.claimed_until),
-            "claim_epoch" => old.claim_epoch
-          },
-          new_state: %{"agent_status" => "pending", "claim_epoch" => updated.claim_epoch}
-        }
-      end)
-      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          event_type: "story.force_unclaimed",
-          project_id: updated.project_id,
-          payload: %{
-            "event" => "story.force_unclaimed",
-            "reason" => "claim_lease_expired",
-            "story_id" => updated.id,
-            "project_id" => updated.project_id,
-            "epic_id" => updated.epic_id,
-            "old_status" => to_string(old.agent_status),
-            "new_status" => "pending",
-            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-          }
-        }
-      end)
 
-    case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, :tenant_gate, reason, _} -> {:error, reason}
-      {:error, :lock, reason, _} -> {:error, reason}
-      {:error, :validate, reason, _} -> {:error, reason}
-      {:error, :story, changeset, _} -> {:error, changeset}
+      # An exhausted subscription, its machine held out: released as that session end, and
+      # spending no attempt.
+      {:ok, "usage_exhausted" = reason} ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_session_ended",
+            webhook_reason: "session_ended:" <> reason,
+            new_state: %{"session_ended_reason" => reason},
+            cause: :usage_exhausted
+          })
+        )
+
+      # The hold needs a lock: nothing released, the next sweep retries.
+      {:error, {:usage_hold, :busy}} ->
+        {:error, :usage_hold_busy}
+
+      {:ok, reason} ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_session_ended",
+            webhook_reason: "session_ended:" <> reason,
+            new_state: %{"session_ended_reason" => reason}
+          })
+        )
+
+      {:error, refusal} ->
+        Logger.error(
+          "reclaim left a budget-killed claim HELD: its escalation was refused again, and " <>
+            "the next sweep retries it — tenant_id=#{tenant_id} story_id=#{story_id} " <>
+            "claim_epoch=#{expected_epoch} refusal=#{inspect(refusal)}"
+        )
+
+        {:error, :budget_escalation_refused}
     end
   end
+
+  @doc """
+  Releases a claim whose runner REPORTED that its session ended — `crashed`,
+  `usage_exhausted` or a budget kill (`wall_clock_exceeded`, `max_turns_exceeded`) in a
+  `session_ended` message (US-44.3, runner contract 1.16.0) — without waiting for the lease.
+
+  It is `reclaim_expired_claim/3` with the lease taken out of the question and nothing else
+  changed: the same release (`release_claim_changes/1` — back to `:pending`, assignment
+  cleared, `lifecycle_entered_at` stamped, lease cleared, epoch bumped), the same
+  `:runner_lost` edge on the delivery stage row in the same transaction
+  (`Loopctl.Delivery.Stages.follow_release/5`), and the same audit entry and webhook, built by
+  the one private function both call. What differs is only what is TRUE: the entry's `action`
+  is `claim_session_ended`, not `claim_lease_expired`, because no lease expired, and its
+  `new_state` names the reported reason, because a crash and an exhausted subscription are
+  different things to an operator reading the log. The entry is attributed to the runner's
+  credential — `actor_type` `"api_key"`, `actor_id` the runner's key (`:actor_id`) — because
+  its label names the runner and it was the runner's message that ended the claim; the
+  reclaim's `"system"` is true only of the worker that times a lease out.
+
+  What the stage row does is `follow_release/5`'s rule, unchanged: an in-flight row goes back
+  to `queued` — counted in its `attempts` when `:cause` is `:attempt` — and a row elsewhere is
+  only rebound to the new epoch. A requeued story is then re-contracted, or for a counted
+  release that reaches the retry ceiling, escalated over `:attempts_exhausted` (US-44.4).
+  WHETHER a re-queue is an attempt is the CALLER's decision, passed as `:cause` (required,
+  `:attempt` or `:usage_exhausted`), never re-derived here from the reason:
+  `Loopctl.Delivery.RunnerStages` decides it from the same function that writes the dispatch
+  ledger's `counts_toward_retry_ceiling`, so the two records cannot disagree. A budget kill's row
+  has already been escalated by then (`Loopctl.Delivery.RunnerStages.end_session/4` escalates
+  first, and calls this only once that escalation has landed or had nothing to change), so it
+  stays `escalated`: ending the claim never re-queues a story the budget stopped. When the
+  escalation does not land, the claim is left held and `reclaim_expired_claim/3` re-drives it.
+
+  THE CLAIM MUST BE THE ONE THE SESSION RAN UNDER: held (`:assigned` or `:implementing`), at
+  exactly `expected_epoch` — the reporting dispatch's own — and not handed to review. Anything
+  else is `{:error, :claim_not_held}` and nothing is written, because each of those means the
+  claim this report is about has already ended, or was never this session's to give back: a
+  lease reclaim, an operator's unclaim or a re-claim moved the epoch, and a claim whose review
+  was requested stopped being the implementer's when it was handed over. The epoch is what
+  makes a late or replayed report harmless — it can never release a claim that started after
+  the session it describes.
+
+  NO TENANT GATE, unlike the reclaim, and deliberately. The reclaim refuses a halted or
+  inactive tenant because its claimants CANNOT RENEW, and releasing a lease they could not
+  have kept would punish them for the halt. Here nobody is being timed out: the claimant
+  itself reported that its session is gone, so there is nothing to protect, and a halt stops
+  custody PROGRESS while a release gives a claim back.
+
+  WHICH reasons end a claim is the caller's decision, not re-checked here:
+  `Loopctl.Delivery.RunnerStages` calls this only from the clauses of its session-end action
+  that end one, and never for `completed`.
+  """
+  @spec release_ended_session(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer(), keyword()) ::
+          {:ok, Story.t()}
+          | {:error,
+             :not_found
+             | :claim_not_held
+             | :audit_chain_append_failed
+             | Ecto.Changeset.t()}
+  def release_ended_session(tenant_id, story_id, expected_epoch, opts) do
+    session_reason = Keyword.fetch!(opts, :session_reason)
+    actor_label = Keyword.fetch!(opts, :actor_label)
+    actor_id = Keyword.fetch!(opts, :actor_id)
+
+    runner_lost_release(tenant_id, story_id, %{
+      # BOUNDED, unlike the reclaim's wait: this runs in the runner channel's own process, and
+      # a wait without end behind a story lock would hold the socket every session on that
+      # machine shares. A wait that runs out raises `lock_not_available`, which the caller
+      # answers as a retry — nothing here has committed.
+      gate: fn -> {:ok, Capacity.set_lock_timeout!(AdminRepo)} end,
+      held?: &claim_held_at?(&1, expected_epoch),
+      not_held: :claim_not_held,
+      action: "claim_session_ended",
+      actor_type: "api_key",
+      actor_id: actor_id,
+      actor_label: actor_label,
+      webhook_reason: "session_ended:" <> session_reason,
+      new_state: %{"session_ended_reason" => session_reason},
+      cause: Keyword.fetch!(opts, :cause)
+    })
+  end
+
+  # THE ONE `:runner_lost` RELEASE, shared by the lease reclaim and a reported session end so
+  # the two cannot drift: a gate, the story locked and re-checked, then released, its stage
+  # row following in the same transaction, one audit entry and one webhook. `spec` carries
+  # only what differs between them — the gate run first (`gate`, a `{:ok, _} | {:error, _}`
+  # thunk), the predicate the locked story must satisfy (`held?`) and the refusal when it does
+  # not (`not_held`), the action, the actor, the webhook's reason, any keys the audit entry
+  # adds to `new_state` on top of the ones every release records, and WHY the claim was
+  # released (`cause`), which decides where the story goes next (`Stages.follow_release/5`).
+  defp runner_lost_release(tenant_id, story_id, spec) do
+    Multi.new()
+    |> Multi.run(:gate, fn _repo, _changes -> spec.gate.() end)
+    |> Multi.run(:lock, fn _repo, _changes -> lock_story(tenant_id, story_id) end)
+    |> Multi.run(:validate, fn _repo, %{lock: story} ->
+      if spec.held?.(story), do: {:ok, story}, else: {:error, spec.not_held}
+    end)
+    |> Multi.run(:story, fn _repo, %{lock: story} ->
+      story
+      |> Ecto.Changeset.change(release_claim_changes(story))
+      |> AdminRepo.update()
+    end)
+    # #803: the claimant is gone, so its delivery stage row follows the release in THIS
+    # transaction — the two commit together or not at all. A row left behind the new epoch
+    # would be refused on every advance with nothing able to move it.
+    |> Multi.run(:stage, fn _repo, %{story: updated} ->
+      Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
+        cause: spec.cause,
+        # Both principals behind this release hold no dispatch lineage: the reclaim worker is
+        # the system, and a runner's credential is a plain `api_keys` row no dispatch minted.
+        actor_lineage: [],
+        actor_label: spec.actor_label
+      )
+    end)
+    |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "story",
+        entity_id: updated.id,
+        action: spec.action,
+        actor_type: spec.actor_type,
+        actor_id: spec.actor_id,
+        actor_label: spec.actor_label,
+        old_state: %{
+          "agent_status" => to_string(old.agent_status),
+          "assigned_agent_id" => old.assigned_agent_id,
+          "claimed_until" => iso8601_or_nil(old.claimed_until),
+          "claim_epoch" => old.claim_epoch
+        },
+        new_state:
+          Map.merge(
+            %{"agent_status" => "pending", "claim_epoch" => updated.claim_epoch},
+            spec.new_state
+          )
+      }
+    end)
+    |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        event_type: "story.force_unclaimed",
+        project_id: updated.project_id,
+        payload: %{
+          "event" => "story.force_unclaimed",
+          "reason" => spec.webhook_reason,
+          "story_id" => updated.id,
+          "project_id" => updated.project_id,
+          "epic_id" => updated.epic_id,
+          "old_status" => to_string(old.agent_status),
+          "new_status" => "pending",
+          "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+        }
+      }
+    end)
+    # AFTER the release's own audit and webhook (see `Stages.recontract_released/4`).
+    |> Multi.run(:recontract, fn _repo, %{story: updated, stage: released} ->
+      Stages.recontract_released(tenant_id, released, updated, spec.actor_label)
+    end)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, %{recontract: story, stage: released}} ->
+        Stages.announce_release(released)
+        {:ok, story}
+
+      # EVERY step, not the four this used to name: a refusal at `:stage`, `:audit` or
+      # `:webhook_events` raised `CaseClauseError`, which on the session-end path is inside the
+      # runner channel's process. Each step's error is already the caller's reason — an atom
+      # (`:audit_chain_append_failed` from `:stage`), or the changeset `:story` or `:audit`
+      # refused.
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
+    end
+  end
+
+  # The claim a session ran under, still held: `lease_expired?/3` without the lease. The same
+  # statuses, the same epoch, and the same exclusion of a claim handed to review.
+  defp claim_held_at?(
+         %Story{agent_status: status, claim_epoch: epoch, review_requested_at: nil},
+         expected_epoch
+       )
+       when status in @claimed_statuses,
+       do: epoch == expected_epoch
+
+  defp claim_held_at?(_story, _expected_epoch), do: false
 
   # "Can this tenant's claimants renew right now?" — the one condition every lease release
   # depends on. Two things make the answer no, and both are refused: a custody halt
@@ -1725,6 +2249,10 @@ defmodule Loopctl.Progress do
   `renewal_grace_seconds/0`. A lease already past that point is left alone, and a NULL
   lease stays NULL. Returns how many leases moved.
 
+  A claim with a `claim_lease_cap` (#879) is not touched and not counted: its lease already
+  IS its cap (`renew_claim/3` says why), and no renewal moves a lease past the dispatch
+  deadline.
+
   Called INSIDE the transaction of each transition that makes renewal possible again —
   `Loopctl.Tenants.clear_custody_halt/1` and `Loopctl.Tenants.activate_tenant/1` — after
   the tenant row is updated: the same tenant-then-story lock order
@@ -1739,7 +2267,8 @@ defmodule Loopctl.Progress do
       from(s in Story,
         where:
           s.tenant_id == ^tenant_id and s.agent_status in ^@claimed_statuses and
-            not is_nil(s.claimed_until) and s.claimed_until < ^floor
+            not is_nil(s.claimed_until) and s.claimed_until < ^floor and
+            is_nil(s.claim_lease_cap)
       )
       |> AdminRepo.update_all(set: [claimed_until: floor])
 
@@ -2677,7 +3206,11 @@ defmodule Loopctl.Progress do
             }
           }
         end)
-        |> maybe_auto_reset(tenant_id, orchestrator_agent_id)
+        |> maybe_auto_reset(
+          tenant_id,
+          orchestrator_agent_id,
+          Keyword.get(opts, :verifier_lineage, [])
+        )
 
       unwrap_verification_transaction(multi)
     end
@@ -2791,7 +3324,27 @@ defmodule Loopctl.Progress do
   - `tenant_id` -- the tenant UUID
   - `story_id` -- the story UUID
   - `opts` -- keyword list with `:orchestrator_agent_id`, `:actor_id`, `:actor_label`,
-    `:actor_lineage`
+    `:actor_lineage`, `:release_cause`
+
+  `:release_cause` is WHY the claim is being taken back, and it decides where a DELIVERY story
+  goes next (US-44.4, #877) — a story whose stage row the release leaves at `queued`:
+
+  - `:operator` (the default) — a human took the story back, so a human decides what it does
+    next: the row is escalated over `{queued, escalated, :operator_released}` and the story is
+    left `:pending`, resolved from `escalated` like any other. It spends no attempt. Every
+    operator-facing caller (`POST /stories/:id/force-unclaim`, `Loopctl.Delivery.Escalations`)
+    takes the default.
+  - `:placement_refused` — `Loopctl.Delivery.Placement.undo_claim/5` giving back a claim its
+    placement could not push because the RUNNER was not available for it (gone, busy, at
+    capacity). The runner refused before any work and the next pass may find it free, so it
+    spends no attempt and the story is re-contracted for the driver to place again.
+  - `:attempt` — the same undo for a refusal that will recur on every pass (a payload the
+    contract rejects, a story that could not be attached): it COUNTS toward the retry ceiling,
+    so the story is re-contracted below it and escalated at it rather than placed, refused and
+    released for ever.
+
+  A story with no delivery stage row, or one whose row is anywhere but `queued` after the
+  release, is released exactly as before either way.
 
   `:actor_lineage` is LOAD-BEARING and defaults to `[]`. Since #862 this function revokes the
   released session's dispatch credential, and that revocation appends a `dispatch_revoked`
@@ -2808,8 +3361,11 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, %Ecto.Changeset{}}` if the release write itself is refused
-  - `{:error, :force_unclaim_failed}` if any LATER step of the transaction is — see the
-    result `case` below for which steps those are and why none of them can reach it today
+  - `{:error, :audit_chain_append_failed}` if the release's escalation could not append its
+    chain entry (`:stage`) — the whole release rolled back
+  - `{:error, :force_unclaim_failed}` if `:stage` refuses for any other reason, or
+    `:recontract`, `:audit` or `:webhook_events` refuses — see the result `case` below for why
+    none can today
 
   The changeset shape is why this spec is not the `{:error, atom()}` it used to claim: the
   `:story` clause has handed back a changeset since this function was written, so the spec
@@ -2821,10 +3377,18 @@ defmodule Loopctl.Progress do
   @spec force_unclaim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | Ecto.Changeset.t()}
   def force_unclaim_story(tenant_id, story_id, opts \\ []) do
+    release_cause = Keyword.get(opts, :release_cause, :operator)
+
+    unless release_cause in [:operator, :placement_refused, :attempt] do
+      raise ArgumentError,
+            "force_unclaim_story/3: :release_cause is :operator, :placement_refused or " <>
+              ":attempt, not #{inspect(release_cause)}"
+    end
+
     multi = force_unclaim_multi(tenant_id, story_id, opts)
 
-    # ONE CLAUSE PER MULTI STEP, and deliberately NO catch-all. The Multi has five steps and
-    # this matched three of them, so a refusal at `:stage`, `:audit` or `:webhook_events` was
+    # ONE CLAUSE PER MULTI STEP, and deliberately NO catch-all. This once matched three of the
+    # Multi's steps, so a refusal at `:stage`, `:audit` or `:webhook_events` was
     # a `CaseClauseError` — an exception out of the one call an operator makes to unstick a
     # parked story, and one that contradicted this function's own `@spec` (846.8, AC-5).
     #
@@ -2838,12 +3402,16 @@ defmodule Loopctl.Progress do
     # text scan, which is what it used to be and what kept having blind spots; the guard's own
     # moduledoc states the two things it still cannot see, and both of those fail loud.
     #
-    # ## None of the three added clauses can fire TODAY, and they are not pretending otherwise
+    # ## What each of those steps can and cannot see
     #
-    #   * `:stage` — `Stages.follow_release/5` is specced `{:ok, StoryStage.t() | nil}` and
-    #     every one of its three branches returns `{:ok, _}` (`stages.ex:976-988`). Its own
-    #     failures are `true = ` and `{1, [updated]} = ` MATCHES and unguarded `AdminRepo`
-    #     statements, so they raise and abort the transaction rather than returning a tuple.
+    #   * `:stage` — `Stages.follow_release/5` returns `{:error, :audit_chain_append_failed}`
+    #     when the escalation a release decides (`:operator_released`, `:attempts_exhausted`)
+    #     could not append its chain entry (US-44.4): the release rolls back and the story is
+    #     still claimed, and the caller is told exactly that. Its other failures are `true = `
+    #     and `{1, [updated]} = ` MATCHES and unguarded `AdminRepo` statements, so they raise
+    #     and abort the transaction instead.
+    #   * `:recontract` — `Progress.recontract_in_transaction/3` returns only `{:ok, story}`;
+    #     its audit insert is an `insert!`, so a refusal raises.
     #   * `:audit` — `Audit.log_in_multi/3` inserts an `AuditLog.create_changeset/1` whose four
     #     required fields (`entity_type`, `entity_id`, `action`, `actor_type`) are all set here
     #     from literals or from `updated.id`, so the changeset is valid by construction. There
@@ -2851,14 +3419,16 @@ defmodule Loopctl.Progress do
     #   * `:webhook_events` — `EventGenerator.generate_events/3` ends `{:ok, events}` on every
     #     path and hard-matches `{:ok, _}` on the inserts underneath, so it too raises instead.
     #
-    # So the shape that actually reaches a caller from those three is an EXCEPTION, which
-    # `Placement.release_claim/5` rescues by design. These clauses exist for the step that is
-    # added next, and the log line is what tells an operator which one it was — the returned
-    # atom names none of them, because `:webhook_events` is not a fact about the story.
+    # So what reaches a caller from those steps, beyond `:stage`'s one named reason, is an
+    # EXCEPTION, which
+    # `Placement.release_claim/5` rescues by design; those clauses exist for the step that is
+    # added next. The log line is what tells an operator which step it was — the returned atom
+    # names none of them, because `:webhook_events` is not a fact about the story.
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: updated}} ->
-        revoke_released_session_credential(tenant_id, updated, opts)
-        {:ok, updated}
+      {:ok, %{recontract: story, stage: released}} ->
+        Stages.announce_release(released)
+        revoke_released_session_credential(tenant_id, story, opts)
+        {:ok, story}
 
       {:error, :lock, reason, _} ->
         {:error, reason}
@@ -2866,18 +3436,30 @@ defmodule Loopctl.Progress do
       {:error, :story, changeset, _} ->
         {:error, changeset}
 
-      {:error, step, reason, _} when step in [:stage, :audit, :webhook_events] ->
-        Logger.error(
-          "force_unclaim rolled back at a step that is not supposed to be able to refuse. " <>
-            "The story is UNCHANGED — still claimed, still held — and the remedy has to be " <>
-            "re-run. tenant_id=#{tenant_id} story_id=#{story_id} step=#{inspect(step)} " <>
-            "reason=#{inspect(reason)}",
-          tenant_id: tenant_id,
-          story_id: story_id
-        )
-
-        {:error, :force_unclaim_failed}
+      # ANY reason, for every one of these steps: a clause pinning one reason covers that reason
+      # and leaves the step's next one a `CaseClauseError`, which is why the coverage guard
+      # counts only an any-reason clause. The escalation's chain entry being refused (logged by
+      # `Stages`) is answered as itself, like every other release path; the release rolled back
+      # and the story is still claimed.
+      {:error, step, reason, _} when step in [:stage, :recontract, :audit, :webhook_events] ->
+        force_unclaim_refused(tenant_id, story_id, step, reason)
     end
+  end
+
+  defp force_unclaim_refused(_tenant_id, _story_id, :stage, :audit_chain_append_failed),
+    do: {:error, :audit_chain_append_failed}
+
+  defp force_unclaim_refused(tenant_id, story_id, step, reason) do
+    Logger.error(
+      "force_unclaim rolled back at a step that is not supposed to be able to refuse. " <>
+        "The story is UNCHANGED — still claimed, still held — and the remedy has to be " <>
+        "re-run. tenant_id=#{tenant_id} story_id=#{story_id} step=#{inspect(step)} " <>
+        "reason=#{inspect(reason)}",
+      tenant_id: tenant_id,
+      story_id: story_id
+    )
+
+    {:error, :force_unclaim_failed}
   end
 
   @doc """
@@ -2929,6 +3511,8 @@ defmodule Loopctl.Progress do
     # before follow_release/5 existed — the same operator remedy as the retro-stamp above.
     |> Multi.run(:stage, fn _repo, %{story: updated} ->
       Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+        cause: Keyword.get(opts, :release_cause, :operator),
+        actor_lineage: Keyword.get(opts, :actor_lineage, []),
         actor_label: actor_label
       )
     end)
@@ -2967,6 +3551,11 @@ defmodule Loopctl.Progress do
           "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
         }
       }
+    end)
+    # AFTER the release's own audit and webhook (see `Stages.recontract_released/4`). Only a
+    # placement undo leaves the row at `queued`; an operator's release escalates it.
+    |> Multi.run(:recontract, fn _repo, %{story: updated, stage: released} ->
+      Stages.recontract_released(tenant_id, released, updated, actor_label)
     end)
   end
 
@@ -3556,19 +4145,34 @@ defmodule Loopctl.Progress do
 
   defp unwrap_verification_transaction(multi) do
     case AdminRepo.transaction(multi) do
-      # When auto-reset happened, return the reset story (non-nil means reset was performed)
-      {:ok, %{auto_reset: %Story{} = reset_story}} -> {:ok, reset_story}
-      {:ok, %{story: updated}} -> {:ok, updated}
-      {:error, _step, {:invalid_transition, _ctx} = reason, _completed} -> {:error, reason}
-      {:error, _step, reason, _completed} -> {:error, reason}
+      # When auto-reset happened, return the reset story (non-nil means reset was performed),
+      # and announce the chain entry its release escalation appended, now that it committed.
+      {:ok, %{auto_reset: {%Story{} = reset_story, released}}} ->
+        Stages.announce_release(released)
+        {:ok, reset_story}
+
+      {:ok, %{story: updated}} ->
+        {:ok, updated}
+
+      {:error, _step, {:invalid_transition, _ctx} = reason, _completed} ->
+        {:error, reason}
+
+      {:error, _step, reason, _completed} ->
+        {:error, reason}
     end
   end
 
-  defp maybe_auto_reset(multi, tenant_id, orchestrator_agent_id) do
+  defp maybe_auto_reset(multi, tenant_id, orchestrator_agent_id, verifier_lineage) do
     Multi.run(multi, :auto_reset, fn _repo, %{lock: old_story, story: rejected_story} ->
       with {:ok, tenant} <- Tenants.get_tenant(tenant_id),
            true <- Tenants.get_tenant_settings(tenant, "auto_reset_on_rejection", true) do
-        perform_auto_reset(rejected_story, old_story, tenant_id, orchestrator_agent_id)
+        perform_auto_reset(
+          rejected_story,
+          old_story,
+          tenant_id,
+          orchestrator_agent_id,
+          verifier_lineage
+        )
       else
         false -> {:ok, nil}
         error -> error
@@ -3576,7 +4180,10 @@ defmodule Loopctl.Progress do
     end)
   end
 
-  defp perform_auto_reset(story, old_story, tenant_id, orchestrator_agent_id) do
+  # A REJECT spent an attempt — the work was judged and was wrong — so an in-flight row is
+  # re-contracted below the retry ceiling and escalated at it (US-44.4). A row already past
+  # `ci` (merged, deployed) is only rebound, as before, and the story stays `pending`.
+  defp perform_auto_reset(story, old_story, tenant_id, orchestrator_agent_id, verifier_lineage) do
     changeset =
       Ecto.Changeset.change(
         story,
@@ -3597,12 +4204,14 @@ defmodule Loopctl.Progress do
 
     with {:ok, reset_story} <- AdminRepo.update(changeset),
          # #803: the stage row follows the release inside the reject's transaction.
-         {:ok, _stage} <-
+         {:ok, released} <-
            Stages.follow_release(
              tenant_id,
              reset_story.id,
              reset_story.claim_epoch,
              :claim_released,
+             cause: :attempt,
+             actor_lineage: verifier_lineage,
              actor_label: "system:auto_reset"
            ),
          {:ok, _audit} <-
@@ -3628,7 +4237,12 @@ defmodule Loopctl.Progress do
              reset_story,
              orchestrator_agent_id
            ) do
-      {:ok, reset_story}
+      # AFTER the reset's own audit entry and webhook (see `Stages.recontract_released/4`). The
+      # release result rides along so `unwrap_verification_transaction/1` can announce its
+      # escalation's chain entry after the commit.
+      with {:ok, story} <-
+             Stages.recontract_released(tenant_id, released, reset_story, "system:auto_reset"),
+           do: {:ok, {story, released}}
     end
   end
 
@@ -3925,36 +4539,18 @@ defmodule Loopctl.Progress do
       }}}
   end
 
-  defp check_claim_dependencies(story) do
-    # Check story-level dependencies: all depends_on stories must be verified
-    story_deps_unmet =
-      from(sd in StoryDependency,
-        join: dep in Story,
-        on: dep.id == sd.depends_on_story_id,
-        where: sd.story_id == ^story.id and dep.verified_status != :verified,
-        select: count(sd.id)
-      )
-      |> AdminRepo.one()
-
-    if story_deps_unmet > 0 do
-      {:error, :dependencies_not_met}
-    else
-      # Check epic-level dependencies: all stories in prerequisite epics must be verified
-      epic_deps_unmet =
-        from(ed in EpicDependency,
-          where: ed.epic_id == ^story.epic_id,
-          join: prereq_story in Story,
-          on: prereq_story.epic_id == ed.depends_on_epic_id,
-          where: prereq_story.verified_status != :verified,
-          select: count(prereq_story.id)
-        )
-        |> AdminRepo.one()
-
-      if epic_deps_unmet > 0 do
-        {:error, :dependencies_not_met}
-      else
-        {:ok, :deps_satisfied}
-      end
+  @doc """
+  Whether `story`'s dependencies — its own and its epic's — are all verified: the check a claim
+  makes under its lock. Also read by `Loopctl.Delivery.Placement` BEFORE it mints, so a story
+  that cannot be claimed spends no dispatch.
+  """
+  @spec check_claim_dependencies(Ecto.UUID.t(), Story.t()) ::
+          {:ok, :deps_satisfied} | {:error, :dependencies_not_met | :not_found}
+  def check_claim_dependencies(tenant_id, %Story{id: story_id}) do
+    case Dependencies.dependency_status(tenant_id, story_id) do
+      :met -> {:ok, :deps_satisfied}
+      :unmet -> {:error, :dependencies_not_met}
+      :not_found -> {:error, :not_found}
     end
   end
 

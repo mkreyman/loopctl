@@ -16,6 +16,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   use LoopctlWeb.ChannelCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
+
+  require Logger
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
@@ -24,6 +27,8 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageDispatcher
   alias Loopctl.Progress
+  alias Loopctl.Runners.Selection
+  alias Loopctl.Runners.Usage
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
@@ -142,6 +147,59 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       refute_push "dispatch", _pushed
     end
 
+    # US-44.6: the triage dispatcher selects through `Loopctl.Runners.Selection` as the driver
+    # does, so an exhausted subscription holds a triage-capable machine out too — and the pass
+    # names the tenant's earliest reset, once for the tenant.
+    test "an EXHAUSTED runner is not sent triage, and the pass logs the earliest reset", ctx do
+      _story = detected_story(ctx)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+      resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      unboxed(fn ->
+        :ok =
+          Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
+      end)
+
+      Logger.put_module_level(Selection, :info)
+      on_exit(fn -> Logger.delete_module_level(Selection) end)
+
+      log =
+        capture_log([level: :info], fn ->
+          assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+        end)
+
+      refute_push "dispatch", _pushed
+      assert [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, log)
+      assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
+      assert DateTime.compare(logged, resets_at) == :eq
+
+      leave_channel(channel)
+    end
+
+    test "the only runner going dry between selection and the push is :no_runner, and " <>
+           "Runners.dispatch/3 records nothing",
+         ctx do
+      story = detected_story(ctx)
+      channel = join_runner(ctx, %{"kinds" => ["triage"]})
+
+      assert exhaust_after_selection(ctx.runner.id, fn ->
+               unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end)
+             end) == [:no_runner]
+
+      refute_push "dispatch", _pushed
+
+      assert [] =
+               unboxed(fn ->
+                 AdminRepo.all(
+                   from r in Loopctl.Runners.DispatchRecord,
+                     where: r.story_id == ^story.id,
+                     select: r.id
+                 )
+               end)
+
+      leave_channel(channel)
+    end
+
     test "a runner that declares NOTHING is not sent triage either", ctx do
       _story = detected_story(ctx)
       join_runner(ctx, %{})
@@ -201,6 +259,134 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # AND IT IS NO LONGER A CANDIDATE, which is the half that matters to every other story:
       # it has left `detected`.
       refute story.id in candidate_ids(50)
+    end
+
+    test "a too-large route that stopped HALFWAY is finished by the next pass", ctx do
+      story = detected_story(ctx)
+      half_take(ctx, story)
+
+      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [stranded: :escalated]
+
+      row = unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end)
+      assert row.stage == :escalated
+      assert row.escalation_reason == "triage_dispatch:triage_too_large"
+    end
+
+    test "a stranded row whose escalation RAISES does not stop the rest of the pass", ctx do
+      broken = detected_story(ctx)
+      half_take(ctx, broken)
+      fine = detected_story(ctx)
+      half_take(ctx, fine)
+
+      # A fault no refusal names, on the broken row only: committed DDL, which is why this
+      # module is `async: false`.
+      name = "test_stranded_fault_" <> String.replace(broken.id, "-", "")
+
+      unboxed(fn ->
+        AdminRepo.query!("""
+        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'some_other_fault: injected by test';
+        END
+        $$
+        """)
+
+        AdminRepo.query!("""
+        CREATE TRIGGER #{name} BEFORE UPDATE ON story_stages FOR EACH ROW
+        WHEN (NEW.story_id = '#{broken.id}') EXECUTE FUNCTION #{name}()
+        """)
+      end)
+
+      on_exit(fn ->
+        unboxed(fn ->
+          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON story_stages")
+          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+        end)
+      end)
+
+      outcomes =
+        ExUnit.CaptureLog.with_log(fn ->
+          unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end)
+        end)
+        |> elem(0)
+
+      # Tagged `{:stranded, _}`, so a pass of failing stranded rows is not judged all-errored and
+      # retried whole.
+      assert Enum.sort(outcomes) == [stranded: :errored, stranded: :escalated]
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, fine.id) end).stage == :escalated
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, broken.id) end).stage == :triaged
+    end
+
+    test "failing stranded rows do not hold every slot: a later one is still finished", ctx do
+      broken = detected_story(ctx)
+      half_take(ctx, broken)
+      fine = detected_story(ctx)
+      half_take(ctx, fine)
+
+      name = "test_stranded_hol_" <> String.replace(broken.id, "-", "")
+
+      unboxed(fn ->
+        AdminRepo.query!("""
+        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'some_other_fault: injected by test';
+        END
+        $$
+        """)
+
+        AdminRepo.query!("""
+        CREATE TRIGGER #{name} BEFORE UPDATE ON story_stages FOR EACH ROW
+        WHEN (NEW.story_id = '#{broken.id}') EXECUTE FUNCTION #{name}()
+        """)
+      end)
+
+      on_exit(fn ->
+        unboxed(fn ->
+          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON story_stages")
+          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+        end)
+      end)
+
+      # A pass limit of ONE, and the failing row is the older: bounded by the pass's limit, the
+      # sweep would take only it, every pass, and never reach `fine`.
+      ExUnit.CaptureLog.with_log(fn ->
+        unboxed(fn -> TriageDispatcher.run_with(1, @budgets) end)
+      end)
+
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, fine.id) end).stage == :escalated
+    end
+
+    test "stranded rows are ranked per tenant: one tenant's backlog does not starve another",
+         ctx do
+      first = detected_story(ctx, intake_record: false)
+      half_take(ctx, first)
+      second = detected_story(ctx, intake_record: false)
+      half_take(ctx, second)
+
+      other = %{ctx | tenant: fixture(:committed_tenant, %{trust_tier: :human_anchored})}
+      theirs = detected_story(other, intake_record: false)
+      half_take(other, theirs)
+
+      ids = unboxed(fn -> TriageDispatcher.stranded(500) end) |> Enum.map(& &1.story_id)
+
+      # Oldest-first across ALL tenants would put both of this tenant's rows ahead of the other
+      # tenant's newer one; ranked per tenant, each tenant's first row comes before any second.
+      assert Enum.find_index(ids, &(&1 == theirs.id)) <
+               Enum.find_index(ids, &(&1 == second.id))
+    end
+
+    test "an unbound triaged row WITH a recorded verdict is not swept", ctx do
+      story = detected_story(ctx)
+      half_take(ctx, story)
+
+      # A row triaged before the binding existed: it has a verdict, so this module's route did
+      # not leave it here and escalating it as too large would misreport it.
+      unboxed(fn ->
+        fixture(:triage_verdict, tenant_id: ctx.tenant.id, story_id: story.id, bind: false)
+      end)
+
+      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == []
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :triaged
     end
 
     test "a LEGACY source whose base_branch is not a git ref name is blocked, not pushed", ctx do
@@ -439,6 +625,43 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     unboxed(fn -> Enum.map(TriageDispatcher.candidates(limit), & &1.story_id) end)
   end
 
+  # Runs `fun` with `runner_id` exhausted the moment the pass has SELECTED its runner (the
+  # free-slot query, on AdminRepo) and before it pushes: a machine running dry between the
+  # selection and `Runners.dispatch/3`. Written on AdminRepo's own connection, so it commits
+  # outside the read.
+  defp exhaust_after_selection(runner_id, fun) do
+    id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:loopctl, :admin_repo, :query],
+        &__MODULE__.exhaust_after_select/4,
+        %{pid: self(), id: id, runner_id: runner_id}
+      )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(id)
+    end
+  end
+
+  @doc false
+  def exhaust_after_select(_event, _measurements, %{query: query}, config) do
+    %{pid: pid, id: id, runner_id: runner_id} = config
+
+    if self() == pid and query =~ ~r/^SELECT .*"in_flight" < .*exists\(/s do
+      :telemetry.detach(id)
+      until = DateTime.add(DateTime.utc_now(), 3_600, :second)
+
+      {1, _} =
+        AdminRepo.update_all(from(r in Loopctl.Runners.Runner, where: r.id == ^runner_id),
+          set: [usage_exhausted_until: until]
+        )
+    end
+  end
+
   defp join_runner(ctx, overrides) do
     {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(ctx.runner_key))
 
@@ -479,5 +702,20 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       "in_flight" => 0,
       "draining" => false
     }
+  end
+
+  # The FIRST half of the too-large route alone: `triaged`, nothing bound, no verdict.
+  defp half_take(ctx, story) do
+    unboxed(fn ->
+      row = Stages.get(ctx.tenant.id, story.id)
+
+      {:ok, _row} =
+        Stages.advance(ctx.tenant.id, story.id, {:detected, :triaged, :forward},
+          claim_epoch: row.claim_epoch,
+          actor_label: "worker:triage_dispatcher",
+          actor_role: :agent,
+          actor_lineage: []
+        )
+    end)
   end
 end

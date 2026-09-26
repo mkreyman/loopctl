@@ -220,7 +220,6 @@ const DECLARED = {
   "POST /api/v1/api_keys/:param/rotate": "gap", // ApiKeyController.rotate
   "GET /api/v1/audit": "gap", // AuditController.index
   "GET /api/v1/changes": "gap", // ChangeController.index
-  "GET /api/v1/stories/blocked": "gap", // DependencyGraphController.blocked
   "POST /api/v1/stories/bulk/claim": "gap", // BulkOperationsController.claim
   "POST /api/v1/stories/bulk/verify": "gap", // BulkOperationsController.verify
   "POST /api/v1/stories/bulk/reject": "gap", // BulkOperationsController.reject
@@ -231,7 +230,6 @@ const DECLARED = {
   "POST /api/v1/stories/:param/artifacts": "gap", // ArtifactReportController.create
   "GET /api/v1/stories/:param/artifacts": "gap", // ArtifactReportController.index
   "GET /api/v1/stories/:param/verifications": "gap", // StoryVerificationController.index
-  "POST /api/v1/stories/:param/merge-precondition": "gap", // MergePreconditionController.create
   "POST /api/v1/agents/register": "gap", // AgentController.register
   "GET /api/v1/agents": "gap", // AgentController.index
   "GET /api/v1/agents/:param": "gap", // AgentController.show

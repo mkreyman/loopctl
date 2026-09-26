@@ -56,6 +56,7 @@ defmodule Loopctl.WorkBreakdown.Story do
              :intake_record_id,
              :claimed_until,
              :claim_epoch,
+             :claim_lease_cap,
              :review_requested_at,
              :inserted_at,
              :updated_at
@@ -128,10 +129,24 @@ defmodule Loopctl.WorkBreakdown.Story do
     # could re-arm a zombie, and one that could set the lease could pin a claim forever.
     field :claimed_until, :utc_datetime_usec
     field :claim_epoch, :integer, default: 0
+    # #879 (US-44.5): the latest instant `claimed_until` may ever reach, for a claim taken
+    # FOR A RUNNER DISPATCH (`Progress.claim_story/3`'s `lease_until:`, passed only by
+    # `Loopctl.Delivery.Placement`) — and the dispatch's `deadline_at`, which the runner stops
+    # the session by. Moved only FORWARD, while the claim is live, when the runner accepts or
+    # the dispatch is resumed (`Progress.reanchor_dispatch_lease/3`), so it is never earlier
+    # than a deadline already sent, and `claimed_until` always equals it — no renewal moves a
+    # capped claim's lease. NULL on every other claim.
+    # Cleared by every release. Same no-cast rule as the fields above — a PATCH that could
+    # clear it could lift the cap — and never a `metadata` key, which PATCH replaces wholesale.
+    field :claim_lease_cap, :utc_datetime_usec
     # Set (once) by `Progress.request_review/3`: the implementer handed the work to review,
     # so its lease no longer applies and the reclaimer leaves the story alone. Cleared by
     # every release. Same no-cast rule as the two fields above.
     field :review_requested_at, :utc_datetime_usec
+    # Set by `Loopctl.Workers.ReclaimExpiredClaimsWorker` when this lease's release failed or
+    # raised, so the tenant's other expired leases are reclaimed ahead of it (#877 review round
+    # 3). Cleared by every release. Same no-cast rule as the fields above.
+    field :lease_reclaim_failed_at, :utc_datetime_usec
 
     # Issue #621: the capability minted by the lifecycle transition that returned
     # this struct — the credential the caller needs for its NEXT custody op

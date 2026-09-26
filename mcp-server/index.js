@@ -49,6 +49,7 @@ import { claimLeaseNotice, renewStoryClaim as renewStoryClaimRequest } from "./l
 import { escalateStory as escalateStoryRequest, escalationNotice } from "./lib/escalation.js";
 import {
   forceUnclaimStory as forceUnclaimStoryRequest,
+  mergePrecondition as mergePreconditionRequest,
   placeDispatch as placeDispatchRequest,
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
@@ -1056,6 +1057,18 @@ async function listReadyStories({ project_id, page, page_size }) {
     params.set("page_size", String(Math.min(page_size, SERVER_MAX_STORY_PAGE_SIZE)));
 
   const result = await apiCall("GET", `/api/v1/stories/ready?${params}`);
+  return toContentCompact(result);
+}
+
+async function listBlockedStories({ project_id, page, page_size }) {
+  const params = new URLSearchParams();
+  if (project_id != null) params.set("project_id", project_id);
+  if (page != null) params.set("page", String(page));
+  if (page_size != null)
+    params.set("page_size", String(Math.min(page_size, SERVER_MAX_STORY_PAGE_SIZE)));
+
+  const qs = params.toString();
+  const result = await apiCall("GET", `/api/v1/stories/blocked${qs ? `?${qs}` : ""}`);
   return toContentCompact(result);
 }
 
@@ -3295,6 +3308,19 @@ async function forceUnclaimStory(args) {
   );
 }
 
+// Epic 44, US-44.1: the merge gate's second run. Same key selection as force-unclaim — the
+// action is `exact_role: [:orchestrator, :user]` and LOOPCTL_ORCH_KEY is pinned when set.
+async function mergePreconditionTool(args) {
+  const orch = orchestratorKeyArgs();
+
+  return toContent(
+    await mergePreconditionRequest(args, {
+      orchKey: orch.resolved,
+      apiCall: (method, path, body) => apiCall(method, path, body, orch.override, orch.options),
+    }),
+  );
+}
+
 // #803/#846: GitHub intake sources — the row that makes a webhook possible, and the binding
 // `place_dispatch` reads `repo` and `base_branch` from. The logic, including how the enrol
 // path keeps the webhook secret out of the tool result, lives in lib/intake-sources.js.
@@ -4291,6 +4317,32 @@ const TOOLS = [
     },
   },
   {
+    name: "list_blocked_stories",
+    description:
+      "List stories with an unverified dependency — a story they depend on, or a story in an " +
+      "epic their epic depends on — each with the blocking dependencies. It is by dependency " +
+      "alone, WHATEVER the story's own status: an in-flight or finished story whose " +
+      "prerequisite was later rejected is listed too. The rows carry no delivery stage: the " +
+      "ones the dispatch driver skips are those whose story_stage is queued (check with " +
+      "story_stage), and place_dispatch refuses them 409 dependencies_not_met. " +
+      "Compact; paginated (page/page_size) with total_count. Refuses 422 when project_id is " +
+      "not a UUID. Key: agent role or higher.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Optional: the UUID of a project to limit the list to.",
+        },
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: {
+          type: "integer",
+          description: "Stories per page (default 100, max 500).",
+        },
+      },
+    },
+  },
+  {
     name: "get_story",
     description: "Get full details for a single story by ID.",
     inputSchema: {
@@ -4311,7 +4363,11 @@ const TOOLS = [
     description:
       "Agent acknowledges a story's acceptance criteria to claim the contract. " +
       "Transitions the story from pending to contracted. " +
-      "story_title and ac_count must match the actual story to prevent silent misclaims.",
+      "story_title and ac_count must match the actual story to prevent silent misclaims. " +
+      "Refused 409 story_held when the story's delivery stage is escalated, done or failed: " +
+      "it is not available to agents even when it reads pending — move on. An escalated " +
+      "story becomes available again only after resolve_escalation sends it to queued; a " +
+      "done or failed one never does.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4338,7 +4394,12 @@ const TOOLS = [
       "Transitions contracted -> assigned. Uses the AGENT key. On a loopctl with claim leases " +
       "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
       "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
-      "is released back to pending under you.",
+      "is released back to pending under you. Refused 409 story_held when the story's " +
+      "delivery stage is escalated, done or failed: it is not yours to claim even when it " +
+      "reads pending or contracted — move on. An escalated story is claimable again only " +
+      "after resolve_escalation sends it to queued; a done or failed one never is. Refused " +
+      "409 dependencies_not_met when a story it depends on, or one in an epic its epic " +
+      "depends on, is not verified: list_blocked_stories names them.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4354,12 +4415,22 @@ const TOOLS = [
     name: "renew_story_claim",
     description:
       "Renew your claim's lease (POST /api/v1/stories/:id/renew-claim): claimed_until becomes " +
-      "now plus the lease length, measured from NOW. Call it well inside the lease on any story " +
-      "you hold longer than it. Uses the AGENT key, the same key as claim_story. Refusals pass " +
+      "now plus the lease length (default 24 hours), measured from NOW. Call it well inside the " +
+      "lease on any story you hold longer than it. A DRIVER-PLACED claim (one a placement took " +
+      "for a runner dispatch) is CAPPED AT ITS DISPATCH DEADLINE (claim_lease_cap: " +
+      "placed_at + wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS at the claim, which is " +
+      "the dispatch's deadline_at; moved forward to a resume's time or the runner's " +
+      "acceptance + wall_clock_seconds + the grace, only while the claim is live; never " +
+      "earlier than a deadline_at already sent), and its claimed_until already IS that cap: " +
+      "renewing it writes nothing and returns the claim as it stands, so renewing " +
+      "never moves claimed_until past that instant. " +
+      "Uses the AGENT key, the same key as claim_story. Refusals pass " +
       "through: 400 claim_epoch missing or not a non-negative integer; 422 not_claimed (the " +
       "story is not assigned or implementing); 409 stale_claim_epoch (the claim has ENDED: it " +
       "expired and was reclaimed, released, or claimed again, so stop working it); 409 " +
-      "not_claimant (your key's agent is not the story's assigned agent).",
+      "not_claimant (your key's agent is not the story's assigned agent); " +
+      "409 lease_cap_reached (a driver-placed claim already at its cap: nothing is renewed " +
+      "and the claim ends there, so stop working it).",
     inputSchema: {
       type: "object",
       properties: {
@@ -4575,7 +4646,11 @@ const TOOLS = [
     name: "reject_story",
     description:
       "Orchestrator rejects a story with a reason. " +
-      "Creates a verification_result with result=fail. Uses the ORCH key.",
+      "Creates a verification_result with result=fail. Uses the ORCH key. " +
+      "The reject releases the claim, and a delivery story may be re-contracted or escalated " +
+      "in the same transaction. A 500 `audit_chain_append_failed` (the escalation's chain " +
+      "entry was refused) means the WHOLE call rolled back: the story is unchanged, and a " +
+      "re-run meets the same server-side condition until an operator acts.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8002,6 +8077,11 @@ const TOOLS = [
       "no_conforming_branch, and when a machine refuses dispatches with branch_not_allowed — a " +
       "runner that ENFORCES a prefix and declares none shows [] here, which is that " +
       "misconfiguration made visible. Per-CONNECTION, like kinds. " +
+      "usage_exhausted_until (runner contract 1.17.0) is until when the machine's SUBSCRIPTION " +
+      "is exhausted, or null: while it is in the future nothing is placed on the machine and " +
+      "place_dispatch refuses 409 runner_exhausted. It is the EFFECTIVE value — the latest of " +
+      "the machine's own and every machine's sharing its account — so a machine that never " +
+      "reported anything can show one; capacity returns at that instant on its own. " +
       "live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +
@@ -8017,7 +8097,8 @@ const TOOLS = [
       "push the work (POST /api/v1/runners/:runner_id/dispatches). This is the control-side " +
       "trigger of the agent delivery loop — the verb that turns a story the loop has decided " +
       "to build into a session running on a machine. Get `runner_id` and its free slots from " +
-      "runner_pool; the story must be `contracted` with its delivery stage at `queued` " +
+      "runner_pool; the story must be `pending` or `contracted` (a pending one is contracted " +
+      "by the placement), its dependencies met, with its delivery stage at `queued` " +
       "(story_stage shows where it is).\n\n" +
       "The STORY OBJECT is not a parameter: loopctl builds it from its own rows and refuses a " +
       "caller-supplied one, because a control plane able to hand a runner prose is able to " +
@@ -8036,6 +8117,11 @@ const TOOLS = [
       "choosing a machine. It refuses a NEW placement only: retrying with a dispatch_id " +
       "loopctl already holds still re-sends that dispatch, because its claim is already " +
       "standing and a draining machine is asked to finish what it holds, not to take more.\n\n" +
+      "409 `runner_exhausted` means the machine's subscription (its own, or one it shares an " +
+      "account with) is exhausted, so every session placed there would end usage_exhausted. " +
+      "NOTHING WAS CLAIMED; the body carries `usage_exhausted_until`, when it clears on its " +
+      "own. Place on another runner — runner_pool shows `usage_exhausted_until` per machine. " +
+      "Like `runner_declines_work` it refuses a NEW placement only.\n\n" +
       "409 `no_conforming_branch` means the machine declares `branch_prefixes` (runner " +
       "contract 1.14.0) and none of them can produce a valid branch name carrying the story " +
       "number and id fragment that keeps two stories off one branch. NOTHING WAS CLAIMED. " +
@@ -8054,7 +8140,15 @@ const TOOLS = [
       "push and re-sent verbatim, because a session may be running on it right now. Neither " +
       "prefix refusal can be raised by a RETRY carrying a dispatch_id loopctl already " +
       "holds: its claim is already standing, so a declaration that changed under you only " +
-      "steers the name and never strands the story.",
+      "steers the name and never strands the story.\n\n" +
+      "A RETRY also moves the claim's deadline: the re-sent dispatch carries deadline_at = now + " +
+      "its wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS (never earlier than the one already " +
+      "sent), so a late or a longer retry gets its whole clock. 409 `dispatch_claim_ended` means " +
+      "the claim that dispatch_id was placed under has ENDED — its lease ran out, or the story " +
+      "left assigned/implementing: nothing was pushed or written and the claim is not revived. " +
+      "Place the story again with a NEW dispatch_id once it is placeable. 409 " +
+      "`dependencies_not_met` means a story it depends on, or one in an epic its epic depends on, " +
+      "is not verified: nothing was minted, claimed or pushed; place it once they are.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8166,18 +8260,59 @@ const TOOLS = [
     },
   },
   {
+    name: "merge_precondition",
+    description:
+      "RUN THE MERGE GATE over a story's real pull request " +
+      "(POST /api/v1/stories/:id/merge-precondition). Both delivery gates run again over the " +
+      "diff that exists, plus custody (`verified_status: verified` by a separate lineage), the " +
+      "12-file / 1000-line hard bound, the head-has-not-moved check and the self-deploy " +
+      "exclusion. The story must be at stage `ci`.\n\n" +
+      "GATE A READS WHAT TRIAGE PERSISTED, NEVER YOU. Its input is the lens verdicts recorded " +
+      "with the story's most recent triage, or a human's re-queue of a Gate A escalation; this " +
+      "tool sends no trio. `gate_a_inputs` on the answer says which (`persisted_triage`, " +
+      "`human_resolution`, or `missing` — which refuses with `gate_a_inputs_missing`).\n\n" +
+      "DECISIONS: `allow` (recorded against the head, the only thing that licenses a merge), " +
+      "`refuse` (the story is escalated before this returns), `already_merged`, `head_moved` " +
+      "(back to implementing), `unevaluated` (503 with Retry-After: a transient forge fault; " +
+      "retry after the delay, nothing transitioned).\n\n" +
+      "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
+      "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
+      "else LOOPCTL_API_KEY. 403 `custody_tier_required` on a tenant without a human anchor, " +
+      "404 for an unknown story, 422 when `claim_epoch` is missing or the story is not at `ci` " +
+      "or has no stage row. A `story_id` that is not a UUID or a bad `claim_epoch` is refused " +
+      "here, before any call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The story UUID, at stage `ci`." },
+        claim_epoch: {
+          type: "integer",
+          description: "The claim epoch you act under; it fences the escalation a refusal writes.",
+        },
+        effect_proof: {
+          type: "object",
+          description:
+            "Optional effect proof for a change touching an effect path. Judged and recorded; " +
+            "it cannot turn a `prove_effect` outcome into an allow.",
+        },
+      },
+      required: ["story_id", "claim_epoch"],
+    },
+  },
+  {
     name: "force_unclaim_story",
     description:
       "TAKE A STORY BACK from the agent holding it (POST /api/v1/stories/:id/force-unclaim). " +
       "Two things happen: the story resets to `agent_status: pending` with " +
       "`assigned_agent_id` cleared, AND — in the same transaction — its delivery stage row " +
       "follows the release back to `queued`.\n\n" +
-      "IT FREES THE STAGE; IT DOES NOT MAKE THE STORY PLACEABLE. place_dispatch wants " +
-      "`agent_status: contracted` AND stage `queued` (`Placement.claimable/2`), and the " +
-      "release leaves the story at `pending`, whose only transition is `pending -> " +
-      "contracted`. Run place_dispatch straight after this one and you get back the IDENTICAL " +
-      "409 `invalid_transition`. THE REMEDY IS THREE CALLS, in this order: " +
-      "force_unclaim_story, then contract_story, then place_dispatch.\n\n" +
+      "A DELIVERY STORY THEN GOES TO `escalated`, NOT BACK TO THE QUEUE (loopctl US-44.4). An " +
+      "operator taking a story back is a human decision, so when the release leaves the stage " +
+      "row at `queued` loopctl escalates it over `operator_released` in the same transaction — " +
+      "it is not left in the queue behind the human's back. It spends no attempt " +
+      "against the retry ceiling. To put it back to work, call resolve_escalation with " +
+      "`to: queued`: that releases (a no-op now) AND re-contracts, so the story is placeable " +
+      "again. A story with no delivery stage row is simply left `pending`, as before.\n\n" +
       "WHEN TO REACH FOR IT. A story sitting at `claimed` with nobody on it is the residue of " +
       "a compensation that did not complete — it is NOT what a refused dispatch normally " +
       "leaves. Placement answers a runner's refusal INLINE by releasing the claim itself " +
@@ -8198,11 +8333,18 @@ const TOOLS = [
       "A REGISTERED AGENT — an unlinked one is refused 400 naming that — and the tenant must be " +
       "human-anchored (403 `custody_tier_required` otherwise). 404 for an unknown story, 429 " +
       "when rate limited. A `story_id` that is not a UUID is refused here, before any call.\n\n" +
-      "It does NOT touch `verified_status`, and it is safe to run twice: on an already-pending " +
-      "story the stage row is written only when it needs to be — a row STRANDED behind the " +
-      "story's claim epoch is rebound to it (the remedy for a row an older release left " +
-      "behind) and an in-flight row is requeued, while a row already at that epoch is left " +
-      "exactly as it is. It takes no request body.",
+      "It does NOT touch `verified_status`. RUN AGAIN on an already-pending story, it is still " +
+      "an operator's release and does what one does: a row STRANDED behind the story's claim " +
+      "epoch is rebound to it (the remedy for a row an older release left behind), an " +
+      "in-flight row is requeued, and a row that is then at `queued` — including one that was " +
+      "already sitting there — is ESCALATED over `operator_released`, like the first run. A " +
+      "row already escalated, or anywhere else at that epoch, is left exactly as it is. EVERY " +
+      "500 means the whole release rolled back and the story is still claimed: " +
+      "`audit_chain_append_failed` (the escalation's chain entry was refused) is a " +
+      "server-side condition a re-run meets again until an operator acts; " +
+      "`force_unclaim_failed` (the " +
+      "server log names the step) is remedied by calling it again. A 422 means the release " +
+      "write itself was rejected. It takes no request body.",
     inputSchema: {
       type: "object",
       properties: {
@@ -9153,6 +9295,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "list_ready_stories":
       return await listReadyStories(args);
 
+    case "list_blocked_stories":
+      return await listBlockedStories(args);
+
     case "get_story":
       return await getStory(args);
 
@@ -9463,6 +9608,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "force_unclaim_story":
       return await forceUnclaimStory(args);
+
+    case "merge_precondition":
+      return await mergePreconditionTool(args);
 
     case "intake_source_enroll":
       return await intakeSourceEnroll(args);

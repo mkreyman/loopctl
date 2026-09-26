@@ -167,8 +167,10 @@ defmodule Loopctl.Delivery.Placement do
 
   require Logger
 
+  alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
+  alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.StageMachine
@@ -222,9 +224,11 @@ defmodule Loopctl.Delivery.Placement do
           | :not_authorized
           | :runner_not_provisioned
           | :runner_declines_work
+          | :runner_exhausted
           | :invalid_transition
           | :wrong_stage
           | :busy
+          | :dispatch_claim_ended
           | atom()
           | {:invalid, [String.t()]}
           | {:invalid_transition, map()}
@@ -264,8 +268,9 @@ defmodule Loopctl.Delivery.Placement do
   written, the claim stands and the session under it is untouched, because a retry does not
   own the claim it would be parking.
 
-  The story must already be `contracted` (`Loopctl.Progress.contract_story/3`) and its stage
-  row must be at `queued`. Both are checked BEFORE anything is minted, so the ordinary
+  The story must be `pending` or `contracted`, with its dependencies met and its stage row at
+  `queued`; a `pending` one is contracted here, attributed to the placing key (#884). All of
+  that happens BEFORE anything is minted, so the ordinary
   "not ready yet" answer costs no `dispatches` row, no ephemeral key and no audit-chain entry
   — see `claimable/2` for why that matters more than it looks.
 
@@ -307,6 +312,12 @@ defmodule Loopctl.Delivery.Placement do
     because it claims nothing and the claim it re-pushes under is live: refusing it would
     strand that claim at `claimed` until its lease expired, which is what the gate exists to
     prevent
+  - `:runner_exhausted` — the machine's subscription is declared exhausted: its own
+    `usage_exhausted_until`, or that of a same-tenant runner sharing its `account_ref`, is in
+    the future (US-44.6, `Loopctl.Runners.usage_exhausted?/2`). Refused BEFORE the claim and
+    on the CLAIM path only, like `:runner_declines_work` and for the same reason: every
+    session placed there would end `usage_exhausted`, and a resume re-sends work the machine
+    already holds.
   - `{:no_conforming_branch, prefixes}` — the machine declared branch prefixes
     (`RunnerJoin.branch_prefixes`, contract 1.14.0) and none of them can produce a valid
     branch name carrying the story number and id fragment. Refused BEFORE the claim, like
@@ -317,6 +328,10 @@ defmodule Loopctl.Delivery.Placement do
   - `{:branch_not_allowed, branch, prefixes}` — the CALLER supplied a `branch` the target
     machine's declaration does not accept. loopctl never rewrites a caller's branch, so the
     only honest answers are to refuse it here or to let the runner refuse it after the claim.
+  - `:dispatch_claim_ended` — a RESUME of a `dispatch_id` whose claim is still the story's
+    but has ENDED: its lease has run out, or the story left `assigned`/`implementing`. Nothing
+    is pushed and nothing is written; the claim is not revived. Re-place with a new
+    `dispatch_id` once the story is placeable again.
   - `:not_found`, `:invalid_transition`, `:wrong_stage` — from the pre-mint readiness check.
     A story that passes the check and is claimed by someone else in between instead gets
     `Loopctl.Progress.claim_story/3`'s own richer `{:invalid_transition, map()}`, and the
@@ -332,8 +347,9 @@ defmodule Loopctl.Delivery.Placement do
 
   "Safe to repeat" means a repeat under the SAME claim. Once that claim ends — the lease
   expires, an operator force-unclaims, a refused push releases it — the ledger row still
-  carries the old epoch, so every later `place/4` with that `dispatch_id` resumes, pushes the
-  recorded epoch and is refused `:stale_claim_epoch` for ever. That is the fence working: the
+  carries the old epoch, so every later `place/4` with that `dispatch_id` resumes and is
+  refused — `:dispatch_claim_ended` while a claim whose lease has run out is still the story's,
+  and `:stale_claim_epoch` for ever once it has been released. That is the fence working: the
   row names a claim that no longer exists. **Re-placing the story needs a NEW `dispatch_id`.**
   """
   @spec place(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
@@ -355,7 +371,7 @@ defmodule Loopctl.Delivery.Placement do
          :ok <- may_mint_session_dispatch(caller.lineage, caller.role) do
       case DispatchLedger.get_record(tenant_id, dispatch_id) do
         nil -> claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts)
-        record -> resume(tenant_id, runner_id, dispatch, record)
+        record -> resume(tenant_id, runner_id, dispatch, record, opts)
       end
     end
   end
@@ -387,7 +403,7 @@ defmodule Loopctl.Delivery.Placement do
   # a caller passing a bare id or a map gets a refusal rather than a lineage of `[]`, which
   # would have read as "an operator" to the clause below.
   defp resolve_caller(tenant_id, %ApiKey{tenant_id: tenant_id, id: id, role: role}) do
-    {:ok, %{lineage: Dispatches.lineage_for_api_key(tenant_id, id), role: role}}
+    {:ok, %{id: id, lineage: Dispatches.lineage_for_api_key(tenant_id, id), role: role}}
   end
 
   defp resolve_caller(_tenant_id, _api_key), do: {:error, :not_authorized}
@@ -444,6 +460,21 @@ defmodule Loopctl.Delivery.Placement do
     if Runners.accepting_work?(meta), do: :ok, else: {:error, :runner_declines_work}
   end
 
+  # AN EXHAUSTED SUBSCRIPTION IS NOT CAPACITY (US-44.6). The unattended selectors never select
+  # such a machine (`Loopctl.Runners.Selection`), and `Runners.dispatch/3` refuses a NEW
+  # dispatch to one — but that refusal comes after the claim and the mint, so a placement
+  # NAMING the runner is refused here first, where nothing has been spent. Mounted beside
+  # `runner_accepting_work/1`, on the CLAIM path only, for the reasons given there; the resume
+  # path's push is exempt in `dispatch/3` too, since the ledger already holds its id. Unlike
+  # that gate it does not need the live meta: the state is on the `runners` row, so a machine
+  # with no socket, or two, is judged the same — and `Runners.dispatch/3` still answers the
+  # connection question afterwards.
+  defp runner_not_exhausted(tenant_id, runner_id) do
+    if Runners.usage_exhausted?(tenant_id, runner_id),
+      do: {:error, :runner_exhausted},
+      else: :ok
+  end
+
   # WHAT THIS MACHINE SAID IT ACCEPTS, off the meta of the ONE socket a push would reach
   # (contract 1.14.0, story 846.2). Nothing is stored, so this is the whole read — see
   # `Runners.declared_branch_prefixes/1` for why a branch prefix takes that form where
@@ -488,8 +519,9 @@ defmodule Loopctl.Delivery.Placement do
     if Runners.custody_halted?(tenant_id), do: {:error, :tenant_halted}, else: :ok
   end
 
-  # A retry of a dispatch the ledger already holds. NOTHING IS CLAIMED, MINTED, BUMPED OR
-  # WRITTEN: the placement already happened, and what is left is to put the frame on the wire
+  # A retry of a dispatch the ledger already holds. NOTHING IS CLAIMED, MINTED OR BUMPED, and
+  # the one write is the lease cap (below): the placement already happened, and what is left
+  # is to put the frame on the wire
   # again under the epoch the ORIGINAL claim produced. Pushing under a freshly read epoch
   # instead would hand the runner a number its ledger row does not carry, and `record_sent/3`
   # would refuse it as a `:dispatch_id_conflict`.
@@ -521,9 +553,43 @@ defmodule Loopctl.Delivery.Placement do
   # So a story that no longer fits the contract is REFUSED here and nothing is written. The
   # claim stands, the session under it is untouched, and the next placement through the claim
   # path is what parks the story — with the fences applied first, where they belong.
-  defp resume(tenant_id, runner_id, dispatch, record) do
-    with {:ok, payload} <- resume_payload(tenant_id, runner_id, dispatch, record) do
+  #
+  # The one thing a resume DOES write is the claim's lease cap, moved forward so the frame's
+  # `deadline_at` leaves the resumed session its whole wall clock (`resume_deadline/4`).
+  defp resume(tenant_id, runner_id, dispatch, record, opts) do
+    with {:ok, payload} <- resume_payload(tenant_id, runner_id, dispatch, record),
+         {:ok, payload} <- resume_deadline(tenant_id, payload, record, opts) do
       push_resumed(tenant_id, runner_id, payload, record)
+    end
+  end
+
+  # A RESUME MOVES THE CLAIM'S CAP FORWARD BEFORE IT PUSHES (#879, US-44.5 review round 3).
+  # Sending the cap as it stood cut a late or a longer resume short, and a resume sent after
+  # the claim-time cap had nearly run out carried a deadline the session could not use. So a
+  # LIVE claim at the recorded epoch is moved to now + this push's wall clock + the grace —
+  # forward only, audited as `claim_lease_reanchored` (`Progress.reanchor_resumed_dispatch_lease/3`)
+  # — and the cap that results is the `deadline_at` sent.
+  #
+  # A claim that has ENDED at that epoch — its lease past, or no longer in a claimed status — is
+  # refused `dispatch_claim_ended`: nothing is pushed and nothing revived, because the lease
+  # sweep may already be handing the story to someone else. A story at ANOTHER epoch is left to
+  # `DispatchLedger.record_sent/3`, which refuses the frame `stale_claim_epoch` before it is
+  # broadcast and marks the row superseded; it carries no deadline at all.
+  #
+  # Before the push rather than after, so the claim is never shorter than a session this push
+  # starts. The cost is the other direction: a push the ledger then refuses (the dispatch was
+  # already answered) leaves the claim held at most this clock and grace from now.
+  defp resume_deadline(tenant_id, payload, record, opts) do
+    case Progress.reanchor_resumed_dispatch_lease(tenant_id, record.story_id, %{
+           claim_epoch: record.claim_epoch,
+           anchored_at: DateTime.utc_now(),
+           wall_clock_seconds: Map.fetch!(payload, "wall_clock_seconds"),
+           actor_label: Keyword.get(opts, :actor_label) || "placement:resume"
+         }) do
+      {:ok, story} -> {:ok, put_deadline(payload, story)}
+      {:error, :claim_not_live} -> {:error, :dispatch_claim_ended}
+      {:error, :stale_claim_epoch} -> {:ok, Map.delete(payload, "deadline_at")}
+      {:error, %Ecto.Changeset{}} = refused -> refused
     end
   end
 
@@ -599,6 +665,11 @@ defmodule Loopctl.Delivery.Placement do
              branch_prefixes: prefixes,
              prefix_policy: :advise
            ),
+         # The same wall clock rule as the claiming path. A resume may carry a new
+         # `wall_clock_seconds`: `resume_deadline/4` moves the cap on it, the push that wins
+         # records it, and the acceptance moves the cap on the LONGEST clock any push carried
+         # (`DispatchLedger.record_reply/3`).
+         {:ok, dispatch} <- lease_capable(dispatch),
          {:ok, dispatch} <- rebuild_story(dispatch, story) do
       {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
     end
@@ -681,12 +752,15 @@ defmodule Loopctl.Delivery.Placement do
     meta = sole_live_meta(tenant_id, runner_id)
 
     with :ok <- runner_accepting_work(meta),
+         :ok <- runner_not_exhausted(tenant_id, runner_id),
          {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
          {:ok, dispatch} <-
            DispatchPayload.fill(tenant_id, dispatch,
              branch_prefixes: declared_branch_prefixes(meta)
            ),
-         :ok <- claimable(tenant_id, story_id),
+         {:ok, dispatch} <- lease_capable(dispatch),
+         {:ok, story} <- ready_story(tenant_id, story_id),
+         :ok <- contract_if_pending(tenant_id, story, caller.id, agent_id, opts),
          {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
       claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)
     end
@@ -698,17 +772,21 @@ defmodule Loopctl.Delivery.Placement do
   # Minting is not free and it is not undoable. Every mint writes a `dispatches` row, an
   # `api_keys` row, and an IMMUTABLE, STH-covered `dispatch_created` entry appended under the
   # tenant's chain advisory lock — the row every writer in the tenant contends on. Nothing
-  # deletes a chain entry, by design. So a caller looping over a story that is not ready (still
-  # `pending`, already claimed, its stage row not at `queued`) would have written a permanent
+  # deletes a chain entry, by design. So a caller looping over a story that is not ready (already
+  # claimed, its dependencies unmet, its stage row not at `queued`) would have written a permanent
   # chain entry and taken the chain lock once per attempt, for an outcome that was never going
-  # to succeed. Reading two rows first turns that into two SELECTs.
+  # to succeed. Reading first — the story, its stage row, and one EXISTS for its dependencies —
+  # turns that into a few SELECTs.
   #
   # It cannot be complete, and is not meant to be: a story claimed between this read and the
   # claim's own lock takes `claim_story/3`'s refusal instead, and `claim_then_push/7` revokes
   # the dispatch minted for it. This bounds the COMMON case; that bounds the race.
   @doc """
-  Whether a story is in a state a placement can take: `contracted`, with its stage row at
-  `queued`.
+  Whether a story is in a state a placement can take: `pending` or `contracted`, with its stage
+  row at `queued`. A `pending` one is contracted by the placement itself, before it mints
+  (#884): a triage-accepted story, a release whose re-contract did not land, and an
+  escalation resolved back to `queued` all leave `pending` at `queued`, and nothing unattended
+  contracted any of them.
 
   Public so the question can be ASKED — by a test proving that a story an operator re-queued
   is actually placeable, and by anything that wants to know before it spends a mint. It is the
@@ -716,16 +794,62 @@ defmodule Loopctl.Delivery.Placement do
   apart; see the note below on why it is a pre-check and not the fence.
   """
   @spec claimable(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          :ok | {:error, :invalid_transition | :wrong_stage | :not_found}
+          :ok
+          | {:error, :invalid_transition | :wrong_stage | :dependencies_not_met | :not_found}
   def claimable(tenant_id, story_id) do
-    with {:ok, story} <- Stories.get_story(tenant_id, story_id) do
-      cond do
-        story.agent_status != :contracted -> {:error, :invalid_transition}
-        stage_of(tenant_id, story_id) != :queued -> {:error, :wrong_stage}
-        true -> :ok
-      end
+    with {:ok, _story} <- ready_story(tenant_id, story_id), do: :ok
+  end
+
+  # The same read, returning the story it judged. DEPENDENCIES ARE PART OF IT (#884): a
+  # triage-accepted story reaches the driver `pending`, and one with unmet dependencies
+  # used to be refused only by the claim — AFTER a dispatch had been minted and a chain entry
+  # appended — on every pass.
+  defp ready_story(tenant_id, story_id) do
+    with {:ok, story} <- Stories.get_story(tenant_id, story_id),
+         :ok <- placeable_status(story),
+         :ok <- at_queued(tenant_id, story_id),
+         {:ok, _} <- Progress.check_claim_dependencies(tenant_id, story) do
+      {:ok, story}
     end
   end
+
+  defp placeable_status(%Story{agent_status: status}) when status in [:pending, :contracted],
+    do: :ok
+
+  defp placeable_status(_story), do: {:error, :invalid_transition}
+
+  defp at_queued(tenant_id, story_id) do
+    if stage_of(tenant_id, story_id) == :queued, do: :ok, else: {:error, :wrong_stage}
+  end
+
+  # A `pending` story is CONTRACTED HERE, BEFORE anything is minted (#884): `pending` at
+  # `queued` is where a triage-accepted story, a release whose re-contract did not land and an
+  # escalation resolved to `queued` all wait, and only an orchestrator key could contract
+  # them. The contract check is skipped as every release re-contract skips it: this is the loop
+  # acting on a story its own stage machine queued. Attributed to the placing key and label.
+  # A contract that lands and a mint or claim that then fails leaves a `contracted` story at
+  # `queued`, which is placeable. A `contracted` story costs nothing here.
+  defp contract_if_pending(
+         tenant_id,
+         %Story{agent_status: :pending} = story,
+         key_id,
+         agent_id,
+         opts
+       ) do
+    case Progress.contract_story(tenant_id, story.id, %{},
+           actor_id: key_id,
+           agent_id: agent_id,
+           actor_label: Keyword.get(opts, :actor_label),
+           skip_contract_check: true
+         ) do
+      {:ok, _story} -> :ok
+      # Contracted or claimed under us: whether it can be claimed is the claim's own decision.
+      {:error, {:invalid_transition, _}} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp contract_if_pending(_tenant_id, _story, _key_id, _agent_id, _opts), do: :ok
 
   defp stage_of(tenant_id, story_id) do
     case Stages.get(tenant_id, story_id) do
@@ -745,7 +869,7 @@ defmodule Loopctl.Delivery.Placement do
   # stays — entries are immutable — which is why the pre-check above is the part that bounds a
   # loop.
   defp claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts) do
-    case claim(tenant_id, story_id, agent_id, session, opts) do
+    case claim(tenant_id, story_id, agent_id, session, dispatch, opts) do
       {:ok, story} ->
         enter_claimed_and_push(tenant_id, runner_id, dispatch, story, session, opts)
 
@@ -848,7 +972,8 @@ defmodule Loopctl.Delivery.Placement do
 
     with {:ok, _row} <- advance,
          {:ok, dispatch} <- attach_story(tenant_id, dispatch, story, session, epoch, opts),
-         :ok <- Runners.dispatch(tenant_id, runner_id, Map.put(dispatch, "claim_epoch", epoch)) do
+         dispatch = dispatch |> Map.put("claim_epoch", epoch) |> put_deadline(story),
+         :ok <- Runners.dispatch(tenant_id, runner_id, dispatch) do
       {:ok,
        %{
          dispatch_id: Map.fetch!(dispatch, "dispatch_id"),
@@ -908,14 +1033,63 @@ defmodule Loopctl.Delivery.Placement do
   # The claim carries the session dispatch on it: `:dispatch_id` becomes the story's
   # `implementer_dispatch_id` and `:lineage` is what the `start_cap` is minted for, both
   # inside the claim's own transaction.
-  defp claim(tenant_id, story_id, agent_id, session, opts) do
+  #
+  # AND A LEASE CAPPED AT THE DISPATCH DEADLINE (#879): `:lease_until` is placed_at plus the
+  # dispatch's wall clock plus `DispatchLease.grace_seconds/0`, and it is the `deadline_at` the
+  # runner stops the session by (`put_deadline/2`). The runner's acceptance, and a resume, may
+  # move the cap LATER while the claim is live (`Progress.reanchor_dispatch_lease/3`), never
+  # earlier. Until then this cap is what ends a claim whose dispatch is never accepted, instead
+  # of the global lease. `placed_at` is taken HERE, immediately before the claim's transaction.
+  defp claim(tenant_id, story_id, agent_id, session, dispatch, opts) do
+    placed_at = DateTime.utc_now()
+
     Progress.claim_story(tenant_id, story_id,
       agent_id: agent_id,
       dispatch_id: session.id,
       lineage: session.lineage_path,
-      actor_label: Keyword.get(opts, :actor_label)
+      actor_label: Keyword.get(opts, :actor_label),
+      lease_until: DispatchLease.cap(placed_at, Map.fetch!(dispatch, "wall_clock_seconds"))
     )
   end
+
+  # THE WALL CLOCK THE CAP IS COMPUTED FROM, judged before anything is minted — by the
+  # CONTRACT'S OWN SCHEMA for the field, the one `Runners.dispatch/3`'s cast applies, so the
+  # two cannot disagree about what is valid (a decimal string is coerced to the integer it
+  # names in both). `claim/6` needs a positive integer to add to `placed_at`, and without this
+  # an out-of-range value was only refused by that cast — AFTER the mint, the claim and two
+  # immutable chain entries. The coerced value is put back, so the cap and the pushed value
+  # are the same number. A resume runs it too (`resume_payload/4`).
+  defp lease_capable(dispatch) do
+    case OpenApiSpex.Cast.cast(
+           RunnerDispatch.schema().properties.wall_clock_seconds,
+           Map.get(dispatch, "wall_clock_seconds")
+         ) do
+      {:ok, seconds} ->
+        {:ok, Map.put(dispatch, "wall_clock_seconds", seconds)}
+
+      {:error, _errors} ->
+        {:error,
+         {:invalid,
+          [
+            "wall_clock_seconds must be an integer from 1 to " <>
+              "#{RunnerDispatch.max_wall_clock_seconds()}"
+          ]}}
+    end
+  end
+
+  # THE CLAIM'S CAP, ON THE WIRE (`RunnerDispatch.deadline_at`, contract 1.19.0): a STOP
+  # BOUND. The runner ends the session by the earlier of its own start + `wall_clock_seconds`
+  # and this instant, reachable or not, and the lease sweep never releases the claim before it
+  # (the cap only ever moves later), so a runner on contract 1.19.0 cut off from control never
+  # runs on a story the SWEEP has released and control placed again. An operator's release —
+  # force-unclaim — can end the claim sooner, by design. ALWAYS the claim's own value: a
+  # caller-supplied `deadline_at` is replaced, exactly as a caller-supplied `claim_epoch` is,
+  # and a claim with no cap sends none. A resume sends the cap it has just moved
+  # (`resume_deadline/4`).
+  defp put_deadline(dispatch, %Story{claim_lease_cap: %DateTime{} = cap}),
+    do: Map.put(dispatch, "deadline_at", DateTime.to_iso8601(cap))
+
+  defp put_deadline(dispatch, %Story{}), do: Map.delete(dispatch, "deadline_at")
 
   # Parented on the caller's own leaf, so the session dispatch can only land inside the
   # caller's subtree — the lineage ceiling, applied by this path rather than inherited from a
@@ -1494,10 +1668,15 @@ defmodule Loopctl.Delivery.Placement do
   # the hash chain for the undo path — and `Progress` reads the lineage as
   # `Keyword.get(opts, :actor_lineage, [])`, so omitting it recorded the placement caller's
   # compensation as the tenant operator's act.
+  #
+  # `release_cause:` (US-44.4, #877) is never the operator default: that escalates the story
+  # for a human, and before it existed the story sat at `queued` + `:pending`, which no
+  # placement ever takes. Which of the two undo causes is `release_cause/1`'s call.
   defp release_claim(tenant_id, story_id, reason, actor_lineage, opts) do
     case Progress.force_unclaim_story(tenant_id, story_id,
            actor_label: Keyword.get(opts, :actor_label),
-           actor_lineage: actor_lineage
+           actor_lineage: actor_lineage,
+           release_cause: release_cause(reason)
          ) do
       {:ok, _story} -> :ok
       other -> log_release_failure(tenant_id, story_id, reason, other)
@@ -1505,6 +1684,59 @@ defmodule Loopctl.Delivery.Placement do
   rescue
     error -> log_release_failure(tenant_id, story_id, reason, error)
   end
+
+  # WHETHER THE REFUSAL SPENT AN ATTEMPT, decided by what refused (#877 review round 1,
+  # finding 3). The RUNNER being unavailable for this dispatch — gone, not the sole socket,
+  # at capacity, the tenant at its admission limit, a lock not granted, the tenant halted — is
+  # a state the next pass may not find, so the undo spends nothing (`:placement_refused`) and
+  # the story is re-contracted for it. EVERYTHING ELSE recurs on every pass for this story —
+  # a payload the contract rejects, a story that could not be attached, a kind the runner does
+  # not do — and uncounted it was placed, refused and released every pass for ever, a chain
+  # entry each time. So it counts (`:attempt`) and the retry ceiling puts it in front of a
+  # human.
+  #
+  # An allowlist of the transient ones, not of the deterministic ones: a refusal nobody has
+  # classified yet is bounded by the ceiling rather than looping.
+  #
+  # Three more are here because the production ceiling is 0, so counted, ONE occurrence
+  # escalates a story to a human (#877 review round 2). Neither is anything in the story:
+  #
+  #   * `:stale_claim_epoch` — the claim this dispatch was built for ended under it (a lease
+  #     reclaim, an operator's force-unclaim) before the ledger read the epoch. A race the next
+  #     pass, claiming afresh, does not meet again.
+  #   * `:not_authorized` — the RUNNER's credential stopped being valid between the pool read
+  #     and the push (revoked, re-enrolled): a problem with the runner, not the story. Bounded
+  #     without counting because the runner channel re-checks its authorization every
+  #     `@recheck_interval_ms` (`LoopctlWeb.RunnerChannel`) and disconnects, which drops the
+  #     runner from Presence, so a later pass meets `:runner_not_connected` instead.
+  #
+  #   * `:runner_exhausted` — the machine's subscription ran dry between the pre-claim check and
+  #     the push (US-44.6). The same fact a `usage_exhausted` session end reports, and that one
+  #     spends no attempt either; the runner is held out until its reset, so a later pass places
+  #     elsewhere.
+  #
+  # `:dispatch_already_replied` and `:dispatch_id_conflict` are NOT here: every pass mints a
+  # fresh `dispatch_id`, so neither can be another pass having got there first. They say
+  # something about this dispatch, and they count.
+  @runner_unavailable [
+    :runner_not_connected,
+    :runner_ambiguous,
+    :runner_at_capacity,
+    :admission_limit_reached,
+    :capacity_busy,
+    :busy,
+    :tenant_halted,
+    :stale_claim_epoch,
+    :not_authorized,
+    :runner_exhausted
+  ]
+
+  @doc false
+  # Public only so `test/loopctl/delivery/placement_test.exs` can hold every entry of the
+  # allowlist above against a table of its own; `release_claim/5` is the one caller.
+  @spec release_cause(term()) :: :placement_refused | :attempt
+  def release_cause(reason) when reason in @runner_unavailable, do: :placement_refused
+  def release_cause(_recurs_every_pass), do: :attempt
 
   defp log_release_failure(tenant_id, story_id, reason, outcome) do
     Logger.error(
