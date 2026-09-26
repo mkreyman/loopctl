@@ -9,6 +9,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Embeddings
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.RankingPriors
@@ -448,6 +449,13 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
         article_id: canonical.id,
         dim: 1536,
         embedding: Pgvector.new(query_vector()),
+        # The hash of the text the materialization worker would embed: without it the row
+        # is stale, and the search re-embeds it with the mock's vector mid-test.
+        embedding_content_hash:
+          canonical
+          |> Embeddings.article_embedding_text()
+          |> Embeddings.text_content_hash(),
+        source_md5: Embeddings.article_source_md5(canonical),
         live_denorm: true
       })
 

@@ -70,7 +70,6 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Embeddings.ShrinkLadder
-  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -472,9 +471,9 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
   defp whole_hash_matches?(_stored, _content_hash), do: false
 
-  defp content_hash(text) do
-    :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
-  end
+  # Shared with every embedding writer: the workers read each other's
+  # `embedding_content_hash` as the no-re-bill guard, so one formula, in one place.
+  defp content_hash(text), do: Embeddings.text_content_hash(text)
 
   defp enqueue_linking(article_id, tenant_id) do
     ArticleLinkingWorker.new(%{article_id: article_id, tenant_id: tenant_id})
@@ -484,9 +483,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   # The initial CHARACTER cap, shared verbatim with `ArticleEmbeddingWorker` — both
   # write `embedding_content_hash` into the same side table and read each other's back
   # as the no-re-bill guard, so a divergent unit here makes every hash miss.
-  defp build_embedding_text(article) do
-    TextBudget.initial("#{article.title}\n\n#{article.body}")
-  end
+  defp build_embedding_text(article), do: Embeddings.article_embedding_text(article)
 
   # Task.yield budget (ms) for a sub-batch provider call — live-tunable via
   # SystemConfig and SCALED by the input count so a ~100-array call gets

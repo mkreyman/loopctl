@@ -1940,6 +1940,33 @@ defmodule Loopctl.Fixtures do
     end
   end
 
+  # A SystemCorpusEmbeddingWorker row in a given Oban state. The suite runs Oban in
+  # `testing: :inline`, which never persists a job, so the row is written directly, as a
+  # real run would leave it, and through OBAN's repo (`Loopctl.Repo`): `AdminRepo` is a
+  # separate sandbox connection. Returns the job id.
+  def fixture(:system_corpus_job, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    %{rows: [[id]]} =
+      Loopctl.Repo.query!(
+        """
+        INSERT INTO oban_jobs (state, queue, worker, args, inserted_at, scheduled_at)
+        VALUES ($1, 'embeddings', $2, $3,
+                NOW() - make_interval(secs => $4), NOW() + make_interval(secs => $5))
+        RETURNING id
+        """,
+        [
+          Map.fetch!(attrs, :state),
+          "Loopctl.Workers.SystemCorpusEmbeddingWorker",
+          %{"tenant_id" => Map.fetch!(attrs, :tenant_id), "dim" => Map.get(attrs, :dim, 1536)},
+          Map.get(attrs, :inserted_ago_s, 0),
+          Map.get(attrs, :due_in_s, 0)
+        ]
+      )
+
+    id
+  end
+
   def fixture(:webhook_event, attrs) do
     attrs = Enum.into(attrs, %{})
 

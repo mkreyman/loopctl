@@ -5,6 +5,16 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.104.2 — 2026-09-26 (system-corpus materialization says what it does)
+
+### Changed
+
+- **`embedding_materialize_system_corpus`** says that it also re-embeds system articles whose
+  text changed since this tenant embedded them, when it answers `already_materialized` or
+  `in_flight`, and when it is refused 409 `materialization_terminal`. loopctl changed to
+  match (#896): it re-embeds changed articles, runs one materialization per tenant at a
+  time, and gates only on the latest run's state.
+
 ## 2.104.1 — 2026-09-26 (the delivery loop has a reference)
 
 ### Changed

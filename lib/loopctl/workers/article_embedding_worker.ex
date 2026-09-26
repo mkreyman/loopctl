@@ -82,7 +82,6 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Embeddings.ShrinkLadder
-  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.Knowledge
   alias Loopctl.Llm
   alias Loopctl.Llm.ProviderError
@@ -379,9 +378,9 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
 
   defp legacy_already_embedded?(_article, _content_hash), do: false
 
-  defp content_hash(text) do
-    :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
-  end
+  # Shared with every embedding writer: the workers read each other's
+  # `embedding_content_hash` as the no-re-bill guard, so one formula, in one place.
+  defp content_hash(text), do: Embeddings.text_content_hash(text)
 
   # Mandatory BYO: the tenant has no embedding key. Cleanly DISCARD (no retry, no
   # crash, no operator-key fallback) with a distinct, queryable reason + a telemetry
@@ -421,7 +420,5 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   # `embedding_content_hash` into the same side table and read each other's back as
   # the no-re-bill guard, so a divergent unit here makes every hash miss and re-bills
   # the provider on every enqueue.
-  defp build_embedding_text(article) do
-    TextBudget.initial("#{article.title}\n\n#{article.body}")
-  end
+  defp build_embedding_text(article), do: Embeddings.article_embedding_text(article)
 end

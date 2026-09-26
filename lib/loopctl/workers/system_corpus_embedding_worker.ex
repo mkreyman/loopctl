@@ -31,9 +31,10 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   ## Batching + self-continuation
 
   One job handles up to `Knowledge.embedding_batch_max/0` articles in ONE provider
-  array call, then re-enqueues itself if more remain. The batch query is an
-  ANTI-JOIN against rows already present at the dimension, so the worker is
-  resumable, idempotent and safe to enqueue at any time.
+  array call, then re-enqueues itself if more remain. The batch is every article with no
+  row at the dimension or a row embedded from different text
+  (`Embeddings.stale_system_articles/3`), so the worker is resumable, idempotent and safe
+  to enqueue at any time.
 
   ## Error taxonomy
 
@@ -44,18 +45,20 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   """
 
   # UNIQUE STATES, load-bearing (review #2): Oban's DEFAULT unique states include
-  # `:executing` and `:completed`, so this worker's self-continuation conflicted with
-  # the very job performing it — `Oban.insert/1` returned the executing job, no
-  # continuation was created, and `replace: [scheduled: …]` could not fire because
-  # the conflict was not in `:scheduled`. A system corpus larger than one batch then
-  # stayed partially materialized while `system_corpus_meta/2` kept reporting
-  # `keyword_only` forever.
+  # `:executing`, so this worker's self-continuation conflicted with the very job
+  # performing it and a multi-batch corpus stalled after one batch. `:executing` stays
+  # OUT; `Embeddings.enqueue_system_corpus_materialization/2` refuses to queue beside an
+  # executing run itself. `period` is unbounded (#896): with 300 s, a job queued or backing
+  # off for longer than that no longer deduplicated, and a second run embedded the same
+  # batch and billed the tenant twice. Continuing by INSERT rather than by snooze keeps
+  # each batch at attempt 1: a snooze adds an attempt every time, and the attempt^4
+  # backoff of a job that had snoozed through a large corpus ran to days.
   use Oban.Worker,
     queue: :embeddings,
     max_attempts: 5,
     unique: [
       keys: [:tenant_id, :dim],
-      period: 300,
+      period: :infinity,
       states: [:available, :scheduled, :retryable]
     ],
     replace: [scheduled: [:args, :scheduled_at]]
@@ -68,7 +71,6 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   alias Loopctl.Embeddings
   alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Embeddings.ShrinkLadder
-  alias Loopctl.Embeddings.TextBudget
   alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Llm
@@ -98,32 +100,35 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)
   end
 
-  # Materialization is (re-)driven by `Embeddings.stale_system_articles/3`, which
-  # reports both the NEVER-materialized articles and the ones whose parent has been
-  # edited since (review: it used to be existence-only, so an edit to a system
-  # article's body left every tenant's vector permanently stale, with
-  # `system_corpus_meta/2` reporting "semantic" throughout and no repair path short
-  # of manual deletion).
-  #
-  # Staleness is detected in SQL by `updated_at`, which is cheap but not exact: an
-  # article can be touched without a content change. The ACTUAL content hash is
-  # therefore compared HERE, before anything is spent — an unchanged article costs a
-  # timestamp touch, never a provider call.
+  # Materialization is driven by `Embeddings.stale_system_articles/3`: the articles with no
+  # row made from their current text. One whose stored content hash already matches that
+  # text (a row written before `source_md5` existed, or an edit that was reverted) is only
+  # STAMPED with the version's md5: no provider call. The rest are embedded.
   defp materialize(tenant_id, dim, articles) do
     {unchanged, entries} =
       articles
       |> Enum.map(fn a -> {a, embedding_text(a)} end)
       |> split_unchanged(tenant_id, dim)
 
-    # ONE update_all for every unchanged article (review) rather than a per-item UPDATE
-    # in a path AC-41.1.11 otherwise de-N+1s.
-    Embeddings.touch_system_article_embeddings(
-      tenant_id,
-      Enum.map(unchanged, fn {article, _text} -> article.id end),
-      dim
-    )
+    Enum.each(unchanged, fn {article, _text} ->
+      Embeddings.stamp_article_source(tenant_id, article, dim)
+    end)
 
-    embed_entries(tenant_id, dim, entries)
+    embed_entries(tenant_id, dim, entries, Enum.map(articles, & &1.id))
+  end
+
+  defp split_unchanged(entries, tenant_id, dim) do
+    hashes =
+      Embeddings.article_embedded_hashes(tenant_id, Enum.map(entries, fn {a, _} -> a.id end), dim)
+
+    Enum.split_with(entries, fn {article, text} ->
+      case Map.get(hashes, article.id) do
+        # `whole_hash/1`: a truncation-marked hash still identifies the FULL text, so an
+        # article whose vector is a prefix is UNCHANGED and must not be re-billed.
+        stored when is_binary(stored) -> ShrinkLadder.whole_hash(stored) == content_hash(text)
+        _ -> false
+      end
+    end)
   end
 
   # Through `ShrinkLadder.embed_batch/3` (#617). An input-too-long rejection used to
@@ -137,8 +142,9 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   # tokens, and an AGGREGATE rejection names no member — so without this the ladder would
   # bisect every batch on every run, paying the whole tree as routine rather than as the
   # one-time recovery it exists to be. Each sub-batch is stored before the next, so an
-  # error later in the batch keeps what was already paid for (`split_unchanged/3` skips it).
-  defp embed_entries(tenant_id, dim, entries) do
+  # error later in the batch keeps what was already paid for (its hash now matches, so
+  # `Embeddings.stale_system_articles/3` skips it on the retry).
+  defp embed_entries(tenant_id, dim, entries, processed_ids) do
     entries
     |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(), fn {_a, text} ->
       text
@@ -150,7 +156,7 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       end
     end)
     |> case do
-      :ok -> continue(tenant_id, dim)
+      :ok -> continue(tenant_id, dim, processed_ids)
       other -> other
     end
   end
@@ -175,9 +181,10 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
         store_all(tenant_id, dim, zip_marked(entries, vectors, truncated))
 
       # PARTIAL: the bisect embedded some members before another half failed (#617 review
-      # follow-up). Those vectors are already billed, and `split_unchanged/3` skips a
-      # stored member on the retry — so storing them is what stops a deterministic failure
-      # re-paying for the same canonicals on every attempt. The error still propagates.
+      # follow-up). Those vectors are already billed, and a stored member's hash matches, so
+      # `Embeddings.stale_system_articles/3` skips it on the retry: storing them is what
+      # stops a deterministic failure re-paying for the same canonicals on every attempt.
+      # The error still propagates.
       {:error, reason, partial} ->
         store_partial(tenant_id, dim, entries, partial)
         propagate(tenant_id, reason)
@@ -226,24 +233,6 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   end
 
   # ONE batched hash read for the whole batch (AC-41.1.11: no per-item query).
-  defp split_unchanged(entries, tenant_id, dim) do
-    hashes =
-      Embeddings.article_embedded_hashes(
-        tenant_id,
-        Enum.map(entries, fn {a, _text} -> a.id end),
-        dim
-      )
-
-    Enum.split_with(entries, fn {article, text} ->
-      case Map.get(hashes, article.id) do
-        # `whole_hash/1`: a truncation-marked hash still identifies the FULL text, so an
-        # article whose vector is a prefix is UNCHANGED and must not be re-billed.
-        stored when is_binary(stored) -> ShrinkLadder.whole_hash(stored) == content_hash(text)
-        _ -> false
-      end
-    end)
-  end
-
   # Vectors are written only after the WHOLE array call succeeded, so a provider
   # failure means zero writes and the batch retries as a unit. The batch's vector
   # LENGTH is checked once, before the first write, so a model that does not emit
@@ -292,20 +281,41 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     {:discard, {:dimension_mismatch, expected, actual}}
   end
 
-  # Self-continuation: more unmaterialized rows means another batch. See the
-  # `unique:` states comment above — with the default states this insert was
-  # swallowed by the currently EXECUTING job and the run stopped after one batch.
-  defp continue(tenant_id, dim) do
-    if Embeddings.stale_system_articles(tenant_id, dim, limit: 1) == [] do
-      :ok
-    else
-      %{tenant_id: tenant_id, dim: dim}
-      |> __MODULE__.new(schedule_in: 1)
-      |> Oban.insert()
-      |> case do
-        {:ok, _job} -> :ok
-        {:error, reason} -> {:error, {:system_corpus_continuation_failed, reason}}
-      end
+  # Self-continuation: more stale rows means another batch, as a FRESH job (attempt 1).
+  # See the `unique:` comment above for why this is an insert and not a snooze.
+  # Continue while a stale article remains that this batch did not just handle. When the
+  # only stale articles left are ones it just stored or stamped, they were edited while it
+  # ran (legitimately stale again) or their md5 disagrees between Elixir and Postgres; a
+  # continuation would handle them in a loop, so stop and let the read path's next fill
+  # start a fresh run, which picks up a real edit. Stopping never strands other articles:
+  # any article this batch did not touch keeps the run going.
+  defp continue(tenant_id, dim, processed_ids) do
+    remaining = Embeddings.stale_system_articles(tenant_id, dim, limit: batch_size())
+
+    cond do
+      remaining == [] ->
+        :ok
+
+      Enum.all?(remaining, &(&1.id in processed_ids)) ->
+        Logger.warning(
+          "SystemCorpusEmbeddingWorker: tenant=#{tenant_id} dim=#{dim} stopping: only " <>
+            "articles this batch just handled are still stale"
+        )
+
+        :ok
+
+      true ->
+        insert_continuation(tenant_id, dim)
+    end
+  end
+
+  defp insert_continuation(tenant_id, dim) do
+    %{tenant_id: tenant_id, dim: dim}
+    |> __MODULE__.new(schedule_in: 1)
+    |> Oban.insert()
+    |> case do
+      {:ok, _job} -> :ok
+      {:error, reason} -> {:error, {:system_corpus_continuation_failed, reason}}
     end
   end
 
@@ -348,13 +358,11 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   defp batch_size, do: Knowledge.embedding_batch_max()
 
   # The same 32,000-CHARACTER first attempt as before, named once (#617) so it cannot
-  # drift from the rung `ShrinkLadder` starts below. The hash in `split_unchanged/3`
-  # is computed over exactly this text, so the cut must not change silently.
-  defp embedding_text(article) do
-    TextBudget.initial("#{article.title}\n\n#{article.body}")
-  end
+  # drift from the rung `ShrinkLadder` starts below. Staleness hashes exactly this text
+  # (`Embeddings.article_embedding_text/1`), so the cut must not change silently.
+  defp embedding_text(article), do: Embeddings.article_embedding_text(article)
 
-  defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
+  defp content_hash(text), do: Embeddings.text_content_hash(text)
 
   defp hash_for(text, false), do: content_hash(text)
   defp hash_for(text, true), do: text |> content_hash() |> ShrinkLadder.truncated_hash()
