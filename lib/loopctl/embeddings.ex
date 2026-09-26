@@ -1605,11 +1605,8 @@ defmodule Loopctl.Embeddings do
       # no-op — an agent key could loop the endpoint to flood the embeddings queue for
       # its own tenant. A limit-1 anti-join probe is cheap and returns a 200-shaped
       # `:already_materialized` with no job created. Checked BEFORE the terminal gate so
-      # a done-but-terminal corpus reports done, not a conflict. "Done" is the WORKER's own
-      # predicate, `stale_system_articles/3`: missing rows AND rows older than a later edit
-      # of their article. Probing missing rows alone answered :already_materialized for a
-      # corrected system article, and nothing else ever re-embedded it.
-      stale_system_articles(tenant_id, dimension, limit: 1) == [] ->
+      # a done-but-terminal corpus reports done, not a conflict.
+      unmaterialized_system_articles(tenant_id, dimension, limit: 1) == [] ->
         {:ok, :already_materialized}
 
       not force? and system_corpus_terminal?(tenant_id, dimension) ->

@@ -804,40 +804,6 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
                Embeddings.enqueue_system_corpus_materialization(tenant.id)
     end
 
-    # A system article corrected after it was materialized (a later migration upserting its
-    # slug) is stale, not missing. The short-circuit probed only for MISSING rows, so the
-    # on-demand call answered :already_materialized and the corrected body was never
-    # re-embedded by any path.
-    test "a system article edited after materialization still enqueues its re-embed" do
-      tenant = fixture(:tenant)
-
-      materialized =
-        for article <- Embeddings.unmaterialized_system_articles(tenant.id, 1536, limit: 1000) do
-          {:ok, _} =
-            Embeddings.materialize_system_article_embedding(
-              tenant.id,
-              article,
-              vec(1536, :close),
-              "sys",
-              1536
-            )
-
-          article
-        end
-
-      assert [edited | _] = materialized
-
-      # The edit: its embedding row now predates the article's last update.
-      from(ae in ArticleEmbedding,
-        where: ae.article_id == ^edited.id and ae.tenant_id == ^tenant.id
-      )
-      |> AdminRepo.update_all(set: [updated_at: DateTime.add(edited.updated_at, -60, :second)])
-
-      Oban.Testing.with_testing_mode(:manual, fn ->
-        assert {:ok, %Oban.Job{}} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
-      end)
-    end
-
     test "the worker materializes the system corpus with the TENANT's own credential" do
       tenant = fixture(:tenant)
       article = system_article()

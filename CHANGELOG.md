@@ -6,22 +6,18 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
-- **A `delivery-loop` system wiki article (migration `20260926060000`), and a corrected
-  system article is now re-embedded on request.** The article is served at
-  `/wiki/delivery-loop` and matched by keyword with no step. Semantic recall of ANY system
-  article exists only on the side-table read path (`embedding_side_table_reads`); on the legacy
-  path every system article is keyword-only for every tenant, and search responses say so in
-  `meta.system_corpus_recall`. On the side-table path, a tenant's semantic search that finds a
-  system article unembedded queues that tenant's materialization; the article becomes
-  semantic once that job has run on the `embeddings` queue, and the search that queued it
-  still answers `keyword_only`. Two cases need an operator:
-  - A tenant whose last materialization job was discarded or cancelled gets no automatic job
-    while Oban still retains that job. Call `embedding_materialize_system_corpus` with an
-    orchestrator-or-higher key, which forces a new one; an agent key is refused 409
-    `materialization_terminal`.
-  - A system article corrected after tenants embedded it is not re-embedded by search.
-    `embedding_materialize_system_corpus` now queues its re-embed for the calling tenant;
-    it answered `already_materialized` before, so nothing ever re-embedded a correction.
+- **A `delivery-loop` system wiki article (migration `20260926060000`).** Served at
+  `/wiki/delivery-loop` and matched by keyword with no step. Semantic recall of system
+  articles exists only on the side-table read path (`embedding_side_table_reads`); on the
+  legacy path every system article is keyword-only for every tenant, as
+  `meta.system_corpus_recall` in search responses says. On the side-table path, a tenant's
+  semantic search that finds a system article unembedded queues a materialization job for
+  that tenant, and the article turns semantic once the job has run; the search that queued it
+  still answers `keyword_only`. The one manual case: while any discarded or cancelled
+  materialization job for that tenant is still retained by Oban, no job is queued
+  automatically, and `embedding_materialize_system_corpus` called with an
+  orchestrator-or-higher key forces one (an agent key is refused 409
+  `materialization_terminal`).
 
 ### Changed
 
