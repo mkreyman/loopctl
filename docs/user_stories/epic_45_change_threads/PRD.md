@@ -1,6 +1,6 @@
 # PRD — Epic 45: Change threads, an agent-native replacement for the pull request
 
-**Status:** draft for review · **Epic:** 45 · **Issue:** mkreyman/loopctl#882
+**Status:** approved 2026-09-26, review round 1 applied · **Epic:** 45 · **Issue:** mkreyman/loopctl#882
 **Builds on:** Epic 44 (`../epic_44_delivery_loop_completion/PRD.md`) and the delivery loop as
 documented in `docs/agent-delivery-loop.md`.
 
@@ -65,7 +65,7 @@ re-placed keeps its thread.
 | Review rounds and findings | loopctl `review_records` + `thread_entries` of kind `finding` | bound to a checkpoint SHA |
 | Fix → finding links | `thread_entries` of kind `fix` | a fix checkpoint names the finding ids it answers |
 | CI evidence | GitHub check runs and statuses, read **by exact SHA** | copied onto the checkpoint when observed |
-| Merge decision | `MergePrecondition`'s recorded `allow` | exists; it now names a checkpoint instead of a PR head |
+| Merge decision | `MergePrecondition`'s recorded `allow` | exists, but PR-shaped: it requires `pr_number` and a `pull_request` fact (`merge_precondition.ex:213-214`, refusals at `:466-467`). Story 45.4 gives it a checkpoint source |
 | Merge | loopctl merge executor (new) | §4 |
 
 **Checkpoint, not keystroke.** Delta records edits between commits. We deliberately do not. What
@@ -73,8 +73,10 @@ reviewers lacked was each fix's *reasoning* next to its diff, and a checkpoint p
 entry gives them that. Edit-level history needs editor integration that we don't own, and it adds
 storage and privacy cost for no measured gain. This is the main thing Delta does that we won't.
 
-`thread_entries` is append-only. Each entry is keyed `(story_id, seq)` and written idempotently by
-`(story_id, dispatch_id, client_seq)`. It is hash-linked into the tenant audit chain, as custody
+`thread_entries` is append-only. Each entry is keyed `(story_id, seq)` and carries a NOT NULL
+`idempotency_key`, unique per `(story_id, author_principal, idempotency_key)`. A session's key is
+`<dispatch_id>:<client_seq>`, and the thread page's key is a per-form nonce, so a retried human
+submit is not written twice. The table is hash-linked into the tenant audit chain, as custody
 events already are. Kinds: `message`, `checkpoint`, `review_requested`, `finding`, `fix`, `verdict`,
 `escalation`, `merge`.
 
@@ -88,21 +90,45 @@ happens.
 1. On `infra`, a repository **ruleset** on `master` restricts updates to one bypass actor, the
    loopctl App. It also requires linear history and blocks force pushes and deletion. A person, a
    session or a PR merge button pushing to `master` is refused by GitHub itself.
-2. The thread branch `loop/<story-id>` is pushable only by the runner's deploy key. This is the
-   "push to `loop/**` only" grant Epic 44 §5 left undecided. Every push is fenced by `claim_epoch`
-   as in 44.5: loopctl records a checkpoint only from the current claimant's epoch.
+2. The runner pushes the thread branch `loop/<story-id>` with a deploy key. This is the "push to
+   `loop/**` only" grant Epic 44 §5 left undecided.
+   - **A deploy key cannot be scoped to a branch.** A second ruleset, on `loop/**`, blocks force
+     pushes and deletion, so no commit already on a thread branch can be dropped.
+   - **Git cannot see a claim epoch.** A reclaimed runner still holding the key can append
+     commits, so the fence is in what loopctl adopts:
+     - A checkpoint is recorded only when the CURRENT claimant reports it under its epoch.
+     - loopctl never adopts a branch head nobody reported.
+     - The merge squashes the RECORDED checkpoint's tree, never the branch head.
+     - The gate refuses (`branch_head_unrecorded`) while the branch head is not the latest
+       recorded checkpoint.
+   - **A zombie's commit therefore reaches `master` only inside a checkpoint the current claimant
+     reported and the review read.** Every line of the merged tree is in a reviewed checkpoint diff.
 3. After `MergePrecondition` records `allow` against a checkpoint SHA, an Oban job
-   (`ThreadMergeWorker`, unique per story) performs a **compare-and-swap squash**. It confirms the
-   checkpoint's history contains the current `master` head (compare API), creates one commit whose
-   tree is the checkpoint's tree and whose parent is that head (Git Data API), and updates the ref
-   with `force: false`.
-   - **If `master` moved** between the two calls, the non-forced update is refused (not a fast
-     forward). The story goes back to `implementing` over the existing `base_moved` edge.
-   - **If it succeeded but the acknowledgement was lost**, the retry finds `master` already at a
-     commit whose tree is the checkpoint's. It answers `already_merged` and adopts that SHA, as
-     `MergePrecondition` already does for a merged PR.
-4. The squash commit's message is generated from the thread: the story title, one paragraph drawn
-   from the final `verdict` entry, and the thread URL, which replaces the PR link.
+   (`ThreadMergeWorker`, unique per story) performs a **compare-and-swap squash**:
+   1. It confirms the checkpoint's history contains the current `master` head (compare API).
+   2. It creates one commit whose tree is the checkpoint's tree and whose parent is that head (Git
+      Data API).
+   3. It **records that commit's SHA on the checkpoint** as `merge_commit_sha`.
+   4. Only then does it update the ref, with `force: false`.
+   - **If the acknowledgement was lost:** the retry asks whether the recorded `merge_commit_sha` is
+     an ancestor of `master`, not whether the trees match. That answer survives other merges
+     landing in between. Every squash also carries a `Loopctl-Story: <id>` trailer, for recovery
+     if the recorded SHA was itself lost.
+   - **An empty change:** a checkpoint whose tree already equals `master`'s is refused as
+     `empty_change` and escalated, never read as merged.
+4. **When `master` has moved,** the executor does not send the story back to `implementing`:
+   1. It asks GitHub to merge `master` INTO the thread branch (`POST /repos/:o/:r/merges`, as the
+      App).
+   2. It records the result as a `base_update` checkpoint, and CI runs on it.
+   3. The story diff against the new merge base is unchanged, so it reuses the recorded review
+      verdict and consumes **no review round**.
+   - Only a textual conflict goes back to `implementing` over `base_moved`.
+   - The cost of a moved base is one CI run on `infra`'s two cheap checks. That is the up-to-date
+     rule `strict = false` avoids in `loopctl`, where one suite takes minutes; the pilot pays it
+     where it is cheap and measures it (criterion 3).
+5. **The squash commit's message quotes no session text.** It carries the story id, the story
+   title reduced to one line of printable characters, the thread URL (which replaces the PR link)
+   and the trailer. A reader who wants the verdict follows the link, where it renders fenced.
 
 "Demote GitHub to a mirror" in the strong sense, with loopctl hosting git, is a **non-goal** (§7).
 In this design GitHub keeps git storage, Actions and deploy triggers. What it loses is the PR as
@@ -118,10 +144,11 @@ Threads do not replace CI. They bind CI to the exact commit that merges.
 - **What loopctl reads:** the evidence for a checkpoint is read by SHA from **both** the
   check-runs and the commit-status APIs. The combined-status API alone never lists check runs, so a green
   status there says nothing about Actions.
-- **The local gate:** the `local-gate` commit status from claude-config#677 counts as evidence for
-  the attested tree. For the pilot, a required check is satisfied by a CI success **or** a
-  `local-gate` success on the same SHA. The trust boundary is #677's (self-attestation bounded by
-  hooks), and the thread records which of the two it was.
+- **The local gate is recorded, never trusted for the merge.** A `local-gate` status from
+  claude-config#677 is posted by whoever pushed, so on this path it is the implementer attesting
+  its own work, which is the shape chain of custody exists to refuse. The thread shows it as an
+  early signal, and the merge requires the real required checks on the checkpoint SHA.
+  Revisit only if the attestation is produced by a lineage separate from the implementer's.
 - **Why the stale-head failure goes away:** the merge gate evaluates one SHA, and the executor
   squashes that SHA's tree. No second object, like a PR head, can drift from it.
 - **After the merge:** `master` runs its full CI on the squash commit as today. That run is the
@@ -136,24 +163,40 @@ Threads do not replace CI. They bind CI to the exact commit that merges.
   entries. For every checkpoint after the first, it also reads the `fix` entries and the findings
   they answer. This is the context a PR never carried.
 - **What it writes:** `finding` entries bound to the checkpoint SHA, each with severity,
-  `file:line`, a failure scenario and an optional `introduced_by` checkpoint. It also writes one
-  `review_records` row with the round's verdict.
+  `file:line`, a failure scenario and `introduced_by`. `introduced_by` is required on every finding
+  after round 1: a checkpoint id, or `none`. It also writes one `review_records` row with the
+  round's verdict.
 - **The round ceiling moves from a per-machine plugin into the server:**
-  - loopctl counts review dispatches per thread.
+  - loopctl counts COMPLETED rounds, meaning `review_records` rows, not dispatches. A review
+    dispatch that dies before recording a verdict uses no round and is simply placed again.
   - A third round is placed only if a round-2 finding carries `introduced_by` pointing at a round-1
     fix checkpoint. That is today's rule, now decidable from data.
   - At the ceiling with material findings, the story escalates with `review_ceiling`, and the
     remedy is a rewrite.
-- **Mark's reviews:** he writes `message` and `finding` entries through the thread view (§6.1) on
-  a user key. A human finding has the same standing as an agent's.
+- **Mark's reviews:** he writes `message` and `finding` entries through the thread page (§6.1),
+  as the tenant's human principal. A human finding has the same standing as an agent's: it binds
+  to a checkpoint and counts toward `introduced_by` and the ceiling.
 
 ### 6.1 Where a human reads a thread
 
 The PR is where Mark looks today, and removing it without a replacement makes the work invisible.
-So the pilot needs a **read-only thread page** on loopctl.com: a LiveView on an authenticated
-session that shows entries, checkpoint diffs (fetched from GitHub by SHA, not stored) and
-findings, with a comment box that posts a `message` entry. The intake issue on GitHub gets a link
-to it. This is the only UI in the epic.
+So the pilot needs a **thread page** on loopctl.com.
+
+- **What it shows:** entries, checkpoint diffs (fetched from GitHub by SHA, not stored) and
+  findings.
+- **What it writes:** `message` and `finding` entries, each carrying a form nonce as its
+  idempotency key.
+- **The intake issue** on GitHub links to it.
+
+**loopctl has no authenticated browser session today.** The router mounts only the
+`:public_signup` and `:public_wiki` live sessions, and every principal is an API key. Story 45.6
+therefore includes browser login:
+- WebAuthn, with the credential enrolled at signup (the L0 human anchor);
+- a session bound to that tenant's human `:user` principal, with RLS scoped as for its key;
+- CSRF protection.
+
+Entries from the page are attributed to that principal with an empty lineage, which is the
+human-operator shape `review-complete` already permits. This is the only UI in the epic.
 
 ### 6.2 What a thread stores from a session
 
@@ -173,11 +216,23 @@ pass the existing secret redaction, and are rendered fenced as untrusted text, a
    adopts it by handoff.
 3. **45.3 Review dispatch:** the `review` kind, checkpoint-bound findings, fix links, and the
    server-side round ceiling.
-4. **45.4 Merge executor:** the GitHub App and the CAS squash, behind a recorded `allow`.
-5. **45.5 CI evidence by exact SHA:** check runs plus statuses, and `local-gate` accepted.
-6. **45.6 Read-only thread page:** §6.1.
-7. **45.7 Pilot wiring on `infra`:** the ruleset, workflows on `loop/**`, and thread-aware
-   variants of the fleet hooks that are PR-shaped today.
+4. **45.4 Gate and stage machine speak checkpoints:**
+   - a checkpoint implementation of the existing `Delivery.PullRequestSource` behaviour, so
+     `MergePrecondition` evaluates a checkpoint without `pr_number`;
+   - `pr_open` reinterpreted as "checkpoint under review" for a thread-mode intake source;
+   - a `ci → ci` `base_updated` edge beside `base_moved`;
+   - the `branch_head_unrecorded` and `empty_change` refusals.
+
+   This is the epic's largest change.
+5. **45.5 Merge executor:** the GitHub App, the CAS squash with its recorded `merge_commit_sha`,
+   and the base update, all behind a recorded `allow`.
+6. **45.6 CI evidence by exact SHA:** check runs plus statuses; `local-gate` recorded but not
+   merge-eligible.
+7. **45.7 Thread page with WebAuthn browser login:** §6.1.
+8. **45.8 Pilot wiring on `infra`:**
+   - the `master` and `loop/**` rulesets;
+   - workflows on `loop/**`;
+   - thread-aware variants of the fleet hooks that are PR-shaped today.
 
 **Non-goals:**
 
@@ -191,8 +246,8 @@ pass the existing secret redaction, and are rendered fenced as untrusted text, a
 **Failure design (SOUL rule 9):**
 
 - **Partition, runner ↔ loopctl:** checkpoints are git commits and survive, and entries are
-  retried idempotently by `client_seq`. A runner that loses its claim cannot record a checkpoint,
-  because of the epoch fence.
+  retried idempotently. A runner that loses its claim can still push, but cannot record a
+  checkpoint, and an unrecorded head blocks the merge (§4 item 2).
 - **State:**
   - Code lives in git.
   - The thread lives in Postgres under RLS.
@@ -200,8 +255,10 @@ pass the existing secret redaction, and are rendered fenced as untrusted text, a
   - The recorded `allow` is loopctl's, per SHA.
 - **Retries:**
   - Entries are idempotent.
-  - The merge executor is unique per story, and a repeated merge resolves to `already_merged`.
-  - A push the webhook missed is found by reading the branch head, not by trusting the event.
+  - The merge executor is unique per story. A repeated merge resolves to `already_merged` by the
+    ancestry of the recorded `merge_commit_sha`.
+  - A checkpoint report that never arrived is re-sent by the runner. loopctl never infers one
+    from the branch head.
 - **Slow GitHub:** the gate answers `unevaluated`/503 with `Retry-After` (exists), the executor
   backs off, and nothing holds a DB connection across a GitHub call.
 - **Where the unit runs:** the implement and review sessions run on runners. The merge runs in an
@@ -237,8 +294,10 @@ Any one of these means stop at the pilot and fold what it learned into the PR-ro
 
 ## 9. Decisions only Mark can make
 
+All three approved by Mark on 2026-09-26 ("Approved. Go ahead with the plan"), on the recommendations below.
+
 | decision | recommendation | blocks |
 |---|---|---|
-| Create the loopctl GitHub App and install it on `infra` with `contents: write` | yes, `infra` only | 45.4 |
-| The runner push grant: deploy key, `loop/**` only (Epic 44 §5's open item) | yes, same grant for both epics | 45.2, 45.4 |
-| A ruleset on `infra` `master` that only the App can update | yes, after 45.4 is green on a scratch branch | 45.7 |
+| Create the loopctl GitHub App and install it on `infra` with `contents: write` | yes, `infra` only | 45.5 |
+| The runner push grant: deploy key, `loop/**` only (Epic 44 §5's open item) | yes, same grant for both epics | 45.2, 45.5 |
+| Rulesets on `infra`: only the App updates `master`; no force push or deletion on `loop/**` | yes, after 45.5 is green on a scratch branch | 45.8 |
