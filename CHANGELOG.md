@@ -6,13 +6,22 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
-- **A `delivery-loop` system wiki article, seeded by migration `20260926060000`.** No manual
-  step. Each tenant embeds it with its own key the first time that tenant runs a semantic
-  search after the deploy: one unembedded system article makes `system_corpus_meta` report
-  `keyword_only`, and that report enqueues the tenant's materialization
-  (`Embeddings.search_disclosure_meta/2`, once per disclosure-cache fill). Until then the
-  article is found by keyword only. `embedding_materialize_system_corpus` does the same thing
-  on demand.
+- **A `delivery-loop` system wiki article (migration `20260926060000`), and a corrected
+  system article is now re-embedded on request.** The article is served at
+  `/wiki/delivery-loop` and matched by keyword with no step. Semantic recall of ANY system
+  article exists only on the side-table read path (`embedding_side_table_reads`); on the legacy
+  path every system article is keyword-only for every tenant, and search responses say so in
+  `meta.system_corpus_recall`. On the side-table path, a tenant's semantic search that finds a
+  system article unembedded queues that tenant's materialization; the article becomes
+  semantic once that job has run on the `embeddings` queue, and the search that queued it
+  still answers `keyword_only`. Two cases need an operator:
+  - A tenant whose last materialization job was discarded or cancelled gets no automatic job
+    while Oban still retains that job. Call `embedding_materialize_system_corpus` with an
+    orchestrator-or-higher key, which forces a new one; an agent key is refused 409
+    `materialization_terminal`.
+  - A system article corrected after tenants embedded it is not re-embedded by search.
+    `embedding_materialize_system_corpus` now queues its re-embed for the calling tenant;
+    it answered `already_materialized` before, so nothing ever re-embedded a correction.
 
 ### Changed
 
