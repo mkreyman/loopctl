@@ -6,13 +6,18 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
-- **A `delivery-loop` system wiki article, seeded by migration `20260926060000`.** No manual
-  step is needed for it to appear at `/wiki/delivery-loop` and in keyword search. It is NOT
-  embedded for tenants that already materialized the system corpus: nothing re-runs
-  materialization when a system article is added, because each tenant embeds the corpus with
-  its own key. Until `embedding_materialize_system_corpus` is run again for a tenant (it is
-  idempotent and embeds only what is missing), the article is keyword-only there, and
-  `system_corpus_meta` in search responses says so.
+- **A `delivery-loop` system wiki article (migration `20260926060000`).** Served at
+  `/wiki/delivery-loop` and matched by keyword with no step. Semantic recall of system
+  articles exists only on the side-table read path (`embedding_side_table_reads`); on the
+  legacy path every system article is keyword-only for every tenant, as
+  `meta.system_corpus_recall` in search responses says. On the side-table path, a tenant's
+  semantic search that finds a system article unembedded queues a materialization job for
+  that tenant, and the article turns semantic once the job has run; the search that queued it
+  still answers `keyword_only`. The one manual case: while any discarded or cancelled
+  materialization job for that tenant is still retained by Oban, no job is queued
+  automatically, and `embedding_materialize_system_corpus` called with an
+  orchestrator-or-higher key forces one (an agent key is refused 409
+  `materialization_terminal`).
 
 ### Changed
 
