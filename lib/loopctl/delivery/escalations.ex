@@ -375,7 +375,7 @@ defmodule Loopctl.Delivery.Escalations do
     # was never going to take.
     with :ok <- resolvable(to),
          {:ok, row} <- live_row(tenant_id, story_id),
-         :ok <- at_escalated_or_finish(tenant_id, story_id, to, row),
+         :ok <- at_escalated(row),
          :ok <- Stages.precheck(transition, advance_opts),
          {:ok, epoch, released} <-
            prepare_story(tenant_id, story_id, to, row, opts, actor_lineage),
@@ -383,14 +383,6 @@ defmodule Loopctl.Delivery.Escalations do
            Stages.advance(tenant_id, story_id, transition, [claim_epoch: epoch] ++ advance_opts),
          {:ok, _story} <- recontract(tenant_id, released, Keyword.get(opts, :actor_label)) do
       {:ok, resolved}
-    else
-      {:finish_requeue, row, story} ->
-        with :ok <- Stages.precheck(transition, advance_opts),
-             {:ok, _story} <- recontract(tenant_id, story, Keyword.get(opts, :actor_label)),
-             do: {:ok, row}
-
-      error ->
-        error
     end
   end
 
@@ -459,7 +451,9 @@ defmodule Loopctl.Delivery.Escalations do
       # An agent contracted it — or contracted AND claimed it — between the transition and
       # this call: the row left `escalated` first, so for that instant the story was listed as
       # ready. It is past `pending`, which is what the resolution asked for — not a failure of
-      # a resolution that already committed.
+      # a resolution that already committed. Any OTHER failure leaves the story `pending` at
+      # `queued`: the state a freshly triaged story awaits its contract in, which
+      # `contract_story` takes from there.
       {:error, {:invalid_transition, %{current_agent_status: status}}} when status != :pending ->
         {:ok, story}
 
@@ -479,31 +473,4 @@ defmodule Loopctl.Delivery.Escalations do
   # runner, and would send an operator looking for a race that did not happen.
   defp at_escalated(%StoryStage{stage: :escalated}), do: :ok
   defp at_escalated(%StoryStage{stage: stage}), do: {:error, {:not_escalated, stage}}
-
-  # A RE-QUEUE WHOSE RE-CONTRACT NEVER LANDED IS FINISHED BY RESOLVING AGAIN. The transition
-  # commits before the re-contract runs (`Stages.advance/4` is its own transaction on
-  # `Loopctl.Repo`), so a re-contract that raised or was refused left the row at `queued` with
-  # the story `pending` — which no placement takes and no lease recovers. A second
-  # `resolve(to: :queued)` then meets exactly that pair and re-contracts; the human gate below
-  # is asked first, as for any resolve, and nothing else is written.
-  defp at_escalated_or_finish(tenant_id, story_id, :queued, %StoryStage{stage: :queued} = row) do
-    case pending_story(tenant_id, story_id) do
-      nil -> at_escalated(row)
-      story -> {:finish_requeue, row, story}
-    end
-  end
-
-  defp at_escalated_or_finish(_tenant_id, _story_id, _to, row), do: at_escalated(row)
-
-  defp pending_story(tenant_id, story_id) do
-    {:ok, story} =
-      Repo.with_tenant(tenant_id, fn ->
-        Repo.one(
-          from s in Story,
-            where: s.id == ^story_id and s.tenant_id == ^tenant_id and s.agent_status == :pending
-        )
-      end)
-
-    story
-  end
 end

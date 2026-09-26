@@ -89,30 +89,6 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       assert :ok = claimable(ctx)
     end
 
-    # #883 review round 3, finding 2. The transition commits before the re-contract runs, so a
-    # re-contract that raised or was refused left `queued` + `pending`: no placement takes it,
-    # and a plain retry was answered `{:not_escalated, :queued}`. Resolving again finishes it.
-    test "a re-queue whose re-contract never landed is finished by resolving again", ctx do
-      assert {:ok, _row} = resolve(ctx, :queued)
-      unstick(ctx)
-      assert {:error, :invalid_transition} = claimable(ctx)
-
-      assert {:ok, row} = resolve(ctx, :queued)
-      assert row.stage == :queued
-      assert reload(ctx).agent_status == :contracted
-      assert :ok = claimable(ctx)
-    end
-
-    test "finishing a re-queue still asks the human gate first", ctx do
-      assert {:ok, _row} = resolve(ctx, :queued)
-      unstick(ctx)
-
-      assert {:error, :human_required} =
-               resolve(ctx, :queued, actor_lineage: [Ecto.UUID.generate()])
-
-      assert reload(ctx).agent_status == :pending
-    end
-
     test "a resolved story is CLAIMABLE: the claim's held-stage refusal lets it go", ctx do
       # While the row sits at `escalated` a claim is refused `:story_held` — a human owns the
       # story. Resolution moves the row out first, so the refusal must not outlive it.
@@ -360,17 +336,6 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
   # ASKED THROUGH THE FUNCTION A PLACEMENT ASKS, never by restating its rule: a test that
   # listed the conditions itself would pass a story `place/4` still refused.
-  # The state a re-contract that failed after its transition leaves: the row at `queued`,
-  # the story `pending`.
-  defp unstick(ctx) do
-    unboxed(fn ->
-      {1, _} =
-        AdminRepo.update_all(from(s in Story, where: s.id == ^ctx.story.id),
-          set: [agent_status: :pending]
-        )
-    end)
-  end
-
   defp claimable(ctx), do: unboxed(fn -> Placement.claimable(ctx.tenant.id, ctx.story.id) end)
 
   defp reload(ctx), do: unboxed(fn -> AdminRepo.get!(Story, ctx.story.id) end)

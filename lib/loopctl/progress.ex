@@ -1967,9 +1967,8 @@ defmodule Loopctl.Progress do
       actor_type: "system",
       actor_id: nil,
       actor_label: label,
-      # A lease that ran out is an attempt spent and lost (US-44.4), unless its runner reported
-      # `usage_exhausted` for this claim and is held out now. Decided under the story lock.
-      cause: fn -> RunnerStages.reclaim_release_cause(tenant_id, story_id, expected_epoch) end
+      # A lease that ran out is an attempt spent and lost (US-44.4).
+      cause: :attempt
     }
 
     case RunnerStages.escalate_recorded_budget_kill(tenant_id, story_id, expected_epoch, label) do
@@ -2086,11 +2085,6 @@ defmodule Loopctl.Progress do
     })
   end
 
-  # A cause the caller could only decide under the story lock arrives as a function, run here,
-  # after `:lock` and `:validate`.
-  defp release_cause(cause) when is_function(cause, 0), do: cause.()
-  defp release_cause(cause), do: cause
-
   # THE ONE `:runner_lost` RELEASE, shared by the lease reclaim and a reported session end so
   # the two cannot drift: a gate, the story locked and re-checked, then released, its stage
   # row following in the same transaction, one audit entry and one webhook. `spec` carries
@@ -2116,7 +2110,7 @@ defmodule Loopctl.Progress do
     # would be refused on every advance with nothing able to move it.
     |> Multi.run(:stage, fn _repo, %{story: updated} ->
       Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
-        cause: release_cause(spec.cause),
+        cause: spec.cause,
         # Both principals behind this release hold no dispatch lineage: the reclaim worker is
         # the system, and a runner's credential is a plain `api_keys` row no dispatch minted.
         actor_lineage: [],

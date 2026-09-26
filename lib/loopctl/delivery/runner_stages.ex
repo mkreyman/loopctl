@@ -549,33 +549,6 @@ defmodule Loopctl.Delivery.RunnerStages do
     end
   end
 
-  @doc """
-  The LEASE RECLAIM's `:cause` for an ordinary expiry of `story_id`'s claim at `claim_epoch`
-  (#883 review round 3). `:usage_exhausted` — no attempt spent — only when the runner recorded
-  `usage_exhausted` for that claim AND its machine is held out now: the hold landed and the
-  release did not, so nothing can place the story back on that machine and there is nothing a
-  count would bound. `:attempt` otherwise, including a recorded `usage_exhausted` whose hold was
-  never written — then the counted expiry is the ONLY bound on a story returning to the same
-  exhausted machine every pass.
-
-  Read by `Loopctl.Progress.reclaim_expired_claim/3` INSIDE its transaction, after the story is
-  locked and the lease re-checked, so a report recorded between an earlier read and the lock
-  cannot be missed.
-  """
-  @spec reclaim_release_cause(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
-          :attempt | :usage_exhausted
-  def reclaim_release_cause(tenant_id, story_id, claim_epoch) do
-    with %{runner_id: runner_id} <-
-           DispatchLedger.session_ended_with(tenant_id, story_id, claim_epoch, [
-             "usage_exhausted"
-           ]),
-         true <- Runners.usage_exhausted?(tenant_id, runner_id) do
-      :usage_exhausted
-    else
-      _ -> :attempt
-    end
-  end
-
   # A BROKEN TENANT CHAIN, answered rather than raised, at the runner-message boundary: every
   # `Stages.advance/4` a runner's message drives (`apply/3` and the budget escalation of
   # `end_session/4`, which the lease reclaim shares) goes through here. The chain's own

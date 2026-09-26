@@ -655,33 +655,6 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
       assert releases(ctx) == []
     end
 
-    # #883 review round 3, finding 4. A recorded usage_exhausted whose release never landed:
-    # with the machine HELD OUT, nothing can place the story back there, so the expiry spends
-    # nothing; with no hold, the counted expiry is the only bound on it returning to the same
-    # exhausted machine every pass.
-    test "a recorded usage_exhausted is reclaimed uncounted while its runner is held out", ctx do
-      assert {:ok, {:recorded, _session}} = record_only(ctx, "usage_exhausted")
-
-      unboxed(fn ->
-        :ok = Usage.mark_session_exhausted(ctx.tenant_id, ctx.runner.id, nil)
-      end)
-
-      expire_lease(ctx)
-      assert {:ok, _released} = reclaim(ctx)
-
-      row = stage_row(ctx)
-      assert row.stage == :queued
-      assert row.attempts == %{}
-    end
-
-    test "a recorded usage_exhausted whose hold never landed is reclaimed COUNTED", ctx do
-      assert {:ok, {:recorded, _session}} = record_only(ctx, "usage_exhausted")
-      expire_lease(ctx)
-
-      assert {:ok, _released} = reclaim(ctx)
-      assert stage_row(ctx).attempts == %{"runner_lost" => 1}
-    end
-
     test "a claim whose session CRASHED is still re-queued as a lease expiry", ctx do
       # Only a BUDGET reason is re-driven; a recorded crash whose release never ran is an
       # ordinary expired lease.

@@ -661,7 +661,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   @doc """
   The ACCEPTED dispatch that served `story_id`'s claim at `claim_epoch` and whose runner
   recorded one of `reasons` in `session_ended` (`record_session_end/4`), or `nil`. Returns
-  `session_of/1`'s map plus `:dispatch_id`, `:reason` and `:runner_id`.
+  `session_of/1`'s map plus `:dispatch_id` and `:reason`.
 
   For the lease reclaim, which must not re-queue a claim a budget kill ended
   (`Loopctl.Progress.reclaim_expired_claim/3`). A read with no lock: every field it returns is
@@ -671,7 +671,6 @@ defmodule Loopctl.Runners.DispatchLedger do
           %{
             dispatch_id: Ecto.UUID.t(),
             reason: String.t(),
-            runner_id: Ecto.UUID.t(),
             kind: String.t() | nil,
             story_id: Ecto.UUID.t(),
             claim_epoch: integer(),
@@ -694,11 +693,7 @@ defmodule Loopctl.Runners.DispatchLedger do
     with %DispatchRecord{} <- record do
       record
       |> session_of()
-      |> Map.merge(%{
-        dispatch_id: record.dispatch_id,
-        reason: record.session_ended_reason,
-        runner_id: record.runner_id
-      })
+      |> Map.merge(%{dispatch_id: record.dispatch_id, reason: record.session_ended_reason})
     end
   end
 
