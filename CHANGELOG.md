@@ -6,6 +6,25 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Intake sources carry a merge mode, and a `thread`-mode story merges from a recorded
+  checkpoint with no pull request (epic 45, US-45.4). Migration `20260926140000` adds
+  `intake_sources.mode`, NOT NULL, default `pr`; no backfill and no manual step, and every
+  existing source behaves exactly as before.** `POST` and `PATCH /api/v1/intake/sources`
+  (and the `intake_source_enroll` / `intake_source_update` MCP tools) take `mode: "pr" |
+  "thread"`, read by presence; null or any other value is 422, and a change is recorded as
+  `intake_source_mode_set` on the audit chain. For a thread-mode story,
+  `POST /stories/:id/merge-precondition` judges the story's latest RECORDED checkpoint
+  (`pr_number` is null) and adds refusals `branch_head_unrecorded` (the thread branch
+  `loop/<story_id>` names a commit nobody reported), `empty_change` (the checkpoint's tree
+  equals the base branch's), `checkpoint_tree_mismatch` and `no_checkpoint_recorded`. The
+  verdict carries `mode`, `checkpoint_id` and `checkpoint_sha`, and a thread-mode allow is
+  recorded naming the checkpoint id and sha. A new stage edge, `ci -> ci` over
+  `base_updated`, is taken only for a `base_update` checkpoint the control plane recorded on
+  top of the checkpoint last allowed: the head moves to it, the old allow is cleared, and
+  the story keeps its review verdict and is judged again in the same call. It is not
+  runner-reportable; the runner contract is unchanged. For a thread-mode repository the
+  gate's `GITHUB_TOKEN` also reads `git/ref/heads/*` and `git/commits/*` (contents: read,
+  which the tree reads already need).
 - **Runners may report checkpoints and notes on a story's change thread (epic 45, US-45.2,
   runner contract 1.20.0). RE-VENDOR the contract to send them; a runner that does not gets
   today's behaviour.** Two new optional channel messages. `checkpoint` carries `{dispatch_id,

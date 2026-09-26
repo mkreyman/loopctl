@@ -88,14 +88,24 @@ defmodule LoopctlWeb.MergePreconditionController do
         properties: %{
           decision: %OpenApiSpex.Schema{
             type: :string,
-            enum: ["allow", "refuse", "already_merged", "head_moved", "unevaluated"],
+            enum: [
+              "allow",
+              "refuse",
+              "already_merged",
+              "head_moved",
+              "base_updated",
+              "unevaluated"
+            ],
             description:
               "`allow` licenses the merge, and the allow has been RECORDED against the " <>
                 "head it judged. `refuse` has already escalated the story. " <>
                 "`already_merged` reports a merge GitHub had already performed AND a " <>
                 "recorded allow authorised — one nobody authorised is a `refuse` naming " <>
                 "the sha. `head_moved` sends the story back to `implementing` because the " <>
-                "pull request's head is not the one CI ran on. `unevaluated` (HTTP 503) is " <>
+                "pull request's head is not the one CI ran on. `base_updated` (thread mode " <>
+                "only) is returned only when following a control-recorded base update " <>
+                "failed to write; a followed one is judged again and its verdict returned. " <>
+                "`unevaluated` (HTTP 503) is " <>
                 "a transient forge fault: nothing was decided, nothing transitioned, retry."
           },
           reasons: %OpenApiSpex.Schema{
@@ -104,6 +114,22 @@ defmodule LoopctlWeb.MergePreconditionController do
             items: @reason_schema
           },
           repo: %OpenApiSpex.Schema{type: :string, nullable: true},
+          mode: %OpenApiSpex.Schema{
+            type: :string,
+            enum: ["pr", "thread"],
+            description:
+              "The story's intake source's mode. `thread` judges the latest RECORDED " <>
+                "checkpoint instead of a pull request, so `pr_number` is null."
+          },
+          checkpoint_id: %OpenApiSpex.Schema{
+            type: :string,
+            format: :uuid,
+            nullable: true,
+            description:
+              "Thread mode: the recorded checkpoint judged. A thread-mode allow is recorded " <>
+                "naming it and `checkpoint_sha`."
+          },
+          checkpoint_sha: %OpenApiSpex.Schema{type: :string, nullable: true},
           pr_number: %OpenApiSpex.Schema{type: :integer, nullable: true},
           head_sha: %OpenApiSpex.Schema{
             type: :string,
@@ -200,6 +226,15 @@ defmodule LoopctlWeb.MergePreconditionController do
         "GitHub, a truncated file list, a diff that does not parse, a stale trigger at " <>
         "either the head or the merge base, and an unverified or custody-unattributed " <>
         "story all REFUSE.\n\n" <>
+        "THREAD MODE (the story's intake source has `mode: thread`) needs no pull request: " <>
+        "the gate judges the story's latest RECORDED checkpoint on the thread branch " <>
+        "`loop/<story_id>`, and adds three refusals — `branch_head_unrecorded` when the " <>
+        "branch head is not that checkpoint, `empty_change` when its tree equals the base " <>
+        "branch's, and `checkpoint_tree_mismatch` when the forge's tree for it is not the one " <>
+        "recorded — plus `no_checkpoint_recorded` for a thread with none. A thread whose " <>
+        "latest checkpoint is a control-recorded `base_update` of the checkpoint last " <>
+        "allowed stays at `ci` (`base_updated` edge), keeps its review verdict, and is " <>
+        "judged again at the new head in the same call.\n\n" <>
         "A `refuse` decision escalates the story on the `merge_gate` edge before " <>
         "responding, and returns 200: a refusal is an answer, not a request error. An " <>
         "`already_merged` decision reports a pull request GitHub already merged, with its " <>
@@ -368,6 +403,9 @@ defmodule LoopctlWeb.MergePreconditionController do
       decision: verdict.decision,
       reasons: Enum.map(verdict.reasons, &reason/1),
       repo: verdict.repo,
+      mode: verdict.mode,
+      checkpoint_id: verdict.checkpoint_id,
+      checkpoint_sha: verdict.checkpoint_sha,
       pr_number: verdict.pr_number,
       head_sha: verdict.head_sha,
       recorded_head_sha: verdict.recorded_head_sha,

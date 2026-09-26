@@ -146,6 +146,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Runner
+  alias Loopctl.Threads.Checkpoint
   alias Loopctl.WorkBreakdown.Story
 
   @lock_timeout "2000ms"
@@ -161,6 +162,11 @@ defmodule Loopctl.Delivery.Stages do
   # decides once it has requeued the row (US-44.4).
   @release_only_edges [:runner_lost, :claim_released] ++
                         StageMachine.release_escalation_edges()
+
+  # Edges `advance/4` refuses from every caller because a DEDICATED function takes them after
+  # checking what the edge asserts, under the same locks: `:base_updated` is
+  # `follow_base_update/4`'s, and is legal only for a control-recorded `base_update` checkpoint.
+  @dedicated_edges [:base_updated]
 
   # WHY a claim was released, which decides where the story goes next (US-44.4, #877). Every
   # caller of `follow_release/5` names one; see its doc for the table.
@@ -217,6 +223,7 @@ defmodule Loopctl.Delivery.Stages do
           | :stale_claim_epoch
           | :wrong_stage
           | :effect_conflict
+          | :invalid_event_data
           | :busy
 
   @doc """
@@ -412,6 +419,117 @@ defmodule Loopctl.Delivery.Stages do
       in_tenant(tenant_id, fn ->
         transition(tenant_id, story_id, {from, to, edge}, epoch, effects, sanitise_reason(opts))
       end)
+    end
+  end
+
+  @type base_update_error ::
+          :not_found
+          | :stale_claim_epoch
+          | :stale_stage
+          | :checkpoint_not_found
+          | :not_a_base_update
+          | :no_recorded_allow
+          | :base_update_not_of_allowed
+          | :effect_conflict
+          | :busy
+
+  @doc """
+  Takes `{:ci, :ci, :base_updated}` for a THREAD-mode story whose base moved under an allowed
+  checkpoint (US-45.4, Epic 45 PRD §4 item 4): `head_sha` becomes the `base_update`
+  checkpoint's commit, every head-keyed identity of the old head is cleared (the recorded
+  allow first), and the story stays at `ci` — its review verdict and custody binding are
+  untouched, so the gate re-judges the new head without a new review round.
+
+  The ONLY way to take the edge; `advance/4` refuses it. Everything the edge asserts is
+  checked HERE, under the story's share lock and the stage row's update lock, in the
+  transaction that writes it:
+
+  - `:checkpoint_not_found` — `checkpoint_id` is not a checkpoint of this story in the tenant
+  - `:not_a_base_update` — it is a claimant's checkpoint, not one the control plane recorded
+    (`Loopctl.Threads.record_base_update/3` is the only writer of that kind)
+  - `:stale_stage` — the row is not at `ci`
+  - `:no_recorded_allow` — the gate has allowed nothing at this head, so there is no
+    checkpoint the base could have moved under
+  - `:base_update_not_of_allowed` — the checkpoint's parent is not the checkpoint the gate
+    last allowed, or the row's head is no longer that checkpoint. Any other movement of the
+    head is ordinary work and goes over `:base_moved`
+  - `:stale_claim_epoch`, `:not_found`, `:busy` — as for `advance/4`
+
+  A replay after the edge committed finds the allow cleared and answers
+  `:no_recorded_allow`; the caller reads `get/2`, where `head_sha` already names the update.
+
+  ## Options
+
+  - `:claim_epoch` (required) — the epoch the caller acts under
+  - `:actor_label` — attribution on the transition event
+  """
+  @spec follow_base_update(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, StoryStage.t()} | {:error, base_update_error()}
+  def follow_base_update(tenant_id, story_id, checkpoint_id, opts) do
+    epoch = Keyword.fetch!(opts, :claim_epoch)
+    transition = {:ci, :ci, :base_updated}
+    true = StageMachine.allowed?(:ci, :ci, :base_updated)
+
+    in_tenant(tenant_id, fn ->
+      # The lock order `transition/6` takes, taken first here so the checks below read the
+      # row it is about to write; `transition/6` re-takes both locks this transaction holds.
+      story = share_lock_story(tenant_id, story_id)
+      if story.claim_epoch != epoch, do: Repo.rollback(:stale_claim_epoch)
+      row = lock_row(tenant_id, story_id) || Repo.rollback(:not_found)
+      checkpoint = base_update_checkpoint!(tenant_id, story_id, checkpoint_id, row)
+
+      event_data = %{
+        "checkpoint_id" => checkpoint.id,
+        "base_update_sha" => checkpoint.commit_sha,
+        "previous_head_sha" => row.head_sha
+      }
+
+      transition(
+        tenant_id,
+        story_id,
+        transition,
+        epoch,
+        [head_sha: checkpoint.commit_sha],
+        opts |> Keyword.take([:actor_label]) |> Keyword.put(:event_data, event_data)
+      )
+    end)
+  end
+
+  defp base_update_checkpoint!(tenant_id, story_id, checkpoint_id, row) do
+    checkpoint = story_checkpoint(tenant_id, story_id, checkpoint_id)
+
+    parent =
+      checkpoint && checkpoint.parent_checkpoint_id &&
+        story_checkpoint(tenant_id, story_id, checkpoint.parent_checkpoint_id)
+
+    cond do
+      is_nil(checkpoint) -> Repo.rollback(:checkpoint_not_found)
+      checkpoint.kind != :base_update -> Repo.rollback(:not_a_base_update)
+      row.stage != :ci -> Repo.rollback(:stale_stage)
+      is_nil(row.merge_gate_allowed_sha) -> Repo.rollback(:no_recorded_allow)
+      not of_allowed?(parent, row) -> Repo.rollback(:base_update_not_of_allowed)
+      true -> checkpoint
+    end
+  end
+
+  # The base update's first parent is the checkpoint the gate ALLOWED, and the row still
+  # stands at that head. Either half false is some other head movement, and that is
+  # `:base_moved`'s, never this edge's.
+  defp of_allowed?(nil, _row), do: false
+
+  defp of_allowed?(%Checkpoint{commit_sha: sha}, %StoryStage{} = row),
+    do: row.merge_gate_allowed_sha == sha and row.head_sha == sha
+
+  defp story_checkpoint(tenant_id, story_id, checkpoint_id) do
+    case Ecto.UUID.cast(checkpoint_id) do
+      {:ok, id} ->
+        Repo.one(
+          from c in Checkpoint,
+            where: c.tenant_id == ^tenant_id and c.story_id == ^story_id and c.id == ^id
+        )
+
+      :error ->
+        nil
     end
   end
 
@@ -910,6 +1028,10 @@ defmodule Loopctl.Delivery.Stages do
   ## Options
 
   - `:claim_epoch` (required), `:actor_label`
+  - `:event_data` — a JSON-encodable map recorded under `"payload"` on the `effect_recorded`
+    event, bounded as `advance/4`'s is. The merge gate names the checkpoint a thread-mode
+    allow was granted for this way (US-45.4). Nothing is recorded for a replay of a write
+    that already landed, because a replay writes no event.
   """
   @spec record_effect(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), keyword()) ::
           {:ok, StoryStage.t()} | {:error, effect_error()}
@@ -917,6 +1039,7 @@ defmodule Loopctl.Delivery.Stages do
     epoch = Keyword.fetch!(opts, :claim_epoch)
 
     with :ok <- recordable(effect),
+         :ok <- event_data_ok(opts),
          {:ok, value} <- validate_effect(effect, value) do
       in_tenant(tenant_id, fn ->
         effect_write(tenant_id, story_id, {effect, value}, epoch, opts)
@@ -966,7 +1089,10 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
+  # A transition's `:event_data` belongs to the TRANSITION's event, which already carries it;
+  # the effect events it writes stay exactly `effect` and `value`.
   defp put_effects(row, effects, opts) do
+    opts = Keyword.delete(opts, :event_data)
     Enum.reduce(effects, row, fn {effect, value}, acc -> put_effect(acc, effect, value, opts) end)
   end
 
@@ -983,7 +1109,10 @@ defmodule Loopctl.Delivery.Stages do
       )
       |> Repo.update_all([])
 
-    data = %{"effect" => Atom.to_string(effect), "value" => event_value(value)}
+    data =
+      note(nil, opts)
+      |> Map.merge(%{"effect" => Atom.to_string(effect), "value" => event_value(value)})
+
     insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
     row
   end
@@ -1428,6 +1557,9 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   defp allowed_for_caller(_from, _to, edge) when edge in @release_only_edges,
+    do: {:error, :invalid_transition}
+
+  defp allowed_for_caller(_from, _to, edge) when edge in @dedicated_edges,
     do: {:error, :invalid_transition}
 
   defp allowed_for_caller(from, to, edge) do

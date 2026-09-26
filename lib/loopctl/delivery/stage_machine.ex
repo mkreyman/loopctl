@@ -34,6 +34,16 @@ defmodule Loopctl.Delivery.StageMachine do
     saying no change was needed, while a budget exhaustion closes nothing at all. A verdict
     somebody else reaches about the report, so it is not runner-reportable — `triaged` is
     not a runner source stage
+  - `:base_updated` — ci -> ci, a THREAD-mode story whose base moved under an allowed
+    checkpoint (US-45.4, Epic 45 PRD §4 item 4). Control merged the base into the thread
+    branch and recorded the result as a `base_update` checkpoint; the story diff against the
+    new merge base is unchanged, so the story STAYS at `ci`, keeps its review verdict and its
+    custody binding, and only its head moves: `head_sha` becomes the `base_update` sha and
+    every head-keyed identity (the recorded allow first) is cleared with the old head. Taken
+    ONLY by `Loopctl.Delivery.Stages.follow_base_update/4`, which checks under the row's lock
+    that the checkpoint is a control-recorded `base_update` whose first parent is the
+    checkpoint the gate last allowed; `advance/4` refuses it from every caller and it is not
+    runner-reportable. Any other head movement is still `:base_moved`.
   - `:merge_gate` — ci -> escalated, the merge-precondition gate refusing (design §5:
     a clean result merges with no human, anything else routes to Gate A)
   - `:session_escalated` — any in-flight stage, `merged` or `deployed` -> escalated: the
@@ -178,6 +188,7 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:reviewing, :implementing, :review_findings},
                    {:pr_open, :implementing, :base_moved},
                    {:ci, :implementing, :base_moved},
+                   {:ci, :ci, :base_updated},
                    {:deployed, :escalated, :verification_failed},
                    {:triaged, :escalated, :triage_escalate},
                    {:triaged, :failed, :triage_reject},
@@ -404,6 +415,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :ci_red
           | :review_findings
           | :base_moved
+          | :base_updated
           | :verification_failed
           | :triage_escalate
           | :triage_reject
@@ -622,7 +634,11 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec ends_session?(stage()) :: boolean()
   def ends_session?(to), do: to in @session_ends_at
 
-  @doc "True for an edge counted in `attempts` — every edge except `:forward`."
+  @doc """
+  True for an edge counted in `attempts` — every edge except `:forward`. `:base_updated` IS
+  counted: it is not a retry, but how many times a base moved under one story is exactly what
+  an operator reading a slow thread wants to see.
+  """
   @spec counted?(edge()) :: boolean()
   def counted?(edge), do: edge != :forward
 
@@ -722,6 +738,12 @@ defmodule Loopctl.Delivery.StageMachine do
   def clears(:merged, :implementing, :merge_refused), do: @merge_keyed ++ @head_keyed
 
   def clears(_from, :implementing, edge) when edge != :forward, do: @head_keyed
+
+  # The head moves to the `base_update` sha, which the SAME transition writes back as its
+  # effect (`Loopctl.Delivery.Stages.follow_base_update/4`). Everything keyed to the OLD head
+  # goes with it: the allow was granted for a commit that is no longer the head, and the
+  # unevaluated count was kept against it.
+  def clears(:ci, :ci, :base_updated), do: @head_keyed
 
   def clears(_from, _to, _edge), do: []
 

@@ -34,6 +34,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Dispatches
+  alias Loopctl.Intake
   alias Loopctl.MockPullRequestSource
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Story
@@ -432,6 +433,186 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   end
 
   # -- helpers ---------------------------------------------------------------------------
+
+  describe "thread mode (US-45.4)" do
+    @tree String.duplicate("e", 40)
+    @base_tree String.duplicate("f", 40)
+    @update String.duplicate("d", 40)
+    @update_tree String.duplicate("0", 40)
+
+    setup ctx do
+      {:ok, _source} = Intake.update_source(ctx.tenant_id, source_id(ctx), %{mode: "thread"})
+
+      checkpoint =
+        fixture(:thread_checkpoint, %{
+          tenant_id: ctx.tenant_id,
+          story_id: ctx.story_id,
+          seq: 1,
+          commit_sha: @head,
+          tree_sha: @tree
+        })
+
+      %{checkpoint: checkpoint}
+    end
+
+    test "TC-45.4.1 a pr-mode source is untouched: it never reads a checkpoint", ctx do
+      {:ok, _source} = Intake.update_source(ctx.tenant_id, source_id(ctx), %{mode: "pr"})
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+
+      Mox.stub(MockPullRequestSource, :branch_head, fn _repo, _branch ->
+        flunk("a pr-mode story read the thread branch")
+      end)
+
+      assert {:ok, %Verdict{decision: :allow, mode: :pr, pr_number: 4242}} = evaluate(ctx)
+    end
+
+    test "TC-45.4.2 a thread story at ci allows the recorded checkpoint, and the allow names it",
+         ctx do
+      stub_thread(ctx)
+
+      assert {:ok, %Verdict{decision: :allow} = verdict} = enforce(ctx)
+      assert verdict.mode == :thread
+      assert verdict.pr_number == nil
+      assert verdict.checkpoint_id == ctx.checkpoint.id
+      assert verdict.checkpoint_sha == @head
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert row.merge_gate_allowed_sha == @head
+
+      assert %{"payload" => %{"checkpoint_id" => id, "checkpoint_sha" => @head}} =
+               allow_event_data(ctx)
+
+      assert id == ctx.checkpoint.id
+    end
+
+    test "TC-45.4.3 a branch head nobody reported refuses branch_head_unrecorded", ctx do
+      pushed = String.duplicate("9", 40)
+      stub_thread(ctx, branch_head: pushed)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:branch_head_unrecorded, pushed, @head} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      assert row.escalation_reason =~ "branch_head_unrecorded"
+    end
+
+    test "TC-45.4.3 a checkpoint whose tree is the base's refuses empty_change", ctx do
+      stub_thread(ctx, base_tree: @tree)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:empty_change, @tree} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).escalation_reason =~ "empty_change"
+    end
+
+    test "TC-45.4.5 a base update of the allowed checkpoint stays at ci and allows the new head",
+         ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      {:ok, update, :created} =
+        Loopctl.Threads.record_base_update(ctx.tenant_id, ctx.story_id,
+          commit_sha: @update,
+          tree_sha: @update_tree,
+          first_parent_sha: @head
+        )
+
+      stub_thread(ctx, head: @update, tree: @update_tree, first_parent: @head)
+
+      assert {:ok, %Verdict{decision: :allow} = verdict} = enforce(ctx)
+      assert verdict.checkpoint_id == update.id
+      assert verdict.head_sha == @update
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert row.head_sha == @update
+      assert row.merge_gate_allowed_sha == @update
+      assert row.attempts == %{"base_updated" => 1}
+
+      # The review verdict and custody binding are the story's, and nothing touched them.
+      story = AdminRepo.get!(Story, ctx.story_id)
+      assert story.verified_status == :verified
+      assert story.agent_status == :reported_done
+    end
+
+    test "any other head movement is still base_moved, back to implementing", ctx do
+      moved = String.duplicate("9", 40)
+
+      fixture(:thread_checkpoint, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        seq: 2,
+        commit_sha: moved,
+        tree_sha: @tree,
+        parent_checkpoint_id: ctx.checkpoint.id
+      })
+
+      stub_thread(ctx, head: moved)
+
+      assert {:ok, %Verdict{decision: :head_moved}} = enforce(ctx)
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :implementing
+      assert row.attempts == %{"base_moved" => 1}
+    end
+  end
+
+  defp source_id(ctx) do
+    AdminRepo.one!(
+      from s in Loopctl.Intake.Source,
+        where: s.project_id == ^ctx.project_id and is_nil(s.revoked_at),
+        select: s.id
+    )
+  end
+
+  # The forge's view of the thread: the branch head, the checkpoint commit and the comparison
+  # of the base with it. Each read asserts the ref it was asked for, so a gate reading the
+  # wrong branch or comparing against the wrong base fails here rather than passing.
+  defp stub_thread(ctx, opts \\ []) do
+    head = Keyword.get(opts, :head, @head)
+    branch = "loop/" <> ctx.story_id
+
+    Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^branch ->
+      {:ok, Keyword.get(opts, :branch_head, head)}
+    end)
+
+    Mox.stub(MockPullRequestSource, :commit, fn @repo, ^head ->
+      {:ok,
+       %{
+         tree_sha: Keyword.get(opts, :tree, @tree),
+         parent_shas: [Keyword.get(opts, :first_parent, @base)]
+       }}
+    end)
+
+    Mox.stub(MockPullRequestSource, :compare, fn @repo, "master", ^head ->
+      {:ok,
+       %{
+         merge_base_sha: @base,
+         base_tree_sha: Keyword.get(opts, :base_tree, @base_tree),
+         diffstat: %{files: 1, changed_lines: 1},
+         diff: {:ok, %{files: ["lib/widgets/thing.ex"], renames: []}}
+       }}
+    end)
+
+    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+  end
+
+  defp allow_event_data(ctx) do
+    {:ok, data} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        Repo.one(
+          from e in Loopctl.Delivery.StageEvent,
+            where:
+              e.story_id == ^ctx.story_id and e.event == "effect_recorded" and
+                fragment("?->>'effect'", e.data) == "merge_gate_allowed_sha",
+            order_by: [desc: e.inserted_at],
+            limit: 1,
+            select: e.data
+        )
+      end)
+
+    data
+  end
 
   defp evaluate(ctx), do: MergePrecondition.evaluate(ctx.tenant_id, ctx.story_id, opts())
   defp enforce(ctx), do: MergePrecondition.enforce(ctx.tenant_id, ctx.story_id, opts())

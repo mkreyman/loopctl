@@ -143,6 +143,152 @@ defmodule Loopctl.Threads do
   end
 
   @doc """
+  The story's latest recorded checkpoint, whatever its kind, or `nil` when it has none. What
+  the merge gate judges for a THREAD-mode story (US-45.4): loopctl never adopts a branch head
+  nobody reported, so the latest RECORD is the head, and the gate refuses
+  `branch_head_unrecorded` while the branch says otherwise. Takes no lock.
+  """
+  @spec latest_recorded_checkpoint(Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
+  def latest_recorded_checkpoint(tenant_id, story_id) do
+    {:ok, checkpoint} =
+      Repo.with_tenant(tenant_id, fn -> latest_checkpoint(tenant_id, story_id) end)
+
+    checkpoint
+  end
+
+  @doc """
+  The checkpoint `checkpoint_id` of this story, or `nil`. Takes no lock.
+  """
+  @spec get_checkpoint(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
+  def get_checkpoint(tenant_id, story_id, checkpoint_id) do
+    case Ecto.UUID.cast(checkpoint_id) do
+      {:ok, id} ->
+        {:ok, checkpoint} =
+          Repo.with_tenant(tenant_id, fn ->
+            Repo.one(
+              from c in Checkpoint,
+                where: c.tenant_id == ^tenant_id and c.story_id == ^story_id and c.id == ^id
+            )
+          end)
+
+        checkpoint
+
+      :error ->
+        nil
+    end
+  end
+
+  @doc """
+  Records a `base_update` checkpoint: the CONTROL PLANE's merge of the base branch into the
+  thread branch, after the base moved under an allowed checkpoint (US-45.4, PRD §4 item 4).
+
+  CONTROL-ONLY. No endpoint, no runner message and no tool reaches it: the caller is the merge
+  executor, which asked GitHub to merge the base INTO the thread branch and records the commit
+  GitHub made. That is what licenses `{:ci, :ci, :base_updated}`
+  (`Loopctl.Delivery.Stages.follow_base_update/4`) — the story diff against the new merge
+  base is unchanged, so its review verdict still stands — and it is why the kind is never
+  something a claimant can report.
+
+  Refused unless `first_parent_sha` is the commit of the story's LATEST checkpoint: a merge of
+  the base into anything else is not a base update of the checkpoint the gate judged. The
+  checkpoint's parent is that latest checkpoint, and its `claim_epoch` is the story's current
+  one, so a later claim does not inherit it.
+
+  ## Options
+
+  - `:commit_sha`, `:tree_sha` (required) — the merge commit GitHub returned, and its tree
+  - `:first_parent_sha` (required) — that commit's first parent, as GitHub returned it
+  - `:actor_label` — recorded as the entry's author principal, default `"control:base_update"`
+
+  Idempotent: the same commit again answers `{:ok, checkpoint, :existing}`; the same commit
+  with another tree is `checkpoint_conflict`.
+  """
+  @spec record_base_update(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Checkpoint.t(), :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, String.t() | map()}
+  def record_base_update(tenant_id, story_id, opts) do
+    commit_sha = Keyword.fetch!(opts, :commit_sha)
+    tree_sha = Keyword.fetch!(opts, :tree_sha)
+    first_parent = Keyword.fetch!(opts, :first_parent_sha)
+
+    with :ok <- valid_sha(commit_sha, "commit_sha"),
+         :ok <- valid_sha(tree_sha, "tree_sha"),
+         :ok <- valid_sha(first_parent, "first_parent_sha"),
+         :ok <- same_object_format(commit_sha, tree_sha) do
+      in_story_lock(tenant_id, story_id, fn ->
+        base_update_locked(tenant_id, story_id, commit_sha, tree_sha, first_parent, opts)
+      end)
+    end
+  end
+
+  defp base_update_locked(tenant_id, story_id, commit_sha, tree_sha, first_parent, opts) do
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
+         epoch = story.claim_epoch,
+         nil <- checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch),
+         {:latest, %Checkpoint{commit_sha: ^first_parent} = parent} <-
+           {:latest, latest_checkpoint(tenant_id, story_id)} do
+      insert_base_update(tenant_id, story_id, parent, commit_sha, tree_sha, epoch, opts)
+    else
+      {:story, nil} ->
+        {:error, :not_found}
+
+      %Checkpoint{kind: :base_update, tree_sha: ^tree_sha} = existing ->
+        {:ok, existing, :existing, []}
+
+      %Checkpoint{} ->
+        conflict("checkpoint_conflict", "commit_sha is already recorded as another checkpoint")
+
+      {:latest, _other} ->
+        {:error, :unprocessable_entity,
+         "first_parent_sha must be the commit of the story's latest recorded checkpoint"}
+    end
+  end
+
+  defp insert_base_update(tenant_id, story_id, parent, commit_sha, tree_sha, epoch, opts) do
+    checkpoint =
+      Repo.insert!(%Checkpoint{
+        tenant_id: tenant_id,
+        story_id: story_id,
+        seq: parent.seq + 1,
+        kind: :base_update,
+        commit_sha: commit_sha,
+        tree_sha: tree_sha,
+        parent_checkpoint_id: parent.id,
+        claim_epoch: epoch,
+        dispatch_id: nil
+      })
+
+    entry =
+      Entry.system_changeset(%{
+        kind: :checkpoint,
+        idempotency_key: @reserved_key_prefix <> "base_update:#{commit_sha}:#{epoch}",
+        body: "base update #{commit_sha} of #{parent.commit_sha}",
+        checkpoint_id: checkpoint.id
+      })
+
+    adopted = %{
+      "commit_sha" => commit_sha,
+      "tree_sha" => tree_sha,
+      "claim_epoch" => epoch,
+      "checkpoint_seq" => checkpoint.seq,
+      "checkpoint_kind" => "base_update",
+      "first_parent_sha" => parent.commit_sha
+    }
+
+    entry_opts = [
+      author_principal: Keyword.get(opts, :actor_label, "control:base_update"),
+      # The control plane acts under no dispatch.
+      actor_lineage: [],
+      adopted: adopted
+    ]
+
+    with {:ok, _entry, :created, chained} <- insert_entry(tenant_id, story_id, entry, entry_opts) do
+      {:ok, checkpoint, :created, chained}
+    end
+  end
+
+  @doc """
   Records a `message` or `review_requested` entry on the story's thread, from any principal
   of the tenant. `attrs` carries `kind`, `idempotency_key`, `body` and an optional
   `checkpoint_id` of this story.

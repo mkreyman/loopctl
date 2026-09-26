@@ -2,7 +2,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
   @moduledoc """
   One merge-precondition evaluation (issue #803, design §5 "Both gates run twice" and §9).
 
-  - `decision` — one of five:
+  - `decision` — one of six:
     - `:allow` — and only from `enforce/3`, which records the allow against the head it
       judged. Nothing else licenses a merge
     - `:refuse` — a gate verdict. The story is escalated
@@ -11,6 +11,10 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     - `:head_moved` — the pull request's head is not the one CI ran on and the story was
       verified at, so the change goes back to `implementing`. New commits are ordinary; this
       is not an escalation
+    - `:base_updated` — THREAD mode only: the latest checkpoint is a control-recorded
+      `base_update` of the checkpoint the gate last allowed. `enforce/3` takes
+      `{:ci, :ci, :base_updated}` and judges again at the new head, so a caller sees this
+      decision only when that transition could not be written (its reasons say why)
     - `:unevaluated` — a TRANSIENT forge fault. Nothing was decided and nothing transitions;
       the caller retries. Never an escalation, because one network blip must not park a
       story until a human acts
@@ -32,6 +36,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
     A verdict is only ever about the diff at THIS head
+  - `mode` — `:pr` or `:thread`, the story's intake source's (US-45.4)
+  - `checkpoint_id`, `checkpoint_sha` — THREAD mode: the recorded checkpoint judged. An allow
+    in thread mode is recorded naming both
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
     request that was merged before this evaluation ran
   - `diffstat` — the forge's own `%{files: n, changed_lines: n}`, never `length(files)`
@@ -66,12 +73,16 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :proof,
     :retry_after,
     :recorded_head_sha,
+    :checkpoint_id,
+    :checkpoint_sha,
+    mode: :pr,
     custody: nil,
     gate_a_inputs: :missing,
     trio_outputs_ignored: false
   ]
 
-  @type decision :: :allow | :refuse | :already_merged | :head_moved | :unevaluated
+  @type decision ::
+          :allow | :refuse | :already_merged | :head_moved | :base_updated | :unevaluated
 
   @type t :: %__MODULE__{
           decision: decision(),
@@ -89,6 +100,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           gate_a_inputs: :persisted_triage | :human_resolution | :missing,
           trio_outputs_ignored: boolean(),
           retry_after: pos_integer() | nil,
-          recorded_head_sha: String.t() | nil
+          recorded_head_sha: String.t() | nil,
+          mode: :pr | :thread,
+          checkpoint_id: Ecto.UUID.t() | nil,
+          checkpoint_sha: String.t() | nil
         }
 end

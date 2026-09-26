@@ -143,6 +143,24 @@ function epicRefusal(value, { clearable }) {
   return uuidRefusal(value, "target_epic_id");
 }
 
+/**
+ * The two merge routes a source may take (US-45.4). `pr` is the default and what every source
+ * did before the field existed; `thread` makes the merge gate read the story's latest recorded
+ * checkpoint instead of a pull request. NOT nullable — the server answers 422 — so a null is
+ * refused here where the reason can be stated.
+ */
+export const SOURCE_MODES = ["pr", "thread"];
+
+export function modeRefusal(mode) {
+  if (SOURCE_MODES.includes(mode)) return null;
+
+  return refuse(
+    "`mode` must be `pr` or `thread`, or must be left out entirely (enrolment then takes " +
+      "`pr`, and an update keeps the current value). It cannot be null: every source reaches " +
+      "its base branch by one route or the other.",
+  );
+}
+
 export function sourcePath(sourceId) {
   return `${SOURCES_PATH}/${encodeURIComponent(sourceId)}`;
 }
@@ -171,6 +189,7 @@ export function publicSource(source) {
     project_id: source.project_id,
     repo_full_name: source.repo_full_name,
     base_branch: source.base_branch,
+    mode: source.mode,
     target_epic_id: source.target_epic_id,
     revoked_at: source.revoked_at,
     inserted_at: source.inserted_at,
@@ -197,7 +216,7 @@ export function webhookUrl(baseUrl, webhookPath) {
  * shape. It never throws.
  */
 export async function enrollIntakeSource(
-  { repo_full_name, project_id, target_epic_id, base_branch, secret_file } = {},
+  { repo_full_name, project_id, target_epic_id, base_branch, mode, secret_file } = {},
   { userKey, apiCall, baseUrl, fs = defaultFs, homedir = os.homedir() } = {},
 ) {
   if (!userKey) return refuse(MISSING_USER_KEY);
@@ -234,6 +253,14 @@ export async function enrollIntakeSource(
           "`master`, or send `main` for a repository created on GitHub since 2020.",
       );
     }
+  }
+
+  // OPTIONAL, read by PRESENCE like the branch: omitted, the source takes `pr`. Named, it
+  // must be one of the two modes; anything else (null included) is a 422 at the server and
+  // is refused here, before a secret file is reserved.
+  if (mode !== undefined) {
+    const badMode = modeRefusal(mode);
+    if (badMode) return badMode;
   }
 
   if (typeof secret_file !== "string" || secret_file.trim() === "") {
@@ -285,6 +312,7 @@ export async function enrollIntakeSource(
     body.target_epic_id = target_epic_id;
   }
   if (base_branch !== undefined) body.base_branch = base_branch;
+  if (mode !== undefined) body.mode = mode;
 
   let result;
   try {
@@ -466,11 +494,17 @@ export async function updateIntakeSource(args = {}, { userKey, apiCall } = {}) {
     body.base_branch = args.base_branch;
   }
 
+  if (args.mode !== undefined) {
+    const badMode = modeRefusal(args.mode);
+    if (badMode) return badMode;
+    body.mode = args.mode;
+  }
+
   if (Object.keys(body).length === 0) {
     return refuse(
-      "Nothing to update. Name at least one of `target_epic_id` (null clears it) or " +
-        "`base_branch`. A body carrying neither is refused 422 `nothing_to_update`, because a " +
-        "field you do not send is left exactly as it was.",
+      "Nothing to update. Name at least one of `target_epic_id` (null clears it), " +
+        "`base_branch` or `mode`. A body carrying none of them is refused 422 " +
+        "`nothing_to_update`, because a field you do not send is left exactly as it was.",
     );
   }
 

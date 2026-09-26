@@ -40,6 +40,20 @@ defmodule Loopctl.Delivery.StageMachineTest do
     end
   end
 
+  test "base_updated keeps a story at ci, is control's, and takes the old head with it (US-45.4)" do
+    assert StageMachine.allowed?(:ci, :ci, :base_updated)
+
+    assert for({from, to, :base_updated} <- StageMachine.transitions(), do: {from, to}) == [
+             {:ci, :ci}
+           ]
+
+    refute :base_updated in StageMachine.runner_edges()
+    refute StageMachine.chained?(:ci, :ci, :base_updated)
+    assert StageMachine.clears(:ci, :ci, :base_updated) == StageMachine.head_keyed()
+    # base_moved is still the edge for every other head movement.
+    assert StageMachine.allowed?(:ci, :implementing, :base_moved)
+  end
+
   test "done and failed have no way out, and escalated only a human's" do
     for {from, _to, edge} <- StageMachine.transitions(), from in [:done, :failed, :escalated] do
       assert from == :escalated and edge == :human_resolution

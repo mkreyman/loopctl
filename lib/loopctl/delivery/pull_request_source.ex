@@ -33,6 +33,13 @@ defmodule Loopctl.Delivery.PullRequestSource do
     `{:error, reason}`, which becomes Gate B's unreadable-diff marker. Every added,
     modified, deleted and renamed-to path, plus both names of every rename
 
+  ## `branch_head/2`, `commit/2` and `compare/3` — a checkpoint instead of a pull request
+
+  The reads `Loopctl.Delivery.CheckpointSource` builds the same `t:pull_request/0` facts from
+  for a THREAD-mode story (US-45.4, Epic 45), where no pull request exists: the thread
+  branch's head, the checkpoint commit's tree and parents, and the comparison of the base
+  branch with the checkpoint. Same forge, same timeouts, same failure classification.
+
   ## `repo_files/2`
 
   The repository's whole file list at one ref — Gate B's stale-trigger input. The
@@ -137,6 +144,41 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   @doc "The facts of one pull request. See the moduledoc."
   @callback pull_request(repo(), pos_integer()) :: {:ok, pull_request()} | {:error, term()}
+
+  @typedoc """
+  One commit, as much of it as the thread-mode merge gate judges (US-45.4): its tree and its
+  parents IN ORDER, so `hd(parent_shas)` is the first parent.
+  """
+  @type commit :: %{tree_sha: String.t(), parent_shas: [String.t()]}
+
+  @typedoc """
+  The three-dot comparison `base...head` (US-45.4): what a pull request from `head` into
+  `base` would show, without a pull request.
+
+  - `:merge_base_sha` — the merge base of the two
+  - `:base_tree_sha` — the tree of the commit `base` names NOW, which an `empty_change` is
+    judged against
+  - `:diffstat`, `:diff` — the same shapes as on `t:pull_request/0`, over the files the
+    comparison lists. A list the forge truncated is `{:error, _}` in `:diff`, never a short one
+  """
+  @type comparison :: %{
+          merge_base_sha: String.t(),
+          base_tree_sha: String.t(),
+          diffstat: %{files: non_neg_integer(), changed_lines: non_neg_integer()},
+          diff: diff()
+        }
+
+  @doc """
+  The commit a branch names now (US-45.4) — the thread branch head the merge gate compares
+  against the latest RECORDED checkpoint. Exact-match on the branch, never a prefix.
+  """
+  @callback branch_head(repo(), String.t()) :: {:ok, String.t()} | {:error, term()}
+
+  @doc "The tree and ordered parents of one commit (US-45.4)."
+  @callback commit(repo(), String.t()) :: {:ok, commit()} | {:error, term()}
+
+  @doc "The three-dot comparison `base...head` (US-45.4). See `t:comparison/0`."
+  @callback compare(repo(), String.t(), String.t()) :: {:ok, comparison()} | {:error, term()}
 
   @doc "Every file the repository holds at `ref`."
   @callback repo_files(repo(), String.t()) :: {:ok, [String.t()]} | {:error, term()}

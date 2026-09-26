@@ -8510,7 +8510,10 @@ const TOOLS = [
       "an unnamed branch on a `main` repository sends every dispatch to cut from a branch that " +
       "does not exist, and the failure arrives after the claim. There is no cleared state for " +
       "it (a dispatch must name one), so null or blank is refused rather than falling back to " +
-      "the default; intake_source_update changes it afterwards.",
+      "the default; intake_source_update changes it afterwards.\n\n" +
+      "`mode` picks the merge route: `pr` (the default) or `thread`, where the merge gate " +
+      "evaluates the story's latest recorded checkpoint instead of a pull request. A value " +
+      "other than those two, null included, is refused.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8547,6 +8550,17 @@ const TOOLS = [
             "here rather than silently taking the default. Changed later with " +
             "intake_source_update.",
         },
+        mode: {
+          type: "string",
+          enum: ["pr", "thread"],
+          description:
+            "Optional. How this repository's changes reach its base branch. `pr` (the default " +
+            "when omitted): the merge gate reads a pull request by number. `thread`: the merge " +
+            "gate reads the story's latest RECORDED thread checkpoint and needs no pull " +
+            "request, refusing `branch_head_unrecorded` while the thread branch head is not " +
+            "that checkpoint and `empty_change` when its tree equals the base's. Not nullable. " +
+            "Changed later with intake_source_update.",
+        },
         secret_file: {
           type: "string",
           description:
@@ -8563,7 +8577,8 @@ const TOOLS = [
     description:
       "LIST THE TENANT'S GITHUB INTAKE SOURCES (GET /api/v1/intake/sources): per source its " +
       "`id` (the webhook URL is /api/v1/intake/github/<id>), `project_id`, `repo_full_name`, " +
-      "`base_branch`, `target_epic_id`, `revoked_at` and timestamps. Active sources only " +
+      "`base_branch`, `mode` (`pr` or `thread`), `target_epic_id`, `revoked_at` and " +
+      "timestamps. Active sources only " +
       "unless `include_revoked` is true.\n\n" +
       "THE WEBHOOK SECRET IS NOT HERE AND IS NOT ANYWHERE. It is returned once by " +
       "intake_source_enroll and the column is redacted on the schema, so this is not the way " +
@@ -8587,15 +8602,16 @@ const TOOLS = [
     name: "intake_source_update",
     description:
       "SET WHERE A SOURCE'S WORK LANDS (PATCH /api/v1/intake/sources/:id): `target_epic_id`, " +
-      "the epic triaged stories are created in, and `base_branch`, the branch every dispatch " +
-      "for this repository is cut FROM and carries.\n\n" +
+      "the epic triaged stories are created in, `base_branch`, the branch every dispatch " +
+      "for this repository is cut FROM and carries, and `mode`, the merge route (`pr` or " +
+      "`thread` — a thread-mode source's merge gate reads the latest recorded checkpoint " +
+      "instead of a pull request).\n\n" +
       "PRESENCE DECIDES, AND A FIELD YOU DO NOT NAME IS LEFT EXACTLY AS IT WAS. Naming " +
-      "neither is refused 422 `nothing_to_update` rather than being a silent no-op. DO NOT " +
+      "none of them is refused 422 `nothing_to_update` rather than being a silent no-op. DO NOT " +
       "SEND `target_epic_id: null` TO MEAN 'I AM NOT CHANGING THIS' — an explicit null is the " +
       "only way to CLEAR the epic, and clearing it returns the source to escalating every " +
       "report to a human instead of filing a story. Leave the field out instead. " +
-      "`base_branch` has no cleared state at all (every dispatch must name a branch to cut " +
-      "from), so a null there is refused.\n\n" +
+      "`base_branch` and `mode` have no cleared state at all, so a null there is refused.\n\n" +
       "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
       "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
       "call; this is what corrects one that was not — a source enrolled before the parameter " +
@@ -8629,6 +8645,14 @@ const TOOLS = [
           description:
             "The branch dispatches for this repository are cut from, e.g. `main`. 1-255 " +
             "characters, not nullable. Omit to leave the current value alone.",
+        },
+        mode: {
+          type: "string",
+          enum: ["pr", "thread"],
+          description:
+            "`pr` or `thread`: whether the merge gate reads a pull request or the story's " +
+            "latest recorded thread checkpoint. Not nullable. Omit to leave the current value " +
+            "alone.",
         },
       },
       required: ["source_id"],

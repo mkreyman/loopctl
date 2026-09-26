@@ -209,6 +209,89 @@ defmodule Loopctl.ThreadsTest do
     end
   end
 
+  describe "base updates (US-45.4)" do
+    @merge String.duplicate("d", 40)
+    @merge_tree String.duplicate("f", 40)
+
+    defp base_update(ctx, overrides \\ []) do
+      Threads.record_base_update(
+        ctx.tenant_id,
+        ctx.story.id,
+        Keyword.merge(
+          [commit_sha: @merge, tree_sha: @merge_tree, first_parent_sha: @sha1],
+          overrides
+        )
+      )
+    end
+
+    test "control records one on top of the latest checkpoint, chained to it" do
+      ctx = claimed_story()
+      {:ok, parent, :created} = checkpoint(ctx)
+
+      assert {:ok, update, :created} = base_update(ctx)
+      assert update.kind == :base_update
+      assert update.parent_checkpoint_id == parent.id
+      assert update.seq == parent.seq + 1
+      assert update.claim_epoch == @epoch
+
+      assert Threads.latest_recorded_checkpoint(ctx.tenant_id, ctx.story.id).id == update.id
+
+      actions =
+        Repo.all(
+          from e in ChainEntry,
+            where: e.tenant_id == ^ctx.tenant_id,
+            select: e.payload["checkpoint_kind"]
+        )
+
+      assert "base_update" in actions
+    end
+
+    test "a first parent that is not the latest checkpoint is refused, nothing written" do
+      ctx = claimed_story()
+      {:ok, _parent, :created} = checkpoint(ctx)
+
+      assert {:error, :unprocessable_entity, message} =
+               base_update(ctx, first_parent_sha: @sha2)
+
+      assert message =~ "latest recorded checkpoint"
+      assert Threads.latest_recorded_checkpoint(ctx.tenant_id, ctx.story.id).kind == :checkpoint
+    end
+
+    test "a thread with no checkpoint has nothing to update" do
+      ctx = claimed_story()
+
+      assert {:error, :unprocessable_entity, _message} = base_update(ctx)
+    end
+
+    test "a resend is the same checkpoint; another tree for the same commit is a conflict" do
+      ctx = claimed_story()
+      {:ok, _parent, :created} = checkpoint(ctx)
+      {:ok, update, :created} = base_update(ctx)
+
+      assert {:ok, %{id: id}, :existing} = base_update(ctx)
+      assert id == update.id
+
+      assert {:error, {:conflict, "checkpoint_conflict", _}} =
+               base_update(ctx, tree_sha: String.duplicate("0", 40))
+    end
+
+    test "another tenant's story is not found (tenant isolation)" do
+      ctx = claimed_story()
+      other = claimed_story()
+      {:ok, _parent, :created} = checkpoint(ctx)
+
+      assert {:error, :not_found} =
+               Threads.record_base_update(other.tenant_id, ctx.story.id,
+                 commit_sha: @merge,
+                 tree_sha: @merge_tree,
+                 first_parent_sha: @sha1
+               )
+
+      assert Threads.latest_recorded_checkpoint(other.tenant_id, ctx.story.id) == nil
+      assert Threads.get_checkpoint(other.tenant_id, ctx.story.id, Ecto.UUID.generate()) == nil
+    end
+  end
+
   describe "entries" do
     test "a retry of the same write is the same entry; another author's key is distinct" do
       ctx = claimed_story()
