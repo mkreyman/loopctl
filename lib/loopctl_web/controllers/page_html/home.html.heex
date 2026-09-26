@@ -751,7 +751,7 @@
               detected → triaged → queued → claimed → worktree → implementing → reviewing → pr_open → ci → merged → deployed → verified → done
             </p>
             <p class="mt-2 font-mono text-xs text-slate-500">
-              any gate refusal → escalated (a human resolves it)
+              any gate refusal → escalated (a human resolves it) · triage reject or exhausted budget → failed (final)
             </p>
           </div>
 
@@ -771,7 +771,7 @@
                 Runners you own
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                Enroll your own dev machines. Each one connects over a socket and declares its repositories, its capacity and the branch prefixes it accepts. loopctl reserves capacity before it places work and never runs a model itself.
+                Enroll your own dev machines. Each one connects over a socket and declares its repositories, its capacity and the branch prefixes it accepts. loopctl reserves capacity before it places work and never runs the sessions itself.
               </p>
             </div>
             <div class="bg-slate-900 border border-slate-700 rounded-md p-4">

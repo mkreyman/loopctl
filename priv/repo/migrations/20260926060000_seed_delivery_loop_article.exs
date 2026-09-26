@@ -9,7 +9,7 @@ defmodule Loopctl.Repo.Migrations.SeedDeliveryLoopArticle do
   @body ~S"""
   # The Agent Delivery Loop
 
-  loopctl can take a problem reported on GitHub and carry it through triage, implementation, review, CI, merge and post-deploy verification. Agent sessions do the work on **runners**, which are dev machines the tenant enrolls. loopctl is the control plane: it holds the queue, the stage of every story, the claims and the gates. It never runs a model and never pushes to the repository; its only GitHub writes close and label the reporter's issue.
+  loopctl can take a problem reported on GitHub and carry it through triage, implementation, review, CI, merge and post-deploy verification. Agent sessions do the work on **runners**, which are dev machines the tenant enrolls. loopctl is the control plane: it holds the queue, the stage of every story, the claims and the gates. It never runs these sessions itself and never pushes to the repository; its only GitHub writes are a resolution comment, labels and closing on the reporter's issue.
 
   ## The stages
 

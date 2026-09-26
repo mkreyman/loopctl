@@ -31,7 +31,7 @@ loopctl is a **dumb state store** with a **two-tier trust model**:
 - **An independent orchestrator** reads those updates, performs verification, and writes its findings (`verified_status`: unverified -> verified -> rejected)
 - It is **structurally impossible** for implementing agents to mark their own work as verified
 
-loopctl never runs a model, executes your code, or pushes to your repository. It stores state, enforces access control, and serves data. When you use the [agent delivery loop](docs/agent-delivery-loop.md), it also queues work for the machines you enroll and gates what their sessions may do next.
+loopctl never executes your code or pushes to your repository. It stores state, enforces access control, and serves data. When you use the [agent delivery loop](docs/agent-delivery-loop.md), it also queues work for the machines you enroll and gates what their sessions may do next.
 
 ## Key Features
 

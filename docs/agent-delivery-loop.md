@@ -2,7 +2,7 @@
 
 loopctl can take a problem someone reports on GitHub and carry it through triage, implementation, review, CI, merge and deployment. Agents do the work on your own machines, and loopctl decides what may happen next. This page describes the operator-visible parts: what to set up, what each step does and refuses, and where to look when a story stops moving.
 
-loopctl is the control plane. It holds the queue, the stage of every story, the claims and the gates. The sessions run on **runners**, which are dev machines you enroll and which connect to loopctl over a socket. loopctl never runs a model and never pushes to your repository. Its only GitHub writes are closing and labelling the reporter's issue, with `GITHUB_TOKEN`; it reads pull requests and deployments to judge them. It tells a runner what to do, and it records and judges what the runner reports.
+loopctl is the control plane. It holds the queue, the stage of every story, the claims and the gates. The sessions run on **runners**, which are dev machines you enroll and which connect to loopctl over a socket. loopctl never runs these sessions itself and never pushes to your repository. Its only GitHub writes are on the reporter's issue: a resolution comment, labels, and closing it, with `GITHUB_TOKEN`. It reads pull requests and deployments to judge them. It tells a runner what to do, and it records and judges what the runner reports.
 
 Every step below goes through the same chain of custody as the rest of loopctl. Custody endpoints are `exact_role`-gated, a session cannot resolve its own escalation, and a runner cannot move a story to `verified` or `done`. See [chain-of-custody-v2.md](chain-of-custody-v2.md).
 
@@ -32,7 +32,7 @@ An **intake source** binds one GitHub repository to one work project. It also re
   - content type `application/json`
   - the **Issues** event only
   - the secret from that file
-- **Name `target_epic_id`.** A source without one escalates every triaged report to a human.
+- **Name `target_epic_id`.** A source without one creates no stories: its reports wait as intake records at `pending_triage`, and they become stories on the next run after `intake_source_update` names an epic. Nothing is lost, and nothing shows up in `story_stage` meanwhile.
 - **Name `base_branch`.** Set it to `main` for a repository that uses it; the default is `master`.
 - Change either later with `intake_source_update`. Revoke a source with `intake_source_revoke`. Revoking keeps the row and frees the repository for a new enrollment.
 

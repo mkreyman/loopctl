@@ -31,9 +31,11 @@ defmodule Loopctl.Delivery.TriageTrigger do
   arrival a writer of work-breakdown structure) or to pick one by a rule nobody declared. The
   operator says instead.
 
-  A source that names none yields `{:error, :no_target_epic}` and the record is ESCALATED —
+  A source that names none yields `{:error, :no_target_epic}`, and no story is created —
   the question has not been answered and guessing an answer is worse than asking. That is the
-  same choice the nullable column makes and it is why the column is nullable.
+  same choice the nullable column makes and it is why the column is nullable. The record is not
+  escalated: `Loopctl.Workers.TriageTriggerWorker` leaves it `pending_triage` and retries it,
+  so it promotes on the first run after an epic is named.
 
   ## Running it twice is safe, and the mechanism is a unique index
 
@@ -95,7 +97,7 @@ defmodule Loopctl.Delivery.TriageTrigger do
   Creates the story for `record` and opens its delivery stage at `detected`.
 
   Returns `{:ok, story}` — including when the story already existed, see the moduledoc — or
-  `{:error, reason}`. The caller escalates the record on `:no_target_epic`.
+  `{:error, reason}`. The caller retries the record on `:no_target_epic`.
   """
   @spec promote(Record.t()) :: {:ok, map()} | {:error, error()}
   def promote(%Record{} = record) do
