@@ -68,11 +68,14 @@ defmodule Loopctl.BulkOperations do
         # ONE read for the whole batch, under the story locks just taken — the single-story
         # claim's refusal of a held stage (`Progress.claim_story/3`), asked once, not per story.
         held = Stages.held_story_ids(tenant_id, Map.keys(locked_stories))
+        # And ONE read for the dependencies, for the same reason (#890): per story, it would
+        # lengthen how long every lock in the batch is held.
+        blocked = Dependencies.unmet_story_ids(tenant_id, Map.keys(locked_stories))
 
         process_claims(
           sorted_ids,
           locked_stories,
-          held,
+          {held, blocked},
           agent_id,
           tenant_id,
           actor_id,
@@ -476,7 +479,8 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
-  defp validate_claim_preconditions(story, held) do
+  # `held` and `blocked` are each ONE read for the whole batch (`bulk_claim/4`).
+  defp validate_claim_preconditions(story, {held, blocked}) do
     cond do
       story.agent_status != :contracted ->
         {:error, "Story is not in contracted status (current: #{story.agent_status})"}
@@ -484,16 +488,14 @@ defmodule Loopctl.BulkOperations do
       MapSet.member?(held, story.id) ->
         {:error, :story_held}
 
-      true ->
-        check_story_dependencies_satisfied(story)
-    end
-  end
+      MapSet.member?(blocked, story.id) ->
+        {:error,
+         "Story has an unverified dependency (its own, or one of its epic's); " <>
+           "list_blocked_stories names what is blocking it"}
 
-  # The claim's own definition (`Dependencies`), so bulk and single claim cannot disagree.
-  defp check_story_dependencies_satisfied(story) do
-    if Dependencies.dependencies_unmet?(story.tenant_id, story.id),
-      do: {:error, "Story has an unverified dependency (its own, or one of its epic's)"},
-      else: :ok
+      true ->
+        :ok
+    end
   end
 
   defp validate_verify_preconditions(story) do

@@ -1060,6 +1060,18 @@ async function listReadyStories({ project_id, page, page_size }) {
   return toContentCompact(result);
 }
 
+async function listBlockedStories({ project_id, page, page_size }) {
+  const params = new URLSearchParams();
+  if (project_id != null) params.set("project_id", project_id);
+  if (page != null) params.set("page", String(page));
+  if (page_size != null)
+    params.set("page_size", String(Math.min(page_size, SERVER_MAX_STORY_PAGE_SIZE)));
+
+  const qs = params.toString();
+  const result = await apiCall("GET", `/api/v1/stories/blocked${qs ? `?${qs}` : ""}`);
+  return toContentCompact(result);
+}
+
 async function getStory({ story_id }) {
   const result = await apiCall("GET", `/api/v1/stories/${story_id}`);
   return toContent(result);
@@ -4302,6 +4314,29 @@ const TOOLS = [
         },
       },
       required: ["project_id"],
+    },
+  },
+  {
+    name: "list_blocked_stories",
+    description:
+      "List stories that cannot be worked yet because a dependency is unverified — a story " +
+      "they depend on, or a story in an epic their epic depends on. The dispatch driver " +
+      "does not select these, and place_dispatch refuses them 409 dependencies_not_met, so " +
+      "this is where a queue that is not draining shows why. Compact results; paginated " +
+      "(page/page_size) with total_count. Any key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Optional: the UUID of a project to limit the list to.",
+        },
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: {
+          type: "integer",
+          description: "Stories per page (default 100, max 500).",
+        },
+      },
     },
   },
   {
@@ -9254,6 +9289,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "list_ready_stories":
       return await listReadyStories(args);
+
+    case "list_blocked_stories":
+      return await listBlockedStories(args);
 
     case "get_story":
       return await getStory(args);

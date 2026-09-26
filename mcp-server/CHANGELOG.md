@@ -5,6 +5,15 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.103.6 — 2026-09-26 (a stalled queue can say why)
+
+### Added
+
+- **`list_blocked_stories`** (`GET /api/v1/stories/blocked`, which had no tool and sat on the
+  route sweep's gap list): the stories an unverified dependency is holding back. loopctl's
+  dispatch driver does not select them and `place_dispatch` refuses them, so this is where a
+  queue that is not draining shows why (loopctl epic 44, #890).
+
 ## 2.103.5 — 2026-09-26 (place_dispatch names its dependency refusal)
 
 ### Changed

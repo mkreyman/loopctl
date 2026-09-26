@@ -59,21 +59,49 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
   end
 
   @doc """
-  Whether `story_id` in `tenant_id` has a story-level or epic-level dependency unmet.
-
-  FAILS CLOSED: a story that is not in `tenant_id` (another tenant's id, or a row deleted since
-  it was read) answers `true`, so nothing claims or places it on the strength of a check that
-  found no row to judge.
+  `story_id`'s dependencies in `tenant_id`: `:met`, `:unmet` (a story-level or epic-level
+  prerequisite is not verified), or `:not_found` — the story is not in `tenant_id` (another
+  tenant's id, or a row deleted since it was read). The three are kept apart so a caller can say
+  WHICH, and the `:not_found` branch is stated here rather than implied by a comparison.
   """
-  @spec dependencies_unmet?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
-  def dependencies_unmet?(tenant_id, story_id) do
+  @spec dependency_status(Ecto.UUID.t(), Ecto.UUID.t()) :: :met | :unmet | :not_found
+  def dependency_status(tenant_id, story_id) do
     from(s in Story,
       as: :story,
       where: s.id == ^story_id and s.tenant_id == ^tenant_id,
       select: exists(unmet_story_dependencies()) or exists(unmet_epic_dependencies())
     )
     |> AdminRepo.one()
-    |> Kernel.!=(false)
+    |> case do
+      nil -> :not_found
+      true -> :unmet
+      false -> :met
+    end
+  end
+
+  @doc """
+  Whether `story_id` in `tenant_id` has a dependency unmet. FAILS CLOSED: a story not found
+  answers `true`, so nothing claims or places it on a check that found no row to judge.
+  """
+  @spec dependencies_unmet?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def dependencies_unmet?(tenant_id, story_id),
+    do: dependency_status(tenant_id, story_id) != :met
+
+  @doc """
+  The subset of `story_ids` in `tenant_id` with a dependency unmet, in ONE read: for a caller
+  judging a whole batch under the locks it holds (`Loopctl.BulkOperations.bulk_claim/4`).
+  An id not in `tenant_id` is not in the result; the caller has already locked what it found.
+  """
+  @spec unmet_story_ids(Ecto.UUID.t(), [Ecto.UUID.t()]) :: MapSet.t()
+  def unmet_story_ids(tenant_id, story_ids) do
+    from(s in Story,
+      as: :story,
+      where: s.id in ^story_ids and s.tenant_id == ^tenant_id,
+      where: exists(unmet_story_dependencies()) or exists(unmet_epic_dependencies()),
+      select: s.id
+    )
+    |> AdminRepo.all()
+    |> MapSet.new()
   end
 
   # ===================================================================

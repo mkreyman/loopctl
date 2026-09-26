@@ -11,6 +11,7 @@ defmodule Loopctl.WorkBreakdown.Queries do
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.Stages
   alias Loopctl.Projects.Project
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
@@ -138,34 +139,17 @@ defmodule Loopctl.WorkBreakdown.Queries do
     page_size = opts |> Keyword.get(:page_size, 100) |> max(1) |> min(500)
     offset = (page - 1) * page_size
 
-    # Stories that have at least one unverified dependency (story-level or epic-level)
+    # Stories that have at least one unverified dependency (story-level or epic-level): the
+    # SAME definition the claim and the dispatch driver use (`Dependencies`), so this view lists
+    # exactly the stories they hold back.
     blocked_query =
-      Story
+      from(s in Story, as: :story)
       |> where([s], s.tenant_id == ^tenant_id)
       |> apply_project_filter(opts)
       |> where(
         [s],
-        fragment(
-          """
-          EXISTS (
-            SELECT 1 FROM story_dependencies sd
-            JOIN stories dep ON dep.id = sd.depends_on_story_id
-            WHERE sd.story_id = ?
-            AND dep.verified_status != 'verified'
-          )
-          OR EXISTS (
-            SELECT 1 FROM epic_dependencies ed
-            WHERE ed.epic_id = ?
-            AND EXISTS (
-              SELECT 1 FROM stories prereq_story
-              WHERE prereq_story.epic_id = ed.depends_on_epic_id
-              AND prereq_story.verified_status != 'verified'
-            )
-          )
-          """,
-          s.id,
-          s.epic_id
-        )
+        exists(Dependencies.unmet_story_dependencies()) or
+          exists(Dependencies.unmet_epic_dependencies())
       )
 
     total = AdminRepo.aggregate(blocked_query, :count, :id)

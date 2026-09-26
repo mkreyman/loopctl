@@ -37,6 +37,45 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
     end
   end
 
+  describe "dependency_status/2 and unmet_story_ids/2" do
+    # #890 review round 1: the EPIC half, and the three answers kept apart.
+    test "an epic whose prerequisite epic holds an unverified story is unmet, until it is verified" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      prereq_epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+      prereq = fixture(:story, %{tenant_id: tenant.id, epic_id: prereq_epic.id, number: "1.1"})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "2.1"})
+
+      fixture(:epic_dependency, %{
+        tenant_id: tenant.id,
+        epic_id: epic.id,
+        depends_on_epic_id: prereq_epic.id
+      })
+
+      assert Dependencies.dependency_status(tenant.id, story.id) == :unmet
+
+      assert Dependencies.unmet_story_ids(tenant.id, [story.id, prereq.id]) ==
+               MapSet.new([story.id])
+
+      Loopctl.AdminRepo.update_all(
+        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^prereq.id),
+        set: [verified_status: :verified]
+      )
+
+      assert Dependencies.dependency_status(tenant.id, story.id) == :met
+      assert Dependencies.unmet_story_ids(tenant.id, [story.id]) == MapSet.new()
+    end
+
+    test "a story that is not there is :not_found, and dependencies_unmet?/2 fails closed on it" do
+      tenant = fixture(:tenant)
+      gone = Ecto.UUID.generate()
+
+      assert Dependencies.dependency_status(tenant.id, gone) == :not_found
+      assert Dependencies.dependencies_unmet?(tenant.id, gone)
+    end
+  end
+
   describe "create_story_dependency/3" do
     test "creates a valid dependency within same epic" do
       tenant = fixture(:tenant)

@@ -4543,11 +4543,13 @@ defmodule Loopctl.Progress do
   that cannot be claimed spends no dispatch.
   """
   @spec check_claim_dependencies(Ecto.UUID.t(), Story.t()) ::
-          {:ok, :deps_satisfied} | {:error, :dependencies_not_met}
+          {:ok, :deps_satisfied} | {:error, :dependencies_not_met | :not_found}
   def check_claim_dependencies(tenant_id, %Story{id: story_id}) do
-    if Dependencies.dependencies_unmet?(tenant_id, story_id),
-      do: {:error, :dependencies_not_met},
-      else: {:ok, :deps_satisfied}
+    case Dependencies.dependency_status(tenant_id, story_id) do
+      :met -> {:ok, :deps_satisfied}
+      :unmet -> {:error, :dependencies_not_met}
+      :not_found -> {:error, :not_found}
+    end
   end
 
   defp validate_unclaim(story, _agent_id) when story.agent_status == :pending do
