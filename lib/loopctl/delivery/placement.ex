@@ -268,8 +268,9 @@ defmodule Loopctl.Delivery.Placement do
   written, the claim stands and the session under it is untouched, because a retry does not
   own the claim it would be parking.
 
-  The story must already be `contracted` (`Loopctl.Progress.contract_story/3`) and its stage
-  row must be at `queued`. Both are checked BEFORE anything is minted, so the ordinary
+  The story must be `pending` or `contracted`, with its dependencies met and its stage row at
+  `queued`; a `pending` one is contracted here, attributed to the placing key (#884). All of
+  that happens BEFORE anything is minted, so the ordinary
   "not ready yet" answer costs no `dispatches` row, no ephemeral key and no audit-chain entry
   — see `claimable/2` for why that matters more than it looks.
 
@@ -402,7 +403,7 @@ defmodule Loopctl.Delivery.Placement do
   # a caller passing a bare id or a map gets a refusal rather than a lineage of `[]`, which
   # would have read as "an operator" to the clause below.
   defp resolve_caller(tenant_id, %ApiKey{tenant_id: tenant_id, id: id, role: role}) do
-    {:ok, %{lineage: Dispatches.lineage_for_api_key(tenant_id, id), role: role}}
+    {:ok, %{id: id, lineage: Dispatches.lineage_for_api_key(tenant_id, id), role: role}}
   end
 
   defp resolve_caller(_tenant_id, _api_key), do: {:error, :not_authorized}
@@ -758,7 +759,8 @@ defmodule Loopctl.Delivery.Placement do
              branch_prefixes: declared_branch_prefixes(meta)
            ),
          {:ok, dispatch} <- lease_capable(dispatch),
-         :ok <- claimable(tenant_id, story_id),
+         {:ok, story} <- ready_story(tenant_id, story_id),
+         :ok <- contract_if_pending(tenant_id, story, caller.id, agent_id, opts),
          {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
       claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)
     end
@@ -770,17 +772,18 @@ defmodule Loopctl.Delivery.Placement do
   # Minting is not free and it is not undoable. Every mint writes a `dispatches` row, an
   # `api_keys` row, and an IMMUTABLE, STH-covered `dispatch_created` entry appended under the
   # tenant's chain advisory lock — the row every writer in the tenant contends on. Nothing
-  # deletes a chain entry, by design. So a caller looping over a story that is not ready (still
-  # `pending`, already claimed, its stage row not at `queued`) would have written a permanent
+  # deletes a chain entry, by design. So a caller looping over a story that is not ready (already
+  # claimed, its dependencies unmet, its stage row not at `queued`) would have written a permanent
   # chain entry and taken the chain lock once per attempt, for an outcome that was never going
-  # to succeed. Reading two rows first turns that into two SELECTs.
+  # to succeed. Reading first — the story, its stage row, and one EXISTS for its dependencies —
+  # turns that into a few SELECTs.
   #
   # It cannot be complete, and is not meant to be: a story claimed between this read and the
   # claim's own lock takes `claim_story/3`'s refusal instead, and `claim_then_push/7` revokes
   # the dispatch minted for it. This bounds the COMMON case; that bounds the race.
   @doc """
   Whether a story is in a state a placement can take: `pending` or `contracted`, with its stage
-  row at `queued`. A `pending` one is contracted by the placement itself, inside `claim/6`
+  row at `queued`. A `pending` one is contracted by the placement itself, before it mints
   (#884): a triage-accepted story, a release whose re-contract did not land, and an
   escalation resolved back to `queued` all leave `pending` at `queued`, and nothing unattended
   contracted any of them.
@@ -791,16 +794,62 @@ defmodule Loopctl.Delivery.Placement do
   apart; see the note below on why it is a pre-check and not the fence.
   """
   @spec claimable(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          :ok | {:error, :invalid_transition | :wrong_stage | :not_found}
+          :ok
+          | {:error, :invalid_transition | :wrong_stage | :dependencies_not_met | :not_found}
   def claimable(tenant_id, story_id) do
-    with {:ok, story} <- Stories.get_story(tenant_id, story_id) do
-      cond do
-        story.agent_status not in [:pending, :contracted] -> {:error, :invalid_transition}
-        stage_of(tenant_id, story_id) != :queued -> {:error, :wrong_stage}
-        true -> :ok
-      end
+    with {:ok, _story} <- ready_story(tenant_id, story_id), do: :ok
+  end
+
+  # The same read, returning the story it judged. DEPENDENCIES ARE PART OF IT (#884): a
+  # triage-accepted story reaches the driver `pending`, and one with unmet dependencies
+  # used to be refused only by the claim — AFTER a dispatch had been minted and a chain entry
+  # appended — on every pass.
+  defp ready_story(tenant_id, story_id) do
+    with {:ok, story} <- Stories.get_story(tenant_id, story_id),
+         :ok <- placeable_status(story),
+         :ok <- at_queued(tenant_id, story_id),
+         {:ok, _} <- Progress.check_claim_dependencies(tenant_id, story) do
+      {:ok, story}
     end
   end
+
+  defp placeable_status(%Story{agent_status: status}) when status in [:pending, :contracted],
+    do: :ok
+
+  defp placeable_status(_story), do: {:error, :invalid_transition}
+
+  defp at_queued(tenant_id, story_id) do
+    if stage_of(tenant_id, story_id) == :queued, do: :ok, else: {:error, :wrong_stage}
+  end
+
+  # A `pending` story is CONTRACTED HERE, BEFORE anything is minted (#884): `pending` at
+  # `queued` is where a triage-accepted story, a release whose re-contract did not land and an
+  # escalation resolved to `queued` all wait, and only an orchestrator key could contract
+  # them. The contract check is skipped as every release re-contract skips it: this is the loop
+  # acting on a story its own stage machine queued. Attributed to the placing key and label.
+  # A contract that lands and a mint or claim that then fails leaves a `contracted` story at
+  # `queued`, which is placeable. A `contracted` story costs nothing here.
+  defp contract_if_pending(
+         tenant_id,
+         %Story{agent_status: :pending} = story,
+         key_id,
+         agent_id,
+         opts
+       ) do
+    case Progress.contract_story(tenant_id, story.id, %{},
+           actor_id: key_id,
+           agent_id: agent_id,
+           actor_label: Keyword.get(opts, :actor_label),
+           skip_contract_check: true
+         ) do
+      {:ok, _story} -> :ok
+      # Contracted or claimed under us: whether it can be claimed is the claim's own decision.
+      {:error, {:invalid_transition, _}} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp contract_if_pending(_tenant_id, _story, _key_id, _agent_id, _opts), do: :ok
 
   defp stage_of(tenant_id, story_id) do
     case Stages.get(tenant_id, story_id) do
@@ -991,38 +1040,16 @@ defmodule Loopctl.Delivery.Placement do
   # move the cap LATER while the claim is live (`Progress.reanchor_dispatch_lease/3`), never
   # earlier. Until then this cap is what ends a claim whose dispatch is never accepted, instead
   # of the global lease. `placed_at` is taken HERE, immediately before the claim's transaction.
-  #
-  # A `pending` story is CONTRACTED FIRST, here (#884): `pending` at `queued` is where a
-  # triage-accepted story, a release whose re-contract did not land and an escalation resolved
-  # to `queued` all wait, and only an orchestrator key could contract them. The contract check
-  # is skipped as every release's re-contract skips it — the placement is the loop acting on a
-  # story its own stage machine queued, not an agent acknowledging criteria. A contract that
-  # lands and a claim that then fails leaves a `contracted` story at `queued`: placeable.
   defp claim(tenant_id, story_id, agent_id, session, dispatch, opts) do
-    with :ok <- contract_if_pending(tenant_id, story_id, Keyword.get(opts, :actor_label)) do
-      placed_at = DateTime.utc_now()
+    placed_at = DateTime.utc_now()
 
-      Progress.claim_story(tenant_id, story_id,
-        agent_id: agent_id,
-        dispatch_id: session.id,
-        lineage: session.lineage_path,
-        actor_label: Keyword.get(opts, :actor_label),
-        lease_until: DispatchLease.cap(placed_at, Map.fetch!(dispatch, "wall_clock_seconds"))
-      )
-    end
-  end
-
-  defp contract_if_pending(tenant_id, story_id, label) do
-    case Progress.contract_story(tenant_id, story_id, %{},
-           actor_label: label,
-           skip_contract_check: true
-         ) do
-      {:ok, _story} -> :ok
-      # Not pending — already contracted, or claimed under it: whether it can be claimed is the
-      # claim's own decision, with the claim's own refusal.
-      {:error, {:invalid_transition, _}} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
+    Progress.claim_story(tenant_id, story_id,
+      agent_id: agent_id,
+      dispatch_id: session.id,
+      lineage: session.lineage_path,
+      actor_label: Keyword.get(opts, :actor_label),
+      lease_until: DispatchLease.cap(placed_at, Map.fetch!(dispatch, "wall_clock_seconds"))
+    )
   end
 
   # THE WALL CLOCK THE CAP IS COMPUTED FROM, judged before anything is minted — by the

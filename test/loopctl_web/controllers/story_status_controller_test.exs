@@ -287,6 +287,29 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
       end
     end
 
+    # #890 review round 2: named, so an agent can tell it from a lost race or a wrong status.
+    test "refuses a story with an unverified prerequisite: 409 dependencies_not_met", %{
+      conn: conn
+    } do
+      %{story: story, raw_key: raw_key} = setup_story_with_agent(%{agent_status: :contracted})
+
+      blocker =
+        fixture(:story, %{tenant_id: story.tenant_id, epic_id: story.epic_id, number: "99.1"})
+
+      fixture(:story_dependency, %{
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        depends_on_story_id: blocker.id
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/claim")
+
+      assert %{"error" => %{"code" => "dependencies_not_met"}} = json_response(conn, 409)
+    end
+
     test "rejects claim on already assigned story (409)", %{conn: conn} do
       %{story: story, raw_key: raw_key} =
         setup_story_with_agent(%{agent_status: :assigned})

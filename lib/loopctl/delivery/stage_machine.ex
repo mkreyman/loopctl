@@ -78,7 +78,7 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:operator_released` — queued -> escalated, when an OPERATOR force-unclaims a story the
     loop was delivering. A human took the story back, so a human decides what it does next
     — resolved from `escalated` like any other — rather than the loop re-queuing it under
-    them or leaving it `queued` with nothing contracted, which no placement ever takes.
+    them or leaving it `queued` for the next placement to take.
   - Both are CONTROL-ONLY and are taken in exactly one place: the releasing transaction
     itself, straight after the release requeued the row
     (`Loopctl.Delivery.Stages.follow_release/5`). `advance/4` refuses them from every caller,

@@ -354,6 +354,65 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert_push "dispatch", _pushed, @reply_timeout
 
       assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :assigned
+
+      # Attributed to the key that placed it, not to nobody (#884 review round 3).
+      contracted_by =
+        unboxed(fn ->
+          AdminRepo.one(
+            from a in Loopctl.Audit.AuditLog,
+              where: a.entity_id == ^story.id and a.action == "status_changed",
+              where: fragment("?->>'agent_status' = 'contracted'", a.new_state),
+              where: a.actor_id == ^ctx.operator.id,
+              select: {a.actor_id, a.new_state}
+          )
+        end)
+
+      assert {actor_id, new_state} = contracted_by
+      assert actor_id == ctx.operator.id
+      # And names the runner's agent it was contracted for (#887 review round 1).
+      assert new_state["agent_id"] == runner.agent_id
+    end
+
+    test "a story that is neither pending nor contracted is refused before anything is minted",
+         ctx do
+      %{runner: runner, story: story} = ctx
+      before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
+
+      # A stale `queued` row behind a story that is already claimed.
+      unboxed(fn ->
+        {1, _} =
+          AdminRepo.update_all(from(s in Story, where: s.id == ^story.id),
+            set: [agent_status: :assigned]
+          )
+      end)
+
+      assert {:error, :invalid_transition} = place(ctx, dispatch_payload(story))
+      assert unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end) == before
+    end
+
+    # #884 review round 3, finding 6. A triage-accepted story with unmet dependencies reaches
+    # the driver `pending`; refused before the mint, not by the claim after it, every pass.
+    test "unmet dependencies are refused before anything is minted or contracted", ctx do
+      %{runner: runner, story: story} = ctx
+      before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
+      blocker = fixture(:committed_story, %{tenant_id: runner.tenant_id})
+
+      unboxed(fn ->
+        fixture(:story_dependency, %{
+          tenant_id: runner.tenant_id,
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+
+        {1, _} =
+          AdminRepo.update_all(from(s in Story, where: s.id == ^story.id),
+            set: [agent_status: :pending]
+          )
+      end)
+
+      assert {:error, :dependencies_not_met} = place(ctx, dispatch_payload(story))
+      assert unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end) == before
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :pending
     end
 
     test "a story that is not ready is refused BEFORE anything is minted", ctx do
@@ -400,19 +459,36 @@ defmodule Loopctl.Delivery.PlacementTest do
     test "a claim that fails past the pre-check REVOKES the dispatch it minted", ctx do
       %{runner: runner, story: story} = ctx
 
-      # The race `claimable/2` cannot close, made deterministic. An unmet story dependency is
-      # invisible to the pre-check — the story is `contracted` and its stage row is at `queued`
-      # — and `claim_story/3` refuses it. That is the one path on which a dispatch is minted
-      # for a claim that never happens, so its ephemeral key must not be left live for its
-      # four-hour TTL with no session to use it and nothing else to revoke it.
+      # The race `claimable/2` cannot close, made deterministic. The pre-check reads the story's
+      # dependencies (#884), so the blocker is added AFTER it: a trigger inserts the dependency
+      # when the session dispatch is minted, between the pre-check and the claim — which then
+      # refuses. That is the one path on which a dispatch is minted for a claim that never
+      # happens, so its ephemeral key must not be left live for its four-hour TTL.
       blocker = fixture(:committed_story, %{tenant_id: runner.tenant_id})
+      name = "test_dep_at_mint_" <> String.replace(story.id, "-", "")
 
       unboxed(fn ->
-        fixture(:story_dependency, %{
-          tenant_id: runner.tenant_id,
-          story_id: story.id,
-          depends_on_story_id: blocker.id
-        })
+        AdminRepo.query!("""
+        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          INSERT INTO story_dependencies (id, tenant_id, story_id, depends_on_story_id, inserted_at)
+          VALUES (gen_random_uuid(), NEW.tenant_id, '#{story.id}', '#{blocker.id}', now());
+          RETURN NEW;
+        END
+        $$
+        """)
+
+        AdminRepo.query!("""
+        CREATE TRIGGER #{name} AFTER INSERT ON dispatches FOR EACH ROW
+        WHEN (NEW.tenant_id = '#{runner.tenant_id}') EXECUTE FUNCTION #{name}()
+        """)
+      end)
+
+      on_exit(fn ->
+        unboxed(fn ->
+          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON dispatches")
+          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+        end)
       end)
 
       assert {:error, :dependencies_not_met} = place(ctx, dispatch_payload(story))

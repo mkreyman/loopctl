@@ -195,7 +195,7 @@ defmodule LoopctlWeb.StoryEscalationController do
         {"The release or re-contract write was rejected (a changeset error, or " <>
            "`contract_mismatch`), or `unresolvable_target`. A re-contract refusal arrives " <>
            "AFTER the story was released and moved to `queued`: it is left `pending` there, " <>
-           "and the next placement contracts it inside its claim (a retried " <>
+           "and the next placement contracts it before it mints (a retried " <>
            "resolve answers 409 `not_escalated`).", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
