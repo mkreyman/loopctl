@@ -95,7 +95,8 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
         "is already queued or executing, and no second one is created. 409 " <>
         "materialization_terminal " <>
         "when this tenant's LATEST materialization job was discarded or cancelled and the " <>
-        "key is below orchestrator; an orchestrator+ key forces a new job. Role: agent+.",
+        "key is below orchestrator. An orchestrator+ key forces: a new job past a terminal " <>
+        "or executing one, and a job waiting out a backoff runs now. Role: agent+.",
     responses: %{
       200 => {"Nothing missing or stale", "application/json", %OpenApiSpex.Schema{type: :object}},
       202 => {"Enqueued", "application/json", %OpenApiSpex.Schema{type: :object}},

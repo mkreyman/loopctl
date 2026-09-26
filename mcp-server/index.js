@@ -5110,8 +5110,9 @@ const TOOLS = [
       "or stale it answers already_materialized and queues nothing, and while a run is queued " +
       "or executing it answers in_flight and queues nothing. Refused 409 " +
       "materialization_terminal when your latest materialization job was discarded or " +
-      "cancelled (e.g. no embedding key) and the key is agent-role; an orchestrator-or-higher " +
-      "key forces a new job.",
+      "cancelled (e.g. no embedding key) and the key is agent-role. An orchestrator-or-higher " +
+      "key forces: a new job past a discarded, cancelled or executing one, and a job waiting " +
+      "out a backoff runs now.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {

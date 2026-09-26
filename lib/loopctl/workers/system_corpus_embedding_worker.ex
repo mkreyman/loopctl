@@ -115,8 +115,9 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       |> Enum.map(fn a -> {a, embedding_text(a)} end)
       |> split_unchanged(tenant_id, dim)
 
-    # ONE update_all for every unchanged article (review) rather than a per-item UPDATE
-    # in a path AC-41.1.11 otherwise de-N+1s.
+    # ONE statement for every unchanged article (review) rather than a per-item UPDATE
+    # in a path AC-41.1.11 otherwise de-N+1s. It stamps each row with the updated_at of
+    # the version whose hash was just compared, so an edit made since stays stale.
     Embeddings.touch_system_article_embeddings(
       tenant_id,
       Enum.map(unchanged, fn {article, _text} -> article end),

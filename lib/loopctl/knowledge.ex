@@ -9680,17 +9680,14 @@ defmodule Loopctl.Knowledge do
   # about what was scanned.
   #
   # MEMOIZED per (tenant, dimension) for a short TTL by
-  # `Embeddings.search_disclosure_meta/2` (review): in the STEADY state the
-  # system-corpus anti-join qualifies NO row, so its `LIMIT 1` never short-circuits
-  # and it scans every system-scoped article with a per-row index probe — a cost that
-  # grows with loopctl's own canonical wiki corpus, paid on every semantic search,
-  # against AC-41.1.12's "the hosted default must not regress".
-  # AC-41.1.7's "on demand" read-path materialization trigger now lives INSIDE
-  # `Embeddings.search_disclosure_meta/2`'s memoized cache fill (review #11), so it
-  # fires only on a DisclosureCache MISS rather than on every semantic response — the
-  # per-request unindexed `oban_jobs` scan + Oban insert it used to cost is gone. The
-  # worker is unique per `(tenant_id, dim)`, its batch query is an anti-join, and the
-  # enqueue refuses to re-drive a permanently-terminated materialization.
+  # `Embeddings.search_disclosure_meta/2` (review): its fill scans every system-scoped
+  # article with per-row index probes (one aggregate pass answering "missing?" and
+  # "missing or edited since?"), a cost that grows with loopctl's own canonical wiki
+  # corpus and must not be paid on every semantic search (AC-41.1.12).
+  # AC-41.1.7's "on demand" read-path materialization trigger lives INSIDE that fill
+  # (review #11), so it fires only on a DisclosureCache MISS, and only when the corpus is
+  # missing or stale for this tenant. It never queues beside a running job, refuses to
+  # re-drive a permanently-terminated one, and its failure never fails the search.
   defp semantic_disclosure_meta(tenant_id, dimension) when is_integer(dimension) do
     Embeddings.search_disclosure_meta(tenant_id, dimension)
   end

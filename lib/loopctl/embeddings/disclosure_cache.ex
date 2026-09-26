@@ -5,13 +5,13 @@ defmodule Loopctl.Embeddings.DisclosureCache do
 
   ## Why this exists
 
-  `Loopctl.Knowledge.search_semantic/3` merges `Embeddings.system_corpus_meta/2` and
+  `Loopctl.Knowledge.search_semantic/3` merges the system-corpus meta and
   `Embeddings.reembed_meta/2` into EVERY semantic response. In the STEADY state those
   are three round trips that always answer the same thing:
 
-    * `system_corpus_meta/2` runs an anti-join over every `scope: :system` article
-      with a per-row index probe into `article_embeddings`. Fully materialized, NO row
-      qualifies — so the `LIMIT 1` short-circuit never fires and the cost grows
+    * the system-corpus state is one aggregate pass over every `scope: :system` article
+      with per-row index probes into `article_embeddings` (is any missing; is any missing
+      or edited since). It visits every row whatever the answer, so the cost grows
       linearly with loopctl's own canonical wiki corpus, on the hottest read in the
       product;
     * `reembed_meta/2` adds two more `exists?` probes.

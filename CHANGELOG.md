@@ -23,8 +23,10 @@ All notable changes to loopctl are documented here.
   call answered `already_materialized`. Both now also act on an article edited since; a
   re-embed only re-stamps the row when the content hash did not change. Each row is stamped
   with the `updated_at` of the article version it was made from, so an edit landing during a
-  run stays stale and no app/database clock skew can mark a row current. A run already queued
-  or executing is not joined by a second one (the endpoint answers `in_flight`). The terminal
+  run stays stale and no app/database clock skew can mark a row current; that holds for every
+  writer of these rows, the re-embed backfill included. A run already queued or executing is
+  not joined by a second one (the endpoint answers `in_flight`); an orchestrator-or-higher key
+  forces past an executing job and runs one waiting out a backoff now. The terminal
   gate above reads the tenant's LATEST job, where it used to block on any discarded or
   cancelled job Oban still retained.
 

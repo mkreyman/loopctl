@@ -669,8 +669,6 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
         ]
       )
 
-      assert Embeddings.system_corpus_terminal?(tenant.id, 1536)
-
       assert {:error, :materialization_terminal} =
                Embeddings.enqueue_system_corpus_materialization(tenant.id)
 
@@ -695,8 +693,6 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
           ]
         )
       end
-
-      refute Embeddings.system_corpus_terminal?(tenant.id, 1536)
 
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert {:ok, %Oban.Job{}} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
@@ -727,8 +723,10 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert %{system_corpus_recall: "semantic"} = Embeddings.system_corpus_meta(tenant.id, 1536)
       assert [_ | _] = Embeddings.stale_system_articles(tenant.id, 1536)
 
-      # Oban runs inline here, so the job the read path queues has already run.
-      Embeddings.search_disclosure_meta(tenant.id, 1536)
+      # Oban runs inline here, so the job the read path queues has already run. The fill's
+      # own meta still reads semantic: an edited article is stale, not missing.
+      assert %{system_corpus_recall: "semantic"} =
+               Embeddings.search_disclosure_meta(tenant.id, 1536)
 
       assert Embeddings.stale_system_articles(tenant.id, 1536) == []
     end
@@ -765,6 +763,24 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
       {:ok, 1} = Embeddings.touch_system_article_embeddings(tenant.id, [edited], 1536)
       refute article.id in stale_ids.()
+
+      # The re-embed backfill writes system rows through the batch writer; it stamps the
+      # version it read the same way, so an edit during its provider call stays stale too.
+      later = set_updated_at.(DateTime.add(edited.updated_at, 1, :second))
+
+      {:ok, _} =
+        Embeddings.upsert_article_embeddings(tenant.id, [{edited, vec(1536), "h2"}],
+          dimension: 1536
+        )
+
+      assert article.id in stale_ids.()
+
+      {:ok, _} =
+        Embeddings.upsert_article_embeddings(tenant.id, [{later, vec(1536), "h3"}],
+          dimension: 1536
+        )
+
+      refute article.id in stale_ids.()
     end
 
     test "a run already queued or executing is not joined by a second one" do
@@ -785,9 +801,40 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       Oban.Testing.with_testing_mode(:manual, fn ->
         assert {:ok, :in_flight} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
 
-        assert {:ok, :in_flight} =
+        # Forced, it goes past: the executing row may be an orphan a crashed node left.
+        assert {:ok, %Oban.Job{conflict?: false}} =
                  Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
       end)
+    end
+
+    test "a job waiting out a backoff is in flight, and forcing runs it now" do
+      tenant = tenant_at(1536)
+      system_article()
+
+      %{rows: [[job_id]]} =
+        Loopctl.Repo.query!(
+          """
+          INSERT INTO oban_jobs (state, queue, worker, args, inserted_at, scheduled_at)
+          VALUES ('retryable', 'embeddings', $1, $2, NOW(), NOW() + interval '5 minutes')
+          RETURNING id
+          """,
+          [
+            "Loopctl.Workers.SystemCorpusEmbeddingWorker",
+            %{"tenant_id" => tenant.id, "dim" => 1536}
+          ]
+        )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, :in_flight} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
+
+        assert {:ok, %Oban.Job{id: ^job_id}} =
+                 Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
+      end)
+
+      %{rows: [[scheduled_at]]} =
+        Loopctl.Repo.query!("SELECT scheduled_at FROM oban_jobs WHERE id = $1", [job_id])
+
+      assert NaiveDateTime.compare(scheduled_at, NaiveDateTime.utc_now()) != :gt
     end
   end
 
