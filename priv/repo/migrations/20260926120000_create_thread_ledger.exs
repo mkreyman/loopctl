@@ -70,7 +70,9 @@ defmodule Loopctl.Repo.Migrations.CreateThreadLedger do
 
     # THE IDEMPOTENCY KEY, per author: a retried write from the same principal finds its row,
     # and two principals never collide on a key only one of them chose.
-    create unique_index(:thread_entries, [:tenant_id, :story_id, :author_principal, :idempotency_key],
+    create unique_index(
+             :thread_entries,
+             [:tenant_id, :story_id, :author_principal, :idempotency_key],
              name: :thread_entries_idempotency_uidx
            )
 
