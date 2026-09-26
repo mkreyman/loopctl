@@ -5107,7 +5107,8 @@ const TOOLS = [
       "matched by keyword only for you. It embeds the system articles you have not embedded " +
       "and re-embeds ones edited since; the search path does the same by itself on the " +
       "side-table read path, so this is for doing it now. Idempotent: when nothing is missing " +
-      "or stale it answers already_materialized and queues nothing. Refused 409 " +
+      "or stale it answers already_materialized and queues nothing, and while a run is queued " +
+      "or executing it answers in_flight and queues nothing. Refused 409 " +
       "materialization_terminal when your latest materialization job was discarded or " +
       "cancelled (e.g. no embedding key) and the key is agent-role; an orchestrator-or-higher " +
       "key forces a new job.",

@@ -20,11 +20,13 @@ All notable changes to loopctl are documented here.
 - **An edited system article is re-embedded (side-table read path).** A system article
   corrected after a tenant embedded it used to keep that tenant's vector of the old body for
   good: the search path queued materialization only for MISSING embeddings, and the on-demand
-  call answered `already_materialized`. Both now also act on an article edited since, and a
-  re-embed only re-stamps the row when the content hash did not change. The terminal gate
-  above reads the tenant's LATEST job, where it used to block on any discarded or cancelled
-  job Oban still retained, which kept a tenant that had since recovered from ever being
-  queued automatically.
+  call answered `already_materialized`. Both now also act on an article edited since; a
+  re-embed only re-stamps the row when the content hash did not change. Each row is stamped
+  with the `updated_at` of the article version it was made from, so an edit landing during a
+  run stays stale and no app/database clock skew can mark a row current. A run already queued
+  or executing is not joined by a second one (the endpoint answers `in_flight`). The terminal
+  gate above reads the tenant's LATEST job, where it used to block on any discarded or
+  cancelled job Oban still retained.
 
 ### Changed
 

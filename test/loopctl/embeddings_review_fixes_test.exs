@@ -733,33 +733,61 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert Embeddings.stale_system_articles(tenant.id, 1536) == []
     end
 
-    test "a row is never stamped earlier than its article, whichever clock stamped the edit" do
+    test "a row vouches for the version it was made from, whichever clock stamped the edit" do
       tenant = tenant_at(1536)
       article = system_article()
-      ahead = DateTime.add(DateTime.utc_now(), 60, :second)
+      stale_ids = fn -> system_article_ids(Embeddings.stale_system_articles(tenant.id, 1536)) end
 
-      AdminRepo.query!("UPDATE articles SET updated_at = $1 WHERE id = $2", [
-        ahead,
-        Ecto.UUID.dump!(article.id)
-      ])
+      # A database clock ahead of the app's: the edit is stamped a minute into the future.
+      set_updated_at = fn at ->
+        AdminRepo.query!("UPDATE articles SET updated_at = $1 WHERE id = $2", [
+          at,
+          Ecto.UUID.dump!(article.id)
+        ])
 
-      article = AdminRepo.get!(Loopctl.Knowledge.Article, article.id)
+        AdminRepo.get!(Loopctl.Knowledge.Article, article.id)
+      end
+
+      loaded = set_updated_at.(DateTime.add(DateTime.utc_now(), 60, :second))
 
       {:ok, _} =
-        Embeddings.materialize_system_article_embedding(tenant.id, article, vec(1536), "h", 1536)
+        Embeddings.materialize_system_article_embedding(tenant.id, loaded, vec(1536), "h", 1536)
 
-      refute article.id in system_article_ids(Embeddings.stale_system_articles(tenant.id, 1536))
+      refute article.id in stale_ids.()
 
-      AdminRepo.query!("UPDATE articles SET updated_at = $1 WHERE id = $2", [
-        DateTime.add(ahead, 60, :second),
-        Ecto.UUID.dump!(article.id)
-      ])
+      # An edit landing after the version was read (mid provider call, or between the
+      # hash comparison and the touch) stays stale, whichever clock is ahead.
+      edited = set_updated_at.(DateTime.add(loaded.updated_at, 1, :second))
+      assert article.id in stale_ids.()
 
-      assert article.id in system_article_ids(Embeddings.stale_system_articles(tenant.id, 1536))
+      {:ok, 1} = Embeddings.touch_system_article_embeddings(tenant.id, [loaded], 1536)
+      assert article.id in stale_ids.()
 
-      {:ok, 1} = Embeddings.touch_system_article_embeddings(tenant.id, [article.id], 1536)
+      {:ok, 1} = Embeddings.touch_system_article_embeddings(tenant.id, [edited], 1536)
+      refute article.id in stale_ids.()
+    end
 
-      refute article.id in system_article_ids(Embeddings.stale_system_articles(tenant.id, 1536))
+    test "a run already queued or executing is not joined by a second one" do
+      tenant = tenant_at(1536)
+      system_article()
+
+      Loopctl.Repo.query!(
+        """
+        INSERT INTO oban_jobs (state, queue, worker, args, inserted_at, scheduled_at)
+        VALUES ('executing', 'embeddings', $1, $2, NOW(), NOW())
+        """,
+        [
+          "Loopctl.Workers.SystemCorpusEmbeddingWorker",
+          %{"tenant_id" => tenant.id, "dim" => 1536}
+        ]
+      )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, :in_flight} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
+
+        assert {:ok, :in_flight} =
+                 Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
+      end)
     end
   end
 

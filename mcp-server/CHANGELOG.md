@@ -11,7 +11,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - **`embedding_materialize_system_corpus`** says that it also re-embeds system articles
   edited since this tenant embedded them, that it queues nothing when nothing is missing or
-  stale, and when it is refused 409 `materialization_terminal` (the tenant's latest job was
+  stale or when a run is already queued or executing (`in_flight`), and when it is refused 409 `materialization_terminal` (the tenant's latest job was
   discarded or cancelled, and the key is agent-role). loopctl changed to match: it used to
   re-embed an edited system article only incidentally, and to block on any retained
   terminal job rather than the latest.

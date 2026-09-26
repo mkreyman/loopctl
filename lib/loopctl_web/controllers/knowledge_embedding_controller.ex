@@ -91,7 +91,9 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
         "article corpus at this tenant's active dimension, using this tenant's own " <>
         "embedding credential. It embeds system articles this tenant has not embedded and " <>
         "re-embeds ones edited since. Idempotent: 200 with already_materialized when " <>
-        "nothing is missing or stale, and no job is created. 409 materialization_terminal " <>
+        "nothing is missing or stale, and no job is created; 202 with in_flight when a run " <>
+        "is already queued or executing, and no second one is created. 409 " <>
+        "materialization_terminal " <>
         "when this tenant's LATEST materialization job was discarded or cancelled and the " <>
         "key is below orchestrator; an orchestrator+ key forces a new job. Role: agent+.",
     responses: %{
@@ -127,6 +129,13 @@ defmodule LoopctlWeb.KnowledgeEmbeddingController do
         conn
         |> put_status(:ok)
         |> json(%{enqueued: false, already_materialized: true, dimension: dimension})
+
+      {:ok, :in_flight} ->
+        # A run for this (tenant, dimension) is already queued or executing; a second one
+        # would embed the same batch again. 202: the work the caller asked for is underway.
+        conn
+        |> put_status(:accepted)
+        |> json(%{enqueued: false, in_flight: true, dimension: dimension})
 
       {:ok, _job} ->
         conn

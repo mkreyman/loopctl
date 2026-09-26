@@ -119,7 +119,7 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     # in a path AC-41.1.11 otherwise de-N+1s.
     Embeddings.touch_system_article_embeddings(
       tenant_id,
-      Enum.map(unchanged, fn {article, _text} -> article.id end),
+      Enum.map(unchanged, fn {article, _text} -> article end),
       dim
     )
 
