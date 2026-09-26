@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.103.4 — 2026-09-26 (a queued delivery story is placeable while still pending)
+
+### Changed
+
+- **`force_unclaim_story`'s description** no longer says a story at `queued` + `pending` is
+  one no placement takes: loopctl's placement now contracts such a story inside its own claim
+  (loopctl epic 44, #884). No change to the request or the key.
+
 ## 2.103.3 — 2026-09-23 (an exhausted subscription is not capacity)
 
 ### Changed

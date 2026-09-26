@@ -336,14 +336,34 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
     end
 
+    # #884: `pending` at `queued` is where a triage-accepted story, a release whose re-contract
+    # did not land and an escalation resolved to `queued` all wait. The placement contracts it
+    # inside its claim; nothing unattended did before.
+    test "a PENDING story at queued is contracted and claimed by the placement", ctx do
+      %{runner: runner, story: story} = ctx
+
+      unboxed(fn ->
+        {1, _} =
+          AdminRepo.update_all(from(s in Story, where: s.id == ^story.id),
+            set: [agent_status: :pending]
+          )
+      end)
+
+      assert :ok = unboxed(fn -> Placement.claimable(runner.tenant_id, story.id) end)
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :assigned
+    end
+
     test "a story that is not ready is refused BEFORE anything is minted", ctx do
       %{runner: runner, story: story} = ctx
       before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
 
-      # Its stage row is at `queued`, but the story itself is back at `pending`.
+      # An operator's force-unclaim escalates the row (US-44.4): not at `queued`, not ready.
       unboxed(fn -> Progress.force_unclaim_story(runner.tenant_id, story.id, []) end)
 
-      assert {:error, :invalid_transition} = place(ctx, dispatch_payload(story))
+      assert {:error, :wrong_stage} = place(ctx, dispatch_payload(story))
 
       # The point of the pre-check: a loop over an unready story writes no `dispatches` row,
       # no ephemeral key and no immutable chain entry, and takes the tenant's chain advisory
@@ -985,7 +1005,7 @@ defmodule Loopctl.Delivery.PlacementTest do
                  )
                end)
 
-      assert {:error, :invalid_transition} =
+      assert {:error, :wrong_stage} =
                unboxed(fn -> Placement.claimable(runner.tenant_id, story.id) end)
     end
 

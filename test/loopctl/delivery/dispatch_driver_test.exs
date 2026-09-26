@@ -101,6 +101,22 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   end
 
   describe "candidates/1 — the states a stage row alone cannot tell apart" do
+    # #884: a triage-accepted story reaches `queued` still `pending`, and `Placement` contracts
+    # it inside its claim — so it is a candidate, where only an orchestrator's contract made it
+    # one before.
+    test "a PENDING story at queued is a candidate", ctx do
+      story = bind_repo(ctx, queued_story(ctx))
+
+      unboxed(fn ->
+        {1, _} =
+          AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+            set: [agent_status: :pending]
+          )
+      end)
+
+      assert story.id in candidate_ids(50)
+    end
+
     test "a released story is never left queued and uncontracted (#877)", ctx do
       story = bind_repo(ctx, queued_story(ctx))
       assert story.id in candidate_ids(50)

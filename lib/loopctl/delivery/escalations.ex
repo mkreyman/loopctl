@@ -389,10 +389,7 @@ defmodule Loopctl.Delivery.Escalations do
   # SENDING A STORY BACK TO `queued` HAS TO MAKE IT PLACEABLE, or it is a stage row that says
   # one thing while the story says another. Escalating does NOT release the claim — the story
   # is still assigned to the session that stopped, at `:implementing` — and
-  # `Placement.claimable/2` requires `agent_status == :contracted` AND stage `queued`. Moving
-  # the row alone left a story an operator had deliberately re-queued that no placement would
-  # take, and no lease recovers it either: the release sets `:pending`, which is not
-  # `:contracted` either.
+  # `Placement.claimable/2` takes only a story that is `pending` or `contracted` at `queued`.
   #
   # So the claim goes back BEFORE the transition, whose epoch is read after the release —
   # releasing bumps it — and the story is re-contracted AFTER it. That second order is not a
@@ -452,8 +449,8 @@ defmodule Loopctl.Delivery.Escalations do
       # this call: the row left `escalated` first, so for that instant the story was listed as
       # ready. It is past `pending`, which is what the resolution asked for — not a failure of
       # a resolution that already committed. Any OTHER failure is returned AFTER the transition
-      # committed: the story is left `pending` at `queued`, which no placement takes until an
-      # orchestrator key re-contracts it (`contract_story`; the resolving `:user` key cannot).
+      # committed: the story is left `pending` at `queued`, which the next placement contracts
+      # inside its claim (#884). Nothing is stranded.
       {:error, {:invalid_transition, %{current_agent_status: status}}} when status != :pending ->
         {:ok, story}
 

@@ -8266,7 +8266,7 @@ const TOOLS = [
       "A DELIVERY STORY THEN GOES TO `escalated`, NOT BACK TO THE QUEUE (loopctl US-44.4). An " +
       "operator taking a story back is a human decision, so when the release leaves the stage " +
       "row at `queued` loopctl escalates it over `operator_released` in the same transaction — " +
-      "it never sits at `queued` + `pending`, which no placement takes. It spends no attempt " +
+      "it is not left in the queue behind the human's back. It spends no attempt " +
       "against the retry ceiling. To put it back to work, call resolve_escalation with " +
       "`to: queued`: that releases (a no-op now) AND re-contracts, so the story is placeable " +
       "again. A story with no delivery stage row is simply left `pending`, as before.\n\n" +

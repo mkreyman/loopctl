@@ -139,7 +139,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
         join: b in subquery(bound_projects),
         on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
         where: s.stage == :queued,
-        where: st.agent_status == :contracted,
+        # `pending` too: `Placement` contracts a pending story inside its claim (#884).
+        where: st.agent_status in [:pending, :contracted],
         select: %{
           tenant_id: s.tenant_id,
           story_id: s.story_id,

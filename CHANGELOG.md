@@ -6,6 +6,14 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**
+  A triage-accepted story, a release whose re-contract did not land, and an escalation resolved
+  back to `queued` all leave a story `pending` at `queued`, which the dispatch driver used to
+  skip until an orchestrator key contracted it. The driver now selects it, and the placement
+  contracts it inside its claim, with the contract check skipped as every release re-contract
+  already skips it. `place_dispatch` on such a story is no longer refused `invalid_transition`.
+  No new setting, no migration.
+
 - **An exhausted subscription is not capacity (epic 44, US-44.6, runner contract 1.17.0).
   RE-VENDOR the contract to send `usage`; a runner that does not is never held out, except by
   its own `usage_exhausted` session ends.** A `status` message may carry `usage: {exhausted,
