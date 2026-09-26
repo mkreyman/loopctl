@@ -827,7 +827,8 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
   end
 
   defp inside_fixture!(dir) do
-    expected = Path.expand(dir)
+    # Physical, as git reports a toplevel: on macOS the tmp dir is reached through a symlink.
+    expected = Loopctl.RealTmpDir.physical!(dir)
 
     # Deliberately WITHOUT --git-dir. Asking git where it thinks it is while TELLING it where
     # it is makes the answer tautological: --show-toplevel then just echoes -C. The value of

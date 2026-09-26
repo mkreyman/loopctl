@@ -99,11 +99,10 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
 
   describe "linked_worktree_status/2" do
     setup do
-      dir =
-        Path.join(
-          Loopctl.RealTmpDir.path!(),
-          "wt_partition_#{System.unique_integer([:positive])}"
-        )
+      # System.tmp_dir!/0 on purpose: nothing here compares with git's output, and on macOS its
+      # unresolved /var spelling is exactly what linked_worktree_status/2's inode comparison
+      # exists to see through.
+      dir = Path.join(System.tmp_dir!(), "wt_partition_#{System.unique_integer([:positive])}")
 
       common = Path.join(dir, "common")
       private = Path.join(dir, "common/worktrees/probe")
