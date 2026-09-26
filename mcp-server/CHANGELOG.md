@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.106.0 — 2026-09-26 (review on a change thread)
+
+### Added
+
+- **`thread_place_review`, `thread_review_get`, `thread_finding`, `thread_verdict`,
+  `thread_fix`** (loopctl US-45.3): an orchestrator places a review, which returns the review
+  dispatch's key once; the reviewer session, holding that key as its only `LOOPCTL_API_KEY`,
+  reads the payload and records findings and one verdict; the story's claimant records the
+  fixes that answer them. `thread_finding` and `thread_verdict` never fall back to
+  `LOOPCTL_AGENT_KEY`.
+
+### Changed
+
+- **`thread_entry`** names the tools that write findings, fixes and verdicts.
+
 ## 2.105.0 — 2026-09-26 (change threads)
 
 ### Added

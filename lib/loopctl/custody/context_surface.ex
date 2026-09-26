@@ -41,7 +41,7 @@ defmodule Loopctl.Custody.ContextSurface do
   # Module names as STRINGS, mirroring `TierCapabilities`' two maps — the scan compares them
   # against `defmodule` lines in source text, and a compile-time reference would make this
   # module depend on every context it lists.
-  @halt_enforcing_contexts ["Loopctl.Delivery.Placement"]
+  @halt_enforcing_contexts ["Loopctl.Delivery.Placement", "Loopctl.Threads.Reviews"]
 
   @doc """
   Context modules that enforce the custody halt themselves. Bound to the modules that actually

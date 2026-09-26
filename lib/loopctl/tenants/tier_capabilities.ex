@@ -168,6 +168,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
       # US-45.1 — a story's change thread: the checkpoints its claimant reports, fenced on the
       # claim, are the record the merge gate will read.
       "LoopctlWeb.ThreadController",
+      # US-45.3 — review on a thread: placing a review mints the reviewer's dispatch, and its
+      # findings, verdicts and the claimant's fixes decide the round count and its ceiling.
+      "LoopctlWeb.ThreadReviewController",
       # LCP-1 §9.2 — TenantController mounts RequireHumanAnchor on
       # :register_owner_key (the custody owner key is the root of trust).
       "LoopctlWeb.TenantController"
@@ -213,7 +216,7 @@ defmodule Loopctl.Tenants.TierCapabilities do
   # what it is for — the mint is how it gets a lineage to claim under. Modules are STRINGS for
   # symmetry with the controller map, though these carry no cross-layer dependency.
   @gated_contexts %{
-    chain_of_custody: ["Loopctl.Delivery.Placement"]
+    chain_of_custody: ["Loopctl.Delivery.Placement", "Loopctl.Threads.Reviews"]
   }
 
   @learn_more "https://loopctl.com/wiki/chain-of-custody"

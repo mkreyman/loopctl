@@ -2453,6 +2453,82 @@ defmodule Loopctl.Fixtures do
   # `:trust_tier` defaults to the column's own default (`:agent_rooted`, what a signup with no
   # WebAuthn ceremony gets). Pass `trust_tier: :human_anchored` for a test of a surface behind
   # `LoopctlWeb.Plugs.RequireHumanAnchor` — every work-breakdown and chain-of-custody route.
+  # US-45.3: a CLAIMED story whose claim a dispatch made, for review placement. The tenant must
+  # be committed (`fixture(:committed_tenant)`, human-anchored), so only an `async: false`
+  # module that sweeps may use it.
+  #
+  # The agents, the two dispatches and the story are COMMITTED, because they cross both repos:
+  # the story references the implementer dispatch and agent by foreign key, and
+  # `Loopctl.Threads.Reviews.place/4` mints the review dispatch on `AdminRepo` with the story
+  # and the reviewer agent as its foreign keys. The thread a test writes stays in the `Repo`
+  # sandbox. The shape is the one
+  # `Loopctl.Delivery.Placement` leaves: an orchestrator ROOT dispatch, and the implementer's
+  # session dispatch as its child.
+  #
+  # Returns the story, the orchestrator's `%ApiKey{}` and raw key, the implementer's, and three
+  # agents: the implementer, a reviewer and a spare.
+  def fixture(:review_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    epoch = Map.get(attrs, :claim_epoch, 1)
+
+    committed =
+      Sandbox.unboxed_run(AdminRepo, fn ->
+        [orchestrator, implementer, reviewer, spare] =
+          for type <- [:orchestrator, :implementer, :implementer, :implementer] do
+            %Agent{tenant_id: tenant_id}
+            |> Agent.register_changeset(build(:agent, %{agent_type: type}))
+            |> AdminRepo.insert!()
+          end
+
+        {:ok, %{dispatch: root, raw_key: orch_raw}} =
+          Loopctl.Dispatches.create_dispatch(tenant_id, %{
+            role: :orchestrator,
+            agent_id: orchestrator.id
+          })
+
+        {:ok, %{dispatch: session, raw_key: impl_raw}} =
+          Loopctl.Dispatches.create_dispatch(tenant_id, %{
+            parent_dispatch_id: root.id,
+            role: :agent,
+            agent_id: implementer.id
+          })
+
+        %{
+          root: root,
+          session: session,
+          orch_raw: orch_raw,
+          orch_key: AdminRepo.get!(ApiKey, root.api_key_id),
+          impl_raw: impl_raw,
+          impl_key: AdminRepo.get!(ApiKey, session.api_key_id),
+          implementer: implementer,
+          reviewer: reviewer,
+          spare: spare
+        }
+      end)
+
+    story = fixture(:committed_story, %{tenant_id: tenant_id, claim_epoch: epoch})
+
+    story =
+      Sandbox.unboxed_run(Loopctl.Repo, fn ->
+        {:ok, story} =
+          Loopctl.Repo.with_tenant(tenant_id, fn ->
+            story
+            |> Ecto.Changeset.change(
+              assigned_agent_id: committed.implementer.id,
+              implementer_dispatch_id: committed.session.id,
+              agent_status: :implementing,
+              claimed_until: DateTime.add(DateTime.utc_now(), 3_600)
+            )
+            |> Loopctl.Repo.update!()
+          end)
+
+        story
+      end)
+
+    Map.merge(committed, %{tenant_id: tenant_id, story: story, epoch: epoch})
+  end
+
   def fixture(:committed_tenant, attrs) do
     attrs = Enum.into(attrs, %{})
     seq = System.unique_integer([:positive])

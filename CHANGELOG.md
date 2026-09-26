@@ -6,6 +6,25 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Review on a change thread (epic 45, US-45.3; migration `20260926160000`, no manual
+  step).** `POST /api/v1/stories/:id/thread/reviews` (orchestrator key or higher) mints the
+  reviewer's dispatch as a sibling of the implementer's and returns its key once; a
+  `finding` (`/thread/findings`) or `verdict` (`/thread/verdicts`) is accepted only on that
+  key, bound to the review and the checkpoint it reads, and the claimant records the `fix`
+  that answers findings (`/thread/fixes`). `GET /thread/reviews/:review_id` is the review's
+  payload. The round count and its ceiling are computed from the thread: a verdict completes
+  its round and revokes the review's dispatch and key, round 3 is placeable only when a
+  round-2 finding's `introduced_by` names a checkpoint a round-1 fix is carried by, and there
+  is never a round 4; a ceiling reached with a critical, high or medium finding records a
+  `review_ceiling` escalation and escalates the story's delivery stage. The migration adds
+  the `thread_reviews` table and nullable `review_id`, `severity`, `location`,
+  `introduced_by` and `finding_ids` columns on `thread_entries`. New refusal codes, none of
+  them `self_review_blocked`: `review_dispatch_required`, `review_closed`,
+  `review_round_superseded`, `review_ceiling_reached`, `reviewer_not_separate`,
+  `reviewer_agent_busy`, `review_placer_on_implementer_chain`, `review_parent_inactive`,
+  `implementer_dispatch_required`, `no_checkpoint`, and the `introduced_by_*`, `fix_*` and
+  `invalid_*` validation codes. MCP 2.106.0 ships the matching tools. The runner contract is
+  not bumped yet: `review` is not a dispatchable kind (AC-45.3.8 remains).
 - **Runners may report checkpoints and notes on a story's change thread (epic 45, US-45.2,
   runner contract 1.20.0). RE-VENDOR the contract to send them; a runner that does not gets
   today's behaviour.** Two new optional channel messages. `checkpoint` carries `{dispatch_id,
