@@ -24,6 +24,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :ambiguous_resolution}` -> 409 (a fuzzy identifier matched >1 active project)
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
+  - `{:error, :dependencies_not_met}` -> 409 `dependencies_not_met` (claim of a story with an unverified prerequisite)
   - `{:error, :story_held}` -> 409 (contract or claim of a story whose delivery stage is `escalated`, `done` or `failed`; an escalated one is claimable again once a human resolves it to `queued`)
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
   - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
@@ -370,6 +371,22 @@ defmodule LoopctlWeb.FallbackController do
   # (`Loopctl.Delivery.Stages.held_story_ids/2`) — cannot be contracted or claimed, even when
   # its claim has ended and it reads `pending`/`contracted`. Not `invalid_transition`: the
   # story's own status allows the call; the stage is what refuses it.
+  # Claim of a story whose prerequisites are not verified (#890): named, not a bare Conflict,
+  # so a caller can tell it from a lost race and knows where to look.
+  def call(conn, {:error, :dependencies_not_met}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "dependencies_not_met",
+        message:
+          "A story this one depends on, or a story in an epic its epic depends on, is not " <>
+            "verified. GET /api/v1/stories/blocked (MCP list_blocked_stories) names them."
+      }
+    })
+  end
+
   def call(conn, {:error, :story_held}) do
     conn
     |> put_status(:conflict)

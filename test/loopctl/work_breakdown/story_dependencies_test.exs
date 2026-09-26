@@ -7,9 +7,9 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
 
   alias Loopctl.WorkBreakdown.Dependencies
 
-  describe "dependencies_unmet?/2" do
+  describe "dependency_status/2" do
     # #887 review round 2: the one definition the claim and the dispatch driver share.
-    test "an unverified prerequisite is unmet, a verified one is not, and another tenant fails closed" do
+    test "an unverified prerequisite is unmet, a verified one is met, another tenant is not found" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
@@ -22,18 +22,18 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
           depends_on_story_id: blocker.id
         })
 
-      assert Dependencies.dependencies_unmet?(tenant.id, story.id)
+      assert Dependencies.dependency_status(tenant.id, story.id) == :unmet
 
-      # Tenant isolation, FAIL-CLOSED: asked as another tenant the story is not there, and a
-      # check with no row to judge must not report its dependencies satisfied.
-      assert Dependencies.dependencies_unmet?(fixture(:tenant).id, story.id)
+      # Tenant isolation: asked as another tenant the story is not there, and that is its own
+      # answer, never "satisfied".
+      assert Dependencies.dependency_status(fixture(:tenant).id, story.id) == :not_found
 
       Loopctl.AdminRepo.update_all(
         from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^blocker.id),
         set: [verified_status: :verified]
       )
 
-      refute Dependencies.dependencies_unmet?(tenant.id, story.id)
+      assert Dependencies.dependency_status(tenant.id, story.id) == :met
     end
   end
 
@@ -67,12 +67,26 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
       assert Dependencies.unmet_story_ids(tenant.id, [story.id]) == MapSet.new()
     end
 
-    test "a story that is not there is :not_found, and dependencies_unmet?/2 fails closed on it" do
+    test "unmet_story_ids/2 reads only its own tenant's stories" do
       tenant = fixture(:tenant)
-      gone = Ecto.UUID.generate()
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      blocker = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.1"})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.2"})
 
-      assert Dependencies.dependency_status(tenant.id, gone) == :not_found
-      assert Dependencies.dependencies_unmet?(tenant.id, gone)
+      {:ok, _dep} =
+        Dependencies.create_story_dependency(tenant.id, %{
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+
+      assert Dependencies.unmet_story_ids(tenant.id, [story.id]) == MapSet.new([story.id])
+      assert Dependencies.unmet_story_ids(fixture(:tenant).id, [story.id]) == MapSet.new()
+    end
+
+    test "a story that is not there is :not_found, never :met" do
+      tenant = fixture(:tenant)
+      assert Dependencies.dependency_status(tenant.id, Ecto.UUID.generate()) == :not_found
     end
   end
 

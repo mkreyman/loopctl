@@ -52,41 +52,12 @@ defmodule Loopctl.WorkBreakdown.Queries do
       |> apply_project_filter(opts)
       |> apply_epic_filter(opts)
 
-    # Exclude stories with unverified story-level dependencies
+    # Exclude stories with an unmet dependency, story-level or epic-level: the SAME definition
+    # the claim, bulk claim, the dispatch driver and the blocked list use (`Dependencies`).
     ready_query =
-      base_query
-      |> where(
-        [s],
-        fragment(
-          """
-          NOT EXISTS (
-            SELECT 1 FROM story_dependencies sd
-            JOIN stories dep ON dep.id = sd.depends_on_story_id
-            WHERE sd.story_id = ?
-            AND dep.verified_status != 'verified'
-          )
-          """,
-          s.id
-        )
-      )
-      # Exclude stories whose parent epic has unmet epic-level dependencies
-      |> where(
-        [s],
-        fragment(
-          """
-          NOT EXISTS (
-            SELECT 1 FROM epic_dependencies ed
-            WHERE ed.epic_id = ?
-            AND EXISTS (
-              SELECT 1 FROM stories prereq_story
-              WHERE prereq_story.epic_id = ed.depends_on_epic_id
-              AND prereq_story.verified_status != 'verified'
-            )
-          )
-          """,
-          s.epic_id
-        )
-      )
+      from(s in base_query, as: :story)
+      |> where([s], not exists(Dependencies.unmet_story_dependencies()))
+      |> where([s], not exists(Dependencies.unmet_epic_dependencies()))
 
       # Exclude stories whose delivery stage is HELD — `escalated`, `done` or `failed` — which
       # can read `pending` once their claim has ended. The one definition, in `Stages`;
@@ -327,10 +298,13 @@ defmodule Loopctl.WorkBreakdown.Queries do
   # attached its own blockers in memory (O(1) queries per page, not O(page_size)).
   defp fetch_blocking_story_dependencies(_tenant_id, [] = _story_ids), do: %{}
 
+  # The DETAIL behind a blocked row: which prerequisites, not whether. Its join and predicate
+  # match `Dependencies.unmet_story_dependencies/0` (tenant on both sides, unverified), so the
+  # row the list selects and the reasons attached to it agree.
   defp fetch_blocking_story_dependencies(tenant_id, story_ids) do
     from(sd in StoryDependency,
       join: dep in Story,
-      on: dep.id == sd.depends_on_story_id,
+      on: dep.id == sd.depends_on_story_id and dep.tenant_id == sd.tenant_id,
       where:
         sd.tenant_id == ^tenant_id and sd.story_id in ^story_ids and
           dep.verified_status != :verified,
@@ -355,7 +329,8 @@ defmodule Loopctl.WorkBreakdown.Queries do
     # Find unverified stories in prerequisite epics (via epic_dependencies)
     from(ed in EpicDependency,
       join: prereq_story in Story,
-      on: prereq_story.epic_id == ed.depends_on_epic_id,
+      on:
+        prereq_story.epic_id == ed.depends_on_epic_id and prereq_story.tenant_id == ed.tenant_id,
       where:
         ed.tenant_id == ^tenant_id and ed.epic_id in ^epic_ids and
           prereq_story.verified_status != :verified,

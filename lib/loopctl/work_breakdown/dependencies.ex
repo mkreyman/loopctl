@@ -30,8 +30,9 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
 
   @doc """
   An `exists` subquery: the story bound as `:story` depends on a story that is not verified.
-  Composed by `dependencies_unmet?/2` (the claim's check) and by
-  `Loopctl.Delivery.DispatchDriver.candidates/1` (selection), so the two cannot disagree.
+  Composed by `dependency_status/2` (the claim), `unmet_story_ids/2` (bulk claim),
+  `Loopctl.Delivery.DispatchDriver.candidates/1` and `Loopctl.WorkBreakdown.Queries`' ready and
+  blocked lists, so none of them can disagree.
   """
   @spec unmet_story_dependencies() :: Ecto.Query.t()
   def unmet_story_dependencies do
@@ -78,14 +79,6 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
       false -> :met
     end
   end
-
-  @doc """
-  Whether `story_id` in `tenant_id` has a dependency unmet. FAILS CLOSED: a story not found
-  answers `true`, so nothing claims or places it on a check that found no row to judge.
-  """
-  @spec dependencies_unmet?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
-  def dependencies_unmet?(tenant_id, story_id),
-    do: dependency_status(tenant_id, story_id) != :met
 
   @doc """
   The subset of `story_ids` in `tenant_id` with a dependency unmet, in ONE read: for a caller

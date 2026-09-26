@@ -75,7 +75,7 @@ defmodule Loopctl.BulkOperations do
         process_claims(
           sorted_ids,
           locked_stories,
-          {held, blocked},
+          %{held: held, blocked: blocked},
           agent_id,
           tenant_id,
           actor_id,
@@ -311,7 +311,7 @@ defmodule Loopctl.BulkOperations do
   defp process_claims(
          sorted_ids,
          locked_stories,
-         held,
+         batch_reads,
          agent_id,
          tenant_id,
          actor_id,
@@ -320,7 +320,7 @@ defmodule Loopctl.BulkOperations do
     Enum.map(sorted_ids, fn story_id ->
       case Map.get(locked_stories, story_id) do
         nil -> %{story_id: story_id, status: "error", reason: "Story not found"}
-        story -> process_claim(story, held, agent_id, tenant_id, actor_id, actor_label)
+        story -> process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label)
       end
     end)
   end
@@ -379,8 +379,8 @@ defmodule Loopctl.BulkOperations do
   # Private: Individual Story Processing
   # ===================================================================
 
-  defp process_claim(story, held, agent_id, tenant_id, actor_id, actor_label) do
-    with :ok <- validate_claim_preconditions(story, held),
+  defp process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label) do
+    with :ok <- validate_claim_preconditions(story, batch_reads),
          {:ok, updated} <- apply_claim(story, agent_id) do
       audit_claim(tenant_id, story, updated, actor_id, actor_label)
       emit_claim_event(tenant_id, story, updated, agent_id)
@@ -480,7 +480,7 @@ defmodule Loopctl.BulkOperations do
   end
 
   # `held` and `blocked` are each ONE read for the whole batch (`bulk_claim/4`).
-  defp validate_claim_preconditions(story, {held, blocked}) do
+  defp validate_claim_preconditions(story, %{held: held, blocked: blocked}) do
     cond do
       story.agent_status != :contracted ->
         {:error, "Story is not in contracted status (current: #{story.agent_status})"}
@@ -491,7 +491,7 @@ defmodule Loopctl.BulkOperations do
       MapSet.member?(blocked, story.id) ->
         {:error,
          "Story has an unverified dependency (its own, or one of its epic's); " <>
-           "list_blocked_stories names what is blocking it"}
+           "GET /api/v1/stories/blocked (MCP list_blocked_stories) names what blocks it"}
 
       true ->
         :ok

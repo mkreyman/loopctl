@@ -4319,11 +4319,14 @@ const TOOLS = [
   {
     name: "list_blocked_stories",
     description:
-      "List stories that cannot be worked yet because a dependency is unverified — a story " +
-      "they depend on, or a story in an epic their epic depends on. The dispatch driver " +
-      "does not select these, and place_dispatch refuses them 409 dependencies_not_met, so " +
-      "this is where a queue that is not draining shows why. Compact results; paginated " +
-      "(page/page_size) with total_count. Any key.",
+      "List stories with an unverified dependency — a story they depend on, or a story in an " +
+      "epic their epic depends on — each with the blocking dependencies. It is by dependency " +
+      "alone, WHATEVER the story's own status: an in-flight or finished story whose " +
+      "prerequisite was later rejected is listed too. The queued ones (agent_status " +
+      "pending or contracted) are what the dispatch driver skips and place_dispatch refuses " +
+      "409 dependencies_not_met, so this is where a queue that is not draining shows why. " +
+      "Compact; paginated (page/page_size) with total_count. Refuses 422 when project_id is " +
+      "not a UUID. Key: agent role or higher.",
     inputSchema: {
       type: "object",
       properties: {
