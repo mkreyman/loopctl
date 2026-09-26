@@ -40,7 +40,10 @@ defmodule Loopctl.Threads do
 
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.Claimant
+  alias Loopctl.Delivery.Stages
+  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
@@ -65,7 +68,8 @@ defmodule Loopctl.Threads do
     :claim_epoch,
     :agent_status,
     :claimed_until,
-    :review_requested_at
+    :review_requested_at,
+    :implementer_dispatch_id
   ]
 
   @type thread :: %{
@@ -90,6 +94,11 @@ defmodule Loopctl.Threads do
     result
   end
 
+  @doc false
+  # The advisory-lock namespace every write takes, for a test that holds the lock itself.
+  @spec lock_namespace() :: integer()
+  def lock_namespace, do: @thread_lock_namespace
+
   @doc "The largest page of entries `get_thread/3` returns."
   @spec max_entry_page() :: pos_integer()
   def max_entry_page, do: @max_entry_page
@@ -103,12 +112,20 @@ defmodule Loopctl.Threads do
   - `:claim_epoch` (required) — the epoch the caller's claim returned
   - `:commit_sha`, `:tree_sha` (required) — lowercase hex, 40 or 64 characters
   - `:note` — the claimant's reasoning, stored as the checkpoint entry's body. Untrusted.
-  - `:author_principal` (required), `:actor_lineage` (required) — SERVER-resolved from the key
+  - `:author_principal` (required), `:actor_lineage` (required) — SERVER-resolved: a lineage
+    list, or `:custody` for the lineage of the dispatch the story's claim recorded
+    (`implementer_dispatch_id`), read under the story's lock
+  - `:replay_only` — answer only the recorder's resend of a checkpoint already recorded, and
+    refuse anything else `:dispatch_not_accepted`. For a runner whose dispatch is no longer
+    accepted (`Loopctl.Delivery.RunnerThreads`): it may be told its earlier write landed, and
+    may write nothing new.
 
   Returns `{:ok, checkpoint, :created | :existing}`.
   """
   @spec record_checkpoint(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Checkpoint.t(), :created | :existing} | {:error, term()}
+          {:ok, Checkpoint.t(), :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, String.t() | map()}
   def record_checkpoint(tenant_id, story_id, opts) do
     commit_sha = Keyword.fetch!(opts, :commit_sha)
     tree_sha = Keyword.fetch!(opts, :tree_sha)
@@ -132,12 +149,25 @@ defmodule Loopctl.Threads do
 
   ## Options
 
-  - `:author_principal` (required), `:actor_lineage` (required) — SERVER-resolved from the key
+  - `:author_principal` (required), `:actor_lineage` (required) — as for
+    `record_checkpoint/3`
+  - `:claim_epoch` — when given, the story's `claim_epoch` must still be this one, read under
+    the story's lock, or a NEW write is `{:error, :stale_claim_epoch}`. A runner's note is
+    lineage-attributed to the claim it ran under, and that claim's lineage is only its own
+    while its epoch is current.
+  - `:replay_only` — answer only a resend of an entry already recorded, and refuse a new one
+    `:dispatch_not_accepted`, as for a checkpoint.
+
+  A resend of an entry already recorded by this author under this key is answered from the
+  row BEFORE either check: it writes nothing, so no claim needs to be current for it, and a
+  runner that lost the ack must be able to learn its note landed.
 
   Returns `{:ok, entry, :created | :existing}`.
   """
   @spec record_entry(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Entry.t(), :created | :existing} | {:error, term()}
+          {:ok, Entry.t(), :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, String.t() | map()}
   def record_entry(tenant_id, story_id, attrs, opts) do
     changeset = Entry.changeset(%Entry{}, attrs)
 
@@ -229,18 +259,25 @@ defmodule Loopctl.Threads do
   # else, and every new write, goes through the fence.
   defp checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
-    fence = fn -> claimant(tenant_id, story_id, Keyword.fetch!(opts, :agent_id), epoch) end
 
     case {locked_story(tenant_id, story_id),
           checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch)} do
       {nil, _} ->
         {:error, :not_found}
 
-      {_story, nil} ->
-        with :ok <- fence.(),
-             do: insert_checkpoint(tenant_id, story_id, commit_sha, tree_sha, opts)
+      {story, nil} ->
+        with :ok <- fence(story, opts, epoch),
+             do:
+               insert_checkpoint(
+                 tenant_id,
+                 story_id,
+                 commit_sha,
+                 tree_sha,
+                 with_lineage(opts, tenant_id, story)
+               )
 
-      {_story, existing} ->
+      {story, existing} ->
+        fence = fn -> fence(story, opts, epoch) end
         recorded = checkpoint_entry(existing)
 
         with :ok <- replay_allowed(recorded, Keyword.fetch!(opts, :author_principal), fence),
@@ -263,14 +300,35 @@ defmodule Loopctl.Threads do
     )
   end
 
-  defp claimant(tenant_id, story_id, agent_id, epoch) do
-    case locked_story(tenant_id, story_id) do
-      nil ->
-        {:error, :not_found}
-
-      story ->
-        with :ok <- Claimant.check(story, agent_id, epoch), do: lease(story)
+  # Decided on the story row this transaction already holds FOR SHARE.
+  defp fence(story, opts, epoch) do
+    if Keyword.get(opts, :replay_only, false) do
+      {:error, :dispatch_not_accepted}
+    else
+      with :ok <- Claimant.check(story, Keyword.fetch!(opts, :agent_id), epoch),
+           do: lease(story)
     end
+  end
+
+  # `:custody` is resolved HERE, on the row held FOR SHARE, so the lineage is the one the
+  # claim the write is fenced on recorded: a claim or release cannot change
+  # `implementer_dispatch_id` between this read and the insert. It is a foreign key with no
+  # delete, so a declared dispatch always resolves; a claim no placement made has none, `[]`.
+  defp with_lineage(opts, tenant_id, story) do
+    case Keyword.fetch!(opts, :actor_lineage) do
+      :custody -> Keyword.put(opts, :actor_lineage, custody_lineage(tenant_id, story))
+      lineage when is_list(lineage) -> opts
+    end
+  end
+
+  defp custody_lineage(_tenant_id, %Story{implementer_dispatch_id: nil}), do: []
+
+  defp custody_lineage(tenant_id, %Story{implementer_dispatch_id: dispatch_id}) do
+    Repo.one(
+      from d in Dispatch,
+        where: d.id == ^dispatch_id and d.tenant_id == ^tenant_id,
+        select: d.lineage_path
+    ) || []
   end
 
   defp lease(story) do
@@ -447,16 +505,28 @@ defmodule Loopctl.Threads do
     author = Keyword.fetch!(opts, :author_principal)
     key = Ecto.Changeset.get_field(changeset, :idempotency_key)
 
-    with {:story, %Story{}} <- {:story, locked_story(tenant_id, story_id)},
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
          nil <- entry_by_key(tenant_id, story_id, author, key),
+         :ok <- new_write_allowed(opts),
+         :ok <- epoch_current(story, Keyword.get(opts, :claim_epoch)),
          :ok <- checkpoint_of_story(changeset, tenant_id, story_id) do
-      insert_entry(tenant_id, story_id, changeset, opts)
+      insert_entry(tenant_id, story_id, changeset, with_lineage(opts, tenant_id, story))
     else
       {:story, nil} -> {:error, :not_found}
       %Entry{} = existing -> replay(existing, changeset)
       error -> error
     end
   end
+
+  defp new_write_allowed(opts) do
+    if Keyword.get(opts, :replay_only, false),
+      do: {:error, :dispatch_not_accepted},
+      else: :ok
+  end
+
+  defp epoch_current(_story, nil), do: :ok
+  defp epoch_current(%Story{claim_epoch: epoch}, epoch), do: :ok
+  defp epoch_current(_story, _epoch), do: {:error, :stale_claim_epoch}
 
   defp entry_by_key(tenant_id, story_id, author, key) do
     Repo.one(
@@ -554,29 +624,45 @@ defmodule Loopctl.Threads do
 
   # `fun` answers `{:ok, value, status, chain_entries}`; the chain entries are announced only
   # once the transaction that wrote them has committed.
+  #
+  # EVERY lock the write waits for — the per-story lock, the story's FOR SHARE, and the
+  # tenant's audit-chain lock the append takes — is bounded by `Capacity.lock_timeout_ms/0`,
+  # the wait `Capacity.busy_retry_ms/0` (every `:busy` refusal's retry interval) is derived
+  # from, so the retry a caller is told is always longer than the wait that just ran out.
+  # Contention — a lock wait that ran out, a deadlock Postgres broke by choosing this write, a
+  # connection lost — is `{:error, :busy}` through `Stages.answering_busy/4`, the one copy of
+  # that policy, counted as `[:loopctl, :threads, :busy]`. Unanswered, each raised inside the
+  # runner channel's `handle_in` and took down every session on that socket; over HTTP it was
+  # a 500. `:busy` does not promise nothing was written — a connection lost while the write
+  # committed may have committed it — and both writes are safe to resend: the resend of one
+  # that landed is answered from its row. A chain HASH violation is not contention and still
+  # raises, for the caller to answer.
   defp in_story_lock(tenant_id, story_id, fun) do
-    result =
-      Repo.with_tenant(tenant_id, fn ->
+    Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "thread write", fn ->
+      tenant_id
+      |> Repo.with_tenant(fn ->
+        Capacity.set_lock_timeout!()
+
         Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
           @thread_lock_namespace,
           story_id
         ])
 
-        case fun.() do
-          {:ok, _, _, _} = ok -> ok
-          error -> Repo.rollback(error)
-        end
+        committed_or_rolled_back(fun.())
       end)
-
-    case result do
-      {:ok, {:ok, value, status, chained}} ->
-        Enum.each(chained, &AuditChain.announce_entry/1)
-        {:ok, value, status}
-
-      {:error, error} ->
-        error
-    end
+      |> announced()
+    end)
   end
+
+  defp committed_or_rolled_back({:ok, _, _, _} = ok), do: ok
+  defp committed_or_rolled_back(error), do: Repo.rollback(error)
+
+  defp announced({:ok, {:ok, value, status, chained}}) do
+    Enum.each(chained, &AuditChain.announce_entry/1)
+    {:ok, value, status}
+  end
+
+  defp announced({:error, error}), do: error
 
   defp next_entry_seq(tenant_id, story_id) do
     Repo.one(

@@ -336,8 +336,11 @@ defmodule LoopctlWeb.FallbackController do
         status: 503,
         code: "busy",
         message:
-          "The delivery stage row was locked by another writer and this call gave up " <>
-            "waiting. Nothing was written; retry after the retry-after interval."
+          "A lock this write needed (a delivery stage row, a story's change thread, or the " <>
+            "tenant's audit chain) was held by another writer, or the connection was lost, and " <>
+            "this call gave up. Retry after the retry-after interval: nothing was written " <>
+            "unless the connection was lost as the write committed, and a resend of a write " <>
+            "that did land is answered as already recorded."
       }
     })
   end

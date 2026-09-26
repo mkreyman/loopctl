@@ -16,11 +16,11 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.2.1",
-      "description": "Runner contract minor bump adds optional checkpoint_report and thread_entry messages and adds review to x-connection.dispatchable_kinds; a runner that sends neither message gets today's behaviour."
+      "description": "Runner contract minor bump adds optional checkpoint and thread_entry messages; a runner that sends neither message gets today's behaviour. The review dispatch kind is not part of this bump: it arrives with US-45.3, which places the review dispatch."
     },
     {
       "id": "AC-45.2.2",
-      "description": "A checkpoint_report carries story_id, claim_epoch, commit_sha, tree_sha and optional parent sha; loopctl records it through the same function as US-45.1 with the same epoch fence."
+      "description": "A checkpoint carries dispatch_id (which names the story; a story id is never taken off the wire), claim_epoch, commit_sha, tree_sha and an optional note; loopctl derives the parent from the previous checkpoint of the same claim and records it through the same function as US-45.1 with the same epoch fence."
     },
     {
       "id": "AC-45.2.3",
@@ -59,7 +59,7 @@
         "joined runner, claimed story"
       ],
       "steps": [
-        "push checkpoint_report"
+        "push checkpoint"
       ],
       "expected_results": [
         "checkpoint recorded; stale epoch refused"

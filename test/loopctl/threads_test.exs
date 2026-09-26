@@ -5,6 +5,7 @@ defmodule Loopctl.ThreadsTest do
 
   import Ecto.Query
 
+  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AuditChain.Entry, as: ChainEntry
   alias Loopctl.Repo
   alias Loopctl.Threads
@@ -359,6 +360,78 @@ defmodule Loopctl.ThreadsTest do
       assert Enum.map(last.entries, & &1.body) == ["5"]
       assert last.next_after_seq == nil
     end
+  end
+
+  test "a write that cannot get the story's lock in time is :busy, nothing written" do
+    ctx = claimed_story()
+    test_pid = self()
+
+    # The holder takes the TRANSACTION-scoped lock the write takes, so the checkin's rollback
+    # releases it; a session-level lock would outlive the test on a pooled connection.
+    holder =
+      spawn(fn ->
+        :ok = Sandbox.checkout(Repo)
+
+        Repo.transaction(fn ->
+          Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+            Threads.lock_namespace(),
+            ctx.story.id
+          ])
+
+          send(test_pid, :held)
+
+          receive do
+            :release -> :ok
+          end
+        end)
+
+        Sandbox.checkin(Repo)
+      end)
+
+    assert_receive :held, 5_000
+    on_exit(fn -> send(holder, :release) end)
+    ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :threads, :busy]])
+
+    assert {:error, :busy} = entry(ctx, message("blocked"))
+    tenant_id = ctx.tenant_id
+    assert_receive {[:loopctl, :threads, :busy], ^ref, _, %{tenant_id: ^tenant_id}}
+    send(holder, :release)
+  end
+
+  test "a new entry fenced on a claim_epoch is refused once the epoch moved; its resend is not" do
+    ctx = claimed_story()
+
+    fenced = fn key ->
+      Threads.record_entry(ctx.tenant_id, ctx.story.id, message(key),
+        author_principal: "agent:runner",
+        actor_lineage: [],
+        claim_epoch: @epoch
+      )
+    end
+
+    assert {:ok, _, :created} = fenced.("k1")
+    set_story(ctx, claim_epoch: @epoch + 1)
+
+    assert {:error, :stale_claim_epoch} = fenced.("k2")
+    # A resend writes nothing, so it is answered from the row: the runner learns it landed.
+    assert {:ok, _, :existing} = fenced.("k1")
+  end
+
+  test "replay_only answers an entry's resend and refuses a new one" do
+    ctx = claimed_story()
+
+    write = fn key, opts ->
+      Threads.record_entry(
+        ctx.tenant_id,
+        ctx.story.id,
+        message(key),
+        [author_principal: "agent:runner", actor_lineage: []] ++ opts
+      )
+    end
+
+    assert {:ok, first, :created} = write.("k1", [])
+    assert {:ok, ^first, :existing} = write.("k1", replay_only: true)
+    assert {:error, :dispatch_not_accepted} = write.("k2", replay_only: true)
   end
 
   test "every write appends an audit-chain entry on the story" do

@@ -1,5 +1,68 @@
 {
   "$defs": {
+    "RunnerCheckpoint": {
+      "description": "A commit the session under an ACCEPTED `implement` dispatch pushed (since 1.20.0), recorded on the story's change thread. Optional: a runner that never sends it gets today's behaviour. Recorded only for the story's current claimant at the current `claim_epoch` while the claim is live. IDEMPOTENT: a resend of the same commit, tree and note is answered `ok` with `replayed: true`; the same commit under this claim with another tree or note is `checkpoint_conflict`. At most 60000 bytes under the byte rule. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+      "properties": {
+        "claim_epoch": {
+          "description": "The `claim_epoch` of the dispatch, echoed.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "commit_sha": {
+          "description": "The pushed commit: lowercase hex, 40 or 64 characters.",
+          "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          "type": "string"
+        },
+        "dispatch_id": {
+          "description": "The ACCEPTED implement dispatch whose session pushed the commit. It names the story; a story id is never taken from the wire.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "note": {
+          "description": "Why this commit, in the session's words. Untrusted: recorded, never executed. At most 16384 UTF-8 BYTES — the `maxLength` beside this is the same number counted as graphemes, which is looser. THE MESSAGE CAP IS WHAT BINDS: the whole message is at most 60000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so a note under this field's maximum can still be `invalid_payload`. Whitespace alone is `invalid_payload`, and a credential-shaped value is `secret_blocked`.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "string"
+        },
+        "tree_sha": {
+          "description": "The commit's tree, in the same object format as `commit_sha` (both 40 or both 64); a mismatch is `invalid_payload`.",
+          "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch",
+        "commit_sha",
+        "tree_sha"
+      ],
+      "type": "object"
+    },
+    "RunnerCheckpointAck": {
+      "description": "The reply to an accepted `checkpoint`.",
+      "properties": {
+        "checkpoint_id": {
+          "description": "The checkpoint's id — the same on every resend. A `thread_entry` may name it as its `checkpoint_id`.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "replayed": {
+          "description": "False on the delivery that recorded this checkpoint, true on any resend of it. A resend writes nothing.",
+          "type": "boolean"
+        },
+        "seq": {
+          "description": "The checkpoint's position among the story's checkpoints.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "checkpoint_id",
+        "seq",
+        "replayed"
+      ],
+      "type": "object"
+    },
     "RunnerDisconnecting": {
       "description": "Pushed as `disconnecting` on the runner's topic immediately before loopctl closes the runner's connection itself. `runner_revoked` and `no_longer_authorized` mean the credential no longer works: do not reconnect until re-enrolled. `server_shutdown` means the node is stopping: reconnect. `join_refused_not_authorized` arrives as the `disconnecting` field of a refused join's error reply, because an unjoined topic cannot carry a push.",
       "properties": {
@@ -836,6 +899,69 @@
       ],
       "type": "object"
     },
+    "RunnerThreadEntry": {
+      "description": "A note on the story's change thread from the session under an ACCEPTED `implement` dispatch (since 1.20.0), recorded as a `message` entry. Optional: a runner that never sends it gets today's behaviour. The entry's idempotency key is `<dispatch_id>:<client_seq>`: a resend with the same `client_seq` and the same `body` and `checkpoint_id` is answered `ok` with `replayed: true`, and a different one is `idempotency_key_reused`. At most 60000 bytes under the byte rule. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+      "properties": {
+        "body": {
+          "description": "The note. Untrusted: recorded, never executed. At most 16384 UTF-8 BYTES — the `maxLength` beside this is the same number counted as graphemes, which is looser. THE MESSAGE CAP IS WHAT BINDS: the whole message is at most 60000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so a note under this field's maximum can still be `invalid_payload`; split it across entries. Whitespace alone is `invalid_payload`, and a credential-shaped value is `secret_blocked`.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "string"
+        },
+        "checkpoint_id": {
+          "description": "A checkpoint of THIS story (a `checkpoint` ack's `checkpoint_id`) the note is about. Any other id is `invalid_payload`.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "claim_epoch": {
+          "description": "The `claim_epoch` of the dispatch, echoed.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "client_seq": {
+          "description": "The runner's own number for this note within the dispatch. Number each note once; a resend carries the same number.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "description": "The ACCEPTED implement dispatch whose session wrote the note. It names the story; a story id is never taken from the wire.",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch",
+        "client_seq",
+        "body"
+      ],
+      "type": "object"
+    },
+    "RunnerThreadEntryAck": {
+      "description": "The reply to an accepted `thread_entry`.",
+      "properties": {
+        "entry_id": {
+          "description": "The entry's id — the same on every resend.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "replayed": {
+          "description": "False on the delivery that recorded this note, true on any resend of it. A resend writes nothing.",
+          "type": "boolean"
+        },
+        "seq": {
+          "description": "The entry's position on the story's thread.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "entry_id",
+        "seq",
+        "replayed"
+      ],
+      "type": "object"
+    },
     "RunnerTraceAck": {
       "description": "The reply to `trace` and `trace_cursor`: the highest seq such that every seq from 0 to it is stored, or -1 when seq 0 is not. Resume from `acked_seq + 1`.",
       "properties": {
@@ -1496,6 +1622,23 @@
       "implement"
     ],
     "error_fields": {
+      "checkpoint": {
+        "audit_chain_append_failed": [],
+        "checkpoint_conflict": [],
+        "claim_not_live": [],
+        "dispatch_not_accepted": [],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "not_claimant": [],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "secret_blocked": [],
+        "stale_claim_epoch": [],
+        "unknown_dispatch": []
+      },
       "dispatch_reply": {
         "already_replied": [],
         "internal_error": [],
@@ -1577,6 +1720,21 @@
           "min_interval_ms"
         ]
       },
+      "thread_entry": {
+        "audit_chain_append_failed": [],
+        "dispatch_not_accepted": [],
+        "idempotency_key_reused": [],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "secret_blocked": [],
+        "stale_claim_epoch": [],
+        "unknown_dispatch": []
+      },
       "trace": {
         "batch_too_large": [
           "max_events",
@@ -1629,6 +1787,19 @@
       }
     },
     "errors": {
+      "checkpoint": [
+        "rate_limited",
+        "invalid_payload",
+        "unknown_dispatch",
+        "dispatch_not_accepted",
+        "stale_claim_epoch",
+        "not_claimant",
+        "claim_not_live",
+        "checkpoint_conflict",
+        "secret_blocked",
+        "audit_chain_append_failed",
+        "internal_error"
+      ],
       "dispatch_reply": [
         "rate_limited",
         "invalid_payload",
@@ -1674,6 +1845,17 @@
         "invalid_payload",
         "internal_error"
       ],
+      "thread_entry": [
+        "rate_limited",
+        "invalid_payload",
+        "unknown_dispatch",
+        "dispatch_not_accepted",
+        "stale_claim_epoch",
+        "idempotency_key_reused",
+        "secret_blocked",
+        "audit_chain_append_failed",
+        "internal_error"
+      ],
       "trace": [
         "rate_limited",
         "invalid_payload",
@@ -1707,6 +1889,7 @@
       ]
     },
     "events": {
+      "checkpoint": "RunnerCheckpoint",
       "disconnecting": "RunnerDisconnecting",
       "dispatch": "RunnerDispatch",
       "dispatch_reply": "RunnerDispatchReply",
@@ -1715,6 +1898,7 @@
       "stage": "RunnerStageReport",
       "status": "RunnerStatus",
       "story": "RunnerStory",
+      "thread_entry": "RunnerThreadEntry",
       "trace": "RunnerTraceBatch",
       "trace_cursor": "RunnerTraceCursor",
       "trace_event": "RunnerTraceEvent",
@@ -1724,6 +1908,18 @@
       "implement"
     ],
     "limits": {
+      "checkpoint": {
+        "fields": {
+          "note": {
+            "max_length": 16384
+          }
+        },
+        "max_bytes": 60000
+      },
+      "checkpoint_burst": {
+        "capacity": 8,
+        "refill_interval_ms": 500
+      },
       "dispatch_reply_burst": {
         "capacity": 8,
         "refill_interval_ms": 250
@@ -1778,6 +1974,19 @@
           }
         },
         "max_bytes": 48000
+      },
+      "thread_body_max_utf8_bytes": 16384,
+      "thread_entry": {
+        "fields": {
+          "body": {
+            "max_length": 16384
+          }
+        },
+        "max_bytes": 60000
+      },
+      "thread_entry_burst": {
+        "capacity": 12,
+        "refill_interval_ms": 250
       },
       "trace_max_batch_bytes": 60000,
       "trace_max_event_bytes": 12000,
@@ -1884,12 +2093,24 @@
         "audit_chain_append_failed",
         "unknown_story_stage"
       ],
+      "checkpoint": [
+        "not_claimant",
+        "claim_not_live",
+        "checkpoint_conflict",
+        "secret_blocked"
+      ],
+      "thread_entry": [
+        "idempotency_key_reused",
+        "secret_blocked"
+      ],
       "triage_verdict": [
         "stale_stage"
       ]
     },
     "replies": {
+      "checkpoint": "RunnerCheckpointAck",
       "session_ended": "RunnerSessionEndedAck",
+      "thread_entry": "RunnerThreadEntryAck",
       "trace": "RunnerTraceAck",
       "trace_cursor": "RunnerTraceAck",
       "triage_verdict": "RunnerTriageVerdictAck"
@@ -1998,5 +2219,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.19.0"
+  "x-contract-version": "1.20.0"
 }

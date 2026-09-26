@@ -808,9 +808,17 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
-  # `nil` is a row written before `kind` existed, when `implement` was the only kind sent.
-  defp implement_dispatch(%DispatchRecord{kind: kind}) when kind in ["implement", nil], do: :ok
-  defp implement_dispatch(%DispatchRecord{}), do: {:error, :unknown_dispatch}
+  defp implement_dispatch(%DispatchRecord{kind: kind}) do
+    if implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
+  end
+
+  @doc """
+  Whether a ledger row's `kind` is an implement session: `"implement"`, or `nil` — a row
+  written before `kind` existed, when `implement` was the only kind sent. The ONE reading of
+  that rule, for every path that must refuse a triage session a claim to report on.
+  """
+  @spec implement_kind?(String.t() | nil) :: boolean()
+  def implement_kind?(kind), do: kind in ["implement", nil]
 
   defp session_of(%DispatchRecord{} = record) do
     %{

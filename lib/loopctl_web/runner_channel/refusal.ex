@@ -129,9 +129,15 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # design, so the two sides disagree about what it decided and no retry can settle that.
   # `session_ended` (1.16.0) uses it with the same meaning: a DIFFERENT report of how a
   # session ended, for a dispatch whose report is already on the ledger row.
+  #
+  # The change thread's five (1.20.0, `Loopctl.Delivery.RunnerThreads`), all PERMANENT for the
+  # bytes that earned them: `not_claimant` and `claim_not_live` — the claim is not this
+  # runner's, or is over — `checkpoint_conflict` and `idempotency_key_reused` — a resend that
+  # is not the same write — and `secret_blocked`, a credential in a text field.
   @verbatim ~w(unknown_dispatch stale_claim_epoch already_replied dispatch_not_accepted
                run_mismatch stale_stage unknown_story_stage effect_conflict
-               already_recorded)a
+               already_recorded not_claimant claim_not_live checkpoint_conflict
+               idempotency_key_reused secret_blocked)a
 
   def for_message(reason) when reason in @verbatim, do: %{reason: Atom.to_string(reason)}
 
@@ -139,8 +145,9 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   def for_message(:rejected_by_database),
     do: %{reason: "invalid_payload", details: ["a value was refused by the database"]}
 
-  # A lock this write could not get in time, or a deadlock Postgres broke by choosing it.
-  # Nothing was written and the message is fine, so the runner is told to SEND IT AGAIN —
+  # A lock this write could not get in time, a deadlock Postgres broke by choosing it, or a
+  # lost connection. The message is fine, so the runner is told to SEND IT AGAIN — a write
+  # that did commit before the connection was lost is answered as already recorded —
   # never `invalid_payload`, which tells it to stop. The interval is LONGER than the wait that
   # just ran out: retrying after exactly that wait puts the runner back in the same queue with
   # no backoff. `:capacity_busy` is the ledger's name and `:busy` is

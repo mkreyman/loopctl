@@ -6,6 +6,21 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runners may report checkpoints and notes on a story's change thread (epic 45, US-45.2,
+  runner contract 1.20.0). RE-VENDOR the contract to send them; a runner that does not gets
+  today's behaviour.** Two new optional channel messages. `checkpoint` carries `{dispatch_id,
+  claim_epoch, commit_sha, tree_sha, note?}` and is recorded through the same
+  `Loopctl.Threads` fence as `POST /stories/:id/thread/checkpoints`: only for the story's
+  current claimant (the runner's agent) at the current epoch while the claim is live.
+  `thread_entry` carries `{dispatch_id, claim_epoch, client_seq, body, checkpoint_id?}` and
+  records a `message` entry keyed `<dispatch_id>:<client_seq>`. Both name an accepted
+  `implement` dispatch, are attributed to the custody dispatch the placement minted, and are
+  idempotent: an identical resend is answered `replayed: true`, even after the claim moved
+  or the dispatch was superseded. A write that could not get its locks is `rate_limited` with
+  `min_interval_ms`. Each message is capped under the byte rule, and that cap binds before a
+  text field's own maximum does. New refusal codes:
+  `not_claimant`, `claim_not_live`, `checkpoint_conflict`, `idempotency_key_reused`,
+  `secret_blocked`, all permanent. No migration.
 - **A `delivery-loop` system wiki article (migration `20260926060000`).** Served at
   `/wiki/delivery-loop` and matched by keyword with no step. Semantic recall of system
   articles exists only on the side-table read path (`embedding_side_table_reads`); on the

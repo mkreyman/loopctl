@@ -614,14 +614,34 @@ defmodule Loopctl.Delivery.RunnerStages do
   @chain_hash_violation "audit_chain_hash_violation"
 
   defp advance_answering_broken_chain(tenant_id, story_id, transition, opts) do
-    Stages.advance(tenant_id, story_id, transition, opts)
+    answering_broken_chain(
+      tenant_id,
+      fn -> "story_id=#{story_id} transition=#{inspect(transition)}" end,
+      fn -> Stages.advance(tenant_id, story_id, transition, opts) end
+    )
+  end
+
+  @doc """
+  Runs `fun`, a runner message's write, answering a tenant audit chain that refuses the append
+  as a HASH VIOLATION with `{:error, :audit_chain_append_failed}` instead of raising inside the
+  runner channel. Every other exception still raises. `context` is called only for the log
+  line, to name the write.
+
+  The ONE copy of that policy for every runner-message path that appends to the chain: the
+  stage machine's transitions here, and `Loopctl.Delivery.RunnerThreads`' thread writes.
+  """
+  @spec answering_broken_chain(Ecto.UUID.t(), (-> String.t()), (-> result)) ::
+          result | {:error, :audit_chain_append_failed}
+        when result: term()
+  def answering_broken_chain(tenant_id, context, fun) do
+    fun.()
   rescue
     error in Postgrex.Error ->
       if chain_hash_violation?(error) do
         Logger.error(
-          "tenant audit chain refused an append as a HASH VIOLATION; the runner's transition " <>
+          "tenant audit chain refused an append as a HASH VIOLATION; the runner's write " <>
             "was not applied and is answered audit_chain_append_failed: tenant_id=#{tenant_id} " <>
-            "story_id=#{story_id} transition=#{inspect(transition)}"
+            context.()
         )
 
         {:error, :audit_chain_append_failed}
@@ -630,6 +650,8 @@ defmodule Loopctl.Delivery.RunnerStages do
       end
   end
 
+  # The tenant audit chain's own trigger refusing an append as a HASH VIOLATION (P0001
+  # `audit_chain_hash_violation`).
   defp chain_hash_violation?(%Postgrex.Error{postgres: %{pg_code: "P0001", message: message}})
        when is_binary(message),
        do: String.starts_with?(message, @chain_hash_violation)
