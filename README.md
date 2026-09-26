@@ -31,7 +31,7 @@ loopctl is a **dumb state store** with a **two-tier trust model**:
 - **An independent orchestrator** reads those updates, performs verification, and writes its findings (`verified_status`: unverified -> verified -> rejected)
 - It is **structurally impossible** for implementing agents to mark their own work as verified
 
-loopctl never runs a model, executes your code, or touches your repository. It stores state, enforces access control, and serves data. When you use the [agent delivery loop](docs/agent-delivery-loop.md), it also queues work for the machines you enroll and gates what their sessions may do next.
+loopctl never runs a model, executes your code, or pushes to your repository. It stores state, enforces access control, and serves data. When you use the [agent delivery loop](docs/agent-delivery-loop.md), it also queues work for the machines you enroll and gates what their sessions may do next.
 
 ## Key Features
 
@@ -903,7 +903,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `force_unclaim_story` | Take a story back from the agent holding it | orchestrator |
 | `merge_precondition` | Run the merge gate over a story's pull request | orchestrator or user |
 | `renew_story_claim` | Renew a claim's lease | agent |
-| `revoke_dispatch` | Revoke a dispatch key and its subtree | orchestrator |
+| `revoke_dispatch` | Revoke a dispatch key and its subtree | user (sent as `LOOPCTL_USER_KEY`); a dispatch-minted orchestrator key may revoke inside its own lineage |
 
 Agents call tools directly: `mcp__loopctl__get_tenant()`, `mcp__loopctl__list_projects()`, `mcp__loopctl__create_project({name: "MyApp", slug: "myapp"})`. No curl or bash needed.
 

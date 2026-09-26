@@ -156,7 +156,7 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
     #     ACTION, read from the controller source's `when action in [...]` scoping.
     #   - each refusal code a row names <-> something on the route producing it: a plug
     #     mounted for the action, or a string literal in a function the action reaches.
-    test "every delivery-loop runner, dispatch and merge-gate route is indexed, with a real role and tool" do
+    test "every delivery-loop runner, dispatch, merge-gate and stage route is indexed, with a real role and tool" do
       indexed =
         LoopctlWeb.RouteDiscoveryController.curated_routes()
         |> Map.new(&{{&1.method, &1.path}, &1.description})
@@ -167,7 +167,8 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
       clauses = [
         runners: &String.starts_with?(&1, "/api/v1/runners"),
         dispatches: &String.starts_with?(&1, "/api/v1/dispatches"),
-        merge_gate: &String.ends_with?(&1, "/merge-precondition")
+        merge_gate: &String.ends_with?(&1, "/merge-precondition"),
+        story_stage: &(&1 =~ ~r{^/api/v1/stories/:id/(stage|stage/resolve|escalate|renew-claim)$})
       ]
 
       for {clause, match?} <- clauses do

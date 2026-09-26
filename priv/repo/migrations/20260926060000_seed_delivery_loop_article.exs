@@ -1,14 +1,15 @@
 defmodule Loopctl.Repo.Migrations.SeedDeliveryLoopArticle do
   use Ecto.Migration
 
-  # The public wiki article for the agent delivery loop. The source copy is
-  # docs/articles/delivery-loop.md; the body is inlined because docs/ is not in a release.
+  # The public wiki article for the agent delivery loop. This migration is its only copy: the
+  # body is inlined because docs/ is not in a release, and a second copy there would drift.
+  # A later correction is a new migration upserting this slug.
   @slug "delivery-loop"
   @title "The Agent Delivery Loop — From a Reported Issue to a Verified Deploy"
   @body ~S"""
   # The Agent Delivery Loop
 
-  loopctl can take a problem reported on GitHub and carry it through triage, implementation, review, CI, merge and post-deploy verification. Agent sessions do the work on **runners**, which are dev machines the tenant enrolls. loopctl is the control plane: it holds the queue, the stage of every story, the claims and the gates. It never runs a model and never touches the repository.
+  loopctl can take a problem reported on GitHub and carry it through triage, implementation, review, CI, merge and post-deploy verification. Agent sessions do the work on **runners**, which are dev machines the tenant enrolls. loopctl is the control plane: it holds the queue, the stage of every story, the claims and the gates. It never runs a model and never pushes to the repository; its only GitHub writes close and label the reporter's issue.
 
   ## The stages
 
@@ -27,7 +28,7 @@ defmodule Loopctl.Repo.Migrations.SeedDeliveryLoopArticle do
   - **Triage.** A triage session on a runner returns a verdict: `story` (queued), `escalate` or `reject`. A `story` verdict that fails a delivery gate is escalated instead of queued.
   - **Placement.** An operator (`place_dispatch`) or the unattended dispatch driver claims a queued story under a fresh custody dispatch and sends it to a runner with a free slot.
   - **The session.** The runner reports each stage as it implements, reviews, opens the pull request and watches CI. It can move a story forward, or back to `implementing`, but never to `verified` or `done`.
-  - **The merge gate.** `merge_precondition` re-checks the real diff: both delivery gates, custody, a hard size bound and an unmoved head. Only `allow` licenses a merge, and `refuse` escalates the story.
+  - **The merge gate.** An orchestrator or operator calls `merge_precondition`, which a runner session cannot. It re-checks the real diff: both delivery gates, custody and a hard size bound. Only `allow` licenses a merge, `refuse` escalates the story, and a head that moved since CI sends it back to `implementing`.
   - **After the merge.** Post-deploy verification moves a story from `deployed` to `verified`, and completion moves it to `done` once the reporter's issue is closed.
 
   ## The claim: lease and fence
@@ -67,7 +68,8 @@ defmodule Loopctl.Repo.Migrations.SeedDeliveryLoopArticle do
       NOW()
     )
     ON CONFLICT (slug) WHERE scope = 'system'
-    DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, updated_at = NOW()
+    DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body, category = EXCLUDED.category,
+      status = EXCLUDED.status, metadata = EXCLUDED.metadata, updated_at = NOW()
     """)
   end
 

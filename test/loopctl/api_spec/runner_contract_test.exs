@@ -2538,4 +2538,29 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert RunnerDispatch.ref_fields()[:base_branch] == :shared
     end
   end
+
+  describe "the moduledoc's message table" do
+    # A runner author reads this table rather than the export; it was maintained by hand and
+    # every row had fallen behind error_reasons/0, which is what the channel actually sends.
+    test "each runner -> control row names exactly the reasons the contract publishes" do
+      {:docs_v1, _, _, _, %{"en" => moduledoc}, _, _} = Code.fetch_docs(RunnerContract)
+
+      rows =
+        Regex.scan(
+          ~r/^\| runner -> control \| `"([a-z_]+)"` \|.*\| ([^|]+) \|$/m,
+          moduledoc,
+          capture: :all_but_first
+        )
+
+      assert rows != [], "the table matched no row: its shape has drifted from this test"
+
+      for [event, reasons] <- rows do
+        documented = Regex.scan(~r/`([a-z_]+)`/, reasons, capture: :all_but_first)
+
+        assert MapSet.new(List.flatten(documented)) ==
+                 MapSet.new(Map.fetch!(RunnerContract.error_reasons(), event)),
+               "the #{event} row's reasons disagree with error_reasons/0"
+      end
+    end
+  end
 end

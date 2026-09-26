@@ -748,7 +748,7 @@
                 <span class="text-accent-400">POST</span> /api/v1/runners/:runner_id/dispatches
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                Place a queued story on a runner under a fresh custody dispatch. dispatch_id is the idempotency key, and loopctl derives the branch. Refusals name what to fix, such as no_intake_source, runner_exhausted or no_conforming_branch. MCP: place_dispatch.
+                Place a queued story on a runner under a fresh custody dispatch. dispatch_id is the idempotency key, and loopctl derives the branch. Refusals name what to fix, such as no_intake_source, runner_exhausted or no_conforming_branch. Needs a user key no dispatch minted. MCP: place_dispatch.
               </p>
             </div>
             <div class="bg-slate-800 border border-slate-700 rounded-md p-3">
@@ -780,7 +780,7 @@
                 <span class="text-accent-400">POST</span> /api/v1/stories/:id/merge-precondition
               </p>
               <p class="mt-1.5 text-sm text-slate-400">
-                The merge gate over the real pull request: both delivery gates, custody, the size bound and an unmoved head. Only allow licenses a merge, and refuse escalates the story. MCP: merge_precondition.
+                The merge gate over the real pull request, called by an orchestrator or operator key (a runner session cannot): both delivery gates, custody and the size bound. Only allow licenses a merge, refuse escalates the story, and a head that moved since CI sends it back to implementing. MCP: merge_precondition.
               </p>
             </div>
             <div class="bg-slate-800 border border-slate-700 rounded-md p-3">

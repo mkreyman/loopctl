@@ -2,7 +2,7 @@
 
 loopctl can take a problem someone reports on GitHub and carry it through triage, implementation, review, CI, merge and deployment. Agents do the work on your own machines, and loopctl decides what may happen next. This page describes the operator-visible parts: what to set up, what each step does and refuses, and where to look when a story stops moving.
 
-loopctl is the control plane. It holds the queue, the stage of every story, the claims and the gates. The sessions run on **runners**, which are dev machines you enroll and which connect to loopctl over a socket. loopctl never runs a model and never touches your repository. It tells a runner what to do, and it records and judges what the runner reports.
+loopctl is the control plane. It holds the queue, the stage of every story, the claims and the gates. The sessions run on **runners**, which are dev machines you enroll and which connect to loopctl over a socket. loopctl never runs a model and never pushes to your repository. Its only GitHub writes are closing and labelling the reporter's issue, with `GITHUB_TOKEN`; it reads pull requests and deployments to judge them. It tells a runner what to do, and it records and judges what the runner reports.
 
 Every step below goes through the same chain of custody as the rest of loopctl. Custody endpoints are `exact_role`-gated, a session cannot resolve its own escalation, and a runner cannot move a story to `verified` or `done`. See [chain-of-custody-v2.md](chain-of-custody-v2.md).
 
@@ -42,7 +42,7 @@ Reporter text is untrusted from end to end. It is stored only in `untrusted_*` f
 
 ## 2. Triage
 
-A cron job (`TriageTriggerWorker`) turns each new intake record into a stub story at `detected`, which carries no reporter text. A second job (`TriageDispatcher`) sends a `triage` session to a runner that declared the `triage` kind. Triage claims nothing.
+A cron job (`TriageTriggerWorker`) turns each new intake record into a stub story at `detected`, which carries no reporter text. A second job (`TriageDispatchWorker`, running `Loopctl.Delivery.TriageDispatcher`) sends a `triage` session to a runner that declared the `triage` kind. Triage claims nothing.
 
 The runner answers with a `triage_verdict`: `story`, `escalate` or `reject`, with a confidence and optional per-lens verdicts.
 
@@ -73,12 +73,12 @@ The wire protocol is the **runner contract**, declared in `Loopctl.ApiSpec.Runne
 Placement claims a `queued` story under a freshly minted custody dispatch and pushes the work to one runner. There are two ways to place.
 
 - **An operator** uses `place_dispatch`, which calls `POST /api/v1/runners/:runner_id/dispatches`.
-  - It needs an orchestrator-or-higher key on a human-anchored tenant.
+  - It needs a user key that no dispatch minted (`LOOPCTL_USER_KEY`), on a human-anchored tenant. A key below user that no dispatch minted, such as a legacy orchestrator key, is refused with 403 `root_dispatch_forbidden`.
   - `dispatch_id` is the idempotency key: retry with the same one rather than start a second session.
   - Do not send `branch`. loopctl derives it from the story, behind a prefix that machine declared.
 - **The unattended dispatch driver** (`Loopctl.Delivery.DispatchDriver`) places the oldest eligible story on an eligible runner every minute, fairly across tenants.
   - It is off unless `DISPATCH_DRIVER_ENABLED` is `true` or `1`.
-  - It refuses to run while any of its budgets is unset: `DISPATCH_WALL_CLOCK_SECONDS`, `DISPATCH_MAX_TURNS` and `DISPATCH_MAX_ATTEMPTS`.
+  - It refuses to run while `DISPATCH_WALL_CLOCK_SECONDS` or `DISPATCH_MAX_TURNS` is unset. It does run with `DISPATCH_MAX_ATTEMPTS` unset, which means a retry ceiling of 0: the first counted release escalates the story. Set it before turning the driver on.
   - It keeps no memory between runs. A story that needs a person is logged at ERROR as blocked, not retried in a loop.
 
 A placement refusal says what to fix:
@@ -108,18 +108,18 @@ A claim carries a lease (`claimed_until`) and a fence (`claim_epoch`). Every rep
 
 The session on the runner implements the story, reviews it, opens the pull request and reports each stage. A runner may move a story forward only through the stages it holds, plus the edges that send it back to `implementing`: red CI, review findings, a moved base, or a refused merge.
 
-Before a merge, an orchestrator or operator calls `merge_precondition`, which calls `POST /api/v1/stories/:id/merge-precondition` with an orchestrator or user key. The story must be at `ci`. The gate re-runs both delivery gates over the real diff, using the lens verdicts that triage recorded rather than anything the caller sends. It also checks these, and refuses on any one:
+Before a merge, an orchestrator or operator calls `merge_precondition` (`POST /api/v1/stories/:id/merge-precondition`) with an orchestrator or user key. A runner session cannot call it, so the unattended driver alone does not take a story past `ci`. The story must be at `ci`. The gate re-runs both delivery gates over the real diff, using the lens verdicts that triage recorded rather than anything the caller sends. It also checks these, and refuses on any one:
 
 - custody;
 - a hard size bound of 12 files and 1,000 changed lines;
-- the head has not moved since it was checked;
 - the change is not to the loop's own deploy repository.
 
 | Decision | Meaning |
 |---|---|
 | `allow` | Recorded against the head. This is the only answer that licenses a merge. |
 | `refuse` | The story has already been escalated when this returns. |
-| `already_merged`, `head_moved` | Nothing to do, or check again against the new head. |
+| `already_merged` | The pull request is already merged; nothing to do. |
+| `head_moved` | The pull request's head changed since CI ran. The story goes back to `implementing` over `base_moved`, and the recorded head is cleared, so the gate is not called again until the story is back at `ci`. |
 | `unevaluated` | 503 with `Retry-After`. After repeated `unevaluated` answers the story escalates. |
 
 ## 7. After the merge
@@ -134,7 +134,7 @@ Before a merge, an orchestrator or operator calls `merge_precondition`, which ca
 |---|---|
 | `story_stage` shows `escalated` | Read `escalation_reason`, which is untrusted session text. Then `resolve_escalation` with `to: queued` to work it again, or `done` / `failed`. It needs a user key that no dispatch minted, so a session cannot resolve its own escalation. |
 | A story is held by a session that is gone | `force_unclaim_story` (orchestrator key; `exact_role`). A delivery story then goes to `escalated` over `operator_released` instead of back to the queue. Re-queue it with `resolve_escalation`. |
-| A dispatch key must stop working | `revoke_dispatch` revokes it and every dispatch below it. |
+| A dispatch key must stop working | `revoke_dispatch` revokes it and every dispatch below it. Use a user key; an orchestrator key that no dispatch minted is refused with 403 `unlineaged_revoke_forbidden`. |
 | `stage: null` | The loop has never touched this story. |
 
 A session escalates its own story with `escalate_story`, using an agent key held by the claimant.
