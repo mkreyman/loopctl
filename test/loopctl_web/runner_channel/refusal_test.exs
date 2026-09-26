@@ -130,7 +130,16 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
         # that carries nothing.
         {"session_ended", {:invalid, ["something"]}},
         {"session_ended", :capacity_busy},
-        {"session_ended", :already_recorded}
+        {"session_ended", :already_recorded},
+        # The change thread (1.20.0): its own codes carry nothing beside the reason.
+        {"checkpoint", {:invalid, ["something"]}},
+        {"checkpoint", :not_claimant},
+        {"checkpoint", :claim_not_live},
+        {"checkpoint", :checkpoint_conflict},
+        {"checkpoint", :secret_blocked},
+        {"thread_entry", {:invalid, ["something"]}},
+        {"thread_entry", :idempotency_key_reused},
+        {"thread_entry", :secret_blocked}
       ]
 
       for {event, reason} <- produced do
@@ -198,6 +207,23 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       # makes that collision loud.
       refute Map.has_key?(RunnerStages.row_state(row), :reason)
       assert refusal.effects == %{branch: "feature/story-11-abcdef01"}
+    end
+
+    test "the change thread's refusals are their own published codes, never internal_error" do
+      # Each names a remedy no older code carries (see `@error_reasons` in the contract): a
+      # claim that is over or not this runner's, a resend that is not the same write, a
+      # credential in a text field. Through the catch-all they would all read `internal_error`,
+      # which a runner is told it may retry.
+      log =
+        capture_log(fn ->
+          for reason <-
+                ~w(not_claimant claim_not_live checkpoint_conflict idempotency_key_reused
+                   secret_blocked)a do
+            assert Refusal.for_message(reason) == %{reason: Atom.to_string(reason)}
+          end
+        end)
+
+      refute log =~ "no clause names"
     end
 
     test "a refused chain append is PERMANENT, never a retry instruction" do

@@ -983,3 +983,7 @@ config :loopctl, :dispatch_max_attempts, 2
 # claim's cap is exactly placed_at + wall_clock_seconds + 900 in the suite and never depends on
 # a developer's shell.
 config :loopctl, :dispatch_lease_grace_seconds, 900
+
+# US-45.2: a thread write waits this long for its per-story lock before answering `:busy`.
+# Short here so the test that holds the lock does not wait out the production default.
+config :loopctl, :thread_lock_timeout_ms, 200

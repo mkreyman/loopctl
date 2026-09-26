@@ -336,8 +336,9 @@ defmodule LoopctlWeb.FallbackController do
         status: 503,
         code: "busy",
         message:
-          "The delivery stage row was locked by another writer and this call gave up " <>
-            "waiting. Nothing was written; retry after the retry-after interval."
+          "A row this write needed (a delivery stage row, or a story's change thread) was " <>
+            "locked by another writer and this call gave up waiting. Nothing was written; " <>
+            "retry after the retry-after interval."
       }
     })
   end

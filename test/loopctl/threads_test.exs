@@ -5,6 +5,7 @@ defmodule Loopctl.ThreadsTest do
 
   import Ecto.Query
 
+  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AuditChain.Entry, as: ChainEntry
   alias Loopctl.Repo
   alias Loopctl.Threads
@@ -359,6 +360,33 @@ defmodule Loopctl.ThreadsTest do
       assert Enum.map(last.entries, & &1.body) == ["5"]
       assert last.next_after_seq == nil
     end
+  end
+
+  test "a write that cannot get the story's lock in time is :busy, nothing written" do
+    ctx = claimed_story()
+    test_pid = self()
+
+    holder =
+      spawn(fn ->
+        :ok = Sandbox.checkout(Repo)
+
+        Repo.query!("SELECT pg_advisory_lock($1::int, hashtext($2))", [
+          :erlang.phash2(:loopctl_thread_ledger),
+          ctx.story.id
+        ])
+
+        send(test_pid, :held)
+
+        receive do
+          :release -> Sandbox.checkin(Repo)
+        end
+      end)
+
+    assert_receive :held, 5_000
+    on_exit(fn -> send(holder, :release) end)
+
+    assert {:error, :busy} = entry(ctx, message("blocked"))
+    send(holder, :release)
   end
 
   test "every write appends an audit-chain entry on the story" do

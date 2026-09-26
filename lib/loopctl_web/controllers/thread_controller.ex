@@ -108,6 +108,9 @@ defmodule LoopctlWeb.ThreadController do
            "`claim_not_live` (the claim has ended), or `checkpoint_conflict` (this commit is " <>
            "already recorded under this claim with a different tree or note)", "application/json",
          Schemas.ErrorResponse},
+      503 =>
+        {"`busy`: the story's thread lock was held past the wait bound; nothing written",
+         "application/json", Schemas.ErrorResponse},
       422 =>
         {"A sha is not 40 or 64 lowercase hex characters, `note` is over the bound, or " <>
            "`note` carries a credential (`secret_blocked`)", "application/json",
@@ -154,6 +157,9 @@ defmodule LoopctlWeb.ThreadController do
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"`idempotency_key_reused`: the key already names a different entry by this author",
+         "application/json", Schemas.ErrorResponse},
+      503 =>
+        {"`busy`: the story's thread lock was held past the wait bound; nothing written",
          "application/json", Schemas.ErrorResponse},
       422 =>
         {"A field is invalid (a non-UUID `checkpoint_id` included), the kind is not " <>

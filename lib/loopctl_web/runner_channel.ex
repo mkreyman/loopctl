@@ -91,6 +91,18 @@ defmodule LoopctlWeb.RunnerChannel do
   first copy caused. Like `stage`, it does not check the custody halt: it records what a
   session already did.
 
+  ## Change threads (contract 1.20.0, US-45.2)
+
+  `"checkpoint"` (`RunnerCheckpoint`) is a commit the session pushed, and `"thread_entry"`
+  (`RunnerThreadEntry`) a note it wants on the story's thread. Each is cast by the contract,
+  metered by its own bucket (`RunnerContract.checkpoint_burst/0`,
+  `RunnerContract.thread_entry_burst/0`), and applied by `Loopctl.Delivery.RunnerThreads`,
+  which resolves the runner's ACCEPTED implement dispatch to its story and calls
+  `Loopctl.Threads` — the function the HTTP surface calls, with the same claimant fence. The
+  channel opens no second write path to a thread. The reply is the recorded id, its `seq` and
+  `replayed`, and an identical resend is answered `ok` with `replayed: true`. Like `stage`,
+  neither checks the custody halt: each records what a session already did.
+
   ## What an operator can see (issue #815)
 
   - The channel process carries `runner_id`, `runner_name`, `tenant_id`, `node` and
@@ -115,6 +127,7 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.Delivery.RunnerStages
+  alias Loopctl.Delivery.RunnerThreads
   alias Loopctl.Delivery.TriageVerdict
   alias Loopctl.LogValue
   alias Loopctl.Runners
@@ -139,6 +152,10 @@ defmodule LoopctlWeb.RunnerChannel do
   @session_ended_capacity RunnerContract.session_ended_burst() |> Map.fetch!("capacity")
   @session_ended_refill_ms RunnerContract.session_ended_burst()
                            |> Map.fetch!("refill_interval_ms")
+  @checkpoint_capacity RunnerContract.checkpoint_burst() |> Map.fetch!("capacity")
+  @checkpoint_refill_ms RunnerContract.checkpoint_burst() |> Map.fetch!("refill_interval_ms")
+  @entry_capacity RunnerContract.thread_entry_burst() |> Map.fetch!("capacity")
+  @entry_refill_ms RunnerContract.thread_entry_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -178,6 +195,8 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:stage_bucket, :full)
        |> assign(:verdict_bucket, :full)
        |> assign(:session_ended_bucket, :full)
+       |> assign(:checkpoint_bucket, :full)
+       |> assign(:thread_entry_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -449,6 +468,67 @@ defmodule LoopctlWeb.RunnerChannel do
     else
       {:error, :rate_limited} -> rate_limited(socket, "session_ended", @session_ended_refill_ms)
       {:error, reason} -> refuse(socket, "session_ended", message_error(reason))
+    end
+  end
+
+  # A commit the session pushed (contract 1.20.0, US-45.2). `RunnerThreads` resolves the
+  # dispatch to its story and records it through `Loopctl.Threads`, fenced on the claim.
+  # IDEMPOTENT, and the ack says which it was: a resend after a lost ack is the same bytes.
+  defp handle_message("checkpoint", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with {:ok, message} <- RunnerContract.cast_checkpoint(payload),
+         {:ok, bucket} <-
+           ReplyBucket.take(
+             socket.assigns.checkpoint_bucket,
+             now,
+             @checkpoint_capacity,
+             @checkpoint_refill_ms
+           ) do
+      socket = assign(socket, :checkpoint_bucket, bucket)
+
+      case RunnerThreads.record_checkpoint(tenant_id, runner, message) do
+        {:ok, %{checkpoint: checkpoint, replayed?: replayed?}} ->
+          {:reply,
+           {:ok, %{checkpoint_id: checkpoint.id, seq: checkpoint.seq, replayed: replayed?}},
+           socket}
+
+        {:error, reason} ->
+          refuse(socket, "checkpoint", message_error(reason))
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, "checkpoint", @checkpoint_refill_ms)
+      {:error, reason} -> refuse(socket, "checkpoint", message_error(reason))
+    end
+  end
+
+  # A note the session puts on the story's thread (contract 1.20.0, US-45.2), keyed
+  # `<dispatch_id>:<client_seq>` so a resend is recognised as the same note.
+  defp handle_message("thread_entry", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with {:ok, message} <- RunnerContract.cast_thread_entry(payload),
+         {:ok, bucket} <-
+           ReplyBucket.take(
+             socket.assigns.thread_entry_bucket,
+             now,
+             @entry_capacity,
+             @entry_refill_ms
+           ) do
+      socket = assign(socket, :thread_entry_bucket, bucket)
+
+      case RunnerThreads.record_entry(tenant_id, runner, message) do
+        {:ok, %{entry: entry, replayed?: replayed?}} ->
+          {:reply, {:ok, %{entry_id: entry.id, seq: entry.seq, replayed: replayed?}}, socket}
+
+        {:error, reason} ->
+          refuse(socket, "thread_entry", message_error(reason))
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, "thread_entry", @entry_refill_ms)
+      {:error, reason} -> refuse(socket, "thread_entry", message_error(reason))
     end
   end
 

@@ -108,7 +108,9 @@ defmodule Loopctl.Threads do
   Returns `{:ok, checkpoint, :created | :existing}`.
   """
   @spec record_checkpoint(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Checkpoint.t(), :created | :existing} | {:error, term()}
+          {:ok, Checkpoint.t(), :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, String.t() | map()}
   def record_checkpoint(tenant_id, story_id, opts) do
     commit_sha = Keyword.fetch!(opts, :commit_sha)
     tree_sha = Keyword.fetch!(opts, :tree_sha)
@@ -137,7 +139,9 @@ defmodule Loopctl.Threads do
   Returns `{:ok, entry, :created | :existing}`.
   """
   @spec record_entry(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Entry.t(), :created | :existing} | {:error, term()}
+          {:ok, Entry.t(), :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, String.t() | map()}
   def record_entry(tenant_id, story_id, attrs, opts) do
     changeset = Entry.changeset(%Entry{}, attrs)
 
@@ -554,19 +558,33 @@ defmodule Loopctl.Threads do
 
   # `fun` answers `{:ok, value, status, chain_entries}`; the chain entries are announced only
   # once the transaction that wrote them has committed.
+  #
+  # A write waits for the per-story lock (and the story's FOR SHARE) at most `lock_timeout_ms/0`
+  # and is then answered `{:error, :busy}`, nothing written. Unbounded, a write stuck behind a
+  # slow holder raised a connection timeout inside the runner channel's `handle_in` and took
+  # down every session on that socket; over HTTP it was a 500.
   defp in_story_lock(tenant_id, story_id, fun) do
     result =
-      Repo.with_tenant(tenant_id, fn ->
-        Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
-          @thread_lock_namespace,
-          story_id
-        ])
+      try do
+        Repo.with_tenant(tenant_id, fn ->
+          Repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{lock_timeout_ms()}ms"])
 
-        case fun.() do
-          {:ok, _, _, _} = ok -> ok
-          error -> Repo.rollback(error)
-        end
-      end)
+          Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+            @thread_lock_namespace,
+            story_id
+          ])
+
+          case fun.() do
+            {:ok, _, _, _} = ok -> ok
+            error -> Repo.rollback(error)
+          end
+        end)
+      rescue
+        error in Postgrex.Error ->
+          if error.postgres[:code] == :lock_not_available,
+            do: {:error, {:error, :busy}},
+            else: reraise(error, __STACKTRACE__)
+      end
 
     case result do
       {:ok, {:ok, value, status, chained}} ->
@@ -577,6 +595,10 @@ defmodule Loopctl.Threads do
         error
     end
   end
+
+  # How long a write waits for its locks before answering `:busy`. Config, so tests can make
+  # the wait short without `Application.put_env`.
+  defp lock_timeout_ms, do: Application.get_env(:loopctl, :thread_lock_timeout_ms, 5_000)
 
   defp next_entry_seq(tenant_id, story_id) do
     Repo.one(

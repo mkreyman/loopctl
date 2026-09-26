@@ -7,16 +7,19 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
   alias Loopctl.ApiSpec.RunnerContract.Kinds
+  alias Loopctl.ApiSpec.RunnerContract.RunnerCheckpoint
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatchReply
   alias Loopctl.ApiSpec.RunnerContract.RunnerSessionEnded
   alias Loopctl.ApiSpec.RunnerContract.RunnerStage
   alias Loopctl.ApiSpec.RunnerContract.RunnerStory
+  alias Loopctl.ApiSpec.RunnerContract.RunnerThreadEntry
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.DeliveryGates.GateA
   alias Loopctl.Runners.Usage
+  alias Loopctl.Threads.Entry, as: ThreadEntry
   alias OpenApiSpex.Schema
 
   @join %{
@@ -39,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "e329766f232d25234ecc2ff6d4b1ff4c3d83aa51b794a8cf3e875d8198af241a"
+  @digest "6ab72b9a042e9d40120f6486c65f6f67b006d8a31f213cade92c6189d72fea7b"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -73,22 +76,26 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.19.0"
-      assert schema["x-contract-version"] == "1.19.0"
+      assert RunnerContract.version() == "1.20.0"
+      assert schema["x-contract-version"] == "1.20.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
                "trace" => "RunnerTraceBatch",
                "trace_cursor" => "RunnerTraceCursor",
                "stage" => "RunnerStageReport",
-               "session_ended" => "RunnerSessionEnded"
+               "session_ended" => "RunnerSessionEnded",
+               "checkpoint" => "RunnerCheckpoint",
+               "thread_entry" => "RunnerThreadEntry"
              } = connection["events"]
 
       assert connection["replies"] == %{
                "trace" => "RunnerTraceAck",
                "trace_cursor" => "RunnerTraceAck",
                "triage_verdict" => "RunnerTriageVerdictAck",
-               "session_ended" => "RunnerSessionEndedAck"
+               "session_ended" => "RunnerSessionEndedAck",
+               "checkpoint" => "RunnerCheckpointAck",
+               "thread_entry" => "RunnerThreadEntryAck"
              }
 
       # #803: the kind lists are published so a runner reads them rather than parsing prose.
@@ -136,6 +143,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
       assert connection["limits"]["stage_burst"] == RunnerContract.stage_burst()
       assert connection["limits"]["session_ended_burst"] == RunnerContract.session_ended_burst()
+      assert connection["limits"]["checkpoint_burst"] == RunnerContract.checkpoint_burst()
+      assert connection["limits"]["thread_entry_burst"] == RunnerContract.thread_entry_burst()
 
       # #803: the stage transition table is published so a runner can refuse an impossible
       # transition locally. It is DERIVED from the server's machine — asserted here against
@@ -1570,7 +1579,10 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       expected_unbounded = [
         {RunnerStory, ["id"]},
         {RunnerContract.RunnerTriage, ["issue_number", "record_id", "truncated"]},
-        {RunnerContract.RunnerTriageVerdict, ["confidence", "duplicate_of", "outcome"]}
+        {RunnerContract.RunnerTriageVerdict, ["confidence", "duplicate_of", "outcome"]},
+        # 1.20.0: ids, integers, and the two shas, whose length the `pattern` fixes.
+        {RunnerCheckpoint, ["claim_epoch", "commit_sha", "dispatch_id", "tree_sha"]},
+        {RunnerThreadEntry, ["checkpoint_id", "claim_epoch", "client_seq", "dispatch_id"]}
       ]
 
       for {mod, unbounded} <- expected_unbounded do
@@ -1796,6 +1808,211 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # takes the edge. Published nowhere a runner could send it from.
       refute Enum.any?(connection["stage_transitions"], &(&1["edge"] == "budget_reported"))
       assert {:implementing, :escalated, :budget_reported} in StageMachine.transitions()
+    end
+  end
+
+  describe "the change-thread messages (contract 1.20.0, US-45.2)" do
+    @sha String.duplicate("a", 40)
+    @tree String.duplicate("b", 40)
+
+    defp checkpoint_msg(attrs \\ %{}) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "claim_epoch" => 3,
+          "commit_sha" => @sha,
+          "tree_sha" => @tree
+        },
+        attrs
+      )
+    end
+
+    defp entry_msg(attrs \\ %{}) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "claim_epoch" => 3,
+          "client_seq" => 0,
+          "body" => "why I did it"
+        },
+        attrs
+      )
+    end
+
+    test "a checkpoint casts to its declared fields, with the dispatch id in one case" do
+      upper = String.upcase(Ecto.UUID.generate())
+
+      payload =
+        checkpoint_msg(%{"dispatch_id" => upper, "note" => "first cut", "parent" => "dropped"})
+
+      assert {:ok, message} = RunnerContract.cast_checkpoint(payload)
+
+      assert message == %{
+               dispatch_id: String.downcase(upper),
+               claim_epoch: 3,
+               commit_sha: @sha,
+               tree_sha: @tree,
+               note: "first cut"
+             }
+
+      # A SHA-256 repository's shas are 64 characters.
+      assert {:ok, _} =
+               RunnerContract.cast_checkpoint(
+                 checkpoint_msg(%{
+                   "commit_sha" => String.duplicate("c", 64),
+                   "tree_sha" => String.duplicate("d", 64)
+                 })
+               )
+    end
+
+    test "every checkpoint field but the note is required" do
+      for key <- ~w(dispatch_id claim_epoch commit_sha tree_sha) do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_checkpoint(Map.delete(checkpoint_msg(), key)),
+               key
+      end
+
+      assert {:ok, message} = RunnerContract.cast_checkpoint(checkpoint_msg())
+      refute Map.has_key?(message, :note)
+    end
+
+    test "a sha that is not lowercase hex of 40 or 64 characters is refused at the cast" do
+      for bad <- [
+            String.upcase(@sha),
+            String.duplicate("a", 39),
+            String.duplicate("a", 41),
+            String.duplicate("g", 40)
+          ] do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_checkpoint(checkpoint_msg(%{"commit_sha" => bad})),
+               bad
+
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_checkpoint(checkpoint_msg(%{"tree_sha" => bad})),
+               bad
+      end
+    end
+
+    test "an empty note, a negative epoch and a NUL are refused" do
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_checkpoint(checkpoint_msg(%{"note" => ""}))
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_checkpoint(checkpoint_msg(%{"claim_epoch" => -1}))
+
+      assert {:error, {:invalid, ["strings may not contain a NUL character"]}} =
+               RunnerContract.cast_checkpoint(checkpoint_msg(%{"note" => "a\u0000b"}))
+    end
+
+    test "a thread entry casts to its declared fields; client_seq and body are required" do
+      checkpoint_id = Ecto.UUID.generate()
+
+      payload =
+        entry_msg(%{"client_seq" => 7, "checkpoint_id" => checkpoint_id, "kind" => "verdict"})
+
+      assert {:ok, message} = RunnerContract.cast_thread_entry(payload)
+
+      # `kind` is not the runner's to send: it is dropped, and the entry is always a message.
+      assert message == %{
+               dispatch_id: payload["dispatch_id"],
+               claim_epoch: 3,
+               client_seq: 7,
+               body: "why I did it",
+               checkpoint_id: checkpoint_id
+             }
+
+      for key <- ~w(dispatch_id claim_epoch client_seq body) do
+        assert {:error, {:invalid, [_ | _]}} =
+                 RunnerContract.cast_thread_entry(Map.delete(entry_msg(), key)),
+               key
+      end
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_thread_entry(entry_msg(%{"client_seq" => -1}))
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_thread_entry(entry_msg(%{"body" => ""}))
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_thread_entry(entry_msg(%{"checkpoint_id" => "not-a-uuid"}))
+    end
+
+    test "a message over its byte budget is refused, though every field is within its maxLength" do
+      # A note of `Entry.max_body_bytes/0` ASCII characters is inside its `maxLength` and inside
+      # the UTF-8 cap, and the byte rule charges it six bytes a character — so it is a frame the
+      # socket could close on. The budget is what refuses it, before any database work.
+      text = String.duplicate("x", ThreadEntry.max_body_bytes())
+
+      assert {:error, {:invalid, [checkpoint_detail]}} =
+               RunnerContract.cast_checkpoint(checkpoint_msg(%{"note" => text}))
+
+      assert checkpoint_detail =~ "#{RunnerCheckpoint.max_bytes()} bytes"
+
+      assert {:error, {:invalid, [entry_detail]}} =
+               RunnerContract.cast_thread_entry(entry_msg(%{"body" => text}))
+
+      assert entry_detail =~ "#{RunnerThreadEntry.max_bytes()} bytes"
+
+      # And a note just inside the budget is admitted.
+      fits = String.duplicate("x", 9_000)
+      assert {:ok, _} = RunnerContract.cast_checkpoint(checkpoint_msg(%{"note" => fits}))
+      assert {:ok, _} = RunnerContract.cast_thread_entry(entry_msg(%{"body" => fits}))
+    end
+
+    test "the largest message either budget admits fits the runner socket's frame" do
+      {_path, _socket, opts} =
+        Enum.find(LoopctlWeb.Endpoint.__sockets__(), &match?({"/runner/socket", _, _}, &1))
+
+      frame_cap = opts |> Keyword.fetch!(:websocket) |> Keyword.fetch!(:max_frame_size)
+
+      for max_bytes <- [RunnerCheckpoint.max_bytes(), RunnerThreadEntry.max_bytes()] do
+        assert max_bytes + RunnerContract.frame_envelope_bytes() < frame_cap
+      end
+    end
+
+    test "both are published events with a reply, refusals, permanent codes and a bucket" do
+      connection = RunnerContract.json_schema()["x-connection"]
+
+      for event <- ~w(checkpoint thread_entry) do
+        assert event in RunnerContract.inbound_events()
+        assert "internal_error" in connection["errors"][event]
+        refute RunnerContract.permanent_error?(event, "rate_limited")
+        assert RunnerContract.permanent_error?(event, "secret_blocked")
+        assert RunnerContract.permanent_error?(event, "stale_claim_epoch")
+      end
+
+      for code <- ~w(not_claimant claim_not_live checkpoint_conflict) do
+        assert code in connection["errors"]["checkpoint"]
+        assert RunnerContract.permanent_error?("checkpoint", code)
+      end
+
+      assert "idempotency_key_reused" in connection["errors"]["thread_entry"]
+      assert RunnerContract.permanent_error?("thread_entry", "idempotency_key_reused")
+
+      # A note is not fenced on the claimant, so it cannot be refused as not the claimant's.
+      refute "not_claimant" in connection["errors"]["thread_entry"]
+
+      assert connection["limits"]["checkpoint"] == RunnerCheckpoint.limits()
+      assert connection["limits"]["thread_entry"] == RunnerThreadEntry.limits()
+      assert connection["limits"]["thread_body_max_utf8_bytes"] == ThreadEntry.max_body_bytes()
+
+      assert %{"capacity" => _, "refill_interval_ms" => _} =
+               connection["limits"]["checkpoint_burst"]
+
+      assert %{"capacity" => _, "refill_interval_ms" => _} =
+               connection["limits"]["thread_entry_burst"]
+    end
+
+    test "the version's changelog row names both messages and says they are optional (AC-45.2.4)" do
+      {:docs_v1, _, _, _, %{"en" => moduledoc}, _, _} = Code.fetch_docs(RunnerContract)
+
+      assert [row] = Regex.run(~r/^\| \(1\.20\.0\) .*$/m, moduledoc)
+      assert row =~ "`checkpoint`"
+      assert row =~ "`thread_entry`"
+      assert row =~ "OPTIONAL"
+
+      # US-45.3 brings the review kind; this release does not make it dispatchable.
+      refute "review" in RunnerContract.json_schema()["x-connection"]["dispatchable_kinds"]
     end
   end
 

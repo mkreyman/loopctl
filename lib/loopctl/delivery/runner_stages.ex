@@ -630,11 +630,18 @@ defmodule Loopctl.Delivery.RunnerStages do
       end
   end
 
-  defp chain_hash_violation?(%Postgrex.Error{postgres: %{pg_code: "P0001", message: message}})
-       when is_binary(message),
-       do: String.starts_with?(message, @chain_hash_violation)
+  @doc """
+  True when `error` is the tenant audit chain's own trigger refusing an append as a HASH
+  VIOLATION (P0001 `audit_chain_hash_violation`). Every runner-message path that appends to
+  the chain answers it as `audit_chain_append_failed` rather than raising in the channel —
+  `advance_answering_broken_chain/4` here, and `Loopctl.Delivery.RunnerThreads`.
+  """
+  @spec chain_hash_violation?(Postgrex.Error.t()) :: boolean()
+  def chain_hash_violation?(%Postgrex.Error{postgres: %{pg_code: "P0001", message: message}})
+      when is_binary(message),
+      do: String.starts_with?(message, @chain_hash_violation)
 
-  defp chain_hash_violation?(%Postgrex.Error{}), do: false
+  def chain_hash_violation?(%Postgrex.Error{}), do: false
 
   # THE SLOT, released when the session is over by a rule the SERVER can check — never on the
   # runner's word alone, which is the rule `StageMachine.ends_session?/1` exists to hold: a
