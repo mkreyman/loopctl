@@ -8106,7 +8106,9 @@ const TOOLS = [
       "sent), so a late or a longer retry gets its whole clock. 409 `dispatch_claim_ended` means " +
       "the claim that dispatch_id was placed under has ENDED — its lease ran out, or the story " +
       "left assigned/implementing: nothing was pushed or written and the claim is not revived. " +
-      "Place the story again with a NEW dispatch_id once it is placeable.",
+      "Place the story again with a NEW dispatch_id once it is placeable. 409 " +
+      "`dependencies_not_met` means a story it depends on, or one in an epic its epic depends on, " +
+      "is not verified: nothing was minted, claimed or pushed; place it once they are.",
     inputSchema: {
       type: "object",
       properties: {

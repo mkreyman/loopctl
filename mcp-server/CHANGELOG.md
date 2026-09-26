@@ -5,6 +5,14 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.103.5 — 2026-09-26 (place_dispatch names its dependency refusal)
+
+### Changed
+
+- **`place_dispatch`** names the new 409 `dependencies_not_met` (loopctl epic 44, #887): a
+  story it depends on, or one in an epic its epic depends on, is not verified, and nothing was
+  minted, claimed or pushed. Remedy: verify the prerequisites, then place again.
+
 ## 2.103.4 — 2026-09-26 (a queued delivery story is placeable while still pending)
 
 ### Changed

@@ -775,7 +775,8 @@ defmodule Loopctl.Delivery.Placement do
   # deletes a chain entry, by design. So a caller looping over a story that is not ready (already
   # claimed, its dependencies unmet, its stage row not at `queued`) would have written a permanent
   # chain entry and taken the chain lock once per attempt, for an outcome that was never going
-  # to succeed. Reading two rows first turns that into two SELECTs.
+  # to succeed. Reading first — the story, its stage row, and one EXISTS for its dependencies —
+  # turns that into a few SELECTs.
   #
   # It cannot be complete, and is not meant to be: a story claimed between this read and the
   # claim's own lock takes `claim_story/3`'s refusal instead, and `claim_then_push/7` revokes

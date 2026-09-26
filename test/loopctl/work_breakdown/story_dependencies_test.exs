@@ -3,7 +3,38 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
 
   setup :verify_on_exit!
 
+  import Ecto.Query
+
   alias Loopctl.WorkBreakdown.Dependencies
+
+  describe "dependencies_unmet?/2" do
+    # #887 review round 2: the one definition the claim and the dispatch driver share.
+    test "an unverified prerequisite is unmet, a verified one is not, and only in its tenant" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      blocker = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.1"})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.2"})
+
+      {:ok, _dep} =
+        Dependencies.create_story_dependency(tenant.id, %{
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+
+      assert Dependencies.dependencies_unmet?(tenant.id, story.id)
+
+      # Tenant isolation: asked as another tenant, the story and its dependency are not there.
+      refute Dependencies.dependencies_unmet?(fixture(:tenant).id, story.id)
+
+      Loopctl.AdminRepo.update_all(
+        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^blocker.id),
+        set: [verified_status: :verified]
+      )
+
+      refute Dependencies.dependencies_unmet?(tenant.id, story.id)
+    end
+  end
 
   describe "create_story_dependency/3" do
     test "creates a valid dependency within same epic" do

@@ -32,10 +32,9 @@ defmodule Loopctl.Progress do
   alias Loopctl.TokenUsage
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epic
-  alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
-  alias Loopctl.WorkBreakdown.StoryDependency
   alias Loopctl.Workers.ReviewKnowledgeWorker
   alias Loopctl.Workers.WebhookDeliveryWorker
 
@@ -4545,39 +4544,10 @@ defmodule Loopctl.Progress do
   """
   @spec check_claim_dependencies(Ecto.UUID.t(), Story.t()) ::
           {:ok, :deps_satisfied} | {:error, :dependencies_not_met}
-  def check_claim_dependencies(tenant_id, %Story{tenant_id: tenant_id} = story) do
-    # Check story-level dependencies: all depends_on stories must be verified
-    story_deps_unmet =
-      from(sd in StoryDependency,
-        join: dep in Story,
-        on: dep.id == sd.depends_on_story_id,
-        where: sd.tenant_id == ^tenant_id and dep.tenant_id == ^tenant_id,
-        where: sd.story_id == ^story.id and dep.verified_status != :verified,
-        select: count(sd.id)
-      )
-      |> AdminRepo.one()
-
-    if story_deps_unmet > 0 do
-      {:error, :dependencies_not_met}
-    else
-      # Check epic-level dependencies: all stories in prerequisite epics must be verified
-      epic_deps_unmet =
-        from(ed in EpicDependency,
-          where: ed.tenant_id == ^tenant_id and ed.epic_id == ^story.epic_id,
-          join: prereq_story in Story,
-          on:
-            prereq_story.epic_id == ed.depends_on_epic_id and prereq_story.tenant_id == ^tenant_id,
-          where: prereq_story.verified_status != :verified,
-          select: count(prereq_story.id)
-        )
-        |> AdminRepo.one()
-
-      if epic_deps_unmet > 0 do
-        {:error, :dependencies_not_met}
-      else
-        {:ok, :deps_satisfied}
-      end
-    end
+  def check_claim_dependencies(tenant_id, %Story{id: story_id}) do
+    if Dependencies.dependencies_unmet?(tenant_id, story_id),
+      do: {:error, :dependencies_not_met},
+      else: {:ok, :deps_satisfied}
   end
 
   defp validate_unclaim(story, _agent_id) when story.agent_status == :pending do

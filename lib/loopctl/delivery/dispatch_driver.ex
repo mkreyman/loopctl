@@ -84,9 +84,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
   alias Loopctl.Runners.Selection
-  alias Loopctl.WorkBreakdown.EpicDependency
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
-  alias Loopctl.WorkBreakdown.StoryDependency
 
   require Logger
 
@@ -104,7 +103,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
   @doc """
   The stories this pass will attempt, at most `limit`, fairly across tenants.
 
-  `queued` AND `pending` or `contracted` AND under a project bound to exactly ONE active intake source —
+  `queued` AND `pending` or `contracted` AND with no unmet dependency (its own or its epic's,
+  `Loopctl.WorkBreakdown.Dependencies`) AND under a project bound to exactly ONE active intake source —
   see the moduledoc on why the stage row alone selected released stories for ever, and why an
   unaddressable project is the same trap wearing the driver's own `:blocked` label. Ranked per
   tenant and ordered by that rank first, so a tenant with one queued story is reached in the
@@ -135,27 +135,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
     # A story whose dependencies are unmet is NOT a candidate: `Placement` refuses it before it
     # mints, so selected it would be refused on every pass, its `updated_at` frozen at the head
-    # of the oldest-first ranking. The same two reads `Progress.check_claim_dependencies/2`
-    # makes: an unverified story it depends on, or an unverified story in an epic its epic
-    # depends on.
-    unmet_story_deps =
-      from sd in StoryDependency,
-        join: dep in Story,
-        on: dep.id == sd.depends_on_story_id and dep.tenant_id == sd.tenant_id,
-        where:
-          sd.story_id == parent_as(:story).id and sd.tenant_id == parent_as(:story).tenant_id,
-        where: dep.verified_status != :verified,
-        select: 1
-
-    unmet_epic_deps =
-      from ed in EpicDependency,
-        join: prereq in Story,
-        on: prereq.epic_id == ed.depends_on_epic_id and prereq.tenant_id == ed.tenant_id,
-        where:
-          ed.epic_id == parent_as(:story).epic_id and ed.tenant_id == parent_as(:story).tenant_id,
-        where: prereq.verified_status != :verified,
-        select: 1
-
+    # of the oldest-first ranking. The claim's own definition (`Dependencies`), not a copy, and
+    # the count of stories left out is logged each pass (`log_waiting_on_dependencies/0`).
     ranked =
       from s in StoryStage,
         join: st in Story,
@@ -166,8 +147,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
         where: s.stage == :queued,
         # `pending` too: `Placement` contracts a pending story before it mints (#884).
         where: st.agent_status in [:pending, :contracted],
-        where: not exists(unmet_story_deps),
-        where: not exists(unmet_epic_deps),
+        where: not exists(Dependencies.unmet_story_dependencies()),
+        where: not exists(Dependencies.unmet_epic_dependencies()),
         select: %{
           tenant_id: s.tenant_id,
           story_id: s.story_id,
@@ -322,6 +303,41 @@ defmodule Loopctl.Delivery.DispatchDriver do
   end
 
   @doc """
+  How many `queued`, placeable-status stories are left out of `candidates/1` because a
+  dependency is unmet. Not an error — a story waiting on its prerequisite is working as
+  intended — but a queue that never drains must not look like an empty one, so each pass logs
+  the count when it is not zero.
+  """
+  @spec waiting_on_dependencies() :: non_neg_integer()
+  def waiting_on_dependencies do
+    from(s in StoryStage,
+      join: st in Story,
+      as: :story,
+      on: st.id == s.story_id and st.tenant_id == s.tenant_id,
+      where: s.stage == :queued and st.agent_status in [:pending, :contracted],
+      where:
+        exists(Dependencies.unmet_story_dependencies()) or
+          exists(Dependencies.unmet_epic_dependencies()),
+      select: count(s.story_id)
+    )
+    # Across every tenant, as `candidates/1` reads: the BYPASSRLS repo.
+    |> Loopctl.AdminRepo.one()
+  end
+
+  defp log_waiting_on_dependencies do
+    case waiting_on_dependencies() do
+      0 ->
+        :ok
+
+      count ->
+        Logger.info(
+          "DispatchDriver: #{count} queued stories wait on unverified dependencies " <>
+            "and are not candidates"
+        )
+    end
+  end
+
+  @doc """
   The pass itself, on budgets already decided: what `run/1` does once both gates pass.
 
   Separate from `run/1` for the same reason `normalise_budget/2` is — the gates read
@@ -338,6 +354,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
+    log_waiting_on_dependencies()
+
     {outcomes, _cache} =
       limit
       |> candidates()

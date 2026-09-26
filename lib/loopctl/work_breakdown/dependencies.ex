@@ -25,6 +25,51 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
   alias Loopctl.WorkBreakdown.StoryDependency
 
   # ===================================================================
+  # Unmet dependencies — ONE definition (#887)
+  # ===================================================================
+
+  @doc """
+  An `exists` subquery: the story bound as `:story` depends on a story that is not verified.
+  Composed by `dependencies_unmet?/2` (the claim's check) and by
+  `Loopctl.Delivery.DispatchDriver.candidates/1` (selection), so the two cannot disagree.
+  """
+  @spec unmet_story_dependencies() :: Ecto.Query.t()
+  def unmet_story_dependencies do
+    from sd in StoryDependency,
+      join: dep in Story,
+      on: dep.id == sd.depends_on_story_id and dep.tenant_id == sd.tenant_id,
+      where: sd.story_id == parent_as(:story).id and sd.tenant_id == parent_as(:story).tenant_id,
+      where: dep.verified_status != :verified,
+      select: 1
+  end
+
+  @doc """
+  An `exists` subquery: the epic of the story bound as `:story` depends on an epic holding a
+  story that is not verified.
+  """
+  @spec unmet_epic_dependencies() :: Ecto.Query.t()
+  def unmet_epic_dependencies do
+    from ed in EpicDependency,
+      join: prereq in Story,
+      on: prereq.epic_id == ed.depends_on_epic_id and prereq.tenant_id == ed.tenant_id,
+      where:
+        ed.epic_id == parent_as(:story).epic_id and ed.tenant_id == parent_as(:story).tenant_id,
+      where: prereq.verified_status != :verified,
+      select: 1
+  end
+
+  @doc "Whether `story_id` in `tenant_id` has a story-level or epic-level dependency unmet."
+  @spec dependencies_unmet?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def dependencies_unmet?(tenant_id, story_id) do
+    from(s in Story,
+      as: :story,
+      where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+      where: exists(unmet_story_dependencies()) or exists(unmet_epic_dependencies())
+    )
+    |> AdminRepo.exists?()
+  end
+
+  # ===================================================================
   # Epic Dependencies
   # ===================================================================
 
