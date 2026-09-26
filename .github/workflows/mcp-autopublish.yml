@@ -16,7 +16,7 @@ on:
 
 jobs:
   autopublish:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     permissions:
       contents: write # create + push the record tag
       id-token: write # npm provenance

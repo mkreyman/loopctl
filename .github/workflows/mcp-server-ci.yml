@@ -29,7 +29,7 @@ jobs:
   # filter so the gate below always has a job to report on.
   changes:
     name: Detect mcp-server changes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     outputs:
       mcp: ${{ steps.filter.outputs.mcp }}
     steps:
@@ -59,11 +59,17 @@ jobs:
     name: Published files require a version bump
     needs: changes
     if: needs.changes.outputs.mcp == 'true' && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # The step below runs `node`. GitHub's hosted image carries it; a self-hosted runner's
+      # PATH may not, so it is installed here as the test job installs it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Fail if a shipped file changed without a version bump
         env:
@@ -99,7 +105,7 @@ jobs:
     name: Node unit tests
     needs: changes
     if: needs.changes.outputs.mcp == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     defaults:
       run:
         working-directory: mcp-server
@@ -134,7 +140,7 @@ jobs:
     name: MCP Server Gate
     needs: [changes, test, version-bump]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, beelink]
     steps:
       - name: Assert the unit suite and the version-bump guard did not fail
         run: |

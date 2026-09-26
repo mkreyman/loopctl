@@ -916,26 +916,19 @@ jobs:
     # schedule. This ensures the scale suite (which commits real rows and runs
     # ANALYZE) is executed in CI and that the DBConnection.OwnershipError or
     # other regressions are caught before they reach production.
-    runs-on: ubuntu-latest
+    # On beelink, like the Test job and for the same reason: a required check on every PR, and
+    # GitHub-hosted minutes on it spent the account's included allowance (2026-09-26). The
+    # database is this run's own, on the host Postgres the Test job uses, and is dropped at
+    # the end.
+    runs-on: [self-hosted, beelink]
     if: >
       github.event_name == 'schedule' ||
       github.event_name == 'push' ||
       github.event_name == 'pull_request'
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: loopctl_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+    env:
+      MIX_TEST_PARTITION: scale${{ github.run_id }}
+      TEST_DB_PORT: "5433"
+      PGPORT: "5433"
     steps:
       - uses: actions/checkout@v4
 
@@ -997,30 +990,30 @@ jobs:
               END IF;
             END \$\$;
           "
-          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
-            GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
-            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
+
+      - name: Create the database
+        run: mix ecto.create
+
+      - name: Grant RLS roles on the schema, before any table exists
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d "loopctl_test${MIX_TEST_PARTITION}" -c "
             GRANT USAGE, CREATE ON SCHEMA public TO loopctl_app;
             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO loopctl_app;
             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO loopctl_app;
           "
 
-      - name: Setup database
-        run: mix ecto.create && mix ecto.migrate
-        env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
+      - name: Migrate
+        run: mix ecto.migrate
 
       - name: Grant RLS roles access to tables
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
+          PGPASSWORD=postgres psql -h localhost -U postgres -d "loopctl_test${MIX_TEST_PARTITION}" -c "
             GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
             GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
           "
 
       - name: Run scale tests (TC-27.1.1 through TC-27.1.4, AC-27.1.7)
         run: SCALE_TESTS=true mix test --only scale test/loopctl/knowledge/scale_seed_test.exs
-        env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
       # US-41.1 AC-41.1.12(i) — the per-dimension ANN plan GATE. It EXPLAINs the real
       # request-path inner ANN (BOTH article search and agent-memory recall — each has
@@ -1041,8 +1034,12 @@ jobs:
           SCALE_TESTS=true mix test --only scale \
             test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
         env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
           EMBEDDING_PLAN_GATE_DIMENSIONS: "1536"
+
+      - name: Drop this run's test database
+        if: always()
+        run: |
+          dropdb --if-exists -h localhost -p "${PGPORT}" -U postgres "loopctl_test${MIX_TEST_PARTITION}" 2>&1 || true
 
   pgbouncer-e2e:
     name: Pgbouncer e2e (US-27.13)
@@ -1531,7 +1528,9 @@ jobs:
   # It does NOT need the deploy credentials — read-only probes with a low-privilege key.
   smoke-preflight:
     name: Pre-deploy Smoke (current release)
-    runs-on: ubuntu-latest
+    # Every PR runs this, so it is on beelink with the other per-PR jobs (2026-09-26); beelink
+    # carries jq, so the install step below finds it and does nothing.
+    runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
 
