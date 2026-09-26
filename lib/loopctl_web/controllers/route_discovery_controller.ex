@@ -287,6 +287,36 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{method: "POST", path: "/api/v1/stories/:id/claim", description: "Claim story"},
       %{
         method: "POST",
+        path: "/api/v1/stories/:id/renew-claim",
+        description:
+          "Renew a claim's lease, fenced by claim_epoch; 409 lease_cap_reached once a " <>
+            "driver-placed claim's cap has passed. Role: agent (exact) on a human-anchored " <>
+            "tenant. MCP tool: renew_story_claim"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/stories/:id/escalate",
+        description:
+          "The claimant session parks its own delivery story for a human (body: claim_epoch, " <>
+            "reason). Role: agent (exact) on a human-anchored tenant. MCP tool: escalate_story"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/stories/:id/stage",
+        description:
+          "Read a story's delivery stage row: stage, claim_epoch, attempts, escalation " <>
+            "reason. Role: agent or above. MCP tool: story_stage"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/stories/:id/stage/resolve",
+        description:
+          "Resolve an escalated story to queued, done or failed; a dispatch-minted key is " <>
+            "refused, so a session cannot resolve its own escalation. Role: user or above on a " <>
+            "human-anchored tenant. MCP tool: resolve_escalation"
+      },
+      %{
+        method: "POST",
         path: "/api/v1/stories/:id/start",
         description: "Start implementation (alias: /start-work)"
       },
@@ -359,7 +389,7 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       %{
         method: "POST",
         path: "/api/v1/stories/:id/force-unclaim",
-        description: "Force-unclaim a story (orchestrator/user only)"
+        description: "Force-unclaim a story (orchestrator key only; exact role)"
       },
 
       # Artifact reports

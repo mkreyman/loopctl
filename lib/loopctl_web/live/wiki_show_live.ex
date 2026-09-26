@@ -18,7 +18,9 @@ defmodule LoopctlWeb.WikiShowLive do
     case Knowledge.get_system_article_by_slug(slug) do
       {:ok, article} ->
         all_articles = Knowledge.list_system_articles()
-        rendered_html = render_markdown(article.body, all_articles)
+
+        rendered_html =
+          render_markdown(drop_title_heading(article.body, article.title), all_articles)
 
         {:ok,
          socket
@@ -70,7 +72,7 @@ defmodule LoopctlWeb.WikiShowLive do
       </nav>
 
       <%!-- Main content --%>
-      <main class="flex-1 px-6 py-8 lg:px-12">
+      <main class="flex-1 min-w-0 px-6 py-8 lg:px-12">
         <%= if @article do %>
           <article class="mx-auto max-w-3xl" id="wiki-article">
             <header class="mb-8">
@@ -87,7 +89,7 @@ defmodule LoopctlWeb.WikiShowLive do
             </header>
 
             <div
-              class="prose prose-invert prose-slate max-w-none prose-headings:font-display prose-code:font-mono prose-code:text-accent-300 prose-pre:rounded-md prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950"
+              class="prose prose-invert prose-slate max-w-none prose-code:before:content-none prose-code:after:content-none prose-headings:font-display prose-code:font-mono prose-code:text-accent-300 prose-pre:rounded-md prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950"
               id="wiki-body"
             >
               {Phoenix.HTML.raw(@rendered_html)}
@@ -111,6 +113,24 @@ defmodule LoopctlWeb.WikiShowLive do
     </div>
     """
   end
+
+  # The page header already shows the title, and system article bodies open with it again as
+  # an H1 ("# Dispatch Lineage" under "Dispatch Lineage — Ephemeral Keys ..."). Drop that
+  # leading H1 only when the title begins with its text, so a body whose first heading is
+  # something else keeps it.
+  defp drop_title_heading(body, title) when is_binary(body) and is_binary(title) do
+    case Regex.run(~r/\A\s*# ([^\n]+)\n/, body) do
+      [heading_line, heading] ->
+        if String.starts_with?(title, String.trim(heading)),
+          do: String.replace_prefix(body, heading_line, ""),
+          else: body
+
+      nil ->
+        body
+    end
+  end
+
+  defp drop_title_heading(body, _title), do: body
 
   defp render_markdown(nil, _all_articles), do: ""
 

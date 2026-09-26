@@ -59,6 +59,12 @@
             Features
           </a>
           <a
+            href="#delivery-loop"
+            class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
+          >
+            Delivery Loop
+          </a>
+          <a
             href="#cost-intelligence"
             class="hover:text-slate-200 transition-colors focus:outline-none focus:ring-2 focus:ring-accent-500 focus:ring-offset-2 focus:ring-offset-slate-950 rounded-sm"
           >
@@ -125,6 +131,12 @@
             class="block text-sm text-slate-400 hover:text-slate-200 transition-colors min-h-[44px] leading-[44px]"
           >
             Features
+          </a>
+          <a
+            href="#delivery-loop"
+            class="block text-sm text-slate-400 hover:text-slate-200 transition-colors min-h-[44px] leading-[44px]"
+          >
+            Delivery Loop
           </a>
           <a
             href="/docs"
@@ -723,6 +735,79 @@
         </div>
       </section>
 
+      <%!-- Delivery Loop Section --%>
+      <section id="delivery-loop" class="bg-slate-950 py-16 sm:py-24 border-t border-slate-800/50">
+        <div class="max-w-5xl mx-auto px-6">
+          <h2 class="text-sm font-semibold text-accent-400">Agent Delivery Loop</h2>
+          <p class="mt-2 font-display text-3xl font-semibold tracking-tight text-slate-100 sm:text-4xl">
+            From a reported issue to a verified deploy
+          </p>
+          <p class="mt-4 text-base text-slate-400 max-w-2xl">
+            A problem reported on GitHub is triaged, implemented, reviewed, merged and checked after deploy by agent sessions on machines you enroll. loopctl is the control plane: it holds the queue and the stage of every story, and it decides what may happen next.
+          </p>
+
+          <div class="mt-8 overflow-x-auto bg-slate-900 border border-slate-700 rounded-md p-4">
+            <p class="font-mono text-xs text-slate-400 whitespace-nowrap">
+              detected → triaged → queued → claimed → worktree → implementing → reviewing → pr_open → ci → merged → deployed → verified → done
+            </p>
+            <p class="mt-2 font-mono text-xs text-slate-500">
+              any gate refusal → escalated (a human resolves it) · triage reject or exhausted budget → failed (final)
+            </p>
+          </div>
+
+          <div class="mt-8 grid grid-cols-1 gap-x-8 gap-y-8 sm:grid-cols-2 lg:grid-cols-4">
+            <div class="bg-slate-900 border border-slate-700 rounded-md p-4">
+              <p class="text-xs font-mono text-slate-500">feature</p>
+              <p class="mt-1.5 text-sm font-semibold text-slate-200">
+                Intake from GitHub
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                A signed webhook turns each issue on a repository you enroll into a story. The reporter's text is stored as untrusted and screened. The implementer never sees it, only the story triage drafts from it.
+              </p>
+            </div>
+            <div class="bg-slate-900 border border-slate-700 rounded-md p-4">
+              <p class="text-xs font-mono text-slate-500">feature</p>
+              <p class="mt-1.5 text-sm font-semibold text-slate-200">
+                Runners you own
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Enroll your own dev machines. Each one connects over a socket and declares its repositories, its capacity and the branch prefixes it accepts. loopctl reserves capacity before it places work and never runs the sessions itself.
+              </p>
+            </div>
+            <div class="bg-slate-900 border border-slate-700 rounded-md p-4">
+              <p class="text-xs font-mono text-slate-500">feature</p>
+              <p class="mt-1.5 text-sm font-semibold text-slate-200">
+                A fenced stage machine
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                Every story moves through one declared set of stages, under a claim lease and an epoch fence. A session that lost its claim cannot move a story someone else now holds, and a runner can never mark work verified or done.
+              </p>
+            </div>
+            <div class="bg-slate-900 border border-slate-700 rounded-md p-4">
+              <p class="text-xs font-mono text-slate-500">feature</p>
+              <p class="mt-1.5 text-sm font-semibold text-slate-200">
+                Gates, then a human
+              </p>
+              <p class="mt-1.5 text-sm text-slate-400">
+                A merge gate re-checks the real diff before anything merges, and post-deploy verification confirms what shipped. Wherever a gate refuses, the story is parked for a person, and only a human key can release it.
+              </p>
+            </div>
+          </div>
+
+          <p class="mt-8 text-sm text-slate-400">
+            Setup, refusals and recovery:
+            <a
+              href="https://github.com/mkreyman/loopctl/blob/master/docs/agent-delivery-loop.md"
+              class="text-accent-400 hover:text-accent-300 underline underline-offset-2"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              the delivery loop reference
+            </a>
+          </p>
+        </div>
+      </section>
+
       <%!-- Getting Started Section --%>
       <section id="get-started" class="bg-slate-950 py-16 sm:py-24 border-t border-slate-800/50">
         <div class="max-w-5xl mx-auto px-6">
@@ -740,7 +825,7 @@
               <div class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-sm bg-accent-900 text-accent-400 text-sm font-mono font-bold">
                 1
               </div>
-              <div>
+              <div class="min-w-0 flex-1">
                 <h3 class="text-sm font-semibold text-slate-200">Register your tenant</h3>
                 <div class="mt-2 bg-slate-800 border border-slate-700 rounded-md p-3 font-mono text-xs text-slate-300 overflow-x-auto">
                   {step1_code_block(assigns)}
@@ -757,7 +842,7 @@
               <div class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-sm bg-accent-900 text-accent-400 text-sm font-mono font-bold">
                 2
               </div>
-              <div>
+              <div class="min-w-0 flex-1">
                 <h3 class="text-sm font-semibold text-slate-200">
                   Create API keys for your agents
                 </h3>
@@ -778,7 +863,7 @@
               <div class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-sm bg-accent-900 text-accent-400 text-sm font-mono font-bold">
                 3
               </div>
-              <div>
+              <div class="min-w-0 flex-1">
                 <h3 class="text-sm font-semibold text-slate-200">
                   Create a project and import stories
                 </h3>
@@ -800,7 +885,7 @@
               <div class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-sm bg-accent-900 text-accent-400 text-sm font-mono font-bold">
                 4
               </div>
-              <div>
+              <div class="min-w-0 flex-1">
                 <h3 class="text-sm font-semibold text-slate-200">
                   Connect the MCP server (optional)
                 </h3>

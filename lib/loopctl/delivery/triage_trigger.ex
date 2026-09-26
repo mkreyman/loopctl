@@ -7,18 +7,12 @@ defmodule Loopctl.Delivery.TriageTrigger do
   was a production RPC by hand. This is the missing edge — the one place a
   `pending_triage` record becomes a `stories` row at the `detected` stage.
 
-  ## What it does NOT do yet, and why that is not a half-measure
+  ## What it does not do: dispatch the triage session
 
-  It does not dispatch triage. `triage` is not in
-  `Loopctl.ApiSpec.RunnerContract.RunnerDispatch.dispatchable_kinds/0`, because no deployed
-  runner accepts the kind and a triage session needs its own contained tool set — the
-  runner's work, not loopctl's. Sending it early is not merely useless: against a runner on
-  the implied path one refusal writes a permanent `kind_not_supported` for that machine.
-
-  So this lands the half that does not depend on the other side. A record becomes a story at
-  `detected`, linked by `intake_record_id`, and the dispatch is one call added here when the
-  interlock moves. Splitting it that way is also what lets both sides be built at once, which
-  is the whole reason the payload landed before the trigger.
+  This module only makes the stub story. Sending the triage session to a runner is
+  `Loopctl.Delivery.TriageDispatcher`'s job (runner contract 1.10.0), which picks up stories at
+  `detected` and sends kind `triage` only to a runner that declared it on join. The two were
+  built apart so that neither side waited on the other.
 
   ## The stub story carries NO reporter text
 
@@ -37,9 +31,11 @@ defmodule Loopctl.Delivery.TriageTrigger do
   arrival a writer of work-breakdown structure) or to pick one by a rule nobody declared. The
   operator says instead.
 
-  A source that names none yields `{:error, :no_target_epic}` and the record is ESCALATED —
+  A source that names none yields `{:error, :no_target_epic}`, and no story is created —
   the question has not been answered and guessing an answer is worse than asking. That is the
-  same choice the nullable column makes and it is why the column is nullable.
+  same choice the nullable column makes and it is why the column is nullable. The record is not
+  escalated: `Loopctl.Workers.TriageTriggerWorker` leaves it `pending_triage` and retries it,
+  so it promotes on the first run after an epic is named.
 
   ## Running it twice is safe, and the mechanism is a unique index
 
@@ -101,7 +97,7 @@ defmodule Loopctl.Delivery.TriageTrigger do
   Creates the story for `record` and opens its delivery stage at `detected`.
 
   Returns `{:ok, story}` — including when the story already existed, see the moduledoc — or
-  `{:error, reason}`. The caller escalates the record on `:no_target_epic`.
+  `{:error, reason}`. The caller retries the record on `:no_target_epic`.
   """
   @spec promote(Record.t()) :: {:ok, map()} | {:error, error()}
   def promote(%Record{} = record) do

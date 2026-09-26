@@ -71,6 +71,27 @@ defmodule LoopctlWeb.WikiLiveTest do
       assert html =~ "<strong>chain of custody</strong>"
     end
 
+    test "drops a leading H1 that repeats the title, and keeps one that does not", %{conn: conn} do
+      create_system_article(%{
+        slug: "title-h1-article",
+        title: "Dispatch Heading — With A Subtitle",
+        body: "# Dispatch Heading\n\nFirst paragraph."
+      })
+
+      create_system_article(%{
+        slug: "other-h1-article",
+        title: "Setup Guide",
+        body: "# Step 1: Install\n\nFirst paragraph."
+      })
+
+      {:ok, view, _html} = live(conn, ~p"/wiki/title-h1-article")
+      refute has_element?(view, "#wiki-body h1")
+      assert has_element?(view, "#wiki-body p", "First paragraph.")
+
+      {:ok, view, _html} = live(conn, ~p"/wiki/other-h1-article")
+      assert has_element?(view, "#wiki-body h1", "Step 1: Install")
+    end
+
     test "neutralizes executable markup in article body (sanitized render)", %{conn: conn} do
       # A malicious system article body: raw script tag plus an event-handler
       # attribute smuggled through an image. The public render must strip/escape

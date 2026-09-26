@@ -2538,4 +2538,46 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert RunnerDispatch.ref_fields()[:base_branch] == :shared
     end
   end
+
+  describe "the moduledoc's message table" do
+    # A runner author reads this table rather than the export; it was maintained by hand and
+    # every row had fallen behind error_reasons/0, which is what the channel actually sends.
+    test "has one row per published event, naming exactly the reasons the contract publishes" do
+      {:docs_v1, _, _, _, %{"en" => moduledoc}, _, _} = Code.fetch_docs(RunnerContract)
+
+      rows =
+        ~r/^\| runner -> control \| (.+?) \| .*\| ([^|]+) \|$/m
+        |> Regex.scan(moduledoc, capture: :all_but_first)
+        |> Map.new(fn [event_cell, reasons] -> {row_event(event_cell), row_reasons(reasons)} end)
+
+      assert Map.keys(rows) |> Enum.sort() ==
+               RunnerContract.error_reasons() |> Map.keys() |> Enum.sort(),
+             "the table's runner -> control rows and error_reasons/0 name different events"
+
+      for {event, published} <- RunnerContract.error_reasons() do
+        assert rows[event] == MapSet.new(published),
+               "the #{event} row's reasons disagree with error_reasons/0"
+      end
+    end
+  end
+
+  # The event a row describes: a quoted event name, `phx_join` (published as "join"), or the
+  # catch-all row for events the channel does not know (published as "unknown_event").
+  defp row_event("`phx_join`" <> _), do: "join"
+  defp row_event("any other event"), do: "unknown_event"
+
+  defp row_event(cell) do
+    [_, event] = Regex.run(~r/^`"([a-z_]+)"`$/, cell)
+    event
+  end
+
+  # A trailing parenthetical is commentary (it can name a reason the event is NEVER sent).
+  defp row_reasons(cell) do
+    [reasons | _] = String.split(cell, " (", parts: 2)
+
+    ~r/`([a-z_]+)`/
+    |> Regex.scan(reasons, capture: :all_but_first)
+    |> List.flatten()
+    |> MapSet.new()
+  end
 end

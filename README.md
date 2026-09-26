@@ -31,7 +31,7 @@ loopctl is a **dumb state store** with a **two-tier trust model**:
 - **An independent orchestrator** reads those updates, performs verification, and writes its findings (`verified_status`: unverified -> verified -> rejected)
 - It is **structurally impossible** for implementing agents to mark their own work as verified
 
-loopctl does not make decisions, execute code, or run tests. It stores state, enforces access control, and serves data.
+loopctl never executes your code or pushes to your repository. It stores state, enforces access control, and serves data. When you use the [agent delivery loop](docs/agent-delivery-loop.md), it also queues work for the machines you enroll and gates what their sessions may do next.
 
 ## Key Features
 
@@ -47,6 +47,7 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 - **Token cost intelligence** -- agents report token usage per story; per-agent efficiency rankings, configurable budgets, and anomaly detection prevent runaway costs across long sprints
 - **Agent memory** -- per-agent private working memory (Epic 28): short-term session turns (TTL-pruned) plus long-term, vector-embedded facts recalled by semantic similarity, isolated per `(tenant, subject_id)` and distinct from the shared Knowledge Wiki. See [`docs/agent-memory.md`](docs/agent-memory.md).
 - **Hybrid (curated + RAG) knowledge retrieval** -- a single Knowledge Wiki entrypoint (Epic 31) that prefers a governed curated answer when one genuinely answers a query, else falls back to semantic/keyword retrieval, returning `provenance` (`curated`/`retrieved`) on one uniform shape so callers never branch on which subsystem answered. See [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md).
+- **Agent delivery loop** -- a reported GitHub issue is triaged, implemented, reviewed, merged and verified after deploy by agent sessions on runner machines you enroll. loopctl is the control plane: an intake webhook, a stage machine with a claim lease and fence, placement (by an operator or an unattended driver), a merge gate, and escalation to a human wherever a gate refuses. See [`docs/agent-delivery-loop.md`](docs/agent-delivery-loop.md).
 - **OpenAPI 3.0** -- self-documenting API with Swagger UI for agent discovery
 
 ## Concepts
@@ -70,6 +71,9 @@ loopctl does not make decisions, execute code, or run tests. It stores state, en
 | **Subject** | The owner of a memory scope, derived server-side from the API key: an agent key's `agent_id` (so rotated keys share one memory), else the key's own id. Never client-supplied. |
 | **Context Retriever** | Governed, auto-generated agent query access to loopctl's own STRUCTURED records (`projects`/`stories`/`epics`). An admin declares a tenant-scoped **entity** (typed, server-allowlisted fields); the generator emits per-entity `cr_filter_*`/`cr_search_*` tools; the executor runs the query parameterized, dual-tenant-scoped, allowlist-shaped, audited (fail-closed), and rate-limited — never model-authored SQL. One of loopctl's four agent layers (Knowledge Wiki / Agent Memory / Context Retriever / Corpus tier). See [`docs/context-retriever.md`](docs/context-retriever.md). |
 | **Corpus tier** | An index over REFERENCE DOCUMENTS whose files stay in the client's own repo (`corpus_*`). Stores VERBATIM chunks, never distilled articles; `corpus_search` answers with a POINTER plus a bounded snippet — `{source_ref, locator, snippet, score}`, never the chunk body — so the caller opens the file itself. Reach for it when you need the exact wording of an authoritative document rather than what we learned about it; an empty `knowledge_search` says nothing about whether a document is indexed here. The fourth of loopctl's four agent layers. See [`docs/user_stories/epic_43_corpus_tier/README.md`](docs/user_stories/epic_43_corpus_tier/README.md). |
+| **Runner** | A dev machine you enroll that connects to loopctl over a socket and runs the delivery loop's agent sessions. It declares its repositories, the kinds of work it runs, its capacity and its branch prefixes. The wire protocol is the runner contract (`priv/runner_contract/v1.json`). |
+| **Intake source** | A GitHub repository bound to a work project. Its webhook turns issues into stories, and it names the epic triaged stories go into and the branch dispatches are cut from. |
+| **Stage** | Where a story is in the delivery loop (`detected` through `done`, or `escalated` / `failed`), with a claim lease and an epoch fence. `escalated` is left only by a human's resolution. |
 | **Hybrid Retrieval** | A Knowledge Wiki entrypoint (`knowledge_hybrid_search`) that resolves a query to EITHER a governed curated answer OR a semantic/keyword retrieval result, on one shape carrying `provenance` (`curated`/`retrieved`), `confidence`, and `curated_article_id`. Prevents a curated doc that doesn't actually answer the query from winning by default in a sparse pool (absolute, not pool-relative, scoring). Paired with progressive disclosure (`knowledge_progressive_index`/`knowledge_progressive_drill`) for cheap topic browsing. See [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md). |
 
 ## Tech Stack
@@ -890,6 +894,16 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `recover_cap` | Re-mint a capability token after a session crash | agent |
 | `get_sth` | Get the latest Signed Tree Head for the audit chain (public) | none |
 | `list_routes` | Discover all API endpoints | orchestrator |
+| `runner_enroll` / `runner_list` / `runner_revoke` / `runner_pool` | Enroll delivery-loop runner machines and see which are connected | user |
+| `intake_source_enroll` / `_list` / `_update` / `_revoke` | Bind a GitHub repository to a project as the delivery loop's input | user |
+| `place_dispatch` | Place a queued story on a runner | user |
+| `story_stage` | Read a story's delivery stage | any |
+| `escalate_story` | A session parks its own story for a human | agent |
+| `resolve_escalation` | Move an escalated story to `queued`, `done` or `failed` | user (not dispatch-minted) |
+| `force_unclaim_story` | Take a story back from the agent holding it | orchestrator |
+| `merge_precondition` | Run the merge gate over a story's pull request | orchestrator or user |
+| `renew_story_claim` | Renew a claim's lease | agent |
+| `revoke_dispatch` | Revoke a dispatch key and its subtree | user (sent as `LOOPCTL_USER_KEY`); a dispatch-minted orchestrator key may revoke inside its own lineage |
 
 Agents call tools directly: `mcp__loopctl__get_tenant()`, `mcp__loopctl__list_projects()`, `mcp__loopctl__create_project({name: "MyApp", slug: "myapp"})`. No curl or bash needed.
 

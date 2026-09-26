@@ -49,6 +49,13 @@ unblocks dependent stories. A rejection sets `verified_status = rejected`; when 
 `pending` so the story can be re-worked, and the cycle count increments. If the orchestrator was
 also the implementer, verify returns `409 self_verify_blocked`.
 
+This loop is driven by an orchestrator session. The **agent delivery loop** automates most of
+it: it takes GitHub issues through triage, places them unattended on runner machines you
+enroll, and runs review, CI and post-deploy verification, parking a story for a human
+wherever a gate refuses. A merge still needs an orchestrator or operator to call the merge
+gate (`merge_precondition`), which a runner session cannot. It is set up and operated differently; see
+[agent-delivery-loop.md](agent-delivery-loop.md).
+
 ---
 
 ## Why the Chain-of-Custody Matters

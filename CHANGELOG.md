@@ -4,6 +4,16 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Added
+
+- **A `delivery-loop` system wiki article, seeded by migration `20260926060000`.** No manual
+  step is needed for it to appear at `/wiki/delivery-loop` and in keyword search. It is NOT
+  embedded for tenants that already materialized the system corpus: nothing re-runs
+  materialization when a system article is added, because each tenant embeds the corpus with
+  its own key. Until `embedding_materialize_system_corpus` is run again for a tenant (it is
+  idempotent and embeds only what is missing), the article is keyword-only there, and
+  `system_corpus_meta` in search responses says so.
+
 ### Changed
 
 - **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**
