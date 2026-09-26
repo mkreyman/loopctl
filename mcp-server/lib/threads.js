@@ -11,10 +11,13 @@
  *   part of the thread.
  * - thread_entry travels on the key named by `principal` (agent by default). A reviewer
  *   writes findings on its own agent key; a person writes on LOOPCTL_USER_KEY. The server
- *   refuses a finding or verdict from the implementer (409 self_review_blocked) and a fix from
+ *   refuses a finding or verdict from the implementer (409 implementer_cannot_judge) and a fix from
  *   anyone but the current claimant.
- * - thread_get reads on the agent key when there is one, else the orchestrator or user key:
- *   reads are open to every role.
+ * - thread_get reads on the first key configured, agent first, then LOOPCTL_API_KEY, the
+ *   orchestrator key and the user key: reads are open to every role.
+ *
+ * Every call passes the env var it is pinned to as `keyHint`, so a missing key is reported
+ * by name rather than as some other feature's configuration error.
  *
  * Only presence of the required fields is checked here. Everything else is the server's
  * judgement and passes through unchanged.
@@ -56,10 +59,21 @@ function compact(obj) {
 }
 
 /** `GET /api/v1/stories/:id/thread`. */
-export async function getThread({ story_id } = {}, { apiCall, env = process.env } = {}) {
+export async function getThread({ story_id, after_seq, limit } = {}, { apiCall, env = process.env } = {}) {
   if (!present(story_id)) return missing("story_id");
-  const key = env.LOOPCTL_AGENT_KEY || env.LOOPCTL_ORCH_KEY || env.LOOPCTL_USER_KEY;
-  return apiCall("GET", threadPath(story_id), null, key);
+  const keyVar =
+    ["LOOPCTL_AGENT_KEY", "LOOPCTL_API_KEY", "LOOPCTL_ORCH_KEY", "LOOPCTL_USER_KEY"].find(
+      (name) => env[name],
+    ) || "LOOPCTL_AGENT_KEY";
+  const query = compact({ after_seq, limit });
+  const qs = new URLSearchParams(query).toString();
+  return apiCall(
+    "GET",
+    qs ? `${threadPath(story_id)}?${qs}` : threadPath(story_id),
+    null,
+    env[keyVar],
+    keyVar,
+  );
 }
 
 /** `POST /api/v1/stories/:id/thread/checkpoints` on the AGENT key. */
@@ -76,6 +90,7 @@ export async function recordCheckpoint(
     checkpointsPath(story_id),
     compact({ claim_epoch, commit_sha, tree_sha, note }),
     env.LOOPCTL_AGENT_KEY,
+    "LOOPCTL_AGENT_KEY",
   );
 }
 
@@ -123,5 +138,6 @@ export async function recordEntry(
       claim_epoch,
     }),
     env[keyVar],
+    keyVar,
   );
 }

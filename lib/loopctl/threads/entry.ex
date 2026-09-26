@@ -67,6 +67,7 @@ defmodule Loopctl.Threads.Entry do
     |> validate_length(:body, min: 1, max: @max_body_bytes, count: :bytes)
     |> validate_inclusion(:severity, @severities)
     |> validate_introduced_by()
+    |> unique_constraint(:idempotency_key, name: :thread_entries_idempotency_uidx)
   end
 
   # A checkpoint id, or the literal `none`: the reviewer said so explicitly.

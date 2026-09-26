@@ -118,6 +118,21 @@ defmodule Loopctl.ThreadsTest do
       assert {:error, :not_claimant} = checkpoint(ctx, @sha1, agent_id: nil)
     end
 
+    test "the same sha with a different tree is a conflict" do
+      ctx = claimed_story()
+      {:ok, _, :created} = checkpoint(ctx)
+
+      assert {:error, {:conflict, "checkpoint_conflict", _}} =
+               checkpoint(ctx, @sha1, tree_sha: String.duplicate("9", 40))
+    end
+
+    test "a note carrying a credential is refused" do
+      ctx = claimed_story()
+
+      assert {:error, :unprocessable_entity, %{code: "secret_blocked"}} =
+               checkpoint(ctx, @sha1, note: "ghp_" <> String.duplicate("A", 36))
+    end
+
     test "a resend is the checkpoint already recorded; the next one chains to it" do
       ctx = claimed_story()
 
@@ -193,8 +208,9 @@ defmodule Loopctl.ThreadsTest do
 
     test "a fix names its checkpoint and findings of this story" do
       ctx = claimed_story()
-      {:ok, cp, :created} = checkpoint(ctx)
-      {:ok, f, :created} = entry(ctx, finding(cp))
+      {:ok, found_in, :created} = checkpoint(ctx)
+      {:ok, f, :created} = entry(ctx, finding(found_in))
+      {:ok, cp, :created} = checkpoint(ctx, @sha2)
 
       fix = %{"kind" => "fix", "idempotency_key" => "x1", "body" => "fixed"}
       as_claimant = [as: ctx.agent, claim_epoch: @epoch]
@@ -203,7 +219,8 @@ defmodule Loopctl.ThreadsTest do
                entry(ctx, Map.put(fix, "finding_ids", [f.id]), as_claimant)
 
       with_cp = Map.put(fix, "checkpoint_id", cp.id)
-      assert {:error, :unprocessable_entity, _} = entry(ctx, with_cp, as_claimant)
+      assert {:error, :unprocessable_entity, msg} = entry(ctx, with_cp, as_claimant)
+      assert msg =~ "findings it answers"
 
       assert {:error, :unprocessable_entity, _} =
                entry(
@@ -214,6 +231,100 @@ defmodule Loopctl.ThreadsTest do
 
       assert {:ok, _, :created} = entry(ctx, Map.put(with_cp, "finding_ids", [f.id]), as_claimant)
     end
+
+    test "a fix is carried by a checkpoint of the current claim, newer than its findings" do
+      ctx = claimed_story()
+      {:ok, older, :created} = checkpoint(ctx)
+      {:ok, found_in, :created} = checkpoint(ctx, @sha2)
+      {:ok, f, :created} = entry(ctx, finding(found_in))
+
+      fix = %{
+        "kind" => "fix",
+        "idempotency_key" => "x",
+        "body" => "fixed",
+        "finding_ids" => [f.id]
+      }
+
+      as_claimant = [as: ctx.agent, claim_epoch: @epoch]
+
+      for stale <- [older, found_in] do
+        assert {:error, :unprocessable_entity, msg} =
+                 entry(ctx, Map.put(fix, "checkpoint_id", stale.id), as_claimant)
+
+        assert msg =~ "after the findings"
+      end
+
+      # A checkpoint recorded under an EARLIER claim of the same story.
+      {:ok, _} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(s in Story, where: s.id == ^ctx.story.id)
+          |> Repo.update_all(set: [claim_epoch: @epoch + 1])
+        end)
+
+      {:ok, _} = checkpoint(ctx, String.duplicate("f", 40), claim_epoch: @epoch + 1) |> elem_ok()
+      {:ok, newest} = latest(ctx)
+
+      {:ok, _} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(c in Loopctl.Threads.Checkpoint, where: c.id == ^newest.id)
+          |> Repo.update_all(set: [claim_epoch: @epoch])
+        end)
+
+      assert {:error, :unprocessable_entity, msg} =
+               entry(ctx, Map.put(fix, "checkpoint_id", newest.id),
+                 as: ctx.agent,
+                 claim_epoch: @epoch + 1
+               )
+
+      assert msg =~ "current claim"
+    end
+
+    test "a key reused for a different entry is refused; the same write replays" do
+      ctx = claimed_story()
+      attrs = %{"kind" => "message", "idempotency_key" => "round-1", "body" => "first"}
+      {:ok, _, :created} = entry(ctx, attrs)
+
+      assert {:error, {:conflict, "idempotency_key_reused", _}} =
+               entry(ctx, %{attrs | "body" => "second"})
+
+      assert {:error, {:conflict, "idempotency_key_reused", _}} =
+               entry(ctx, %{attrs | "kind" => "verdict"})
+    end
+
+    test "loopctl's key prefix is reserved" do
+      ctx = claimed_story()
+
+      assert {:error, :unprocessable_entity, msg} =
+               entry(ctx, %{"kind" => "message", "idempotency_key" => "loopctl:x", "body" => "m"})
+
+      assert msg =~ "loopctl:"
+    end
+
+    test "entries are paged" do
+      ctx = claimed_story()
+
+      for i <- 1..5,
+          do:
+            {:ok, _, :created} =
+              entry(ctx, %{"kind" => "message", "idempotency_key" => "m#{i}", "body" => "#{i}"})
+
+      {:ok, first} = Threads.get_thread(ctx.tenant_id, ctx.story.id, limit: 2)
+      assert Enum.map(first.entries, & &1.body) == ["1", "2"]
+      assert first.next_after_seq == 2
+
+      {:ok, last} =
+        Threads.get_thread(ctx.tenant_id, ctx.story.id, after_seq: 4, limit: 2)
+
+      assert Enum.map(last.entries, & &1.body) == ["5"]
+      assert last.next_after_seq == nil
+    end
+  end
+
+  defp elem_ok({:ok, cp, :created}), do: {:ok, cp}
+
+  defp latest(ctx) do
+    {:ok, thread} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
+    {:ok, List.last(thread.checkpoints)}
   end
 
   describe "authorization by kind" do
@@ -221,9 +332,10 @@ defmodule Loopctl.ThreadsTest do
       ctx = claimed_story()
       {:ok, cp, :created} = checkpoint(ctx)
 
-      assert {:error, :self_review_blocked} = entry(ctx, finding(cp), as: ctx.agent)
+      assert {:error, {:conflict, "implementer_cannot_judge", _}} =
+               entry(ctx, finding(cp), as: ctx.agent)
 
-      assert {:error, :self_review_blocked} =
+      assert {:error, {:conflict, "implementer_cannot_judge", _}} =
                entry(ctx, %{"kind" => "verdict", "idempotency_key" => "v", "body" => "ok"},
                  as: ctx.agent
                )
@@ -268,10 +380,35 @@ defmodule Loopctl.ThreadsTest do
         )
       end
 
-      assert {:error, :self_review_blocked} =
+      assert {:error, {:conflict, "implementer_cannot_judge", _}} =
                judge.("child", impl.lineage_path ++ [Ecto.UUID.generate()])
 
       assert {:ok, _, :created} = judge.("sibling", [root, Ecto.UUID.generate()])
+    end
+
+    test "on dispatch-minted work, a key no dispatch minted judges only as a human" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+      impl = dispatch(ctx.tenant_id, [Ecto.UUID.generate()])
+
+      {:ok, _} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(s in Story, where: s.id == ^ctx.story.id)
+          |> Repo.update_all(set: [implementer_dispatch_id: impl.id])
+        end)
+
+      judge = fn key, agent_id, role ->
+        Threads.record_entry(ctx.tenant_id, ctx.story.id, finding(cp, key),
+          agent_id: agent_id,
+          actor_role: role,
+          author_principal: "p:#{key}",
+          actor_lineage: []
+        )
+      end
+
+      assert {:error, :caller_lineage_required} = judge.("legacy", ctx.reviewer.id, :agent)
+      assert {:error, :caller_lineage_required} = judge.("orch", nil, :orchestrator)
+      assert {:ok, _, :created} = judge.("human", nil, :user)
     end
 
     test "a human principal may judge" do

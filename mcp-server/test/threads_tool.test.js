@@ -30,8 +30,8 @@ const ENV = {
 
 function fakeApi() {
   const calls = [];
-  const apiCall = async (method, apiPath, body, key) => {
-    calls.push({ method, path: apiPath, body, key });
+  const apiCall = async (method, apiPath, body, key, keyHint) => {
+    calls.push({ method, path: apiPath, body, key, keyHint });
     return { ok: true };
   };
   return { calls, apiCall };
@@ -51,6 +51,7 @@ describe("thread_checkpoint", () => {
         path: `/api/v1/stories/${STORY_ID}/thread/checkpoints`,
         body: { claim_epoch: 4, commit_sha: SHA, tree_sha: TREE },
         key: "agent-key",
+        keyHint: "LOOPCTL_AGENT_KEY",
       },
     ]);
   });
@@ -121,6 +122,26 @@ describe("thread_get", () => {
   });
 });
 
+describe("thread_get paging and keys", () => {
+  test("pages with after_seq and limit, and names the key it fell back to", async () => {
+    const { calls, apiCall } = fakeApi();
+    await getThread(
+      { story_id: STORY_ID, after_seq: 4, limit: 2 },
+      { apiCall, env: { LOOPCTL_API_KEY: "api-key" } },
+    );
+
+    assert.equal(calls[0].path, `/api/v1/stories/${STORY_ID}/thread?after_seq=4&limit=2`);
+    assert.equal(calls[0].key, "api-key");
+    assert.equal(calls[0].keyHint, "LOOPCTL_API_KEY");
+  });
+
+  test("with no key at all, the hint still names the agent key", async () => {
+    const { calls, apiCall } = fakeApi();
+    await getThread({ story_id: STORY_ID }, { apiCall, env: {} });
+    assert.equal(calls[0].keyHint, "LOOPCTL_AGENT_KEY");
+  });
+});
+
 describe("wiring", () => {
   for (const [tool, handler] of [
     ["thread_get", "threadGet"],
@@ -134,6 +155,10 @@ describe("wiring", () => {
         `${tool} not dispatched`,
       );
       assert.ok(README.includes(`| \`${tool}\` |`), `${tool} has no README row`);
+      assert.ok(
+        INDEX_SRC.includes("apiCall(method, path, body, key, { exactKey: true, keyHint })"),
+        "thread calls must pass their keyHint",
+      );
     });
   }
 });

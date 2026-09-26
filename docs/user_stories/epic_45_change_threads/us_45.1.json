@@ -28,7 +28,7 @@
     },
     {
       "id": "AC-45.1.4",
-      "description": "Re-sending an entry with the same idempotency_key from the same author returns the existing entry with 200 and writes nothing; the same key from a different author is a distinct entry."
+      "description": "Re-sending an entry with the same idempotency_key and the same fields from the same author returns the existing entry with 200 and writes nothing; the same key naming a different entry is 409 idempotency_key_reused; the same key from a different author is a distinct entry; keys starting loopctl: are reserved."
     },
     {
       "id": "AC-45.1.5",
@@ -52,7 +52,7 @@
     },
     {
       "id": "AC-45.1.10",
-      "description": "Entries are authorized by kind: finding and verdict are refused with 409 self_review_blocked when the author is the story's assigned agent or its lineage is on the implementer's dispatch chain; fix is accepted only from the current claimant presenting the current claim_epoch (409 not_claimant or stale_claim_epoch otherwise); message and review_requested are open to any principal of the tenant."
+      "description": "Entries are authorized by kind: finding and verdict are refused with 409 implementer_cannot_judge when the author is the story's assigned agent or its lineage is on the implementer's dispatch chain, and with 409 caller_lineage_required from a key no dispatch minted on dispatch-minted work unless it is a human user key (never self_review_blocked, which counts toward the L6 custody halt); fix is accepted only from the current claimant presenting the current claim_epoch (409 not_claimant or stale_claim_epoch otherwise), carried by a checkpoint of the current claim recorded after the findings it answers; message and review_requested are open to any principal of the tenant."
     },
     {
       "id": "AC-45.1.11",
@@ -189,7 +189,7 @@
         "claimant writes a finding; non-claimant writes a fix; stale epoch fix"
       ],
       "expected_results": [
-        "409 self_review_blocked; 409 not_claimant; 409 stale_claim_epoch"
+        "409 implementer_cannot_judge; 409 not_claimant; 409 stale_claim_epoch"
       ]
     },
     {

@@ -32,6 +32,7 @@ defmodule LoopctlWeb.ThreadController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:show, :entry]
 
   @max_body_bytes Entry.max_body_bytes()
+  @max_entry_page Threads.max_entry_page()
   @caller_kinds Enum.map(Entry.caller_kinds(), &to_string/1)
 
   tags(["Threads"])
@@ -39,10 +40,16 @@ defmodule LoopctlWeb.ThreadController do
   operation(:show,
     summary: "Read a story's change thread",
     description:
-      "The story's checkpoints and entries, each in `seq` order. Every entry `body` is " <>
+      "The story's checkpoints, and one page of its entries, each in `seq` order. Pass " <>
+        "`next_after_seq` back as `after_seq` for the next page; it is null on the last. " <>
+        "`limit` defaults to 200 and is capped at #{@max_entry_page}. Every entry `body` is " <>
         "UNTRUSTED text a session or a person wrote; it is marked `body_untrusted: true` and " <>
         "must be fenced wherever it reaches a prompt.",
-    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    parameters: [
+      id: [in: :path, type: :string, description: "Story UUID"],
+      after_seq: [in: :query, type: :integer, description: "Return entries after this seq"],
+      limit: [in: :query, type: :integer, description: "Page size, at most #{@max_entry_page}"]
+    ],
     responses: %{
       200 => {"The thread", "application/json", %Schema{type: :object}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
@@ -81,11 +88,13 @@ defmodule LoopctlWeb.ThreadController do
          Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"`not_claimant` (the key's agent is not the story's) or `stale_claim_epoch` (the " <>
-           "claim has ended)", "application/json", Schemas.ErrorResponse},
+        {"`not_claimant` (the key's agent is not the story's), `stale_claim_epoch` (the " <>
+           "claim has ended) or `checkpoint_conflict` (the commit is already recorded with a " <>
+           "different tree)", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"A sha is not 40 or 64 lowercase hex characters, or `note` is over the bound",
-         "application/json", Schemas.ErrorResponse},
+        {"A sha is not 40 or 64 lowercase hex characters, `note` is over the bound, or " <>
+           "`note` carries a credential (`secret_blocked`)", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -99,8 +108,14 @@ defmodule LoopctlWeb.ThreadController do
         "`idempotency_key`: a resend answers 200 with the entry already written.\n\n" <>
         "A `finding` must name a `checkpoint_id` of this story, and after the story's first " <>
         "completed review round it must also carry `introduced_by`: a checkpoint id of this " <>
-        "story, or `none`. A `fix` must name at least one `finding_ids` entry, each a finding " <>
-        "of this story. `body` is capped at #{@max_body_bytes} bytes and is UNTRUSTED.",
+        "story, or `none`. A `fix` is the CURRENT CLAIMANT's, with its `claim_epoch`, and " <>
+        "names the `checkpoint_id` carrying it — a checkpoint of the current claim, recorded " <>
+        "after the ones its findings were found in — and at least one `finding_ids` entry. " <>
+        "A `finding` or `verdict` is refused from the implementer or its dispatch chain, and " <>
+        "from a key no dispatch minted unless it is a human `user` key. Reusing an " <>
+        "`idempotency_key` for a different entry is refused; keys starting `loopctl:` are " <>
+        "reserved. `body` is capped at #{@max_body_bytes} bytes, refused when it carries a " <>
+        "credential, and is UNTRUSTED.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Entry", "application/json",
@@ -117,7 +132,12 @@ defmodule LoopctlWeb.ThreadController do
              type: :string,
              description: "A checkpoint id of this story, or `none`"
            },
-           severity: %Schema{type: :string, enum: ~w(critical high medium low)}
+           severity: %Schema{type: :string, enum: ~w(critical high medium low)},
+           claim_epoch: %Schema{
+             type: :integer,
+             minimum: 0,
+             description: "Required for a `fix`: the epoch the caller's claim returned"
+           }
          }
        }},
     responses: %{
@@ -125,22 +145,50 @@ defmodule LoopctlWeb.ThreadController do
       201 => {"Written", "application/json", %Schema{type: :object}},
       403 => {"The tenant is not human-anchored", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"`implementer_cannot_judge`, `caller_lineage_required`, " <>
+           "`unresolvable_dispatch_lineage` (a finding or verdict), `not_claimant` or " <>
+           "`stale_claim_epoch` (a fix), or `idempotency_key_reused`", "application/json",
+         Schemas.ErrorResponse},
       422 =>
-        {"A field is invalid, the kind is loopctl's own, or a reference does not belong to " <>
-           "this story", "application/json", Schemas.ErrorResponse},
+        {"A field is invalid, the kind is loopctl's own, the key is reserved, the body " <>
+           "carries a credential (`secret_blocked`), or a reference does not belong to this " <>
+           "story", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
   @doc "GET /api/v1/stories/:id/thread"
-  def show(conn, %{"id" => story_id}) do
+  def show(conn, %{"id" => story_id} = params) do
     with {:ok, story_id} <- story_uuid(story_id),
-         {:ok, thread} <- Threads.get_thread(tenant_id(conn), story_id) do
+         {:ok, page} <- page_opts(params),
+         {:ok, thread} <- Threads.get_thread(tenant_id(conn), story_id, page) do
       json(conn, %{
         story_id: story_id,
         checkpoints: Enum.map(thread.checkpoints, &render_checkpoint/1),
-        entries: Enum.map(thread.entries, &render_entry/1)
+        entries: Enum.map(thread.entries, &render_entry/1),
+        next_after_seq: thread.next_after_seq
       })
+    end
+  end
+
+  defp page_opts(params) do
+    with {:ok, after_seq} <- int_param(params, "after_seq"),
+         {:ok, limit} <- int_param(params, "limit") do
+      {:ok, Enum.reject([after_seq: after_seq, limit: limit], fn {_k, v} -> is_nil(v) end)}
+    end
+  end
+
+  defp int_param(params, name) do
+    case Map.get(params, name) do
+      nil ->
+        {:ok, nil}
+
+      value ->
+        case Integer.parse(to_string(value)) do
+          {int, ""} when int >= 0 -> {:ok, int}
+          _ -> {:error, :bad_request, "#{name} must be a non-negative integer"}
+        end
     end
   end
 
@@ -163,6 +211,8 @@ defmodule LoopctlWeb.ThreadController do
       conn
       |> put_status(created_or_ok(status))
       |> json(%{checkpoint: render_checkpoint(checkpoint)})
+    else
+      other -> conflict_or(conn, other)
     end
   end
 
@@ -181,14 +231,27 @@ defmodule LoopctlWeb.ThreadController do
            Threads.record_entry(api_key.tenant_id, story_id, attrs,
              agent_id: api_key.agent_id,
              claim_epoch: params["claim_epoch"],
+             actor_role: api_key.role,
              author_principal: principal(api_key),
              actor_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
            ) do
       conn
       |> put_status(created_or_ok(status))
       |> json(%{entry: render_entry(entry)})
+    else
+      other -> conflict_or(conn, other)
     end
   end
+
+  # The thread's own 409s carry a code the fallback does not know; everything else is the
+  # fallback's to render.
+  defp conflict_or(conn, {:error, {:conflict, code, message}}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{error: %{status: 409, code: code, message: message}})
+  end
+
+  defp conflict_or(_conn, other), do: other
 
   defp tenant_id(conn), do: conn.assigns.current_api_key.tenant_id
 

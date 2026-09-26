@@ -92,6 +92,36 @@ defmodule LoopctlWeb.ThreadControllerTest do
              |> json_response(200)
   end
 
+  test "the implementer judging its own work is 409 implementer_cannot_judge", %{conn: conn} do
+    %{story: story, raw_key: key} = claimed_story()
+
+    %{"checkpoint" => %{"id" => cp_id}} =
+      conn |> post_checkpoint(key, story, @checkpoint) |> json_response(201)
+
+    finding = %{
+      "kind" => "finding",
+      "idempotency_key" => "f",
+      "body" => "mine",
+      "severity" => "low",
+      "checkpoint_id" => cp_id
+    }
+
+    assert %{"error" => %{"code" => "implementer_cannot_judge"}} =
+             build_conn()
+             |> auth(key)
+             |> post(~p"/api/v1/stories/#{story.id}/thread/entries", finding)
+             |> json_response(409)
+  end
+
+  test "a malformed page parameter is 400", %{conn: conn} do
+    %{story: story, raw_key: key} = claimed_story()
+
+    assert conn
+           |> auth(key)
+           |> get(~p"/api/v1/stories/#{story.id}/thread?limit=lots")
+           |> json_response(400)
+  end
+
   test "an unknown or malformed story id is 404", %{conn: conn} do
     %{raw_key: key} = claimed_story()
 
