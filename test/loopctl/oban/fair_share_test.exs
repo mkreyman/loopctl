@@ -115,7 +115,7 @@ defmodule Loopctl.Oban.FairShareTest do
       end)
 
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           assert FairShare.gate(tenant.id, :knowledge, 1) == :ok
         end)
 

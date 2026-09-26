@@ -203,7 +203,7 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeaderTest do
       bad_key = %ApiKey{id: "not-a-uuid", tenant_id: Ecto.UUID.generate()}
 
       {conn, log} =
-        ExUnit.CaptureLog.with_log(fn ->
+        Loopctl.OwnLog.with_own_log(fn ->
           bad_key |> bootstrap_conn() |> ValidateWitnessHeader.call(@enforce)
         end)
 
@@ -213,28 +213,12 @@ defmodule LoopctlWeb.Plugs.ValidateWitnessHeaderTest do
 
       # Log records the failure but leaks no SQL — struct name / sqlstate only.
       #
-      # `ExUnit.CaptureLog.with_log` installs a PROCESS-GLOBAL logger handler for
-      # the duration of the block, so under `async: true` a concurrently-running
-      # test module's warning/error log (e.g. `LoopctlWeb.DBErrorLogger`, which
-      # can interpolate raw query text, or the slow-query logger) would land in
-      # this captured buffer. Asserting the ABSENCE of SQL across the whole global
-      # buffer is therefore non-deterministic. The security guarantee under test
-      # is that the PLUG's own emitted line is sanitized — so scope the SQL-absence
-      # checks to exactly the plug's log line(s). A foreign concurrent line can
-      # neither satisfy nor violate this, and the guarantee stays genuinely tested.
+      # with_own_log keeps only what THIS process logged, so a concurrent async test's own
+      # query text (LoopctlWeb.DBErrorLogger, the slow-query logger) can neither satisfy nor
+      # violate the SQL-absence checks.
       assert log =~ "atomic bootstrap consume failed"
-
-      plug_log_lines =
-        log
-        |> String.split("\n")
-        |> Enum.filter(&String.contains?(&1, "atomic bootstrap consume failed"))
-
-      assert plug_log_lines != [], "expected the plug to log its consume-failure line"
-
-      for line <- plug_log_lines do
-        refute line =~ "query:", "plug log line leaked a query: #{line}"
-        refute line =~ ~r/SELECT|INSERT|UPDATE/, "plug log line leaked SQL: #{line}"
-      end
+      refute log =~ "query:"
+      refute log =~ ~r/SELECT|INSERT|UPDATE/
     end
 
     test "a second bootstrap request from the same key is rejected 412" do

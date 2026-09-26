@@ -2,7 +2,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
   use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
-  import ExUnit.CaptureLog
+  import Loopctl.OwnLog, only: [capture_own_log: 1]
 
   setup :verify_on_exit!
 
@@ -782,7 +782,7 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       end)
 
       log =
-        capture_log(fn ->
+        capture_own_log(fn ->
           assert :ok =
                    ArticleLinkingWorker.perform(%Oban.Job{
                      args: %{"article_id" => source.id, "tenant_id" => tenant.id}
@@ -795,12 +795,10 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       # ...tagged, not swallowed anonymously: a bounded class, never the raw exit reason
       # (which carries the whole DBConnection call tuple).
       #
-      # capture_log collects every process in the VM, and a concurrent async test's own
-      # DBConnection lines — or its own corpus-size count — land in it too, so the checks read
-      # only the lines that name THIS test's article.
-      lines = article_lines(log, source)
-      assert lines =~ "corpus-size count exited (noproc)"
-      refute lines =~ "DBConnection"
+      # capture_own_log keeps only what THIS process logged: a concurrent async test's own
+      # DBConnection lines would otherwise land in the capture and fail the refute.
+      assert log =~ "corpus-size count exited (noproc)"
+      refute log =~ "DBConnection"
 
       # ...and the linking it merely observes still happened. That is the whole point.
       assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
@@ -823,16 +821,15 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       end)
 
       log =
-        capture_log(fn ->
+        capture_own_log(fn ->
           assert :ok =
                    ArticleLinkingWorker.perform(%Oban.Job{
                      args: %{"article_id" => source.id, "tenant_id" => tenant.id}
                    })
         end)
 
-      lines = article_lines(log, source)
-      assert lines =~ "corpus-size count exited (RuntimeError)"
-      refute lines =~ "pool died"
+      assert log =~ "corpus-size count exited (RuntimeError)"
+      refute log =~ "pool died"
       assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
     end
 
@@ -850,14 +847,14 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       end)
 
       log =
-        capture_log(fn ->
+        capture_own_log(fn ->
           assert :ok =
                    ArticleLinkingWorker.perform(%Oban.Job{
                      args: %{"article_id" => source.id, "tenant_id" => tenant.id}
                    })
         end)
 
-      assert article_lines(log, source) =~ "corpus-size count threw (boom)"
+      assert log =~ "corpus-size count threw (boom)"
       assert [_] = links_of_type(tenant.id, source.id, target.id, :relates_to)
     end
   end
@@ -1289,11 +1286,5 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       assert Map.fetch!(by_id, similar.id) >= 0.6
       assert Map.get(by_id, dissimilar.id, 0.0) < 0.6
     end
-  end
-
-  # Every captured line that names this test's article — the worker ends each of its messages
-  # with "for article <id>" — joined, so a refute covers every line the worker wrote about it.
-  defp article_lines(log, article) do
-    log |> String.split("\n") |> Enum.filter(&(&1 =~ "article #{article.id}")) |> Enum.join("\n")
   end
 end
