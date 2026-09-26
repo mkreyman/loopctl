@@ -1588,7 +1588,9 @@ defmodule Loopctl.Progress do
   @spec live_claim?(Story.t(), DateTime.t()) :: boolean()
   def live_claim?(%Story{agent_status: status, claimed_until: until}, now)
       when status in @claimed_statuses,
-      do: is_nil(until) or DateTime.after?(until, now)
+      # Live until the lease is strictly in the past, the boundary `lease_expired?/3` uses
+      # (`compare(until, now) == :lt`), so the two never disagree about the same instant.
+      do: is_nil(until) or not DateTime.before?(until, now)
 
   def live_claim?(%Story{}, _now), do: false
 

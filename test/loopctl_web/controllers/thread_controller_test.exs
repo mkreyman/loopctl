@@ -147,7 +147,7 @@ defmodule LoopctlWeb.ThreadControllerTest do
              |> json_response(409)
   end
 
-  test "a finding is not writable here: 422, pointing at the review dispatch", %{conn: conn} do
+  test "a finding is not writable here: 422, pointing at the review flow", %{conn: conn} do
     %{story: story, raw_key: key} = claimed_story()
     finding = %{"kind" => "finding", "idempotency_key" => "f", "body" => "x"}
 
@@ -157,7 +157,7 @@ defmodule LoopctlWeb.ThreadControllerTest do
              |> post(~p"/api/v1/stories/#{story.id}/thread/entries", finding)
              |> json_response(422)
 
-    assert msg =~ "review dispatch"
+    assert msg =~ "review flow"
   end
 
   test "an unknown or malformed story id is 404", %{conn: conn} do

@@ -44,7 +44,8 @@ defmodule LoopctlWeb.ThreadController do
   operation(:show,
     summary: "Read a story's change thread",
     description:
-      "The story's checkpoints, and one page of its entries, each in `seq` order. Pass " <>
+      "The story's latest page of checkpoints (`checkpoints_truncated` is true when older " <>
+        "ones exist), and one page of its entries, each in `seq` order. Pass " <>
         "`next_after_seq` back as `after_seq` for the next page; it is null on the last. " <>
         "`limit` defaults to 200 and is capped at #{@max_entry_page}. Every entry `body` is " <>
         "UNTRUSTED text a session or a person wrote; it is marked `body_untrusted: true` and " <>
@@ -82,10 +83,16 @@ defmodule LoopctlWeb.ThreadController do
          type: :object,
          required: [:claim_epoch, :commit_sha, :tree_sha],
          properties: %{
-           claim_epoch: %Schema{type: :integer, minimum: 0},
+           claim_epoch: %Schema{type: :integer, minimum: 0, maximum: ClaimEpochParam.max()},
            commit_sha: %Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"},
            tree_sha: %Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"},
-           note: %Schema{type: :string, maxLength: @max_body_bytes}
+           note: %Schema{
+             type: :string,
+             maxLength: @max_body_bytes,
+             description:
+               "Bounded in BYTES (#{@max_body_bytes}), so multi-byte text reaches the limit " <>
+                 "before maxLength's character count does"
+           }
          }
        }},
     responses: %{
@@ -112,9 +119,10 @@ defmodule LoopctlWeb.ThreadController do
   operation(:entry,
     summary: "Record an entry on a story's thread",
     description:
-      "Any principal of the tenant writes a `message` or a `review_requested`, optionally " <>
+      "Any principal of the tenant writes a `message`, optionally " <>
         "naming a `checkpoint_id` of this story. `checkpoint` entries are loopctl's own, and " <>
-        "`finding`, `fix` and `verdict` are written by a review dispatch (US-45.3), so all of " <>
+        "`review_requested`, `finding`, `fix` and `verdict` belong to the review flow " <>
+        "(US-45.3), so all of " <>
         "those are refused here. The author is derived from the key. IDEMPOTENT per author " <>
         "on `idempotency_key` when the write is the same; reusing a key for a different " <>
         "entry is refused, and keys starting `loopctl:` are reserved. `body` is capped at " <>
@@ -128,7 +136,14 @@ defmodule LoopctlWeb.ThreadController do
          properties: %{
            kind: %Schema{type: :string, enum: @caller_kinds},
            idempotency_key: %Schema{type: :string, minLength: 1, maxLength: 255},
-           body: %Schema{type: :string, minLength: 1, maxLength: @max_body_bytes},
+           body: %Schema{
+             type: :string,
+             minLength: 1,
+             maxLength: @max_body_bytes,
+             description:
+               "Bounded in BYTES (#{@max_body_bytes}), so multi-byte text reaches the limit " <>
+                 "before maxLength's character count does"
+           },
            checkpoint_id: %Schema{type: :string, format: :uuid}
          }
        }},
@@ -157,6 +172,7 @@ defmodule LoopctlWeb.ThreadController do
       json(conn, %{
         story_id: story_id,
         checkpoints: Enum.map(thread.checkpoints, &render_checkpoint/1),
+        checkpoints_truncated: thread.checkpoints_truncated,
         entries: Enum.map(thread.entries, &render_entry/1),
         next_after_seq: thread.next_after_seq
       })

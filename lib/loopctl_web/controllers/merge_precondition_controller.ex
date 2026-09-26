@@ -215,6 +215,7 @@ defmodule LoopctlWeb.MergePreconditionController do
            claim_epoch: %OpenApiSpex.Schema{
              type: :integer,
              minimum: 0,
+             maximum: LoopctlWeb.ClaimEpochParam.max(),
              description:
                "The claim epoch the caller acts under. It fences the escalation a refusal " <>
                  "writes; a stale epoch refuses the write rather than permitting anything."

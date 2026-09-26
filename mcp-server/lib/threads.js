@@ -6,9 +6,9 @@
  * recording fake. Keys are selected here, from the injected env, so which key a call travels
  * on is testable behaviour:
  *
- * - thread_checkpoint travels on the AGENT key. The endpoint is `exact_role: :agent` and
- *   compares the key's agent with the story's claimant: only the claimant says a commit is
- *   part of the thread.
+ * - thread_checkpoint travels on the key claim_story claims with: LOOPCTL_API_KEY when it is
+ *   set, else LOOPCTL_AGENT_KEY (the same resolveKey order). The endpoint compares the key's
+ *   agent with the story's claimant, so the checkpoint must go out on the key that claimed.
  * - thread_entry writes a `message` or `review_requested` on the key named by `principal`
  *   (agent by default; a person writes on LOOPCTL_USER_KEY). Findings, fixes and verdicts
  *   are not written through this tool: their author is a review dispatch (loopctl US-45.3).
@@ -48,6 +48,12 @@ function missing(field) {
 
 function present(value) {
   return typeof value === "string" && value.trim() !== "";
+}
+
+// The key claim_story claimed with (index.js resolveKey: LOOPCTL_API_KEY first), so a
+// checkpoint or an agent-principal entry is sent as the same agent that holds the claim.
+function claimKeyVar(env) {
+  return env.LOOPCTL_API_KEY ? "LOOPCTL_API_KEY" : "LOOPCTL_AGENT_KEY";
 }
 
 // Drops keys whose value is undefined or null, so an absent optional is not sent as null.
@@ -95,8 +101,8 @@ export async function recordCheckpoint(
     "POST",
     checkpointsPath(story_id),
     compact({ claim_epoch, commit_sha, tree_sha, note }),
-    env.LOOPCTL_AGENT_KEY,
-    "LOOPCTL_AGENT_KEY",
+    env[claimKeyVar(env)],
+    claimKeyVar(env),
   );
 }
 
@@ -117,8 +123,8 @@ export async function recordEntry(
   if (!present(idempotency_key)) return missing("idempotency_key");
   if (!present(body)) return missing("body");
 
-  const keyVar = PRINCIPAL_KEYS[principal];
-  if (!keyVar) {
+  const keyVar = principal === "agent" ? claimKeyVar(env) : PRINCIPAL_KEYS[principal];
+  if (!PRINCIPAL_KEYS[principal]) {
     return {
       error: true,
       status: 0,

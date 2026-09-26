@@ -21,8 +21,12 @@ defmodule Loopctl.Threads.Entry do
   # checkpoint they describe; `finding`, `fix` and `verdict` belong to the review dispatch
   # (US-45.3); `escalation` and `merge` to the flows that perform those acts. The kind column
   # admits all of them so those stories need no migration to start writing.
-  @caller_kinds [:message, :review_requested]
-  @kinds @caller_kinds ++ [:checkpoint, :finding, :fix, :verdict, :escalation, :merge]
+  # `review_requested` is written by the request-review flow alongside
+  # `stories.review_requested_at`, never by a caller: a caller-written one could claim a
+  # request the implementer never made, or disagree with the story.
+  @caller_kinds [:message]
+  @kinds @caller_kinds ++
+           [:checkpoint, :review_requested, :finding, :fix, :verdict, :escalation, :merge]
 
   schema "thread_entries" do
     tenant_field()

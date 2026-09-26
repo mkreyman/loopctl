@@ -27,7 +27,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :dependencies_not_met}` -> 409 `dependencies_not_met` (claim of a story with an unverified prerequisite)
   - `{:error, :story_held}` -> 409 (contract or claim of a story whose delivery stage is `escalated`, `done` or `failed`; an escalated one is claimable again once a human resolves it to `queued`)
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
-  - `{:error, :claim_not_live}` -> 409 (US-45.1: the claim's lease has lapsed; the claim has ended)
+  - `{:error, :claim_not_live}` -> 409 (US-45.1: the claim no longer accepts work — lease lapsed, review requested, or not in a claimed status)
   - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
   - `{:error, :not_claimed}` -> 422 (#803: renew-claim on a story that is not assigned or implementing)
   - `{:error, :lease_cap_reached}` -> 409 (#879: renew-claim on a driver-placed claim whose `claim_lease_cap` has passed; no renewal can extend it)
@@ -268,8 +268,9 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
-  # US-45.1: the epoch is current but the claim's lease has lapsed, so the claim has ended
-  # even though the reclaimer has not yet run. Same remedy as `stale_claim_epoch`.
+  # US-45.1: the epoch is current but the claim no longer accepts the implementer's work: its
+  # lease lapsed, review was requested, or the story left a claimed status. Renewing fixes
+  # none of the last two, so the message does not tell the caller to renew.
   def call(conn, {:error, :claim_not_live}) do
     conn
     |> put_status(:conflict)
@@ -278,8 +279,9 @@ defmodule LoopctlWeb.FallbackController do
         status: 409,
         code: "claim_not_live",
         message:
-          "Your claim on this story has lapsed: its lease expired. Stop working this claim; " <>
-            "renew it before it lapses, or claim the story afresh if it is still available.",
+          "Your claim on this story no longer accepts work: its lease expired, you " <>
+            "requested review, or the story is no longer in a claimed status. Stop adding " <>
+            "to it; read the story's stage to see which.",
         remediation: %{learn_more: "https://loopctl.com/wiki/agent-pattern"}
       }
     })

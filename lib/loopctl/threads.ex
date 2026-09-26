@@ -70,6 +70,7 @@ defmodule Loopctl.Threads do
 
   @type thread :: %{
           checkpoints: [Checkpoint.t()],
+          checkpoints_truncated: boolean(),
           entries: [Entry.t()],
           next_after_seq: pos_integer() | nil
         }
@@ -174,9 +175,12 @@ defmodule Loopctl.Threads do
 
       {page, rest} = Enum.split(entries, limit)
 
+      {checkpoints, truncated?} = latest_checkpoints(tenant_id, story_id)
+
       {:ok,
        %{
-         checkpoints: latest_checkpoints(tenant_id, story_id),
+         checkpoints: checkpoints,
+         checkpoints_truncated: truncated?,
          entries: page,
          next_after_seq: if(rest == [], do: nil, else: List.last(page).seq)
        }}
@@ -189,12 +193,15 @@ defmodule Loopctl.Threads do
   # returns only the latest page: the merge gate and a reviewer need the current head and
   # what led to it, never the whole history on every poll.
   defp latest_checkpoints(tenant_id, story_id) do
-    Checkpoint
-    |> where([c], c.tenant_id == ^tenant_id and c.story_id == ^story_id)
-    |> order_by([c], desc: c.seq)
-    |> limit(^@max_entry_page)
-    |> Repo.all()
-    |> Enum.reverse()
+    rows =
+      Checkpoint
+      |> where([c], c.tenant_id == ^tenant_id and c.story_id == ^story_id)
+      |> order_by([c], desc: c.seq)
+      |> limit(^(@max_entry_page + 1))
+      |> Repo.all()
+
+    {page, rest} = Enum.split(rows, @max_entry_page)
+    {Enum.reverse(page), rest != []}
   end
 
   defp in_story(schema, tenant_id, story_id) do
@@ -224,30 +231,35 @@ defmodule Loopctl.Threads do
     epoch = Keyword.fetch!(opts, :claim_epoch)
     fence = fn -> claimant(tenant_id, story_id, Keyword.fetch!(opts, :agent_id), epoch) end
 
-    case checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch) do
-      nil ->
+    case {locked_story(tenant_id, story_id),
+          checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch)} do
+      {nil, _} ->
+        {:error, :not_found}
+
+      {_story, nil} ->
         with :ok <- fence.(),
              do: insert_checkpoint(tenant_id, story_id, commit_sha, tree_sha, opts)
 
-      existing ->
-        with :ok <- replay_allowed(existing, Keyword.fetch!(opts, :author_principal), fence),
-             do: replay_checkpoint(existing, tree_sha, Keyword.get(opts, :note))
+      {_story, existing} ->
+        recorded = checkpoint_entry(existing)
+
+        with :ok <- replay_allowed(recorded, Keyword.fetch!(opts, :author_principal), fence),
+             do: replay_checkpoint(existing, recorded, tree_sha, Keyword.get(opts, :note))
     end
   end
 
   # Only the recorder replays. Anyone else meets the fence, which is there to NAME the refusal
   # (an ended claim, a stranger): a checkpoint under epoch E was recorded by E's claimant, so
   # nobody but its recorder can pass it.
-  defp replay_allowed(checkpoint, author, fence) do
-    if recorded_by?(checkpoint, author), do: :ok, else: fence.()
-  end
+  defp replay_allowed(%{author_principal: author}, author, _fence), do: :ok
+  defp replay_allowed(_recorded, _author, fence), do: fence.()
 
-  defp recorded_by?(checkpoint, author) do
-    Repo.exists?(
+  # The checkpoint's own entry, read once: who recorded it and the note it carries.
+  defp checkpoint_entry(checkpoint) do
+    Repo.one(
       from e in Entry,
-        where:
-          e.checkpoint_id == ^checkpoint.id and e.kind == :checkpoint and
-            e.author_principal == ^author
+        where: e.checkpoint_id == ^checkpoint.id and e.kind == :checkpoint,
+        select: %{author_principal: e.author_principal, body: e.body}
     )
   end
 
@@ -269,22 +281,14 @@ defmodule Loopctl.Threads do
 
   # The same checkpoint, resent: the tree must match, and a note, when sent, must be the one
   # recorded. Anything else is a different write, refused rather than acknowledged.
-  defp replay_checkpoint(%Checkpoint{tree_sha: tree_sha} = existing, tree_sha, note) do
-    if is_nil(note) or note == checkpoint_note(existing),
+  defp replay_checkpoint(%Checkpoint{tree_sha: tree_sha} = existing, recorded, tree_sha, note) do
+    if is_nil(note) or note == recorded.body,
       do: {:ok, existing, :existing, []},
       else: conflict("checkpoint_conflict", "commit_sha is already recorded with another note")
   end
 
-  defp replay_checkpoint(_existing, _tree_sha, _note),
+  defp replay_checkpoint(_existing, _recorded, _tree_sha, _note),
     do: conflict("checkpoint_conflict", "commit_sha is already recorded with another tree_sha")
-
-  defp checkpoint_note(checkpoint) do
-    Repo.one(
-      from e in Entry,
-        where: e.checkpoint_id == ^checkpoint.id and e.kind == :checkpoint,
-        select: e.body
-    )
-  end
 
   defp insert_checkpoint(tenant_id, story_id, commit_sha, tree_sha, opts) do
     lineage = Keyword.fetch!(opts, :actor_lineage)
@@ -395,9 +399,9 @@ defmodule Loopctl.Threads do
       kind in Entry.caller_kinds() ->
         :ok
 
-      kind in [:finding, :fix, :verdict] ->
+      kind in [:finding, :fix, :verdict, :review_requested] ->
         {:error, :unprocessable_entity,
-         "kind #{kind} is written by a review dispatch (US-45.3), not through this endpoint"}
+         "kind #{kind} is written by the review flow (US-45.3), not through this endpoint"}
 
       true ->
         {:error, :unprocessable_entity, "kind #{kind} is written by loopctl, not a caller"}

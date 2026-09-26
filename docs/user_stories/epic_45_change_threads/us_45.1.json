@@ -36,7 +36,7 @@
     },
     {
       "id": "AC-45.1.6",
-      "description": "Callers write message and review_requested entries only, from any principal of the tenant; finding, fix and verdict are refused with 422 naming the review dispatch (US-45.3), and checkpoint, escalation and merge as loopctl's own. A checkpoint_id is cast to a canonical UUID and must name a checkpoint of the same story."
+      "description": "Callers write message entries only, from any principal of the tenant; review_requested, finding, fix and verdict belong to the review flow (US-45.3) and are refused with 422, and checkpoint, escalation and merge as loopctl's own. A checkpoint_id is cast to a canonical UUID and must name a checkpoint of the same story."
     },
     {
       "id": "AC-45.1.7",
@@ -44,7 +44,7 @@
     },
     {
       "id": "AC-45.1.8",
-      "description": "GET /api/v1/stories/:id/thread returns all checkpoints and one page of entries (after_seq, limit capped, next_after_seq), bodies marked untrusted, and 400 for a page parameter outside a non-negative int4; MCP tools thread_get, thread_checkpoint and thread_entry call the three endpoints, declared and dispatched, with a README row each naming every refusal."
+      "description": "GET /api/v1/stories/:id/thread returns the latest page of checkpoints with checkpoints_truncated, and one page of entries (after_seq, limit capped, next_after_seq), bodies marked untrusted, and 400 for a page parameter outside a non-negative int4 or a limit of 0; MCP tools thread_get, thread_checkpoint and thread_entry call the three endpoints, declared and dispatched, with a README row each naming every refusal, and send a checkpoint on the key claim_story claims with."
     },
     {
       "id": "AC-45.1.9",

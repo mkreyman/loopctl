@@ -79,6 +79,7 @@ defmodule Loopctl.ThreadsTest do
       assert cp.seq == 1 and cp.claim_epoch == @epoch
 
       {:ok, thread} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
+      refute thread.checkpoints_truncated
       assert [%{kind: :checkpoint, checkpoint_id: cp_id}] = thread.entries
       assert cp_id == cp.id
     end
@@ -141,6 +142,18 @@ defmodule Loopctl.ThreadsTest do
       assert again.claim_epoch == @epoch + 1 and again.seq == first.seq + 1
       # A claim's first checkpoint has no parent: it did not build on the ended claim's.
       assert again.parent_checkpoint_id == nil
+    end
+
+    test "a resend for a story that no longer exists is 404, not a replay" do
+      ctx = claimed_story()
+      {:ok, _, :created} = checkpoint(ctx)
+
+      {:ok, _} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.query!("DELETE FROM stories WHERE id = $1", [Ecto.UUID.dump!(ctx.story.id)])
+        end)
+
+      assert {:error, :not_found} = checkpoint(ctx)
     end
 
     test "the recorder's resend replays even after its lease lapsed; another agent's is fenced" do
@@ -212,8 +225,10 @@ defmodule Loopctl.ThreadsTest do
       assert {:error, {:conflict, "idempotency_key_reused", _}} =
                entry(ctx, message("round-1", "second"))
 
+      {:ok, cp, :created} = checkpoint(ctx)
+
       assert {:error, {:conflict, "idempotency_key_reused", _}} =
-               entry(ctx, %{message("round-1", "first") | "kind" => "review_requested"})
+               entry(ctx, Map.put(message("round-1", "first"), "checkpoint_id", cp.id))
     end
 
     test "a checkpoint_id is canonicalised, so an uppercase resend replays" do
@@ -243,11 +258,11 @@ defmodule Loopctl.ThreadsTest do
     test "judgement kinds and loopctl's own kinds are refused" do
       ctx = claimed_story()
 
-      for kind <- ~w(finding fix verdict) do
+      for kind <- ~w(finding fix verdict review_requested) do
         assert {:error, :unprocessable_entity, msg} =
                  entry(ctx, %{"kind" => kind, "idempotency_key" => kind, "body" => "x"})
 
-        assert msg =~ "review dispatch"
+        assert msg =~ "review flow"
       end
 
       for kind <- ~w(checkpoint merge escalation) do
@@ -328,6 +343,7 @@ defmodule Loopctl.ThreadsTest do
 
       {:ok, thread} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
       assert length(thread.checkpoints) == max
+      assert thread.checkpoints_truncated
       assert hd(thread.checkpoints).seq == 2 and List.last(thread.checkpoints).seq == max + 1
     end
 

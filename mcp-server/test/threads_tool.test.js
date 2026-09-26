@@ -56,6 +56,16 @@ describe("thread_checkpoint", () => {
     ]);
   });
 
+  test("travels on the key claim_story claims with: LOOPCTL_API_KEY wins when set", async () => {
+    const { calls, apiCall } = fakeApi();
+    await recordCheckpoint(
+      { story_id: STORY_ID, claim_epoch: 4, commit_sha: SHA, tree_sha: TREE },
+      { apiCall, env: { ...ENV, LOOPCTL_API_KEY: "api-key" } },
+    );
+    assert.equal(calls[0].key, "api-key");
+    assert.equal(calls[0].keyHint, "LOOPCTL_API_KEY");
+  });
+
   test("refuses client-side without claim_epoch, calling nothing", async () => {
     const { calls, apiCall } = fakeApi();
     const res = await recordCheckpoint(
