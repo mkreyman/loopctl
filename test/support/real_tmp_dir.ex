@@ -11,29 +11,13 @@ defmodule Loopctl.RealTmpDir do
   exactly, and they should keep doing so.
   """
 
-  @doc "The physical tmp dir, resolved once per VM: the answer cannot change during a run."
   @spec path!() :: String.t()
   def path! do
-    case :persistent_term.get({__MODULE__, :path}, nil) do
-      nil ->
-        path = physical!(System.tmp_dir!())
-        :persistent_term.put({__MODULE__, :path}, path)
-        path
+    dir = System.tmp_dir!()
+    unless File.dir?(dir), do: raise("the tmp dir #{inspect(dir)} does not exist")
 
-      path ->
-        path
-    end
-  end
-
-  @doc """
-  `dir` with every symlink resolved: what git reports as a toplevel. For the isolation guards,
-  which compare a fixture's path with git's answer and must compare the same spelling.
-  """
-  @spec physical!(String.t()) :: String.t()
-  def physical!(dir) do
-    case System.cmd("pwd", ["-P"], cd: dir, stderr_to_stdout: true) do
-      {physical, 0} -> String.trim_trailing(physical, "\n")
-      {output, status} -> raise "pwd -P in #{inspect(dir)} exited #{status}: #{output}"
-    end
+    # Not cached: System.tmp_dir!/0 reads TMPDIR on every call, and this must follow it.
+    {physical, 0} = System.cmd("pwd", ["-P"], cd: dir)
+    String.trim_trailing(physical, "\n")
   end
 end
