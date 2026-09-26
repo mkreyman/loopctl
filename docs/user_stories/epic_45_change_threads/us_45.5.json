@@ -20,7 +20,7 @@
     },
     {
       "id": "AC-45.5.2",
-      "description": "It verifies the checkpoint contains the base head, creates the squash commit with the checkpoint tree and the base head as parent, records merge_commit_sha, and only then updates the ref with force false."
+      "description": "It reads the commit's tree from the forge by commit_sha and refuses with tree_mismatch, escalating, when it differs from the recorded tree_sha; otherwise it verifies the checkpoint contains the base head, creates the squash commit with that tree and the base head as parent, records merge_commit_sha, and only then updates the ref with force false."
     },
     {
       "id": "AC-45.5.3",
@@ -28,7 +28,7 @@
     },
     {
       "id": "AC-45.5.4",
-      "description": "A non-fast-forward refusal merges the base into the thread branch as the App, records a base_update checkpoint, and returns the story to ci; a merge conflict returns it to implementing over base_moved."
+      "description": "A non-fast-forward refusal merges the base into the thread branch as the App and records a base_update checkpoint through a control-plane function that has no HTTP route and bypasses the claimant fence; the story stays at ci over base_updated. A merge conflict returns it to implementing over base_moved."
     },
     {
       "id": "AC-45.5.5",
@@ -104,9 +104,44 @@
       "expected_results": [
         "escalated, no merge"
       ]
+    },
+    {
+      "id": "TC-45.5.5",
+      "verifies": [
+        "AC-45.5.1"
+      ],
+      "name": "only on a recorded allow",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "enqueue with no allow; with an allow on another checkpoint"
+      ],
+      "expected_results": [
+        "no merge in either case"
+      ]
+    },
+    {
+      "id": "TC-45.5.6",
+      "verifies": [
+        "AC-45.5.2"
+      ],
+      "name": "tree mismatch",
+      "type": "integration",
+      "preconditions": [
+        "mocked forge"
+      ],
+      "steps": [
+        "recorded tree differs from the forge's"
+      ],
+      "expected_results": [
+        "escalated with tree_mismatch; no ref update"
+      ]
     }
   ],
-  "technical_notes": "Forge access through a behaviour with a Mox mock in test.",
+  "technical_notes": [
+    "Forge access through a behaviour with a Mox mock in test.",
+    "The base_update checkpoint is written by a control-plane function with no HTTP route, never through the claimant-fenced checkpoint endpoint."
+  ],
   "dependencies": [
     "US-45.4"
   ]

@@ -62,7 +62,9 @@
       ]
     }
   ],
-  "technical_notes": "",
+  "technical_notes": [
+    "The combined-status API alone never lists check runs."
+  ],
   "dependencies": [
     "US-45.4"
   ]

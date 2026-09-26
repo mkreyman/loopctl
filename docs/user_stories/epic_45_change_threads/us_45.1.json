@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.1.1",
-      "description": "A thread_checkpoints table (tenant_id, story_id, seq, commit_sha, tree_sha, parent_checkpoint_id, kind checkpoint|base_update, claim_epoch, dispatch_id, merge_commit_sha, inserted_at) exists with RLS enabled, unique (story_id, commit_sha) and unique (story_id, seq)."
+      "description": "A thread_checkpoints table (tenant_id, story_id, seq, commit_sha, tree_sha, parent_checkpoint_id, kind checkpoint|base_update, claim_epoch, dispatch_id, merge_commit_sha, gate_evidence map, inserted_at) exists with RLS enabled, unique (story_id, commit_sha) and unique (story_id, seq)."
     },
     {
       "id": "AC-45.1.2",
@@ -24,7 +24,7 @@
     },
     {
       "id": "AC-45.1.3",
-      "description": "Recording a checkpoint is refused with 409 stale_claim_epoch unless the caller is the story's current claimant and names the story's current claim_epoch; the checkpoint's seq is assigned server-side."
+      "description": "Recording a checkpoint is refused with 409 stale_claim_epoch unless the caller is the story's current claimant and names the story's current claim_epoch; the checkpoint's seq is assigned server-side; resending a commit_sha already recorded returns the recorded checkpoint with 200 and writes nothing."
     },
     {
       "id": "AC-45.1.4",
@@ -36,7 +36,7 @@
     },
     {
       "id": "AC-45.1.6",
-      "description": "A finding entry must reference a checkpoint of the same story; a fix entry must name at least one finding of the same story; a finding recorded after the first completed review round without introduced_by is 422."
+      "description": "A finding entry must reference a checkpoint of the same story and carry a severity of critical, high, medium or low; a fix entry must reference the fix checkpoint (checkpoint_id) and at least one finding of the same story; after the story's first completed review round a finding must carry introduced_by, either a checkpoint id of the same story or the literal none."
     },
     {
       "id": "AC-45.1.7",
@@ -49,6 +49,14 @@
     {
       "id": "AC-45.1.9",
       "description": "Tenant B cannot read or write tenant A's thread."
+    },
+    {
+      "id": "AC-45.1.10",
+      "description": "Entries are authorized by kind: finding and verdict are refused with 409 self_review_blocked when the author is the story's assigned agent or its lineage is on the implementer's dispatch chain; fix is accepted only from the current claimant presenting the current claim_epoch (409 not_claimant or stale_claim_epoch otherwise); message and review_requested are open to any principal of the tenant."
+    },
+    {
+      "id": "AC-45.1.11",
+      "description": "An entry whose body matches the secret denylist (Loopctl.Security.SecretDenylist) is refused with 422 secret_blocked and nothing is written."
     }
   ],
   "test_cases": [
@@ -166,8 +174,45 @@
       "expected_results": [
         "404"
       ]
+    },
+    {
+      "id": "TC-45.1.8",
+      "verifies": [
+        "AC-45.1.10"
+      ],
+      "name": "authorization by kind",
+      "type": "integration",
+      "preconditions": [
+        "claimed story"
+      ],
+      "steps": [
+        "claimant writes a finding; non-claimant writes a fix; stale epoch fix"
+      ],
+      "expected_results": [
+        "409 self_review_blocked; 409 not_claimant; 409 stale_claim_epoch"
+      ]
+    },
+    {
+      "id": "TC-45.1.9",
+      "verifies": [
+        "AC-45.1.11"
+      ],
+      "name": "secret in a body",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "entry body containing a GitHub token shape"
+      ],
+      "expected_results": [
+        "422 secret_blocked"
+      ]
     }
   ],
-  "technical_notes": "Never add tenant_id, story_id, seq or author_principal to a cast list. author_principal is derived from the authenticating key. The route coverage test in mcp-server must see the new routes reached.",
+  "technical_notes": [
+    "Never cast tenant_id, story_id, seq, author_principal or dispatch_id.",
+    "author_principal and the caller's lineage are derived from the authenticating key.",
+    "A round is complete when a non-implementer principal writes a verdict entry; review_records rows are the custody lifecycle's and are not counted.",
+    "The mcp-server route coverage test must see the new routes reached."
+  ],
   "dependencies": []
 }

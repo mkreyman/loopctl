@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.3.1",
-      "description": "A review dispatch kind exists; placing one requires a lineage separate from the implementer's, via the existing self-review rule."
+      "description": "A review dispatch kind exists; it is minted as a sibling of the implementer's dispatch under the orchestrator's root, never on the implementer's chain, and every finding and verdict it writes passes the US-45.1 self-review rule again at write time."
     },
     {
       "id": "AC-45.3.2",
@@ -24,11 +24,11 @@
     },
     {
       "id": "AC-45.3.3",
-      "description": "A completed round is a review_records row; a review dispatch that ends without one uses no round."
+      "description": "A completed round is a verdict entry written by a non-implementer principal on the thread; a review dispatch that ends without one uses no round, and review_records rows from the custody lifecycle are not counted."
     },
     {
       "id": "AC-45.3.4",
-      "description": "A third round is placeable only when a round-2 finding has introduced_by naming a checkpoint that a round-1 fix produced; otherwise the story escalates with review_ceiling at the end of round 2 when material findings remain, and no round 4 is ever placeable."
+      "description": "A third round is placeable only when a round-2 finding's introduced_by names a checkpoint that a round-1 fix entry references; otherwise, when a round-2 finding of severity critical, high or medium remains, the story escalates with review_ceiling at the end of round 2, and no round 4 is ever placeable."
     }
   ],
   "test_cases": [
@@ -76,10 +76,31 @@
       "expected_results": [
         "round 3 placeable only in the first case; round 4 never"
       ]
+    },
+    {
+      "id": "TC-45.3.4",
+      "verifies": [
+        "AC-45.3.2"
+      ],
+      "name": "review payload",
+      "type": "integration",
+      "preconditions": [
+        "thread with a round-1 finding and its fix"
+      ],
+      "steps": [
+        "build the review payload"
+      ],
+      "expected_results": [
+        "story, checkpoint diff ref, reasoning entries, and each fix with the findings it answers"
+      ]
     }
   ],
-  "technical_notes": "Reuse validate_not_self_review/3.",
+  "technical_notes": [
+    "The round count and the ceiling are computed from thread_entries alone.",
+    "Material means severity critical, high or medium."
+  ],
   "dependencies": [
-    "US-45.1"
+    "US-45.1",
+    "US-45.2"
   ]
 }

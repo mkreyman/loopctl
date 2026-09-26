@@ -76,10 +76,30 @@
       "expected_results": [
         "one entry"
       ]
+    },
+    {
+      "id": "TC-45.7.4",
+      "verifies": [
+        "AC-45.7.4"
+      ],
+      "name": "issue link",
+      "type": "integration",
+      "preconditions": [
+        "mocked forge"
+      ],
+      "steps": [
+        "record the first checkpoint of an intake story"
+      ],
+      "expected_results": [
+        "the intake issue receives one comment with the thread URL"
+      ]
     }
   ],
-  "technical_notes": "",
+  "technical_notes": [
+    "The page reuses the WebAuthn credential enrolled at tenant signup."
+  ],
   "dependencies": [
-    "US-45.1"
+    "US-45.1",
+    "US-45.5"
   ]
 }

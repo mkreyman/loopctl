@@ -66,9 +66,45 @@
       "expected_results": [
         "checks run on the SHA"
       ]
+    },
+    {
+      "id": "TC-45.8.3",
+      "verifies": [
+        "AC-45.8.4"
+      ],
+      "name": "thread-aware hooks",
+      "type": "manual",
+      "preconditions": [
+        "infra in thread mode"
+      ],
+      "steps": [
+        "run gate-unmerged-pr, ci-status, wait-for-checks and review-round-counter against a thread"
+      ],
+      "expected_results": [
+        "each reads the thread, none demands a PR"
+      ]
+    },
+    {
+      "id": "TC-45.8.4",
+      "verifies": [
+        "AC-45.8.5"
+      ],
+      "name": "pilot report",
+      "type": "manual",
+      "preconditions": [
+        "20 changes merged"
+      ],
+      "steps": [
+        "measure the four success criteria"
+      ],
+      "expected_results": [
+        "a report on the PRD's criteria, with the decision to widen or stop"
+      ]
     }
   ],
-  "technical_notes": "Enable only after US-45.5 is green on a scratch branch.",
+  "technical_notes": [
+    "Enable only after US-45.5 is green on a scratch branch."
+  ],
   "dependencies": [
     "US-45.5",
     "US-45.6",

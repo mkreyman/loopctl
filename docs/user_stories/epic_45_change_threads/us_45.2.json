@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.2.1",
-      "description": "Runner contract minor bump adds optional checkpoint_report and thread_entry messages; a runner that sends neither gets today's behaviour."
+      "description": "Runner contract minor bump adds optional checkpoint_report and thread_entry messages and adds review to x-connection.dispatchable_kinds; a runner that sends neither message gets today's behaviour."
     },
     {
       "id": "AC-45.2.2",
@@ -81,7 +81,9 @@
       ]
     }
   ],
-  "technical_notes": "Runner adoption happens in mkreyman/loopctl-runner by handoff.",
+  "technical_notes": [
+    "Runner adoption happens in mkreyman/loopctl-runner by handoff."
+  ],
   "dependencies": [
     "US-45.1"
   ]

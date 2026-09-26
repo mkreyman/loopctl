@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.4.1",
-      "description": "An intake source carries a mode, pr or thread, defaulting to pr; existing sources behave exactly as before."
+      "description": "An intake source carries a mode, pr or thread, defaulting to pr; existing sources behave exactly as before; intake_source_update and intake_source_enroll set the mode through their MCP tools."
     },
     {
       "id": "AC-45.4.2",
@@ -28,7 +28,7 @@
     },
     {
       "id": "AC-45.4.4",
-      "description": "The stage machine has a ci to ci base_updated edge; for a thread-mode story pr_open means a checkpoint under review."
+      "description": "The stage machine has a ci to ci base_updated edge taken only for a base_update checkpoint the control plane recorded, whose first parent is the checkpoint the gate last allowed and whose tree is GitHub's clean merge of the base into it. The edge replaces head_sha with the base_update SHA and clears merge_gate_allowed_sha, keeps the story's review verdict and custody binding, and does not send the story to implementing; any other head movement still goes over base_moved."
     },
     {
       "id": "AC-45.4.5",
@@ -98,9 +98,28 @@
       "expected_results": [
         "allowed"
       ]
+    },
+    {
+      "id": "TC-45.4.5",
+      "verifies": [
+        "AC-45.4.4"
+      ],
+      "name": "base_updated keeps review",
+      "type": "integration",
+      "preconditions": [
+        "thread story allowed at checkpoint C"
+      ],
+      "steps": [
+        "record a base_update merge of master into C; re-run the gate"
+      ],
+      "expected_results": [
+        "story stays at ci; allow on the new head without a new review round"
+      ]
     }
   ],
-  "technical_notes": "Largest change in the epic.",
+  "technical_notes": [
+    "Largest change in the epic."
+  ],
   "dependencies": [
     "US-45.1"
   ]
