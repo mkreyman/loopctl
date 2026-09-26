@@ -13,7 +13,11 @@ defmodule Loopctl.RealTmpDir do
 
   @spec path!() :: String.t()
   def path! do
-    {physical, 0} = System.cmd("pwd", ["-P"], cd: System.tmp_dir!())
-    String.trim(physical)
+    dir = System.tmp_dir!()
+    unless File.dir?(dir), do: raise("the tmp dir #{inspect(dir)} does not exist")
+
+    # Not cached: System.tmp_dir!/0 reads TMPDIR on every call, and this must follow it.
+    {physical, 0} = System.cmd("pwd", ["-P"], cd: dir)
+    String.trim_trailing(physical, "\n")
   end
 end
