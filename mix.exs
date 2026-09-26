@@ -167,7 +167,8 @@ defmodule Loopctl.MixProject do
 
       # Testing
       {:mox, "~> 1.2", only: :test},
-      {:lazy_html, ">= 0.1.0", only: :test},
+      # 0.1.13 and later: EEF-CVE-2026-92106 (mutation XSS through unescaped SVG/MathML text).
+      {:lazy_html, ">= 0.1.13", only: :test},
 
       # Code quality
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

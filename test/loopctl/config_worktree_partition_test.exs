@@ -99,7 +99,12 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
 
   describe "linked_worktree_status/2" do
     setup do
-      dir = Path.join(System.tmp_dir!(), "wt_partition_#{System.unique_integer([:positive])}")
+      dir =
+        Path.join(
+          Loopctl.RealTmpDir.path!(),
+          "wt_partition_#{System.unique_integer([:positive])}"
+        )
+
       common = Path.join(dir, "common")
       private = Path.join(dir, "common/worktrees/probe")
       link = Path.join(dir, "link-to-common")
@@ -156,7 +161,10 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
 
     test "yields nothing outside a git repository" do
       dir =
-        Path.join(System.tmp_dir!(), "wt_partition_nogit_#{System.unique_integer([:positive])}")
+        Path.join(
+          Loopctl.RealTmpDir.path!(),
+          "wt_partition_nogit_#{System.unique_integer([:positive])}"
+        )
 
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf!(dir) end)
@@ -200,7 +208,10 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
       # worktree the porcelain cut — which is what this test needs, since the suite itself
       # may be running in the MAIN tree, where derive/1 is nil whatever stderr does.
       dir =
-        Path.join(System.tmp_dir!(), "wt_partition_noisy_#{System.unique_integer([:positive])}")
+        Path.join(
+          Loopctl.RealTmpDir.path!(),
+          "wt_partition_noisy_#{System.unique_integer([:positive])}"
+        )
 
       repo = Path.join(dir, "repo")
       wt = Path.join(dir, "wt")
@@ -293,7 +304,10 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
       cmd = module_attribute!(:rev_parse_cmd)
 
       dir =
-        Path.join(System.tmp_dir!(), "wt_partition_silent_#{System.unique_integer([:positive])}")
+        Path.join(
+          Loopctl.RealTmpDir.path!(),
+          "wt_partition_silent_#{System.unique_integer([:positive])}"
+        )
 
       File.mkdir_p!(dir)
       on_exit(fn -> File.rm_rf!(dir) end)
@@ -334,7 +348,10 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
       # the common git dir plus a `.git` file in the tree, which is a worktree's whole
       # identity, so `git worktree add`'s commit requirement does not apply.
       dir =
-        Path.join(System.tmp_dir!(), "wt_partition_env_#{System.unique_integer([:positive])}")
+        Path.join(
+          Loopctl.RealTmpDir.path!(),
+          "wt_partition_env_#{System.unique_integer([:positive])}"
+        )
 
       repo = Path.join(dir, "repo")
       wt = Path.join(dir, "wt")
@@ -466,7 +483,10 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
     # repository-LOCAL config alone.
     test "a global config that tries to move the worktree does not move derive/1" do
       dir =
-        Path.join(System.tmp_dir!(), "wt_partition_cfg_#{System.unique_integer([:positive])}")
+        Path.join(
+          Loopctl.RealTmpDir.path!(),
+          "wt_partition_cfg_#{System.unique_integer([:positive])}"
+        )
 
       repo = Path.join(dir, "repo")
       elsewhere = Path.join(dir, "elsewhere")

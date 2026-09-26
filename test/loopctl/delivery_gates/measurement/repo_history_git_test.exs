@@ -22,7 +22,7 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryGitTest do
 
   1. **`RepoHistory.scrubbed_git_env/0` on every invocation** — the actual fix, in the module
      under test as well as here, so an inherited `GIT_DIR` cannot retarget anything.
-  2. The fixture is created under `System.tmp_dir!/0`, OUTSIDE the project tree, so a discovery
+  2. The fixture is created under `Loopctl.RealTmpDir.path!/0`, OUTSIDE the project tree, so a discovery
      failure has no repository above it to find and is a loud error rather than somebody's
      branch.
   3. Every command pins `--git-dir` and `--work-tree`.
@@ -41,7 +41,7 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryGitTest do
   defp warning_repo do
     repo =
       Path.join([
-        System.tmp_dir!(),
+        Loopctl.RealTmpDir.path!(),
         "loopctl-git-fixture-#{System.unique_integer([:positive])}"
       ])
 
@@ -179,7 +179,10 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryGitTest do
       # The incident this file is written around: a directory that is not a repository must
       # FAIL here. It only did not because the fixture used to sit inside one.
       outside =
-        Path.join(System.tmp_dir!(), "loopctl-not-a-repo-#{System.unique_integer([:positive])}")
+        Path.join(
+          Loopctl.RealTmpDir.path!(),
+          "loopctl-not-a-repo-#{System.unique_integer([:positive])}"
+        )
 
       File.mkdir_p!(outside)
       on_exit(fn -> File.rm_rf!(outside) end)
