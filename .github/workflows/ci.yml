@@ -51,8 +51,8 @@ env:
   # mix.exs `~> 1.18`); only the OTP line moves forward to a working, current patch.
   OTP_VERSION: "28.5.0.2"
 
-# SELF-HOSTED SPLIT (nuc since 2026-08-07, beelink before it). lint / test /
-# security / dialyzer moved; the rest
+# SELF-HOSTED SPLIT (runners on beelink). lint / test /
+# security / dialyzer / scale-test moved; the rest
 # stay on ubuntu-latest for specific reasons, not by omission. Measured job times
 # (2026-07-30) are recorded per entry, because the whole point of the split is
 # billed minutes and an unmeasured "it is rare" claim is how cost hides:
@@ -60,13 +60,9 @@ env:
 #   pgbouncer-e2e   1.4-2.4 min, EVERY push and PR. Needs pgbouncer in front of
 #                   Postgres; the port topology has to be reworked for a shared
 #                   host DB. Also GATES deploy, so it cannot simply be dropped.
-#   scale-test      3.1-5.1 min, EVERY push and PR -- its `if:` is
-#                   schedule || push || pull_request, i.e. effectively always.
-#                   (An earlier version of this comment called it
-#                   "schedule/dispatch-gated ... rare". That was wrong: it is the
-#                   narrowly-gated scale-NIGHTLY matrix that is rare. The mistake
-#                   understated the recurring cost, which is exactly the number
-#                   this block exists to make visible.)
+#   scale-test      MOVED to beelink 2026-09-26: 3.1-5.1 min on EVERY push and PR
+#                   had spent the account's included minutes. It brings its own
+#                   Postgres service container on a Docker-picked host port.
 #   scale-nightly   ZERO billed hosted minutes: it moved self-hosted (the port is
 #                   DONE -- see the per-matrix-file database note on the job) and
 #                   it no longer runs nightly. ~143 min of wall clock per full
@@ -299,7 +295,8 @@ jobs:
   test:
     name: Test
     runs-on: [self-hosted, beelink]
-    # NO `services:` block on self-hosted. nuc already runs a long-lived
+    # NO `services:` block on a FIXED host port on self-hosted (scale-test's container binds a
+    # loopback port Docker picks, so it cannot collide). nuc already runs a long-lived
     # Postgres 16 bound to 127.0.0.1:5432 — reachable because the job runs ON that
     # host — the same database local `mix test`
     # uses — so a service container declaring 5432:5432 cannot bind and the job
@@ -912,24 +909,32 @@ jobs:
 
   scale-test:
     name: Scale Tests (US-27.1)
-    # Run on push to master and PRs touching scale-related paths, plus nightly
-    # schedule. This ensures the scale suite (which commits real rows and runs
+    # Runs on EVERY push and PR, plus the nightly schedule (the `if:` below). This ensures the scale suite (which commits real rows and runs
     # ANALYZE) is executed in CI and that the DBConnection.OwnershipError or
     # other regressions are caught before they reach production.
-    runs-on: ubuntu-latest
+    # On beelink since 2026-09-26: 3-5 minutes on every push and PR had spent the account's
+    # included GitHub-hosted minutes. It keeps its OWN Postgres service container, on a host
+    # port Docker picks, so its committed corpus, its role bootstrap and its index builds
+    # never touch the CI Postgres the Test job runs against.
+    runs-on: [self-hosted, beelink]
+    timeout-minutes: 30
     if: >
       github.event_name == 'schedule' ||
       github.event_name == 'push' ||
       github.event_name == 'pull_request'
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.2), so
+        # the job never pulls a floating tag from Docker Hub: a present digest is not re-pulled.
+        image: pgvector/pgvector@sha256:fce8fb583b92ef8af5150b373a96415d46a8cd38ba09b38efeea17c8b4c7d782
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: loopctl_test
         ports:
-          - 5432:5432
+          # Loopback only, on a port Docker picks: postgres/postgres must not be offered to the
+          # LAN, and a fixed 5432 would collide with the host's own Postgres.
+          - 127.0.0.1::5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -938,6 +943,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      # The Test job's clean, without its PLT and toolchain-cache notes, which do not apply
+      # here: keep _build and deps warm for the slot's other jobs, drop everything else.
+      - name: Clean the workspace, keeping the compiled tree
+        run: |
+          git clean -ffdx -e /_build -e /deps || {
+            echo "clean failed; wiping the workspace so the next run re-clones"
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
+          }
+          rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
+          git reset --hard HEAD
+
+      - name: Point the suite and psql at this job's Postgres container
+        run: |
+          echo "TEST_DB_PORT=${{ job.services.postgres.ports['5432'] }}" >> "$GITHUB_ENV"
+          echo "PGPORT=${{ job.services.postgres.ports['5432'] }}" >> "$GITHUB_ENV"
 
       - uses: erlef/setup-beam@v1
         with:
@@ -965,18 +988,6 @@ jobs:
               exit 1
             fi
           done
-
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-            _build
-          # Include config/*.exs in the key and NO loose restore-keys — a partial-key
-          # restore would reuse a _build compiled under the old config, keeping a stale
-          # dep beam (phoenix_ecto's Plug.Exception.Postgrex.Error) that collides with our
-          # own defimpl and fails `mix compile --warnings-as-errors`. Matches the other jobs.
-          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -1007,8 +1018,6 @@ jobs:
 
       - name: Setup database
         run: mix ecto.create && mix ecto.migrate
-        env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
       - name: Grant RLS roles access to tables
         run: |
@@ -1019,8 +1028,6 @@ jobs:
 
       - name: Run scale tests (TC-27.1.1 through TC-27.1.4, AC-27.1.7)
         run: SCALE_TESTS=true mix test --only scale test/loopctl/knowledge/scale_seed_test.exs
-        env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
       # US-41.1 AC-41.1.12(i) — the per-dimension ANN plan GATE. It EXPLAINs the real
       # request-path inner ANN (BOTH article search and agent-memory recall — each has
@@ -1041,7 +1048,6 @@ jobs:
           SCALE_TESTS=true mix test --only scale \
             test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
         env:
-          DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
           EMBEDDING_PLAN_GATE_DIMENSIONS: "1536"
 
   pgbouncer-e2e:
@@ -1289,7 +1295,8 @@ jobs:
           - test/loopctl/knowledge/vector_endpoint_e2e_latency_scale_test.exs
           - test/loopctl/knowledge/remediation_matrix_scale_test.exs
           - test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
-    # NO `services:` block on self-hosted. nuc already runs a long-lived Postgres 16
+    # NO `services:` block on a FIXED host port on self-hosted (scale-test's container binds a
+    # loopback port Docker picks, so it cannot collide). nuc already runs a long-lived Postgres 16
     # bound to 127.0.0.1:5432, so a service container declaring 5432:5432 cannot bind and
     # the job dies at "Initialize containers" before its first step. That host instance
     # has pgvector 0.8.2 available, which is what the pgvector/pgvector:pg16 image was
