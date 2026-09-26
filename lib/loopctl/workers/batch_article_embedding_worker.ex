@@ -121,8 +121,8 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     {to_embed, already} =
       articles
       |> Enum.map(fn article ->
-        text = build_embedding_text(article)
-        {article, text, content_hash(text)}
+        text = Embeddings.article_embedding_text(article)
+        {article, text, Embeddings.text_content_hash(text)}
       end)
       |> split_to_embed(tenant_id)
 
@@ -471,19 +471,10 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
   defp whole_hash_matches?(_stored, _content_hash), do: false
 
-  # Shared with every embedding writer: the workers read each other's
-  # `embedding_content_hash` as the no-re-bill guard, so one formula, in one place.
-  defp content_hash(text), do: Embeddings.text_content_hash(text)
-
   defp enqueue_linking(article_id, tenant_id) do
     ArticleLinkingWorker.new(%{article_id: article_id, tenant_id: tenant_id})
     |> Oban.insert()
   end
-
-  # The initial CHARACTER cap, shared verbatim with `ArticleEmbeddingWorker` — both
-  # write `embedding_content_hash` into the same side table and read each other's back
-  # as the no-re-bill guard, so a divergent unit here makes every hash miss.
-  defp build_embedding_text(article), do: Embeddings.article_embedding_text(article)
 
   # Task.yield budget (ms) for a sub-batch provider call — live-tunable via
   # SystemConfig and SCALED by the input count so a ~100-array call gets

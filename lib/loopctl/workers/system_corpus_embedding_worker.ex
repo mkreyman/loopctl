@@ -89,9 +89,9 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
     # the next `embedding_model` edit.
     dim = args["dim"] || Embeddings.resolve_write_dimension(tenant_id)
 
-    case Embeddings.stale_system_articles(tenant_id, dim, limit: batch_size()) do
+    case Embeddings.stale_system_articles_with_hashes(tenant_id, dim, limit: batch_size()) do
       [] -> :ok
-      articles -> materialize(tenant_id, dim, articles)
+      stale -> materialize(tenant_id, dim, stale)
     end
   end
 
@@ -104,11 +104,8 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   # row made from their current text. One whose stored content hash already matches that
   # text (a row written before `source_md5` existed, or an edit that was reverted) is only
   # STAMPED with the version's md5: no provider call. The rest are embedded.
-  defp materialize(tenant_id, dim, articles) do
-    {unchanged, entries} =
-      articles
-      |> Enum.map(fn a -> {a, embedding_text(a)} end)
-      |> split_unchanged(tenant_id, dim)
+  defp materialize(tenant_id, dim, stale) do
+    {unchanged, entries} = split_unchanged(stale)
 
     {:ok, stamped} = Embeddings.stamp_article_sources(tenant_id, unchanged, dim)
 
@@ -119,20 +116,20 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       )
     end
 
-    embed_entries(tenant_id, dim, entries, Enum.map(articles, & &1.id))
+    embed_entries(tenant_id, dim, entries, Enum.map(stale, fn {a, _} -> {a.id, a.text_md5} end))
   end
 
-  # ONE batched hash read for the whole batch (AC-41.1.11: no per-item query). Returns
-  # `{unchanged, entries}`: `unchanged` as `{article, stored_hash}`, the hash compared, which
-  # the stamp re-checks; `entries` as `{article, text}` to embed.
-  defp split_unchanged(entries, tenant_id, dim) do
-    hashes =
-      Embeddings.article_embedded_hashes(tenant_id, Enum.map(entries, fn {a, _} -> a.id end), dim)
+  # The stored hashes arrive with the batch (`stale_system_articles_with_hashes/3`, one
+  # statement: AC-41.1.11, no per-item query). Returns `{unchanged, entries}`: `unchanged`
+  # as `{article, stored_hash}`, the hash compared, which the stamp re-checks; `entries` as
+  # `{article, text}` to embed.
+  defp split_unchanged(stale) do
+    Enum.reduce(stale, {[], []}, fn {article, stored}, {unchanged, to_embed} ->
+      text = Embeddings.article_embedding_text(article)
 
-    Enum.reduce(entries, {[], []}, fn {article, text} = entry, {unchanged, to_embed} ->
-      case unchanged_hash(Map.get(hashes, article.id), text) do
-        nil -> {unchanged, [entry | to_embed]}
-        stored -> {[{article, stored} | unchanged], to_embed}
+      case unchanged_hash(stored, text) do
+        nil -> {unchanged, [{article, text} | to_embed]}
+        hash -> {[{article, hash} | unchanged], to_embed}
       end
     end)
     |> then(fn {unchanged, to_embed} -> {Enum.reverse(unchanged), Enum.reverse(to_embed)} end)
@@ -142,7 +139,7 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   # truncation-marked hash still identifies the FULL text, so an article whose vector is a
   # prefix is UNCHANGED and must not be re-billed.
   defp unchanged_hash(stored, text) when is_binary(stored),
-    do: if(ShrinkLadder.whole_hash(stored) == content_hash(text), do: stored)
+    do: if(ShrinkLadder.whole_hash(stored) == Embeddings.text_content_hash(text), do: stored)
 
   defp unchanged_hash(_stored, _text), do: nil
 
@@ -159,7 +156,7 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
   # one-time recovery it exists to be. Each sub-batch is stored before the next, so an
   # error later in the batch keeps what was already paid for (its hash now matches, so
   # `Embeddings.stale_system_articles/3` skips it on the retry).
-  defp embed_entries(tenant_id, dim, entries, processed_ids) do
+  defp embed_entries(tenant_id, dim, entries, processed_versions) do
     entries
     |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(), fn {_a, text} ->
       text
@@ -171,7 +168,7 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
       end
     end)
     |> case do
-      :ok -> continue(tenant_id, dim, processed_ids)
+      :ok -> continue(tenant_id, dim, processed_versions)
       other -> other
     end
   end
@@ -297,14 +294,13 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
   # Self-continuation: more stale rows means another batch, as a FRESH job (attempt 1).
   # See the `unique:` comment above for why this is an insert and not a snooze.
-  # Continue while a stale article remains that this batch did not just handle, probed
-  # directly (a page of the stale set capped at the batch size would be exactly this batch
-  # again when all of it went stale during the run, and stop with others still waiting).
-  # When the only stale articles left are ones this batch just stored or stamped, they were
-  # edited while it ran; a continuation would handle them in a loop, so stop and let the
-  # read path's next fill start a fresh run, which picks the edit up.
-  defp continue(tenant_id, dim, processed_ids) do
-    if Embeddings.system_corpus_stale?(tenant_id, dim, exclude_ids: processed_ids),
+  # Continue while a stale article remains other than the VERSIONS this batch just handled,
+  # probed directly. An article edited during the run is a new version, so it keeps the run
+  # going and the edit is embedded by this run's continuation, not left for a later search.
+  # What stops it is an article still stale at the very version it just stored or stamped
+  # (its md5 disagreeing between writer and trigger): continuing would repeat that forever.
+  defp continue(tenant_id, dim, processed_versions) do
+    if Embeddings.system_corpus_stale?(tenant_id, dim, exclude_versions: processed_versions),
       do: insert_continuation(tenant_id, dim),
       else: :ok
   end
@@ -357,13 +353,11 @@ defmodule Loopctl.Workers.SystemCorpusEmbeddingWorker do
 
   defp batch_size, do: Knowledge.embedding_batch_max()
 
-  # The same 32,000-CHARACTER first attempt as before, named once (#617) so it cannot
-  # drift from the rung `ShrinkLadder` starts below. Staleness hashes exactly this text
-  # (`Embeddings.article_embedding_text/1`), so the cut must not change silently.
-  defp embedding_text(article), do: Embeddings.article_embedding_text(article)
+  # The text embedded is `Embeddings.article_embedding_text/1` (the 32,000-CHARACTER first
+  # attempt, #617) and its hash `Embeddings.text_content_hash/1`, both shared with every
+  # embedding writer, which read each other's hashes as the no-re-bill guard.
+  defp hash_for(text, false), do: Embeddings.text_content_hash(text)
 
-  defp content_hash(text), do: Embeddings.text_content_hash(text)
-
-  defp hash_for(text, false), do: content_hash(text)
-  defp hash_for(text, true), do: text |> content_hash() |> ShrinkLadder.truncated_hash()
+  defp hash_for(text, true),
+    do: text |> Embeddings.text_content_hash() |> ShrinkLadder.truncated_hash()
 end

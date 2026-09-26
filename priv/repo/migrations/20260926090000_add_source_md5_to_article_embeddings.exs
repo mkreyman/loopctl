@@ -14,12 +14,14 @@ defmodule Loopctl.Repo.Migrations.AddSourceMd5ToArticleEmbeddings do
   they read, and the backfill below fires the trigger rather than repeating the expression.
 
   Backfill, in SQL, so the release does not make corpora read stale: system articles get
-  `text_md5`, and each existing system row gets `source_md5` when EITHER the currency test
-  it replaces passed (the row is no older than its article, which is what "current" meant
-  until now) OR its stored content hash is the sha256 of the article's text as it stands
-  (below the `TextBudget` cap, where the cut is a no-op). A row neither vouches for stays
-  NULL and reads stale; the worker stamps it with no provider call when its hash matches,
-  and re-embeds it when it does not, which is what the old test would also have done.
+  `text_md5`, and each existing system row gets `source_md5` when its content can be
+  vouched for. Below the `TextBudget` cap (where the cut is a no-op) that is its stored
+  content hash, with any truncation marker stripped, equal to the sha256 of the article's
+  text as it stands: authoritative, and it catches a row embedded from the text BEFORE an
+  edit but written after it, which a timestamp calls current. Above the cap SQL cannot
+  reproduce the cut, so the currency test this replaces decides (the row is no older than
+  its article). A row neither vouches for stays NULL and reads stale; the worker stamps it
+  with no provider call when its hash matches, and re-embeds it when it does not.
   """
   use Ecto.Migration
 
@@ -57,14 +59,12 @@ defmodule Loopctl.Repo.Migrations.AddSourceMd5ToArticleEmbeddings do
     UPDATE article_embeddings AS ae SET source_md5 = a.text_md5
     FROM articles AS a
     WHERE ae.article_id = a.id AND a.scope = 'system' AND ae.source_md5 IS NULL
-      AND (
-        ae.updated_at >= a.updated_at
-        OR (
-          char_length(#{@text}) < 32000
-          AND ae.embedding_content_hash =
-                encode(sha256(convert_to(#{@text}, 'UTF8')), 'hex')
-        )
-      )
+      AND CASE
+        WHEN char_length(#{@text}) < 32000 THEN
+          regexp_replace(ae.embedding_content_hash, '^t:', '') =
+            encode(sha256(convert_to(#{@text}, 'UTF8')), 'hex')
+        ELSE ae.updated_at >= a.updated_at
+      END
     """
   end
 

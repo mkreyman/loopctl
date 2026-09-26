@@ -21,7 +21,8 @@ defmodule Loopctl.Embeddings.DisclosureCache do
       whether to queue a materialization.
 
   The answer only changes when the materialization worker runs, a system article is
-  added/published, or a re-embed makes progress — none of which is request-driven.
+  added, published or has its title or body edited, or a re-embed makes progress — none of
+  which is request-driven. An edit is therefore noticed within one TTL per node.
   A short TTL therefore removes the per-request cost while bounding staleness to the
   TTL (a disclosure string, never a result-set predicate).
 

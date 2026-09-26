@@ -38,6 +38,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
   import Ecto.Query
 
+  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings
   alias Loopctl.Knowledge
@@ -873,7 +874,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)
     end
 
-    test "an edit landing during a run stays stale, and the worker does not loop on it" do
+    test "an edit landing during a run is a new version, so the run continues to embed it" do
       tenant = tenant_at(1536)
       article = system_article()
 
@@ -893,13 +894,85 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
                    "dim" => 1536
                  })
 
-        # It was just embedded and still reads stale, so another batch would pay again for
-        # the same result: the worker stops, and the read path's next fill starts afresh.
-        refute_enqueued(worker: SystemCorpusEmbeddingWorker)
+        # The article it just embedded changed while it ran: a new version, so a FRESH job
+        # continues the run and embeds the edit, rather than leaving it for a later search.
+        assert_enqueued(
+          worker: SystemCorpusEmbeddingWorker,
+          args: %{"tenant_id" => tenant.id, "dim" => 1536}
+        )
       end)
 
       assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)
     end
+
+    test "a version still stale after its own run ends the run, never a continuation loop" do
+      tenant = tenant_at(1536)
+      article = system_article()
+
+      # A raw write of text_md5 alone does not fire the trigger, so this version can never
+      # read current: the case the continuation's exclusion of processed versions exists for.
+      AdminRepo.query!("UPDATE articles SET text_md5 = NULL WHERE id = $1", [
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok =
+                 perform_job(SystemCorpusEmbeddingWorker, %{
+                   "tenant_id" => tenant.id,
+                   "dim" => 1536
+                 })
+
+        refute_enqueued(worker: SystemCorpusEmbeddingWorker)
+      end)
+    end
+
+    test "while another caller holds the gate, a search gives up and an explicit call waits" do
+      tenant = tenant_at(1536)
+      system_article()
+      holder = hold_gate_lock("#{tenant.id}:1536")
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        Embeddings.search_disclosure_meta(tenant.id, 1536)
+        refute_enqueued(worker: SystemCorpusEmbeddingWorker)
+      end)
+
+      waiter =
+        Task.async(fn ->
+          Oban.Testing.with_testing_mode(:manual, fn ->
+            Embeddings.enqueue_system_corpus_materialization(tenant.id)
+          end)
+        end)
+
+      refute Task.yield(waiter, 300)
+      send(holder, :release)
+      assert {:ok, %Oban.Job{}} = Task.await(waiter)
+    end
+  end
+
+  # Takes the gate's advisory lock on a connection of its own and holds it until told to
+  # release. The key and namespace mirror `Embeddings.take_gate_lock/2`.
+  defp hold_gate_lock(key) do
+    test = self()
+
+    holder =
+      spawn(fn ->
+        :ok = Sandbox.checkout(Loopctl.Repo)
+
+        Loopctl.Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+          :erlang.phash2(:loopctl_system_corpus_gate),
+          key
+        ])
+
+        send(test, :gate_held)
+
+        receive do
+          :release -> Sandbox.checkin(Loopctl.Repo)
+        end
+      end)
+
+    assert_receive :gate_held, 5_000
+    on_exit(fn -> send(holder, :release) end)
+    holder
   end
 
   # ---------------------------------------------------------------------------

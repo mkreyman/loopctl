@@ -1474,17 +1474,62 @@ defmodule Loopctl.Embeddings do
   end
 
   @doc """
+  `stale_system_articles/3` with each article's stored `embedding_content_hash` at
+  `dimension` (nil when it has no row), read in the same statement, for the worker's
+  stamp-or-embed decision.
+  """
+  @spec stale_system_articles_with_hashes(Ecto.UUID.t(), pos_integer(), keyword()) ::
+          [{Article.t(), String.t() | nil}]
+  def stale_system_articles_with_hashes(tenant_id, dimension, opts \\ [])
+      when is_binary(tenant_id) and is_integer(dimension) do
+    limit = Keyword.get(opts, :limit, @default_batch_size)
+
+    AdminRepo.all(
+      from(a in stale_system_articles_query(tenant_id, dimension),
+        left_join: ae in ArticleEmbedding,
+        on: ae.article_id == a.id and ae.tenant_id == ^tenant_id and ae.dim == ^dimension,
+        order_by: a.id,
+        limit: ^limit,
+        select:
+          {struct(a, [:id, :tenant_id, :scope, :status, :title, :body, :text_md5]),
+           ae.embedding_content_hash}
+      )
+    )
+  end
+
+  @doc """
   Whether any system article has no row made from its current text for this tenant, an
-  `EXISTS` that loads no row. `exclude_ids:` leaves those articles out (the worker asking
-  whether anything remains beyond the batch it just handled).
+  `EXISTS` that loads no row. `exclude_versions:` is a list of `{article_id, text_md5}`
+  the caller just handled: an article is left out only while its text is still that
+  version, so one edited since (during the run) counts as stale and keeps the run going.
   """
   @spec system_corpus_stale?(Ecto.UUID.t(), pos_integer(), keyword()) :: boolean()
   def system_corpus_stale?(tenant_id, dimension, opts \\ []) do
-    exclude = Keyword.get(opts, :exclude_ids, [])
+    query = stale_system_articles_query(tenant_id, dimension)
 
-    AdminRepo.exists?(
-      from(a in stale_system_articles_query(tenant_id, dimension), where: a.id not in ^exclude)
-    )
+    query =
+      case Keyword.get(opts, :exclude_versions, []) do
+        [] ->
+          query
+
+        versions ->
+          ids = Enum.map(versions, fn {id, _} -> Ecto.UUID.dump!(id) end)
+          md5s = Enum.map(versions, fn {_, md5} -> md5 end)
+
+          where(
+            query,
+            [a],
+            fragment(
+              "(?, ?) NOT IN (SELECT * FROM unnest(?::uuid[], ?::text[]))",
+              a.id,
+              a.text_md5,
+              ^ids,
+              ^md5s
+            )
+          )
+      end
+
+    AdminRepo.exists?(query)
   end
 
   defp stale_system_articles_query(tenant_id, dimension),
@@ -1621,7 +1666,7 @@ defmodule Loopctl.Embeddings do
     # content-hash test) returns a 200-shaped `:already_materialized` with no job created.
     # Checked BEFORE the job gates so a done-but-terminal corpus reports done.
     if system_corpus_stale?(tenant_id, dimension),
-      do: gate_materialization(tenant_id, dimension, force?),
+      do: gate_materialization(tenant_id, dimension, force?, :wait),
       else: {:ok, :already_materialized}
   end
 
@@ -1639,10 +1684,10 @@ defmodule Loopctl.Embeddings do
   # Lifeline rescues it, `Loopctl.ObanConfig.lifeline_rescue_after_ms/0`); discarded or cancelled
   # is the terminal gate unless forced; anything else, including a run backing off,
   # inserts, which Oban's uniqueness answers as a conflict.
-  defp gate_materialization(tenant_id, dimension, force?) do
+  defp gate_materialization(tenant_id, dimension, force?, lock_mode) do
     {:ok, result} =
       Repo.transaction(fn ->
-        locked? = take_gate_lock("system_corpus:#{tenant_id}:#{dimension}", force?)
+        locked? = take_gate_lock("#{tenant_id}:#{dimension}", lock_mode)
 
         case locked? && latest_system_corpus_run_state(tenant_id, dimension) do
           # Another caller holds the gate right now and is deciding; waiting for it would
@@ -1664,18 +1709,31 @@ defmodule Loopctl.Embeddings do
     result
   end
 
-  # Unforced callers (the read path, an agent POST) TRY the lock and answer in flight when
-  # another caller holds it, never waiting on a search. A forced call (an orchestrator's
-  # deliberate retry) WAITS for it: answering in flight there could be false, since the
-  # holder may have been an unforced call that the terminal gate refused, leaving nothing
-  # queued while the operator was told a run was underway.
-  defp take_gate_lock(key, true) do
-    Repo.query!("SELECT pg_advisory_xact_lock(hashtext($1))", [key])
+  # Only the READ PATH tries the lock, answering in flight when another caller holds it:
+  # it must never hold a connection on a search, and a fill that loses the race loses
+  # nothing, since the next fill asks again. Every explicit call (an agent's or an
+  # orchestrator's POST) WAITS for it: answering in flight there could be false, since the
+  # holder may have been a fill that the terminal gate refused, leaving nothing queued while
+  # the caller was told a run was underway. The two-int form under a namespace keeps this
+  # lock class apart from every other advisory lock (the convention in `Loopctl.Memory`).
+  @system_corpus_gate_lock_ns :erlang.phash2(:loopctl_system_corpus_gate)
+
+  defp take_gate_lock(key, :wait) do
+    Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+      @system_corpus_gate_lock_ns,
+      key
+    ])
+
     true
   end
 
-  defp take_gate_lock(key, false) do
-    %{rows: [[locked?]]} = Repo.query!("SELECT pg_try_advisory_xact_lock(hashtext($1))", [key])
+  defp take_gate_lock(key, :try) do
+    %{rows: [[locked?]]} =
+      Repo.query!("SELECT pg_try_advisory_xact_lock($1::int, hashtext($2))", [
+        @system_corpus_gate_lock_ns,
+        key
+      ])
+
     locked?
   end
 
@@ -2144,11 +2202,11 @@ defmodule Loopctl.Embeddings do
   @spec system_corpus_meta(Ecto.UUID.t(), pos_integer() | nil) :: map()
   def system_corpus_meta(tenant_id, dimension \\ nil) when is_binary(tenant_id) do
     dimension = dimension || active_dimension(tenant_id)
-    pending = length(unmaterialized_system_articles(tenant_id, dimension, limit: 1))
+    corpus_meta(unmaterialized_system_articles(tenant_id, dimension, limit: 1) != [], dimension)
+  end
 
-    if pending == 0 do
-      %{system_corpus_recall: "semantic", system_corpus_dimension: dimension}
-    else
+  defp corpus_meta(missing?, dimension) do
+    if missing? do
       %{
         system_corpus_recall: "keyword_only",
         system_corpus_dimension: dimension,
@@ -2158,6 +2216,8 @@ defmodule Loopctl.Embeddings do
             "tenant's own embedding credential; until that materialization runs they are " <>
             "matched by keyword only."
       }
+    else
+      %{system_corpus_recall: "semantic", system_corpus_dimension: dimension}
     end
   end
 
@@ -2177,16 +2237,11 @@ defmodule Loopctl.Embeddings do
   def search_disclosure_meta(tenant_id, dimension)
       when is_binary(tenant_id) and is_integer(dimension) do
     DisclosureCache.fetch({:disclosure, tenant_id, dimension}, fn ->
-      # The staleness probe first: a corpus with every article current has none missing,
-      # so the steady state pays ONE anti-join and the missing probe runs only when needed.
-      stale? = system_corpus_stale?(tenant_id, dimension)
+      # Both probes in ONE statement: is anything stale (the trigger), is anything missing
+      # (the meta).
+      {stale?, missing?} = system_corpus_flags(tenant_id, dimension)
 
-      corpus_meta =
-        if stale?,
-          do: system_corpus_meta(tenant_id, dimension),
-          else: %{system_corpus_recall: "semantic", system_corpus_dimension: dimension}
-
-      meta = Map.merge(corpus_meta, reembed_meta(tenant_id, dimension))
+      meta = Map.merge(corpus_meta(missing?, dimension), reembed_meta(tenant_id, dimension))
 
       # AC-41.1.7's "on demand" read-path materialization trigger lives INSIDE the
       # memoized fill (review): it was previously called on EVERY semantic response,
@@ -2205,12 +2260,24 @@ defmodule Loopctl.Embeddings do
   # vector is of the old text. The enqueue's own first check is that staleness, so a
   # current corpus queues nothing, and a run in progress is a conflict, never a second
   # run. Its failure must not fail the search that noticed: the next fill tries again.
+  defp system_corpus_flags(tenant_id, dimension) do
+    stale = stale_system_articles_query(tenant_id, dimension)
+    missing = system_articles_without_row(tenant_id, dimension, :any)
+
+    AdminRepo.one(
+      from(t in fragment("SELECT 1"),
+        select:
+          {fragment("EXISTS (?)", subquery(stale)), fragment("EXISTS (?)", subquery(missing))}
+      )
+    )
+  end
+
   # Skipped when the search runs inside a caller's `Repo` transaction: the gate's own
   # transaction would join it, holding the advisory lock until the caller commits, and a
   # failure inside it would abort the caller's transaction under a rescue it cannot see.
   # The next fill outside one queues the run.
   defp maybe_trigger_system_corpus(tenant_id, dimension) do
-    unless Repo.in_transaction?(), do: gate_materialization(tenant_id, dimension, false)
+    unless Repo.in_transaction?(), do: gate_materialization(tenant_id, dimension, false, :try)
     :ok
   rescue
     e ->
