@@ -289,6 +289,7 @@ defmodule Loopctl.ThreadsTest do
 
       assert Threads.latest_recorded_checkpoint(other.tenant_id, ctx.story.id) == nil
       assert Threads.get_checkpoint(other.tenant_id, ctx.story.id, Ecto.UUID.generate()) == nil
+      assert Threads.get_checkpoint(ctx.tenant_id, ctx.story.id, "not-a-uuid") == nil
     end
   end
 

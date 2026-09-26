@@ -102,10 +102,11 @@ defmodule LoopctlWeb.MergePreconditionController do
                 "`already_merged` reports a merge GitHub had already performed AND a " <>
                 "recorded allow authorised — one nobody authorised is a `refuse` naming " <>
                 "the sha. `head_moved` sends the story back to `implementing` because the " <>
-                "pull request's head is not the one CI ran on. `base_updated` (thread mode " <>
-                "only) is returned only when following a control-recorded base update " <>
-                "failed to write; a followed one is judged again and its verdict returned. " <>
-                "`unevaluated` (HTTP 503) is " <>
+                "pull request's head is not the one CI ran on (in thread mode, also a " <>
+                "thread branch naming a commit nobody recorded). `base_updated` (thread " <>
+                "mode only): the story stayed at `ci` and its head is now the control-" <>
+                "recorded base update; nothing was allowed, so ask again once CI has run " <>
+                "on that head. `unevaluated` (HTTP 503) is " <>
                 "a transient forge fault: nothing was decided, nothing transitioned, retry."
           },
           reasons: %OpenApiSpex.Schema{
@@ -228,13 +229,17 @@ defmodule LoopctlWeb.MergePreconditionController do
         "story all REFUSE.\n\n" <>
         "THREAD MODE (the story's intake source has `mode: thread`) needs no pull request: " <>
         "the gate judges the story's latest RECORDED checkpoint on the thread branch " <>
-        "`loop/<story_id>`, and adds three refusals — `branch_head_unrecorded` when the " <>
-        "branch head is not that checkpoint, `empty_change` when its tree equals the base " <>
-        "branch's, and `checkpoint_tree_mismatch` when the forge's tree for it is not the one " <>
-        "recorded — plus `no_checkpoint_recorded` for a thread with none. A thread whose " <>
+        "`loop/<story_id>` and refuses `empty_change` (its tree equals the base branch's, or " <>
+        "no file changed), `checkpoint_tree_mismatch` (the forge's tree for it is not the " <>
+        "one recorded), `no_checkpoint_recorded` and `base_update_parents_mismatch` (below). " <>
+        "A branch head that is not the recorded checkpoint is `head_moved` with reason " <>
+        "`branch_head_unrecorded`: back to `implementing`, not escalated. A thread whose " <>
         "latest checkpoint is a control-recorded `base_update` of the checkpoint last " <>
-        "allowed stays at `ci` (`base_updated` edge), keeps its review verdict, and is " <>
-        "judged again at the new head in the same call.\n\n" <>
+        "allowed, with exactly two parents on the forge (that checkpoint, then the base's " <>
+        "current head), answers `base_updated`: it stays at `ci` on the `base_updated` edge, " <>
+        "keeps its review verdict, and the NEXT call judges the new head. Parents that do " <>
+        "not match refuse `base_update_parents_mismatch`. A `base_updated` edge that cannot " <>
+        "be written counts as unevaluated.\n\n" <>
         "A `refuse` decision escalates the story on the `merge_gate` edge before " <>
         "responding, and returns 200: a refusal is an answer, not a request error. An " <>
         "`already_merged` decision reports a pull request GitHub already merged, with its " <>

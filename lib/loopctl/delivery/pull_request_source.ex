@@ -103,6 +103,20 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   @type repo :: String.t()
 
+  @doc """
+  The configured implementation (`config :loopctl, :delivery_pull_request_source`), resolved
+  at call time. The ONE resolver every delivery-loop forge caller uses, so they cannot resolve
+  different forges.
+  """
+  @spec impl() :: module()
+  def impl,
+    do:
+      Application.get_env(
+        :loopctl,
+        :delivery_pull_request_source,
+        Loopctl.Delivery.GitHubPullRequestSource
+      )
+
   @type diff :: {:ok, DiffNames.parsed()} | {:error, term()}
 
   @type pull_request :: %{
@@ -156,13 +170,14 @@ defmodule Loopctl.Delivery.PullRequestSource do
   `base` would show, without a pull request.
 
   - `:merge_base_sha` — the merge base of the two
-  - `:base_tree_sha` — the tree of the commit `base` names NOW, which an `empty_change` is
-    judged against
+  - `:base_head_sha`, `:base_tree_sha` — the commit `base` names NOW and its tree. An
+    `empty_change` is judged against the tree; a base update's second parent must be the head
   - `:diffstat`, `:diff` — the same shapes as on `t:pull_request/0`, over the files the
     comparison lists. A list the forge truncated is `{:error, _}` in `:diff`, never a short one
   """
   @type comparison :: %{
           merge_base_sha: String.t(),
+          base_head_sha: String.t(),
           base_tree_sha: String.t(),
           diffstat: %{files: non_neg_integer(), changed_lines: non_neg_integer()},
           diff: diff()

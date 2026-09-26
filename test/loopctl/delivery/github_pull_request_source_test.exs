@@ -376,7 +376,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
         json(conn, %{
           "merge_base_commit" => %{"sha" => @merge_base},
-          "base_commit" => %{"commit" => %{"tree" => %{"sha" => "basetree"}}},
+          "base_commit" => %{"sha" => "basehead", "commit" => %{"tree" => %{"sha" => "basetree"}}},
           "files" => [
             %{
               "status" => "modified",
@@ -397,6 +397,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
       assert {:ok, cmp} = Source.compare(@repo, "master", @head)
       assert cmp.merge_base_sha == @merge_base
+      assert cmp.base_head_sha == "basehead"
       assert cmp.base_tree_sha == "basetree"
       assert cmp.diffstat == %{files: 2, changed_lines: 4}
 
@@ -408,7 +409,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       stub(fn conn ->
         json(conn, %{
           "merge_base_commit" => %{"sha" => @merge_base},
-          "base_commit" => %{"commit" => %{"tree" => %{"sha" => "basetree"}}},
+          "base_commit" => %{"sha" => "basehead", "commit" => %{"tree" => %{"sha" => "basetree"}}},
           "files" => [%{"status" => "modified", "filename" => "lib/a.ex"}]
         })
       end)
@@ -429,7 +430,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       stub(fn conn ->
         json(conn, %{
           "merge_base_commit" => %{"sha" => @merge_base},
-          "base_commit" => %{"commit" => %{"tree" => %{"sha" => "basetree"}}},
+          "base_commit" => %{"sha" => "basehead", "commit" => %{"tree" => %{"sha" => "basetree"}}},
           "files" => files
         })
       end)

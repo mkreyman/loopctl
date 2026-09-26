@@ -991,6 +991,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     @base_tree String.duplicate("f", 40)
     @allowed String.duplicate("c", 40)
     @checkpoint_id "00000000-0000-4000-8000-000000000045"
+    @base_head String.duplicate("8", 40)
 
     test "allows the recorded checkpoint with no pull request number, naming it" do
       verdict = judge_thread([])
@@ -1003,11 +1004,11 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.head_sha == @head
     end
 
-    test "refuses branch_head_unrecorded while the branch names another commit" do
+    test "a branch naming a commit nobody recorded goes back to implementing, not to a human" do
       other = String.duplicate("9", 40)
       verdict = judge_thread(branch_head_sha: other)
 
-      assert verdict.decision == :refuse
+      assert verdict.decision == :head_moved
       assert {:branch_head_unrecorded, other, @head} in verdict.reasons
     end
 
@@ -1016,6 +1017,13 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
 
       assert verdict.decision == :refuse
       assert {:empty_change, @tree} in verdict.reasons
+    end
+
+    test "refuses empty_change when the comparison lists no changed file" do
+      verdict = judge_thread(diffstat: %{files: 0, changed_lines: 0})
+
+      assert verdict.decision == :refuse
+      assert {:empty_change, :no_changed_files} in verdict.reasons
     end
 
     test "refuses a checkpoint whose forge tree is not the tree recorded" do
@@ -1053,16 +1061,32 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.checkpoint_id == @checkpoint_id
     end
 
-    test "every premise of the base_updated edge is required; otherwise it is head_moved" do
+    test "every LEDGER premise of the base_updated edge is required; otherwise head_moved" do
       for {label, overrides} <- [
             not_a_base_update: [kind: :checkpoint],
             parent_not_allowed: [parent_sha: String.duplicate("9", 40)],
             no_recorded_allow: [recorded_allow_sha: nil],
-            head_not_allowed: [recorded_head_sha: String.duplicate("9", 40)],
-            forge_parent_differs: [first_parent_sha: String.duplicate("9", 40)]
+            head_not_allowed: [recorded_head_sha: String.duplicate("9", 40)]
           ] do
         verdict = judge_thread(Keyword.merge(base_update_facts(), overrides))
         assert verdict.decision == :head_moved, inspect(label)
+      end
+    end
+
+    test "a base update whose forge parents are not exactly [allowed, base head] is refused" do
+      other = String.duplicate("9", 40)
+
+      for parents <- [
+            [@allowed],
+            [@allowed, other],
+            [other, @base_head],
+            [@allowed, @base_head, other]
+          ] do
+        verdict = judge_thread(Keyword.put(base_update_facts(), :parent_shas, parents))
+
+        assert verdict.decision == :refuse, inspect(parents)
+
+        assert {:base_update_parents_mismatch, parents, [@allowed, @base_head]} in verdict.reasons
       end
     end
 
@@ -1085,13 +1109,17 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     }
 
     pr =
-      [files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10}]
+      [
+        files: ["lib/widgets/thing.ex"],
+        diffstat: Keyword.get(overrides, :diffstat, %{files: 1, changed_lines: 10})
+      ]
       |> pull_request()
       |> Map.merge(%{
         branch_head_sha: Keyword.get(overrides, :branch_head_sha, @head),
         head_tree_sha: Keyword.get(overrides, :head_tree_sha, @tree),
+        base_head_sha: @base_head,
         base_tree_sha: Keyword.get(overrides, :base_tree_sha, @base_tree),
-        first_parent_sha: Keyword.get(overrides, :first_parent_sha, @allowed)
+        parent_shas: Keyword.get(overrides, :parent_shas, [@allowed, @base_head])
       })
 
     [
@@ -1113,8 +1141,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       kind: :base_update,
       parent_sha: @allowed,
       recorded_head_sha: @allowed,
-      recorded_allow_sha: @allowed,
-      first_parent_sha: @allowed
+      recorded_allow_sha: @allowed
     ]
   end
 

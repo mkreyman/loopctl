@@ -89,6 +89,8 @@ defmodule Loopctl.Intake do
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.InjectionDetector
+  alias Loopctl.Delivery.StageMachine
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Delivery
   alias Loopctl.Intake.GithubPayload
   alias Loopctl.Intake.Record
@@ -99,6 +101,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.Story
 
   # The largest webhook body the intake route reads. An `issues` payload with a maximal
   # 65,536-character body, escaped, plus its repository and user objects, stays well under
@@ -366,7 +369,9 @@ defmodule Loopctl.Intake do
   Updates an ACTIVE source's mutable fields in ONE transaction (#803 round 2).
 
   `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it),
-  `:base_branch` (NOT nullable) and `:mode` (`"pr"` or `"thread"`, NOT nullable; US-45.4). A key that is ABSENT is left alone, which is why this
+  `:base_branch` (NOT nullable) and `:mode` (`"pr"` or `"thread"`, NOT nullable; US-45.4). A
+  mode CHANGE is `{:error, :stories_in_flight}` while any story of the source's project is
+  past intake and not terminal. A key that is ABSENT is left alone, which is why this
   takes a map rather than two positional arguments: "absent" and "explicitly null" are
   different requests for the epic, and only the map can carry that difference.
 
@@ -379,7 +384,8 @@ defmodule Loopctl.Intake do
   operator reading the chain still sees a repoint as a repoint and a rebase as a rebase.
   """
   @spec update_source(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Source.t()} | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update}
+          {:ok, Source.t()}
+          | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update | :stories_in_flight}
   def update_source(tenant_id, source_id, attrs, opts \\ [])
       when is_binary(tenant_id) and is_binary(source_id) and is_map(attrs) do
     fields = for key <- [:target_epic_id, :base_branch, :mode], Map.has_key?(attrs, key), do: key
@@ -410,9 +416,40 @@ defmodule Loopctl.Intake do
 
     changeset = if mode?, do: cast_mode(changeset, Map.get(attrs, :mode)), else: changeset
 
-    with {:ok, changeset} <- valid(changeset) do
+    with {:ok, changeset} <- valid(changeset),
+         :ok <- mode_change_allowed(tenant_id, source, changeset) do
       write_update(tenant_id, changeset, fields, opts)
     end
+  end
+
+  # A MODE CHANGE UNDER A STORY IN FLIGHT IS REFUSED (US-45.4). The mode decides what the merge
+  # gate reads — a pull request or a recorded checkpoint — so flipping it mid-delivery would
+  # judge a story on a route it was never built for: a pr-mode story has no checkpoints, and a
+  # thread-mode story has no pull request. In flight is every stage past intake (`detected`)
+  # that is not terminal (`StageMachine.terminal_stages/0`). Naming the mode it already has is
+  # not a change and is never refused.
+  #
+  # Read, not locked: a story entering the loop between this read and the commit is judged
+  # under the new mode. Closing that would need a lock every placement takes, for an operator
+  # act that happens once per repository.
+  defp mode_change_allowed(tenant_id, source, changeset) do
+    cond do
+      is_nil(Ecto.Changeset.get_change(changeset, :mode)) -> :ok
+      stories_in_flight?(tenant_id, source.project_id) -> {:error, :stories_in_flight}
+      true -> :ok
+    end
+  end
+
+  defp stories_in_flight?(tenant_id, project_id) do
+    settled = [:detected | StageMachine.terminal_stages()]
+
+    AdminRepo.exists?(
+      from st in StoryStage,
+        join: s in Story,
+        on: s.id == st.story_id and s.tenant_id == st.tenant_id,
+        where: st.tenant_id == ^tenant_id and s.project_id == ^project_id,
+        where: st.stage not in ^settled
+    )
   end
 
   # `empty_values: []` for the reason `cast_base_branch/2` gives: a caller that SENT a value

@@ -1024,6 +1024,12 @@ describe("the descriptions carry what a caller needs instead of the controller",
     }
   });
 
+  test("intake_source_update names the 409 a mode change meets with stories in flight", () => {
+    for (const text of [description("intake_source_update"), row("intake_source_update")]) {
+      assert.match(text, /stories_in_flight/, "it never names the refusal");
+    }
+  });
+
   test("intake_source_revoke is named for what it does, and says the row is kept", () => {
     const text = description("intake_source_revoke");
 

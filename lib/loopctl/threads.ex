@@ -161,20 +161,26 @@ defmodule Loopctl.Threads do
   """
   @spec get_checkpoint(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
   def get_checkpoint(tenant_id, story_id, checkpoint_id) do
+    {:ok, checkpoint} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(checkpoint_query(tenant_id, story_id, checkpoint_id))
+      end)
+
+    checkpoint
+  end
+
+  @doc """
+  The query `get_checkpoint/3` runs, for a caller already inside a tenant transaction
+  (`Loopctl.Delivery.Stages.follow_base_update/4`), which must not open another. A
+  `checkpoint_id` that is not a UUID matches nothing.
+  """
+  @spec checkpoint_query(Ecto.UUID.t(), Ecto.UUID.t(), term()) :: Ecto.Query.t()
+  def checkpoint_query(tenant_id, story_id, checkpoint_id) do
+    query = from c in Checkpoint, where: c.tenant_id == ^tenant_id and c.story_id == ^story_id
+
     case Ecto.UUID.cast(checkpoint_id) do
-      {:ok, id} ->
-        {:ok, checkpoint} =
-          Repo.with_tenant(tenant_id, fn ->
-            Repo.one(
-              from c in Checkpoint,
-                where: c.tenant_id == ^tenant_id and c.story_id == ^story_id and c.id == ^id
-            )
-          end)
-
-        checkpoint
-
-      :error ->
-        nil
+      {:ok, id} -> where(query, [c], c.id == ^id)
+      :error -> where(query, false)
     end
   end
 

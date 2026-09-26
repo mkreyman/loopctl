@@ -54,21 +54,33 @@ defmodule Loopctl.Delivery.MergePrecondition do
   in the same shape, so every gate above runs unchanged and no `pr_number` is needed. Three
   refusals are added, each read from the forge and never from the claimant's report:
 
-  - `{:branch_head_unrecorded, branch_head, checkpoint}` — the thread branch names a commit
-    that is not the latest recorded checkpoint. Git cannot see a claim, so a reclaimed runner
-    can still push; loopctl never adopts a head nobody reported, and the merge executor
-    squashes the RECORDED checkpoint's tree, never the branch head (PRD §4 item 2)
-  - `{:empty_change, tree}` — the checkpoint's tree equals the base's. There is nothing to
-    merge, and an empty change is never read as merged
+  - `{:empty_change, tree | :no_changed_files}` — the checkpoint's tree equals the base's, or
+    the comparison lists no changed file. There is nothing to merge, and an empty change is
+    never read as merged
   - `{:checkpoint_tree_mismatch, forge, recorded}` — the forge's tree for the checkpoint
     commit is not the tree the claimant reported, so the record is not what it describes
+  - `{:base_update_parents_mismatch, parents, expected}` — see below
 
-  A head that moved goes back to `implementing` over `:base_moved`, as in pr mode, with ONE
-  exception: when the latest checkpoint is a `base_update` the control plane recorded, whose
-  first parent is the checkpoint the gate last allowed (in the ledger AND on the forge), the
-  decision is `:base_updated`. `enforce/3` then takes `{:ci, :ci, :base_updated}` through
-  `Loopctl.Delivery.Stages.follow_base_update/4` and judges again at the new head, so the
-  story stays at `ci` with its review verdict and custody binding, and needs no new round.
+  Two things go back to `implementing` over `:base_moved`, as a moved pull request head does,
+  because each is ordinary work rather than something for a human: a latest checkpoint that
+  is not the head the stage row recorded, and `{:branch_head_unrecorded, branch, checkpoint}`
+  — the thread branch names a commit nobody reported (a push that has not been recorded yet,
+  or a reclaimed runner's). loopctl never adopts a head nobody reported, and the merge
+  executor squashes the RECORDED checkpoint's tree, never the branch head (PRD §4 item 2).
+
+  ONE head movement is not `:base_moved`: the latest checkpoint is a `base_update` the
+  control plane recorded (`Loopctl.Threads.record_base_update/3`), its ledger parent is the
+  checkpoint the gate last allowed, and the stage row still stands at that allowed head. The
+  commit must then have EXACTLY two parents as the forge reports them — the allowed checkpoint
+  first and the base branch's current head second — or the gate refuses
+  `:base_update_parents_mismatch`. Its TREE is not recomputed: US-45.5's executor makes the
+  commit with GitHub's own merge of the base into the checkpoint, so the tree is that merge by
+  construction. When all of that holds the decision is `:base_updated`: `enforce/3` takes
+  `{:ci, :ci, :base_updated}` through `Loopctl.Delivery.Stages.follow_base_update/4` and stops.
+  The story stays at `ci` with its review verdict and custody binding; the next call judges
+  the new head as every head is judged. A transition that cannot be written counts toward
+  `max_consecutive_unevaluated`, so it escalates once the bound passes rather than repeating
+  for ever.
 
   A thread-mode allow is recorded naming the checkpoint id and its sha, on the
   `effect_recorded` event of `merge_gate_allowed_sha`.
@@ -205,6 +217,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.Delivery.CheckpointSource
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition.Verdict
+  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.DeliveryGates
@@ -549,13 +562,17 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp consumed_facts(facts) do
     case value(facts, :pull_request) do
       %{merged?: true} -> @merged_facts
-      %{} = pr -> if head_moved?(pr, facts), do: @merged_facts, else: @forge_facts
+      %{} = pr -> if moved?(pr, facts), do: @merged_facts, else: @forge_facts
       _unreadable -> @merged_facts
     end
   end
 
-  defp head_moved?(pr, facts),
-    do: head_moved_reasons(pr, Map.get(facts, :recorded_head_sha)) != []
+  defp moved?(pr, facts), do: moved_reasons(pr, facts) != []
+
+  # Everything that sends a story back to `implementing` rather than being judged: a head that
+  # is not the recorded one, and in thread mode a branch naming a commit nobody reported.
+  defp moved_reasons(pr, facts),
+    do: head_moved_reasons(pr, Map.get(facts, :recorded_head_sha)) ++ branch_reasons(facts, pr)
 
   defp error_reason(facts, key) do
     case Map.get(facts, key) do
@@ -640,34 +657,50 @@ defmodule Loopctl.Delivery.MergePrecondition do
         diffstat: Map.get(pr, :diffstat)
     }
 
-    case head_moved_reasons(pr, Map.get(facts, :recorded_head_sha)) do
-      [] ->
+    case {head_moved_reasons(pr, Map.get(facts, :recorded_head_sha)), moved_reasons(pr, facts)} do
+      {_head, []} ->
         gated(verdict, facts, pr, carried)
 
-      moved ->
-        if base_update_of_allowed?(facts, pr),
-          do: %{verdict | decision: :base_updated, reasons: []},
-          else: %{verdict | decision: :head_moved, reasons: Enum.uniq(moved ++ carried)}
+      {[], moved} ->
+        %{verdict | decision: :head_moved, reasons: Enum.uniq(moved ++ carried)}
+
+      {_head, moved} ->
+        case base_update(facts, pr) do
+          :follow -> %{verdict | decision: :base_updated, reasons: []}
+          {:refuse, reasons} -> refuse(verdict, reasons ++ carried)
+          :none -> %{verdict | decision: :head_moved, reasons: Enum.uniq(moved ++ carried)}
+        end
     end
   end
 
-  # AC-45.4.4: the ONE head movement that is not `:base_moved`. Every clause is required, and
-  # each is read from somewhere the claimant cannot write: the checkpoint's KIND (only
-  # `Loopctl.Threads.record_base_update/3`, a control-plane function, writes `base_update`),
-  # its PARENT in the ledger, the stage row's recorded allow and head, and the commit's first
-  # parent AS THE FORGE REPORTS IT.
-  defp base_update_of_allowed?(facts, pr) do
+  # AC-45.4.4: the ONE head movement that is not `:base_moved`. The ledger premises are read
+  # from where the claimant cannot write: the checkpoint's KIND (only the control-plane
+  # `Loopctl.Threads.record_base_update/3` writes `base_update`), its PARENT in the ledger, and
+  # the stage row's recorded allow and head. When they hold, the commit's parents AS THE FORGE
+  # REPORTS THEM must be exactly the allowed checkpoint and the base's current head; anything
+  # else is a base update that is not what the ledger says it is, and a human looks.
+  defp base_update(facts, pr) do
     allowed = Map.get(facts, :recorded_allow_sha)
 
     case value(facts, :checkpoint) do
-      %{kind: :base_update, parent_sha: parent} ->
-        mode(facts) == :thread and is_binary(allowed) and parent == allowed and
-          Map.get(facts, :recorded_head_sha) == allowed and
-          Map.get(pr, :first_parent_sha) == allowed
+      %{kind: :base_update, parent_sha: ^allowed}
+      when is_binary(allowed) ->
+        if mode(facts) == :thread and Map.get(facts, :recorded_head_sha) == allowed,
+          do: base_update_parents(pr, allowed),
+          else: :none
 
       _other ->
-        false
+        :none
     end
+  end
+
+  defp base_update_parents(pr, allowed) do
+    expected = [allowed, Map.get(pr, :base_head_sha)]
+    parents = Map.get(pr, :parent_shas)
+
+    if is_binary(Map.get(pr, :base_head_sha)) and parents == expected,
+      do: :follow,
+      else: {:refuse, [{:base_update_parents_mismatch, parents, expected}]}
   end
 
   defp gated(verdict, facts, pr, carried) do
@@ -724,27 +757,36 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # AC-45.4.3, and the recorded tree checked against the forge's. See the moduledoc.
   defp thread_reasons(facts, pr) do
     if mode(facts) == :thread do
-      head = Map.get(pr, :head_sha)
       tree = Map.get(pr, :head_tree_sha)
-      recorded_tree = checkpoint_field(facts, :tree_sha)
 
-      branch_head_reasons(Map.get(pr, :branch_head_sha), head) ++
-        tree_reasons(tree, recorded_tree) ++
-        empty_change_reasons(tree, Map.get(pr, :base_tree_sha))
+      tree_reasons(tree, checkpoint_field(facts, :tree_sha)) ++
+        empty_change_reasons(tree, Map.get(pr, :base_tree_sha), Map.get(pr, :diffstat))
     else
       []
     end
   end
 
-  defp branch_head_reasons(head, head), do: []
-  defp branch_head_reasons(branch_head, head), do: [{:branch_head_unrecorded, branch_head, head}]
+  # AC-45.4.3's `branch_head_unrecorded`, routed as a moved head is: back to `implementing`.
+  defp branch_reasons(facts, pr) do
+    head = Map.get(pr, :head_sha)
+
+    case {mode(facts), Map.get(pr, :branch_head_sha)} do
+      {:thread, ^head} -> []
+      {:thread, branch_head} -> [{:branch_head_unrecorded, branch_head, head}]
+      {_mode, _branch_head} -> []
+    end
+  end
 
   defp tree_reasons(tree, tree) when is_binary(tree), do: []
   defp tree_reasons(forge, recorded), do: [{:checkpoint_tree_mismatch, forge, recorded}]
 
-  defp empty_change_reasons(tree, tree) when is_binary(tree), do: [{:empty_change, tree}]
-  defp empty_change_reasons(_tree, base) when is_binary(base), do: []
-  defp empty_change_reasons(_tree, base), do: [{:base_tree_unreadable, shape(base)}]
+  # Two ways a change is empty: its tree IS the base's, or the comparison lists no file.
+  defp empty_change_reasons(tree, tree, _diffstat) when is_binary(tree),
+    do: [{:empty_change, tree}]
+
+  defp empty_change_reasons(_tree, _base, %{files: 0}), do: [{:empty_change, :no_changed_files}]
+  defp empty_change_reasons(_tree, base, _diffstat) when is_binary(base), do: []
+  defp empty_change_reasons(_tree, base, _diffstat), do: [{:base_tree_unreadable, shape(base)}]
 
   defp mode(facts), do: Map.get(facts, :mode, :pr)
 
@@ -1000,8 +1042,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # -- gathering the facts ---------------------------------------------------------------
 
   defp gather(story, stage, opts) do
-    source = Intake.source_for_project(story.tenant_id, story.project_id)
-    repo = with {:ok, source} <- source, do: {:ok, source.repo_full_name}
+    source = source_for_story(story)
+    repo = repo_of(source)
     mode = source_mode(source)
 
     {pr_number, checkpoint, pull_request} =
@@ -1021,8 +1063,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # two calls were identical anyway (the adapter reports a merged pull request's merge
       # base as its head), so they were round trips whose results were discarded and whose
       # failure could mask the decision they were not part of.
-      head_files: repo_files(repo, pull_request, :head_sha, stage.head_sha),
-      base_files: repo_files(repo, pull_request, :merge_base_sha, stage.head_sha),
+      head_files: repo_files(repo, pull_request, :head_sha, {stage.head_sha, mode}),
+      base_files: repo_files(repo, pull_request, :merge_base_sha, {stage.head_sha, mode}),
       triggers: DeliveryGates.load_triggers(),
       # Resolved HERE, with the other configured facts, so `judge/1` stays the pure function
       # its moduledoc says it is and a test can name a different list without touching
@@ -1067,7 +1109,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   end
 
   # The latest RECORDED checkpoint, never the branch head (PRD §4 item 2), with the commit of
-  # the checkpoint it was recorded on top of — which `base_update_of_allowed?/2` compares with
+  # the checkpoint it was recorded on top of — which `base_update/2` compares with
   # the recorded allow.
   defp thread_facts(story, {:ok, source}, {:ok, repo}) do
     case Threads.latest_recorded_checkpoint(story.tenant_id, story.id) do
@@ -1106,9 +1148,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp repo_files(_repo, {:ok, %{merged?: true}}, _key, _recorded), do: {:error, :not_consumed}
 
-  defp repo_files({:ok, repo}, {:ok, pr}, key, recorded) do
+  defp repo_files({:ok, repo}, {:ok, pr}, key, {recorded, mode}) do
     cond do
-      head_moved_reasons(pr, recorded) != [] -> {:error, :not_consumed}
+      moved?(pr, %{recorded_head_sha: recorded, mode: mode}) -> {:error, :not_consumed}
       is_binary(Map.get(pr, key)) -> source().repo_files(repo, Map.get(pr, key))
       true -> {:error, {:missing_ref, key, shape(Map.get(pr, key))}}
     end
@@ -1132,18 +1174,19 @@ defmodule Loopctl.Delivery.MergePrecondition do
   """
   @spec repo_for_story(map()) :: fact(String.t())
   def repo_for_story(%{tenant_id: tenant_id, project_id: project_id}) do
-    with {:ok, source} <- Intake.source_for_project(tenant_id, project_id) do
-      {:ok, source.repo_full_name}
-    end
+    repo_of(Intake.source_for_project(tenant_id, project_id))
   end
 
-  defp source do
-    Application.get_env(
-      :loopctl,
-      :delivery_pull_request_source,
-      Loopctl.Delivery.GitHubPullRequestSource
-    )
-  end
+  # ONE derivation of the repository from a resolved source, shared by `repo_for_story/1` and
+  # `gather/3` — which needs the source itself too, for its mode and base branch, and so reads
+  # it once rather than twice.
+  defp source_for_story(%{tenant_id: tenant_id, project_id: project_id}),
+    do: Intake.source_for_project(tenant_id, project_id)
+
+  defp repo_of({:ok, source}), do: {:ok, source.repo_full_name}
+  defp repo_of(error), do: error
+
+  defp source, do: PullRequestSource.impl()
 
   # -- the one write ---------------------------------------------------------------------
 
@@ -1175,30 +1218,26 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  # THREAD mode: take `{:ci, :ci, :base_updated}` and judge AGAIN at the new head, once. The
-  # re-run's verdict is the answer — typically an allow on the base update with no new review
-  # round. `Stages.follow_base_update/4` re-checks the edge's whole premise under the row's
-  # lock, so a verdict computed a moment earlier cannot take it on stale facts. A second
-  # `:base_updated` from the re-run would mean the head moved again in between; it is refused
-  # rather than followed, which bounds the recursion.
+  # THREAD mode: take `{:ci, :ci, :base_updated}` and STOP. The new head has had no CI run,
+  # so it is judged by the NEXT call like every other head, never in this one.
+  # `Stages.follow_base_update/4` re-checks the edge's ledger premises under the row's lock.
+  # A transition that cannot be written is an unevaluated result: it counts toward the same
+  # bound, so it escalates rather than repeating for ever.
   defp act(tenant_id, story_id, %Verdict{decision: :base_updated} = verdict, opts) do
-    if Keyword.get(opts, :base_update_followed, false) do
-      act(tenant_id, story_id, refuse(verdict, [:base_update_repeated]), opts)
-    else
-      follow_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+    follow_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
 
-      case Stages.follow_base_update(tenant_id, story_id, verdict.checkpoint_id, follow_opts) do
-        {:ok, _row} ->
-          rerun(tenant_id, story_id, Keyword.put(opts, :base_update_followed, true), verdict)
+    case Stages.follow_base_update(tenant_id, story_id, verdict.checkpoint_id, follow_opts) do
+      {:ok, _row} ->
+        verdict
 
-        {:error, reason} ->
-          Logger.warning(
-            "merge_gate base_updated not written story_id=#{story_id} " <>
-              "tenant_id=#{tenant_id} reason=#{inspect(reason)}"
-          )
+      {:error, reason} ->
+        Logger.warning(
+          "merge_gate base_updated not written story_id=#{story_id} " <>
+            "tenant_id=#{tenant_id} reason=#{inspect(reason)}"
+        )
 
-          %{verdict | reasons: [{:transition_failed, :ci, :base_updated, reason}]}
-      end
+        failed = [{:transition_failed, :ci, :base_updated, reason}]
+        act(tenant_id, story_id, %{verdict | decision: :unevaluated, reasons: failed}, opts)
     end
   end
 
@@ -1208,13 +1247,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp act(tenant_id, story_id, %Verdict{decision: :refuse} = verdict, opts) do
     transition(tenant_id, story_id, verdict, escalation_transition(), opts)
-  end
-
-  defp rerun(tenant_id, story_id, opts, %Verdict{} = previous) do
-    case enforce(tenant_id, story_id, opts) do
-      {:ok, verdict} -> verdict
-      {:error, reason} -> %{previous | reasons: [{:rerun_failed, reason}]}
-    end
   end
 
   # An allow is a RECORDED fact or it is not an allow. Without this the gate's authorisation

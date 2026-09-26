@@ -12,9 +12,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
       verified at, so the change goes back to `implementing`. New commits are ordinary; this
       is not an escalation
     - `:base_updated` — THREAD mode only: the latest checkpoint is a control-recorded
-      `base_update` of the checkpoint the gate last allowed. `enforce/3` takes
-      `{:ci, :ci, :base_updated}` and judges again at the new head, so a caller sees this
-      decision only when that transition could not be written (its reasons say why)
+      `base_update` of the checkpoint the gate last allowed. `enforce/3` has taken
+      `{:ci, :ci, :base_updated}`; nothing is allowed, and the next evaluation judges the new
+      head. A transition that could not be written is `:unevaluated` instead
     - `:unevaluated` — a TRANSIENT forge fault. Nothing was decided and nothing transitions;
       the caller retries. Never an escalation, because one network blip must not park a
       story until a human acts

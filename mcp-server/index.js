@@ -8375,8 +8375,22 @@ const TOOLS = [
       "`human_resolution`, or `missing` — which refuses with `gate_a_inputs_missing`).\n\n" +
       "DECISIONS: `allow` (recorded against the head, the only thing that licenses a merge), " +
       "`refuse` (the story is escalated before this returns), `already_merged`, `head_moved` " +
-      "(back to implementing), `unevaluated` (503 with Retry-After: a transient forge fault; " +
-      "retry after the delay, nothing transitioned).\n\n" +
+      "(back to implementing), `base_updated` (thread mode, below), `unevaluated` (503 with " +
+      "Retry-After: a transient forge fault; retry after the delay, nothing transitioned).\n\n" +
+      "THREAD MODE — the story's intake source has `mode: thread` (set with " +
+      "intake_source_update). There is no pull request: the gate judges the story's latest " +
+      "RECORDED checkpoint on the branch `loop/<story_id>` and `pr_number` is null. It adds " +
+      "refusals `empty_change` (the checkpoint's tree equals the base's, or no file changed), " +
+      "`checkpoint_tree_mismatch` (the forge's tree is not the one the claimant recorded), " +
+      "`no_checkpoint_recorded` and `base_update_parents_mismatch`. A branch head that is not " +
+      "the recorded checkpoint is `head_moved` with reason `branch_head_unrecorded` — back to " +
+      "implementing, not escalated: record the checkpoint first. When the control plane has " +
+      "recorded a base update of the checkpoint last allowed, and the forge shows it with " +
+      "exactly two parents (that checkpoint, then the base's current head), the answer is " +
+      "`base_updated`: the story stays at `ci`, keeps its review verdict, and NOTHING is " +
+      "allowed yet — call again once CI has run on the new head. Other parents refuse " +
+      "`base_update_parents_mismatch`. The answer carries `mode`, `checkpoint_id` and " +
+      "`checkpoint_sha`; an allow is recorded naming the checkpoint.\n\n" +
       "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
       "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
       "else LOOPCTL_API_KEY. 403 `custody_tier_required` on a tenant without a human anchor, " +
@@ -8611,7 +8625,10 @@ const TOOLS = [
       "SEND `target_epic_id: null` TO MEAN 'I AM NOT CHANGING THIS' — an explicit null is the " +
       "only way to CLEAR the epic, and clearing it returns the source to escalating every " +
       "report to a human instead of filing a story. Leave the field out instead. " +
-      "`base_branch` and `mode` have no cleared state at all, so a null there is refused.\n\n" +
+      "`base_branch` and `mode` have no cleared state at all, so a null there is refused. " +
+      "CHANGING `mode` is refused 409 `stories_in_flight` while any story of the source's " +
+      "project is in the delivery loop (past intake and not terminal): the mode decides what " +
+      "that story's merge gate reads.\n\n" +
       "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
       "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
       "call; this is what corrects one that was not — a source enrolled before the parameter " +

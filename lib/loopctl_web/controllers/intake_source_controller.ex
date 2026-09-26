@@ -114,7 +114,7 @@ defmodule LoopctlWeb.IntakeSourceController do
              description:
                "Optional. `pr` (the default when omitted) or `thread`. A `thread` source's " <>
                  "merge gate evaluates the story's latest recorded checkpoint instead of a " <>
-                 "pull request, and refuses `branch_head_unrecorded` and `empty_change`. NOT " <>
+                 "pull request (see `POST /stories/:id/merge-precondition`). NOT " <>
                  "nullable: an explicit null or any other value is a 422."
            },
            target_epic_id: %Schema{
@@ -226,8 +226,10 @@ defmodule LoopctlWeb.IntakeSourceController do
              description:
                "Optional; omitted leaves it as it is. `pr` or `thread`. A `thread` source's " <>
                  "merge gate evaluates the story's latest recorded checkpoint instead of a " <>
-                 "pull request, and refuses `branch_head_unrecorded` and `empty_change`. NOT " <>
-                 "nullable: an explicit null or any other value is a 422."
+                 "pull request (see `POST /stories/:id/merge-precondition`). NOT " <>
+                 "nullable: an explicit null or any other value is a 422. A CHANGE is " <>
+                 "409 `stories_in_flight` while any story of this source's project is past " <>
+                 "intake and not terminal, because the mode decides what its merge gate reads."
            },
            target_epic_id: %Schema{
              type: :string,
@@ -262,6 +264,10 @@ defmodule LoopctlWeb.IntakeSourceController do
          %Schema{type: :object, properties: %{source: @source_schema}}},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"`stories_in_flight`: a mode change while a story of this source's project is past " <>
+           "intake and not terminal. Nothing is changed, the other fields included.",
+         "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -340,6 +346,20 @@ defmodule LoopctlWeb.IntakeSourceController do
             message:
               "Name at least one of target_epic_id (null clears it), base_branch or mode. A " <>
                 "field you do not send is left exactly as it was."
+          }
+        })
+
+      {:error, :stories_in_flight} ->
+        conn
+        |> put_status(409)
+        |> json(%{
+          error: %{
+            status: 409,
+            code: "stories_in_flight",
+            message:
+              "This source's project has a story in the delivery loop (past intake and not " <>
+                "terminal), and the mode decides what its merge gate reads. Change the mode " <>
+                "once no story is in flight. Nothing was changed."
           }
         })
 

@@ -5,17 +5,23 @@ defmodule Loopctl.Delivery.CheckpointSource do
 
   It returns the same `t:Loopctl.Delivery.PullRequestSource.pull_request/0` map the pull
   request path does, so Gate B, the hard bound, custody and the head comparison run over it
-  unchanged, plus four thread facts the gate adds refusals for:
+  unchanged, plus the thread facts the gate judges:
 
-  - `:branch_head_sha` — the commit the thread branch `loop/<story_id>` names now. The gate
-    refuses `branch_head_unrecorded` while it is not the checkpoint: git cannot see a claim,
-    so a reclaimed runner can still push, and loopctl never adopts a head nobody reported
+  - `:branch_head_sha` — the commit the thread branch `loop/<story_id>` names now. While it
+    is not the checkpoint the gate answers `branch_head_unrecorded` and sends the story back
+    to `implementing`: git cannot see a claim, so a reclaimed runner can still push, and
+    loopctl never adopts a head nobody reported
   - `:head_tree_sha` — the checkpoint commit's tree AS THE FORGE READS IT. The recorded
     `tree_sha` is the claimant's report; a disagreement is refused rather than believed
-  - `:base_tree_sha` — the base branch's tree now. Equal to the checkpoint's, the change is
-    `empty_change`: there is nothing to merge, and that is never read as merged
-  - `:first_parent_sha` — the checkpoint commit's first parent, which a `base_update`
-    checkpoint must have as the checkpoint the gate last allowed
+  - `:base_head_sha`, `:base_tree_sha` — the base branch's head and tree now. A tree equal to
+    the checkpoint's is `empty_change`: there is nothing to merge, and that is never read as
+    merged
+  - `:parent_shas` — the checkpoint commit's parents in order. A `base_update` checkpoint must
+    have exactly two: the checkpoint the gate last allowed, then the base head
+
+  The three reads are SEQUENTIAL. Each is bounded by the adapter's timeouts, and running them
+  concurrently would save at most two round trips on a call a session makes once per head,
+  at the price of a task per read and a partial-failure path that would need its own tests.
 
   ## Why this is not a second implementation of the behaviour
 
@@ -31,13 +37,16 @@ defmodule Loopctl.Delivery.CheckpointSource do
   pull request that could not be read is; `MergePrecondition.transient?/1` decides whether
   that is a retry or an escalation. There is no partial answer that can reach an allow.
 
-  ## A checkpoint the executor already merged
+  ## A checkpoint the executor may have merged
 
-  A `merge_commit_sha` on the checkpoint (US-45.5 writes it) is a merge that happened. It is
-  answered without reading anything, as the pull request adapter answers a merged pull
-  request: the gate's question is then whether a recorded allow authorised it.
+  A `merge_commit_sha` on the checkpoint is NOT proof of a merge: the executor (US-45.5)
+  records it BEFORE its compare-and-swap ref update, which can fail. So it is answered as
+  merged only when the forge shows that commit reachable from the base branch
+  (`PullRequestSource.contains?/3`), and the gate's question is then whether a recorded allow
+  authorised it. Not reachable, it is judged as an open checkpoint, never as already merged.
   """
 
+  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Threads.Checkpoint
 
   @doc """
@@ -52,21 +61,31 @@ defmodule Loopctl.Delivery.CheckpointSource do
   """
   @spec pull_request(String.t(), String.t(), Ecto.UUID.t(), Checkpoint.t()) ::
           {:ok, map()} | {:error, term()}
-  def pull_request(_repo, _base_branch, _story_id, %Checkpoint{merge_commit_sha: merged} = cp)
+  def pull_request(repo, base_branch, story_id, %Checkpoint{merge_commit_sha: merged} = cp)
       when is_binary(merged) do
-    {:ok,
-     %{
-       state: "closed",
-       merged?: true,
-       merge_sha: merged,
-       head_sha: cp.commit_sha,
-       merge_base_sha: cp.commit_sha,
-       diffstat: %{files: 0, changed_lines: 0},
-       diff: {:ok, %{files: [], renames: []}}
-     }}
+    case source().contains?(repo, merged, base_branch) do
+      {:ok, true} -> {:ok, merged_facts(cp, merged)}
+      {:ok, false} -> open_facts(repo, base_branch, story_id, cp)
+      {:error, _reason} = error -> error
+    end
   end
 
-  def pull_request(repo, base_branch, story_id, %Checkpoint{} = checkpoint) do
+  def pull_request(repo, base_branch, story_id, %Checkpoint{} = checkpoint),
+    do: open_facts(repo, base_branch, story_id, checkpoint)
+
+  defp merged_facts(checkpoint, merged) do
+    %{
+      state: "closed",
+      merged?: true,
+      merge_sha: merged,
+      head_sha: checkpoint.commit_sha,
+      merge_base_sha: checkpoint.commit_sha,
+      diffstat: %{files: 0, changed_lines: 0},
+      diff: {:ok, %{files: [], renames: []}}
+    }
+  end
+
+  defp open_facts(repo, base_branch, story_id, %Checkpoint{} = checkpoint) do
     sha = checkpoint.commit_sha
 
     with {:ok, branch_head} <- source().branch_head(repo, thread_branch(story_id)),
@@ -83,17 +102,12 @@ defmodule Loopctl.Delivery.CheckpointSource do
          diff: comparison.diff,
          branch_head_sha: branch_head,
          head_tree_sha: commit.tree_sha,
+         base_head_sha: comparison.base_head_sha,
          base_tree_sha: comparison.base_tree_sha,
-         first_parent_sha: List.first(commit.parent_shas)
+         parent_shas: commit.parent_shas
        }}
     end
   end
 
-  defp source do
-    Application.get_env(
-      :loopctl,
-      :delivery_pull_request_source,
-      Loopctl.Delivery.GitHubPullRequestSource
-    )
-  end
+  defp source, do: PullRequestSource.impl()
 end

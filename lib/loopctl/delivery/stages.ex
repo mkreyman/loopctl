@@ -146,6 +146,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Runner
+  alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.WorkBreakdown.Story
 
@@ -455,6 +456,12 @@ defmodule Loopctl.Delivery.Stages do
     head is ordinary work and goes over `:base_moved`
   - `:stale_claim_epoch`, `:not_found`, `:busy` — as for `advance/4`
 
+  The LEDGER is what this checks. The commit's parents as the forge reports them — exactly the
+  allowed checkpoint and the base head — are checked by the merge gate before it asks for this
+  edge (`Loopctl.Delivery.MergePrecondition`), and its tree is GitHub's merge of the base into
+  the checkpoint by construction (US-45.5's executor makes it through GitHub's merge API), so
+  neither is recomputed here.
+
   A replay after the edge committed finds the allow cleared and answers
   `:no_recorded_allow`; the caller reads `get/2`, where `head_sha` already names the update.
 
@@ -520,18 +527,8 @@ defmodule Loopctl.Delivery.Stages do
   defp of_allowed?(%Checkpoint{commit_sha: sha}, %StoryStage{} = row),
     do: row.merge_gate_allowed_sha == sha and row.head_sha == sha
 
-  defp story_checkpoint(tenant_id, story_id, checkpoint_id) do
-    case Ecto.UUID.cast(checkpoint_id) do
-      {:ok, id} ->
-        Repo.one(
-          from c in Checkpoint,
-            where: c.tenant_id == ^tenant_id and c.story_id == ^story_id and c.id == ^id
-        )
-
-      :error ->
-        nil
-    end
-  end
+  defp story_checkpoint(tenant_id, story_id, checkpoint_id),
+    do: Repo.one(Threads.checkpoint_query(tenant_id, story_id, checkpoint_id))
 
   @doc """
   Every refusal `advance/4` decides BEFORE it opens a transaction, asked WITHOUT advancing

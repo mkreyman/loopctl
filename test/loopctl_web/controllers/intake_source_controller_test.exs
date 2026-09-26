@@ -516,6 +516,80 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       assert AdminRepo.get!(Source, source.id).mode == :pr
     end
 
+    test "a mode CHANGE under a story in flight is 409 stories_in_flight; a settled one is not",
+         %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      story =
+        fixture(:story, %{tenant_id: ctx.tenant.id, epic_id: epic.id, project_id: ctx.project.id})
+
+      stage =
+        fixture(:story_stage, %{
+          tenant_id: ctx.tenant.id,
+          story_id: story.id,
+          stage: :ci,
+          repo: AdminRepo
+        })
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "thread"})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "stories_in_flight"
+      assert AdminRepo.get!(Source, source.id).mode == :pr
+
+      # Naming the mode it already has is not a change.
+      conn
+      |> auth(ctx.operator_key)
+      |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "pr"})
+      |> json_response(200)
+
+      # A terminal story is not in flight, and neither is one still at intake.
+      for settled <- [:done, :detected] do
+        {1, _} =
+          from(r in Loopctl.Delivery.StoryStage, where: r.id == ^stage.id)
+          |> AdminRepo.update_all(set: [stage: settled])
+
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "thread"})
+        |> json_response(200)
+
+        {1, _} =
+          from(x in Source, where: x.id == ^source.id) |> AdminRepo.update_all(set: [mode: :pr])
+      end
+    end
+
+    test "a story in flight in ANOTHER project does not block this source's mode", %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      other = fixture(:project, %{tenant_id: ctx.tenant.id})
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: other.id})
+      story = fixture(:story, %{tenant_id: ctx.tenant.id, epic_id: epic.id, project_id: other.id})
+
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant.id,
+        story_id: story.id,
+        stage: :ci,
+        repo: AdminRepo
+      })
+
+      conn
+      |> auth(ctx.operator_key)
+      |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "thread"})
+      |> json_response(200)
+    end
+
     test "another tenant's source keeps its mode (tenant isolation)", %{conn: conn} do
       ctx = operator_ctx()
       other = fixture(:tenant)
