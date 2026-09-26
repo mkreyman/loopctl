@@ -444,7 +444,7 @@ defmodule LoopctlWeb.StoryStatusController do
         {:error, :conflict}
 
       {:error, :dependencies_not_met} ->
-        {:error, :conflict}
+        {:error, :dependencies_not_met}
 
       {:error, :not_found} ->
         {:error, :not_found}

@@ -133,8 +133,6 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       end)
 
       refute story.id in candidate_ids(50)
-      # Counted and logged each pass, so a queue that never drains is not a silent one.
-      assert unboxed(fn -> DispatchDriver.waiting_on_dependencies() end) >= 1
 
       # The prerequisite verified: the story is a candidate again (#887 review round 2).
       verify(blocker)
@@ -804,15 +802,6 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   # `unboxed/1` for the reason `PlacementTest` records: `fixture(:committed_story)` checks out
   # its own unboxed connection, and nesting two `unboxed_run`s on the same repo checks the
   # connection back in at the inner block's end.
-  defp verify(story) do
-    unboxed(fn ->
-      {1, _} =
-        AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
-          set: [verified_status: :verified]
-        )
-    end)
-  end
-
   defp queued_story(ctx), do: ctx |> triaged_story() |> queue()
 
   defp triaged_story(ctx) do
@@ -912,6 +901,15 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   defp leave_channel(channel) do
     Process.unlink(channel.channel_pid)
     leave(channel)
+  end
+
+  defp verify(story) do
+    unboxed(fn ->
+      {1, _} =
+        AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+          set: [verified_status: :verified]
+        )
+    end)
   end
 
   defp candidate_ids(limit) do

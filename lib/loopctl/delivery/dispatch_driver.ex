@@ -135,8 +135,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
     # A story whose dependencies are unmet is NOT a candidate: `Placement` refuses it before it
     # mints, so selected it would be refused on every pass, its `updated_at` frozen at the head
-    # of the oldest-first ranking. The claim's own definition (`Dependencies`), not a copy, and
-    # the count of stories left out is logged each pass (`log_waiting_on_dependencies/0`).
+    # of the oldest-first ranking. The claim's own definition (`Dependencies`), not a copy. A
+    # story left out here is still visible as blocked (`Queries.list_blocked_stories/2`).
     ranked =
       from s in StoryStage,
         join: st in Story,
@@ -303,41 +303,6 @@ defmodule Loopctl.Delivery.DispatchDriver do
   end
 
   @doc """
-  How many `queued`, placeable-status stories are left out of `candidates/1` because a
-  dependency is unmet. Not an error — a story waiting on its prerequisite is working as
-  intended — but a queue that never drains must not look like an empty one, so each pass logs
-  the count when it is not zero.
-  """
-  @spec waiting_on_dependencies() :: non_neg_integer()
-  def waiting_on_dependencies do
-    from(s in StoryStage,
-      join: st in Story,
-      as: :story,
-      on: st.id == s.story_id and st.tenant_id == s.tenant_id,
-      where: s.stage == :queued and st.agent_status in [:pending, :contracted],
-      where:
-        exists(Dependencies.unmet_story_dependencies()) or
-          exists(Dependencies.unmet_epic_dependencies()),
-      select: count(s.story_id)
-    )
-    # Across every tenant, as `candidates/1` reads: the BYPASSRLS repo.
-    |> Loopctl.AdminRepo.one()
-  end
-
-  defp log_waiting_on_dependencies do
-    case waiting_on_dependencies() do
-      0 ->
-        :ok
-
-      count ->
-        Logger.info(
-          "DispatchDriver: #{count} queued stories wait on unverified dependencies " <>
-            "and are not candidates"
-        )
-    end
-  end
-
-  @doc """
   The pass itself, on budgets already decided: what `run/1` does once both gates pass.
 
   Separate from `run/1` for the same reason `normalise_budget/2` is — the gates read
@@ -354,8 +319,6 @@ defmodule Loopctl.Delivery.DispatchDriver do
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    log_waiting_on_dependencies()
-
     {outcomes, _cache} =
       limit
       |> candidates()

@@ -26,6 +26,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.Progress
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.WebhookDeliveryWorker
 
@@ -67,11 +68,14 @@ defmodule Loopctl.BulkOperations do
         # ONE read for the whole batch, under the story locks just taken — the single-story
         # claim's refusal of a held stage (`Progress.claim_story/3`), asked once, not per story.
         held = Stages.held_story_ids(tenant_id, Map.keys(locked_stories))
+        # And ONE read for the dependencies, for the same reason (#890): per story, it would
+        # lengthen how long every lock in the batch is held.
+        blocked = Dependencies.unmet_story_ids(tenant_id, Map.keys(locked_stories))
 
         process_claims(
           sorted_ids,
           locked_stories,
-          held,
+          %{held: held, blocked: blocked},
           agent_id,
           tenant_id,
           actor_id,
@@ -307,7 +311,7 @@ defmodule Loopctl.BulkOperations do
   defp process_claims(
          sorted_ids,
          locked_stories,
-         held,
+         batch_reads,
          agent_id,
          tenant_id,
          actor_id,
@@ -316,7 +320,7 @@ defmodule Loopctl.BulkOperations do
     Enum.map(sorted_ids, fn story_id ->
       case Map.get(locked_stories, story_id) do
         nil -> %{story_id: story_id, status: "error", reason: "Story not found"}
-        story -> process_claim(story, held, agent_id, tenant_id, actor_id, actor_label)
+        story -> process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label)
       end
     end)
   end
@@ -375,8 +379,8 @@ defmodule Loopctl.BulkOperations do
   # Private: Individual Story Processing
   # ===================================================================
 
-  defp process_claim(story, held, agent_id, tenant_id, actor_id, actor_label) do
-    with :ok <- validate_claim_preconditions(story, held),
+  defp process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label) do
+    with :ok <- validate_claim_preconditions(story, batch_reads),
          {:ok, updated} <- apply_claim(story, agent_id) do
       audit_claim(tenant_id, story, updated, actor_id, actor_label)
       emit_claim_event(tenant_id, story, updated, agent_id)
@@ -475,7 +479,8 @@ defmodule Loopctl.BulkOperations do
     end
   end
 
-  defp validate_claim_preconditions(story, held) do
+  # `held` and `blocked` are each ONE read for the whole batch (`bulk_claim/4`).
+  defp validate_claim_preconditions(story, %{held: held, blocked: blocked}) do
     cond do
       story.agent_status != :contracted ->
         {:error, "Story is not in contracted status (current: #{story.agent_status})"}
@@ -483,43 +488,11 @@ defmodule Loopctl.BulkOperations do
       MapSet.member?(held, story.id) ->
         {:error, :story_held}
 
+      MapSet.member?(blocked, story.id) ->
+        {:error, :dependencies_not_met}
+
       true ->
-        check_story_dependencies_satisfied(story)
-    end
-  end
-
-  defp check_story_dependencies_satisfied(story) do
-    unmet_count =
-      from(sd in Loopctl.WorkBreakdown.StoryDependency,
-        join: dep in Story,
-        on: dep.id == sd.depends_on_story_id,
-        where: sd.story_id == ^story.id and dep.verified_status != :verified,
-        select: count(sd.id)
-      )
-      |> AdminRepo.one()
-
-    if unmet_count > 0 do
-      {:error, "Story has #{unmet_count} unverified dependency(ies)"}
-    else
-      check_epic_dependencies_satisfied(story)
-    end
-  end
-
-  defp check_epic_dependencies_satisfied(story) do
-    unmet_count =
-      from(ed in Loopctl.WorkBreakdown.EpicDependency,
-        where: ed.epic_id == ^story.epic_id,
-        join: prereq_story in Story,
-        on: prereq_story.epic_id == ed.depends_on_epic_id,
-        where: prereq_story.verified_status != :verified,
-        select: count(prereq_story.id)
-      )
-      |> AdminRepo.one()
-
-    if unmet_count > 0 do
-      {:error, "Parent epic has #{unmet_count} unverified prerequisite story(ies)"}
-    else
-      :ok
+        :ok
     end
   end
 
@@ -999,6 +972,12 @@ defmodule Loopctl.BulkOperations do
         "pre-existing done work, so mark-complete does not apply"
 
   defp format_reason(:already_verified), do: "story is already verified"
+
+  # Leads with its code, as `:story_held` does, so a bulk caller can branch on it.
+  defp format_reason(:dependencies_not_met),
+    do:
+      "dependencies_not_met: Story has an unverified dependency (its own, or one of its " <>
+        "epic's); GET /api/v1/stories/blocked (MCP list_blocked_stories) names what blocks it"
 
   defp format_reason(:story_held),
     do:

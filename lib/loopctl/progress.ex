@@ -244,6 +244,8 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in contracted state
+  - `{:error, :dependencies_not_met}` if a story it depends on, or one in an epic its epic
+    depends on, is not verified (`check_claim_dependencies/2`)
   - `{:error, :story_held}` if its delivery stage row is at a held stage
     (`Loopctl.Delivery.Stages.held_story_ids/2`): `escalated`, which is claimable again once
     `Loopctl.Delivery.Escalations.resolve/3` sends it to `queued`, or `done` / `failed`,
@@ -4543,11 +4545,13 @@ defmodule Loopctl.Progress do
   that cannot be claimed spends no dispatch.
   """
   @spec check_claim_dependencies(Ecto.UUID.t(), Story.t()) ::
-          {:ok, :deps_satisfied} | {:error, :dependencies_not_met}
+          {:ok, :deps_satisfied} | {:error, :dependencies_not_met | :not_found}
   def check_claim_dependencies(tenant_id, %Story{id: story_id}) do
-    if Dependencies.dependencies_unmet?(tenant_id, story_id),
-      do: {:error, :dependencies_not_met},
-      else: {:ok, :deps_satisfied}
+    case Dependencies.dependency_status(tenant_id, story_id) do
+      :met -> {:ok, :deps_satisfied}
+      :unmet -> {:error, :dependencies_not_met}
+      :not_found -> {:error, :not_found}
+    end
   end
 
   defp validate_unclaim(story, _agent_id) when story.agent_status == :pending do

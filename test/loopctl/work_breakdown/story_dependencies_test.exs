@@ -6,10 +6,12 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
   import Ecto.Query
 
   alias Loopctl.WorkBreakdown.Dependencies
+  alias Loopctl.WorkBreakdown.Queries
+  alias Loopctl.WorkBreakdown.Story
 
-  describe "dependencies_unmet?/2" do
+  describe "dependency_status/2" do
     # #887 review round 2: the one definition the claim and the dispatch driver share.
-    test "an unverified prerequisite is unmet, a verified one is not, and only in its tenant" do
+    test "an unverified prerequisite is unmet, a verified one is met, another tenant is not found" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
@@ -22,17 +24,102 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
           depends_on_story_id: blocker.id
         })
 
-      assert Dependencies.dependencies_unmet?(tenant.id, story.id)
+      assert Dependencies.dependency_status(tenant.id, story.id) == :unmet
 
-      # Tenant isolation: asked as another tenant, the story and its dependency are not there.
-      refute Dependencies.dependencies_unmet?(fixture(:tenant).id, story.id)
+      # Tenant isolation: asked as another tenant the story is not there, and that is its own
+      # answer, never "satisfied".
+      assert Dependencies.dependency_status(fixture(:tenant).id, story.id) == :not_found
 
       Loopctl.AdminRepo.update_all(
-        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^blocker.id),
+        from(s in Story, where: s.id == ^blocker.id),
         set: [verified_status: :verified]
       )
 
-      refute Dependencies.dependencies_unmet?(tenant.id, story.id)
+      assert Dependencies.dependency_status(tenant.id, story.id) == :met
+    end
+  end
+
+  describe "dependency_status/2 and unmet_story_ids/2" do
+    # #890 review round 1: the EPIC half, and the three answers kept apart.
+    test "an epic whose prerequisite epic holds an unverified story is unmet, until it is verified" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      prereq_epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+      prereq = fixture(:story, %{tenant_id: tenant.id, epic_id: prereq_epic.id, number: "1.1"})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "2.1"})
+
+      fixture(:epic_dependency, %{
+        tenant_id: tenant.id,
+        epic_id: epic.id,
+        depends_on_epic_id: prereq_epic.id
+      })
+
+      assert Dependencies.dependency_status(tenant.id, story.id) == :unmet
+
+      assert Dependencies.unmet_story_ids(tenant.id, [story.id, prereq.id]) ==
+               MapSet.new([story.id])
+
+      Loopctl.AdminRepo.update_all(
+        from(s in Story, where: s.id == ^prereq.id),
+        set: [verified_status: :verified]
+      )
+
+      assert Dependencies.dependency_status(tenant.id, story.id) == :met
+      assert Dependencies.unmet_story_ids(tenant.id, [story.id]) == MapSet.new()
+    end
+
+    test "unmet_story_ids/2 reads only its own tenant's stories" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      blocker = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.1"})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "1.2"})
+
+      {:ok, _dep} =
+        Dependencies.create_story_dependency(tenant.id, %{
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+
+      assert Dependencies.unmet_story_ids(tenant.id, [story.id]) == MapSet.new([story.id])
+      assert Dependencies.unmet_story_ids(fixture(:tenant).id, [story.id]) == MapSet.new()
+    end
+
+    test "a story that is not there is :not_found, never :met" do
+      tenant = fixture(:tenant)
+      assert Dependencies.dependency_status(tenant.id, Ecto.UUID.generate()) == :not_found
+    end
+  end
+
+  describe "Queries.list_blocked_stories/2" do
+    # #890 review round 3: a prerequisite that blocks both directly and through its epic is
+    # listed once.
+    test "a prerequisite blocking directly AND through its epic is listed once" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      prereq_epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+      blocker = fixture(:story, %{tenant_id: tenant.id, epic_id: prereq_epic.id, number: "1.1"})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "2.1"})
+
+      {:ok, _dep} =
+        Dependencies.create_story_dependency(tenant.id, %{
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+
+      fixture(:epic_dependency, %{
+        tenant_id: tenant.id,
+        epic_id: epic.id,
+        depends_on_epic_id: prereq_epic.id
+      })
+
+      {:ok, %{data: rows}} = Queries.list_blocked_stories(tenant.id)
+      row = Enum.find(rows, &(&1.story.id == story.id)) || Enum.find(rows, &(&1[:id] == story.id))
+      assert row, "the story is listed as blocked"
+      assert [%{id: id}] = row.blocking_dependencies
+      assert id == blocker.id
     end
   end
 
