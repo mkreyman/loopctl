@@ -57,8 +57,8 @@ defmodule LoopctlWeb.ThreadController do
     responses: %{
       200 => {"The thread", "application/json", %Schema{type: :object}},
       400 =>
-        {"after_seq or limit is not a non-negative integer", "application/json",
-         Schemas.ErrorResponse},
+        {"after_seq is not a non-negative integer, or limit is not between 1 and the cap",
+         "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -165,10 +165,14 @@ defmodule LoopctlWeb.ThreadController do
 
   defp page_opts(params) do
     with {:ok, after_seq} <- int_param(params, "after_seq"),
-         {:ok, limit} <- int_param(params, "limit") do
+         {:ok, limit} <- int_param(params, "limit"),
+         :ok <- positive_limit(limit) do
       {:ok, Enum.reject([after_seq: after_seq, limit: limit], fn {_k, v} -> is_nil(v) end)}
     end
   end
+
+  defp positive_limit(0), do: {:error, :bad_request, "limit must be at least 1"}
+  defp positive_limit(_limit), do: :ok
 
   defp int_param(params, name) do
     case Map.get(params, name) do

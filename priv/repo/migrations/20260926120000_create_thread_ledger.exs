@@ -59,12 +59,18 @@ defmodule Loopctl.Repo.Migrations.CreateThreadLedger do
       add :body, :text, null: false
 
       add :checkpoint_id,
-          references(:thread_checkpoints, type: :binary_id, on_delete: :restrict)
+          # NO ACTION, not RESTRICT: it is checked at the END of the statement, so a tenant
+          # delete that cascades into both tables removes the entries before the check runs.
+          references(:thread_checkpoints, type: :binary_id, on_delete: :nothing)
 
       timestamps(type: :utc_datetime_usec, updated_at: false)
     end
 
     create unique_index(:thread_entries, [:tenant_id, :story_id, :seq])
+
+    # The checkpoint's own entry is read by checkpoint_id on every replay, and the foreign key
+    # is checked on every checkpoint delete; both would otherwise scan the table.
+    create index(:thread_entries, [:checkpoint_id])
 
     # THE IDEMPOTENCY KEY, per author: a retried write from the same principal finds its row,
     # and two principals never collide on a key only one of them chose.

@@ -126,6 +126,22 @@ defmodule Loopctl.ThreadsTest do
 
       assert {:ok, again, :created} = checkpoint(ctx, @sha1, claim_epoch: @epoch + 1)
       assert again.claim_epoch == @epoch + 1 and again.seq == first.seq + 1
+      # A claim's first checkpoint has no parent: it did not build on the ended claim's.
+      assert again.parent_checkpoint_id == nil
+    end
+
+    test "the recorder's resend replays even after its lease lapsed; another agent's is fenced" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+      set_story(ctx, claimed_until: DateTime.add(DateTime.utc_now(), -60))
+
+      assert {:ok, ^cp, :existing} = checkpoint(ctx)
+
+      assert {:error, :not_claimant} =
+               checkpoint(ctx, @sha1,
+                 agent_id: ctx.other.id,
+                 author_principal: "agent:#{ctx.other.id}"
+               )
     end
 
     test "the same commit with another tree or note is a conflict" do
@@ -149,6 +165,8 @@ defmodule Loopctl.ThreadsTest do
       assert {:error, :unprocessable_entity, _} = checkpoint(ctx, @sha1, tree_sha: "abc")
       assert {:error, :unprocessable_entity, msg} = checkpoint(ctx, @sha1, note: "")
       assert msg =~ "note"
+      assert {:error, :unprocessable_entity, msg} = checkpoint(ctx, @sha1, note: "   ")
+      assert msg =~ "non-empty"
 
       too_big = String.duplicate("n", Entry.max_body_bytes() + 1)
       assert {:error, :unprocessable_entity, msg} = checkpoint(ctx, @sha1, note: too_big)
@@ -240,6 +258,27 @@ defmodule Loopctl.ThreadsTest do
                entry(ctx, message("s", "ghp_" <> String.duplicate("A", 36)))
 
       assert {:ok, %{entries: []}} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
+    end
+
+    test "a credential in an idempotency key is refused and reported" do
+      ctx = claimed_story()
+      ref = make_ref()
+      test_pid = self()
+
+      :telemetry.attach(
+        "threads-secret-#{inspect(ref)}",
+        [:loopctl, :threads, :secret_blocked],
+        fn _event, _m, meta, _ -> send(test_pid, {:blocked, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach("threads-secret-#{inspect(ref)}") end)
+      story_id = ctx.story.id
+
+      assert {:error, :unprocessable_entity, %{code: "secret_blocked"}} =
+               entry(ctx, message("ghp_" <> String.duplicate("A", 36)))
+
+      assert_receive {:blocked, %{field: :idempotency_key, story_id: ^story_id}}
     end
 
     test "entries are paged" do

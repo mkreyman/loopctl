@@ -27,12 +27,16 @@ defmodule Loopctl.Threads do
   `Loopctl.Delivery.Stages` does, so a release waits rather than committing between the fence
   check and the insert), then appends to the audit chain in the same transaction. Nothing
   takes those in another order. A read takes neither. A resend is idempotent only when it is
-  the SAME write; a different write reusing a key or a checkpoint is refused. Every body is
-  scanned by `Loopctl.Security.SecretDenylist` first, because an entry is hash-linked into
-  the audit chain and could never be removed.
+  the SAME write; a different write reusing a key or a checkpoint is refused. Every body, note
+  and idempotency key is scanned by `Loopctl.Security.SecretDenylist` first: an entry is
+  served to every role of the tenant and there is no path to edit or remove one. The audit
+  chain records each write's id, seq, kind, author and checkpoint, NOT its body, so the chain
+  proves an entry was written, not what it said.
   """
 
   import Ecto.Query
+
+  require Logger
 
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.Claimant
@@ -104,7 +108,7 @@ defmodule Loopctl.Threads do
     with :ok <- valid_sha(commit_sha, "commit_sha"),
          :ok <- valid_sha(tree_sha, "tree_sha"),
          :ok <- valid_note(note),
-         :ok <- no_secret(note) do
+         :ok <- no_secret(note, :note, tenant_id, story_id) do
       in_story_lock(tenant_id, story_id, fn ->
         checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts)
       end)
@@ -129,7 +133,14 @@ defmodule Loopctl.Threads do
 
     with :ok <- caller_kind(changeset),
          :ok <- reserved_key(changeset),
-         :ok <- no_secret(Ecto.Changeset.get_field(changeset, :body)) do
+         :ok <- no_secret(Ecto.Changeset.get_field(changeset, :body), :body, tenant_id, story_id),
+         :ok <-
+           no_secret(
+             Ecto.Changeset.get_field(changeset, :idempotency_key),
+             :idempotency_key,
+             tenant_id,
+             story_id
+           ) do
       in_story_lock(tenant_id, story_id, fn ->
         entry_locked(tenant_id, story_id, changeset, opts)
       end)
@@ -184,15 +195,36 @@ defmodule Loopctl.Threads do
   # Checkpoints
   # ---------------------------------------------------------------------------
 
+  # A resend from the principal that recorded the checkpoint is answered from the row BEFORE
+  # the fence: the write already happened under a claim that was live, and a lost response
+  # followed by a lapsed lease must not read as "never recorded". It writes nothing. Anyone
+  # else, and every new write, goes through the fence.
   defp checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
+    fence = fn -> claimant(tenant_id, story_id, Keyword.fetch!(opts, :agent_id), epoch) end
 
-    with :ok <- claimant(tenant_id, story_id, Keyword.fetch!(opts, :agent_id), epoch) do
-      case checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch) do
-        nil -> insert_checkpoint(tenant_id, story_id, commit_sha, tree_sha, opts)
-        existing -> replay_checkpoint(existing, tree_sha, Keyword.get(opts, :note))
-      end
+    case checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch) do
+      nil ->
+        with :ok <- fence.(),
+             do: insert_checkpoint(tenant_id, story_id, commit_sha, tree_sha, opts)
+
+      existing ->
+        with :ok <- replay_allowed(existing, Keyword.fetch!(opts, :author_principal), fence),
+             do: replay_checkpoint(existing, tree_sha, Keyword.get(opts, :note))
     end
+  end
+
+  defp replay_allowed(checkpoint, author, fence) do
+    if recorded_by?(checkpoint, author), do: :ok, else: fence.()
+  end
+
+  defp recorded_by?(checkpoint, author) do
+    Repo.exists?(
+      from e in Entry,
+        where:
+          e.checkpoint_id == ^checkpoint.id and e.kind == :checkpoint and
+            e.author_principal == ^author
+    )
   end
 
   defp claimant(tenant_id, story_id, agent_id, epoch) do
@@ -234,6 +266,10 @@ defmodule Loopctl.Threads do
     lineage = Keyword.fetch!(opts, :actor_lineage)
     epoch = Keyword.fetch!(opts, :claim_epoch)
     previous = latest_checkpoint(tenant_id, story_id)
+    # The parent is the previous checkpoint OF THIS CLAIM, the one this claimant built on. A
+    # claim resuming at an earlier commit than the last one recorded would otherwise get a
+    # parent that git says is its descendant; a claim's first checkpoint has none.
+    parent = latest_checkpoint(tenant_id, story_id, epoch)
 
     checkpoint =
       Repo.insert!(%Checkpoint{
@@ -242,7 +278,7 @@ defmodule Loopctl.Threads do
         seq: if(previous, do: previous.seq + 1, else: 1),
         commit_sha: commit_sha,
         tree_sha: tree_sha,
-        parent_checkpoint_id: previous && previous.id,
+        parent_checkpoint_id: parent && parent.id,
         claim_epoch: epoch,
         dispatch_id: List.last(lineage)
       })
@@ -269,13 +305,15 @@ defmodule Loopctl.Threads do
     )
   end
 
-  defp latest_checkpoint(tenant_id, story_id) do
-    Repo.one(
+  defp latest_checkpoint(tenant_id, story_id, epoch \\ :any) do
+    query =
       from c in Checkpoint,
         where: c.tenant_id == ^tenant_id and c.story_id == ^story_id,
         order_by: [desc: c.seq],
         limit: 1
-    )
+
+    query = if epoch == :any, do: query, else: where(query, [c], c.claim_epoch == ^epoch)
+    Repo.one(query)
   end
 
   defp valid_sha(value, field) do
@@ -286,11 +324,18 @@ defmodule Loopctl.Threads do
 
   defp valid_note(nil), do: :ok
 
-  defp valid_note(note) when is_binary(note) and note != "" do
-    if byte_size(note) <= Entry.max_body_bytes(),
-      do: :ok,
-      else:
+  # Whitespace-only is empty, as the changeset's cast treats an entry body.
+  defp valid_note(note) when is_binary(note) do
+    cond do
+      String.trim(note) == "" ->
+        {:error, :unprocessable_entity, "note must be a non-empty string"}
+
+      byte_size(note) > Entry.max_body_bytes() ->
         {:error, :unprocessable_entity, "note must be at most #{Entry.max_body_bytes()} bytes"}
+
+      true ->
+        :ok
+    end
   end
 
   defp valid_note(_note), do: {:error, :unprocessable_entity, "note must be a non-empty string"}
@@ -328,15 +373,29 @@ defmodule Loopctl.Threads do
       else: :ok
   end
 
-  defp no_secret(body) do
-    if SecretDenylist.contains_secret?(body),
-      do:
-        {:error, :unprocessable_entity,
-         %{
-           code: "secret_blocked",
-           message: "the text carries a credential-shaped value and was not recorded"
-         }},
-      else: :ok
+  defp no_secret(value, field, tenant_id, story_id) do
+    if SecretDenylist.contains_secret?(value) do
+      # The same signal the coordination bus emits, so thread leak attempts reach the same
+      # dashboards and alerts. The value itself is never logged.
+      :telemetry.execute([:loopctl, :threads, :secret_blocked], %{count: 1}, %{
+        tenant_id: tenant_id,
+        story_id: story_id,
+        field: field
+      })
+
+      Logger.warning(
+        "thread denylist hit: blocked #{field} carrying a credential shape " <>
+          "(tenant=#{tenant_id} story=#{story_id})"
+      )
+
+      {:error, :unprocessable_entity,
+       %{
+         code: "secret_blocked",
+         message: "#{field} carries a credential-shaped value and was not recorded"
+       }}
+    else
+      :ok
+    end
   end
 
   defp entry_locked(tenant_id, story_id, changeset, opts) do

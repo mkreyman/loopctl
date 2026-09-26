@@ -117,6 +117,11 @@ defmodule LoopctlWeb.ThreadControllerTest do
            |> auth(key)
            |> get(~p"/api/v1/stories/#{story.id}/thread?after_seq=99999999999")
            |> json_response(400)
+
+    assert build_conn()
+           |> auth(key)
+           |> get(~p"/api/v1/stories/#{story.id}/thread?limit=0")
+           |> json_response(400)
   end
 
   test "a key reused for a different entry is 409 idempotency_key_reused", %{conn: conn} do
