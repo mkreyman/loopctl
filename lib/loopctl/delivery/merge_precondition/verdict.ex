@@ -2,7 +2,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
   @moduledoc """
   One merge-precondition evaluation (issue #803, design §5 "Both gates run twice" and §9).
 
-  - `decision` — one of five:
+  - `decision` — one of:
     - `:allow` — and only from `enforce/3`, which records the allow against the head it
       judged. Nothing else licenses a merge
     - `:refuse` — a gate verdict. The story is escalated
@@ -32,6 +32,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
     A verdict is only ever about the diff at THIS head
+  - `mode` — `:pr` or `:thread`, the story's intake source's (US-45.4)
+  - `checkpoint_id`, `checkpoint_sha` — THREAD mode: the recorded checkpoint judged. An allow
+    in thread mode is recorded naming both
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
     request that was merged before this evaluation ran
   - `diffstat` — the forge's own `%{files: n, changed_lines: n}`, never `length(files)`
@@ -66,6 +69,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :proof,
     :retry_after,
     :recorded_head_sha,
+    :checkpoint_id,
+    :checkpoint_sha,
+    mode: :pr,
     custody: nil,
     gate_a_inputs: :missing,
     trio_outputs_ignored: false
@@ -89,6 +95,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           gate_a_inputs: :persisted_triage | :human_resolution | :missing,
           trio_outputs_ignored: boolean(),
           retry_after: pos_integer() | nil,
-          recorded_head_sha: String.t() | nil
+          recorded_head_sha: String.t() | nil,
+          mode: :pr | :thread,
+          checkpoint_id: Ecto.UUID.t() | nil,
+          checkpoint_sha: String.t() | nil
         }
 end

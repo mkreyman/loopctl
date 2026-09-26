@@ -27,6 +27,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition
@@ -432,6 +433,268 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   end
 
   # -- helpers ---------------------------------------------------------------------------
+
+  describe "thread mode (US-45.4)" do
+    @tree String.duplicate("e", 40)
+    @base_tree String.duplicate("f", 40)
+
+    setup ctx do
+      set_mode(ctx, :thread)
+
+      checkpoint =
+        fixture(:thread_checkpoint, %{
+          tenant_id: ctx.tenant_id,
+          story_id: ctx.story_id,
+          seq: 1,
+          commit_sha: @head,
+          tree_sha: @tree
+        })
+
+      %{checkpoint: checkpoint}
+    end
+
+    test "TC-45.4.1 a pr-mode source is untouched: it never reads a checkpoint", ctx do
+      set_mode(ctx, :pr)
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+
+      Mox.stub(MockPullRequestSource, :branch_head, fn _repo, _branch ->
+        flunk("a pr-mode story read the thread branch")
+      end)
+
+      assert {:ok, %Verdict{decision: :allow, mode: :pr, pr_number: 4242}} = evaluate(ctx)
+    end
+
+    test "TC-45.4.2 a thread story at ci allows the recorded checkpoint, and the allow names it",
+         ctx do
+      stub_thread(ctx)
+
+      assert {:ok, %Verdict{decision: :allow} = verdict} = enforce(ctx)
+      assert verdict.mode == :thread
+      assert verdict.pr_number == nil
+      assert verdict.checkpoint_id == ctx.checkpoint.id
+      assert verdict.checkpoint_sha == @head
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert row.merge_gate_allowed_sha == @head
+
+      assert %{"payload" => %{"checkpoint_id" => id, "checkpoint_sha" => @head}} =
+               allow_event_data(ctx)
+
+      assert id == ctx.checkpoint.id
+    end
+
+    test "TC-45.4.3 a branch head nobody reported goes back to implementing, unescalated", ctx do
+      pushed = String.duplicate("9", 40)
+      stub_thread(ctx, branch_head: pushed)
+
+      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
+      assert {:branch_head_unrecorded, pushed, @head} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :implementing
+      assert row.attempts == %{"base_moved" => 1}
+      assert row.escalation_reason == nil
+    end
+
+    test "TC-45.4.3 a checkpoint whose tree is the base's refuses empty_change", ctx do
+      stub_thread(ctx, base_tree: @tree)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:empty_change, @tree} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).escalation_reason =~ "empty_change"
+    end
+
+    test "a thread branch the forge does not have goes back to implementing, branch_missing",
+         ctx do
+      stub_thread(ctx)
+
+      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, _branch ->
+        {:error, {:github_api_error, 404}}
+      end)
+
+      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
+      assert {:branch_missing, @head} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :implementing
+      assert row.escalation_reason == nil
+    end
+
+    test "the gate reads EXACTLY the branch the story's dispatch named", ctx do
+      {_raw_key, runner} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id})
+      # The fixture's unboxed run gives up this process's AdminRepo checkout; take it back.
+      checkout_admin()
+      dispatched = "agent/story-4242-dispatched"
+
+      {:ok, _record} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.insert!(%Loopctl.Runners.DispatchRecord{
+            tenant_id: ctx.tenant_id,
+            runner_id: runner.id,
+            dispatch_id: Ecto.UUID.generate(),
+            story_id: ctx.story_id,
+            claim_epoch: 0,
+            kind: "implement",
+            branch: dispatched,
+            # Released, so the row holds no slot and `runner_dispatches_unreleased_bounded`
+            # has nothing to bound: only its branch matters here.
+            status: "accepted",
+            wall_clock_seconds: 3_600,
+            released_at: DateTime.utc_now()
+          })
+        end)
+
+      stub_thread(ctx)
+
+      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^dispatched -> {:ok, @head} end)
+
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+    end
+
+    test "a recorded checkpoint the forge cannot find goes back to implementing, unescalated",
+         ctx do
+      stub_thread(ctx)
+
+      Mox.stub(MockPullRequestSource, :commit, fn @repo, @head ->
+        {:error, {:github_api_error, 404}}
+      end)
+
+      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
+      assert {:checkpoint_unpushed, @head} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :implementing
+      assert row.escalation_reason == nil
+    end
+
+    test "a branch naming another commit is judged without reading the checkpoint commit",
+         ctx do
+      stub_thread(ctx, branch_head: String.duplicate("9", 40))
+
+      Mox.stub(MockPullRequestSource, :commit, fn _repo, _sha ->
+        flunk("the checkpoint commit was read although the branch already decided")
+      end)
+
+      assert {:ok, %Verdict{decision: :head_moved}} = enforce(ctx)
+    end
+
+    test "a merge_commit_sha the base does not contain is NOT already_merged", ctx do
+      merged = String.duplicate("6", 40)
+      set_merge_commit(ctx, merged)
+      stub_thread(ctx)
+
+      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^merged, "master" -> {:ok, false} end)
+
+      assert {:ok, %Verdict{decision: :allow, merge_sha: nil}} = enforce(ctx)
+    end
+
+    test "a merge_commit_sha the base contains is already_merged under the recorded allow",
+         ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      merged = String.duplicate("6", 40)
+      set_merge_commit(ctx, merged)
+      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^merged, "master" -> {:ok, true} end)
+
+      assert {:ok, %Verdict{decision: :already_merged, merge_sha: ^merged}} = evaluate(ctx)
+    end
+
+    test "any other head movement is still base_moved, back to implementing", ctx do
+      moved = String.duplicate("9", 40)
+
+      fixture(:thread_checkpoint, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        seq: 2,
+        commit_sha: moved,
+        tree_sha: @tree,
+        parent_checkpoint_id: ctx.checkpoint.id
+      })
+
+      stub_thread(ctx, head: moved)
+
+      # A moved head is decided from the checkpoint alone: the file lists are never read.
+      Mox.stub(MockPullRequestSource, :repo_files, fn _repo, _ref ->
+        flunk("a moved head read the repository's file lists")
+      end)
+
+      assert {:ok, %Verdict{decision: :head_moved}} = enforce(ctx)
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :implementing
+      assert row.attempts == %{"base_moved" => 1}
+    end
+  end
+
+  # DIRECTLY, not through `Intake.update_source/4`: this story is already at `ci`, and the API
+  # refuses a mode change under a story in flight (`stories_in_flight`) — the state these tests
+  # need is one the API deliberately cannot produce.
+  defp set_mode(ctx, mode) do
+    {1, _} =
+      from(s in Loopctl.Intake.Source, where: s.project_id == ^ctx.project_id)
+      |> AdminRepo.update_all(set: [mode: mode])
+  end
+
+  # The forge's view of the thread: the branch head, the checkpoint commit and the comparison
+  # of the base with it. Each read asserts the ref it was asked for, so a gate reading the
+  # wrong branch or comparing against the wrong base fails here rather than passing.
+  defp stub_thread(ctx, opts \\ []) do
+    head = Keyword.get(opts, :head, @head)
+    branch = DispatchPayload.story_branch(ctx.tenant_id, AdminRepo.get!(Story, ctx.story_id))
+
+    Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^branch ->
+      {:ok, Keyword.get(opts, :branch_head, head)}
+    end)
+
+    Mox.stub(MockPullRequestSource, :commit, fn @repo, ^head ->
+      {:ok,
+       %{
+         tree_sha: Keyword.get(opts, :tree, @tree),
+         parent_shas: [@base]
+       }}
+    end)
+
+    Mox.stub(MockPullRequestSource, :compare, fn @repo, "master", ^head ->
+      {:ok, comparison(Keyword.get(opts, :base_tree, @base_tree))}
+    end)
+
+    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+  end
+
+  defp comparison(base_tree) do
+    %{
+      merge_base_sha: @base,
+      base_tree_sha: base_tree,
+      diffstat: %{files: 1, changed_lines: 1},
+      diff: {:ok, %{files: ["lib/widgets/thing.ex"], renames: []}}
+    }
+  end
+
+  defp set_merge_commit(ctx, sha) do
+    {:ok, {1, _}} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        from(c in Loopctl.Threads.Checkpoint, where: c.id == ^ctx.checkpoint.id)
+        |> Repo.update_all(set: [merge_commit_sha: sha])
+      end)
+  end
+
+  defp allow_event_data(ctx) do
+    {:ok, data} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        Repo.one(
+          from e in Loopctl.Delivery.StageEvent,
+            where:
+              e.story_id == ^ctx.story_id and e.event == "effect_recorded" and
+                fragment("?->>'effect'", e.data) == "merge_gate_allowed_sha",
+            order_by: [desc: e.inserted_at],
+            limit: 1,
+            select: e.data
+        )
+      end)
+
+    data
+  end
 
   defp evaluate(ctx), do: MergePrecondition.evaluate(ctx.tenant_id, ctx.story_id, opts())
   defp enforce(ctx), do: MergePrecondition.enforce(ctx.tenant_id, ctx.story_id, opts())

@@ -6,6 +6,28 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Intake sources carry a merge mode, and a `thread`-mode story merges from a recorded
+  checkpoint with no pull request (epic 45, US-45.4). Migration `20260926140000` adds
+  `intake_sources.mode`, NOT NULL, default `pr`; no backfill and no manual step, and every
+  existing source behaves exactly as before.** `POST` and `PATCH /api/v1/intake/sources`
+  (and the `intake_source_enroll` / `intake_source_update` MCP tools) take `mode: "pr" |
+  "thread"`, read by presence; null or any other value is 422, and a change is recorded as
+  `intake_source_mode_set` on the audit chain. For a thread-mode story,
+  `POST /stories/:id/merge-precondition` judges the story's latest RECORDED checkpoint on
+  the branch the story was dispatched on (`pr_number` is null) and adds refusals
+  `empty_change` (the checkpoint's tree equals the base branch's, or no file changed),
+  `checkpoint_tree_mismatch` and `no_checkpoint_recorded`. A branch missing on the forge
+  (`branch_missing`), naming a commit nobody reported (`branch_head_unrecorded`), or naming
+  a checkpoint that was never pushed (`checkpoint_unpushed`) is `head_moved`, back to
+  `implementing`. The verdict carries `mode`, `checkpoint_id` and `checkpoint_sha`, and a
+  thread-mode allow is recorded naming the checkpoint id and sha. No stage-machine change;
+  the runner contract is unchanged.
+  Changing a source's mode is 409 `stories_in_flight` while any story of its project is past
+  intake and not done or failed (an escalated story counts), and so is ENROLLING a mode that
+  differs from the project's previous source's, so revoke-and-re-enrol cannot bypass it.
+  For a thread-mode repository the
+  gate's `GITHUB_TOKEN` also reads `git/ref/heads/*` and `git/commits/*` (contents: read,
+  which the tree reads already need).
 - **Runners may report checkpoints and notes on a story's change thread (epic 45, US-45.2,
   runner contract 1.20.0). RE-VENDOR the contract to send them; a runner that does not gets
   today's behaviour.** Two new optional channel messages. `checkpoint` carries `{dispatch_id,

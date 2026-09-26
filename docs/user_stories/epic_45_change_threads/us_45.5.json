@@ -37,6 +37,10 @@
     {
       "id": "AC-45.5.6",
       "description": "The App's credentials are new environment variables documented in deploy/FLY_SECRETS.md; with them unset the worker refuses and escalates rather than merging."
+    },
+    {
+      "id": "AC-45.5.7",
+      "description": "The stage machine has a ci to ci base_updated edge taken only for a base_update checkpoint the control plane recorded, whose first parent is the checkpoint the gate last allowed and whose tree is GitHub's clean merge of the base into it. The edge replaces head_sha with the base_update SHA and clears merge_gate_allowed_sha, keeps the story's review verdict and custody binding, and does not send the story to implementing; any other head movement still goes over base_moved. The edge must not allow a base_update head until US-45.6's CI evidence for that exact SHA is green. (Moved from US-45.4, where it was AC-45.4.4.)"
     }
   ],
   "test_cases": [
@@ -136,6 +140,38 @@
       "expected_results": [
         "escalated with tree_mismatch; no ref update"
       ]
+    },
+    {
+      "id": "TC-45.5.7",
+      "verifies": [
+        "AC-45.5.7"
+      ],
+      "name": "base_updated edge",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "transition ci to ci over base_updated"
+      ],
+      "expected_results": [
+        "allowed"
+      ]
+    },
+    {
+      "id": "TC-45.5.8",
+      "verifies": [
+        "AC-45.5.7"
+      ],
+      "name": "base_updated keeps review",
+      "type": "integration",
+      "preconditions": [
+        "thread story allowed at checkpoint C"
+      ],
+      "steps": [
+        "record a base_update merge of master into C; re-run the gate"
+      ],
+      "expected_results": [
+        "story stays at ci; allow on the new head without a new review round"
+      ]
     }
   ],
   "technical_notes": [
@@ -143,6 +179,7 @@
     "The base_update checkpoint is written by a control-plane function with no HTTP route, never through the claimant-fenced checkpoint endpoint."
   ],
   "dependencies": [
-    "US-45.4"
+    "US-45.4",
+    "US-45.6"
   ]
 }

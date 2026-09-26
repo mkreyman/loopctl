@@ -85,6 +85,18 @@ defmodule Loopctl.ThreadsTest do
       assert cp_id == cp.id
     end
 
+    test "latest_recorded_checkpoint/2 is the newest checkpoint, and nil for another tenant" do
+      ctx = claimed_story()
+      other = claimed_story()
+      assert Threads.latest_recorded_checkpoint(ctx.tenant_id, ctx.story.id) == nil
+
+      {:ok, _first, :created} = checkpoint(ctx, @sha1)
+      {:ok, second, :created} = checkpoint(ctx, @sha2)
+
+      assert Threads.latest_recorded_checkpoint(ctx.tenant_id, ctx.story.id).id == second.id
+      assert Threads.latest_recorded_checkpoint(other.tenant_id, ctx.story.id) == nil
+    end
+
     test "a stale epoch is refused and nothing is written" do
       ctx = claimed_story()
 

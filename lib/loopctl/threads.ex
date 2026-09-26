@@ -143,6 +143,19 @@ defmodule Loopctl.Threads do
   end
 
   @doc """
+  The story's latest recorded checkpoint, or `nil` when it has none — ONE row, by `seq`. What
+  the merge gate judges for a THREAD-mode story (US-45.4): loopctl never adopts a branch head
+  nobody reported, so the latest RECORD is the head. Takes no lock.
+  """
+  @spec latest_recorded_checkpoint(Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
+  def latest_recorded_checkpoint(tenant_id, story_id) do
+    {:ok, checkpoint} =
+      Repo.with_tenant(tenant_id, fn -> latest_checkpoint(tenant_id, story_id) end)
+
+    checkpoint
+  end
+
+  @doc """
   Records a `message` or `review_requested` entry on the story's thread, from any principal
   of the tenant. `attrs` carries `kind`, `idempotency_key`, `body` and an optional
   `checkpoint_id` of this story.

@@ -48,6 +48,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
   alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.WorkBreakdown.Story
 
   @type error ::
@@ -176,6 +177,46 @@ defmodule Loopctl.Delivery.DispatchPayload do
     case Enum.find(candidates, &valid_branch?(&1 <> suffix)) do
       nil -> {:error, {:no_conforming_branch, prefixes}}
       prefix -> {:ok, prefix <> suffix}
+    end
+  end
+
+  @doc """
+  The branch `story` was DISPATCHED on — the name its implement dispatch put on the wire and
+  the ledger pinned (`runner_dispatches.branch`, #846.2), newest dispatch first. Every reader
+  that needs a story's branch reads it here rather than deriving one, because the derivation
+  depends on the prefixes a runner declared on its socket at placement time, which nothing
+  keeps.
+
+  Only a story whose every ledger row predates that column falls back to `branch_for/2`, with
+  no prefixes: the name such a dispatch carried whenever its runner declared none. For one
+  that did, that fallback names a branch the dispatch did not use, and the forge answers it
+  as missing — which sends the story back to `implementing` rather than judging the wrong
+  commit.
+  """
+  @spec story_branch(Ecto.UUID.t(), Story.t()) :: String.t()
+  def story_branch(tenant_id, %Story{} = story) do
+    {:ok, recorded} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
+            where: not is_nil(r.branch),
+            # `DispatchLedger.implement_kind?/1`'s rule, in SQL: `implement`, or NULL for a row
+            # written before `kind` existed. A triage dispatch's branch is never the story's.
+            where: r.kind == "implement" or is_nil(r.kind),
+            order_by: [desc: r.inserted_at],
+            limit: 1,
+            select: r.branch
+        )
+      end)
+
+    case recorded do
+      branch when is_binary(branch) ->
+        branch
+
+      nil ->
+        {:ok, branch} = branch_for(story, [])
+        branch
     end
   end
 

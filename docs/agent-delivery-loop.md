@@ -122,6 +122,8 @@ Before a merge, an orchestrator or operator calls `merge_precondition` (`POST /a
 | `head_moved` | The pull request's head changed since CI ran. The story goes back to `implementing` over `base_moved`, and the recorded head is cleared, so the gate is not called again until the story is back at `ci`. |
 | `unevaluated` | 503 with `Retry-After`. After repeated `unevaluated` answers the story escalates. |
 
+**Thread mode (epic 45, US-45.4).** An intake source set to `mode: thread` (`intake_source_update`) has no pull request. The gate judges the story's latest RECORDED checkpoint on the branch the story was dispatched on, needs no `pr_number`, and also refuses `empty_change` (the checkpoint's tree equals the base's, or no file changed), `checkpoint_tree_mismatch` and `no_checkpoint_recorded`. The branch is judged first: a branch the forge does not have (`branch_missing`), one naming a commit nobody reported (`branch_head_unrecorded`) or a recorded checkpoint that was never pushed (`checkpoint_unpushed`) is `head_moved`, back to `implementing` like any moved head. An allow is recorded naming the checkpoint id and sha. What happens when the base moves under an allowed checkpoint is US-45.5's.
+
 ## 7. After the merge
 
 - **`deployed` to `verified`, or to `escalated`:** `PostDeployVerification` compares the merge commit with the repository's deployment records.
