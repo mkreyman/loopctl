@@ -175,6 +175,19 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
       assert body["error"]["message"] =~ "NEW dispatch_id"
     end
 
+    # #887 review round 1: the placement's own pre-mint dependency refusal. With no clause
+    # here it fell through to the fallback's catch-all and answered 500.
+    test "dependencies_not_met is a 409, not a 500" do
+      conn =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          :dependencies_not_met
+        )
+
+      assert conn.status == 409
+      assert Jason.decode!(conn.resp_body)["error"]["code"] == "dependencies_not_met"
+    end
+
     # US-44.6. A drain never clears on its own; an exhausted subscription does, at a known
     # instant, so the refusal carries it — read for the runner the PATH names, in the tenant the
     # KEY belongs to. On `Repo`-side rows (`fixture(:stage_tenant)`), which is the connection

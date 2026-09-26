@@ -28,13 +28,12 @@ defmodule Loopctl.Delivery.DispatchDriver do
   is the part that cannot starve a story, and it is what
   `Loopctl.Workers.TriageTriggerWorker.candidates/0` already uses.
 
-  A candidate must also be `contracted`, because `Placement.place/4` refuses anything else.
-  Every release that puts a story's row back to `queued` now re-contracts it in the same
-  transaction or escalates it (`Loopctl.Delivery.Stages.follow_release/5`, US-44.4), so a
-  released story is either a candidate again or in front of a human. The filter stays: a
-  `queued` + `:pending` story (one released before that, or by a path that has not learned it)
-  selected on the stage alone would be picked for ever, its `updated_at` frozen at the release
-  and so permanently near the head of an oldest-first queue.
+  A candidate must also be `pending` or `contracted` (#884): `Placement.place/4` contracts a
+  `pending` one before it mints, so a triage-accepted story, a release whose re-contract did
+  not land, and an escalation resolved to `queued` are all placed without an orchestrator.
+  Any OTHER status behind a `queued` row (a stale row under a claimed story) is left out:
+  selected on the stage alone it would be refused on every pass, its `updated_at` frozen and
+  so permanently near the head of an oldest-first queue.
 
   ## Eligibility is decided BEFORE the claim, on all four facts
 
@@ -85,6 +84,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
   alias Loopctl.Runners.Selection
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
@@ -103,7 +103,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
   @doc """
   The stories this pass will attempt, at most `limit`, fairly across tenants.
 
-  `queued` AND `contracted` AND under a project bound to exactly ONE active intake source —
+  `queued` AND `pending` or `contracted` AND with no unmet dependency (its own or its epic's,
+  `Loopctl.WorkBreakdown.Dependencies`) AND under a project bound to exactly ONE active intake source —
   see the moduledoc on why the stage row alone selected released stories for ever, and why an
   unaddressable project is the same trap wearing the driver's own `:blocked` label. Ranked per
   tenant and ordered by that rank first, so a tenant with one queued story is reached in the
@@ -132,14 +133,22 @@ defmodule Loopctl.Delivery.DispatchDriver do
         having: count(src.id) == 1,
         select: %{tenant_id: src.tenant_id, project_id: src.project_id}
 
+    # A story whose dependencies are unmet is NOT a candidate: `Placement` refuses it before it
+    # mints, so selected it would be refused on every pass, its `updated_at` frozen at the head
+    # of the oldest-first ranking. The claim's own definition (`Dependencies`), not a copy. A
+    # story left out here is still visible as blocked (`Queries.list_blocked_stories/2`).
     ranked =
       from s in StoryStage,
         join: st in Story,
+        as: :story,
         on: st.id == s.story_id and st.tenant_id == s.tenant_id,
         join: b in subquery(bound_projects),
         on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
         where: s.stage == :queued,
-        where: st.agent_status == :contracted,
+        # `pending` too: `Placement` contracts a pending story before it mints (#884).
+        where: st.agent_status in [:pending, :contracted],
+        where: not exists(Dependencies.unmet_story_dependencies()),
+        where: not exists(Dependencies.unmet_epic_dependencies()),
         select: %{
           tenant_id: s.tenant_id,
           story_id: s.story_id,
@@ -395,7 +404,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   #
   # ONLY TWO REFUSALS ADVANCE, and the reason is what makes this safe rather than a retry
   # loop. `{:no_conforming_branch, _}` is decided inside `DispatchPayload.fill/3`, and
-  # `:runner_exhausted` by `Placement`'s own check just ahead of it — both BEFORE `claimable/2`
+  # `:runner_exhausted` by `Placement`'s own check just ahead of it — both BEFORE the story pre-check
   # and before the mint, so a refused attempt has written nothing at all: no dispatch row, no
   # ephemeral key, no chain entry, no claim. And both concern the MACHINE. Every other refusal
   # either concerns the STORY (`invalid_transition`, `story_not_dispatchable`, the tenant's

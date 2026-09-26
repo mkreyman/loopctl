@@ -1060,6 +1060,18 @@ async function listReadyStories({ project_id, page, page_size }) {
   return toContentCompact(result);
 }
 
+async function listBlockedStories({ project_id, page, page_size }) {
+  const params = new URLSearchParams();
+  if (project_id != null) params.set("project_id", project_id);
+  if (page != null) params.set("page", String(page));
+  if (page_size != null)
+    params.set("page_size", String(Math.min(page_size, SERVER_MAX_STORY_PAGE_SIZE)));
+
+  const qs = params.toString();
+  const result = await apiCall("GET", `/api/v1/stories/blocked${qs ? `?${qs}` : ""}`);
+  return toContentCompact(result);
+}
+
 async function getStory({ story_id }) {
   const result = await apiCall("GET", `/api/v1/stories/${story_id}`);
   return toContent(result);
@@ -4305,6 +4317,32 @@ const TOOLS = [
     },
   },
   {
+    name: "list_blocked_stories",
+    description:
+      "List stories with an unverified dependency — a story they depend on, or a story in an " +
+      "epic their epic depends on — each with the blocking dependencies. It is by dependency " +
+      "alone, WHATEVER the story's own status: an in-flight or finished story whose " +
+      "prerequisite was later rejected is listed too. The rows carry no delivery stage: the " +
+      "ones the dispatch driver skips are those whose story_stage is queued (check with " +
+      "story_stage), and place_dispatch refuses them 409 dependencies_not_met. " +
+      "Compact; paginated (page/page_size) with total_count. Refuses 422 when project_id is " +
+      "not a UUID. Key: agent role or higher.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: {
+          type: "string",
+          description: "Optional: the UUID of a project to limit the list to.",
+        },
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: {
+          type: "integer",
+          description: "Stories per page (default 100, max 500).",
+        },
+      },
+    },
+  },
+  {
     name: "get_story",
     description: "Get full details for a single story by ID.",
     inputSchema: {
@@ -4359,7 +4397,9 @@ const TOOLS = [
       "is released back to pending under you. Refused 409 story_held when the story's " +
       "delivery stage is escalated, done or failed: it is not yours to claim even when it " +
       "reads pending or contracted — move on. An escalated story is claimable again only " +
-      "after resolve_escalation sends it to queued; a done or failed one never is.",
+      "after resolve_escalation sends it to queued; a done or failed one never is. Refused " +
+      "409 dependencies_not_met when a story it depends on, or one in an epic its epic " +
+      "depends on, is not verified: list_blocked_stories names them.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8057,7 +8097,8 @@ const TOOLS = [
       "push the work (POST /api/v1/runners/:runner_id/dispatches). This is the control-side " +
       "trigger of the agent delivery loop — the verb that turns a story the loop has decided " +
       "to build into a session running on a machine. Get `runner_id` and its free slots from " +
-      "runner_pool; the story must be `contracted` with its delivery stage at `queued` " +
+      "runner_pool; the story must be `pending` or `contracted` (a pending one is contracted " +
+      "by the placement), its dependencies met, with its delivery stage at `queued` " +
       "(story_stage shows where it is).\n\n" +
       "The STORY OBJECT is not a parameter: loopctl builds it from its own rows and refuses a " +
       "caller-supplied one, because a control plane able to hand a runner prose is able to " +
@@ -8105,7 +8146,9 @@ const TOOLS = [
       "sent), so a late or a longer retry gets its whole clock. 409 `dispatch_claim_ended` means " +
       "the claim that dispatch_id was placed under has ENDED — its lease ran out, or the story " +
       "left assigned/implementing: nothing was pushed or written and the claim is not revived. " +
-      "Place the story again with a NEW dispatch_id once it is placeable.",
+      "Place the story again with a NEW dispatch_id once it is placeable. 409 " +
+      "`dependencies_not_met` means a story it depends on, or one in an epic its epic depends on, " +
+      "is not verified: nothing was minted, claimed or pushed; place it once they are.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8266,7 +8309,7 @@ const TOOLS = [
       "A DELIVERY STORY THEN GOES TO `escalated`, NOT BACK TO THE QUEUE (loopctl US-44.4). An " +
       "operator taking a story back is a human decision, so when the release leaves the stage " +
       "row at `queued` loopctl escalates it over `operator_released` in the same transaction — " +
-      "it never sits at `queued` + `pending`, which no placement takes. It spends no attempt " +
+      "it is not left in the queue behind the human's back. It spends no attempt " +
       "against the retry ceiling. To put it back to work, call resolve_escalation with " +
       "`to: queued`: that releases (a no-op now) AND re-contracts, so the story is placeable " +
       "again. A story with no delivery stage row is simply left `pending`, as before.\n\n" +
@@ -9251,6 +9294,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "list_ready_stories":
       return await listReadyStories(args);
+
+    case "list_blocked_stories":
+      return await listBlockedStories(args);
 
     case "get_story":
       return await getStory(args);

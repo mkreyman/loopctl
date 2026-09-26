@@ -77,7 +77,14 @@ defmodule Loopctl.Delivery.TriageDispatcher do
 
   require Logger
 
-  @type outcome :: :dispatched | :no_runner | :deferred | :blocked | :escalated | :errored
+  @type outcome ::
+          :dispatched
+          | :no_runner
+          | :deferred
+          | :blocked
+          | :escalated
+          | :errored
+          | {:stranded, :escalated | :blocked | :errored}
 
   @kind "triage"
 
@@ -271,7 +278,12 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   """
   @spec stranded(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
   def stranded(limit) when is_integer(limit) and limit > 0 do
-    Loopctl.AdminRepo.all(
+    # RANKED PER TENANT, oldest first within each: the first row of EVERY tenant before any
+    # tenant's second. Rows whose escalation keeps failing are not touched, so they keep their
+    # place; ranked across all tenants at once, one tenant's failures held every slot and no
+    # other tenant's stranded row was ever finished (`ReclaimExpiredClaimsWorker` ranks its
+    # candidates the same way, for the same reason).
+    ranked =
       from s in StoryStage,
         left_join: d in DispatchRecord,
         on:
@@ -281,9 +293,22 @@ defmodule Loopctl.Delivery.TriageDispatcher do
         on: v.tenant_id == s.tenant_id and v.story_id == s.story_id,
         where: s.stage == :triaged,
         where: is_nil(d.id) and is_nil(v.id),
-        order_by: [asc: s.updated_at, asc: s.story_id],
+        select: %{
+          tenant_id: s.tenant_id,
+          story_id: s.story_id,
+          updated_at: s.updated_at,
+          rank:
+            over(row_number(),
+              partition_by: s.tenant_id,
+              order_by: [asc: s.updated_at, asc: s.story_id]
+            )
+        }
+
+    Loopctl.AdminRepo.all(
+      from r in subquery(ranked),
+        order_by: [asc: r.rank, asc: r.updated_at, asc: r.story_id],
         limit: ^limit,
-        select: %{tenant_id: s.tenant_id, story_id: s.story_id}
+        select: %{tenant_id: r.tenant_id, story_id: r.story_id}
     )
   end
 
@@ -401,12 +426,17 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   # ONE STRANDED ROW MAY NOT KILL THE PASS either: `stranded/1` ranks oldest-first, so a row
   # whose escalation raises would head every later pass and no detected story would ever be
   # triaged again. The same rescue `attempt/3` gives a candidate.
+  #
+  # Every outcome is TAGGED `{:stranded, outcome}`: `TriageDispatchWorker.run_result/1` judges
+  # the pass by its CANDIDATES, and a stranded row that keeps failing — raising or refused —
+  # reappears every pass, so counted among them it either hid a pass whose every candidate
+  # errored or failed passes that only re-ran the same escalation.
   defp finish_stranded(row) do
-    escalate_too_large(row)
+    {:stranded, escalate_too_large(row)}
   rescue
-    error -> errored(row, Exception.format(:error, error, __STACKTRACE__))
+    error -> {:stranded, errored(row, Exception.format(:error, error, __STACKTRACE__))}
   catch
-    kind, value -> errored(row, Exception.format(kind, value, __STACKTRACE__))
+    kind, value -> {:stranded, errored(row, Exception.format(kind, value, __STACKTRACE__))}
   end
 
   defp escalate_too_large(%{tenant_id: tenant_id, story_id: story_id}) do

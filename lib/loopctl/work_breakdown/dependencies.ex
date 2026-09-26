@@ -25,6 +25,79 @@ defmodule Loopctl.WorkBreakdown.Dependencies do
   alias Loopctl.WorkBreakdown.StoryDependency
 
   # ===================================================================
+  # Unmet dependencies — ONE definition (#887)
+  # ===================================================================
+
+  @doc """
+  An `exists` subquery: the story bound as `:story` depends on a story that is not verified.
+  Composed by `dependency_status/2` (the claim), `unmet_story_ids/2` (bulk claim),
+  `Loopctl.Delivery.DispatchDriver.candidates/1` and `Loopctl.WorkBreakdown.Queries`' ready and
+  blocked lists, so none of them can disagree.
+  """
+  @spec unmet_story_dependencies() :: Ecto.Query.t()
+  def unmet_story_dependencies do
+    from sd in StoryDependency,
+      join: dep in Story,
+      on: dep.id == sd.depends_on_story_id and dep.tenant_id == sd.tenant_id,
+      where: sd.story_id == parent_as(:story).id and sd.tenant_id == parent_as(:story).tenant_id,
+      where: dep.verified_status != :verified,
+      select: 1
+  end
+
+  @doc """
+  An `exists` subquery: the epic of the story bound as `:story` depends on an epic holding a
+  story that is not verified.
+  """
+  @spec unmet_epic_dependencies() :: Ecto.Query.t()
+  def unmet_epic_dependencies do
+    from ed in EpicDependency,
+      join: prereq in Story,
+      on: prereq.epic_id == ed.depends_on_epic_id and prereq.tenant_id == ed.tenant_id,
+      where:
+        ed.epic_id == parent_as(:story).epic_id and ed.tenant_id == parent_as(:story).tenant_id,
+      where: prereq.verified_status != :verified,
+      select: 1
+  end
+
+  @doc """
+  `story_id`'s dependencies in `tenant_id`: `:met`, `:unmet` (a story-level or epic-level
+  prerequisite is not verified), or `:not_found` — the story is not in `tenant_id` (another
+  tenant's id, or a row deleted since it was read). The three are kept apart so a caller can say
+  WHICH, and the `:not_found` branch is stated here rather than implied by a comparison.
+  """
+  @spec dependency_status(Ecto.UUID.t(), Ecto.UUID.t()) :: :met | :unmet | :not_found
+  def dependency_status(tenant_id, story_id) do
+    from(s in Story,
+      as: :story,
+      where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+      select: exists(unmet_story_dependencies()) or exists(unmet_epic_dependencies())
+    )
+    |> AdminRepo.one()
+    |> case do
+      nil -> :not_found
+      true -> :unmet
+      false -> :met
+    end
+  end
+
+  @doc """
+  The subset of `story_ids` in `tenant_id` with a dependency unmet, in ONE read: for a caller
+  judging a whole batch under the locks it holds (`Loopctl.BulkOperations.bulk_claim/4`).
+  An id not in `tenant_id` is not in the result; the caller has already locked what it found.
+  """
+  @spec unmet_story_ids(Ecto.UUID.t(), [Ecto.UUID.t()]) :: MapSet.t()
+  def unmet_story_ids(tenant_id, story_ids) do
+    from(s in Story,
+      as: :story,
+      where: s.id in ^story_ids and s.tenant_id == ^tenant_id,
+      where: exists(unmet_story_dependencies()) or exists(unmet_epic_dependencies()),
+      select: s.id
+    )
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
+  # ===================================================================
   # Epic Dependencies
   # ===================================================================
 

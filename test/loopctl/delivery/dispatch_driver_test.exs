@@ -101,6 +101,63 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   end
 
   describe "candidates/1 — the states a stage row alone cannot tell apart" do
+    # #884: a triage-accepted story reaches `queued` still `pending`, and `Placement` contracts
+    # it inside its claim — so it is a candidate, where only an orchestrator's contract made it
+    # one before.
+    test "a PENDING story at queued is a candidate", ctx do
+      story = bind_repo(ctx, queued_story(ctx))
+
+      unboxed(fn ->
+        {1, _} =
+          AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+            set: [agent_status: :pending]
+          )
+      end)
+
+      assert story.id in candidate_ids(50)
+    end
+
+    # #887 review round 1. Placement refuses a story with unmet dependencies before it mints,
+    # so selected it would be refused on every pass, frozen at the head of the queue.
+    test "a story with an unmet STORY dependency is not a candidate", ctx do
+      story = bind_repo(ctx, queued_story(ctx))
+      blocker = fixture(:committed_story, %{tenant_id: ctx.tenant.id})
+      assert story.id in candidate_ids(50)
+
+      unboxed(fn ->
+        fixture(:story_dependency, %{
+          tenant_id: ctx.tenant.id,
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+      end)
+
+      refute story.id in candidate_ids(50)
+
+      # The prerequisite verified: the story is a candidate again (#887 review round 2).
+      verify(blocker)
+      assert story.id in candidate_ids(50)
+    end
+
+    test "a story whose EPIC depends on an unverified epic is not a candidate", ctx do
+      story = bind_repo(ctx, queued_story(ctx))
+      blocker = fixture(:committed_story, %{tenant_id: ctx.tenant.id})
+      assert story.id in candidate_ids(50)
+
+      unboxed(fn ->
+        fixture(:epic_dependency, %{
+          tenant_id: ctx.tenant.id,
+          epic_id: story.epic_id,
+          depends_on_epic_id: blocker.epic_id
+        })
+      end)
+
+      refute story.id in candidate_ids(50)
+
+      verify(blocker)
+      assert story.id in candidate_ids(50)
+    end
+
     test "a released story is never left queued and uncontracted (#877)", ctx do
       story = bind_repo(ctx, queued_story(ctx))
       assert story.id in candidate_ids(50)
@@ -844,6 +901,15 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   defp leave_channel(channel) do
     Process.unlink(channel.channel_pid)
     leave(channel)
+  end
+
+  defp verify(story) do
+    unboxed(fn ->
+      {1, _} =
+        AdminRepo.update_all(from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+          set: [verified_status: :verified]
+        )
+    end)
   end
 
   defp candidate_ids(limit) do

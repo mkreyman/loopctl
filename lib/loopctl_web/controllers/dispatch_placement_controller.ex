@@ -79,8 +79,9 @@ defmodule LoopctlWeb.DispatchPlacementController do
         "pushes the dispatch to the runner — the three steps `Loopctl.Delivery.Placement` " <>
         "performs as one. A TRIGGER and not a scheduler: the caller names the story and the " <>
         "runner, and nothing here selects work or runs on a cadence.\n\n" <>
-        "The story must be `contracted` and its stage row at `queued`; both are checked " <>
-        "BEFORE anything is minted, so a not-ready story costs no dispatch row, no ephemeral " <>
+        "The story must be `pending` or `contracted`, its dependencies met, and its stage " <>
+        "row at `queued`; a `pending` story is contracted by the placement. All of that is " <>
+        "checked BEFORE anything is minted, so a not-ready story costs no dispatch row, no ephemeral " <>
         "key and no audit-chain entry.\n\n" <>
         "REPEATING is safe under the same claim — a repeat with the same `dispatch_id` " <>
         "resumes and re-pushes. Once that claim has ended the recorded epoch is stale for " <>
@@ -215,7 +216,9 @@ defmodule LoopctlWeb.DispatchPlacementController do
            "declared prefixes; or `dispatch_claim_ended` — a RETRY of a recorded " <>
            "dispatch_id whose claim has ended (its lease ran out, or the story left " <>
            "assigned/implementing): nothing was pushed or written and the claim is not " <>
-           "revived, so place the story again with a new dispatch_id once it is placeable",
+           "revived, so place the story again with a new dispatch_id once it is placeable; " <>
+           "or `dependencies_not_met` — a story it depends on (or one in an epic its epic " <>
+           "depends on) is not verified, and nothing was minted, claimed or pushed",
          "application/json", Schemas.ErrorResponse},
       422 =>
         {"Validation error; `branch_not_allowed` — the `branch` you named does not start " <>
@@ -556,6 +559,16 @@ defmodule LoopctlWeb.DispatchPlacementController do
       message:
         "This dispatch_id is already recorded against a different story or runner. A " <>
           "dispatch_id names one placement; use a new one."
+    })
+  end
+
+  # #887 review round 1. Refused BEFORE the mint by the placement's own pre-check (#884); the
+  # fallback has no clause for the atom and answered 500.
+  defp refuse(conn, :dependencies_not_met) do
+    error(conn, 409, "dependencies_not_met", %{
+      message:
+        "A story this one depends on, or a story in an epic its epic depends on, is not " <>
+          "verified yet. Nothing was minted, claimed or pushed; place it once they are."
     })
   end
 

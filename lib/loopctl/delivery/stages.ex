@@ -1036,11 +1036,11 @@ defmodule Loopctl.Delivery.Stages do
 
   ## Where the story goes next (US-44.4, #877)
 
-  A release sets `agent_status: :pending`, and the dispatch driver selects `queued` +
-  `:contracted` only — so a row the release leaves at `queued` would be UNREACHABLE: no
-  placement takes it, no alert fires, and nothing re-contracts it. Every release therefore
-  ends somewhere the driver or a human acts on, decided here by the `:cause`, only for a row
-  that is at `queued` once the release is done:
+  A release sets `agent_status: :pending`. A placement contracts a `pending` story at
+  `queued` inside its own claim (#884), so a requeued row is placeable either way; the
+  release's re-contract (`recontract_released/4`) makes it `contracted` at once, as every
+  other `queued` story is. What the `:cause` decides is whether the row goes back to the
+  queue at all, only for a row that is at `queued` once the release is done:
 
   | `:cause` | outcome | counted |
   |---|---|---|

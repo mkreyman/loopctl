@@ -32,10 +32,9 @@ defmodule Loopctl.Progress do
   alias Loopctl.TokenUsage
   alias Loopctl.Webhooks.EventGenerator
   alias Loopctl.Webhooks.WebhookEvent
+  alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Epic
-  alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
-  alias Loopctl.WorkBreakdown.StoryDependency
   alias Loopctl.Workers.ReviewKnowledgeWorker
   alias Loopctl.Workers.WebhookDeliveryWorker
 
@@ -245,6 +244,8 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in contracted state
+  - `{:error, :dependencies_not_met}` if a story it depends on, or one in an epic its epic
+    depends on, is not verified (`check_claim_dependencies/2`)
   - `{:error, :story_held}` if its delivery stage row is at a held stage
     (`Loopctl.Delivery.Stages.held_story_ids/2`): `escalated`, which is claimable again once
     `Loopctl.Delivery.Escalations.resolve/3` sends it to `queued`, or `done` / `failed`,
@@ -270,7 +271,7 @@ defmodule Loopctl.Progress do
       end)
       |> Multi.run(:not_held, fn _repo, %{lock: story} -> not_held(tenant_id, story.id) end)
       |> Multi.run(:check_deps, fn _repo, %{lock: story} ->
-        check_claim_dependencies(story)
+        check_claim_dependencies(tenant_id, story)
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         now = DateTime.utc_now()
@@ -1932,7 +1933,7 @@ defmodule Loopctl.Progress do
   `session_ended` (`runner_dispatches.session_ended_reason` `wall_clock_exceeded` or
   `max_turns_exceeded`), the channel's own escalation of it did not complete — the lease
   would not have run out otherwise — so the reclaim takes the SAME escalation first, through
-  the one function the channel uses (`Loopctl.Delivery.RunnerStages.escalate_recorded_budget_kill/4`,
+  the one function the channel uses (`Loopctl.Delivery.RunnerStages.redrive_recorded_session_end/4`,
   in-flight row -> `escalated` over `:budget_reported`), and only then releases the claim.
   The row is then no longer in flight, so the release only rebinds it: the story is
   `pending` behind an `escalated` row, which is held (`Loopctl.Delivery.Stages.held_story_ids/2`),
@@ -1954,6 +1955,7 @@ defmodule Loopctl.Progress do
              | :custody_halted
              | :tenant_inactive
              | :budget_escalation_refused
+             | :usage_hold_busy
              | :audit_chain_append_failed
              | Ecto.Changeset.t()}
   def reclaim_expired_claim(tenant_id, story_id, expected_epoch) do
@@ -1971,7 +1973,7 @@ defmodule Loopctl.Progress do
       cause: :attempt
     }
 
-    case RunnerStages.escalate_recorded_budget_kill(tenant_id, story_id, expected_epoch, label) do
+    case RunnerStages.redrive_recorded_session_end(tenant_id, story_id, expected_epoch, label) do
       :none ->
         runner_lost_release(
           tenant_id,
@@ -1982,6 +1984,24 @@ defmodule Loopctl.Progress do
             new_state: %{}
           })
         )
+
+      # An exhausted subscription, its machine held out: released as that session end, and
+      # spending no attempt.
+      {:ok, "usage_exhausted" = reason} ->
+        runner_lost_release(
+          tenant_id,
+          story_id,
+          Map.merge(lease, %{
+            action: "claim_session_ended",
+            webhook_reason: "session_ended:" <> reason,
+            new_state: %{"session_ended_reason" => reason},
+            cause: :usage_exhausted
+          })
+        )
+
+      # The hold needs a lock: nothing released, the next sweep retries.
+      {:error, {:usage_hold, :busy}} ->
+        {:error, :usage_hold_busy}
 
       {:ok, reason} ->
         runner_lost_release(
@@ -4519,36 +4539,18 @@ defmodule Loopctl.Progress do
       }}}
   end
 
-  defp check_claim_dependencies(story) do
-    # Check story-level dependencies: all depends_on stories must be verified
-    story_deps_unmet =
-      from(sd in StoryDependency,
-        join: dep in Story,
-        on: dep.id == sd.depends_on_story_id,
-        where: sd.story_id == ^story.id and dep.verified_status != :verified,
-        select: count(sd.id)
-      )
-      |> AdminRepo.one()
-
-    if story_deps_unmet > 0 do
-      {:error, :dependencies_not_met}
-    else
-      # Check epic-level dependencies: all stories in prerequisite epics must be verified
-      epic_deps_unmet =
-        from(ed in EpicDependency,
-          where: ed.epic_id == ^story.epic_id,
-          join: prereq_story in Story,
-          on: prereq_story.epic_id == ed.depends_on_epic_id,
-          where: prereq_story.verified_status != :verified,
-          select: count(prereq_story.id)
-        )
-        |> AdminRepo.one()
-
-      if epic_deps_unmet > 0 do
-        {:error, :dependencies_not_met}
-      else
-        {:ok, :deps_satisfied}
-      end
+  @doc """
+  Whether `story`'s dependencies — its own and its epic's — are all verified: the check a claim
+  makes under its lock. Also read by `Loopctl.Delivery.Placement` BEFORE it mints, so a story
+  that cannot be claimed spends no dispatch.
+  """
+  @spec check_claim_dependencies(Ecto.UUID.t(), Story.t()) ::
+          {:ok, :deps_satisfied} | {:error, :dependencies_not_met | :not_found}
+  def check_claim_dependencies(tenant_id, %Story{id: story_id}) do
+    case Dependencies.dependency_status(tenant_id, story_id) do
+      :met -> {:ok, :deps_satisfied}
+      :unmet -> {:error, :dependencies_not_met}
+      :not_found -> {:error, :not_found}
     end
   end
 

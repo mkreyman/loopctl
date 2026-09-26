@@ -48,8 +48,14 @@ defmodule Loopctl.Workers.TriageDispatchWorker do
   """
   @spec run_result([TriageDispatcher.outcome()]) ::
           :ok | {:error, {:all_candidates_errored, pos_integer()}}
-  def run_result(results) when is_list(results),
-    do: all_errored(Enum.count(results, &(&1 == :errored)), length(results))
+  #
+  # A stranded row's outcome (`{:stranded, _}`) is left out of BOTH counts: one whose
+  # escalation keeps failing reappears every pass, and in the total it would hide a pass whose
+  # every candidate errored for ever; as an error it would fail passes that only re-run it.
+  def run_result(results) when is_list(results) do
+    candidates = Enum.reject(results, &match?({:stranded, _}, &1))
+    all_errored(Enum.count(candidates, &(&1 == :errored)), length(candidates))
+  end
 
   defp all_errored(count, count) when count > 0, do: {:error, {:all_candidates_errored, count}}
   defp all_errored(_errored, _total), do: :ok

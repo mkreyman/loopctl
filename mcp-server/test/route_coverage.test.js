@@ -220,7 +220,6 @@ const DECLARED = {
   "POST /api/v1/api_keys/:param/rotate": "gap", // ApiKeyController.rotate
   "GET /api/v1/audit": "gap", // AuditController.index
   "GET /api/v1/changes": "gap", // ChangeController.index
-  "GET /api/v1/stories/blocked": "gap", // DependencyGraphController.blocked
   "POST /api/v1/stories/bulk/claim": "gap", // BulkOperationsController.claim
   "POST /api/v1/stories/bulk/verify": "gap", // BulkOperationsController.verify
   "POST /api/v1/stories/bulk/reject": "gap", // BulkOperationsController.reject

@@ -655,6 +655,79 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
       assert releases(ctx) == []
     end
 
+    # #884 review round 2, finding 2. The report was recorded and the node died before the
+    # hold and the release ran. The reclaim finishes that session end: the machine held out,
+    # the claim released WITHOUT spending an attempt.
+    test "a recorded usage_exhausted is finished by the reclaim: held out, uncounted", ctx do
+      assert {:ok, {:recorded, _session}} = record_only(ctx, "usage_exhausted")
+      expire_lease(ctx)
+
+      assert {:ok, _released} = reclaim(ctx)
+
+      row = stage_row(ctx)
+      assert row.stage == :queued
+      assert row.attempts == %{}
+      assert %DateTime{} = usage_until(ctx)
+
+      assert [%AuditLog{new_state: %{"session_ended_reason" => "usage_exhausted"}}] =
+               releases(ctx)
+    end
+
+    # #884 review round 3, finding 7. A hold already in place — here the runner's own precise
+    # reset, two hours out — is not rewritten to the provisional eight days, and a sweep that
+    # retries does not keep pushing it forward.
+    test "a runner already held out keeps its own hold when the reclaim finishes", ctx do
+      assert {:ok, {:recorded, _session}} = record_only(ctx, "usage_exhausted")
+      resets_at = DateTime.add(DateTime.utc_now(), 7_200, :second)
+
+      unboxed(fn ->
+        :ok = Usage.record(ctx.tenant_id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
+      end)
+
+      expire_lease(ctx)
+      assert {:ok, _released} = reclaim(ctx)
+
+      assert stage_row(ctx).attempts == %{}
+      assert_in_delta seconds_from_now(usage_until(ctx)), 7_200, 5
+    end
+
+    # With the machine NOT held out, the counted expiry is the only bound on the story being
+    # placed straight back on it (#883 review round 2, finding 1).
+    test "a recorded usage_exhausted whose hold the database refuses is reclaimed COUNTED",
+         ctx do
+      assert {:ok, {:recorded, _session}} = record_only(ctx, "usage_exhausted")
+      name = "test_hold_refused_" <> String.replace(ctx.runner.id, "-", "")
+
+      unboxed(fn ->
+        AdminRepo.query!("""
+        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'refused by test' USING ERRCODE = '22023';
+        END
+        $$
+        """)
+
+        AdminRepo.query!("""
+        CREATE TRIGGER #{name} BEFORE UPDATE ON runners FOR EACH ROW
+        WHEN (NEW.id = '#{ctx.runner.id}' AND
+              NEW.usage_exhausted_until IS DISTINCT FROM OLD.usage_exhausted_until)
+        EXECUTE FUNCTION #{name}()
+        """)
+      end)
+
+      on_exit(fn ->
+        unboxed(fn ->
+          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON runners")
+          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+        end)
+      end)
+
+      expire_lease(ctx)
+      assert {:ok, _released} = reclaim(ctx)
+      assert stage_row(ctx).attempts == %{"runner_lost" => 1}
+      assert usage_until(ctx) == nil
+    end
+
     test "a claim whose session CRASHED is still re-queued as a lease expiry", ctx do
       # Only a BUDGET reason is re-driven; a recorded crash whose release never ran is an
       # ordinary expired lease.
