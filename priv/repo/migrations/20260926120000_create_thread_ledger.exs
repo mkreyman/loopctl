@@ -61,7 +61,6 @@ defmodule Loopctl.Repo.Migrations.CreateThreadLedger do
       add :checkpoint_id,
           references(:thread_checkpoints, type: :binary_id, on_delete: :restrict)
 
-
       timestamps(type: :utc_datetime_usec, updated_at: false)
     end
 
