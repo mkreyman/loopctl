@@ -14,10 +14,15 @@ defmodule Loopctl.Embeddings.DisclosureCache do
       qualifies — so the `LIMIT 1` short-circuit never fires and the cost grows
       linearly with loopctl's own canonical wiki corpus, on the hottest read in the
       product;
-    * `reembed_meta/2` adds two more `exists?` probes.
+    * `reembed_meta/2` adds two more `exists?` probes;
+    * the fill also asks whether any system article has no row made from its current
+      text (`Embeddings.system_corpus_stale?/2`, an `EXISTS` comparing the stored
+      `article_embeddings.source_md5` with the trigger-kept `articles.text_md5`), to decide
+      whether to queue a materialization.
 
   The answer only changes when the materialization worker runs, a system article is
-  added/published, or a re-embed makes progress — none of which is request-driven.
+  added, published or has its title or body edited, or a re-embed makes progress — none of
+  which is request-driven. An edit is therefore noticed within one TTL per node.
   A short TTL therefore removes the per-request cost while bounding staleness to the
   TTL (a disclosure string, never a result-set predicate).
 

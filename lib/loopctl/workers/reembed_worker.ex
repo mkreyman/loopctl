@@ -156,7 +156,7 @@ defmodule Loopctl.Workers.ReembedWorker do
     articles
     |> Enum.group_by(& &1.project_id)
     |> Enum.reduce_while(:ok, fn {project_id, group}, :ok ->
-      entries = Enum.map(group, fn a -> {a, article_text(a)} end)
+      entries = Enum.map(group, fn a -> {a, Embeddings.article_embedding_text(a)} end)
 
       result =
         embed_and_store(
@@ -485,14 +485,10 @@ defmodule Loopctl.Workers.ReembedWorker do
   # applied, now named once (#617) so the first attempt cannot drift away from the
   # rung the ladder starts below. It stays CHARACTERS on purpose: a byte cap here
   # would silently shorten multi-byte text the provider was already accepting.
-  defp article_text(article) do
-    TextBudget.initial("#{article.title}\n\n#{article.body}")
-  end
-
   defp memory_text(memory), do: TextBudget.initial(memory.text || "")
 
-  defp content_hash(text), do: :sha256 |> :crypto.hash(text) |> Base.encode16(case: :lower)
+  defp hash_for(text, false), do: Embeddings.text_content_hash(text)
 
-  defp hash_for(text, false), do: content_hash(text)
-  defp hash_for(text, true), do: text |> content_hash() |> ShrinkLadder.truncated_hash()
+  defp hash_for(text, true),
+    do: text |> Embeddings.text_content_hash() |> ShrinkLadder.truncated_hash()
 end

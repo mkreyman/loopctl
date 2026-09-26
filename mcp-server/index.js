@@ -5104,7 +5104,15 @@ const TOOLS = [
       "Materialize the shared SYSTEM-scoped article corpus for THIS tenant at its active " +
       "embedding dimension, using this tenant's own embedding credential. System articles " +
       "cannot be embedded once for everyone (embeddings are BYO), so until this runs they are " +
-      "matched by keyword only for you. Idempotent and batched; safe to call repeatedly.",
+      "matched by keyword only for you. It embeds the system articles you have not embedded " +
+      "and re-embeds ones whose text changed since; on the side-table read path your searches " +
+      "trigger the same thing, so this is for doing it now. Answers already_materialized when " +
+      "nothing is missing or changed, and in_flight when a run is already queued, executing " +
+      "or backing off (one run at a time; an orchestrator-or-higher key re-schedules a run " +
+      "backing off after an error to now, and a run left executing by a crashed node holds " +
+      "until Oban's Lifeline rescues it). Refused 409 materialization_terminal when your latest run " +
+      "was discarded or cancelled (e.g. no embedding key) and the key is agent-role; an " +
+      "orchestrator-or-higher key forces a new run.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {

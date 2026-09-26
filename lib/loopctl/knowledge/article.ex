@@ -149,6 +149,11 @@ defmodule Loopctl.Knowledge.Article do
     # by PATCH.
     field :content_changed_at, :utc_datetime_usec
 
+    # md5 of `title <> "\n\n" <> body`, kept by the `articles_text_md5` trigger for
+    # system-scope rows only (migration 20260926090000); read-only here, never cast. System
+    # corpus staleness compares it with `article_embeddings.source_md5`.
+    field :text_md5, :string, read_after_writes: true
+
     # USAGE for the importance prior (#790): the number of DISTINCT UTC DAYS on which this
     # article received a caller-chosen body read (`Knowledge.heat_read_access_types/0`)
     # inside the stamping window. Written ONLY by `Loopctl.Knowledge.Importance.stamp/2`,

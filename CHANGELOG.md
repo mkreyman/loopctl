@@ -13,11 +13,26 @@ All notable changes to loopctl are documented here.
   `meta.system_corpus_recall` in search responses says. On the side-table path, a tenant's
   semantic search that finds a system article unembedded queues a materialization job for
   that tenant, and the article turns semantic once the job has run; the search that queued it
-  still answers `keyword_only`. The one manual case: while any discarded or cancelled
-  materialization job for that tenant is still retained by Oban, no job is queued
-  automatically, and `embedding_materialize_system_corpus` called with an
-  orchestrator-or-higher key forces one (an agent key is refused 409
-  `materialization_terminal`).
+  still answers `keyword_only`. The one manual case: when that tenant's latest
+  materialization run was discarded or cancelled, no job is queued automatically, and
+  `embedding_materialize_system_corpus` called with an orchestrator-or-higher key forces one
+  (an agent key is refused 409 `materialization_terminal`).
+- **A system article whose text changed is re-embedded, one run at a time (#896).** A system
+  article corrected after a tenant embedded it used to keep that tenant's vector of the old
+  text for good. Migration `20260926090000` adds `article_embeddings.source_md5`, the md5 of
+  the title and body a row was made from, and `articles.text_md5`, the same md5 of the current
+  text, kept by a trigger for system-scope rows however they are written; staleness compares
+  the two. A correction, a seeding migration's upsert included, is picked up by the next
+  semantic search on the side-table path; a write that changes neither title nor body queues
+  nothing. No manual step: the migration backfills both columns in SQL, stamping each existing
+  system row whose stored content hash still matches its article, so the release does not make
+  corpora read stale. A row it cannot vouch for is stamped by the worker with no provider call
+  when its hash matches, and re-embedded when it does not. Materialization is single-flight per tenant
+  and dimension: a run already queued, executing or backing off answers `in_flight`, and an
+  orchestrator-or-higher key re-schedules a run backing off after an error to now instead of
+  starting another. A run left `executing` by a crashed node holds until Oban's Lifeline
+  rescues it (`Loopctl.ObanConfig.lifeline_rescue_after_ms/0`). The terminal gate reads the
+  tenant's LATEST run, where it used to block on any retained discarded or cancelled job.
 
 ### Changed
 

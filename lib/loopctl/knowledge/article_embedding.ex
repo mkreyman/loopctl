@@ -44,6 +44,9 @@ defmodule Loopctl.Knowledge.ArticleEmbedding do
     field :embedding, Pgvector.Ecto.Vector
     field :live_denorm, :boolean, default: true
     field :embedding_content_hash, :string
+    # md5 of the `title <> "\n\n" <> body` this row was made from; set by the writer from
+    # the article it read, never cast (see migration 20260926090000).
+    field :source_md5, :string
 
     belongs_to :article, Article
 

@@ -38,6 +38,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
   import Ecto.Query
 
+  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings
   alias Loopctl.Knowledge
@@ -629,7 +630,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert Embeddings.article_embedded_hash(tenant.id, article.id, 1536) != original_hash
     end
 
-    test "a TOUCHED-but-unchanged system article costs a timestamp, not a provider call" do
+    test "a TOUCHED-but-unchanged system article is not stale and costs nothing" do
       tenant = tenant_at(1536)
       article = system_article()
 
@@ -639,37 +640,24 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
       assert :ok = perform_job(SystemCorpusEmbeddingWorker, %{"tenant_id" => tenant.id})
 
+      # A write that bumps updated_at without changing the embedded text (a suppression
+      # flip, a status or metadata write) is not an edit: staleness is by content hash.
       stamp_article_newer(article.id)
 
-      assert Enum.map(Embeddings.stale_system_articles(tenant.id, 1536), & &1.id) == [article.id]
+      assert Embeddings.stale_system_articles(tenant.id, 1536) == []
 
       Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, _texts ->
         flunk("re-embedded an article whose content hash did not change")
       end)
 
       assert :ok = perform_job(SystemCorpusEmbeddingWorker, %{"tenant_id" => tenant.id})
-      assert Embeddings.stale_system_articles(tenant.id, 1536) == []
     end
 
     test "a TERMINAL job stops the read path re-enqueuing forever" do
       tenant = tenant_at(1536)
 
-      # The suite runs Oban in `testing: :inline`, which executes jobs WITHOUT
-      # persisting them — so the terminal row is written directly, exactly as a real
-      # `{:discard, {:no_embedding_key, _}}` would leave it. Through OBAN's repo:
-      # `AdminRepo` is a separate sandbox connection.
-      Loopctl.Repo.query!(
-        """
-        INSERT INTO oban_jobs (state, queue, worker, args, inserted_at, scheduled_at)
-        VALUES ('discarded', 'embeddings', $1, $2, NOW(), NOW())
-        """,
-        [
-          "Loopctl.Workers.SystemCorpusEmbeddingWorker",
-          %{"tenant_id" => tenant.id, "dim" => 1536}
-        ]
-      )
-
-      assert Embeddings.system_corpus_terminal?(tenant.id, 1536)
+      # As a real `{:discard, {:no_embedding_key, _}}` would leave it.
+      fixture(:system_corpus_job, %{tenant_id: tenant.id, state: "discarded"})
 
       assert {:error, :materialization_terminal} =
                Embeddings.enqueue_system_corpus_materialization(tenant.id)
@@ -678,6 +666,313 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       assert {:ok, _} =
                Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
     end
+
+    test "only the LATEST run's state gates: a completed run after a discarded one does not" do
+      tenant = tenant_at(1536)
+      system_article()
+
+      for state <- ["discarded", "completed"],
+          do: fixture(:system_corpus_job, %{tenant_id: tenant.id, state: state})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, %Oban.Job{conflict?: false}} =
+                 Embeddings.enqueue_system_corpus_materialization(tenant.id)
+      end)
+    end
+
+    test "a changed title or body is stale; the read path re-embeds it while the meta reads semantic" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      assert {:ok, :already_materialized} =
+               Embeddings.enqueue_system_corpus_materialization(tenant.id)
+
+      AdminRepo.query!("UPDATE articles SET title = $1, updated_at = NOW() WHERE id = $2", [
+        "A corrected title",
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)
+
+      # Oban runs inline here, so the job the read path queues has already run. The fill's
+      # own meta still reads semantic: a changed article is stale, not missing.
+      assert %{system_corpus_recall: "semantic"} =
+               Embeddings.search_disclosure_meta(tenant.id, 1536)
+
+      assert Embeddings.stale_system_articles(tenant.id, 1536) == []
+    end
+
+    test "one run at a time: a run executing, or backing off long after it was queued, is in flight" do
+      tenant = tenant_at(1536)
+      system_article()
+      fixture(:system_corpus_job, %{tenant_id: tenant.id, state: "executing"})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, :in_flight} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
+
+        # Forcing never doubles a run that is executing.
+        assert {:ok, :in_flight} =
+                 Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
+      end)
+    end
+
+    test "a run backing off is in flight however old, and forcing runs it now" do
+      tenant = tenant_at(1536)
+      system_article()
+
+      job_id =
+        fixture(:system_corpus_job, %{
+          tenant_id: tenant.id,
+          state: "retryable",
+          inserted_ago_s: 3600,
+          due_in_s: 600
+        })
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, :in_flight} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
+
+        assert {:ok, :in_flight} =
+                 Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
+      end)
+
+      %{rows: [[scheduled_at]]} =
+        Loopctl.Repo.query!("SELECT scheduled_at FROM oban_jobs WHERE id = $1", [job_id])
+
+      assert NaiveDateTime.compare(scheduled_at, NaiveDateTime.utc_now()) != :gt
+    end
+
+    test "forcing never pulls forward a run snoozed for a provider's Retry-After" do
+      tenant = tenant_at(1536)
+      system_article()
+
+      job_id =
+        fixture(:system_corpus_job, %{tenant_id: tenant.id, state: "scheduled", due_in_s: 120})
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, :in_flight} =
+                 Embeddings.enqueue_system_corpus_materialization(tenant.id, force: true)
+      end)
+
+      %{rows: [[scheduled_at]]} =
+        Loopctl.Repo.query!("SELECT scheduled_at FROM oban_jobs WHERE id = $1", [job_id])
+
+      assert NaiveDateTime.compare(scheduled_at, NaiveDateTime.utc_now()) == :gt
+    end
+
+    test "a row written before source_md5 existed is stamped, not re-billed" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      AdminRepo.query!(
+        "UPDATE article_embeddings SET source_md5 = NULL WHERE tenant_id = $1 AND article_id = $2",
+        [Ecto.UUID.dump!(tenant.id), Ecto.UUID.dump!(article.id)]
+      )
+
+      assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, _texts ->
+        flunk("re-embedded an article whose content hash still matches")
+      end)
+
+      assert :ok =
+               perform_job(SystemCorpusEmbeddingWorker, %{"tenant_id" => tenant.id, "dim" => 1536})
+
+      assert Embeddings.stale_system_articles(tenant.id, 1536) == []
+    end
+
+    test "rows record the trigger's md5, so unicode and empty text read current once embedded" do
+      tenant = tenant_at(1536)
+
+      article =
+        system_article(title: "Ünïcødé — naïve café ✓", body: "Zeile 1\nزبان\n\t日本語 🚀")
+
+      empty = system_article(title: "Empty body", body: "")
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      stale_ids = system_article_ids(Embeddings.stale_system_articles(tenant.id, 1536))
+      refute article.id in stale_ids
+      refute empty.id in stale_ids
+    end
+
+    test "only system rows record source_md5; a tenant row's writer may hold a newer version" do
+      tenant = tenant_at(1536)
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      {:ok, _} = Embeddings.upsert_article_embedding(tenant.id, article, vec(1536), "h", 1536)
+
+      assert [nil] =
+               AdminRepo.all(
+                 from(ae in ArticleEmbedding,
+                   where: ae.article_id == ^article.id,
+                   select: ae.source_md5
+                 )
+               )
+    end
+
+    test "a stamp leaves a row whose hash changed since it was compared" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      AdminRepo.query!(
+        "UPDATE article_embeddings SET source_md5 = NULL, embedding_content_hash = 'other' " <>
+          "WHERE tenant_id = $1 AND article_id = $2",
+        [Ecto.UUID.dump!(tenant.id), Ecto.UUID.dump!(article.id)]
+      )
+
+      assert {:ok, 0} =
+               Embeddings.stamp_article_sources(tenant.id, [{article, "compared-hash"}], 1536)
+
+      assert {:ok, 1} = Embeddings.stamp_article_sources(tenant.id, [{article, "other"}], 1536)
+    end
+
+    test "a search inside a caller's Repo transaction queues nothing" do
+      tenant = tenant_at(1536)
+      system_article()
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        {:ok, _} =
+          Loopctl.Repo.transaction(fn -> Embeddings.search_disclosure_meta(tenant.id, 1536) end)
+
+        refute_enqueued(worker: SystemCorpusEmbeddingWorker)
+      end)
+    end
+
+    test "an edited system article is queued again by the enqueue, without force" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      assert {:ok, :already_materialized} =
+               Embeddings.enqueue_system_corpus_materialization(tenant.id)
+
+      AdminRepo.query!("UPDATE articles SET body = $1 WHERE id = $2", [
+        "a corrected body",
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert {:ok, %Oban.Job{}} = Embeddings.enqueue_system_corpus_materialization(tenant.id)
+      end)
+    end
+
+    test "a text change is seen however it was written, updated_at or not" do
+      tenant = tenant_at(1536)
+      article = system_article()
+      materialize_published_system_corpus(tenant.id, 1536)
+
+      # Memoise the current version on this node first.
+      assert Embeddings.stale_system_articles(tenant.id, 1536) == []
+
+      AdminRepo.query!("UPDATE articles SET body = $1 WHERE id = $2", [
+        "a raw fix that left updated_at alone",
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)
+    end
+
+    test "an edit landing during a run is a new version, so the run continues to embed it" do
+      tenant = tenant_at(1536)
+      article = system_article()
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts ->
+        AdminRepo.query!("UPDATE articles SET body = $1, updated_at = NOW() WHERE id = $2", [
+          "edited mid-run",
+          Ecto.UUID.dump!(article.id)
+        ])
+
+        {:ok, Enum.map(texts, fn _ -> vec(1536) end)}
+      end)
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok =
+                 perform_job(SystemCorpusEmbeddingWorker, %{
+                   "tenant_id" => tenant.id,
+                   "dim" => 1536
+                 })
+
+        # The article it just embedded changed while it ran: a new version, so a FRESH job
+        # continues the run and embeds the edit, rather than leaving it for a later search.
+        assert_enqueued(
+          worker: SystemCorpusEmbeddingWorker,
+          args: %{"tenant_id" => tenant.id, "dim" => 1536}
+        )
+      end)
+
+      assert [^article | _] = Embeddings.stale_system_articles(tenant.id, 1536) |> by_id(article)
+    end
+
+    test "a version still stale after its own run ends the run, never a continuation loop" do
+      tenant = tenant_at(1536)
+      article = system_article()
+
+      # A raw write of text_md5 alone does not fire the trigger, so this version can never
+      # read current: the case the continuation's exclusion of processed versions exists for.
+      AdminRepo.query!("UPDATE articles SET text_md5 = NULL WHERE id = $1", [
+        Ecto.UUID.dump!(article.id)
+      ])
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok =
+                 perform_job(SystemCorpusEmbeddingWorker, %{
+                   "tenant_id" => tenant.id,
+                   "dim" => 1536
+                 })
+
+        refute_enqueued(worker: SystemCorpusEmbeddingWorker)
+      end)
+    end
+
+    test "while another caller holds the gate, a search gives up and an explicit call waits" do
+      tenant = tenant_at(1536)
+      system_article()
+      holder = hold_gate_lock("#{tenant.id}:1536")
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        Embeddings.search_disclosure_meta(tenant.id, 1536)
+        refute_enqueued(worker: SystemCorpusEmbeddingWorker)
+      end)
+
+      waiter =
+        Task.async(fn ->
+          Oban.Testing.with_testing_mode(:manual, fn ->
+            Embeddings.enqueue_system_corpus_materialization(tenant.id)
+          end)
+        end)
+
+      refute Task.yield(waiter, 300)
+      send(holder, :release)
+      assert {:ok, %Oban.Job{}} = Task.await(waiter)
+    end
+  end
+
+  # Takes the gate's advisory lock on a connection of its own and holds it until told to
+  # release. The key and namespace mirror `Embeddings.take_gate_lock/2`.
+  defp hold_gate_lock(key) do
+    test = self()
+
+    holder =
+      spawn(fn ->
+        :ok = Sandbox.checkout(Loopctl.Repo)
+
+        Loopctl.Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+          :erlang.phash2(:loopctl_system_corpus_gate),
+          key
+        ])
+
+        send(test, :gate_held)
+
+        receive do
+          :release -> Sandbox.checkin(Loopctl.Repo)
+        end
+      end)
+
+    assert_receive :gate_held, 5_000
+    on_exit(fn -> send(holder, :release) end)
+    holder
   end
 
   # ---------------------------------------------------------------------------
@@ -788,6 +1083,9 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   # Materializes every PUBLISHED system article for `tenant_id` so the corpus meta is
   # "semantic" — the instance ships a bootstrap system corpus, so a test that needs a
   # materialized state has to embed it.
+  defp by_id(articles, %{id: id} = wanted),
+    do: articles |> Enum.filter(&(&1.id == id)) |> Enum.map(fn _ -> wanted end)
+
   defp materialize_published_system_corpus(tenant_id, dim) do
     Mox.stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts ->
       {:ok, Enum.map(texts, fn _ -> vec(dim) end)}
@@ -857,8 +1155,8 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       %{
         id: id,
         tenant_id: nil,
-        title: "System article #{System.unique_integer([:positive])}",
-        body: "shared operator content",
+        title: Keyword.get(opts, :title, "System article #{System.unique_integer([:positive])}"),
+        body: Keyword.get(opts, :body, "shared operator content"),
         category: :reference,
         status: status,
         scope: :system,
