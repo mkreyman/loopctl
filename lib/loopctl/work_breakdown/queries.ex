@@ -150,7 +150,8 @@ defmodule Loopctl.WorkBreakdown.Queries do
 
         %{
           story: story,
-          blocking_dependencies: story_blockers ++ epic_blockers
+          # One entry per prerequisite: a story can block both directly and through its epic.
+          blocking_dependencies: Enum.uniq_by(story_blockers ++ epic_blockers, & &1.id)
         }
       end)
 

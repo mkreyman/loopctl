@@ -10,9 +10,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Added
 
 - **`list_blocked_stories`** (`GET /api/v1/stories/blocked`, which had no tool and sat on the
-  route sweep's gap list): the stories an unverified dependency is holding back. loopctl's
-  dispatch driver does not select them and `place_dispatch` refuses them, so this is where a
-  queue that is not draining shows why (loopctl epic 44, #890).
+  route sweep's gap list): every story with an unverified dependency, whatever its own status,
+  with what blocks it. Those whose delivery stage is `queued` are what loopctl's dispatch
+  driver skips and `place_dispatch` refuses (loopctl epic 44, #890).
+
+### Changed
+
+- **`claim_story`** names the 409 `dependencies_not_met` that loopctl's single-story claim now
+  answers with a code, and points at `list_blocked_stories`.
 
 ## 2.103.5 — 2026-09-26 (place_dispatch names its dependency refusal)
 

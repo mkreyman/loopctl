@@ -4322,9 +4322,9 @@ const TOOLS = [
       "List stories with an unverified dependency — a story they depend on, or a story in an " +
       "epic their epic depends on — each with the blocking dependencies. It is by dependency " +
       "alone, WHATEVER the story's own status: an in-flight or finished story whose " +
-      "prerequisite was later rejected is listed too. The queued ones (agent_status " +
-      "pending or contracted) are what the dispatch driver skips and place_dispatch refuses " +
-      "409 dependencies_not_met, so this is where a queue that is not draining shows why. " +
+      "prerequisite was later rejected is listed too. The rows carry no delivery stage: the " +
+      "ones the dispatch driver skips are those whose story_stage is queued (check with " +
+      "story_stage), and place_dispatch refuses them 409 dependencies_not_met. " +
       "Compact; paginated (page/page_size) with total_count. Refuses 422 when project_id is " +
       "not a UUID. Key: agent role or higher.",
     inputSchema: {
@@ -4397,7 +4397,9 @@ const TOOLS = [
       "is released back to pending under you. Refused 409 story_held when the story's " +
       "delivery stage is escalated, done or failed: it is not yours to claim even when it " +
       "reads pending or contracted — move on. An escalated story is claimable again only " +
-      "after resolve_escalation sends it to queued; a done or failed one never is.",
+      "after resolve_escalation sends it to queued; a done or failed one never is. Refused " +
+      "409 dependencies_not_met when a story it depends on, or one in an epic its epic " +
+      "depends on, is not verified: list_blocked_stories names them.",
     inputSchema: {
       type: "object",
       properties: {

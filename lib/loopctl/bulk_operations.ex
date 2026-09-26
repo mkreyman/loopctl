@@ -489,9 +489,7 @@ defmodule Loopctl.BulkOperations do
         {:error, :story_held}
 
       MapSet.member?(blocked, story.id) ->
-        {:error,
-         "Story has an unverified dependency (its own, or one of its epic's); " <>
-           "GET /api/v1/stories/blocked (MCP list_blocked_stories) names what blocks it"}
+        {:error, :dependencies_not_met}
 
       true ->
         :ok
@@ -974,6 +972,12 @@ defmodule Loopctl.BulkOperations do
         "pre-existing done work, so mark-complete does not apply"
 
   defp format_reason(:already_verified), do: "story is already verified"
+
+  # Leads with its code, as `:story_held` does, so a bulk caller can branch on it.
+  defp format_reason(:dependencies_not_met),
+    do:
+      "dependencies_not_met: Story has an unverified dependency (its own, or one of its " <>
+        "epic's); GET /api/v1/stories/blocked (MCP list_blocked_stories) names what blocks it"
 
   defp format_reason(:story_held),
     do:

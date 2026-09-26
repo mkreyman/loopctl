@@ -367,10 +367,6 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
-  # US-44.3: a story whose delivery stage is HELD — `escalated`, `done` or `failed`
-  # (`Loopctl.Delivery.Stages.held_story_ids/2`) — cannot be contracted or claimed, even when
-  # its claim has ended and it reads `pending`/`contracted`. Not `invalid_transition`: the
-  # story's own status allows the call; the stage is what refuses it.
   # Claim of a story whose prerequisites are not verified (#890): named, not a bare Conflict,
   # so a caller can tell it from a lost race and knows where to look.
   def call(conn, {:error, :dependencies_not_met}) do
@@ -387,6 +383,10 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # US-44.3: a story whose delivery stage is HELD — `escalated`, `done` or `failed`
+  # (`Loopctl.Delivery.Stages.held_story_ids/2`) — cannot be contracted or claimed, even when
+  # its claim has ended and it reads `pending`/`contracted`. Not `invalid_transition`: the
+  # story's own status allows the call; the stage is what refuses it.
   def call(conn, {:error, :story_held}) do
     conn
     |> put_status(:conflict)

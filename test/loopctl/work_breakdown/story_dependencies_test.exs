@@ -6,6 +6,8 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
   import Ecto.Query
 
   alias Loopctl.WorkBreakdown.Dependencies
+  alias Loopctl.WorkBreakdown.Queries
+  alias Loopctl.WorkBreakdown.Story
 
   describe "dependency_status/2" do
     # #887 review round 2: the one definition the claim and the dispatch driver share.
@@ -29,7 +31,7 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
       assert Dependencies.dependency_status(fixture(:tenant).id, story.id) == :not_found
 
       Loopctl.AdminRepo.update_all(
-        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^blocker.id),
+        from(s in Story, where: s.id == ^blocker.id),
         set: [verified_status: :verified]
       )
 
@@ -59,7 +61,7 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
                MapSet.new([story.id])
 
       Loopctl.AdminRepo.update_all(
-        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^prereq.id),
+        from(s in Story, where: s.id == ^prereq.id),
         set: [verified_status: :verified]
       )
 
@@ -87,6 +89,37 @@ defmodule Loopctl.WorkBreakdown.StoryDependenciesTest do
     test "a story that is not there is :not_found, never :met" do
       tenant = fixture(:tenant)
       assert Dependencies.dependency_status(tenant.id, Ecto.UUID.generate()) == :not_found
+    end
+  end
+
+  describe "Queries.list_blocked_stories/2" do
+    # #890 review round 3: a prerequisite that blocks both directly and through its epic is
+    # listed once.
+    test "a prerequisite blocking directly AND through its epic is listed once" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      prereq_epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 1})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id, number: 2})
+      blocker = fixture(:story, %{tenant_id: tenant.id, epic_id: prereq_epic.id, number: "1.1"})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, number: "2.1"})
+
+      {:ok, _dep} =
+        Dependencies.create_story_dependency(tenant.id, %{
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+
+      fixture(:epic_dependency, %{
+        tenant_id: tenant.id,
+        epic_id: epic.id,
+        depends_on_epic_id: prereq_epic.id
+      })
+
+      {:ok, %{data: rows}} = Queries.list_blocked_stories(tenant.id)
+      row = Enum.find(rows, &(&1.story.id == story.id)) || Enum.find(rows, &(&1[:id] == story.id))
+      assert row, "the story is listed as blocked"
+      assert [%{id: id}] = row.blocking_dependencies
+      assert id == blocker.id
     end
   end
 

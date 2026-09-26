@@ -244,6 +244,8 @@ defmodule Loopctl.Progress do
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in contracted state
+  - `{:error, :dependencies_not_met}` if a story it depends on, or one in an epic its epic
+    depends on, is not verified (`check_claim_dependencies/2`)
   - `{:error, :story_held}` if its delivery stage row is at a held stage
     (`Loopctl.Delivery.Stages.held_story_ids/2`): `escalated`, which is claimable again once
     `Loopctl.Delivery.Escalations.resolve/3` sends it to `queued`, or `done` / `failed`,
