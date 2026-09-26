@@ -19,7 +19,7 @@
           "type": "string"
         },
         "note": {
-          "description": "Why this commit, in the session's words. Untrusted: recorded, never executed. At most 16384 UTF-8 BYTES — the `maxLength` beside this is the same number counted as graphemes, which is looser. Whitespace alone is `invalid_payload`, and a credential-shaped value is `secret_blocked`.",
+          "description": "Why this commit, in the session's words. Untrusted: recorded, never executed. At most 16384 UTF-8 BYTES — the `maxLength` beside this is the same number counted as graphemes, which is looser. THE MESSAGE CAP IS WHAT BINDS: the whole message is at most 60000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so a note under this field's maximum can still be `invalid_payload`. Whitespace alone is `invalid_payload`, and a credential-shaped value is `secret_blocked`.",
           "maxLength": 16384,
           "minLength": 1,
           "type": "string"
@@ -903,7 +903,7 @@
       "description": "A note on the story's change thread from the session under an ACCEPTED `implement` dispatch (since 1.20.0), recorded as a `message` entry. Optional: a runner that never sends it gets today's behaviour. The entry's idempotency key is `<dispatch_id>:<client_seq>`: a resend with the same `client_seq` and the same `body` and `checkpoint_id` is answered `ok` with `replayed: true`, and a different one is `idempotency_key_reused`. At most 60000 bytes under the byte rule. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
       "properties": {
         "body": {
-          "description": "The note. Untrusted: recorded, never executed. At most 16384 UTF-8 BYTES — the `maxLength` beside this is the same number counted as graphemes, which is looser. Whitespace alone is `invalid_payload`, and a credential-shaped value is `secret_blocked`.",
+          "description": "The note. Untrusted: recorded, never executed. At most 16384 UTF-8 BYTES — the `maxLength` beside this is the same number counted as graphemes, which is looser. THE MESSAGE CAP IS WHAT BINDS: the whole message is at most 60000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so a note under this field's maximum can still be `invalid_payload`; split it across entries. Whitespace alone is `invalid_payload`, and a credential-shaped value is `secret_blocked`.",
           "maxLength": 16384,
           "minLength": 1,
           "type": "string"

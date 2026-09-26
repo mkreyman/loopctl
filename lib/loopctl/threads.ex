@@ -147,9 +147,15 @@ defmodule Loopctl.Threads do
 
   - `:author_principal` (required), `:actor_lineage` (required) — SERVER-resolved from the key
   - `:claim_epoch` — when given, the story's `claim_epoch` must still be this one, read under
-    the story's lock, or the write (a resend included) is `{:error, :stale_claim_epoch}`. A
-    runner's note is lineage-attributed to the claim it ran under, and that claim's lineage is
-    only its own while its epoch is current.
+    the story's lock, or a NEW write is `{:error, :stale_claim_epoch}`. A runner's note is
+    lineage-attributed to the claim it ran under, and that claim's lineage is only its own
+    while its epoch is current.
+  - `:replay_only` — answer only a resend of an entry already recorded, and refuse a new one
+    `:dispatch_not_accepted`, as for a checkpoint.
+
+  A resend of an entry already recorded by this author under this key is answered from the
+  row BEFORE either check: it writes nothing, so no claim needs to be current for it, and a
+  runner that lost the ack must be able to learn its note landed.
 
   Returns `{:ok, entry, :created | :existing}`.
   """
@@ -471,8 +477,9 @@ defmodule Loopctl.Threads do
     key = Ecto.Changeset.get_field(changeset, :idempotency_key)
 
     with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
-         :ok <- epoch_current(story, Keyword.get(opts, :claim_epoch)),
          nil <- entry_by_key(tenant_id, story_id, author, key),
+         :ok <- new_write_allowed(opts),
+         :ok <- epoch_current(story, Keyword.get(opts, :claim_epoch)),
          :ok <- checkpoint_of_story(changeset, tenant_id, story_id) do
       insert_entry(tenant_id, story_id, changeset, opts)
     else
@@ -480,6 +487,12 @@ defmodule Loopctl.Threads do
       %Entry{} = existing -> replay(existing, changeset)
       error -> error
     end
+  end
+
+  defp new_write_allowed(opts) do
+    if Keyword.get(opts, :replay_only, false),
+      do: {:error, :dispatch_not_accepted},
+      else: :ok
   end
 
   defp epoch_current(_story, nil), do: :ok

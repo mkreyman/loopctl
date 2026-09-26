@@ -289,20 +289,20 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     runner's own counter for the dispatch, and the entry's idempotency key is
     `<dispatch_id>:<client_seq>`, so number each note once and never reuse a number for
     different content. An optional `checkpoint_id` (from a `checkpoint` ack) ties the note to
-    that checkpoint. A note is refused `stale_claim_epoch` once the story's claim has moved
-    past the message's epoch.
+    that checkpoint. A NEW note is refused `stale_claim_epoch` once the story's claim has
+    moved past the message's epoch.
 
   Both name an ACCEPTED `implement` dispatch; any other kind is `unknown_dispatch`, as on
-  `session_ended`, and a dispatch no longer accepted is `dispatch_not_accepted` — except a
-  checkpoint's RESEND, below. The story is never taken off the wire. A write that could not
+  `session_ended`, and a dispatch no longer accepted is `dispatch_not_accepted` — except for
+  a RESEND, below. The story is never taken off the wire. A write that could not
   get its locks in time is refused `rate_limited` with `min_interval_ms`; nothing was
   written, so resend after that interval.
 
   **RESENDING IS SAFE, AND IS THE ANSWER TO A LOST ACK.** A byte-identical checkpoint, or a
   `thread_entry` with the same `client_seq` and the same content, is answered `ok` with
-  `replayed: true` and the id it was first recorded under. A checkpoint's resend is answered
-  from the row even after the claim's lease has lapsed or the claim has moved, and whatever
-  the dispatch's status by then, because the write happened while it was live. A DIFFERENT write reusing either identity is refused — `checkpoint_conflict` (the
+  `replayed: true` and the id it was first recorded under. Either one's resend is answered from
+  its row even after the claim's lease has lapsed or the claim has moved, and whatever the
+  dispatch's status by then, because the write happened while it was live. A DIFFERENT write reusing either identity is refused — `checkpoint_conflict` (the
   same commit under this claim with another tree or note) and `idempotency_key_reused` (the
   same `client_seq` with other content) — permanently, because acknowledging it would tell the
   runner its new content was recorded when it was not.
@@ -312,10 +312,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   credential-shaped value is `secret_blocked`, permanently for those bytes: remove the value
   and send a new write under a new `client_seq`.
 
-  Each text field is at most `thread_body_max_utf8_bytes` UTF-8 bytes (its `maxLength` counts
-  graphemes and is looser), and the whole message is bounded by the byte rule at
+  **THE MESSAGE CAP IS WHAT BINDS.** The whole message is bounded by the byte rule at
   `x-connection.limits.checkpoint.max_bytes` / `thread_entry.max_bytes`, so a conforming
-  message always fits a frame. Split a long note across several entries.
+  message always fits a frame. The byte rule charges 6 bytes per character, so a note well
+  under the per-field `thread_body_max_utf8_bytes` (the HTTP surface's cap, whose `maxLength`
+  counts graphemes and is looser still) can already exceed it: measure the message under the
+  byte rule, not the field, and split a long note across several entries.
 
   ## Server-initiated disconnects (since 1.2.0)
 
@@ -2592,8 +2594,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             description:
               "Why this commit, in the session's words. Untrusted: recorded, never executed. " <>
                 "At most #{Entry.max_body_bytes()} UTF-8 BYTES — the `maxLength` beside this " <>
-                "is the same number counted as graphemes, which is looser. Whitespace alone " <>
-                "is `invalid_payload`, and a credential-shaped value is `secret_blocked`."
+                "is the same number counted as graphemes, which is looser. THE MESSAGE CAP IS " <>
+                "WHAT BINDS: the whole message is at most #{@max_bytes} bytes under the byte " <>
+                "rule, which charges 6 bytes per character and 12 for one outside the Basic " <>
+                "Multilingual Plane, so a note under this field's maximum can still be " <>
+                "`invalid_payload`. Whitespace alone is `invalid_payload`, and a " <>
+                "credential-shaped value is `secret_blocked`."
           }
         }
       },
@@ -2704,7 +2710,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             description:
               "The note. Untrusted: recorded, never executed. At most " <>
                 "#{Entry.max_body_bytes()} UTF-8 BYTES — the `maxLength` beside this is the " <>
-                "same number counted as graphemes, which is looser. Whitespace alone is " <>
+                "same number counted as graphemes, which is looser. THE MESSAGE CAP IS WHAT " <>
+                "BINDS: the whole message is at most #{@max_bytes} bytes under the byte rule, " <>
+                "which charges 6 bytes per character and 12 for one outside the Basic " <>
+                "Multilingual Plane, so a note under this field's maximum can still be " <>
+                "`invalid_payload`; split it across entries. Whitespace alone is " <>
                 "`invalid_payload`, and a credential-shaped value is `secret_blocked`."
           },
           checkpoint_id: %Schema{

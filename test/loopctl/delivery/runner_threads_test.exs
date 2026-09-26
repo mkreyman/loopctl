@@ -266,6 +266,19 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
       assert length(thread(ctx).checkpoints) == 1
     end
 
+    test "a note's resend after the claim moved and the row went superseded is answered" do
+      ctx = session()
+      {:ok, %{entry: recorded}} = entry(ctx)
+
+      set_story(ctx.story, claim_epoch: @epoch + 1)
+      assert {:ok, %{entry: again, replayed?: true}} = entry(ctx)
+      assert again.id == recorded.id
+
+      set_status(ctx, "superseded")
+      assert {:ok, %{entry: ^again, replayed?: true}} = entry(ctx)
+      assert {:error, :dispatch_not_accepted} = entry(ctx, %{client_seq: 1})
+    end
+
     test "a row that is not accepted records no checkpoint, though the claim is still live" do
       ctx = session()
       set_status(ctx, "superseded")
@@ -367,6 +380,48 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
       assert thread(ctx).entries == []
     end
   end
+
+  describe "database failures" do
+    @describetag :capture_log
+
+    setup do
+      %{message: %{dispatch_id: Ecto.UUID.generate()}}
+    end
+
+    test "a deadlock, a lock timeout and a pool timeout are busy, not a raise", %{message: m} do
+      for error <- [
+            %Postgrex.Error{postgres: pg_error(:deadlock_detected, "40P01")},
+            %Postgrex.Error{postgres: pg_error(:lock_not_available, "55P03")},
+            DBConnection.ConnectionError.exception("checkout timed out")
+          ] do
+        assert {:error, :busy} =
+                 RunnerThreads.answering_database(Ecto.UUID.generate(), m, "t", fn ->
+                   raise error
+                 end)
+      end
+    end
+
+    test "a hash-chain violation is audit_chain_append_failed; anything else raises",
+         %{message: m} do
+      violation = %Postgrex.Error{
+        postgres: %{pg_code: "P0001", message: "audit_chain_hash_violation: broken"}
+      }
+
+      assert {:error, :audit_chain_append_failed} =
+               RunnerThreads.answering_database(Ecto.UUID.generate(), m, "t", fn ->
+                 raise violation
+               end)
+
+      assert_raise Postgrex.Error, fn ->
+        RunnerThreads.answering_database(Ecto.UUID.generate(), m, "t", fn ->
+          raise %Postgrex.Error{postgres: pg_error(:unique_violation, "23505")}
+        end)
+      end
+    end
+  end
+
+  defp pg_error(code, pg_code),
+    do: %{code: code, pg_code: pg_code, severity: "ERROR", message: Atom.to_string(code)}
 
   describe "tenant isolation" do
     test "a runner cannot write to the thread of another tenant's dispatch" do

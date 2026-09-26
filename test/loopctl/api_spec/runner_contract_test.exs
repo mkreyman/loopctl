@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "6ab72b9a042e9d40120f6486c65f6f67b006d8a31f213cade92c6189d72fea7b"
+  @digest "b57abb32bcd65ffda6e36b8b4d240990168120d743cf7052c4db141c4e0f924e"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -2753,6 +2753,55 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "the branch a session works on is story-unique and the one it cuts from is shared" do
       assert RunnerDispatch.ref_fields()[:branch] == :story_unique
       assert RunnerDispatch.ref_fields()[:base_branch] == :shared
+    end
+  end
+
+  describe "the thread messages' byte cap (1.20.0)" do
+    # THE MESSAGE CAP IS WHAT BINDS: at 6 bytes an ASCII character, a note well under the
+    # field's UTF-8 maximum already overruns it, and the contract says so.
+    defp thread_entry(body),
+      do: %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "claim_epoch" => 1,
+        "client_seq" => 0,
+        "body" => body
+      }
+
+    defp checkpoint_with(note),
+      do: %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "claim_epoch" => 1,
+        "commit_sha" => String.duplicate("a", 40),
+        "tree_sha" => String.duplicate("b", 40),
+        "note" => note
+      }
+
+    test "a note under the field maximum but over the message cap is invalid_payload" do
+      long = String.duplicate("x", 10_000)
+      assert byte_size(long) < ThreadEntry.max_body_bytes()
+
+      for {cast, payload, max} <- [
+            {&RunnerContract.cast_thread_entry/1, thread_entry(long),
+             RunnerThreadEntry.max_bytes()},
+            {&RunnerContract.cast_checkpoint/1, checkpoint_with(long),
+             RunnerCheckpoint.max_bytes()}
+          ] do
+        assert {:error, {:invalid, [message]}} = cast.(payload)
+        assert message =~ "exceeds #{max} bytes under the byte rule"
+      end
+    end
+
+    test "a note inside the message cap casts" do
+      short = String.duplicate("x", 9_000)
+      assert {:ok, %{body: ^short}} = RunnerContract.cast_thread_entry(thread_entry(short))
+      assert {:ok, %{note: ^short}} = RunnerContract.cast_checkpoint(checkpoint_with(short))
+    end
+
+    test "the published descriptions say the message cap is what binds" do
+      for schema <- [RunnerThreadEntry.schema(), RunnerCheckpoint.schema()] do
+        field = schema.properties[:body] || schema.properties[:note]
+        assert field.description =~ "THE MESSAGE CAP IS WHAT BINDS"
+      end
     end
   end
 

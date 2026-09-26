@@ -395,7 +395,7 @@ defmodule Loopctl.ThreadsTest do
     send(holder, :release)
   end
 
-  test "an entry fenced on a claim_epoch is refused once the story's epoch is another" do
+  test "a new entry fenced on a claim_epoch is refused once the epoch moved; its resend is not" do
     ctx = claimed_story()
 
     fenced = fn key ->
@@ -410,8 +410,25 @@ defmodule Loopctl.ThreadsTest do
     set_story(ctx, claim_epoch: @epoch + 1)
 
     assert {:error, :stale_claim_epoch} = fenced.("k2")
-    # The resend of the write made under the old claim is refused too: that claim is over.
-    assert {:error, :stale_claim_epoch} = fenced.("k1")
+    # A resend writes nothing, so it is answered from the row: the runner learns it landed.
+    assert {:ok, _, :existing} = fenced.("k1")
+  end
+
+  test "replay_only answers an entry's resend and refuses a new one" do
+    ctx = claimed_story()
+
+    write = fn key, opts ->
+      Threads.record_entry(
+        ctx.tenant_id,
+        ctx.story.id,
+        message(key),
+        [author_principal: "agent:runner", actor_lineage: []] ++ opts
+      )
+    end
+
+    assert {:ok, first, :created} = write.("k1", [])
+    assert {:ok, ^first, :existing} = write.("k1", replay_only: true)
+    assert {:error, :dispatch_not_accepted} = write.("k2", replay_only: true)
   end
 
   test "every write appends an audit-chain entry on the story" do

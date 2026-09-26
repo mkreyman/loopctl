@@ -97,7 +97,7 @@ defmodule LoopctlWeb.RunnerChannel do
   (`RunnerThreadEntry`) a note it wants on the story's thread. Each is cast by the contract,
   metered by its own bucket (`RunnerContract.checkpoint_burst/0`,
   `RunnerContract.thread_entry_burst/0`), and applied by `Loopctl.Delivery.RunnerThreads`,
-  which resolves the runner's ACCEPTED implement dispatch to its story and calls
+  which resolves the runner's implement dispatch to its story (accepted, for a new write) and calls
   `Loopctl.Threads` — the function the HTTP surface calls, with the same claimant fence. The
   channel opens no second write path to a thread. The reply is the recorded id, its `seq` and
   `replayed`, and an identical resend is answered `ok` with `replayed: true`. Like `stage`,

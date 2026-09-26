@@ -640,33 +640,6 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
-  `accepted_session/3`'s map for a dispatch `runner_id` holds, WHATEVER its status, with the
-  status added — or `{:error, :unknown_dispatch}` exactly as there.
-
-  For a resend that must still be answered after the row moved on: a checkpoint recorded while
-  the session ran is resent after a lost ack, by which time a release and a reply or trace may
-  have marked the row `superseded` (`Loopctl.Delivery.RunnerThreads`). A read with no lock;
-  every field but `status` is written with the row and never changed.
-  """
-  @spec held_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok,
-           %{
-             status: String.t(),
-             kind: String.t() | nil,
-             story_id: Ecto.UUID.t(),
-             claim_epoch: integer(),
-             slot_generation: integer()
-           }}
-          | {:error, :unknown_dispatch}
-  def held_session(tenant_id, runner_id, dispatch_id) do
-    {:ok, held} = in_tenant(tenant_id, fn -> held(tenant_id, runner_id, dispatch_id) end)
-
-    with {:ok, %DispatchRecord{} = record} <- held do
-      {:ok, Map.take(record, [:status, :kind, :story_id, :claim_epoch, :slot_generation])}
-    end
-  end
-
-  @doc """
   The story a dispatch `runner_id` holds in this tenant is for, WHATEVER its status: `{:ok,
   story_id}`, or `{:error, :unknown_dispatch}` for a row another runner or tenant holds, exactly
   as for none.
@@ -835,9 +808,17 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
-  # `nil` is a row written before `kind` existed, when `implement` was the only kind sent.
-  defp implement_dispatch(%DispatchRecord{kind: kind}) when kind in ["implement", nil], do: :ok
-  defp implement_dispatch(%DispatchRecord{}), do: {:error, :unknown_dispatch}
+  defp implement_dispatch(%DispatchRecord{kind: kind}) do
+    if implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
+  end
+
+  @doc """
+  Whether a ledger row's `kind` is an implement session: `"implement"`, or `nil` — a row
+  written before `kind` existed, when `implement` was the only kind sent. The ONE reading of
+  that rule, for every path that must refuse a triage session a claim to report on.
+  """
+  @spec implement_kind?(String.t() | nil) :: boolean()
+  def implement_kind?(kind), do: kind in ["implement", nil]
 
   defp session_of(%DispatchRecord{} = record) do
     %{

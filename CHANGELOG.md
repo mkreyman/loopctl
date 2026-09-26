@@ -15,7 +15,10 @@ All notable changes to loopctl are documented here.
   `thread_entry` carries `{dispatch_id, claim_epoch, client_seq, body, checkpoint_id?}` and
   records a `message` entry keyed `<dispatch_id>:<client_seq>`. Both name an accepted
   `implement` dispatch, are attributed to the custody dispatch the placement minted, and are
-  idempotent: an identical resend is answered `replayed: true`. New refusal codes:
+  idempotent: an identical resend is answered `replayed: true`, even after the claim moved
+  or the dispatch was superseded. A write that could not get its locks is `rate_limited` with
+  `min_interval_ms`. Each message is capped under the byte rule, and that cap binds before a
+  text field's own maximum does. New refusal codes:
   `not_claimant`, `claim_not_live`, `checkpoint_conflict`, `idempotency_key_reused`,
   `secret_blocked`, all permanent. No migration.
 - **A `delivery-loop` system wiki article (migration `20260926060000`).** Served at
