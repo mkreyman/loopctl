@@ -1,0 +1,139 @@
+/**
+ * US-45.1 on the MCP side: thread_get, thread_checkpoint, thread_entry.
+ *
+ * Runs the real code in ../lib/threads.js with `apiCall` injected as a recording fake; the
+ * last block source-pins index.js and the README so the wiring cannot drift from the logic.
+ *
+ * Run: node --test test/*.test.js
+ */
+
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+import { getThread, recordCheckpoint, recordEntry } from "../lib/threads.js";
+
+const DIR = path.dirname(fileURLToPath(import.meta.url));
+const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
+const README = readFileSync(path.join(DIR, "..", "README.md"), "utf8");
+
+const STORY_ID = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+const SHA = "a".repeat(40);
+const TREE = "b".repeat(40);
+const ENV = {
+  LOOPCTL_AGENT_KEY: "agent-key",
+  LOOPCTL_ORCH_KEY: "orch-key",
+  LOOPCTL_USER_KEY: "user-key",
+};
+
+function fakeApi() {
+  const calls = [];
+  const apiCall = async (method, apiPath, body, key) => {
+    calls.push({ method, path: apiPath, body, key });
+    return { ok: true };
+  };
+  return { calls, apiCall };
+}
+
+describe("thread_checkpoint", () => {
+  test("POSTs to /thread/checkpoints on the AGENT key, dropping an absent note", async () => {
+    const { calls, apiCall } = fakeApi();
+    await recordCheckpoint(
+      { story_id: STORY_ID, claim_epoch: 4, commit_sha: SHA, tree_sha: TREE },
+      { apiCall, env: ENV },
+    );
+
+    assert.deepEqual(calls, [
+      {
+        method: "POST",
+        path: `/api/v1/stories/${STORY_ID}/thread/checkpoints`,
+        body: { claim_epoch: 4, commit_sha: SHA, tree_sha: TREE },
+        key: "agent-key",
+      },
+    ]);
+  });
+
+  test("refuses client-side without a sha, calling nothing", async () => {
+    const { calls, apiCall } = fakeApi();
+    const res = await recordCheckpoint(
+      { story_id: STORY_ID, claim_epoch: 4, tree_sha: TREE },
+      { apiCall, env: ENV },
+    );
+    assert.equal(res.error, true);
+    assert.equal(calls.length, 0);
+  });
+});
+
+describe("thread_entry", () => {
+  const finding = {
+    story_id: STORY_ID,
+    kind: "finding",
+    idempotency_key: "f1",
+    body: "bug",
+    checkpoint_id: "cp",
+    severity: "high",
+  };
+
+  test("travels on the agent key by default", async () => {
+    const { calls, apiCall } = fakeApi();
+    await recordEntry(finding, { apiCall, env: ENV });
+
+    assert.equal(calls[0].path, `/api/v1/stories/${STORY_ID}/thread/entries`);
+    assert.equal(calls[0].key, "agent-key");
+    assert.deepEqual(calls[0].body, {
+      kind: "finding",
+      idempotency_key: "f1",
+      body: "bug",
+      checkpoint_id: "cp",
+      severity: "high",
+    });
+  });
+
+  test("principal user travels on the user key; an unknown principal calls nothing", async () => {
+    const { calls, apiCall } = fakeApi();
+    await recordEntry({ ...finding, principal: "user" }, { apiCall, env: ENV });
+    assert.equal(calls[0].key, "user-key");
+
+    const res = await recordEntry({ ...finding, principal: "root" }, { apiCall, env: ENV });
+    assert.equal(res.error, true);
+    assert.equal(calls.length, 1);
+  });
+});
+
+describe("thread_get", () => {
+  test("GETs the thread on the agent key, falling back to the orchestrator key", async () => {
+    const { calls, apiCall } = fakeApi();
+    await getThread({ story_id: STORY_ID }, { apiCall, env: ENV });
+    await getThread(
+      { story_id: STORY_ID },
+      { apiCall, env: { LOOPCTL_ORCH_KEY: "orch-key" } },
+    );
+
+    assert.deepEqual(
+      calls.map((c) => [c.method, c.path, c.key]),
+      [
+        ["GET", `/api/v1/stories/${STORY_ID}/thread`, "agent-key"],
+        ["GET", `/api/v1/stories/${STORY_ID}/thread`, "orch-key"],
+      ],
+    );
+  });
+});
+
+describe("wiring", () => {
+  for (const [tool, handler] of [
+    ["thread_get", "threadGet"],
+    ["thread_checkpoint", "threadCheckpoint"],
+    ["thread_entry", "threadEntry"],
+  ]) {
+    test(`${tool} is declared, dispatched and documented`, () => {
+      assert.ok(INDEX_SRC.includes(`name: "${tool}"`), `${tool} not declared`);
+      assert.ok(
+        INDEX_SRC.includes(`case "${tool}":\n      return await ${handler}(args);`),
+        `${tool} not dispatched`,
+      );
+      assert.ok(README.includes(`| \`${tool}\` |`), `${tool} has no README row`);
+    });
+  }
+});

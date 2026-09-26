@@ -413,6 +413,12 @@ defmodule LoopctlWeb.Router do
     # session parked stayed parked for ever, including the one the first end-to-end run left.
     get "/stories/:id/stage", StoryEscalationController, :show
     post "/stories/:id/stage/resolve", StoryEscalationController, :resolve
+    # US-45.1: the story's change thread — the checkpoints its claimant reported and the
+    # entries written around them. Checkpoints are claimant-only (exact_role: :agent); entries
+    # are any principal's; reads stay open.
+    get "/stories/:id/thread", ThreadController, :show
+    post "/stories/:id/thread/checkpoints", ThreadController, :checkpoint
+    post "/stories/:id/thread/entries", ThreadController, :entry
     # Discoverability aliases — same actions, alternate URL patterns agents tend to guess
     post "/stories/:id/report-done", StoryStatusController, :report
     post "/stories/:id/start-work", StoryStatusController, :start

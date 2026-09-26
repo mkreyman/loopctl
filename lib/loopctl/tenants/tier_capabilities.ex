@@ -165,6 +165,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
       # a refusal escalates it. Same surface as verify: it reads `verified_status`
       # and the verifier's lineage, and it is the last gate before an outward effect.
       "LoopctlWeb.MergePreconditionController",
+      # US-45.1 — a story's change thread: the checkpoints its claimant reports and the
+      # review findings and fixes recorded against them are the record the merge gate reads.
+      "LoopctlWeb.ThreadController",
       # LCP-1 §9.2 — TenantController mounts RequireHumanAnchor on
       # :register_owner_key (the custody owner key is the root of trust).
       "LoopctlWeb.TenantController"
