@@ -27,6 +27,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :dependencies_not_met}` -> 409 `dependencies_not_met` (claim of a story with an unverified prerequisite)
   - `{:error, :story_held}` -> 409 (contract or claim of a story whose delivery stage is `escalated`, `done` or `failed`; an escalated one is claimable again once a human resolves it to `queued`)
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
+  - `{:error, :claim_not_live}` -> 409 (US-45.1: the claim's lease has lapsed; the claim has ended)
   - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
   - `{:error, :not_claimed}` -> 422 (#803: renew-claim on a story that is not assigned or implementing)
   - `{:error, :lease_cap_reached}` -> 409 (#879: renew-claim on a driver-placed claim whose `claim_lease_cap` has passed; no renewal can extend it)
@@ -262,6 +263,23 @@ defmodule LoopctlWeb.FallbackController do
             "it came from has ended — its lease expired and it was reclaimed, it was " <>
             "released, or the story was claimed again. Stop working this claim; read the " <>
             "story and claim it afresh if it is still available.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/agent-pattern"}
+      }
+    })
+  end
+
+  # US-45.1: the epoch is current but the claim's lease has lapsed, so the claim has ended
+  # even though the reclaimer has not yet run. Same remedy as `stale_claim_epoch`.
+  def call(conn, {:error, :claim_not_live}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "claim_not_live",
+        message:
+          "Your claim on this story has lapsed: its lease expired. Stop working this claim; " <>
+            "renew it before it lapses, or claim the story afresh if it is still available.",
         remediation: %{learn_more: "https://loopctl.com/wiki/agent-pattern"}
       }
     })

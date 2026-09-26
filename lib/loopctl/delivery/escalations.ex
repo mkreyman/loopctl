@@ -82,6 +82,7 @@ defmodule Loopctl.Delivery.Escalations do
   `story_stages` at all.
   """
 
+  alias Loopctl.Delivery.Claimant
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -178,25 +179,9 @@ defmodule Loopctl.Delivery.Escalations do
         )
       end)
 
-    cond do
-      is_nil(story) ->
-        {:error, :not_found}
-
-      # An UNCLAIMED story is not this caller's, and a key with no agent must never satisfy
-      # the check by matching that nil. Both halves of the comparison have to be a real
-      # agent, which is why this is not `story.assigned_agent_id == agent_id` alone.
-      is_nil(story.assigned_agent_id) or is_nil(agent_id) ->
-        {:error, :not_claimant}
-
-      story.assigned_agent_id != agent_id ->
-        {:error, :not_claimant}
-
-      story.claim_epoch != epoch ->
-        {:error, :stale_claim_epoch}
-
-      true ->
-        :ok
-    end
+    if is_nil(story),
+      do: {:error, :not_found},
+      else: Claimant.check(story, agent_id, epoch)
   end
 
   defp live_row(tenant_id, story_id) do

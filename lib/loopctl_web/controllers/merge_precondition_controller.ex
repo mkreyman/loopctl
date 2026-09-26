@@ -315,11 +315,12 @@ defmodule LoopctlWeb.MergePreconditionController do
     end
   end
 
-  defp claim_epoch(%{"claim_epoch" => epoch}) when is_integer(epoch) and epoch >= 0,
-    do: {:ok, epoch}
-
-  defp claim_epoch(_params),
-    do: {:error, :unprocessable_entity, "claim_epoch must be a non-negative integer"}
+  defp claim_epoch(params) do
+    case LoopctlWeb.ClaimEpochParam.fetch(params) do
+      {:ok, epoch} -> {:ok, epoch}
+      _ -> {:error, :unprocessable_entity, "claim_epoch must be a non-negative integer"}
+    end
+  end
 
   # Presence only: the value is never passed on, so nothing a caller sends can reach Gate A.
   defp ignored_trio(%{"trio_outputs" => _outputs}), do: [trio_outputs: :ignored]

@@ -16,69 +16,52 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.3.1",
-      "description": "A review dispatch kind exists; it is minted as a sibling of the implementer's dispatch under the orchestrator's root, never on the implementer's chain, and every finding and verdict it writes passes the US-45.1 self-review rule again at write time."
+      "description": "A review dispatch kind exists; loopctl places it as a sibling of the implementer's dispatch under the orchestrator's root, never on the implementer's chain and never for a principal that recorded a checkpoint of the thread."
     },
     {
       "id": "AC-45.3.2",
-      "description": "The review payload carries the story, the checkpoint diff reference, reasoning entries, and every fix entry with the findings it answers."
+      "description": "The review payload carries the story, the checkpoint diff reference, the thread's entries, and every fix with the findings it answers."
     },
     {
       "id": "AC-45.3.3",
-      "description": "A completed round is a verdict entry written by a non-implementer principal on the thread; a review dispatch that ends without one uses no round, and review_records rows from the custody lifecycle are not counted."
+      "description": "finding and verdict entries are accepted only from the key a placed review dispatch minted, bound to that dispatch and to the checkpoint it reviews; each review dispatch writes exactly one verdict, and a completed round is that verdict. A dispatch that ends without one uses no round."
     },
     {
       "id": "AC-45.3.4",
-      "description": "A third round is placeable only when a round-2 finding's introduced_by names a checkpoint that a round-1 fix entry references; otherwise, when a round-2 finding of severity critical, high or medium remains, the story escalates with review_ceiling at the end of round 2, and no round 4 is ever placeable."
+      "description": "A finding carries a severity (critical, high, medium, low) and, after round 1, introduced_by: a checkpoint id of the story at or before the checkpoint it was found in, or none, canonicalised."
+    },
+    {
+      "id": "AC-45.3.5",
+      "description": "A fix entry is accepted only from the current claimant under the current claim_epoch with a live lease, names at least one finding of the story, and is carried by a checkpoint of the current claim recorded after the checkpoints its findings were found in."
+    },
+    {
+      "id": "AC-45.3.6",
+      "description": "A third round is placeable only when a round-2 finding's introduced_by names a checkpoint a round-1 fix references; otherwise, when a round-2 finding of severity critical, high or medium remains, the story escalates with review_ceiling at the end of round 2, and no round 4 is ever placeable."
+    },
+    {
+      "id": "AC-45.3.7",
+      "description": "Refusals on this path never use self_review_blocked, which feeds the L6 custody halt; the judgement kinds' refusals have their own codes."
     }
   ],
   "test_cases": [
     {
       "id": "TC-45.3.1",
       "verifies": [
-        "AC-45.3.1"
+        "AC-45.3.1",
+        "AC-45.3.3"
       ],
-      "name": "self-review refused",
+      "name": "only a placed review dispatch judges",
       "type": "integration",
       "preconditions": [],
       "steps": [
-        "place a review under the implementer's lineage"
+        "finding from the implementer, from a released implementer, from a user key, from the review dispatch"
       ],
       "expected_results": [
-        "refused"
+        "refused, refused, refused, accepted"
       ]
     },
     {
       "id": "TC-45.3.2",
-      "verifies": [
-        "AC-45.3.3"
-      ],
-      "name": "crashed review does not count",
-      "type": "integration",
-      "preconditions": [],
-      "steps": [
-        "review dispatch released without a record"
-      ],
-      "expected_results": [
-        "round count unchanged"
-      ]
-    },
-    {
-      "id": "TC-45.3.3",
-      "verifies": [
-        "AC-45.3.4"
-      ],
-      "name": "ceiling from data",
-      "type": "integration",
-      "preconditions": [],
-      "steps": [
-        "round 2 findings with and without introduced_by on a fix checkpoint"
-      ],
-      "expected_results": [
-        "round 3 placeable only in the first case; round 4 never"
-      ]
-    },
-    {
-      "id": "TC-45.3.4",
       "verifies": [
         "AC-45.3.2"
       ],
@@ -91,13 +74,61 @@
         "build the review payload"
       ],
       "expected_results": [
-        "story, checkpoint diff ref, reasoning entries, and each fix with the findings it answers"
+        "story, checkpoint diff ref, entries, each fix with its findings"
+      ]
+    },
+    {
+      "id": "TC-45.3.3",
+      "verifies": [
+        "AC-45.3.3"
+      ],
+      "name": "one verdict per dispatch",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "a second verdict from the same review dispatch; a dispatch released with no verdict"
+      ],
+      "expected_results": [
+        "refused; round count unchanged"
+      ]
+    },
+    {
+      "id": "TC-45.3.4",
+      "verifies": [
+        "AC-45.3.4",
+        "AC-45.3.5"
+      ],
+      "name": "finding and fix rules",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "introduced_by after found; fix on an older checkpoint; fix under an ended claim"
+      ],
+      "expected_results": [
+        "each refused"
+      ]
+    },
+    {
+      "id": "TC-45.3.5",
+      "verifies": [
+        "AC-45.3.6",
+        "AC-45.3.7"
+      ],
+      "name": "ceiling from data",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "round 2 findings with and without introduced_by on a fix checkpoint"
+      ],
+      "expected_results": [
+        "round 3 placeable only in the first case; round 4 never; no self_review_blocked"
       ]
     }
   ],
   "technical_notes": [
-    "The round count and the ceiling are computed from thread_entries alone.",
-    "Material means severity critical, high or medium."
+    "The round count and the ceiling are computed from thread_entries alone, one verdict per review dispatch.",
+    "Material means severity critical, high or medium.",
+    "The fix rules and the lessons of #901's three review rounds carry over: canonical UUIDs, lease-only liveness, ordering by checkpoint seq, and no key-inferred judge."
   ],
   "dependencies": [
     "US-45.1",

@@ -16,150 +16,111 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.1.1",
-      "description": "A thread_checkpoints table (tenant_id, story_id, seq, commit_sha, tree_sha, parent_checkpoint_id, kind checkpoint|base_update, claim_epoch, dispatch_id, merge_commit_sha, gate_evidence map, inserted_at) exists with RLS enabled, unique (story_id, commit_sha) and unique (story_id, seq)."
+      "description": "A thread_checkpoints table (tenant_id, story_id, seq, commit_sha, tree_sha, parent_checkpoint_id, kind checkpoint|base_update, claim_epoch, dispatch_id, merge_commit_sha, gate_evidence map, inserted_at) exists with RLS enabled, unique (story_id, seq) and unique (story_id, commit_sha, claim_epoch)."
     },
     {
       "id": "AC-45.1.2",
-      "description": "A thread_entries table (tenant_id, story_id, seq, kind, author_principal, dispatch_id, idempotency_key NOT NULL, body, checkpoint_id, finding_ids, introduced_by, severity, inserted_at) exists with RLS enabled, unique (story_id, seq) and unique (story_id, author_principal, idempotency_key); kind is one of message, checkpoint, review_requested, finding, fix, verdict, escalation, merge."
+      "description": "A thread_entries table (tenant_id, story_id, seq, kind, author_principal, dispatch_id, idempotency_key NOT NULL, body, checkpoint_id, inserted_at) exists with RLS enabled, unique (story_id, seq) and unique (story_id, author_principal, idempotency_key); the kind column admits message, checkpoint, review_requested, finding, fix, verdict, escalation and merge."
     },
     {
       "id": "AC-45.1.3",
-      "description": "Recording a checkpoint is refused with 409 stale_claim_epoch unless the caller is the story's current claimant and names the story's current claim_epoch; the checkpoint's seq is assigned server-side; resending a commit_sha already recorded returns the recorded checkpoint with 200 and writes nothing."
+      "description": "Recording a checkpoint is refused with 409 not_claimant, stale_claim_epoch or claim_not_live unless the caller is the story's current claimant (Delivery.Claimant) under the current claim_epoch with a live lease; the lease alone decides liveness, so a claimant that reported done is still the claimant. The same (commit_sha, claim_epoch) resent with the same tree and note returns the recorded checkpoint with 200; another tree or note is 409 checkpoint_conflict; the same commit under a new claim is recorded again."
     },
     {
       "id": "AC-45.1.4",
-      "description": "Re-sending an entry with the same idempotency_key from the same author returns the existing entry with 200 and writes nothing; the same key from a different author is a distinct entry."
+      "description": "Re-sending an entry with the same idempotency_key and the same kind, body and checkpoint_id from the same author returns the existing entry with 200; the same key naming a different entry is 409 idempotency_key_reused; keys starting loopctl: are reserved."
     },
     {
       "id": "AC-45.1.5",
-      "description": "Entry bodies are bounded by one module attribute that both the changeset and the OpenAPI operation reference, and a body over the bound is 422."
+      "description": "Entry bodies and checkpoint notes are bounded by one module attribute that both the changeset and the OpenAPI operation reference, and refused with 422 secret_blocked when the secret denylist matches."
     },
     {
       "id": "AC-45.1.6",
-      "description": "A finding entry must reference a checkpoint of the same story and carry a severity of critical, high, medium or low; a fix entry must reference the fix checkpoint (checkpoint_id) and at least one finding of the same story; after the story's first completed review round a finding must carry introduced_by, either a checkpoint id of the same story or the literal none."
+      "description": "Callers write message and review_requested entries only, from any principal of the tenant; finding, fix and verdict are refused with 422 naming the review dispatch (US-45.3), and checkpoint, escalation and merge as loopctl's own. A checkpoint_id is cast to a canonical UUID and must name a checkpoint of the same story."
     },
     {
       "id": "AC-45.1.7",
-      "description": "Every recorded checkpoint and entry appends an audit-chain event for the story."
+      "description": "Every recorded checkpoint and entry appends an audit-chain event for the story in the same transaction; writes take a per-story advisory lock and the story FOR SHARE, reads take no lock."
     },
     {
       "id": "AC-45.1.8",
-      "description": "GET /api/v1/stories/:id/thread returns the checkpoints and entries in seq order, with entry bodies marked untrusted; MCP tools thread_get, thread_checkpoint and thread_entry call the three endpoints, declared and dispatched, with a README row each."
+      "description": "GET /api/v1/stories/:id/thread returns all checkpoints and one page of entries (after_seq, limit capped, next_after_seq), bodies marked untrusted, and 400 for a page parameter outside a non-negative int4; MCP tools thread_get, thread_checkpoint and thread_entry call the three endpoints, declared and dispatched, with a README row each naming every refusal."
     },
     {
       "id": "AC-45.1.9",
       "description": "Tenant B cannot read or write tenant A's thread."
-    },
-    {
-      "id": "AC-45.1.10",
-      "description": "Entries are authorized by kind: finding and verdict are refused with 409 self_review_blocked when the author is the story's assigned agent or its lineage is on the implementer's dispatch chain; fix is accepted only from the current claimant presenting the current claim_epoch (409 not_claimant or stale_claim_epoch otherwise); message and review_requested are open to any principal of the tenant."
-    },
-    {
-      "id": "AC-45.1.11",
-      "description": "An entry whose body matches the secret denylist (Loopctl.Security.SecretDenylist) is refused with 422 secret_blocked and nothing is written."
     }
   ],
   "test_cases": [
     {
       "id": "TC-45.1.1",
       "verifies": [
-        "AC-45.1.1",
-        "AC-45.1.2"
+        "AC-45.1.3"
       ],
-      "name": "migrations create the tables with RLS",
+      "name": "checkpoint fence",
       "type": "integration",
       "preconditions": [
-        "test db"
+        "claimed story"
       ],
       "steps": [
-        "migrate"
+        "stale epoch; other agent; lapsed lease; reported-done claimant"
       ],
       "expected_results": [
-        "tables and unique indexes present; RLS enabled"
+        "409 stale_claim_epoch; 409 not_claimant; 409 claim_not_live; 201"
       ]
     },
     {
       "id": "TC-45.1.2",
       "verifies": [
-        "AC-45.1.3"
+        "AC-45.1.3",
+        "AC-45.1.4"
       ],
-      "name": "checkpoint from a stale epoch is refused",
+      "name": "replay rules",
       "type": "integration",
       "preconditions": [
         "claimed story"
       ],
       "steps": [
-        "POST checkpoint with an old epoch"
+        "resend a checkpoint and an entry; resend with different content; same commit under a new claim"
       ],
       "expected_results": [
-        "409 stale_claim_epoch; nothing written"
+        "200 existing; 409 conflict codes; 201 new checkpoint"
       ]
     },
     {
       "id": "TC-45.1.3",
       "verifies": [
-        "AC-45.1.4"
+        "AC-45.1.5",
+        "AC-45.1.6"
       ],
-      "name": "idempotent entry",
-      "type": "integration",
-      "preconditions": [
-        "claimed story"
-      ],
+      "name": "entry kinds and content",
+      "type": "unit",
+      "preconditions": [],
       "steps": [
-        "POST the same entry twice"
+        "finding, fix, verdict, checkpoint kinds; non-UUID and uppercase checkpoint_id; secret in body; reserved key"
       ],
       "expected_results": [
-        "one row; second answer 200 with the same id"
+        "422 each; uppercase canonicalised and replays"
       ]
     },
     {
       "id": "TC-45.1.4",
       "verifies": [
-        "AC-45.1.5",
-        "AC-45.1.6"
+        "AC-45.1.7",
+        "AC-45.1.8"
       ],
-      "name": "entry validation",
-      "type": "unit",
+      "name": "audit and read",
+      "type": "integration",
       "preconditions": [],
       "steps": [
-        "oversized body; finding without checkpoint; fix without finding; round-2 finding without introduced_by"
+        "record a checkpoint and a message; page the thread; out-of-range after_seq"
       ],
       "expected_results": [
-        "each 422"
+        "two chain events; pages; 400"
       ]
     },
     {
       "id": "TC-45.1.5",
-      "verifies": [
-        "AC-45.1.7"
-      ],
-      "name": "audit events",
-      "type": "integration",
-      "preconditions": [],
-      "steps": [
-        "record a checkpoint and an entry"
-      ],
-      "expected_results": [
-        "two audit events on the story"
-      ]
-    },
-    {
-      "id": "TC-45.1.6",
-      "verifies": [
-        "AC-45.1.8"
-      ],
-      "name": "read the thread and the MCP wiring",
-      "type": "integration",
-      "preconditions": [],
-      "steps": [
-        "GET thread; node test on tool declaration and dispatch"
-      ],
-      "expected_results": [
-        "seq order; untrusted marker; tools declared and dispatched"
-      ]
-    },
-    {
-      "id": "TC-45.1.7",
       "verifies": [
         "AC-45.1.9"
       ],
@@ -174,44 +135,11 @@
       "expected_results": [
         "404"
       ]
-    },
-    {
-      "id": "TC-45.1.8",
-      "verifies": [
-        "AC-45.1.10"
-      ],
-      "name": "authorization by kind",
-      "type": "integration",
-      "preconditions": [
-        "claimed story"
-      ],
-      "steps": [
-        "claimant writes a finding; non-claimant writes a fix; stale epoch fix"
-      ],
-      "expected_results": [
-        "409 self_review_blocked; 409 not_claimant; 409 stale_claim_epoch"
-      ]
-    },
-    {
-      "id": "TC-45.1.9",
-      "verifies": [
-        "AC-45.1.11"
-      ],
-      "name": "secret in a body",
-      "type": "unit",
-      "preconditions": [],
-      "steps": [
-        "entry body containing a GitHub token shape"
-      ],
-      "expected_results": [
-        "422 secret_blocked"
-      ]
     }
   ],
   "technical_notes": [
     "Never cast tenant_id, story_id, seq, author_principal or dispatch_id.",
-    "author_principal and the caller's lineage are derived from the authenticating key.",
-    "A round is complete when a non-implementer principal writes a verdict entry; review_records rows are the custody lifecycle's and are not counted.",
+    "Judgement kinds (finding, fix, verdict) and round counting belong to US-45.3: #901 tried to infer the judge's separation from the calling key and was circumvented at every review round.",
     "The mcp-server route coverage test must see the new routes reached."
   ],
   "dependencies": []
