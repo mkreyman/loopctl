@@ -381,17 +381,53 @@ defmodule Loopctl.Webhooks do
           }
         })
 
-      multi =
-        Multi.new()
-        |> Multi.insert(:event, changeset)
-        |> Multi.run(:oban_job, fn _repo, %{event: event} ->
-          WebhookDeliveryWorker.enqueue(tenant_id, event.id)
-        end)
+      insert_event_changeset_with_delivery(changeset)
+    end
+  end
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{event: event}} -> {:ok, event}
-        {:error, _step, reason, _changes} -> {:error, reason}
-      end
+  @doc """
+  Writes one webhook event for `webhook_id` and its delivery job in ONE `AdminRepo`
+  transaction, so neither commits without the other (#885). This is how every webhook event
+  is written.
+
+  Called inside a caller's `AdminRepo` transaction it joins that transaction, and the event
+  and job commit or roll back with the caller's state change. Called outside one, it is a
+  transaction of its own, one `AdminRepo` checkout for both rows.
+
+  Returns `{:ok, event}`, or `{:error, changeset}` for an event changeset that is invalid;
+  that refusal is made before anything is written, so the caller may log it and carry on,
+  inside a transaction or not. A write the DATABASE refuses is different inside a caller's
+  transaction: Postgres has already aborted that transaction, so this raises rather than
+  hand back an error the caller would log and carry on past. Outside one, both rows roll
+  back and the error is returned.
+  """
+  @spec insert_event_with_delivery(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) ::
+          {:ok, WebhookEvent.t()} | {:error, term()}
+  def insert_event_with_delivery(tenant_id, webhook_id, event_type, payload) do
+    %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook_id}
+    |> WebhookEvent.create_changeset(%{event_type: event_type, payload: payload})
+    |> insert_event_changeset_with_delivery()
+  end
+
+  defp insert_event_changeset_with_delivery(%Ecto.Changeset{valid?: false} = changeset),
+    do: {:error, changeset}
+
+  defp insert_event_changeset_with_delivery(changeset) do
+    in_caller_transaction? = AdminRepo.in_transaction?()
+
+    Multi.new()
+    |> Multi.insert(:event, changeset)
+    |> WebhookDeliveryWorker.enqueue(:job, :event)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, %{event: event}} ->
+        {:ok, event}
+
+      {:error, step, reason, _changes} when in_caller_transaction? ->
+        raise "webhook #{step} write refused inside the caller's transaction: #{inspect(reason)}"
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
     end
   end
 

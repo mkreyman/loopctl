@@ -1079,8 +1079,9 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
     end
   end
 
-  # WebhookDeliveryWorker.enqueue/2 writes on Loopctl.AdminOban, so the job row is on
-  # AdminRepo's sandbox connection, which the Loopctl.Repo default above cannot see (#885).
+  # Webhooks.insert_event_with_delivery/4 writes the job in an AdminRepo transaction, so the
+  # row is on AdminRepo's sandbox connection, which the Loopctl.Repo default above cannot
+  # see (#885).
   defp assert_webhook_enqueued(tenant_id) do
     Oban.Testing.assert_enqueued(
       repo: Loopctl.AdminRepo,

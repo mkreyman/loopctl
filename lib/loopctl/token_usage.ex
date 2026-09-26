@@ -45,11 +45,10 @@ defmodule Loopctl.TokenUsage do
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report
+  alias Loopctl.Webhooks
   alias Loopctl.Webhooks.EventGenerator
-  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
-  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @doc """
   Creates a new token usage report.
@@ -1048,24 +1047,11 @@ defmodule Loopctl.TokenUsage do
     webhooks = EventGenerator.matching_webhooks(tenant_id, event_type, project_id)
 
     Enum.each(webhooks, fn webhook ->
-      with {:ok, event} <-
-             %WebhookEvent{
-               tenant_id: tenant_id,
-               webhook_id: webhook.id
-             }
-             |> WebhookEvent.create_changeset(%{
-               event_type: event_type,
-               payload: payload
-             })
-             |> AdminRepo.insert(),
-           {:ok, _job} <-
-             WebhookDeliveryWorker.enqueue(tenant_id, event.id) do
-        :ok
-      else
-        {:error, reason} ->
-          Logger.warning(
-            "Failed to create #{event_type} webhook event for tenant #{tenant_id}: #{inspect(reason)}"
-          )
+      with {:error, reason} <-
+             Webhooks.insert_event_with_delivery(tenant_id, webhook.id, event_type, payload) do
+        Logger.warning(
+          "Failed to create #{event_type} webhook event for tenant #{tenant_id}: #{inspect(reason)}"
+        )
       end
     end)
   end

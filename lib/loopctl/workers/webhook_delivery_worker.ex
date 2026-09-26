@@ -118,30 +118,25 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
   def backoff_seconds(_attempt), do: List.last(@backoff_schedule)
 
   @doc """
-  Enqueues delivery of `event_id` on `Loopctl.AdminRepo`, the repo every webhook event row
-  is written on.
+  Appends the delivery job for the webhook event at `event_step` to `multi`.
 
-  The event is usually written inside an `AdminRepo` transaction, so the job must be too.
-  A bare `Oban.insert/1` writes through Oban's configured `Loopctl.Repo`, a different
-  connection: the job committed at once, could run before the event was visible (the
-  worker then found nothing and dropped the webhook), and survived the event's transaction
-  rolling back (#885). The Multi-aware `Oban.insert/4` runs its insert on the repo the
-  Multi executes on, the same mechanism `Loopctl.Memory` uses for its embedding job.
-  Called inside an `AdminRepo` transaction, this nested transaction joins it; called
-  outside one, the job commits on its own after the already-committed event.
+  Use it through `Loopctl.Webhooks.insert_event_with_delivery/4`, which writes the event and
+  this job in one `AdminRepo` transaction. The Multi-aware `Oban.insert/4` runs its insert on
+  the repo the Multi executes on, so the job is written on the event's own connection and
+  commits or rolls back with it. A bare `Oban.insert/1` writes through Oban's configured
+  `Loopctl.Repo`, a different connection: the job committed at once, could run before the
+  event was visible (the worker then found nothing and dropped the webhook), and survived
+  the event's transaction rolling back (#885).
 
-  Every writer calls this rather than `new/1` plus `Oban.insert/1`, and
   `test/loopctl/webhooks/enqueue_delivery_test.exs` refuses any other enqueue of this worker
   under `lib/`.
   """
-  @spec enqueue(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, term()}
-  def enqueue(tenant_id, event_id) do
-    job = new(%{webhook_event_id: event_id, tenant_id: tenant_id})
-
-    case Multi.new() |> Oban.insert(:job, job) |> AdminRepo.transaction() do
-      {:ok, %{job: job}} -> {:ok, job}
-      {:error, :job, reason, _changes} -> {:error, reason}
-    end
+  @spec enqueue(Multi.t(), Multi.name(), Multi.name()) :: Multi.t()
+  def enqueue(%Multi{} = multi, name, event_step) do
+    Oban.insert(multi, name, fn changes ->
+      event = Map.fetch!(changes, event_step)
+      new(%{webhook_event_id: event.id, tenant_id: event.tenant_id})
+    end)
   end
 
   # Hard per-job wall-clock cap (backstop to the bounded DNS resolve in the egress

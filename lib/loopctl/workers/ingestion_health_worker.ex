@@ -146,10 +146,12 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   ## Alert durability (at-least-once)
 
   The anomaly row + `detected` audit are inserted atomically, but the operator alert
-  + webhook enqueues run POST-commit, after the anomaly transaction rather than inside it.
-  A crash between commit and enqueue would leave
-  an unresolved row with `alerted: false`; the next run detects that and re-fires the
-  notifications rather than silently losing them on the no-notify update path.
+  + webhook events run POST-commit, after the anomaly transaction rather than inside it.
+  The operator alert is an Oban job inserted through Oban's configured `Loopctl.Repo`, so it
+  cannot join the anomaly's `AdminRepo` transaction; the webhook events stay beside it so
+  one `alerted` flip, made after both, covers the pair. A crash between commit and alert
+  would leave an unresolved row with `alerted: false`; the next run detects that and
+  re-fires the notifications rather than silently losing them on the no-notify update path.
 
   ## Race-safety
 
@@ -188,10 +190,9 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionHealth
   alias Loopctl.TelemetryEvents
+  alias Loopctl.Webhooks
   alias Loopctl.Webhooks.EventGenerator
-  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.Workers.ScaleAlertDeliveryWorker
-  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @webhook_event_type "knowledge.ingestion_anomaly_detected"
 
@@ -1489,22 +1490,12 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   end
 
   defp deliver_anomaly_event(tenant_id, webhook, event_type, payload, anomaly_id) do
-    with {:ok, event} <-
-           %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
-           |> WebhookEvent.create_changeset(%{
-             event_type: event_type,
-             payload: payload
-           })
-           |> AdminRepo.insert(),
-         {:ok, _job} <-
-           WebhookDeliveryWorker.enqueue(tenant_id, event.id) do
-      :ok
-    else
-      {:error, reason} ->
-        Logger.warning(
-          "IngestionHealthWorker: failed to create #{event_type} webhook event " <>
-            "for anomaly #{anomaly_id}: #{inspect(reason)}"
-        )
+    with {:error, reason} <-
+           Webhooks.insert_event_with_delivery(tenant_id, webhook.id, event_type, payload) do
+      Logger.warning(
+        "IngestionHealthWorker: failed to create #{event_type} webhook event " <>
+          "for anomaly #{anomaly_id}: #{inspect(reason)}"
+      )
     end
   end
 

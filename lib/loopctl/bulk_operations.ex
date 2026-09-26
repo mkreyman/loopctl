@@ -24,11 +24,10 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Progress
+  alias Loopctl.Webhooks
   alias Loopctl.Webhooks.EventGenerator
-  alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Dependencies
   alias Loopctl.WorkBreakdown.Story
-  alias Loopctl.Workers.WebhookDeliveryWorker
 
   @max_batch_size 50
 
@@ -911,18 +910,9 @@ defmodule Loopctl.BulkOperations do
   defp emit_single_webhook_event(tenant_id, webhook, event_type, payload) do
     require Logger
 
-    with {:ok, event} <-
-           %WebhookEvent{tenant_id: tenant_id, webhook_id: webhook.id}
-           |> WebhookEvent.create_changeset(%{event_type: event_type, payload: payload})
-           |> AdminRepo.insert(),
-         {:ok, _job} <-
-           WebhookDeliveryWorker.enqueue(tenant_id, event.id) do
-      :ok
-    else
-      {:error, reason} ->
-        Logger.warning(
-          "Failed webhook event/delivery for webhook #{webhook.id}: #{inspect(reason)}"
-        )
+    with {:error, reason} <-
+           Webhooks.insert_event_with_delivery(tenant_id, webhook.id, event_type, payload) do
+      Logger.warning("Failed webhook event for webhook #{webhook.id}: #{inspect(reason)}")
     end
   end
 
