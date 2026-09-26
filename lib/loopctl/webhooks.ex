@@ -385,11 +385,7 @@ defmodule Loopctl.Webhooks do
         Multi.new()
         |> Multi.insert(:event, changeset)
         |> Multi.run(:oban_job, fn _repo, %{event: event} ->
-          WebhookDeliveryWorker.new(%{
-            webhook_event_id: event.id,
-            tenant_id: tenant_id
-          })
-          |> Oban.insert()
+          WebhookDeliveryWorker.enqueue(tenant_id, event.id)
         end)
 
       case AdminRepo.transaction(multi) do

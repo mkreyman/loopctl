@@ -1059,11 +1059,7 @@ defmodule Loopctl.TokenUsage do
              })
              |> AdminRepo.insert(),
            {:ok, _job} <-
-             WebhookDeliveryWorker.new(%{
-               webhook_event_id: event.id,
-               tenant_id: tenant_id
-             })
-             |> Oban.insert() do
+             WebhookDeliveryWorker.enqueue(tenant_id, event.id) do
         :ok
       else
         {:error, reason} ->

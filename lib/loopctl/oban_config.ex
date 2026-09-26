@@ -515,6 +515,33 @@ defmodule Loopctl.ObanConfig do
   end
 
   @doc """
+  Options for `Loopctl.AdminOban`, an INSERT-ONLY Oban instance on `Loopctl.AdminRepo`.
+
+  A job must commit or roll back with the rows it refers to, and that only holds when it
+  is written on the same connection. The main instance writes on `Loopctl.Repo`, so a job
+  enqueued inside an `AdminRepo` transaction committed at once on another connection: it
+  could run before its row was visible, and it survived that transaction rolling back
+  (#885). Enqueueing through this instance puts the job row in the caller's own
+  `AdminRepo` transaction.
+
+  It runs nothing: no queues, no plugins, no leadership. The main instance stages and
+  executes the jobs it writes, which share the one `oban_jobs` table. `:testing` and
+  `:prefix` are inherited from `main` so both instances behave alike in every environment.
+  """
+  @spec admin_inserter(keyword()) :: keyword()
+  def admin_inserter(main) when is_list(main) do
+    [
+      name: Loopctl.AdminOban,
+      repo: Loopctl.AdminRepo,
+      queues: false,
+      plugins: false,
+      peer: false,
+      testing: Keyword.get(main, :testing, :disabled),
+      prefix: Keyword.get(main, :prefix, "public")
+    ]
+  end
+
+  @doc """
   Returns the full Oban `:plugins` list (US-35.3).
 
   Owns the crontab so the all-tenants `ComputeSthWorker` safety-sweep schedule is

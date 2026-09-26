@@ -158,6 +158,9 @@ defmodule Loopctl.Application do
       Loopctl.RateLimiter.FailOpenLog,
       Loopctl.RateLimiter.FailOpenBackstop,
       {Oban, Application.fetch_env!(:loopctl, Oban)},
+      # #885: insert-only instance on AdminRepo, so a job enqueued inside an AdminRepo
+      # transaction commits or rolls back with it. After the main instance, which runs it.
+      {Oban, Loopctl.ObanConfig.admin_inserter(Application.fetch_env!(:loopctl, Oban))},
       # US-35.2 / US-38.3: supervised, CLUSTER-WIDE singleton (leadership via
       # :global, negotiated in init) that subscribes to the fixed audit-chain
       # firehose topic and debounce-enqueues one ComputeSthWorker job per tenant
