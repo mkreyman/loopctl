@@ -632,7 +632,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
   defp tmp_dir do
     dir =
       Path.join(
-        System.tmp_dir!(),
+        Loopctl.RealTmpDir.path!(),
         "check_drift_#{System.unique_integer([:positive, :monotonic])}_#{:erlang.phash2(self())}"
       )
 
