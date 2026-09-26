@@ -7,12 +7,12 @@ All notable changes to loopctl are documented here.
 ### Added
 
 - **A `delivery-loop` system wiki article, seeded by migration `20260926060000`.** No manual
-  step is needed for it to appear at `/wiki/delivery-loop` and in keyword search. It is NOT
-  embedded for tenants that already materialized the system corpus: nothing re-runs
-  materialization when a system article is added, because each tenant embeds the corpus with
-  its own key. Until `embedding_materialize_system_corpus` is run again for a tenant (it is
-  idempotent and embeds only what is missing), the article is keyword-only there, and
-  `system_corpus_meta` in search responses says so.
+  step. Each tenant embeds it with its own key the first time that tenant runs a semantic
+  search after the deploy: one unembedded system article makes `system_corpus_meta` report
+  `keyword_only`, and that report enqueues the tenant's materialization
+  (`Embeddings.search_disclosure_meta/2`, once per disclosure-cache fill). Until then the
+  article is found by keyword only. `embedding_materialize_system_corpus` does the same thing
+  on demand.
 
 ### Changed
 
