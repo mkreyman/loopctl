@@ -1,0 +1,88 @@
+{
+  "id": "US-45.2",
+  "title": "Runner contract: report checkpoints and thread entries",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "high",
+  "phase": "change_threads",
+  "story": {
+    "as_a": "runner session implementing a story",
+    "i_want_to": "report each commit I push as a checkpoint and each reasoning note as an entry over the runner channel",
+    "so_that": "the thread fills as the work happens rather than being reconstructed afterwards"
+  },
+  "rationale": "The runner is the only party that knows when a checkpoint exists; PRD \u00a73 and \u00a74 item 2.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.2.1",
+      "description": "Runner contract minor bump adds optional checkpoint_report and thread_entry messages; a runner that sends neither gets today's behaviour."
+    },
+    {
+      "id": "AC-45.2.2",
+      "description": "A checkpoint_report carries story_id, claim_epoch, commit_sha, tree_sha and optional parent sha; loopctl records it through the same function as US-45.1 with the same epoch fence."
+    },
+    {
+      "id": "AC-45.2.3",
+      "description": "A thread_entry message carries a client_seq; its idempotency key is dispatch_id:client_seq."
+    },
+    {
+      "id": "AC-45.2.4",
+      "description": "priv/runner_contract/v1.json is regenerated and its changelog names the version and both messages."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.2.1",
+      "verifies": [
+        "AC-45.2.1",
+        "AC-45.2.4"
+      ],
+      "name": "contract carries the messages",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "read v1.json"
+      ],
+      "expected_results": [
+        "version bumped; both messages declared optional"
+      ]
+    },
+    {
+      "id": "TC-45.2.2",
+      "verifies": [
+        "AC-45.2.2"
+      ],
+      "name": "checkpoint over the channel",
+      "type": "integration",
+      "preconditions": [
+        "joined runner, claimed story"
+      ],
+      "steps": [
+        "push checkpoint_report"
+      ],
+      "expected_results": [
+        "checkpoint recorded; stale epoch refused"
+      ]
+    },
+    {
+      "id": "TC-45.2.3",
+      "verifies": [
+        "AC-45.2.3"
+      ],
+      "name": "entry retry over the channel",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "send the same client_seq twice"
+      ],
+      "expected_results": [
+        "one entry"
+      ]
+    }
+  ],
+  "technical_notes": "Runner adoption happens in mkreyman/loopctl-runner by handoff.",
+  "dependencies": [
+    "US-45.1"
+  ]
+}

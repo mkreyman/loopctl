@@ -1,0 +1,113 @@
+{
+  "id": "US-45.5",
+  "title": "Merge executor: a GitHub App squashes the allowed checkpoint by compare-and-swap",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "critical",
+  "phase": "change_threads",
+  "story": {
+    "as_a": "loopctl control plane",
+    "i_want_to": "merge an allowed checkpoint to the base branch myself",
+    "so_that": "the merged tree is exactly the tree the gate allowed, with no pull request and no stale head"
+  },
+  "rationale": "PRD \u00a74 item 3 and 4.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.5.1",
+      "description": "ThreadMergeWorker is unique per story and runs only on a recorded allow for the checkpoint it merges."
+    },
+    {
+      "id": "AC-45.5.2",
+      "description": "It verifies the checkpoint contains the base head, creates the squash commit with the checkpoint tree and the base head as parent, records merge_commit_sha, and only then updates the ref with force false."
+    },
+    {
+      "id": "AC-45.5.3",
+      "description": "A retry whose recorded merge_commit_sha is an ancestor of the base head answers already_merged and moves the story to merged."
+    },
+    {
+      "id": "AC-45.5.4",
+      "description": "A non-fast-forward refusal merges the base into the thread branch as the App, records a base_update checkpoint, and returns the story to ci; a merge conflict returns it to implementing over base_moved."
+    },
+    {
+      "id": "AC-45.5.5",
+      "description": "The squash message carries the story id, a one-line printable title, the thread URL and a Loopctl-Story trailer, and no entry body."
+    },
+    {
+      "id": "AC-45.5.6",
+      "description": "The App's credentials are new environment variables documented in deploy/FLY_SECRETS.md; with them unset the worker refuses and escalates rather than merging."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.5.1",
+      "verifies": [
+        "AC-45.5.2",
+        "AC-45.5.3"
+      ],
+      "name": "lost acknowledgement",
+      "type": "integration",
+      "preconditions": [
+        "mocked forge"
+      ],
+      "steps": [
+        "ref update succeeds, ack lost, retry"
+      ],
+      "expected_results": [
+        "already_merged"
+      ]
+    },
+    {
+      "id": "TC-45.5.2",
+      "verifies": [
+        "AC-45.5.4"
+      ],
+      "name": "moved base",
+      "type": "integration",
+      "preconditions": [
+        "mocked forge"
+      ],
+      "steps": [
+        "non-fast-forward then clean base merge"
+      ],
+      "expected_results": [
+        "base_update checkpoint; story at ci"
+      ]
+    },
+    {
+      "id": "TC-45.5.3",
+      "verifies": [
+        "AC-45.5.5"
+      ],
+      "name": "message",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "build message with a hostile title"
+      ],
+      "expected_results": [
+        "one printable line; no entry text"
+      ]
+    },
+    {
+      "id": "TC-45.5.4",
+      "verifies": [
+        "AC-45.5.6"
+      ],
+      "name": "unconfigured",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "run without App env"
+      ],
+      "expected_results": [
+        "escalated, no merge"
+      ]
+    }
+  ],
+  "technical_notes": "Forge access through a behaviour with a Mox mock in test.",
+  "dependencies": [
+    "US-45.4"
+  ]
+}

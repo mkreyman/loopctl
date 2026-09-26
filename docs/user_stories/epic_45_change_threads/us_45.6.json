@@ -1,0 +1,69 @@
+{
+  "id": "US-45.6",
+  "title": "CI evidence by exact SHA",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "high",
+  "phase": "change_threads",
+  "story": {
+    "as_a": "merge gate",
+    "i_want_to": "read check runs and commit statuses for the checkpoint's exact SHA",
+    "so_that": "a green result on any other commit can never satisfy the gate"
+  },
+  "rationale": "PRD \u00a75; the combined status API never lists check runs.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.6.1",
+      "description": "Evidence for a checkpoint is read from both the check-runs and the commit-status APIs for its SHA and copied onto the checkpoint."
+    },
+    {
+      "id": "AC-45.6.2",
+      "description": "A local-gate status is recorded on the checkpoint and never satisfies a required check."
+    },
+    {
+      "id": "AC-45.6.3",
+      "description": "A required check missing, pending or failed on the SHA makes the gate answer unevaluated or refuse, never allow."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.6.1",
+      "verifies": [
+        "AC-45.6.1",
+        "AC-45.6.3"
+      ],
+      "name": "exact SHA",
+      "type": "integration",
+      "preconditions": [
+        "mocked forge"
+      ],
+      "steps": [
+        "green on the parent, pending on the checkpoint"
+      ],
+      "expected_results": [
+        "not allow"
+      ]
+    },
+    {
+      "id": "TC-45.6.2",
+      "verifies": [
+        "AC-45.6.2"
+      ],
+      "name": "local-gate alone",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "only local-gate success"
+      ],
+      "expected_results": [
+        "not allow"
+      ]
+    }
+  ],
+  "technical_notes": "",
+  "dependencies": [
+    "US-45.4"
+  ]
+}

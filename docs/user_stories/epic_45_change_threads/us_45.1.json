@@ -1,0 +1,173 @@
+{
+  "id": "US-45.1",
+  "title": "Thread ledger: checkpoints and entries bound to a story",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "high",
+  "phase": "change_threads",
+  "story": {
+    "as_a": "orchestrator or runner session working a delivery story",
+    "i_want_to": "record each checkpoint and each reasoning, finding, fix and verdict entry against the story's thread",
+    "so_that": "a reviewer and Mark read a change's reasoning next to its diff, in one place, without a pull request"
+  },
+  "rationale": "loopctl holds everything around a change except the change; PRD \u00a73.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.1.1",
+      "description": "A thread_checkpoints table (tenant_id, story_id, seq, commit_sha, tree_sha, parent_checkpoint_id, kind checkpoint|base_update, claim_epoch, dispatch_id, merge_commit_sha, inserted_at) exists with RLS enabled, unique (story_id, commit_sha) and unique (story_id, seq)."
+    },
+    {
+      "id": "AC-45.1.2",
+      "description": "A thread_entries table (tenant_id, story_id, seq, kind, author_principal, dispatch_id, idempotency_key NOT NULL, body, checkpoint_id, finding_ids, introduced_by, severity, inserted_at) exists with RLS enabled, unique (story_id, seq) and unique (story_id, author_principal, idempotency_key); kind is one of message, checkpoint, review_requested, finding, fix, verdict, escalation, merge."
+    },
+    {
+      "id": "AC-45.1.3",
+      "description": "Recording a checkpoint is refused with 409 stale_claim_epoch unless the caller is the story's current claimant and names the story's current claim_epoch; the checkpoint's seq is assigned server-side."
+    },
+    {
+      "id": "AC-45.1.4",
+      "description": "Re-sending an entry with the same idempotency_key from the same author returns the existing entry with 200 and writes nothing; the same key from a different author is a distinct entry."
+    },
+    {
+      "id": "AC-45.1.5",
+      "description": "Entry bodies are bounded by one module attribute that both the changeset and the OpenAPI operation reference, and a body over the bound is 422."
+    },
+    {
+      "id": "AC-45.1.6",
+      "description": "A finding entry must reference a checkpoint of the same story; a fix entry must name at least one finding of the same story; a finding recorded after the first completed review round without introduced_by is 422."
+    },
+    {
+      "id": "AC-45.1.7",
+      "description": "Every recorded checkpoint and entry appends an audit-chain event for the story."
+    },
+    {
+      "id": "AC-45.1.8",
+      "description": "GET /api/v1/stories/:id/thread returns the checkpoints and entries in seq order, with entry bodies marked untrusted; MCP tools thread_get, thread_checkpoint and thread_entry call the three endpoints, declared and dispatched, with a README row each."
+    },
+    {
+      "id": "AC-45.1.9",
+      "description": "Tenant B cannot read or write tenant A's thread."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.1.1",
+      "verifies": [
+        "AC-45.1.1",
+        "AC-45.1.2"
+      ],
+      "name": "migrations create the tables with RLS",
+      "type": "integration",
+      "preconditions": [
+        "test db"
+      ],
+      "steps": [
+        "migrate"
+      ],
+      "expected_results": [
+        "tables and unique indexes present; RLS enabled"
+      ]
+    },
+    {
+      "id": "TC-45.1.2",
+      "verifies": [
+        "AC-45.1.3"
+      ],
+      "name": "checkpoint from a stale epoch is refused",
+      "type": "integration",
+      "preconditions": [
+        "claimed story"
+      ],
+      "steps": [
+        "POST checkpoint with an old epoch"
+      ],
+      "expected_results": [
+        "409 stale_claim_epoch; nothing written"
+      ]
+    },
+    {
+      "id": "TC-45.1.3",
+      "verifies": [
+        "AC-45.1.4"
+      ],
+      "name": "idempotent entry",
+      "type": "integration",
+      "preconditions": [
+        "claimed story"
+      ],
+      "steps": [
+        "POST the same entry twice"
+      ],
+      "expected_results": [
+        "one row; second answer 200 with the same id"
+      ]
+    },
+    {
+      "id": "TC-45.1.4",
+      "verifies": [
+        "AC-45.1.5",
+        "AC-45.1.6"
+      ],
+      "name": "entry validation",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "oversized body; finding without checkpoint; fix without finding; round-2 finding without introduced_by"
+      ],
+      "expected_results": [
+        "each 422"
+      ]
+    },
+    {
+      "id": "TC-45.1.5",
+      "verifies": [
+        "AC-45.1.7"
+      ],
+      "name": "audit events",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "record a checkpoint and an entry"
+      ],
+      "expected_results": [
+        "two audit events on the story"
+      ]
+    },
+    {
+      "id": "TC-45.1.6",
+      "verifies": [
+        "AC-45.1.8"
+      ],
+      "name": "read the thread and the MCP wiring",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "GET thread; node test on tool declaration and dispatch"
+      ],
+      "expected_results": [
+        "seq order; untrusted marker; tools declared and dispatched"
+      ]
+    },
+    {
+      "id": "TC-45.1.7",
+      "verifies": [
+        "AC-45.1.9"
+      ],
+      "name": "tenant isolation",
+      "type": "integration",
+      "preconditions": [
+        "two tenants"
+      ],
+      "steps": [
+        "tenant B reads and writes tenant A's thread"
+      ],
+      "expected_results": [
+        "404"
+      ]
+    }
+  ],
+  "technical_notes": "Never add tenant_id, story_id, seq or author_principal to a cast list. author_principal is derived from the authenticating key. The route coverage test in mcp-server must see the new routes reached.",
+  "dependencies": []
+}

@@ -1,0 +1,85 @@
+{
+  "id": "US-45.7",
+  "title": "Thread page with WebAuthn browser login",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "high",
+  "phase": "change_threads",
+  "story": {
+    "as_a": "Mark",
+    "i_want_to": "read a thread from one URL and write messages and findings on it",
+    "so_that": "the work is visible without GitHub"
+  },
+  "rationale": "PRD \u00a76.1; loopctl has no authenticated browser session today.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.7.1",
+      "description": "Browser login uses the WebAuthn credential enrolled at signup and binds the session to the tenant's human user principal, with CSRF protection and RLS scoped as for that principal."
+    },
+    {
+      "id": "AC-45.7.2",
+      "description": "The thread page shows checkpoints, entries (rendered as untrusted text) and findings, and fetches diffs from the forge by SHA without storing them."
+    },
+    {
+      "id": "AC-45.7.3",
+      "description": "The page writes message and finding entries with a per-form nonce as idempotency key, attributed to the human principal with an empty lineage."
+    },
+    {
+      "id": "AC-45.7.4",
+      "description": "The intake issue receives a link to the thread page."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.7.1",
+      "verifies": [
+        "AC-45.7.1"
+      ],
+      "name": "login",
+      "type": "integration",
+      "preconditions": [],
+      "steps": [
+        "WebAuthn assertion"
+      ],
+      "expected_results": [
+        "session bound to the human principal"
+      ]
+    },
+    {
+      "id": "TC-45.7.2",
+      "verifies": [
+        "AC-45.7.2"
+      ],
+      "name": "render",
+      "type": "liveview",
+      "preconditions": [],
+      "steps": [
+        "open a thread"
+      ],
+      "expected_results": [
+        "entries fenced; diff fetched"
+      ]
+    },
+    {
+      "id": "TC-45.7.3",
+      "verifies": [
+        "AC-45.7.3"
+      ],
+      "name": "double submit",
+      "type": "liveview",
+      "preconditions": [],
+      "steps": [
+        "submit the same form twice"
+      ],
+      "expected_results": [
+        "one entry"
+      ]
+    }
+  ],
+  "technical_notes": "",
+  "dependencies": [
+    "US-45.1"
+  ]
+}
