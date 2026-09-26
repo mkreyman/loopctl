@@ -146,8 +146,8 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   ## Alert durability (at-least-once)
 
   The anomaly row + `detected` audit are inserted atomically, but the operator alert
-  + webhook enqueues run POST-commit (they can't join the AdminRepo transaction — Oban
-  jobs insert through `Loopctl.Repo`). A crash between commit and enqueue would leave
+  + webhook enqueues run POST-commit, after the anomaly transaction rather than inside it.
+  A crash between commit and enqueue would leave
   an unresolved row with `alerted: false`; the next run detects that and re-fires the
   notifications rather than silently losing them on the no-notify update path.
 

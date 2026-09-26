@@ -58,6 +58,7 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
 
   require Logger
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Egress
   alias Loopctl.Egress.Scope
@@ -116,26 +117,36 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
 
   def backoff_seconds(_attempt), do: List.last(@backoff_schedule)
 
+  @doc """
+  Enqueues delivery of `event_id` on `Loopctl.AdminRepo`, the repo every webhook event row
+  is written on.
+
+  The event is usually written inside an `AdminRepo` transaction, so the job must be too.
+  A bare `Oban.insert/1` writes through Oban's configured `Loopctl.Repo`, a different
+  connection: the job committed at once, could run before the event was visible (the
+  worker then found nothing and dropped the webhook), and survived the event's transaction
+  rolling back (#885). The Multi-aware `Oban.insert/4` runs its insert on the repo the
+  Multi executes on, the same mechanism `Loopctl.Memory` uses for its embedding job.
+  Called inside an `AdminRepo` transaction, this nested transaction joins it; called
+  outside one, the job commits on its own after the already-committed event.
+
+  Every writer calls this rather than `new/1` plus `Oban.insert/1`, and
+  `test/loopctl/webhooks/enqueue_delivery_test.exs` refuses any other enqueue of this worker
+  under `lib/`.
+  """
+  @spec enqueue(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, term()}
+  def enqueue(tenant_id, event_id) do
+    job = new(%{webhook_event_id: event_id, tenant_id: tenant_id})
+
+    case Multi.new() |> Oban.insert(:job, job) |> AdminRepo.transaction() do
+      {:ok, %{job: job}} -> {:ok, job}
+      {:error, :job, reason, _changes} -> {:error, reason}
+    end
+  end
+
   # Hard per-job wall-clock cap (backstop to the bounded DNS resolve in the egress
   # guard + Req receive_timeout). A hostile/slow webhook target can't pin a
   # :webhooks queue slot indefinitely (ie-02 / GHSA-jh42-wf7g-f5rg).
-  @doc """
-  Enqueues delivery of `event_id` on `Loopctl.AdminOban`, the instance that writes on
-  `Loopctl.AdminRepo`.
-
-  Every webhook event row is written on `AdminRepo`, usually inside a transaction, so the
-  job must be too: enqueued on the main instance it committed on `Loopctl.Repo` at once,
-  could run before the event was visible (the worker then found nothing and dropped the
-  webhook), and survived the event's transaction rolling back (#885). Every writer calls
-  this rather than `new/1` plus `Oban.insert/1`; `test/loopctl/webhooks/enqueue_guard_test.exs`
-  refuses any other enqueue of this worker under `lib/`.
-  """
-  @spec enqueue(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, Oban.Job.t()} | {:error, Ecto.Changeset.t() | term()}
-  def enqueue(tenant_id, event_id) do
-    Oban.insert(Loopctl.AdminOban, new(%{webhook_event_id: event_id, tenant_id: tenant_id}))
-  end
-
   @impl Oban.Worker
   def timeout(_job), do: :timer.seconds(30)
 
