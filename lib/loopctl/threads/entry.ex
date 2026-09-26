@@ -71,11 +71,21 @@ defmodule Loopctl.Threads.Entry do
   end
 
   # A checkpoint id, or the literal `none`: the reviewer said so explicitly.
+  # Normalised to Ecto's canonical lowercase form, so the stored value joins to a checkpoint
+  # id however the caller cased it.
   defp validate_introduced_by(changeset) do
-    validate_change(changeset, :introduced_by, fn :introduced_by, value ->
-      if value == "none" or match?({:ok, _}, Ecto.UUID.cast(value)),
-        do: [],
-        else: [introduced_by: "must be a checkpoint id or \"none\""]
-    end)
+    case get_change(changeset, :introduced_by) do
+      nil ->
+        changeset
+
+      "none" ->
+        changeset
+
+      value ->
+        case Ecto.UUID.cast(value) do
+          {:ok, uuid} -> put_change(changeset, :introduced_by, uuid)
+          :error -> add_error(changeset, :introduced_by, "must be a checkpoint id or \"none\"")
+        end
+    end
   end
 end

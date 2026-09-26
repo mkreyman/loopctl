@@ -40,8 +40,10 @@ defmodule Loopctl.Threads do
   import Ecto.Query
 
   alias Loopctl.AuditChain
+  alias Loopctl.Delivery.Claimant
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Threads.Checkpoint
@@ -86,7 +88,7 @@ defmodule Loopctl.Threads do
   def max_entry_page, do: @max_entry_page
 
   defp read_thread(tenant_id, story_id, opts) do
-    if entry_story(tenant_id, story_id) do
+    if entry_story(tenant_id, story_id, :read) do
       limit = opts |> Keyword.get(:limit, @default_entry_page) |> max(1) |> min(@max_entry_page)
       after_seq = Keyword.get(opts, :after_seq, 0)
 
@@ -138,6 +140,7 @@ defmodule Loopctl.Threads do
 
     with :ok <- valid_sha(commit_sha, "commit_sha"),
          :ok <- valid_sha(tree_sha, "tree_sha"),
+         :ok <- valid_note(Keyword.get(opts, :note)),
          :ok <- no_secret(Keyword.get(opts, :note)) do
       in_story_lock(tenant_id, story_id, fn ->
         checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts)
@@ -178,29 +181,51 @@ defmodule Loopctl.Threads do
   # Checkpoints
   # ---------------------------------------------------------------------------
 
+  # A checkpoint is keyed by (commit_sha, claim_epoch): a claimant resuming at a commit an
+  # ENDED claim recorded records it again under its own claim, so its fixes can cite it.
   defp checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts) do
-    with :ok <-
-           claimant(
-             tenant_id,
-             story_id,
-             Keyword.fetch!(opts, :agent_id),
-             Keyword.fetch!(opts, :claim_epoch)
-           ) do
-      case checkpoint_by_sha(tenant_id, story_id, commit_sha) do
-        %Checkpoint{tree_sha: ^tree_sha} = existing ->
-          {:ok, existing, :existing, []}
+    epoch = Keyword.fetch!(opts, :claim_epoch)
 
-        %Checkpoint{} ->
-          conflict(
-            "checkpoint_conflict",
-            "commit_sha is already recorded with a different tree_sha"
-          )
-
-        nil ->
-          insert_checkpoint(tenant_id, story_id, commit_sha, tree_sha, opts)
+    with :ok <- claimant(tenant_id, story_id, Keyword.fetch!(opts, :agent_id), epoch) do
+      case checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch) do
+        nil -> insert_checkpoint(tenant_id, story_id, commit_sha, tree_sha, opts)
+        existing -> replay_checkpoint(existing, tree_sha, Keyword.get(opts, :note))
       end
     end
   end
+
+  # The same checkpoint, resent: the tree must match, and a note, when sent, must be the one
+  # recorded. Anything else is a different write, refused rather than acknowledged.
+  defp replay_checkpoint(%Checkpoint{tree_sha: tree_sha} = existing, tree_sha, note) do
+    if is_nil(note) or note == checkpoint_note(existing),
+      do: {:ok, existing, :existing, []},
+      else: conflict("checkpoint_conflict", "commit_sha is already recorded with another note")
+  end
+
+  defp replay_checkpoint(_existing, _tree_sha, _note),
+    do: conflict("checkpoint_conflict", "commit_sha is already recorded with another tree_sha")
+
+  defp checkpoint_note(checkpoint) do
+    Repo.one(
+      from e in Entry,
+        where: e.checkpoint_id == ^checkpoint.id and e.kind == :checkpoint,
+        select: e.body
+    )
+  end
+
+  defp valid_note(nil), do: :ok
+
+  defp valid_note(note) when is_binary(note) do
+    size = byte_size(note)
+
+    if size > 0 and size <= Entry.max_body_bytes(),
+      do: :ok,
+      else:
+        {:error, :unprocessable_entity,
+         "note must be 1 to #{Entry.max_body_bytes()} bytes when sent"}
+  end
+
+  defp valid_note(_note), do: {:error, :unprocessable_entity, "note must be a string"}
 
   defp insert_checkpoint(tenant_id, story_id, commit_sha, tree_sha, opts) do
     lineage = Keyword.fetch!(opts, :actor_lineage)
@@ -223,7 +248,8 @@ defmodule Loopctl.Threads do
     entry_changeset =
       Entry.changeset(%Entry{}, %{
         kind: :checkpoint,
-        idempotency_key: @reserved_key_prefix <> "checkpoint:" <> commit_sha,
+        idempotency_key:
+          @reserved_key_prefix <> "checkpoint:#{commit_sha}:#{Keyword.fetch!(opts, :claim_epoch)}",
         body: note,
         checkpoint_id: checkpoint.id
       })
@@ -234,11 +260,12 @@ defmodule Loopctl.Threads do
     end
   end
 
-  defp checkpoint_by_sha(tenant_id, story_id, commit_sha) do
+  defp checkpoint_by_sha(tenant_id, story_id, commit_sha, epoch) do
     Repo.one(
       from c in Checkpoint,
         where:
-          c.tenant_id == ^tenant_id and c.story_id == ^story_id and c.commit_sha == ^commit_sha
+          c.tenant_id == ^tenant_id and c.story_id == ^story_id and c.commit_sha == ^commit_sha and
+            c.claim_epoch == ^epoch
     )
   end
 
@@ -260,21 +287,20 @@ defmodule Loopctl.Threads do
   defp valid_sha(_value, field),
     do: {:error, :unprocessable_entity, "#{field} must be 40 or 64 lowercase hex characters"}
 
-  # The same rule `Loopctl.Delivery.Escalations` applies to the claimant: both halves of the
-  # comparison must be a real agent, so an unclaimed story never matches a key with no agent.
   defp claimant(tenant_id, story_id, agent_id, epoch) do
-    case entry_story(tenant_id, story_id) do
+    case entry_story(tenant_id, story_id, :lock) do
       nil -> {:error, :not_found}
       story -> claimant_of(story, agent_id, epoch)
     end
   end
 
+  # The shared claimant rule, plus LIVENESS: a claim whose lease has lapsed has ended even
+  # before the reclaimer runs, and nothing it reports may join the thread.
   defp claimant_of(story, agent_id, epoch) do
-    cond do
-      is_nil(story.assigned_agent_id) or is_nil(agent_id) -> {:error, :not_claimant}
-      story.assigned_agent_id != agent_id -> {:error, :not_claimant}
-      story.claim_epoch != epoch -> {:error, :stale_claim_epoch}
-      true -> :ok
+    with :ok <- Claimant.check(story, agent_id, epoch) do
+      if Progress.live_claim?(story, DateTime.utc_now()),
+        do: :ok,
+        else: {:error, :claim_not_live}
     end
   end
 
@@ -293,7 +319,7 @@ defmodule Loopctl.Threads do
   end
 
   defp entry_locked(tenant_id, story_id, author, attrs, changeset, opts) do
-    with {:story, %{} = story} <- {:story, entry_story(tenant_id, story_id)},
+    with {:story, %Story{} = story} <- {:story, entry_story(tenant_id, story_id, :lock)},
          nil <- entry_by_key(tenant_id, story_id, author, attrs),
          :ok <- author_may_write(story, changeset, opts),
          {:ok, changeset} <- apply_references(changeset, story) do
@@ -348,33 +374,66 @@ defmodule Loopctl.Threads do
       else: :ok
   end
 
-  # FOR SHARE, as `Loopctl.Delivery.Stages` takes it: a release or reclaim takes the story
-  # FOR UPDATE to end a claim, so it waits for this transaction instead of committing between
-  # the fence check and the insert. The per-story thread lock is taken before this and by no
-  # path that holds the story lock, so the order cannot invert.
-  defp entry_story(tenant_id, story_id) do
-    Repo.one(
-      from s in Story,
-        where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-        lock: "FOR SHARE",
-        select: %{
-          id: s.id,
-          tenant_id: s.tenant_id,
-          assigned_agent_id: s.assigned_agent_id,
-          claim_epoch: s.claim_epoch,
-          implementer_dispatch_id: s.implementer_dispatch_id
-        }
-    )
+  # A write takes the story FOR SHARE, as `Loopctl.Delivery.Stages` does: a release or reclaim
+  # takes it FOR UPDATE to end a claim, so it waits for this transaction instead of committing
+  # between the fence check and the insert. The per-story thread lock is taken before this and
+  # by no path that holds the story lock, so the order cannot invert. A READ takes no row lock:
+  # a poll must never queue a release behind it.
+  @story_fields [
+    :id,
+    :tenant_id,
+    :assigned_agent_id,
+    :claim_epoch,
+    :implementer_dispatch_id,
+    :agent_status,
+    :claimed_until
+  ]
+
+  defp entry_story(tenant_id, story_id, :read) do
+    Repo.one(story_query(tenant_id, story_id))
+  end
+
+  defp entry_story(tenant_id, story_id, :lock) do
+    Repo.one(story_query(tenant_id, story_id) |> lock("FOR SHARE"))
+  end
+
+  defp story_query(tenant_id, story_id) do
+    from s in Story,
+      where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+      select: struct(s, ^@story_fields)
   end
 
   defp author_may_write(story, changeset, opts) do
     case Ecto.Changeset.get_field(changeset, :kind) do
-      kind when kind in [:finding, :verdict] -> not_the_implementer(story, opts)
-      :fix -> claimant_of(story, Keyword.get(opts, :agent_id), Keyword.get(opts, :claim_epoch))
+      :verdict -> with :ok <- something_to_judge(story), do: not_the_implementer(story, opts)
+      :finding -> not_the_implementer(story, opts)
+      :fix -> fix_author(story, opts)
       _open -> :ok
     end
   end
 
+  defp something_to_judge(story) do
+    if Repo.exists?(
+         from c in Checkpoint,
+           where: c.tenant_id == ^story.tenant_id and c.story_id == ^story.id
+       ),
+       do: :ok,
+       else: {:error, :unprocessable_entity, "a verdict needs a checkpoint to judge"}
+  end
+
+  defp fix_author(story, opts) do
+    case Keyword.get(opts, :claim_epoch) do
+      epoch when is_integer(epoch) -> claimant_of(story, Keyword.get(opts, :agent_id), epoch)
+      _ -> {:error, :bad_request, "claim_epoch is required for a fix"}
+    end
+  end
+
+  # WHO IMPLEMENTED is read from the thread, not only from the story's current claim fields:
+  # a claim released or reclaimed rewrites `assigned_agent_id` and `implementer_dispatch_id`,
+  # and the principal that recorded the checkpoints under review must still be unable to judge
+  # them. The implementers are every principal that recorded a checkpoint, every dispatch a
+  # checkpoint was recorded under, and the story's current claimant and implementer dispatch.
+  #
   # Refused with its OWN code, never `self_review_blocked`: that code is an L6 custody signal
   # the fallback counts toward a tenant-wide halt, and an implementer mis-filing its own notes
   # as a finding — or its client retrying one — must not be able to halt the tenant.
@@ -382,15 +441,20 @@ defmodule Loopctl.Threads do
   # An EMPTY caller lineage on dispatch-minted work is refused unless the caller is a human
   # (`:user` role, no agent), the same permit `review-complete` draws: a legacy key no
   # dispatch minted, in the implementer's own process, would otherwise grant it the round.
+  # A declared implementer dispatch that cannot be read fails CLOSED.
   defp not_the_implementer(story, opts) do
     agent_id = Keyword.get(opts, :agent_id)
     lineage = Keyword.fetch!(opts, :actor_lineage)
+    {authors, dispatch_ids} = implementers(story)
 
     cond do
+      Keyword.fetch!(opts, :author_principal) in authors ->
+        implementer_cannot_judge()
+
       not is_nil(agent_id) and agent_id == story.assigned_agent_id ->
         implementer_cannot_judge()
 
-      is_nil(story.implementer_dispatch_id) ->
+      dispatch_ids == [] ->
         :ok
 
       lineage == [] and human?(agent_id, Keyword.get(opts, :actor_role)) ->
@@ -400,17 +464,50 @@ defmodule Loopctl.Threads do
         {:error, :caller_lineage_required}
 
       true ->
-        # Read on the RLS repo inside this transaction, not `Dispatches.get_dispatch/2`, which
-        # checks out one of AdminRepo's three connections for a read every judgement makes.
-        # A declared implementer dispatch that cannot be read fails CLOSED.
-        story |> implementer_lineage() |> separated_from(lineage)
+        story |> implementer_lineages(dispatch_ids) |> separated_from(lineage)
     end
   end
 
-  defp separated_from([], _caller), do: {:error, :unresolvable_dispatch_lineage}
+  defp implementers(story) do
+    authors =
+      Repo.all(
+        from e in Entry,
+          where:
+            e.tenant_id == ^story.tenant_id and e.story_id == ^story.id and
+              e.kind == :checkpoint,
+          distinct: true,
+          select: e.author_principal
+      )
 
-  defp separated_from(impl, caller) do
-    if Dispatches.lineage_same_chain?(impl, caller),
+    dispatch_ids =
+      Repo.all(
+        from c in Checkpoint,
+          where:
+            c.tenant_id == ^story.tenant_id and c.story_id == ^story.id and
+              not is_nil(c.dispatch_id),
+          distinct: true,
+          select: c.dispatch_id
+      )
+
+    {authors, Enum.uniq(Enum.reject([story.implementer_dispatch_id | dispatch_ids], &is_nil/1))}
+  end
+
+  # Read on the RLS repo inside this transaction, not `Dispatches.get_dispatch/2`, which checks
+  # out one of AdminRepo's three connections for a read every judgement makes.
+  defp implementer_lineages(story, dispatch_ids) do
+    Repo.all(
+      from d in Dispatch,
+        where: d.id in ^dispatch_ids and d.tenant_id == ^story.tenant_id,
+        select: d.lineage_path
+    )
+    |> then(fn lineages -> {lineages, length(dispatch_ids)} end)
+  end
+
+  defp separated_from({lineages, expected}, _caller) when length(lineages) != expected,
+    do: {:error, :unresolvable_dispatch_lineage}
+
+  defp separated_from({lineages, _expected}, caller) do
+    if Enum.any?(lineages, &Dispatches.lineage_same_chain?(&1, caller)),
       do: implementer_cannot_judge(),
       else: :ok
   end
@@ -419,19 +516,12 @@ defmodule Loopctl.Threads do
     do:
       conflict(
         "implementer_cannot_judge",
-        "the story's implementer, or a dispatch on its chain, cannot write a finding or verdict"
+        "a principal that implemented this story, or a dispatch on its chain, cannot write a " <>
+          "finding or verdict"
       )
 
   defp human?(nil, role) when role in [:user, :superadmin], do: true
   defp human?(_agent_id, _role), do: false
-
-  defp implementer_lineage(story) do
-    Repo.one(
-      from d in Dispatch,
-        where: d.id == ^story.implementer_dispatch_id and d.tenant_id == ^story.tenant_id,
-        select: d.lineage_path
-    ) || []
-  end
 
   defp entry_by_key(tenant_id, story_id, author, attrs) do
     case attrs["idempotency_key"] || attrs[:idempotency_key] do
@@ -463,6 +553,7 @@ defmodule Loopctl.Threads do
          :ok <- checkpoint_of_story(checkpoint_id, kind, tenant_id, story_id),
          :ok <- findings_of_story(finding_ids, kind, tenant_id, story_id),
          :ok <- introduced_by_rule(introduced_by, kind, tenant_id, story_id),
+         :ok <- introduced_not_after_found(kind, introduced_by, checkpoint_id),
          :ok <- fix_follows_findings(kind, checkpoint_id, finding_ids, story) do
       {:ok, changeset}
     end
@@ -470,8 +561,6 @@ defmodule Loopctl.Threads do
 
   # A fix is carried by a checkpoint of the CURRENT claim, recorded after every checkpoint its
   # findings were found in: code that predates a finding cannot have fixed it.
-  defp fix_follows_findings(:fix, _checkpoint_id, [], _story), do: :ok
-
   defp fix_follows_findings(:fix, checkpoint_id, finding_ids, story) do
     fix_cp =
       Repo.one(
@@ -494,7 +583,10 @@ defmodule Loopctl.Threads do
         {:error, :unprocessable_entity,
          "a fix must be carried by a checkpoint of the current claim"}
 
-      fix_cp.seq <= found_at ->
+      # `found_at` is never nil here — `findings_of_story/4` refuses a fix with no findings —
+      # and it is defaulted rather than compared, because Elixir orders nil after every
+      # number and would refuse for the wrong reason.
+      fix_cp.seq <= (found_at || 0) ->
         {:error, :unprocessable_entity,
          "a fix must be carried by a checkpoint recorded after the findings it answers"}
 
@@ -564,6 +656,26 @@ defmodule Loopctl.Threads do
       do: :ok,
       else: {:error, :unprocessable_entity, "introduced_by is not a checkpoint of this story"}
   end
+
+  # A defect is introduced at or before the checkpoint it was found in, never after it.
+  defp introduced_not_after_found(:finding, introduced_by, found_in)
+       when is_binary(introduced_by) and introduced_by != "none" do
+    seqs =
+      Repo.all(
+        from c in Checkpoint,
+          where: c.id in ^[introduced_by, found_in],
+          select: {c.id, c.seq}
+      )
+      |> Map.new()
+
+    if Map.fetch!(seqs, introduced_by) <= Map.fetch!(seqs, found_in),
+      do: :ok,
+      else:
+        {:error, :unprocessable_entity,
+         "introduced_by must be at or before the checkpoint the finding was found in"}
+  end
+
+  defp introduced_not_after_found(_kind, _introduced_by, _found_in), do: :ok
 
   defp checkpoint_in_story?(checkpoint_id, tenant_id, story_id) do
     Repo.exists?(

@@ -328,8 +328,7 @@ defmodule LoopctlWeb.StoryEscalationController do
     end
   end
 
-  defp actor_label(%{agent_id: nil, id: key_id}), do: "api_key:" <> key_id
-  defp actor_label(%{agent_id: agent_id}), do: "agent:" <> agent_id
+  defp actor_label(api_key), do: LoopctlWeb.ActorLabel.of(api_key)
 
   # The stage row as the API renders it. `escalation_reason` is the STORED text — escaped for
   # invisible characters on the way in (#804) and never fenced: this is a JSON body for an

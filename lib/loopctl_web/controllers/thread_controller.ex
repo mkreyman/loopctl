@@ -20,6 +20,8 @@ defmodule LoopctlWeb.ThreadController do
   alias Loopctl.Dispatches
   alias Loopctl.Threads
   alias Loopctl.Threads.Entry
+  alias LoopctlWeb.ActorLabel
+  alias LoopctlWeb.ClaimEpochParam
   alias OpenApiSpex.Schema
 
   action_fallback LoopctlWeb.FallbackController
@@ -52,6 +54,9 @@ defmodule LoopctlWeb.ThreadController do
     ],
     responses: %{
       200 => {"The thread", "application/json", %Schema{type: :object}},
+      400 =>
+        {"after_seq or limit is not a non-negative integer", "application/json",
+         Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -88,9 +93,10 @@ defmodule LoopctlWeb.ThreadController do
          Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"`not_claimant` (the key's agent is not the story's), `stale_claim_epoch` (the " <>
-           "claim has ended) or `checkpoint_conflict` (the commit is already recorded with a " <>
-           "different tree)", "application/json", Schemas.ErrorResponse},
+        {"`not_claimant` (the key's agent is not the story's), `stale_claim_epoch` or " <>
+           "`claim_not_live` (the claim has ended), or `checkpoint_conflict` (this commit is " <>
+           "already recorded under this claim with a different tree or note)", "application/json",
+         Schemas.ErrorResponse},
       422 =>
         {"A sha is not 40 or 64 lowercase hex characters, `note` is over the bound, or " <>
            "`note` carries a credential (`secret_blocked`)", "application/json",
@@ -143,17 +149,22 @@ defmodule LoopctlWeb.ThreadController do
     responses: %{
       200 => {"Already written", "application/json", %Schema{type: :object}},
       201 => {"Written", "application/json", %Schema{type: :object}},
+      400 =>
+        {"claim_epoch sent but not a non-negative integer, or missing on a `fix`",
+         "application/json", Schemas.ErrorResponse},
       403 => {"The tenant is not human-anchored", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"`implementer_cannot_judge`, `caller_lineage_required`, " <>
-           "`unresolvable_dispatch_lineage` (a finding or verdict), `not_claimant` or " <>
-           "`stale_claim_epoch` (a fix), or `idempotency_key_reused`", "application/json",
-         Schemas.ErrorResponse},
+           "`unresolvable_dispatch_lineage` (a finding or verdict), `not_claimant`, " <>
+           "`stale_claim_epoch` or `claim_not_live` (a fix), or `idempotency_key_reused`",
+         "application/json", Schemas.ErrorResponse},
       422 =>
         {"A field is invalid, the kind is loopctl's own, the key is reserved, the body " <>
-           "carries a credential (`secret_blocked`), or a reference does not belong to this " <>
-           "story", "application/json", Schemas.ErrorResponse},
+           "carries a credential (`secret_blocked`), a reference does not belong to this " <>
+           "story, `introduced_by` is after the checkpoint the finding was found in, or a " <>
+           "verdict is written before any checkpoint exists", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -227,10 +238,11 @@ defmodule LoopctlWeb.ThreadController do
       )
 
     with {:ok, story_id} <- story_uuid(story_id),
+         {:ok, epoch} <- optional_claim_epoch(params),
          {:ok, entry, status} <-
            Threads.record_entry(api_key.tenant_id, story_id, attrs,
              agent_id: api_key.agent_id,
-             claim_epoch: params["claim_epoch"],
+             claim_epoch: epoch,
              actor_role: api_key.role,
              author_principal: principal(api_key),
              actor_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
@@ -264,16 +276,24 @@ defmodule LoopctlWeb.ThreadController do
     end
   end
 
-  defp claim_epoch(%{"claim_epoch" => epoch}) when is_integer(epoch) and epoch >= 0,
-    do: {:ok, epoch}
+  defp claim_epoch(params) do
+    case ClaimEpochParam.fetch(params) do
+      {:ok, epoch} -> {:ok, epoch}
+      _ -> {:error, :bad_request, "claim_epoch must be a non-negative integer"}
+    end
+  end
 
-  defp claim_epoch(_params),
-    do: {:error, :bad_request, "claim_epoch must be a non-negative integer"}
+  # Optional on an entry (only a `fix` needs one), but a value that is sent must be an integer:
+  # a string compared with the story's epoch would read as a claim that has ended.
+  defp optional_claim_epoch(params) do
+    case ClaimEpochParam.fetch(params) do
+      {:ok, epoch} -> {:ok, epoch}
+      :missing -> {:ok, nil}
+      :malformed -> {:error, :bad_request, "claim_epoch must be a non-negative integer"}
+    end
+  end
 
-  # The same attribution shape the stage machine records: the agent when the key has one,
-  # otherwise the key itself.
-  defp principal(%{agent_id: nil, id: key_id}), do: "api_key:" <> key_id
-  defp principal(%{agent_id: agent_id}), do: "agent:" <> agent_id
+  defp principal(api_key), do: ActorLabel.of(api_key)
 
   defp created_or_ok(:created), do: :created
   defp created_or_ok(:existing), do: :ok

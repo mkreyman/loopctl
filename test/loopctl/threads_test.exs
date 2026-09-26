@@ -19,7 +19,7 @@ defmodule Loopctl.ThreadsTest do
   @tree String.duplicate("c", 40)
 
   defp claimed_story do
-    story = fixture(:stage_story, %{claim_epoch: @epoch})
+    story = fixture(:stage_story, %{claim_epoch: @epoch, agent_status: :implementing})
     agent = fixture(:stage_agent, %{tenant_id: story.tenant_id})
     reviewer = fixture(:stage_agent, %{tenant_id: story.tenant_id})
 
@@ -116,6 +116,41 @@ defmodule Loopctl.ThreadsTest do
 
       assert {:error, :not_claimant} = checkpoint(ctx, @sha1, agent_id: ctx.reviewer.id)
       assert {:error, :not_claimant} = checkpoint(ctx, @sha1, agent_id: nil)
+    end
+
+    test "a new claim resuming at a recorded commit records it again under its own epoch" do
+      ctx = claimed_story()
+      {:ok, first, :created} = checkpoint(ctx)
+      set_story(ctx, claim_epoch: @epoch + 1)
+
+      assert {:ok, again, :created} = checkpoint(ctx, @sha1, claim_epoch: @epoch + 1)
+      assert again.claim_epoch == @epoch + 1 and again.seq == first.seq + 1
+      assert {:ok, ^again, :existing} = checkpoint(ctx, @sha1, claim_epoch: @epoch + 1)
+    end
+
+    test "a lapsed lease has ended the claim" do
+      ctx = claimed_story()
+      set_story(ctx, claimed_until: DateTime.add(DateTime.utc_now(), -60))
+
+      assert {:error, :claim_not_live} = checkpoint(ctx)
+    end
+
+    test "a note must be non-empty and within the bound, and a resend must repeat it" do
+      ctx = claimed_story()
+
+      assert {:error, :unprocessable_entity, msg} = checkpoint(ctx, @sha1, note: "")
+      assert msg =~ "note"
+
+      too_big = String.duplicate("n", Entry.max_body_bytes() + 1)
+      assert {:error, :unprocessable_entity, msg} = checkpoint(ctx, @sha1, note: too_big)
+      assert msg =~ "note"
+
+      {:ok, cp, :created} = checkpoint(ctx, @sha1, note: "why")
+      assert {:ok, ^cp, :existing} = checkpoint(ctx, @sha1, note: "why")
+      assert {:ok, ^cp, :existing} = checkpoint(ctx)
+
+      assert {:error, {:conflict, "checkpoint_conflict", _}} =
+               checkpoint(ctx, @sha1, note: "another")
     end
 
     test "the same sha with a different tree is a conflict" do
@@ -220,7 +255,7 @@ defmodule Loopctl.ThreadsTest do
 
       with_cp = Map.put(fix, "checkpoint_id", cp.id)
       assert {:error, :unprocessable_entity, msg} = entry(ctx, with_cp, as_claimant)
-      assert msg =~ "findings it answers"
+      assert msg == "a fix must name the findings it answers"
 
       assert {:error, :unprocessable_entity, _} =
                entry(
@@ -322,12 +357,84 @@ defmodule Loopctl.ThreadsTest do
 
   defp elem_ok({:ok, cp, :created}), do: {:ok, cp}
 
+  defp set_story(ctx, fields) do
+    {:ok, _} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        from(s in Story, where: s.id == ^ctx.story.id) |> Repo.update_all(set: fields)
+      end)
+  end
+
   defp latest(ctx) do
     {:ok, thread} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
     {:ok, List.last(thread.checkpoints)}
   end
 
   describe "authorization by kind" do
+    test "a released implementer still cannot judge the checkpoints it recorded" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+      set_story(ctx, assigned_agent_id: nil)
+
+      assert {:error, {:conflict, "implementer_cannot_judge", _}} =
+               entry(ctx, finding(cp), as: ctx.agent)
+    end
+
+    test "a dispatch that recorded a checkpoint cannot judge after its claim is released" do
+      ctx = claimed_story()
+      root = Ecto.UUID.generate()
+      impl = dispatch(ctx.tenant_id, [root])
+
+      {:ok, cp, :created} = checkpoint(ctx, @sha1, actor_lineage: impl.lineage_path)
+      set_story(ctx, assigned_agent_id: nil)
+
+      judge = fn key, lineage ->
+        Threads.record_entry(ctx.tenant_id, ctx.story.id, finding(cp, key),
+          agent_id: ctx.reviewer.id,
+          author_principal: "agent:#{ctx.reviewer.id}",
+          actor_lineage: lineage
+        )
+      end
+
+      assert {:error, {:conflict, "implementer_cannot_judge", _}} =
+               judge.("child", impl.lineage_path ++ [Ecto.UUID.generate()])
+
+      assert {:ok, _, :created} = judge.("sibling", [root, Ecto.UUID.generate()])
+    end
+
+    test "a new claimant cannot judge the thread it now holds" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+      set_story(ctx, assigned_agent_id: ctx.reviewer.id)
+
+      assert {:error, {:conflict, "implementer_cannot_judge", _}} = entry(ctx, finding(cp))
+    end
+
+    test "a verdict needs a checkpoint to judge" do
+      ctx = claimed_story()
+
+      assert {:error, :unprocessable_entity, msg} =
+               entry(ctx, %{"kind" => "verdict", "idempotency_key" => "v", "body" => "ok"})
+
+      assert msg =~ "checkpoint"
+    end
+
+    test "a fix without an epoch is a bad request, not an ended claim" do
+      ctx = claimed_story()
+      {:ok, found_in, :created} = checkpoint(ctx)
+      {:ok, f, :created} = entry(ctx, finding(found_in))
+      {:ok, cp, :created} = checkpoint(ctx, @sha2)
+
+      fix = %{
+        "kind" => "fix",
+        "idempotency_key" => "x",
+        "body" => "fixed",
+        "checkpoint_id" => cp.id,
+        "finding_ids" => [f.id]
+      }
+
+      assert {:error, :bad_request, _} = entry(ctx, fix, as: ctx.agent)
+    end
+
     test "the implementer cannot judge its own work" do
       ctx = claimed_story()
       {:ok, cp, :created} = checkpoint(ctx)
@@ -436,6 +543,18 @@ defmodule Loopctl.ThreadsTest do
 
     assert {:ok, _, :created} = entry(ctx, Map.put(finding(cp, "f4"), "introduced_by", "none"))
     assert {:ok, _, :created} = entry(ctx, Map.put(finding(cp, "f5"), "introduced_by", cp.id))
+
+    assert {:ok, upper, :created} =
+             entry(ctx, Map.put(finding(cp, "f6"), "introduced_by", String.upcase(cp.id)))
+
+    assert upper.introduced_by == cp.id
+
+    {:ok, later, :created} = checkpoint(ctx, @sha2)
+
+    assert {:error, :unprocessable_entity, msg} =
+             entry(ctx, Map.put(finding(cp, "f7"), "introduced_by", later.id))
+
+    assert msg =~ "at or before"
   end
 
   test "every write appends an audit-chain entry on the story" do

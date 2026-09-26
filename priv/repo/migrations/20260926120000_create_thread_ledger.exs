@@ -39,7 +39,9 @@ defmodule Loopctl.Repo.Migrations.CreateThreadLedger do
     end
 
     create unique_index(:thread_checkpoints, [:tenant_id, :story_id, :seq])
-    create unique_index(:thread_checkpoints, [:tenant_id, :story_id, :commit_sha])
+    # Keyed by claim: a claimant resuming at a commit an ENDED claim recorded records it again
+    # under its own claim, so the fixes it writes can cite a checkpoint of the current claim.
+    create unique_index(:thread_checkpoints, [:tenant_id, :story_id, :commit_sha, :claim_epoch])
 
     create constraint(:thread_checkpoints, :thread_checkpoints_kind,
              check: "kind IN ('checkpoint', 'base_update')"

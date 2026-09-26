@@ -38,7 +38,7 @@ defmodule LoopctlWeb.ThreadControllerTest do
     {:ok, _} =
       Repo.with_tenant(tenant.id, fn ->
         from(s in Story, where: s.id == ^story.id)
-        |> Repo.update_all(set: [assigned_agent_id: agent.id])
+        |> Repo.update_all(set: [assigned_agent_id: agent.id, agent_status: :implementing])
       end)
 
     %{story: story, raw_key: raw_key, operator_key: operator_key}
@@ -111,6 +111,35 @@ defmodule LoopctlWeb.ThreadControllerTest do
              |> auth(key)
              |> post(~p"/api/v1/stories/#{story.id}/thread/entries", finding)
              |> json_response(409)
+  end
+
+  test "a string claim_epoch on an entry is 400, never an ended claim", %{conn: conn} do
+    %{story: story, raw_key: key} = claimed_story()
+
+    entry = %{
+      "kind" => "message",
+      "idempotency_key" => "m",
+      "body" => "x",
+      "claim_epoch" => "#{@epoch}"
+    }
+
+    assert conn
+           |> auth(key)
+           |> post(~p"/api/v1/stories/#{story.id}/thread/entries", entry)
+           |> json_response(400)
+  end
+
+  test "a lapsed lease is 409 claim_not_live", %{conn: conn} do
+    %{story: story, raw_key: key} = claimed_story()
+
+    {:ok, _} =
+      Repo.with_tenant(story.tenant_id, fn ->
+        from(s in Story, where: s.id == ^story.id)
+        |> Repo.update_all(set: [claimed_until: DateTime.add(DateTime.utc_now(), -60)])
+      end)
+
+    assert %{"error" => %{"code" => "claim_not_live"}} =
+             conn |> post_checkpoint(key, story, @checkpoint) |> json_response(409)
   end
 
   test "a malformed page parameter is 400", %{conn: conn} do
