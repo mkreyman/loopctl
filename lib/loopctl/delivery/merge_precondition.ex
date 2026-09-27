@@ -115,17 +115,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   A thread-mode allow is recorded naming the checkpoint id and its sha, and `base_sha` — the
   MERGE BASE the judged diff is relative to — on the `effect_recorded` event of
-  `merge_gate_allowed_sha`. THAT IS THE MERGE EXECUTOR'S CONTRACT (US-45.5): it merges only
-  while the base head still equals the recorded `base_sha`, and otherwise takes the
-  base-update path (AC-45.5.4, AC-45.5.7). A squash of the checkpoint's tree onto a base that
-  moved would silently revert every base commit the judged diff never saw, so base freshness
-  is enforced at the one step that writes the base.
+  `merge_gate_allowed_sha`, and then enqueues `Loopctl.Workers.ThreadMergeWorker`. THAT IS THE
+  MERGE EXECUTOR'S CONTRACT (`Loopctl.Delivery.MergeExecutor`, US-45.5): it merges only while
+  the base head still equals the recorded `base_sha`, and otherwise takes the base-update path
+  (AC-45.5.4, AC-45.5.7). A squash of the checkpoint's tree onto a base that moved would
+  silently revert every base commit the judged diff never saw, so base freshness is enforced
+  at the one step that writes the base.
 
-  THIS GATE JUDGES CLAIMANT CHECKPOINTS ONLY (`kind: :checkpoint`,
-  `Loopctl.Threads.claim_checkpoints/2`). A `base_update` checkpoint — the executor's merge of
-  the base into the thread — is written by US-45.5, and until that story makes
-  `claim_checkpoints/2` treat the latest `base_update` reaching the allowed checkpoint as the
-  judged head (AC-45.5.9) the gate does not see one.
+  The checkpoint judged is `Loopctl.Threads.claim_checkpoints/2`'s `latest`: the claim's latest
+  claimant checkpoint, or a `base_update` — the executor's merge of the base into the thread —
+  whose parents reach the checkpoint this gate last allowed (AC-45.5.9). Such a base update is
+  the same change on a newer base, so it keeps its review and custody and is judged here like
+  any checkpoint, green CI on its exact sha included. Any other `base_update` is invisible.
 
   ## The loop may not merge its own control plane
 
@@ -274,6 +275,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.WorkBreakdown.Stories
+  alias Loopctl.Workers.ThreadMergeWorker
 
   # Design §5: "the 12-file / 1,000-line bound". A CEILING over the configured limits, not
   # a default for them — configuration may tighten it and may not loosen it. Without this,
@@ -1660,7 +1662,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # because the epoch does not move across a `ci -> implementing -> ci` cycle. The
     # recursion terminates: the second call carries `:refuse`.
     case record_allow(tenant_id, story_id, verdict, opts) do
-      %Verdict{decision: :allow} = allowed -> allowed
+      %Verdict{decision: :allow} = allowed -> merge_thread(tenant_id, story_id, allowed)
       %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
     end
   end
@@ -1689,6 +1691,19 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp act(tenant_id, story_id, %Verdict{decision: :refuse} = verdict, opts) do
     transition(tenant_id, story_id, verdict, escalation_transition(), opts)
   end
+
+  # US-45.5: a RECORDED thread-mode allow is what the merge executor acts on, so it is enqueued
+  # here and nowhere else — after the allow landed, never before. On every allow, a replay of
+  # the same one included: a caller asking the gate again after an enqueue that did not land
+  # enqueues again, and the job is unique per story, so the resend costs nothing. A pull
+  # request is merged by whoever opened it, not by loopctl.
+  defp merge_thread(tenant_id, story_id, %Verdict{mode: :thread, checkpoint_id: id} = allowed)
+       when is_binary(id) do
+    :ok = ThreadMergeWorker.enqueue(tenant_id, story_id)
+    allowed
+  end
+
+  defp merge_thread(_tenant_id, _story_id, %Verdict{} = allowed), do: allowed
 
   # An allow is a RECORDED fact or it is not an allow. Without this the gate's authorisation
   # lives only in the response, and an already-merged pull request cannot be told from one

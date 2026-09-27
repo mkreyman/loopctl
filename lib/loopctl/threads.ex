@@ -15,6 +15,11 @@ defmodule Loopctl.Threads do
     in #901 and #905; nothing here takes a key;
   - `record_fix/4` — a `fix` from the story's current claimant, under the checkpoint fence.
 
+  Two writes are loopctl's own and have NO HTTP route, because the merge executor
+  (`Loopctl.Delivery.MergeExecutor`, US-45.5) is their only caller:
+  `record_base_update/4` — the base merged into the thread, which bypasses the claimant fence
+  because loopctl, not the claimant, made the commit — and `record_merge_commit/5`.
+
   The rules each applies are `Loopctl.Threads.Reviews`', which only reads. The insert, the
   lock and the replay stay private to this module, so there is no other way in.
 
@@ -60,6 +65,9 @@ defmodule Loopctl.Threads do
   alias Loopctl.WorkBreakdown.Story
 
   @thread_lock_namespace :erlang.phash2(:loopctl_thread_ledger)
+
+  # The author of a `base_update` checkpoint's entry: loopctl's merge executor (US-45.5).
+  @merge_executor_principal "control:merge_executor"
   @sha_pattern ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
 
   # Idempotency keys loopctl writes for its own entries. A caller may not use the prefix, so a
@@ -156,12 +164,16 @@ defmodule Loopctl.Threads do
   What the merge gate judges for a THREAD-mode story (US-45.4), read in one tenant
   transaction:
 
-  - `:latest` — the latest checkpoint of kind `checkpoint` the story's CURRENT claim
-    recorded (its `claim_epoch` now), or `nil` when that claim recorded none. loopctl never
-    adopts a branch head nobody reported, and a checkpoint an ENDED claim recorded is that
-    claim's work, not the current one's
-  - `:earlier_shas` — the current claim's OTHER checkpoints' commits, newest first. A branch
-    naming one of them has gone back, not forward
+  - `:latest` — the JUDGED HEAD: the latest checkpoint the story's CURRENT claim recorded (its
+    `claim_epoch` now) that the gate may judge, or `nil` when that claim recorded none. That
+    is every checkpoint of kind `checkpoint`, plus a `base_update` whose chain of parents
+    reaches the checkpoint the gate LAST allowed (`Loopctl.Delivery.Stages.last_allow_query/2`,
+    AC-45.5.9): the executor merged the base into the allowed work, so the same change comes
+    back through the gate on a newer base. Any other `base_update` is invisible here. loopctl
+    never adopts a branch head nobody reported, and a checkpoint an ENDED claim recorded is
+    that claim's work, not the current one's
+  - `:earlier_shas` — the current claim's OTHER judged checkpoints' commits, newest first. A
+    branch naming one of them has gone back, not forward
   - `:earlier_claim_recorded?` — whether any ENDED claim recorded a checkpoint. With no
     `:latest`, it tells a thread whose claim was released (the gate's `claim_ended`) from one
     that never recorded anything (`no_checkpoint_recorded`)
@@ -192,14 +204,15 @@ defmodule Loopctl.Threads do
   defp unwrap_read({:ok, {:error, _reason} = error}), do: error
   defp unwrap_read({:error, _reason} = error), do: error
 
-  # ONE query: the story's current epoch and every claimant checkpoint's few judged fields —
-  # never `gate_evidence` — split by claim here. A story not in the tenant is no row at all.
+  # ONE query: the story's current epoch and every checkpoint's few judged fields — never
+  # `gate_evidence` — split by claim here, and the gate's last allow, which decides which
+  # `base_update` checkpoints are judged. A story not in the tenant is no row at all.
   defp read_claim_checkpoints(tenant_id, story_id) do
     rows =
       Repo.all(
         from s in Story,
           left_join: c in Checkpoint,
-          on: c.tenant_id == s.tenant_id and c.story_id == s.id and c.kind == :checkpoint,
+          on: c.tenant_id == s.tenant_id and c.story_id == s.id,
           where: s.id == ^story_id and s.tenant_id == ^tenant_id,
           order_by: [desc: c.seq],
           select:
@@ -211,21 +224,28 @@ defmodule Loopctl.Threads do
                tree_sha: c.tree_sha,
                claim_epoch: c.claim_epoch,
                merge_commit_sha: c.merge_commit_sha,
+               kind: c.kind,
+               parent_checkpoint_id: c.parent_checkpoint_id,
                # The merge gate's CI-wait fallback origin (US-45.6).
                inserted_at: c.inserted_at
              }}
       )
 
     case rows do
-      [] -> {:error, :not_found}
-      [{epoch, _} | _] -> {:ok, split_by_claim(epoch, Enum.map(rows, &elem(&1, 1)))}
+      [] ->
+        {:error, :not_found}
+
+      [{epoch, _} | _] ->
+        allowed = Repo.one(Stages.last_allow_query(tenant_id, story_id))
+        {:ok, split_by_claim(epoch, Enum.map(rows, &elem(&1, 1)), allowed)}
     end
   end
 
-  defp split_by_claim(epoch, checkpoints) do
+  defp split_by_claim(epoch, checkpoints, allowed) do
     # A story with no checkpoint joins to one row of NULLs.
     checkpoints = Enum.reject(checkpoints, &is_nil(&1.id))
-    {current, earlier_claims} = Enum.split_with(checkpoints, &(&1.claim_epoch == epoch))
+    judged = judged_checkpoints(checkpoints, allowed)
+    {current, earlier_claims} = Enum.split_with(judged, &(&1.claim_epoch == epoch))
 
     {latest, earlier} =
       case current do
@@ -238,6 +258,35 @@ defmodule Loopctl.Threads do
       earlier_shas: Enum.map(earlier, & &1.commit_sha),
       earlier_claim_recorded?: earlier_claims != []
     }
+  end
+
+  # AC-45.5.9: every claimant checkpoint, and a `base_update` only when it IS the checkpoint
+  # the gate last allowed or its parents lead back to it. The first half is what lets the
+  # executor merge a base update once the gate has allowed it: from then on the allow names
+  # the base update itself. The walk follows `parent_checkpoint_id` through the story's own
+  # rows, so it is bounded by them and cannot cycle: each id is visited once.
+  defp judged_checkpoints(checkpoints, allowed) do
+    by_id = Map.new(checkpoints, &{&1.id, &1})
+    allowed_id = allowed && allowed.checkpoint_id
+
+    Enum.filter(checkpoints, fn
+      %{kind: :base_update, id: ^allowed_id} -> true
+      %{kind: :base_update} = checkpoint -> reaches?(checkpoint, allowed_id, by_id, MapSet.new())
+      _claimant -> true
+    end)
+  end
+
+  defp reaches?(_checkpoint, nil, _by_id, _seen), do: false
+
+  defp reaches?(%{parent_checkpoint_id: nil}, _allowed_id, _by_id, _seen), do: false
+
+  defp reaches?(%{parent_checkpoint_id: allowed_id}, allowed_id, _by_id, _seen), do: true
+
+  defp reaches?(%{parent_checkpoint_id: parent_id}, allowed_id, by_id, seen) do
+    case {Map.fetch(by_id, parent_id), MapSet.member?(seen, parent_id)} do
+      {{:ok, parent}, false} -> reaches?(parent, allowed_id, by_id, MapSet.put(seen, parent_id))
+      _unknown_or_seen -> false
+    end
   end
 
   @doc """
@@ -504,6 +553,207 @@ defmodule Loopctl.Threads do
         {:error, _reason} = error -> error
       end
     end)
+  end
+
+  @doc """
+  Records a `base_update` checkpoint — the base branch merged INTO the thread by loopctl's
+  GitHub App — and takes the stage machine's `ci -> ci` `:base_updated` edge onto it, in ONE
+  transaction (US-45.5, AC-45.5.4 and AC-45.5.7).
+
+  A CONTROL-PLANE write with NO HTTP route: `Loopctl.Delivery.MergeExecutor` is its only
+  caller, having made the commit itself. It therefore bypasses the claimant fence
+  (`record_checkpoint/3`'s), which is there because a claimant's report is a claim about a
+  commit loopctl did not make. What fences it instead, read under the story's lock:
+
+  - `parent_checkpoint_id` is a checkpoint of THIS story under its CURRENT claim, else
+    `{:error, :not_found}` / `{:error, :stale_claim_epoch}`
+  - the stage row is at `ci` and its allow names the parent's commit
+    (`Loopctl.Delivery.Stages.follow_base_update/4`), else `:stale_stage` /
+    `:allow_not_for_parent`. So a base update exists only for the checkpoint the gate last
+    allowed, and never outlives the edge that makes it the head.
+
+  The caller must have verified what only the forge knows: that `commit_sha` is GitHub's
+  clean merge of the base into the parent, with the parent as its FIRST parent, and that
+  `tree_sha` is that commit's tree.
+
+  Idempotent: the same commit recorded again under the same claim, with the same parent and
+  tree, answers `{:ok, checkpoint, :existing}` and writes nothing. The same commit with a
+  different parent or tree is `checkpoint_conflict`.
+
+  ## Options
+
+  - `:commit_sha`, `:tree_sha` (required) — lowercase hex, one object format
+  - `:note` — the entry body; defaults to naming the merge
+  - `:actor_label` — on the stage events
+  """
+  @spec record_base_update(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Checkpoint.t(), :created | :existing} | {:error, term()}
+  def record_base_update(tenant_id, story_id, parent_checkpoint_id, opts) do
+    commit_sha = Keyword.fetch!(opts, :commit_sha)
+    tree_sha = Keyword.fetch!(opts, :tree_sha)
+
+    with :ok <- valid_sha(commit_sha, "commit_sha"),
+         :ok <- valid_sha(tree_sha, "tree_sha"),
+         :ok <- same_object_format(commit_sha, tree_sha) do
+      in_story_lock(tenant_id, story_id, fn ->
+        base_update_locked(tenant_id, story_id, parent_checkpoint_id, opts)
+      end)
+    end
+  end
+
+  @doc "The principal a `base_update` checkpoint's entry is recorded under."
+  @spec merge_executor_principal() :: String.t()
+  def merge_executor_principal, do: @merge_executor_principal
+
+  @doc """
+  Records the squash commit the merge executor created for `checkpoint_id` as its
+  `merge_commit_sha`, BEFORE the executor moves the base ref (US-45.5, AC-45.5.2), so a
+  retry whose acknowledgement was lost can ask whether that commit reached the base.
+
+  A compare-and-set: it writes only while the stored value is still `expected` (`nil` for a
+  first squash, the previous sha when a stale one is replaced). Otherwise it writes nothing
+  and answers `{:error, {:merge_commit_moved, stored}}`, so two executors racing cannot each
+  believe their own commit is the recorded one. Writing the value already stored is `:ok`.
+  No HTTP route; takes no story lock, only the checkpoint's row, with a bounded wait
+  (`{:error, :busy}` on contention). `{:error, :not_found}` for no such checkpoint.
+  """
+  @spec record_merge_commit(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          String.t() | nil,
+          String.t()
+        ) :: :ok | {:error, term()}
+  def record_merge_commit(tenant_id, story_id, checkpoint_id, expected, merge_commit_sha) do
+    with :ok <- valid_sha(merge_commit_sha, "merge_commit_sha") do
+      write = fn ->
+        merge_commit_locked(tenant_id, story_id, checkpoint_id, expected, merge_commit_sha)
+      end
+
+      Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "merge commit write", fn ->
+        tenant_id |> Repo.with_tenant(write) |> unwrap_write()
+      end)
+    end
+  end
+
+  defp unwrap_write({:ok, answer}), do: answer
+  defp unwrap_write({:error, _reason} = error), do: error
+
+  defp merge_commit_locked(tenant_id, story_id, checkpoint_id, expected, merge_commit_sha) do
+    Capacity.set_lock_timeout!(Repo)
+
+    stored =
+      Repo.one(
+        from c in Checkpoint,
+          where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
+          where: c.story_id == ^story_id,
+          lock: "FOR UPDATE",
+          select: %{sha: c.merge_commit_sha}
+      )
+
+    case stored do
+      nil ->
+        {:error, :not_found}
+
+      %{sha: ^merge_commit_sha} ->
+        :ok
+
+      %{sha: ^expected} ->
+        {1, _} =
+          from(c in Checkpoint, where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id)
+          |> Repo.update_all(set: [merge_commit_sha: merge_commit_sha, updated_at: now()])
+
+        :ok
+
+      %{sha: other} ->
+        {:error, {:merge_commit_moved, other}}
+    end
+  end
+
+  defp now, do: DateTime.utc_now()
+
+  defp base_update_locked(tenant_id, story_id, parent_id, opts) do
+    commit_sha = Keyword.fetch!(opts, :commit_sha)
+    tree_sha = Keyword.fetch!(opts, :tree_sha)
+
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
+         {:parent, %Checkpoint{} = parent} <-
+           {:parent, checkpoint_of(tenant_id, story_id, parent_id)},
+         :ok <- epoch_current(story, parent.claim_epoch) do
+      case checkpoint_by_sha(tenant_id, story_id, commit_sha, story.claim_epoch) do
+        nil ->
+          insert_base_update(tenant_id, story, parent, commit_sha, tree_sha, opts)
+
+        %Checkpoint{kind: :base_update, parent_checkpoint_id: ^parent_id, tree_sha: ^tree_sha} =
+            existing ->
+          {:ok, existing, :existing, []}
+
+        _different ->
+          conflict("checkpoint_conflict", "commit_sha is already recorded as another checkpoint")
+      end
+    else
+      {:story, nil} -> {:error, :not_found}
+      {:parent, nil} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  # The LOCK ORDER is the one every writer here keeps: the story (held FOR SHARE by now), the
+  # stage row (`follow_base_update/4`), and the audit chain LAST (`insert_entry/4`). Taking
+  # the edge after the entry would hold the chain head while waiting for a stage row that a
+  # chained transition holds while waiting for the chain.
+  defp insert_base_update(tenant_id, story, parent, commit_sha, tree_sha, opts) do
+    previous = latest_checkpoint(tenant_id, story.id)
+
+    checkpoint =
+      Repo.insert!(%Checkpoint{
+        tenant_id: tenant_id,
+        story_id: story.id,
+        seq: if(previous, do: previous.seq + 1, else: 1),
+        kind: :base_update,
+        commit_sha: commit_sha,
+        tree_sha: tree_sha,
+        parent_checkpoint_id: parent.id,
+        claim_epoch: story.claim_epoch
+      })
+
+    Stages.follow_base_update(
+      tenant_id,
+      story.id,
+      %{id: checkpoint.id, commit_sha: commit_sha, parent_commit_sha: parent.commit_sha},
+      actor_label: Keyword.get(opts, :actor_label, @merge_executor_principal)
+    )
+
+    entry =
+      Entry.system_changeset(%{
+        kind: :checkpoint,
+        idempotency_key: @reserved_key_prefix <> "base_update:#{commit_sha}:#{story.claim_epoch}",
+        body:
+          Keyword.get(opts, :note) ||
+            "base update #{commit_sha}: the base branch merged into checkpoint " <>
+              parent.commit_sha,
+        checkpoint_id: checkpoint.id
+      })
+
+    adopted = %{
+      "commit_sha" => commit_sha,
+      "tree_sha" => tree_sha,
+      "claim_epoch" => story.claim_epoch,
+      "checkpoint_seq" => checkpoint.seq,
+      "checkpoint_kind" => "base_update",
+      "parent_checkpoint_id" => parent.id
+    }
+
+    entry_opts = [
+      author_principal: @merge_executor_principal,
+      actor_lineage: [],
+      adopted: adopted
+    ]
+
+    with {:ok, _entry, :created, chained} <-
+           insert_entry(tenant_id, story.id, entry, entry_opts) do
+      {:ok, checkpoint, :created, chained}
+    end
   end
 
   defp write_gate_evidence(tenant_id, story_id, checkpoint_id, key, record) do
@@ -1382,7 +1632,10 @@ defmodule Loopctl.Threads do
     {:ok, value, status}
   end
 
-  defp announced({:error, error}), do: error
+  defp announced({:error, {:error, _reason} = error}), do: error
+  defp announced({:error, {:error, _status, _message} = error}), do: error
+  # A refusal `Loopctl.Delivery.Stages.follow_base_update/4` rolled the transaction back with.
+  defp announced({:error, reason}), do: {:error, reason}
 
   defp next_entry_seq(tenant_id, story_id) do
     Repo.one(

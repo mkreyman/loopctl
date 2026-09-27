@@ -914,6 +914,13 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # `Retry-After` this module cannot turn into a number — an HTTP-date, which is legal — is
   # still a rate limit, and classifying it as a permission denial would escalate a story on
   # the one shape that says most clearly "come back later".
+  @doc false
+  # The classification above, for `Loopctl.Delivery.GitHubAppMergeForge` (US-45.5): the App's
+  # writes fail in the same shapes as these reads, and a second copy of what a 403 means is
+  # the copy that drifts.
+  @spec classify_failure(Req.Response.t()) :: term()
+  def classify_failure(%Req.Response{} = response), do: failure(response)
+
   defp failure(%Req.Response{status: status} = response) when status in [403, 429] do
     if status == 429 or limited?(response),
       do: {:github_rate_limited, status, delay(response)},

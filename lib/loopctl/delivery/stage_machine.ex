@@ -89,6 +89,17 @@ defmodule Loopctl.Delivery.StageMachine do
     as it refuses the release edges, and neither is runner-reportable.
   - `:human_resolution` — escalated -> queued | done | failed, and ONLY for a human
     principal (see `Loopctl.Delivery.Stages.advance/4`).
+  - `:base_updated` — ci -> ci, when the merge executor (US-45.5) found the base branch moved
+    since the gate's allow and merged it INTO the thread as the GitHub App. The story's
+    change is the same diff against a newer merge base, so it keeps its review verdict and its
+    custody binding and does not go back to `implementing`: the edge replaces `head_sha` with
+    the `base_update` checkpoint's sha and clears the allow, and the merge gate judges the
+    new head again, CI included. TRANSACTION-ONLY like the release edges: `advance/4` refuses
+    it from every caller, and it is taken only by `Loopctl.Threads.record_base_update/4`, in
+    the transaction that records the `base_update` checkpoint, for a checkpoint whose first
+    parent is the one the stage row's allow names (`Loopctl.Delivery.Stages.follow_base_update/4`).
+    Any other head movement is still `:base_moved`. Counted in `attempts`, so a thread's base
+    moves are visible on its row.
 
   `done` and `failed` are terminal; `escalated` is terminal except for `:human_resolution`.
   """
@@ -193,7 +204,8 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:triaged, :escalated, :triage_escalate},
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
-                   {:merged, :implementing, :merge_refused}
+                   {:merged, :implementing, :merge_refused},
+                   {:ci, :ci, :base_updated}
                  ] ++
                  @budget_exceeded ++
                  @released ++
@@ -430,6 +442,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :operator_released
           | :human_resolution
           | :session_escalated
+          | :base_updated
 
   @type effect ::
           :runner_id
@@ -735,6 +748,11 @@ defmodule Loopctl.Delivery.StageMachine do
   def clears(:merged, :implementing, :merge_refused), do: @merge_keyed ++ @head_keyed
 
   def clears(_from, :implementing, edge) when edge != :forward, do: @head_keyed
+
+  # The base merged into the thread (US-45.5): a new head, so everything bound to the old one
+  # goes — the allow above all, which was granted for a commit that is no longer the head.
+  # The transaction taking the edge writes the new `head_sha` (`Stages.follow_base_update/4`).
+  def clears(:ci, :ci, :base_updated), do: @head_keyed
 
   def clears(_from, _to, _edge), do: []
 

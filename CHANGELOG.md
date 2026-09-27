@@ -6,6 +6,29 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **loopctl merges a THREAD-mode story itself, as a GitHub App (epic 45, US-45.5). Set
+  `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` to enable it; until both are set every
+  thread-mode allow ESCALATES `merge_executor: :app_unconfigured` and nothing thread-mode
+  merges.** No migration. Install the App on each thread-mode repository with
+  `contents: write` (the executor asks for a token scoped to that one repository and that one
+  permission), and give the base branch a ruleset whose only bypass actor is the App. When the
+  merge gate records a thread-mode allow it enqueues `ThreadMergeWorker` (Oban `default`
+  queue, unique per story), which squashes the ALLOWED checkpoint's tree onto the base head
+  (one commit, the base head its only parent, a message carrying the story number and title,
+  the thread URL and a `Loopctl-Story` trailer), records the commit on the checkpoint as
+  `merge_commit_sha` and only then moves the base ref with `force: false`, and moves the story
+  to `merged`. It merges only while the base head is still the allow's `base_sha`. When the
+  base has moved (or the ref update is not a fast-forward) it merges the base INTO the thread
+  branch as the App, records that as a `base_update` checkpoint, and keeps the story at `ci`
+  over the new `base_updated` edge — review verdict and custody kept, the allow cleared — so
+  the gate judges the new head again once CI on it is green; a conflict goes back to
+  `implementing` over `base_moved` (or escalates `claim_not_live` when nobody can fix it).
+  Every other refusal escalates over `merge_gate` with a `merge_executor:` reason
+  (`tree_mismatch`, `empty_change`, a ref update the ruleset refused, and after the worker's
+  last retry `forge_unavailable`). `thread-mode` workflows must run on `push` to `loop/**`
+  for a base update to get the CI it needs; a push by the App's installation token triggers
+  them.
+
 - **A thread-mode merge requires green CI on the checkpoint's exact commit (epic 45, US-45.6,
   migration `20260927100000`). A THREAD-mode source must now name its `required_checks`, and
   the gate's `GITHUB_TOKEN` needs `actions: read` (and, best effort, `commit statuses: read`)

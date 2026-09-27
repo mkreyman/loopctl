@@ -40,6 +40,22 @@ defmodule Loopctl.Delivery.StageMachineTest do
     end
   end
 
+  test "TC-45.5.7 ci -> ci over base_updated is allowed, replaces the head, and is control's" do
+    assert StageMachine.allowed?(:ci, :ci, :base_updated)
+
+    # A new head: everything bound to the old one goes, the allow above all.
+    assert Enum.sort(StageMachine.clears(:ci, :ci, :base_updated)) ==
+             Enum.sort(StageMachine.head_keyed())
+
+    # From ci only, to ci only: it never sends the story to implementing.
+    assert for({f, t, :base_updated} <- StageMachine.transitions(), do: {f, t}) == [{:ci, :ci}]
+
+    # A runner cannot report it, and it is neither chained nor a session end.
+    refute StageMachine.runner_reportable?(:ci, :ci, :base_updated)
+    refute StageMachine.chained?(:ci, :ci, :base_updated)
+    refute StageMachine.reason_required?(:ci, :base_updated)
+  end
+
   test "done and failed have no way out, and escalated only a human's" do
     for {from, _to, edge} <- StageMachine.transitions(), from in [:done, :failed, :escalated] do
       assert from == :escalated and edge == :human_resolution

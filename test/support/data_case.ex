@@ -230,6 +230,20 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # US-45.5: the merge executor's App writes, on the same fail-closed default.
+    Mox.stub(Loopctl.MockMergeForge, :session, fn _repo -> {:error, :not_stubbed} end)
+
+    for {name, arity} <- [
+          branch_head: 2,
+          commit: 2,
+          ancestor?: 3,
+          create_commit: 2,
+          update_ref: 3,
+          merge: 4
+        ] do
+      Mox.stub(Loopctl.MockMergeForge, name, not_stubbed(arity))
+    end
+
     # US-45.4: the thread-mode reads, on the same fail-closed default.
     Mox.stub(Loopctl.MockPullRequestSource, :branch_head, fn _repo, _branch ->
       {:error, :not_stubbed}
@@ -567,6 +581,11 @@ defmodule Loopctl.DataCase do
     # every request and only raises when an opt-in `x-test-raise-db-error` header
     # is present — so there is NO global router mock to stub here.
   end
+
+  # `{:error, :not_stubbed}` at any arity, for a behaviour whose every callback defaults the same.
+  defp not_stubbed(2), do: fn _a, _b -> {:error, :not_stubbed} end
+  defp not_stubbed(3), do: fn _a, _b, _c -> {:error, :not_stubbed} end
+  defp not_stubbed(4), do: fn _a, _b, _c, _d -> {:error, :not_stubbed} end
 
   @doc """
   A helper that transforms changeset errors into a map of messages.
