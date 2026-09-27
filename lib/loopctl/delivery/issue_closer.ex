@@ -102,6 +102,7 @@ defmodule Loopctl.Delivery.IssueCloser do
   require Logger
 
   alias Loopctl.Delivery.MergePrecondition
+  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.Resolution
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.IssueClosures
@@ -386,11 +387,5 @@ defmodule Loopctl.Delivery.IssueCloser do
     )
   end
 
-  defp source do
-    Application.get_env(
-      :loopctl,
-      :delivery_pull_request_source,
-      Loopctl.Delivery.GitHubPullRequestSource
-    )
-  end
+  defp source, do: PullRequestSource.impl()
 end

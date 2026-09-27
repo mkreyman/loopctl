@@ -74,6 +74,15 @@ defmodule Loopctl.Runners.DispatchRecord do
     # The branch the FIRST push named, so a retry of this dispatch cannot land on another one
     # (#846.2). NULL on every row written before that column existed.
     field :branch, :string
+    # The merge route an IMPLEMENT dispatch was placed under — the story's intake source `mode`
+    # when it was first sent (US-45.4). NULL for every other row and every row older than the
+    # column, read as `pr` (no accepted row at all is read as `pr` too).
+    # Never rewritten: a retry finds the first insert's row.
+    field :mode, :string
+    # The base branch the same implement dispatch was sent with (US-45.4), bound the same way.
+    # NULL for every other row and every row older than the column: the merge gate then falls
+    # back to the source's current base branch.
+    field :base_branch, :string
     field :status, :string, default: "sent"
     field :reason, :string
     field :reason_detail, :string

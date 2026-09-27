@@ -152,6 +152,92 @@ defmodule Loopctl.Threads do
     end
   end
 
+  @typedoc """
+  What the merge gate judges for a THREAD-mode story (US-45.4), read in one tenant
+  transaction:
+
+  - `:latest` — the latest checkpoint of kind `checkpoint` the story's CURRENT claim
+    recorded (its `claim_epoch` now), or `nil` when that claim recorded none. loopctl never
+    adopts a branch head nobody reported, and a checkpoint an ENDED claim recorded is that
+    claim's work, not the current one's
+  - `:earlier_shas` — the current claim's OTHER checkpoints' commits, newest first. A branch
+    naming one of them has gone back, not forward
+  - `:earlier_claim_recorded?` — whether any ENDED claim recorded a checkpoint. With no
+    `:latest`, it tells a thread whose claim was released (the gate's `claim_ended`) from one
+    that never recorded anything (`no_checkpoint_recorded`)
+  """
+  @type claim_checkpoints :: %{
+          latest: Checkpoint.t() | nil,
+          earlier_shas: [String.t()],
+          earlier_claim_recorded?: boolean()
+        }
+
+  @doc """
+  The current claim's checkpoints as `t:claim_checkpoints/0`, or `{:error, reason}` when they
+  could not be read — `{:error, :busy}` for contention a caller retries out of
+  (`Loopctl.Delivery.Stages.answering_busy/4`, the one classification of that), or
+  `{:error, :not_found}` for a story not in the tenant. Never raises for either. Takes no lock.
+  """
+  @spec claim_checkpoints(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, claim_checkpoints()} | {:error, term()}
+  def claim_checkpoints(tenant_id, story_id) do
+    Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "thread read", fn ->
+      tenant_id
+      |> Repo.with_tenant(fn -> read_claim_checkpoints(tenant_id, story_id) end)
+      |> unwrap_read()
+    end)
+  end
+
+  defp unwrap_read({:ok, {:ok, result}}), do: {:ok, result}
+  defp unwrap_read({:ok, {:error, _reason} = error}), do: error
+  defp unwrap_read({:error, _reason} = error), do: error
+
+  # ONE query: the story's current epoch and every claimant checkpoint's few judged fields —
+  # never `gate_evidence` — split by claim here. A story not in the tenant is no row at all.
+  defp read_claim_checkpoints(tenant_id, story_id) do
+    rows =
+      Repo.all(
+        from s in Story,
+          left_join: c in Checkpoint,
+          on: c.tenant_id == s.tenant_id and c.story_id == s.id and c.kind == :checkpoint,
+          where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+          order_by: [desc: c.seq],
+          select:
+            {s.claim_epoch,
+             %{
+               id: c.id,
+               seq: c.seq,
+               commit_sha: c.commit_sha,
+               tree_sha: c.tree_sha,
+               claim_epoch: c.claim_epoch,
+               merge_commit_sha: c.merge_commit_sha
+             }}
+      )
+
+    case rows do
+      [] -> {:error, :not_found}
+      [{epoch, _} | _] -> {:ok, split_by_claim(epoch, Enum.map(rows, &elem(&1, 1)))}
+    end
+  end
+
+  defp split_by_claim(epoch, checkpoints) do
+    # A story with no checkpoint joins to one row of NULLs.
+    checkpoints = Enum.reject(checkpoints, &is_nil(&1.id))
+    {current, earlier_claims} = Enum.split_with(checkpoints, &(&1.claim_epoch == epoch))
+
+    {latest, earlier} =
+      case current do
+        [latest | earlier] -> {struct(Checkpoint, latest), earlier}
+        [] -> {nil, []}
+      end
+
+    %{
+      latest: latest,
+      earlier_shas: Enum.map(earlier, & &1.commit_sha),
+      earlier_claim_recorded?: earlier_claims != []
+    }
+  end
+
   @doc """
   Records a `message` or `review_requested` entry on the story's thread, from any principal
   of the tenant. `attrs` carries `kind`, `idempotency_key`, `body` and an optional

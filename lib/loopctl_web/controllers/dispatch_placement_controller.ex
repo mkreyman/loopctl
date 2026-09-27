@@ -155,7 +155,8 @@ defmodule LoopctlWeb.DispatchPlacementController do
                  "repository can never be given one branch. You may choose the prefix; you " <>
                  "may not drop the suffix. Nothing is claimed on any of the three. A retry " <>
                  "naming a different branch from the one this dispatch was already sent on " <>
-                 "is `branch_conflict`."
+                 "is `branch_conflict`, and one naming a different `base_branch` from the " <>
+                 "recorded one is `base_branch_conflict`."
            },
            base_branch: %Schema{
              type: :string,
@@ -229,7 +230,9 @@ defmodule LoopctlWeb.DispatchPlacementController do
            "`branch_not_unique` — the `branch` you named does not carry this story's own " <>
            "suffix, so two stories on one repository could share it; or `branch_conflict` — " <>
            "a retry named a different `branch` from the one this dispatch was already sent " <>
-           "on. Nothing was claimed on any of them. Or " <>
+           "on; or `base_branch_conflict` — a retry named a different `base_branch` from the " <>
+           "one recorded at the first push, which the merge gate judges against. Nothing " <>
+           "was claimed on any of them. Or " <>
            "`story_not_accepted` — the story object is built by loopctl from " <>
            "its own records and may not be supplied by a caller; or " <>
            "`story_not_dispatchable` — the story exceeds a cap the runner contract declares " <>
@@ -539,6 +542,19 @@ defmodule LoopctlWeb.DispatchPlacementController do
           "`branch` to re-send the recorded one, or send that one.",
       branch: supplied,
       recorded_branch: recorded
+    })
+  end
+
+  # THE SAME RULE FOR THE BASE (US-45.4 review round 3, finding 3): the first push's base
+  # branch is the one the merge gate judges the thread against, so a retry may not move it.
+  defp refuse(conn, {:base_branch_conflict, supplied, recorded}) do
+    error(conn, 422, "base_branch_conflict", %{
+      message:
+        "This dispatch was already sent on another base branch, and a retry may not move it — " <>
+          "the merge gate judges the change against the recorded one. Nothing was claimed. " <>
+          "Omit `base_branch` to re-send the recorded one, or send that one.",
+      base_branch: supplied,
+      recorded_base_branch: recorded
     })
   end
 

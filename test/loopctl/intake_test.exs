@@ -79,6 +79,71 @@ defmodule Loopctl.IntakeTest do
     end
   end
 
+  describe "source_for_project/2" do
+    test "exactly one live source of THIS project; another project's never counts" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      project_id = project.id
+
+      assert {:error, {:no_intake_source, ^project_id}} =
+               Intake.source_for_project(tenant.id, project.id)
+
+      {_secret, mine} =
+        fixture(:intake_source, %{tenant_id: tenant.id, project_id: project.id, mode: :thread})
+
+      fixture(:intake_source, %{tenant_id: tenant.id, repo_full_name: "acme/other"})
+
+      assert {:ok, %Source{id: id, mode: :thread}} =
+               Intake.source_for_project(tenant.id, project.id)
+
+      assert id == mine.id
+
+      fixture(:intake_source, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        repo_full_name: "acme/second"
+      })
+
+      assert {:error, {:ambiguous_intake_source, ^project_id, 2}} =
+               Intake.source_for_project(tenant.id, project.id)
+    end
+
+    test "the project is filtered in SQL: the tenant's other sources are never loaded" do
+      {_secret, source} = fixture(:intake_source, %{})
+      test_pid = self()
+      id = {__MODULE__, make_ref()}
+
+      # The handler runs in the querying process, so only this test's queries are collected.
+      :ok =
+        :telemetry.attach(
+          id,
+          [:loopctl, :admin_repo, :query],
+          fn _event, _measurements, %{query: query}, pid ->
+            if self() == pid, do: send(pid, {:query, query})
+          end,
+          test_pid
+        )
+
+      try do
+        assert {:ok, _} = Intake.source_for_project(source.tenant_id, source.project_id)
+      after
+        :telemetry.detach(id)
+      end
+
+      assert_received {:query, query}
+      assert query =~ ~r/FROM "intake_sources"/
+      assert query =~ ~r/"project_id" = \$\d/
+    end
+
+    test "another tenant's source is never read (tenant isolation)" do
+      {_secret, source} = fixture(:intake_source, %{})
+      other = fixture(:tenant)
+
+      assert {:error, {:no_intake_source, _}} =
+               Intake.source_for_project(other.id, source.project_id)
+    end
+  end
+
   describe "create_source/3" do
     test "an archived work project is refused" do
       tenant = fixture(:tenant)

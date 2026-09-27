@@ -30,8 +30,49 @@ All notable changes to loopctl are documented here.
   codes: `review_closed`, `review_claim_ended`, `review_round_superseded`,
   `reviewer_not_separate`, `tenant_halted`; over HTTP, `review_dispatch_refused` (a retry of a
   review the runner refused: place a new one with a new `dispatch_id`) and `422 invalid_uuid`
-  for a malformed body id. MCP server 2.106.0 adds `thread_request_review`,
+  for a malformed body id. MCP server 2.107.0 adds `thread_request_review`,
   `thread_review_get` and `thread_fix`.
+- **Intake sources carry a merge mode, and a `thread`-mode story merges from a recorded
+  checkpoint with no pull request (epic 45, US-45.4). Migration `20260926140000` adds
+  `intake_sources.mode`, NOT NULL, default `pr`; no backfill and no manual step, and every
+  existing source behaves exactly as before.** `POST` and `PATCH /api/v1/intake/sources`
+  (and the `intake_source_enroll` / `intake_source_update` MCP tools) take `mode: "pr" |
+  "thread"`, read by presence; null or any other value is 422, and a change is recorded as
+  `intake_source_mode_set` on the audit chain. For a thread-mode story,
+  `POST /stories/:id/merge-precondition` judges the latest checkpoint the story's CURRENT
+  claim recorded, on the branch that claim's dispatch ran on (`pr_number` is null). **A
+  thread-mode source needs runners at contract 1.20.0 or later sending `checkpoint`
+  messages; otherwise every story is refused `no_checkpoint_recorded`.** It adds refusals
+  `empty_change` (the checkpoint's tree equals the base branch's, or no file changed),
+  `checkpoint_tree_mismatch`, `no_checkpoint_recorded`, `claim_ended` (the current claim
+  recorded nothing, but an earlier, released one did) and `thread_unreadable` (loopctl could
+  not read the thread). A branch missing from a readable
+  repository (`branch_missing`), naming a commit nobody reported (`branch_head_unrecorded`),
+  naming an earlier checkpoint of the claim (`branch_head_regressed`), or a checkpoint that
+  is not the recorded head, is `head_moved` back to `implementing` while the claim is live,
+  and a refusal naming `claim_not_live` (escalated) when it is not. The diff judged is the
+  checkpoint's three-dot diff against its merge base, so a base that moved on is not a
+  refusal. A checkpoint the base already contains, its branch deleted or not, is
+  `already_merged` only under a recorded allow naming it, and otherwise refused
+  `checkpoint_on_base_without_allow`. An unreadable repository
+  refuses `pull_request_unavailable`. The gate's token also reads `GET /repos/:repo` after a
+  404 on the branch. The verdict carries `mode`, `checkpoint_id`, `checkpoint_sha` and
+  `base_sha` (the merge base the judged diff is relative to), and a thread-mode allow is
+  recorded naming the checkpoint id and sha and that `base_sha`; the merge executor
+  (US-45.5) merges only while the base head still equals it. No stage-machine change; the runner contract is
+  unchanged.
+  **The mode and base branch are bound at placement.** Migration `20260926150000` adds
+  `runner_dispatches.mode` and `runner_dispatches.base_branch` (nullable, no backfill, no
+  manual step): an implement dispatch records its intake source's mode and the base branch it
+  was sent with when it is first sent, and the merge gate reads both from the current claim's
+  dispatch, a NULL mode meaning `pr` and a NULL base branch meaning the source's current one;
+  a claim with no accepted dispatch at all is judged as a pull request against the source's
+  current base branch, so flipping a source to thread never re-routes a session's own PR.
+  Changing a source's mode or base branch is therefore always allowed and affects only stories
+  placed afterwards.
+  For a thread-mode repository the
+  gate's `GITHUB_TOKEN` also reads `git/ref/heads/*` and `git/commits/*` (contents: read,
+  which the tree reads already need).
 - **Runners may report checkpoints and notes on a story's change thread (epic 45, US-45.2,
   runner contract 1.20.0). RE-VENDOR the contract to send them; a runner that does not gets
   today's behaviour.** Two new optional channel messages. `checkpoint` carries `{dispatch_id,

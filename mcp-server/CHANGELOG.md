@@ -5,7 +5,7 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.106.0 — 2026-09-26 (review on a change thread)
+## 2.107.0 — 2026-09-26 (review on a change thread)
 
 ### Added
 

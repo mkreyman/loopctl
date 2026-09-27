@@ -142,6 +142,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   alias Loopctl.Runners.TraceEvent
   alias Loopctl.WorkBreakdown.Story
 
+  # The `kind`s that are an implement session; NULL is one too (see `implement_kind?/1`).
+  @implement_kinds ["implement"]
+
   # Retention (see "Retention" in the moduledoc). The batch is one DELETE statement's worth of
   # rows and the budget is one tenant's worth per run: both bound how long a single statement
   # and a single run can hold a connection of the RLS pool, and the budget is what makes a run
@@ -161,8 +164,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   @doc """
   Records a validated dispatch as `sent`, or finds the row an earlier dispatch of the same
   `dispatch_id` wrote. See the moduledoc for the refusals.
+
+  `:mode` — the intake source's merge mode (`"pr"`, `"thread"`, or nil) the placement
+  resolved, recorded on an implement dispatch's row only (US-45.4).
   """
-  @spec record_sent(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+  @spec record_sent(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, DispatchRecord.t()}
           | {:error,
              :stale_claim_epoch
@@ -171,7 +177,7 @@ defmodule Loopctl.Runners.DispatchLedger do
              | :admission_limit_reached
              | :runner_at_capacity
              | :capacity_busy}
-  def record_sent(tenant_id, runner_id, dispatch) do
+  def record_sent(tenant_id, runner_id, dispatch, opts \\ []) do
     now = DateTime.utc_now()
 
     row = %{
@@ -188,6 +194,14 @@ defmodule Loopctl.Runners.DispatchLedger do
       # re-deriving one from a declaration the machine may have changed since.
       branch: dispatch.branch,
       status: "sent",
+      # THE ROUTE IS BOUND AT PLACEMENT (US-45.4): the merge mode and the base branch this
+      # implement dispatch is placed under, so the merge gate later judges the story on the
+      # route it was built for, whatever its intake source is changed to in between. The mode
+      # is the one `Loopctl.Delivery.DispatchPayload.fill/3` resolved with the repository
+      # (`:mode`); the base branch is the one on the wire. Both are NULL for a non-implement
+      # dispatch, which has no merge route, and `on_conflict: :nothing` keeps the first send's.
+      mode: implement_only(dispatch, Keyword.get(opts, :mode)),
+      base_branch: implement_only(dispatch, Map.get(dispatch, :base_branch)),
       trace_acked_seq: -1,
       wall_clock_seconds: dispatch.wall_clock_seconds,
       # Born holding NO slot: the row is inserted first (that is how a retry is told from a
@@ -900,7 +914,8 @@ defmodule Loopctl.Runners.DispatchLedger do
     if implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
   end
 
-  @implement_kind "implement"
+  defp implement_only(dispatch, value),
+    do: if(implement_kind?(dispatch.kind), do: value, else: nil)
 
   @doc """
   Whether a ledger row's `kind` is an implement session: `"implement"`, or `nil` — a row
@@ -911,18 +926,43 @@ defmodule Loopctl.Runners.DispatchLedger do
   rule as a query filter.
   """
   @spec implement_kind?(String.t() | nil) :: boolean()
-  def implement_kind?(kind), do: kind in [@implement_kind, nil]
+  def implement_kind?(kind), do: is_nil(kind) or kind in @implement_kinds
 
   @doc "`implement_kind?/1` as a filter on a query whose first binding is a ledger row."
   @spec where_implement_kind(Ecto.Queryable.t()) :: Ecto.Query.t()
   def where_implement_kind(query),
-    do: where(query, [r], r.kind == @implement_kind or is_nil(r.kind))
+    do: where(query, [r], is_nil(r.kind) or r.kind in ^@implement_kinds)
 
   # The kind a session accessor answers for: `:implement` (the default everywhere), a named
   # kind, or `:any`.
   defp of_kind(query, :implement), do: where_implement_kind(query)
   defp of_kind(query, :any), do: query
   defp of_kind(query, kind) when is_binary(kind), do: where(query, [r], r.kind == ^kind)
+
+  # A dispatch whose session RAN is one its runner ACCEPTED. A `sent` row may never have
+  # reached a machine and a `refused` one never ran, so neither names a route anything was
+  # built on. `superseded` is not read either: a row is superseded only by a LATER claim's
+  # dispatch, so no row of the current claim can be.
+  @route_statuses ["accepted"]
+
+  @doc """
+  The query for the ROUTE `story`'s current claim was dispatched on (US-45.4): the newest
+  implement row of the story's CURRENT `claim_epoch` that its runner ACCEPTED, selecting the
+  `mode`, `branch` and `base_branch` recorded at the first push. The ledger's rules for "the
+  current claim's accepted implement row" live here, with the other readers of this table;
+  `Loopctl.Delivery.DispatchPayload.dispatch_route/2` runs it under a bounded lock wait.
+  """
+  @spec claim_route_query(Ecto.UUID.t(), Story.t()) :: Ecto.Query.t()
+  def claim_route_query(tenant_id, %Story{} = story) do
+    from(r in DispatchRecord,
+      where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
+      where: r.claim_epoch == ^story.claim_epoch and r.status in ^@route_statuses,
+      order_by: [desc: r.inserted_at],
+      limit: 1,
+      select: %{mode: r.mode, branch: r.branch, base_branch: r.base_branch}
+    )
+    |> where_implement_kind()
+  end
 
   defp session_of(%DispatchRecord{} = record) do
     %{

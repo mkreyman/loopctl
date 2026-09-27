@@ -103,6 +103,7 @@ defmodule Loopctl.Runners do
   alias Loopctl.AuditChain.Entry, as: AuditEntry
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.LogValue
   alias Loopctl.Repo
   alias Loopctl.Runners.Capacity
@@ -543,9 +544,12 @@ defmodule Loopctl.Runners do
   Steps 8-13 run in ONE transaction: the ledger row and its slot commit together or not at
   all, and a re-send of a `dispatch_id` whose row still holds its slot takes no second one.
 
-  Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/3`) — or
+  Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/4`) — or
   finds the one an earlier call with the same `dispatch_id` wrote, so a retry never creates a
-  second row — and only then broadcasts on `dispatch_topic/1`. That write runs on the RLS
+  second row — and only then broadcasts on `dispatch_topic/1`. The merge mode
+  `Loopctl.Delivery.DispatchPayload.fill/3` resolved rides in the payload under
+  `DispatchPayload.placed_mode_key/0`; the cast keeps only declared fields, so it never
+  reaches the wire, and it is recorded on the row (US-45.4). That write runs on the RLS
   `Loopctl.Repo` in a transaction of its own, like the rest of the ledger, so this function
   must not be called from inside a `Repo` transaction (`Repo.with_tenant/2` raises there).
   The runner's channel then pushes the `"dispatch"` event on the runner's own
@@ -616,6 +620,8 @@ defmodule Loopctl.Runners do
   end
 
   defp do_dispatch(tenant_id, runner_id, payload) do
+    placed_mode = placed_mode(payload)
+
     with {:ok, dispatch} <- RunnerContract.cast_dispatch(payload),
          {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
          :ok <- not_halted(tenant_id),
@@ -623,10 +629,18 @@ defmodule Loopctl.Runners do
          {:ok, meta} <- single_live_socket(tenant_id, runner_id),
          :ok <- kind_supported(tenant_id, runner_id, meta, dispatch.kind),
          :ok <- not_exhausted(tenant_id, runner_id, dispatch.dispatch_id),
-         {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
+         {:ok, _record} <-
+           DispatchLedger.record_sent(tenant_id, runner_id, dispatch, mode: placed_mode) do
       broadcast_dispatch(tenant_id, runner_id, dispatch)
     end
   end
+
+  # Read beside the payload, never from the cast: `cast_dispatch/1` keeps only the declared
+  # fields, which is also what keeps this atom key off the wire.
+  defp placed_mode(payload) when is_map(payload),
+    do: Map.get(payload, DispatchPayload.placed_mode_key())
+
+  defp placed_mode(_payload), do: nil
 
   defp not_exhausted(tenant_id, runner_id, dispatch_id) do
     if usage_exhausted?(tenant_id, runner_id) and

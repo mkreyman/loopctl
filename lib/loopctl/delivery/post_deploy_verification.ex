@@ -146,6 +146,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PostDeployVerification.Result
+  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.Resolution
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
@@ -699,13 +700,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     end
   end
 
-  defp source do
-    Application.get_env(
-      :loopctl,
-      :delivery_pull_request_source,
-      Loopctl.Delivery.GitHubPullRequestSource
-    )
-  end
+  defp source, do: PullRequestSource.impl()
 
   # -- the writes ------------------------------------------------------------------------
 
