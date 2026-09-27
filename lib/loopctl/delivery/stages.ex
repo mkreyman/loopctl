@@ -217,6 +217,7 @@ defmodule Loopctl.Delivery.Stages do
           | :stale_claim_epoch
           | :wrong_stage
           | :effect_conflict
+          | :invalid_event_data
           | :busy
 
   @doc """
@@ -910,6 +911,10 @@ defmodule Loopctl.Delivery.Stages do
   ## Options
 
   - `:claim_epoch` (required), `:actor_label`
+  - `:event_data` — a JSON-encodable map recorded under `"payload"` on the `effect_recorded`
+    event, bounded as `advance/4`'s is. The merge gate names the checkpoint a thread-mode
+    allow was granted for this way (US-45.4). Nothing is recorded for a replay of a write
+    that already landed, because a replay writes no event.
   """
   @spec record_effect(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), keyword()) ::
           {:ok, StoryStage.t()} | {:error, effect_error()}
@@ -917,6 +922,7 @@ defmodule Loopctl.Delivery.Stages do
     epoch = Keyword.fetch!(opts, :claim_epoch)
 
     with :ok <- recordable(effect),
+         :ok <- event_data_ok(opts),
          {:ok, value} <- validate_effect(effect, value) do
       in_tenant(tenant_id, fn ->
         effect_write(tenant_id, story_id, {effect, value}, epoch, opts)
@@ -966,7 +972,10 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
+  # A transition's `:event_data` belongs to the TRANSITION's event, which already carries it;
+  # the effect events it writes stay exactly `effect` and `value`.
   defp put_effects(row, effects, opts) do
+    opts = Keyword.delete(opts, :event_data)
     Enum.reduce(effects, row, fn {effect, value}, acc -> put_effect(acc, effect, value, opts) end)
   end
 
@@ -983,7 +992,10 @@ defmodule Loopctl.Delivery.Stages do
       )
       |> Repo.update_all([])
 
-    data = %{"effect" => Atom.to_string(effect), "value" => event_value(value)}
+    data =
+      note(nil, opts)
+      |> Map.merge(%{"effect" => Atom.to_string(effect), "value" => event_value(value)})
+
     insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
     row
   end

@@ -66,6 +66,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     build(:runner_dispatch, Map.put(attrs, "story_id", story_id))
   end
 
+  # A live intake source for the story's project, on the ledger's own connection.
   # A release of the story's claim, as every release path in `Progress` writes it.
   defp release_claim(tenant_id, story_id) do
     as_tenant(tenant_id, fn ->
@@ -139,7 +140,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end)
   end
 
-  describe "record_sent/3" do
+  describe "record_sent/4" do
     test "writes one `sent` row carrying the dispatch's identity", %{runner: runner} do
       # The kind is set AFTER the cast: `triage` is a declared kind the cast refuses to
       # dispatch (contract 1.5.0), while the ledger stores whatever kind it is handed — which
@@ -152,6 +153,35 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert record.kind == "triage"
       assert record.trace_acked_seq == -1
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
+    end
+
+    test "an implement dispatch binds the mode it was placed under and its base branch; a retry keeps both (US-45.4)",
+         %{runner: runner} do
+      {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
+      base_branch = dispatch.base_branch
+      assert is_binary(base_branch)
+
+      assert {:ok, %{mode: "thread", base_branch: ^base_branch}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch, mode: "thread")
+
+      # A retry carrying a different mode (the source changed since): the first send's stands.
+      assert {:ok, %{mode: "thread", base_branch: ^base_branch}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch, mode: "pr")
+    end
+
+    test "a triage dispatch records no route, and an implement one given no mode records none",
+         %{runner: runner} do
+      {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
+
+      assert {:ok, %{mode: nil, base_branch: nil}} =
+               DispatchLedger.record_sent(
+                 runner.tenant_id,
+                 runner.id,
+                 %{dispatch | kind: "triage"},
+                 mode: "thread"
+               )
+
+      assert %{mode: nil} = sent(runner, %{})
     end
 
     test "the same dispatch_id twice finds the first row instead of writing a second",

@@ -2,7 +2,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
   @moduledoc """
   One merge-precondition evaluation (issue #803, design §5 "Both gates run twice" and §9).
 
-  - `decision` — one of five:
+  - `decision` — one of:
     - `:allow` — and only from `enforce/3`, which records the allow against the head it
       judged. Nothing else licenses a merge
     - `:refuse` — a gate verdict. The story is escalated
@@ -31,10 +31,20 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     unevaluated verdict is a rate limit, so an unbounded retry would amplify the very
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
-    A verdict is only ever about the diff at THIS head
+    A verdict is only ever about the diff at THIS head. In THREAD mode `merge_base_sha` is
+    what a thread-mode allow records as `base_sha`, and the merge executor (US-45.5) merges
+    only while the base head still equals it, taking the base-update path otherwise
+  - `mode` — `:pr` or `:thread`: the mode BOUND on the claim's implement dispatch at
+    placement (US-45.4), not the intake source's current mode. nil when the route could not
+    be read (the verdict is then `:unevaluated`)
+  - `checkpoint_id`, `checkpoint_sha` — THREAD mode: the recorded checkpoint judged. An allow
+    in thread mode is recorded naming both
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
     request that was merged before this evaluation ran
-  - `diffstat` — the forge's own `%{files: n, changed_lines: n}`, never `length(files)`
+  - `diffstat` — `%{files: n, changed_lines: n}`. In pr mode the forge's own totals, never
+    `length(files)`. In THREAD mode GitHub's comparison carries no totals, so both are derived
+    from the files it lists — and a list that reaches `@compare_file_cap` in
+    `Loopctl.Delivery.GitHubPullRequestSource` is refused as truncated rather than counted
   - `gate_a`, `gate_b`, `proof` — the underlying gate results, recorded whatever the
     decision, so a refusal can be read without re-running anything. `nil` for a gate that
     was never reached
@@ -66,6 +76,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :proof,
     :retry_after,
     :recorded_head_sha,
+    :checkpoint_id,
+    :checkpoint_sha,
+    mode: :pr,
     custody: nil,
     gate_a_inputs: :missing,
     trio_outputs_ignored: false
@@ -89,6 +102,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           gate_a_inputs: :persisted_triage | :human_resolution | :missing,
           trio_outputs_ignored: boolean(),
           retry_after: pos_integer() | nil,
-          recorded_head_sha: String.t() | nil
+          recorded_head_sha: String.t() | nil,
+          mode: :pr | :thread | nil,
+          checkpoint_id: Ecto.UUID.t() | nil,
+          checkpoint_sha: String.t() | nil
         }
 end

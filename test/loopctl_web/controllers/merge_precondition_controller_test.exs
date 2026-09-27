@@ -120,8 +120,13 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       assert data["reasons"] == []
       assert data["repo"] == @repo
       assert data["pr_number"] == 4242
+      # US-45.4: a pr-mode source judges a pull request and names no checkpoint.
+      assert data["mode"] == "pr"
+      assert data["checkpoint_id"] == nil
       assert data["head_sha"] == @head
       assert data["merge_base_sha"] == @base
+      # base_sha is a THREAD-mode field (the merge base an allow records); a pr verdict has none.
+      assert Map.has_key?(data, "base_sha") and data["base_sha"] == nil
       assert data["custody"] == "ok"
       assert data["gate_a_inputs"] == "persisted_triage"
       assert data["hard_bound"] == %{"max_files" => 12, "max_changed_lines" => 1000}

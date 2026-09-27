@@ -2213,6 +2213,35 @@ defmodule Loopctl.Fixtures do
     |> Loopctl.Repo.insert!()
   end
 
+  # One `thread_checkpoints` row inserted DIRECTLY on the RLS `Loopctl.Repo` connection
+  # (US-45.4), so a merge-gate or stage-machine test can place a checkpoint of either kind
+  # without driving a claim, a lease and a runner through `Loopctl.Threads`. `:repo` picks the
+  # connection, as `fixture(:story_stage)` does, for the committed-tenant modules. `seq` is
+  # required, so a test states the order it means; `parent_checkpoint_id` links a base update
+  # to the checkpoint it was merged into.
+  def fixture(:thread_checkpoint, attrs) do
+    attrs = Enum.into(attrs, %{})
+    repo = Map.get(attrs, :repo, Loopctl.Repo)
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    row =
+      struct!(
+        Loopctl.Threads.Checkpoint,
+        attrs
+        |> Map.drop([:repo])
+        |> Map.put_new(:kind, :checkpoint)
+        |> Map.put_new(:claim_epoch, 0)
+        |> Map.put_new(:tree_sha, String.duplicate("e", 40))
+      )
+
+    if repo == Loopctl.Repo do
+      {:ok, checkpoint} = Loopctl.Repo.with_tenant(tenant_id, fn -> repo.insert!(row) end)
+      checkpoint
+    else
+      repo.insert!(row)
+    end
+  end
+
   def fixture(:stage_story, attrs) do
     attrs = Enum.into(attrs, %{})
 
@@ -2589,11 +2618,18 @@ defmodule Loopctl.Fixtures do
       end
 
     {:ok, %{source: source, webhook_secret: secret}} =
-      Loopctl.Intake.create_source(tenant_id, %{
-        repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
-        project_id: project_id,
-        target_epic_id: Map.get(attrs, :target_epic_id)
-      })
+      Loopctl.Intake.create_source(
+        tenant_id,
+        Map.merge(
+          %{
+            repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
+            project_id: project_id,
+            target_epic_id: Map.get(attrs, :target_epic_id)
+          },
+          # By presence, as the context reads it: omitted keeps the `pr` default.
+          Map.take(attrs, [:mode])
+        )
+      )
 
     {secret, source}
   end
