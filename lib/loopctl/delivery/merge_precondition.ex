@@ -59,16 +59,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
     never read as merged
   - `{:checkpoint_tree_mismatch, forge, recorded}` — the forge's tree for the checkpoint
     commit is not the tree the claimant reported, so the record is not what it describes
-  - `{:no_checkpoint_recorded, _}` — a thread with no checkpoint is never judged from its
-    branch
+  - `{:no_checkpoint_recorded, _}` — the story's CURRENT claim recorded no checkpoint
+    (`Loopctl.Threads.latest_recorded_checkpoint/2` reads only that claim's), so there is
+    nothing to judge; a thread is never judged from its branch. A thread-mode source's
+    runners must be at runner contract 1.20.0 or later and send `checkpoint` messages, or
+    every story is refused here
 
   The BRANCH FACT is judged first, and everything it can say goes back to `implementing`
   over `:base_moved`, as a moved pull request head does, because each is ordinary work
-  rather than something for a human: `{:branch_missing, checkpoint}` (the forge has no such
-  branch), `{:branch_head_unrecorded, branch, checkpoint}` (the branch names a commit nobody
-  reported — a push not recorded yet, or a reclaimed runner's) and
-  `{:checkpoint_unpushed, checkpoint}` (the branch names it but the forge cannot find the
-  commit). The branch is the one the story was DISPATCHED on
+  rather than something for a human: `{:branch_missing, checkpoint}` (a 404 on the branch in
+  a repository the token can read) and `{:branch_head_unrecorded, branch, checkpoint}` (the
+  branch names a commit nobody reported — a push not recorded yet, or a reclaimed runner's).
+  A repository the token cannot read is a forge failure and escalates. The branch is the one the story was DISPATCHED on
   (`Loopctl.Delivery.DispatchPayload.story_branch/2`), never a name derived here. loopctl
   never adopts a head nobody reported, and a merge squashes the RECORDED checkpoint's tree,
   never the branch head (PRD §4 item 2). A latest checkpoint that is not the head the stage
@@ -737,12 +739,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp branch_reasons(facts, pr) do
     head = Map.get(pr, :head_sha)
 
-    case {mode(facts), Map.get(pr, :branch_head_sha), Map.get(pr, :pushed?, true)} do
-      {:thread, :missing, _pushed} -> [{:branch_missing, head}]
-      {:thread, ^head, false} -> [{:checkpoint_unpushed, head}]
-      {:thread, ^head, _pushed} -> []
-      {:thread, branch_head, _pushed} -> [{:branch_head_unrecorded, branch_head, head}]
-      {_mode, _branch_head, _pushed} -> []
+    case {mode(facts), Map.get(pr, :branch_head_sha)} do
+      {:thread, :missing} -> [{:branch_missing, head}]
+      {:thread, ^head} -> []
+      {:thread, branch_head} -> [{:branch_head_unrecorded, branch_head, head}]
+      {_mode, _branch_head} -> []
     end
   end
 
@@ -1141,9 +1142,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   answer to "which repo is this story's", and the two would drift.
   """
   @spec repo_for_story(map()) :: fact(String.t())
-  def repo_for_story(%{tenant_id: tenant_id, project_id: project_id}) do
-    repo_of(Intake.source_for_project(tenant_id, project_id))
-  end
+  def repo_for_story(story), do: story |> source_for_story() |> repo_of()
 
   # ONE derivation of the repository from a resolved source, shared by `repo_for_story/1` and
   # `gather/3` — which needs the source itself too, for its mode and base branch, and so reads

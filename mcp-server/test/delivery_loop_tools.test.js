@@ -312,7 +312,6 @@ describe("merge_precondition (US-44.1)", () => {
       for (const name of [
         "branch_head_unrecorded",
         "branch_missing",
-        "checkpoint_unpushed",
         "empty_change",
         "checkpoint_tree_mismatch",
         "no_checkpoint_recorded",

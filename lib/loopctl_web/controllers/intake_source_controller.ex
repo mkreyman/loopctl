@@ -114,7 +114,9 @@ defmodule LoopctlWeb.IntakeSourceController do
              description:
                "Optional. `pr` (the default when omitted) or `thread`. A `thread` source's " <>
                  "merge gate evaluates the story's latest recorded checkpoint instead of a " <>
-                 "pull request (see `POST /stories/:id/merge-precondition`). NOT " <>
+                 "pull request (see `POST /stories/:id/merge-precondition`); its runners " <>
+                 "must be at runner contract 1.20.0 or later and send `checkpoint` " <>
+                 "messages, or every story is refused `no_checkpoint_recorded`. NOT " <>
                  "nullable: an explicit null or any other value is a 422. A mode that " <>
                  "differs from the project's previous source's is 409 `stories_in_flight` " <>
                  "while any story of the project is in flight."
@@ -233,7 +235,9 @@ defmodule LoopctlWeb.IntakeSourceController do
              description:
                "Optional; omitted leaves it as it is. `pr` or `thread`. A `thread` source's " <>
                  "merge gate evaluates the story's latest recorded checkpoint instead of a " <>
-                 "pull request (see `POST /stories/:id/merge-precondition`). NOT " <>
+                 "pull request (see `POST /stories/:id/merge-precondition`); its runners " <>
+                 "must be at runner contract 1.20.0 or later and send `checkpoint` " <>
+                 "messages, or every story is refused `no_checkpoint_recorded`. NOT " <>
                  "nullable: an explicit null or any other value is a 422. A CHANGE is " <>
                  "409 `stories_in_flight` while any story of this source's project is past " <>
                  "intake and not done or failed (escalated counts), because the mode decides " <>

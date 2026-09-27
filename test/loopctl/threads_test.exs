@@ -97,6 +97,31 @@ defmodule Loopctl.ThreadsTest do
       assert Threads.latest_recorded_checkpoint(other.tenant_id, ctx.story.id) == nil
     end
 
+    test "latest_recorded_checkpoint/2 reads only the CURRENT claim's claimant checkpoints" do
+      ctx = claimed_story()
+      {:ok, _recorded, :created} = checkpoint(ctx, @sha1)
+
+      # A later claim: the checkpoint the ended claim recorded is not this claim's work.
+      set_story(ctx, claim_epoch: @epoch + 1)
+      assert Threads.latest_recorded_checkpoint(ctx.tenant_id, ctx.story.id) == nil
+
+      # And a checkpoint of another kind under the current claim is not judged either.
+      {:ok, _} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.insert!(%Loopctl.Threads.Checkpoint{
+            tenant_id: ctx.tenant_id,
+            story_id: ctx.story.id,
+            seq: 2,
+            kind: :base_update,
+            commit_sha: @sha2,
+            tree_sha: @tree,
+            claim_epoch: @epoch + 1
+          })
+        end)
+
+      assert Threads.latest_recorded_checkpoint(ctx.tenant_id, ctx.story.id) == nil
+    end
+
     test "a stale epoch is refused and nothing is written" do
       ctx = claimed_story()
 

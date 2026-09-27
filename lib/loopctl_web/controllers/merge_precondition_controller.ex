@@ -225,14 +225,18 @@ defmodule LoopctlWeb.MergePreconditionController do
         "either the head or the merge base, and an unverified or custody-unattributed " <>
         "story all REFUSE.\n\n" <>
         "THREAD MODE (the story's intake source has `mode: thread`) needs no pull request: " <>
-        "the gate judges the story's latest RECORDED checkpoint on the branch the story was " <>
-        "DISPATCHED on (pinned in the dispatch ledger), and `pr_number` is null. It refuses " <>
+        "the gate judges the latest checkpoint the story's CURRENT claim recorded, on the " <>
+        "branch the story was DISPATCHED on (pinned in the dispatch ledger), and `pr_number` " <>
+        "is null. Its runners must be at runner contract 1.20.0 or later and send " <>
+        "`checkpoint` messages, or every story is refused `no_checkpoint_recorded`. It refuses " <>
         "`empty_change` (the checkpoint's tree equals the base branch's, or no file changed), " <>
         "`checkpoint_tree_mismatch` (the forge's tree for it is not the one recorded) and " <>
         "`no_checkpoint_recorded`. The BRANCH is judged first: a branch the forge does not " <>
-        "have (`branch_missing`), one naming a commit nobody recorded " <>
-        "(`branch_head_unrecorded`) or a checkpoint the forge cannot find " <>
-        "(`checkpoint_unpushed`) is `head_moved` — back to `implementing`, not escalated. A " <>
+        "have in a repository the token can read (`branch_missing`) or one naming a commit " <>
+        "nobody recorded (`branch_head_unrecorded`) is `head_moved` — back to " <>
+        "`implementing`, not escalated. A repository the token cannot read, or a 404 on the " <>
+        "checkpoint's commit or comparison once the branch names it, refuses " <>
+        "`pull_request_unavailable`. A " <>
         "checkpoint carrying a merge commit counts as `already_merged` only when that commit " <>
         "is on the base branch. A thread-mode allow is recorded naming the checkpoint id and " <>
         "sha, and the verdict carries `mode`, `checkpoint_id` and `checkpoint_sha`.\n\n" <>

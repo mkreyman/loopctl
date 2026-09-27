@@ -16,7 +16,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   - `GET /repos/:repo/git/ref/heads/:branch` — the thread branch head. `ref`, singular: the
     plural endpoint matches by PREFIX, so `loop/1` would answer with `loop/10` too
-  - `GET /repos/:repo/git/commits/:sha` — a checkpoint's tree and its parents, in order
+  - `GET /repos/:repo/git/commits/:sha` — a checkpoint's tree
+  - `GET /repos/:repo` — only after a 404 on the branch ref, to tell a missing branch from a
+    repository the token cannot read
   - `GET /repos/:repo/compare/:base...:head` — the merge base, the base's CURRENT tree, and
     the changed files. The comparison lists at most `@compare_file_cap` files and carries no
     total of its own, so a list that reaches the cap is refused as truncated rather than
@@ -182,6 +184,14 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   @impl true
+  def repository_readable(repo) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, _body} <- get(repo, "") do
+      :ok
+    end
+  end
+
+  @impl true
   def compare(repo, base, head) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, base} <- ref(base),
@@ -191,14 +201,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  defp commit_facts(%{"tree" => %{"sha" => tree}, "parents" => parents})
-       when is_binary(tree) and is_list(parents) do
-    shas = for %{"sha" => sha} <- parents, is_binary(sha), do: sha
-
-    if length(shas) == length(parents),
-      do: {:ok, %{tree_sha: tree, parent_shas: shas}},
-      else: {:error, {:unreadable_commit, :invalid_parents}}
-  end
+  defp commit_facts(%{"tree" => %{"sha" => tree}}) when is_binary(tree),
+    do: {:ok, %{tree_sha: tree}}
 
   defp commit_facts(body), do: {:error, {:unreadable_commit, shape(body)}}
 

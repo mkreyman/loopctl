@@ -1024,6 +1024,14 @@ describe("the descriptions carry what a caller needs instead of the controller",
     }
   });
 
+  test("both write tools say a thread source needs runners at contract 1.20.0 (US-45.4)", () => {
+    for (const name of ["intake_source_enroll", "intake_source_update"]) {
+      const tool = loadTools().find((t) => t.name === name);
+      assert.match(tool.inputSchema.properties.mode.description, /1\.20\.0/, name);
+      assert.match(tool.inputSchema.properties.mode.description, /no_checkpoint_recorded/, name);
+    }
+  });
+
   test("both write tools name the 409 a mode change meets with stories in flight", () => {
     for (const text of [
       description("intake_source_update"),

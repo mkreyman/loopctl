@@ -24,7 +24,7 @@
     },
     {
       "id": "AC-45.4.3",
-      "description": "The gate refuses branch_head_unrecorded when the thread branch head is not the latest recorded checkpoint, and empty_change when the checkpoint tree equals the base tree."
+      "description": "When the thread branch head is not the latest checkpoint the story's current claim recorded, or the branch is missing from a repository the token can read, the gate answers head_moved with reason branch_head_unrecorded or branch_missing and returns the story to implementing over base_moved, without escalating. It refuses empty_change when the checkpoint tree equals the base tree or the comparison lists no changed file."
     },
     {
       "id": "AC-45.4.5",

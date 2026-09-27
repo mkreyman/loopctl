@@ -232,6 +232,10 @@ defmodule Loopctl.DataCase do
 
     Mox.stub(Loopctl.MockPullRequestSource, :commit, fn _repo, _sha -> {:error, :not_stubbed} end)
 
+    Mox.stub(Loopctl.MockPullRequestSource, :repository_readable, fn _repo ->
+      {:error, :not_stubbed}
+    end)
+
     Mox.stub(Loopctl.MockPullRequestSource, :compare, fn _repo, _base, _head ->
       {:error, :not_stubbed}
     end)

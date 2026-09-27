@@ -1058,13 +1058,6 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert {:branch_missing, @head} in verdict.reasons
     end
 
-    test "a checkpoint the branch names but the forge cannot find goes back, unpushed" do
-      verdict = judge_thread(pushed?: false)
-
-      assert verdict.decision == :head_moved
-      assert {:checkpoint_unpushed, @head} in verdict.reasons
-    end
-
     test "the branch fact is judged FIRST: it is reported ahead of a moved head" do
       other = String.duplicate("9", 40)
       moved = String.duplicate("7", 40)
@@ -1095,7 +1088,6 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       |> pull_request()
       |> Map.merge(%{
         branch_head_sha: Keyword.get(overrides, :branch_head_sha, @head),
-        pushed?: Keyword.get(overrides, :pushed?, true),
         head_tree_sha: Keyword.get(overrides, :head_tree_sha, @tree),
         base_tree_sha: Keyword.get(overrides, :base_tree_sha, @base_tree)
       })

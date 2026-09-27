@@ -142,6 +142,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   alias Loopctl.Runners.TraceEvent
   alias Loopctl.WorkBreakdown.Story
 
+  # The `kind`s that are an implement session; NULL is one too (see `implement_kind?/1`).
+  @implement_kinds ["implement"]
+
   # Retention (see "Retention" in the moduledoc). The batch is one DELETE statement's worth of
   # rows and the budget is one tenant's worth per run: both bound how long a single statement
   # and a single run can hold a connection of the RLS pool, and the budget is what makes a run
@@ -818,7 +821,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   that rule, for every path that must refuse a triage session a claim to report on.
   """
   @spec implement_kind?(String.t() | nil) :: boolean()
-  def implement_kind?(kind), do: kind in ["implement", nil]
+  def implement_kind?(kind), do: is_nil(kind) or kind in @implement_kinds
+
+  @doc """
+  `implement_kind?/1` as a query filter over `Loopctl.Runners.DispatchRecord` rows: the same
+  rule, from the same `@implement_kinds`, for a reader that must not fetch every row to apply
+  it (`Loopctl.Delivery.DispatchPayload.story_branch/2`).
+  """
+  @spec where_implement_kind(Ecto.Queryable.t()) :: Ecto.Query.t()
+  def where_implement_kind(query),
+    do: where(query, [r], is_nil(r.kind) or r.kind in ^@implement_kinds)
 
   defp session_of(%DispatchRecord{} = record) do
     %{

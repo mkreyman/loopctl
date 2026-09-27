@@ -37,7 +37,10 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     in thread mode is recorded naming both
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
     request that was merged before this evaluation ran
-  - `diffstat` — the forge's own `%{files: n, changed_lines: n}`, never `length(files)`
+  - `diffstat` — `%{files: n, changed_lines: n}`. In pr mode the forge's own totals, never
+    `length(files)`. In THREAD mode GitHub's comparison carries no totals, so both are derived
+    from the files it lists — and a list that reaches `@compare_file_cap` in
+    `Loopctl.Delivery.GitHubPullRequestSource` is refused as truncated rather than counted
   - `gate_a`, `gate_b`, `proof` — the underlying gate results, recorded whatever the
     decision, so a refusal can be read without re-running anything. `nil` for a gate that
     was never reached

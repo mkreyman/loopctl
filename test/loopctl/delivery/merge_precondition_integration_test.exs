@@ -513,6 +513,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         {:error, {:github_api_error, 404}}
       end)
 
+      # The repository reads, so the 404 is about the branch.
+      Mox.stub(MockPullRequestSource, :repository_readable, fn @repo -> :ok end)
+
       assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
       assert {:branch_missing, @head} in reasons
 
@@ -552,7 +555,25 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
     end
 
-    test "a recorded checkpoint the forge cannot find goes back to implementing, unescalated",
+    test "a branch 404 in a repository the token CANNOT read escalates, never branch_missing",
+         ctx do
+      stub_thread(ctx)
+
+      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, _branch ->
+        {:error, {:github_api_error, 404}}
+      end)
+
+      Mox.stub(MockPullRequestSource, :repository_readable, fn @repo ->
+        {:error, {:github_api_error, 404}}
+      end)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:pull_request_unavailable, {:github_api_error, 404}} in reasons
+      refute Enum.any?(reasons, &match?({:branch_missing, _}, &1))
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "a 404 on the commit once the branch names it escalates as pull_request_unavailable",
          ctx do
       stub_thread(ctx)
 
@@ -560,12 +581,26 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         {:error, {:github_api_error, 404}}
       end)
 
-      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
-      assert {:checkpoint_unpushed, @head} in reasons
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:pull_request_unavailable, {:github_api_error, 404}} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
 
-      row = Stages.get(ctx.tenant_id, ctx.story_id)
-      assert row.stage == :implementing
-      assert row.escalation_reason == nil
+    test "a checkpoint an ENDED claim recorded is not judged: no_checkpoint_recorded", ctx do
+      {1, _} =
+        from(s in Story, where: s.id == ^ctx.story_id)
+        |> AdminRepo.update_all(set: [claim_epoch: 1])
+
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(r in StoryStage, where: r.story_id == ^ctx.story_id)
+          |> Repo.update_all(set: [claim_epoch: 1])
+        end)
+
+      stub_thread(ctx)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
+      assert Enum.any?(reasons, &match?({:no_checkpoint_recorded, _}, &1))
     end
 
     test "a branch naming another commit is judged without reading the checkpoint commit",
@@ -650,8 +685,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     Mox.stub(MockPullRequestSource, :commit, fn @repo, ^head ->
       {:ok,
        %{
-         tree_sha: Keyword.get(opts, :tree, @tree),
-         parent_shas: [@base]
+         tree_sha: Keyword.get(opts, :tree, @tree)
        }}
     end)
 

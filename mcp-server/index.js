@@ -8379,14 +8379,16 @@ const TOOLS = [
       "retry after the delay, nothing transitioned).\n\n" +
       "THREAD MODE — the story's intake source has `mode: thread` (set with " +
       "intake_source_update). There is no pull request: the gate judges the story's latest " +
-      "RECORDED checkpoint on the branch the story was DISPATCHED on, and `pr_number` is " +
-      "null. It adds refusals `empty_change` (the checkpoint's tree equals the base's, or no " +
+      "checkpoint recorded under the story's CURRENT claim, on the branch the story was " +
+      "DISPATCHED on, and `pr_number` is null. The source's runners must be at runner " +
+      "contract 1.20.0 or later and send checkpoint messages, or every story is refused " +
+      "`no_checkpoint_recorded`. It adds refusals `empty_change` (the checkpoint's tree equals the base's, or no " +
       "file changed), `checkpoint_tree_mismatch` (the forge's tree is not the one the " +
       "claimant recorded) and `no_checkpoint_recorded`. The branch is judged first: a branch " +
-      "the forge does not have (`branch_missing`), one naming a commit nobody recorded " +
-      "(`branch_head_unrecorded`) or a recorded checkpoint that was never pushed " +
-      "(`checkpoint_unpushed`) is `head_moved` — back to implementing, not escalated: push " +
-      "and record the checkpoint. The answer carries `mode`, `checkpoint_id` and " +
+      "the forge does not have in a readable repository (`branch_missing`) or one naming a " +
+      "commit nobody recorded (`branch_head_unrecorded`) is `head_moved` — back to " +
+      "implementing, not escalated: push and record the checkpoint. A repository the token " +
+      "cannot read refuses `pull_request_unavailable`. The answer carries `mode`, `checkpoint_id` and " +
       "`checkpoint_sha`; an allow is recorded naming the checkpoint.\n\n" +
       "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
       "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
@@ -8571,7 +8573,9 @@ const TOOLS = [
             "Optional. How this repository's changes reach its base branch. `pr` (the default " +
             "when omitted): the merge gate reads a pull request by number. `thread`: the merge " +
             "gate reads the story's latest RECORDED thread checkpoint and needs no pull " +
-            "request (see merge_precondition). Not nullable. Changed later with " +
+            "request (see merge_precondition). Its runners must be at runner contract 1.20.0 or " +
+            "later and send checkpoint messages, or every story is refused " +
+            "`no_checkpoint_recorded`. Not nullable. Changed later with " +
             "intake_source_update.",
         },
         secret_file: {
@@ -8667,8 +8671,9 @@ const TOOLS = [
           enum: ["pr", "thread"],
           description:
             "`pr` or `thread`: whether the merge gate reads a pull request or the story's " +
-            "latest recorded thread checkpoint. Not nullable. Omit to leave the current value " +
-            "alone.",
+            "latest recorded thread checkpoint. `thread` needs runners at contract 1.20.0 or " +
+            "later sending checkpoint messages, or every story is refused " +
+            "`no_checkpoint_recorded`. Not nullable. Omit to leave the current value alone.",
         },
       },
       required: ["source_id"],

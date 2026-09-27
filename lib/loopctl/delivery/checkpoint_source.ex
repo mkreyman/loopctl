@@ -8,10 +8,11 @@ defmodule Loopctl.Delivery.CheckpointSource do
   unchanged, plus the thread facts the gate judges:
 
   - `:branch_head_sha` — the commit the story's branch names now, or `:missing` when the
-    forge has no such branch (a 404). The branch is the one the story was DISPATCHED on
-    (`Loopctl.Delivery.DispatchPayload.story_branch/2`), never a name derived here
-  - `:pushed?` — `false` when the branch names the checkpoint but the forge cannot find the
-    commit (a 404 on `commit/2` or `compare/3`)
+    forge has no such branch: a 404 on the ref in a repository the token CAN read
+    (`repository_readable/1`). A 404 because the repository itself cannot be read is a
+    token or permission fault, an error a human fixes, never `:missing`. The branch is the
+    one the story was DISPATCHED on (`Loopctl.Delivery.DispatchPayload.story_branch/2`),
+    never a name derived here
   - `:head_tree_sha` — the checkpoint commit's tree AS THE FORGE READS IT. The recorded
     `tree_sha` is the claimant's report; a disagreement is refused rather than believed
   - `:base_tree_sha` — the base branch's tree now. Equal to the checkpoint's, the change is
@@ -23,8 +24,9 @@ defmodule Loopctl.Delivery.CheckpointSource do
   commit and comparison reads: the gate sends the story back to `implementing` on that fact
   alone (`branch_missing`, `branch_head_unrecorded`), so nothing else is worth a round trip,
   and a checkpoint that was recorded but never pushed would otherwise 404 on its own sha and
-  read as a forge failure a human has to look at. A 404 on the commit or the comparison when
-  the branch DOES name the checkpoint is the same fact seen late, and answers `pushed?: false`.
+  read as a forge failure a human has to look at. Once the branch DOES name the checkpoint,
+  the commit is pushed, so a 404 on the commit or the comparison is a wrong base branch or a
+  permission fault: an error like any other, which escalates as it does in pr mode.
 
   The reads are SEQUENTIAL: the branch decides whether the other two run at all, and those two
   are bounded by the adapter's timeouts.
@@ -107,12 +109,6 @@ defmodule Loopctl.Delivery.CheckpointSource do
          head_tree_sha: commit.tree_sha,
          base_tree_sha: comparison.base_tree_sha
        })}
-    else
-      {:error, {:github_api_error, 404}} ->
-        {:ok, Map.merge(open(sha), %{branch_head_sha: sha, pushed?: false})}
-
-      {:error, _reason} = error ->
-        error
     end
   end
 
@@ -120,11 +116,19 @@ defmodule Loopctl.Delivery.CheckpointSource do
 
   # A branch the forge does not have is a FACT about the thread — nothing was pushed, or it
   # was deleted — not a forge failure, so it is `:missing` rather than an error that would
-  # escalate. Every other failure keeps its classification.
+  # escalate. But GitHub answers the same 404 for a repository the token cannot see, so the
+  # 404 means `:missing` only once the repository itself reads; otherwise the repository's
+  # own failure is the answer. Every other failure keeps its classification.
   defp branch_head(repo, branch) do
     case source().branch_head(repo, branch) do
-      {:error, {:github_api_error, 404}} -> {:ok, :missing}
-      other -> other
+      {:error, {:github_api_error, 404}} ->
+        case source().repository_readable(repo) do
+          :ok -> {:ok, :missing}
+          {:error, _reason} = unreadable -> unreadable
+        end
+
+      other ->
+        other
     end
   end
 

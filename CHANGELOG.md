@@ -13,13 +13,16 @@ All notable changes to loopctl are documented here.
   (and the `intake_source_enroll` / `intake_source_update` MCP tools) take `mode: "pr" |
   "thread"`, read by presence; null or any other value is 422, and a change is recorded as
   `intake_source_mode_set` on the audit chain. For a thread-mode story,
-  `POST /stories/:id/merge-precondition` judges the story's latest RECORDED checkpoint on
-  the branch the story was dispatched on (`pr_number` is null) and adds refusals
+  `POST /stories/:id/merge-precondition` judges the latest checkpoint the story's CURRENT
+  claim recorded, on the branch the story was dispatched on (`pr_number` is null). **A
+  thread-mode source needs runners at contract 1.20.0 or later sending `checkpoint`
+  messages; otherwise every story is refused `no_checkpoint_recorded`.** It adds refusals
   `empty_change` (the checkpoint's tree equals the base branch's, or no file changed),
-  `checkpoint_tree_mismatch` and `no_checkpoint_recorded`. A branch missing on the forge
-  (`branch_missing`), naming a commit nobody reported (`branch_head_unrecorded`), or naming
-  a checkpoint that was never pushed (`checkpoint_unpushed`) is `head_moved`, back to
-  `implementing`. The verdict carries `mode`, `checkpoint_id` and `checkpoint_sha`, and a
+  `checkpoint_tree_mismatch` and `no_checkpoint_recorded`. A branch missing from a readable
+  repository (`branch_missing`) or naming a commit nobody reported
+  (`branch_head_unrecorded`) is `head_moved`, back to `implementing`; an unreadable
+  repository refuses `pull_request_unavailable`. The gate's token also reads `GET
+  /repos/:repo` after a 404 on the branch. The verdict carries `mode`, `checkpoint_id` and `checkpoint_sha`, and a
   thread-mode allow is recorded naming the checkpoint id and sha. No stage-machine change;
   the runner contract is unchanged.
   Changing a source's mode is 409 `stories_in_flight` while any story of its project is past

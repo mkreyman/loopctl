@@ -357,7 +357,19 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       assert {:error, {:github_api_error, 404}} = Source.branch_head(@repo, "loop/abc")
     end
 
-    test "commit/2 returns the tree and the parents IN ORDER" do
+    test "repository_readable/1 reads the repository itself, and passes its failure through" do
+      stub(fn conn ->
+        assert conn.request_path == "/repos/acme/widgets"
+        json(conn, %{"full_name" => "acme/widgets"})
+      end)
+
+      assert :ok = Source.repository_readable(@repo)
+
+      stub(fn conn -> Plug.Conn.resp(conn, 404, "{}") end)
+      assert {:error, {:github_api_error, 404}} = Source.repository_readable(@repo)
+    end
+
+    test "commit/2 returns the commit's tree" do
       stub(fn conn ->
         assert conn.request_path == "/repos/acme/widgets/git/commits/#{@head}"
 
@@ -367,7 +379,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         })
       end)
 
-      assert {:ok, %{tree_sha: "t1", parent_shas: ["p1", "p2"]}} = Source.commit(@repo, @head)
+      assert {:ok, %{tree_sha: "t1"}} = Source.commit(@repo, @head)
     end
 
     test "compare/3 reads the merge base, the base's tree and a diffstat over every file" do

@@ -48,6 +48,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
   alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.WorkBreakdown.Story
 
@@ -197,17 +198,16 @@ defmodule Loopctl.Delivery.DispatchPayload do
   def story_branch(tenant_id, %Story{} = story) do
     {:ok, recorded} =
       Repo.with_tenant(tenant_id, fn ->
-        Repo.one(
-          from r in DispatchRecord,
-            where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
-            where: not is_nil(r.branch),
-            # `DispatchLedger.implement_kind?/1`'s rule, in SQL: `implement`, or NULL for a row
-            # written before `kind` existed. A triage dispatch's branch is never the story's.
-            where: r.kind == "implement" or is_nil(r.kind),
-            order_by: [desc: r.inserted_at],
-            limit: 1,
-            select: r.branch
+        from(r in DispatchRecord,
+          where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
+          where: not is_nil(r.branch),
+          order_by: [desc: r.inserted_at],
+          limit: 1,
+          select: r.branch
         )
+        # A triage dispatch's branch is never the story's.
+        |> DispatchLedger.where_implement_kind()
+        |> Repo.one()
       end)
 
     case recorded do

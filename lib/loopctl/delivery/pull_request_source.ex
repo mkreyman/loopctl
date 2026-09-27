@@ -160,10 +160,9 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback pull_request(repo(), pos_integer()) :: {:ok, pull_request()} | {:error, term()}
 
   @typedoc """
-  One commit, as much of it as the thread-mode merge gate judges (US-45.4): its tree and its
-  parents IN ORDER, so `hd(parent_shas)` is the first parent.
+  One commit, as much of it as the thread-mode merge gate judges (US-45.4): its tree.
   """
-  @type commit :: %{tree_sha: String.t(), parent_shas: [String.t()]}
+  @type commit :: %{tree_sha: String.t()}
 
   @typedoc """
   The three-dot comparison `base...head` (US-45.4): what a pull request from `head` into
@@ -188,8 +187,15 @@ defmodule Loopctl.Delivery.PullRequestSource do
   """
   @callback branch_head(repo(), String.t()) :: {:ok, String.t()} | {:error, term()}
 
-  @doc "The tree and ordered parents of one commit (US-45.4)."
+  @doc "The tree of one commit (US-45.4)."
   @callback commit(repo(), String.t()) :: {:ok, commit()} | {:error, term()}
+
+  @doc """
+  `:ok` when the repository itself can be read (US-45.4). What tells a branch that does not
+  exist (a 404 on its ref in a readable repository) from a token that cannot see the
+  repository at all (the same 404, for a different reason a human has to fix).
+  """
+  @callback repository_readable(repo()) :: :ok | {:error, term()}
 
   @doc "The three-dot comparison `base...head` (US-45.4). See `t:comparison/0`."
   @callback compare(repo(), String.t(), String.t()) :: {:ok, comparison()} | {:error, term()}
