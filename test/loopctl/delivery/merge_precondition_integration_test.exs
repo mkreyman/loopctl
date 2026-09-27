@@ -659,18 +659,44 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         @repo, ^in_flight -> {:ok, %{tree_sha: @tree, parents: [@head, @base_head]}}
       end)
 
+      # Its second parent is on the base branch: the executor's own merge.
+      Mox.stub(MockPullRequestSource, :contains?, fn @repo, sha, "master" ->
+        {:ok, sha == @base_head}
+      end)
+
       # Evaluated, not enforced: the verdict is a retry, never a moved head.
       assert {:ok, %Verdict{decision: :unevaluated, reasons: reasons}} = evaluate(ctx)
       assert inspect(reasons) =~ "base_update_in_flight"
 
-      # The same head merged onto some OTHER commit is a push nobody reported.
+      # Two parents, the second NOT on the base: somebody's merge, a moved head.
       Mox.stub(MockPullRequestSource, :commit, fn
         @repo, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
-        @repo, ^in_flight -> {:ok, %{tree_sha: @tree, parents: [@base, @base_head]}}
+        @repo, ^in_flight -> {:ok, %{tree_sha: @tree, parents: [@head, @base]}}
       end)
 
       assert {:ok, %Verdict{decision: decision}} = evaluate(ctx)
       assert decision in [:head_moved, :refuse]
+    end
+
+    test "round 2, finding 5: a claimant's single-parent commit on the allowed checkpoint is head_moved",
+         ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+      make_claim_live(ctx)
+
+      pushed = String.duplicate("7", 40)
+      stub_thread(ctx, branch_head: pushed)
+
+      Mox.stub(MockPullRequestSource, :commit, fn
+        @repo, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
+        @repo, ^pushed -> {:ok, %{tree_sha: @tree, parents: [@head]}}
+      end)
+
+      Mox.stub(MockPullRequestSource, :contains?, fn @repo, _sha, "master" -> {:ok, true} end)
+
+      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
+      assert {:branch_head_unrecorded, pushed, @head} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :implementing
     end
 
     test "TC-45.4.3 a checkpoint whose tree is the base's refuses empty_change", ctx do

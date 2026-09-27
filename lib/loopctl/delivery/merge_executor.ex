@@ -103,6 +103,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
 
   require Logger
 
+  alias Loopctl.Delivery.CheckpointSource
   alias Loopctl.Delivery.Claimant
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.MergeForge
@@ -504,8 +505,13 @@ defmodule Loopctl.Delivery.MergeExecutor do
   defp recover_or_moved(ctx, head, base_head) do
     sha = ctx.checkpoint.commit_sha
 
-    with {:ok, %{parents: [^sha, second], tree_sha: tree}} <- ctx.forge.commit(ctx.session, head),
-         {:ok, true} <- ctx.forge.ancestor?(ctx.session, second, base_head),
+    with {:ok, %{tree_sha: tree} = commit} <- ctx.forge.commit(ctx.session, head),
+         {:ok, second} <-
+           CheckpointSource.base_update_of(
+             commit,
+             sha,
+             &ctx.forge.ancestor?(ctx.session, &1, base_head)
+           ),
          {:ok, {:ok, %{tree_sha: ^tree}}} <-
            with_temp(ctx, &ctx.forge.merge(ctx.session, &1, second, base_message(ctx))) do
       record_base_update(ctx, %{sha: head, tree_sha: tree})

@@ -128,25 +128,51 @@ defmodule Loopctl.Delivery.CheckpointSource do
     case branch_head(repo, branch) do
       {:ok, ^sha} -> checkpoint_facts(repo, base_branch, checkpoint)
       {:ok, :missing} -> missing_facts(repo, base_branch, checkpoint)
-      {:ok, other} -> moved_facts(repo, sha, other, allowed)
+      {:ok, other} -> moved_facts({repo, base_branch}, sha, other, allowed)
       {:error, _reason} = error -> error
     end
   end
 
   # A branch head nobody recorded is a moved head — UNLESS the checkpoint is the one the gate
-  # ALLOWED and that head's first parent is it: that is the merge executor's base update
-  # between moving the thread branch and recording it (US-45.5). Answered as a transient fault,
-  # `{:base_update_in_flight, head}`, so the gate retries rather than sending the story back.
-  defp moved_facts(repo, sha, other, sha) do
-    case source().commit(repo, other) do
-      {:ok, %{parents: [^sha | _]}} -> {:error, {:base_update_in_flight, other}}
-      {:ok, _commit} -> {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
+  # ALLOWED and that head has the SHAPE of the merge executor's base update
+  # (`base_update_of/3`): between moving the thread branch and recording it (US-45.5).
+  # Answered as a transient fault, `{:base_update_in_flight, head}`, so the gate retries
+  # rather than sending the story back. A claimant's commit on top of the checkpoint has one
+  # parent and is a moved head, as before.
+  defp moved_facts({repo, base_branch}, sha, other, sha) do
+    on_base? = &source().contains?(repo, &1, base_branch)
+
+    with {:ok, commit} <- source().commit(repo, other),
+         {:ok, _second} <- base_update_of(commit, sha, on_base?) do
+      {:error, {:base_update_in_flight, other}}
+    else
+      :no -> {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
       {:error, _reason} = error -> error
     end
   end
 
-  defp moved_facts(_repo, sha, other, _allowed),
+  defp moved_facts(_where, sha, other, _allowed),
     do: {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
+
+  @doc """
+  Whether `commit` has the shape of the merge executor's base update of `checkpoint_sha`
+  (US-45.5): EXACTLY two parents, the first the checkpoint and the second a commit on the
+  base branch, which `on_base?` answers (`{:ok, boolean}` or an error). `{:ok, second}`, `:no`,
+  or the error. The one predicate for the gate's in-flight answer and the executor's
+  recovery of its own base update — anything else, a claimant's single-parent commit on the
+  checkpoint included, is a moved head.
+  """
+  @spec base_update_of(map(), String.t(), (String.t() -> {:ok, boolean()} | {:error, term()})) ::
+          {:ok, String.t()} | :no | {:error, term()}
+  def base_update_of(%{parents: [checkpoint_sha, second]}, checkpoint_sha, on_base?) do
+    case on_base?.(second) do
+      {:ok, true} -> {:ok, second}
+      {:ok, false} -> :no
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def base_update_of(_commit, _checkpoint_sha, _on_base?), do: :no
 
   defp checkpoint_facts(repo, base_branch, %Checkpoint{commit_sha: sha} = checkpoint) do
     with {:ok, commit} <- source().commit(repo, sha),
