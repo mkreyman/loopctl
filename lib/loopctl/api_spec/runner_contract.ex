@@ -352,7 +352,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     the dispatch's capacity slot is given back, and every later judgement is `review_closed`.
 
   Both name an ACCEPTED `review` dispatch at its `claim_epoch`; any other kind is
-  `unknown_dispatch`. Each is bound to the review loopctl recorded for that dispatch and that
+  `unknown_dispatch`. Once that dispatch's `session_ended` is recorded the session is over: a
+  resend of a judgement it made is still answered, and a new one is `dispatch_not_accepted`. Each is bound to the review loopctl recorded for that dispatch and that
   runner, and refused, permanently: `review_closed` after the verdict,
   `review_claim_ended` when the implementer's claim the review was placed under has ended (a
   release, a force-unclaim, a new claim) — nothing it judged can count for the claim that

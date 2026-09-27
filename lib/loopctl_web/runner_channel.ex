@@ -461,18 +461,8 @@ defmodule LoopctlWeb.RunnerChannel do
       RunnerContract.cast_session_ended(payload),
       {:session_ended_bucket, @session_ended_capacity, @session_ended_refill_ms},
       fn message ->
-        case RunnerReviews.end_session(tenant_id, runner, message) do
-          :not_review ->
-            end_implement_session(tenant_id, runner, message)
-
-          # A review session (1.21.0) frees its slot and touches no stage, so its ack carries
-          # no row: only what it was and whether this was a resend.
-          {:ok, %{replayed?: replayed?}} ->
-            {:ok, %{kind: RunnerReviews.kind(), replayed: replayed?}}
-
-          {:error, _reason} = refused ->
-            refused
-        end
+        with {:ok, held} <- RunnerStages.held_dispatch(tenant_id, runner.id, message.dispatch_id),
+             do: end_session(tenant_id, runner, message, held)
       end
     )
   end
@@ -661,10 +651,21 @@ defmodule LoopctlWeb.RunnerChannel do
   # sends the same row for the same reason (#849) and the two must not be able to drift.
   defp stage_ack(row), do: RunnerStages.row_state(row)
 
-  defp end_implement_session(tenant_id, runner, message) do
-    with {:ok, %{row: row, replayed?: replayed?}} <-
-           RunnerStages.end_session(tenant_id, runner.id, message, actor_id: runner.api_key_id),
-         do: {:ok, Map.put(stage_ack(row), :replayed, replayed?)}
+  # Routed on the kind of the row read ONCE for this report. A review session (1.21.0) frees
+  # its slot and touches no stage, so its ack carries no row: only what it was and whether this
+  # was a resend.
+  defp end_session(tenant_id, runner, message, %{kind: kind} = held) do
+    if kind == RunnerReviews.kind() do
+      with {:ok, %{replayed?: replayed?}} <-
+             RunnerReviews.end_session(tenant_id, runner, message),
+           do: {:ok, %{kind: kind, replayed: replayed?}}
+    else
+      with {:ok, %{row: row, replayed?: replayed?}} <-
+             RunnerStages.end_held_session(tenant_id, runner.id, message, held,
+               actor_id: runner.api_key_id
+             ),
+           do: {:ok, Map.put(stage_ack(row), :replayed, replayed?)}
+    end
   end
 
   defp rate_limited(socket, event, min_interval_ms),

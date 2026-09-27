@@ -406,21 +406,26 @@ defmodule Loopctl.Threads.Reviews do
   end
 
   @doc false
-  # Every named finding is a finding of a COMPLETED round of this story, and the fix's
-  # checkpoint comes after every checkpoint they were found in (by checkpoint seq).
-  @spec answers_findings(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()], Checkpoint.t()) ::
+  # Every named finding is a finding of a COMPLETED round of this story's CURRENT claim, and
+  # the fix's checkpoint comes after every checkpoint they were found in (by checkpoint seq).
+  # An earlier claim's finding is `unknown_finding`: rounds belong to a claim, and a fix
+  # naming one could otherwise make a round-2 finding of THIS claim look like a round-1 fix's
+  # defect and open a third round.
+  @spec answers_findings(Ecto.UUID.t(), Story.t(), [Ecto.UUID.t()], Checkpoint.t()) ::
           :ok | refusal()
-  def answers_findings(tenant_id, story_id, finding_ids, checkpoint) do
+  def answers_findings(tenant_id, story, finding_ids, checkpoint) do
     found_in =
       Repo.all(
         from e in Entry,
           join: c in Checkpoint,
           on: c.id == e.checkpoint_id,
+          join: r in Review,
+          on: r.id == e.review_id,
           join: v in Entry,
           on: v.review_id == e.review_id and v.kind == :verdict,
           where:
-            e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.kind == :finding and
-              e.id in ^finding_ids,
+            e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :finding and
+              e.id in ^finding_ids and r.claim_epoch == ^story.claim_epoch,
           select: c.seq
       )
 
@@ -429,7 +434,8 @@ defmodule Loopctl.Threads.Reviews do
         refuse(
           :unprocessable_entity,
           "unknown_finding",
-          "finding_ids must name findings of this story's completed review rounds"
+          "finding_ids must name findings of the completed review rounds of this story's " <>
+            "current claim"
         )
 
       Enum.any?(found_in, &(&1 >= checkpoint.seq)) ->

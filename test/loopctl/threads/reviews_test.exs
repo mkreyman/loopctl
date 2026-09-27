@@ -648,6 +648,16 @@ defmodule Loopctl.Threads.ReviewsTest do
                verdict(ctx, r2, "v-final")
     end
 
+    test "a finding of an earlier claim is unknown_finding to this claim's fix", ctx do
+      %{f1: f1} = round_one_fixed(ctx)
+
+      # The story is released and claimed again; the new claim records its own checkpoint.
+      set_story(ctx, claim_epoch: epoch(ctx) + 1)
+      cp = checkpoint(ctx, 16)
+
+      assert "unknown_finding" == code(fix(ctx, cp, [f1.id]))
+    end
+
     test "rounds belong to a claim: a new claim starts at round 1 after a ceiling", ctx do
       %{cp1: cp1} = round_one_fixed(ctx)
       r2 = placed!(ctx)

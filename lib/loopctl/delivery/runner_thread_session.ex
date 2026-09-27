@@ -22,7 +22,8 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
           kind: String.t() | nil,
           story_id: Ecto.UUID.t(),
           claim_epoch: integer(),
-          slot_generation: integer()
+          slot_generation: integer(),
+          session_ended?: boolean()
         }
 
   @doc """
@@ -59,7 +60,8 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
                 kind: r.kind,
                 story_id: r.story_id,
                 claim_epoch: r.claim_epoch,
-                slot_generation: r.slot_generation
+                slot_generation: r.slot_generation,
+                session_ended?: not is_nil(r.session_ended_at)
               }
           )
         end)

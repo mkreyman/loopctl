@@ -629,6 +629,73 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   # Finding 6 of US-44.5 review round 2: only the reply that WRITES the story may take it
   # `FOR NO KEY UPDATE`; every other reply shares it, as a trace does. Observed on the SQL the
   # reply issues, in this process, because a row lock leaves no trace in `pg_locks`.
+  # US-45.3: a review dispatch carries the IMPLEMENTER's story and claim epoch, so the fences
+  # on epoch and story alone cannot tell it from the implementer's session.
+  describe "a review dispatch is not the implementer's session" do
+    test "its acceptance neither moves the implementer's capped lease nor locks it for write",
+         %{runner: runner} do
+      record = sent(runner, %{}, %{kind: "review"})
+      provisional = DateTime.add(DateTime.utc_now(), 60, :second)
+      set_lease(runner.tenant_id, record.story_id, provisional, provisional)
+
+      locks = story_locks(fn -> assert {:ok, _} = reply(runner, record) end)
+
+      assert locks == ["FOR SHARE"]
+      assert lease(runner.tenant_id, record.story_id) == {provisional, provisional}
+    end
+
+    test "its budget kill is not read as the implementer's session end", %{runner: runner} do
+      implement = accepted(runner)
+      review = sent(runner, %{"story_id" => implement.story_id}, %{kind: "review"})
+      {:ok, review} = reply(runner, review)
+
+      ended = fn record, reason ->
+        %{dispatch_id: record.dispatch_id, claim_epoch: record.claim_epoch, reason: reason}
+      end
+
+      assert {:ok, {:recorded, _}} =
+               DispatchLedger.record_review_session_end(
+                 runner.tenant_id,
+                 runner.id,
+                 ended.(review, "wall_clock_exceeded"),
+                 "review-digest"
+               )
+
+      reasons = ["wall_clock_exceeded", "max_turns_exceeded", "usage_exhausted"]
+
+      assert nil ==
+               DispatchLedger.session_ended_with(
+                 runner.tenant_id,
+                 implement.story_id,
+                 implement.claim_epoch,
+                 reasons
+               )
+
+      assert {:ok, {:recorded, _}} =
+               DispatchLedger.record_session_end(
+                 runner.tenant_id,
+                 runner.id,
+                 ended.(implement, "max_turns_exceeded"),
+                 %{
+                   reason: "max_turns_exceeded",
+                   digest: "implement-digest",
+                   counts_toward_retry_ceiling: nil,
+                   story_id: implement.story_id
+                 }
+               )
+
+      assert %{dispatch_id: dispatch_id} =
+               DispatchLedger.session_ended_with(
+                 runner.tenant_id,
+                 implement.story_id,
+                 implement.claim_epoch,
+                 reasons
+               )
+
+      assert dispatch_id == implement.dispatch_id
+    end
+  end
+
   describe "record_reply/3 takes the story's write lock only when it writes the story" do
     test "an acceptance of a capped claim locks the story FOR NO KEY UPDATE",
          %{runner: runner} do

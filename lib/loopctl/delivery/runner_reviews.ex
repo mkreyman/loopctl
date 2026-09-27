@@ -40,8 +40,10 @@ defmodule Loopctl.Delivery.RunnerReviews do
 
   ## A dispatch no longer accepted
 
-  A NEW judgement needs the dispatch `accepted`. A RESEND of one already recorded is answered
-  from its row whatever the dispatch's status, as `RunnerThreads` answers a checkpoint.
+  A NEW judgement needs the dispatch `accepted` AND its session not reported ended: once
+  `session_ended` is recorded for it the review is over, and a late judgement is
+  `dispatch_not_accepted`. A RESEND of one already recorded is answered from its row whatever
+  the dispatch's status, as `RunnerThreads` answers a checkpoint.
 
   ## Database failures
 
@@ -54,7 +56,6 @@ defmodule Loopctl.Delivery.RunnerReviews do
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.RunnerThreads
   alias Loopctl.Delivery.RunnerThreadSession
-  alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Threads
@@ -109,38 +110,27 @@ defmodule Loopctl.Delivery.RunnerReviews do
 
   @doc """
   Records a `session_ended` report for a REVIEW dispatch and frees the runner's slot for it.
-  `:not_review` when the dispatch this runner holds is not a review, so the caller can hand
-  the report to `Loopctl.Delivery.RunnerStages.end_session/4`; every other answer is final.
+  The caller has read the row once and routed on its kind
+  (`Loopctl.Delivery.RunnerStages.held_dispatch/3`); the record re-checks the kind under the
+  row lock.
 
   A review holds no claim, so the report has no stage effect and counts toward no retry
-  ceiling: all it can do is say the session is gone, which is what the slot waits on.
-  Idempotent on the report's digest, as an implement session's is.
+  ceiling: all it can do is say the session is gone, which is what the slot waits on. Once it
+  is recorded the review may only have judgements it already made answered again. Idempotent
+  on the report's digest, as an implement session's is.
   """
   @spec end_session(Ecto.UUID.t(), runner(), map()) ::
-          :not_review | {:ok, %{replayed?: boolean()}} | {:error, term()}
+          {:ok, %{replayed?: boolean()}} | {:error, term()}
   def end_session(tenant_id, runner, %{} = message) do
-    read = fn -> DispatchLedger.get_record(tenant_id, message.dispatch_id) end
-
-    case Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "runner review read", read) do
-      {:error, :busy} = busy ->
-        busy
-
-      %{kind: @kind, runner_id: runner_id} when runner_id == runner.id ->
-        with {:ok, {outcome, session}} <-
-               DispatchLedger.record_review_session_end(
-                 tenant_id,
-                 runner.id,
-                 message,
-                 TriageVerdictRecord.digest(message)
-               ) do
-          release(tenant_id, message.dispatch_id, session.slot_generation)
-          {:ok, %{replayed?: outcome == :replayed}}
-        end
-
-      # Another kind, another runner's row, or none: the implement path answers each of
-      # those with its own fences.
-      _not_this_runners_review ->
-        :not_review
+    with {:ok, {outcome, session}} <-
+           DispatchLedger.record_review_session_end(
+             tenant_id,
+             runner.id,
+             message,
+             TriageVerdictRecord.digest(message)
+           ) do
+      release(tenant_id, message.dispatch_id, session.slot_generation)
+      {:ok, %{replayed?: outcome == :replayed}}
     end
   end
 
@@ -197,7 +187,9 @@ defmodule Loopctl.Delivery.RunnerReviews do
       {:ok,
        %{
          story_id: row.story_id,
-         accepted?: row.status == "accepted",
+         # A session that REPORTED ending (`end_session/3`) is over even though its row
+         # stays `accepted`: it may only have a judgement it already made answered again.
+         accepted?: row.status == "accepted" and not row.session_ended?,
          slot_generation: row.slot_generation
        }}
     end

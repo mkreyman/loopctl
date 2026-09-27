@@ -19,6 +19,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.AuditChain.Entry, as: ChainEntry
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Progress
@@ -200,6 +201,18 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
     row
   end
 
+  defp chain_count(ctx) do
+    {:ok, count} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        Repo.aggregate(
+          from(c in ChainEntry, where: c.tenant_id == ^ctx.tenant_id),
+          :count
+        )
+      end)
+
+    count
+  end
+
   defp reviews(ctx) do
     {:ok, rows} =
       Repo.with_tenant(ctx.tenant_id, fn ->
@@ -237,15 +250,45 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       assert story.claim_epoch == @epoch
     end
 
-    test "a lost response is retried with the same dispatch_id and pushes the same review",
+    test "a lost response is retried with the same dispatch_id and answers the same review",
          ctx do
+      %{review: review, dispatch_id: dispatch_id} = accepted_review!(ctx)
+      chained = chain_count(ctx)
+
+      # The runner already holds it and replied, so a second push would be refused
+      # (dispatch_already_replied): the retry is answered from the row instead.
+
+      assert {:ok, %{review: ^review, dispatch_id: ^dispatch_id}} =
+               place(ctx, dispatch_id: dispatch_id)
+
+      refute_push "dispatch", _, 200
+      assert chain_count(ctx) == chained
+
+      # The same id for another story is a different placement.
+      other = fixture(:ledger_story, %{tenant_id: ctx.tenant_id, claim_epoch: @epoch})
+
+      assert {:error, {:conflict, "dispatch_id_conflict", _}} =
+               Placement.place_review(ctx.tenant_id, ctx.runner.id, other.id,
+                 api_key: ctx.operator,
+                 dispatch_id: dispatch_id,
+                 repo: @repo,
+                 base_branch: "master"
+               )
+    end
+
+    test "a recorded review whose push never reached the ledger is pushed by the retry", ctx do
       dispatch_id = Ecto.UUID.generate()
 
-      {:ok, %{review: review}} = place(ctx, dispatch_id: dispatch_id)
-      assert_push "dispatch", _, @reply_timeout
+      {:ok, review, :created} =
+        Threads.record_review(ctx.tenant_id, ctx.story.id,
+          dispatch_id: dispatch_id,
+          runner_id: ctx.runner.id,
+          agent_id: ctx.runner.agent_id,
+          placed_by: "t"
+        )
 
       assert {:ok, %{review: ^review}} = place(ctx, dispatch_id: dispatch_id)
-      assert_push "dispatch", %{dispatch_id: ^dispatch_id}, @reply_timeout
+      assert_push "dispatch", %{dispatch_id: ^dispatch_id, kind: "review"}, @reply_timeout
     end
 
     test "the runner's agent must be separate from the implementer", ctx do
@@ -505,6 +548,72 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
 
       assert_reply ref, :error, %{reason: "dispatch_not_accepted"}, @reply_timeout
       assert is_nil(ledger_row(ctx, dispatch_id).session_ended_reason)
+    end
+
+    test "an implement placement cannot resume a review's dispatch id", ctx do
+      %{dispatch_id: dispatch_id} = accepted_review!(ctx)
+
+      assert {:error, :dispatch_id_conflict} =
+               Placement.place(
+                 ctx.tenant_id,
+                 ctx.runner.id,
+                 %{"dispatch_id" => dispatch_id, "story_id" => ctx.story.id},
+                 api_key: ctx.operator
+               )
+
+      refute_push "dispatch", _, 200
+    end
+
+    test "a review session cannot report a stage: only an implement session moves one", ctx do
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story.id,
+        stage: :implementing,
+        claim_epoch: @epoch
+      })
+
+      %{dispatch_id: dispatch_id} = accepted_review!(ctx)
+
+      ref =
+        push(ctx.channel, "stage", %{
+          "dispatch_id" => dispatch_id,
+          "claim_epoch" => @epoch,
+          "from" => "implementing",
+          "to" => "reviewing"
+        })
+
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+
+      {:ok, row} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.one(from s in StoryStage, where: s.story_id == ^ctx.story.id)
+        end)
+
+      assert row.stage == :implementing
+    end
+
+    test "after a review session reports ending, a late verdict is refused; a resend is not",
+         ctx do
+      %{dispatch_id: dispatch_id} = accepted_review!(ctx)
+      ref = finding(ctx, dispatch_id, %{"client_seq" => 5})
+      assert_reply ref, :ok, %{entry_id: entry_id}, @reply_timeout
+
+      ref =
+        push(ctx.channel, "session_ended", %{
+          "dispatch_id" => dispatch_id,
+          "claim_epoch" => @epoch,
+          "reason" => "wall_clock_exceeded"
+        })
+
+      assert_reply ref, :ok, %{kind: "review"}, @reply_timeout
+
+      assert_reply verdict(ctx, dispatch_id),
+                   :error,
+                   %{reason: "dispatch_not_accepted"},
+                   @reply_timeout
+
+      ref = finding(ctx, dispatch_id, %{"client_seq" => 5})
+      assert_reply ref, :ok, %{entry_id: ^entry_id, replayed: true}, @reply_timeout
     end
 
     test "a halted tenant's judgements are refused tenant_halted, and nothing is written", ctx do

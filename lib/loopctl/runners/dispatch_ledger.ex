@@ -640,31 +640,38 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
-  The story a dispatch `runner_id` holds in this tenant is for, WHATEVER its status: `{:ok,
-  story_id}`, or `{:error, :unknown_dispatch}` for a row another runner or tenant holds, exactly
-  as for none.
+  The story a dispatch `runner_id` holds in this tenant is for, and the dispatch's KIND,
+  WHATEVER its status: `{:ok, %{story_id: story_id, kind: kind}}`, or
+  `{:error, :unknown_dispatch}` for a row another runner or tenant holds, exactly as for none.
 
   A read with no lock, for the `session_ended` path (US-44.3), which has to know the story
   BEFORE it records anything and cannot use `accepted_session/3` to learn it: a resend of a
   `crashed` report arrives after the release it caused, by which time a reply or trace may have
-  marked the row `superseded`, and that resend must still be answered `ok`. `story_id` is written
-  with the row and never changed, so the unlocked read cannot be stale.
+  marked the row `superseded`, and that resend must still be answered `ok`. `story_id` and
+  `kind` are written with the row and never changed, so the unlocked read cannot be stale. The
+  kind is what the report is ROUTED on — an implement session's end moves its story, a review
+  session's (US-45.3) only frees its slot — so the path reads the row once.
   """
-  @spec held_story(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, Ecto.UUID.t()} | {:error, :unknown_dispatch}
-  def held_story(tenant_id, runner_id, dispatch_id) do
+  @spec held_dispatch(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, %{story_id: Ecto.UUID.t(), kind: String.t() | nil}}
+          | {:error, :unknown_dispatch}
+  def held_dispatch(tenant_id, runner_id, dispatch_id) do
     {:ok, held} = in_tenant(tenant_id, fn -> held(tenant_id, runner_id, dispatch_id) end)
 
-    with {:ok, %DispatchRecord{story_id: story_id}} <- held, do: {:ok, story_id}
+    with {:ok, %DispatchRecord{story_id: story_id, kind: kind}} <- held,
+         do: {:ok, %{story_id: story_id, kind: kind}}
   end
 
   @doc """
-  The ACCEPTED dispatch that served `story_id`'s claim at `claim_epoch` and whose runner
+  The ACCEPTED IMPLEMENT dispatch that served `story_id`'s claim at `claim_epoch` and whose runner
   recorded one of `reasons` in `session_ended` (`record_session_end/4`), or `nil`. Returns
   `session_of/1`'s map plus `:dispatch_id`, `:reason` and `:runner_id`.
 
   For the lease reclaim, which must not re-queue a claim a budget kill ended
-  (`Loopctl.Progress.reclaim_expired_claim/3`). A read with no lock: every field it returns is
+  (`Loopctl.Progress.reclaim_expired_claim/3`). Only an implement session's end counts
+  (`where_implement_kind/1`): a review session runs under the same story and epoch, and its
+  budget kill or exhausted subscription says nothing about the implementer's. A read with no
+  lock: every field it returns is
   final once the report is recorded, and the reclaim re-checks the claim under the story lock.
   """
   @spec session_ended_with(Ecto.UUID.t(), Ecto.UUID.t(), integer(), [String.t()]) ::
@@ -681,14 +688,15 @@ defmodule Loopctl.Runners.DispatchLedger do
   def session_ended_with(tenant_id, story_id, claim_epoch, reasons) do
     {:ok, record} =
       in_tenant(tenant_id, fn ->
-        Repo.one(
-          from r in DispatchRecord,
-            where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
-            where: r.claim_epoch == ^claim_epoch and r.status == "accepted",
-            where: r.session_ended_reason in ^reasons,
-            order_by: [asc: r.session_ended_at],
-            limit: 1
+        from(r in DispatchRecord,
+          where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+          where: r.claim_epoch == ^claim_epoch and r.status == "accepted",
+          where: r.session_ended_reason in ^reasons,
+          order_by: [asc: r.session_ended_at],
+          limit: 1
         )
+        |> where_implement_kind()
+        |> Repo.one()
       end)
 
     with %DispatchRecord{} <- record do
@@ -708,7 +716,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   `attrs` carries what the caller derived from the message: `:reason`, `:digest` (the canonical
   digest of the whole message) and `:counts_toward_retry_ceiling` (`nil` for a reason that
-  re-queues nothing) — and `:story_id`, the dispatch's story as `held_story/3` returned it, so
+  re-queues nothing) — and `:story_id`, the dispatch's story as `held_dispatch/3` returned it, so
   the story's lock can be taken first without reading the dispatch row twice. A row whose
   story is not that one is `:unknown_dispatch`. Returns
   `{:ok, {:recorded | :replayed, session}}`, where `session` is the map `accepted_session/3`
@@ -839,7 +847,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   # The lock order of `fence_then_lock/3` — the story's row under a share lock, then the
   # dispatch's — but with the fence DEFERRED: the caller compares the digest first. The story
-  # is the caller's (`held_story/3` read it; a row's `story_id` never changes), checked against
+  # is the caller's (`held_dispatch/3` read it; a row's `story_id` never changes), checked against
   # the locked row rather than read from it a second time.
   defp lock_for_session_end(tenant_id, runner_id, message, story_id) do
     current = current_claim_epoch(tenant_id, story_id)
@@ -883,13 +891,23 @@ defmodule Loopctl.Runners.DispatchLedger do
     if implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
   end
 
+  @implement_kind "implement"
+
   @doc """
   Whether a ledger row's `kind` is an implement session: `"implement"`, or `nil` — a row
   written before `kind` existed, when `implement` was the only kind sent. The ONE reading of
-  that rule, for every path that must refuse a triage session a claim to report on.
+  that rule, for every path that must refuse a triage or a review session a claim to report
+  on: a review dispatch (US-45.3) carries the IMPLEMENTER's `claim_epoch` and story, so an
+  epoch or story fence alone cannot tell the two apart. `where_implement_kind/1` is the same
+  rule as a query filter.
   """
   @spec implement_kind?(String.t() | nil) :: boolean()
-  def implement_kind?(kind), do: kind in ["implement", nil]
+  def implement_kind?(kind), do: kind in [@implement_kind, nil]
+
+  @doc "`implement_kind?/1` as a filter on a query whose first binding is a ledger row."
+  @spec where_implement_kind(Ecto.Queryable.t()) :: Ecto.Query.t()
+  def where_implement_kind(query),
+    do: where(query, [r], r.kind == @implement_kind or is_nil(r.kind))
 
   defp session_of(%DispatchRecord{} = record) do
     %{
@@ -959,11 +977,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   defp release_if_refused(%DispatchRecord{}), do: :ok
 
   # THE STORY LOCK A REPLY TAKES, chosen once and before any lock: `FOR NO KEY UPDATE` only
-  # for the reply that WRITES the story — an acceptance of a dispatch whose story holds a
-  # CAPPED claim (`reanchor_lease/3`). Every other reply only reads the epoch and shares the
-  # row, as a trace does, so it never queues behind one it does not conflict with. It cannot
-  # be taken as a share lock and upgraded later: two replies both holding the share lock would
-  # each wait on the other's.
+  # for the reply that WRITES the story — an acceptance of an IMPLEMENT dispatch whose story
+  # holds a CAPPED claim (`reanchor_lease/3`). A review's acceptance carries the implementer's
+  # epoch but runs no part of its claim, so it never moves the implementer's lease. Every other
+  # reply only reads the epoch and shares the row, as a trace does, so it never queues behind
+  # one it does not conflict with. It cannot be taken as a share lock and upgraded later: two
+  # replies both holding the share lock would each wait on the other's.
   #
   # Decided from an UNLOCKED read, which cannot mislead in the direction that matters: a claim
   # writes its cap in the transaction that bumps the epoch, before any dispatch row for it
@@ -971,13 +990,14 @@ defmodule Loopctl.Runners.DispatchLedger do
   # had that same cap here. A story released or claimed again since is refused by the fence.
   defp reply_story_lock(tenant_id, runner_id, %{decision: "accepted", dispatch_id: dispatch_id}) do
     capped? =
-      Repo.exists?(
-        from r in DispatchRecord,
-          join: s in Story,
-          on: s.id == r.story_id and s.tenant_id == r.tenant_id,
-          where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
-          where: r.dispatch_id == ^dispatch_id and not is_nil(s.claim_lease_cap)
+      from(r in DispatchRecord,
+        join: s in Story,
+        on: s.id == r.story_id and s.tenant_id == r.tenant_id,
+        where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+        where: r.dispatch_id == ^dispatch_id and not is_nil(s.claim_lease_cap)
       )
+      |> where_implement_kind()
+      |> Repo.exists?()
 
     if capped?, do: :no_key_update, else: :share
   end
@@ -1000,6 +1020,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   # like any other value Postgres refuses: raised, it would crash the channel and the runner
   # would resend the same reply for ever. A claim with nothing to move (ended, or another epoch)
   # is not a refusal.
+  #
+  # ONLY AN IMPLEMENT ACCEPTANCE gets here with a `%Story{}`: `reply_story_lock/3` takes the
+  # write lock only for an implement dispatch (`where_implement_kind/1`), so a review's
+  # acceptance, which carries the implementer's epoch, never moves the implementer's lease.
+  # That lock choice is the one place the kind is decided for this path.
   defp reanchor_lease(
          %DispatchRecord{replied_at: %DateTime{} = replied_at} = record,
          %Story{} = story,

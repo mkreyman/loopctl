@@ -58,7 +58,8 @@ defmodule LoopctlWeb.ThreadReviewController do
         "#{Reviews.max_rounds() + 1}. The runner's agent must be separate: not the story's " <>
         "claimant, not a checkpoint recorder, and the agent of no dispatch on the " <>
         "implementer's lineage chain. IDEMPOTENT on `dispatch_id`: resend a lost request " <>
-        "with the same one and the same review is pushed again.",
+        "with the same one and the recorded review is answered, pushed only if it never " <>
+        "reached the runner ledger.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Review placement", "application/json",

@@ -253,6 +253,23 @@ defmodule Loopctl.Threads do
   end
 
   @doc """
+  The review loopctl recorded for `dispatch_id` in this tenant, or nil (US-45.3). A read for
+  `Loopctl.Delivery.Placement.place_review/4`, which answers a retry of a recorded placement
+  from its row.
+  """
+  @spec review_by_dispatch(Ecto.UUID.t(), Ecto.UUID.t()) :: Review.t() | nil
+  def review_by_dispatch(tenant_id, dispatch_id) do
+    {:ok, review} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in Review, where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id
+        )
+      end)
+
+    review
+  end
+
+  @doc """
   Records a `fix` from the story's current claimant (US-45.3): the checkpoint that carries it
   and the findings of completed rounds it answers. The checkpoint fence applies — the claimant
   under the current epoch with a live lease — and the checkpoint must be one this claim
@@ -1102,7 +1119,7 @@ defmodule Loopctl.Threads do
              story,
              Ecto.Changeset.get_field(changeset, :checkpoint_id)
            ),
-         :ok <- Reviews.answers_findings(tenant_id, story_id, finding_ids, checkpoint) do
+         :ok <- Reviews.answers_findings(tenant_id, story, finding_ids, checkpoint) do
       insert_entry(tenant_id, story_id, changeset,
         author_principal: author,
         actor_lineage: Keyword.fetch!(opts, :actor_lineage)

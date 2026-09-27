@@ -373,9 +373,12 @@ defmodule Loopctl.Delivery.Placement do
          :ok <- not_halted(tenant_id),
          :ok <- Tenants.require_human_anchor(tenant_id),
          :ok <- may_mint_session_dispatch(caller.lineage, caller.role) do
+      # A resume re-pushes an IMPLEMENT session and moves its claim's cap. An id the ledger
+      # holds for any other kind (a review carries the implementer's story and epoch) is not
+      # this placement's to resume.
       case DispatchLedger.get_record(tenant_id, dispatch_id) do
         nil -> claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts)
-        record -> resume(tenant_id, runner_id, dispatch, record, opts)
+        record -> resume_implement(tenant_id, runner_id, dispatch, record, opts)
       end
     end
   end
@@ -410,7 +413,10 @@ defmodule Loopctl.Delivery.Placement do
 
   - `:api_key` (required) — the key the request authenticated with; orchestrator or higher.
   - `:dispatch_id` — the ledger id to push under. Generated when absent. A repeat with the same
-    id re-pushes the same review (idempotent), so a lost response is retried with it.
+    id on the same story and runner is answered from the recorded review, with no pre-checks,
+    no second chain entry and no second push — unless the push never reached the ledger, when
+    it is pushed now. So a lost response is retried with it. The id on another story, or
+    another runner, is `dispatch_id_conflict`.
   - `:wall_clock_seconds`, `:max_turns` — the session's budget; `REVIEW_WALL_CLOCK_SECONDS` and
     `REVIEW_MAX_TURNS` when absent.
   - `:repo`, `:base_branch` — for a story whose project is bound to no intake source, as on
@@ -429,23 +435,34 @@ defmodule Loopctl.Delivery.Placement do
           {:ok, %{review: Review.t(), dispatch_id: Ecto.UUID.t()}} | {:error, term()}
   def place_review(tenant_id, runner_id, story_id, opts)
       when is_binary(tenant_id) and is_binary(runner_id) and is_binary(story_id) do
-    meta = sole_live_meta(tenant_id, runner_id)
-
     with {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
          :ok <- review_placer(caller.role),
          {:ok, dispatch_id} <- review_dispatch_id(Keyword.get(opts, :dispatch_id)),
          :ok <- not_halted(tenant_id),
-         :ok <- Tenants.require_human_anchor(tenant_id),
-         :ok <- runner_accepting_work(meta),
+         :ok <- Tenants.require_human_anchor(tenant_id) do
+      case Threads.review_by_dispatch(tenant_id, dispatch_id) do
+        nil ->
+          place_new_review(tenant_id, runner_id, story_id, dispatch_id, opts)
+
+        %Review{story_id: ^story_id, runner_id: ^runner_id} = review ->
+          retry_review(tenant_id, runner_id, review, opts)
+
+        %Review{} ->
+          {:error,
+           {:conflict, "dispatch_id_conflict", "dispatch_id names another story's review"}}
+      end
+    end
+  end
+
+  defp place_new_review(tenant_id, runner_id, story_id, dispatch_id, opts) do
+    meta = sole_live_meta(tenant_id, runner_id)
+
+    with :ok <- runner_accepting_work(meta),
          :ok <- runner_not_exhausted(tenant_id, runner_id),
          {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
-         {:ok, dispatch} <-
-           DispatchPayload.fill(tenant_id, review_dispatch(dispatch_id, story_id, opts),
-             branch_prefixes: declared_branch_prefixes(meta)
-           ),
+         {:ok, dispatch} <- fill_review(tenant_id, dispatch_id, story_id, meta, opts),
          :ok <- review_push_ready(tenant_id, runner_id, meta, dispatch),
-         {:ok, story} <- review_story(tenant_id, story_id),
-         {:ok, story_object} <- ImplementerInput.story_object(story),
+         {:ok, story_object} <- review_story_object(tenant_id, story_id),
          {:ok, review, _status} <-
            Threads.record_review(tenant_id, story_id,
              dispatch_id: dispatch_id,
@@ -457,6 +474,42 @@ defmodule Loopctl.Delivery.Placement do
          :ok <- Runners.dispatch(tenant_id, runner_id, payload) do
       {:ok, %{review: review, dispatch_id: dispatch_id}}
     end
+  end
+
+  # A RETRY OF A PLACEMENT ALREADY RECORDED — the caller's response was lost, or the push lost
+  # the race after the pre-checks. Answered from the review row, with none of the pre-checks:
+  # a review whose push went out holds its own slot, and a runner that already replied would
+  # refuse it again, so asking them would refuse the very retry the id exists for. It writes
+  # no chain entry and pushes nothing a second time; only a review the ledger never recorded
+  # as SENT is pushed now, through `Runners.dispatch/3`, which judges that push itself.
+  defp retry_review(tenant_id, runner_id, review, opts) do
+    answer = {:ok, %{review: review, dispatch_id: review.dispatch_id}}
+
+    case DispatchLedger.get_record(tenant_id, review.dispatch_id) do
+      nil ->
+        meta = sole_live_meta(tenant_id, runner_id)
+
+        with {:ok, dispatch} <-
+               fill_review(tenant_id, review.dispatch_id, review.story_id, meta, opts),
+             {:ok, story_object} <- review_story_object(tenant_id, review.story_id),
+             payload = review_payload(tenant_id, dispatch, story_object, review),
+             :ok <- Runners.dispatch(tenant_id, runner_id, payload),
+             do: answer
+
+      _sent ->
+        answer
+    end
+  end
+
+  defp fill_review(tenant_id, dispatch_id, story_id, meta, opts) do
+    DispatchPayload.fill(tenant_id, review_dispatch(dispatch_id, story_id, opts),
+      branch_prefixes: declared_branch_prefixes(meta)
+    )
+  end
+
+  defp review_story_object(tenant_id, story_id) do
+    with {:ok, story} <- review_story(tenant_id, story_id),
+         do: ImplementerInput.story_object(story)
   end
 
   # What `Runners.dispatch/3` would refuse, asked before the review is recorded (see "Order" in
@@ -726,6 +779,12 @@ defmodule Loopctl.Delivery.Placement do
   #
   # The one thing a resume DOES write is the claim's lease cap, moved forward so the frame's
   # `deadline_at` leaves the resumed session its whole wall clock (`resume_deadline/4`).
+  defp resume_implement(tenant_id, runner_id, dispatch, record, opts) do
+    if DispatchLedger.implement_kind?(record.kind),
+      do: resume(tenant_id, runner_id, dispatch, record, opts),
+      else: {:error, :dispatch_id_conflict}
+  end
+
   defp resume(tenant_id, runner_id, dispatch, record, opts) do
     with {:ok, payload} <- resume_payload(tenant_id, runner_id, dispatch, record),
          {:ok, payload} <- resume_deadline(tenant_id, payload, record, opts) do
