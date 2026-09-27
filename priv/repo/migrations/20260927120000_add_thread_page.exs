@@ -107,7 +107,6 @@ defmodule Loopctl.Repo.Migrations.AddThreadPage do
     # assertion is verified. Only `AdminRepo` reads or writes it (`Loopctl.WebAuthn.Reauth`).
     create table(:webauthn_login_challenges, primary_key: false) do
       add :id, :binary_id, primary_key: true
-      add :purpose, :string, null: false
       add :challenge, :binary, null: false
       add :expires_at, :utc_datetime_usec, null: false
       add :used_at, :utc_datetime_usec, null: true

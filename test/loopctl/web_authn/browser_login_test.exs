@@ -70,7 +70,7 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
       assert issued.allowed_credentials == []
       assert %{challenge_id: _, challenge: _, rp_id: _, expires_at: _} = issued
 
-      assert %LoginChallenge{purpose: "browser_login", used_at: nil} =
+      assert %LoginChallenge{used_at: nil} =
                AdminRepo.get(LoginChallenge, issued.challenge_id)
     end
 
@@ -110,6 +110,23 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
       assert_in_delta DateTime.diff(expires, DateTime.utc_now()),
                       BrowserLogin.lifetime_seconds(),
                       5
+    end
+
+    test "an assertion spends the challenge it names and no other", ctx do
+      {:ok, first} = BrowserLogin.begin()
+      {:ok, second} = BrowserLogin.begin()
+
+      # Each login advances the authenticator's counter, as a real one does.
+      expect(Loopctl.MockWebAuthn, :verify_authentication, fn _, _, _ ->
+        {:ok, %{sign_count: 1}}
+      end)
+
+      expect(Loopctl.MockWebAuthn, :verify_authentication, fn _, _, _ ->
+        {:ok, %{sign_count: 2}}
+      end)
+
+      assert {:ok, _} = BrowserLogin.complete(assertion(second.challenge_id, ctx.authenticator))
+      assert {:ok, _} = BrowserLogin.complete(assertion(first.challenge_id, ctx.authenticator))
     end
 
     test "a challenge is good once: the replay is refused", ctx do

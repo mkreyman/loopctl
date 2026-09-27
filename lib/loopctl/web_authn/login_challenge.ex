@@ -13,7 +13,6 @@ defmodule Loopctl.WebAuthn.LoginChallenge do
   @type t :: %__MODULE__{}
 
   schema "webauthn_login_challenges" do
-    field :purpose, :string
     field :challenge, :binary
     field :expires_at, :utc_datetime_usec
     field :used_at, :utc_datetime_usec

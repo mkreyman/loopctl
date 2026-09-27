@@ -6,7 +6,7 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
   ## Usernameless, on Reauth's ceremony
 
   There is no slug, no tenant and no credential list on the way in. `begin/0` issues a challenge
-  with EMPTY `allow_credentials` (`Loopctl.WebAuthn.Reauth.issue_discoverable_challenge/1`), the
+  with EMPTY `allow_credentials` (`Loopctl.WebAuthn.Reauth.issue_discoverable_challenge/0`), the
   browser offers whichever discoverable credential (a passkey, or a security key holding a
   resident credential) it has for loopctl, and `complete/1` identifies the authenticator by the
   assertion's credential id — globally unique — and the tenant by the authenticator. So nothing
@@ -58,8 +58,6 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
   alias Loopctl.WebAuthn.BrowserSession
   alias Loopctl.WebAuthn.Reauth
 
-  @purpose "browser_login"
-
   # Short and absolute: a working day. The page is where a human reads and writes a thread,
   # not a console left open for a week, and a session that outlived its authenticator's owner
   # would be the one standing credential in a system built to have none.
@@ -73,10 +71,6 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
           authenticated_at: DateTime.t()
         }
 
-  @doc "The Reauth purpose a login challenge is issued and consumed under."
-  @spec purpose() :: String.t()
-  def purpose, do: @purpose
-
   @doc "The absolute lifetime of a browser session, in seconds."
   @spec lifetime_seconds() :: pos_integer()
   def lifetime_seconds, do: @lifetime_seconds
@@ -88,7 +82,7 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
   """
   @spec begin() :: {:ok, map()} | {:error, :unavailable}
   def begin do
-    case Reauth.issue_discoverable_challenge(@purpose) do
+    case Reauth.issue_discoverable_challenge() do
       {:ok, issued} -> {:ok, issued}
       {:error, _changeset} -> {:error, :unavailable}
     end
@@ -103,7 +97,7 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
   @spec complete(map()) :: {:ok, principal()} | {:error, term()}
   def complete(params) when is_map(params) do
     with {:ok, %{authenticator: authenticator}} <-
-           Reauth.verify_discoverable_and_consume(@purpose, params),
+           Reauth.verify_discoverable_and_consume(params),
          {:ok, %Tenant{status: :active}} <- Tenants.get_tenant(authenticator.tenant_id) do
       open_session(authenticator.tenant_id, authenticator.id)
     else

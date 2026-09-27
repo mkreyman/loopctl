@@ -202,10 +202,13 @@ defmodule Loopctl.WebAuthn.Reauth do
   verify): the credential alone is the whole identity here, so it must also prove its holder.
 
   Stored in `webauthn_login_challenges`, single-use and TTL-bounded exactly as a reauth
-  challenge is, and bound to no tenant. Returns the same keys `issue_challenge/2` does.
+  challenge is, and bound to no tenant. That table holds browser-login challenges and nothing
+  else (`Loopctl.WebAuthn.BrowserLogin` is its one writer), so a challenge carries no purpose:
+  there is no other ceremony's challenge to tell it from. Returns the same keys
+  `issue_challenge/2` does.
   """
-  @spec issue_discoverable_challenge(String.t()) :: {:ok, issue_result()} | {:error, term()}
-  def issue_discoverable_challenge(purpose) when is_binary(purpose) do
+  @spec issue_discoverable_challenge() :: {:ok, issue_result()} | {:error, term()}
+  def issue_discoverable_challenge do
     rp_opts = WebAuthn.rp_opts()
 
     challenge =
@@ -216,7 +219,6 @@ defmodule Loopctl.WebAuthn.Reauth do
     expires_at = DateTime.utc_now() |> DateTime.add(@challenge_ttl_seconds, :second)
 
     case AdminRepo.insert(%LoginChallenge{
-           purpose: purpose,
            challenge: :erlang.term_to_binary(challenge),
            expires_at: expires_at
          }) do
@@ -237,7 +239,7 @@ defmodule Loopctl.WebAuthn.Reauth do
 
   @doc """
   US-45.7 — verifies a USERNAMELESS assertion against a challenge from
-  `issue_discoverable_challenge/1` and consumes it (single-use; consumed before anything else is
+  `issue_discoverable_challenge/0` and consumes it (single-use; consumed before anything else is
   looked up, so every attempt spends it). The authenticator is found by the assertion's
   credential id in any tenant — a credential id is globally unique — and the assertion is
   verified against that authenticator's stored key and the stored challenge, with the same
@@ -247,17 +249,16 @@ defmodule Loopctl.WebAuthn.Reauth do
   signature gets, so an attempt learns nothing about which credentials exist. Returns
   `{:ok, %{authenticator: authenticator, sign_count: n}}`.
   """
-  @spec verify_discoverable_and_consume(String.t(), map()) ::
+  @spec verify_discoverable_and_consume(map()) ::
           {:ok, %{sign_count: non_neg_integer(), authenticator: RootAuthenticator.t()}}
           | {:error, term()}
-  def verify_discoverable_and_consume(purpose, params)
-      when is_binary(purpose) and is_map(params) do
+  def verify_discoverable_and_consume(params) when is_map(params) do
     with {:ok, challenge_id} <- fetch_uuid(params, "challenge_id"),
          {:ok, credential_id} <- fetch_b64(params, "credential_id"),
          {:ok, authenticator_data} <- fetch_b64(params, "authenticator_data"),
          {:ok, signature} <- fetch_b64(params, "signature"),
          {:ok, client_data_json} <- fetch_b64(params, "client_data_json"),
-         {:ok, challenge} <- consume_login_challenge(purpose, challenge_id),
+         {:ok, challenge} <- consume_login_challenge(challenge_id),
          {:ok, authenticator} <- enrolled(credential_id),
          {:ok, %{sign_count: new_count}} <-
            WebAuthn.verify_authentication(
@@ -274,7 +275,7 @@ defmodule Loopctl.WebAuthn.Reauth do
       {:ok, %{sign_count: new_count, authenticator: updated}}
     else
       {:error, reason} = error ->
-        Logger.info("WebAuthn discoverable login rejected (#{purpose}): #{inspect(reason)}")
+        Logger.info("WebAuthn discoverable login rejected: #{inspect(reason)}")
         error
     end
   end
@@ -286,13 +287,11 @@ defmodule Loopctl.WebAuthn.Reauth do
     end
   end
 
-  defp consume_login_challenge(purpose, challenge_id) do
+  defp consume_login_challenge(challenge_id) do
     now = DateTime.utc_now()
 
     from(c in LoginChallenge,
-      where:
-        c.id == ^challenge_id and c.purpose == ^purpose and is_nil(c.used_at) and
-          c.expires_at > ^now,
+      where: c.id == ^challenge_id and is_nil(c.used_at) and c.expires_at > ^now,
       select: c.challenge
     )
     |> AdminRepo.update_all(set: [used_at: now])

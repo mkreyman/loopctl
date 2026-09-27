@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.7.1",
-      "description": "Browser login uses the WebAuthn credential enrolled at signup and binds the session to the tenant's human user principal, with CSRF protection and RLS scoped as for that principal."
+      "description": "Browser login uses a discoverable WebAuthn credential enrolled for the tenant (signup or enrollment), usernameless, with user verification, and binds the session to the tenant's human user principal, with CSRF protection and RLS scoped as for that principal."
     },
     {
       "id": "AC-45.7.2",
