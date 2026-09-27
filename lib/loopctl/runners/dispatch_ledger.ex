@@ -134,6 +134,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
+  alias Loopctl.Intake
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
   alias Loopctl.Repo
@@ -141,6 +142,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.TraceEvent
   alias Loopctl.WorkBreakdown.Story
+
+  # The `kind`s that are an implement session; NULL is one too (see `implement_kind?/1`).
+  @implement_kinds ["implement"]
 
   # Retention (see "Retention" in the moduledoc). The batch is one DELETE statement's worth of
   # rows and the budget is one tenant's worth per run: both bound how long a single statement
@@ -188,6 +192,9 @@ defmodule Loopctl.Runners.DispatchLedger do
       # re-deriving one from a declaration the machine may have changed since.
       branch: dispatch.branch,
       status: "sent",
+      # Filled in the transaction below: the merge route this implement dispatch is placed
+      # under (US-45.4).
+      mode: nil,
       trace_acked_seq: -1,
       wall_clock_seconds: dispatch.wall_clock_seconds,
       # Born holding NO slot: the row is inserted first (that is how a retry is told from a
@@ -215,6 +222,8 @@ defmodule Loopctl.Runners.DispatchLedger do
       # this read and the row it gates.
       if current_claim_epoch(tenant_id, dispatch.story_id) != dispatch.claim_epoch,
         do: Repo.rollback(:stale_claim_epoch)
+
+      row = %{row | mode: placed_mode(tenant_id, dispatch)}
 
       # Inserted BEFORE the slot is taken, holding none. A concurrent first send of the same
       # id waits here on the unique index and then finds this transaction's committed row;
@@ -812,13 +821,51 @@ defmodule Loopctl.Runners.DispatchLedger do
     if implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
   end
 
+  # THE MODE IS BOUND AT PLACEMENT (US-45.4). An implement dispatch records the merge route
+  # of the story's intake source as it is NOW, chosen by the same rule every other reader of a
+  # project's repository uses (`Intake.select_project_source/2`), so the merge gate later
+  # judges the story on the route it was built for, whatever the source is changed to in
+  # between. NULL — read as `pr` — for a non-implement dispatch, and for a story whose project
+  # has no single live source (the placement's own repository resolution refuses that case
+  # first, unless the caller named the repository itself).
+  defp placed_mode(tenant_id, dispatch) do
+    with true <- implement_kind?(dispatch.kind),
+         project_id when is_binary(project_id) <- story_project(tenant_id, dispatch.story_id),
+         {:ok, source} <-
+           tenant_id
+           |> Intake.live_sources_query()
+           |> Repo.all()
+           |> Intake.select_project_source(project_id) do
+      Atom.to_string(source.mode)
+    else
+      _no_route -> nil
+    end
+  end
+
+  defp story_project(tenant_id, story_id) do
+    Repo.one(
+      from s in Story,
+        where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+        select: s.project_id
+    )
+  end
+
   @doc """
   Whether a ledger row's `kind` is an implement session: `"implement"`, or `nil` — a row
   written before `kind` existed, when `implement` was the only kind sent. The ONE reading of
   that rule, for every path that must refuse a triage session a claim to report on.
   """
   @spec implement_kind?(String.t() | nil) :: boolean()
-  def implement_kind?(kind), do: kind in ["implement", nil]
+  def implement_kind?(kind), do: is_nil(kind) or kind in @implement_kinds
+
+  @doc """
+  `implement_kind?/1` as a query filter over `Loopctl.Runners.DispatchRecord` rows: the same
+  rule, from the same `@implement_kinds`, for a reader that must not fetch every row to apply
+  it (`Loopctl.Delivery.DispatchPayload.dispatch_route/3`).
+  """
+  @spec where_implement_kind(Ecto.Queryable.t()) :: Ecto.Query.t()
+  def where_implement_kind(query),
+    do: where(query, [r], is_nil(r.kind) or r.kind in ^@implement_kinds)
 
   defp session_of(%DispatchRecord{} = record) do
     %{

@@ -217,6 +217,7 @@ defmodule Loopctl.Delivery.Stages do
           | :stale_claim_epoch
           | :wrong_stage
           | :effect_conflict
+          | :invalid_event_data
           | :busy
 
   @doc """
@@ -910,6 +911,10 @@ defmodule Loopctl.Delivery.Stages do
   ## Options
 
   - `:claim_epoch` (required), `:actor_label`
+  - `:event_data` — a JSON-encodable map recorded under `"payload"` on the `effect_recorded`
+    event, bounded as `advance/4`'s is. The merge gate names the checkpoint a thread-mode
+    allow was granted for this way (US-45.4). Nothing is recorded for a replay of a write
+    that already landed, because a replay writes no event.
   """
   @spec record_effect(Ecto.UUID.t(), Ecto.UUID.t(), atom(), term(), keyword()) ::
           {:ok, StoryStage.t()} | {:error, effect_error()}
@@ -917,6 +922,7 @@ defmodule Loopctl.Delivery.Stages do
     epoch = Keyword.fetch!(opts, :claim_epoch)
 
     with :ok <- recordable(effect),
+         :ok <- event_data_ok(opts),
          {:ok, value} <- validate_effect(effect, value) do
       in_tenant(tenant_id, fn ->
         effect_write(tenant_id, story_id, {effect, value}, epoch, opts)
@@ -958,15 +964,61 @@ defmodule Loopctl.Delivery.Stages do
 
     cond do
       not runner_resolvable?(effect, value, row.tenant_id) -> Repo.rollback(:invalid_effect)
-      # A replay of the write that already landed, from any stage: nothing to do.
-      current == value -> row
+      # A replay of the write that already landed, from any stage: nothing to write, except
+      # an `:event_data` that no longer matches the last event's (`refresh_payload/4`).
+      current == value -> refresh_payload(row, effect, value, opts)
       row.stage not in StageMachine.effect_stages(effect) -> Repo.rollback(:wrong_stage)
       not is_nil(current) -> Repo.rollback(:effect_conflict)
       true -> set_effect(row, effect, value, opts)
     end
   end
 
+  # THE LATEST EVENT MATCHES THE LATEST ANSWER. A replay of an identity that already landed
+  # writes nothing — unless it carries `:event_data` that differs from the payload on the
+  # identity's newest `effect_recorded` event. Then a new event records it, so a reader of the
+  # events sees what the last caller was told: the merge gate re-allowing the same head
+  # against a moved base, say, records the new `base_sha` rather than leaving the old one.
+  # The identity itself never changes; only the evidence recorded beside it does.
+  defp refresh_payload(row, effect, value, opts) do
+    case Keyword.fetch(opts, :event_data) do
+      {:ok, payload} when is_map(payload) ->
+        if latest_effect_payload(row, effect) != payload do
+          data = %{"effect" => Atom.to_string(effect), "value" => event_value(value)}
+
+          insert_event(
+            Repo,
+            row,
+            "effect_recorded",
+            nil,
+            nil,
+            opts[:actor_label],
+            Map.put(data, "payload", payload)
+          )
+        end
+
+        row
+
+      _none ->
+        row
+    end
+  end
+
+  defp latest_effect_payload(row, effect) do
+    Repo.one(
+      from e in StageEvent,
+        where: e.tenant_id == ^row.tenant_id and e.story_stage_id == ^row.id,
+        where: e.event == "effect_recorded",
+        where: fragment("?->>'effect'", e.data) == ^Atom.to_string(effect),
+        order_by: [desc: e.inserted_at],
+        limit: 1,
+        select: fragment("?->'payload'", e.data)
+    )
+  end
+
+  # A transition's `:event_data` belongs to the TRANSITION's event, which already carries it;
+  # the effect events it writes stay exactly `effect` and `value`.
   defp put_effects(row, effects, opts) do
+    opts = Keyword.delete(opts, :event_data)
     Enum.reduce(effects, row, fn {effect, value}, acc -> put_effect(acc, effect, value, opts) end)
   end
 
@@ -983,7 +1035,10 @@ defmodule Loopctl.Delivery.Stages do
       )
       |> Repo.update_all([])
 
-    data = %{"effect" => Atom.to_string(effect), "value" => event_value(value)}
+    data =
+      note(nil, opts)
+      |> Map.merge(%{"effect" => Atom.to_string(effect), "value" => event_value(value)})
+
     insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
     row
   end

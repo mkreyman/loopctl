@@ -8377,6 +8377,27 @@ const TOOLS = [
       "`refuse` (the story is escalated before this returns), `already_merged`, `head_moved` " +
       "(back to implementing), `unevaluated` (503 with Retry-After: a transient forge fault; " +
       "retry after the delay, nothing transitioned).\n\n" +
+      "THREAD MODE — the story's current claim was PLACED under an intake source with " +
+      "`mode: thread` (set with intake_source_update; the mode is bound to the dispatch at " +
+      "placement, so a later change reaches only later placements). There is no pull request: the gate judges the latest " +
+      "checkpoint recorded under the story's CURRENT claim, on the branch that claim's " +
+      "dispatch ran on, and `pr_number` is null. The source's runners must be at runner " +
+      "contract 1.20.0 or later and send checkpoint messages, or every story is refused " +
+      "`no_checkpoint_recorded`; a story whose claim was released after an earlier one " +
+      "recorded checkpoints is refused `claim_ended`. It adds refusals `empty_change` (the " +
+      "checkpoint's tree equals the base's, or no file changed) and " +
+      "`checkpoint_tree_mismatch` (the forge's tree is not the one the claimant recorded). " +
+      "The branch is judged first: a branch missing from a readable repository " +
+      "(`branch_missing`), one naming a commit nobody recorded (`branch_head_unrecorded`), " +
+      "one naming an earlier checkpoint of the claim (`branch_head_regressed`), or a " +
+      "checkpoint that is not the recorded head, or a base that moved since the checkpoint " +
+      "was cut (`base_moved_since_checkpoint`: rebase), means the head moved. While the claim is " +
+      "LIVE that is `head_moved` — back to implementing: push and record the checkpoint. " +
+      "When it is NOT live (reported, review requested, lease expired) nobody can record " +
+      "the fix, so it is a refusal naming `claim_not_live`, and the story escalates. A " +
+      "repository the token cannot read refuses `pull_request_unavailable`. The answer " +
+      "carries `mode`, `checkpoint_id`, `checkpoint_sha` and `base_sha`; an allow is " +
+      "recorded naming the checkpoint and the base it was judged against.\n\n" +
       "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
       "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
       "else LOOPCTL_API_KEY. 403 `custody_tier_required` on a tenant without a human anchor, " +
@@ -8510,7 +8531,13 @@ const TOOLS = [
       "an unnamed branch on a `main` repository sends every dispatch to cut from a branch that " +
       "does not exist, and the failure arrives after the claim. There is no cleared state for " +
       "it (a dispatch must name one), so null or blank is refused rather than falling back to " +
-      "the default; intake_source_update changes it afterwards.",
+      "the default; intake_source_update changes it afterwards.\n\n" +
+      "`mode` picks the merge route: `pr` (the default) or `thread`, where the merge gate " +
+      "evaluates the story's latest recorded checkpoint instead of a pull request. A value " +
+      "other than those two, null included, is refused. " +
+      "The mode is BOUND to each implement dispatch when it is placed: a change affects " +
+      "only stories placed afterwards, and a story already placed keeps the mode its " +
+      "dispatch recorded, so a change is always allowed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8547,6 +8574,18 @@ const TOOLS = [
             "here rather than silently taking the default. Changed later with " +
             "intake_source_update.",
         },
+        mode: {
+          type: "string",
+          enum: ["pr", "thread"],
+          description:
+            "Optional. How this repository's changes reach its base branch. `pr` (the default " +
+            "when omitted): the merge gate reads a pull request by number. `thread`: the merge " +
+            "gate reads the story's latest RECORDED thread checkpoint and needs no pull " +
+            "request (see merge_precondition). Its runners must be at runner contract 1.20.0 or " +
+            "later and send checkpoint messages, or every story is refused " +
+            "`no_checkpoint_recorded`. Not nullable. Changed later with " +
+            "intake_source_update.",
+        },
         secret_file: {
           type: "string",
           description:
@@ -8563,7 +8602,8 @@ const TOOLS = [
     description:
       "LIST THE TENANT'S GITHUB INTAKE SOURCES (GET /api/v1/intake/sources): per source its " +
       "`id` (the webhook URL is /api/v1/intake/github/<id>), `project_id`, `repo_full_name`, " +
-      "`base_branch`, `target_epic_id`, `revoked_at` and timestamps. Active sources only " +
+      "`base_branch`, `mode` (`pr` or `thread`), `target_epic_id`, `revoked_at` and " +
+      "timestamps. Active sources only " +
       "unless `include_revoked` is true.\n\n" +
       "THE WEBHOOK SECRET IS NOT HERE AND IS NOT ANYWHERE. It is returned once by " +
       "intake_source_enroll and the column is redacted on the schema, so this is not the way " +
@@ -8587,15 +8627,19 @@ const TOOLS = [
     name: "intake_source_update",
     description:
       "SET WHERE A SOURCE'S WORK LANDS (PATCH /api/v1/intake/sources/:id): `target_epic_id`, " +
-      "the epic triaged stories are created in, and `base_branch`, the branch every dispatch " +
-      "for this repository is cut FROM and carries.\n\n" +
+      "the epic triaged stories are created in, `base_branch`, the branch every dispatch " +
+      "for this repository is cut FROM and carries, and `mode`, the merge route (`pr` or " +
+      "`thread` — a thread-mode source's merge gate reads the latest recorded checkpoint " +
+      "instead of a pull request).\n\n" +
       "PRESENCE DECIDES, AND A FIELD YOU DO NOT NAME IS LEFT EXACTLY AS IT WAS. Naming " +
-      "neither is refused 422 `nothing_to_update` rather than being a silent no-op. DO NOT " +
+      "none of them is refused 422 `nothing_to_update` rather than being a silent no-op. DO NOT " +
       "SEND `target_epic_id: null` TO MEAN 'I AM NOT CHANGING THIS' — an explicit null is the " +
       "only way to CLEAR the epic, and clearing it returns the source to escalating every " +
       "report to a human instead of filing a story. Leave the field out instead. " +
-      "`base_branch` has no cleared state at all (every dispatch must name a branch to cut " +
-      "from), so a null there is refused.\n\n" +
+      "`base_branch` and `mode` have no cleared state at all, so a null there is refused. " +
+      "The mode is BOUND to each implement dispatch when it is placed: a change affects " +
+      "only stories placed afterwards, and a story already placed keeps the mode its " +
+      "dispatch recorded, so a change is always allowed.\n\n" +
       "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
       "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
       "call; this is what corrects one that was not — a source enrolled before the parameter " +
@@ -8629,6 +8673,15 @@ const TOOLS = [
           description:
             "The branch dispatches for this repository are cut from, e.g. `main`. 1-255 " +
             "characters, not nullable. Omit to leave the current value alone.",
+        },
+        mode: {
+          type: "string",
+          enum: ["pr", "thread"],
+          description:
+            "`pr` or `thread`: whether the merge gate reads a pull request or the story's " +
+            "latest recorded thread checkpoint. `thread` needs runners at contract 1.20.0 or " +
+            "later sending checkpoint messages, or every story is refused " +
+            "`no_checkpoint_recorded`. Not nullable. Omit to leave the current value alone.",
         },
       },
       required: ["source_id"],

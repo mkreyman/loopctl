@@ -45,9 +45,12 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Delivery.DispatchDriver
+  alias Loopctl.Delivery.Stages
   alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchLedger
+  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.WorkBreakdown.Story
 
   @type error ::
@@ -178,6 +181,79 @@ defmodule Loopctl.Delivery.DispatchPayload do
       prefix -> {:ok, prefix <> suffix}
     end
   end
+
+  # A dispatch whose session RAN: accepted by its runner, or superseded after running. A
+  # `sent` row may never have reached a machine and a `refused` one never ran, so neither
+  # names a route anything was built on.
+  @ran_statuses ["accepted", "superseded"]
+
+  @doc """
+  The ROUTE `story`'s current claim was dispatched on (US-45.4): the merge `mode` its
+  implement dispatch was placed under, and the branch its work is on. Read from the implement
+  row of the story's CURRENT `claim_epoch` whose session ran (`accepted` or `superseded`),
+  newest first, through the shared implement-kind filter
+  (`Loopctl.Runners.DispatchLedger.where_implement_kind/1`).
+
+  - `mode` — the row's recorded mode (`Loopctl.Runners.DispatchLedger.record_sent/3` binds it
+    at placement). NULL, or no such row, is `:pr`, the only route there was before the column
+  - `branch`, in this order, the first that is present:
+    1. `stage_branch` — the `branch` effect the runner reported on the stage row at
+       `worktree`, which is the branch its session actually works on
+    2. the row's `branch`, the name the dispatch put on the wire (#846.2)
+    3. `branch_for/2` with no prefixes, for a story no row names a branch for: the name such a
+       dispatch carried whenever its runner declared none. For one that did, the forge
+       answers it as missing
+
+  `{:error, :busy}` for contention a caller retries out of
+  (`Loopctl.Delivery.Stages.answering_busy/4`, counted as
+  `[:loopctl, :delivery, :dispatch_route_busy]`); it never raises for that.
+  """
+  @spec dispatch_route(Ecto.UUID.t(), Story.t(), String.t() | nil) ::
+          {:ok, %{mode: :pr | :thread, branch: String.t()}} | {:error, term()}
+  def dispatch_route(tenant_id, %Story{} = story, stage_branch) do
+    Stages.answering_busy(
+      tenant_id,
+      [:loopctl, :delivery, :dispatch_route_busy],
+      "dispatch route read",
+      fn ->
+        tenant_id
+        |> Repo.with_tenant(fn -> Repo.one(route_query(tenant_id, story)) end)
+        |> route(story, stage_branch)
+      end
+    )
+  end
+
+  defp route_query(tenant_id, story) do
+    from(r in DispatchRecord,
+      where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
+      where: r.claim_epoch == ^story.claim_epoch and r.status in ^@ran_statuses,
+      order_by: [desc: r.inserted_at],
+      limit: 1,
+      select: %{mode: r.mode, branch: r.branch}
+    )
+    |> DispatchLedger.where_implement_kind()
+  end
+
+  defp route({:ok, row}, story, stage_branch) do
+    row = row || %{mode: nil, branch: nil}
+
+    with {:ok, branch} <- route_branch(stage_branch, row.branch, story) do
+      {:ok, %{mode: route_mode(row.mode), branch: branch}}
+    end
+  end
+
+  defp route({:error, _reason} = error, _story, _stage_branch), do: error
+
+  defp route_mode("thread"), do: :thread
+  defp route_mode(_pr_or_legacy), do: :pr
+
+  defp route_branch(stage_branch, _row_branch, _story) when is_binary(stage_branch),
+    do: {:ok, stage_branch}
+
+  defp route_branch(_stage_branch, row_branch, _story) when is_binary(row_branch),
+    do: {:ok, row_branch}
+
+  defp route_branch(_stage_branch, _row_branch, story), do: branch_for(story, [])
 
   @doc """
   The part of a branch name that makes it this story's and nobody else's.

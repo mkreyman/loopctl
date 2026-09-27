@@ -66,6 +66,21 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     build(:runner_dispatch, Map.put(attrs, "story_id", story_id))
   end
 
+  # A live intake source for the story's project, on the ledger's own connection.
+  defp mode_source(tenant_id, story_id, mode) do
+    as_tenant(tenant_id, fn ->
+      story = Repo.get!(Loopctl.WorkBreakdown.Story, story_id)
+
+      Repo.insert!(%Loopctl.Intake.Source{
+        tenant_id: tenant_id,
+        project_id: story.project_id,
+        repo_full_name: "acme/mode-#{System.unique_integer([:positive])}",
+        webhook_secret: "secret",
+        mode: mode
+      })
+    end)
+  end
+
   # A release of the story's claim, as every release path in `Progress` writes it.
   defp release_claim(tenant_id, story_id) do
     as_tenant(tenant_id, fn ->
@@ -152,6 +167,39 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert record.kind == "triage"
       assert record.trace_acked_seq == -1
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
+    end
+
+    test "an implement dispatch binds its source's mode at placement; a retry keeps it (US-45.4)",
+         %{runner: runner} do
+      payload = dispatch_payload(runner.tenant_id)
+      source = mode_source(runner.tenant_id, payload["story_id"], :thread)
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+
+      assert {:ok, %{mode: "thread"}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+
+      # The source changes AFTER placement: the dispatch keeps the mode it was placed under.
+      as_tenant(runner.tenant_id, fn ->
+        source |> Ecto.Changeset.change(mode: :pr) |> Repo.update!()
+      end)
+
+      assert {:ok, %{mode: "thread"}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+    end
+
+    test "a triage dispatch records no mode, and neither does a story with no source",
+         %{runner: runner} do
+      payload = dispatch_payload(runner.tenant_id)
+      mode_source(runner.tenant_id, payload["story_id"], :thread)
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+
+      assert {:ok, %{mode: nil}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, %{
+                 dispatch
+                 | kind: "triage"
+               })
+
+      assert %{mode: nil} = sent(runner, %{})
     end
 
     test "the same dispatch_id twice finds the first row instead of writing a second",

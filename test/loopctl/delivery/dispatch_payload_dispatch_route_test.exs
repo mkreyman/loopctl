@@ -1,0 +1,101 @@
+defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
+  @moduledoc """
+  `Loopctl.Delivery.DispatchPayload.dispatch_route/3` (US-45.4): the merge mode a story's
+  CURRENT claim was placed under, and the branch its work is on, read from the implement
+  ledger row of that claim whose session ran. The merge gate judges a story on this route,
+  so a later source change, a triage row, or a dispatch that never ran must not change it.
+  """
+
+  use Loopctl.DataCase, async: true
+
+  alias Loopctl.Delivery.DispatchPayload
+  alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchRecord
+
+  setup do
+    story = fixture(:stage_story, %{})
+    runner = fixture(:stage_runner, %{tenant_id: story.tenant_id})
+    %{story: story, runner: runner}
+  end
+
+  defp record(ctx, at, fields) do
+    status = Keyword.get(fields, :status, "accepted")
+
+    {:ok, row} =
+      Repo.with_tenant(ctx.story.tenant_id, fn ->
+        Repo.insert!(%DispatchRecord{
+          tenant_id: ctx.story.tenant_id,
+          runner_id: ctx.runner.id,
+          dispatch_id: Ecto.UUID.generate(),
+          story_id: ctx.story.id,
+          claim_epoch: Keyword.get(fields, :claim_epoch, ctx.story.claim_epoch),
+          kind: Keyword.get(fields, :kind, "implement"),
+          branch: Keyword.get(fields, :branch),
+          mode: Keyword.get(fields, :mode),
+          status: status,
+          # `runner_dispatches_reason_iff_refused`: a refused row carries its reason.
+          reason: if(status == "refused", do: "unsupported_kind"),
+          wall_clock_seconds: 3_600,
+          released_at: DateTime.utc_now(),
+          inserted_at: at,
+          updated_at: at
+        })
+      end)
+
+    row
+  end
+
+  defp route(ctx, stage_branch \\ nil),
+    do: DispatchPayload.dispatch_route(ctx.story.tenant_id, ctx.story, stage_branch)
+
+  @t1 ~U[2026-09-26 10:00:00.000000Z]
+  @t2 ~U[2026-09-26 11:00:00.000000Z]
+  @t3 ~U[2026-09-26 12:00:00.000000Z]
+
+  test "the mode is the one the claim's dispatch recorded at placement", ctx do
+    record(ctx, @t1, mode: "thread", branch: "agent/b")
+
+    assert {:ok, %{mode: :thread, branch: "agent/b"}} = route(ctx)
+  end
+
+  test "a row with no recorded mode, or no row at all, is pr", ctx do
+    assert {:ok, %{mode: :pr}} = route(ctx)
+
+    record(ctx, @t1, branch: "agent/b")
+    assert {:ok, %{mode: :pr}} = route(ctx)
+  end
+
+  test "branch order: the stage's reported branch, then the dispatch's, then derived", ctx do
+    {:ok, derived} = DispatchPayload.branch_for(ctx.story, [])
+    assert {:ok, %{branch: ^derived}} = route(ctx)
+
+    record(ctx, @t1, branch: "agent/dispatched")
+    assert {:ok, %{branch: "agent/dispatched"}} = route(ctx)
+    assert {:ok, %{branch: "agent/worked-on"}} = route(ctx, "agent/worked-on")
+  end
+
+  test "the newest row whose session RAN, of the CURRENT claim, of an implement kind", ctx do
+    record(ctx, @t1, mode: "thread", branch: "agent/ran")
+    record(ctx, @t2, mode: "pr", branch: "agent/refused", status: "refused")
+    record(ctx, @t2, mode: "pr", branch: "agent/sent", status: "sent")
+    record(ctx, @t2, mode: "pr", branch: "agent/triage", kind: "triage")
+
+    record(ctx, @t3,
+      mode: "pr",
+      branch: "agent/other-claim",
+      claim_epoch: ctx.story.claim_epoch + 1
+    )
+
+    assert {:ok, %{mode: :thread, branch: "agent/ran"}} = route(ctx)
+
+    record(ctx, @t3, mode: "pr", branch: "agent/superseded", status: "superseded")
+    assert {:ok, %{mode: :pr, branch: "agent/superseded"}} = route(ctx)
+  end
+
+  test "another tenant's dispatch is never read (tenant isolation)", ctx do
+    record(ctx, @t1, mode: "thread", branch: "agent/mine")
+    other = fixture(:stage_story, %{})
+
+    assert {:ok, %{mode: :pr}} = DispatchPayload.dispatch_route(other.tenant_id, ctx.story, nil)
+  end
+end

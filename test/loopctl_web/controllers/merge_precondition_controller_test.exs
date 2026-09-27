@@ -120,6 +120,9 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       assert data["reasons"] == []
       assert data["repo"] == @repo
       assert data["pr_number"] == 4242
+      # US-45.4: a pr-mode source judges a pull request and names no checkpoint.
+      assert data["mode"] == "pr"
+      assert data["checkpoint_id"] == nil
       assert data["head_sha"] == @head
       assert data["merge_base_sha"] == @base
       assert data["custody"] == "ok"
