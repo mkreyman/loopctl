@@ -659,7 +659,7 @@
       "type": "object"
     },
     "RunnerReviewVerdict": {
-      "description": "The verdict of the session under an ACCEPTED `review` dispatch (since 1.21.0): ONE per review, sent after every finding. It completes the review's round, ends the review — every later judgement is `review_closed` — and gives the dispatch's capacity slot back. Idempotent on `<dispatch_id>:<client_seq>`. At most 60000 bytes under the byte rule. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+      "description": "The verdict of the session under an ACCEPTED `review` dispatch (since 1.21.0): ONE per review, sent after every finding. It completes the review's round, ends the review — every later judgement is `review_closed`. It does not free the capacity slot: the `session_ended` the runner sends when the session stops does. Idempotent on `<dispatch_id>:<client_seq>`. At most 60000 bytes under the byte rule. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
       "properties": {
         "body": {
           "description": "The verdict in the session's words. Untrusted. Whether the round asked for changes is its findings, not this text.",

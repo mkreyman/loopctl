@@ -33,9 +33,10 @@ defmodule Loopctl.Threads.Reviews do
   A completed round IS a review's one `verdict`. A review placed for round N completes it only
   while exactly N - 1 rounds of its claim are complete (`review_round_superseded`), so two
   reviews of one round cannot both count, and a review that ends without a verdict uses no
-  round. Round 2 always follows round 1. Round 3 is placeable only when a round-2 finding's
-  `introduced_by` names a checkpoint that carries a fix the thread recorded BEFORE the round-2
-  review was placed (`placed_at_seq`), so nothing written while round 2 is under way can
+  round. Round 2 always follows round 1. Round 3 is placeable only when a MATERIAL round-2
+  finding's `introduced_by` names a checkpoint that carries a fix the thread recorded BEFORE
+  the round-2 review was placed (`placed_at_seq`), so nothing written while round 2 is under
+  way can
   reopen the decision it is making. There is never a round 4. When the round that reaches the
   ceiling has a material finding (critical, high or medium), its verdict records a
   `review_ceiling` escalation in the same transaction, and `Loopctl.Workers.ReviewCeilingWorker`
@@ -487,8 +488,10 @@ defmodule Loopctl.Threads.Reviews do
     |> Map.new()
   end
 
-  # A round-2 finding introduced by a checkpoint that carries a fix: the defect round 1's own
-  # fix put there, which is what a third round exists for. Every fix checkpoint a round-2
+  # A MATERIAL round-2 finding (critical, high or medium) introduced by a checkpoint that
+  # carries a fix: the defect round 1's own fix put there, which is what a third round exists
+  # for. A low one never opens round 3 — it would otherwise buy the story another round, and
+  # suppress the ceiling escalation a serious finding beside it is owed. Every fix checkpoint a round-2
   # finding can name IS a round-1 fix's: `introduced_by` is at or before the round-2
   # checkpoint, a fix names only findings of COMPLETED rounds, and a fix of a round-2 finding
   # comes after the checkpoint it was found in.
@@ -497,24 +500,31 @@ defmodule Loopctl.Threads.Reviews do
   # checkpoints of this claim: a fix written while round 2 streams its findings, or after its
   # verdict, cannot reopen the decision round 2 is making.
   defp third_round_warranted?(tenant_id, story, %{2 => %{id: round2, placed_at_seq: placed}}) do
-    fix_checkpoints =
-      Repo.all(
-        from e in Entry,
-          join: c in Checkpoint,
-          on: c.id == e.checkpoint_id,
-          where:
-            e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :fix and
-              e.seq <= ^placed and c.claim_epoch == ^story.claim_epoch,
-          select: e.checkpoint_id
-      )
+    case fix_checkpoints_before(tenant_id, story, placed) do
+      [] -> false
+      fix_checkpoints -> material_finding_introduced_by?(tenant_id, round2, fix_checkpoints)
+    end
+  end
 
-    fix_checkpoints != [] and
-      Repo.exists?(
-        from e in Entry,
-          where:
-            e.tenant_id == ^tenant_id and e.review_id == ^round2 and e.kind == :finding and
-              e.introduced_by in ^fix_checkpoints
-      )
+  defp fix_checkpoints_before(tenant_id, story, placed) do
+    Repo.all(
+      from e in Entry,
+        join: c in Checkpoint,
+        on: c.id == e.checkpoint_id,
+        where:
+          e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :fix and
+            e.seq <= ^placed and c.claim_epoch == ^story.claim_epoch,
+        select: e.checkpoint_id
+    )
+  end
+
+  defp material_finding_introduced_by?(tenant_id, review_id, fix_checkpoints) do
+    Repo.exists?(
+      from e in Entry,
+        where:
+          e.tenant_id == ^tenant_id and e.review_id == ^review_id and e.kind == :finding and
+            e.severity in ^@material and e.introduced_by in ^fix_checkpoints
+    )
   end
 
   # ---------------------------------------------------------------------------

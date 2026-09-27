@@ -6,15 +6,16 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
   the translation of a write's 422 into what the runner channel publishes. ONE copy, so the
   two coordinators cannot drift apart on how a thread message is resolved or refused.
 
-  Each caller applies its own KIND rule to the row this returns: an `implement` session writes
-  checkpoints and notes, a `review` session writes judgements, and a row of the other kind is
-  `:unknown_dispatch` to either.
+  The read is KIND-SCOPED, implement by default, as `DispatchLedger`'s session accessors are:
+  an `implement` session writes checkpoints and notes, a `review` session (`kind: "review"`)
+  writes judgements, and a row of any other kind reads as none (`:unknown_dispatch`).
   """
 
   import Ecto.Query
 
   alias Loopctl.Delivery.Stages
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
 
   @type row :: %{
@@ -29,7 +30,8 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
   @doc """
   The ledger row `runner_id` holds for the message's dispatch, whatever its status, provided
   the message's `claim_epoch` is the dispatch's. A row another runner or tenant holds reads as
-  none (`:unknown_dispatch`). Contention on the read is `:busy`, counted under
+  none (`:unknown_dispatch`), and so is a row of another kind than `opts[:kind]` (implement by
+  default; `DispatchLedger.where_implement_kind/1`). Contention on the read is `:busy`, counted under
   `[:loopctl, :threads, :busy]` and logged as `what`.
 
   The epoch check is not the fence: `Loopctl.Threads` reads the story's epoch under its lock,
@@ -44,26 +46,28 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
             required(:claim_epoch) => integer(),
             optional(atom()) => term()
           },
-          String.t()
+          String.t(),
+          keyword()
         ) ::
           {:ok, row()} | {:error, :busy | :unknown_dispatch | :stale_claim_epoch}
-  def read(tenant_id, runner_id, message, what) do
+  def read(tenant_id, runner_id, message, what, opts \\ []) do
     read = fn ->
       {:ok, row} =
         Repo.with_tenant(tenant_id, fn ->
-          Repo.one(
-            from r in DispatchRecord,
-              where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
-              where: r.dispatch_id == ^message.dispatch_id,
-              select: %{
-                status: r.status,
-                kind: r.kind,
-                story_id: r.story_id,
-                claim_epoch: r.claim_epoch,
-                slot_generation: r.slot_generation,
-                session_ended?: not is_nil(r.session_ended_at)
-              }
+          from(r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+            where: r.dispatch_id == ^message.dispatch_id,
+            select: %{
+              status: r.status,
+              kind: r.kind,
+              story_id: r.story_id,
+              claim_epoch: r.claim_epoch,
+              slot_generation: r.slot_generation,
+              session_ended?: not is_nil(r.session_ended_at)
+            }
           )
+          |> of_kind(Keyword.get(opts, :kind, :implement))
+          |> Repo.one()
         end)
 
       {:ok, row}
@@ -75,6 +79,9 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
       {:ok, row}
     end
   end
+
+  defp of_kind(query, :implement), do: DispatchLedger.where_implement_kind(query)
+  defp of_kind(query, kind) when is_binary(kind), do: where(query, [r], r.kind == ^kind)
 
   defp found(nil), do: {:error, :unknown_dispatch}
   defp found(row), do: {:ok, row}

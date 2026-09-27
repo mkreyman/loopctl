@@ -64,6 +64,26 @@ defmodule LoopctlWeb.ThreadHTTP do
     end
   end
 
+  @doc """
+  A UUID from the request BODY, named `field`: a malformed or (when `required`) missing one is
+  `422 invalid_uuid` naming the field. Unlike `uuid/1`, which reads a PATH id and answers 404,
+  a bad body value is the caller's request being wrong, not a resource being absent.
+  """
+  @spec body_uuid(map(), String.t(), :required | :optional) ::
+          {:ok, Ecto.UUID.t() | nil} | {:error, {:unprocessable_entity, String.t(), String.t()}}
+  def body_uuid(params, field, presence) do
+    case {Map.get(params, field), presence} do
+      {nil, :optional} ->
+        {:ok, nil}
+
+      {value, _presence} ->
+        case Ecto.UUID.cast(value) do
+          {:ok, uuid} -> {:ok, uuid}
+          :error -> {:error, {:unprocessable_entity, "invalid_uuid", "#{field} must be a UUID"}}
+        end
+    end
+  end
+
   @doc "A required `claim_epoch`; a missing or malformed one is 400."
   @spec claim_epoch(map()) :: {:ok, non_neg_integer()} | {:error, :bad_request, String.t()}
   def claim_epoch(params) do

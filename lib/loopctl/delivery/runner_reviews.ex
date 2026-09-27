@@ -18,25 +18,24 @@ defmodule Loopctl.Delivery.RunnerReviews do
 
   ## After a verdict
 
-  The verdict ends the review, so the runner's capacity slot for it is released at once
-  (`Loopctl.Runners.DispatchLedger.release_slot/3`); a release that does not land is left to
-  `Loopctl.Workers.HealRunnerCapacityWorker`, which frees a slot whose session can no longer be
-  running. A verdict that recorded a `review_ceiling` escalation ENQUEUES one
-  `Loopctl.Workers.ReviewCeilingWorker` job for its story (unique per story), rather than
-  moving the stage inline: this runs inside the runner channel's `handle_in`, where a raised
-  database error takes down every session on the socket, and the job is the durable path
-  anyway. An enqueue that fails is logged and left to the worker's minute sweep.
+  The verdict ends the REVIEW, not the SESSION: the runner is still running it when it sends
+  the verdict, so the slot stays held until the session's `session_ended` (`end_session/3`),
+  exactly as an implement session's does. A session that never reports is freed by
+  `Loopctl.Workers.HealRunnerCapacityWorker`. A verdict that recorded a `review_ceiling`
+  escalation ENQUEUES one `Loopctl.Workers.ReviewCeilingWorker` job for its story (unique per
+  story) rather than moving the stage inline: this runs inside the runner channel's
+  `handle_in`, where a raised database error takes down every session on the socket, and the
+  job is the durable path anyway. An enqueue that fails is logged and left to the worker's
+  minute sweep. The enqueue is idempotent, so a RESEND of a verdict already recorded runs it
+  again and answers what was recorded, `escalated` included.
 
-  Both steps are idempotent, so a RESEND of a verdict already recorded runs them again and
-  answers what was recorded, `escalated` included: the resend may be the only delivery whose
-  answer the runner ever sees, and the first delivery's release may never have landed.
-
-  ## A review session that ends without a verdict
+  ## When a review session ends
 
   `session_ended` for a review dispatch (`end_session/3`) records the report on the ledger row
-  and frees the slot. That is ALL it does: a review holds no claim, so there is no stage
-  effect and nothing counted against the retry ceiling. Superseded, closed, crashed or out of
-  budget, the answer is the same.
+  and frees the slot, with or without a verdict before it. That is ALL it does: a review holds
+  no claim, so there is no stage effect and nothing counted against the retry ceiling. The
+  release never raises into the channel: contention or any database error is logged and the
+  slot is left to `Loopctl.Workers.HealRunnerCapacityWorker`.
 
   ## A dispatch no longer accepted
 
@@ -53,9 +52,12 @@ defmodule Loopctl.Delivery.RunnerReviews do
   (`Loopctl.Delivery.RunnerStages.answering_broken_chain/3`) — the one copy of each policy.
   """
 
+  require Logger
+
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.RunnerThreads
   alias Loopctl.Delivery.RunnerThreadSession
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Threads
@@ -103,7 +105,7 @@ defmodule Loopctl.Delivery.RunnerReviews do
   def record_verdict(tenant_id, runner, %{} = message) do
     with {:ok, %{entry: entry, escalation: escalation}, status, session} <-
            judge(tenant_id, runner, message, base_attrs(message, "verdict"), "review_verdict") do
-      after_verdict(tenant_id, message, session, escalation)
+      after_verdict(tenant_id, session, escalation)
       {:ok, %{entry: entry, replayed?: status == :existing, escalated?: escalation != nil}}
     end
   end
@@ -129,7 +131,7 @@ defmodule Loopctl.Delivery.RunnerReviews do
              message,
              TriageVerdictRecord.digest(message)
            ) do
-      release(tenant_id, message.dispatch_id, session.slot_generation)
+      free_slot(tenant_id, message.dispatch_id, session.slot_generation)
       {:ok, %{replayed?: outcome == :replayed}}
     end
   end
@@ -162,28 +164,57 @@ defmodule Loopctl.Delivery.RunnerReviews do
     end
   end
 
-  # The slot first: the review is over whatever the stage machine does next. Both steps are
-  # idempotent, so a resend runs them again.
-  defp after_verdict(tenant_id, message, session, escalation) do
-    release(tenant_id, message.dispatch_id, session.slot_generation)
+  # The ceiling job only: the slot belongs to the SESSION, which `end_session/3` frees. The
+  # enqueue is idempotent, so a resend runs it again.
+  defp after_verdict(tenant_id, session, escalation) do
     if escalation, do: ReviewCeilingWorker.enqueue(tenant_id, session.story_id)
     :ok
   end
 
-  defp release(tenant_id, dispatch_id, generation) do
-    _ = DispatchLedger.release_slot(tenant_id, dispatch_id, generation)
-    :ok
+  @doc false
+  # Frees a review session's slot, and NEVER RAISES: this runs in the runner channel's
+  # `handle_in`. Contention is answered by `Stages.answering_busy/4`, and anything else the
+  # database raises is rescued; either way the outcome is logged and the slot is left to
+  # `HealRunnerCapacityWorker`, which frees a slot whose session can no longer be running.
+  # Public only so its test can drive it with the database refusing; `end_session/3` is the
+  # caller.
+  @spec free_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer()) :: :ok
+  def free_slot(tenant_id, dispatch_id, generation) do
+    release = fn -> DispatchLedger.release_slot(tenant_id, dispatch_id, generation) end
+
+    case Stages.answering_busy(
+           tenant_id,
+           [:loopctl, :threads, :busy],
+           "review slot release",
+           release
+         ) do
+      {:error, _reason} = error -> log_unreleased(tenant_id, dispatch_id, error)
+      _released_or_not -> :ok
+    end
+  rescue
+    error in [Postgrex.Error, DBConnection.ConnectionError] ->
+      log_unreleased(tenant_id, dispatch_id, error)
+  end
+
+  defp log_unreleased(tenant_id, dispatch_id, reason) do
+    Logger.warning(
+      "review slot not released; HealRunnerCapacityWorker frees it: #{inspect(reason)} " <>
+        "tenant_id=#{tenant_id} dispatch_id=#{dispatch_id}",
+      tenant_id: tenant_id,
+      dispatch_id: dispatch_id
+    )
   end
 
   # --- the session -----------------------------------------------------------------------
 
-  # The ledger row this runner holds for the message's dispatch
-  # (`Loopctl.Delivery.RunnerThreadSession.read/4`), and this module's own rule on it: only a
-  # review session judges.
+  # The REVIEW row this runner holds for the message's dispatch, asked for by kind
+  # (`Loopctl.Delivery.RunnerThreadSession.read/5`): only a review session judges, and a row
+  # of any other kind reads as none.
   defp session(tenant_id, runner_id, message) do
     with {:ok, row} <-
-           RunnerThreadSession.read(tenant_id, runner_id, message, "runner review read"),
-         :ok <- review_kind(row) do
+           RunnerThreadSession.read(tenant_id, runner_id, message, "runner review read",
+             kind: @kind
+           ) do
       {:ok,
        %{
          story_id: row.story_id,
@@ -194,9 +225,6 @@ defmodule Loopctl.Delivery.RunnerReviews do
        }}
     end
   end
-
-  defp review_kind(%{kind: @kind}), do: :ok
-  defp review_kind(_row), do: {:error, :unknown_dispatch}
 
   # --- answers ---------------------------------------------------------------------------
 

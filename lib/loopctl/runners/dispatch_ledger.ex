@@ -591,7 +591,13 @@ defmodule Loopctl.Runners.DispatchLedger do
   @doc """
   The session a runner is running under `dispatch_id`: `{:ok, %{kind:, story_id:,
   claim_epoch:, slot_generation:}}` for an ACCEPTED dispatch this runner holds in this tenant.
-  `kind` is what lets a triage verdict refuse to answer an implement dispatch (US-44.1).
+
+  KIND-SCOPED, IMPLEMENT BY DEFAULT: a row of another kind reads as none
+  (`:unknown_dispatch`), so a consumer cannot forget the kind. A review dispatch (US-45.3)
+  carries the implementer's story and `claim_epoch`, and a triage dispatch holds no claim, so
+  neither may reach an implement path through a fence on epoch or story. A caller that wants
+  another kind asks for it: `kind: "triage"` (`Loopctl.Delivery.TriageVerdict`), or `kind:
+  :any`. Implement means `implement_kind?/1`.
 
   For the `stage` path (#803, contract 1.4.0), which needs the story the dispatch is for and
   the slot generation to release when the session ends. It is a READ and takes no lock: the
@@ -606,7 +612,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   that does not exist. `:dispatch_not_accepted` for a row still `sent`, `refused` or
   `superseded`: no session is running, so there is no transition to report.
   """
-  @spec accepted_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec accepted_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok,
            %{
              kind: String.t() | nil,
@@ -615,21 +621,22 @@ defmodule Loopctl.Runners.DispatchLedger do
              slot_generation: integer()
            }}
           | {:error, :unknown_dispatch | :dispatch_not_accepted}
-  def accepted_session(tenant_id, runner_id, dispatch_id) do
+  def accepted_session(tenant_id, runner_id, dispatch_id, opts \\ []) do
     {:ok, result} =
       in_tenant(tenant_id, fn ->
-        Repo.one(
-          from r in DispatchRecord,
-            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
-            where: r.dispatch_id == ^dispatch_id,
-            select: %{
-              status: r.status,
-              kind: r.kind,
-              story_id: r.story_id,
-              claim_epoch: r.claim_epoch,
-              slot_generation: r.slot_generation
-            }
+        from(r in DispatchRecord,
+          where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+          where: r.dispatch_id == ^dispatch_id,
+          select: %{
+            status: r.status,
+            kind: r.kind,
+            story_id: r.story_id,
+            claim_epoch: r.claim_epoch,
+            slot_generation: r.slot_generation
+          }
         )
+        |> of_kind(Keyword.get(opts, :kind, :implement))
+        |> Repo.one()
       end)
 
     case result do
@@ -656,7 +663,8 @@ defmodule Loopctl.Runners.DispatchLedger do
           {:ok, %{story_id: Ecto.UUID.t(), kind: String.t() | nil}}
           | {:error, :unknown_dispatch}
   def held_dispatch(tenant_id, runner_id, dispatch_id) do
-    {:ok, held} = in_tenant(tenant_id, fn -> held(tenant_id, runner_id, dispatch_id) end)
+    {:ok, held} =
+      in_tenant(tenant_id, fn -> held(tenant_id, runner_id, dispatch_id, kind: :any) end)
 
     with {:ok, %DispatchRecord{story_id: story_id, kind: kind}} <- held,
          do: {:ok, %{story_id: story_id, kind: kind}}
@@ -807,7 +815,8 @@ defmodule Loopctl.Runners.DispatchLedger do
     context = %{operation: :record_session_end, dispatch_id: message.dispatch_id, run_id: nil}
 
     runner_write(tenant_id, runner_id, context, fn ->
-      with {:ok, record} <- held(tenant_id, runner_id, message.dispatch_id, true) do
+      with {:ok, record} <-
+             held(tenant_id, runner_id, message.dispatch_id, lock: true, kind: :any) do
         review_session_end(record, message, digest)
       end
     end)
@@ -852,7 +861,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   defp lock_for_session_end(tenant_id, runner_id, message, story_id) do
     current = current_claim_epoch(tenant_id, story_id)
 
-    case held(tenant_id, runner_id, message.dispatch_id, true) do
+    case held(tenant_id, runner_id, message.dispatch_id, lock: true, kind: :any) do
       {:ok, %DispatchRecord{story_id: ^story_id} = record} -> {:ok, record, current}
       {:ok, %DispatchRecord{}} -> {:error, :unknown_dispatch}
       {:error, :unknown_dispatch} = refused -> refused
@@ -908,6 +917,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   @spec where_implement_kind(Ecto.Queryable.t()) :: Ecto.Query.t()
   def where_implement_kind(query),
     do: where(query, [r], r.kind == @implement_kind or is_nil(r.kind))
+
+  # The kind a session accessor answers for: `:implement` (the default everywhere), a named
+  # kind, or `:any`.
+  defp of_kind(query, :implement), do: where_implement_kind(query)
+  defp of_kind(query, :any), do: query
+  defp of_kind(query, kind) when is_binary(kind), do: where(query, [r], r.kind == ^kind)
 
   defp session_of(%DispatchRecord{} = record) do
     %{
@@ -1365,10 +1380,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   # under the write lock, which only a reply that writes the story takes — so that reply writes
   # the row it fenced on rather than reading it a second time (`reanchor_lease/3`).
   defp fence_then_lock(tenant_id, runner_id, dispatch_id, story_lock \\ :share) do
-    with {:ok, %DispatchRecord{story_id: story_id}} <- held(tenant_id, runner_id, dispatch_id) do
+    with {:ok, %DispatchRecord{story_id: story_id}} <-
+           held(tenant_id, runner_id, dispatch_id, kind: :any) do
       story = locked_story(tenant_id, story_id, story_lock)
 
-      with {:ok, record} <- held(tenant_id, runner_id, dispatch_id, true),
+      with {:ok, record} <- held(tenant_id, runner_id, dispatch_id, lock: true, kind: :any),
            :ok <- story_fence(record, story && story.claim_epoch) do
         {:ok, record, story}
       end
@@ -1376,14 +1392,20 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   # The ownership predicate: tenant AND runner. A row another runner holds is refused
-  # exactly like a row that does not exist.
-  defp held(tenant_id, runner_id, dispatch_id, locked? \\ false) do
+  # exactly like a row that does not exist. KIND-SCOPED, and the caller must SAY which kind:
+  # `:implement`, a named kind, or `:any` for the paths every kind shares — a reply, a trace,
+  # the `session_ended` routing read, and the two session-end WRITES, which check the kind
+  # themselves under the row lock. There is no default, so no caller inherits a kind it did
+  # not choose. `lock: true` takes the row `FOR UPDATE`.
+  defp held(tenant_id, runner_id, dispatch_id, opts) do
     query =
-      from r in DispatchRecord,
+      from(r in DispatchRecord,
         where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
         where: r.dispatch_id == ^dispatch_id
+      )
+      |> of_kind(Keyword.fetch!(opts, :kind))
 
-    query = if locked?, do: lock(query, "FOR UPDATE"), else: query
+    query = if Keyword.get(opts, :lock, false), do: lock(query, "FOR UPDATE"), else: query
 
     case Repo.one(query) do
       nil -> {:error, :unknown_dispatch}

@@ -137,17 +137,9 @@ defmodule Loopctl.Delivery.RunnerStages do
   def apply(tenant_id, runner_id, %{} = stage) do
     with {:ok, session} <-
            DispatchLedger.accepted_session(tenant_id, runner_id, stage.dispatch_id),
-         :ok <- implement_session(session),
          :ok <- dispatch_epoch_matches(session, stage) do
       advance(tenant_id, runner_id, session, stage)
     end
-  end
-
-  # Only an implement session moves a story's stage. A review (US-45.3) or triage session
-  # carries the story and, for a review, the implementer's own epoch, so without this it would
-  # pass every fence below; refused as `unknown_dispatch`, as a checkpoint from one is.
-  defp implement_session(%{kind: kind}) do
-    if DispatchLedger.implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
   end
 
   # The dispatch's own epoch, checked before a transaction is opened. It is NOT the fence —

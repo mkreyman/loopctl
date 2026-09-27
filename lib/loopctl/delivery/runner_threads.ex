@@ -10,8 +10,8 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   1. resolve the runner's dispatch to its story, from the ledger row — the story is NEVER
      taken off the wire — and refuse any kind but `implement` as `:unknown_dispatch`
-     (`Loopctl.Runners.DispatchLedger.implement_kind?/1`), as `session_ended` does: a triage
-     session has no claim to report on;
+     (`Loopctl.Delivery.RunnerThreadSession.read/5`, implement by default), as
+     `session_ended` does: a triage session has no claim to report on;
   2. refuse an epoch that is not even the dispatch's, before the write's transaction opens;
   3. resolve WHO is writing, from the server's own rows, never from the message;
   4. translate `Loopctl.Threads`' refusals into the reasons the contract publishes.
@@ -78,7 +78,6 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.RunnerThreadSession
-  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
@@ -171,19 +170,14 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   # --- the session -----------------------------------------------------------------------
 
-  # The ledger row `runner_id` holds for the message's dispatch
-  # (`Loopctl.Delivery.RunnerThreadSession.read/4`), and this module's own rule on it: only an
-  # implement session writes checkpoints and notes.
+  # The IMPLEMENT row `runner_id` holds for the message's dispatch
+  # (`Loopctl.Delivery.RunnerThreadSession.read/5`, implement by default): only an implement
+  # session writes checkpoints and notes, and a row of any other kind reads as none.
   defp session(tenant_id, runner_id, message) do
     with {:ok, row} <-
-           RunnerThreadSession.read(tenant_id, runner_id, message, "runner thread read"),
-         :ok <- implement_kind(row) do
+           RunnerThreadSession.read(tenant_id, runner_id, message, "runner thread read") do
       {:ok, %{story_id: row.story_id, accepted?: row.status == "accepted"}}
     end
-  end
-
-  defp implement_kind(%{kind: kind}) do
-    if DispatchLedger.implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
   end
 
   defp put_checkpoint(attrs, nil), do: attrs

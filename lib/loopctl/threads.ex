@@ -221,7 +221,8 @@ defmodule Loopctl.Threads do
 
   `attrs` (string keys): `kind` (`finding` | `verdict`), `idempotency_key`, `body`, and for a
   finding `severity`, an optional `location` and `introduced_by`. The key is scoped to the
-  review. Refused `:tenant_halted` while the tenant's custody is halted.
+  review. A NEW judgement is refused `:tenant_halted` while the tenant's custody is halted; a
+  resend of one already recorded is answered from its row even then.
 
   ## Options
 
@@ -236,8 +237,7 @@ defmodule Loopctl.Threads do
           | {:error, term()}
           | {:error, :unprocessable_entity, term()}
   def record_judgement(tenant_id, story_id, dispatch_id, attrs, opts) do
-    with :ok <- not_halted(tenant_id),
-         {:ok, changeset} <- judgement_changeset(attrs),
+    with {:ok, changeset} <- judgement_changeset(attrs),
          :ok <- screen(changeset, tenant_id, story_id),
          :ok <-
            no_secret(
@@ -1008,10 +1008,15 @@ defmodule Loopctl.Threads do
   # Every rule a NEW judgement meets, decided once under the lock: the claim the review
   # belongs to is still the story's, the reviewer is still separate, and the review may still
   # judge. `completed` is read once and reused for the ceiling a verdict may reach.
+  #
+  # The custody HALT is checked here, for new writes only: a resend of a judgement already
+  # recorded is answered from its row before any rule, halt included, so a runner that lost
+  # an ack during a halt still learns its write landed.
   defp judge_new(story, review, changeset, opts) do
     tenant_id = review.tenant_id
 
-    with :ok <- new_write_allowed(opts),
+    with :ok <- not_halted(tenant_id),
+         :ok <- new_write_allowed(opts),
          :ok <- Reviews.claim_current(story, review.claim_epoch),
          :ok <- Reviews.reviewer_separate(tenant_id, story, review.agent_id),
          completed = Reviews.completed(tenant_id, story),

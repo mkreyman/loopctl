@@ -167,6 +167,7 @@ defmodule Loopctl.Delivery.Placement do
 
   require Logger
 
+  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
@@ -445,7 +446,7 @@ defmodule Loopctl.Delivery.Placement do
           place_new_review(tenant_id, runner_id, story_id, dispatch_id, opts)
 
         %Review{story_id: ^story_id, runner_id: ^runner_id} = review ->
-          retry_review(tenant_id, runner_id, review, opts)
+          answer_recorded(tenant_id, runner_id, review, push_unsent: true, opts: opts)
 
         %Review{} ->
           {:error,
@@ -462,43 +463,106 @@ defmodule Loopctl.Delivery.Placement do
          {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
          {:ok, dispatch} <- fill_review(tenant_id, dispatch_id, story_id, meta, opts),
          :ok <- review_push_ready(tenant_id, runner_id, meta, dispatch),
-         {:ok, story_object} <- review_story_object(tenant_id, story_id),
-         {:ok, review, _status} <-
+         {:ok, story} <- review_story(tenant_id, story_id),
+         {:ok, story_object} <- ImplementerInput.story_object(story),
+         :ok <- review_payload_valid(dispatch, story_object, story.claim_epoch),
+         {:ok, review, status} <-
            Threads.record_review(tenant_id, story_id,
              dispatch_id: dispatch_id,
              runner_id: runner_id,
              agent_id: agent_id,
              placed_by: Keyword.get(opts, :actor_label, "api:review_placement")
-           ),
-         payload = review_payload(tenant_id, dispatch, story_object, review),
-         :ok <- Runners.dispatch(tenant_id, runner_id, payload) do
-      {:ok, %{review: review, dispatch_id: dispatch_id}}
+           ) do
+      push_recorded(tenant_id, runner_id, dispatch, story_object, review, status)
     end
   end
 
-  # A RETRY OF A PLACEMENT ALREADY RECORDED — the caller's response was lost, or the push lost
-  # the race after the pre-checks. Answered from the review row, with none of the pre-checks:
-  # a review whose push went out holds its own slot, and a runner that already replied would
-  # refuse it again, so asking them would refuse the very retry the id exists for. It writes
-  # no chain entry and pushes nothing a second time; only a review the ledger never recorded
-  # as SENT is pushed now, through `Runners.dispatch/3`, which judges that push itself.
-  defp retry_review(tenant_id, runner_id, review, opts) do
+  # `:created` is this call's placement, and it pushes. `:existing` is a concurrent placement
+  # of the same `dispatch_id` that recorded the row between this call's look-up and its write:
+  # that call owns the push, so this one answers from the row by the retry rules and NEVER
+  # pushes — pushing too would put the same dispatch on the wire twice.
+  defp push_recorded(tenant_id, runner_id, dispatch, story_object, review, :created) do
+    payload = review_payload(tenant_id, dispatch, story_object, review)
+
+    with :ok <- Runners.dispatch(tenant_id, runner_id, payload),
+         do: {:ok, %{review: review, dispatch_id: review.dispatch_id}}
+  end
+
+  defp push_recorded(tenant_id, runner_id, _dispatch, _story_object, review, :existing),
+    do: answer_recorded(tenant_id, runner_id, review, push_unsent: false)
+
+  # THE PAYLOAD IS JUDGED BEFORE ANYTHING IS WRITTEN. The push casts it
+  # (`RunnerContract.cast_dispatch/1`), but by then the review row and its chain entry exist,
+  # so a budget over the contract's maximum left a recorded review nothing was ever sent for.
+  # The same cast runs here on the payload as it will be sent, with the `review` object's
+  # values standing in shape for shape: every one of them is loopctl's own id, round or sha,
+  # and the cast is what the caller's fields have to pass.
+  defp review_payload_valid(dispatch, story_object, claim_epoch) do
+    probe =
+      dispatch
+      |> Map.put("claim_epoch", claim_epoch)
+      |> Map.put("story", story_object)
+      |> Map.put("review", %{
+        "review_id" => Ecto.UUID.generate(),
+        "round" => 1,
+        "checkpoint_id" => Ecto.UUID.generate(),
+        "checkpoint_seq" => 1,
+        "commit_sha" => String.duplicate("0", 40),
+        "tree_sha" => String.duplicate("0", 40)
+      })
+
+    with {:ok, _cast} <- RunnerContract.cast_dispatch(probe), do: :ok
+  end
+
+  @doc false
+  # A PLACEMENT ALREADY RECORDED, answered from its row — a caller's retry after a lost
+  # response (`push_unsent: true`), or the loser of a concurrent placement of the same
+  # `dispatch_id` (`push_unsent: false`). None of the pre-checks: a review whose push went out
+  # holds its own slot, and a runner that already replied would refuse it again, so asking them
+  # would refuse the very retry the id exists for. No chain entry is written. What the answer
+  # is depends on the LEDGER row:
+  #
+  #   * sent (in flight) or accepted — the review, as recorded;
+  #   * refused, or superseded before it was accepted — `review_dispatch_refused`: that push
+  #     will never run, and its id cannot be sent again, so the caller places a NEW review
+  #     with a new `dispatch_id`;
+  #   * none — the push never reached the ledger. A retry pushes it now, through
+  #     `Runners.dispatch/3`, which judges that push itself; the loser of a race does not, the
+  #     winner is pushing it.
+  #
+  # Public only so `test/loopctl/delivery/review_placement_test.exs` can hold the loser's
+  # branch, which only a race reaches, to these rules; `place_review/4` is the caller.
+  @spec answer_recorded(Ecto.UUID.t(), Ecto.UUID.t(), Review.t(), keyword()) ::
+          {:ok, %{review: Review.t(), dispatch_id: Ecto.UUID.t()}} | {:error, term()}
+  def answer_recorded(tenant_id, runner_id, review, opts) do
     answer = {:ok, %{review: review, dispatch_id: review.dispatch_id}}
 
     case DispatchLedger.get_record(tenant_id, review.dispatch_id) do
       nil ->
-        meta = sole_live_meta(tenant_id, runner_id)
+        if Keyword.fetch!(opts, :push_unsent),
+          do: push_unsent(tenant_id, runner_id, review, Keyword.get(opts, :opts, []), answer),
+          else: answer
 
-        with {:ok, dispatch} <-
-               fill_review(tenant_id, review.dispatch_id, review.story_id, meta, opts),
-             {:ok, story_object} <- review_story_object(tenant_id, review.story_id),
-             payload = review_payload(tenant_id, dispatch, story_object, review),
-             :ok <- Runners.dispatch(tenant_id, runner_id, payload),
-             do: answer
-
-      _sent ->
+      %{status: status} when status in ["sent", "accepted"] ->
         answer
+
+      %{status: status} ->
+        {:error,
+         {:conflict, "review_dispatch_refused",
+          "this review's dispatch was #{status} by the runner and will never run; place a " <>
+            "new review with a new dispatch_id"}}
     end
+  end
+
+  defp push_unsent(tenant_id, runner_id, review, opts, answer) do
+    meta = sole_live_meta(tenant_id, runner_id)
+
+    with {:ok, dispatch} <-
+           fill_review(tenant_id, review.dispatch_id, review.story_id, meta, opts),
+         {:ok, story_object} <- review_story_object(tenant_id, review.story_id),
+         payload = review_payload(tenant_id, dispatch, story_object, review),
+         :ok <- Runners.dispatch(tenant_id, runner_id, payload),
+         do: answer
   end
 
   defp fill_review(tenant_id, dispatch_id, story_id, meta, opts) do
@@ -539,11 +603,17 @@ defmodule Loopctl.Delivery.Placement do
   defp review_accepted(_tenant_id, _runner_id, _meta, _no_repo),
     do: {:error, :repo_not_allowed}
 
+  # The one runner's own row, not the tenant's capacity map.
   defp review_slot_free(tenant_id, runner_id) do
-    case Runners.capacity(tenant_id) do
-      %{^runner_id => %{in_flight: in_flight, max_sessions: max}} when in_flight < max -> :ok
-      %{^runner_id => _full} -> {:error, :runner_at_capacity}
-      _revoked -> {:error, :not_authorized}
+    case Runners.get_runner(tenant_id, runner_id) do
+      {:ok, %{revoked_at: nil, in_flight: in_flight, max_sessions: max}} when in_flight < max ->
+        :ok
+
+      {:ok, %{revoked_at: nil}} ->
+        {:error, :runner_at_capacity}
+
+      _revoked_or_gone ->
+        {:error, :not_authorized}
     end
   end
 

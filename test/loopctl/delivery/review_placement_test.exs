@@ -16,11 +16,13 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
   use LoopctlWeb.ChannelCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain.Entry, as: ChainEntry
   alias Loopctl.Delivery.Placement
+  alias Loopctl.Delivery.RunnerReviews
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Progress
   alias Loopctl.Repo
@@ -213,6 +215,15 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
     count
   end
 
+  defp stage_of(ctx) do
+    {:ok, stage} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        Repo.one(from s in StoryStage, where: s.story_id == ^ctx.story.id, select: s.stage)
+      end)
+
+    stage
+  end
+
   defp reviews(ctx) do
     {:ok, rows} =
       Repo.with_tenant(ctx.tenant_id, fn ->
@@ -276,6 +287,44 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
                )
     end
 
+    test "a retry of a review the runner refused is review_dispatch_refused", ctx do
+      {:ok, %{dispatch_id: dispatch_id}} = place(ctx)
+      assert_push "dispatch", _, @reply_timeout
+
+      ref =
+        push(ctx.channel, "dispatch_reply", %{
+          "dispatch_id" => dispatch_id,
+          "claim_epoch" => @epoch,
+          "decision" => "refused",
+          "reason" => "draining"
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+
+      assert {:error, {:conflict, "review_dispatch_refused", message}} =
+               place(ctx, dispatch_id: dispatch_id)
+
+      assert message =~ "new dispatch_id"
+      refute_push "dispatch", _, 200
+    end
+
+    test "the loser of a race answers from the row and never pushes", ctx do
+      # `record_review/3` answered `:existing`: another placement recorded this id first and
+      # owns the push, which has not reached the ledger yet.
+      {:ok, review, :created} =
+        Threads.record_review(ctx.tenant_id, ctx.story.id,
+          dispatch_id: Ecto.UUID.generate(),
+          runner_id: ctx.runner.id,
+          agent_id: ctx.runner.agent_id,
+          placed_by: "t"
+        )
+
+      assert {:ok, %{review: ^review}} =
+               Placement.answer_recorded(ctx.tenant_id, ctx.runner.id, review, push_unsent: false)
+
+      refute_push "dispatch", _, 200
+    end
+
     test "a recorded review whose push never reached the ledger is pushed by the retry", ctx do
       dispatch_id = Ecto.UUID.generate()
 
@@ -313,6 +362,17 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
                place(ctx, dispatch_id: payload["dispatch_id"])
 
       refute_push "dispatch", _, 200
+    end
+
+    test "a payload the contract refuses records no review and chains nothing", ctx do
+      chained = chain_count(ctx)
+
+      # Over the contract's one-day maximum: the push would refuse it at the cast.
+      assert {:error, {:invalid, _}} = place(ctx, wall_clock_seconds: 86_400 * 2)
+
+      refute_push "dispatch", _, 200
+      assert reviews(ctx) == []
+      assert chain_count(ctx) == chained
     end
 
     test "a push the runner would refuse records no review", ctx do
@@ -355,7 +415,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
   end
 
   describe "judgements over the socket" do
-    test "a finding and the verdict are recorded; the verdict closes the review and its slot",
+    test "a finding and the verdict are recorded; the verdict closes the review, the session's end frees the slot",
          ctx do
       %{review: review, dispatch_id: dispatch_id} = accepted_review!(ctx)
 
@@ -367,10 +427,22 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
 
       ref = verdict(ctx, dispatch_id)
       assert_reply ref, :ok, %{replayed: false, escalated: false}, @reply_timeout
-      refute is_nil(ledger_row(ctx, dispatch_id).released_at)
+
+      # The session is still running when it sends the verdict: its slot stays held.
+      assert is_nil(ledger_row(ctx, dispatch_id).released_at)
 
       ref = finding(ctx, dispatch_id)
       assert_reply ref, :error, %{reason: "review_closed"}, @reply_timeout
+
+      ref =
+        push(ctx.channel, "session_ended", %{
+          "dispatch_id" => dispatch_id,
+          "claim_epoch" => @epoch,
+          "reason" => "completed"
+        })
+
+      assert_reply ref, :ok, %{kind: "review"}, @reply_timeout
+      refute is_nil(ledger_row(ctx, dispatch_id).released_at)
 
       {:ok, thread} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
       assert Enum.any?(thread.entries, &(&1.id == entry_id and &1.review_id == review.id))
@@ -479,7 +551,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       assert kinds == [:finding]
     end
 
-    test "a resent verdict answers the recorded escalation and frees the slot again", ctx do
+    test "a resent verdict answers the recorded escalation and re-drives the stage move", ctx do
       fixture(:story_stage, %{
         tenant_id: ctx.tenant_id,
         story_id: ctx.story.id,
@@ -495,16 +567,17 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       assert_reply ref, :ok, _, @reply_timeout
 
       assert_reply verdict(ctx, r2, 77), :ok, %{escalated: true, replayed: false}, @reply_timeout
+      assert stage_of(ctx) == :escalated
 
-      # The first delivery's release never landed, as far as the ledger knows.
+      # The first delivery's move never landed, as far as the stage row knows.
       {:ok, {1, _}} =
         Repo.with_tenant(ctx.tenant_id, fn ->
-          from(d in DispatchRecord, where: d.dispatch_id == ^r2)
-          |> Repo.update_all(set: [released_at: nil])
+          from(s in StoryStage, where: s.story_id == ^ctx.story.id)
+          |> Repo.update_all(set: [stage: :implementing])
         end)
 
       assert_reply verdict(ctx, r2, 77), :ok, %{escalated: true, replayed: true}, @reply_timeout
-      refute is_nil(ledger_row(ctx, r2).released_at)
+      assert stage_of(ctx) == :escalated
     end
 
     test "a review session that ends without a verdict frees its slot, and moves no stage",
@@ -533,6 +606,19 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
 
       ref = push(ctx.channel, "session_ended", ended)
       assert_reply ref, :ok, %{kind: "review", replayed: true}, @reply_timeout
+    end
+
+    test "freeing a review session's slot never raises: a database failure is logged", ctx do
+      log =
+        capture_log(fn ->
+          Repo.transaction(fn ->
+            {:error, _} = Repo.query("SELECT 1 / 0")
+            assert :ok = RunnerReviews.free_slot(ctx.tenant_id, Ecto.UUID.generate(), 0)
+            Repo.rollback(:done)
+          end)
+        end)
+
+      assert log =~ "review slot not released"
     end
 
     test "a review session that never ran cannot report ending", ctx do
@@ -625,6 +711,19 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
 
       {:ok, thread} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
       refute Enum.any?(thread.entries, &(&1.kind == :finding))
+    end
+
+    test "during a halt, a resend of a judgement already recorded is still answered", ctx do
+      %{dispatch_id: dispatch_id} = accepted_review!(ctx)
+      ref = finding(ctx, dispatch_id, %{"client_seq" => 9})
+      assert_reply ref, :ok, %{entry_id: entry_id}, @reply_timeout
+      assert_reply verdict(ctx, dispatch_id, 10), :ok, %{replayed: false}, @reply_timeout
+
+      halt(ctx)
+
+      ref = finding(ctx, dispatch_id, %{"client_seq" => 9})
+      assert_reply ref, :ok, %{entry_id: ^entry_id, replayed: true}, @reply_timeout
+      assert_reply verdict(ctx, dispatch_id, 10), :ok, %{replayed: true}, @reply_timeout
     end
 
     test "a reviewer that stops being separate is refused on the wire", ctx do

@@ -15,7 +15,10 @@ defmodule Loopctl.Threads.ReviewDispatchRaceTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.Placement
   alias Loopctl.Repo
+  alias Loopctl.Runners
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Threads
   alias Loopctl.Threads.Review
   alias Loopctl.WorkBreakdown.Story
@@ -80,6 +83,86 @@ defmodule Loopctl.Threads.ReviewDispatchRaceTest do
       tries == 0 -> flunk("the second placement never waited on the first")
       true -> Process.sleep(20) && await_waiter(tries - 1)
     end
+  end
+
+  test "the loser of a same-story race answers from the row and does not push again" do
+    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+    {_raw, operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+    {_raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id})
+
+    {implementer, session} =
+      unboxed(fn ->
+        implementer = fixture(:stage_agent, %{tenant_id: tenant.id})
+        session = fixture(:stage_dispatch, %{tenant_id: tenant.id, agent_id: implementer.id})
+        {implementer, session}
+      end)
+
+    %{story: story} = claimed_story(tenant.id, implementer, session)
+    dispatch_id = Ecto.UUID.generate()
+    parent = self()
+
+    # The runner on the pool, declaring `review`, so the placement's pre-checks pass.
+    {:ok, _ref} =
+      Runners.Presence.track(self(), Runners.pool_topic(tenant.id), runner.name, %{
+        runner_id: runner.id,
+        kinds: ["review"],
+        repos: ["acme/widgets"],
+        draining: false,
+        max_sessions: 4
+      })
+
+    # The WINNER: holds the story's thread lock, and records the review only when told to.
+    winner =
+      Task.async(fn ->
+        unboxed(fn ->
+          Repo.with_tenant(tenant.id, fn ->
+            Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+              Threads.lock_namespace(),
+              story.id
+            ])
+
+            send(parent, :locked)
+            receive do: (:record -> :ok)
+
+            {:ok, review, :created} =
+              Threads.record_review(tenant.id, story.id,
+                dispatch_id: dispatch_id,
+                runner_id: runner.id,
+                agent_id: runner.agent_id,
+                placed_by: "winner"
+              )
+
+            review
+          end)
+        end)
+      end)
+
+    assert_receive :locked, 2_000
+
+    # The LOSER: its look-up finds nothing yet, and its write waits on the winner's lock.
+    loser =
+      Task.async(fn ->
+        unboxed(fn ->
+          Placement.place_review(tenant.id, runner.id, story.id,
+            api_key: operator,
+            dispatch_id: dispatch_id,
+            repo: "acme/widgets",
+            base_branch: "master",
+            wall_clock_seconds: 600,
+            max_turns: 20
+          )
+        end)
+      end)
+
+    await_waiter()
+    send(winner.pid, :record)
+    assert {:ok, review} = Task.await(winner)
+
+    assert {:ok, %{review: %{id: review_id}, dispatch_id: ^dispatch_id}} = Task.await(loser)
+    assert review_id == review.id
+
+    # Nothing was pushed by the loser: the ledger holds no row for the id.
+    assert unboxed(fn -> DispatchLedger.get_record(tenant.id, dispatch_id) end) == nil
   end
 
   test "the second of two placements sharing a dispatch_id is dispatch_id_conflict" do

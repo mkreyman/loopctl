@@ -168,6 +168,29 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
     assert message =~ "Nothing was claimed"
   end
 
+  test "a malformed uuid in the body is 422 naming the field; in the path it is 404", ctx do
+    path = "/api/v1/stories/#{ctx.story.id}/thread/reviews"
+
+    assert %{"error" => %{"code" => "invalid_uuid", "message" => message}} =
+             post_as(ctx.operator_raw, path, %{"runner_id" => "nope"}) |> json_response(422)
+
+    assert message =~ "runner_id"
+
+    assert %{"error" => %{"code" => "invalid_uuid", "message" => message}} =
+             post_as(ctx.operator_raw, path, %{
+               "runner_id" => ctx.runner.id,
+               "dispatch_id" => "nope"
+             })
+             |> json_response(422)
+
+    assert message =~ "dispatch_id"
+
+    assert post_as(ctx.operator_raw, "/api/v1/stories/nope/thread/reviews", %{
+             "runner_id" => ctx.runner.id
+           })
+           |> json_response(404)
+  end
+
   test "a review placement refusal carries its own code", ctx do
     join_runner(ctx)
     path = "/api/v1/stories/#{ctx.story.id}/thread/reviews"

@@ -611,6 +611,16 @@ defmodule Loopctl.Threads.ReviewsTest do
                Reviews.rounds(ctx.tenant_id, ctx.story.id)
     end
 
+    test "a LOW finding introduced by a fix does not open round 3 over a critical one", ctx do
+      %{cp2: cp2} = round_one_fixed(ctx)
+      r2 = placed!(ctx)
+      finding!(ctx, r2, %{"introduced_by" => "none", "severity" => "critical"})
+      finding!(ctx, r2, %{"introduced_by" => cp2.id, "severity" => "low"})
+
+      assert %{escalation: %Entry{kind: :escalation}} = verdict!(ctx, r2)
+      assert %{next_round: nil} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
+    end
+
     test "a round 2 with only low findings reaches the ceiling without escalating", ctx do
       round_one_fixed(ctx)
       r2 = placed!(ctx)
@@ -627,9 +637,10 @@ defmodule Loopctl.Threads.ReviewsTest do
       cp2 = checkpoint(ctx, 2)
 
       # Round 2 is placed on cp2 BEFORE any fix exists; a fix on cp2 lands mid-round, and a
-      # round-2 finding names cp2 as where its defect came in.
+      # MATERIAL round-2 finding names cp2 as where its defect came in — so the fix's timing is
+      # the only thing standing between it and round 3.
       r2 = placed!(ctx)
-      finding!(ctx, r2, %{"introduced_by" => cp2.id, "severity" => "low"})
+      finding!(ctx, r2, %{"introduced_by" => cp2.id, "severity" => "medium"})
       assert {:ok, _fix, :created} = fix(ctx, cp2, [f1.id])
       verdict!(ctx, r2)
 
@@ -681,7 +692,7 @@ defmodule Loopctl.Threads.ReviewsTest do
       cp2 = checkpoint(ctx, 2)
 
       r2 = placed!(ctx)
-      finding!(ctx, r2, %{"introduced_by" => cp2.id, "severity" => "low"})
+      finding!(ctx, r2, %{"introduced_by" => cp2.id, "severity" => "medium"})
       verdict!(ctx, r2)
       assert %{next_round: nil} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
 

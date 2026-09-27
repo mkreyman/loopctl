@@ -8341,7 +8341,7 @@ const TOOLS = [
       "of the current claim. It claims nothing and returns NO credential: the review's " +
       "findings and verdict come back over that runner's socket, never through this tool. " +
       "Rounds are counted per claim (a story claimed again starts at round 1). Round 2 " +
-      "always follows round 1; round 3 only when a round-2 finding names a checkpoint " +
+      "always follows round 1; round 3 only when a material round-2 finding names a checkpoint " +
       "carrying a round-1 fix recorded before round 2 was placed; never round 4. A round " +
       "whose verdict reaches the ceiling with a material finding escalates the story. " +
       "Needs LOOPCTL_ORCH_KEY (principal " +
@@ -8349,8 +8349,11 @@ const TOOLS = [
       "with the same one. Refusals: 403 for an agent key; 409 `no_checkpoint`, " +
       "`review_claim_ended` (no live claim to review), `review_ceiling_reached`, `reviewer_not_separate` (the runner's agent is the claimant, " +
       "recorded a checkpoint, or is on the implementer's lineage chain), " +
-      "`implementer_dispatch_required`, `dispatch_id_conflict`, and the push's own " +
-      "(`runner_not_connected`, `kind_not_supported`, `budget_unset`, ...); 429 at capacity; " +
+      "`implementer_dispatch_required`, `dispatch_id_conflict`, `review_dispatch_refused` " +
+      "(the runner refused or superseded that review: place a new one with a new " +
+      "`dispatch_id`), and the push's own " +
+      "(`runner_not_connected`, `kind_not_supported`, `budget_unset`, ...); 422 " +
+      "`invalid_uuid` for a malformed `runner_id` or `dispatch_id`; 429 at capacity; " +
       "503 `tenant_halted`.",
     inputSchema: {
       type: "object",

@@ -644,6 +644,33 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert lease(runner.tenant_id, record.story_id) == {provisional, provisional}
     end
 
+    test "each session-end WRITE refuses the other kind under its own row lock",
+         %{runner: runner} do
+      implement = accepted(runner)
+      review = sent(runner, %{"story_id" => implement.story_id}, %{kind: "review"})
+      {:ok, review} = reply(runner, review)
+
+      message = fn record ->
+        %{dispatch_id: record.dispatch_id, claim_epoch: record.claim_epoch, reason: "crashed"}
+      end
+
+      assert {:error, :unknown_dispatch} =
+               DispatchLedger.record_review_session_end(
+                 runner.tenant_id,
+                 runner.id,
+                 message.(implement),
+                 "d1"
+               )
+
+      assert {:error, :unknown_dispatch} =
+               DispatchLedger.record_session_end(runner.tenant_id, runner.id, message.(review), %{
+                 reason: "crashed",
+                 digest: "d2",
+                 counts_toward_retry_ceiling: true,
+                 story_id: review.story_id
+               })
+    end
+
     test "its budget kill is not read as the implementer's session end", %{runner: runner} do
       implement = accepted(runner)
       review = sent(runner, %{"story_id" => implement.story_id}, %{kind: "review"})

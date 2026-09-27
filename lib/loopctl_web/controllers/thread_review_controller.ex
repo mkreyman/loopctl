@@ -53,7 +53,7 @@ defmodule LoopctlWeb.ThreadReviewController do
         "choice). It claims nothing and mints no credential: the review's findings and " <>
         "verdict come back over the runner socket from that runner. Rounds are counted per " <>
         "claim, so a story claimed again starts at round 1. Round 2 always follows " <>
-        "round 1; round 3 only when a round-2 finding's `introduced_by` names a checkpoint " <>
+        "round 1; round 3 only when a material round-2 finding's `introduced_by` names a checkpoint " <>
         "carrying a fix recorded before round 2 was placed; never round " <>
         "#{Reviews.max_rounds() + 1}. The runner's agent must be separate: not the story's " <>
         "claimant, not a checkpoint recorder, and the agent of no dispatch on the " <>
@@ -97,12 +97,16 @@ defmodule LoopctlWeb.ThreadReviewController do
            "story has no live claim to review), `review_ceiling_reached`, " <>
            "`reviewer_not_separate` (the runner's agent is the claimant, recorded a " <>
            "checkpoint, or is on the implementer's lineage chain), " <>
-           "`implementer_dispatch_required`, `dispatch_id_conflict`, or a runner refusal " <>
+           "`implementer_dispatch_required`, `dispatch_id_conflict`, " <>
+           "`review_dispatch_refused` (a retry of a review the runner refused or superseded: " <>
+           "place a new review with a new `dispatch_id`), or a runner refusal " <>
            "(`runner_not_provisioned`, `runner_declines_work`, `runner_not_connected`, " <>
            "`repo_not_allowed`, " <>
            "`kind_not_supported`, `budget_unset`, ...)", "application/json",
          Schemas.ErrorResponse},
-      422 => {"An invalid field", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"`invalid_uuid` (a malformed `runner_id` or `dispatch_id` in the body; a malformed " <>
+           "path id is 404), or another invalid field", "application/json", Schemas.ErrorResponse},
       429 =>
         {"The runner or the tenant is at capacity", "application/json", Schemas.ErrorResponse},
       503 =>
@@ -184,11 +188,12 @@ defmodule LoopctlWeb.ThreadReviewController do
     api_key = conn.assigns.current_api_key
 
     with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
-         {:ok, runner_id} <- ThreadHTTP.uuid(params["runner_id"]),
+         {:ok, runner_id} <- ThreadHTTP.body_uuid(params, "runner_id", :required),
+         {:ok, requested_dispatch_id} <- ThreadHTTP.body_uuid(params, "dispatch_id", :optional),
          {:ok, %{review: review, dispatch_id: dispatch_id}} <-
            Placement.place_review(api_key.tenant_id, runner_id, story_id,
              api_key: api_key,
-             dispatch_id: params["dispatch_id"],
+             dispatch_id: requested_dispatch_id,
              wall_clock_seconds: params["wall_clock_seconds"],
              max_turns: params["max_turns"],
              repo: params["repo"],
