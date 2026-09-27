@@ -103,7 +103,7 @@ defmodule Loopctl.Threads.HumanFindingsTest do
   end
 
   defp human!(ctx, checkpoint, attrs \\ %{}) do
-    {:ok, entry, :created} = human(ctx, checkpoint, attrs)
+    {:ok, %{entry: entry, escalation: nil}, :created} = human(ctx, checkpoint, attrs)
     entry
   end
 
@@ -195,8 +195,8 @@ defmodule Loopctl.Threads.HumanFindingsTest do
       cp = checkpoint(ctx, 1)
       attrs = %{"idempotency_key" => "form-nonce-1"}
 
-      assert {:ok, entry, :created} = human(ctx, cp, attrs)
-      assert {:ok, ^entry, :existing} = human(ctx, cp, attrs)
+      assert {:ok, %{entry: entry}, :created} = human(ctx, cp, attrs)
+      assert {:ok, %{entry: ^entry}, :existing} = human(ctx, cp, attrs)
 
       assert {:error, {:conflict, "idempotency_key_reused", _}} =
                human(ctx, cp, Map.put(attrs, "body", "something else"))
@@ -350,7 +350,33 @@ defmodule Loopctl.Threads.HumanFindingsTest do
       assert cp1.seq < cp2.seq
     end
 
-    test "one written AFTER the round's verdict counts for neither decision", ctx do
+    test "it counts in the round in progress on ANY checkpoint of the claim", ctx do
+      cp1 = checkpoint(ctx, 1)
+      r1 = placed!(ctx)
+      verdict!(ctx, r1)
+      checkpoint(ctx, 2)
+
+      # Round 2 reviews cp2; the human's critical finding is on cp1, while round 2 is open.
+      r2 = placed!(ctx)
+      human!(ctx, cp1, %{"introduced_by" => "none", "severity" => "critical"})
+
+      assert %{escalation: %Entry{kind: :escalation}} = verdict!(ctx, r2)
+    end
+
+    test "one written BEFORE the round opened counts in the round it was written in", ctx do
+      cp1 = checkpoint(ctx, 1)
+      r1 = placed!(ctx)
+      human!(ctx, cp1, %{"severity" => "critical"})
+      verdict!(ctx, r1)
+      checkpoint(ctx, 2)
+
+      # Round 2 finds nothing: the round-1 finding must not count in it.
+      r2 = placed!(ctx)
+      assert %{escalation: nil} = verdict!(ctx, r2)
+    end
+
+    test "a material one written AFTER the final verdict escalates over review_ceiling",
+         ctx do
       checkpoint(ctx, 1)
       r1 = placed!(ctx)
       f1 = agent_finding!(ctx, r1, %{})
@@ -362,8 +388,52 @@ defmodule Loopctl.Threads.HumanFindingsTest do
       assert %{escalation: nil} = verdict!(ctx, r2)
       assert %{next_round: nil} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
 
-      human!(ctx, cp2, %{"introduced_by" => cp2.id, "severity" => "critical"})
+      # A LOW one escalates nothing.
+      assert {:ok, %{escalation: nil}, :created} =
+               human(ctx, cp2, %{"introduced_by" => "none", "severity" => "low"})
+
+      attrs = %{"introduced_by" => cp2.id, "severity" => "critical", "idempotency_key" => "late"}
+      assert {:ok, %{escalation: %Entry{} = escalation}, :created} = human(ctx, cp2, attrs)
+
+      assert escalation.kind == :escalation and escalation.review_id == r2.id
+      assert escalation.author_principal == Threads.review_ceiling_principal()
+      assert escalation.body =~ "review_ceiling"
+      # It decided nothing about the rounds: there is still no round 3.
       assert %{next_round: nil} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
+
+      # The resend hears the same escalation; a second late finding records no second one.
+      assert {:ok, %{escalation: ^escalation}, :existing} = human(ctx, cp2, attrs)
+
+      assert {:ok, %{escalation: ^escalation}, :created} =
+               human(ctx, cp2, %{"introduced_by" => "none", "severity" => "high"})
+    end
+
+    test "after a ceiling verdict that already escalated, the same escalation is returned",
+         ctx do
+      checkpoint(ctx, 1)
+      r1 = placed!(ctx)
+      verdict!(ctx, r1)
+      cp2 = checkpoint(ctx, 2)
+      r2 = placed!(ctx)
+      agent_finding!(ctx, r2, %{"introduced_by" => "none", "severity" => "high"})
+      %{escalation: %Entry{} = escalation} = verdict!(ctx, r2)
+
+      assert {:ok, %{escalation: ^escalation}, :created} =
+               human(ctx, cp2, %{"introduced_by" => "none", "severity" => "high"})
+    end
+
+    test "a halted tenant is refused a new finding; the resend of a recorded one is answered",
+         ctx do
+      cp = checkpoint(ctx, 1)
+      attrs = %{"idempotency_key" => "before-halt"}
+      {:ok, %{entry: entry}, :created} = human(ctx, cp, attrs)
+
+      Repo.update_all(from(t in Loopctl.Tenants.Tenant, where: t.id == ^ctx.tenant_id),
+        set: [custody_halted_at: DateTime.utc_now()]
+      )
+
+      assert {:error, :tenant_halted} = human(ctx, cp)
+      assert {:ok, %{entry: ^entry}, :existing} = human(ctx, cp, attrs)
     end
   end
 end

@@ -1105,44 +1105,54 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
   end
 
   describe "checkpoint_diff/3 (US-45.7)" do
-    test "compares against the parent checkpoint, asking for the diff media type" do
+    test "compares the base branch with the checkpoint, asking for the diff media type" do
       stub(fn conn ->
         send(self(), {:diff_request, conn.request_path, Plug.Conn.get_req_header(conn, "accept")})
         Plug.Conn.send_resp(conn, 200, "diff --git a/x b/x\n+added\n")
       end)
 
       assert {:ok, %{text: "diff --git a/x b/x\n+added\n", truncated: false}} =
-               Source.checkpoint_diff(@repo, @merge_base, @head)
+               Source.checkpoint_diff(@repo, "release/1.2", @head)
 
       assert_received {:diff_request, path, ["application/vnd.github.diff"]}
-      assert path == "/repos/acme/widgets/compare/#{@merge_base}...#{@head}"
+      assert path == "/repos/acme/widgets/compare/release/1.2...#{@head}"
     end
 
-    test "with no parent it reads the commit's own diff" do
-      stub(fn conn ->
-        send(self(), {:diff_path, conn.request_path})
-        Plug.Conn.send_resp(conn, 200, "+x\n")
-      end)
+    test "chunks are accumulated in order, and the bound and the deadline both cut" do
+      far = System.monotonic_time(:millisecond) + 60_000
+      start = {Req.new(), Req.Response.new(status: 200)}
 
-      assert {:ok, %{text: "+x\n"}} = Source.checkpoint_diff(@repo, nil, @head)
-      assert_received {:diff_path, "/repos/acme/widgets/commits/" <> @head}
+      {:cont, acc} = Source.collect_diff({:data, "one "}, start, far)
+      {:cont, acc} = Source.collect_diff({:data, "two "}, acc, far)
+      {:cont, {_req, response}} = Source.collect_diff({:data, "three"}, acc, far)
+
+      assert {chunks, 13} = Req.Response.get_private(response, :diff)
+      assert IO.iodata_to_binary(chunks) == "one two three"
+      refute Req.Response.get_private(response, :truncated)
+
+      past = System.monotonic_time(:millisecond) - 1
+      {:halt, {_req, late}} = Source.collect_diff({:data, "late"}, start, past)
+      assert Req.Response.get_private(late, :truncated)
     end
 
     test "a diff past the byte bound is cut and marked truncated, never refused" do
       big = String.duplicate("+", 600 * 1024)
       stub(fn conn -> Plug.Conn.send_resp(conn, 200, big) end)
 
-      assert {:ok, %{text: text, truncated: true}} = Source.checkpoint_diff(@repo, nil, @head)
+      assert {:ok, %{text: text, truncated: true}} =
+               Source.checkpoint_diff(@repo, "master", @head)
+
       assert byte_size(text) == 512 * 1024
     end
 
-    test "a forge failure keeps the shared classification, and a malformed sha is refused unread" do
+    test "a forge failure keeps the shared classification; a malformed ref or sha is refused unread" do
       stub(fn conn -> Plug.Conn.send_resp(conn, 502, "") end)
 
-      assert {:error, {:github_api_error, 502}} = Source.checkpoint_diff(@repo, nil, @head)
+      assert {:error, {:github_api_error, 502}} = Source.checkpoint_diff(@repo, "master", @head)
 
-      assert {:error, {:invalid_sha, _}} = Source.checkpoint_diff(@repo, nil, "HEAD?x=1")
-      assert {:error, {:invalid_sha, _}} = Source.checkpoint_diff(@repo, "../../x", @head)
+      assert {:error, {:invalid_sha, _}} = Source.checkpoint_diff(@repo, "master", "HEAD?x=1")
+      assert {:error, {:invalid_ref, _}} = Source.checkpoint_diff(@repo, "../../x", @head)
+      assert {:error, {:invalid_ref, _}} = Source.checkpoint_diff(@repo, nil, @head)
     end
   end
 end

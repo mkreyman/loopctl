@@ -1,14 +1,24 @@
 defmodule Loopctl.WebAuthn.BrowserLoginTest do
   @moduledoc """
-  US-45.7 (AC-45.7.1): browser login on `Loopctl.WebAuthn.Reauth`'s ceremony, and what ends a
-  session. The WebAuthn adapter is `Loopctl.MockWebAuthn` (config/test.exs).
+  US-45.7 (AC-45.7.1): browser login on `Loopctl.WebAuthn.Reauth`'s ceremony, the one answer
+  it gives every slug, and what ends a session. The WebAuthn adapter is `Loopctl.MockWebAuthn`
+  (config/test.exs).
+
+  The ceremony runs on `AdminRepo`, so its tests use `AdminRepo` fixtures; a session is
+  validated under the tenant's RLS on `Loopctl.Repo`, so `validate/2`'s tests use `Repo` ones.
   """
 
   use Loopctl.DataCase, async: true
 
+  import Ecto.Query
+
   alias Loopctl.AdminRepo
-  alias Loopctl.Tenants.RootAuthenticators
+  alias Loopctl.Repo
+  alias Loopctl.Tenants.RootAuthenticator
+  alias Loopctl.Tenants.Tenant
   alias Loopctl.WebAuthn.BrowserLogin
+  alias Loopctl.WebAuthn.BrowserSession
+  alias Loopctl.WebAuthn.Reauth
   alias Loopctl.WebAuthn.ReauthChallenge
 
   setup :verify_on_exit!
@@ -29,90 +39,120 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
     }
   end
 
-  defp session(tenant, authenticator, at \\ System.system_time(:second)) do
-    BrowserLogin.to_session(%{
-      tenant_id: tenant.id,
-      authenticator_id: authenticator.id,
-      authenticated_at: at
-    })
+  # A tenant, authenticator and session on the RLS repo, where `validate/2` reads.
+  defp repo_session(attrs \\ %{}) do
+    tenant = fixture(:stage_tenant, %{})
+    auth = fixture(:root_authenticator, tenant_id: tenant.id, repo: Repo)
+
+    session =
+      fixture(
+        :browser_session,
+        Map.merge(%{tenant_id: tenant.id, authenticator_id: auth.id, repo: Repo}, attrs)
+      )
+
+    %{
+      tenant: tenant,
+      auth: auth,
+      session: session,
+      cookie: %{"tenant_id" => tenant.id, "session_id" => session.id}
+    }
   end
 
   describe "begin/1" do
     test "issues a stored browser_login challenge for the tenant's enrolled credentials", ctx do
       assert {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
-      assert issued.tenant_id == ctx.tenant.id
 
       assert issued.allowed_credentials == [
                Base.url_encode64(ctx.authenticator.credential_id, padding: false)
              ]
 
-      assert %ReauthChallenge{purpose: "browser_login"} =
+      assert %ReauthChallenge{purpose: "browser_login", tenant_id: tid} =
                AdminRepo.get(ReauthChallenge, issued.challenge_id)
+
+      assert tid == ctx.tenant.id
+      refute Map.has_key?(issued, :tenant_id)
     end
 
-    test "one answer for an unknown slug, a tenant with no authenticator, and one not active" do
+    test "every slug gets the same answer: the same keys and shapes, no tenant id", ctx do
       bare = fixture(:tenant)
       suspended = fixture(:tenant, %{status: :suspended})
       fixture(:root_authenticator, tenant_id: suspended.id)
 
-      assert {:error, :unavailable} = BrowserLogin.begin("no-such-tenant")
-      assert {:error, :unavailable} = BrowserLogin.begin(bare.slug)
-      assert {:error, :unavailable} = BrowserLogin.begin(suspended.slug)
-      assert {:error, :unavailable} = BrowserLogin.begin(nil)
+      {:ok, real} = BrowserLogin.begin(ctx.tenant.slug)
+
+      for slug <- ["no-such-tenant", bare.slug, suspended.slug, nil] do
+        assert {:ok, decoy} = BrowserLogin.begin(slug)
+        assert Map.keys(decoy) |> Enum.sort() == Map.keys(real) |> Enum.sort()
+        assert {:ok, _} = Ecto.UUID.cast(decoy.challenge_id)
+        assert byte_size(decoy.challenge) == byte_size(real.challenge)
+        assert [credential] = decoy.allowed_credentials
+        assert {:ok, _} = Base.url_decode64(credential, padding: false)
+        assert decoy.rp_id == real.rp_id
+        assert %DateTime{} = decoy.expires_at
+        # A decoy is never stored, so its id can only fail verification.
+        assert AdminRepo.get(ReauthChallenge, decoy.challenge_id) == nil
+      end
     end
 
-    test "the tenant's budget is fail-closed", ctx do
-      stub(Loopctl.MockRateLimiter, :check_rate, fn "browser_login:challenge:tenant:" <> _,
-                                                    _,
-                                                    _ ->
-        {:deny, 60}
-      end)
+    test "a decoy's credential is stable for its slug and differs between slugs" do
+      {:ok, one} = BrowserLogin.begin("ghost-a")
+      {:ok, again} = BrowserLogin.begin("ghost-a")
+      {:ok, other} = BrowserLogin.begin("ghost-b")
 
-      assert {:error, :rate_limited} = BrowserLogin.begin(ctx.tenant.slug)
+      assert one.allowed_credentials == again.allowed_credentials
+      refute one.allowed_credentials == other.allowed_credentials
+      refute one.challenge_id == again.challenge_id
+    end
+
+    test "there is no per-tenant budget a stranger could spend", ctx do
+      expect(Loopctl.MockRateLimiter, :check_rate, 0, fn _, _, _ -> {:deny, 1} end)
+      assert {:ok, _} = BrowserLogin.begin(ctx.tenant.slug)
     end
   end
 
-  describe "complete/2" do
-    test "a verified assertion binds the tenant and the asserting authenticator", ctx do
+  describe "complete/1" do
+    test "a verified assertion opens a session on the tenant the stored challenge names", ctx do
       {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
 
       assert {:ok, principal} =
-               BrowserLogin.complete(
-                 ctx.tenant.id,
-                 assertion(issued.challenge_id, ctx.authenticator)
-               )
+               BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
 
       assert principal.tenant_id == ctx.tenant.id
       assert principal.authenticator_id == ctx.authenticator.id
-      assert_in_delta principal.authenticated_at, System.system_time(:second), 5
-    end
 
-    test "the tenant's verify budget is fail-closed and checked before verification", ctx do
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      assert %BrowserSession{revoked_at: nil, expires_at: expires} =
+               AdminRepo.get(BrowserSession, principal.session_id)
 
-      stub(Loopctl.MockRateLimiter, :check_rate, fn
-        "browser_login:verify:tenant:" <> _, _, _ -> {:deny, 60}
-        _bucket, _window, _limit -> {:allow, 1}
-      end)
-
-      expect(Loopctl.MockWebAuthn, :verify_authentication, 0, fn _, _, _ -> {:ok, %{}} end)
-
-      assert {:error, :rate_limited} =
-               BrowserLogin.complete(
-                 ctx.tenant.id,
-                 assertion(issued.challenge_id, ctx.authenticator)
-               )
+      assert_in_delta DateTime.diff(expires, DateTime.utc_now()),
+                      BrowserLogin.lifetime_seconds(),
+                      5
     end
 
     test "a challenge is good once: the replay is refused", ctx do
       {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
       params = assertion(issued.challenge_id, ctx.authenticator)
 
-      assert {:ok, _} = BrowserLogin.complete(ctx.tenant.id, params)
-      assert {:error, :challenge_not_found} = BrowserLogin.complete(ctx.tenant.id, params)
+      assert {:ok, _} = BrowserLogin.complete(params)
+      assert {:error, :challenge_not_found} = BrowserLogin.complete(params)
     end
 
-    test "an assertion the adapter rejects binds nothing", ctx do
+    test "a decoy challenge fails exactly as a replayed one does", ctx do
+      {:ok, decoy} = BrowserLogin.begin("nobody-here")
+
+      assert {:error, :challenge_not_found} =
+               BrowserLogin.complete(assertion(decoy.challenge_id, ctx.authenticator))
+
+      assert {:error, :challenge_not_found} = BrowserLogin.complete(%{})
+    end
+
+    test "a challenge issued for another ceremony cannot sign in", ctx do
+      {:ok, other} = Reauth.issue_challenge(ctx.tenant.id, "rotate_audit_key")
+
+      assert {:error, :challenge_not_found} =
+               BrowserLogin.complete(assertion(other.challenge_id, ctx.authenticator))
+    end
+
+    test "an assertion the adapter rejects opens nothing", ctx do
       expect(Loopctl.MockWebAuthn, :verify_authentication, fn _, _, _ ->
         {:error, :invalid_signature}
       end)
@@ -120,78 +160,96 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
       {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
 
       assert {:error, :invalid_signature} =
-               BrowserLogin.complete(
-                 ctx.tenant.id,
-                 assertion(issued.challenge_id, ctx.authenticator)
-               )
+               BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
+
+      assert AdminRepo.aggregate(BrowserSession, :count) == 0
     end
 
-    test "tenant isolation: one tenant's challenge cannot sign in to another", ctx do
+    test "tenant isolation: another tenant's credential cannot answer this tenant's challenge",
+         ctx do
       other = fixture(:tenant)
       other_auth = fixture(:root_authenticator, tenant_id: other.id)
       {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
 
-      assert {:error, :challenge_not_found} =
-               BrowserLogin.complete(other.id, assertion(issued.challenge_id, other_auth))
-
-      assert {:error, :invalid_login} = BrowserLogin.complete("not-a-uuid", %{})
+      assert {:error, :not_found} =
+               BrowserLogin.complete(assertion(issued.challenge_id, other_auth))
     end
 
     test "an expired challenge is refused", ctx do
       {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
 
       AdminRepo.update_all(
-        Ecto.Query.from(c in ReauthChallenge, where: c.id == ^issued.challenge_id),
+        from(c in ReauthChallenge, where: c.id == ^issued.challenge_id),
         set: [expires_at: DateTime.add(DateTime.utc_now(), -1)]
       )
 
       assert {:error, :challenge_not_found} =
-               BrowserLogin.complete(
-                 ctx.tenant.id,
-                 assertion(issued.challenge_id, ctx.authenticator)
-               )
+               BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
     end
   end
 
-  describe "validate/2" do
-    test "a live session validates", ctx do
-      assert {:ok, %{tenant_id: tid}} =
-               BrowserLogin.validate(session(ctx.tenant, ctx.authenticator))
-
-      assert tid == ctx.tenant.id
+  describe "validate/2, under the tenant's RLS" do
+    test "a live session validates" do
+      %{cookie: cookie, tenant: tenant, session: session} = repo_session()
+      assert {:ok, %{tenant_id: tid, session_id: sid}} = BrowserLogin.validate(cookie)
+      assert tid == tenant.id and sid == session.id
     end
 
-    test "the lifetime is absolute", ctx do
-      at = System.system_time(:second) - BrowserLogin.lifetime_seconds() - 1
-
-      assert {:error, :expired} =
-               BrowserLogin.validate(session(ctx.tenant, ctx.authenticator, at))
-
-      future = System.system_time(:second) + 3_600
-
-      assert {:error, :expired} =
-               BrowserLogin.validate(session(ctx.tenant, ctx.authenticator, future))
+    test "the lifetime is absolute" do
+      %{cookie: cookie} = repo_session(%{expires_at: DateTime.add(DateTime.utc_now(), -1)})
+      assert {:error, :no_session} = BrowserLogin.validate(cookie)
     end
 
-    test "revoking the authenticator ends the session", ctx do
-      {:ok, _} = RootAuthenticators.delete(ctx.tenant.id, ctx.authenticator.id)
+    test "logout revokes on the server: every copy of the cookie stops working" do
+      %{cookie: cookie, session: session} = repo_session()
+      copy = Map.new(cookie)
 
-      assert {:error, :authenticator_revoked} =
-               BrowserLogin.validate(session(ctx.tenant, ctx.authenticator))
+      {:ok, _} =
+        Repo.with_tenant(cookie["tenant_id"], fn ->
+          from(s in BrowserSession, where: s.id == ^session.id)
+          |> Repo.update_all(set: [revoked_at: DateTime.utc_now()])
+        end)
+
+      assert {:error, :no_session} = BrowserLogin.validate(copy)
     end
 
-    test "a tenant no longer active ends the session", ctx do
-      ctx.tenant |> Ecto.Changeset.change(status: :suspended) |> AdminRepo.update!()
-
-      assert {:error, :tenant_inactive} =
-               BrowserLogin.validate(session(ctx.tenant, ctx.authenticator))
-    end
-
-    test "tenant isolation: an authenticator of another tenant does not validate", ctx do
+    test "revoke/1 writes the revocation for its own tenant's row only", ctx do
+      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      {:ok, principal} = BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
       other = fixture(:tenant)
 
-      assert {:error, :authenticator_revoked} =
-               BrowserLogin.validate(session(other, ctx.authenticator))
+      :ok = BrowserLogin.revoke(%{"tenant_id" => other.id, "session_id" => principal.session_id})
+      assert %{revoked_at: nil} = AdminRepo.get(BrowserSession, principal.session_id)
+
+      :ok = BrowserLogin.revoke(BrowserLogin.to_session(principal))
+      assert %{revoked_at: %DateTime{}} = AdminRepo.get(BrowserSession, principal.session_id)
+    end
+
+    test "revoking the authenticator ends the session" do
+      %{cookie: cookie, auth: auth} = repo_session()
+
+      {:ok, _} =
+        Repo.with_tenant(cookie["tenant_id"], fn ->
+          Repo.delete_all(from a in RootAuthenticator, where: a.id == ^auth.id)
+        end)
+
+      assert {:error, :no_session} = BrowserLogin.validate(cookie)
+    end
+
+    test "a tenant no longer active ends the session" do
+      %{cookie: cookie, tenant: tenant} = repo_session()
+
+      Repo.update_all(from(t in Tenant, where: t.id == ^tenant.id), set: [status: :suspended])
+
+      assert {:error, :no_session} = BrowserLogin.validate(cookie)
+    end
+
+    test "tenant isolation: a session presented under another tenant does not validate" do
+      %{cookie: cookie} = repo_session()
+      %{tenant: other} = repo_session()
+
+      assert {:error, :no_session} =
+               BrowserLogin.validate(%{cookie | "tenant_id" => other.id})
     end
 
     test "anything else is no session" do
@@ -199,19 +257,7 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
       assert {:error, :no_session} = BrowserLogin.validate(%{"tenant_id" => "x"})
 
       assert {:error, :no_session} =
-               BrowserLogin.validate(%{
-                 "tenant_id" => "nope",
-                 "authenticator_id" => "nope",
-                 "authenticated_at" => System.system_time(:second)
-               })
-    end
-  end
-
-  describe "RootAuthenticators.enrolled?/2" do
-    test "is scoped to the tenant", ctx do
-      other = fixture(:tenant)
-      assert RootAuthenticators.enrolled?(ctx.tenant.id, ctx.authenticator.id)
-      refute RootAuthenticators.enrolled?(other.id, ctx.authenticator.id)
+               BrowserLogin.validate(%{"tenant_id" => "nope", "session_id" => "nope"})
     end
   end
 end

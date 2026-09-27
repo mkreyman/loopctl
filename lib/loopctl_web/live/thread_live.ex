@@ -44,6 +44,7 @@ defmodule LoopctlWeb.ThreadLive do
 
   alias Loopctl.Threads
   alias Loopctl.WebAuthn.BrowserLogin
+  alias Loopctl.Workers.ReviewCeilingWorker
 
   @revalidate_ms 60_000
 
@@ -71,10 +72,10 @@ defmodule LoopctlWeb.ThreadLive do
     end
   end
 
+  # Once, at mount: the NEWEST page of entries. A write adds its own entry
+  # (`record_written/3`); "load older" walks backwards. Nothing re-reads the whole thread.
   defp load(socket) do
-    tenant_id = socket.assigns.browser_principal.tenant_id
-
-    case Threads.page(tenant_id, socket.assigns.story_id, limit: Threads.max_entry_page()) do
+    case Threads.page(socket.assigns.browser_principal.tenant_id, socket.assigns.story_id) do
       {:ok, page} ->
         socket
         |> assign(:story, page.story)
@@ -82,10 +83,10 @@ defmodule LoopctlWeb.ThreadLive do
         |> assign(:repo, page.repo)
         |> assign(:checkpoints, page.checkpoints)
         |> assign(:checkpoints_truncated, page.checkpoints_truncated)
-        |> assign(:next_after_seq, page.next_after_seq)
-        |> assign(:findings, Enum.filter(page.entries, &(&1.kind == :finding)))
-        |> assign(:halted, Loopctl.Runners.custody_halted?(tenant_id))
-        |> assign_new(:finding_form, fn -> finding_form(page.checkpoints) end)
+        |> assign(:older_before_seq, page.older_before_seq)
+        |> assign(:findings, page.findings)
+        |> assign(:halted, page.halted)
+        |> assign(:finding_form, finding_form(page.checkpoints))
         |> stream(:entries, page.entries, reset: true)
 
       {:error, :not_found} ->
@@ -119,7 +120,11 @@ defmodule LoopctlWeb.ThreadLive do
     )
   end
 
+  # A page with no story (a malformed id, or a story this tenant cannot see) has nothing to
+  # write to or read from: every event is refused here, before any clause reads a story id.
   @impl true
+  def handle_event(_event, _params, %{assigns: %{story: nil}} = socket), do: {:noreply, socket}
+
   def handle_event("post_message", %{"message" => %{"body" => body, "nonce" => key}}, socket) do
     write(socket, :message_form, :message, fn principal ->
       Threads.record_entry(
@@ -148,6 +153,7 @@ defmodule LoopctlWeb.ThreadLive do
   end
 
   def handle_event("load_diff", %{"id" => checkpoint_id}, socket) when is_binary(checkpoint_id) do
+    # A failed fetch leaves an error state, and the retry control sends this event again.
     if Map.get(socket.assigns.diffs, checkpoint_id) == :loading do
       {:noreply, socket}
     else
@@ -163,21 +169,18 @@ defmodule LoopctlWeb.ThreadLive do
     end
   end
 
-  def handle_event("load_more", _params, %{assigns: %{next_after_seq: seq}} = socket)
+  # The page before the oldest one shown, inserted above it. Each entry goes in at the top, so
+  # the page is fed newest first to leave it oldest first on screen.
+  def handle_event("load_older", _params, %{assigns: %{older_before_seq: seq}} = socket)
       when is_integer(seq) do
     case Threads.page(socket.assigns.browser_principal.tenant_id, socket.assigns.story_id,
-           after_seq: seq,
-           limit: Threads.max_entry_page()
+           before_seq: seq
          ) do
       {:ok, page} ->
         {:noreply,
          socket
-         |> assign(:next_after_seq, page.next_after_seq)
-         |> assign(
-           :findings,
-           socket.assigns.findings ++ Enum.filter(page.entries, &(&1.kind == :finding))
-         )
-         |> stream(:entries, page.entries)}
+         |> assign(:older_before_seq, page.older_before_seq)
+         |> stream(:entries, Enum.reverse(page.entries), at: 0)}
 
       {:error, :not_found} ->
         {:noreply, assign(socket, :story, nil)}
@@ -193,12 +196,11 @@ defmodule LoopctlWeb.ThreadLive do
     case BrowserLogin.validate(BrowserLogin.to_session(socket.assigns.browser_principal)) do
       {:ok, principal} ->
         case fun.(principal) do
-          {:ok, _entry, _created_or_existing} ->
+          {:ok, written, _created_or_existing} ->
             {:noreply,
              socket
              |> assign(form_key, fresh_form(kind, socket))
-             |> assign(:notice, {kind, :ok, "Recorded."})
-             |> load()}
+             |> record_written(kind, written)}
 
           error ->
             {:noreply, assign(socket, :notice, {kind, :error, error_message(error)})}
@@ -207,6 +209,44 @@ defmodule LoopctlWeb.ThreadLive do
       {:error, _reason} ->
         {:noreply, signed_out(socket)}
     end
+  end
+
+  # The written entry goes into the page as it is; checkpoints, diffs and older pages are left
+  # alone. A finding that met the review ceiling brings its escalation with it, and the page
+  # says so rather than "Recorded.": the stage move is enqueued now, and the minute sweep of
+  # `ReviewCeilingWorker` is its backstop.
+  defp record_written(socket, :message, entry) do
+    socket
+    |> stream_insert(:entries, entry)
+    |> assign(:notice, {:message, :ok, "Recorded."})
+  end
+
+  defp record_written(socket, :finding, %{entry: entry, escalation: escalation}) do
+    socket =
+      socket
+      |> stream_insert(:entries, entry)
+      |> assign(:findings, upsert(socket.assigns.findings, entry))
+
+    case escalation do
+      nil ->
+        assign(socket, :notice, {:finding, :ok, "Recorded."})
+
+      escalation ->
+        ReviewCeilingWorker.enqueue(entry.tenant_id, entry.story_id)
+
+        socket
+        |> stream_insert(:entries, escalation)
+        |> assign(
+          :notice,
+          {:finding, :ok,
+           "Recorded. The review rounds are at their ceiling, so this finding escalated the " <>
+             "story (review_ceiling)."}
+        )
+    end
+  end
+
+  defp upsert(findings, entry) do
+    if Enum.any?(findings, &(&1.id == entry.id)), do: findings, else: findings ++ [entry]
   end
 
   defp fresh_form(:message, _socket), do: message_form()
@@ -368,7 +408,11 @@ defmodule LoopctlWeb.ThreadLive do
                   >
                     show diff
                   </button>
-                  <.diff id={"diff-#{cp.id}"} state={Map.get(@diffs, cp.id)} />
+                  <.diff
+                    id={"diff-#{cp.id}"}
+                    checkpoint_id={cp.id}
+                    state={Map.get(@diffs, cp.id)}
+                  />
                 </div>
               </li>
             </ol>
@@ -378,6 +422,16 @@ defmodule LoopctlWeb.ThreadLive do
             <h2 class="border-b border-slate-800 px-4 py-2 font-mono text-xs uppercase tracking-wide text-slate-400">
               Entries
             </h2>
+            <div :if={@older_before_seq} class="border-b border-slate-800 px-4 py-2">
+              <button
+                type="button"
+                id="thread-load-older"
+                phx-click="load_older"
+                class="font-mono text-xs text-accent-400 hover:text-accent-300"
+              >
+                load older entries
+              </button>
+            </div>
             <ol id="thread-entries" phx-update="stream" class="divide-y divide-slate-800">
               <li :for={{dom_id, entry} <- @streams.entries} id={dom_id} class="px-4 py-3">
                 <.entry_header entry={entry} />
@@ -387,16 +441,6 @@ defmodule LoopctlWeb.ThreadLive do
                 >{entry.body}</pre>
               </li>
             </ol>
-            <div :if={@next_after_seq} class="border-t border-slate-800 px-4 py-2">
-              <button
-                type="button"
-                id="thread-load-more"
-                phx-click="load_more"
-                class="font-mono text-xs text-accent-400 hover:text-accent-300"
-              >
-                load more
-              </button>
-            </div>
           </section>
         </div>
 
@@ -590,6 +634,7 @@ defmodule LoopctlWeb.ThreadLive do
   end
 
   attr :id, :string, required: true
+  attr :checkpoint_id, :string, required: true
   attr :state, :any, required: true
 
   defp diff(%{state: nil} = assigns), do: ~H""
@@ -620,7 +665,18 @@ defmodule LoopctlWeb.ThreadLive do
     assigns = assign(assigns, :reason, diff_error(reason))
 
     ~H"""
-    <p id={@id} class="font-mono text-xs text-rose-400">diff unavailable: {@reason}</p>
+    <p id={@id} class="font-mono text-xs text-rose-400">
+      diff unavailable: {@reason}
+      <button
+        type="button"
+        id={"#{@id}-retry"}
+        phx-click="load_diff"
+        phx-value-id={@checkpoint_id}
+        class="ml-2 text-accent-400 hover:text-accent-300"
+      >
+        retry
+      </button>
+    </p>
     """
   end
 
@@ -646,7 +702,11 @@ defmodule LoopctlWeb.ThreadLive do
 
   defp notice(assigns), do: ~H""
 
-  defp diff_error(:no_intake_source), do: "the project has no single intake repository"
+  defp diff_error({:no_intake_source, _project}), do: "the project has no intake repository"
+
+  defp diff_error({:ambiguous_intake_source, _project, _count}),
+    do: "the project has more than one intake repository"
+
   defp diff_error({:github_unreachable, _}), do: "the forge did not answer in time"
   defp diff_error({:github_rate_limited, _, _}), do: "the forge is rate limiting; try later"
   defp diff_error({:github_api_error, status}), do: "the forge answered #{status}"

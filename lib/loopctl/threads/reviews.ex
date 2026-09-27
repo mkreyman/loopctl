@@ -16,9 +16,10 @@ defmodule Loopctl.Threads.Reviews do
 
   A HUMAN finding (US-45.7, PRD §6) is the one judgement no review writes: the tenant's human
   records it from the thread page (`Loopctl.Threads.record_human_finding/3`). It binds to a
-  checkpoint of the current claim, a fix may answer it, and it counts in the round whose
-  checkpoint it is on while that round is in progress (`round_findings/4`), toward the
-  round-3 decision and the ceiling like a reviewer's.
+  checkpoint of the current claim, a fix may answer it, and it counts in the round that was in
+  progress when it was written (`round_findings/4`), toward the round-3 decision and the
+  ceiling like a reviewer's. A material one written after the final round's verdict escalates
+  over `review_ceiling`.
 
   ## Separation
 
@@ -84,8 +85,7 @@ defmodule Loopctl.Threads.Reviews do
           optional(1..3) => %{
             id: Ecto.UUID.t(),
             verdict_seq: pos_integer(),
-            placed_at_seq: non_neg_integer(),
-            checkpoint_id: Ecto.UUID.t()
+            placed_at_seq: non_neg_integer()
           }
         }
 
@@ -380,8 +380,7 @@ defmodule Loopctl.Threads.Reviews do
       Map.put(completed, review.round, %{
         id: review.id,
         verdict_seq: verdict_seq,
-        placed_at_seq: review.placed_at_seq,
-        checkpoint_id: review.checkpoint_id
+        placed_at_seq: review.placed_at_seq
       })
 
     case next_round(tenant_id, story, completed) do
@@ -399,14 +398,17 @@ defmodule Loopctl.Threads.Reviews do
   end
 
   # The findings of completed round `round`: the review's own, plus the HUMAN findings (US-45.7,
-  # PRD §6: "a human finding has the same standing as an agent's") written on the checkpoint that
-  # round reviewed WHILE it was the round in progress — after the previous round's verdict and
-  # before this one's. The window is what keeps a human finding in ONE round: without it a
-  # finding on a checkpoint two rounds reviewed would count in both, and one written after a
-  # verdict could reopen a decision that verdict already made.
+  # PRD §6: "a human finding has the same standing as an agent's") written WHILE it was the round
+  # in progress — after the previous round's verdict and before this one's — on whichever
+  # checkpoint they name. The window is what keeps a human finding in ONE round, and what stops
+  # one written after a verdict reopening the decision that verdict made. It needs no claim test
+  # of its own: only rounds 2 and 3 are ever read here (the ceiling and the round-3 decision),
+  # so the window always opens at a verdict of the CURRENT claim, and a human finding can only
+  # name a checkpoint of the claim current when it was written
+  # (`human_finding_checkpoint/3`). A human finding written after the FINAL verdict counts in no
+  # round: it escalates instead (`Loopctl.Threads.record_human_finding/3`).
   defp round_findings(tenant_id, story, completed, round) do
-    %{id: review_id, verdict_seq: verdict_seq, checkpoint_id: checkpoint_id} =
-      Map.fetch!(completed, round)
+    %{id: review_id, verdict_seq: verdict_seq} = Map.fetch!(completed, round)
 
     after_seq =
       case Map.get(completed, round - 1) do
@@ -417,7 +419,7 @@ defmodule Loopctl.Threads.Reviews do
     of_round =
       dynamic(
         [e],
-        e.review_id == ^review_id or ^humans_in_window(checkpoint_id, after_seq, verdict_seq)
+        e.review_id == ^review_id or ^humans_in_window(after_seq, verdict_seq)
       )
 
     from e in Entry,
@@ -425,14 +427,31 @@ defmodule Loopctl.Threads.Reviews do
       where: ^of_round
   end
 
-  defp humans_in_window(checkpoint_id, after_seq, before_seq) do
+  defp humans_in_window(after_seq, before_seq) do
     human = Threads.human_principal()
 
     dynamic(
       [e],
-      is_nil(e.review_id) and e.author_principal == ^human and
-        e.checkpoint_id == ^checkpoint_id and e.seq > ^after_seq and e.seq < ^before_seq
+      is_nil(e.review_id) and e.author_principal == ^human and e.seq > ^after_seq and
+        e.seq < ^before_seq
     )
+  end
+
+  @doc false
+  # The review whose verdict brought the story's CURRENT claim to the ceiling, or nil while a
+  # round is still placeable. What a material human finding written after that verdict
+  # escalates against (`Loopctl.Threads.record_human_finding/3`).
+  @spec ceiling_review(Ecto.UUID.t(), Story.t()) :: Review.t() | nil
+  def ceiling_review(tenant_id, story) do
+    completed = completed_reviews(tenant_id, story)
+
+    with true <- map_size(completed) > 0,
+         nil <- next_round(tenant_id, story, completed) do
+      %{id: id} = completed |> Enum.max_by(fn {round, _} -> round end) |> elem(1)
+      Repo.one(from r in Review, where: r.id == ^id and r.tenant_id == ^tenant_id)
+    else
+      _open -> nil
+    end
   end
 
   @doc false
@@ -589,14 +608,7 @@ defmodule Loopctl.Threads.Reviews do
       on: r.id == e.review_id,
       where: e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :verdict,
       where: r.claim_epoch == ^story.claim_epoch,
-      select:
-        {r.round,
-         %{
-           id: r.id,
-           verdict_seq: e.seq,
-           placed_at_seq: r.placed_at_seq,
-           checkpoint_id: r.checkpoint_id
-         }}
+      select: {r.round, %{id: r.id, verdict_seq: e.seq, placed_at_seq: r.placed_at_seq}}
     )
     |> Repo.all()
     |> Map.new()

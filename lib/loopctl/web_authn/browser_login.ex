@@ -12,21 +12,39 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
   and persisted in one conditional update. Every failure is closed. A second ceremony would be
   a second place to get any of that wrong.
 
-  ## What a session is bound to
+  ## One answer for every slug
 
-  The tenant, and the authenticator that asserted, stamped with the time it did. The principal
-  it writes as is `Loopctl.Threads.human_principal/0` with an empty lineage — the
-  human-operator shape PRD §6.1 names. The session carries no key and no role; it grants
-  exactly what the thread page does with it.
+  `begin/1` answers a slug that names no tenant, an inactive one or one with no authenticator
+  with a DECOY challenge of the same shape as a real one: an unstored challenge id, fresh
+  challenge bytes, and a credential id derived from the slug under an application secret, so
+  a repeated try sees the same one. The login form carries only the challenge id; `complete/1`
+  resolves the tenant from the STORED challenge, and a decoy id resolves to nothing and fails
+  exactly as a replayed one does. Nothing a stranger sees tells a real slug from an invented
+  one, and no tenant id reaches the page. What remains is timing: a real challenge costs a
+  lookup and an insert that a decoy does not.
+
+  There is deliberately no per-TENANT budget. A budget keyed on something a stranger can name
+  is a lock a stranger can close on the tenant's own human. The budgets are per CLIENT, in the
+  web layer (`LoopctlWeb.LoginLive`, `LoopctlWeb.BrowserSessionController`), and a challenge is
+  short-lived and single-use.
+
+  ## What a session is
+
+  A `browser_sessions` row bound to the tenant and the authenticator that asserted; the cookie
+  carries only its id and tenant. The principal it writes as is
+  `Loopctl.Threads.human_principal/0` with an empty lineage — the human-operator shape PRD §6.1
+  names. It carries no key and no role.
 
   ## When a session ends
 
-  `validate/2` is asked on EVERY request and every LiveView mount, and again before every
-  write and on a timer while a page is open, so each of these ends it on the next ask:
+  `validate/2` is asked on EVERY request and every LiveView mount, and again before every write
+  and on a timer while a page is open. It reads the row under the tenant's RLS, so each of these
+  ends a session on the next ask:
 
-  - the absolute lifetime (`lifetime_seconds/0`) has passed since the assertion. It is
-    absolute, not idle: a stolen cookie is good for at most this long however it is used;
-  - the authenticator was revoked (`Loopctl.Tenants.Enrollment.revoke/2` deletes the row);
+  - the absolute lifetime (`lifetime_seconds/0`) has passed since the assertion;
+  - logout revoked the row (`revoke/1`) — a copied cookie dies with it;
+  - the authenticator was revoked (`Loopctl.Tenants.Enrollment.revoke/2` deletes it, and the
+    row goes with it by `ON DELETE CASCADE`);
   - the tenant is no longer `:active`, or no longer exists.
 
   A custody HALT does not end a session: reads stay open during a halt, as they do on the API
@@ -34,9 +52,16 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
   `Loopctl.Threads` itself.
   """
 
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.Repo
   alias Loopctl.Tenants
-  alias Loopctl.Tenants.RootAuthenticators
+  alias Loopctl.Tenants.Tenant
+  alias Loopctl.WebAuthn.BrowserSession
   alias Loopctl.WebAuthn.Reauth
+  alias Loopctl.WebAuthn.ReauthChallenge
+  alias Plug.Crypto.KeyGenerator
 
   @purpose "browser_login"
 
@@ -45,17 +70,17 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
   # would be the one standing credential in a system built to have none.
   @lifetime_seconds 8 * 60 * 60
 
-  # Per TENANT, fail-closed, on top of the web layer's per-IP budget: issuing a challenge writes
-  # a row and verifying one is CPU-bound, and a tenant's human signs in a handful of times a day.
-  # The same shape as `LoopctlWeb.TenantAuthenticatorController`'s ceremony budget.
-  @rate_window_ms 60 * 60_000
-  @max_per_window 60
+  # The length of a decoy credential id and challenge. A platform or roaming authenticator's
+  # credential id is commonly this long; a challenge is what the adapter issues.
+  @decoy_credential_bytes 32
+  @decoy_challenge_bytes 32
 
-  @typedoc "What a session holds, and what `validate/2` returns when it still holds."
+  @typedoc "An authenticated browser session, as `validate/2` returns it."
   @type principal :: %{
           tenant_id: Ecto.UUID.t(),
+          session_id: Ecto.UUID.t(),
           authenticator_id: Ecto.UUID.t(),
-          authenticated_at: integer()
+          authenticated_at: DateTime.t()
         }
 
   @doc "The Reauth purpose a login challenge is issued and consumed under."
@@ -67,120 +92,171 @@ defmodule Loopctl.WebAuthn.BrowserLogin do
   def lifetime_seconds, do: @lifetime_seconds
 
   @doc """
-  Issues a login challenge for the tenant named by `slug`.
-
-  `{:error, :unavailable}` for every reason one cannot be issued — no such tenant, a tenant not
-  `:active`, no enrolled authenticator — deliberately one answer, so the login form does not
-  tell a stranger which slugs exist. `{:error, :rate_limited}` past the tenant's budget, which
-  does say the slug exists, to someone who has already spent that budget on it.
+  A login challenge for the tenant named by `slug`: `challenge_id`, `challenge`,
+  `allowed_credentials`, `rp_id` and `expires_at`, the same keys and shapes whether `slug` names
+  a tenant that can sign in or not (see the moduledoc). `{:error, :unavailable}` only when a
+  real challenge could not be stored.
   """
-  @spec begin(String.t()) :: {:ok, map()} | {:error, :unavailable}
-  def begin(slug) when is_binary(slug) do
-    with {:ok, tenant} <- Tenants.get_tenant_by_slug(String.trim(slug)),
-         :active <- tenant.status,
-         :ok <- budget("challenge", tenant.id),
+  @spec begin(term()) :: {:ok, map()} | {:error, :unavailable}
+  def begin(slug) do
+    with slug when is_binary(slug) <- slug,
+         {:ok, %Tenant{status: :active} = tenant} <- Tenants.get_tenant_by_slug(String.trim(slug)),
          {:ok, issued} <- Reauth.issue_challenge(tenant.id, @purpose) do
-      {:ok, Map.put(issued, :tenant_id, tenant.id)}
-    else
-      {:error, :rate_limited} = limited -> limited
-      _unavailable -> {:error, :unavailable}
-    end
-  end
-
-  def begin(_slug), do: {:error, :unavailable}
-
-  @doc """
-  Verifies a login assertion (the `Reauth.verify_and_consume/3` params) for `tenant_id` and
-  returns the principal to bind the session to. Fails closed on every error.
-  """
-  @spec complete(Ecto.UUID.t(), map()) :: {:ok, principal()} | {:error, term()}
-  def complete(tenant_id, params) when is_binary(tenant_id) and is_map(params) do
-    with {:ok, tenant_id} <- cast_id(tenant_id),
-         {:ok, tenant} <- Tenants.get_tenant(tenant_id),
-         :active <- tenant.status,
-         :ok <- budget("verify", tenant.id),
-         {:ok, %{authenticator: authenticator}} <-
-           Reauth.verify_and_consume(tenant.id, @purpose, params) do
       {:ok,
-       %{
-         tenant_id: tenant.id,
-         authenticator_id: authenticator.id,
-         authenticated_at: System.system_time(:second)
-       }}
+       Map.take(issued, [:challenge_id, :challenge, :allowed_credentials, :rp_id, :expires_at])}
     else
-      {:error, _reason} = error -> error
-      _inactive -> {:error, :tenant_inactive}
+      {:error, %Ecto.Changeset{}} -> {:error, :unavailable}
+      _no_login_here -> {:ok, decoy(slug)}
     end
   end
 
-  def complete(_tenant_id, _params), do: {:error, :invalid_login}
+  defp decoy(slug) do
+    credential =
+      :hmac
+      |> :crypto.mac(:sha256, decoy_key(), "browser_login decoy:" <> to_string_slug(slug))
+      |> binary_part(0, @decoy_credential_bytes)
 
-  defp cast_id(id) do
-    case Ecto.UUID.cast(id) do
-      {:ok, id} -> {:ok, id}
-      :error -> {:error, :invalid_login}
-    end
+    %{
+      challenge_id: Ecto.UUID.generate(),
+      challenge:
+        @decoy_challenge_bytes |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false),
+      allowed_credentials: [Base.url_encode64(credential, padding: false)],
+      rp_id: Keyword.get(Loopctl.WebAuthn.rp_opts(), :rp_id),
+      expires_at: DateTime.add(DateTime.utc_now(), Reauth.challenge_ttl_seconds(), :second)
+    }
   end
 
-  @doc "The session value for `principal`: string keys, as a cookie session stores them."
-  @spec to_session(principal()) :: map()
-  def to_session(%{tenant_id: tenant_id, authenticator_id: id, authenticated_at: at}),
-    do: %{"tenant_id" => tenant_id, "authenticator_id" => id, "authenticated_at" => at}
+  defp to_string_slug(slug) when is_binary(slug), do: String.trim(slug)
+  defp to_string_slug(_slug), do: ""
+
+  # Derived from the endpoint's secret, so a decoy id is stable per slug for this deployment
+  # and unpredictable without the secret.
+  defp decoy_key do
+    :loopctl
+    |> Application.fetch_env!(LoopctlWeb.Endpoint)
+    |> Keyword.fetch!(:secret_key_base)
+    |> KeyGenerator.generate("browser_login decoy", length: 32)
+  end
 
   @doc """
-  Whether a stored session value still authenticates, at `now` (unix seconds). Asked on every
+  Verifies a login assertion — the `Reauth.verify_and_consume/3` params, `challenge_id`
+  included — and opens a session. The tenant is the one the STORED challenge was issued for,
+  never one the client names; an id no challenge carries (a decoy, a replay, an expired one)
+  is `{:error, :challenge_not_found}`. Fails closed on every error.
+  """
+  @spec complete(map()) :: {:ok, principal()} | {:error, term()}
+  def complete(%{"challenge_id" => challenge_id} = params) when is_binary(challenge_id) do
+    with {:ok, tenant_id} <- challenge_tenant(challenge_id),
+         {:ok, %Tenant{status: :active}} <- Tenants.get_tenant(tenant_id),
+         {:ok, %{authenticator: authenticator}} <-
+           Reauth.verify_and_consume(tenant_id, @purpose, params) do
+      open_session(tenant_id, authenticator.id)
+    else
+      {:ok, %Tenant{}} -> {:error, :tenant_inactive}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def complete(_params), do: {:error, :challenge_not_found}
+
+  # Only WHICH tenant: whether the challenge may be consumed — its purpose, expiry and single use
+  # — is `Reauth.verify_and_consume/3`'s to decide, and it decides it atomically.
+  defp challenge_tenant(challenge_id) do
+    with {:ok, id} <- Ecto.UUID.cast(challenge_id),
+         tenant_id when is_binary(tenant_id) <-
+           AdminRepo.one(from c in ReauthChallenge, where: c.id == ^id, select: c.tenant_id) do
+      {:ok, tenant_id}
+    else
+      _none -> {:error, :challenge_not_found}
+    end
+  end
+
+  # Also clears the tenant's expired sessions, so the table holds at most what is live plus
+  # what expired since this tenant's last login.
+  defp open_session(tenant_id, authenticator_id) do
+    now = DateTime.utc_now()
+
+    AdminRepo.delete_all(
+      from s in BrowserSession, where: s.tenant_id == ^tenant_id and s.expires_at <= ^now
+    )
+
+    session =
+      AdminRepo.insert!(%BrowserSession{
+        tenant_id: tenant_id,
+        authenticator_id: authenticator_id,
+        expires_at: DateTime.add(now, @lifetime_seconds, :second)
+      })
+
+    {:ok,
+     %{
+       tenant_id: tenant_id,
+       session_id: session.id,
+       authenticator_id: authenticator_id,
+       authenticated_at: session.inserted_at
+     }}
+  end
+
+  @doc "Ends a session now, on the server: every copy of its cookie stops validating."
+  @spec revoke(term()) :: :ok
+  def revoke(%{"tenant_id" => tenant_id, "session_id" => session_id} = session) do
+    if well_formed?(session) do
+      AdminRepo.update_all(
+        from(s in BrowserSession,
+          where: s.id == ^session_id and s.tenant_id == ^tenant_id and is_nil(s.revoked_at)
+        ),
+        set: [revoked_at: DateTime.utc_now()]
+      )
+    end
+
+    :ok
+  end
+
+  def revoke(_session), do: :ok
+
+  @doc "The session (cookie) value for `principal`: its tenant and its row, nothing else."
+  @spec to_session(principal()) :: map()
+  def to_session(%{tenant_id: tenant_id, session_id: session_id}),
+    do: %{"tenant_id" => tenant_id, "session_id" => session_id}
+
+  @doc """
+  Whether a stored session value still authenticates at `now`: its row exists under the
+  tenant's RLS, is neither revoked nor expired, and its tenant is `:active`. Asked on every
   request; see the moduledoc for what ends a session.
   """
-  @spec validate(term(), integer()) :: {:ok, principal()} | {:error, atom()}
-  def validate(session, now \\ System.system_time(:second))
+  @spec validate(term(), DateTime.t()) :: {:ok, principal()} | {:error, :no_session}
+  def validate(session, now \\ DateTime.utc_now())
 
-  def validate(
-        %{"tenant_id" => tenant_id, "authenticator_id" => id, "authenticated_at" => at},
-        now
-      )
-      when is_binary(tenant_id) and is_binary(id) and is_integer(at) do
-    principal = %{tenant_id: tenant_id, authenticator_id: id, authenticated_at: at}
+  def validate(%{"tenant_id" => tenant_id, "session_id" => session_id} = session, now) do
+    if well_formed?(session) do
+      {:ok, principal} =
+        Repo.with_tenant(tenant_id, fn -> Repo.one(live_session(tenant_id, session_id, now)) end)
 
-    with :ok <- well_formed(tenant_id, id),
-         :ok <- within_lifetime(at, now),
-         :ok <- still_holds(tenant_id, id) do
-      {:ok, principal}
+      if principal, do: {:ok, principal}, else: {:error, :no_session}
+    else
+      {:error, :no_session}
     end
   end
 
   def validate(_session, _now), do: {:error, :no_session}
 
-  defp budget(action, tenant_id) do
-    if Loopctl.RateLimiter.gate_ok?(
-         "browser_login:#{action}:tenant:#{tenant_id}",
-         @rate_window_ms,
-         @max_per_window
-       ),
-       do: :ok,
-       else: {:error, :rate_limited}
+  defp live_session(tenant_id, session_id, now) do
+    from s in BrowserSession,
+      join: t in Tenant,
+      on: t.id == s.tenant_id,
+      where: s.id == ^session_id and s.tenant_id == ^tenant_id,
+      where: is_nil(s.revoked_at) and s.expires_at > ^now and t.status == :active,
+      select: %{
+        tenant_id: s.tenant_id,
+        session_id: s.id,
+        authenticator_id: s.authenticator_id,
+        authenticated_at: s.inserted_at
+      }
   end
 
-  defp well_formed(tenant_id, id) do
-    if match?({:ok, _}, Ecto.UUID.cast(tenant_id)) and match?({:ok, _}, Ecto.UUID.cast(id)),
-      do: :ok,
-      else: {:error, :no_session}
+  defp well_formed?(%{"tenant_id" => tenant_id, "session_id" => session_id}) do
+    match?({:ok, _}, cast(tenant_id)) and match?({:ok, _}, cast(session_id))
   end
 
-  # Absolute from the assertion; a stamp from the future (beyond a minute of clock skew) is not
-  # one this server wrote, and does not extend the lifetime.
-  defp within_lifetime(at, now) do
-    if now - at <= @lifetime_seconds and at <= now + 60, do: :ok, else: {:error, :expired}
-  end
-
-  defp still_holds(tenant_id, id) do
-    cond do
-      not active?(tenant_id) -> {:error, :tenant_inactive}
-      not RootAuthenticators.enrolled?(tenant_id, id) -> {:error, :authenticator_revoked}
-      true -> :ok
-    end
-  end
-
-  defp active?(tenant_id) do
-    match?({:ok, %{status: :active}}, Tenants.get_tenant(tenant_id))
-  end
+  defp cast(value) when is_binary(value), do: Ecto.UUID.cast(value)
+  defp cast(_value), do: :error
 end

@@ -5,18 +5,23 @@ defmodule Loopctl.Threads.IssueLinks do
 
   ## When the link is written
 
-  In the transaction that records the thread's FIRST checkpoint (`Loopctl.Threads`). A story
-  is a thread from the moment it exists, but until its claimant reports a commit the page has
-  nothing on it but the story; the first checkpoint is when there is work to look at, and it
-  is also the one moment every thread passes through exactly once. Recording at claim time
-  instead would link threads that never produce a commit.
+  Once the thread has a checkpoint. A story is a thread from the moment it exists, but until
+  its claimant reports a commit the page has nothing on it but the story; the first checkpoint
+  is when there is work to look at. Linking at claim time instead would link threads that never
+  produce a commit.
 
-  ## Two halves, far apart, as `Loopctl.Intake.IssueClosures` is
+  The intent is DERIVED from durable state rather than written beside the checkpoint:
+  `record_due/1` finds every intake story with a checkpoint and no link row and writes one. So
+  a thread whose checkpoints predate this code is linked the same way as a new one, and no
+  checkpoint path carries a second write it could forget.
 
-  - `record_in/3` runs INSIDE the checkpoint's transaction and touches no network. The unique
-    index on `(tenant_id, story_id)` and `ON CONFLICT DO NOTHING` make it once per story.
-  - `attempt/2` runs from `Loopctl.Workers.ThreadIssueLinkWorker` with NOTHING held: a
-    compare-and-set claim, one bounded forge call, one short write.
+  ## Two halves, both from `Loopctl.Workers.ThreadIssueLinkWorker`
+
+  - `record_due/1` — a bounded fleet-wide read and an insert per story. The unique index on
+    `(tenant_id, story_id)` and `ON CONFLICT DO NOTHING` make it once per story, however many
+    sweeps overlap.
+  - `attempt/2` — with NOTHING held: a compare-and-set claim, one bounded forge call, one short
+    write.
 
   ## Can a retry do it twice?
 
@@ -29,9 +34,8 @@ defmodule Loopctl.Threads.IssueLinks do
 
   ## Isolation
 
-  `record_in/3` runs on the caller's RLS `Loopctl.Repo` transaction. The drainer's fleet-wide
-  candidate read and its marker writes run on `AdminRepo` with an explicit `tenant_id` on every
-  row-addressed statement, exactly as the closure outbox does.
+  Both halves are fleet-wide on `AdminRepo`, as the closure outbox's drain is: every statement
+  that addresses a row carries an explicit `tenant_id`, and every join matches it on both sides.
   """
 
   import Ecto.Query
@@ -43,6 +47,7 @@ defmodule Loopctl.Threads.IssueLinks do
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
+  alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.IssueLink
   alias Loopctl.WorkBreakdown.Story
 
@@ -56,52 +61,62 @@ defmodule Loopctl.Threads.IssueLinks do
   def max_attempts, do: @max_attempts
 
   @doc """
-  Records the intent to link `story_id`'s intake issue, in the CALLER's `Loopctl.Repo`
-  transaction. `:ok` when a row now exists, `:no_link` when the story came from no intake
-  record or its source is revoked — the ordinary case for an authored story.
+  Writes a link row for up to `limit` intake stories whose thread has a checkpoint and has
+  none yet, fleet-wide. A story whose intake source is revoked is skipped: the tenant
+  disconnected that repository. Returns how many rows it wrote.
   """
-  @spec record_in(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: :ok | :no_link
-  def record_in(repo, tenant_id, story_id) do
-    case target(repo, tenant_id, story_id) do
-      nil -> :no_link
-      target -> insert(repo, tenant_id, story_id, target)
-    end
-  end
+  @spec record_due(pos_integer()) :: non_neg_integer()
+  def record_due(limit) when is_integer(limit) and limit > 0 do
+    now = DateTime.utc_now()
 
-  defp target(repo, tenant_id, story_id) do
-    repo.one(
-      from s in Story,
+    rows =
+      from(s in Story,
+        as: :story,
         join: r in Record,
         on: r.id == s.intake_record_id and r.tenant_id == s.tenant_id,
         join: src in Source,
         on: src.id == r.source_id and src.tenant_id == r.tenant_id,
-        where: s.tenant_id == ^tenant_id and s.id == ^story_id,
         where: is_nil(src.revoked_at) and r.issue_number > 0,
-        select: %{repo_full_name: src.repo_full_name, issue_number: r.issue_number}
-    )
-  end
+        where:
+          exists(
+            from c in Checkpoint,
+              where:
+                c.tenant_id == parent_as(:story).tenant_id and
+                  c.story_id == parent_as(:story).id and c.kind == :checkpoint
+          ),
+        where:
+          not exists(
+            from l in IssueLink,
+              where:
+                l.tenant_id == parent_as(:story).tenant_id and
+                  l.story_id == parent_as(:story).id
+          ),
+        limit: ^limit,
+        select: %{
+          tenant_id: s.tenant_id,
+          story_id: s.id,
+          repo_full_name: src.repo_full_name,
+          issue_number: r.issue_number
+        }
+      )
+      |> AdminRepo.all()
+      |> Enum.map(
+        &Map.merge(&1, %{
+          id: Ecto.UUID.generate(),
+          status: :pending,
+          attempts: 0,
+          inserted_at: now,
+          updated_at: now
+        })
+      )
 
-  defp insert(repo, tenant_id, story_id, target) do
-    now = DateTime.utc_now()
+    {count, _} =
+      AdminRepo.insert_all(IssueLink, rows,
+        on_conflict: :nothing,
+        conflict_target: {:unsafe_fragment, "(tenant_id, story_id)"}
+      )
 
-    row = %{
-      id: Ecto.UUID.generate(),
-      tenant_id: tenant_id,
-      story_id: story_id,
-      repo_full_name: target.repo_full_name,
-      issue_number: target.issue_number,
-      status: :pending,
-      attempts: 0,
-      inserted_at: now,
-      updated_at: now
-    }
-
-    repo.insert_all(IssueLink, [row],
-      on_conflict: :nothing,
-      conflict_target: {:unsafe_fragment, "(tenant_id, story_id)"}
-    )
-
-    :ok
+    count
   end
 
   @doc "One tenant's link row for a story, or nil."

@@ -33,11 +33,16 @@ defmodule LoopctlWeb.BrowserAuth do
   def session_key, do: @session_key
 
   @doc """
-  The extra session `LoopctlWeb.LoginLive` mounts with: the client IP resolved in the HTTP
-  pipeline, for its per-IP rate limit (the shape `LoopctlWeb.SignupLive.signup_session/1` uses).
+  The extra session `LoopctlWeb.LoginLive` mounts with: its per-client rate-limit key,
+  `Loopctl.RemoteIp.bucket_key/1` of the address the HTTP pipeline resolved — the same key
+  `LoopctlWeb.BrowserSessionController` throttles on, so one client has one budget.
   """
   @spec login_session(Plug.Conn.t()) :: map()
-  def login_session(conn), do: LoopctlWeb.SignupLive.signup_session(conn)
+  def login_session(conn), do: %{"login_rate_key" => client_key(conn)}
+
+  @doc "The per-client rate-limit key for `conn` (`Loopctl.RemoteIp.bucket_key/1`)."
+  @spec client_key(Plug.Conn.t()) :: String.t()
+  def client_key(conn), do: Loopctl.RemoteIp.bucket_key(conn.remote_ip)
 
   @doc false
   def on_mount(:require_browser_session, _params, session, socket) do
@@ -79,9 +84,14 @@ defmodule LoopctlWeb.BrowserAuth do
     |> redirect(to: safe_return_to(return_to))
   end
 
-  @doc "Ends the session and disconnects every LiveView it has open."
+  @doc """
+  Ends the session ON THE SERVER (`BrowserLogin.revoke/1`), so a copy of the cookie stops
+  working too, drops the cookie, and disconnects every LiveView the session has open.
+  """
   @spec log_out(Plug.Conn.t()) :: Plug.Conn.t()
   def log_out(conn) do
+    BrowserLogin.revoke(get_session(conn, @session_key))
+
     if live_socket_id = get_session(conn, :live_socket_id) do
       LoopctlWeb.Endpoint.broadcast(live_socket_id, "disconnect", %{})
     end

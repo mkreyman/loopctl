@@ -205,11 +205,12 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @type checkpoint_diff :: %{text: String.t(), truncated: boolean()}
 
   @doc """
-  The unified diff of `head_sha` against `base_sha`, or of the commit `head_sha` alone when
-  `base_sha` is nil (US-45.7). Read for a HUMAN on demand and never stored, so it is bounded in
-  bytes and in wall clock rather than refused when large: a cut diff is marked `truncated`.
+  The unified diff of the three-dot comparison `base_ref...head_sha` (US-45.7): what the change
+  at `head_sha` is against the branch it will merge onto, as the merge gate judges it. Read for
+  a HUMAN on demand and never stored, so it is bounded in bytes and in wall clock rather than
+  refused when large: a cut diff is marked `truncated`.
   """
-  @callback checkpoint_diff(repo(), String.t() | nil, String.t()) ::
+  @callback checkpoint_diff(repo(), String.t(), String.t()) ::
               {:ok, checkpoint_diff()} | {:error, term()}
 
   @doc "The three-dot comparison `base...head` (US-45.4). See `t:comparison/0`."

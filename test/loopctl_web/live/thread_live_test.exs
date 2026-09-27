@@ -2,34 +2,28 @@ defmodule LoopctlWeb.ThreadLiveTest do
   @moduledoc """
   US-45.7 — the thread page (TC-45.7.2, TC-45.7.3) and the session guarding it.
 
-  `async: false`: the session is validated on `AdminRepo` (the tenant, its authenticator, its
-  halt) while the thread lives on the RLS `Repo`, which are separate sandbox connections, so
-  the tenant is committed — the shape `LoopctlWeb.ThreadControllerTest` gives for the same
-  reason. The authenticator stays on the `AdminRepo` sandbox, which is the only connection that
-  reads it.
+  Everything the page reads — its session, the tenant's status and halt, the thread — is read
+  under the tenant's RLS on `Loopctl.Repo`, so the whole fixture lives on that one sandbox
+  connection and the module runs async.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Ecto.Query
   import Phoenix.LiveViewTest
 
+  alias Loopctl.Intake.Source
   alias Loopctl.Repo
-  alias Loopctl.Tenants
-  alias Loopctl.Tenants.RootAuthenticators
+  alias Loopctl.Tenants.RootAuthenticator
+  alias Loopctl.Tenants.Tenant
   alias Loopctl.Threads
   alias Loopctl.Threads.Entry
   alias Loopctl.WebAuthn.BrowserLogin
+  alias Loopctl.WebAuthn.BrowserSession
   alias Loopctl.WorkBreakdown.Story
   alias LoopctlWeb.BrowserAuth
 
   setup :verify_on_exit!
-
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
 
   @epoch 2
   @tree String.duplicate("e", 40)
@@ -37,8 +31,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
   @sha2 String.duplicate("2", 40)
 
   setup %{conn: conn} do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    authenticator = fixture(:root_authenticator, tenant_id: tenant.id)
+    {tenant, authenticator, session} = human()
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})
     agent = fixture(:stage_agent, %{tenant_id: tenant.id})
 
@@ -54,24 +47,50 @@ defmodule LoopctlWeb.ThreadLiveTest do
         )
       end)
 
-    fixture(:intake_record, %{
-      tenant_id: tenant.id,
-      project_id: story.project_id,
-      repo_full_name: "acme/widgets"
-    })
+    record =
+      fixture(:intake_record, %{
+        tenant_id: tenant.id,
+        project_id: story.project_id,
+        repo_full_name: "acme/widgets"
+      })
 
-    ctx = %{tenant: tenant, authenticator: authenticator, story: story, agent: agent}
-    {:ok, Map.put(ctx, :conn, signed_in(conn, tenant, authenticator))}
+    {:ok, _} =
+      Repo.with_tenant(tenant.id, fn ->
+        from(s in Source, where: s.id == ^record.source_id)
+        |> Repo.update_all(set: [base_branch: "trunk"])
+      end)
+
+    {:ok,
+     %{
+       tenant: tenant,
+       authenticator: authenticator,
+       session: session,
+       story: story,
+       agent: agent,
+       conn: signed_in(conn, session)
+     }}
   end
 
-  defp signed_in(conn, tenant, authenticator, at \\ System.system_time(:second)) do
+  # A tenant, the authenticator its human enrolled, and a live session, on the RLS repo.
+  defp human(session_attrs \\ %{}) do
+    tenant = fixture(:stage_tenant, %{})
+    auth = fixture(:root_authenticator, tenant_id: tenant.id, repo: Repo)
+
+    session =
+      fixture(
+        :browser_session,
+        Map.merge(%{tenant_id: tenant.id, authenticator_id: auth.id, repo: Repo}, session_attrs)
+      )
+
+    {tenant, auth, session}
+  end
+
+  defp signed_in(conn, session) do
     init_test_session(conn, %{
-      BrowserAuth.session_key() =>
-        BrowserLogin.to_session(%{
-          tenant_id: tenant.id,
-          authenticator_id: authenticator.id,
-          authenticated_at: at
-        })
+      BrowserAuth.session_key() => %{
+        "tenant_id" => session.tenant_id,
+        "session_id" => session.id
+      }
     })
   end
 
@@ -90,6 +109,19 @@ defmodule LoopctlWeb.ThreadLiveTest do
     cp
   end
 
+  defp message(ctx, key, body) do
+    {:ok, entry, :created} =
+      Threads.record_entry(
+        ctx.tenant.id,
+        ctx.story.id,
+        %{"kind" => "message", "idempotency_key" => key, "body" => body},
+        author_principal: "agent:#{ctx.agent.id}",
+        actor_lineage: []
+      )
+
+    entry
+  end
+
   defp entries(ctx, kind) do
     {:ok, rows} =
       Repo.with_tenant(ctx.tenant.id, fn ->
@@ -99,7 +131,22 @@ defmodule LoopctlWeb.ThreadLiveTest do
     rows
   end
 
+  defp in_tenant(ctx, fun) do
+    {:ok, result} = Repo.with_tenant(ctx.tenant.id, fun)
+    result
+  end
+
   defp open(ctx), do: live(ctx.conn, ~p"/threads/#{ctx.story.id}")
+
+  defp nonce_of(view, form) do
+    [_, value] =
+      Regex.run(
+        ~r/value="([^"]+)"/,
+        view |> element("##{form}-form input[name='#{form}[nonce]']") |> render()
+      )
+
+    value
+  end
 
   describe "the session guard (AC-45.7.1)" do
     test "an unauthenticated request is sent to /login, remembering the thread", ctx do
@@ -108,17 +155,18 @@ defmodule LoopctlWeb.ThreadLiveTest do
       assert get_session(conn, "browser_return_to") == "/threads/#{ctx.story.id}"
     end
 
-    test "an expired session, and a revoked authenticator, are refused at the request", ctx do
-      stale = System.system_time(:second) - BrowserLogin.lifetime_seconds() - 5
+    test "an expired, a logged-out and a revoked-authenticator session are all refused",
+         ctx do
+      {_tenant, _auth, expired} = human(%{expires_at: DateTime.add(DateTime.utc_now(), -1)})
+      assert redirected_to(get(signed_in(build_conn(), expired), ~p"/threads/x")) == ~p"/login"
 
-      expired =
-        build_conn()
-        |> signed_in(ctx.tenant, ctx.authenticator, stale)
-        |> get(~p"/threads/#{ctx.story.id}")
+      {_tenant, _auth, revoked} = human(%{revoked_at: DateTime.utc_now()})
+      assert redirected_to(get(signed_in(build_conn(), revoked), ~p"/threads/x")) == ~p"/login"
 
-      assert redirected_to(expired) == ~p"/login"
+      in_tenant(ctx, fn ->
+        Repo.delete_all(from a in RootAuthenticator, where: a.id == ^ctx.authenticator.id)
+      end)
 
-      {:ok, _} = RootAuthenticators.delete(ctx.tenant.id, ctx.authenticator.id)
       assert redirected_to(get(ctx.conn, ~p"/threads/#{ctx.story.id}")) == ~p"/login"
     end
 
@@ -143,16 +191,27 @@ defmodule LoopctlWeb.ThreadLiveTest do
     end
 
     test "tenant isolation: another tenant's human does not see the thread", ctx do
-      other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-      other_auth = fixture(:root_authenticator, tenant_id: other.id)
+      {_other, _auth, session} = human()
 
       {:ok, view, _html} =
-        build_conn()
-        |> signed_in(other, other_auth)
-        |> live(~p"/threads/#{ctx.story.id}")
+        build_conn() |> signed_in(session) |> live(~p"/threads/#{ctx.story.id}")
 
       assert has_element?(view, "#thread-not-found")
       refute has_element?(view, "#thread-page")
+    end
+
+    test "a malformed thread id renders not-found and refuses crafted writes", ctx do
+      {:ok, view, _html} = live(ctx.conn, ~p"/threads/not-a-uuid")
+      assert has_element?(view, "#thread-not-found")
+
+      render_hook(view, "post_message", %{"message" => %{"nonce" => "n", "body" => "b"}})
+
+      render_hook(view, "post_finding", %{
+        "finding" => %{"nonce" => "n", "body" => "b", "severity" => "high"}
+      })
+
+      render_hook(view, "load_diff", %{"id" => Ecto.UUID.generate()})
+      assert has_element?(view, "#thread-not-found")
     end
   end
 
@@ -171,19 +230,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
           "jobs" => [%{"name" => "test", "conclusion" => "success"}]
         })
 
-      {:ok, _, :created} =
-        Threads.record_entry(
-          ctx.tenant.id,
-          ctx.story.id,
-          %{
-            "kind" => "message",
-            "idempotency_key" => "m1",
-            "body" => "<script>alert(1)</script> **not bold**"
-          },
-          author_principal: "agent:#{ctx.agent.id}",
-          actor_lineage: []
-        )
-
+      message(ctx, "m1", "<script>alert(1)</script> **not bold**")
       {:ok, view, _html} = open(ctx)
 
       assert has_element?(view, "#checkpoint-#{cp.id}", "checkpoint")
@@ -200,28 +247,30 @@ defmodule LoopctlWeb.ThreadLiveTest do
       refute has_element?(view, "#thread-entries strong")
     end
 
-    test "a diff is fetched from the forge by SHA, against the parent checkpoint", ctx do
+    test "every checkpoint's diff is the placed base...checkpoint comparison", ctx do
       cp1 = checkpoint(ctx, @sha1)
       cp2 = checkpoint(ctx, @sha2)
 
-      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn "acme/widgets", @sha1, @sha2 ->
-        {:ok, %{text: "diff --git a/x b/x\n+the added line", truncated: false}}
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, 2, fn "acme/widgets",
+                                                                    "trunk",
+                                                                    head ->
+        {:ok, %{text: "diff --git a/x b/x\n+line of #{head}", truncated: false}}
       end)
 
       {:ok, view, _html} = open(ctx)
-      view |> element("#diff-button-#{cp2.id}") |> render_click()
-      render_async(view)
 
-      assert has_element?(view, "#diff-#{cp2.id}", "+the added line")
-      refute has_element?(view, "#diff-#{cp1.id}")
+      for cp <- [cp1, cp2] do
+        view |> element("#diff-button-#{cp.id}") |> render_click()
+        render_async(view)
+        assert has_element?(view, "#diff-#{cp.id}", "+line of #{cp.commit_sha}")
+      end
     end
 
-    test "a slow forge leaves the ledger rendered; a down one is shown where the diff goes",
-         ctx do
+    test "a slow forge leaves the ledger rendered; a down one offers a retry", ctx do
       cp = checkpoint(ctx, @sha1)
       test_pid = self()
 
-      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn _repo, nil, @sha1 ->
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn _repo, "trunk", @sha1 ->
         send(test_pid, {:forge_asked, self()})
 
         receive do
@@ -241,6 +290,31 @@ defmodule LoopctlWeb.ThreadLiveTest do
       send(forge, :answer)
       render_async(view)
       assert has_element?(view, "#diff-#{cp.id}", "did not answer")
+
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn _repo, "trunk", @sha1 ->
+        {:ok, %{text: "+second time", truncated: false}}
+      end)
+
+      view |> element("#diff-#{cp.id}-retry") |> render_click()
+      render_async(view)
+      assert has_element?(view, "#diff-#{cp.id}", "+second time")
+    end
+
+    test "the page opens on the NEWEST entries and walks backwards", ctx do
+      checkpoint(ctx, @sha1)
+
+      for n <- 1..(Threads.max_entry_page() + 5),
+          do: message(ctx, "m#{n}", "message number #{n}")
+
+      last = Threads.max_entry_page() + 5
+      {:ok, view, _html} = open(ctx)
+
+      assert has_element?(view, "#thread-entries pre", "message number #{last}")
+      refute has_element?(view, "#thread-entries pre", "implemented the thing")
+
+      view |> element("#thread-load-older") |> render_click()
+      assert has_element?(view, "#thread-entries pre", "implemented the thing")
+      refute has_element?(view, "#thread-load-older")
     end
   end
 
@@ -250,9 +324,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
       checkpoint(ctx, @sha1)
       {:ok, view, _html} = open(ctx)
 
-      nonce =
-        view |> element("#message-form input[name='message[nonce]']") |> render() |> nonce_of()
-
+      nonce = nonce_of(view, "message")
       params = %{message: %{body: "looks right to me", nonce: nonce}}
 
       view |> form("#message-form") |> render_submit(params)
@@ -263,18 +335,39 @@ defmodule LoopctlWeb.ThreadLiveTest do
       assert message.author_principal == "human:webauthn"
       assert message.dispatch_id == nil
       assert has_element?(view, "#message-notice", "Recorded")
+      assert has_element?(view, "#entry-#{message.id}", "looks right to me")
+    end
+
+    test "a write adds its entry without re-reading the ledger", ctx do
+      cp = checkpoint(ctx, @sha1)
+
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn _repo, _base, _head ->
+        {:ok, %{text: "+kept", truncated: false}}
+      end)
+
+      {:ok, view, _html} = open(ctx)
+      view |> element("#diff-button-#{cp.id}") |> render_click()
+      render_async(view)
+
+      # Written behind the page's back: a write that re-read the thread would show it.
+      message(ctx, "behind", "written elsewhere")
+
+      view
+      |> form("#message-form")
+      |> render_submit(%{message: %{nonce: "n1", body: "mine"}})
+
+      assert has_element?(view, "#thread-entries pre", "mine")
+      refute has_element?(view, "#thread-entries pre", "written elsewhere")
+      assert has_element?(view, "#diff-#{cp.id}", "+kept")
     end
 
     test "a finding form submitted twice is one finding, bound to the checkpoint", ctx do
       cp = checkpoint(ctx, @sha1)
       {:ok, view, _html} = open(ctx)
 
-      nonce =
-        view |> element("#finding-form input[name='finding[nonce]']") |> render() |> nonce_of()
-
       params = %{
         finding: %{
-          nonce: nonce,
+          nonce: nonce_of(view, "finding"),
           checkpoint_id: cp.id,
           severity: "high",
           location: "lib/a.ex:1",
@@ -293,7 +386,10 @@ defmodule LoopctlWeb.ThreadLiveTest do
 
     test "a halted tenant reads, writes a message, and is refused a finding", ctx do
       cp = checkpoint(ctx, @sha1)
-      {:ok, _} = Tenants.halt_custody(ctx.tenant.id)
+
+      Repo.update_all(from(t in Tenant, where: t.id == ^ctx.tenant.id),
+        set: [custody_halted_at: DateTime.utc_now()]
+      )
 
       {:ok, view, _html} = open(ctx)
       assert has_element?(view, "#thread-halted")
@@ -311,10 +407,82 @@ defmodule LoopctlWeb.ThreadLiveTest do
       assert [_message] = entries(ctx, :message)
     end
 
+    test "a material finding after the final verdict escalates, and the page says so", ctx do
+      orchestrator = fixture(:stage_agent, %{tenant_id: ctx.tenant.id})
+      reviewer = fixture(:stage_agent, %{tenant_id: ctx.tenant.id})
+      root = fixture(:stage_dispatch, %{tenant_id: ctx.tenant.id, agent_id: orchestrator.id})
+
+      session =
+        fixture(:stage_dispatch, %{tenant_id: ctx.tenant.id, agent_id: ctx.agent.id, parent: root})
+
+      in_tenant(ctx, fn ->
+        from(s in Story, where: s.id == ^ctx.story.id)
+        |> Repo.update_all(set: [implementer_dispatch_id: session.id])
+      end)
+
+      round = fn ->
+        {:ok, review, :created} =
+          Threads.record_review(ctx.tenant.id, ctx.story.id,
+            dispatch_id: Ecto.UUID.generate(),
+            runner_id: reviewer.id,
+            agent_id: reviewer.id,
+            placed_by: "api_key:test"
+          )
+
+        {:ok, _, :created} =
+          Threads.record_judgement(
+            ctx.tenant.id,
+            ctx.story.id,
+            review.dispatch_id,
+            %{"kind" => "verdict", "idempotency_key" => "v-#{review.id}", "body" => "done"},
+            runner_id: reviewer.id,
+            author_principal: "agent:#{reviewer.id}"
+          )
+      end
+
+      checkpoint(ctx, @sha1)
+      round.()
+      cp2 = checkpoint(ctx, @sha2)
+      round.()
+
+      stage =
+        fixture(:story_stage, %{
+          tenant_id: ctx.tenant.id,
+          story_id: ctx.story.id,
+          stage: :reviewing,
+          claim_epoch: @epoch
+        })
+
+      {:ok, view, _html} = open(ctx)
+
+      view
+      |> form("#finding-form")
+      |> render_submit(%{
+        finding: %{
+          nonce: "late",
+          checkpoint_id: cp2.id,
+          severity: "critical",
+          introduced_by: "none",
+          body: "found after the last round"
+        }
+      })
+
+      assert has_element?(view, "#finding-notice", "escalated the story")
+      assert [escalation] = entries(ctx, :escalation)
+      assert has_element?(view, "#entry-#{escalation.id}", "review_ceiling")
+
+      # The stage moved at once: the page enqueued the move (Oban runs inline here).
+      assert %{stage: :escalated} =
+               in_tenant(ctx, fn -> Repo.get(Loopctl.Delivery.StoryStage, stage.id) end)
+    end
+
     test "a revoked authenticator refuses an open page's next write", ctx do
       checkpoint(ctx, @sha1)
       {:ok, view, _html} = open(ctx)
-      {:ok, _} = RootAuthenticators.delete(ctx.tenant.id, ctx.authenticator.id)
+
+      in_tenant(ctx, fn ->
+        Repo.delete_all(from a in RootAuthenticator, where: a.id == ^ctx.authenticator.id)
+      end)
 
       assert {:error, {:redirect, %{to: "/login"}}} =
                view
@@ -324,18 +492,26 @@ defmodule LoopctlWeb.ThreadLiveTest do
       assert [] == entries(ctx, :message)
     end
 
-    test "the revalidation timer signs an idle page out", ctx do
+    test "a logout elsewhere signs an idle page out on its timer", ctx do
       checkpoint(ctx, @sha1)
       {:ok, view, _html} = open(ctx)
-      {:ok, _} = RootAuthenticators.delete(ctx.tenant.id, ctx.authenticator.id)
+
+      in_tenant(ctx, fn ->
+        from(s in BrowserSession, where: s.id == ^ctx.session.id)
+        |> Repo.update_all(set: [revoked_at: DateTime.utc_now()])
+      end)
 
       send(view.pid, :revalidate)
       assert_redirect(view, "/login")
     end
   end
 
-  defp nonce_of(html) do
-    [_, value] = Regex.run(~r/value="([^"]+)"/, html)
-    value
+  test "the session value names the row and its tenant, nothing else", ctx do
+    assert BrowserLogin.to_session(%{
+             tenant_id: ctx.tenant.id,
+             session_id: ctx.session.id,
+             authenticator_id: ctx.authenticator.id,
+             authenticated_at: DateTime.utc_now()
+           }) == %{"tenant_id" => ctx.tenant.id, "session_id" => ctx.session.id}
   end
 end

@@ -1,73 +1,53 @@
 defmodule Loopctl.Workers.ThreadIssueLinkWorkerTest do
   @moduledoc """
-  US-45.7 (TC-45.7.4): the first checkpoint of an intake story leads to ONE comment on its
-  intake issue carrying the thread page's URL, however often the drainer runs.
+  US-45.7 (TC-45.7.4): an intake story whose thread has a checkpoint leads to ONE comment on its
+  intake issue carrying the thread page's URL, however often the worker runs — for a thread
+  recorded before the worker existed as much as for a new one.
 
-  `async: false`: the checkpoint is recorded on the RLS `Repo` and the drainer reads on
-  `AdminRepo`, separate sandbox connections, so the story, its claim and its checkpoint are
-  committed and swept (`sweep_committed_runner_tenants/0`).
+  The worker derives the intent from the checkpoint rows and drains it, both on `AdminRepo`,
+  so the whole path runs on that one sandbox connection, async.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.Repo
-  alias Loopctl.Threads
+  alias Loopctl.AdminRepo
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.ThreadIssueLinkWorker
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
+  test "the first checkpoint of an intake story leads to one comment with the thread URL" do
+    tenant = fixture(:tenant)
+    story = fixture(:story, %{tenant_id: tenant.id})
 
-  @epoch 1
+    record =
+      fixture(:intake_record, %{
+        tenant_id: tenant.id,
+        repo: AdminRepo,
+        repo_full_name: "acme/widgets",
+        issue_number: 314
+      })
 
-  test "the first checkpoint of an intake story posts one comment with the thread URL" do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {_raw, _key, agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
-    {source, record} = fixture(:committed_intake, %{tenant_id: tenant.id})
-    story = fixture(:committed_story, %{tenant_id: tenant.id})
+    AdminRepo.update_all(from(s in Story, where: s.id == ^story.id),
+      set: [intake_record_id: record.id]
+    )
 
-    Sandbox.unboxed_run(Repo, fn ->
-      {:ok, _} =
-        Repo.with_tenant(tenant.id, fn ->
-          from(s in Story, where: s.id == ^story.id)
-          |> Repo.update_all(
-            set: [
-              assigned_agent_id: agent.id,
-              agent_status: :implementing,
-              claim_epoch: @epoch,
-              claimed_until: DateTime.add(DateTime.utc_now(), 3_600),
-              intake_record_id: record.id
-            ]
-          )
-        end)
+    for {seq, sha} <- [{1, "a"}, {2, "b"}] do
+      fixture(:thread_checkpoint, %{
+        repo: AdminRepo,
+        tenant_id: tenant.id,
+        story_id: story.id,
+        seq: seq,
+        commit_sha: String.duplicate(sha, 40)
+      })
+    end
 
-      for sha <- [String.duplicate("a", 40), String.duplicate("b", 40)] do
-        {:ok, _cp, :created} =
-          Threads.record_checkpoint(tenant.id, story.id,
-            agent_id: agent.id,
-            claim_epoch: @epoch,
-            commit_sha: sha,
-            tree_sha: String.duplicate("c", 40),
-            author_principal: "agent:#{agent.id}",
-            actor_lineage: []
-          )
-      end
-    end)
-
-    repo = source.repo_full_name
-    number = record.issue_number
     url = ThreadIssueLinkWorker.thread_url(story.id)
     assert String.ends_with?(url, "/threads/#{story.id}")
 
-    expect(Loopctl.MockPullRequestSource, :comment_issue, 1, fn ^repo, ^number, body ->
+    expect(Loopctl.MockPullRequestSource, :comment_issue, 1, fn "acme/widgets", 314, body ->
       assert body =~ url
       :ok
     end)

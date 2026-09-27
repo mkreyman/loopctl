@@ -12,10 +12,15 @@ defmodule Loopctl.Repo.Migrations.AddThreadPage do
      opens nothing to a key.
 
   2. `thread_issue_links`: the outbox for the comment that links a story's intake issue to its
-     thread page (AC-45.7.4). One row per story, written in the transaction that records the
-     thread's FIRST checkpoint, drained by `Loopctl.Workers.ThreadIssueLinkWorker` with
+     thread page (AC-45.7.4). One row per story, written by `Loopctl.Workers.ThreadIssueLinkWorker`
+     for every intake story whose thread has a checkpoint, and drained by the same worker with
      nothing held across the forge call — the shape `intake_issue_closures` has, for the same
      reasons.
+
+  3. `browser_sessions`: the server side of a thread-page login (`Loopctl.WebAuthn.BrowserLogin`).
+     The cookie names a row; logout REVOKES it, so a copied cookie stops working at once rather
+     than when it expires. Deleting the authenticator that asserted, or the tenant, deletes its
+     sessions (`ON DELETE CASCADE`), which is how a revoked authenticator ends a session.
   """
 
   use Ecto.Migration
@@ -66,9 +71,29 @@ defmodule Loopctl.Repo.Migrations.AddThreadPage do
            )
 
     enable_rls(:thread_issue_links)
+
+    create table(:browser_sessions, primary_key: false) do
+      add :id, :binary_id, primary_key: true
+      add :tenant_id, references(:tenants, type: :binary_id, on_delete: :delete_all), null: false
+
+      add :authenticator_id,
+          references(:tenant_root_authenticators, type: :binary_id, on_delete: :delete_all),
+          null: false
+
+      add :expires_at, :utc_datetime_usec, null: false
+      add :revoked_at, :utc_datetime_usec, null: true
+
+      timestamps(type: :utc_datetime_usec, updated_at: false)
+    end
+
+    create index(:browser_sessions, [:tenant_id, :expires_at])
+    create index(:browser_sessions, [:authenticator_id])
+
+    enable_rls(:browser_sessions)
   end
 
   def down do
+    drop table(:browser_sessions)
     drop table(:thread_issue_links)
 
     drop constraint(:thread_entries, :thread_entries_judgement_shape)

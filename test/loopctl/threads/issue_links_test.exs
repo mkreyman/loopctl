@@ -1,128 +1,112 @@
 defmodule Loopctl.Threads.IssueLinksTest do
   @moduledoc """
-  US-45.7 (AC-45.7.4): the outbox that links a story's intake issue to its thread page.
-  Recording lives on the RLS `Repo` (the checkpoint's transaction), draining on `AdminRepo`;
-  each half is tested on its own connection here, and the whole path end to end in
-  `Loopctl.Workers.ThreadIssueLinkWorkerTest`.
+  US-45.7 (AC-45.7.4): the outbox that links a story's intake issue to its thread page — the
+  intent derived from durable state (`record_due/1`) and the drain (`attempt/2`), both on
+  `AdminRepo`. The worker that runs them in order is `Loopctl.Workers.ThreadIssueLinkWorkerTest`.
   """
 
   use Loopctl.DataCase, async: true
 
   import Ecto.Query
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Intake.Source
-  alias Loopctl.Repo
-  alias Loopctl.Threads
   alias Loopctl.Threads.IssueLink
   alias Loopctl.Threads.IssueLinks
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
 
-  @epoch 2
-  @tree String.duplicate("c", 40)
   @url "https://loopctl.test/threads/x"
 
-  defp claimed_story do
-    story = fixture(:stage_story, %{claim_epoch: @epoch, agent_status: :implementing})
-    agent = fixture(:stage_agent, %{tenant_id: story.tenant_id})
+  # An intake story on `AdminRepo`, where the sweep reads: its record, its source, and — when
+  # `checkpoint?` — a checkpoint of kind `kind`.
+  defp intake_story(attrs \\ %{}) do
+    tenant = Map.get_lazy(attrs, :tenant, fn -> fixture(:tenant) end)
+    story = fixture(:story, %{tenant_id: tenant.id})
 
-    update_story(story, assigned_agent_id: agent.id)
-    %{story: story, agent: agent, tenant_id: story.tenant_id}
-  end
-
-  defp update_story(story, fields) do
-    {:ok, _} =
-      Repo.with_tenant(story.tenant_id, fn ->
-        from(s in Story, where: s.id == ^story.id) |> Repo.update_all(set: fields)
-      end)
-  end
-
-  defp link_intake(ctx, attrs \\ %{}) do
     record =
-      fixture(
-        :intake_record,
-        Map.merge(%{tenant_id: ctx.tenant_id, issue_number: 77}, attrs)
+      fixture(:intake_record, %{
+        tenant_id: tenant.id,
+        repo: AdminRepo,
+        repo_full_name: "acme/widgets",
+        issue_number: Map.get(attrs, :issue_number, 77)
+      })
+
+    AdminRepo.update_all(from(s in Story, where: s.id == ^story.id),
+      set: [intake_record_id: record.id]
+    )
+
+    if Map.get(attrs, :checkpoint?, true) do
+      fixture(:thread_checkpoint, %{
+        repo: AdminRepo,
+        tenant_id: tenant.id,
+        story_id: story.id,
+        seq: 1,
+        kind: Map.get(attrs, :kind, :checkpoint),
+        commit_sha: String.duplicate("a", 40)
+      })
+    end
+
+    %{tenant: tenant, story: story, record: record}
+  end
+
+  defp links(story_id),
+    do: AdminRepo.all(from l in IssueLink, where: l.story_id == ^story_id)
+
+  describe "record_due/1, the intent" do
+    test "an intake story whose thread has a checkpoint gets ONE link; a second sweep adds none" do
+      %{story: story} = intake_story()
+
+      assert IssueLinks.record_due(50) >= 1
+
+      assert [%IssueLink{status: :pending, issue_number: 77, repo_full_name: "acme/widgets"}] =
+               links(story.id)
+
+      IssueLinks.record_due(50)
+      assert [_one] = links(story.id)
+    end
+
+    test "threads that predate the worker are linked the same way (the backfill)" do
+      # Nothing but durable state: a checkpoint row, no link, nothing written beside it.
+      %{story: story} = intake_story()
+      assert [] == links(story.id)
+      IssueLinks.record_due(50)
+      assert [_one] = links(story.id)
+    end
+
+    test "no checkpoint, only a base_update, an authored story, or a revoked source: no link" do
+      %{story: none} = intake_story(%{checkpoint?: false})
+      %{story: base_only} = intake_story(%{kind: :base_update})
+      %{story: revoked, record: record} = intake_story()
+
+      AdminRepo.update_all(from(s in Source, where: s.id == ^record.source_id),
+        set: [revoked_at: DateTime.utc_now()]
       )
 
-    update_story(ctx.story, intake_record_id: record.id)
-    record
-  end
+      authored_tenant = fixture(:tenant)
+      authored = fixture(:story, %{tenant_id: authored_tenant.id})
 
-  defp checkpoint(ctx, n) do
-    Threads.record_checkpoint(ctx.tenant_id, ctx.story.id,
-      agent_id: ctx.agent.id,
-      claim_epoch: @epoch,
-      commit_sha: n |> Integer.to_string(16) |> String.pad_leading(40, "0"),
-      tree_sha: @tree,
-      author_principal: "agent:#{ctx.agent.id}",
-      actor_lineage: []
-    )
-  end
+      fixture(:thread_checkpoint, %{
+        repo: AdminRepo,
+        tenant_id: authored_tenant.id,
+        story_id: authored.id,
+        seq: 1,
+        commit_sha: String.duplicate("b", 40)
+      })
 
-  defp links(ctx) do
-    {:ok, rows} =
-      Repo.with_tenant(ctx.tenant_id, fn ->
-        Repo.all(from l in IssueLink, where: l.story_id == ^ctx.story.id)
-      end)
+      IssueLinks.record_due(50)
 
-    rows
-  end
-
-  describe "record_in/3, at the thread's first checkpoint" do
-    test "an intake story's first checkpoint records ONE link; later ones add none" do
-      ctx = claimed_story()
-      link_intake(ctx)
-
-      assert {:ok, _, :created} = checkpoint(ctx, 1)
-      assert [%IssueLink{status: :pending, issue_number: 77} = link] = links(ctx)
-      assert link.repo_full_name == "mkreyman/home_care_billing"
-
-      assert {:ok, _, :created} = checkpoint(ctx, 2)
-      assert [_one] = links(ctx)
+      for story <- [none, base_only, revoked, authored], do: assert([] == links(story.id))
     end
 
-    test "an authored story, and a story whose source is revoked, record none" do
-      authored = claimed_story()
-      assert {:ok, _, :created} = checkpoint(authored, 1)
-      assert [] == links(authored)
+    test "tenant isolation: a link is written for the story's own tenant only" do
+      %{story: story, tenant: tenant} = intake_story()
+      IssueLinks.record_due(50)
 
-      revoked = claimed_story()
-      record = link_intake(revoked)
-
-      {:ok, _} =
-        Repo.with_tenant(revoked.tenant_id, fn ->
-          from(s in Source, where: s.id == ^record.source_id)
-          |> Repo.update_all(set: [revoked_at: DateTime.utc_now()])
-        end)
-
-      assert {:ok, _, :created} = checkpoint(revoked, 1)
-      assert [] == links(revoked)
-    end
-
-    test "a second record_in for the same story is absorbed" do
-      ctx = claimed_story()
-      link_intake(ctx)
-
-      {:ok, results} =
-        Repo.with_tenant(ctx.tenant_id, fn ->
-          for _ <- 1..2, do: IssueLinks.record_in(Repo, ctx.tenant_id, ctx.story.id)
-        end)
-
-      assert results == [:ok, :ok]
-      assert [_one] = links(ctx)
-    end
-
-    test "tenant isolation: another tenant's story records nothing" do
-      ctx = claimed_story()
-      link_intake(ctx)
-      other = fixture(:stage_tenant, %{})
-
-      {:ok, result} =
-        Repo.with_tenant(other.id, fn -> IssueLinks.record_in(Repo, other.id, ctx.story.id) end)
-
-      assert result == :no_link
-      assert [] == links(ctx)
+      assert [%IssueLink{tenant_id: tid}] = links(story.id)
+      assert tid == tenant.id
+      assert IssueLinks.get(fixture(:tenant).id, story.id) == nil
     end
   end
 

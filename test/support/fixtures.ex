@@ -59,6 +59,8 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.TokenUsage.CostAnomaly
   alias Loopctl.TokenUsage.CostSummary
   alias Loopctl.TokenUsage.Report, as: TokenUsageReport
+  alias Loopctl.WebAuthn.BrowserLogin
+  alias Loopctl.WebAuthn.BrowserSession
   alias Loopctl.Webhooks.Webhook
   alias Loopctl.Webhooks.WebhookEvent
   alias Loopctl.WorkBreakdown.Epic
@@ -991,8 +993,12 @@ defmodule Loopctl.Fixtures do
     |> AdminRepo.update!()
   end
 
+  # `:repo` picks the sandbox connection: `AdminRepo` (default), where the WebAuthn ceremony
+  # reads it, or `Loopctl.Repo` for a test whose tenant lives there (the thread page, which
+  # validates its session under the tenant's RLS).
   def fixture(:root_authenticator, attrs) do
     attrs = Enum.into(attrs, %{})
+    {repo, attrs} = Map.pop(attrs, :repo, AdminRepo)
 
     {tenant_id, attrs} =
       case Map.get(attrs, :tenant_id) do
@@ -1004,9 +1010,35 @@ defmodule Loopctl.Fixtures do
           {tid, Map.delete(attrs, :tenant_id)}
       end
 
-    %RootAuthenticator{tenant_id: tenant_id}
-    |> RootAuthenticator.create_changeset(build(:root_authenticator, attrs))
-    |> AdminRepo.insert!()
+    insert = fn ->
+      %RootAuthenticator{tenant_id: tenant_id}
+      |> RootAuthenticator.create_changeset(build(:root_authenticator, attrs))
+      |> repo.insert!()
+    end
+
+    in_tenant(repo, tenant_id, insert)
+  end
+
+  # A `browser_sessions` row (US-45.7) for `:tenant_id` and `:authenticator_id`, live for the
+  # session lifetime unless `:expires_at` / `:revoked_at` say otherwise. `:repo` as for
+  # `fixture(:root_authenticator)`; the thread page validates on `Loopctl.Repo`.
+  def fixture(:browser_session, attrs) do
+    attrs = Enum.into(attrs, %{})
+    repo = Map.get(attrs, :repo, AdminRepo)
+
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    in_tenant(repo, tenant_id, fn ->
+      repo.insert!(%BrowserSession{
+        tenant_id: tenant_id,
+        authenticator_id: Map.fetch!(attrs, :authenticator_id),
+        expires_at:
+          Map.get_lazy(attrs, :expires_at, fn ->
+            DateTime.add(DateTime.utc_now(), BrowserLogin.lifetime_seconds())
+          end),
+        revoked_at: Map.get(attrs, :revoked_at)
+      })
+    end)
   end
 
   def fixture(:agent, attrs) do
@@ -3406,4 +3438,13 @@ defmodule Loopctl.Fixtures do
     do: Map.put_new(attrs, :required_checks, ["test"])
 
   defp default_thread_checks(attrs), do: attrs
+
+  # On the RLS `Loopctl.Repo`, a row is inserted under its tenant's context: an earlier
+  # `with_tenant/2` in the same sandbox transaction leaves another tenant's context set.
+  defp in_tenant(Loopctl.Repo, tenant_id, fun) do
+    {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, fun)
+    row
+  end
+
+  defp in_tenant(_repo, _tenant_id, fun), do: fun.()
 end

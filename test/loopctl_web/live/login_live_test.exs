@@ -8,7 +8,9 @@ defmodule LoopctlWeb.LoginLiveTest do
 
   import Phoenix.LiveViewTest
 
+  alias Loopctl.AdminRepo
   alias Loopctl.WebAuthn.BrowserLogin
+  alias Loopctl.WebAuthn.BrowserSession
   alias LoopctlWeb.BrowserAuth
 
   setup :verify_on_exit!
@@ -28,6 +30,11 @@ defmodule LoopctlWeb.LoginLiveTest do
     }
   end
 
+  defp session_row(conn) do
+    %{"session_id" => id} = get_session(conn, BrowserAuth.session_key())
+    AdminRepo.get(BrowserSession, id)
+  end
+
   describe "the ceremony (TC-45.7.1)" do
     test "a WebAuthn assertion binds the session to the tenant's human principal", ctx do
       conn = init_test_session(ctx.conn, %{"planted" => "before login"})
@@ -39,42 +46,54 @@ defmodule LoopctlWeb.LoginLiveTest do
       assert ids == [Base.url_encode64(ctx.authenticator.credential_id, padding: false)]
 
       render_hook(view, "assertion_captured", captured(ctx.authenticator))
+      refute render(view) =~ ctx.tenant.id
       conn = follow_trigger_action(form(view, "#login-assertion-form"), conn)
 
       assert redirected_to(conn) == ~p"/login"
-      stored = get_session(conn, BrowserAuth.session_key())
-      assert stored["tenant_id"] == ctx.tenant.id
-      assert stored["authenticator_id"] == ctx.authenticator.id
-      assert {:ok, _principal} = BrowserLogin.validate(stored)
+      assert get_session(conn, BrowserAuth.session_key())["tenant_id"] == ctx.tenant.id
+
+      assert %BrowserSession{revoked_at: nil, authenticator_id: auth_id} = session_row(conn)
+      assert auth_id == ctx.authenticator.id
       # The session was renewed: nothing planted before the login survives it.
       assert get_session(conn, "planted") == nil
       assert is_binary(get_session(conn, :live_socket_id))
     end
 
-    test "the challenge and tenant the form posts are the server's, not the client's", ctx do
+    test "the challenge the form posts is the server's, not the client's", ctx do
       {:ok, view, _html} = live(ctx.conn, ~p"/login")
       view |> form("#login-form", login: %{slug: ctx.tenant.slug}) |> render_submit()
 
-      # A client naming its own tenant and challenge changes nothing it posts.
+      # A client naming its own challenge changes nothing the form posts.
       render_hook(
         view,
         "assertion_captured",
-        Map.merge(captured(ctx.authenticator), %{
-          "tenant_id" => Ecto.UUID.generate(),
-          "challenge_id" => Ecto.UUID.generate()
-        })
+        Map.put(captured(ctx.authenticator), "challenge_id", Ecto.UUID.generate())
       )
 
       conn = follow_trigger_action(form(view, "#login-assertion-form"), ctx.conn)
       assert get_session(conn, BrowserAuth.session_key())["tenant_id"] == ctx.tenant.id
     end
 
-    test "an unknown slug is one refusal, and nothing is pushed", ctx do
+    test "a real slug and an unknown one get the same answer", ctx do
       {:ok, view, _html} = live(ctx.conn, ~p"/login")
-      view |> form("#login-form", login: %{slug: "nobody-here"}) |> render_submit()
 
-      assert has_element?(view, "#login-status", "No tenant with that slug")
-      refute_push_event(view, "webauthn:login", _)
+      view |> form("#login-form", login: %{slug: ctx.tenant.slug}) |> render_submit()
+      assert_push_event(view, "webauthn:login", real)
+      real_status = view |> element("#login-status") |> render()
+
+      view |> form("#login-form", login: %{slug: "nobody-here"}) |> render_submit()
+      assert_push_event(view, "webauthn:login", decoy)
+
+      assert Map.keys(decoy) == Map.keys(real)
+      assert length(decoy.allowed_credentials) == 1
+      assert byte_size(decoy.challenge) == byte_size(real.challenge)
+      assert view |> element("#login-status") |> render() == real_status
+
+      # The decoy arms the same form, and its assertion fails as a wrong one does.
+      render_hook(view, "assertion_captured", captured(ctx.authenticator))
+      conn = follow_trigger_action(form(view, "#login-assertion-form"), ctx.conn)
+      assert redirected_to(conn) == ~p"/login"
+      assert get_session(conn, BrowserAuth.session_key()) == nil
     end
 
     test "an assertion before any challenge, or an oversized one, arms nothing", ctx do
@@ -94,9 +113,9 @@ defmodule LoopctlWeb.LoginLiveTest do
       assert has_element?(view, "#login-status", "cannot read")
     end
 
-    test "the per-IP challenge budget is fail-closed", ctx do
+    test "the per-client challenge budget is fail-closed, keyed on the client", ctx do
       stub(Loopctl.MockRateLimiter, :check_rate, fn
-        "browser_login:challenge:ip:" <> _, _, _ -> {:deny, 30}
+        "browser_login:challenge:127.0.0.1", _, _ -> {:deny, 30}
         _bucket, _window, _limit -> {:allow, 1}
       end)
 
@@ -111,12 +130,7 @@ defmodule LoopctlWeb.LoginLiveTest do
   describe "POST /login" do
     test "a replayed assertion is refused and binds nothing", ctx do
       {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
-
-      login =
-        Map.merge(captured(ctx.authenticator), %{
-          "tenant_id" => ctx.tenant.id,
-          "challenge_id" => issued.challenge_id
-        })
+      login = Map.put(captured(ctx.authenticator), "challenge_id", issued.challenge_id)
 
       first = post(ctx.conn, ~p"/login", %{"login" => login})
       assert get_session(first, BrowserAuth.session_key())
@@ -126,9 +140,9 @@ defmodule LoopctlWeb.LoginLiveTest do
       assert get_session(replay, BrowserAuth.session_key()) == nil
     end
 
-    test "the per-IP verify budget is checked before any verification", ctx do
+    test "the per-client verify budget is checked before any verification", ctx do
       stub(Loopctl.MockRateLimiter, :check_rate, fn
-        "browser_login:verify:ip:" <> _, _, _ -> {:deny, 30}
+        "browser_login:verify:127.0.0.1", _, _ -> {:deny, 30}
         _bucket, _window, _limit -> {:allow, 1}
       end)
 
@@ -137,11 +151,7 @@ defmodule LoopctlWeb.LoginLiveTest do
 
       conn =
         post(ctx.conn, ~p"/login", %{
-          "login" =>
-            Map.merge(captured(ctx.authenticator), %{
-              "tenant_id" => ctx.tenant.id,
-              "challenge_id" => issued.challenge_id
-            })
+          "login" => Map.put(captured(ctx.authenticator), "challenge_id", issued.challenge_id)
         })
 
       assert get_session(conn, BrowserAuth.session_key()) == nil
@@ -152,11 +162,7 @@ defmodule LoopctlWeb.LoginLiveTest do
 
       conn =
         Plug.Test.conn(:post, "/login", %{
-          "login" =>
-            Map.merge(captured(ctx.authenticator), %{
-              "tenant_id" => ctx.tenant.id,
-              "challenge_id" => issued.challenge_id
-            })
+          "login" => Map.put(captured(ctx.authenticator), "challenge_id", issued.challenge_id)
         })
 
       assert_raise Plug.CSRFProtection.InvalidCSRFTokenError, fn ->
@@ -166,21 +172,20 @@ defmodule LoopctlWeb.LoginLiveTest do
   end
 
   describe "DELETE /logout" do
-    test "drops the session", ctx do
-      conn =
-        ctx.conn
-        |> init_test_session(%{
-          BrowserAuth.session_key() =>
-            BrowserLogin.to_session(%{
-              tenant_id: ctx.tenant.id,
-              authenticator_id: ctx.authenticator.id,
-              authenticated_at: System.system_time(:second)
-            })
+    test "revokes the session on the server and drops the cookie", ctx do
+      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+
+      logged_in =
+        post(ctx.conn, ~p"/login", %{
+          "login" => Map.put(captured(ctx.authenticator), "challenge_id", issued.challenge_id)
         })
-        |> delete(~p"/logout")
+
+      row = session_row(logged_in)
+      conn = logged_in |> recycle() |> delete(~p"/logout")
 
       assert redirected_to(conn) == ~p"/login"
       assert conn.private[:plug_session_info] == :drop
+      assert %BrowserSession{revoked_at: %DateTime{}} = AdminRepo.get(BrowserSession, row.id)
     end
   end
 end

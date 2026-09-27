@@ -396,12 +396,11 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   defp status?(_status), do: false
 
   @impl true
-  def checkpoint_diff(repo, base_sha, head_sha) do
+  def checkpoint_diff(repo, base_ref, head_sha) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, head} <- hex_sha(head_sha),
-         {:ok, base} <- optional_hex_sha(base_sha) do
-      path = if base, do: "/compare/#{base}...#{head}", else: "/commits/#{head}"
-      read_diff(repo, path)
+         {:ok, base} <- ref(base_ref) do
+      read_diff(repo, "/compare/#{base}...#{head}")
     end
   end
 
@@ -410,9 +409,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   defp hex_sha(sha), do: {:error, {:invalid_sha, shape(sha)}}
-
-  defp optional_hex_sha(nil), do: {:ok, nil}
-  defp optional_hex_sha(sha), do: hex_sha(sha)
 
   defp read_diff(repo, path) do
     url = @api_base <> "/repos/" <> repo <> path
@@ -425,7 +421,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
     case Req.get(url, opts) do
       {:ok, %Req.Response{status: 200} = response} ->
-        text = response.body |> IO.iodata_to_binary() |> String.replace_invalid()
+        {chunks, _bytes} = Req.Response.get_private(response, :diff, {[], 0})
+        text = chunks |> IO.iodata_to_binary() |> String.replace_invalid()
         {:ok, %{text: text, truncated: Req.Response.get_private(response, :truncated, false)}}
 
       {:ok, %Req.Response{} = response} ->
@@ -436,26 +433,39 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  # Accumulates at most `@max_diff_bytes` and stops at the deadline. Either stop marks the
+  # Accumulates at most `@max_diff_bytes` as IODATA with a running byte count — each chunk is
+  # consed on once, never copied again — and stops at the deadline. Either stop marks the
   # response `truncated`, so the page says the diff is partial rather than showing it as whole.
-  defp collect_diff({:data, data}, {request, response}, deadline) do
-    body = IO.iodata_to_binary([response.body || "", data])
-    room = @max_diff_bytes - byte_size(response.body || "")
+  # An error response's body is collected the same way and never read. Public only so the
+  # accumulation can be driven chunk by chunk: `Req.Test` delivers a body in one piece.
+  @doc false
+  @spec collect_diff({:data, binary()}, {Req.Request.t(), Req.Response.t()}, integer()) ::
+          {:cont | :halt, {Req.Request.t(), Req.Response.t()}}
+  def collect_diff({:data, data}, {request, response}, deadline) do
+    {chunks, bytes} = Req.Response.get_private(response, :diff, {[], 0})
+    room = @max_diff_bytes - bytes
 
     cond do
       byte_size(data) > room ->
-        {:halt, {request, truncated(response, binary_part(body, 0, @max_diff_bytes))}}
+        {:halt, {request, truncated(response, [chunks, binary_part(data, 0, room)], room)}}
 
       System.monotonic_time(:millisecond) > deadline ->
-        {:halt, {request, truncated(response, body)}}
+        {:halt, {request, truncated(response, [chunks, data], byte_size(data))}}
 
       true ->
-        {:cont, {request, %{response | body: body}}}
+        {:cont,
+         {request,
+          Req.Response.put_private(response, :diff, {[chunks, data], bytes + byte_size(data)})}}
     end
   end
 
-  defp truncated(response, body),
-    do: %{response | body: body} |> Req.Response.put_private(:truncated, true)
+  defp truncated(response, chunks, added) do
+    {_chunks, bytes} = Req.Response.get_private(response, :diff, {[], 0})
+
+    response
+    |> Req.Response.put_private(:diff, {chunks, bytes + added})
+    |> Req.Response.put_private(:truncated, true)
+  end
 
   defp diff_headers do
     Enum.map(headers(), fn

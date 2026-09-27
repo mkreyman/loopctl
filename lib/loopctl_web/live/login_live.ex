@@ -4,13 +4,15 @@ defmodule LoopctlWeb.LoginLive do
 
   The ceremony, in four hops:
 
-  1. The human names the tenant (its slug) and submits `begin`. The LiveView, after a per-IP
-     budget, asks `Loopctl.WebAuthn.BrowserLogin.begin/1` for a stored, single-use challenge
-     bound to the tenant's enrolled authenticators, and pushes it to the `WebAuthnLogin` hook.
+  1. The human names the tenant (its slug) and submits `begin`. The LiveView, after a
+     per-client budget, asks `Loopctl.WebAuthn.BrowserLogin.begin/1` for a challenge and pushes
+     it to the `WebAuthnLogin` hook. A slug that cannot sign in gets a decoy of the same shape,
+     so the page answers every slug alike.
   2. The hook runs `navigator.credentials.get()` and pushes the assertion back.
-  3. The LiveView bounds the assertion's fields and fills a plain form whose `tenant_id` and
-     `challenge_id` come from ITS OWN assigns, never from the client, then triggers the form
-     (`phx-trigger-action`).
+  3. The LiveView bounds the assertion's fields and fills a plain form whose `challenge_id`
+     comes from ITS OWN assigns, never from the client, then triggers the form
+     (`phx-trigger-action`). No tenant id is ever on the page: the server resolves the tenant
+     from the stored challenge.
   4. The form POSTs to `LoopctlWeb.BrowserSessionController`, through the `:browser` pipeline's
      CSRF check, which verifies and consumes the challenge and binds the session. A LiveView
      cannot write the session cookie, which is why the last hop is a POST.
@@ -52,9 +54,10 @@ defmodule LoopctlWeb.LoginLive do
      |> assign(:status, nil)}
   end
 
-  # The HTTP-resolved client IP when the session carries one; otherwise a per-connection key,
-  # so a missing IP never collapses every visitor onto one bucket.
-  defp rate_key(%{"client_ip" => ip}, _socket) when is_binary(ip), do: "ip:" <> ip
+  # `Loopctl.RemoteIp.bucket_key/1` of the HTTP-resolved client (`BrowserAuth.login_session/1`);
+  # a per-connection key when the session carries none, so a missing key never collapses every
+  # visitor onto one bucket.
+  defp rate_key(%{"login_rate_key" => key}, _socket) when is_binary(key), do: key
   defp rate_key(_session, socket), do: "conn:" <> socket.id
 
   @impl true
@@ -63,7 +66,7 @@ defmodule LoopctlWeb.LoginLive do
          {:ok, issued} <- BrowserLogin.begin(slug) do
       {:noreply,
        socket
-       |> assign(:pending, %{tenant_id: issued.tenant_id, challenge_id: issued.challenge_id})
+       |> assign(:pending, issued.challenge_id)
        |> assign(:status, {:info, "Touch your authenticator to sign in."})
        |> push_event("webauthn:login", %{
          challenge: issued.challenge,
@@ -75,26 +78,19 @@ defmodule LoopctlWeb.LoginLive do
         {:noreply, assign(socket, :status, {:error, "Too many sign-in attempts. Try later."})}
 
       {:error, :unavailable} ->
-        {:noreply,
-         assign(
-           socket,
-           :status,
-           {:error, "No tenant with that slug can sign in with an authenticator."}
-         )}
+        {:noreply, assign(socket, :status, {:error, "Sign-in is unavailable. Try again."})}
     end
   end
 
-  def handle_event("assertion_captured", params, %{assigns: %{pending: %{} = pending}} = socket) do
+  def handle_event("assertion_captured", params, %{assigns: %{pending: challenge_id}} = socket)
+      when is_binary(challenge_id) do
     case assertion(params) do
       {:ok, fields} ->
         {:noreply,
          socket
          |> assign(
            :assertion,
-           Map.merge(fields, %{
-             "tenant_id" => pending.tenant_id,
-             "challenge_id" => pending.challenge_id
-           })
+           Map.put(fields, "challenge_id", challenge_id)
          )
          |> assign(:pending, nil)
          |> assign(:trigger_submit, true)
@@ -160,8 +156,7 @@ defmodule LoopctlWeb.LoginLive do
         class="space-y-4 rounded-md border border-slate-800 bg-slate-900/60 p-5"
       >
         <p class="text-sm text-slate-300">
-          Signed in to tenant <span class="font-mono text-slate-100">{@signed_in.tenant_id}</span>. Open a thread from
-          the link on its GitHub issue.
+          Signed in. Open a thread from the link on its GitHub issue.
         </p>
         <.link
           href={~p"/logout"}
@@ -219,7 +214,7 @@ defmodule LoopctlWeb.LoginLive do
           <input
             :for={
               name <-
-                ~w(tenant_id challenge_id credential_id authenticator_data signature client_data_json)
+                ~w(challenge_id credential_id authenticator_data signature client_data_json)
             }
             type="hidden"
             name={"login[#{name}]"}
