@@ -117,6 +117,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   @behaviour Loopctl.Delivery.PullRequestSource
 
+  alias Loopctl.GitSha
   alias Loopctl.Verification.GitHubActions
 
   @api_base "https://api.github.com"
@@ -144,7 +145,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # otherwise hold the page's diff panel for as long as it liked.
   @max_diff_bytes 512 * 1024
   @diff_deadline_ms 10_000
-  @hex_sha ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
   @ref ~r{\A[A-Za-z0-9_./-]+\z}
   @control ~r/[\x00-\x1f\x7f]/
 
@@ -405,7 +405,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   defp hex_sha(sha) when is_binary(sha) do
-    if Regex.match?(@hex_sha, sha), do: {:ok, sha}, else: {:error, {:invalid_sha, printable(sha)}}
+    if GitSha.valid?(sha), do: {:ok, sha}, else: {:error, {:invalid_sha, printable(sha)}}
   end
 
   defp hex_sha(sha), do: {:error, {:invalid_sha, shape(sha)}}

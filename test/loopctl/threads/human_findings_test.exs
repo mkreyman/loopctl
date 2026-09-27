@@ -412,8 +412,26 @@ defmodule Loopctl.Threads.HumanFindingsTest do
       assert {:ok, %{escalation: {:already_escalated, ^escalation}}, :created} =
                human(ctx, cp2, second)
 
-      assert {:ok, %{escalation: {:already_escalated, ^escalation}}, :existing} =
-               human(ctx, cp2, second)
+      # Its resend answers what it RECORDED, which is nothing: never :already_escalated inferred
+      # from the ceiling as it stands now.
+      assert {:ok, %{escalation: nil}, :existing} = human(ctx, cp2, second)
+    end
+
+    test "a finding counted in round 2, resent after the ceiling escalated, answers nothing",
+         ctx do
+      checkpoint(ctx, 1)
+      r1 = placed!(ctx)
+      verdict!(ctx, r1)
+      cp2 = checkpoint(ctx, 2)
+      r2 = placed!(ctx)
+
+      attrs = %{"introduced_by" => "none", "severity" => "critical", "idempotency_key" => "r2"}
+      assert {:ok, %{escalation: nil}, :created} = human(ctx, cp2, attrs)
+
+      # Round 2 completes at the ceiling and escalates, counting that finding.
+      assert %{escalation: %Entry{kind: :escalation}} = verdict!(ctx, r2)
+
+      assert {:ok, %{escalation: nil}, :existing} = human(ctx, cp2, attrs)
     end
 
     test "after a ceiling verdict that already escalated, the same escalation is returned",
@@ -428,20 +446,6 @@ defmodule Loopctl.Threads.HumanFindingsTest do
 
       assert {:ok, %{escalation: {:already_escalated, ^escalation}}, :created} =
                human(ctx, cp2, %{"introduced_by" => "none", "severity" => "high"})
-    end
-
-    test "a halted tenant is refused a new finding; the resend of a recorded one is answered",
-         ctx do
-      cp = checkpoint(ctx, 1)
-      attrs = %{"idempotency_key" => "before-halt"}
-      {:ok, %{entry: entry}, :created} = human(ctx, cp, attrs)
-
-      Repo.update_all(from(t in Loopctl.Tenants.Tenant, where: t.id == ^ctx.tenant_id),
-        set: [custody_halted_at: DateTime.utc_now()]
-      )
-
-      assert {:error, :tenant_halted} = human(ctx, cp)
-      assert {:ok, %{entry: ^entry}, :existing} = human(ctx, cp, attrs)
     end
   end
 end

@@ -22,11 +22,14 @@ defmodule LoopctlWeb.ThreadLive do
 
   ## What it writes, and the failures it answers
 
-  - **A replayed submit.** Each form carries a nonce minted when it was rendered, and the nonce
-    IS the entry's idempotency key. The key is taken from the SUBMITTED form, not the socket, so
-    a double click, a resubmit after a lost reply or a reconnect replays the same key and
-    `Loopctl.Threads` answers it from the row: one entry. A fresh nonce is minted only once the
-    write is recorded.
+  - **A replayed submit.** Each form carries a nonce, and the nonce IS the entry's idempotency
+    key. The key is taken from the SUBMITTED form, not the socket, so a double click or a
+    resubmit after a lost reply replays the same key and `Loopctl.Threads` answers it from the
+    row: one entry. A RECONNECT mounts the page again, which mints fresh nonces, so each form
+    has a `phx-change` handler: LiveView's form recovery sends the form's values from before the
+    reconnect as a change on rejoin, and the handler ADOPTS the recovered nonce (a well-formed
+    one only) along with the rest, so the resubmit still carries the key its first submit did.
+    A fresh nonce is minted only once a write is recorded.
   - **Who writes.** The principal is `Loopctl.Threads.human_principal/0` with an EMPTY lineage,
     through the same context entry points the API reaches, under the same story lock and rules
     (`record_entry/4` for a message, `record_human_finding/3` for a finding). Nothing here
@@ -81,13 +84,40 @@ defmodule LoopctlWeb.ThreadLive do
         |> assign(:story, page.story)
         |> assign(:page_title, page.story.title)
         |> assign(:repo, page.repo)
-        |> assign(:checkpoints, page.checkpoints)
-        |> assign(:checkpoints_truncated, page.checkpoints_truncated)
+        |> assign_checkpoints(page)
         |> assign(:older_before_seq, page.older_before_seq)
         |> assign(:findings, page.findings)
         |> assign(:halted, page.halted)
-        |> assign(:finding_form, finding_form(page.checkpoints))
+        |> assign(:finding_form, finding_form(page.claim_checkpoints))
         |> stream(:entries, page.entries, reset: true)
+
+      {:error, :not_found} ->
+        assign(socket, :story, nil)
+    end
+  end
+
+  # The checkpoints move while the page is open: a claimant records one, a story is claimed
+  # again. So they are re-read on the revalidation tick and after every write
+  # (`refresh_checkpoints/1`), and with them the two things that depend on them — which diffs
+  # may be opened, and which checkpoints a finding may bind to.
+  defp assign_checkpoints(socket, read) do
+    socket
+    |> assign(:checkpoints, read.checkpoints)
+    |> assign(:checkpoints_truncated, read.checkpoints_truncated)
+    |> assign(:claim_checkpoints, read.claim_checkpoints)
+  end
+
+  defp refresh_checkpoints(socket) do
+    tenant_id = socket.assigns.browser_principal.tenant_id
+
+    case Threads.page_checkpoints(tenant_id, socket.assigns.story_id) do
+      {:ok, read} ->
+        socket
+        |> assign_checkpoints(read)
+        |> assign(
+          :finding_form,
+          rebind_finding_form(socket.assigns.finding_form, read.claim_checkpoints)
+        )
 
       {:error, :not_found} ->
         assign(socket, :story, nil)
@@ -104,14 +134,14 @@ defmodule LoopctlWeb.ThreadLive do
 
   defp message_form, do: to_form(%{"body" => "", "nonce" => nonce()}, as: :message)
 
-  defp finding_form(checkpoints) do
-    latest = checkpoints |> Enum.filter(&(&1.kind == :checkpoint)) |> List.last()
-
+  # The finding form binds only to the CURRENT claim's checkpoints (`claim_checkpoints`), the
+  # only ones `Loopctl.Threads.record_human_finding/3` accepts, defaulting to the latest.
+  defp finding_form(claim_checkpoints) do
     to_form(
       %{
         "body" => "",
         "nonce" => nonce(),
-        "checkpoint_id" => latest && latest.id,
+        "checkpoint_id" => latest_id(claim_checkpoints),
         "severity" => "medium",
         "location" => "",
         "introduced_by" => ""
@@ -120,10 +150,58 @@ defmodule LoopctlWeb.ThreadLive do
     )
   end
 
+  # Keeps what the human typed, nonce included, and moves the checkpoint to the latest of the
+  # current claim only when the one chosen is no longer bindable.
+  defp rebind_finding_form(form, claim_checkpoints) do
+    chosen = form.params["checkpoint_id"]
+
+    if Enum.any?(claim_checkpoints, &(&1.id == chosen)),
+      do: form,
+      else:
+        to_form(Map.put(form.params, "checkpoint_id", latest_id(claim_checkpoints)), as: :finding)
+  end
+
+  defp latest_id([]), do: nil
+  defp latest_id(checkpoints), do: List.last(checkpoints).id
+
+  # What a `phx-change` adopts: the client's values, and its nonce only when well-formed — the
+  # shape `nonce/0` mints. Anything else keeps the form's own.
+  @nonce_shape ~r/\A[A-Za-z0-9_-]{16,64}\z/
+
+  defp adopt(form, params, fields, as) do
+    adopted = Map.take(params, fields)
+
+    adopted =
+      case params["nonce"] do
+        nonce when is_binary(nonce) ->
+          if Regex.match?(@nonce_shape, nonce),
+            do: Map.put(adopted, "nonce", nonce),
+            else: adopted
+
+        _other ->
+          adopted
+      end
+
+    to_form(Map.merge(form.params, adopted), as: as)
+  end
+
   # A page with no story (a malformed id, or a story this tenant cannot see) has nothing to
   # write to or read from: every event is refused here, before any clause reads a story id.
   @impl true
   def handle_event(_event, _params, %{assigns: %{story: nil}} = socket), do: {:noreply, socket}
+
+  # Form recovery on reconnect arrives here, as does every keystroke: the form assign follows
+  # the client, so a re-render never throws away what was typed, and a recovered nonce is kept.
+  def handle_event("change_message", %{"message" => params}, socket) when is_map(params) do
+    form = adopt(socket.assigns.message_form, params, ~w(body), :message)
+    {:noreply, assign(socket, :message_form, form)}
+  end
+
+  def handle_event("change_finding", %{"finding" => params}, socket) when is_map(params) do
+    fields = ~w(body checkpoint_id severity location introduced_by)
+    form = adopt(socket.assigns.finding_form, params, fields, :finding)
+    {:noreply, assign(socket, :finding_form, form)}
+  end
 
   def handle_event("post_message", %{"message" => %{"body" => body, "nonce" => key}}, socket) do
     write(socket, :message_form, :message, fn principal ->
@@ -172,14 +250,16 @@ defmodule LoopctlWeb.ThreadLive do
   # the page is fed newest first to leave it oldest first on screen.
   def handle_event("load_older", _params, %{assigns: %{older_before_seq: seq}} = socket)
       when is_integer(seq) do
-    case Threads.page(socket.assigns.browser_principal.tenant_id, socket.assigns.story_id,
-           before_seq: seq
+    case Threads.page_entries(
+           socket.assigns.browser_principal.tenant_id,
+           socket.assigns.story_id,
+           seq
          ) do
-      {:ok, page} ->
+      {:ok, older} ->
         {:noreply,
          socket
-         |> assign(:older_before_seq, page.older_before_seq)
-         |> stream(:entries, Enum.reverse(page.entries), at: 0)}
+         |> assign(:older_before_seq, older.older_before_seq)
+         |> stream(:entries, Enum.reverse(older.entries), at: 0)}
 
       {:error, :not_found} ->
         {:noreply, assign(socket, :story, nil)}
@@ -213,13 +293,18 @@ defmodule LoopctlWeb.ThreadLive do
       {:ok, principal} ->
         case fun.(principal) do
           {:ok, written, _created_or_existing} ->
+            socket = refresh_checkpoints(socket)
+
             {:noreply,
              socket
              |> assign(form_key, fresh_form(kind, socket))
              |> record_written(kind, written)}
 
           error ->
-            {:noreply, assign(socket, :notice, {kind, :error, error_message(error)})}
+            {:noreply,
+             socket
+             |> refresh_checkpoints()
+             |> assign(:notice, {kind, :error, error_message(error)})}
         end
 
       {:error, _reason} ->
@@ -275,7 +360,7 @@ defmodule LoopctlWeb.ThreadLive do
   end
 
   defp fresh_form(:message, _socket), do: message_form()
-  defp fresh_form(:finding, socket), do: finding_form(socket.assigns.checkpoints)
+  defp fresh_form(:finding, socket), do: finding_form(socket.assigns.claim_checkpoints)
 
   defp blank_to_nil(value) when is_binary(value) do
     if String.trim(value) == "", do: nil, else: value
@@ -337,7 +422,7 @@ defmodule LoopctlWeb.ThreadLive do
     case BrowserLogin.validate(BrowserLogin.to_session(socket.assigns.browser_principal)) do
       {:ok, _principal} ->
         schedule_revalidate()
-        {:noreply, socket}
+        {:noreply, if(socket.assigns.story, do: refresh_checkpoints(socket), else: socket)}
 
       {:error, _reason} ->
         {:noreply, signed_out(socket)}
@@ -509,7 +594,13 @@ defmodule LoopctlWeb.ThreadLive do
             <h2 class="mb-3 font-mono text-xs uppercase tracking-wide text-slate-400">
               Write a message
             </h2>
-            <.form for={@message_form} id="message-form" phx-submit="post_message" class="space-y-3">
+            <.form
+              for={@message_form}
+              id="message-form"
+              phx-change="change_message"
+              phx-submit="post_message"
+              class="space-y-3"
+            >
               <input
                 type="hidden"
                 name={@message_form[:nonce].name}
@@ -531,85 +622,104 @@ defmodule LoopctlWeb.ThreadLive do
             <h2 class="mb-3 font-mono text-xs uppercase tracking-wide text-slate-400">
               Record a finding
             </h2>
-            <.form for={@finding_form} id="finding-form" phx-submit="post_finding" class="space-y-3">
-              <input
-                type="hidden"
-                name={@finding_form[:nonce].name}
-                value={@finding_form[:nonce].value}
-              />
-              <label
-                class="block text-xs uppercase tracking-wide text-slate-400"
-                for="finding-checkpoint"
-              >
-                Checkpoint
-              </label>
-              <select
-                name={@finding_form[:checkpoint_id].name}
-                id="finding-checkpoint"
-                class={select_class()}
-              >
-                <option
-                  :for={cp <- Enum.filter(@checkpoints, &(&1.kind == :checkpoint))}
-                  value={cp.id}
-                  selected={cp.id == @finding_form[:checkpoint_id].value}
+            <p
+              :if={@claim_checkpoints == []}
+              id="finding-unavailable"
+              class="mb-3 font-mono text-xs text-slate-500"
+            >
+              A finding binds to a checkpoint of the current claim, and it has recorded none.
+            </p>
+            <.form
+              for={@finding_form}
+              id="finding-form"
+              phx-change="change_finding"
+              phx-submit="post_finding"
+              class="space-y-3"
+            >
+              <fieldset disabled={@claim_checkpoints == []} class="space-y-3">
+                <input
+                  type="hidden"
+                  name={@finding_form[:nonce].name}
+                  value={@finding_form[:nonce].value}
+                />
+                <label
+                  class="block text-xs uppercase tracking-wide text-slate-400"
+                  for="finding-checkpoint"
                 >
-                  #{cp.seq} {String.slice(cp.commit_sha, 0, 12)}
-                </option>
-              </select>
-              <label
-                class="block text-xs uppercase tracking-wide text-slate-400"
-                for="finding-severity"
-              >
-                Severity
-              </label>
-              <select
-                name={@finding_form[:severity].name}
-                id="finding-severity"
-                class={select_class()}
-              >
-                <option
-                  :for={s <- Loopctl.Threads.Entry.severities()}
-                  value={s}
-                  selected={to_string(s) == @finding_form[:severity].value}
+                  Checkpoint
+                </label>
+                <select
+                  name={@finding_form[:checkpoint_id].name}
+                  id="finding-checkpoint"
+                  class={select_class()}
                 >
-                  {s}
-                </option>
-              </select>
-              <.input field={@finding_form[:location]} label="Location" placeholder="lib/file.ex:42" />
-              <label
-                class="block text-xs uppercase tracking-wide text-slate-400"
-                for="finding-introduced-by"
-              >
-                Introduced by
-              </label>
-              <select
-                name={@finding_form[:introduced_by].name}
-                id="finding-introduced-by"
-                class={select_class()}
-              >
-                <option value="">(round 1: leave empty)</option>
-                <option value="none" selected={@finding_form[:introduced_by].value == "none"}>
-                  none
-                </option>
-                <option
-                  :for={cp <- Enum.filter(@checkpoints, &(&1.kind == :checkpoint))}
-                  value={cp.id}
-                  selected={cp.id == @finding_form[:introduced_by].value}
+                  <option
+                    :for={cp <- @claim_checkpoints}
+                    value={cp.id}
+                    selected={cp.id == @finding_form[:checkpoint_id].value}
+                  >
+                    #{cp.seq} {String.slice(cp.commit_sha, 0, 12)}
+                  </option>
+                </select>
+                <label
+                  class="block text-xs uppercase tracking-wide text-slate-400"
+                  for="finding-severity"
                 >
-                  #{cp.seq} {String.slice(cp.commit_sha, 0, 12)}
-                </option>
-              </select>
-              <textarea
-                name={@finding_form[:body].name}
-                id="finding-body"
-                rows="4"
-                required
-                placeholder="What is wrong, and the failure it causes"
-                class={textarea_class()}
-              >{@finding_form[:body].value}</textarea>
-              <button type="submit" id="finding-submit" class={button_class()}>
-                Record finding
-              </button>
+                  Severity
+                </label>
+                <select
+                  name={@finding_form[:severity].name}
+                  id="finding-severity"
+                  class={select_class()}
+                >
+                  <option
+                    :for={s <- Loopctl.Threads.Entry.severities()}
+                    value={s}
+                    selected={to_string(s) == @finding_form[:severity].value}
+                  >
+                    {s}
+                  </option>
+                </select>
+                <.input
+                  field={@finding_form[:location]}
+                  label="Location"
+                  placeholder="lib/file.ex:42"
+                />
+                <label
+                  class="block text-xs uppercase tracking-wide text-slate-400"
+                  for="finding-introduced-by"
+                >
+                  Introduced by
+                </label>
+                <select
+                  name={@finding_form[:introduced_by].name}
+                  id="finding-introduced-by"
+                  class={select_class()}
+                >
+                  <option value="">(round 1: leave empty)</option>
+                  <option value="none" selected={@finding_form[:introduced_by].value == "none"}>
+                    none
+                  </option>
+                  <option
+                    :for={cp <- Enum.filter(@checkpoints, &(&1.kind == :checkpoint))}
+                    value={cp.id}
+                    selected={cp.id == @finding_form[:introduced_by].value}
+                  >
+                    #{cp.seq} {String.slice(cp.commit_sha, 0, 12)}
+                  </option>
+                </select>
+                <textarea
+                  name={@finding_form[:body].name}
+                  id="finding-body"
+                  rows="4"
+                  required
+                  placeholder="What is wrong, and the failure it causes"
+                  class={textarea_class()}
+                >{@finding_form[:body].value}</textarea>
+                <button type="submit" id="finding-submit" class={button_class()}>
+                  Record finding
+                </button>
+              </fieldset>
               <.notice notice={@notice} kind={:finding} />
             </.form>
           </section>

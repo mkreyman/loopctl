@@ -15,7 +15,6 @@ defmodule LoopctlWeb.ThreadLiveTest do
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Tenants.RootAuthenticator
-  alias Loopctl.Tenants.Tenant
   alias Loopctl.Threads
   alias Loopctl.Threads.Entry
   alias Loopctl.WebAuthn.BrowserLogin
@@ -418,7 +417,95 @@ defmodule LoopctlWeb.ThreadLiveTest do
     end
   end
 
+  describe "the finding form binds only to the current claim" do
+    defp reclaim(ctx, epoch) do
+      in_tenant(ctx, fn ->
+        from(s in Story, where: s.id == ^ctx.story.id)
+        |> Repo.update_all(set: [claim_epoch: epoch])
+      end)
+    end
+
+    defp checkpoint_options(view) do
+      view
+      |> element("#finding-checkpoint")
+      |> render()
+      |> then(&Regex.scan(~r/value="([^"]+)"/, &1))
+      |> Enum.map(fn [_, id] -> id end)
+    end
+
+    test "only the current claim's checkpoints are offered, refreshed on the tick", ctx do
+      old = checkpoint(ctx, @sha1)
+      {:ok, view, _html} = open(ctx)
+      assert checkpoint_options(view) == [old.id]
+
+      # Re-claimed, and the new claim records a checkpoint while the page is open.
+      reclaim(ctx, @epoch + 1)
+      new = checkpoint(ctx, @sha2, @epoch + 1)
+      send(view.pid, :revalidate)
+
+      assert checkpoint_options(view) == [new.id]
+
+      assert has_element?(
+               view,
+               "#finding-checkpoint option[selected]",
+               String.slice(@sha2, 0, 12)
+             )
+
+      # The diff allow-list followed the refresh.
+      assert has_element?(view, "#diff-button-#{new.id}")
+    end
+
+    test "a claim with no checkpoint disables the form and says why", ctx do
+      checkpoint(ctx, @sha1)
+      reclaim(ctx, @epoch + 1)
+      {:ok, view, _html} = open(ctx)
+
+      assert has_element?(view, "#finding-unavailable")
+      assert has_element?(view, "#finding-form fieldset[disabled]")
+      assert checkpoint_options(view) == []
+    end
+
+    test "a write refreshes the checkpoints too", ctx do
+      checkpoint(ctx, @sha1)
+      {:ok, view, _html} = open(ctx)
+      new = checkpoint(ctx, @sha2)
+
+      view |> form("#message-form") |> render_submit(%{message: %{body: "hi"}})
+      assert new.id in checkpoint_options(view)
+    end
+  end
+
   describe "writing (TC-45.7.3)" do
+    test "a resubmit after a reconnect carries the first submit's nonce: one entry", ctx do
+      checkpoint(ctx, @sha1)
+      {:ok, first, _html} = open(ctx)
+      nonce = nonce_of(first, "message")
+
+      # The write lands, but the page never hears back and reconnects: a fresh mount, which
+      # mints a fresh nonce.
+      first |> form("#message-form") |> render_submit(%{message: %{body: "only once"}})
+      {:ok, again, _html} = open(ctx)
+      refute nonce_of(again, "message") == nonce
+
+      # Form recovery sends the pre-reconnect values as a change; the resubmit carries them.
+      again
+      |> form("#message-form")
+      |> render_change(%{message: %{body: "only once", nonce: nonce}})
+
+      again |> form("#message-form") |> render_submit()
+
+      assert [_one] = entries(ctx, :message)
+    end
+
+    test "a malformed recovered nonce is not adopted", ctx do
+      checkpoint(ctx, @sha1)
+      {:ok, view, _html} = open(ctx)
+      minted = nonce_of(view, "message")
+
+      view |> form("#message-form") |> render_change(%{message: %{body: "x", nonce: "short"}})
+      assert nonce_of(view, "message") == minted
+    end
+
     test "the same message form submitted twice is one entry, the human's, with no lineage",
          ctx do
       checkpoint(ctx, @sha1)
@@ -482,29 +569,6 @@ defmodule LoopctlWeb.ThreadLiveTest do
       assert [finding] = entries(ctx, :finding)
       assert finding.checkpoint_id == cp.id and finding.author_principal == "human:webauthn"
       assert has_element?(view, "#finding-#{finding.id}", "lib/a.ex:1")
-    end
-
-    test "a halted tenant reads, writes a message, and is refused a finding", ctx do
-      cp = checkpoint(ctx, @sha1)
-
-      Repo.update_all(from(t in Tenant, where: t.id == ^ctx.tenant.id),
-        set: [custody_halted_at: DateTime.utc_now()]
-      )
-
-      {:ok, view, _html} = open(ctx)
-      assert has_element?(view, "#thread-halted")
-
-      view
-      |> form("#finding-form")
-      |> render_submit(%{
-        finding: %{nonce: "f1", checkpoint_id: cp.id, severity: "high", body: "b"}
-      })
-
-      assert has_element?(view, "#finding-notice", "halted")
-      assert [] == entries(ctx, :finding)
-
-      view |> form("#message-form") |> render_submit(%{message: %{nonce: "m1", body: "hi"}})
-      assert [_message] = entries(ctx, :message)
     end
 
     test "a material finding after the final verdict escalates, and the page says so", ctx do

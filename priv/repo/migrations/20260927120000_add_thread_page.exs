@@ -125,7 +125,7 @@ defmodule Loopctl.Repo.Migrations.AddThreadPage do
   not known to be closed. The in-flight stages are `Loopctl.Delivery.StageMachine`'s
   `@in_flight` as of this migration (claimed, worktree, implementing, reviewing, pr_open, ci);
   a migration may not read application code that changes after it. Public so the query is
-  tested (`Loopctl.Threads.IssueLinksBackfillTest`).
+  tested (`Loopctl.Threads.IssueLinksTest`, "the migration's one-time backfill").
   """
   def backfill_sql do
     """

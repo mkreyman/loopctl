@@ -76,6 +76,23 @@ defmodule Loopctl.ThreadsTest do
     do: %{"kind" => "message", "idempotency_key" => key, "body" => body}
 
   describe "checkpoints" do
+    test "a commit or tree that is not a git object id is refused before anything is written" do
+      ctx = claimed_story()
+
+      for {sha, tree} <- [
+            {String.upcase(@sha1), @tree},
+            {String.duplicate("a", 39), @tree},
+            {@sha1, String.duplicate("z", 40)}
+          ] do
+        assert {:error, :unprocessable_entity, message} =
+                 checkpoint(ctx, sha, tree_sha: tree)
+
+        assert message =~ "lowercase hex"
+      end
+
+      assert {:ok, %{checkpoints: []}} = Threads.get_thread(ctx.tenant_id, ctx.story.id)
+    end
+
     test "the claimant records one, with a checkpoint entry beside it" do
       ctx = claimed_story()
 

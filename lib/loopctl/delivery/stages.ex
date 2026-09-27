@@ -140,6 +140,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.Untrusted
+  alias Loopctl.GitSha
   alias Loopctl.Intake.IssueClosures
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
@@ -154,8 +155,6 @@ defmodule Loopctl.Delivery.Stages do
 
   # The story statuses a claim holds. Entering `claimed` needs one.
   @claimed_statuses [:assigned, :implementing]
-
-  @sha ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
 
   # Edges only a claim release takes, inside its own transaction (`follow_release/5`), and
   # `advance/4` therefore refuses from every caller: the release itself, and what the release
@@ -1902,7 +1901,7 @@ defmodule Loopctl.Delivery.Stages do
 
   defp validate_effect(sha, value)
        when sha in [:head_sha, :merge_sha, :merge_gate_allowed_sha] and is_binary(value) do
-    if Regex.match?(@sha, value), do: {:ok, value}, else: {:error, :invalid_effect}
+    if GitSha.valid?(value), do: {:ok, value}, else: {:error, :invalid_effect}
   end
 
   defp validate_effect(:worktree_path, value), do: bounded_text(value, 4096)
