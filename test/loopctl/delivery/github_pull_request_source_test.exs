@@ -753,6 +753,178 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
+  describe "check_evidence/3 (US-45.6)" do
+    @branch "loop/story-7-abcd1234"
+
+    defp gh_run(id, extra \\ %{}) do
+      Map.merge(
+        %{
+          "id" => id,
+          "path" => ".github/workflows/ci.yml",
+          "head_sha" => @head,
+          "head_branch" => @branch,
+          "event" => "push"
+        },
+        extra
+      )
+    end
+
+    defp gh_job(id, name, conclusion),
+      do: %{"id" => id, "name" => name, "status" => "completed", "conclusion" => conclusion}
+
+    # The three reads, each answered by `answers`, keyed by what it asks for.
+    defp stub_ci(answers) do
+      stub(fn conn ->
+        case String.split(conn.request_path, "/") do
+          [_, "repos", "acme", "widgets", "actions", "runs"] ->
+            send(self(), {:runs_query, URI.decode_query(conn.query_string)})
+            json(conn, answers.runs)
+
+          [_, "repos", "acme", "widgets", "actions", "runs", id, "jobs"] ->
+            assert URI.decode_query(conn.query_string)["filter"] == "latest"
+            json(conn, Map.fetch!(answers.jobs, String.to_integer(id)))
+
+          [_, "repos", "acme", "widgets", "commits", @head, "status"] ->
+            answer_statuses(conn, answers.statuses)
+        end
+      end)
+    end
+
+    defp answer_statuses(conn, {:status, code}),
+      do: conn |> Plug.Conn.put_status(code) |> json(%{})
+
+    defp answer_statuses(conn, body), do: json(conn, body)
+
+    test "reads the jobs of the push runs of THIS branch at THIS commit, tagged with the run" do
+      stub_ci(%{
+        runs: %{"total_count" => 1, "workflow_runs" => [gh_run(5)]},
+        jobs: %{5 => %{"total_count" => 1, "jobs" => [gh_job(50, "test", "success")]}},
+        statuses: %{
+          "total_count" => 1,
+          "statuses" => [%{"context" => "local-gate", "state" => "success"}]
+        }
+      })
+
+      assert {:ok, %{jobs: [job], statuses: [%{context: "local-gate"}]}} =
+               Source.check_evidence(@repo, @head, @branch)
+
+      assert %{id: 50, name: "test", run_id: 5, workflow: ".github/workflows/ci.yml"} = job
+
+      assert_received {:runs_query, query}
+      assert query["head_sha"] == @head
+      assert query["branch"] == @branch
+      assert query["event"] == "push"
+    end
+
+    # Round 1 of #910, finding 2: a run the API filter let through for another branch, event or
+    # commit is dropped here too — only the thread's own push runs are trusted.
+    test "a run for another branch, event or commit is never read" do
+      stub_ci(%{
+        runs: %{
+          "total_count" => 3,
+          "workflow_runs" => [
+            gh_run(6, %{"head_branch" => "evil"}),
+            gh_run(7, %{"event" => "workflow_dispatch"}),
+            gh_run(8, %{"head_sha" => String.duplicate("9", 40)})
+          ]
+        },
+        jobs: %{},
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:ok, %{jobs: []}} = Source.check_evidence(@repo, @head, @branch)
+    end
+
+    # Round 1 of #910, finding 3: a job repeated across a moved page boundary is counted once,
+    # and a list short of its total is refused.
+    test "jobs are de-duplicated by id and a short list is refused as truncated" do
+      stub_ci(%{
+        runs: %{"total_count" => 1, "workflow_runs" => [gh_run(5)]},
+        jobs: %{
+          5 => %{
+            "total_count" => 2,
+            "jobs" => [gh_job(50, "test", "success"), gh_job(50, "test", "success")]
+          }
+        },
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:error, {:jobs_truncated, 2, 1}} = Source.check_evidence(@repo, @head, @branch)
+    end
+
+    # #910 round 2, finding 6: shape is judged before anything reads an entry's fields.
+    test "a jobs list with a malformed entry is unreadable, never a crash" do
+      stub_ci(%{
+        runs: %{"total_count" => 1, "workflow_runs" => [gh_run(5)]},
+        jobs: %{5 => %{"total_count" => 2, "jobs" => [gh_job(50, "test", "success"), "junk"]}},
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:error, {:unreadable_jobs, {:list, 2}}} =
+               Source.check_evidence(@repo, @head, @branch)
+    end
+
+    # #910 round 3, finding 2: a commit pushed more than once has a run per push per workflow;
+    # only each workflow's newest is read, and the bound counts workflows, not pushes.
+    test "only each workflow's newest run is read, and the bound counts workflows" do
+      runs =
+        for push <- 0..3, {wf, n} <- [{"a", 1}, {"b", 2}, {"c", 3}] do
+          gh_run(push * 10 + n, %{"path" => ".github/workflows/#{wf}.yml"})
+        end
+
+      newest =
+        runs
+        |> Enum.group_by(& &1["path"])
+        |> Enum.map(fn {_, rs} -> Enum.max_by(rs, & &1["id"])["id"] end)
+
+      stub_ci(%{
+        runs: %{"total_count" => length(runs), "workflow_runs" => runs},
+        jobs:
+          Map.new(
+            newest,
+            &{&1, %{"total_count" => 1, "jobs" => [gh_job(&1 * 100, "test", "success")]}}
+          ),
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:ok, %{runs: read_runs, jobs: jobs}} = Source.check_evidence(@repo, @head, @branch)
+      assert Enum.sort(Enum.map(read_runs, & &1.id)) == Enum.sort(newest)
+      assert length(jobs) == 3
+    end
+
+    test "more workflow runs than the bound is refused rather than read" do
+      runs = for id <- 1..11, do: gh_run(id, %{"path" => ".github/workflows/w#{id}.yml"})
+
+      stub_ci(%{
+        runs: %{"total_count" => 11, "workflow_runs" => runs},
+        jobs: %{},
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:error, {:too_many_workflow_runs, 11}} =
+               Source.check_evidence(@repo, @head, @branch)
+    end
+
+    # Round 1 of #910, finding 4: the statuses feed only the recorded local-gate state.
+    test "statuses that cannot be read are recorded as unread, never a failed read" do
+      stub_ci(%{
+        runs: %{"total_count" => 1, "workflow_runs" => [gh_run(5)]},
+        jobs: %{5 => %{"total_count" => 1, "jobs" => [gh_job(50, "test", "success")]}},
+        statuses: {:status, 403}
+      })
+
+      assert {:ok, %{jobs: [_], statuses: {:unread, _reason}}} =
+               Source.check_evidence(@repo, @head, @branch)
+    end
+
+    test "an unreadable runs body is an error naming its shape" do
+      stub(fn conn -> json(conn, %{"message" => "nope"}) end)
+
+      assert {:error, {:unreadable_workflow_runs, {:map, ["message"]}}} =
+               Source.check_evidence(@repo, @head, @branch)
+    end
+  end
+
   defp stub(fun), do: Req.Test.stub(Source, fun)
 
   defp deployment_route(conn, statuses) do

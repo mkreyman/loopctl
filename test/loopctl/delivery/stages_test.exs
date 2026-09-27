@@ -433,6 +433,37 @@ defmodule Loopctl.Delivery.StagesTest do
     end
   end
 
+  describe "entered_at/3 (US-45.6)" do
+    test "the newest transition INTO the stage, nil before the story ever entered it" do
+      {story, _row} = at_stage(:pr_open)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert Stages.entered_at(story.tenant_id, story.id, :ci) == {:ok, nil}
+
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:pr_open, :ci}, opts)
+      {:ok, first} = Stages.entered_at(story.tenant_id, story.id, :ci)
+      assert %DateTime{} = first
+
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :implementing, :ci_red}, opts)
+
+      [:implementing, :reviewing, :pr_open, :ci]
+      |> Enum.chunk_every(2, 1, :discard)
+      |> Enum.each(fn [from, to] ->
+        {:ok, _} = Stages.advance(story.tenant_id, story.id, {from, to}, opts)
+      end)
+
+      {:ok, second} = Stages.entered_at(story.tenant_id, story.id, :ci)
+      assert DateTime.compare(second, first) == :gt
+
+      # A later transition OUT of the stage does not move when it was entered.
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :implementing, :ci_red}, opts)
+      assert Stages.entered_at(story.tenant_id, story.id, :ci) == {:ok, second}
+
+      # Another tenant's story is never read.
+      assert Stages.entered_at(fixture(:tenant).id, story.id, :ci) == {:ok, nil}
+    end
+  end
+
   describe "note_unevaluated/4" do
     test "counts consecutive results at ONE head, and resets when the head moves" do
       {story, _row} = at_stage(:ci)

@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.108.0 — 2026-09-27 (CI evidence by exact SHA)
+
+### Changed
+
+- **`intake_source_enroll`, `intake_source_update`** take `required_checks` (loopctl US-45.6):
+  the CI checks a thread-mode checkpoint must pass on its exact commit. A thread source must
+  name at least one; `local-gate` and malformed lists are refused locally. The source row in a
+  result now carries `required_checks`.
+- **`merge_precondition`** says how CI is judged on a thread checkpoint and names the new
+  reasons: `required_check_failed`, `required_check_pending`, `required_check_missing`,
+  `required_checks_unset`, `required_check_timed_out`, `ci_evidence_unavailable`,
+  `ci_evidence_not_recorded`. A CI wait never counts toward the unevaluated bound and is
+  refused past the gate's CI wait limit from the story's entry into ci; a checkpoint changing
+  CI definitions is refused `ci_definition_changed`. Only a job of a workflow run that a push
+  of the thread branch triggered, concluding `success`, satisfies a required check.
+
 ## 2.107.0 — 2026-09-26 (review on a change thread)
 
 ### Added

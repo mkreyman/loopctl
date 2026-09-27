@@ -210,7 +210,9 @@ defmodule Loopctl.Threads do
                commit_sha: c.commit_sha,
                tree_sha: c.tree_sha,
                claim_epoch: c.claim_epoch,
-               merge_commit_sha: c.merge_commit_sha
+               merge_commit_sha: c.merge_commit_sha,
+               # The merge gate's CI-wait fallback origin (US-45.6).
+               inserted_at: c.inserted_at
              }}
       )
 
@@ -469,6 +471,116 @@ defmodule Loopctl.Threads do
         where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id and c.story_id == ^story_id
     )
   end
+
+  @doc """
+  Copies the merge gate's evidence onto a checkpoint (US-45.6, AC-45.6.1): `record` is stored
+  under `key` in the checkpoint's `gate_evidence`, replacing that key and leaving every other
+  one.
+
+  NEVER OVER A NEWER READ (US-45.6 review round 1, finding 6). Two evaluations can overlap,
+  and the slower one may have read earlier: without a guard it would write a stale "pending"
+  over the green record an allow was granted on. A record carrying `"read_at"` (ISO 8601 UTC,
+  which orders as text) replaces only a stored one read strictly earlier; one read no later
+  than what is stored changes nothing and is answered `:superseded`, so a caller about to act
+  on it knows it did not land. One identical to what is stored, `read_at` aside, is `:ok`
+  with no write.
+
+  Not a thread WRITE in the claimant's sense — the gate, not a principal, records what the
+  forge said about a commit — so it takes no story lock and no claim fence. Its lock wait is
+  bounded and contention is `{:error, :busy}`, counted as `[:loopctl, :threads, :busy]`.
+  `{:error, :not_found}` when the story has no such checkpoint.
+  """
+  @spec record_gate_evidence(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) ::
+          :ok | :superseded | {:error, :not_found | term()}
+  def record_gate_evidence(tenant_id, story_id, checkpoint_id, key, record)
+      when is_binary(key) and is_map(record) do
+    Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "gate evidence write", fn ->
+      tenant_id
+      |> Repo.with_tenant(fn ->
+        write_gate_evidence(tenant_id, story_id, checkpoint_id, key, record)
+      end)
+      |> case do
+        {:ok, answer} -> answer
+        {:error, _reason} = error -> error
+      end
+    end)
+  end
+
+  defp write_gate_evidence(tenant_id, story_id, checkpoint_id, key, record) do
+    Capacity.set_lock_timeout!(Repo)
+
+    stored =
+      Repo.one(
+        from c in Checkpoint,
+          where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
+          where: c.story_id == ^story_id,
+          lock: "FOR UPDATE",
+          select: %{present: true, record: fragment("?->?", c.gate_evidence, ^key)}
+      )
+
+    case evidence_write(stored, record) do
+      :write ->
+        {1, _} =
+          from(c in Checkpoint, where: c.id == ^checkpoint_id)
+          |> update([c],
+            set: [gate_evidence: fragment("? || ?", c.gate_evidence, ^%{key => record})]
+          )
+          |> Repo.update_all([])
+
+        :ok
+
+      # Same judgement, read later: only the stored `read_at` moves, so a slower evaluation
+      # that read in between can no longer pass for the newer one (#910 round 2, finding 3).
+      :advance_read_at ->
+        {1, _} =
+          from(c in Checkpoint, where: c.id == ^checkpoint_id)
+          |> update([c],
+            set: [
+              gate_evidence:
+                fragment(
+                  "jsonb_set(?, ARRAY[?, 'read_at'], to_jsonb(?::text))",
+                  c.gate_evidence,
+                  ^key,
+                  ^Map.get(record, "read_at")
+                )
+            ]
+          )
+          |> Repo.update_all([])
+
+        :ok
+
+      answer ->
+        answer
+    end
+  end
+
+  # The decision, taken under the row lock so two evaluations cannot both think they are the
+  # newer one. A record read no LATER than the stored one is `:superseded`, never `:ok`: the
+  # allow path must not record an allow on evidence that did not land (round 2, finding 4).
+  # One that says exactly what is stored already, read_at aside, rewrites nothing but the
+  # stored `read_at` (when it is later), so a CI wait polled for hours rewrites the judgement
+  # only when it moves (finding 6) and the ordering guard stays current.
+  defp evidence_write(nil, _record), do: {:error, :not_found}
+  defp evidence_write(%{record: nil}, _record), do: :write
+
+  defp evidence_write(%{record: stored}, record) do
+    later? = later?(Map.get(record, "read_at"), Map.get(stored, "read_at"))
+    same? = Map.delete(stored, "read_at") == Map.delete(record, "read_at")
+
+    cond do
+      same? and later? and is_binary(Map.get(record, "read_at")) -> :advance_read_at
+      same? -> :ok
+      not later? -> :superseded
+      true -> :write
+    end
+  end
+
+  # ISO 8601 UTC with fixed-width fractions orders as text (`CiEvidence.to_record/5`). A record
+  # with no `read_at` makes no ordering claim and is written.
+  defp later?(nil, _stored), do: true
+  defp later?(_read_at, nil), do: true
+  defp later?(read_at, stored) when is_binary(read_at) and is_binary(stored), do: read_at > stored
+  defp later?(_read_at, _stored), do: true
 
   defp locked_story(tenant_id, story_id),
     do: Repo.one(story_query(tenant_id, story_id) |> lock("FOR SHARE"))

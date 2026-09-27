@@ -452,7 +452,9 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
         |> auth(ctx.operator_key)
         |> post(
           ~p"/api/v1/intake/sources",
-          Map.put(create_params(ctx, "mkreyman/infra"), "mode", "thread")
+          create_params(ctx, "mkreyman/infra")
+          |> Map.put("mode", "thread")
+          |> Map.put("required_checks", ["test"])
         )
         |> json_response(201)
 
@@ -470,7 +472,8 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
         fixture(:intake_source, %{
           tenant_id: ctx.tenant.id,
           project_id: ctx.project.id,
-          target_epic_id: epic.id
+          target_epic_id: epic.id,
+          required_checks: ["test"]
         })
 
       body =
@@ -540,7 +543,10 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       body =
         conn
         |> auth(ctx.operator_key)
-        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "thread"})
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
+          "mode" => "thread",
+          "required_checks" => ["test"]
+        })
         |> json_response(200)
 
       assert body["source"]["mode"] == "thread"

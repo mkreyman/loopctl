@@ -6,6 +6,38 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A thread-mode merge requires green CI on the checkpoint's exact commit (epic 45, US-45.6,
+  migration `20260927100000`). A THREAD-mode source must now name its `required_checks`, and
+  the gate's `GITHUB_TOKEN` needs `actions: read` (and, best effort, `commit statuses: read`)
+  for it.** The
+  migration adds `intake_sources.required_checks` (`varchar(255)[]`, NOT NULL, default empty; no
+  backfill). `POST`/`PATCH /api/v1/intake/sources` and the `intake_source_enroll` /
+  `intake_source_update` MCP tools take it; a `thread` source naming none is 422, judged over
+  the source as it will be, `local-gate` is refused, and a change is recorded as
+  `intake_source_required_checks_set` on the audit chain. **A thread-mode source enrolled
+  before this migration has no required checks and every one of its stories is refused
+  `required_checks_unset` until one is named.** Name GitHub Actions JOB names, and make
+  sure each required job runs on every push to the thread branches (no path filter or
+  job-level `if:` that can skip it): a required check that never appears is refused after the
+  wait. The merge gate trusts ONLY the jobs of the GitHub Actions workflow runs that a PUSH
+  of the thread branch at the checkpoint's exact commit triggered (the Actions runs and jobs
+  APIs; the gate's `GITHUB_TOKEN` needs `actions: read`), and a job passes only by
+  concluding `success` — a skipped job fails. Commit statuses and check runs created any
+  other way are never trusted, because the implementer can create them; a CI that reports
+  only statuses cannot satisfy thread mode. Per name, the newest run of each workflow counts
+  and every workflow must pass. A failed one refuses `required_check_failed`; one still
+  running or not yet reported answers `unevaluated` (`required_check_pending` /
+  `required_check_missing`), never counted toward the unevaluated bound, and refused
+  `required_check_timed_out` once the wait passes `MergePrecondition.ci_wait_limit_seconds/0`
+  from the story's entry into `ci`. A checkpoint that changes `.github/workflows/` or
+  `.github/actions/` is refused `ci_definition_changed` for a human (`ci_definition_unknown`
+  when its diff could not be listed), because Actions runs the workflow files of the commit
+  under test. A failed read is `ci_evidence_unavailable`. The list is read from
+  the source live, so correcting it reaches stories already in flight. A
+  `local-gate` status is recorded and never satisfies a required check. What was read is
+  returned as `ci_evidence` and copied onto the checkpoint's `gate_evidence` under `ci`; an
+  allow whose copy did not land is refused `ci_evidence_not_recorded`. MCP server 2.108.0.
+
 - **Review on a change thread (epic 45, US-45.3, runner contract 1.21.0, migration
   `20260926160000`). RE-VENDOR the contract and declare `review` to take review dispatches.**
   `POST /api/v1/stories/:id/thread/reviews` (orchestrator or above, human-anchored tenants)

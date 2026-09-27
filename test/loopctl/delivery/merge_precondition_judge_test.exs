@@ -1200,6 +1200,199 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     end
   end
 
+  describe "CI evidence on the checkpoint's exact commit (US-45.6)" do
+    test "a failed required check refuses, naming it and its conclusion" do
+      verdict =
+        judge_thread(ci: %{jobs: [run("test", "completed", "failure")], statuses: []})
+
+      assert verdict.decision == :refuse
+      assert {:required_check_failed, "test", "failure"} in verdict.reasons
+    end
+
+    test "a pending required check is unevaluated, retried after five minutes, never allowed" do
+      verdict = judge_thread(ci: %{jobs: [run("test", "in_progress", nil)], statuses: []})
+
+      assert verdict.decision == :unevaluated
+      assert {:required_check_pending, "test"} in verdict.reasons
+      assert verdict.retry_after == 300
+    end
+
+    test "a required check missing from the commit is unevaluated, never allowed" do
+      verdict = judge_thread(ci: %{jobs: [], statuses: []})
+
+      assert verdict.decision == :unevaluated
+      assert {:required_check_missing, "test"} in verdict.reasons
+    end
+
+    test "a failure decides even while another required check is still running" do
+      ci = %{
+        jobs: [run("test", "completed", "failure"), run("lint", "queued", nil)],
+        statuses: []
+      }
+
+      verdict = judge_thread(required_checks: ["test", "lint"], ci: ci)
+
+      assert verdict.decision == :refuse
+      assert {:required_check_failed, "test", "failure"} in verdict.reasons
+      refute {:required_check_pending, "lint"} in verdict.reasons
+    end
+
+    # TC-45.6.2: the local gate alone never satisfies a required check.
+    test "only a local-gate success is not an allow" do
+      ci = %{jobs: [], statuses: [%{context: "local-gate", state: "success"}]}
+      verdict = judge_thread(ci: ci)
+
+      assert verdict.decision == :unevaluated
+      assert {:required_check_missing, "test"} in verdict.reasons
+      assert verdict.ci_evidence["local_gate"] == "success"
+    end
+
+    test "a thread source requiring no check is refused, not allowed" do
+      verdict = judge_thread(required_checks: [])
+
+      assert verdict.decision == :refuse
+      assert :required_checks_unset in verdict.reasons
+
+      # `local-gate` alone is the same as nothing: it is never looked up.
+      assert :required_checks_unset in judge_thread(required_checks: ["local-gate"]).reasons
+    end
+
+    test "an evidence read that failed transiently is unevaluated; otherwise it refuses" do
+      transient = judge_thread([], ci_evidence: {:error, {:github_unreachable, :timeout}})
+      assert transient.decision == :unevaluated
+      assert {:ci_evidence_unavailable, {:github_unreachable, :timeout}} in transient.reasons
+
+      broken = judge_thread([], ci_evidence: {:error, {:check_runs_truncated, 120, 100}})
+      assert broken.decision == :refuse
+      assert {:ci_evidence_unavailable, {:check_runs_truncated, 120, 100}} in broken.reasons
+    end
+
+    test "an allow carries the evidence it rests on, for enforce/3 to copy" do
+      verdict = judge_thread([])
+
+      assert verdict.decision == :allow
+      assert %{"sha" => @head, "passed" => ["test"], "required" => ["test"]} = verdict.ci_evidence
+    end
+
+    # Round 3: Actions runs the workflow files of the commit under test, so a thread that
+    # changes them could make its own required checks green.
+    test "a checkpoint changing CI definitions is refused for a human, renames included" do
+      for {files, renames} <- [
+            {[".github/workflows/ci.yml"], []},
+            {[".github/actions/setup/action.yml"], []},
+            # #910 round 2, finding 5: a composite action a workflow calls from anywhere.
+            {["ci/run-tests/action.yml"], []},
+            {["action.yaml"], []},
+            {["ci/new.yml"], [{".github/workflows/old.yml", "ci/new.yml"}]}
+          ] do
+        pr_diff = {:ok, %{files: files, renames: renames}}
+        verdict = judge_thread(diff_override: pr_diff)
+
+        assert verdict.decision == :refuse, inspect(files)
+        assert Enum.any?(verdict.reasons, &match?({:ci_definition_changed, _}, &1))
+      end
+    end
+
+    # Round 1 of #910, finding 7: a diff that could not be listed fails CLOSED here.
+    test "a checkpoint whose diff could not be listed is refused ci_definition_unknown" do
+      verdict = judge_thread(diff_override: {:error, {:file_list_truncated, 300}})
+
+      assert verdict.decision == :refuse
+      assert {:ci_definition_unknown, {:file_list_truncated, 300}} in verdict.reasons
+    end
+
+    # Round 1 of #910, finding 5: contention reading the ci entry is a retry, not a crash.
+    test "a ci-entry read that met contention is unevaluated" do
+      verdict = judge_thread([], ci_entered_at: {:error, :busy})
+
+      assert verdict.decision == :unevaluated
+      assert {:ci_entry_unreadable, :busy} in verdict.reasons
+    end
+
+    # Review round 2, finding 3: a CI wait holds back only an allow.
+    test "a refusal is decided now, not held back while CI is still running" do
+      running = %{jobs: [run("test", "queued", nil)], statuses: []}
+      verdict = judge_thread(head_tree_sha: String.duplicate("f", 40), ci: running)
+
+      assert verdict.decision == :refuse
+      refute {:required_check_pending, "test"} in verdict.reasons
+    end
+
+    # Review round 2, finding 5: required checks with no read fail closed.
+    test "required checks with nothing read refuse ci_evidence_not_read" do
+      verdict = judge_thread([], ci_evidence: {:ok, nil})
+
+      assert verdict.decision == :refuse
+      assert :ci_evidence_not_read in verdict.reasons
+    end
+
+    test "an allow whose evidence was superseded by a newer read is judged again" do
+      superseded = MergePrecondition.allow_evidence_outcome(judge_thread([]), :superseded)
+
+      # Round 3: a wait like any CI wait — not counted, asked again on the CI interval.
+      assert superseded.decision == :unevaluated
+      assert [{:ci_evidence_superseded, @head}] = superseded.reasons
+      assert superseded.retry_after == 300
+      refute MergePrecondition.counts_toward_unevaluated_bound?(superseded)
+    end
+
+    # Review round 1, finding 4: contention on the evidence write is a retry, not an escalation.
+    test "an allow whose evidence write met contention is unevaluated; other failures refuse" do
+      allowed = judge_thread([])
+
+      busy = MergePrecondition.allow_evidence_outcome(allowed, {:error, :busy})
+      assert busy.decision == :unevaluated
+      assert {:ci_evidence_not_recorded, :busy} in busy.reasons
+      assert MergePrecondition.counts_toward_unevaluated_bound?(busy)
+
+      gone = MergePrecondition.allow_evidence_outcome(allowed, {:error, :not_found})
+      assert gone.decision == :refuse
+      assert {:ci_evidence_not_recorded, :not_found} in gone.reasons
+
+      assert :ok = MergePrecondition.allow_evidence_outcome(allowed, :ok)
+    end
+
+    test "a pr-mode verdict reads and carries no CI evidence" do
+      verdict = judge([])
+
+      assert verdict.mode == :pr
+      assert verdict.ci_evidence == nil
+      refute :required_checks_unset in verdict.reasons
+    end
+
+    # Review round 1, findings 1 and 2: a CI wait is bounded in TIME, never by polls.
+    test "a CI wait, running or missing, is left out of the unevaluated bound" do
+      pending = judge_thread(ci: %{jobs: [run("test", "queued", nil)], statuses: []})
+      refute MergePrecondition.counts_toward_unevaluated_bound?(pending)
+
+      missing = judge_thread(ci: %{jobs: [], statuses: []})
+      refute MergePrecondition.counts_toward_unevaluated_bound?(missing)
+
+      forge = judge_thread([], ci_evidence: {:error, {:github_unreachable, :timeout}})
+      assert MergePrecondition.counts_toward_unevaluated_bound?(forge)
+    end
+
+    test "past the wait limit a check still running or never reported is refused" do
+      entered = ~U[2026-09-27 00:00:00Z]
+      late = DateTime.add(entered, MergePrecondition.ci_wait_limit_seconds() + 1)
+      on_time = DateTime.add(entered, MergePrecondition.ci_wait_limit_seconds())
+
+      stuck = %{jobs: [run("test", "in_progress", nil)], statuses: []}
+
+      refused = judge_thread([ci: stuck], ci_entered_at: {:ok, entered}, now: late)
+      assert refused.decision == :refuse
+      assert {:required_check_timed_out, "test", :pending} in refused.reasons
+
+      never =
+        judge_thread([ci: %{jobs: [], statuses: []}], ci_entered_at: {:ok, entered}, now: late)
+
+      assert {:required_check_timed_out, "test", :missing} in never.reasons
+
+      waiting = judge_thread([ci: stuck], ci_entered_at: {:ok, entered}, now: on_time)
+      assert waiting.decision == :unevaluated
+    end
+  end
+
   # The facts of a thread story at its latest recorded checkpoint, as `gather/3` resolves them
   # through `Loopctl.Delivery.CheckpointSource`.
   defp judge_thread(overrides, fact_overrides \\ []) do
@@ -1222,6 +1415,12 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
         base_tree_sha: Keyword.get(overrides, :base_tree_sha, @base_tree)
       })
 
+    pr =
+      case Keyword.fetch(overrides, :diff_override) do
+        {:ok, diff} -> Map.put(pr, :diff, diff)
+        :error -> pr
+      end
+
     [
       pr_number: {:ok, nil},
       pull_request: {:ok, pr},
@@ -1232,11 +1431,23 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     |> Map.merge(%{
       mode: Keyword.get(overrides, :mode, :thread),
       checkpoint: {:ok, checkpoint},
-      claim_live?: Keyword.get(overrides, :claim_live?, true)
+      claim_live?: Keyword.get(overrides, :claim_live?, true),
+      required_checks: Keyword.get(overrides, :required_checks, ["test"]),
+      ci_entered_at: {:ok, nil},
+      ci_evidence: {:ok, ci_read(Keyword.get(overrides, :ci, green_ci()))}
     })
     |> Map.merge(Map.new(fact_overrides))
     |> MergePrecondition.judge()
   end
+
+  # US-45.6: the checkpoint commit's CI as `gather/3` reads it.
+  defp green_ci, do: %{jobs: [run("test", "completed", "success")], statuses: []}
+
+  defp run(name, status, conclusion),
+    do: %{name: name, status: status, conclusion: conclusion, app: "github-actions"}
+
+  defp ci_read(evidence),
+    do: %{evidence: evidence, sha: @head, read_at: ~U[2026-09-27 10:00:00Z]}
 
   defp judge(opts), do: opts |> facts() |> MergePrecondition.judge()
 

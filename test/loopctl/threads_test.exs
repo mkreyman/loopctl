@@ -254,6 +254,100 @@ defmodule Loopctl.ThreadsTest do
     end
   end
 
+  describe "record_gate_evidence/5 (US-45.6)" do
+    test "stores the record under its key and keeps every other key" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+
+      assert :ok =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "other", %{
+                 "a" => 1
+               })
+
+      assert :ok =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", %{
+                 "sha" => @sha1
+               })
+
+      assert :ok =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", %{
+                 "sha" => @sha2
+               })
+
+      assert %{"other" => %{"a" => 1}, "ci" => %{"sha" => @sha2}} = stored_evidence(ctx, cp.id)
+    end
+
+    # Review round 1, finding 6: a slower evaluation that read earlier never overwrites.
+    test "a record read no later than the stored one changes nothing" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+      newer = %{"read_at" => "2026-09-27T10:00:01.000000Z", "passed" => ["test"]}
+      older = %{"read_at" => "2026-09-27T10:00:00.000000Z", "pending" => ["test"]}
+
+      assert :ok = Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", newer)
+
+      # Round 2, finding 4: the caller is told it did not land.
+      assert :superseded =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", older)
+
+      assert %{"ci" => ^newer} = stored_evidence(ctx, cp.id)
+
+      # Round 2, finding 6: the same judgement read later is :ok and writes nothing.
+      same_later = %{newer | "read_at" => "2026-09-27T10:00:05.000000Z"}
+
+      assert :ok =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", same_later)
+
+      # #910 round 2, finding 3: the same judgement read later moves the stored read_at, so a
+      # slower evaluation that read in between (10:00:03) can no longer pass for the newer one.
+      assert %{"ci" => ^same_later} = stored_evidence(ctx, cp.id)
+
+      # The same judgement read EARLIER than what is stored is :ok, never :superseded: the
+      # stored record already says the same thing, so an allow resting on it may stand.
+      assert :ok = Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", newer)
+      assert %{"ci" => ^same_later} = stored_evidence(ctx, cp.id)
+      in_between = %{"read_at" => "2026-09-27T10:00:03.000000Z", "pending" => ["test"]}
+
+      assert :superseded =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", in_between)
+
+      newest = %{"read_at" => "2026-09-27T10:00:10.000000Z", "failed" => ["test"]}
+      assert :ok = Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", newest)
+      assert %{"ci" => ^newest} = stored_evidence(ctx, cp.id)
+    end
+
+    test "another story's checkpoint, or another tenant's, is not_found and untouched" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+      other = claimed_story()
+
+      assert {:error, :not_found} =
+               Threads.record_gate_evidence(ctx.tenant_id, other.story.id, cp.id, "ci", %{
+                 "x" => 1
+               })
+
+      assert {:error, :not_found} =
+               Threads.record_gate_evidence(other.tenant_id, ctx.story.id, cp.id, "ci", %{
+                 "x" => 1
+               })
+
+      assert stored_evidence(ctx, cp.id) == %{}
+    end
+  end
+
+  defp stored_evidence(ctx, checkpoint_id) do
+    {:ok, evidence} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        Repo.one!(
+          from c in Loopctl.Threads.Checkpoint,
+            where: c.id == ^checkpoint_id,
+            select: c.gate_evidence
+        )
+      end)
+
+    evidence
+  end
+
   describe "entries" do
     test "a retry of the same write is the same entry; another author's key is distinct" do
       ctx = claimed_story()

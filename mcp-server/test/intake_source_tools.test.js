@@ -168,6 +168,7 @@ describe("intake_source_enroll", () => {
       "mode",
       "project_id",
       "repo_full_name",
+      "required_checks",
       "revoked_at",
       "target_epic_id",
       "updated_at",
@@ -346,6 +347,56 @@ describe("intake_source_enroll", () => {
       deps({ apiCall }),
     );
     assert.equal(calls[1].body.mode, "thread");
+  });
+
+  test("sends required_checks only when given (US-45.6)", async () => {
+    const { calls, apiCall } = fakeApi(created(), created());
+
+    await enrollIntakeSource(
+      { repo_full_name: REPO, project_id: PROJECT_ID, secret_file: secretFileIn("rc-a") },
+      deps({ apiCall }),
+    );
+    assert.ok(!("required_checks" in calls[0].body), "unnamed required_checks reached the server");
+
+    await enrollIntakeSource(
+      {
+        repo_full_name: REPO,
+        project_id: PROJECT_ID,
+        mode: "thread",
+        required_checks: ["test", "lint"],
+        secret_file: secretFileIn("rc-b"),
+      },
+      deps({ apiCall }),
+    );
+    assert.deepEqual(calls[1].body.required_checks, ["test", "lint"]);
+  });
+
+  test("malformed required_checks, or local-gate among them, are refused locally", async () => {
+    for (const [i, [bad, reason]] of [
+      ["test", /must be a list/],
+      [[""], /must be a list/],
+      [[7], /must be a list/],
+      [["test "], /must be a list/],
+      [["test", "test"], /must be a list/],
+      [["test", "local-gate"], /local-gate` can never be a required check/],
+    ].entries()) {
+      const { calls, apiCall } = fakeApi(created());
+
+      const result = await enrollIntakeSource(
+        {
+          repo_full_name: REPO,
+          project_id: PROJECT_ID,
+          mode: "thread",
+          required_checks: bad,
+          secret_file: secretFileIn(`rc-bad-${i}.secret`),
+        },
+        deps({ apiCall }),
+      );
+
+      assert.equal(result.error, true, JSON.stringify(bad));
+      assert.match(result.body, reason);
+      assert.equal(calls.length, 0, "a refused enrolment must not reach the API");
+    }
   });
 
   test("an unknown or null mode is refused locally, without enrolling anything", async () => {
@@ -748,6 +799,25 @@ describe("intake_source_update", () => {
 
     assert.deepEqual(calls[0].body, { mode: "thread" });
     assert.equal(result.source.mode, "thread");
+  });
+
+  test("required_checks alone is a complete update, forwarded as named (US-45.6)", async () => {
+    const { calls, apiCall } = fakeApi({ source: { ...created().source, required_checks: ["e2e"] } });
+
+    const result = await updateIntakeSource(
+      { source_id: SOURCE_ID, required_checks: ["e2e"] },
+      deps({ apiCall }),
+    );
+
+    assert.deepEqual(calls[0].body, { required_checks: ["e2e"] });
+    assert.deepEqual(result.source.required_checks, ["e2e"]);
+
+    const refused = await updateIntakeSource(
+      { source_id: SOURCE_ID, required_checks: ["local-gate"] },
+      deps({ apiCall }),
+    );
+    assert.equal(refused.error, true);
+    assert.equal(calls.length, 1, "a refused update must not reach the API");
   });
 
   test("a null mode is refused locally on update, naming the reason", async () => {
