@@ -59,35 +59,13 @@ defmodule Loopctl.Intake.IssueClosures do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.ForgeOutbox
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
 
-  # How many TRANSIENT attempts a closure gets before it becomes a human's problem. A blip
-  # clears in seconds; at the backoff below, six attempts spans about an hour and a half of
-  # wall clock even when the forge says nothing about when to come back.
-  #
-  # An earlier version of this note claimed six attempts was "past any rate-limit window
-  # GitHub applies", and that was FALSE (#826 review, H1): the backoffs then totalled about
-  # half an hour, while GitHub's PRIMARY limit is hourly. A closure hitting a primary limit
-  # spent all six attempts inside one window and abandoned with the reporter never told. Two
-  # things fix it and both are needed — the schedule below, and `retry_after` being HONOURED
-  # rather than computed and dropped.
-  @max_attempts 6
-
-  # Exponential, in seconds, indexed by the attempt just made: 3m, 6m, 12m, 24m, 48m. The list
-  # is one shorter than `@max_attempts` because there is no wait after the last one.
-  #
-  # It STARTS ABOVE THE CRON INTERVAL, and that is the other half of H1. The drainer runs
-  # every 120s, so the previous first two entries (60s and 120s) were not backoff at all —
-  # the row was due again on the very next sweep, and a struggling forge got hit at full
-  # cadence for the two attempts that matter most.
-  @backoff_seconds [180, 360, 720, 1_440, 2_880]
-
-  # The pessimistic delay `claim_attempt/2` writes BEFORE an attempt runs. See the note there:
-  # it is what stops a candidate that RAISES from sitting at the head of the oldest-first
-  # queue and being re-served on every sweep.
-  @in_flight_backoff_seconds 180
+  # The attempt bound, the backoff schedule, the in-flight delay and the compare-and-set are
+  # `Loopctl.ForgeOutbox`'s, shared with the thread-link outbox so the two cannot drift.
 
   @typedoc "Why a closure will never be attempted again."
   @type abandon_reason ::
@@ -110,7 +88,7 @@ defmodule Loopctl.Intake.IssueClosures do
 
   @doc "How many transient attempts a closure gets. See the moduledoc."
   @spec max_attempts() :: pos_integer()
-  def max_attempts, do: @max_attempts
+  def max_attempts, do: ForgeOutbox.max_attempts()
 
   @doc """
   Records the INTENT to close a story's linked issue, in the CALLER'S transaction.
@@ -361,22 +339,7 @@ defmodule Loopctl.Intake.IssueClosures do
   """
   @spec claim_attempt(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, IssueClosure.t()} | {:error, :not_pending}
-  def claim_attempt(tenant_id, id) do
-    now = DateTime.utc_now()
-
-    update_pending(
-      tenant_id,
-      id,
-      [
-        set: [
-          next_attempt_at: DateTime.add(now, @in_flight_backoff_seconds, :second),
-          updated_at: now
-        ],
-        inc: [attempts: 1]
-      ],
-      dynamic([c], is_nil(c.next_attempt_at) or c.next_attempt_at <= ^now)
-    )
-  end
+  def claim_attempt(tenant_id, id), do: ForgeOutbox.claim_attempt(IssueClosure, tenant_id, id)
 
   @doc "Records that the resolution label is on the issue."
   @spec mark_labelled(Ecto.UUID.t(), Ecto.UUID.t()) ::
@@ -434,7 +397,7 @@ defmodule Loopctl.Intake.IssueClosures do
   @spec mark_transient_failure(Ecto.UUID.t(), IssueClosure.t(), term(), pos_integer() | nil) ::
           {:ok, IssueClosure.t()} | {:error, :not_pending}
   def mark_transient_failure(tenant_id, %IssueClosure{} = closure, reason, retry_after \\ nil) do
-    if closure.attempts >= @max_attempts do
+    if closure.attempts >= ForgeOutbox.max_attempts() do
       mark_abandoned(tenant_id, closure.id, :retries_exhausted, reason)
     else
       now = DateTime.utc_now()
@@ -458,11 +421,8 @@ defmodule Loopctl.Intake.IssueClosures do
   directly is a bound nobody can prove still holds.
   """
   @spec wait_seconds(non_neg_integer(), pos_integer() | nil) :: pos_integer()
-  def wait_seconds(attempts_made, retry_after) do
-    backoff = backoff(attempts_made)
-
-    if is_integer(retry_after) and retry_after > backoff, do: retry_after, else: backoff
-  end
+  def wait_seconds(attempts_made, retry_after),
+    do: ForgeOutbox.wait_seconds(attempts_made, retry_after)
 
   @doc """
   Records that this closure will NEVER be attempted again, and why. Terminal.
@@ -611,43 +571,12 @@ defmodule Loopctl.Intake.IssueClosures do
 
   # -- writes ------------------------------------------------------------------------------
 
-  defp stamp(tenant_id, id, field) do
-    now = DateTime.utc_now()
-    update_pending(tenant_id, id, set: [{field, now}, {:updated_at, now}])
-  end
+  defp stamp(tenant_id, id, field), do: ForgeOutbox.stamp(IssueClosure, tenant_id, id, field)
 
-  # EVERY write is a compare-and-set on `:pending`, on the tenant's own row.
-  #
-  # That is what makes the whole thing safe under two concurrent drainers and under a replay:
-  # once a row is `:closed` or `:abandoned` nothing can move it, so a late writer from an
-  # earlier attempt cannot resurrect it, un-close it, or reset its backoff.
-  defp update_pending(tenant_id, id, updates, extra_predicate \\ nil) do
-    query =
-      from c in IssueClosure,
-        where: c.tenant_id == ^tenant_id and c.id == ^id and c.status == :pending,
-        select: c
-
-    query = if extra_predicate, do: where(query, ^extra_predicate), else: query
-
-    case AdminRepo.update_all(query, updates) do
-      {1, [row]} -> {:ok, row}
-      {0, _none} -> {:error, :not_pending}
-    end
-  end
-
-  # WHICH DELAY an attempt waits, indexed from the attempt just MADE.
-  #
-  # `attempts_made` is 1 after the first claim, so the index is one less. Zero is guarded
-  # explicitly rather than left to `Enum.at/3`, which treats -1 as "from the end" and would
-  # return the LONGEST delay as the shortest — a 48-minute first backoff. It is unreachable
-  # through `close/1`, which always claims before it can fail, but `wait_seconds/2` is public
-  # precisely so the schedule can be asserted without driving a closure, and an assertion
-  # helper that lies about its own first entry is worse than no helper (#826 round 2,
-  # finding 4).
-  defp backoff(attempts_made) when attempts_made <= 1, do: hd(@backoff_seconds)
-
-  defp backoff(attempts_made),
-    do: Enum.at(@backoff_seconds, attempts_made - 1, List.last(@backoff_seconds))
+  # EVERY write is a compare-and-set on `:pending`, on the tenant's own row
+  # (`Loopctl.ForgeOutbox.update_pending/5`).
+  defp update_pending(tenant_id, id, updates),
+    do: ForgeOutbox.update_pending(IssueClosure, tenant_id, id, updates)
 
   defp abandon_text(:closed_by_other), do: "closed_by_other"
   defp abandon_text(:source_revoked), do: "source_revoked"
@@ -656,30 +585,5 @@ defmodule Loopctl.Intake.IssueClosures do
   defp abandon_text({:permanent_forge_failure, reason}),
     do: "permanent_forge_failure: #{error_text(reason)}"
 
-  # A forge reason is REMOTE DATA, and this is the ONE column built from an unbounded amount
-  # of it. Only its inspected form, bounded, reaches the row.
-  #
-  # BOUNDED IN CODE POINTS, because that is what the `intake_issue_closures_text_bounds` CHECK
-  # counts (`char_length`). `String.slice/3` counts GRAPHEMES, and a grapheme can be several
-  # code points — so a reason carrying emoji or combining marks passed the slice at 1,900
-  # graphemes and arrived at Postgres well over 2,000 code points (#826 review, finding 5).
-  # The CHECK then raised INSIDE `mark_abandoned/4`, which is precisely the write that says
-  # "never retry this": the row stayed `:pending`, `due/1` reads oldest-first, and one issue
-  # with a decorated label could abort every subsequent sweep for every tenant.
-  #
-  # The blast radius is fixed in three places and all three are wanted: this bound, the
-  # pessimistic schedule in `claim_attempt/2` so a raise cannot hold the head of the queue,
-  # and the callers no longer echoing RAW LABEL NAMES into a reason at all.
-  @error_text_budget 1_900
-
-  defp error_text(nil), do: nil
-
-  defp error_text(reason) do
-    text = inspect(reason)
-    chars = String.to_charlist(text)
-
-    if length(chars) > @error_text_budget,
-      do: chars |> Enum.take(@error_text_budget) |> List.to_string(),
-      else: text
-  end
+  defp error_text(reason), do: ForgeOutbox.error_text(reason)
 end

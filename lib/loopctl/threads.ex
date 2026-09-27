@@ -13,7 +13,10 @@ defmodule Loopctl.Threads do
   - `record_judgement/5` — a `finding` or `verdict` from the runner holding that dispatch,
     bound to its `thread_reviews` row. Inferring a judge from a calling key was circumvented
     in #901 and #905; nothing here takes a key;
-  - `record_fix/4` — a `fix` from the story's current claimant, under the checkpoint fence.
+  - `record_fix/4` — a `fix` from the story's current claimant, under the checkpoint fence;
+  - `record_human_finding/3` — a `finding` from the tenant's human on the thread page
+    (US-45.7), as `human_principal/0` with an empty lineage. It has no HTTP route: the only
+    principal that writes it is the WebAuthn-authenticated browser session.
 
   Two writes are loopctl's own and have NO HTTP route, because the merge executor
   (`Loopctl.Delivery.MergeExecutor`, US-45.5) is their only caller:
@@ -51,8 +54,12 @@ defmodule Loopctl.Threads do
 
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.Claimant
+  alias Loopctl.Delivery.DispatchPayload
+  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.GitSha
+  alias Loopctl.Intake
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
@@ -60,6 +67,7 @@ defmodule Loopctl.Threads do
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
+  alias Loopctl.Threads.IssueLinks
   alias Loopctl.Threads.Review
   alias Loopctl.Threads.Reviews
   alias Loopctl.WorkBreakdown.Story
@@ -68,7 +76,12 @@ defmodule Loopctl.Threads do
 
   # The author of a `base_update` checkpoint's entry: loopctl's merge executor (US-45.5).
   @merge_executor_principal "control:merge_executor"
-  @sha_pattern ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
+  # The tenant's human, authenticated in the browser by the WebAuthn credential enrolled at
+  # signup (US-45.7). The label the audit chain already gives WebAuthn-authenticated human acts
+  # (`Loopctl.Tenants`, `Loopctl.Tenants.Enrollment`). No API key can produce it:
+  # `LoopctlWeb.ActorLabel` gives `agent:` or `api_key:`. The `thread_entries_judgement_shape`
+  # CHECK names it literally, as the one author a finding with no review may have.
+  @human_principal "human:webauthn"
 
   # Idempotency keys loopctl writes for its own entries. A caller may not use the prefix, so a
   # caller's key can never collide with the key a later checkpoint needs.
@@ -352,7 +365,8 @@ defmodule Loopctl.Threads do
 
   @doc """
   Records a `finding` or `verdict` from the review dispatch `dispatch_id`, which `runner_id`
-  holds (US-45.3). The ONE way a judgement is written: the review is bound under the thread
+  holds (US-45.3). The ONE way a REVIEWER's judgement is written (a human's finding is
+  `record_human_finding/3`): the review is bound under the thread
   lock by the dispatch AND the runner, then its separation, whether it is still open and
   whether its round is still current are decided there too.
 
@@ -443,6 +457,313 @@ defmodule Loopctl.Threads do
       in_story_lock(tenant_id, story_id, fn ->
         fix_locked(tenant_id, story_id, changeset, opts)
       end)
+    end
+  end
+
+  @doc """
+  The principal the tenant's human writes as from the thread page (US-45.7): authenticated in
+  the browser by the WebAuthn credential enrolled at signup, with an EMPTY lineage. The label
+  WebAuthn-authenticated human acts already carry in the audit chain; no API key produces it.
+  """
+  @spec human_principal() :: String.t()
+  def human_principal, do: @human_principal
+
+  @doc """
+  Records a `finding` from the tenant's human (US-45.7, PRD §6: "a human finding has the same
+  standing as an agent's: it binds to a checkpoint and counts toward `introduced_by` and the
+  ceiling"). Written by the thread page only; there is no HTTP route, because the only
+  principal that may write it is the WebAuthn-authenticated browser session.
+
+  `attrs` (string keys): `idempotency_key` (the page's per-form nonce), `body`,
+  `checkpoint_id`, `severity`, and optionally `location` and `introduced_by`.
+
+  The finding binds to a checkpoint of kind `checkpoint` that the story's CURRENT, still-held
+  claim recorded: rounds belong to a claim, and a finding on an ended claim's work could count
+  for the one that follows. `introduced_by` follows the round rule a reviewer's does
+  (`Loopctl.Threads.Reviews.human_introduced_by_allowed/4`). It counts in the round in progress
+  when it was written (`Loopctl.Threads.Reviews`).
+
+  A MATERIAL finding written once the claim's rounds have reached the ceiling has no round left
+  to count in, so it escalates the story over the same `review_ceiling` edge a ceiling verdict
+  does: the escalation entry is recorded in this transaction, bound to the final review, and
+  `Loopctl.Workers.ReviewCeilingWorker` moves the stage. One escalation per review: when the
+  ceiling verdict already escalated, that one is returned, marked as already there.
+
+  Refused `:tenant_halted` while the tenant's custody is halted, as every judgement is. A
+  resend of a finding already recorded under the same key is answered from its row — halt
+  included — so a double submit is one entry; a different finding reusing the key is
+  `idempotency_key_reused`.
+
+  `escalation` says which of the two happened: `{:escalated, entry}` when THIS finding recorded
+  the escalation, `{:already_escalated, entry}` when the story was already escalated at the
+  ceiling (by the ceiling verdict or an earlier finding) and this one changed nothing. A resend
+  answers what its first delivery RECORDED: `{:escalated, entry}` when that delivery wrote the
+  escalation, nil otherwise — an `:already_escalated` first answer recorded nothing — and never
+  anything inferred from the ceiling as it stands at the resend.
+
+  Returns `{:ok, %{entry: entry, escalation: nil | {:escalated | :already_escalated, entry}},
+  :created | :existing}`.
+  """
+  @spec record_human_finding(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+          {:ok,
+           %{
+             entry: Entry.t(),
+             escalation: nil | {:escalated | :already_escalated, Entry.t()}
+           }, :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, term()}
+  def record_human_finding(tenant_id, story_id, attrs) do
+    changeset =
+      Entry.changeset(%Entry{}, %{
+        "kind" => "finding",
+        "idempotency_key" => Map.get(attrs, "idempotency_key"),
+        "body" => Map.get(attrs, "body"),
+        "checkpoint_id" => Map.get(attrs, "checkpoint_id")
+      })
+
+    with :ok <- valid(changeset),
+         :ok <- human_finding_checkpoint_given(changeset),
+         {:ok, changeset} <- finding_fields(changeset, attrs),
+         :ok <- screen(changeset, tenant_id, story_id),
+         :ok <-
+           no_secret(
+             Ecto.Changeset.get_field(changeset, :location),
+             :location,
+             tenant_id,
+             story_id
+           ) do
+      in_story_lock(tenant_id, story_id, fn ->
+        human_finding_locked(tenant_id, story_id, changeset)
+      end)
+    end
+  end
+
+  @typedoc """
+  The checkpoints the thread page shows, and the claim a human finding may bind to: its epoch,
+  whether it is still held, and its own claimant checkpoints (`Reviews.human_finding_checkpoint/3`
+  accepts nothing else).
+  """
+  @type page_checkpoints :: %{
+          checkpoints: [Checkpoint.t()],
+          checkpoints_truncated: boolean(),
+          claim_checkpoints: [Checkpoint.t()]
+        }
+
+  @typedoc "What the thread page renders (US-45.7)."
+  @type page :: %{
+          story: %{id: Ecto.UUID.t(), number: String.t() | nil, title: String.t()},
+          checkpoints: [Checkpoint.t()],
+          checkpoints_truncated: boolean(),
+          claim_checkpoints: [Checkpoint.t()],
+          entries: [Entry.t()],
+          older_before_seq: pos_integer() | nil,
+          findings: [Entry.t()],
+          repo: String.t() | nil,
+          halted: boolean()
+        }
+
+  @doc """
+  The thread page's read (US-45.7), with no forge call. One `Loopctl.Repo.with_tenant/2`
+  transaction under the tenant's RLS reads:
+
+  - `entries`, `older_before_seq` — the NEWEST page of entries (`page_entries/3`);
+  - `checkpoints`, `checkpoints_truncated`, `claim_checkpoints` — `page_checkpoints/2`;
+  - `findings` — the story's findings, the latest #{@max_entry_page}, oldest first, whatever
+    page of entries is loaded;
+  - `repo` — the repository diffs come from, or nil when the project has no single live intake
+    source.
+
+  `halted` — whether the tenant's custody is halted — is the thread's one halt check
+  (`Runners.custody_halted?/1`), asked after that transaction.
+
+  `{:error, :not_found}` for a story the tenant cannot see.
+  """
+  @spec page(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, page()} | {:error, :not_found}
+  def page(tenant_id, story_id) do
+    {:ok, result} =
+      Repo.with_tenant(tenant_id, fn ->
+        case page_story(tenant_id, story_id) do
+          nil -> {:error, :not_found}
+          story -> {:ok, read_page(tenant_id, story)}
+        end
+      end)
+
+    with {:ok, page} <- result,
+         do: {:ok, Map.put(page, :halted, Runners.custody_halted?(tenant_id))}
+  end
+
+  @doc """
+  A page of the thread's entries, oldest first within it: the NEWEST page, or with
+  `before_seq` the page before that entry — how the page walks backwards without re-reading
+  anything else. `older_before_seq` is the `before_seq` of the next older page, or nil when this
+  one reaches the start. `{:error, :not_found}` for a story the tenant cannot see.
+  """
+  @spec page_entries(Ecto.UUID.t(), Ecto.UUID.t(), pos_integer() | nil) ::
+          {:ok, %{entries: [Entry.t()], older_before_seq: pos_integer() | nil}}
+          | {:error, :not_found}
+  def page_entries(tenant_id, story_id, before_seq \\ nil) do
+    in_page_story(tenant_id, story_id, fn story -> read_entries(tenant_id, story, before_seq) end)
+  end
+
+  @doc """
+  The page's checkpoints (as `get_thread/3` returns them) and `claim_checkpoints`: the
+  claimant checkpoints of the story's CURRENT claim, oldest first, or none when the claim is not
+  held — the only ones a human finding may bind to. What the page re-reads on its revalidation
+  tick and after a write. `{:error, :not_found}` for a story the tenant cannot see.
+  """
+  @spec page_checkpoints(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, page_checkpoints()} | {:error, :not_found}
+  def page_checkpoints(tenant_id, story_id) do
+    in_page_story(tenant_id, story_id, fn story -> read_checkpoints(tenant_id, story) end)
+  end
+
+  defp in_page_story(tenant_id, story_id, fun) do
+    {:ok, result} =
+      Repo.with_tenant(tenant_id, fn ->
+        case page_story(tenant_id, story_id) do
+          nil -> {:error, :not_found}
+          story -> {:ok, fun.(story)}
+        end
+      end)
+
+    result
+  end
+
+  defp read_page(tenant_id, story) do
+    tenant_id
+    |> read_entries(story, nil)
+    |> Map.merge(read_checkpoints(tenant_id, story))
+    |> Map.merge(%{
+      story: Map.take(story, [:id, :number, :title]),
+      findings: latest_findings(tenant_id, story.id),
+      repo: project_repo(tenant_id, story.project_id)
+    })
+  end
+
+  defp read_entries(tenant_id, story, before_seq) do
+    query =
+      from e in Entry,
+        where: e.tenant_id == ^tenant_id and e.story_id == ^story.id,
+        order_by: [desc: e.seq],
+        limit: ^(@max_entry_page + 1)
+
+    query = if before_seq, do: where(query, [e], e.seq < ^before_seq), else: query
+    {page, rest} = query |> Repo.all() |> Enum.split(@max_entry_page)
+    entries = Enum.reverse(page)
+
+    %{entries: entries, older_before_seq: if(rest == [], do: nil, else: hd(entries).seq)}
+  end
+
+  defp read_checkpoints(tenant_id, story) do
+    {checkpoints, truncated?} = latest_checkpoints(tenant_id, story.id)
+
+    claim_checkpoints =
+      if is_nil(story.assigned_agent_id),
+        do: [],
+        else:
+          Enum.filter(
+            checkpoints,
+            &(&1.kind == :checkpoint and &1.claim_epoch == story.claim_epoch)
+          )
+
+    %{
+      checkpoints: checkpoints,
+      checkpoints_truncated: truncated?,
+      claim_checkpoints: claim_checkpoints
+    }
+  end
+
+  defp latest_findings(tenant_id, story_id) do
+    from(e in Entry,
+      where: e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.kind == :finding,
+      order_by: [desc: e.seq],
+      limit: ^@max_entry_page
+    )
+    |> Repo.all()
+    |> Enum.reverse()
+  end
+
+  @doc """
+  The unified diff of one checkpoint, fetched from the forge and never stored (US-45.7, PRD
+  §6.1): the three-dot comparison of the base branch the checkpoint's OWN claim was placed on
+  with the checkpoint's commit — the change as the merge gate judged it when that claim was
+  current. A checkpoint of an earlier claim is judged against that claim's base, not the
+  current one's (`DispatchPayload.dispatch_route/3` with the checkpoint's `claim_epoch`).
+
+  A claim whose dispatch ledger recorded no base (a row written before the column existed, or
+  no row at all) falls back to the intake source's CURRENT base branch, and the answer says so:
+  `base_placed: false`.
+
+  Every read runs in a short RLS transaction that is CLOSED before the forge is asked, so
+  nothing holds a connection across GitHub. The forge call is bounded by the adapter
+  (`Loopctl.Delivery.PullRequestSource.checkpoint_diff/3`); a slow or absent forge is an
+  `{:error, reason}` for the caller to show beside a ledger that rendered without it.
+  """
+  @spec checkpoint_diff(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, map()} | {:error, term()}
+  def checkpoint_diff(tenant_id, story_id, checkpoint_id) do
+    {:ok, target} =
+      Repo.with_tenant(tenant_id, fn -> diff_target(tenant_id, story_id, checkpoint_id) end)
+
+    with {:ok, story, source, checkpoint} <- target,
+         {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story, checkpoint.claim_epoch) do
+      base = DispatchPayload.placed_base_branch(route, source)
+
+      with {:ok, diff} <-
+             PullRequestSource.impl().checkpoint_diff(
+               source.repo_full_name,
+               base,
+               checkpoint.commit_sha
+             ) do
+        {:ok, Map.merge(diff, %{base: base, base_placed: is_binary(route.base_branch)})}
+      end
+    end
+  end
+
+  defp diff_target(tenant_id, story_id, checkpoint_id) do
+    with {:ok, checkpoint_id} <- Ecto.UUID.cast(checkpoint_id) |> ok_or(:not_found),
+         %Story{} = story <-
+           Repo.one(from s in Story, where: s.tenant_id == ^tenant_id and s.id == ^story_id) ||
+             {:error, :not_found},
+         %Checkpoint{} = checkpoint <-
+           checkpoint_of(tenant_id, story_id, checkpoint_id) || {:error, :not_found},
+         {:ok, source} <- project_source(tenant_id, story.project_id) do
+      {:ok, story, source, checkpoint}
+    end
+  end
+
+  defp ok_or({:ok, value}, _reason), do: {:ok, value}
+  defp ok_or(:error, reason), do: {:error, reason}
+
+  defp page_story(tenant_id, story_id) do
+    Repo.one(
+      from s in Story,
+        where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+        select: %{
+          id: s.id,
+          number: s.number,
+          title: s.title,
+          project_id: s.project_id,
+          claim_epoch: s.claim_epoch,
+          assigned_agent_id: s.assigned_agent_id
+        }
+    )
+  end
+
+  # The project's source by the ONE rule the gates use (`Intake.select_project_source/2`),
+  # read here under RLS rather than on `AdminRepo`.
+  defp project_source(tenant_id, project_id) do
+    tenant_id
+    |> Intake.live_sources_query()
+    |> where([s], s.project_id == ^project_id)
+    |> Repo.all()
+    |> Intake.select_project_source(project_id)
+  end
+
+  defp project_repo(tenant_id, project_id) do
+    case project_source(tenant_id, project_id) do
+      {:ok, source} -> source.repo_full_name
+      {:error, _reason} -> nil
     end
   end
 
@@ -1022,6 +1343,9 @@ defmodule Loopctl.Threads do
 
     with {:ok, _entry, :created, chained} <-
            insert_entry(tenant_id, story_id, entry, Keyword.put(opts, :adopted, adopted)) do
+      # AC-45.7.4: the thread's FIRST checkpoint is when its page has work on it. The intent to
+      # link the intake issue commits with it; the comment is posted later with nothing held.
+      if is_nil(previous), do: IssueLinks.record_in(Repo, tenant_id, story_id)
       {:ok, checkpoint, :created, chained}
     end
   end
@@ -1057,7 +1381,7 @@ defmodule Loopctl.Threads do
   end
 
   defp valid_sha(value, field) do
-    if is_binary(value) and Regex.match?(@sha_pattern, value),
+    if GitSha.valid?(value),
       do: :ok,
       else: {:error, :unprocessable_entity, "#{field} must be 40 or 64 lowercase hex characters"}
   end
@@ -1307,8 +1631,10 @@ defmodule Loopctl.Threads do
   # Reviews (US-45.3). Every rule is `Loopctl.Threads.Reviews`'; the writes are here.
   # ---------------------------------------------------------------------------
 
-  # Read FRESH, as `Loopctl.Delivery.Placement` reads it: a judgement decides what may merge,
-  # which is custody progress a halted tenant must not make.
+  # THE halt check of the thread — judgements, fixes, human findings, and the thread page's
+  # banner (`page/3`) — and it is `Runners.custody_halted?/1`, the one `Loopctl.Delivery.Placement`
+  # uses, so none of them can disagree. Read FRESH: a judgement decides what may merge, which is
+  # custody progress a halted tenant must not make.
   defp not_halted(tenant_id) do
     if Runners.custody_halted?(tenant_id), do: {:error, :tenant_halted}, else: :ok
   end
@@ -1635,6 +1961,120 @@ defmodule Loopctl.Threads do
       {:story, nil} -> {:error, :not_found}
       %Entry{} = existing -> replay(existing, changeset)
       other -> other
+    end
+  end
+
+  defp human_finding_checkpoint_given(changeset) do
+    if Ecto.Changeset.get_field(changeset, :checkpoint_id),
+      do: :ok,
+      else:
+        {:error,
+         {:unprocessable_entity, "finding_checkpoint_required",
+          "a finding binds to a checkpoint: checkpoint_id is required"}}
+  end
+
+  # A resend is answered from its row before any rule, halt included: the page that lost its
+  # response must learn its finding landed, and a double submit must be one entry.
+  defp human_finding_locked(tenant_id, story_id, changeset) do
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
+         nil <- entry_by_key(tenant_id, story_id, @human_principal, key_of(changeset)),
+         :ok <- not_halted(tenant_id),
+         {:ok, checkpoint} <-
+           Reviews.human_finding_checkpoint(
+             tenant_id,
+             story,
+             Ecto.Changeset.get_field(changeset, :checkpoint_id)
+           ),
+         :ok <-
+           Reviews.human_introduced_by_allowed(
+             tenant_id,
+             story,
+             checkpoint,
+             Ecto.Changeset.get_field(changeset, :introduced_by)
+           ) do
+      with {:ok, entry, :created, chained} <-
+             insert_entry(tenant_id, story_id, changeset,
+               author_principal: @human_principal,
+               actor_lineage: []
+             ),
+           {:ok, escalation, escalation_chained} <- human_ceiling(tenant_id, story, entry) do
+        {:ok, %{entry: entry, escalation: escalation}, :created, chained ++ escalation_chained}
+      end
+    else
+      {:story, nil} ->
+        {:error, :not_found}
+
+      %Entry{} = existing ->
+        case replay(existing, changeset) do
+          {:ok, entry, :existing, []} ->
+            {:ok, %{entry: entry, escalation: recorded_ceiling(tenant_id, story_id, entry)},
+             :existing, []}
+
+          conflict ->
+            conflict
+        end
+
+      other ->
+        other
+    end
+  end
+
+  # A material human finding once the claim's rounds are at the ceiling: the escalation a
+  # ceiling verdict would have recorded, bound to the final review, recorded now — or the one
+  # that verdict already recorded. A finding below material, or with rounds still to place,
+  # escalates nothing: it counts in a round instead (`Reviews.round_findings/4`).
+  defp human_ceiling(tenant_id, story, entry) do
+    with true <- entry.severity in Reviews.material(),
+         %Review{} = review <- Reviews.ceiling_review(tenant_id, story) do
+      key = @reserved_key_prefix <> "review_ceiling:#{review.id}"
+
+      case entry_by_review_key(tenant_id, review.id, key) do
+        %Entry{} = recorded -> {:ok, {:already_escalated, recorded}, []}
+        nil -> insert_human_ceiling(tenant_id, story, review, key)
+      end
+    else
+      _below_material_or_open -> {:ok, nil, []}
+    end
+  end
+
+  defp insert_human_ceiling(tenant_id, story, review, key) do
+    changeset =
+      %{
+        kind: :escalation,
+        idempotency_key: key,
+        body:
+          "review_ceiling: a material finding was recorded by #{@human_principal} after " <>
+            "round #{review.round} of #{Reviews.max_rounds()}, and no further round is " <>
+            "placeable; the remedy is a rewrite, not another round",
+        checkpoint_id: review.checkpoint_id
+      }
+      |> Entry.system_changeset()
+      |> Ecto.Changeset.put_change(:review_id, review.id)
+
+    with {:ok, escalation, :created, chained} <-
+           insert_entry(tenant_id, story.id, changeset,
+             author_principal: @review_ceiling_principal,
+             actor_lineage: []
+           ),
+         do: {:ok, {:escalated, escalation}, chained}
+  end
+
+  # What a resend of a human finding answers: what its FIRST delivery did, read from what was
+  # recorded for it, never from the ceiling as it stands now. The escalation a human finding
+  # records is written in the same transaction, straight after it (`human_ceiling/3`), so it is
+  # the entry at the finding's seq plus one; anything else there is not this finding's doing,
+  # and the resend answers plain "recorded".
+  defp recorded_ceiling(tenant_id, story_id, entry) do
+    next = entry.seq + 1
+
+    case Repo.one(
+           from e in Entry,
+             where:
+               e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.seq == ^next and
+                 e.kind == :escalation and e.author_principal == ^@review_ceiling_principal
+         ) do
+      nil -> nil
+      escalation -> {:escalated, escalation}
     end
   end
 

@@ -70,6 +70,23 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     assert {:ok, %{base_branch: "trunk"}} = route(ctx)
   end
 
+  test "dispatch_route/3 reads the claim of the epoch it is given, not the current one (US-45.7)",
+       ctx do
+    earlier = ctx.story.claim_epoch
+    record(ctx, @t1, mode: "thread", base_branch: "release-1", claim_epoch: earlier)
+    record(ctx, @t2, mode: "thread", base_branch: "main", claim_epoch: earlier + 1)
+
+    story = %{ctx.story | claim_epoch: earlier + 1}
+
+    assert {:ok, %{base_branch: "main"}} = DispatchPayload.dispatch_route(story.tenant_id, story)
+
+    assert {:ok, %{base_branch: "release-1"}} =
+             DispatchPayload.dispatch_route(story.tenant_id, story, earlier)
+
+    assert {:ok, %{base_branch: nil}} =
+             DispatchPayload.dispatch_route(story.tenant_id, story, earlier + 7)
+  end
+
   test "a row that recorded no mode is pr; NO row is nil, for the caller's source fallback",
        ctx do
     assert {:ok, %{mode: nil, branch: nil, base_branch: nil}} = route(ctx)

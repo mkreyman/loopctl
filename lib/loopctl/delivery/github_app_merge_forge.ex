@@ -30,6 +30,7 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
   @behaviour Loopctl.Delivery.MergeForge
 
   alias Loopctl.Delivery.GitHubPullRequestSource
+  alias Loopctl.GitSha
 
   @api_base "https://api.github.com"
   @connect_timeout_ms 2_000
@@ -41,7 +42,6 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
 
   @repo_name ~r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}
   @ref ~r{\A[A-Za-z0-9_./-]+\z}
-  @sha ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
 
   @impl true
   def session(repo) do
@@ -334,7 +334,7 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
   defp ref(ref), do: {:error, {:invalid_ref, shape(ref)}}
 
   defp sha(sha) when is_binary(sha) do
-    if Regex.match?(@sha, sha), do: {:ok, sha}, else: {:error, {:invalid_sha, shape(sha)}}
+    if GitSha.valid?(sha), do: {:ok, sha}, else: {:error, {:invalid_sha, shape(sha)}}
   end
 
   defp sha(sha), do: {:error, {:invalid_sha, shape(sha)}}

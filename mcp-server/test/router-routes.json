@@ -302,12 +302,16 @@
     ["GET","/enroll","Phoenix.LiveView.Plug",":index"],
     ["GET","/health","LoopctlWeb.HealthController",":check"],
     ["GET","/health/ready","LoopctlWeb.HealthController",":ready"],
+    ["GET","/login","Phoenix.LiveView.Plug",":index"],
+    ["POST","/login","LoopctlWeb.BrowserSessionController",":create"],
+    ["DELETE","/logout","LoopctlWeb.BrowserSessionController",":delete"],
     ["GET","/privacy","LoopctlWeb.PageController",":privacy"],
     ["GET","/signup","Phoenix.LiveView.Plug",":index"],
     ["GET","/swagger","LoopctlWeb.RedirectController",":swagger"],
     ["GET","/swaggerui","OpenApiSpex.Plug.SwaggerUI","[path: \"/api/v1/openapi\"]"],
     ["GET","/tenants/:id/onboarding","Phoenix.LiveView.Plug",":index"],
     ["GET","/terms","LoopctlWeb.PageController",":terms"],
+    ["GET","/threads/:story_id","Phoenix.LiveView.Plug",":show"],
     ["GET","/wiki","Phoenix.LiveView.Plug",":index"],
     ["GET","/wiki/:slug","Phoenix.LiveView.Plug",":show"]
   ]

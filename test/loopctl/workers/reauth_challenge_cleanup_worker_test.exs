@@ -11,6 +11,7 @@ defmodule Loopctl.Workers.ReauthChallengeCleanupWorkerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.WebAuthn.EnrollmentChallenge
+  alias Loopctl.WebAuthn.LoginChallenge
   alias Loopctl.WebAuthn.ReauthChallenge
   alias Loopctl.Workers.ReauthChallengeCleanupWorker
 
@@ -84,5 +85,29 @@ defmodule Loopctl.Workers.ReauthChallengeCleanupWorkerTest do
 
     assert AdminRepo.get(ReauthChallenge, live_reauth.id)
     assert AdminRepo.get(EnrollmentChallenge, live_enrollment.id)
+  end
+
+  test "sweeps the usernameless login challenges by the same rule (US-45.7)" do
+    now = DateTime.utc_now()
+    future = DateTime.add(now, 300, :second)
+    past = DateTime.add(now, -60, :second)
+
+    insert = fn expires_at, used_at ->
+      AdminRepo.insert!(%LoginChallenge{
+        challenge: :erlang.term_to_binary(%{bytes: :crypto.strong_rand_bytes(16)}),
+        expires_at: expires_at,
+        used_at: used_at
+      })
+    end
+
+    expired = insert.(past, nil)
+    used = insert.(future, now)
+    live = insert.(future, nil)
+
+    assert :ok = ReauthChallengeCleanupWorker.perform(%Oban.Job{args: %{}})
+
+    refute AdminRepo.get(LoginChallenge, expired.id)
+    refute AdminRepo.get(LoginChallenge, used.id)
+    assert AdminRepo.get(LoginChallenge, live.id)
   end
 end

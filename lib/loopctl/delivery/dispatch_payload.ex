@@ -229,7 +229,22 @@ defmodule Loopctl.Delivery.DispatchPayload do
              base_branch: String.t() | nil
            }}
           | {:error, term()}
-  def dispatch_route(tenant_id, %Story{} = story) do
+  def dispatch_route(tenant_id, %Story{} = story),
+    do: dispatch_route(tenant_id, story, story.claim_epoch)
+
+  @doc """
+  `dispatch_route/2` for the claim of `claim_epoch` rather than the current one (US-45.7): the
+  route a checkpoint recorded under an earlier claim was built on. Same lock bound, same `:busy`.
+  """
+  @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer()) ::
+          {:ok,
+           %{
+             mode: :pr | :thread | nil,
+             branch: String.t() | nil,
+             base_branch: String.t() | nil
+           }}
+          | {:error, term()}
+  def dispatch_route(tenant_id, %Story{} = story, claim_epoch) do
     Stages.answering_busy(
       tenant_id,
       [:loopctl, :delivery, :dispatch_route_busy],
@@ -240,7 +255,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
           # A lock held on the ledger (a retention prune, a migration) costs the gate a bounded
           # wait and an `:unevaluated` answer, never a request held open behind it.
           Capacity.set_lock_timeout!(Repo)
-          Repo.one(DispatchLedger.claim_route_query(tenant_id, story))
+          Repo.one(DispatchLedger.claim_route_query(tenant_id, story.id, claim_epoch))
         end)
         |> route()
       end

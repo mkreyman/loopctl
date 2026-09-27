@@ -117,6 +117,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   @behaviour Loopctl.Delivery.PullRequestSource
 
+  alias Loopctl.GitSha
   alias Loopctl.Verification.GitHubActions
 
   @api_base "https://api.github.com"
@@ -138,6 +139,12 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @max_reset_delay_seconds 3_900
 
   @repo_name ~r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}
+  # US-45.7: a checkpoint diff is read for a HUMAN on the thread page and never stored. It is
+  # bounded in bytes (a generated file can make a diff megabytes long) and in WALL CLOCK: the
+  # receive timeout bounds each chunk, not the whole body, so a forge trickling bytes would
+  # otherwise hold the page's diff panel for as long as it liked.
+  @max_diff_bytes 512 * 1024
+  @diff_deadline_ms 10_000
   @ref ~r{\A[A-Za-z0-9_./-]+\z}
   @control ~r/[\x00-\x1f\x7f]/
 
@@ -387,6 +394,85 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
        do: true
 
   defp status?(_status), do: false
+
+  @impl true
+  def checkpoint_diff(repo, base_ref, head_sha) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, head} <- hex_sha(head_sha),
+         {:ok, base} <- ref(base_ref) do
+      read_diff(repo, "/compare/#{base}...#{head}")
+    end
+  end
+
+  defp hex_sha(sha) when is_binary(sha) do
+    if GitSha.valid?(sha), do: {:ok, sha}, else: {:error, {:invalid_sha, printable(sha)}}
+  end
+
+  defp hex_sha(sha), do: {:error, {:invalid_sha, shape(sha)}}
+
+  defp read_diff(repo, path) do
+    url = @api_base <> "/repos/" <> repo <> path
+    deadline = System.monotonic_time(:millisecond) + @diff_deadline_ms
+
+    opts =
+      req_options()
+      |> Keyword.put(:headers, diff_headers())
+      |> Keyword.put(:into, &collect_diff(&1, &2, deadline))
+
+    case Req.get(url, opts) do
+      {:ok, %Req.Response{status: 200} = response} ->
+        {chunks, _bytes} = Req.Response.get_private(response, :diff, {[], 0})
+        text = chunks |> IO.iodata_to_binary() |> String.replace_invalid()
+        {:ok, %{text: text, truncated: Req.Response.get_private(response, :truncated, false)}}
+
+      {:ok, %Req.Response{} = response} ->
+        {:error, failure(response)}
+
+      {:error, reason} ->
+        {:error, {:github_unreachable, shape(reason)}}
+    end
+  end
+
+  # Accumulates at most `@max_diff_bytes` as IODATA with a running byte count — each chunk is
+  # consed on once, never copied again — and stops at the deadline. Either stop marks the
+  # response `truncated`, so the page says the diff is partial rather than showing it as whole.
+  # An error response's body is collected the same way and never read. Public only so the
+  # accumulation can be driven chunk by chunk: `Req.Test` delivers a body in one piece.
+  @doc false
+  @spec collect_diff({:data, binary()}, {Req.Request.t(), Req.Response.t()}, integer()) ::
+          {:cont | :halt, {Req.Request.t(), Req.Response.t()}}
+  def collect_diff({:data, data}, {request, response}, deadline) do
+    {chunks, bytes} = Req.Response.get_private(response, :diff, {[], 0})
+    room = @max_diff_bytes - bytes
+
+    cond do
+      byte_size(data) > room ->
+        {:halt, {request, truncated(response, [chunks, binary_part(data, 0, room)], room)}}
+
+      System.monotonic_time(:millisecond) > deadline ->
+        {:halt, {request, truncated(response, [chunks, data], byte_size(data))}}
+
+      true ->
+        {:cont,
+         {request,
+          Req.Response.put_private(response, :diff, {[chunks, data], bytes + byte_size(data)})}}
+    end
+  end
+
+  defp truncated(response, chunks, added) do
+    {_chunks, bytes} = Req.Response.get_private(response, :diff, {[], 0})
+
+    response
+    |> Req.Response.put_private(:diff, {chunks, bytes + added})
+    |> Req.Response.put_private(:truncated, true)
+  end
+
+  defp diff_headers do
+    Enum.map(headers(), fn
+      {"accept", _} -> {"accept", "application/vnd.github.diff"}
+      header -> header
+    end)
+  end
 
   @impl true
   def compare(repo, base, head) do
