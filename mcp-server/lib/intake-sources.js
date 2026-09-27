@@ -168,14 +168,19 @@ export function modeRefusal(mode) {
  * stored mode this client cannot see, so only the shape is judged here.
  */
 export function requiredChecksRefusal(checks) {
+  // The same shape the server holds (`Source.validate_required_checks/1`): non-blank, no
+  // surrounding whitespace (a job name never carries it, so "test " could never match), and
+  // distinct. Bounds on count and length stay the server's alone.
   const ok =
     Array.isArray(checks) &&
-    checks.every((name) => typeof name === "string" && name.trim() !== "");
+    checks.every((name) => typeof name === "string" && name !== "" && name.trim() === name) &&
+    new Set(checks).size === checks.length;
 
   if (!ok) {
     return refuse(
-      "`required_checks` must be a list of GitHub Actions job names, as they appear " +
-        "on the commit (for example [\"test\", \"lint\"]).",
+      "`required_checks` must be a list of distinct GitHub Actions job names, as they " +
+        "appear on the commit, with no surrounding whitespace (for example " +
+        "[\"test\", \"lint\"]).",
     );
   }
 

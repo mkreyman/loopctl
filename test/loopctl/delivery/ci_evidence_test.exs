@@ -85,6 +85,39 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
              judge(["test"], [%{leg_a | conclusion: "success"}, leg_b])
   end
 
+  # #910 round 3, findings 3 and 4: the newest run of a workflow is taken from the RUNS, so a
+  # re-run with no jobs yet holds the name pending, and a run that died before creating any
+  # job fails a name no job carries.
+  test "a newest run with no jobs yet holds the name pending, over an older run's failure" do
+    old_fail = job("test", "completed", "failure", %{run_id: 10})
+
+    runs = [
+      %{id: 10, workflow: "ci.yml", status: "completed", conclusion: "failure"},
+      %{id: 11, workflow: "ci.yml", status: "queued", conclusion: nil}
+    ]
+
+    assert %{pending: ["test"], failed: []} =
+             CiEvidence.judge(["test"], %{runs: runs, jobs: [old_fail], statuses: []})
+  end
+
+  test "a newest run that ended with no jobs fails a name no job carries" do
+    runs = [%{id: 12, workflow: "ci.yml", status: "completed", conclusion: "startup_failure"}]
+
+    assert %{failed: [{"test", "run_startup_failure"}]} =
+             CiEvidence.judge(["test"], %{runs: runs, jobs: [], statuses: []})
+
+    # A completed jobless run of ANOTHER workflow does not fail a name some job carries.
+    green = job("test", "completed", "success", %{run_id: 13, workflow: "ci.yml"})
+
+    runs = [
+      %{id: 13, workflow: "ci.yml", status: "completed", conclusion: "success"},
+      %{id: 14, workflow: "lint.yml", status: "completed", conclusion: "startup_failure"}
+    ]
+
+    assert %{passed: ["test"]} =
+             CiEvidence.judge(["test"], %{runs: runs, jobs: [green], statuses: []})
+  end
+
   test "each required name is judged on its own" do
     jobs = [
       job("test", "completed", "success", %{id: 1}),

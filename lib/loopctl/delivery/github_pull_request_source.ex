@@ -225,7 +225,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
          {:ok, branch} <- ref(branch),
          {:ok, runs} <- push_runs(repo, sha, branch),
          {:ok, jobs} <- jobs_of(repo, runs) do
-      {:ok, %{jobs: jobs, statuses: commit_statuses(repo, sha)}}
+      {:ok,
+       %{runs: Enum.map(runs, &run_fact/1), jobs: jobs, statuses: commit_statuses(repo, sha)}}
     end
   end
 
@@ -244,11 +245,32 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     with {:ok, body} <- get(repo, "/actions/runs?" <> query),
          {:ok, runs} <- workflow_runs(body) do
       {:ok,
-       Enum.filter(runs, fn run ->
+       runs
+       |> Enum.filter(fn run ->
          run["head_sha"] == sha and run["head_branch"] == branch and run["event"] == "push"
-       end)}
+       end)
+       |> newest_per_workflow()}
       |> bounded_runs()
     end
+  end
+
+  # A commit pushed more than once has a run per push per workflow; only each workflow's
+  # NEWEST run is judged (`Loopctl.Delivery.CiEvidence`), so only it is read, and the bound
+  # counts workflows rather than pushes (#910 round 3, finding 2).
+  defp newest_per_workflow(runs) do
+    runs
+    |> Enum.group_by(& &1["path"])
+    |> Enum.map(fn {_path, same} -> Enum.max_by(same, & &1["id"]) end)
+    |> Enum.sort_by(& &1["id"])
+  end
+
+  defp run_fact(run) do
+    %{
+      id: run["id"],
+      workflow: run["path"],
+      status: run["status"],
+      conclusion: run["conclusion"]
+    }
   end
 
   # One jobs read per run: a push that triggered more workflows than this is refused rather

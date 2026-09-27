@@ -83,14 +83,20 @@ defmodule Loopctl.Delivery.CiEvidence do
 
   @doc "Judges `evidence` for one commit against `required`. See the moduledoc."
   @spec judge([String.t()], evidence()) :: result()
-  def judge(required, %{jobs: jobs, statuses: statuses}) do
+  def judge(required, %{jobs: jobs, statuses: statuses} = evidence) do
+    # The newest run of each workflow, and its jobs, computed ONCE per judgement.
+    runs = newest_runs(Map.get(evidence, :runs), jobs)
+    newest_ids = MapSet.new(runs, & &1.id)
+    job_run_ids = MapSet.new(jobs, &run_id/1)
+    counted = Enum.filter(jobs, &(run_id(&1) in newest_ids))
+    jobless = Enum.reject(runs, &(&1.id in job_run_ids))
     acc = %{passed: [], pending: [], missing: [], failed: []}
 
     judged =
       required
       |> lookup_names()
       |> Enum.reduce(acc, fn name, acc ->
-        case check_state(name, jobs) do
+        case check_state(name, counted, jobless) do
           {:failed, conclusion} -> Map.update!(acc, :failed, &[{name, conclusion} | &1])
           state -> Map.update!(acc, state, &[name | &1])
         end
@@ -100,35 +106,50 @@ defmodule Loopctl.Delivery.CiEvidence do
     Map.put(judged, :local_gate, local_gate_state(statuses))
   end
 
-  defp check_state(name, jobs) do
+  # Every job carrying the name, in each workflow's newest run. A newest run with NO jobs yet
+  # that is still running may be about to create one, so it holds the name pending (#910 round
+  # 3, finding 3). One that ENDED with no jobs at all (`startup_failure`, an invalid workflow)
+  # fails the name when no job carries it — otherwise it read as missing and waited out the CI
+  # limit before anyone was told CI never ran (finding 4).
+  defp check_state(name, jobs, jobless) do
     states =
-      jobs
-      |> newest_run_per_workflow()
-      |> Enum.filter(&(&1.name == name))
-      |> Enum.map(&job_state/1)
+      for(%{name: ^name} = job <- jobs, do: job_state(job)) ++
+        for %{status: status} <- jobless, status != "completed", do: :pending
 
+    dead = for %{status: "completed", conclusion: conclusion} <- jobless, do: conclusion || "none"
+
+    combine(states, dead)
+  end
+
+  defp combine([], [conclusion | _]), do: {:failed, "run_" <> conclusion}
+  defp combine([], []), do: :missing
+
+  defp combine(states, _dead) do
     cond do
-      states == [] -> :missing
       failed = Enum.find(states, &match?({:failed, _}, &1)) -> failed
       :pending in states -> :pending
       true -> :passed
     end
   end
 
-  # Per workflow file, the jobs of its NEWEST run only: a later push run of the commit
-  # supersedes an earlier one. Within that run EVERY job counts — matrix legs and any jobs
-  # that share a name are separate jobs, and one green leg must never hide a red one (#910
-  # round 2, finding 1). The jobs read is `filter=latest`, so each is its latest attempt.
-  defp newest_run_per_workflow(jobs) do
-    newest =
-      jobs
-      |> Enum.group_by(&Map.get(&1, :workflow), &(Map.get(&1, :run_id) || 0))
-      |> Map.new(fn {workflow, run_ids} -> {workflow, Enum.max(run_ids)} end)
+  # The newest run of each workflow file. The runs come from the adapter already reduced to
+  # that (`GitHubPullRequestSource`); a caller that names no runs gets them derived from the
+  # jobs, which is all an older caller carried.
+  defp newest_runs(runs, _jobs) when is_list(runs) do
+    runs
+    |> Enum.group_by(&Map.get(&1, :workflow))
+    |> Enum.map(fn {_workflow, same} -> Enum.max_by(same, & &1.id) end)
+  end
 
-    Enum.filter(jobs, fn job ->
-      (Map.get(job, :run_id) || 0) == Map.fetch!(newest, Map.get(job, :workflow))
+  defp newest_runs(nil, jobs) do
+    jobs
+    |> Enum.group_by(&Map.get(&1, :workflow), &run_id/1)
+    |> Enum.map(fn {workflow, ids} ->
+      %{id: Enum.max(ids), workflow: workflow, status: "completed", conclusion: nil}
     end)
   end
+
+  defp run_id(job), do: Map.get(job, :run_id) || 0
 
   defp job_state(%{status: "completed", conclusion: "success"}), do: :passed
 

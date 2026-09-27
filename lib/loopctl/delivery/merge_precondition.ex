@@ -572,13 +572,20 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  # AC-45.6.1: the CI evidence the verdict read is copied onto the checkpoint it was read
-  # for, whatever the decision, so the thread shows why a checkpoint did or did not merge.
-  # An allow has ALREADY copied it (`record_allow/4`, where a copy that does not land is a
-  # refusal); for any other decision a copy that does not land is logged and changes nothing,
+  # AC-45.6.1: the CI evidence a DECISION rested on is copied onto the checkpoint it was read
+  # for, so the thread shows why a checkpoint did or did not merge. An allow has ALREADY
+  # copied it (`record_allow/4`, where a copy that does not land is not an allow); for a
+  # refusal a copy that does not land is logged and changes nothing,
   # because the decision it would explain was not an authorisation.
   defp note_ci_evidence(%Verdict{decision: :allow} = verdict, _tenant_id, _story_id),
     do: verdict
+
+  # Only a DECISION is copied (#910 round 3, finding 5): a CI wait, a moved head or an adopted
+  # merge explains nothing about why a checkpoint did or did not merge, and copying every wait
+  # rewrote the checkpoint on every poll for up to a day.
+  defp note_ci_evidence(%Verdict{decision: decision} = verdict, _tenant_id, _story_id)
+       when decision != :refuse,
+       do: verdict
 
   defp note_ci_evidence(%Verdict{} = verdict, tenant_id, story_id) do
     case copy_ci_evidence(tenant_id, story_id, verdict) do
@@ -756,6 +763,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
   (`ci_wait_limit_seconds/0`), because polls are the wrong unit for it: a pipeline waiting on
   `needs:` outlasts a few polls legitimately. A wait that ALSO carries a transient forge fault
   counts, as that fault always has.
+
+  A pure CI wait also CLEARS the count, because the forge answered. Faults that alternate with
+  answered waits therefore never reach the bound — and do not need to: every answered poll is
+  judged against `ci_wait_limit_seconds/0`, so the wait still ends at that limit on the first
+  poll the forge answers after it.
   """
   @spec counts_toward_unevaluated_bound?(Verdict.t()) :: boolean()
   def counts_toward_unevaluated_bound?(%Verdict{reasons: reasons}) do
@@ -1420,10 +1432,22 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # the same facts.
     skip? = moved_reasons(facts) != []
 
+    # The three forge reads are independent, so they run CONCURRENTLY: the wait is the slowest
+    # read's, not their sum (#910 round 3, finding 6). Each is bounded by the adapter's own
+    # timeouts; the order of the results is fixed.
+    [head_files, base_files, ci_evidence] =
+      [
+        fn -> repo_files(repo, pull_request, :head_sha, skip?) end,
+        fn -> repo_files(repo, pull_request, :merge_base_sha, skip?) end,
+        fn -> ci_evidence(facts, pull_request, skip?) end
+      ]
+      |> Task.async_stream(& &1.(), timeout: :infinity)
+      |> Enum.map(fn {:ok, fact} -> fact end)
+
     Map.merge(facts, %{
-      head_files: repo_files(repo, pull_request, :head_sha, skip?),
-      base_files: repo_files(repo, pull_request, :merge_base_sha, skip?),
-      ci_evidence: ci_evidence(facts, pull_request, skip?),
+      head_files: head_files,
+      base_files: base_files,
+      ci_evidence: ci_evidence,
       # When the story entered `ci`, what a CI wait is measured from — read on exactly the path
       # that reads CI, so a lock wait on it can never mask a merged or moved head's decision
       # (#910 round 2, finding 2).
@@ -1467,8 +1491,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
     with {:ok, repo} <- facts.repo,
          {:ok, %{commit_sha: sha}} <- facts.checkpoint,
          [_ | _] <- names do
+      # Stamped BEFORE the read: evidence is ordered by when it was read FROM, so a slow read
+      # that began earlier can never pass for the newer one (#910 round 3, finding 1).
+      started = DateTime.utc_now()
+
       case source().check_evidence(repo, sha, branch) do
-        {:ok, evidence} -> {:ok, %{evidence: evidence, sha: sha, read_at: DateTime.utc_now()}}
+        {:ok, evidence} -> {:ok, %{evidence: evidence, sha: sha, read_at: started}}
         {:error, _reason} = error -> error
       end
     else

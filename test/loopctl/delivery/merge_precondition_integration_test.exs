@@ -536,6 +536,31 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_allowed_sha == nil
     end
 
+    # #910 round 3, finding 1: read_at is stamped when the read STARTS.
+    test "the evidence's read_at is when the read began, not when it returned", ctx do
+      stub_thread(ctx)
+      test_pid = self()
+
+      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha, _branch ->
+        send(test_pid, {:reading_at, DateTime.utc_now()})
+        Process.sleep(20)
+        {:ok, %{jobs: [ci_run("test", "success")], statuses: []}}
+      end)
+
+      assert {:ok, %Verdict{decision: :allow} = verdict} = enforce(ctx)
+      assert_received {:reading_at, reading_at}
+      {:ok, read_at, _} = DateTime.from_iso8601(verdict.ci_evidence["read_at"])
+      assert DateTime.compare(read_at, reading_at) != :gt
+    end
+
+    # #910 round 3, finding 5: a CI wait decides nothing and copies nothing.
+    test "a CI wait copies no evidence onto the checkpoint", ctx do
+      stub_thread(ctx, ci: %{jobs: [ci_run("test", nil, "queued")], statuses: []})
+
+      assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
+      refute Map.has_key?(checkpoint_evidence(ctx), "ci")
+    end
+
     # AC-45.6.1: whatever the decision, the evidence read is copied onto the checkpoint.
     test "the evidence is copied onto the checkpoint on an allow and on a refusal", ctx do
       stub_thread(ctx)

@@ -864,8 +864,36 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
                Source.check_evidence(@repo, @head, @branch)
     end
 
+    # #910 round 3, finding 2: a commit pushed more than once has a run per push per workflow;
+    # only each workflow's newest is read, and the bound counts workflows, not pushes.
+    test "only each workflow's newest run is read, and the bound counts workflows" do
+      runs =
+        for push <- 0..3, {wf, n} <- [{"a", 1}, {"b", 2}, {"c", 3}] do
+          gh_run(push * 10 + n, %{"path" => ".github/workflows/#{wf}.yml"})
+        end
+
+      newest =
+        runs
+        |> Enum.group_by(& &1["path"])
+        |> Enum.map(fn {_, rs} -> Enum.max_by(rs, & &1["id"])["id"] end)
+
+      stub_ci(%{
+        runs: %{"total_count" => length(runs), "workflow_runs" => runs},
+        jobs:
+          Map.new(
+            newest,
+            &{&1, %{"total_count" => 1, "jobs" => [gh_job(&1 * 100, "test", "success")]}}
+          ),
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:ok, %{runs: read_runs, jobs: jobs}} = Source.check_evidence(@repo, @head, @branch)
+      assert Enum.sort(Enum.map(read_runs, & &1.id)) == Enum.sort(newest)
+      assert length(jobs) == 3
+    end
+
     test "more workflow runs than the bound is refused rather than read" do
-      runs = for id <- 1..11, do: gh_run(id)
+      runs = for id <- 1..11, do: gh_run(id, %{"path" => ".github/workflows/w#{id}.yml"})
 
       stub_ci(%{
         runs: %{"total_count" => 11, "workflow_runs" => runs},

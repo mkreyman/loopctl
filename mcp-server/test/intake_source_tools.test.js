@@ -376,6 +376,8 @@ describe("intake_source_enroll", () => {
       ["test", /must be a list/],
       [[""], /must be a list/],
       [[7], /must be a list/],
+      [["test "], /must be a list/],
+      [["test", "test"], /must be a list/],
       [["test", "local-gate"], /local-gate` can never be a required check/],
     ].entries()) {
       const { calls, apiCall } = fakeApi(created());
