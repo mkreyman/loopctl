@@ -53,7 +53,7 @@ defmodule LoopctlWeb.ThreadLive do
     socket =
       socket
       |> assign(:page_title, "Thread")
-      |> assign(:diffs, %{})
+      |> assign(:open_diff, nil)
       |> assign(:notice, nil)
       |> stream_configure(:entries, dom_id: &"entry-#{&1.id}")
 
@@ -152,20 +152,19 @@ defmodule LoopctlWeb.ThreadLive do
     end)
   end
 
+  # ONE diff is open at a time: opening another closes it, and the page never holds more than
+  # one diff's text. Only a checkpoint on this page may be opened, and asking for the one that
+  # is already open or loading does nothing; a failed one may be asked for again (retry).
   def handle_event("load_diff", %{"id" => checkpoint_id}, socket) when is_binary(checkpoint_id) do
-    # A failed fetch leaves an error state, and the retry control sends this event again.
-    if Map.get(socket.assigns.diffs, checkpoint_id) == :loading do
-      {:noreply, socket}
-    else
-      tenant_id = socket.assigns.browser_principal.tenant_id
-      story_id = socket.assigns.story_id
+    cond do
+      not Enum.any?(socket.assigns.checkpoints, &(&1.id == checkpoint_id)) ->
+        {:noreply, socket}
 
-      {:noreply,
-       socket
-       |> assign(:diffs, Map.put(socket.assigns.diffs, checkpoint_id, :loading))
-       |> start_async({:diff, checkpoint_id}, fn ->
-         Threads.checkpoint_diff(tenant_id, story_id, checkpoint_id)
-       end)}
+      open_or_loading?(socket.assigns.open_diff, checkpoint_id) ->
+        {:noreply, socket}
+
+      true ->
+        {:noreply, open_diff(socket, checkpoint_id)}
     end
   end
 
@@ -188,6 +187,23 @@ defmodule LoopctlWeb.ThreadLive do
   end
 
   def handle_event(_event, _params, socket), do: {:noreply, socket}
+
+  defp open_diff(socket, checkpoint_id) do
+    tenant_id = socket.assigns.browser_principal.tenant_id
+    story_id = socket.assigns.story_id
+
+    socket
+    |> close_diff()
+    |> assign(:open_diff, {checkpoint_id, :loading})
+    |> start_async({:diff, checkpoint_id}, fn ->
+      Threads.checkpoint_diff(tenant_id, story_id, checkpoint_id)
+    end)
+  end
+
+  defp close_diff(%{assigns: %{open_diff: {id, :loading}}} = socket),
+    do: cancel_async(socket, {:diff, id})
+
+  defp close_diff(socket), do: socket
 
   # Every write re-validates the session FIRST: a page opened before the authenticator was
   # revoked must not write after it. On a refusal the form is kept AS IT WAS — same nonce — so
@@ -231,7 +247,7 @@ defmodule LoopctlWeb.ThreadLive do
       nil ->
         assign(socket, :notice, {:finding, :ok, "Recorded."})
 
-      escalation ->
+      {:escalated, escalation} ->
         ReviewCeilingWorker.enqueue(entry.tenant_id, entry.story_id)
 
         socket
@@ -241,6 +257,15 @@ defmodule LoopctlWeb.ThreadLive do
           {:finding, :ok,
            "Recorded. The review rounds are at their ceiling, so this finding escalated the " <>
              "story (review_ceiling)."}
+        )
+
+      {:already_escalated, _escalation} ->
+        assign(
+          socket,
+          :notice,
+          {:finding, :ok,
+           "Recorded. The story was already escalated at the review ceiling; this finding " <>
+             "adds to that, and escalates nothing new."}
         )
     end
   end
@@ -285,14 +310,27 @@ defmodule LoopctlWeb.ThreadLive do
   # ---------------------------------------------------------------------------
 
   @impl true
-  def handle_async({:diff, checkpoint_id}, {:ok, result}, socket) do
-    {:noreply, assign(socket, :diffs, Map.put(socket.assigns.diffs, checkpoint_id, result))}
+  # A result lands only on the diff still open: one whose checkpoint was closed in favour of
+  # another is dropped.
+  def handle_async({:diff, checkpoint_id}, result, socket) do
+    case socket.assigns.open_diff do
+      {^checkpoint_id, :loading} ->
+        {:noreply, assign(socket, :open_diff, {checkpoint_id, diff_outcome(result)})}
+
+      _other ->
+        {:noreply, socket}
+    end
   end
 
-  def handle_async({:diff, checkpoint_id}, {:exit, reason}, socket) do
-    {:noreply,
-     assign(socket, :diffs, Map.put(socket.assigns.diffs, checkpoint_id, {:error, reason}))}
-  end
+  defp diff_outcome({:ok, result}), do: result
+  defp diff_outcome({:exit, reason}), do: {:error, reason}
+
+  defp open_or_loading?({id, :loading}, id), do: true
+  defp open_or_loading?({id, {:ok, _diff}}, id), do: true
+  defp open_or_loading?(_open, _id), do: false
+
+  defp diff_state({id, state}, id), do: state
+  defp diff_state(_open, _id), do: nil
 
   @impl true
   def handle_info(:revalidate, socket) do
@@ -399,7 +437,7 @@ defmodule LoopctlWeb.ThreadLive do
                 <.ci_evidence id={"ci-#{cp.id}"} record={cp.gate_evidence["ci"]} />
                 <div class="mt-2">
                   <button
-                    :if={Map.get(@diffs, cp.id) == nil}
+                    :if={diff_state(@open_diff, cp.id) == nil}
                     type="button"
                     id={"diff-button-#{cp.id}"}
                     phx-click="load_diff"
@@ -411,7 +449,7 @@ defmodule LoopctlWeb.ThreadLive do
                   <.diff
                     id={"diff-#{cp.id}"}
                     checkpoint_id={cp.id}
-                    state={Map.get(@diffs, cp.id)}
+                    state={diff_state(@open_diff, cp.id)}
                   />
                 </div>
               </li>
@@ -645,11 +683,23 @@ defmodule LoopctlWeb.ThreadLive do
     """
   end
 
-  defp diff(%{state: {:ok, %{text: text, truncated: truncated}}} = assigns) do
-    assigns = assign(assigns, lines: String.split(text, "\n"), truncated: truncated)
+  defp diff(%{state: {:ok, %{text: text, truncated: truncated} = result}} = assigns) do
+    assigns =
+      assign(assigns,
+        lines: String.split(text, "\n"),
+        truncated: truncated,
+        base: result.base,
+        base_placed: result.base_placed
+      )
 
     ~H"""
     <div id={@id} class="mt-1 overflow-x-auto rounded-md border border-slate-800 bg-slate-900">
+      <p id={"#{@id}-base"} class="px-3 py-1 font-mono text-xs text-slate-500">
+        against <span class="text-slate-300">{@base}</span>
+        <span :if={!@base_placed} class="text-amber-400">
+          — this claim recorded no placed base, so this is the source's CURRENT base branch
+        </span>
+      </p>
       <p :if={@truncated} class="px-3 py-1 font-mono text-xs text-amber-400">
         diff truncated: showing the first part only
       </p>

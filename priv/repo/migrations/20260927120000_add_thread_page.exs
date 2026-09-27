@@ -1,6 +1,6 @@
 defmodule Loopctl.Repo.Migrations.AddThreadPage do
   @moduledoc """
-  US-45.7, the thread page (Epic 45 PRD §6.1). Two changes.
+  US-45.7, the thread page (Epic 45 PRD §6.1).
 
   1. A HUMAN finding. PRD §6: Mark writes `finding` entries through the thread page as the
      tenant's human principal, and a human finding has the same standing as an agent's. A
@@ -12,15 +12,23 @@ defmodule Loopctl.Repo.Migrations.AddThreadPage do
      opens nothing to a key.
 
   2. `thread_issue_links`: the outbox for the comment that links a story's intake issue to its
-     thread page (AC-45.7.4). One row per story, written by `Loopctl.Workers.ThreadIssueLinkWorker`
-     for every intake story whose thread has a checkpoint, and drained by the same worker with
-     nothing held across the forge call — the shape `intake_issue_closures` has, for the same
-     reasons.
+     thread page (AC-45.7.4). One row per story, written in the transaction that records the
+     thread's FIRST checkpoint and drained by `Loopctl.Workers.ThreadIssueLinkWorker` with nothing
+     held across the forge call — the shape `intake_issue_closures` has, for the same reasons.
+     Threads that already have a checkpoint get their row ONCE, here (`backfill_sql/0`), and
+     only while the work is still in flight: a link posted on an issue whose story merged,
+     shipped or was abandoned long ago tells its reporter nothing and wakes them for nothing.
 
   3. `browser_sessions`: the server side of a thread-page login (`Loopctl.WebAuthn.BrowserLogin`).
      The cookie names a row; logout REVOKES it, so a copied cookie stops working at once rather
      than when it expires. Deleting the authenticator that asserted, or the tenant, deletes its
      sessions (`ON DELETE CASCADE`), which is how a revoked authenticator ends a session.
+
+  4. Usernameless login. `webauthn_login_challenges` holds the challenge a login is issued BEFORE
+     anyone is identified, so it has no tenant: the assertion's credential id identifies the
+     authenticator, and the authenticator the tenant. That makes a credential id a GLOBAL key,
+     so it gets a global unique index — without it, a credential id enrolled in two tenants would
+     leave a login choosing between them.
   """
 
   use Ecto.Migration
@@ -90,9 +98,66 @@ defmodule Loopctl.Repo.Migrations.AddThreadPage do
     create index(:browser_sessions, [:authenticator_id])
 
     enable_rls(:browser_sessions)
+
+    create unique_index(:tenant_root_authenticators, [:credential_id],
+             name: :tenant_root_authenticators_credential_id_uidx
+           )
+
+    # Not tenant-scoped, and deliberately without RLS: nothing identifies a tenant until the
+    # assertion is verified. Only `AdminRepo` reads or writes it (`Loopctl.WebAuthn.Reauth`).
+    create table(:webauthn_login_challenges, primary_key: false) do
+      add :id, :binary_id, primary_key: true
+      add :purpose, :string, null: false
+      add :challenge, :binary, null: false
+      add :expires_at, :utc_datetime_usec, null: false
+      add :used_at, :utc_datetime_usec, null: true
+
+      timestamps(type: :utc_datetime_usec, updated_at: false)
+    end
+
+    create index(:webauthn_login_challenges, [:expires_at])
+
+    execute(backfill_sql())
+  end
+
+  @doc """
+  The one-time backfill of `thread_issue_links`: intake stories whose thread already has a
+  claimant checkpoint, whose stage is IN FLIGHT, whose source is connected and whose issue is
+  not known to be closed. The in-flight stages are `Loopctl.Delivery.StageMachine`'s
+  `@in_flight` as of this migration (claimed, worktree, implementing, reviewing, pr_open, ci);
+  a migration may not read application code that changes after it. Public so the query is
+  tested (`Loopctl.Threads.IssueLinksBackfillTest`).
+  """
+  def backfill_sql do
+    """
+    INSERT INTO thread_issue_links
+      (id, tenant_id, story_id, repo_full_name, issue_number, status, attempts,
+       inserted_at, updated_at)
+    SELECT gen_random_uuid(), s.tenant_id, s.id, src.repo_full_name, r.issue_number,
+           'pending', 0, now(), now()
+    FROM stories s
+    JOIN intake_records r ON r.id = s.intake_record_id AND r.tenant_id = s.tenant_id
+    JOIN intake_sources src ON src.id = r.source_id AND src.tenant_id = r.tenant_id
+    JOIN story_stages st ON st.tenant_id = s.tenant_id AND st.story_id = s.id
+    WHERE src.revoked_at IS NULL
+      AND r.issue_number > 0
+      AND r.issue_state IS DISTINCT FROM 'closed'
+      AND st.stage IN ('claimed', 'worktree', 'implementing', 'reviewing', 'pr_open', 'ci')
+      AND EXISTS (
+        SELECT 1 FROM thread_checkpoints c
+        WHERE c.tenant_id = s.tenant_id AND c.story_id = s.id AND c.kind = 'checkpoint'
+      )
+    ON CONFLICT DO NOTHING
+    """
   end
 
   def down do
+    drop table(:webauthn_login_challenges)
+
+    drop index(:tenant_root_authenticators, [:credential_id],
+           name: :tenant_root_authenticators_credential_id_uidx
+         )
+
     drop table(:browser_sessions)
     drop table(:thread_issue_links)
 

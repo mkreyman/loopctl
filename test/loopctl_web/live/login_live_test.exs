@@ -40,10 +40,9 @@ defmodule LoopctlWeb.LoginLiveTest do
       conn = init_test_session(ctx.conn, %{"planted" => "before login"})
       {:ok, view, _html} = live(conn, ~p"/login")
 
-      view |> form("#login-form", login: %{slug: ctx.tenant.slug}) |> render_submit()
-      assert_push_event(view, "webauthn:login", %{challenge: challenge, allowed_credentials: ids})
+      view |> element("#login-begin") |> render_click()
+      assert_push_event(view, "webauthn:login", %{challenge: challenge, allowed_credentials: []})
       assert is_binary(challenge)
-      assert ids == [Base.url_encode64(ctx.authenticator.credential_id, padding: false)]
 
       render_hook(view, "assertion_captured", captured(ctx.authenticator))
       refute render(view) =~ ctx.tenant.id
@@ -61,7 +60,7 @@ defmodule LoopctlWeb.LoginLiveTest do
 
     test "the challenge the form posts is the server's, not the client's", ctx do
       {:ok, view, _html} = live(ctx.conn, ~p"/login")
-      view |> form("#login-form", login: %{slug: ctx.tenant.slug}) |> render_submit()
+      view |> element("#login-begin") |> render_click()
 
       # A client naming its own challenge changes nothing the form posts.
       render_hook(
@@ -74,24 +73,25 @@ defmodule LoopctlWeb.LoginLiveTest do
       assert get_session(conn, BrowserAuth.session_key())["tenant_id"] == ctx.tenant.id
     end
 
-    test "a real slug and an unknown one get the same answer", ctx do
+    test "there is nothing to type: no slug field, and the page names no tenant", ctx do
       {:ok, view, _html} = live(ctx.conn, ~p"/login")
 
-      view |> form("#login-form", login: %{slug: ctx.tenant.slug}) |> render_submit()
-      assert_push_event(view, "webauthn:login", real)
-      real_status = view |> element("#login-status") |> render()
+      refute has_element?(view, "input[name*='slug']")
+      assert has_element?(view, "#login-requirement", "discoverable credential")
 
-      view |> form("#login-form", login: %{slug: "nobody-here"}) |> render_submit()
-      assert_push_event(view, "webauthn:login", decoy)
+      view |> element("#login-begin") |> render_click()
+      assert_push_event(view, "webauthn:login", %{allowed_credentials: []})
+      refute render(view) =~ ctx.tenant.id
+    end
 
-      assert Map.keys(decoy) == Map.keys(real)
-      assert length(decoy.allowed_credentials) == 1
-      assert byte_size(decoy.challenge) == byte_size(real.challenge)
-      assert view |> element("#login-status") |> render() == real_status
+    test "an unknown credential is refused like any failed assertion", ctx do
+      {:ok, view, _html} = live(ctx.conn, ~p"/login")
+      view |> element("#login-begin") |> render_click()
 
-      # The decoy arms the same form, and its assertion fails as a wrong one does.
-      render_hook(view, "assertion_captured", captured(ctx.authenticator))
+      stranger = %{ctx.authenticator | credential_id: :crypto.strong_rand_bytes(16)}
+      render_hook(view, "assertion_captured", captured(stranger))
       conn = follow_trigger_action(form(view, "#login-assertion-form"), ctx.conn)
+
       assert redirected_to(conn) == ~p"/login"
       assert get_session(conn, BrowserAuth.session_key()) == nil
     end
@@ -101,7 +101,7 @@ defmodule LoopctlWeb.LoginLiveTest do
       render_hook(view, "assertion_captured", captured(ctx.authenticator))
       refute has_element?(view, "#login-assertion-form[phx-trigger-action]")
 
-      view |> form("#login-form", login: %{slug: ctx.tenant.slug}) |> render_submit()
+      view |> element("#login-begin") |> render_click()
 
       render_hook(
         view,
@@ -120,7 +120,7 @@ defmodule LoopctlWeb.LoginLiveTest do
       end)
 
       {:ok, view, _html} = live(ctx.conn, ~p"/login")
-      view |> form("#login-form", login: %{slug: ctx.tenant.slug}) |> render_submit()
+      view |> element("#login-begin") |> render_click()
 
       assert has_element?(view, "#login-status", "Too many")
       refute_push_event(view, "webauthn:login", _)
@@ -129,7 +129,7 @@ defmodule LoopctlWeb.LoginLiveTest do
 
   describe "POST /login" do
     test "a replayed assertion is refused and binds nothing", ctx do
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      {:ok, issued} = BrowserLogin.begin()
       login = Map.put(captured(ctx.authenticator), "challenge_id", issued.challenge_id)
 
       first = post(ctx.conn, ~p"/login", %{"login" => login})
@@ -147,7 +147,7 @@ defmodule LoopctlWeb.LoginLiveTest do
       end)
 
       expect(Loopctl.MockWebAuthn, :verify_authentication, 0, fn _, _, _ -> {:ok, %{}} end)
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      {:ok, issued} = BrowserLogin.begin()
 
       conn =
         post(ctx.conn, ~p"/login", %{
@@ -158,7 +158,7 @@ defmodule LoopctlWeb.LoginLiveTest do
     end
 
     test "is CSRF-protected: a POST with no token is refused by the pipeline", ctx do
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      {:ok, issued} = BrowserLogin.begin()
 
       conn =
         Plug.Test.conn(:post, "/login", %{
@@ -173,7 +173,7 @@ defmodule LoopctlWeb.LoginLiveTest do
 
   describe "DELETE /logout" do
     test "revokes the session on the server and drops the cookie", ctx do
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      {:ok, issued} = BrowserLogin.begin()
 
       logged_in =
         post(ctx.conn, ~p"/login", %{

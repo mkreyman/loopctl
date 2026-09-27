@@ -67,6 +67,7 @@ defmodule Loopctl.Threads do
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
+  alias Loopctl.Threads.IssueLinks
   alias Loopctl.Threads.Review
   alias Loopctl.Threads.Reviews
   alias Loopctl.WorkBreakdown.Story
@@ -487,17 +488,27 @@ defmodule Loopctl.Threads do
   to count in, so it escalates the story over the same `review_ceiling` edge a ceiling verdict
   does: the escalation entry is recorded in this transaction, bound to the final review, and
   `Loopctl.Workers.ReviewCeilingWorker` moves the stage. One escalation per review: when the
-  ceiling verdict already escalated, that one is returned.
+  ceiling verdict already escalated, that one is returned, marked as already there.
 
   Refused `:tenant_halted` while the tenant's custody is halted, as every judgement is. A
   resend of a finding already recorded under the same key is answered from its row — halt
   included — so a double submit is one entry; a different finding reusing the key is
   `idempotency_key_reused`.
 
-  Returns `{:ok, %{entry: entry, escalation: entry | nil}, :created | :existing}`.
+  `escalation` says which of the two happened: `{:escalated, entry}` when THIS finding recorded
+  the escalation, `{:already_escalated, entry}` when the story was already escalated at the
+  ceiling (by the ceiling verdict or an earlier finding) and this one changed nothing. A resend
+  answers what its first delivery did.
+
+  Returns `{:ok, %{entry: entry, escalation: nil | {:escalated | :already_escalated, entry}},
+  :created | :existing}`.
   """
   @spec record_human_finding(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
-          {:ok, %{entry: Entry.t(), escalation: Entry.t() | nil}, :created | :existing}
+          {:ok,
+           %{
+             entry: Entry.t(),
+             escalation: nil | {:escalated | :already_escalated, Entry.t()}
+           }, :created | :existing}
           | {:error, term()}
           | {:error, :unprocessable_entity, term()}
   def record_human_finding(tenant_id, story_id, attrs) do
@@ -609,30 +620,38 @@ defmodule Loopctl.Threads do
 
   @doc """
   The unified diff of one checkpoint, fetched from the forge and never stored (US-45.7, PRD
-  §6.1): the three-dot comparison of the base branch the story's claim was PLACED on
-  (`Loopctl.Delivery.DispatchPayload.placed_base_branch/2`) with the checkpoint's commit — the
-  change as the merge gate judges it, whether the checkpoint is the thread's first, a later
-  one, or a `base_update` that merged the base in.
+  §6.1): the three-dot comparison of the base branch the checkpoint's OWN claim was placed on
+  with the checkpoint's commit — the change as the merge gate judged it when that claim was
+  current. A checkpoint of an earlier claim is judged against that claim's base, not the
+  current one's (`DispatchPayload.dispatch_route/3` with the checkpoint's `claim_epoch`).
 
-  The checkpoint, the story and its source are read in one short RLS transaction, and the
-  placed base in another (`DispatchPayload.dispatch_route/2`); both are CLOSED before the forge
-  is asked, so nothing holds a connection across GitHub. The forge call is bounded by the
-  adapter (`Loopctl.Delivery.PullRequestSource.checkpoint_diff/3`); a slow or absent forge is
-  an `{:error, reason}` for the caller to show beside a ledger that rendered without it.
+  A claim whose dispatch ledger recorded no base (a row written before the column existed, or
+  no row at all) falls back to the intake source's CURRENT base branch, and the answer says so:
+  `base_placed: false`.
+
+  Every read runs in a short RLS transaction that is CLOSED before the forge is asked, so
+  nothing holds a connection across GitHub. The forge call is bounded by the adapter
+  (`Loopctl.Delivery.PullRequestSource.checkpoint_diff/3`); a slow or absent forge is an
+  `{:error, reason}` for the caller to show beside a ledger that rendered without it.
   """
   @spec checkpoint_diff(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, PullRequestSource.checkpoint_diff()} | {:error, term()}
+          {:ok, map()} | {:error, term()}
   def checkpoint_diff(tenant_id, story_id, checkpoint_id) do
     {:ok, target} =
       Repo.with_tenant(tenant_id, fn -> diff_target(tenant_id, story_id, checkpoint_id) end)
 
-    with {:ok, story, source, head_sha} <- target,
-         {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story) do
-      PullRequestSource.impl().checkpoint_diff(
-        source.repo_full_name,
-        DispatchPayload.placed_base_branch(route, source),
-        head_sha
-      )
+    with {:ok, story, source, checkpoint} <- target,
+         {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story, checkpoint.claim_epoch) do
+      base = DispatchPayload.placed_base_branch(route, source)
+
+      with {:ok, diff} <-
+             PullRequestSource.impl().checkpoint_diff(
+               source.repo_full_name,
+               base,
+               checkpoint.commit_sha
+             ) do
+        {:ok, Map.merge(diff, %{base: base, base_placed: is_binary(route.base_branch)})}
+      end
     end
   end
 
@@ -644,7 +663,7 @@ defmodule Loopctl.Threads do
          %Checkpoint{} = checkpoint <-
            checkpoint_of(tenant_id, story_id, checkpoint_id) || {:error, :not_found},
          {:ok, source} <- project_source(tenant_id, story.project_id) do
-      {:ok, story, source, checkpoint.commit_sha}
+      {:ok, story, source, checkpoint}
     end
   end
 
@@ -1252,6 +1271,9 @@ defmodule Loopctl.Threads do
 
     with {:ok, _entry, :created, chained} <-
            insert_entry(tenant_id, story_id, entry, Keyword.put(opts, :adopted, adopted)) do
+      # AC-45.7.4: the thread's FIRST checkpoint is when its page has work on it. The intent to
+      # link the intake issue commits with it; the comment is posted later with nothing held.
+      if is_nil(previous), do: IssueLinks.record_in(Repo, tenant_id, story_id)
       {:ok, checkpoint, :created, chained}
     end
   end
@@ -1933,7 +1955,7 @@ defmodule Loopctl.Threads do
       key = @reserved_key_prefix <> "review_ceiling:#{review.id}"
 
       case entry_by_review_key(tenant_id, review.id, key) do
-        %Entry{} = recorded -> {:ok, recorded, []}
+        %Entry{} = recorded -> {:ok, {:already_escalated, recorded}, []}
         nil -> insert_human_ceiling(tenant_id, story, review, key)
       end
     else
@@ -1960,7 +1982,7 @@ defmodule Loopctl.Threads do
              author_principal: @review_ceiling_principal,
              actor_lineage: []
            ),
-         do: {:ok, escalation, chained}
+         do: {:ok, {:escalated, escalation}, chained}
   end
 
   # What a resend of a human finding answers: the ceiling escalation, when a material finding
@@ -1969,15 +1991,22 @@ defmodule Loopctl.Threads do
     with true <- entry.severity in Reviews.material(),
          %Story{} = story <- Repo.one(story_row(tenant_id, story_id)),
          %Review{} = review <- Reviews.ceiling_review(tenant_id, story) do
-      entry_by_review_key(
-        tenant_id,
-        review.id,
-        @reserved_key_prefix <> "review_ceiling:#{review.id}"
-      )
+      tenant_id
+      |> entry_by_review_key(review.id, @reserved_key_prefix <> "review_ceiling:#{review.id}")
+      |> caused_by(entry)
     else
       _none -> nil
     end
   end
+
+  # The escalation THIS finding recorded is written in the same transaction, straight after
+  # it, so its seq is the finding's plus one; any other was already there.
+  defp caused_by(nil, _entry), do: nil
+
+  defp caused_by(%Entry{seq: seq} = escalation, %Entry{seq: finding}) when seq == finding + 1,
+    do: {:escalated, escalation}
+
+  defp caused_by(escalation, _entry), do: {:already_escalated, escalation}
 
   defp claimant_fence(story, agent_id, epoch) do
     with :ok <- Claimant.check(story, agent_id, epoch), do: lease(story)

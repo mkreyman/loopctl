@@ -94,11 +94,11 @@ defmodule LoopctlWeb.ThreadLiveTest do
     })
   end
 
-  defp checkpoint(ctx, sha) do
+  defp checkpoint(ctx, sha, epoch \\ @epoch) do
     {:ok, cp, :created} =
       Threads.record_checkpoint(ctx.tenant.id, ctx.story.id,
         agent_id: ctx.agent.id,
-        claim_epoch: @epoch,
+        claim_epoch: epoch,
         commit_sha: sha,
         tree_sha: @tree,
         note: "implemented the thing",
@@ -120,6 +120,30 @@ defmodule LoopctlWeb.ThreadLiveTest do
       )
 
     entry
+  end
+
+  # The implement dispatch a claim was placed under, as the ledger records it once its runner
+  # accepted it: what `DispatchPayload.dispatch_route/3` reads the placed base from.
+  defp placed(ctx, runner, epoch, base_branch) do
+    now = DateTime.utc_now()
+
+    in_tenant(ctx, fn ->
+      Repo.insert!(%Loopctl.Runners.DispatchRecord{
+        tenant_id: ctx.tenant.id,
+        runner_id: runner.id,
+        dispatch_id: Ecto.UUID.generate(),
+        story_id: ctx.story.id,
+        claim_epoch: epoch,
+        kind: "implement",
+        mode: "thread",
+        base_branch: base_branch,
+        status: "accepted",
+        wall_clock_seconds: 3_600,
+        released_at: now,
+        inserted_at: now,
+        updated_at: now
+      })
+    end)
   end
 
   defp entries(ctx, kind) do
@@ -247,23 +271,99 @@ defmodule LoopctlWeb.ThreadLiveTest do
       refute has_element?(view, "#thread-entries strong")
     end
 
-    test "every checkpoint's diff is the placed base...checkpoint comparison", ctx do
+    test "a checkpoint's diff is against ITS claim's placed base; no placed base falls back, and says so",
+         ctx do
+      runner = fixture(:stage_runner, %{tenant_id: ctx.tenant.id})
+      placed(ctx, runner, @epoch, "release-1")
       cp1 = checkpoint(ctx, @sha1)
-      cp2 = checkpoint(ctx, @sha2)
 
-      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, 2, fn "acme/widgets",
-                                                                    "trunk",
-                                                                    head ->
-        {:ok, %{text: "diff --git a/x b/x\n+line of #{head}", truncated: false}}
+      # The story is re-claimed; the new claim was placed on another base, and records a
+      # checkpoint of its own. The first checkpoint is still judged against ITS claim's base.
+      in_tenant(ctx, fn ->
+        from(s in Story, where: s.id == ^ctx.story.id)
+        |> Repo.update_all(set: [claim_epoch: @epoch + 1])
+      end)
+
+      placed(ctx, runner, @epoch + 1, "main")
+      cp2 = checkpoint(ctx, @sha2, @epoch + 1)
+
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn "acme/widgets",
+                                                                 "release-1",
+                                                                 @sha1 ->
+        {:ok, %{text: "+first", truncated: false}}
+      end)
+
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn "acme/widgets", "main", @sha2 ->
+        {:ok, %{text: "+second", truncated: false}}
       end)
 
       {:ok, view, _html} = open(ctx)
 
-      for cp <- [cp1, cp2] do
-        view |> element("#diff-button-#{cp.id}") |> render_click()
-        render_async(view)
-        assert has_element?(view, "#diff-#{cp.id}", "+line of #{cp.commit_sha}")
-      end
+      view |> element("#diff-button-#{cp1.id}") |> render_click()
+      render_async(view)
+      assert has_element?(view, "#diff-#{cp1.id}-base", "release-1")
+      refute has_element?(view, "#diff-#{cp1.id}-base", "CURRENT base")
+
+      view |> element("#diff-button-#{cp2.id}") |> render_click()
+      render_async(view)
+      assert has_element?(view, "#diff-#{cp2.id}", "+second")
+    end
+
+    test "a claim with no ledger row is diffed against the source's current base, flagged",
+         ctx do
+      cp = checkpoint(ctx, @sha1)
+
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn "acme/widgets", "trunk", @sha1 ->
+        {:ok, %{text: "+fallback", truncated: false}}
+      end)
+
+      {:ok, view, _html} = open(ctx)
+      view |> element("#diff-button-#{cp.id}") |> render_click()
+      render_async(view)
+
+      assert has_element?(view, "#diff-#{cp.id}", "+fallback")
+      assert has_element?(view, "#diff-#{cp.id}-base", "CURRENT base")
+    end
+
+    test "one diff is open at a time; opening another closes it", ctx do
+      cp1 = checkpoint(ctx, @sha1)
+      cp2 = checkpoint(ctx, @sha2)
+
+      stub(Loopctl.MockPullRequestSource, :checkpoint_diff, fn _repo, _base, head ->
+        {:ok, %{text: "+of #{head}", truncated: false}}
+      end)
+
+      {:ok, view, _html} = open(ctx)
+      view |> element("#diff-button-#{cp1.id}") |> render_click()
+      render_async(view)
+      view |> element("#diff-button-#{cp2.id}") |> render_click()
+      render_async(view)
+
+      assert has_element?(view, "#diff-#{cp2.id}", "+of #{@sha2}")
+      refute has_element?(view, "#diff-#{cp1.id}")
+      assert has_element?(view, "#diff-button-#{cp1.id}")
+    end
+
+    test "only this page's checkpoints are fetched, and an open diff is not fetched again",
+         ctx do
+      cp = checkpoint(ctx, @sha1)
+
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, 1, fn _repo, _base, _head ->
+        {:ok, %{text: "+once", truncated: false}}
+      end)
+
+      {:ok, view, _html} = open(ctx)
+      render_hook(view, "load_diff", %{"id" => Ecto.UUID.generate()})
+      render_async(view)
+      # Nothing was opened for an id this page does not show.
+      assert :sys.get_state(view.pid).socket.assigns.open_diff == nil
+
+      view |> element("#diff-button-#{cp.id}") |> render_click()
+      render_async(view)
+      render_hook(view, "load_diff", %{"id" => cp.id})
+      render_async(view)
+
+      assert has_element?(view, "#diff-#{cp.id}", "+once")
     end
 
     test "a slow forge leaves the ledger rendered; a down one offers a retry", ctx do
@@ -470,6 +570,22 @@ defmodule LoopctlWeb.ThreadLiveTest do
       assert has_element?(view, "#finding-notice", "escalated the story")
       assert [escalation] = entries(ctx, :escalation)
       assert has_element?(view, "#entry-#{escalation.id}", "review_ceiling")
+
+      # A second late finding is told the story was ALREADY escalated, and moves nothing.
+      view
+      |> form("#finding-form")
+      |> render_submit(%{
+        finding: %{
+          nonce: "later",
+          checkpoint_id: cp2.id,
+          severity: "high",
+          introduced_by: "none",
+          body: "another after the last round"
+        }
+      })
+
+      assert has_element?(view, "#finding-notice", "already escalated")
+      assert [_one] = entries(ctx, :escalation)
 
       # The stage moved at once: the page enqueued the move (Oban runs inline here).
       assert %{stage: :escalated} =

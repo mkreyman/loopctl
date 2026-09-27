@@ -18,8 +18,9 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WebAuthn.BrowserLogin
   alias Loopctl.WebAuthn.BrowserSession
+  alias Loopctl.WebAuthn.LoginChallenge
   alias Loopctl.WebAuthn.Reauth
-  alias Loopctl.WebAuthn.ReauthChallenge
+  alias Loopctl.WebAuthn.Wax, as: WaxAdapter
 
   setup :verify_on_exit!
 
@@ -58,61 +59,42 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
     }
   end
 
-  describe "begin/1" do
-    test "issues a stored browser_login challenge for the tenant's enrolled credentials", ctx do
-      assert {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+  describe "begin/0" do
+    test "issues a stored, tenantless, usernameless challenge that requires user verification" do
+      expect(Loopctl.MockWebAuthn, :new_authentication_challenge, fn opts ->
+        assert opts[:user_verification] == "required"
+        %{bytes: <<1::256>>, rp_id: "localhost"}
+      end)
 
-      assert issued.allowed_credentials == [
-               Base.url_encode64(ctx.authenticator.credential_id, padding: false)
-             ]
+      assert {:ok, issued} = BrowserLogin.begin()
+      assert issued.allowed_credentials == []
+      assert %{challenge_id: _, challenge: _, rp_id: _, expires_at: _} = issued
 
-      assert %ReauthChallenge{purpose: "browser_login", tenant_id: tid} =
-               AdminRepo.get(ReauthChallenge, issued.challenge_id)
-
-      assert tid == ctx.tenant.id
-      refute Map.has_key?(issued, :tenant_id)
+      assert %LoginChallenge{purpose: "browser_login", used_at: nil} =
+               AdminRepo.get(LoginChallenge, issued.challenge_id)
     end
 
-    test "every slug gets the same answer: the same keys and shapes, no tenant id", ctx do
-      bare = fixture(:tenant)
-      suspended = fixture(:tenant, %{status: :suspended})
-      fixture(:root_authenticator, tenant_id: suspended.id)
+    test "it takes no input, so every visitor gets the same shape" do
+      {:ok, one} = BrowserLogin.begin()
+      {:ok, two} = BrowserLogin.begin()
 
-      {:ok, real} = BrowserLogin.begin(ctx.tenant.slug)
-
-      for slug <- ["no-such-tenant", bare.slug, suspended.slug, nil] do
-        assert {:ok, decoy} = BrowserLogin.begin(slug)
-        assert Map.keys(decoy) |> Enum.sort() == Map.keys(real) |> Enum.sort()
-        assert {:ok, _} = Ecto.UUID.cast(decoy.challenge_id)
-        assert byte_size(decoy.challenge) == byte_size(real.challenge)
-        assert [credential] = decoy.allowed_credentials
-        assert {:ok, _} = Base.url_decode64(credential, padding: false)
-        assert decoy.rp_id == real.rp_id
-        assert %DateTime{} = decoy.expires_at
-        # A decoy is never stored, so its id can only fail verification.
-        assert AdminRepo.get(ReauthChallenge, decoy.challenge_id) == nil
-      end
+      assert Map.keys(one) == Map.keys(two)
+      assert byte_size(one.challenge) == byte_size(two.challenge)
+      refute one.challenge_id == two.challenge_id
     end
 
-    test "a decoy's credential is stable for its slug and differs between slugs" do
-      {:ok, one} = BrowserLogin.begin("ghost-a")
-      {:ok, again} = BrowserLogin.begin("ghost-a")
-      {:ok, other} = BrowserLogin.begin("ghost-b")
-
-      assert one.allowed_credentials == again.allowed_credentials
-      refute one.allowed_credentials == other.allowed_credentials
-      refute one.challenge_id == again.challenge_id
-    end
-
-    test "there is no per-tenant budget a stranger could spend", ctx do
+    test "there is no per-tenant budget a stranger could spend" do
       expect(Loopctl.MockRateLimiter, :check_rate, 0, fn _, _, _ -> {:deny, 1} end)
-      assert {:ok, _} = BrowserLogin.begin(ctx.tenant.slug)
+      assert {:ok, _} = BrowserLogin.begin()
     end
   end
 
   describe "complete/1" do
-    test "a verified assertion opens a session on the tenant the stored challenge names", ctx do
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+    test "the asserting credential names the tenant: tenant A's credential opens A's session",
+         ctx do
+      other = fixture(:tenant)
+      fixture(:root_authenticator, tenant_id: other.id)
+      {:ok, issued} = BrowserLogin.begin()
 
       assert {:ok, principal} =
                BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
@@ -120,8 +102,10 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
       assert principal.tenant_id == ctx.tenant.id
       assert principal.authenticator_id == ctx.authenticator.id
 
-      assert %BrowserSession{revoked_at: nil, expires_at: expires} =
+      assert %BrowserSession{revoked_at: nil, expires_at: expires, tenant_id: tid} =
                AdminRepo.get(BrowserSession, principal.session_id)
+
+      assert tid == ctx.tenant.id
 
       assert_in_delta DateTime.diff(expires, DateTime.utc_now()),
                       BrowserLogin.lifetime_seconds(),
@@ -129,62 +113,158 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
     end
 
     test "a challenge is good once: the replay is refused", ctx do
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      {:ok, issued} = BrowserLogin.begin()
       params = assertion(issued.challenge_id, ctx.authenticator)
 
       assert {:ok, _} = BrowserLogin.complete(params)
       assert {:error, :challenge_not_found} = BrowserLogin.complete(params)
     end
 
-    test "a decoy challenge fails exactly as a replayed one does", ctx do
-      {:ok, decoy} = BrowserLogin.begin("nobody-here")
+    test "an unknown credential fails as a bad assertion does, and spends the challenge", ctx do
+      {:ok, issued} = BrowserLogin.begin()
+      stranger = %{ctx.authenticator | credential_id: :crypto.strong_rand_bytes(16)}
+      params = assertion(issued.challenge_id, stranger)
+
+      assert {:error, :invalid_assertion} = BrowserLogin.complete(params)
 
       assert {:error, :challenge_not_found} =
-               BrowserLogin.complete(assertion(decoy.challenge_id, ctx.authenticator))
-
-      assert {:error, :challenge_not_found} = BrowserLogin.complete(%{})
-    end
-
-    test "a challenge issued for another ceremony cannot sign in", ctx do
-      {:ok, other} = Reauth.issue_challenge(ctx.tenant.id, "rotate_audit_key")
-
-      assert {:error, :challenge_not_found} =
-               BrowserLogin.complete(assertion(other.challenge_id, ctx.authenticator))
-    end
-
-    test "an assertion the adapter rejects opens nothing", ctx do
-      expect(Loopctl.MockWebAuthn, :verify_authentication, fn _, _, _ ->
-        {:error, :invalid_signature}
-      end)
-
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
-
-      assert {:error, :invalid_signature} =
                BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
-
-      assert AdminRepo.aggregate(BrowserSession, :count) == 0
     end
 
-    test "tenant isolation: another tenant's credential cannot answer this tenant's challenge",
-         ctx do
-      other = fixture(:tenant)
-      other_auth = fixture(:root_authenticator, tenant_id: other.id)
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+    test "a reauth challenge, or an expired login challenge, cannot sign in", ctx do
+      {:ok, reauth} = Reauth.issue_challenge(ctx.tenant.id, "browser_login")
 
-      assert {:error, :not_found} =
-               BrowserLogin.complete(assertion(issued.challenge_id, other_auth))
-    end
+      assert {:error, :challenge_not_found} =
+               BrowserLogin.complete(assertion(reauth.challenge_id, ctx.authenticator))
 
-    test "an expired challenge is refused", ctx do
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      {:ok, issued} = BrowserLogin.begin()
 
       AdminRepo.update_all(
-        from(c in ReauthChallenge, where: c.id == ^issued.challenge_id),
+        from(c in LoginChallenge, where: c.id == ^issued.challenge_id),
         set: [expires_at: DateTime.add(DateTime.utc_now(), -1)]
       )
 
       assert {:error, :challenge_not_found} =
                BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
+
+      assert {:error, :invalid_assertion} = BrowserLogin.complete(:not_a_map)
+    end
+
+    test "an inactive tenant's credential opens nothing", ctx do
+      ctx.tenant |> Ecto.Changeset.change(status: :suspended) |> AdminRepo.update!()
+      {:ok, issued} = BrowserLogin.begin()
+
+      assert {:error, :tenant_inactive} =
+               BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
+    end
+
+    test "an authenticator revoked before the session is written is a clean refusal", ctx do
+      AdminRepo.delete!(ctx.authenticator)
+
+      assert {:error, :authenticator_revoked} =
+               BrowserLogin.open_session(ctx.tenant.id, ctx.authenticator.id)
+    end
+
+    test "a credential id is globally unique: another tenant cannot enroll it", ctx do
+      other = fixture(:tenant)
+
+      assert {:error, %Ecto.Changeset{errors: [credential_id: _]}} =
+               %RootAuthenticator{tenant_id: other.id}
+               |> RootAuthenticator.create_changeset(%{
+                 credential_id: ctx.authenticator.credential_id,
+                 public_key: :erlang.term_to_binary(%{1 => 2}),
+                 attestation_format: "none",
+                 friendly_name: "copy"
+               })
+               |> AdminRepo.insert()
+    end
+  end
+
+  describe "complete/1 against the real WebAuthn verifier" do
+    setup do
+      stub(Loopctl.MockWebAuthn, :new_authentication_challenge, fn opts ->
+        WaxAdapter.new_authentication_challenge(opts)
+      end)
+
+      stub(Loopctl.MockWebAuthn, :verify_authentication, fn payload, challenge, opts ->
+        WaxAdapter.verify_authentication(payload, challenge, opts)
+      end)
+
+      {pub_point, priv} = :crypto.generate_key(:ecdh, :secp256r1)
+      <<4, x::binary-size(32), y::binary-size(32)>> = pub_point
+      tenant = fixture(:tenant)
+      credential_id = :crypto.strong_rand_bytes(16)
+
+      fixture(:root_authenticator,
+        tenant_id: tenant.id,
+        credential_id: credential_id,
+        public_key: :erlang.term_to_binary(%{1 => 2, 3 => -7, -1 => 1, -2 => x, -3 => y})
+      )
+
+      %{wax_tenant: tenant, credential_id: credential_id, priv: priv}
+    end
+
+    defp signed(challenge_id, credential_id, priv, challenge_b64, flags) do
+      auth_data = :crypto.hash(:sha256, "localhost") <> <<flags>> <> <<1::unsigned-32>>
+
+      client_data_json =
+        Jason.encode!(%{
+          "type" => "webauthn.get",
+          "challenge" => challenge_b64,
+          "origin" => "http://localhost:4002"
+        })
+
+      signature =
+        :crypto.sign(
+          :ecdsa,
+          :sha256,
+          auth_data <> :crypto.hash(:sha256, client_data_json),
+          [priv, :secp256r1]
+        )
+
+      %{
+        "challenge_id" => challenge_id,
+        "credential_id" => Base.url_encode64(credential_id, padding: false),
+        "authenticator_data" => Base.url_encode64(auth_data, padding: false),
+        "signature" => Base.url_encode64(signature, padding: false),
+        "client_data_json" => Base.url_encode64(client_data_json, padding: false)
+      }
+    end
+
+    test "a verified, user-verified assertion signs in", ctx do
+      {:ok, issued} = BrowserLogin.begin()
+      params = signed(issued.challenge_id, ctx.credential_id, ctx.priv, issued.challenge, 0x05)
+
+      assert {:ok, %{tenant_id: tid}} = BrowserLogin.complete(params)
+      assert tid == ctx.wax_tenant.id
+    end
+
+    test "an assertion WITHOUT user verification is refused", ctx do
+      {:ok, issued} = BrowserLogin.begin()
+      params = signed(issued.challenge_id, ctx.credential_id, ctx.priv, issued.challenge, 0x01)
+
+      assert {:error, :invalid_assertion} = BrowserLogin.complete(params)
+    end
+
+    test "a bad signature and an unknown credential get the same answer", ctx do
+      {:ok, bad} = BrowserLogin.begin()
+      {other_pub, other_priv} = :crypto.generate_key(:ecdh, :secp256r1)
+      _ = other_pub
+      params = signed(bad.challenge_id, ctx.credential_id, other_priv, bad.challenge, 0x05)
+      assert {:error, bad_answer} = BrowserLogin.complete(params)
+
+      {:ok, unknown} = BrowserLogin.begin()
+
+      params =
+        signed(
+          unknown.challenge_id,
+          :crypto.strong_rand_bytes(16),
+          ctx.priv,
+          unknown.challenge,
+          0x05
+        )
+
+      assert {:error, ^bad_answer} = BrowserLogin.complete(params)
     end
   end
 
@@ -214,7 +294,7 @@ defmodule Loopctl.WebAuthn.BrowserLoginTest do
     end
 
     test "revoke/1 writes the revocation for its own tenant's row only", ctx do
-      {:ok, issued} = BrowserLogin.begin(ctx.tenant.slug)
+      {:ok, issued} = BrowserLogin.begin()
       {:ok, principal} = BrowserLogin.complete(assertion(issued.challenge_id, ctx.authenticator))
       other = fixture(:tenant)
 

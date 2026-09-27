@@ -4,15 +4,17 @@ defmodule LoopctlWeb.LoginLive do
 
   The ceremony, in four hops:
 
-  1. The human names the tenant (its slug) and submits `begin`. The LiveView, after a
-     per-client budget, asks `Loopctl.WebAuthn.BrowserLogin.begin/1` for a challenge and pushes
-     it to the `WebAuthnLogin` hook. A slug that cannot sign in gets a decoy of the same shape,
-     so the page answers every slug alike.
-  2. The hook runs `navigator.credentials.get()` and pushes the assertion back.
+  1. The human presses "sign in" — there is nothing to type. The LiveView, after a per-client
+     budget, asks `Loopctl.WebAuthn.BrowserLogin.begin/0` for a usernameless challenge (no
+     allowed credentials) and pushes it to the `WebAuthnLogin` hook. Every visitor gets the same
+     answer, because there is no input for it to depend on.
+  2. The hook runs `navigator.credentials.get()` with `userVerification: "required"`; the
+     browser offers the discoverable credential it holds for loopctl, and the hook pushes the
+     assertion back.
   3. The LiveView bounds the assertion's fields and fills a plain form whose `challenge_id`
      comes from ITS OWN assigns, never from the client, then triggers the form
-     (`phx-trigger-action`). No tenant id is ever on the page: the server resolves the tenant
-     from the stored challenge.
+     (`phx-trigger-action`). No tenant id is ever on the page: the server identifies the
+     tenant by the asserting credential.
   4. The form POSTs to `LoopctlWeb.BrowserSessionController`, through the `:browser` pipeline's
      CSRF check, which verifies and consumes the challenge and binds the session. A LiveView
      cannot write the session cookie, which is why the last hop is a POST.
@@ -47,7 +49,6 @@ defmodule LoopctlWeb.LoginLive do
      |> assign(:page_title, "Sign in")
      |> assign(:signed_in, signed_in)
      |> assign(:rate_key, rate_key(session, socket))
-     |> assign(:form, to_form(%{"slug" => ""}, as: :login))
      |> assign(:pending, nil)
      |> assign(:assertion, %{})
      |> assign(:trigger_submit, false)
@@ -61,9 +62,9 @@ defmodule LoopctlWeb.LoginLive do
   defp rate_key(_session, socket), do: "conn:" <> socket.id
 
   @impl true
-  def handle_event("begin", %{"login" => %{"slug" => slug}}, socket) when is_binary(slug) do
+  def handle_event("begin", _params, socket) do
     with :ok <- budget(socket),
-         {:ok, issued} <- BrowserLogin.begin(slug) do
+         {:ok, issued} <- BrowserLogin.begin() do
       {:noreply,
        socket
        |> assign(:pending, issued.challenge_id)
@@ -145,7 +146,11 @@ defmodule LoopctlWeb.LoginLive do
         <div>
           <h1 class="font-display text-xl font-semibold text-slate-100">Sign in to loopctl</h1>
           <p class="mt-1 text-sm text-slate-400">
-            With the authenticator you enrolled when the tenant was created.
+            With the passkey or security key you enrolled when the tenant was created.
+          </p>
+          <p id="login-requirement" class="mt-2 text-xs text-slate-500">
+            It must hold a discoverable credential (a passkey, or a security key with a resident
+            credential), and it will ask you to unlock it with a fingerprint, face or PIN.
           </p>
         </div>
       </header>
@@ -169,27 +174,16 @@ defmodule LoopctlWeb.LoginLive do
       </div>
 
       <div :if={!@signed_in} id="login-app" phx-hook="WebAuthnLogin" class="space-y-6">
-        <.form
-          for={@form}
-          id="login-form"
-          phx-submit="begin"
-          class="space-y-4 rounded-md border border-slate-800 bg-slate-900/60 p-5"
-        >
-          <.input
-            field={@form[:slug]}
-            label="Tenant slug"
-            placeholder="acme"
-            autocomplete="username"
-            required
-          />
+        <div class="rounded-md border border-slate-800 bg-slate-900/60 p-5">
           <button
-            type="submit"
+            type="button"
             id="login-begin"
+            phx-click="begin"
             class="w-full rounded-md bg-accent-700 px-4 py-2 text-sm font-medium text-slate-50 transition-colors hover:bg-accent-600"
           >
-            Sign in with authenticator
+            Sign in with a passkey
           </button>
-        </.form>
+        </div>
 
         <p
           :if={@status}

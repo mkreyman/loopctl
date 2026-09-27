@@ -393,7 +393,9 @@ defmodule Loopctl.Threads.HumanFindingsTest do
                human(ctx, cp2, %{"introduced_by" => "none", "severity" => "low"})
 
       attrs = %{"introduced_by" => cp2.id, "severity" => "critical", "idempotency_key" => "late"}
-      assert {:ok, %{escalation: %Entry{} = escalation}, :created} = human(ctx, cp2, attrs)
+
+      assert {:ok, %{escalation: {:escalated, %Entry{} = escalation}}, :created} =
+               human(ctx, cp2, attrs)
 
       assert escalation.kind == :escalation and escalation.review_id == r2.id
       assert escalation.author_principal == Threads.review_ceiling_principal()
@@ -401,11 +403,17 @@ defmodule Loopctl.Threads.HumanFindingsTest do
       # It decided nothing about the rounds: there is still no round 3.
       assert %{next_round: nil} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
 
-      # The resend hears the same escalation; a second late finding records no second one.
-      assert {:ok, %{escalation: ^escalation}, :existing} = human(ctx, cp2, attrs)
+      # The resend hears that IT escalated; a second late finding records no second one and is
+      # told the story was already escalated.
+      assert {:ok, %{escalation: {:escalated, ^escalation}}, :existing} = human(ctx, cp2, attrs)
 
-      assert {:ok, %{escalation: ^escalation}, :created} =
-               human(ctx, cp2, %{"introduced_by" => "none", "severity" => "high"})
+      second = %{"introduced_by" => "none", "severity" => "high", "idempotency_key" => "later"}
+
+      assert {:ok, %{escalation: {:already_escalated, ^escalation}}, :created} =
+               human(ctx, cp2, second)
+
+      assert {:ok, %{escalation: {:already_escalated, ^escalation}}, :existing} =
+               human(ctx, cp2, second)
     end
 
     test "after a ceiling verdict that already escalated, the same escalation is returned",
@@ -418,7 +426,7 @@ defmodule Loopctl.Threads.HumanFindingsTest do
       agent_finding!(ctx, r2, %{"introduced_by" => "none", "severity" => "high"})
       %{escalation: %Entry{} = escalation} = verdict!(ctx, r2)
 
-      assert {:ok, %{escalation: ^escalation}, :created} =
+      assert {:ok, %{escalation: {:already_escalated, ^escalation}}, :created} =
                human(ctx, cp2, %{"introduced_by" => "none", "severity" => "high"})
     end
 

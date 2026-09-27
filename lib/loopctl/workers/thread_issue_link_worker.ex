@@ -1,13 +1,12 @@
 defmodule Loopctl.Workers.ThreadIssueLinkWorker do
   @moduledoc """
-  US-45.7 (AC-45.7.4): fills and drains the thread-link outbox, `Loopctl.Threads.IssueLinks` —
-  one comment on a story's intake issue carrying the URL of the story's thread page. Runs every
-  two minutes via Oban Cron.
+  US-45.7 (AC-45.7.4): drains the thread-link outbox, `Loopctl.Threads.IssueLinks` — one
+  comment on a story's intake issue carrying the URL of the story's thread page. Runs every two
+  minutes via Oban Cron, and reads only pending rows.
 
   The same drainer shape as `Loopctl.Workers.IntakeIssueCloseWorker`, for the same reasons: the
-  intent is a row derived from durable state (a checkpoint exists, no link does), so it cannot
-  be lost, and the comment is posted here with nothing held, so the network is never inside a
-  transaction. A candidate is
+  intent is written in the checkpoint's transaction so it cannot be lost, and the comment is
+  posted here with nothing held, so the network is never inside a transaction. A candidate is
   ONE bounded forge call, the first rate-limited answer stops the run, and one candidate that
   raises costs that candidate rather than the batch. It holds no state; a node that dies
   mid-run leaves rows the next run on any node re-reads.
@@ -26,11 +25,6 @@ defmodule Loopctl.Workers.ThreadIssueLinkWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
-    # First the intent, derived from durable state (`IssueLinks.record_due/1`): every intake
-    # story whose thread has a checkpoint and no link yet, including threads that predate this
-    # worker. Then the drain.
-    IssueLinks.record_due(@batch)
-
     results =
       IssueLinks.due(@batch)
       |> Enum.reduce_while([], fn link, acc ->

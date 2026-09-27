@@ -8,22 +8,28 @@ All notable changes to loopctl are documented here.
 
 - **The thread page and browser login (epic 45, US-45.7).** `GET /threads/:story_id` shows a
   story's change thread — checkpoints with their CI evidence, entries as untrusted text,
-  findings — and fetches a checkpoint's diff (the placed base branch `...` the checkpoint) from
-  GitHub on demand, never storing it. The tenant's human signs in at `/login` with the WebAuthn
-  authenticator enrolled at signup; every slug gets the same answer, so the form does not
-  reveal which tenants exist. A session is a `browser_sessions` row: it lasts at most 8 hours,
-  logout revokes it on the server (a copied cookie stops working), and revoking the
-  authenticator or deactivating the tenant ends it on the next request. From the page the
-  human writes `message` and `finding` entries as `human:webauthn` with an empty lineage; a
-  human finding counts toward the review round ceiling like a reviewer's, and a material one
-  written after the final round escalates the story over `review_ceiling`. Migration
-  `20260927120000_add_thread_page` relaxes the `thread_entries_judgement_shape` CHECK for that
-  author only and adds `thread_issue_links` and `browser_sessions`. **A new outward act:**
-  every intake story whose thread has a checkpoint — including threads recorded before this
-  deploy — gets ONE comment on the reporter's GitHub issue linking the thread page, from the new
-  cron worker `ThreadIssueLinkWorker` (every two minutes). It uses the `GITHUB_TOKEN` the issue
-  closer already needs (`issues: write`); no new variable. The link is built from the
-  endpoint's configured URL (`PHX_HOST`).
+  findings — and fetches a checkpoint's diff (the base branch that checkpoint's claim was placed
+  on `...` the checkpoint) from GitHub on demand, never storing it. The tenant's human signs in
+  at `/login` USERNAMELESS, with a discoverable WebAuthn credential (a passkey, or a security key
+  holding a resident credential) enrolled for the tenant, and user verification is required; a
+  credential enrolled without a resident key cannot sign in there. A session is a
+  `browser_sessions` row: it lasts at most 8 hours, logout revokes it on the server (a copied
+  cookie stops working), and revoking the authenticator or deactivating the tenant ends it on
+  the next request. From the page the human writes `message` and `finding` entries as
+  `human:webauthn` with an empty lineage; a human finding counts toward the review round ceiling
+  like a reviewer's, and a material one written after the final round escalates the story over
+  `review_ceiling`. Migration `20260927120000_add_thread_page` relaxes the
+  `thread_entries_judgement_shape` CHECK for that author only; adds `thread_issue_links`,
+  `browser_sessions` and `webauthn_login_challenges`; adds a GLOBAL unique index on
+  `tenant_root_authenticators.credential_id` (it fails if two tenants share a credential id —
+  check first with `SELECT credential_id FROM tenant_root_authenticators GROUP BY 1 HAVING
+  count(*) > 1`); and backfills a link row, once, for every intake story whose thread already
+  has a checkpoint, whose stage is in flight and whose issue is not known to be closed. **A new
+  outward act:** each such story, and every new intake thread at its first checkpoint, gets ONE
+  comment on the reporter's GitHub issue linking the thread page, from the new cron worker
+  `ThreadIssueLinkWorker` (every two minutes). It uses the `GITHUB_TOKEN` the issue closer
+  already needs (`issues: write`); no new variable. The link is built from the endpoint's
+  configured URL (`PHX_HOST`).
 
 - **loopctl merges a THREAD-mode story itself, as a GitHub App (epic 45, US-45.5). Set
   `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` to enable it; until both are set every

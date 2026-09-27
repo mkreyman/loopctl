@@ -5,8 +5,8 @@ defmodule LoopctlWeb.BrowserSessionController do
   assertion here as an ordinary form POST, through the `:browser` pipeline's CSRF protection.
 
   - `create/2` verifies the assertion (`Loopctl.WebAuthn.BrowserLogin.complete/1`, which is
-    `Loopctl.WebAuthn.Reauth`'s ceremony, on the tenant the STORED challenge names) and binds
-    the session. Throttled per client, fail-closed, before any verification work.
+    `Loopctl.WebAuthn.Reauth`'s usernameless ceremony, on the tenant the asserting credential is
+    enrolled in) and binds the session. Throttled per client, fail-closed, before any verification work.
   - `delete/2` ends the session.
   """
 

@@ -43,6 +43,19 @@ defmodule Loopctl.Tenants.RootAuthenticators do
   end
 
   @doc """
+  US-45.7 — the authenticator enrolled under `credential_id` in ANY tenant: what a usernameless
+  login identifies its tenant by, before any tenant is known. A credential id is globally unique
+  (`tenant_root_authenticators_credential_id_uidx`), so this names at most one row.
+  """
+  @spec get_by_credential_id(binary()) :: {:ok, RootAuthenticator.t()} | {:error, :not_found}
+  def get_by_credential_id(credential_id) when is_binary(credential_id) do
+    case AdminRepo.one(from a in RootAuthenticator, where: a.credential_id == ^credential_id) do
+      nil -> {:error, :not_found}
+      authenticator -> {:ok, authenticator}
+    end
+  end
+
+  @doc """
   Counts root authenticators for a tenant.
   """
   @spec count_by_tenant(Ecto.UUID.t()) :: non_neg_integer()

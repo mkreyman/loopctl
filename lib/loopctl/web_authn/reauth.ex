@@ -39,6 +39,7 @@ defmodule Loopctl.WebAuthn.Reauth do
   alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.RootAuthenticators
   alias Loopctl.WebAuthn
+  alias Loopctl.WebAuthn.LoginChallenge
   alias Loopctl.WebAuthn.ReauthChallenge
 
   # Reauth challenges are short-lived — the operator has just clicked
@@ -190,6 +191,114 @@ defmodule Loopctl.WebAuthn.Reauth do
       {:error, reason} = error ->
         Logger.info("WebAuthn reauth rejected (#{purpose}): #{inspect(reason)}")
         error
+    end
+  end
+
+  @doc """
+  US-45.7 — a challenge for a USERNAMELESS assertion: `allow_credentials` is empty, so the
+  browser offers any discoverable credential it holds for this relying party, and nothing about
+  any tenant is sent before the assertion names its credential. User verification is REQUIRED
+  (`user_verification: "required"` on the stored challenge, which the adapter enforces at
+  verify): the credential alone is the whole identity here, so it must also prove its holder.
+
+  Stored in `webauthn_login_challenges`, single-use and TTL-bounded exactly as a reauth
+  challenge is, and bound to no tenant. Returns the same keys `issue_challenge/2` does.
+  """
+  @spec issue_discoverable_challenge(String.t()) :: {:ok, issue_result()} | {:error, term()}
+  def issue_discoverable_challenge(purpose) when is_binary(purpose) do
+    rp_opts = WebAuthn.rp_opts()
+
+    challenge =
+      rp_opts
+      |> Keyword.put(:user_verification, "required")
+      |> WebAuthn.new_authentication_challenge()
+
+    expires_at = DateTime.utc_now() |> DateTime.add(@challenge_ttl_seconds, :second)
+
+    case AdminRepo.insert(%LoginChallenge{
+           purpose: purpose,
+           challenge: :erlang.term_to_binary(challenge),
+           expires_at: expires_at
+         }) do
+      {:ok, stored} ->
+        {:ok,
+         %{
+           challenge_id: stored.id,
+           challenge: encode_challenge_bytes(challenge),
+           allowed_credentials: [],
+           rp_id: Keyword.get(rp_opts, :rp_id),
+           expires_at: expires_at
+         }}
+
+      {:error, changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  @doc """
+  US-45.7 — verifies a USERNAMELESS assertion against a challenge from
+  `issue_discoverable_challenge/1` and consumes it (single-use; consumed before anything else is
+  looked up, so every attempt spends it). The authenticator is found by the assertion's
+  credential id in any tenant — a credential id is globally unique — and the assertion is
+  verified against that authenticator's stored key and the stored challenge, with the same
+  counter check as `verify_and_consume/3`.
+
+  A credential id no tenant enrolled is `{:error, :invalid_assertion}`, the answer a bad
+  signature gets, so an attempt learns nothing about which credentials exist. Returns
+  `{:ok, %{authenticator: authenticator, sign_count: n}}`.
+  """
+  @spec verify_discoverable_and_consume(String.t(), map()) ::
+          {:ok, %{sign_count: non_neg_integer(), authenticator: RootAuthenticator.t()}}
+          | {:error, term()}
+  def verify_discoverable_and_consume(purpose, params)
+      when is_binary(purpose) and is_map(params) do
+    with {:ok, challenge_id} <- fetch_uuid(params, "challenge_id"),
+         {:ok, credential_id} <- fetch_b64(params, "credential_id"),
+         {:ok, authenticator_data} <- fetch_b64(params, "authenticator_data"),
+         {:ok, signature} <- fetch_b64(params, "signature"),
+         {:ok, client_data_json} <- fetch_b64(params, "client_data_json"),
+         {:ok, challenge} <- consume_login_challenge(purpose, challenge_id),
+         {:ok, authenticator} <- enrolled(credential_id),
+         {:ok, %{sign_count: new_count}} <-
+           WebAuthn.verify_authentication(
+             %{
+               credential_id: credential_id,
+               authenticator_data: authenticator_data,
+               signature: signature,
+               client_data_json: client_data_json
+             },
+             challenge,
+             allow_credentials: [{authenticator.credential_id, authenticator.public_key}]
+           ),
+         {:ok, updated} <- persist_counter(authenticator, new_count) do
+      {:ok, %{sign_count: new_count, authenticator: updated}}
+    else
+      {:error, reason} = error ->
+        Logger.info("WebAuthn discoverable login rejected (#{purpose}): #{inspect(reason)}")
+        error
+    end
+  end
+
+  defp enrolled(credential_id) do
+    case RootAuthenticators.get_by_credential_id(credential_id) do
+      {:ok, authenticator} -> {:ok, authenticator}
+      {:error, :not_found} -> {:error, :invalid_assertion}
+    end
+  end
+
+  defp consume_login_challenge(purpose, challenge_id) do
+    now = DateTime.utc_now()
+
+    from(c in LoginChallenge,
+      where:
+        c.id == ^challenge_id and c.purpose == ^purpose and is_nil(c.used_at) and
+          c.expires_at > ^now,
+      select: c.challenge
+    )
+    |> AdminRepo.update_all(set: [used_at: now])
+    |> case do
+      {1, [serialized]} -> deserialize_challenge(serialized)
+      _none -> {:error, :challenge_not_found}
     end
   end
 

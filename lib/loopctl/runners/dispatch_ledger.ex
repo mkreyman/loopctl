@@ -953,10 +953,18 @@ defmodule Loopctl.Runners.DispatchLedger do
   `Loopctl.Delivery.DispatchPayload.dispatch_route/2` runs it under a bounded lock wait.
   """
   @spec claim_route_query(Ecto.UUID.t(), Story.t()) :: Ecto.Query.t()
-  def claim_route_query(tenant_id, %Story{} = story) do
+  def claim_route_query(tenant_id, %Story{} = story),
+    do: claim_route_query(tenant_id, story.id, story.claim_epoch)
+
+  @doc """
+  `claim_route_query/2` for the claim of `claim_epoch`, current or ended (US-45.7: a checkpoint's
+  diff is judged against the base ITS claim was placed on). The same rule, one copy.
+  """
+  @spec claim_route_query(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) :: Ecto.Query.t()
+  def claim_route_query(tenant_id, story_id, claim_epoch) do
     from(r in route_rows_query(),
-      where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
-      where: r.claim_epoch == ^story.claim_epoch,
+      where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+      where: r.claim_epoch == ^claim_epoch,
       order_by: [desc: r.inserted_at],
       limit: 1,
       select: %{mode: r.mode, branch: r.branch, base_branch: r.base_branch}
