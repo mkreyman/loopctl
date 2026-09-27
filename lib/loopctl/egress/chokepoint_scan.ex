@@ -71,11 +71,9 @@ defmodule Loopctl.Egress.ChokepointScan do
         ":webhook, tenant_supplied: true) before building the request, then keeps the " <>
         "pin (pinned_request_opts + redirect: false). It is allowlisted for the same " <>
         "reason Loopctl.Provider is — it is the wrapper, not a call site that bypasses one.",
-    "Loopctl.Verification.GitHubActions" =>
-      "Reads a commit's GitHub Actions workflow-run status for verification. Operator-plane, fixed vendor " <>
-        "host, carries no tenant content outbound.",
     "Loopctl.Delivery.GitHubPullRequestSource" =>
-      "Reads a pull request's state, diffstat, changed names, file tree and deployments " <>
+      "Reads a pull request's state, diffstat, changed names, file tree and deployments, " <>
+        "and a commit's Actions workflow runs for story verification (#913), " <>
         "for the #803 merge precondition and post-deploy verification, AND (#805) WRITES " <>
         "to the issue a story came from: it adds a loopctl:resolution-* label, posts the " <>
         "resolution text and closes the issue. NO LONGER GET ONLY — that justification was " <>

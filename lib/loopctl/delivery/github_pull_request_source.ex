@@ -271,6 +271,35 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     |> Enum.sort_by(& &1["id"])
   end
 
+  @doc """
+  Every CI workflow run of commit `sha`, for story verification (#913).
+
+  The runs a `push` or `pull_request` triggered, on any branch, since verification judges a
+  commit rather than a thread branch; any other event (`schedule`, `workflow_run`,
+  `dynamic`) is not the commit's CI. Only the NEWEST run of each workflow per event per
+  branch is returned. A re-run keeps its run id and reports its latest attempt, so a higher
+  id is a later push of the same commit. Read, shape-checked and truncation-refused by the
+  same code as the merge gate's `check_evidence/3`, so the two cannot disagree about which
+  runs exist. Needs `actions: read`, never Checks, which a fine-grained token cannot hold.
+  """
+  @spec commit_ci_runs(String.t(), String.t()) :: {:ok, [map()]} | {:error, term()}
+  def commit_ci_runs(repo, sha) do
+    query = URI.encode_query(%{"head_sha" => sha, "per_page" => @workflow_run_page})
+
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, sha} <- ref(sha),
+         {:ok, body} <- get(repo, "/actions/runs?" <> query),
+         {:ok, runs} <- workflow_runs(body) do
+      {:ok,
+       runs
+       |> Enum.filter(&(&1["head_sha"] == sha and &1["event"] in ["push", "pull_request"]))
+       |> Enum.group_by(&{&1["path"], &1["event"], &1["head_branch"]})
+       |> Enum.map(fn {_key, same} -> Enum.max_by(same, & &1["id"]) end)
+       |> Enum.sort_by(& &1["id"])
+       |> Enum.map(&Map.put(run_fact(&1), :url, &1["html_url"]))}
+    end
+  end
+
   defp run_fact(run) do
     %{
       id: run["id"],

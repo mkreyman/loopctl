@@ -209,6 +209,17 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Story verification reads Actions workflow runs; `GITHUB_TOKEN` needs `actions: read`, not
+  Checks (#913).** Verification's CI lookup read a commit's check runs, which needs the Checks
+  permission. GitHub grants that to Apps only, so a fine-grained token cannot hold it, and every
+  lookup on a private repository returned 403. It now reads the commit's workflow runs, with
+  the same reader as the thread merge gate. **Before upgrading, give `GITHUB_TOKEN`
+  `actions: read`**, or verification reports no CI evidence and falls back to local test
+  re-execution. Three verdicts changed:
+  - a commit with no workflow runs is no longer verified as passing;
+  - a cancelled run is no evidence rather than a failure;
+  - a timed-out run fails instead of waiting indefinitely.
+
 - **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**
   A triage-accepted story, a release whose re-contract did not land, and an escalation resolved
   back to `queued` all leave a story `pending` at `queued`, which the dispatch driver used to

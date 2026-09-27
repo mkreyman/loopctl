@@ -15,24 +15,16 @@ defmodule Loopctl.Verification.GitHubActions do
 
   @behaviour Loopctl.Verification.CiBehaviour
 
-  require Logger
+  alias Loopctl.Delivery.GitHubPullRequestSource
+
+  # Conclusions of a run that did not run the commit's CI at all.
+  @not_run ["skipped", "neutral"]
 
   @impl true
   def get_status(repo_url, commit_sha) do
-    {owner, repo} = parse_repo_url(repo_url)
-
-    case Req.get(
-           "https://api.github.com/repos/#{owner}/#{repo}/actions/runs",
-           req_options(params: [head_sha: commit_sha, per_page: 100])
-         ) do
-      {:ok, %{status: 200, body: %{"workflow_runs" => runs}}} when is_list(runs) ->
-        {:ok, summarize_workflow_runs(runs)}
-
-      {:ok, %{status: status}} ->
-        {:error, {:github_api_error, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+    with {:ok, repo} <- repo_full_name(repo_url),
+         {:ok, runs} <- GitHubPullRequestSource.commit_ci_runs(repo, commit_sha) do
+      summarize_workflow_runs(runs)
     end
   end
 
@@ -41,27 +33,11 @@ defmodule Loopctl.Verification.GitHubActions do
     {:ok, []}
   end
 
-  defp parse_repo_url(url) do
+  defp repo_full_name(url) do
     case Regex.run(~r|github\.com[:/]([^/]+)/([^/.]+)|, url) do
-      [_, owner, repo] -> {owner, repo}
-      _ -> {"unknown", "unknown"}
+      [_, owner, repo] -> {:ok, owner <> "/" <> repo}
+      _ -> {:error, {:unrecognized_repo_url, url}}
     end
-  end
-
-  # A Req.Test plug is injected from config in the test env (config/test.exs), the same
-  # config-based seam `Loopctl.Delivery.GitHubPullRequestSource` uses.
-  defp req_options(opts) do
-    opts = Keyword.put(opts, :headers, github_headers())
-
-    case Application.get_env(:loopctl, :verification_github_req_plug) do
-      nil -> opts
-      plug -> Keyword.put(opts, :plug, plug)
-    end
-  end
-
-  defp github_headers do
-    auth_headers(System.get_env("GITHUB_TOKEN")) ++
-      [{"accept", "application/vnd.github+json"}, {"user-agent", "loopctl-verification"}]
   end
 
   @doc """
@@ -86,36 +62,43 @@ defmodule Loopctl.Verification.GitHubActions do
   end
 
   @doc """
-  Summarizes a commit's workflow runs, as `GET /actions/runs?head_sha=` returns them.
+  The CI verdict for a commit's workflow runs, as `GitHubPullRequestSource.commit_ci_runs/2`
+  returns them (newest run per workflow, event and branch).
 
-  Only the NEWEST run of each workflow per triggering event counts: GitHub lists runs
-  newest first, and a re-run of a failed workflow is a new run that supersedes it.
-
-    * no runs yet, or any counted run not `completed` - `in_progress` (the caller snoozes);
-    * every counted run concluded `success` - `success`;
-    * otherwise - `failure`. A `cancelled`, `timed_out`, `skipped` or `action_required`
-      run is not a pass, and used to read as `in_progress` for ever.
-
-  An empty list used to read as SUCCESS (`Enum.all?/2` of nothing is true), so a commit
-  whose CI had not started yet was verified.
+    * any run not `completed` - `in_progress`; the caller snoozes until it finishes;
+    * a run that concluded `skipped` or `neutral` did not run the commit's CI and is left
+      out;
+    * any remaining run that did not succeed and was not cancelled - `failure`, with that
+      run's URL;
+    * otherwise a `cancelled` run - `{:error, :ci_cancelled}`. A run cancelled by a newer
+      push (`cancel-in-progress`) says nothing about this commit, so it is no evidence
+      rather than a failure, and the caller falls back to local re-execution;
+    * nothing left at all - `{:error, :no_workflow_runs}`: a repository without Actions CI,
+      or a commit a path filter skipped, is no evidence either, never a pass. (An empty
+      list once read as SUCCESS, since `Enum.all?/2` of nothing is true.)
+    * otherwise - `success`.
   """
-  @spec summarize_workflow_runs([map()]) :: %{
-          status: String.t(),
-          conclusion: String.t() | nil,
-          url: String.t()
-        }
+  @spec summarize_workflow_runs([map()]) ::
+          {:ok, %{status: String.t(), conclusion: String.t() | nil, url: String.t()}}
+          | {:error, :ci_cancelled | :no_workflow_runs}
   def summarize_workflow_runs(runs) do
-    counted = Enum.uniq_by(runs, &{&1["workflow_id"], &1["event"]})
+    counted = Enum.reject(runs, &(&1.status == "completed" and &1.conclusion in @not_run))
 
     cond do
-      counted == [] or Enum.any?(counted, &(&1["status"] != "completed")) ->
-        %{status: "in_progress", conclusion: nil, url: ""}
+      Enum.any?(runs, &(&1.status != "completed")) ->
+        {:ok, %{status: "in_progress", conclusion: nil, url: ""}}
 
-      Enum.all?(counted, &(&1["conclusion"] == "success")) ->
-        %{status: "completed", conclusion: "success", url: ""}
+      failed = Enum.find(counted, &(&1.conclusion not in ["success", "cancelled"])) ->
+        {:ok, %{status: "completed", conclusion: "failure", url: failed.url || ""}}
+
+      Enum.any?(counted, &(&1.conclusion == "cancelled")) ->
+        {:error, :ci_cancelled}
+
+      counted == [] ->
+        {:error, :no_workflow_runs}
 
       true ->
-        %{status: "completed", conclusion: "failure", url: ""}
+        {:ok, %{status: "completed", conclusion: "success", url: ""}}
     end
   end
 end

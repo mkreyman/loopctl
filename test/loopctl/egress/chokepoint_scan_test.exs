@@ -119,7 +119,6 @@ defmodule Loopctl.Egress.ChokepointScanTest do
       allowed = ChokepointScan.allowed()
 
       # Naming them here is the point: each exemption is DOCUMENTED, not invisible.
-      assert Map.has_key?(allowed, "Loopctl.Verification.GitHubActions")
       assert Map.has_key?(allowed, "Loopctl.Secrets.FlyAdapter")
       assert Map.has_key?(allowed, "Loopctl.CLI.Client")
     end
