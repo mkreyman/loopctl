@@ -43,6 +43,18 @@ defmodule Loopctl.Tenants.RootAuthenticators do
   end
 
   @doc """
+  Whether authenticator `id` is still enrolled for the tenant (US-45.7). A browser session
+  authenticated by an authenticator ends when that authenticator is revoked, which deletes the
+  row, so the session re-asks this on every request.
+  """
+  @spec enrolled?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def enrolled?(tenant_id, id) when is_binary(tenant_id) and is_binary(id) do
+    AdminRepo.exists?(
+      from a in RootAuthenticator, where: a.tenant_id == ^tenant_id and a.id == ^id
+    )
+  end
+
+  @doc """
   Counts root authenticators for a tenant.
   """
   @spec count_by_tenant(Ecto.UUID.t()) :: non_neg_integer()

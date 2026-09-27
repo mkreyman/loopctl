@@ -2242,6 +2242,28 @@ defmodule Loopctl.Fixtures do
     end
   end
 
+  # One `thread_issue_links` row inserted DIRECTLY on `AdminRepo` (US-45.7), where the drainer
+  # (`Loopctl.Threads.IssueLinks.due/1` and `attempt/2`) reads and writes it, so a drain test
+  # does not have to record a checkpoint on the RLS `Repo` connection it cannot see. Needs a
+  # story on `AdminRepo` (`fixture(:story)`); `:repo_full_name` must name a live intake source
+  # for the attempt to post.
+  def fixture(:thread_issue_link, attrs) do
+    attrs = Enum.into(attrs, %{})
+    now = DateTime.utc_now()
+
+    AdminRepo.insert!(%Loopctl.Threads.IssueLink{
+      tenant_id: Map.fetch!(attrs, :tenant_id),
+      story_id: Map.fetch!(attrs, :story_id),
+      repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
+      issue_number: Map.get(attrs, :issue_number, 42),
+      status: Map.get(attrs, :status, :pending),
+      attempts: Map.get(attrs, :attempts, 0),
+      next_attempt_at: Map.get(attrs, :next_attempt_at),
+      inserted_at: now,
+      updated_at: now
+    })
+  end
+
   def fixture(:stage_story, attrs) do
     attrs = Enum.into(attrs, %{})
 

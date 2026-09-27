@@ -14,6 +14,12 @@ defmodule Loopctl.Threads.Reviews do
   none is handed to anyone, so there is no credential whose ceiling, separation or lifetime
   has to be defended: #901 and #905 each lost that defence one round at a time.
 
+  A HUMAN finding (US-45.7, PRD §6) is the one judgement no review writes: the tenant's human
+  records it from the thread page (`Loopctl.Threads.record_human_finding/3`). It binds to a
+  checkpoint of the current claim, a fix may answer it, and it counts in the round whose
+  checkpoint it is on while that round is in progress (`round_findings/4`), toward the
+  round-3 decision and the ceiling like a reviewer's.
+
   ## Separation
 
   The reviewer is the runner's AGENT. It is refused `reviewer_not_separate` when it is the
@@ -78,7 +84,8 @@ defmodule Loopctl.Threads.Reviews do
           optional(1..3) => %{
             id: Ecto.UUID.t(),
             verdict_seq: pos_integer(),
-            placed_at_seq: non_neg_integer()
+            placed_at_seq: non_neg_integer(),
+            checkpoint_id: Ecto.UUID.t()
           }
         }
 
@@ -373,16 +380,15 @@ defmodule Loopctl.Threads.Reviews do
       Map.put(completed, review.round, %{
         id: review.id,
         verdict_seq: verdict_seq,
-        placed_at_seq: review.placed_at_seq
+        placed_at_seq: review.placed_at_seq,
+        checkpoint_id: review.checkpoint_id
       })
 
     case next_round(tenant_id, story, completed) do
       nil ->
         Repo.aggregate(
-          from(e in Entry,
-            where:
-              e.tenant_id == ^tenant_id and e.review_id == ^review.id and e.kind == :finding and
-                e.severity in ^@material
+          from(e in round_findings(tenant_id, story, completed, review.round),
+            where: e.severity in ^@material
           ),
           :count
         )
@@ -390,6 +396,86 @@ defmodule Loopctl.Threads.Reviews do
       _round ->
         0
     end
+  end
+
+  # The findings of completed round `round`: the review's own, plus the HUMAN findings (US-45.7,
+  # PRD §6: "a human finding has the same standing as an agent's") written on the checkpoint that
+  # round reviewed WHILE it was the round in progress — after the previous round's verdict and
+  # before this one's. The window is what keeps a human finding in ONE round: without it a
+  # finding on a checkpoint two rounds reviewed would count in both, and one written after a
+  # verdict could reopen a decision that verdict already made.
+  defp round_findings(tenant_id, story, completed, round) do
+    %{id: review_id, verdict_seq: verdict_seq, checkpoint_id: checkpoint_id} =
+      Map.fetch!(completed, round)
+
+    after_seq =
+      case Map.get(completed, round - 1) do
+        %{verdict_seq: seq} -> seq
+        nil -> 0
+      end
+
+    of_round =
+      dynamic(
+        [e],
+        e.review_id == ^review_id or ^humans_in_window(checkpoint_id, after_seq, verdict_seq)
+      )
+
+    from e in Entry,
+      where: e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :finding,
+      where: ^of_round
+  end
+
+  defp humans_in_window(checkpoint_id, after_seq, before_seq) do
+    human = Threads.human_principal()
+
+    dynamic(
+      [e],
+      is_nil(e.review_id) and e.author_principal == ^human and
+        e.checkpoint_id == ^checkpoint_id and e.seq > ^after_seq and e.seq < ^before_seq
+    )
+  end
+
+  @doc false
+  # The checkpoint a HUMAN finding binds to (US-45.7): a claimant checkpoint the story's
+  # current, still-held claim recorded. Rounds belong to a claim, so a finding on an ended
+  # claim's work could otherwise count for the claim that follows; a `base_update` is loopctl's
+  # merge of the base, never what a review judges.
+  @spec human_finding_checkpoint(Ecto.UUID.t(), Story.t(), Ecto.UUID.t()) ::
+          {:ok, Checkpoint.t()} | refusal()
+  def human_finding_checkpoint(tenant_id, story, checkpoint_id) do
+    case Threads.checkpoint_of(tenant_id, story.id, checkpoint_id) do
+      %Checkpoint{kind: :checkpoint, claim_epoch: epoch} = checkpoint
+      when epoch == story.claim_epoch and not is_nil(story.assigned_agent_id) ->
+        {:ok, checkpoint}
+
+      _other ->
+        refuse(
+          :unprocessable_entity,
+          "finding_checkpoint_not_current_claim",
+          "a finding binds to a checkpoint the story's current claim recorded"
+        )
+    end
+  end
+
+  @doc false
+  # A human finding's `introduced_by` meets the rule a reviewer's does, for the round in
+  # progress: none allowed while no round is complete, required once one is, and then a
+  # checkpoint at or before the one the finding is on, or `none`. The round is the NEXT one of
+  # the current claim, the one `round_findings/4` will count the finding in.
+  @spec human_introduced_by_allowed(Ecto.UUID.t(), Story.t(), Checkpoint.t(), String.t() | nil) ::
+          :ok | refusal()
+  def human_introduced_by_allowed(tenant_id, story, checkpoint, introduced_by) do
+    round = map_size(completed_reviews(tenant_id, story)) + 1
+
+    introduced_by_allowed(
+      %Review{
+        tenant_id: tenant_id,
+        story_id: story.id,
+        checkpoint_id: checkpoint.id,
+        round: round
+      },
+      introduced_by
+    )
   end
 
   @doc false
@@ -431,7 +517,7 @@ defmodule Loopctl.Threads.Reviews do
             e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :finding and
               e.id in ^finding_ids and r.claim_epoch == ^story.claim_epoch,
           select: c.seq
-      )
+      ) ++ human_findings_found_in(tenant_id, story, finding_ids)
 
     cond do
       length(found_in) != length(finding_ids) ->
@@ -453,6 +539,24 @@ defmodule Loopctl.Threads.Reviews do
       true ->
         :ok
     end
+  end
+
+  # A HUMAN finding (US-45.7) is answerable as a reviewer's is, on a checkpoint of the current
+  # claim. It belongs to no review, so "of a completed round" is replaced by the claim test
+  # `human_finding_checkpoint/3` already applied when it was written.
+  defp human_findings_found_in(tenant_id, story, finding_ids) do
+    human = Threads.human_principal()
+
+    Repo.all(
+      from e in Entry,
+        join: c in Checkpoint,
+        on: c.id == e.checkpoint_id,
+        where:
+          e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :finding and
+            e.id in ^finding_ids and is_nil(e.review_id) and e.author_principal == ^human and
+            c.claim_epoch == ^story.claim_epoch,
+        select: c.seq
+    )
   end
 
   # ---------------------------------------------------------------------------
@@ -485,7 +589,14 @@ defmodule Loopctl.Threads.Reviews do
       on: r.id == e.review_id,
       where: e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :verdict,
       where: r.claim_epoch == ^story.claim_epoch,
-      select: {r.round, %{id: r.id, verdict_seq: e.seq, placed_at_seq: r.placed_at_seq}}
+      select:
+        {r.round,
+         %{
+           id: r.id,
+           verdict_seq: e.seq,
+           placed_at_seq: r.placed_at_seq,
+           checkpoint_id: r.checkpoint_id
+         }}
     )
     |> Repo.all()
     |> Map.new()
@@ -502,10 +613,13 @@ defmodule Loopctl.Threads.Reviews do
   # Only fixes the thread recorded BY THE TIME ROUND 2 WAS PLACED count (`placed_at_seq`), on
   # checkpoints of this claim: a fix written while round 2 streams its findings, or after its
   # verdict, cannot reopen the decision round 2 is making.
-  defp third_round_warranted?(tenant_id, story, %{2 => %{id: round2, placed_at_seq: placed}}) do
+  defp third_round_warranted?(tenant_id, story, %{2 => %{placed_at_seq: placed}} = completed) do
     case fix_checkpoints_before(tenant_id, story, placed) do
-      [] -> false
-      fix_checkpoints -> material_finding_introduced_by?(tenant_id, round2, fix_checkpoints)
+      [] ->
+        false
+
+      fix_checkpoints ->
+        material_finding_introduced_by?(tenant_id, story, completed, fix_checkpoints)
     end
   end
 
@@ -521,12 +635,11 @@ defmodule Loopctl.Threads.Reviews do
     )
   end
 
-  defp material_finding_introduced_by?(tenant_id, review_id, fix_checkpoints) do
+  # Round 2's findings, a human's included (`round_findings/4`).
+  defp material_finding_introduced_by?(tenant_id, story, completed, fix_checkpoints) do
     Repo.exists?(
-      from e in Entry,
-        where:
-          e.tenant_id == ^tenant_id and e.review_id == ^review_id and e.kind == :finding and
-            e.severity in ^@material and e.introduced_by in ^fix_checkpoints
+      from e in round_findings(tenant_id, story, completed, 2),
+        where: e.severity in ^@material and e.introduced_by in ^fix_checkpoints
     )
   end
 

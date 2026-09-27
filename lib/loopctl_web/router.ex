@@ -26,6 +26,12 @@ defmodule LoopctlWeb.Router do
     }
   end
 
+  # US-45.7 — the thread page's browser session, on top of `:browser`. Asks
+  # `BrowserLogin.validate/2` on every request; the LiveView half is `BrowserAuth.on_mount/4`.
+  pipeline :browser_session do
+    plug LoopctlWeb.Plugs.RequireBrowserSession
+  end
+
   pipeline :api do
     plug :accepts, ["json"]
     plug OpenApiSpex.Plug.PutApiSpec, module: Loopctl.ApiSpec
@@ -95,6 +101,39 @@ defmodule LoopctlWeb.Router do
     live_session :public_wiki, root_layout: {LoopctlWeb.Layouts, :root} do
       live "/wiki", WikiIndexLive, :index
       live "/wiki/:slug", WikiShowLive, :show
+    end
+  end
+
+  # US-45.7 — browser login for the thread page (Epic 45 PRD §6.1). The ONE authenticated
+  # browser session loopctl has: a WebAuthn assertion with the credential enrolled at signup
+  # (`Loopctl.WebAuthn.BrowserLogin`, which is `Reauth`'s ceremony). `/login` is public — it is
+  # how a session starts — in its own live_session so its `session:` MFA can hand it the
+  # HTTP-resolved client IP for its rate limit. The assertion is POSTed to
+  # `BrowserSessionController` because a LiveView cannot write the session cookie; that POST
+  # and the logout DELETE go through `:browser`'s CSRF protection.
+  scope "/", LoopctlWeb do
+    pipe_through :browser
+
+    live_session :browser_login,
+      session: {LoopctlWeb.BrowserAuth, :login_session, []},
+      root_layout: {LoopctlWeb.Layouts, :root} do
+      live "/login", LoginLive, :index
+    end
+
+    post "/login", BrowserSessionController, :create
+    delete "/logout", BrowserSessionController, :delete
+  end
+
+  # US-45.7 — the thread page. BOTH layers guard it: `:browser_session` on the HTTP request,
+  # and the live_session's `on_mount` on every mount, including a live navigation that never
+  # reaches the router's plugs.
+  scope "/", LoopctlWeb do
+    pipe_through [:browser, :browser_session]
+
+    live_session :browser_threads,
+      on_mount: {LoopctlWeb.BrowserAuth, :require_browser_session},
+      root_layout: {LoopctlWeb.Layouts, :root} do
+      live "/threads/:story_id", ThreadLive, :show
     end
   end
 

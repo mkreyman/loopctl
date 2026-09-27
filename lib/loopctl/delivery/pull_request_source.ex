@@ -198,6 +198,20 @@ defmodule Loopctl.Delivery.PullRequestSource do
   """
   @callback repository_readable(repo()) :: :ok | {:error, term()}
 
+  @typedoc """
+  A checkpoint's unified diff as the thread page shows it (US-45.7): the text, cut at the
+  adapter's byte bound, and whether it was cut.
+  """
+  @type checkpoint_diff :: %{text: String.t(), truncated: boolean()}
+
+  @doc """
+  The unified diff of `head_sha` against `base_sha`, or of the commit `head_sha` alone when
+  `base_sha` is nil (US-45.7). Read for a HUMAN on demand and never stored, so it is bounded in
+  bytes and in wall clock rather than refused when large: a cut diff is marked `truncated`.
+  """
+  @callback checkpoint_diff(repo(), String.t() | nil, String.t()) ::
+              {:ok, checkpoint_diff()} | {:error, term()}
+
   @doc "The three-dot comparison `base...head` (US-45.4). See `t:comparison/0`."
   @callback compare(repo(), String.t(), String.t()) :: {:ok, comparison()} | {:error, term()}
 

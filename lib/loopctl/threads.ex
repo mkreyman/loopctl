@@ -13,7 +13,10 @@ defmodule Loopctl.Threads do
   - `record_judgement/5` — a `finding` or `verdict` from the runner holding that dispatch,
     bound to its `thread_reviews` row. Inferring a judge from a calling key was circumvented
     in #901 and #905; nothing here takes a key;
-  - `record_fix/4` — a `fix` from the story's current claimant, under the checkpoint fence.
+  - `record_fix/4` — a `fix` from the story's current claimant, under the checkpoint fence;
+  - `record_human_finding/3` — a `finding` from the tenant's human on the thread page
+    (US-45.7), as `human_principal/0` with an empty lineage. It has no HTTP route: the only
+    principal that writes it is the WebAuthn-authenticated browser session.
 
   Two writes are loopctl's own and have NO HTTP route, because the merge executor
   (`Loopctl.Delivery.MergeExecutor`, US-45.5) is their only caller:
@@ -51,8 +54,10 @@ defmodule Loopctl.Threads do
 
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.Claimant
+  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.Intake
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
@@ -60,6 +65,7 @@ defmodule Loopctl.Threads do
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
+  alias Loopctl.Threads.IssueLinks
   alias Loopctl.Threads.Review
   alias Loopctl.Threads.Reviews
   alias Loopctl.WorkBreakdown.Story
@@ -68,6 +74,12 @@ defmodule Loopctl.Threads do
 
   # The author of a `base_update` checkpoint's entry: loopctl's merge executor (US-45.5).
   @merge_executor_principal "control:merge_executor"
+  # The tenant's human, authenticated in the browser by the WebAuthn credential enrolled at
+  # signup (US-45.7). The label the audit chain already gives WebAuthn-authenticated human acts
+  # (`Loopctl.Tenants`, `Loopctl.Tenants.Enrollment`). No API key can produce it:
+  # `LoopctlWeb.ActorLabel` gives `agent:` or `api_key:`. The `thread_entries_judgement_shape`
+  # CHECK names it literally, as the one author a finding with no review may have.
+  @human_principal "human:webauthn"
   @sha_pattern ~r/\A[0-9a-f]{40}([0-9a-f]{24})?\z/
 
   # Idempotency keys loopctl writes for its own entries. A caller may not use the prefix, so a
@@ -352,7 +364,8 @@ defmodule Loopctl.Threads do
 
   @doc """
   Records a `finding` or `verdict` from the review dispatch `dispatch_id`, which `runner_id`
-  holds (US-45.3). The ONE way a judgement is written: the review is bound under the thread
+  holds (US-45.3). The ONE way a REVIEWER's judgement is written (a human's finding is
+  `record_human_finding/3`): the review is bound under the thread
   lock by the dispatch AND the runner, then its separation, whether it is still open and
   whether its round is still current are decided there too.
 
@@ -443,6 +456,165 @@ defmodule Loopctl.Threads do
       in_story_lock(tenant_id, story_id, fn ->
         fix_locked(tenant_id, story_id, changeset, opts)
       end)
+    end
+  end
+
+  @doc """
+  The principal the tenant's human writes as from the thread page (US-45.7): authenticated in
+  the browser by the WebAuthn credential enrolled at signup, with an EMPTY lineage. The label
+  WebAuthn-authenticated human acts already carry in the audit chain; no API key produces it.
+  """
+  @spec human_principal() :: String.t()
+  def human_principal, do: @human_principal
+
+  @doc """
+  Records a `finding` from the tenant's human (US-45.7, PRD §6: "a human finding has the same
+  standing as an agent's: it binds to a checkpoint and counts toward `introduced_by` and the
+  ceiling"). Written by the thread page only; there is no HTTP route, because the only
+  principal that may write it is the WebAuthn-authenticated browser session.
+
+  `attrs` (string keys): `idempotency_key` (the page's per-form nonce), `body`,
+  `checkpoint_id`, `severity`, and optionally `location` and `introduced_by`.
+
+  The finding binds to a checkpoint of kind `checkpoint` that the story's CURRENT, still-held
+  claim recorded: rounds belong to a claim, and a finding on an ended claim's work could count
+  for the one that follows. `introduced_by` follows the round rule a reviewer's does
+  (`Loopctl.Threads.Reviews.human_introduced_by_allowed/4`). How it counts toward the rounds is
+  `Loopctl.Threads.Reviews`'.
+
+  Refused `:tenant_halted` while the tenant's custody is halted, as every judgement is. A
+  resend of a finding already recorded under the same key is answered from its row — halt
+  included — so a double submit is one entry; a different finding reusing the key is
+  `idempotency_key_reused`.
+
+  Returns `{:ok, entry, :created | :existing}`.
+  """
+  @spec record_human_finding(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+          {:ok, Entry.t(), :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, term()}
+  def record_human_finding(tenant_id, story_id, attrs) do
+    changeset =
+      Entry.changeset(%Entry{}, %{
+        "kind" => "finding",
+        "idempotency_key" => Map.get(attrs, "idempotency_key"),
+        "body" => Map.get(attrs, "body"),
+        "checkpoint_id" => Map.get(attrs, "checkpoint_id")
+      })
+
+    with :ok <- valid(changeset),
+         :ok <- human_finding_checkpoint_given(changeset),
+         {:ok, changeset} <- finding_fields(changeset, attrs),
+         :ok <- screen(changeset, tenant_id, story_id),
+         :ok <-
+           no_secret(
+             Ecto.Changeset.get_field(changeset, :location),
+             :location,
+             tenant_id,
+             story_id
+           ) do
+      in_story_lock(tenant_id, story_id, fn ->
+        human_finding_locked(tenant_id, story_id, changeset)
+      end)
+    end
+  end
+
+  @typedoc "What the thread page renders (US-45.7), read in one tenant transaction."
+  @type page :: %{
+          story: %{id: Ecto.UUID.t(), number: String.t() | nil, title: String.t()},
+          checkpoints: [Checkpoint.t()],
+          checkpoints_truncated: boolean(),
+          entries: [Entry.t()],
+          next_after_seq: pos_integer() | nil,
+          repo: String.t() | nil
+        }
+
+  @doc """
+  The thread page's read (US-45.7): the story's title, its thread as `get_thread/3` returns it
+  (the same `:after_seq` / `:limit` paging), and the repository its diffs come from, or nil
+  when the project has no single live intake source. One `Loopctl.Repo.with_tenant/2`
+  transaction, under the tenant's RLS; no forge call. `{:error, :not_found}` for a story the
+  tenant cannot see.
+  """
+  @spec page(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: {:ok, page()} | {:error, :not_found}
+  def page(tenant_id, story_id, opts \\ []) do
+    {:ok, result} =
+      Repo.with_tenant(tenant_id, fn ->
+        with %{} = story <- page_story(tenant_id, story_id) || {:error, :not_found},
+             {:ok, thread} <- read_thread(tenant_id, story_id, opts) do
+          {:ok,
+           Map.merge(thread, %{
+             story: Map.take(story, [:id, :number, :title]),
+             repo: project_repo(tenant_id, story.project_id)
+           })}
+        end
+      end)
+
+    result
+  end
+
+  @doc """
+  The unified diff of one checkpoint, fetched from the forge by SHA and never stored (US-45.7,
+  PRD §6.1): against its parent checkpoint when it has one, otherwise the commit's own diff.
+
+  The checkpoint, its parent and the repository are read in one short RLS transaction that is
+  CLOSED before the forge is asked, so nothing holds a connection across GitHub. The forge call
+  is bounded by the adapter (`Loopctl.Delivery.PullRequestSource.checkpoint_diff/3`); a slow or
+  absent forge is an `{:error, reason}` for the caller to show beside a ledger that rendered
+  without it.
+  """
+  @spec checkpoint_diff(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, PullRequestSource.checkpoint_diff()} | {:error, term()}
+  def checkpoint_diff(tenant_id, story_id, checkpoint_id) do
+    {:ok, target} =
+      Repo.with_tenant(tenant_id, fn -> diff_target(tenant_id, story_id, checkpoint_id) end)
+
+    case target do
+      {:ok, repo, base_sha, head_sha} ->
+        PullRequestSource.impl().checkpoint_diff(repo, base_sha, head_sha)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp diff_target(tenant_id, story_id, checkpoint_id) do
+    with {:ok, checkpoint_id} <- Ecto.UUID.cast(checkpoint_id) |> ok_or(:not_found),
+         %{} = story <- page_story(tenant_id, story_id) || {:error, :not_found},
+         %Checkpoint{} = checkpoint <-
+           checkpoint_of(tenant_id, story_id, checkpoint_id) || {:error, :not_found},
+         repo when is_binary(repo) <-
+           project_repo(tenant_id, story.project_id) || {:error, :no_intake_source} do
+      parent =
+        checkpoint.parent_checkpoint_id &&
+          checkpoint_of(tenant_id, story_id, checkpoint.parent_checkpoint_id)
+
+      {:ok, repo, parent && parent.commit_sha, checkpoint.commit_sha}
+    end
+  end
+
+  defp ok_or({:ok, value}, _reason), do: {:ok, value}
+  defp ok_or(:error, reason), do: {:error, reason}
+
+  defp page_story(tenant_id, story_id) do
+    Repo.one(
+      from s in Story,
+        where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+        select: %{id: s.id, number: s.number, title: s.title, project_id: s.project_id}
+    )
+  end
+
+  # The project's repository by the ONE rule the gates use (`Intake.select_project_source/2`),
+  # read here under RLS rather than on `AdminRepo`.
+  defp project_repo(tenant_id, project_id) do
+    tenant_id
+    |> Intake.live_sources_query()
+    |> where([s], s.project_id == ^project_id)
+    |> Repo.all()
+    |> Intake.select_project_source(project_id)
+    |> case do
+      {:ok, source} -> source.repo_full_name
+      {:error, _reason} -> nil
     end
   end
 
@@ -1022,6 +1194,10 @@ defmodule Loopctl.Threads do
 
     with {:ok, _entry, :created, chained} <-
            insert_entry(tenant_id, story_id, entry, Keyword.put(opts, :adopted, adopted)) do
+      # AC-45.7.4: the thread's FIRST checkpoint is when its page has work on it, and the one
+      # moment every thread passes through once. The intent to link the intake issue commits
+      # with the checkpoint; the comment is posted later with nothing held.
+      if is_nil(previous), do: IssueLinks.record_in(Repo, tenant_id, story_id)
       {:ok, checkpoint, :created, chained}
     end
   end
@@ -1630,6 +1806,45 @@ defmodule Loopctl.Threads do
       insert_entry(tenant_id, story_id, changeset,
         author_principal: author,
         actor_lineage: Keyword.fetch!(opts, :actor_lineage)
+      )
+    else
+      {:story, nil} -> {:error, :not_found}
+      %Entry{} = existing -> replay(existing, changeset)
+      other -> other
+    end
+  end
+
+  defp human_finding_checkpoint_given(changeset) do
+    if Ecto.Changeset.get_field(changeset, :checkpoint_id),
+      do: :ok,
+      else:
+        {:error,
+         {:unprocessable_entity, "finding_checkpoint_required",
+          "a finding binds to a checkpoint: checkpoint_id is required"}}
+  end
+
+  # A resend is answered from its row before any rule, halt included: the page that lost its
+  # response must learn its finding landed, and a double submit must be one entry.
+  defp human_finding_locked(tenant_id, story_id, changeset) do
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
+         nil <- entry_by_key(tenant_id, story_id, @human_principal, key_of(changeset)),
+         :ok <- not_halted(tenant_id),
+         {:ok, checkpoint} <-
+           Reviews.human_finding_checkpoint(
+             tenant_id,
+             story,
+             Ecto.Changeset.get_field(changeset, :checkpoint_id)
+           ),
+         :ok <-
+           Reviews.human_introduced_by_allowed(
+             tenant_id,
+             story,
+             checkpoint,
+             Ecto.Changeset.get_field(changeset, :introduced_by)
+           ) do
+      insert_entry(tenant_id, story_id, changeset,
+        author_principal: @human_principal,
+        actor_lineage: []
       )
     else
       {:story, nil} -> {:error, :not_found}

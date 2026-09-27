@@ -337,6 +337,14 @@ const NON_API = {
   "GET /wiki/:param": "browser", // WikiLive.show
   "GET /swaggerui": "browser", // OpenApiSpex.Plug.SwaggerUI over GET /api/v1/openapi
   "GET /swagger": "browser", // RedirectController.swagger — convenience alias to the above
+  // US-45.7: the thread page and its browser login. The login is a WebAuthn assertion a
+  // browser makes (`navigator.credentials.get`), and the POST/DELETE bind and drop a session
+  // COOKIE through the `:browser` pipeline's CSRF check — nothing an MCP tool can hold. The
+  // thread's data is on `/api/v1/stories/:id/thread`, which tools already reach.
+  "GET /login": "browser", // LoginLive
+  "POST /login": "browser", // BrowserSessionController.create
+  "DELETE /logout": "browser", // BrowserSessionController.delete
+  "GET /threads/:param": "browser", // ThreadLive
 
   // probe: infrastructure, not a caller. `/health` is Fly's continuous liveness check
   // (fly.toml); `/health/ready` is the deploy-time smoke gate (router.ex:100-108).

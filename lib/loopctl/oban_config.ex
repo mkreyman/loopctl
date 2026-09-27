@@ -675,6 +675,11 @@ defmodule Loopctl.ObanConfig do
            # reporter has already been waiting for the deploy. Keep in sync with the crontab
            # assertion in oban_plugins_config_test.exs.
            {"*/2 * * * *", Loopctl.Workers.IntakeIssueCloseWorker},
+           # US-45.7: drains the thread-link outbox — one comment on a story's intake issue
+           # linking its thread page, written when the thread records its first checkpoint.
+           # ONE bounded GitHub call per candidate. Two minutes, like the closure drainer
+           # beside it, because it is the same forge and the same token.
+           {"*/2 * * * *", Loopctl.Workers.ThreadIssueLinkWorker},
            # #803 §2/§4: drains pending_triage intake records into stories the delivery loop
            # can see — the production caller of Loopctl.Delivery.TriageTrigger.promote/1, which
            # had none. EVERY MINUTE, unlike the two-minute forge drainers beside it, because a

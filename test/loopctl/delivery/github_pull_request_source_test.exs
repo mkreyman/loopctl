@@ -1103,4 +1103,46 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       refute MergePrecondition.transient?(reason)
     end
   end
+
+  describe "checkpoint_diff/3 (US-45.7)" do
+    test "compares against the parent checkpoint, asking for the diff media type" do
+      stub(fn conn ->
+        send(self(), {:diff_request, conn.request_path, Plug.Conn.get_req_header(conn, "accept")})
+        Plug.Conn.send_resp(conn, 200, "diff --git a/x b/x\n+added\n")
+      end)
+
+      assert {:ok, %{text: "diff --git a/x b/x\n+added\n", truncated: false}} =
+               Source.checkpoint_diff(@repo, @merge_base, @head)
+
+      assert_received {:diff_request, path, ["application/vnd.github.diff"]}
+      assert path == "/repos/acme/widgets/compare/#{@merge_base}...#{@head}"
+    end
+
+    test "with no parent it reads the commit's own diff" do
+      stub(fn conn ->
+        send(self(), {:diff_path, conn.request_path})
+        Plug.Conn.send_resp(conn, 200, "+x\n")
+      end)
+
+      assert {:ok, %{text: "+x\n"}} = Source.checkpoint_diff(@repo, nil, @head)
+      assert_received {:diff_path, "/repos/acme/widgets/commits/" <> @head}
+    end
+
+    test "a diff past the byte bound is cut and marked truncated, never refused" do
+      big = String.duplicate("+", 600 * 1024)
+      stub(fn conn -> Plug.Conn.send_resp(conn, 200, big) end)
+
+      assert {:ok, %{text: text, truncated: true}} = Source.checkpoint_diff(@repo, nil, @head)
+      assert byte_size(text) == 512 * 1024
+    end
+
+    test "a forge failure keeps the shared classification, and a malformed sha is refused unread" do
+      stub(fn conn -> Plug.Conn.send_resp(conn, 502, "") end)
+
+      assert {:error, {:github_api_error, 502}} = Source.checkpoint_diff(@repo, nil, @head)
+
+      assert {:error, {:invalid_sha, _}} = Source.checkpoint_diff(@repo, nil, "HEAD?x=1")
+      assert {:error, {:invalid_sha, _}} = Source.checkpoint_diff(@repo, "../../x", @head)
+    end
+  end
 end

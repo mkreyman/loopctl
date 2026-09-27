@@ -19,7 +19,8 @@ defmodule Loopctl.Threads.Entry do
 
   # What a caller writes through the entries API. `checkpoint` entries are written beside the
   # checkpoint they describe; `finding` and `verdict` from a
-  # review dispatch over the runner socket and `fix` from the claimant, each through its own
+  # review dispatch over the runner socket, a `finding` from the tenant's human on the thread
+  # page (US-45.7), and `fix` from the claimant, each through its own
   # `Loopctl.Threads` entry point (US-45.3); `escalation` and `merge` by
   # the flows that perform those acts.
   # `review_requested` is written by the request-review flow alongside
