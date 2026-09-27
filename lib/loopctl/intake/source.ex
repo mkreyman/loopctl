@@ -77,8 +77,9 @@ defmodule Loopctl.Intake.Source do
     # THE CHECKS A THREAD-MODE CHECKPOINT MUST PASS ON ITS EXACT COMMIT (US-45.6). A pull
     # request's required checks are its base branch's protection, enforced by GitHub at merge
     # time; a thread has no pull request and the loopctl App pushes the squash itself, so the
-    # merge gate reads the checks by SHA and this names which ones it requires. Check-run
-    # names or commit-status contexts, as they appear on the commit. `pr` mode never reads it.
+    # merge gate reads the checks by SHA and this names which ones it requires: GitHub Actions
+    # JOB names, as they appear on the commit (a commit-status context can never satisfy one;
+    # see `Loopctl.Delivery.CiEvidence`). `pr` mode never reads it.
     field :required_checks, {:array, :string}, default: []
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
     field :revoked_at, :utc_datetime_usec

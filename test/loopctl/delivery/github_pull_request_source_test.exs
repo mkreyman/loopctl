@@ -852,6 +852,18 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       assert {:error, {:jobs_truncated, 2, 1}} = Source.check_evidence(@repo, @head, @branch)
     end
 
+    # #910 round 2, finding 6: shape is judged before anything reads an entry's fields.
+    test "a jobs list with a malformed entry is unreadable, never a crash" do
+      stub_ci(%{
+        runs: %{"total_count" => 1, "workflow_runs" => [gh_run(5)]},
+        jobs: %{5 => %{"total_count" => 2, "jobs" => [gh_job(50, "test", "success"), "junk"]}},
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:error, {:unreadable_jobs, {:list, 2}}} =
+               Source.check_evidence(@repo, @head, @branch)
+    end
+
     test "more workflow runs than the bound is refused rather than read" do
       runs = for id <- 1..11, do: gh_run(id)
 

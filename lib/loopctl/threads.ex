@@ -529,6 +529,26 @@ defmodule Loopctl.Threads do
 
         :ok
 
+      # Same judgement, read later: only the stored `read_at` moves, so a slower evaluation
+      # that read in between can no longer pass for the newer one (#910 round 2, finding 3).
+      :advance_read_at ->
+        {1, _} =
+          from(c in Checkpoint, where: c.id == ^checkpoint_id)
+          |> update([c],
+            set: [
+              gate_evidence:
+                fragment(
+                  "jsonb_set(?, ARRAY[?, 'read_at'], to_jsonb(?::text))",
+                  c.gate_evidence,
+                  ^key,
+                  ^Map.get(record, "read_at")
+                )
+            ]
+          )
+          |> Repo.update_all([])
+
+        :ok
+
       answer ->
         answer
     end
@@ -537,15 +557,20 @@ defmodule Loopctl.Threads do
   # The decision, taken under the row lock so two evaluations cannot both think they are the
   # newer one. A record read no LATER than the stored one is `:superseded`, never `:ok`: the
   # allow path must not record an allow on evidence that did not land (round 2, finding 4).
-  # One that says exactly what is stored already, read_at aside, is `:ok` with no write, so a
-  # CI wait polled for hours rewrites the row only when the judgement moves (finding 6).
+  # One that says exactly what is stored already, read_at aside, rewrites nothing but the
+  # stored `read_at` (when it is later), so a CI wait polled for hours rewrites the judgement
+  # only when it moves (finding 6) and the ordering guard stays current.
   defp evidence_write(nil, _record), do: {:error, :not_found}
   defp evidence_write(%{record: nil}, _record), do: :write
 
   defp evidence_write(%{record: stored}, record) do
+    later? = later?(Map.get(record, "read_at"), Map.get(stored, "read_at"))
+    same? = Map.delete(stored, "read_at") == Map.delete(record, "read_at")
+
     cond do
-      Map.delete(stored, "read_at") == Map.delete(record, "read_at") -> :ok
-      not later?(Map.get(record, "read_at"), Map.get(stored, "read_at")) -> :superseded
+      same? and later? and is_binary(Map.get(record, "read_at")) -> :advance_read_at
+      same? -> :ok
+      not later? -> :superseded
       true -> :write
     end
   end

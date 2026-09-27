@@ -159,10 +159,12 @@ defmodule LoopctlWeb.MergePreconditionController do
             type: :object,
             nullable: true,
             description:
-              "Thread mode (US-45.6): what CI said about the checkpoint's EXACT commit, read " <>
-                "from both the check-runs and the commit-status APIs — `sha`, `read_at`, " <>
-                "`required`, the raw `check_runs` and `statuses`, `local_gate` (recorded, " <>
-                "never counted), and the judgement `passed` / `pending` / `missing` / " <>
+              "Thread mode (US-45.6): what CI said about the checkpoint's EXACT commit — `sha`, " <>
+                "`read_at`, `required`, `jobs` (the jobs under a required name from the " <>
+                "GitHub Actions workflow runs a push of the thread branch triggered: `name`, " <>
+                "`workflow`, `run_id`, `status`, `conclusion`, `url`), `local_gate` (from the " <>
+                "commit statuses, best effort; recorded, never counted), and the judgement " <>
+                "`passed` / `pending` / `missing` / " <>
                 "`failed`. The same object is copied onto the checkpoint's `gate_evidence` " <>
                 "under `ci`. null when it was not read (pr mode, a moved or merged head)."
           },

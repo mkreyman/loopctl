@@ -9,12 +9,15 @@ defmodule Loopctl.Repo.Migrations.AddIntakeSourcesRequiredChecks do
   gate reads the checks by SHA and needs to know which ones are required. They are named
   here, per repository.
 
-  NOT NULL, default the empty list, so every existing source is unchanged: a `pr`-mode source
-  never reads the column. A `thread`-mode source must name at least one check, which the
-  changeset enforces on every write (`Loopctl.Intake.Source.validate_required_checks/1`) and
-  the gate backstops by refusing `required_checks_unset`.
+  NOT NULL, default the empty list. A `pr`-mode source never reads the column and is
+  unchanged. A `thread`-mode source must name at least one check, which the changeset enforces
+  on every write (`Loopctl.Intake.Source.validate_required_checks/1`) and the gate backstops
+  by refusing `required_checks_unset`.
 
-  No backfill and no manual step.
+  MANUAL STEP for any `thread`-mode source enrolled BEFORE this migration: it has no required
+  checks, so every one of its stories is refused `required_checks_unset` until an operator
+  names them (`intake_source_update` with `required_checks`). No backfill: loopctl cannot know
+  which CI jobs a repository requires.
   """
 
   use Ecto.Migration

@@ -10,7 +10,7 @@ All notable changes to loopctl are documented here.
   migration `20260927100000`). A THREAD-mode source must now name its `required_checks`, and
   the gate's `GITHUB_TOKEN` needs `actions: read` (and, best effort, `commit statuses: read`)
   for it.** The
-  migration adds `intake_sources.required_checks` (text array, NOT NULL, default empty; no
+  migration adds `intake_sources.required_checks` (`varchar(255)[]`, NOT NULL, default empty; no
   backfill). `POST`/`PATCH /api/v1/intake/sources` and the `intake_source_enroll` /
   `intake_source_update` MCP tools take it; a `thread` source naming none is 422, judged over
   the source as it will be, `local-gate` is refused, and a change is recorded as

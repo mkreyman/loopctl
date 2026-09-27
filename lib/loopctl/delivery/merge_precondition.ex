@@ -766,7 +766,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
       end)
   end
 
-  defp ci_result(facts), do: Map.get_lazy(facts, :ci_result, fn -> judge_ci(facts) end)
+  # Put by `judge/1` before anything reads it: CI is judged once per evaluation.
+  defp ci_result(facts), do: Map.fetch!(facts, :ci_result)
 
   defp judge_ci(facts) do
     case value(facts, :ci_evidence) do
@@ -1003,7 +1004,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # edits `.github/workflows/` — or a composite action they call — can make its own required
   # checks report green: the implementer attesting its own work through a check run it never
   # needed an App to create. A human merges such a change. Matched on every name the diff
-  # carries, renames' old and new names included, so moving a workflow file is caught too.
+  # carries, renames' old and new names included, so moving a workflow file is caught too,
+  # and on any composite action's `action.yml`, wherever it sits.
   @ci_definition_prefixes [".github/workflows/", ".github/actions/"]
 
   defp ci_definition_reasons({:ok, %{files: files} = diff}) do
@@ -1021,8 +1023,13 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp ci_definition_reasons({:error, reason}), do: [{:ci_definition_unknown, reason}]
   defp ci_definition_reasons(_no_diff), do: []
 
-  defp ci_definition?(name) when is_binary(name),
-    do: Enum.any?(@ci_definition_prefixes, &String.starts_with?(name, &1))
+  # A composite action can live anywhere a workflow's `uses: ./path` points, so its definition
+  # file is matched by NAME wherever it sits (#910 round 2, finding 5); reusable workflows can
+  # only live under `.github/workflows/`, which the prefix covers.
+  defp ci_definition?(name) when is_binary(name) do
+    Enum.any?(@ci_definition_prefixes, &String.starts_with?(name, &1)) or
+      Path.basename(name) in ["action.yml", "action.yaml"]
+  end
 
   defp ci_definition?(_name), do: false
 
@@ -1402,8 +1409,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # with its list cleared makes a thread already placed refuse `required_checks_unset`,
       # which names the fix — setting the list again — and is not a dead end.
       required_checks: source_required_checks(source),
-      # When the story entered `ci`: what a CI wait is measured from.
-      ci_entered_at: ci_entered_at(mode, story, checkpoint),
       now: DateTime.utc_now()
     }
 
@@ -1418,7 +1423,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
     Map.merge(facts, %{
       head_files: repo_files(repo, pull_request, :head_sha, skip?),
       base_files: repo_files(repo, pull_request, :merge_base_sha, skip?),
-      ci_evidence: ci_evidence(facts, pull_request, skip?)
+      ci_evidence: ci_evidence(facts, pull_request, skip?),
+      # When the story entered `ci`, what a CI wait is measured from — read on exactly the path
+      # that reads CI, so a lock wait on it can never mask a merged or moved head's decision
+      # (#910 round 2, finding 2).
+      ci_entered_at: ci_entered_at(facts, pull_request, skip?, story)
     })
   end
 
@@ -1426,15 +1435,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # (contention is `{:error, :busy}`, a retry). A story that reached `ci` with no recorded
   # transition — a backfill, a repair — falls back to its checkpoint's recording, which is
   # always known, so the wait is bounded for every story (round 1 of #910, finding 8).
-  defp ci_entered_at(:thread, story, checkpoint) do
+  defp ci_entered_at(%{mode: :thread} = facts, {:ok, %{merged?: false}}, false = _skip?, story) do
     case Stages.entered_at(story.tenant_id, story.id, :ci) do
       {:ok, %DateTime{} = entered} -> {:ok, entered}
-      {:ok, nil} -> {:ok, checkpoint_recorded_at(checkpoint)}
+      {:ok, nil} -> {:ok, checkpoint_recorded_at(facts.checkpoint)}
       {:error, _reason} = error -> error
     end
   end
 
-  defp ci_entered_at(_mode, _story, _checkpoint), do: {:ok, nil}
+  defp ci_entered_at(_facts, _pull_request, _skip?, _story), do: {:ok, nil}
 
   defp checkpoint_recorded_at({:ok, %{recorded_at: %DateTime{} = at}}), do: at
   defp checkpoint_recorded_at(_checkpoint), do: nil

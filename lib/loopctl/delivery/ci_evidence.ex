@@ -33,11 +33,12 @@ defmodule Loopctl.Delivery.CiEvidence do
 
   ## How one required check is judged
 
-  Per workflow file, only the job with the name and the highest id counts: job ids only grow,
-  so that is the newest attempt of the newest run, and a re-run that went green supersedes
-  the failure it re-ran (the jobs read is `filter=latest` as well). ACROSS workflows nothing supersedes anything: two workflows
-  with a job `test` are two checks under one name, and a green one must never hide a red one.
-  So a name is `:failed` when any workflow's job failed, `:pending` when none failed and any
+  Per workflow file, only its NEWEST run counts (a later push run of the same commit
+  supersedes an earlier one), and in it EVERY job carrying the name — matrix legs are separate
+  jobs, and one green leg must never hide a red one. Each job is its latest attempt (the jobs
+  read is `filter=latest`), so a re-run that went green supersedes the failure it re-ran.
+  ACROSS workflows nothing supersedes anything either: two workflows with a job `test` are two
+  checks under one name. So a name is `:failed` when any counted job failed, `:pending` when none failed and any
   is still running, `:passed` only when every one passed, and `:missing` when no trusted job
   carries it. A job:
 
@@ -102,11 +103,9 @@ defmodule Loopctl.Delivery.CiEvidence do
   defp check_state(name, jobs) do
     states =
       jobs
+      |> newest_run_per_workflow()
       |> Enum.filter(&(&1.name == name))
-      |> Enum.group_by(&Map.get(&1, :workflow))
-      |> Enum.map(fn {_workflow, named} ->
-        named |> Enum.max_by(&(Map.get(&1, :id) || 0)) |> job_state()
-      end)
+      |> Enum.map(&job_state/1)
 
     cond do
       states == [] -> :missing
@@ -114,6 +113,21 @@ defmodule Loopctl.Delivery.CiEvidence do
       :pending in states -> :pending
       true -> :passed
     end
+  end
+
+  # Per workflow file, the jobs of its NEWEST run only: a later push run of the commit
+  # supersedes an earlier one. Within that run EVERY job counts — matrix legs and any jobs
+  # that share a name are separate jobs, and one green leg must never hide a red one (#910
+  # round 2, finding 1). The jobs read is `filter=latest`, so each is its latest attempt.
+  defp newest_run_per_workflow(jobs) do
+    newest =
+      jobs
+      |> Enum.group_by(&Map.get(&1, :workflow), &(Map.get(&1, :run_id) || 0))
+      |> Map.new(fn {workflow, run_ids} -> {workflow, Enum.max(run_ids)} end)
+
+    Enum.filter(jobs, fn job ->
+      (Map.get(job, :run_id) || 0) == Map.fetch!(newest, Map.get(job, :workflow))
+    end)
   end
 
   defp job_state(%{status: "completed", conclusion: "success"}), do: :passed

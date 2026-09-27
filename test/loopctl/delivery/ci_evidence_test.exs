@@ -73,11 +73,16 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
     assert %{pending: ["test"]} = judge(["test"], [green, running])
   end
 
-  test "within one run, the job's latest attempt (highest id) decides" do
-    first = job("test", "completed", "failure", %{id: 1})
-    retry = job("test", "completed", "success", %{id: 2})
+  # #910 round 2, finding 1: attempts are already collapsed by the `filter=latest` read, so two
+  # jobs of one run sharing a name are separate jobs (matrix legs), and every one must pass.
+  test "within one run, every job carrying the name must pass" do
+    leg_a = job("test", "completed", "failure", %{id: 1})
+    leg_b = job("test", "completed", "success", %{id: 2})
 
-    assert %{passed: ["test"]} = judge(["test"], [first, retry])
+    assert %{failed: [{"test", "failure"}], passed: []} = judge(["test"], [leg_a, leg_b])
+
+    assert %{passed: ["test"]} =
+             judge(["test"], [%{leg_a | conclusion: "success"}, leg_b])
   end
 
   test "each required name is judged on its own" do

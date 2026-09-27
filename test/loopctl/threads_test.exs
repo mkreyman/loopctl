@@ -298,7 +298,18 @@ defmodule Loopctl.ThreadsTest do
       assert :ok =
                Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", same_later)
 
-      assert %{"ci" => ^newer} = stored_evidence(ctx, cp.id)
+      # #910 round 2, finding 3: the same judgement read later moves the stored read_at, so a
+      # slower evaluation that read in between (10:00:03) can no longer pass for the newer one.
+      assert %{"ci" => ^same_later} = stored_evidence(ctx, cp.id)
+
+      # The same judgement read EARLIER than what is stored is :ok, never :superseded: the
+      # stored record already says the same thing, so an allow resting on it may stand.
+      assert :ok = Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", newer)
+      assert %{"ci" => ^same_later} = stored_evidence(ctx, cp.id)
+      in_between = %{"read_at" => "2026-09-27T10:00:03.000000Z", "pending" => ["test"]}
+
+      assert :superseded =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", in_between)
 
       newest = %{"read_at" => "2026-09-27T10:00:10.000000Z", "failed" => ["test"]}
       assert :ok = Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", newest)

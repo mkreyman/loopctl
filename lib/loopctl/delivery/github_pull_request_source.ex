@@ -70,8 +70,12 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   all five (a pull request plus two refs) waits at most 35 seconds before it has an answer,
   and the answer to a timeout is an ESCALATION, never a pass. A THREAD-mode evaluation makes
   more: the branch ref, the commit, the comparison, two trees, the workflow runs, one jobs
-  read per workflow run and the combined status — about eight calls for a repository with a
-  couple of workflows, plus one repository read after a 404 on the branch. Nothing here runs inside a
+  read per workflow run (at most `@max_workflow_runs`, read `@job_read_concurrency` at a time)
+  and the combined status. Their ceiling is the sum of the sequential reads' timeouts plus
+  the jobs reads' in batches: with ten workflows, seven reads plus three batches at 7s each,
+  70 seconds before an answer, and a
+  timeout is a transient `:unevaluated`, never a pass. Plus one repository read after a 404 on
+  the branch. Nothing here runs inside a
   database transaction: the caller gathers every fact before it opens one, so a slow forge
   never holds a pooled connection.
 
@@ -126,6 +130,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @workflow_run_page 100
   @job_page 100
   @max_workflow_runs 10
+  # How many of those jobs reads run at once; each is bounded by `req_options/0`'s timeouts.
+  @job_read_concurrency 4
 
   # GitHub's primary rate-limit window is an hour. Anything beyond that plus slack is not a
   # window rolling over, so it is not turned into a delay a caller would sleep on.
@@ -274,32 +280,40 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # Each run's jobs, latest attempt only (`filter=latest`), tagged with the run and its
   # workflow file. De-duplicated by job id and checked against the total, so a page boundary
   # that moved between reads can neither repeat a job nor hide one.
+  #
+  # CONCURRENT, bounded (#910 round 2, finding 7): the reads are independent, and done one after
+  # another a push that triggered many workflows multiplied the wait by their number. The first
+  # failure in run order is the answer, so the outcome does not depend on which read is slower.
   defp jobs_of(repo, runs) do
-    Enum.reduce_while(runs, {:ok, []}, fn run, {:ok, acc} ->
-      query = URI.encode_query(%{"filter" => "latest", "per_page" => @job_page})
+    query = URI.encode_query(%{"filter" => "latest", "per_page" => @job_page})
 
-      with {:ok, body} <- get(repo, "/actions/runs/#{run["id"]}/jobs?" <> query),
-           {:ok, jobs} <- run_jobs(body, run) do
-        {:cont, {:ok, acc ++ jobs}}
-      else
-        {:error, _reason} = error -> {:halt, error}
-      end
+    runs
+    |> Task.async_stream(
+      fn run ->
+        with {:ok, body} <- get(repo, "/actions/runs/#{run["id"]}/jobs?" <> query) do
+          run_jobs(body, run)
+        end
+      end,
+      max_concurrency: @job_read_concurrency,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while({:ok, []}, fn
+      {:ok, {:ok, jobs}}, {:ok, acc} -> {:cont, {:ok, acc ++ jobs}}
+      {:ok, {:error, _reason} = error}, _acc -> {:halt, error}
     end)
   end
 
   defp run_jobs(%{"total_count" => total, "jobs" => jobs}, run)
        when is_integer(total) and is_list(jobs) do
-    jobs = Enum.uniq_by(jobs, & &1["id"])
+    # Shape FIRST: de-duplicating reads `"id"` off each entry, which raises on a non-map.
+    if Enum.all?(jobs, &job?/1) do
+      jobs = Enum.uniq_by(jobs, & &1["id"])
 
-    cond do
-      not Enum.all?(jobs, &job?/1) ->
-        {:error, {:unreadable_jobs, shape(jobs)}}
-
-      total > length(jobs) ->
-        {:error, {:jobs_truncated, total, length(jobs)}}
-
-      true ->
-        {:ok, Enum.map(jobs, &job_fact(&1, run))}
+      if total > length(jobs),
+        do: {:error, {:jobs_truncated, total, length(jobs)}},
+        else: {:ok, Enum.map(jobs, &job_fact(&1, run))}
+    else
+      {:error, {:unreadable_jobs, shape(jobs)}}
     end
   end
 

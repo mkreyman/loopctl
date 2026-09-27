@@ -1280,6 +1280,9 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       for {files, renames} <- [
             {[".github/workflows/ci.yml"], []},
             {[".github/actions/setup/action.yml"], []},
+            # #910 round 2, finding 5: a composite action a workflow calls from anywhere.
+            {["ci/run-tests/action.yml"], []},
+            {["action.yaml"], []},
             {["ci/new.yml"], [{".github/workflows/old.yml", "ci/new.yml"}]}
           ] do
         pr_diff = {:ok, %{files: files, renames: renames}}
