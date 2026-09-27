@@ -246,6 +246,7 @@ defmodule Loopctl.Delivery.Placement do
           | {:invalid_branch_name, atom(), term()}
           | {:branch_not_unique, atom(), String.t(), String.t()}
           | {:branch_conflict, String.t(), String.t()}
+          | {:base_branch_conflict, String.t(), String.t()}
 
   @doc """
   Claims `dispatch["story_id"]` for `runner_id` and pushes the dispatch to it.
@@ -660,6 +661,7 @@ defmodule Loopctl.Delivery.Placement do
          # finished payload; running it twice costs a string comparison.
          :ok <- DispatchPayload.validate_refs(dispatch, story),
          {:ok, dispatch} <- pin_recorded_branch(dispatch, record),
+         {:ok, dispatch} <- pin_recorded_base_branch(dispatch, record),
          {:ok, dispatch} <-
            DispatchPayload.fill(tenant_id, dispatch,
              branch_prefixes: prefixes,
@@ -696,6 +698,26 @@ defmodule Loopctl.Delivery.Placement do
 
   # A ledger row written before `runner_dispatches.branch` existed. Nothing to pin.
   defp pin_recorded_branch(dispatch, _record), do: {:ok, dispatch}
+
+  # THE BASE BRANCH IS PINNED THE SAME WAY, AND FOR THE SAME REASON (US-45.4 review round 3,
+  # finding 3). The ledger row keeps the first push's `base_branch` (`on_conflict: :nothing`)
+  # and the merge gate judges the three-dot diff against THAT one
+  # (`DispatchPayload.dispatch_route/2`). Letting `fill/3` supply the intake source's CURRENT
+  # base branch here would put a second base on the wire: a source repointed from `master` to
+  # `main` between the placement and a resume would have the session sync from `main` while
+  # the gate judged it against `master`. A caller naming a different one is refused with the
+  # same shape as a branch conflict.
+  defp pin_recorded_base_branch(dispatch, %{base_branch: recorded}) when is_binary(recorded) do
+    case Map.fetch(dispatch, "base_branch") do
+      :error -> {:ok, Map.put(dispatch, "base_branch", recorded)}
+      {:ok, ^recorded} -> {:ok, dispatch}
+      {:ok, other} when is_binary(other) -> {:error, {:base_branch_conflict, other, recorded}}
+      {:ok, _not_a_string} -> {:ok, dispatch}
+    end
+  end
+
+  # A row that records no base branch: a non-implement kind, or one written before the column.
+  defp pin_recorded_base_branch(dispatch, _record), do: {:ok, dispatch}
 
   # `ImplementerInput.story_object/2` is the pure half of `StoryPayload.build/3` — the same
   # allowlist and the same caps, with no database write of any kind. Non-implement kinds carry

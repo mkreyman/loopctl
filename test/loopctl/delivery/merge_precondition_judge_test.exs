@@ -990,7 +990,6 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     @tree String.duplicate("e", 40)
     @base_tree String.duplicate("f", 40)
     @checkpoint_id "00000000-0000-4000-8000-000000000045"
-    @base_head String.duplicate("8", 40)
 
     test "allows the recorded checkpoint with no pull request number, naming it" do
       verdict = judge_thread([])
@@ -1000,7 +999,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.pr_number == nil
       assert verdict.checkpoint_id == @checkpoint_id
       assert verdict.checkpoint_sha == @head
-      assert verdict.base_sha == @base
+      assert verdict.merge_base_sha == @base
       assert verdict.head_sha == @head
     end
 
@@ -1140,11 +1139,11 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       # The executor, not the gate, holds base freshness (US-45.5, AC-45.5.8): refusing here
       # escalated nearly every story in a busy repository whose claim was no longer live.
       for live? <- [true, false] do
-        verdict = judge_thread(base_sha: @base_head, claim_live?: live?)
+        verdict = judge_thread(claim_live?: live?)
 
         assert verdict.decision == :allow, inspect(live?)
         assert verdict.reasons == []
-        assert verdict.base_sha == @base_head
+        assert verdict.merge_base_sha == @base
       end
     end
 
@@ -1220,8 +1219,6 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       |> Map.merge(%{
         branch_head_sha: Keyword.get(overrides, :branch_head_sha, @head),
         head_tree_sha: Keyword.get(overrides, :head_tree_sha, @tree),
-        # The comparison's merge base (the pull_request/1 one) unless overridden.
-        base_sha: Keyword.get(overrides, :base_sha, @base),
         base_tree_sha: Keyword.get(overrides, :base_tree_sha, @base_tree)
       })
 

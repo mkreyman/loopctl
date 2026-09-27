@@ -2697,6 +2697,47 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert again.branch == first.branch
     end
 
+    # US-45.4 REVIEW ROUND 3, FINDING 3. The ledger row keeps the first push's `base_branch`
+    # and the merge gate judges against it, so a resume must put THAT one on the wire, not
+    # the intake source's current one. Without the pin a source repointed between placement
+    # and resume sends the session to sync from a base the gate never judges against.
+    test "a RESUME re-sends the recorded base branch after the source was repointed", ctx do
+      %{runner: runner, story: story} = ctx
+      source = unboxed(fn -> bind_repo(runner.tenant_id, story, "mkreyman/pinned-base") end)
+      payload = Map.delete(dispatch_payload(story), "base_branch")
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", first, @reply_timeout
+      assert first.base_branch == "master"
+
+      assert {:ok, _} =
+               unboxed(fn ->
+                 Loopctl.Intake.update_source(runner.tenant_id, source.id, %{base_branch: "main"})
+               end)
+
+      assert {:ok, _resumed} =
+               Placement.place(runner.tenant_id, runner.id, payload, api_key: ctx.operator)
+
+      assert_push "dispatch", again, @reply_timeout
+      assert again.base_branch == "master"
+    end
+
+    test "a RESUME naming a DIFFERENT base branch is refused", ctx do
+      %{runner: runner, story: story} = ctx
+      _source = unboxed(fn -> bind_repo(runner.tenant_id, story, "mkreyman/pinned-base") end)
+      payload = Map.delete(dispatch_payload(story), "base_branch")
+
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", _first, @reply_timeout
+
+      retry = Map.put(payload, "base_branch", "main")
+
+      assert {:error, {:base_branch_conflict, "main", "master"}} =
+               Placement.place(runner.tenant_id, runner.id, retry, api_key: ctx.operator)
+
+      refute_push "dispatch", _pushed, @reply_timeout
+    end
+
     # The pool is where an operator looks at a machine that is connected and refusing
     # everything, so it is where the declaration has to be readable — the whole defect was
     # that these prefixes lived only in a config file on the target box.

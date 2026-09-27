@@ -51,7 +51,6 @@ defmodule Loopctl.Delivery.DispatchPayload do
   alias Loopctl.Repo
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
-  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.WorkBreakdown.Story
 
   @type error ::
@@ -197,18 +196,11 @@ defmodule Loopctl.Delivery.DispatchPayload do
     end
   end
 
-  # A dispatch whose session RAN is one its runner ACCEPTED. A `sent` row may never have
-  # reached a machine and a `refused` one never ran, so neither names a route anything was
-  # built on. `superseded` is not read either: a row is superseded only by a LATER claim's
-  # dispatch, so no row of the current claim can be.
-  @ran_statuses ["accepted"]
-
   @doc """
   The ROUTE `story`'s current claim was dispatched on (US-45.4): the merge `mode` and the
   `base_branch` its implement dispatch was placed under, and the branch it named. Read from the
-  implement row of the story's CURRENT `claim_epoch` that its runner ACCEPTED, newest first,
-  through the shared implement-kind filter
-  (`Loopctl.Runners.DispatchLedger.where_implement_kind/1`).
+  implement row of the story's CURRENT `claim_epoch` that its runner ACCEPTED, newest first
+  (`Loopctl.Runners.DispatchLedger.claim_route_query/2`, which owns those rules).
 
   Every field is a RECORDED fact, never a derivation; a caller that needs a fallback applies
   it, and one that does not need a field never pays for resolving it:
@@ -248,22 +240,11 @@ defmodule Loopctl.Delivery.DispatchPayload do
           # A lock held on the ledger (a retention prune, a migration) costs the gate a bounded
           # wait and an `:unevaluated` answer, never a request held open behind it.
           Capacity.set_lock_timeout!(Repo)
-          Repo.one(route_query(tenant_id, story))
+          Repo.one(DispatchLedger.claim_route_query(tenant_id, story))
         end)
         |> route()
       end
     )
-  end
-
-  defp route_query(tenant_id, story) do
-    from(r in DispatchRecord,
-      where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
-      where: r.claim_epoch == ^story.claim_epoch and r.status in ^@ran_statuses,
-      order_by: [desc: r.inserted_at],
-      limit: 1,
-      select: %{mode: r.mode, branch: r.branch, base_branch: r.base_branch}
-    )
-    |> DispatchLedger.where_implement_kind()
   end
 
   defp route({:ok, nil}), do: {:ok, %{mode: nil, branch: nil, base_branch: nil}}
@@ -276,9 +257,13 @@ defmodule Loopctl.Delivery.DispatchPayload do
   @doc """
   The branch a THREAD-mode story is judged on (US-45.4), the first that is present:
 
-  1. `stage_branch` — the `branch` effect the runner reported on the stage row at `worktree`,
-     which is the branch its session actually works on
-  2. the route's `branch` (`dispatch_route/2`), the name the dispatch put on the wire
+  1. the route's `branch` (`dispatch_route/2`), the name the CURRENT claim's dispatch put on
+     the wire
+  2. `stage_branch` — the `branch` effect a runner reported on the stage row, for a claim whose
+     row records no branch (written before that column). It comes second because the stage
+     row OUTLIVES a claim: a release does not clear `branch`, so after a re-claim onto a
+     machine declaring another prefix it still names the PREVIOUS claim's branch, whose head
+     is not among the current claim's checkpoints (US-45.4 review round 3, finding 1)
   3. `branch_for/2` with no prefixes, for a story nothing names a branch for: the name such a
      dispatch carried whenever its runner declared none. For one that did, the forge answers
      it as missing
@@ -291,11 +276,11 @@ defmodule Loopctl.Delivery.DispatchPayload do
           String.t() | nil
         ) ::
           {:ok, String.t()} | {:error, {:no_conforming_branch, [String.t()]}}
-  def thread_branch(_route, %Story{}, stage_branch) when is_binary(stage_branch),
-    do: {:ok, stage_branch}
-
   def thread_branch(%{branch: branch}, %Story{}, _stage_branch) when is_binary(branch),
     do: {:ok, branch}
+
+  def thread_branch(_route, %Story{}, stage_branch) when is_binary(stage_branch),
+    do: {:ok, stage_branch}
 
   def thread_branch(_route, %Story{} = story, _stage_branch), do: branch_for(story, [])
 

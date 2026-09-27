@@ -40,7 +40,8 @@ All notable changes to loopctl are documented here.
   manual step): an implement dispatch records its intake source's mode and the base branch it
   was sent with when it is first sent, and the merge gate reads both from the current claim's
   dispatch, a NULL mode meaning `pr` and a NULL base branch meaning the source's current one;
-  a claim with no accepted dispatch at all takes the source's current mode and base branch.
+  a claim with no accepted dispatch at all is judged as a pull request against the source's
+  current base branch, so flipping a source to thread never re-routes a session's own PR.
   Changing a source's mode or base branch is therefore always allowed and affects only stories
   placed afterwards.
   For a thread-mode repository the

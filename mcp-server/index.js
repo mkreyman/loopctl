@@ -8167,7 +8167,9 @@ const TOOLS = [
       "would find the first's work there: keep your prefix and append the suffix the error " +
       "names, or omit `branch`. 422 `branch_conflict` means a retry named a different branch " +
       "from the one this dispatch was already sent on — the branch is recorded at the first " +
-      "push and re-sent verbatim, because a session may be running on it right now. Neither " +
+      "push and re-sent verbatim, because a session may be running on it right now; 422 " +
+      "`base_branch_conflict` is the same for a different `base_branch`, which the merge gate " +
+      "judges against. Neither " +
       "prefix refusal can be raised by a RETRY carrying a dispatch_id loopctl already " +
       "holds: its claim is already standing, so a declaration that changed under you only " +
       "steers the name and never strands the story.\n\n" +
@@ -8397,8 +8399,8 @@ const TOOLS = [
       "When it is NOT live (reported, review requested, lease expired) nobody can record " +
       "the fix, so it is a refusal naming `claim_not_live`, and the story escalates. A " +
       "repository the token cannot read refuses `pull_request_unavailable`. The answer " +
-      "carries `mode` (the one bound at placement, or the source's current mode when the " +
-      "claim has no accepted dispatch; null only when the ledger read met contention), " +
+      "carries `mode` (the one bound at placement, or `pr` when the claim has no accepted " +
+      "dispatch, whatever the source says now; null only when the ledger read met contention), " +
       "`checkpoint_id`, `checkpoint_sha` and `base_sha`. The diff judged is the three-dot " +
       "diff against the merge base, so a base that moved on is not a refusal, and a " +
       "checkpoint the base already contains (its branch deleted or not) is " +

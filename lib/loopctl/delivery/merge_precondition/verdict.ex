@@ -31,10 +31,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     unevaluated verdict is a rate limit, so an unbounded retry would amplify the very
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
-    A verdict is only ever about the diff at THIS head
-  - `base_sha` — THREAD mode: the MERGE BASE the judged diff is relative to. A thread-mode
-    allow records it, and the merge executor (US-45.5) merges only while the base head still
-    equals it, taking the base-update path otherwise
+    A verdict is only ever about the diff at THIS head. In THREAD mode `merge_base_sha` is
+    what a thread-mode allow records as `base_sha`, and the merge executor (US-45.5) merges
+    only while the base head still equals it, taking the base-update path otherwise
   - `mode` — `:pr` or `:thread`: the mode BOUND on the claim's implement dispatch at
     placement (US-45.4), not the intake source's current mode. nil when the route could not
     be read (the verdict is then `:unevaluated`)
@@ -70,7 +69,6 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :pr_number,
     :head_sha,
     :merge_base_sha,
-    :base_sha,
     :merge_sha,
     :diffstat,
     :gate_a,
@@ -95,7 +93,6 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           pr_number: pos_integer() | nil,
           head_sha: String.t() | nil,
           merge_base_sha: String.t() | nil,
-          base_sha: String.t() | nil,
           merge_sha: String.t() | nil,
           diffstat: %{files: non_neg_integer(), changed_lines: non_neg_integer()} | nil,
           gate_a: GateA.Result.t() | nil,

@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.4.1",
-      "description": "An intake source carries a mode, pr or thread, defaulting to pr, settable through the intake_source_enroll and intake_source_update MCP tools. The mode is bound per implement dispatch at placement: the dispatch's ledger row records the source's mode, and the base branch it was sent with, when it is first sent, and the merge gate reads both from the story's current claim's dispatch, with a legacy row read as pr and its base branch falling back to the source's current one, and a claim with no accepted implement dispatch taking the source's current mode and base branch. A mode or base-branch change is always allowed and affects only later placements, so existing stories behave exactly as before."
+      "description": "An intake source carries a mode, pr or thread, defaulting to pr, settable through the intake_source_enroll and intake_source_update MCP tools. The mode is bound per implement dispatch at placement: the dispatch's ledger row records the source's mode, and the base branch it was sent with, when it is first sent, and the merge gate reads both from the story's current claim's dispatch, with a legacy row read as pr and its base branch falling back to the source's current one, and a claim with no accepted implement dispatch judged as pr against the source's current base branch. A mode or base-branch change is always allowed and affects only later placements, so existing stories behave exactly as before."
     },
     {
       "id": "AC-45.4.2",

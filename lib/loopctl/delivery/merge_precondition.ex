@@ -52,7 +52,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   A story whose CURRENT claim was placed in `thread` mode (Epic 45) has no pull request. The
   mode is the one its implement dispatch RECORDED at placement
   (`Loopctl.Runners.DispatchLedger.record_sent/3`), read with the branch from the same ledger
-  row (`Loopctl.Delivery.DispatchPayload.dispatch_route/3`), never the intake source's mode
+  row (`Loopctl.Delivery.DispatchPayload.dispatch_route/2`), never the intake source's mode
   now: changing a source decides only what LATER placements get, so a story is always judged
   on the route it was built for. Its facts come from the latest checkpoint that claim
   recorded (`Loopctl.Threads.claim_checkpoints/2`), through
@@ -98,9 +98,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   The BASE BRANCH is the one the claim was placed on, pinned on the same ledger row as the
   mode; a row that records none (written before the column existed) falls back to the
-  source's current base branch. A claim with NO accepted implement row falls back to the
-  source's current MODE the same way, so a thread-source story with no route is judged as a
-  thread and told what is missing, never judged as a pull request it never had. The branch
+  source's current base branch. A claim with NO accepted implement row is judged as a pull
+  request whatever the source's current mode: no runner was placed on it, so no checkpoint can
+  exist for it, and a source flipped to `thread` must not re-route it. The branch
   itself (`DispatchPayload.thread_branch/3`) is resolved for a thread only: a pull request
   names its own head.
 
@@ -737,7 +737,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
       verdict
       | head_sha: Map.get(pr, :head_sha),
         merge_base_sha: Map.get(pr, :merge_base_sha),
-        base_sha: Map.get(pr, :base_sha),
         diffstat: Map.get(pr, :diffstat)
     }
 
@@ -1131,6 +1130,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # The MODE and the BASE BRANCH are the ones this claim's implement dispatch was PLACED
     # under (US-45.4), never the source's now: a source changed after placement decides only
     # what later placements get. Read from the same ledger row as the dispatched branch.
+    # A pr-mode evaluation pays this read too, and cannot skip it: the ROW is what says the
+    # story is pr, and the source's current mode cannot stand in for it (a story placed as a
+    # thread under a source since flipped back to pr must still be judged as a thread). Its
+    # lock wait is bounded and contention answers `:unevaluated`, which the loop retries.
     {mode, {pr_number, checkpoint, pull_request}} =
       case DispatchPayload.dispatch_route(story.tenant_id, story) do
         {:ok, route} ->
@@ -1241,13 +1244,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
   end
 
   # The mode the claim was PLACED under (`DispatchPayload.dispatch_route/2`). A claim with NO
-  # accepted implement row falls back to the source's CURRENT mode, as the base branch does, so
-  # a thread-source story nobody has placed yet is told `no_checkpoint_recorded` rather than
-  # being judged as a pull request it never had. No source at all is `:pr`, whose input
-  # reasons refuse the missing repository.
+  # accepted implement row is `:pr`, NEVER the source's current mode (US-45.4 review round 3,
+  # finding 2). Such a claim was not placed on a runner: a session claimed the story itself and
+  # calls this gate for the pull request it opened. Reading the source's mode there would let
+  # an operator flipping a source to `thread` re-route every such in-flight story onto a path
+  # it cannot satisfy, which is the "a change affects only later placements" promise broken.
+  # Nothing is lost by it: a checkpoint can only be recorded under an accepted implement row
+  # (`Loopctl.Delivery.RunnerThreads`), so a claim with no row has no thread to judge.
   defp placed_mode(%{mode: mode}, _source) when mode in [:pr, :thread], do: mode
-  defp placed_mode(_route, {:ok, source}), do: source.mode
-  defp placed_mode(_route, _no_source), do: :pr
+  defp placed_mode(_route, _source), do: :pr
 
   # The base branch the claim was PLACED on (`dispatch_route/2`), so repointing the source
   # afterwards cannot move the base a placed story is judged against. A ledger row written
@@ -1385,7 +1390,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
          event_data: %{
            "checkpoint_id" => id,
            "checkpoint_sha" => verdict.checkpoint_sha,
-           "base_sha" => verdict.base_sha
+           "base_sha" => verdict.merge_base_sha
          }
        ]
 

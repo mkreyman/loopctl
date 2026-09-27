@@ -11,16 +11,17 @@ defmodule Loopctl.Delivery.CheckpointSource do
     forge has no such branch: a 404 on the ref in a repository the token CAN read
     (`repository_readable/1`). A 404 because the repository itself cannot be read is a
     token or permission fault, an error a human fixes, never `:missing`. The branch is the
-    one the story was DISPATCHED on (`Loopctl.Delivery.DispatchPayload.dispatch_route/3`),
+    one the story was DISPATCHED on (`Loopctl.Delivery.DispatchPayload.dispatch_route/2`),
     never a name derived here
   - `:head_tree_sha` — the checkpoint commit's tree AS THE FORGE READS IT. The recorded
     `tree_sha` is the claimant's report; a disagreement is refused rather than believed
   - `:base_tree_sha` — the base branch's tree now. Equal to the checkpoint's, the change is
     `empty_change`: there is nothing to merge, and that is never read as merged
-  - `:base_sha` — the comparison's MERGE BASE: the base commit the judged three-dot diff is
-    relative to. An allow records it, and the merge executor (US-45.5) merges only while the
-    base head still equals it, taking the base-update path otherwise. The gate itself judges
-    the diff against that merge base, so a base that moved on is not a reason here
+  - `:merge_base_sha` — the comparison's MERGE BASE: the base commit the judged three-dot
+    diff is relative to. A thread-mode allow records it as `base_sha`, and the merge executor
+    (US-45.5) merges only while the base head still equals it, taking the base-update path
+    otherwise. The gate itself judges the diff against that merge base, so a base that moved
+    on is not a reason here
 
   ## The branch is read FIRST
 
@@ -81,8 +82,9 @@ defmodule Loopctl.Delivery.CheckpointSource do
 
   @doc """
   The facts of `checkpoint`, in `PullRequestSource.pull_request/0`'s shape plus the thread
-  facts listed in the moduledoc. `base_branch` is the intake source's; `branch` is the one
-  the story was dispatched on.
+  facts listed in the moduledoc. `base_branch` is the one the claim was PLACED on, pinned on
+  its implement ledger row (the source's current one only for a row that pinned none);
+  `branch` is the one the current claim's dispatch named.
   """
   @spec pull_request(String.t(), String.t(), String.t(), Checkpoint.t()) ::
           {:ok, map()} | {:error, term()}
@@ -148,7 +150,6 @@ defmodule Loopctl.Delivery.CheckpointSource do
        diffstat: comparison.diffstat,
        diff: comparison.diff,
        head_tree_sha: commit.tree_sha,
-       base_sha: comparison.merge_base_sha,
        base_tree_sha: comparison.base_tree_sha
      })}
   end

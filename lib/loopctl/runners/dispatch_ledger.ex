@@ -837,14 +837,30 @@ defmodule Loopctl.Runners.DispatchLedger do
   @spec implement_kind?(String.t() | nil) :: boolean()
   def implement_kind?(kind), do: is_nil(kind) or kind in @implement_kinds
 
+  # A dispatch whose session RAN is one its runner ACCEPTED. A `sent` row may never have
+  # reached a machine and a `refused` one never ran, so neither names a route anything was
+  # built on. `superseded` is not read either: a row is superseded only by a LATER claim's
+  # dispatch, so no row of the current claim can be.
+  @route_statuses ["accepted"]
+
   @doc """
-  `implement_kind?/1` as a query filter over `Loopctl.Runners.DispatchRecord` rows: the same
-  rule, from the same `@implement_kinds`, for a reader that must not fetch every row to apply
-  it (`Loopctl.Delivery.DispatchPayload.dispatch_route/3`).
+  The query for the ROUTE `story`'s current claim was dispatched on (US-45.4): the newest
+  implement row of the story's CURRENT `claim_epoch` that its runner ACCEPTED, selecting the
+  `mode`, `branch` and `base_branch` recorded at the first push. The ledger's rules for "the
+  current claim's accepted implement row" live here, with the other readers of this table;
+  `Loopctl.Delivery.DispatchPayload.dispatch_route/2` runs it under a bounded lock wait.
   """
-  @spec where_implement_kind(Ecto.Queryable.t()) :: Ecto.Query.t()
-  def where_implement_kind(query),
-    do: where(query, [r], is_nil(r.kind) or r.kind in ^@implement_kinds)
+  @spec claim_route_query(Ecto.UUID.t(), Story.t()) :: Ecto.Query.t()
+  def claim_route_query(tenant_id, %Story{} = story) do
+    from(r in DispatchRecord,
+      where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
+      where: r.claim_epoch == ^story.claim_epoch and r.status in ^@route_statuses,
+      where: is_nil(r.kind) or r.kind in ^@implement_kinds,
+      order_by: [desc: r.inserted_at],
+      limit: 1,
+      select: %{mode: r.mode, branch: r.branch, base_branch: r.base_branch}
+    )
+  end
 
   defp session_of(%DispatchRecord{} = record) do
     %{

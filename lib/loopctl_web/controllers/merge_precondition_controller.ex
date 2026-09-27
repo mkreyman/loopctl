@@ -120,7 +120,7 @@ defmodule LoopctlWeb.MergePreconditionController do
               "The mode BOUND on the claim's implement dispatch at placement, not the intake " <>
                 "source's current mode. `thread` judges the latest RECORDED checkpoint " <>
                 "instead of a pull request, so `pr_number` is null. A claim with no accepted " <>
-                "implement dispatch takes the source's current mode. null only when the " <>
+                "implement dispatch is `pr`, whatever the source says now. null only when the " <>
                 "dispatch ledger could not be read for contention, which is an `unevaluated` " <>
                 "verdict."
           },
@@ -243,8 +243,8 @@ defmodule LoopctlWeb.MergePreconditionController do
         "the gate judges the latest checkpoint the story's CURRENT claim recorded, on the " <>
         "branch that claim's dispatch ran on and against the base branch it was placed on " <>
         "(both pinned in the dispatch ledger; a row that pinned no base branch, or a claim " <>
-        "with no accepted dispatch, falls back to the source's current one — mode " <>
-        "included), and `pr_number` " <>
+        "with no accepted dispatch, falls back to the source's current base branch, and a " <>
+        "claim with no accepted dispatch is judged as a pull request), and `pr_number` " <>
         "is null. Its runners must be at runner contract 1.20.0 or later and send " <>
         "`checkpoint` messages, or every story is refused `no_checkpoint_recorded`. A story " <>
         "whose current claim recorded none while an earlier claim did (it was released) is " <>
@@ -445,7 +445,7 @@ defmodule LoopctlWeb.MergePreconditionController do
       head_sha: verdict.head_sha,
       recorded_head_sha: verdict.recorded_head_sha,
       merge_base_sha: verdict.merge_base_sha,
-      base_sha: verdict.base_sha,
+      base_sha: thread_base_sha(verdict),
       merge_sha: verdict.merge_sha,
       diffstat: verdict.diffstat,
       hard_bound: MergePrecondition.hard_bound(),
@@ -502,4 +502,9 @@ defmodule LoopctlWeb.MergePreconditionController do
       route: result.route
     }
   end
+
+  # The MERGE BASE a thread-mode verdict judged against, under the name an allow records it by.
+  # One field on the verdict (`merge_base_sha`), so the two names cannot diverge.
+  defp thread_base_sha(%{mode: :thread, merge_base_sha: sha}), do: sha
+  defp thread_base_sha(_verdict), do: nil
 end

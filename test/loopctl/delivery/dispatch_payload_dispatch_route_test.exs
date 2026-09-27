@@ -78,14 +78,17 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     assert {:ok, %{mode: :pr}} = route(ctx)
   end
 
-  test "thread branch order: the stage's reported branch, then the dispatch's, then derived",
+  test "thread branch order: the current claim's dispatch, then the stage's, then derived",
        ctx do
     {:ok, derived} = DispatchPayload.branch_for(ctx.story, [])
     assert {:ok, ^derived} = thread_branch(ctx)
+    assert {:ok, "loop/earlier-claim"} = thread_branch(ctx, "loop/earlier-claim")
 
+    # Round 3 finding 1: the stage row still names an EARLIER claim's branch after a re-claim;
+    # the current claim's dispatched branch wins over it.
     record(ctx, @t1, branch: "agent/dispatched")
     assert {:ok, "agent/dispatched"} = thread_branch(ctx)
-    assert {:ok, "agent/worked-on"} = thread_branch(ctx, "agent/worked-on")
+    assert {:ok, "agent/dispatched"} = thread_branch(ctx, "loop/earlier-claim")
   end
 
   test "the newest ACCEPTED row, of the CURRENT claim, of an implement kind", ctx do

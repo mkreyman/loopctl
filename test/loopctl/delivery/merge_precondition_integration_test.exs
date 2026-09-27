@@ -512,7 +512,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
                }
              } = allow_event_data(ctx)
 
-      assert verdict.base_sha == @base_head
+      assert verdict.merge_base_sha == @base_head
 
       assert id == ctx.checkpoint.id
     end
@@ -606,18 +606,21 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
     end
 
-    test "the branch the runner reported at worktree wins over the dispatch's", ctx do
-      set_dispatch(ctx, branch: "agent/dispatched")
-      worked = "agent/worked-on"
+    # Round 3 finding 1: the stage row's `branch` survives a release, so after a re-claim onto
+    # a machine declaring another prefix it names the EARLIER claim's branch. The current
+    # claim's dispatched branch is the one judged.
+    test "the current claim's dispatched branch wins over the stage row's earlier one", ctx do
+      dispatched = "agent/dispatched"
+      set_dispatch(ctx, branch: dispatched)
 
       {:ok, {1, _}} =
         Repo.with_tenant(ctx.tenant_id, fn ->
           from(r in StoryStage, where: r.story_id == ^ctx.story_id)
-          |> Repo.update_all(set: [branch: worked])
+          |> Repo.update_all(set: [branch: "loop/earlier-claim"])
         end)
 
       stub_thread(ctx)
-      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^worked -> {:ok, @head} end)
+      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^dispatched -> {:ok, @head} end)
 
       assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
     end
@@ -667,7 +670,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       # merge executor's (US-45.5, AC-45.5.8), so the allow records THAT merge base.
       stub_thread(ctx, merge_base: @base)
 
-      assert {:ok, %Verdict{decision: :allow, base_sha: @base, reasons: []}} = enforce(ctx)
+      assert {:ok, %Verdict{decision: :allow, merge_base_sha: @base, reasons: []}} = enforce(ctx)
       assert %{"payload" => %{"base_sha" => @base}} = allow_event_data(ctx)
     end
 
@@ -748,7 +751,10 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:ok, %Verdict{decision: :unevaluated}} = evaluate(ctx)
     end
 
-    test "a claim with NO accepted dispatch takes the source's CURRENT mode: thread", ctx do
+    # Round 3 finding 2: a claim nobody placed (a session claimed it and opened a PR) stays a
+    # pull request when the source is flipped to thread; only LATER placements change route.
+    test "a claim with NO accepted dispatch stays a pull request after the source flips to thread",
+         ctx do
       {1, _} =
         from(s in Loopctl.Intake.Source, where: s.project_id == ^ctx.project_id)
         |> AdminRepo.update_all(set: [mode: :thread])
@@ -759,18 +765,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
           |> Repo.delete_all()
         end)
 
-      {:ok, {_n, _}} =
-        Repo.with_tenant(ctx.tenant_id, fn ->
-          from(c in Loopctl.Threads.Checkpoint, where: c.story_id == ^ctx.story_id)
-          |> Repo.delete_all()
-        end)
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
 
-      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _number ->
-        flunk("a thread-source story with no route was judged as a pull request")
-      end)
-
-      assert {:ok, %Verdict{decision: :refuse, mode: :thread, reasons: reasons}} = evaluate(ctx)
-      assert {:no_checkpoint_recorded, :none} in reasons
+      assert {:ok, %Verdict{decision: :allow, mode: :pr, pr_number: 4242}} = evaluate(ctx)
     end
 
     test "a claim with NO accepted dispatch on a pr source is judged as a pull request", ctx do
