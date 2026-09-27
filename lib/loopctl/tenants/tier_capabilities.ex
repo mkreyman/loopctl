@@ -168,6 +168,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
       # US-45.1 — a story's change thread: the checkpoints its claimant reports, fenced on the
       # claim, are the record the merge gate will read.
       "LoopctlWeb.ThreadController",
+      # US-45.3 — review on a thread: requesting a review places a runner dispatch, and the
+      # claimant's fixes are what the round-3 rule reads.
+      "LoopctlWeb.ThreadReviewController",
       # LCP-1 §9.2 — TenantController mounts RequireHumanAnchor on
       # :register_owner_key (the custody owner key is the root of trust).
       "LoopctlWeb.TenantController"

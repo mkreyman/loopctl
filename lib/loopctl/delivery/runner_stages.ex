@@ -227,15 +227,44 @@ defmodule Loopctl.Delivery.RunnerStages do
   @spec end_session(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, %{row: StoryStage.t(), replayed?: boolean()}} | {:error, end_error()}
   def end_session(tenant_id, runner_id, %{} = message, opts) do
+    with {:ok, held} <- held_dispatch(tenant_id, runner_id, message.dispatch_id),
+         do: end_held_session(tenant_id, runner_id, message, held, opts)
+  end
+
+  @doc """
+  The ledger row a `session_ended` names, read ONCE and busy-guarded: its story and its kind
+  (`Loopctl.Runners.DispatchLedger.held_dispatch/3`). The runner channel routes the report on
+  the kind and hands the same value on, so neither path reads the row again to learn it.
+  """
+  @spec held_dispatch(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, %{story_id: Ecto.UUID.t(), kind: String.t() | nil}}
+          | {:error, :unknown_dispatch | :busy}
+  def held_dispatch(tenant_id, runner_id, dispatch_id) do
+    Stages.answering_busy(tenant_id, [:loopctl, :delivery, :stage_busy], "session end read", fn ->
+      DispatchLedger.held_dispatch(tenant_id, runner_id, dispatch_id)
+    end)
+  end
+
+  @doc """
+  `end_session/4` for a row `held_dispatch/3` already read. Only an IMPLEMENT session ends a
+  story's session here: `DispatchLedger.record_session_end/4` refuses any other kind
+  `:unknown_dispatch` under the row lock.
+  """
+  @spec end_held_session(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          map(),
+          %{story_id: Ecto.UUID.t(), kind: String.t() | nil},
+          keyword()
+        ) :: {:ok, %{row: StoryStage.t(), replayed?: boolean()}} | {:error, end_error()}
+  def end_held_session(tenant_id, runner_id, %{} = message, %{story_id: story_id}, opts) do
     actor_id = Keyword.fetch!(opts, :actor_id)
 
     # The stage row is read TWICE: up front only to refuse a story with none before anything
     # is recorded, and once AFTER the action, always, because that is the only read that sees
     # what the action, or any writer between the two reads, left: a row carried from before
     # the record answered a `completed` or an already-ended claim with where the story WAS.
-    with {:ok, story_id} <-
-           DispatchLedger.held_story(tenant_id, runner_id, message.dispatch_id),
-         {:ok, before} <- stage_row(tenant_id, story_id),
+    with {:ok, before} <- stage_row(tenant_id, story_id),
          {:ok, {outcome, session}} <-
            DispatchLedger.record_session_end(
              tenant_id,

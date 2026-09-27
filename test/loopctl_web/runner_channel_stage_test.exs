@@ -572,13 +572,16 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       assert_reply ref, :ok, %{replayed: true, stage: "implementing"}, @reply_timeout
     end
 
-    test "the channel hands its runner's OWN key to end_session, for the release's audit", ctx do
+    test "the channel hands its runner's OWN key to end_held_session, for the release's audit",
+         ctx do
       # The release a report causes is attributed to the runner's `api_key_id`, and the channel
       # is the one place that holds it (`socket.assigns.runner`). A release cannot be observed
       # from here — the ledger's lock on the sandbox connection would hold `AdminRepo`'s — so
       # the CALL is observed instead, traced on the channel process alone.
       %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
-      mfa = {RunnerStages, :end_session, 4}
+      # `end_held_session/5`: the channel reads the row once (`held_dispatch/3`) and routes on
+      # its kind, so this is the call an implement session's report reaches.
+      mfa = {RunnerStages, :end_held_session, 5}
       {:module, _} = Code.ensure_loaded(RunnerStages)
 
       :erlang.trace(channel.channel_pid, true, [:call, {:tracer, self()}])
@@ -592,7 +595,9 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
         :erlang.trace_pattern(mfa, false, [:local])
       end
 
-      assert_received {:trace, _pid, :call, {RunnerStages, :end_session, [_, _, _, opts]}}
+      assert_received {:trace, _pid, :call,
+                       {RunnerStages, :end_held_session, [_, _, _, _held, opts]}}
+
       assert Keyword.fetch!(opts, :actor_id) == runner.api_key_id
       refute is_nil(runner.api_key_id)
     end

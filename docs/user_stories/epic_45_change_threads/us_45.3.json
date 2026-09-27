@@ -12,11 +12,11 @@
     "i_want_to": "place a review as its own dispatch that reads the thread and records findings against a checkpoint",
     "so_that": "review rounds carry each fix's reasoning, and the round ceiling is enforced from data rather than a per-machine plugin"
   },
-  "rationale": "PRD \u00a76: round 2 mostly finds defects round 1's fixes introduced; the reviewer lacked the reasoning.",
+  "rationale": "PRD §6: round 2 mostly finds defects round 1's fixes introduced; the reviewer lacked the reasoning.",
   "acceptance_criteria": [
     {
       "id": "AC-45.3.1",
-      "description": "A review dispatch kind exists; loopctl places it as a sibling of the implementer's dispatch under the orchestrator's root, never on the implementer's chain and never for a principal that recorded a checkpoint of the thread."
+      "description": "A review dispatch kind exists; loopctl places it on a runner through Loopctl.Delivery.Placement exactly as it places an implement dispatch, on the story's latest checkpoint of the current claim, and never for a runner whose agent is the claimant, recorded a checkpoint of the thread, or holds a dispatch on the implementer's lineage chain in either direction."
     },
     {
       "id": "AC-45.3.2",
@@ -24,7 +24,7 @@
     },
     {
       "id": "AC-45.3.3",
-      "description": "finding and verdict entries are accepted only from the key a placed review dispatch minted, bound to that dispatch and to the checkpoint it reviews; each review dispatch writes exactly one verdict, and a completed round is that verdict. A dispatch that ends without one uses no round."
+      "description": "finding and verdict entries are accepted only over the runner socket, from the runner a review dispatch was placed on, bound to that runner's accepted review-kind ledger row and to the checkpoint it reviews; no API key is minted for or returned to anyone. Each review dispatch writes exactly one verdict, and a completed round is that verdict. A dispatch that ends without one uses no round."
     },
     {
       "id": "AC-45.3.4",
@@ -58,7 +58,7 @@
       "type": "integration",
       "preconditions": [],
       "steps": [
-        "finding from the implementer, from a released implementer, from a user key, from the review dispatch"
+        "a finding over HTTP; from a runner whose agent is the claimant; from a runner that holds no accepted review dispatch; from the runner the review was placed on"
       ],
       "expected_results": [
         "refused, refused, refused, accepted"
@@ -132,7 +132,14 @@
   "technical_notes": [
     "The round count and the ceiling are computed from thread_entries alone, one verdict per review dispatch.",
     "Material means severity critical, high or medium.",
-    "The fix rules and the lessons of #901's three review rounds carry over: canonical UUIDs, lease-only liveness, ordering by checkpoint seq, and no key-inferred judge."
+    "The fix rules and the lessons of #901's three review rounds carry over: canonical UUIDs, lease-only liveness, ordering by checkpoint seq, and no key-inferred judge.",
+    "Design (rewrite of #905 after its round-3 review, replacing #901's approach): a review is a RUNNER dispatch of kind review, placed by Placement.place_review. Judgements arrive as the runner-socket messages review_finding and review_verdict (runner contract 1.21.0), attributed to the runner's accepted review-kind DispatchLedger row. No credential is minted for or returned to a caller, which removes the minted-key surface #901 and #905 kept having to defend.",
+    "HTTP keeps POST /stories/:id/thread/reviews (orchestrator+, human-anchored) to request a placement, GET .../reviews/:review_id to read the payload, and POST .../fixes for the claimant. MCP: thread_request_review, thread_review_get, thread_fix.",
+    "Separation is decided at placement AND again under the thread lock on every judgement, through one entry point (Threads.record_judgement/5). The review checkpoint is the story's latest under the current claim epoch; callers never choose it. Judgement writes honour the custody halt.",
+    "The review_ceiling escalation is durable: the verdict records an escalation entry in its own transaction and enqueues one ReviewCeilingWorker job for the story; the worker's minute sweep reconciles until the stage has moved or the claim epoch has. A resent verdict answers the recorded escalation and re-runs the idempotent slot release and enqueue.",
+    "Rounds belong to a CLAIM: every count is of reviews placed under the story's current claim_epoch, so a story claimed again starts at round 1. A review whose claim ended (new epoch, or no claimant after a force-unclaim) is refused review_claim_ended, finally. Only fixes the thread recorded by the time round 2 was placed (thread_reviews.placed_at_seq) count toward round 3.",
+    "Placement asks every push pre-check first (one socket, the machine taking work, review declared, repo, subscription, a free slot), then records the review and its chain entry, then pushes. Recording after the push would let a first finding race its row into a permanent unknown_dispatch; the residual race leaves an inert, unpushed row that a retry of the same dispatch_id pushes.",
+    "A review session's session_ended frees its slot and does nothing else: no stage effect, no retry-ceiling count; its ack is kind and replayed only."
   ],
   "dependencies": [
     "US-45.1",

@@ -167,6 +167,7 @@ defmodule Loopctl.Delivery.Placement do
 
   require Logger
 
+  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
@@ -179,9 +180,13 @@ defmodule Loopctl.Delivery.Placement do
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
+  alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Tenants
+  alias Loopctl.Threads
+  alias Loopctl.Threads.Checkpoint
+  alias Loopctl.Threads.Review
   alias Loopctl.WorkBreakdown.Stories
   alias Loopctl.WorkBreakdown.Story
 
@@ -370,11 +375,299 @@ defmodule Loopctl.Delivery.Placement do
          :ok <- not_halted(tenant_id),
          :ok <- Tenants.require_human_anchor(tenant_id),
          :ok <- may_mint_session_dispatch(caller.lineage, caller.role) do
+      # A resume re-pushes an IMPLEMENT session and moves its claim's cap. An id the ledger
+      # holds for any other kind (a review carries the implementer's story and epoch) is not
+      # this placement's to resume.
       case DispatchLedger.get_record(tenant_id, dispatch_id) do
         nil -> claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts)
-        record -> resume(tenant_id, runner_id, dispatch, record, opts)
+        record -> resume_implement(tenant_id, runner_id, dispatch, record, opts)
       end
     end
+  end
+
+  @doc """
+  Places a REVIEW of `story_id`'s change thread on `runner_id` (US-45.3): a runner dispatch of
+  kind `review`, pushed exactly as an implement dispatch is, through `Runners.dispatch/3` and
+  the ledger. It CLAIMS NOTHING and MINTS NOTHING: the story stays with its implementer, and no
+  API key exists for the review — its findings and verdict come back over the runner socket
+  from the runner that holds this dispatch (`Loopctl.Delivery.RunnerReviews`).
+
+  ## Order: the push is judged, then the review is recorded, then it is pushed
+
+  Everything that can refuse the push BEFORE it is attempted is asked first, of the same live
+  meta the push will reach: one socket, the machine taking work, the `review` kind declared,
+  the repo, the subscription, and a free slot (`review_push_ready/4`). Only then is the review
+  recorded with its chain entry (`Loopctl.Threads.record_review/3`, which decides the round,
+  the checkpoint and the reviewer's separation under the thread lock), and then pushed.
+
+  Recording AFTER the push was the other choice and is worse: the push is a broadcast the
+  runner may act on at once, and a finding arriving before its review row exists is
+  `unknown_dispatch`, which the contract publishes as permanent — the review would be lost
+  with the session still running. So the row is written first, and what is left between the
+  pre-checks and the push is a race (the socket drops, the last slot goes, a lock is not
+  granted). A review that loses it is recorded and was never pushed: it is INERT — every
+  judgement is first resolved from the runner's ledger row, and there is none — it uses no
+  round, since a round is a verdict, and a retry with the same `dispatch_id` finds the row and
+  pushes it. Its `thread_review_placed` chain entry records the placement DECISION, which was
+  made; the ledger row is the record of the push.
+
+  ## Options
+
+  - `:api_key` (required) — the key the request authenticated with; orchestrator or higher.
+  - `:dispatch_id` — the ledger id to push under. Generated when absent. A repeat with the same
+    id on the same story and runner is answered from the recorded review, with no pre-checks,
+    no second chain entry and no second push — unless the push never reached the ledger, when
+    it is pushed now. So a lost response is retried with it. The id on another story, or
+    another runner, is `dispatch_id_conflict`.
+  - `:wall_clock_seconds`, `:max_turns` — the session's budget; `REVIEW_WALL_CLOCK_SECONDS` and
+    `REVIEW_MAX_TURNS` when absent.
+  - `:repo`, `:base_branch` — for a story whose project is bound to no intake source, as on
+    `place/4`; the intake source's otherwise.
+  - `:actor_label` — recorded as the review's `placed_by`.
+
+  ## Refusals
+
+  The claim path's runner refusals (`:runner_not_provisioned`, `:runner_declines_work`,
+  `:runner_exhausted`, `:not_authorized`), `:tenant_halted`, `:custody_tier_required`,
+  `:insufficient_role`, `Loopctl.Threads.record_review/3`'s (`no_checkpoint`,
+  `review_ceiling_reached`, `reviewer_not_separate`, `implementer_dispatch_required`,
+  `dispatch_id_conflict`), and everything `Runners.dispatch/3` refuses.
+  """
+  @spec place_review(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, %{review: Review.t(), dispatch_id: Ecto.UUID.t()}} | {:error, term()}
+  def place_review(tenant_id, runner_id, story_id, opts)
+      when is_binary(tenant_id) and is_binary(runner_id) and is_binary(story_id) do
+    with {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
+         :ok <- review_placer(caller.role),
+         {:ok, dispatch_id} <- review_dispatch_id(Keyword.get(opts, :dispatch_id)),
+         :ok <- not_halted(tenant_id),
+         :ok <- Tenants.require_human_anchor(tenant_id) do
+      case Threads.review_by_dispatch(tenant_id, dispatch_id) do
+        nil ->
+          place_new_review(tenant_id, runner_id, story_id, dispatch_id, opts)
+
+        %Review{story_id: ^story_id, runner_id: ^runner_id} = review ->
+          answer_recorded(tenant_id, runner_id, review, push_unsent: true, opts: opts)
+
+        %Review{} ->
+          {:error,
+           {:conflict, "dispatch_id_conflict", "dispatch_id names another story's review"}}
+      end
+    end
+  end
+
+  defp place_new_review(tenant_id, runner_id, story_id, dispatch_id, opts) do
+    meta = sole_live_meta(tenant_id, runner_id)
+
+    with :ok <- runner_accepting_work(meta),
+         :ok <- runner_not_exhausted(tenant_id, runner_id),
+         {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
+         {:ok, dispatch} <- fill_review(tenant_id, dispatch_id, story_id, meta, opts),
+         :ok <- review_push_ready(tenant_id, runner_id, meta, dispatch),
+         {:ok, story} <- review_story(tenant_id, story_id),
+         {:ok, story_object} <- ImplementerInput.story_object(story),
+         :ok <- review_payload_valid(dispatch, story_object, story.claim_epoch),
+         {:ok, review, status} <-
+           Threads.record_review(tenant_id, story_id,
+             dispatch_id: dispatch_id,
+             runner_id: runner_id,
+             agent_id: agent_id,
+             placed_by: Keyword.get(opts, :actor_label, "api:review_placement")
+           ) do
+      push_recorded(tenant_id, runner_id, dispatch, story_object, review, status)
+    end
+  end
+
+  # `:created` is this call's placement, and it pushes. `:existing` is a concurrent placement
+  # of the same `dispatch_id` that recorded the row between this call's look-up and its write:
+  # that call owns the push, so this one answers from the row by the retry rules and NEVER
+  # pushes — pushing too would put the same dispatch on the wire twice.
+  defp push_recorded(tenant_id, runner_id, dispatch, story_object, review, :created) do
+    payload = review_payload(tenant_id, dispatch, story_object, review)
+
+    with :ok <- Runners.dispatch(tenant_id, runner_id, payload),
+         do: {:ok, %{review: review, dispatch_id: review.dispatch_id}}
+  end
+
+  defp push_recorded(tenant_id, runner_id, _dispatch, _story_object, review, :existing),
+    do: answer_recorded(tenant_id, runner_id, review, push_unsent: false)
+
+  # THE PAYLOAD IS JUDGED BEFORE ANYTHING IS WRITTEN. The push casts it
+  # (`RunnerContract.cast_dispatch/1`), but by then the review row and its chain entry exist,
+  # so a budget over the contract's maximum left a recorded review nothing was ever sent for.
+  # The same cast runs here on the payload as it will be sent, with the `review` object's
+  # values standing in shape for shape: every one of them is loopctl's own id, round or sha,
+  # and the cast is what the caller's fields have to pass.
+  defp review_payload_valid(dispatch, story_object, claim_epoch) do
+    probe =
+      dispatch
+      |> Map.put("claim_epoch", claim_epoch)
+      |> Map.put("story", story_object)
+      |> Map.put("review", %{
+        "review_id" => Ecto.UUID.generate(),
+        "round" => 1,
+        "checkpoint_id" => Ecto.UUID.generate(),
+        "checkpoint_seq" => 1,
+        "commit_sha" => String.duplicate("0", 40),
+        "tree_sha" => String.duplicate("0", 40)
+      })
+
+    with {:ok, _cast} <- RunnerContract.cast_dispatch(probe), do: :ok
+  end
+
+  @doc false
+  # A PLACEMENT ALREADY RECORDED, answered from its row — a caller's retry after a lost
+  # response (`push_unsent: true`), or the loser of a concurrent placement of the same
+  # `dispatch_id` (`push_unsent: false`). None of the pre-checks: a review whose push went out
+  # holds its own slot, and a runner that already replied would refuse it again, so asking them
+  # would refuse the very retry the id exists for. No chain entry is written. What the answer
+  # is depends on the LEDGER row:
+  #
+  #   * sent (in flight) or accepted — the review, as recorded;
+  #   * refused, or superseded before it was accepted — `review_dispatch_refused`: that push
+  #     will never run, and its id cannot be sent again, so the caller places a NEW review
+  #     with a new `dispatch_id`;
+  #   * none — the push never reached the ledger. A retry pushes it now, through
+  #     `Runners.dispatch/3`, which judges that push itself; the loser of a race does not, the
+  #     winner is pushing it.
+  #
+  # Public only so `test/loopctl/delivery/review_placement_test.exs` can hold the loser's
+  # branch, which only a race reaches, to these rules; `place_review/4` is the caller.
+  @spec answer_recorded(Ecto.UUID.t(), Ecto.UUID.t(), Review.t(), keyword()) ::
+          {:ok, %{review: Review.t(), dispatch_id: Ecto.UUID.t()}} | {:error, term()}
+  def answer_recorded(tenant_id, runner_id, review, opts) do
+    answer = {:ok, %{review: review, dispatch_id: review.dispatch_id}}
+
+    case DispatchLedger.get_record(tenant_id, review.dispatch_id) do
+      nil ->
+        if Keyword.fetch!(opts, :push_unsent),
+          do: push_unsent(tenant_id, runner_id, review, Keyword.get(opts, :opts, []), answer),
+          else: answer
+
+      %{status: status} when status in ["sent", "accepted"] ->
+        answer
+
+      %{status: status} ->
+        {:error,
+         {:conflict, "review_dispatch_refused",
+          "this review's dispatch was #{status} by the runner and will never run; place a " <>
+            "new review with a new dispatch_id"}}
+    end
+  end
+
+  defp push_unsent(tenant_id, runner_id, review, opts, answer) do
+    meta = sole_live_meta(tenant_id, runner_id)
+
+    with {:ok, dispatch} <-
+           fill_review(tenant_id, review.dispatch_id, review.story_id, meta, opts),
+         {:ok, story_object} <- review_story_object(tenant_id, review.story_id),
+         payload = review_payload(tenant_id, dispatch, story_object, review),
+         :ok <- Runners.dispatch(tenant_id, runner_id, payload),
+         do: answer
+  end
+
+  defp fill_review(tenant_id, dispatch_id, story_id, meta, opts) do
+    DispatchPayload.fill(tenant_id, review_dispatch(dispatch_id, story_id, opts),
+      branch_prefixes: declared_branch_prefixes(meta)
+    )
+  end
+
+  defp review_story_object(tenant_id, story_id) do
+    with {:ok, story} <- review_story(tenant_id, story_id),
+         do: ImplementerInput.story_object(story)
+  end
+
+  # What `Runners.dispatch/3` would refuse, asked before the review is recorded (see "Order" in
+  # `place_review/4`). The socket question has the same answers `dispatch/3` gives; the kind,
+  # draining and repo questions are `Runners.accepts?/5`, the one copy of that rule; the slot
+  # is read, not taken — `record_sent/3` takes it at the push.
+  defp review_push_ready(tenant_id, runner_id, nil, _dispatch) do
+    case Runners.live_metas(tenant_id, runner_id) do
+      [] -> {:error, :runner_not_connected}
+      _ambiguous -> {:error, :runner_ambiguous}
+    end
+  end
+
+  defp review_push_ready(tenant_id, runner_id, meta, dispatch) do
+    with :ok <- review_accepted(tenant_id, runner_id, meta, Map.get(dispatch, "repo")) do
+      review_slot_free(tenant_id, runner_id)
+    end
+  end
+
+  defp review_accepted(tenant_id, runner_id, meta, repo) when is_binary(repo) do
+    case Runners.accepts?(tenant_id, runner_id, meta, "review", repo) do
+      {:error, :runner_draining} -> {:error, :runner_declines_work}
+      other -> other
+    end
+  end
+
+  defp review_accepted(_tenant_id, _runner_id, _meta, _no_repo),
+    do: {:error, :repo_not_allowed}
+
+  # The one runner's own row, not the tenant's capacity map.
+  defp review_slot_free(tenant_id, runner_id) do
+    case Runners.get_runner(tenant_id, runner_id) do
+      {:ok, %{revoked_at: nil, in_flight: in_flight, max_sessions: max}} when in_flight < max ->
+        :ok
+
+      {:ok, %{revoked_at: nil}} ->
+        {:error, :runner_at_capacity}
+
+      _revoked_or_gone ->
+        {:error, :not_authorized}
+    end
+  end
+
+  # Placing a review claims nothing and hands no credential out, so the only role question is
+  # whether the caller may drive the loop at all: an orchestrator, or a person above one.
+  defp review_placer(role) do
+    if Role.role_at_least?(role, :orchestrator), do: :ok, else: {:error, :insufficient_role}
+  end
+
+  # On the RLS repo, where the thread and its fence are read.
+  defp review_story(tenant_id, story_id) do
+    {:ok, story} = Repo.with_tenant(tenant_id, fn -> Threads.story(tenant_id, story_id) end)
+    if story, do: {:ok, story}, else: {:error, :story_not_found}
+  end
+
+  defp review_dispatch_id(nil), do: {:ok, Ecto.UUID.generate()}
+
+  defp review_dispatch_id(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, id} -> {:ok, id}
+      :error -> {:error, {:invalid, ["dispatch_id must be a UUID"]}}
+    end
+  end
+
+  defp review_dispatch(dispatch_id, story_id, opts) do
+    %{"dispatch_id" => dispatch_id, "story_id" => story_id, "kind" => "review"}
+    |> put_opt("wall_clock_seconds", Keyword.get(opts, :wall_clock_seconds))
+    |> put_opt("max_turns", Keyword.get(opts, :max_turns))
+    |> put_opt("repo", Keyword.get(opts, :repo))
+    |> put_opt("base_branch", Keyword.get(opts, :base_branch))
+  end
+
+  defp put_opt(map, _key, nil), do: map
+  defp put_opt(map, key, value), do: Map.put(map, key, value)
+
+  # The review object names what the session reads — the checkpoint the placement bound — and
+  # the review it judges under. Its epoch is the claim the review was recorded against, the one
+  # the ledger fences the push on.
+  defp review_payload(tenant_id, dispatch, story_object, %Review{} = review) do
+    {:ok, checkpoint} =
+      Repo.with_tenant(tenant_id, fn -> Repo.get!(Checkpoint, review.checkpoint_id) end)
+
+    dispatch
+    |> Map.put("claim_epoch", review.claim_epoch)
+    |> Map.put("story", story_object)
+    |> Map.put("review", %{
+      "review_id" => review.id,
+      "round" => review.round,
+      "checkpoint_id" => checkpoint.id,
+      "checkpoint_seq" => checkpoint.seq,
+      "commit_sha" => checkpoint.commit_sha,
+      "tree_sha" => checkpoint.tree_sha
+    })
   end
 
   # THE STORY OBJECT IS LOOPCTL'S TO BUILD, so a caller may not supply one. `attach_story/6`
@@ -557,6 +850,12 @@ defmodule Loopctl.Delivery.Placement do
   #
   # The one thing a resume DOES write is the claim's lease cap, moved forward so the frame's
   # `deadline_at` leaves the resumed session its whole wall clock (`resume_deadline/4`).
+  defp resume_implement(tenant_id, runner_id, dispatch, record, opts) do
+    if DispatchLedger.implement_kind?(record.kind),
+      do: resume(tenant_id, runner_id, dispatch, record, opts),
+      else: {:error, :dispatch_id_conflict}
+  end
+
   defp resume(tenant_id, runner_id, dispatch, record, opts) do
     with {:ok, payload} <- resume_payload(tenant_id, runner_id, dispatch, record),
          {:ok, payload} <- resume_deadline(tenant_id, payload, record, opts) do

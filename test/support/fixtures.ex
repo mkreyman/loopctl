@@ -2288,6 +2288,33 @@ defmodule Loopctl.Fixtures do
     agent
   end
 
+  # A `dispatches` row on the RLS `Loopctl.Repo` sandbox connection, for a lineage a `Repo`-side
+  # test needs without minting a key (US-45.3's review separation reads the implementer's
+  # lineage chain on `Repo`). `:parent` is another such dispatch; its lineage is extended.
+  def fixture(:stage_dispatch, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    id = Ecto.UUID.generate()
+    parent = Map.get(attrs, :parent)
+    now = DateTime.utc_now()
+
+    {:ok, dispatch} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        Loopctl.Repo.insert!(%Loopctl.Dispatches.Dispatch{
+          id: id,
+          tenant_id: tenant_id,
+          parent_dispatch_id: parent && parent.id,
+          role: Map.get(attrs, :role, :agent),
+          agent_id: Map.fetch!(attrs, :agent_id),
+          lineage_path: if(parent, do: parent.lineage_path ++ [id], else: [id]),
+          expires_at: DateTime.add(now, 3_600),
+          created_at: now
+        })
+      end)
+
+    dispatch
+  end
+
   # A runner (and its key) on the RLS `Loopctl.Repo` sandbox connection, for a
   # `story_stages.runner_id` written by `Loopctl.Delivery.Stages` in an async test (#803).
   def fixture(:stage_runner, attrs) do

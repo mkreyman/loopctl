@@ -6,6 +6,32 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Review on a change thread (epic 45, US-45.3, runner contract 1.21.0, migration
+  `20260926160000`). RE-VENDOR the contract and declare `review` to take review dispatches.**
+  `POST /api/v1/stories/:id/thread/reviews` (orchestrator or above, human-anchored tenants)
+  places a review on a runner as a dispatch of kind `review`, on the story's latest
+  checkpoint of the current claim; it returns no credential. The runner sends the review's
+  findings and its one verdict as the new channel messages `review_finding` and
+  `review_verdict`; there is no HTTP path for either. `GET .../thread/reviews/:review_id`
+  reads the review payload and `POST .../thread/fixes` records the claimant's fixes. Rounds
+  are counted per CLAIM from the thread: round 3 only when a MATERIAL round-2 finding names a
+  checkpoint a round-1 fix carried (a fix recorded before round 2 was placed), never round 4,
+  and a story claimed again starts at round 1. A review whose claim ended writes nothing more
+  (`review_claim_ended`). The verdict of whichever round reaches the ceiling — round 2, or
+  round 3 when one was placeable — moves the delivery stage over the new `review_ceiling`
+  edge if that round has a material finding (reconciled every minute by
+  `ReviewCeilingWorker` until it lands). A review's slot is freed by its session's
+  `session_ended`, not by the verdict; `session_ended` does nothing else for a review. New env vars `REVIEW_WALL_CLOCK_SECONDS` and
+  `REVIEW_MAX_TURNS` (see `deploy/FLY_SECRETS.md`); with them unset a review placement
+  without explicit budgets is refused `budget_unset`. The migration widens the
+  `runner_dispatches.kind` CHECK to include `review`. Its ROLLBACK refuses, and drops
+  nothing, while any `thread_reviews` row or review-kind `runner_dispatches` row exists; with
+  none it drops `thread_reviews` and the judgement columns of `thread_entries`. New refusal
+  codes: `review_closed`, `review_claim_ended`, `review_round_superseded`,
+  `reviewer_not_separate`, `tenant_halted`; over HTTP, `review_dispatch_refused` (a retry of a
+  review the runner refused: place a new one with a new `dispatch_id`) and `422 invalid_uuid`
+  for a malformed body id. MCP server 2.107.0 adds `thread_request_review`,
+  `thread_review_get` and `thread_fix`.
 - **Intake sources carry a merge mode, and a `thread`-mode story merges from a recorded
   checkpoint with no pull request (epic 45, US-45.4). Migration `20260926140000` adds
   `intake_sources.mode`, NOT NULL, default `pr`; no backfill and no manual step, and every

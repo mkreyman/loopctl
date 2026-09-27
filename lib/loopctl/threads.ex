@@ -5,12 +5,18 @@ defmodule Loopctl.Threads do
 
   ## What this module owns, and what it deliberately does not
 
-  It owns the RECORD: checkpoints, and `message` / `review_requested` entries. It does not own
-  JUDGEMENT. Findings, verdicts and the fixes that answer them decide what may merge, so they
-  need an author loopctl can prove is not the implementer, and inferring that from the
-  calling key — its agent, its lineage, whether it wrote a checkpoint — was reviewed three
-  times and circumvented each time (#901). Those kinds arrive with US-45.3, where the author
-  is a review dispatch loopctl itself placed for the thread.
+  It owns the RECORD and every write to it: checkpoints, `message` entries, and the review
+  kinds (US-45.3). Findings, verdicts and the fixes that answer them decide what may merge, so
+  each has ONE narrow entry point here that binds its author under the thread lock:
+
+  - `record_review/3` — loopctl placing a review as a runner dispatch of kind `review`;
+  - `record_judgement/5` — a `finding` or `verdict` from the runner holding that dispatch,
+    bound to its `thread_reviews` row. Inferring a judge from a calling key was circumvented
+    in #901 and #905; nothing here takes a key;
+  - `record_fix/4` — a `fix` from the story's current claimant, under the checkpoint fence.
+
+  The rules each applies are `Loopctl.Threads.Reviews`', which only reads. The insert, the
+  lock and the replay stay private to this module, so there is no other way in.
 
   ## The checkpoint fence
 
@@ -43,10 +49,14 @@ defmodule Loopctl.Threads do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
+  alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
+  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Security.SecretDenylist
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
+  alias Loopctl.Threads.Review
+  alias Loopctl.Threads.Reviews
   alias Loopctl.WorkBreakdown.Story
 
   @thread_lock_namespace :erlang.phash2(:loopctl_thread_ledger)
@@ -258,17 +268,129 @@ defmodule Loopctl.Threads do
     changeset = Entry.changeset(%Entry{}, attrs)
 
     with :ok <- caller_kind(changeset),
-         :ok <- reserved_key(changeset),
-         :ok <- no_secret(Ecto.Changeset.get_field(changeset, :body), :body, tenant_id, story_id),
+         :ok <- screen(changeset, tenant_id, story_id) do
+      in_story_lock(tenant_id, story_id, fn ->
+        entry_locked(tenant_id, story_id, changeset, opts)
+      end)
+    end
+  end
+
+  @doc """
+  Records a review of `story_id` placed as the runner dispatch `:dispatch_id` (US-45.3), for
+  the next round, on the story's latest checkpoint of the current claim. Called by
+  `Loopctl.Delivery.Placement.place_review/4` BEFORE the dispatch is pushed, so a refused push
+  leaves an inert row and never a session with nothing to bind its judgements to.
+
+  Under the thread lock it re-decides everything the placement read: that a dispatch made the
+  claim, the checkpoint, the round and the reviewer's separation (`Loopctl.Threads.Reviews`).
+
+  ## Options
+
+  - `:dispatch_id`, `:runner_id`, `:agent_id` (required) — the ledger dispatch id the review
+    will be pushed under, the runner, and the runner's agent (the reviewer).
+  - `:placed_by` (required) — the requesting principal's label, for the record.
+
+  IDEMPOTENT on `:dispatch_id`: the same placement again answers the row
+  (`:existing`); the id under another story or runner is `dispatch_id_conflict`.
+  """
+  @spec record_review(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Review.t(), :created | :existing} | {:error, term()}
+  def record_review(tenant_id, story_id, opts) do
+    in_story_lock(tenant_id, story_id, fn -> review_locked(tenant_id, story_id, opts) end)
+  end
+
+  @doc """
+  Records a `finding` or `verdict` from the review dispatch `dispatch_id`, which `runner_id`
+  holds (US-45.3). The ONE way a judgement is written: the review is bound under the thread
+  lock by the dispatch AND the runner, then its separation, whether it is still open and
+  whether its round is still current are decided there too.
+
+  `attrs` (string keys): `kind` (`finding` | `verdict`), `idempotency_key`, `body`, and for a
+  finding `severity`, an optional `location` and `introduced_by`. The key is scoped to the
+  review. A NEW judgement is refused `:tenant_halted` while the tenant's custody is halted; a
+  resend of one already recorded is answered from its row even then.
+
+  ## Options
+
+  - `:runner_id` (required) — the runner the socket authenticated.
+  - `:author_principal` (required) — the runner's agent label.
+  - `:replay_only` — answer only a resend of a judgement already recorded.
+
+  Returns `{:ok, %{entry: entry, escalation: entry | nil}, :created | :existing}`.
+  """
+  @spec record_judgement(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, %{entry: Entry.t(), escalation: Entry.t() | nil}, :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, term()}
+  def record_judgement(tenant_id, story_id, dispatch_id, attrs, opts) do
+    with {:ok, changeset} <- judgement_changeset(attrs),
+         :ok <- screen(changeset, tenant_id, story_id),
          :ok <-
            no_secret(
-             Ecto.Changeset.get_field(changeset, :idempotency_key),
-             :idempotency_key,
+             Ecto.Changeset.get_field(changeset, :location),
+             :location,
              tenant_id,
              story_id
            ) do
       in_story_lock(tenant_id, story_id, fn ->
-        entry_locked(tenant_id, story_id, changeset, opts)
+        judgement_locked(tenant_id, story_id, dispatch_id, changeset, opts)
+      end)
+    end
+  end
+
+  @doc """
+  The review loopctl recorded for `dispatch_id` in this tenant, or nil (US-45.3). A read for
+  `Loopctl.Delivery.Placement.place_review/4`, which answers a retry of a recorded placement
+  from its row.
+  """
+  @spec review_by_dispatch(Ecto.UUID.t(), Ecto.UUID.t()) :: Review.t() | nil
+  def review_by_dispatch(tenant_id, dispatch_id) do
+    {:ok, review} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in Review, where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id
+        )
+      end)
+
+    review
+  end
+
+  @doc """
+  Records a `fix` from the story's current claimant (US-45.3): the checkpoint that carries it
+  and the findings of completed rounds it answers. The checkpoint fence applies — the claimant
+  under the current epoch with a live lease — and the checkpoint must be one this claim
+  recorded after every checkpoint its findings were found in. Refused `:tenant_halted` while
+  the tenant's custody is halted.
+
+  `attrs` (string keys): `checkpoint_id`, `finding_ids`, `idempotency_key`, `body`.
+
+  ## Options
+
+  - `:agent_id`, `:claim_epoch`, `:author_principal`, `:actor_lineage` (required) —
+    server-resolved from the calling key.
+  """
+  @spec record_fix(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Entry.t(), :created | :existing}
+          | {:error, term()}
+          | {:error, :unprocessable_entity, term()}
+  def record_fix(tenant_id, story_id, attrs, opts) do
+    changeset =
+      Entry.changeset(%Entry{}, %{
+        "kind" => "fix",
+        "idempotency_key" => Map.get(attrs, "idempotency_key"),
+        "body" => Map.get(attrs, "body"),
+        "checkpoint_id" => Map.get(attrs, "checkpoint_id")
+      })
+
+    with :ok <- not_halted(tenant_id),
+         :ok <- valid(changeset),
+         :ok <- fix_checkpoint_given(changeset),
+         {:ok, finding_ids} <- Reviews.finding_ids(Map.get(attrs, "finding_ids")),
+         :ok <- screen(changeset, tenant_id, story_id) do
+      changeset = Ecto.Changeset.change(changeset, finding_ids: finding_ids)
+
+      in_story_lock(tenant_id, story_id, fn ->
+        fix_locked(tenant_id, story_id, changeset, opts)
       end)
     end
   end
@@ -327,9 +449,25 @@ defmodule Loopctl.Threads do
   end
 
   defp story_query(tenant_id, story_id) do
-    from s in Story,
-      where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-      select: struct(s, ^@story_fields)
+    tenant_id |> story_row(story_id) |> select([s], struct(s, ^@story_fields))
+  end
+
+  defp story_row(tenant_id, story_id),
+    do: from(s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id)
+
+  @doc false
+  # The story's whole row, or nil, under the caller's `Repo.with_tenant/2`.
+  @spec story(Ecto.UUID.t(), Ecto.UUID.t()) :: Story.t() | nil
+  def story(tenant_id, story_id), do: Repo.one(story_row(tenant_id, story_id))
+
+  @doc false
+  # The checkpoint `checkpoint_id` of THIS story, or nil: another story's is none.
+  @spec checkpoint_of(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
+  def checkpoint_of(tenant_id, story_id, checkpoint_id) do
+    Repo.one(
+      from c in Checkpoint,
+        where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id and c.story_id == ^story_id
+    )
   end
 
   defp locked_story(tenant_id, story_id),
@@ -388,12 +526,9 @@ defmodule Loopctl.Threads do
 
   # Decided on the story row this transaction already holds FOR SHARE.
   defp fence(story, opts, epoch) do
-    if Keyword.get(opts, :replay_only, false) do
-      {:error, :dispatch_not_accepted}
-    else
-      with :ok <- Claimant.check(story, Keyword.fetch!(opts, :agent_id), epoch),
-           do: lease(story)
-    end
+    if Keyword.get(opts, :replay_only, false),
+      do: {:error, :dispatch_not_accepted},
+      else: claimant_fence(story, Keyword.fetch!(opts, :agent_id), epoch)
   end
 
   # `:custody` is resolved HERE, on the row held FOR SHARE, so the lineage is the one the
@@ -543,9 +678,14 @@ defmodule Loopctl.Threads do
       kind in Entry.caller_kinds() ->
         :ok
 
-      kind in [:finding, :fix, :verdict, :review_requested] ->
+      kind in [:finding, :fix, :verdict] ->
         {:error, :unprocessable_entity,
-         "kind #{kind} is written by the review flow (US-45.3), not through this endpoint"}
+         "kind #{kind} is written by the review flow (a finding or verdict over the runner " <>
+           "socket, a fix through the thread's fixes endpoint), not as an entry"}
+
+      kind == :review_requested ->
+        {:error, :unprocessable_entity,
+         "kind review_requested is written by the request-review flow, not a caller"}
 
       true ->
         {:error, :unprocessable_entity, "kind #{kind} is written by loopctl, not a caller"}
@@ -560,6 +700,21 @@ defmodule Loopctl.Threads do
         {:error, :unprocessable_entity,
          "idempotency_key may not start with #{@reserved_key_prefix}"},
       else: :ok
+  end
+
+  # The screen every caller-written entry passes before its transaction opens: the reserved
+  # key prefix, and the secret scan of its body and key.
+  defp screen(changeset, tenant_id, story_id) do
+    with :ok <- reserved_key(changeset),
+         :ok <-
+           no_secret(Ecto.Changeset.get_field(changeset, :body), :body, tenant_id, story_id) do
+      no_secret(
+        Ecto.Changeset.get_field(changeset, :idempotency_key),
+        :idempotency_key,
+        tenant_id,
+        story_id
+      )
+    end
   end
 
   defp no_secret(value, field, tenant_id, story_id) do
@@ -614,12 +769,25 @@ defmodule Loopctl.Threads do
   defp epoch_current(%Story{claim_epoch: epoch}, epoch), do: :ok
   defp epoch_current(_story, _epoch), do: {:error, :stale_claim_epoch}
 
+  # Matches `thread_entries_idempotency_uidx`, which is partial on `review_id IS NULL`: a
+  # judgement's key belongs to its review, so an author's message may reuse it.
   defp entry_by_key(tenant_id, story_id, author, key) do
     Repo.one(
       from e in Entry,
         where:
           e.tenant_id == ^tenant_id and e.story_id == ^story_id and
-            e.author_principal == ^author and e.idempotency_key == ^key
+            e.author_principal == ^author and e.idempotency_key == ^key and
+            is_nil(e.review_id)
+    )
+  end
+
+  # A judgement's key is scoped to its REVIEW (`thread_entries_review_idempotency_uidx`).
+  defp entry_by_review_key(tenant_id, review_id, key) do
+    Repo.one(
+      from e in Entry,
+        where:
+          e.tenant_id == ^tenant_id and e.review_id == ^review_id and
+            e.idempotency_key == ^key
     )
   end
 
@@ -627,7 +795,15 @@ defmodule Loopctl.Threads do
   # write reusing a key is refused rather than acknowledged with the old row, which would tell
   # the caller its new entry was recorded when it was not. `checkpoint_id` is an `Ecto.UUID`,
   # so the caller's value and the stored one are compared in one canonical form.
-  @replayed_fields [:kind, :body, :checkpoint_id]
+  @replayed_fields [
+    :kind,
+    :body,
+    :checkpoint_id,
+    :severity,
+    :location,
+    :introduced_by,
+    :finding_ids
+  ]
 
   defp replay(existing, changeset) do
     same? =
@@ -650,15 +826,9 @@ defmodule Loopctl.Threads do
         :ok
 
       checkpoint_id ->
-        if Repo.exists?(
-             from c in Checkpoint,
-               where:
-                 c.id == ^checkpoint_id and c.tenant_id == ^tenant_id and
-                   c.story_id == ^story_id
-           ),
-           do: :ok,
-           else:
-             {:error, :unprocessable_entity, "checkpoint_id is not a checkpoint of this story"}
+        if checkpoint_of(tenant_id, story_id, checkpoint_id),
+          do: :ok,
+          else: {:error, :unprocessable_entity, "checkpoint_id is not a checkpoint of this story"}
     end
   end
 
@@ -697,12 +867,364 @@ defmodule Loopctl.Threads do
             "author_principal" => entry.author_principal,
             "checkpoint_id" => entry.checkpoint_id
           },
-          adopted
+          Map.merge(judgement(entry), adopted)
         )
     })
   end
 
+  # A judgement's event pins what the round count and the ceiling are computed from: which
+  # review wrote it, its severity and origin, and the findings a fix answers. A message or a
+  # checkpoint carries none of these, and its event carries none of the keys.
+  defp judgement(entry) do
+    %{
+      "review_id" => entry.review_id,
+      "severity" => entry.severity && to_string(entry.severity),
+      "introduced_by" => entry.introduced_by,
+      "finding_ids" => entry.finding_ids
+    }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
   defp conflict(code, message), do: {:error, {:conflict, code, message}}
+
+  # ---------------------------------------------------------------------------
+  # Reviews (US-45.3). Every rule is `Loopctl.Threads.Reviews`'; the writes are here.
+  # ---------------------------------------------------------------------------
+
+  # Read FRESH, as `Loopctl.Delivery.Placement` reads it: a judgement decides what may merge,
+  # which is custody progress a halted tenant must not make.
+  defp not_halted(tenant_id) do
+    if Runners.custody_halted?(tenant_id), do: {:error, :tenant_halted}, else: :ok
+  end
+
+  defp review_locked(tenant_id, story_id, opts) do
+    dispatch_id = Keyword.fetch!(opts, :dispatch_id)
+    runner_id = Keyword.fetch!(opts, :runner_id)
+    agent_id = Keyword.fetch!(opts, :agent_id)
+
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
+         nil <- placed_before(tenant_id, story_id, dispatch_id, runner_id),
+         :ok <- Reviews.claim_current(story, story.claim_epoch),
+         :ok <- Reviews.implementer_dispatched(story),
+         {:ok, checkpoint} <- Reviews.latest_checkpoint(tenant_id, story),
+         {:ok, round} <- Reviews.placeable_round(tenant_id, story),
+         :ok <- Reviews.reviewer_separate(tenant_id, story, agent_id) do
+      insert_review(tenant_id, story, checkpoint, round, opts)
+    else
+      {:story, nil} -> {:error, :not_found}
+      other -> other
+    end
+  end
+
+  # The same placement again is answered from its row; the id under another story or runner
+  # is a different placement reusing it. So is an id the runner LEDGER already holds for
+  # anything but this review: the push would leave that row in place (`record_sent/3` does
+  # nothing on conflict), and this review would be bound to another dispatch's session.
+  defp placed_before(tenant_id, story_id, dispatch_id, runner_id) do
+    case Repo.one(
+           from r in Review, where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id
+         ) do
+      nil ->
+        ledger_free(tenant_id, story_id, dispatch_id, runner_id)
+
+      %Review{story_id: ^story_id, runner_id: ^runner_id} = review ->
+        {:ok, review, :existing, []}
+
+      %Review{} ->
+        conflict("dispatch_id_conflict", "dispatch_id names another review")
+    end
+  end
+
+  defp ledger_free(tenant_id, story_id, dispatch_id, runner_id) do
+    case Repo.one(
+           from d in DispatchRecord,
+             where: d.tenant_id == ^tenant_id and d.dispatch_id == ^dispatch_id,
+             select: {d.kind, d.story_id, d.runner_id}
+         ) do
+      nil -> nil
+      {"review", ^story_id, ^runner_id} -> nil
+      _other -> conflict("dispatch_id_conflict", "dispatch_id names another runner dispatch")
+    end
+  end
+
+  # The unique index on `(tenant_id, dispatch_id)` is what decides between two placements
+  # reusing one id on DIFFERENT stories: each holds only its own story's lock, so neither sees
+  # the other in `placed_before/4`, and the second insert meets the index. That is a
+  # `dispatch_id_conflict`, not a 500.
+  defp insert_review(tenant_id, story, checkpoint, round, opts) do
+    %Review{
+      tenant_id: tenant_id,
+      story_id: story.id,
+      dispatch_id: Keyword.fetch!(opts, :dispatch_id),
+      runner_id: Keyword.fetch!(opts, :runner_id),
+      agent_id: Keyword.fetch!(opts, :agent_id),
+      claim_epoch: story.claim_epoch,
+      checkpoint_id: checkpoint.id,
+      round: round,
+      placed_at_seq: next_entry_seq(tenant_id, story.id) - 1,
+      placed_by: Keyword.fetch!(opts, :placed_by)
+    }
+    |> Ecto.Changeset.change()
+    |> Ecto.Changeset.unique_constraint(:dispatch_id,
+      name: :thread_reviews_tenant_id_dispatch_id_index
+    )
+    |> Repo.insert()
+    |> case do
+      {:ok, review} -> chain_review(tenant_id, story, review)
+      {:error, _taken} -> conflict("dispatch_id_conflict", "dispatch_id names another review")
+    end
+  end
+
+  defp chain_review(tenant_id, story, review) do
+    # The runner's credential is a plain key no dispatch minted, and loopctl places the
+    # review itself, so the lineage is an ATTESTED empty one, as `RunnerStages` states it.
+    with {:ok, chain_entry} <-
+           AuditChain.append_in_tenant_transaction(tenant_id, %{
+             action: "thread_review_placed",
+             actor_lineage: [],
+             entity_type: "story",
+             entity_id: story.id,
+             payload: %{
+               "review_id" => review.id,
+               "dispatch_id" => review.dispatch_id,
+               "runner_id" => review.runner_id,
+               "agent_id" => review.agent_id,
+               "checkpoint_id" => review.checkpoint_id,
+               "claim_epoch" => review.claim_epoch,
+               "round" => review.round
+             }
+           }) do
+      {:ok, review, :created, [chain_entry]}
+    end
+  end
+
+  defp judgement_changeset(attrs) do
+    kind = Map.get(attrs, "kind")
+
+    changeset =
+      Entry.changeset(%Entry{}, %{
+        "kind" => kind,
+        "idempotency_key" => Map.get(attrs, "idempotency_key"),
+        "body" => Map.get(attrs, "body")
+      })
+
+    cond do
+      kind not in ["finding", "verdict"] ->
+        {:error, :unprocessable_entity, "a judgement is a finding or a verdict"}
+
+      not changeset.valid? ->
+        {:error, changeset}
+
+      kind == "verdict" ->
+        {:ok, changeset}
+
+      true ->
+        finding_fields(changeset, attrs)
+    end
+  end
+
+  defp finding_fields(changeset, attrs) do
+    with {:ok, severity} <- Reviews.severity(Map.get(attrs, "severity")),
+         {:ok, location} <- Reviews.location(Map.get(attrs, "location")),
+         {:ok, introduced_by} <- Reviews.introduced_by(Map.get(attrs, "introduced_by")) do
+      {:ok,
+       Ecto.Changeset.change(changeset,
+         severity: severity,
+         location: location,
+         introduced_by: introduced_by
+       )}
+    end
+  end
+
+  defp judgement_locked(tenant_id, story_id, dispatch_id, changeset, opts) do
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
+         {:review, %Review{} = review} <-
+           {:review, bound_review(tenant_id, story_id, dispatch_id, opts)} do
+      changeset =
+        Ecto.Changeset.change(changeset,
+          review_id: review.id,
+          checkpoint_id: review.checkpoint_id
+        )
+
+      case entry_by_review_key(tenant_id, review.id, key_of(changeset)) do
+        nil -> judge_new(story, review, changeset, opts)
+        existing -> existing |> replay(changeset) |> as_judgement(review)
+      end
+    else
+      {:story, nil} -> {:error, :not_found}
+      {:review, nil} -> {:error, :unknown_review}
+    end
+  end
+
+  # Bound by the dispatch AND the runner holding it: the review a runner may judge under is
+  # only ever the one loopctl pushed to that runner.
+  defp bound_review(tenant_id, story_id, dispatch_id, opts) do
+    runner_id = Keyword.fetch!(opts, :runner_id)
+
+    Repo.one(
+      from r in Review,
+        where:
+          r.tenant_id == ^tenant_id and r.story_id == ^story_id and
+            r.dispatch_id == ^dispatch_id and r.runner_id == ^runner_id
+    )
+  end
+
+  defp key_of(changeset), do: Ecto.Changeset.get_field(changeset, :idempotency_key)
+
+  # A resend answers what was RECORDED: a verdict's resend carries the escalation its first
+  # delivery wrote, if it wrote one, so the runner hears the same outcome whichever delivery
+  # it heard.
+  defp as_judgement({:ok, %Entry{kind: :verdict} = entry, :existing, []}, review),
+    do: {:ok, %{entry: entry, escalation: recorded_escalation(review)}, :existing, []}
+
+  defp as_judgement({:ok, entry, :existing, []}, _review),
+    do: {:ok, %{entry: entry, escalation: nil}, :existing, []}
+
+  defp as_judgement(error, _review), do: error
+
+  defp recorded_escalation(review) do
+    Repo.one(
+      from e in Entry,
+        where:
+          e.tenant_id == ^review.tenant_id and e.review_id == ^review.id and
+            e.kind == :escalation
+    )
+  end
+
+  # Every rule a NEW judgement meets, decided once under the lock: the claim the review
+  # belongs to is still the story's, the reviewer is still separate, and the review may still
+  # judge. `completed` is read once and reused for the ceiling a verdict may reach.
+  #
+  # The custody HALT is checked here, for new writes only: a resend of a judgement already
+  # recorded is answered from its row before any rule, halt included, so a runner that lost
+  # an ack during a halt still learns its write landed.
+  defp judge_new(story, review, changeset, opts) do
+    tenant_id = review.tenant_id
+
+    with :ok <- not_halted(tenant_id),
+         :ok <- new_write_allowed(opts),
+         :ok <- Reviews.claim_current(story, review.claim_epoch),
+         :ok <- Reviews.reviewer_separate(tenant_id, story, review.agent_id),
+         completed = Reviews.completed(tenant_id, story),
+         :ok <- Reviews.judgeable(review, completed) do
+      insert_judgement(
+        Ecto.Changeset.get_field(changeset, :kind),
+        story,
+        review,
+        changeset,
+        opts,
+        completed
+      )
+    end
+  end
+
+  defp insert_judgement(:finding, story, review, changeset, opts, _completed) do
+    introduced_by = Ecto.Changeset.get_field(changeset, :introduced_by)
+
+    with :ok <- Reviews.introduced_by_allowed(review, introduced_by),
+         {:ok, entry, :created, chained} <-
+           insert_entry(review.tenant_id, story.id, changeset, judge_opts(opts)) do
+      {:ok, %{entry: entry, escalation: nil}, :created, chained}
+    end
+  end
+
+  defp insert_judgement(:verdict, story, review, changeset, opts, completed) do
+    with {:ok, verdict, :created, chained} <-
+           insert_entry(review.tenant_id, story.id, changeset, judge_opts(opts)),
+         {:ok, escalation, escalation_chained} <-
+           ceiling_escalation(story, review, completed, verdict.seq) do
+      {:ok, %{entry: verdict, escalation: escalation}, :created, chained ++ escalation_chained}
+    end
+  end
+
+  defp judge_opts(opts),
+    do: [author_principal: Keyword.fetch!(opts, :author_principal), actor_lineage: []]
+
+  @review_ceiling_principal "control:review_ceiling"
+
+  @doc false
+  # The principal a `review_ceiling` escalation entry is written under, which
+  # `Loopctl.Workers.ReviewCeilingWorker` reads the entries back by.
+  @spec review_ceiling_principal() :: String.t()
+  def review_ceiling_principal, do: @review_ceiling_principal
+
+  # The round this verdict just completed reached the ceiling with a material finding: the
+  # escalation is RECORDED here, in the verdict's transaction, and
+  # `Loopctl.Workers.ReviewCeilingWorker` moves the stage until it lands.
+  defp ceiling_escalation(story, review, completed, verdict_seq) do
+    case Reviews.ceiling_material(review.tenant_id, story, review, completed, verdict_seq) do
+      0 ->
+        {:ok, nil, []}
+
+      material ->
+        changeset =
+          %{
+            kind: :escalation,
+            idempotency_key: @reserved_key_prefix <> "review_ceiling:#{review.id}",
+            body:
+              "review_ceiling: round #{review.round} of #{Reviews.max_rounds()} left " <>
+                "#{material} material finding(s) and no further round is placeable; the " <>
+                "remedy is a rewrite, not another round",
+            checkpoint_id: review.checkpoint_id
+          }
+          |> Entry.system_changeset()
+          |> Ecto.Changeset.put_change(:review_id, review.id)
+
+        with {:ok, entry, :created, chained} <-
+               insert_entry(review.tenant_id, story.id, changeset,
+                 author_principal: @review_ceiling_principal,
+                 actor_lineage: []
+               ),
+             do: {:ok, entry, chained}
+    end
+  end
+
+  defp valid(%Ecto.Changeset{valid?: true}), do: :ok
+  defp valid(changeset), do: {:error, changeset}
+
+  defp fix_checkpoint_given(changeset) do
+    if Ecto.Changeset.get_field(changeset, :checkpoint_id),
+      do: :ok,
+      else:
+        {:error,
+         {:unprocessable_entity, "fix_checkpoint_required",
+          "a fix is carried by a checkpoint: checkpoint_id is required"}}
+  end
+
+  # A resend is answered from its row before the fence, as a checkpoint's is.
+  defp fix_locked(tenant_id, story_id, changeset, opts) do
+    finding_ids = Ecto.Changeset.get_field(changeset, :finding_ids)
+    author = Keyword.fetch!(opts, :author_principal)
+
+    with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
+         nil <- entry_by_key(tenant_id, story_id, author, key_of(changeset)),
+         :ok <-
+           claimant_fence(
+             story,
+             Keyword.fetch!(opts, :agent_id),
+             Keyword.fetch!(opts, :claim_epoch)
+           ),
+         {:ok, checkpoint} <-
+           Reviews.fix_checkpoint(
+             tenant_id,
+             story,
+             Ecto.Changeset.get_field(changeset, :checkpoint_id)
+           ),
+         :ok <- Reviews.answers_findings(tenant_id, story, finding_ids, checkpoint) do
+      insert_entry(tenant_id, story_id, changeset,
+        author_principal: author,
+        actor_lineage: Keyword.fetch!(opts, :actor_lineage)
+      )
+    else
+      {:story, nil} -> {:error, :not_found}
+      %Entry{} = existing -> replay(existing, changeset)
+      other -> other
+    end
+  end
+
+  defp claimant_fence(story, agent_id, epoch) do
+    with :ok <- Claimant.check(story, agent_id, epoch), do: lease(story)
+  end
 
   # ---------------------------------------------------------------------------
   # Transaction and ordering

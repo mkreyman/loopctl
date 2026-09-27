@@ -277,10 +277,17 @@ defmodule Loopctl.Delivery.DispatchDriver do
   #
   # Triage runs against the same wire field as implement, so it is bounded by the same
   # contract maximum. It is not a policy choice: `cast_dispatch/1` refuses anything above it.
-  defp budget_maximum(key) when key in [:dispatch_wall_clock_seconds, :triage_wall_clock_seconds],
-    do: RunnerContract.RunnerDispatch.max_wall_clock_seconds()
+  defp budget_maximum(key)
+       when key in [
+              :dispatch_wall_clock_seconds,
+              :triage_wall_clock_seconds,
+              :review_wall_clock_seconds
+            ],
+       do: RunnerContract.RunnerDispatch.max_wall_clock_seconds()
 
-  defp budget_maximum(key) when key in [:dispatch_max_turns, :triage_max_turns], do: :infinity
+  defp budget_maximum(key)
+       when key in [:dispatch_max_turns, :triage_max_turns, :review_max_turns],
+       do: :infinity
 
   @doc "True when an operator has turned the driver on. Defaults to FALSE."
   @spec enabled?() :: boolean()

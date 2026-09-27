@@ -419,6 +419,12 @@ defmodule LoopctlWeb.Router do
     get "/stories/:id/thread", ThreadController, :show
     post "/stories/:id/thread/checkpoints", ThreadController, :checkpoint
     post "/stories/:id/thread/entries", ThreadController, :entry
+    # US-45.3: review on the thread. An orchestrator REQUESTS a review, which loopctl places on
+    # a runner as a dispatch of kind `review`; its findings and verdict come back over the
+    # runner socket, never here. The claimant records the fixes that answer them.
+    post "/stories/:id/thread/reviews", ThreadReviewController, :place
+    get "/stories/:id/thread/reviews/:review_id", ThreadReviewController, :show
+    post "/stories/:id/thread/fixes", ThreadReviewController, :fix
     # Discoverability aliases — same actions, alternate URL patterns agents tend to guess
     post "/stories/:id/report-done", StoryStatusController, :report
     post "/stories/:id/start-work", StoryStatusController, :start

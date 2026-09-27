@@ -63,6 +63,10 @@ defmodule Loopctl.Delivery.StageMachine do
     with no way out, and it is its own edge rather than `:session_escalated` because the
     escalated queue has to tell "the loop spent its budget on this" apart from "the session
     asked for Mark". Never retried: a budget kill retried is the same kill again, paid twice.
+  - `:review_ceiling` — an in-flight stage -> escalated, when a change thread's final review
+    round completes with a critical, high or medium finding (US-45.3). CONTROL takes it, from
+    `Loopctl.Workers.ReviewCeilingWorker`, never a runner: it is loopctl's verdict about the
+    review, and the remedy is a rewrite, which is Mark's call.
   - `:runner_lost` — an in-flight stage -> queued. Taken by the claim reclaimer
     (`Loopctl.Progress.reclaim_expired_claim/3`), never asked for by a runner: a runner
     that could report itself lost is not lost.
@@ -172,6 +176,13 @@ defmodule Loopctl.Delivery.StageMachine do
   # and there the session's own `:session_escalated` is the way out. See the moduledoc entry.
   @budget_reported for from <- @in_flight, do: {from, :escalated, :budget_reported}
 
+  # A review ceiling reached (US-45.3). CONTROL takes it, from
+  # `Loopctl.Workers.ReviewCeilingWorker` via `Escalations.escalate_as_control/3`, when a
+  # thread's final review round completes with a material finding. Its own edge rather than `:session_escalated`, so the
+  # escalated queue shows the loop's own verdict rather than a session asking for Mark, and it
+  # is not in `@runner_reportable_edges`: a runner cannot assert a review outcome.
+  @review_ceiling for from <- @in_flight, do: {from, :escalated, :review_ceiling}
+
   @transitions @forward ++
                  [
                    {:ci, :implementing, :ci_red},
@@ -186,7 +197,8 @@ defmodule Loopctl.Delivery.StageMachine do
                  ] ++
                  @budget_exceeded ++
                  @released ++
-                 @human_resolution ++ @session_escalated ++ @budget_reported ++ @release_escalated
+                 @human_resolution ++
+                 @session_escalated ++ @budget_reported ++ @release_escalated ++ @review_ceiling
 
   # The part of the machine a RUNNER may report over the channel: one definition, from which
   # `runner_transitions/0`'s doc, the wire enums and the published
@@ -411,6 +423,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :merge_refused
           | :budget_exceeded
           | :budget_reported
+          | :review_ceiling
           | :runner_lost
           | :claim_released
           | :attempts_exhausted

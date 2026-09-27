@@ -1842,11 +1842,25 @@ defmodule Loopctl.Delivery.PlacementTest do
                :kind,
                :max_turns,
                :repo,
+               :review,
                :story,
                :story_id,
                :token_budget,
                :triage,
                :wall_clock_seconds
+             ]
+
+      # `review` (contract 1.21.0, US-45.3) is the third nested object, and the reason a review
+      # is a runner dispatch at all: it names WHAT to read and carries no credential to write
+      # with. Every field is loopctl's own id, round number or sha; the review's findings and
+      # verdict go back over the socket the runner already holds.
+      assert RunnerContract.RunnerReview.schema().properties |> Map.keys() |> Enum.sort() == [
+               :checkpoint_id,
+               :checkpoint_seq,
+               :commit_sha,
+               :review_id,
+               :round,
+               :tree_sha
              ]
 
       # `triage` (contract 1.7.0) is the second nested object and is pinned for the same

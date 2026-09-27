@@ -316,6 +316,28 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
   end
 
   describe "apply/3" do
+    test "a verdict naming an implement dispatch is unknown_dispatch, and moves nothing" do
+      %{story: story, runner: runner} = session()
+
+      implement =
+        fixture(:accepted_dispatch, %{
+          tenant_id: story.tenant_id,
+          runner: runner,
+          story_id: story.id,
+          claim_epoch: @epoch,
+          kind: "implement"
+        })
+
+      assert {:error, :unknown_dispatch} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(implement, verdict("reject"))
+               )
+
+      assert stage_of(story) == :detected
+    end
+
     test "a story verdict advances detected -> triaged and records what was said" do
       %{story: story, runner: runner, record: record} = session()
 

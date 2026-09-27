@@ -655,6 +655,13 @@ defmodule Loopctl.ObanConfig do
            # Bounded per run. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"*/2 * * * *", Loopctl.Workers.PostDeployVerificationWorker},
+           # US-45.3: moves a story to `escalated` for a review ceiling its thread recorded and
+           # the stage machine has not caught up with. The verdict records the escalation in
+           # its own transaction and enqueues one ReviewCeilingWorker job for that story
+           # (unique per story), which makes the move; this cron sweep is the backstop for a
+           # job that was never enqueued or did not land. Every minute, local statements
+           # only. Bounded per run.
+           {"* * * * *", Loopctl.Workers.ReviewCeilingWorker},
            # #805: drains the issue-closure outbox — tells the reporter what happened to the
            # issue her story came from. Up to FOUR bounded GitHub calls per candidate (read,
            # label, comment, close), 80 for a full batch, which is where the worker's

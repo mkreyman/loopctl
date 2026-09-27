@@ -356,6 +356,17 @@ candidate and reports `:no_independent_root` (distinct from an empty pool) when 
 the verify GATE is chain-separated, so a sibling verifier under the same root certifies fine. Do
 not "fix" selection by relaxing the ceiling; mint a second root from the operator key.
 
+### The thread review judge is a placed runner dispatch, never a key (US-45.3)
+
+A change-thread review (`Loopctl.Delivery.Placement.place_review/4`) is a runner dispatch of
+kind `review`. Its findings and verdict arrive over the runner socket and are bound to that
+runner's accepted review-kind ledger row; no API key is minted for it or returned to the
+caller that requested it. Separation (`Loopctl.Threads.Reviews.reviewer_separate/3`) refuses a
+runner whose agent is the claimant, recorded a checkpoint of the thread, or holds a dispatch on
+the implementer's chain (`lineage_same_chain?/2`), at placement and again under the thread
+lock on every judgement. Its refusal is `reviewer_not_separate`, never `self_review_blocked`:
+that code feeds the L6 halt, and a mis-placed reviewer is a placement error, not byzantium.
+
 ## Custody halt (L6) — escalation is thresholded, and the halt is SCOPED
 
 A halt freezes the tenant's custody surface and only a human WebAuthn break-glass ceremony

@@ -260,8 +260,9 @@ defmodule Loopctl.Delivery.TriageVerdict do
           {:ok, %{record: TriageVerdictRecord.t(), replayed?: boolean()}} | {:error, error()}
   def apply(tenant_id, runner_id, %{} = message) do
     with {:ok, session} <-
-           DispatchLedger.accepted_session(tenant_id, runner_id, message.dispatch_id),
-         :ok <- triage_dispatch(session),
+           DispatchLedger.accepted_session(tenant_id, runner_id, message.dispatch_id,
+             kind: "triage"
+           ),
          :ok <- epoch_matches(session, message),
          {:ok, leave} <- route(message),
          {:ok, row} <- bound(tenant_id, session.story_id, message.dispatch_id),
@@ -283,9 +284,6 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # IMPLEMENT dispatch could record a triage verdict for it — with lens verdicts of its own
   # choosing — and the merge gate would then judge that runner's pull request on them.
   # `unknown_dispatch` because, as a triage dispatch, it does not exist.
-  defp triage_dispatch(%{kind: "triage"}), do: :ok
-  defp triage_dispatch(_session), do: {:error, :unknown_dispatch}
-
   # The dispatch's own epoch, checked before a transaction is opened, exactly as
   # `Loopctl.Delivery.RunnerStages` checks it. The FENCE is the story's epoch read under a
   # lock inside `Stages.advance/4`; this refuses a message that does not even match the

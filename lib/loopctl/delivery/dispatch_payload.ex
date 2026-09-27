@@ -500,6 +500,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
   end
 
   defp budget_keys("triage"), do: {:triage_wall_clock_seconds, :triage_max_turns}
+  defp budget_keys("review"), do: {:review_wall_clock_seconds, :review_max_turns}
   defp budget_keys(_implement), do: {:dispatch_wall_clock_seconds, :dispatch_max_turns}
 
   defp budget(key), do: DispatchDriver.normalise_budget(Application.get_env(:loopctl, key), key)

@@ -232,6 +232,20 @@ case System.get_env("TRIAGE_MAX_TURNS") && Integer.parse(System.get_env("TRIAGE_
   _ -> :ok
 end
 
+# US-45.3: the REVIEW session's own budgets. A review reads a checkpoint and the thread and
+# answers with findings and a verdict — more than triage, less than an implement run — so it
+# inherits neither. No default, same policy: an unset pair refuses the placement naming the key.
+case System.get_env("REVIEW_WALL_CLOCK_SECONDS") &&
+       Integer.parse(System.get_env("REVIEW_WALL_CLOCK_SECONDS")) do
+  {seconds, ""} when seconds > 0 -> config :loopctl, :review_wall_clock_seconds, seconds
+  _ -> :ok
+end
+
+case System.get_env("REVIEW_MAX_TURNS") && Integer.parse(System.get_env("REVIEW_MAX_TURNS")) do
+  {turns, ""} when turns > 0 -> config :loopctl, :review_max_turns, turns
+  _ -> :ok
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects
