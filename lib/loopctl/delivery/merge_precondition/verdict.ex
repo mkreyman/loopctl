@@ -29,7 +29,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     verified at. Known even when the forge cannot be reached, which is why the
     consecutive-unevaluated count is kept per THIS head rather than the forge's
   - `retry_after` — on `:unevaluated`, the seconds the forge asked a caller to wait, when it
-    said so at all, or loopctl's own 60 for a CI wait. The endpoint sends it as `Retry-After`; the dominant cause of an
+    said so at all, or loopctl's own 300 for a CI wait. The endpoint sends it as `Retry-After`; the dominant cause of an
     unevaluated verdict is a rate limit, so an unbounded retry would amplify the very
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.

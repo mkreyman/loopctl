@@ -1209,12 +1209,12 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert {:required_check_failed, "test", "failure"} in verdict.reasons
     end
 
-    test "a pending required check is unevaluated, retried after a minute, never allowed" do
+    test "a pending required check is unevaluated, retried after five minutes, never allowed" do
       verdict = judge_thread(ci: %{check_runs: [run("test", "in_progress", nil)], statuses: []})
 
       assert verdict.decision == :unevaluated
       assert {:required_check_pending, "test"} in verdict.reasons
-      assert verdict.retry_after == 60
+      assert verdict.retry_after == 300
     end
 
     test "a required check missing from the commit is unevaluated, never allowed" do
@@ -1272,6 +1272,30 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
 
       assert verdict.decision == :allow
       assert %{"sha" => @head, "passed" => ["test"], "required" => ["test"]} = verdict.ci_evidence
+    end
+
+    # Review round 2, finding 3: a CI wait holds back only an allow.
+    test "a refusal is decided now, not held back while CI is still running" do
+      running = %{check_runs: [run("test", "queued", nil)], statuses: []}
+      verdict = judge_thread(head_tree_sha: String.duplicate("f", 40), ci: running)
+
+      assert verdict.decision == :refuse
+      refute {:required_check_pending, "test"} in verdict.reasons
+    end
+
+    # Review round 2, finding 5: required checks with no read fail closed.
+    test "required checks with nothing read refuse ci_evidence_not_read" do
+      verdict = judge_thread([], ci_evidence: {:ok, nil})
+
+      assert verdict.decision == :refuse
+      assert :ci_evidence_not_read in verdict.reasons
+    end
+
+    test "an allow whose evidence was superseded by a newer read is judged again" do
+      superseded = MergePrecondition.allow_evidence_outcome(judge_thread([]), :superseded)
+
+      assert superseded.decision == :unevaluated
+      assert {:ci_evidence_not_recorded, :superseded} in superseded.reasons
     end
 
     # Review round 1, finding 4: contention on the evidence write is a retry, not an escalation.
@@ -1375,7 +1399,8 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
   # US-45.6: the checkpoint commit's CI as `gather/3` reads it.
   defp green_ci, do: %{check_runs: [run("test", "completed", "success")], statuses: []}
 
-  defp run(name, status, conclusion), do: %{name: name, status: status, conclusion: conclusion}
+  defp run(name, status, conclusion),
+    do: %{name: name, status: status, conclusion: conclusion, app: "github-actions"}
 
   defp ci_read(evidence),
     do: %{evidence: evidence, sha: @head, read_at: ~U[2026-09-27 10:00:00Z]}

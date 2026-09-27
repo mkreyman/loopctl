@@ -209,7 +209,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   @impl true
-  def check_evidence(repo, sha, names) when is_list(names) do
+  def check_evidence(repo, sha) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, sha} <- ref(sha),
          {:ok, runs} <- check_runs_page(repo, sha, 1, []),
@@ -254,6 +254,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   defp check_run_fact(run) do
     %{
       id: run["id"],
+      # The creating App's slug: only a trusted App's run can satisfy a required check
+      # (`Loopctl.Delivery.CiEvidence`).
+      app: get_in(run, ["app", "slug"]),
       name: run["name"],
       status: run["status"],
       conclusion: run["conclusion"],

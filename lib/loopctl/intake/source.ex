@@ -176,6 +176,14 @@ defmodule Loopctl.Intake.Source do
   @max_required_checks 20
   @max_check_name_bytes 200
 
+  @doc "The most required checks a source may name."
+  @spec max_required_checks() :: pos_integer()
+  def max_required_checks, do: @max_required_checks
+
+  @doc "The longest required check name, in bytes."
+  @spec max_check_name_bytes() :: pos_integer()
+  def max_check_name_bytes, do: @max_check_name_bytes
+
   @doc "The status context a session's own local gate posts; never requirable."
   @spec local_gate() :: String.t()
   def local_gate, do: @local_gate

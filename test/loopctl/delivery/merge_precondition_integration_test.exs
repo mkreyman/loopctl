@@ -524,7 +524,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx)
       parent = String.duplicate("b", 40)
 
-      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, sha, ["test"] ->
+      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, sha ->
         cond do
           sha == @head -> {:ok, %{check_runs: [ci_run("test", nil, "in_progress")], statuses: []}}
           sha == parent -> {:ok, %{check_runs: [ci_run("test", "success")], statuses: []}}
@@ -594,6 +594,39 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       # A row that recorded none reads the source's current list.
       set_dispatch(ctx, required_checks: nil)
       assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+    end
+
+    # Review round 2, finding 2: an EMPTY list bound at placement is no policy.
+    test "an empty list bound at placement falls back to the source's current list", ctx do
+      set_dispatch(ctx, required_checks: [])
+      stub_thread(ctx)
+
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+    end
+
+    # Review round 2, finding 7: a completed CI wait ends a run of transient faults.
+    test "a CI wait between forge faults resets their consecutive count", ctx do
+      stub_thread(ctx)
+      blips = MergePrecondition.max_consecutive_unevaluated() - 1
+
+      fault = fn ->
+        Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha ->
+          {:error, {:github_unreachable, :timeout}}
+        end)
+
+        for _ <- 1..blips, do: assert({:ok, %Verdict{decision: :unevaluated}} = enforce(ctx))
+      end
+
+      fault.()
+
+      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha ->
+        {:ok, %{check_runs: [ci_run("test", nil, "queued")], statuses: []}}
+      end)
+
+      assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
+
+      fault.()
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
     end
 
     test "TC-45.4.3 a branch head nobody reported goes back to implementing, unescalated", ctx do
@@ -1069,7 +1102,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     # US-45.6: CI on the CHECKPOINT's commit, green unless the test says otherwise.
     ci = Keyword.get(opts, :ci, %{check_runs: [ci_run("test", "success")], statuses: []})
-    Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, ^head, _names -> {:ok, ci} end)
+    Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, ^head -> {:ok, ci} end)
   end
 
   defp checkpoint_evidence(ctx) do
@@ -1085,7 +1118,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   end
 
   defp ci_run(name, conclusion, status \\ "completed"),
-    do: %{name: name, status: status, conclusion: conclusion, url: nil}
+    do: %{name: name, status: status, conclusion: conclusion, url: nil, app: "github-actions"}
 
   # The comparison, relative to `@base_head` unless `:merge_base` says otherwise.
   defp comparison(base_tree, opts) do

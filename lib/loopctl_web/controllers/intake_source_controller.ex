@@ -31,11 +31,14 @@ defmodule LoopctlWeb.IntakeSourceController do
   tags(["Intake"])
 
   @required_checks_doc "The CI checks a THREAD-mode checkpoint must pass on its exact commit before " <>
-                         "the merge gate allows it (US-45.6): check-run names or commit-status " <>
-                         "contexts as they appear on the commit. A `thread` source must name at " <>
+                         "the merge gate allows it (US-45.6): GitHub Actions check-run names as " <>
+                         "they appear on the commit. A `thread` source must name at " <>
                          "least one (422 otherwise, whichever of `mode` and `required_checks` " <>
-                         "the request named); `pr` mode never reads it. At most 20 distinct, " <>
-                         "non-blank names of at most 200 bytes. `local-gate` is refused (422): " <>
+                         "the request named); `pr` mode never reads it. At most " <>
+                         "#{Source.max_required_checks()} distinct, non-blank names of at most " <>
+                         "#{Source.max_check_name_bytes()} bytes. Only a GitHub Actions check " <>
+                         "run satisfies one; a commit status is recorded, never trusted. " <>
+                         "`local-gate` is refused (422): " <>
                          "that status is posted by whoever pushed, so it is recorded on the " <>
                          "checkpoint and can never satisfy a required check."
 
@@ -127,8 +130,12 @@ defmodule LoopctlWeb.IntakeSourceController do
            project_id: %Schema{type: :string, format: :uuid},
            required_checks: %Schema{
              type: :array,
-             items: %Schema{type: :string, minLength: 1, maxLength: 200},
-             maxItems: 20,
+             items: %Schema{
+               type: :string,
+               minLength: 1,
+               maxLength: Source.max_check_name_bytes()
+             },
+             maxItems: Source.max_required_checks(),
              description: "Optional. " <> @required_checks_doc
            },
            mode: %Schema{
@@ -250,8 +257,12 @@ defmodule LoopctlWeb.IntakeSourceController do
          properties: %{
            required_checks: %Schema{
              type: :array,
-             items: %Schema{type: :string, minLength: 1, maxLength: 200},
-             maxItems: 20,
+             items: %Schema{
+               type: :string,
+               minLength: 1,
+               maxLength: Source.max_check_name_bytes()
+             },
+             maxItems: Source.max_required_checks(),
              description: "Optional. " <> @required_checks_doc
            },
            mode: %Schema{

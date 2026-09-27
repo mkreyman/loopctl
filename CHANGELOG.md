@@ -16,9 +16,11 @@ All notable changes to loopctl are documented here.
   `intake_source_required_checks_set` on the audit chain. **A thread-mode source enrolled
   before this migration has no required checks and every one of its stories is refused
   `required_checks_unset` until one is named.** The merge gate reads the checkpoint's commit
-  from both the check-runs and the commit-status APIs: a failed required check refuses
+  from both the check-runs and the commit-status APIs (only a GitHub Actions check
+  run can satisfy a required check; a commit status, which the implementer could post, is
+  recorded and never trusted): a failed required check refuses
   `required_check_failed`; one still running or not yet reported answers `unevaluated`
-  (`required_check_pending` / `required_check_missing`, `Retry-After: 60`); neither counts
+  (`required_check_pending` / `required_check_missing`, `Retry-After: 300`); neither counts
   toward the unevaluated bound, and six hours after the checkpoint was recorded both are
   refused `required_check_timed_out`. Only the latest result under a name counts. A failed
   read is `ci_evidence_unavailable`. The required checks are BOUND AT PLACEMENT (migration

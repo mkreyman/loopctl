@@ -9,7 +9,7 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
   alias Loopctl.Delivery.CiEvidence
 
   defp run(name, status, conclusion \\ nil),
-    do: %{name: name, status: status, conclusion: conclusion}
+    do: %{name: name, status: status, conclusion: conclusion, app: "github-actions"}
 
   defp status(context, state), do: %{context: context, state: state}
 
@@ -37,15 +37,19 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
     end
   end
 
-  test "a commit status satisfies a required name the check runs do not carry" do
-    assert %{passed: ["ci/external"]} =
-             judge(["ci/external"], [], [status("ci/external", "success")])
+  # Review round 2, finding 1: a status can be posted by the implementer, so it never
+  # satisfies a required check; nor does a run some other App created.
+  test "a commit status never satisfies a required check, however green or new" do
+    statuses = [status("test", "success")]
+    assert %{missing: ["test"], passed: []} = judge(["test"], [], statuses)
 
-    assert %{pending: ["ci/external"]} =
-             judge(["ci/external"], [], [status("ci/external", "pending")])
+    failing = Map.put(run("test", "completed", "failure"), :id, 1)
+    assert %{failed: [{"test", "failure"}]} = judge(["test"], [failing], statuses)
+  end
 
-    assert %{failed: [{"ci/external", "error"}]} =
-             judge(["ci/external"], [], [status("ci/external", "error")])
+  test "only a GitHub Actions check run counts" do
+    other_app = %{run("test", "completed", "success") | app: "some-other-app"}
+    assert %{missing: ["test"], passed: []} = judge(["test"], [other_app])
   end
 
   test "a required name nothing reported is missing" do
@@ -62,21 +66,6 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
 
     rerun = Map.put(run("test", "queued"), :id, 3)
     assert %{pending: ["test"], passed: []} = judge(["test"], [new_pass, rerun])
-  end
-
-  test "between a run and a status of one name the later one decides" do
-    stale_status = %{context: "test", state: "failure", at: "2026-09-27T09:00:00Z"}
-
-    green_run =
-      Map.merge(run("test", "completed", "success"), %{completed_at: "2026-09-27T10:00:00Z"})
-
-    assert %{passed: ["test"]} = judge(["test"], [green_run], [stale_status])
-
-    newer_status = %{stale_status | at: "2026-09-27T11:00:00Z"}
-    assert %{failed: [{"test", "failure"}]} = judge(["test"], [green_run], [newer_status])
-
-    # A run with no timestamp was just queued: nothing is newer.
-    assert %{pending: ["test"]} = judge(["test"], [run("test", "queued")], [newer_status])
   end
 
   test "each required name is judged on its own" do

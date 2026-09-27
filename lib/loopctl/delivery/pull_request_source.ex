@@ -202,13 +202,13 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback compare(repo(), String.t(), String.t()) :: {:ok, comparison()} | {:error, term()}
 
   @doc """
-  The CI evidence for ONE commit (US-45.6): the check runs under each of `names`, read by
-  name with GitHub's `filter=latest`, and every commit status on the commit. Both APIs,
-  because the combined status never lists check runs and the check-runs API never lists
-  statuses. See `Loopctl.Delivery.CiEvidence` for how it is judged. A list the forge
-  truncated is an error, never a partial answer: a missing failure reads as a pass.
+  The CI evidence for ONE commit (US-45.6): EVERY latest check run on it (`filter=latest`),
+  each with the slug of the App that created it, and every commit status. The required
+  names are matched by `Loopctl.Delivery.CiEvidence`, never here, so this reads the same
+  thing whatever a source requires. A list the forge truncated is an error, never a partial
+  answer: a missing failure reads as a pass.
   """
-  @callback check_evidence(repo(), String.t(), [String.t()]) ::
+  @callback check_evidence(repo(), String.t()) ::
               {:ok, Loopctl.Delivery.CiEvidence.evidence()} | {:error, term()}
 
   @doc "Every file the repository holds at `ref`."

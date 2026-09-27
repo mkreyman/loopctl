@@ -7,51 +7,58 @@ defmodule Loopctl.Delivery.CiEvidence do
   the checkpoint's SHA itself (`Loopctl.Delivery.PullRequestSource.check_evidence/3`) and
   this module decides what it says.
 
-  ## Where evidence comes from, and why both
+  ## What may satisfy a required check: a GitHub Actions check run, and nothing else
 
-  From BOTH the check-runs API and the commit-status API, by SHA. GitHub Actions reports
-  check runs, which the combined-status API never lists, so a green combined status says
-  nothing about Actions; an external CI or a hand-posted status reports commit statuses,
-  which the check-runs API never lists. A required name is satisfied by either.
+  Both the check-runs and the commit-status APIs are READ, by SHA, and both are recorded on
+  the checkpoint — GitHub Actions reports check runs, which the combined status never lists.
+  But only a CHECK RUN created by GitHub Actions (`@trusted_check_apps`) can satisfy a
+  required name (US-45.6 review round 2, finding 1). A commit status can be posted by anyone
+  holding `statuses: write` on the repository, which includes the implementer's own runner
+  (it posts `local-gate`), so letting a status satisfy a required name let the implementer
+  post `test = success` over a failing run and merge its own work — the self-attestation this
+  gate exists to refuse, one name over from `local-gate`. A check run needs a GitHub App to
+  create; the implementer holds none. Statuses are therefore evidence to READ, never to trust.
 
   Evidence for ANY OTHER commit never counts: nothing here reads a branch, a parent or a pull
   request, only the one SHA the caller names.
 
   ## How one required check is judged
 
-  - a check run that is not `completed`, or a status that is `pending`, is `:pending`
-  - a completed run concluding `success`, `neutral` or `skipped` (what GitHub itself counts
-    as passing a required check), or a status in `success`, is `:passed`
-  - any other conclusion or state (`failure`, `cancelled`, `timed_out`, `action_required`,
-    `stale`, `error`) is `:failed`
-  - no run and no status under that name is `:missing`
+  Only the LATEST trusted run under a name counts, as GitHub's own required-check rule judges
+  it (round 1, finding 5): the highest id, because ids only grow and a re-run queued a moment
+  ago has no timestamp yet. Then:
 
-  ONLY THE LATEST RESULT UNDER A NAME COUNTS, as it does for GitHub's own required-check rule
-  (US-45.6 review round 1, finding 5). Two workflows can each have a job `test`, and an old
-  external status can share a name with a newer Actions run; judging a failure anywhere as
-  decisive refused a green change for ever on the stale one. Among check runs the latest is
-  the highest id (ids only grow, and a re-run queued a moment ago has no timestamp yet); the
-  combined status is already the latest per context. Between a run and a status the later
-  timestamp wins, and a run with no timestamp is the newest there is (it was just queued).
+  - not `completed` is `:pending`
+  - `completed` concluding `success`, `neutral` or `skipped` (what GitHub itself counts as
+    passing a required check) is `:passed`
+  - any other conclusion (`failure`, `cancelled`, `timed_out`, `action_required`, `stale`) is
+    `:failed`
+  - no trusted run under that name is `:missing`, whatever statuses say
 
   ## The local gate is recorded, never trusted
 
-  `local-gate` (`Loopctl.Intake.Source.local_gate/0`) is posted by whoever pushed, so on the
-  thread path it is the implementer attesting its own work, which chain of custody refuses
-  (PRD §5). Its state is reported under `local_gate` and it is never looked up as a required
-  check, even by a caller that lists it: the intake source refuses to store it, and this
-  module drops it from the list as the backstop.
+  `local-gate` (`Loopctl.Intake.Source.local_gate/0`) is reported under `local_gate` and never
+  looked up as a required check, even by a caller that lists it: the intake source refuses to
+  store it, and this module drops it from the list as the backstop.
   """
 
   alias Loopctl.Intake.Source
 
   @passing_conclusions ["success", "neutral", "skipped"]
 
+  # The apps whose check runs may satisfy a required check. See the moduledoc.
+  @trusted_check_apps ["github-actions"]
+
+  @doc "The GitHub App slugs whose check runs may satisfy a required check."
+  @spec trusted_check_apps() :: [String.t()]
+  def trusted_check_apps, do: @trusted_check_apps
+
   @type check_run :: %{
           required(:name) => String.t(),
           required(:status) => String.t(),
           required(:conclusion) => String.t() | nil,
           optional(:id) => integer() | nil,
+          optional(:app) => String.t() | nil,
           optional(:started_at) => String.t() | nil,
           optional(:completed_at) => String.t() | nil,
           optional(:url) => String.t() | nil
@@ -84,7 +91,7 @@ defmodule Loopctl.Delivery.CiEvidence do
       required
       |> lookup_names()
       |> Enum.reduce(acc, fn name, acc ->
-        case check_state(name, runs, statuses) do
+        case check_state(name, runs) do
           {:failed, conclusion} -> Map.update!(acc, :failed, &[{name, conclusion} | &1])
           state -> Map.update!(acc, state, &[name | &1])
         end
@@ -94,29 +101,15 @@ defmodule Loopctl.Delivery.CiEvidence do
     Map.put(judged, :local_gate, local_gate_state(statuses))
   end
 
-  defp check_state(name, runs, statuses) do
-    run = runs |> Enum.filter(&(&1.name == name)) |> Enum.max_by(&run_order/1, fn -> nil end)
-    status = Enum.find(statuses, &(&1.context == name))
-
-    case {run, status} do
-      {nil, nil} -> :missing
-      {run, nil} -> run_state(run)
-      {nil, status} -> status_state(status)
-      {run, status} -> if run_newer?(run, status), do: run_state(run), else: status_state(status)
+  defp check_state(name, runs) do
+    runs
+    |> Enum.filter(&(&1.name == name and Map.get(&1, :app) in @trusted_check_apps))
+    |> Enum.max_by(&(Map.get(&1, :id) || 0), fn -> nil end)
+    |> case do
+      nil -> :missing
+      run -> run_state(run)
     end
   end
-
-  defp run_order(run), do: Map.get(run, :id) || 0
-
-  defp run_newer?(run, status) do
-    case {run_at(run), Map.get(status, :at)} do
-      {nil, _status_at} -> true
-      {_run_at, nil} -> true
-      {run_at, status_at} -> run_at >= status_at
-    end
-  end
-
-  defp run_at(run), do: Map.get(run, :completed_at) || Map.get(run, :started_at)
 
   defp run_state(%{status: "completed", conclusion: conclusion})
        when conclusion in @passing_conclusions,
@@ -126,10 +119,6 @@ defmodule Loopctl.Delivery.CiEvidence do
     do: {:failed, conclusion || "none"}
 
   defp run_state(_running), do: :pending
-
-  defp status_state(%{state: "success"}), do: :passed
-  defp status_state(%{state: "pending"}), do: :pending
-  defp status_state(%{state: state}), do: {:failed, state}
 
   defp local_gate_state(statuses) do
     local_gate = Source.local_gate()
@@ -154,6 +143,7 @@ defmodule Loopctl.Delivery.CiEvidence do
         Enum.map(runs, fn run ->
           %{
             "name" => run.name,
+            "app" => Map.get(run, :app),
             "status" => run.status,
             "conclusion" => run.conclusion,
             "url" => Map.get(run, :url)

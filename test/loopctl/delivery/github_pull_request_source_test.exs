@@ -755,7 +755,13 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
   describe "check_evidence/3 (US-45.6)" do
     defp gh_run(id, name, conclusion),
-      do: %{"id" => id, "name" => name, "status" => "completed", "conclusion" => conclusion}
+      do: %{
+        "id" => id,
+        "name" => name,
+        "status" => "completed",
+        "conclusion" => conclusion,
+        "app" => %{"slug" => "github-actions"}
+      }
 
     # Review round 1, finding 7: ONE paged read of every run on the commit, never one per name.
     test "reads every latest run on the exact SHA in one paged call, and every status" do
@@ -789,9 +795,18 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       end)
 
       assert {:ok, %{check_runs: runs, statuses: statuses}} =
-               Source.check_evidence(@repo, @head, ["test", "lint / credo"])
+               Source.check_evidence(@repo, @head)
 
-      assert [%{id: 7, name: "test", completed_at: "2026-09-27T10:00:00Z"}, %{id: 8}] = runs
+      assert [
+               %{
+                 id: 7,
+                 name: "test",
+                 app: "github-actions",
+                 completed_at: "2026-09-27T10:00:00Z"
+               },
+               %{id: 8}
+             ] = runs
+
       assert [%{context: "local-gate", state: "success", at: "t"}] = statuses
     end
 
@@ -807,7 +822,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       end)
 
       assert {:ok, %{check_runs: [%{name: "job-1"}, %{name: "job-2"}]}} =
-               Source.check_evidence(@repo, @head, ["job-1"])
+               Source.check_evidence(@repo, @head)
     end
 
     test "a list the forge truncated is an error, never a partial answer" do
@@ -820,7 +835,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       end)
 
       assert {:error, {:check_runs_truncated, 1000, 3}} =
-               Source.check_evidence(@repo, @head, ["test"])
+               Source.check_evidence(@repo, @head)
 
       stub(fn conn ->
         if String.ends_with?(conn.request_path, "/check-runs") do
@@ -831,14 +846,14 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       end)
 
       assert {:error, {:statuses_truncated, 101, 0}} =
-               Source.check_evidence(@repo, @head, ["test"])
+               Source.check_evidence(@repo, @head)
     end
 
     test "an unreadable body is an error naming its shape" do
       stub(fn conn -> json(conn, %{"message" => "nope"}) end)
 
       assert {:error, {:unreadable_check_runs, {:map, ["message"]}}} =
-               Source.check_evidence(@repo, @head, ["test"])
+               Source.check_evidence(@repo, @head)
     end
   end
 

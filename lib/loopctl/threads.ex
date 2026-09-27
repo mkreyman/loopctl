@@ -481,8 +481,9 @@ defmodule Loopctl.Threads do
   and the slower one may have read earlier: without a guard it would write a stale "pending"
   over the green record an allow was granted on. A record carrying `"read_at"` (ISO 8601 UTC,
   which orders as text) replaces only a stored one read strictly earlier; one read no later
-  than what is stored is answered `:ok` and changes nothing, because the newer record is the
-  one that should stand.
+  than what is stored changes nothing and is answered `:superseded`, so a caller about to act
+  on it knows it did not land. One identical to what is stored, `read_at` aside, is `:ok`
+  with no write.
 
   Not a thread WRITE in the claimant's sense — the gate, not a principal, records what the
   forge said about a commit — so it takes no story lock and no claim fence. Its lock wait is
@@ -490,7 +491,7 @@ defmodule Loopctl.Threads do
   `{:error, :not_found}` when the story has no such checkpoint.
   """
   @spec record_gate_evidence(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) ::
-          :ok | {:error, :not_found | term()}
+          :ok | :superseded | {:error, :not_found | term()}
   def record_gate_evidence(tenant_id, story_id, checkpoint_id, key, record)
       when is_binary(key) and is_map(record) do
     Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "gate evidence write", fn ->
@@ -507,38 +508,54 @@ defmodule Loopctl.Threads do
 
   defp write_gate_evidence(tenant_id, story_id, checkpoint_id, key, record) do
     Capacity.set_lock_timeout!(Repo)
-    this = evidence_checkpoint(tenant_id, story_id, checkpoint_id)
 
-    written =
-      this
-      |> newer_than_stored(key, Map.get(record, "read_at"))
-      |> update([c],
-        set: [gate_evidence: fragment("? || ?", c.gate_evidence, ^%{key => record})]
+    stored =
+      Repo.one(
+        from c in Checkpoint,
+          where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
+          where: c.story_id == ^story_id,
+          lock: "FOR UPDATE",
+          select: %{present: true, record: fragment("?->?", c.gate_evidence, ^key)}
       )
-      |> Repo.update_all([])
 
-    case written do
-      {1, _} -> :ok
-      {0, _} -> if Repo.exists?(this), do: :ok, else: {:error, :not_found}
+    case evidence_write(stored, record) do
+      :write ->
+        {1, _} =
+          from(c in Checkpoint, where: c.id == ^checkpoint_id)
+          |> update([c],
+            set: [gate_evidence: fragment("? || ?", c.gate_evidence, ^%{key => record})]
+          )
+          |> Repo.update_all([])
+
+        :ok
+
+      answer ->
+        answer
     end
   end
 
-  defp evidence_checkpoint(tenant_id, story_id, checkpoint_id) do
-    from(c in Checkpoint,
-      where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
-      where: c.story_id == ^story_id
-    )
+  # The decision, taken under the row lock so two evaluations cannot both think they are the
+  # newer one. A record read no LATER than the stored one is `:superseded`, never `:ok`: the
+  # allow path must not record an allow on evidence that did not land (round 2, finding 4).
+  # One that says exactly what is stored already, read_at aside, is `:ok` with no write, so a
+  # CI wait polled for hours rewrites the row only when the judgement moves (finding 6).
+  defp evidence_write(nil, _record), do: {:error, :not_found}
+  defp evidence_write(%{record: nil}, _record), do: :write
+
+  defp evidence_write(%{record: stored}, record) do
+    cond do
+      Map.delete(stored, "read_at") == Map.delete(record, "read_at") -> :ok
+      not later?(Map.get(record, "read_at"), Map.get(stored, "read_at")) -> :superseded
+      true -> :write
+    end
   end
 
-  defp newer_than_stored(query, _key, nil), do: query
-
-  defp newer_than_stored(query, key, read_at) when is_binary(read_at) do
-    where(
-      query,
-      [c],
-      fragment("coalesce(?->?->>'read_at', '') < ?", c.gate_evidence, ^key, ^read_at)
-    )
-  end
+  # ISO 8601 UTC with fixed-width fractions orders as text (`CiEvidence.to_record/5`). A record
+  # with no `read_at` makes no ordering claim and is written.
+  defp later?(nil, _stored), do: true
+  defp later?(_read_at, nil), do: true
+  defp later?(read_at, stored) when is_binary(read_at) and is_binary(stored), do: read_at > stored
+  defp later?(_read_at, _stored), do: true
 
   defp locked_story(tenant_id, story_id),
     do: Repo.one(story_query(tenant_id, story_id) |> lock("FOR SHARE"))

@@ -8504,9 +8504,10 @@ const TOOLS = [
       "checkpoint's tree equals the base's, or no file changed) and " +
       "`checkpoint_tree_mismatch` (the forge's tree is not the one the claimant recorded). " +
       "CI IS READ BY THE CHECKPOINT'S EXACT SHA, from both the check-runs and the " +
-      "commit-status APIs, against the source's `required_checks`: a failed one refuses " +
+      "commit-status APIs, against the source's `required_checks`; only a GitHub Actions " +
+      "check run satisfies one (a status is recorded, never trusted): a failed one refuses " +
       "`required_check_failed`, one still running or not yet reported answers `unevaluated` " +
-      "(`required_check_pending` / `required_check_missing`, retry after 60s; neither counts " +
+      "(`required_check_pending` / `required_check_missing`, retry after 300s; neither counts " +
       "toward the unevaluated bound, and six hours after the checkpoint was recorded both " +
       "are refused `required_check_timed_out`; only the latest result under a name counts, " +
       "and the checks are the ones bound at placement), a source requiring none refuses " +
@@ -8724,7 +8725,7 @@ const TOOLS = [
           items: { type: "string" },
           description:
             "The CI checks a THREAD-mode checkpoint must pass on its exact commit before the " +
-            "merge gate allows it: check-run names or commit-status contexts as they appear " +
+            "merge gate allows it: GitHub Actions check-run names as they appear " +
             "on the commit. A `thread` source must name at least one (422 otherwise); `pr` " +
             "mode never reads it. At most 20 distinct, non-blank names of at most 200 bytes. " +
             "`local-gate` is refused: whoever pushed posts it, so it is only recorded.",
@@ -8834,7 +8835,7 @@ const TOOLS = [
           items: { type: "string" },
           description:
             "The CI checks a THREAD-mode checkpoint must pass on its exact commit before the " +
-            "merge gate allows it: check-run names or commit-status contexts as they appear " +
+            "merge gate allows it: GitHub Actions check-run names as they appear " +
             "on the commit. A `thread` source must name at least one (422 otherwise); `pr` " +
             "mode never reads it. At most 20 distinct, non-blank names of at most 200 bytes. " +
             "`local-gate` is refused. Omit to leave the current list alone.",

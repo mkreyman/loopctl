@@ -17,7 +17,8 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   reasons: `required_check_failed`, `required_check_pending`, `required_check_missing`,
   `required_checks_unset`, `required_check_timed_out`, `ci_evidence_unavailable`,
   `ci_evidence_not_recorded`. A CI wait never counts toward the unevaluated bound and is
-  refused six hours after the checkpoint was recorded.
+  refused six hours after the checkpoint was recorded. Only a GitHub Actions check run
+  satisfies a required check; a commit status is recorded, never trusted.
 
 ## 2.107.0 — 2026-09-26 (review on a change thread)
 
