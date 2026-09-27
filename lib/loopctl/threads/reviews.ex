@@ -24,13 +24,20 @@ defmodule Loopctl.Threads.Reviews do
 
   ## Rounds and the ceiling
 
+  Rounds belong to a CLAIM. Every count below is of the reviews placed under the story's
+  current `claim_epoch`: a story released and claimed again is rewritten work, and it starts
+  at round 1 however many rounds the claim before it used. A review whose claim has ended —
+  a new claim, a release, a force-unclaim — may write nothing more (`review_claim_ended`), so
+  nothing it says can count for the claim that follows.
+
   A completed round IS a review's one `verdict`. A review placed for round N completes it only
-  while exactly N - 1 rounds are complete (`review_round_superseded`), so two reviews of one
-  round cannot both count, and a review that ends without a verdict uses no round. Round 2
-  always follows round 1. Round 3 is placeable only when a round-2 finding's `introduced_by`
-  names a checkpoint that carries a fix written BEFORE the round-2 verdict, so the decision is
-  made once and a later fix cannot reopen it. There is never a round 4. When the round that
-  reaches the ceiling has a material finding (critical, high or medium), its verdict records a
+  while exactly N - 1 rounds of its claim are complete (`review_round_superseded`), so two
+  reviews of one round cannot both count, and a review that ends without a verdict uses no
+  round. Round 2 always follows round 1. Round 3 is placeable only when a round-2 finding's
+  `introduced_by` names a checkpoint that carries a fix the thread recorded BEFORE the round-2
+  review was placed (`placed_at_seq`), so nothing written while round 2 is under way can
+  reopen the decision it is making. There is never a round 4. When the round that reaches the
+  ceiling has a material finding (critical, high or medium), its verdict records a
   `review_ceiling` escalation in the same transaction, and `Loopctl.Workers.ReviewCeilingWorker`
   moves the delivery stage until it lands.
 
@@ -66,6 +73,14 @@ defmodule Loopctl.Threads.Reviews do
   @type refusal ::
           {:error, {:forbidden | :conflict | :unprocessable_entity, String.t(), String.t()}}
 
+  @type completed :: %{
+          optional(1..3) => %{
+            id: Ecto.UUID.t(),
+            verdict_seq: pos_integer(),
+            placed_at_seq: non_neg_integer()
+          }
+        }
+
   @type rounds :: %{
           completed: non_neg_integer(),
           next_round: 1..3 | nil,
@@ -98,7 +113,11 @@ defmodule Loopctl.Threads.Reviews do
   """
   @spec rounds(Ecto.UUID.t(), Ecto.UUID.t()) :: rounds()
   def rounds(tenant_id, story_id) do
-    {:ok, rounds} = Repo.with_tenant(tenant_id, fn -> compute_rounds(tenant_id, story_id) end)
+    {:ok, rounds} =
+      Repo.with_tenant(tenant_id, fn ->
+        tenant_id |> Threads.story(story_id) |> then(&compute_rounds(tenant_id, &1))
+      end)
+
     rounds
   end
 
@@ -171,9 +190,27 @@ defmodule Loopctl.Threads.Reviews do
   def implementer_dispatched(%Story{}), do: :ok
 
   @doc false
-  @spec placeable_round(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, 1..3} | refusal()
-  def placeable_round(tenant_id, story_id) do
-    case compute_rounds(tenant_id, story_id) do
+  # The claim a review reads is still the story's: the same epoch, and still held. A
+  # force-unclaim or a release leaves the epoch where it was and clears the claimant, so the
+  # epoch alone does not say the claim is over.
+  @spec claim_current(Story.t(), non_neg_integer()) :: :ok | refusal()
+  def claim_current(%Story{claim_epoch: epoch, assigned_agent_id: agent}, epoch)
+      when not is_nil(agent),
+      do: :ok
+
+  def claim_current(%Story{}, _epoch),
+    do:
+      refuse(
+        :conflict,
+        "review_claim_ended",
+        "the implementer's claim this review belongs to has ended; nothing it judged can " <>
+          "count for another claim"
+      )
+
+  @doc false
+  @spec placeable_round(Ecto.UUID.t(), Story.t()) :: {:ok, 1..3} | refusal()
+  def placeable_round(tenant_id, story) do
+    case compute_rounds(tenant_id, story) do
       %{next_round: nil, completed: completed} ->
         refuse(
           :conflict,
@@ -249,33 +286,36 @@ defmodule Loopctl.Threads.Reviews do
       )
 
   @doc false
-  @spec review_open(Ecto.UUID.t(), Review.t()) :: :ok | refusal()
-  def review_open(tenant_id, review) do
-    if Repo.exists?(
-         from e in Entry,
-           where: e.tenant_id == ^tenant_id and e.review_id == ^review.id and e.kind == :verdict
-       ),
-       do:
-         refuse(
-           :conflict,
-           "review_closed",
-           "this review has recorded its verdict; it may write nothing further"
-         ),
-       else: :ok
-  end
+  # The completed rounds of the story's CURRENT claim, read ONCE per judgement write under the
+  # thread lock and handed to `judgeable/2` and `ceiling_material/4`, which decide from it
+  # rather than each reading it again.
+  @spec completed(Ecto.UUID.t(), Story.t()) :: completed()
+  def completed(tenant_id, story), do: completed_reviews(tenant_id, story)
 
   @doc false
-  # A review placed for round N completes it only while N - 1 rounds are complete.
-  @spec current_round(Ecto.UUID.t(), Ecto.UUID.t(), Review.t()) :: :ok | refusal()
-  def current_round(tenant_id, story_id, review) do
-    if map_size(completed_reviews(tenant_id, story_id)) == review.round - 1,
-      do: :ok,
-      else:
+  # A review may still judge: it has not recorded its verdict (`review_closed`), and it was
+  # placed for the round its claim is on (`review_round_superseded`). Both from `completed`,
+  # which holds only this claim's reviews — `claim_current/2` has already refused the rest.
+  @spec judgeable(Review.t(), completed()) :: :ok | refusal()
+  def judgeable(review, completed) do
+    cond do
+      Enum.any?(completed, fn {_round, %{id: id}} -> id == review.id end) ->
+        refuse(
+          :conflict,
+          "review_closed",
+          "this review has recorded its verdict; it may write nothing further"
+        )
+
+      map_size(completed) != review.round - 1 ->
         refuse(
           :conflict,
           "review_round_superseded",
           "round #{review.round} was completed by another review"
         )
+
+      true ->
+        :ok
+    end
   end
 
   @doc false
@@ -320,11 +360,20 @@ defmodule Loopctl.Threads.Reviews do
 
   @doc false
   # The number of material findings the review recorded, when its verdict reaches the ceiling;
-  # zero otherwise. Called after the verdict is inserted, so the count includes it.
-  @spec ceiling_material(Ecto.UUID.t(), Ecto.UUID.t(), Review.t()) :: non_neg_integer()
-  def ceiling_material(tenant_id, story_id, review) do
-    case compute_rounds(tenant_id, story_id) do
-      %{ceiling_reached: true} ->
+  # zero otherwise. `completed` is what `completed/2` read before the verdict, and `verdict_seq`
+  # is the verdict just inserted, so the rounds are decided without reading them again.
+  @spec ceiling_material(Ecto.UUID.t(), Story.t(), Review.t(), completed(), pos_integer()) ::
+          non_neg_integer()
+  def ceiling_material(tenant_id, story, review, completed, verdict_seq) do
+    completed =
+      Map.put(completed, review.round, %{
+        id: review.id,
+        verdict_seq: verdict_seq,
+        placed_at_seq: review.placed_at_seq
+      })
+
+    case next_round(tenant_id, story, completed) do
+      nil ->
         Repo.aggregate(
           from(e in Entry,
             where:
@@ -334,7 +383,7 @@ defmodule Loopctl.Threads.Reviews do
           :count
         )
 
-      _rounds ->
+      _round ->
         0
     end
   end
@@ -400,28 +449,33 @@ defmodule Loopctl.Threads.Reviews do
   # Rounds
   # ---------------------------------------------------------------------------
 
-  defp compute_rounds(tenant_id, story_id) do
-    completed = completed_reviews(tenant_id, story_id)
-    count = map_size(completed)
+  defp compute_rounds(_tenant_id, nil), do: %{completed: 0, next_round: 1, ceiling_reached: false}
 
-    next_round =
-      cond do
-        count < 2 -> count + 1
-        count == 2 and third_round_warranted?(tenant_id, story_id, completed) -> 3
-        true -> nil
-      end
-
-    %{completed: count, next_round: next_round, ceiling_reached: is_nil(next_round)}
+  defp compute_rounds(tenant_id, %Story{} = story) do
+    completed = completed_reviews(tenant_id, story)
+    next = next_round(tenant_id, story, completed)
+    %{completed: map_size(completed), next_round: next, ceiling_reached: is_nil(next)}
   end
 
-  # `%{round => {review_id, verdict_seq}}` for every review with a verdict. The verdict check
-  # in `current_round/3` makes the rounds exactly 1..N.
-  defp completed_reviews(tenant_id, story_id) do
+  defp next_round(tenant_id, story, completed) do
+    count = map_size(completed)
+
+    cond do
+      count < 2 -> count + 1
+      count == 2 and third_round_warranted?(tenant_id, story, completed) -> 3
+      true -> nil
+    end
+  end
+
+  # `%{round => %{id, verdict_seq, placed_at_seq}}` for every review of the story's CURRENT
+  # claim with a verdict. `judgeable/2` makes the rounds exactly 1..N.
+  defp completed_reviews(tenant_id, story) do
     from(e in Entry,
       join: r in Review,
       on: r.id == e.review_id,
-      where: e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.kind == :verdict,
-      select: {r.round, {r.id, e.seq}}
+      where: e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :verdict,
+      where: r.claim_epoch == ^story.claim_epoch,
+      select: {r.round, %{id: r.id, verdict_seq: e.seq, placed_at_seq: r.placed_at_seq}}
     )
     |> Repo.all()
     |> Map.new()
@@ -433,14 +487,18 @@ defmodule Loopctl.Threads.Reviews do
   # checkpoint, a fix names only findings of COMPLETED rounds, and a fix of a round-2 finding
   # comes after the checkpoint it was found in.
   #
-  # DECIDED ONCE, AT THE ROUND-2 VERDICT: only fixes written before it (by thread `seq`) count.
-  defp third_round_warranted?(tenant_id, story_id, %{2 => {round2, verdict_seq}}) do
+  # Only fixes the thread recorded BY THE TIME ROUND 2 WAS PLACED count (`placed_at_seq`), on
+  # checkpoints of this claim: a fix written while round 2 streams its findings, or after its
+  # verdict, cannot reopen the decision round 2 is making.
+  defp third_round_warranted?(tenant_id, story, %{2 => %{id: round2, placed_at_seq: placed}}) do
     fix_checkpoints =
       Repo.all(
         from e in Entry,
+          join: c in Checkpoint,
+          on: c.id == e.checkpoint_id,
           where:
-            e.tenant_id == ^tenant_id and e.story_id == ^story_id and e.kind == :fix and
-              e.seq < ^verdict_seq,
+            e.tenant_id == ^tenant_id and e.story_id == ^story.id and e.kind == :fix and
+              e.seq <= ^placed and c.claim_epoch == ^story.claim_epoch,
           select: e.checkpoint_id
       )
 
@@ -503,7 +561,7 @@ defmodule Loopctl.Threads.Reviews do
       entries_truncated: rest != [],
       fixes: fixes,
       fixes_truncated: fixes_truncated,
-      rounds: compute_rounds(tenant_id, story.id)
+      rounds: compute_rounds(tenant_id, story)
     }
   end
 

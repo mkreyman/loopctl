@@ -14,14 +14,20 @@ All notable changes to loopctl are documented here.
   findings and its one verdict as the new channel messages `review_finding` and
   `review_verdict`; there is no HTTP path for either. `GET .../thread/reviews/:review_id`
   reads the review payload and `POST .../thread/fixes` records the claimant's fixes. Rounds
-  are counted from the thread: round 3 only when a round-2 finding names a checkpoint a
-  round-1 fix carried, never round 4, and a round 2 that ends with a material finding moves
-  the delivery stage over the new `review_ceiling` edge (reconciled every minute by
-  `ReviewCeilingWorker` until it lands). New env vars `REVIEW_WALL_CLOCK_SECONDS` and
+  are counted per CLAIM from the thread: round 3 only when a round-2 finding names a
+  checkpoint a round-1 fix carried (a fix recorded before round 2 was placed), never round 4,
+  and a story claimed again starts at round 1. A review whose claim ended writes nothing more
+  (`review_claim_ended`). The verdict of whichever round reaches the ceiling — round 2, or
+  round 3 when one was placeable — moves the delivery stage over the new `review_ceiling`
+  edge if that round has a material finding (reconciled every minute by
+  `ReviewCeilingWorker` until it lands). `session_ended` now also ends a review session: it
+  frees the slot and does nothing else. New env vars `REVIEW_WALL_CLOCK_SECONDS` and
   `REVIEW_MAX_TURNS` (see `deploy/FLY_SECRETS.md`); with them unset a review placement
   without explicit budgets is refused `budget_unset`. The migration widens the
-  `runner_dispatches.kind` CHECK to include `review`; its rollback refuses while any review
-  row exists. New refusal codes: `review_closed`, `review_round_superseded`,
+  `runner_dispatches.kind` CHECK to include `review`. Its ROLLBACK refuses, and drops
+  nothing, while any `thread_reviews` row or review-kind `runner_dispatches` row exists; with
+  none it drops `thread_reviews` and the judgement columns of `thread_entries`. New refusal
+  codes: `review_closed`, `review_claim_ended`, `review_round_superseded`,
   `reviewer_not_separate`, `tenant_halted`. MCP server 2.106.0 adds `thread_request_review`,
   `thread_review_get` and `thread_fix`.
 - **Runners may report checkpoints and notes on a story's change thread (epic 45, US-45.2,

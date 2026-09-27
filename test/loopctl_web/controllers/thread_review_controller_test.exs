@@ -12,10 +12,15 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
   use LoopctlWeb.ConnCase, async: false
 
   import Ecto.Query
+  import Phoenix.ChannelTest, only: [subscribe_and_join: 3]
 
+  require Phoenix.ChannelTest
+
+  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Repo
   alias Loopctl.Threads
   alias Loopctl.WorkBreakdown.Story
+  alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
 
@@ -32,7 +37,7 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
     tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
     {impl_raw, _impl_key, implementer} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
     {operator_raw, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
-    {_runner_raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id})
+    {runner_raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id, name: "reviewer"})
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})
     session = fixture(:stage_dispatch, %{tenant_id: tenant.id, agent_id: implementer.id})
 
@@ -56,8 +61,37 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
       implementer: implementer,
       operator_raw: operator_raw,
       runner: runner,
+      runner_raw: runner_raw,
       session: session
     }
+  end
+
+  # The runner on a live socket declaring `review`, so a placement gets past the push's
+  # pre-checks to the thread's own rules.
+  defp join_runner(ctx) do
+    {:ok, socket} =
+      Phoenix.ChannelTest.connect(RunnerSocket, %{},
+        connect_info: %{
+          x_headers: [{RunnerSocket.token_header(), ctx.runner_raw}],
+          peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
+        }
+      )
+
+    {:ok, _reply, channel} =
+      subscribe_and_join(socket, "runner:" <> ctx.runner.id, %{
+        "contract_version" => RunnerContract.version(),
+        "machine" => "reviewer",
+        "cores" => 4,
+        "memory_mb" => 8_000,
+        "repos" => ["acme/widgets"],
+        "max_sessions" => 2,
+        "in_flight" => 0,
+        "draining" => false,
+        "kinds" => ["implement", "review"]
+      })
+
+    _ = :sys.get_state(channel.channel_pid)
+    channel
   end
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -135,6 +169,7 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
   end
 
   test "a review placement refusal carries its own code", ctx do
+    join_runner(ctx)
     path = "/api/v1/stories/#{ctx.story.id}/thread/reviews"
 
     assert %{"error" => %{"code" => "no_checkpoint"}} =

@@ -18,8 +18,15 @@ defmodule Loopctl.Repo.Migrations.CreateThreadReviews do
   A round is completed by its review's ONE `verdict` entry (partial unique index below), and
   the round count and the ceiling are computed from `thread_entries` alone.
 
+  `placed_at_seq` is the thread's last entry `seq` when the review was placed: a fix counts
+  toward a third round only if the thread recorded it by then, so nothing written while round
+  2 is under way can reopen the decision it is making.
+
   `runner_dispatches_kind` admits `review` (runner contract 1.21.0), so the ledger can record
-  a review dispatch. Rolling back refuses while any review dispatch is recorded.
+  a review dispatch. ROLLING BACK REFUSES while any review exists — a `thread_reviews` row or a
+  `review` ledger row — and drops nothing then. With none, it drops `thread_reviews` and the
+  judgement columns of `thread_entries` (every one NULL, since a judgement needs a review),
+  and restores the per-author idempotency index and the kind CHECK.
 
   RLS is ENABLED (not FORCE): the production role owns the table without BYPASSRLS.
   """
@@ -47,6 +54,7 @@ defmodule Loopctl.Repo.Migrations.CreateThreadReviews do
           null: false
 
       add :round, :integer, null: false
+      add :placed_at_seq, :integer, null: false
       add :placed_by, :string, null: false
 
       timestamps(type: :utc_datetime_usec, updated_at: false)
@@ -138,25 +146,22 @@ defmodule Loopctl.Repo.Migrations.CreateThreadReviews do
   end
 
   def down do
-    # Down folds judgements back into the per-AUTHOR key index, which up split them out of on
-    # purpose: one reviewer agent may use the same key in two reviews. When it has, that index
-    # cannot be rebuilt, and the rollback refuses rather than drop or rewrite a thread entry,
-    # which is append-only and hash-chained.
-    %{rows: [[collisions]]} =
+    # Down refuses while ANY review exists, rather than drop a review, its judgements (thread
+    # entries are append-only and hash-chained) or a ledger row the kind CHECK would no longer
+    # admit. With none, every judgement column is NULL and the per-author key index it restores
+    # can be rebuilt, because only judgements were ever split out of it.
+    %{rows: [[reviews]]} =
       repo().query!("""
-      SELECT count(*) FROM (
-        SELECT 1 FROM thread_entries
-        GROUP BY tenant_id, story_id, author_principal, idempotency_key
-        HAVING count(*) > 1
-      ) AS duplicated
+      SELECT (SELECT count(*) FROM thread_reviews) +
+             (SELECT count(*) FROM runner_dispatches WHERE kind = 'review')
       """)
 
-    if collisions > 0 do
+    if reviews > 0 do
       raise Ecto.MigrationError,
         message:
-          "cannot roll back #{__MODULE__}: #{collisions} (author, idempotency_key) pair(s) " <>
-            "are used by judgements in more than one review, so the per-author unique index " <>
-            "it restores cannot be built. Thread entries are append-only and are not rewritten."
+          "cannot roll back #{__MODULE__}: #{reviews} review row(s) exist (thread_reviews or " <>
+            "review-kind runner_dispatches). Rolling back would drop reviews and their " <>
+            "judgements, which are append-only; it refuses and drops nothing."
     end
 
     drop constraint(:thread_entries, :thread_entries_judgement_shape)

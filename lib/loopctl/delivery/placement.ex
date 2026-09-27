@@ -387,10 +387,24 @@ defmodule Loopctl.Delivery.Placement do
   API key exists for the review — its findings and verdict come back over the runner socket
   from the runner that holds this dispatch (`Loopctl.Delivery.RunnerReviews`).
 
-  The review is recorded first (`Loopctl.Threads.record_review/3`, which decides the round,
-  the checkpoint and the reviewer's separation under the thread lock), then pushed. That is the
-  recoverable order: a refused push leaves an inert review row nothing can judge under, never a
-  session whose judgements have nothing to bind to.
+  ## Order: the push is judged, then the review is recorded, then it is pushed
+
+  Everything that can refuse the push BEFORE it is attempted is asked first, of the same live
+  meta the push will reach: one socket, the machine taking work, the `review` kind declared,
+  the repo, the subscription, and a free slot (`review_push_ready/4`). Only then is the review
+  recorded with its chain entry (`Loopctl.Threads.record_review/3`, which decides the round,
+  the checkpoint and the reviewer's separation under the thread lock), and then pushed.
+
+  Recording AFTER the push was the other choice and is worse: the push is a broadcast the
+  runner may act on at once, and a finding arriving before its review row exists is
+  `unknown_dispatch`, which the contract publishes as permanent — the review would be lost
+  with the session still running. So the row is written first, and what is left between the
+  pre-checks and the push is a race (the socket drops, the last slot goes, a lock is not
+  granted). A review that loses it is recorded and was never pushed: it is INERT — every
+  judgement is first resolved from the runner's ledger row, and there is none — it uses no
+  round, since a round is a verdict, and a retry with the same `dispatch_id` finds the row and
+  pushes it. Its `thread_review_placed` chain entry records the placement DECISION, which was
+  made; the ledger row is the record of the push.
 
   ## Options
 
@@ -429,6 +443,7 @@ defmodule Loopctl.Delivery.Placement do
            DispatchPayload.fill(tenant_id, review_dispatch(dispatch_id, story_id, opts),
              branch_prefixes: declared_branch_prefixes(meta)
            ),
+         :ok <- review_push_ready(tenant_id, runner_id, meta, dispatch),
          {:ok, story} <- review_story(tenant_id, story_id),
          {:ok, story_object} <- ImplementerInput.story_object(story),
          {:ok, review, _status} <-
@@ -441,6 +456,41 @@ defmodule Loopctl.Delivery.Placement do
          payload = review_payload(tenant_id, dispatch, story_object, review),
          :ok <- Runners.dispatch(tenant_id, runner_id, payload) do
       {:ok, %{review: review, dispatch_id: dispatch_id}}
+    end
+  end
+
+  # What `Runners.dispatch/3` would refuse, asked before the review is recorded (see "Order" in
+  # `place_review/4`). The socket question has the same answers `dispatch/3` gives; the kind,
+  # draining and repo questions are `Runners.accepts?/5`, the one copy of that rule; the slot
+  # is read, not taken — `record_sent/3` takes it at the push.
+  defp review_push_ready(tenant_id, runner_id, nil, _dispatch) do
+    case Runners.live_metas(tenant_id, runner_id) do
+      [] -> {:error, :runner_not_connected}
+      _ambiguous -> {:error, :runner_ambiguous}
+    end
+  end
+
+  defp review_push_ready(tenant_id, runner_id, meta, dispatch) do
+    with :ok <- review_accepted(tenant_id, runner_id, meta, Map.get(dispatch, "repo")) do
+      review_slot_free(tenant_id, runner_id)
+    end
+  end
+
+  defp review_accepted(tenant_id, runner_id, meta, repo) when is_binary(repo) do
+    case Runners.accepts?(tenant_id, runner_id, meta, "review", repo) do
+      {:error, :runner_draining} -> {:error, :runner_declines_work}
+      other -> other
+    end
+  end
+
+  defp review_accepted(_tenant_id, _runner_id, _meta, _no_repo),
+    do: {:error, :repo_not_allowed}
+
+  defp review_slot_free(tenant_id, runner_id) do
+    case Runners.capacity(tenant_id) do
+      %{^runner_id => %{in_flight: in_flight, max_sessions: max}} when in_flight < max -> :ok
+      %{^runner_id => _full} -> {:error, :runner_at_capacity}
+      _revoked -> {:error, :not_authorized}
     end
   end
 

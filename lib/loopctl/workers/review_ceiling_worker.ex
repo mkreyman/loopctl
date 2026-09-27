@@ -17,8 +17,9 @@ defmodule Loopctl.Workers.ReviewCeilingWorker do
   (escalated by someone else, merged, released) or whose claim moved on is no longer a
   candidate. The only way back into flight is a new claim, which bumps the epoch, and a new
   claim is one this entry never judged. `reconcile/2` is the same selection scoped to one
-  story, on the RLS repo, which `Loopctl.Delivery.RunnerReviews` calls once right after the
-  verdict, so the ordinary case does not wait for the next tick.
+  story, on the RLS repo; `Loopctl.Delivery.RunnerReviews` enqueues one job for it right after
+  the verdict (`enqueue/2`), so the ordinary case does not wait for the next tick and the
+  channel never runs the move itself.
 
   The candidate read is fleet-wide on AdminRepo (BYPASSRLS, so its explicit predicates are the
   only scoping), as `HealRunnerCapacityWorker`'s is. Each move goes through
@@ -47,9 +48,39 @@ defmodule Loopctl.Workers.ReviewCeilingWorker do
   @batch 50
 
   @impl Oban.Worker
+  def perform(%Oban.Job{args: %{"tenant_id" => tenant_id, "story_id" => story_id}}),
+    do: reconcile(tenant_id, story_id)
+
   def perform(%Oban.Job{}) do
     candidates() |> Enum.each(&escalate/1)
     :ok
+  end
+
+  @doc """
+  Enqueues one job for `story_id`'s outstanding review ceiling (unique per story while one is
+  waiting or running). What a verdict that recorded an escalation calls, from inside the
+  runner channel: a database error here must not raise there, and nothing is lost when the
+  insert fails, because the escalation entry is already committed and the minute sweep finds
+  it. So a failure is logged and answered `:ok`.
+  """
+  @spec enqueue(Ecto.UUID.t(), Ecto.UUID.t()) :: :ok
+  def enqueue(tenant_id, story_id) do
+    case %{"tenant_id" => tenant_id, "story_id" => story_id} |> new() |> Oban.insert() do
+      {:ok, _job} -> :ok
+      {:error, reason} -> log_enqueue_failure(tenant_id, story_id, reason)
+    end
+  rescue
+    error in [Postgrex.Error, DBConnection.ConnectionError] ->
+      log_enqueue_failure(tenant_id, story_id, error)
+  end
+
+  defp log_enqueue_failure(tenant_id, story_id, reason) do
+    Logger.warning(
+      "review_ceiling job not enqueued; the minute sweep will move the stage: " <>
+        "#{inspect(reason)} tenant_id=#{tenant_id} story_id=#{story_id}",
+      tenant_id: tenant_id,
+      story_id: story_id
+    )
   end
 
   @doc """

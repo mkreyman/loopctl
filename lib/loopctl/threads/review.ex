@@ -24,6 +24,8 @@ defmodule Loopctl.Threads.Review do
     field :claim_epoch, :integer
     field :checkpoint_id, :binary_id
     field :round, :integer
+    # The thread's last entry `seq` when this review was placed (see `Threads.Reviews`).
+    field :placed_at_seq, :integer
     field :placed_by, :string
 
     timestamps(updated_at: false)

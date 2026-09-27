@@ -34,8 +34,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"session_ended"` | `RunnerSessionEnded` (since 1.16.0) | `RunnerSessionEndedAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `audit_chain_append_failed`, `internal_error` |
   | runner -> control | `"checkpoint"` | `RunnerCheckpoint` (since 1.20.0) | `RunnerCheckpointAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `not_claimant`, `claim_not_live`, `checkpoint_conflict`, `secret_blocked`, `audit_chain_append_failed`, `internal_error` |
   | runner -> control | `"thread_entry"` | `RunnerThreadEntry` (since 1.20.0) | `RunnerThreadEntryAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `idempotency_key_reused`, `secret_blocked`, `audit_chain_append_failed`, `internal_error` |
-  | runner -> control | `"review_finding"` | `RunnerReviewFinding` (since 1.21.0) | `RunnerReviewFindingAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `tenant_halted`, `review_closed`, `review_round_superseded`, `reviewer_not_separate`, `idempotency_key_reused`, `secret_blocked`, `audit_chain_append_failed`, `internal_error` |
-  | runner -> control | `"review_verdict"` | `RunnerReviewVerdict` (since 1.21.0) | `RunnerReviewVerdictAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `tenant_halted`, `review_closed`, `review_round_superseded`, `reviewer_not_separate`, `idempotency_key_reused`, `secret_blocked`, `audit_chain_append_failed`, `internal_error` |
+  | runner -> control | `"review_finding"` | `RunnerReviewFinding` (since 1.21.0) | `RunnerReviewFindingAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`, `idempotency_key_reused`, `secret_blocked`, `audit_chain_append_failed`, `internal_error` |
+  | runner -> control | `"review_verdict"` | `RunnerReviewVerdict` (since 1.21.0) | `RunnerReviewVerdictAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`, `idempotency_key_reused`, `secret_blocked`, `audit_chain_append_failed`, `internal_error` |
   | runner -> control | `"triage_verdict"` | `RunnerTriageVerdictMessage` (since 1.9.0) | `RunnerTriageVerdictAck` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `already_recorded`, `unknown_story_stage`, `stale_stage`, `audit_chain_append_failed`, `internal_error` |
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
@@ -59,7 +59,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.18.0) A RELEASED STORY IS NEVER LEFT UNREACHABLE, so the row a `session_ended` ack returns after `crashed` may now be `escalated`. A counted release — a `crashed` session, a lost lease — re-contracts the story for the next placement below the retry ceiling (`DISPATCH_MAX_ATTEMPTS`, counted as `attempts.runner_lost` + `attempts.claim_released`) and escalates it at the ceiling over a new CONTROL-ONLY edge, `attempts_exhausted`, with the count in `escalation_reason`; `usage_exhausted` and a refused placement never count. A second control-only edge, `operator_released`, escalates a story an operator took back. Neither edge is runner-reportable and nothing on the wire changes shape: an `attempts` map may now carry either key. Re-vendoring is worth it for the description, not required for the wire | | | | |
   | (1.19.0) A dispatch control PLACES may carry `deadline_at` (`RunnerDispatch.deadline_at`): an instant the runner must END THE SESSION BY — the EARLIER of its own start + `wall_clock_seconds` and `deadline_at`. It is placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS` (#879) — a RE-SEND moves it to the re-send's time + its `wall_clock_seconds` + the grace — so the time before the session starts comes out of the grace, not the wall clock; only a start-up longer than the grace shortens the session. loopctl's lease sweep never releases the claim on the story before it (an operator's force-unclaim can), so a runner that stops by it — even one cut off from control — never runs on a story the sweep released and loopctl placed again. OPTIONAL on the wire, and a holder of any earlier contract ignores it (undeclared keys are dropped) — but it is NOT PROTECTED by it: the claim is now capped at this instant whether or not the runner reads it, so a runner on an earlier contract whose start-up takes longer than the grace can still be running when the sweep releases the story. RE-VENDOR to read it | | | | |
   | (1.20.0) A SESSION REPORTS ITS WORK AS IT HAPPENS, on the story's change thread (epic 45, US-45.2). Two new messages: `checkpoint` (`RunnerCheckpoint`: `dispatch_id`, `claim_epoch`, `commit_sha`, `tree_sha`, optional `note`) for each commit the session pushed, and `thread_entry` (`RunnerThreadEntry`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, optional `checkpoint_id`) for each note it wants on the thread. Both name an ACCEPTED `implement` dispatch at its `claim_epoch`; a checkpoint is recorded only for the story's current claimant while its claim is live. Both are IDEMPOTENT: a resend of the same checkpoint, or of the same `client_seq` with the same content, is answered `ok` with `replayed: true`, and a DIFFERENT write reusing either is `checkpoint_conflict` or `idempotency_key_reused`. Each has its own bucket (`checkpoint_burst`, `thread_entry_burst`) and its own byte budget (`x-connection.limits.checkpoint`, `x-connection.limits.thread_entry`). OPTIONAL — a runner that sends neither gets exactly today's behaviour. RE-VENDOR to send them: a 1.19.0 copy has neither event, no `RunnerCheckpointAck`, no `RunnerThreadEntryAck` and no bucket for either | | | | |
-  | (1.21.0) REVIEW IS DISPATCHABLE (epic 45, US-45.3). `x-connection.dispatchable_kinds` adds `review`: loopctl places a review of a story's change thread as a runner dispatch of kind `review`, carrying the story (`RunnerStory`, as an implement dispatch does) and a `review` object (`RunnerReview`: `review_id`, `round`, and the checkpoint to read — `checkpoint_id`, `checkpoint_seq`, `commit_sha`, `tree_sha`). It CLAIMS NOTHING: `claim_epoch` is the implementer's claim, echoed back like any dispatch's, and the review never writes code. The session answers with two new messages: `review_finding` (`RunnerReviewFinding`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, `severity`, optional `location` and `introduced_by`) for each defect it found, and ONE `review_verdict` (`RunnerReviewVerdict`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`) that completes the review's round and ends it. Both are bound to the review loopctl recorded for THIS dispatch and THIS runner, and are idempotent on `<dispatch_id>:<client_seq>`. New refusal codes: `tenant_halted`, `review_closed`, `review_round_superseded`, `reviewer_not_separate`. Only a runner that DECLARES `review` on join is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run reviews: a 1.20.0 copy has no `review` kind, no `RunnerReview`, no `review_finding` and no `review_verdict` | | | | |
+  | (1.21.0) REVIEW IS DISPATCHABLE (epic 45, US-45.3). `x-connection.dispatchable_kinds` adds `review`: loopctl places a review of a story's change thread as a runner dispatch of kind `review`, carrying the story (`RunnerStory`, as an implement dispatch does) and a `review` object (`RunnerReview`: `review_id`, `round`, and the checkpoint to read — `checkpoint_id`, `checkpoint_seq`, `commit_sha`, `tree_sha`). It CLAIMS NOTHING: `claim_epoch` is the implementer's claim, echoed back like any dispatch's, and the review never writes code. The session answers with two new messages: `review_finding` (`RunnerReviewFinding`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, `severity`, optional `location` and `introduced_by`) for each defect it found, and ONE `review_verdict` (`RunnerReviewVerdict`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`) that completes the review's round and ends it. Both are bound to the review loopctl recorded for THIS dispatch and THIS runner, and are idempotent on `<dispatch_id>:<client_seq>`. New refusal codes: `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`. `session_ended` now also ends a REVIEW session: recorded once, the slot freed, no stage effect and no retry-ceiling count, answered with `kind: "review"` and `replayed` only (`RunnerSessionEndedAck` requires only `replayed` from this version; an implement session's ack still carries every row field). Only a runner that DECLARES `review` on join is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run reviews: a 1.20.0 copy has no `review` kind, no `RunnerReview`, no `review_finding` and no `review_verdict` | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -255,6 +255,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   `unknown_dispatch`. It is optional: a runner that never sends it gets exactly the behaviour
   before 1.16.0.
 
+  **A REVIEW SESSION (since 1.21.0)** ends the same way, whatever `reason`: send it when the
+  session stops without a verdict (superseded, closed, crashed, out of budget) or after one. A
+  review holds no claim, so the report does ONE thing — it frees the runner's slot for the
+  dispatch. No stage moves and nothing is counted against the retry ceiling. It is fenced on
+  the dispatch alone: its `claim_epoch` is the one the dispatch was sent under, and it was
+  accepted, however the implementer's claim has moved since. The ack is `kind: "review"` and
+  `replayed`, with no stage row; recorded once, as for an implement session.
+
   **RECORDED ONCE PER DISPATCH, AND RESENDING IS SAFE.** A byte-identical resend is answered
   `ok` with `replayed: true` and the row as it now stands — EVEN AFTER the release its first
   copy caused has moved the story's `claim_epoch` on, because the resend is matched on its
@@ -346,7 +354,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   Both name an ACCEPTED `review` dispatch at its `claim_epoch`; any other kind is
   `unknown_dispatch`. Each is bound to the review loopctl recorded for that dispatch and that
   runner, and refused, permanently: `review_closed` after the verdict,
-  `review_round_superseded` when another review completed this round first, and
+  `review_claim_ended` when the implementer's claim the review was placed under has ended (a
+  release, a force-unclaim, a new claim) — nothing it judged can count for the claim that
+  follows, so the review is over — `review_round_superseded` when another review completed
+  this round first, and
   `reviewer_not_separate` when this runner's agent is the story's claimant, recorded a
   checkpoint of the thread, or is the agent of a dispatch on the implementer's lineage chain.
   `tenant_halted` is the tenant's custody halt, and clears when an operator lifts it.
@@ -2407,8 +2418,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   defmodule RunnerSessionEnded do
     @moduledoc """
     The `session_ended` message: why the session under an implement dispatch stopped (1.16.0,
-    epic 44 US-44.3). See "Session end" in `Loopctl.ApiSpec.RunnerContract` for what each
-    reason does to the story.
+    epic 44 US-44.3), or under a review dispatch (1.21.0, US-45.3), where it only frees the
+    slot. See "Session end" in `Loopctl.ApiSpec.RunnerContract` for what each reason does to
+    the story.
 
     Three fields and no free text, deliberately. Everything control does with it is decided from
     the `reason` ENUM, and entering `escalated` writes a chained entry that cannot be corrected
@@ -2429,7 +2441,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       %{
         title: "RunnerSessionEnded",
         description:
-          "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0). " <>
+          "Why the session under an ACCEPTED `implement` dispatch stopped (since 1.16.0), or " <>
+            "under an accepted `review` dispatch (since 1.21.0), for which it only frees the " <>
+            "runner's slot: no stage effect, no retry-ceiling count, whatever `reason`. " <>
             "Optional: a runner that never sends it gets the lease reclaim, as before. A FACT, " <>
             "not a request — control decides the story's next stage from `reason`: " <>
             "`completed` changes nothing, `wall_clock_exceeded` and `max_turns_exceeded` " <>
@@ -2447,7 +2461,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             type: :string,
             format: :uuid,
             description:
-              "The ACCEPTED implement dispatch whose session ended. It names the story; a " <>
+              "The ACCEPTED implement or review dispatch whose session ended. It names the " <>
+                "story; a " <>
                 "story id is never taken from the wire."
           },
           claim_epoch: %Schema{
@@ -2485,10 +2500,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         title: "RunnerSessionEndedAck",
         description:
           "The reply to an accepted `session_ended`: where the story now is, and whether this " <>
-            "was a resend. The row fields are the ones a `stage` ack carries.",
+            "was a resend. The row fields are the ones a `stage` ack carries, and an implement " <>
+            "session's ack always has every one. A review session's (since 1.21.0) is " <>
+            "`kind: \"review\"` and `replayed` only: it moved no stage.",
         type: :object,
-        required: [:stage, :claim_epoch, :lock_version, :attempts, :effects, :replayed],
+        required: [:replayed],
         properties: %{
+          kind: %Schema{
+            type: :string,
+            enum: ["review"],
+            description: "Present only on a review session's ack (since 1.21.0)."
+          },
           stage: %Schema{type: :string, description: "The stage the story is at now."},
           claim_epoch: %Schema{
             type: :integer,
@@ -3216,16 +3238,19 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # - `tenant_halted` — the tenant's custody is halted (L6). A judgement decides what may
     #   merge, so it waits for the halt to be lifted; it is not permanent.
     # - `review_closed` — the review already recorded its verdict.
+    # - `review_claim_ended` — the claim the review was placed under has ended.
     # - `review_round_superseded` — another review completed this round first.
     # - `reviewer_not_separate` — this runner's agent may not judge this story.
     "review_finding" =>
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
-         tenant_halted review_closed review_round_superseded reviewer_not_separate
-         idempotency_key_reused secret_blocked audit_chain_append_failed internal_error),
+         tenant_halted review_closed review_claim_ended review_round_superseded
+         reviewer_not_separate idempotency_key_reused secret_blocked audit_chain_append_failed
+         internal_error),
     "review_verdict" =>
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
-         tenant_halted review_closed review_round_superseded reviewer_not_separate
-         idempotency_key_reused secret_blocked audit_chain_append_failed internal_error),
+         tenant_halted review_closed review_claim_ended review_round_superseded
+         reviewer_not_separate idempotency_key_reused secret_blocked audit_chain_append_failed
+         internal_error),
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
@@ -3387,15 +3412,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # sending the same bytes again.
     "checkpoint" => ~w(not_claimant claim_not_live checkpoint_conflict secret_blocked),
     "thread_entry" => ~w(idempotency_key_reused secret_blocked),
-    # 1.21.0. The review is over, lost its round, or may not judge this story, or the write is
+    # 1.21.0. The review is over, its claim ended, it lost its round, or it may not judge this
+    # story, or the write is
     # not the one already recorded, or it carries a credential. `tenant_halted` is NOT here:
     # it clears when an operator lifts the halt.
     "review_finding" =>
-      ~w(review_closed review_round_superseded reviewer_not_separate idempotency_key_reused
-         secret_blocked),
+      ~w(review_closed review_claim_ended review_round_superseded reviewer_not_separate
+         idempotency_key_reused secret_blocked),
     "review_verdict" =>
-      ~w(review_closed review_round_superseded reviewer_not_separate idempotency_key_reused
-         secret_blocked)
+      ~w(review_closed review_claim_ended review_round_superseded reviewer_not_separate
+         idempotency_key_reused secret_blocked)
   }
 
   # THE ONE CONDITIONAL MEMBER OF THE LIST ABOVE, published rather than left in a moduledoc a

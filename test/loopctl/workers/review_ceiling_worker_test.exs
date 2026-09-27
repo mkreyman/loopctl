@@ -156,6 +156,22 @@ defmodule Loopctl.Workers.ReviewCeilingWorkerTest do
     assert stage_of(ctx).lock_version == before
   end
 
+  test "enqueue never raises into its caller: a database failure is logged for the sweep" do
+    # The runner channel calls this after a verdict. With the connection unusable — here a
+    # transaction already aborted — the job cannot be run or inserted, and the answer is
+    # still `:ok`: the escalation entry is committed and the minute sweep finds it.
+    log =
+      capture_log(fn ->
+        Repo.transaction(fn ->
+          {:error, _} = Repo.query("SELECT 1 / 0")
+          assert :ok = ReviewCeilingWorker.enqueue(Ecto.UUID.generate(), Ecto.UUID.generate())
+          Repo.rollback(:done)
+        end)
+      end)
+
+    assert log =~ "review_ceiling job not enqueued"
+  end
+
   test "a claim that moved on proves the escalation unnecessary" do
     ctx = ceiling_story()
 

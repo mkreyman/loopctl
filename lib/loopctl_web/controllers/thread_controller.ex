@@ -6,9 +6,10 @@ defmodule LoopctlWeb.ThreadController do
   - `checkpoint` is `exact_role: :agent`, as `claim`/`escalate` are: only the claiming
     agent's key may say a commit is part of the thread.
   - `entry` is `role: :agent` and takes `message` from any principal. Findings, verdicts and
-    fixes are NOT written here but through `LoopctlWeb.ThreadReviewController`: a finding's or
-    verdict's author must be a review dispatch loopctl placed (US-45.3), never a key whose
-    separation from the implementer is inferred.
+    fixes are NOT written here. A fix goes through `LoopctlWeb.ThreadReviewController`; a
+    finding or verdict arrives over the runner socket from a review dispatch loopctl placed
+    (US-45.3, `Loopctl.Delivery.RunnerReviews`), never from a key whose separation from the
+    implementer is inferred.
   - Both writes are behind `RequireHumanAnchor`, mounted before the role gate, because a
     story is work-breakdown data.
   - Reads stay open to every role.
@@ -129,9 +130,11 @@ defmodule LoopctlWeb.ThreadController do
     description:
       "Any principal of the tenant writes a `message`, optionally " <>
         "naming a `checkpoint_id` of this story. `checkpoint` entries are loopctl's own, " <>
-        "`review_requested` belongs to the request-review flow, and `finding`, `fix` and " <>
-        "`verdict` are written through `/thread/findings`, `/thread/fixes` and " <>
-        "`/thread/verdicts`, so all of those are refused here. The author is derived from the key. IDEMPOTENT per author " <>
+        "`review_requested` belongs to the request-review flow, a `fix` is written through " <>
+        "`POST /stories/{id}/thread/fixes`, and a `finding` or `verdict` has no HTTP path " <>
+        "at all: it arrives over the runner socket as `review_finding` or `review_verdict` " <>
+        "from the runner a review was placed on (runner contract 1.21.0). All of those are " <>
+        "refused here. The author is derived from the key. IDEMPOTENT per author " <>
         "on `idempotency_key` when the write is the same; reusing a key for a different " <>
         "entry is refused, and keys starting `loopctl:` are reserved. `body` is capped at " <>
         "#{@max_body_bytes} bytes, refused when it carries a credential, and is UNTRUSTED.",

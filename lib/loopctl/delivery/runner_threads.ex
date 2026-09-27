@@ -53,8 +53,9 @@ defmodule Loopctl.Delivery.RunnerThreads do
   Anything raised here is raised inside the runner channel's `handle_in`, where it takes down
   every session on the socket, and the runner's resend on rejoin crash-loops it. So:
 
-  - contention on the ledger read is `:busy` (`Loopctl.Delivery.Stages.answering_busy/4`, the
-    one copy of that policy), as `Loopctl.Threads` answers it on the write;
+  - contention on the ledger read is `:busy` (`Loopctl.Delivery.RunnerThreadSession.read/4`,
+    through `Loopctl.Delivery.Stages.answering_busy/4`, the one copy of that policy), as
+    `Loopctl.Threads` answers it on the write;
   - the tenant's audit chain refusing the append as a HASH violation is
     `:audit_chain_append_failed` (`RunnerStages.answering_broken_chain/3`, the one copy of
     that policy), exactly as a `stage` is.
@@ -75,13 +76,9 @@ defmodule Loopctl.Delivery.RunnerThreads do
   `<dispatch_id>:<client_seq>`. The reply says which it was (`replayed?`).
   """
 
-  import Ecto.Query
-
   alias Loopctl.Delivery.RunnerStages
-  alias Loopctl.Delivery.Stages
-  alias Loopctl.Repo
+  alias Loopctl.Delivery.RunnerThreadSession
   alias Loopctl.Runners.DispatchLedger
-  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
@@ -174,54 +171,20 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   # --- the session -----------------------------------------------------------------------
 
-  # The ledger row `runner_id` holds for the message's dispatch, whatever its status. A row
-  # another runner or tenant holds reads as none. Contention on the read is `:busy`.
+  # The ledger row `runner_id` holds for the message's dispatch
+  # (`Loopctl.Delivery.RunnerThreadSession.read/4`), and this module's own rule on it: only an
+  # implement session writes checkpoints and notes.
   defp session(tenant_id, runner_id, message) do
-    read = fn ->
-      {:ok, row} =
-        Repo.with_tenant(tenant_id, fn ->
-          Repo.one(
-            from r in DispatchRecord,
-              where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
-              where: r.dispatch_id == ^message.dispatch_id,
-              select: %{
-                status: r.status,
-                kind: r.kind,
-                story_id: r.story_id,
-                claim_epoch: r.claim_epoch
-              }
-          )
-        end)
-
-      {:ok, row}
-    end
-
     with {:ok, row} <-
-           Stages.answering_busy(
-             tenant_id,
-             [:loopctl, :threads, :busy],
-             "runner thread read",
-             read
-           ),
-         {:ok, row} <- found(row),
-         :ok <- implement_kind(row),
-         :ok <- dispatch_epoch_matches(row, message) do
+           RunnerThreadSession.read(tenant_id, runner_id, message, "runner thread read"),
+         :ok <- implement_kind(row) do
       {:ok, %{story_id: row.story_id, accepted?: row.status == "accepted"}}
     end
   end
 
-  defp found(nil), do: {:error, :unknown_dispatch}
-  defp found(row), do: {:ok, row}
-
   defp implement_kind(%{kind: kind}) do
     if DispatchLedger.implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
   end
-
-  # Not the fence: `Loopctl.Threads` reads the story's epoch under its lock, which is what
-  # decides. A message that does not even match the dispatch it names is refused here for the
-  # cost of the read already made.
-  defp dispatch_epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
-  defp dispatch_epoch_matches(_row, _message), do: {:error, :stale_claim_epoch}
 
   defp put_checkpoint(attrs, nil), do: attrs
   defp put_checkpoint(attrs, checkpoint_id), do: Map.put(attrs, "checkpoint_id", checkpoint_id)
@@ -232,7 +195,9 @@ defmodule Loopctl.Delivery.RunnerThreads do
     do: {:ok, %{key => record, replayed?: status == :existing}}
 
   defp answer({:error, reason}, _key), do: {:error, classify(reason)}
-  defp answer({:error, :unprocessable_entity, detail}, _key), do: {:error, unprocessable(detail)}
+
+  defp answer({:error, :unprocessable_entity, detail}, _key),
+    do: {:error, RunnerThreadSession.unprocessable(detail)}
 
   defp classify({:conflict, "checkpoint_conflict", _message}), do: :checkpoint_conflict
   defp classify({:conflict, "idempotency_key_reused", _message}), do: :idempotency_key_reused
@@ -242,7 +207,7 @@ defmodule Loopctl.Delivery.RunnerThreads do
   defp classify(:not_found), do: :unknown_dispatch
 
   defp classify(%Ecto.Changeset{data: %Entry{}} = changeset),
-    do: {:invalid, changeset_messages(changeset)}
+    do: {:invalid, RunnerThreadSession.changeset_messages(changeset)}
 
   # Every other reason passes through to `LoopctlWeb.RunnerChannel.Refusal`, which publishes
   # `:not_claimant`, `:stale_claim_epoch`, `:claim_not_live`, `:dispatch_not_accepted` and
@@ -250,28 +215,6 @@ defmodule Loopctl.Delivery.RunnerThreads do
   # retry interval. Anything it does not name reaches its catch-all, which logs it and answers
   # `internal_error`.
   defp classify(reason), do: reason
-
-  # Total, because a clause missing here raises inside the channel: a structured 422 this
-  # module does not name yet is still an `invalid_payload` carrying its message.
-  defp unprocessable(%{code: "secret_blocked"}), do: :secret_blocked
-  defp unprocessable(%{message: message}) when is_binary(message), do: {:invalid, [message]}
-  defp unprocessable(message) when is_binary(message), do: {:invalid, [message]}
-  defp unprocessable(detail), do: {:invalid, [inspect(detail)]}
-
-  defp changeset_messages(changeset) do
-    changeset
-    |> Ecto.Changeset.traverse_errors(fn {message, opts} ->
-      Enum.reduce(opts, message, fn {key, value}, acc ->
-        String.replace(acc, "%{#{key}}", to_string_safe(value))
-      end)
-    end)
-    |> Enum.flat_map(fn {field, messages} -> Enum.map(messages, &"#{field} #{&1}") end)
-  end
-
-  defp to_string_safe(value) when is_binary(value) or is_number(value) or is_atom(value),
-    do: to_string(value)
-
-  defp to_string_safe(value), do: inspect(value)
 
   # --- a broken chain -------------------------------------------------------------------
 

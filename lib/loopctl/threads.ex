@@ -801,9 +801,10 @@ defmodule Loopctl.Threads do
 
     with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
          nil <- placed_before(tenant_id, story_id, dispatch_id, runner_id),
+         :ok <- Reviews.claim_current(story, story.claim_epoch),
          :ok <- Reviews.implementer_dispatched(story),
          {:ok, checkpoint} <- Reviews.latest_checkpoint(tenant_id, story),
-         {:ok, round} <- Reviews.placeable_round(tenant_id, story_id),
+         {:ok, round} <- Reviews.placeable_round(tenant_id, story),
          :ok <- Reviews.reviewer_separate(tenant_id, story, agent_id) do
       insert_review(tenant_id, story, checkpoint, round, opts)
     else
@@ -843,20 +844,35 @@ defmodule Loopctl.Threads do
     end
   end
 
+  # The unique index on `(tenant_id, dispatch_id)` is what decides between two placements
+  # reusing one id on DIFFERENT stories: each holds only its own story's lock, so neither sees
+  # the other in `placed_before/4`, and the second insert meets the index. That is a
+  # `dispatch_id_conflict`, not a 500.
   defp insert_review(tenant_id, story, checkpoint, round, opts) do
-    review =
-      Repo.insert!(%Review{
-        tenant_id: tenant_id,
-        story_id: story.id,
-        dispatch_id: Keyword.fetch!(opts, :dispatch_id),
-        runner_id: Keyword.fetch!(opts, :runner_id),
-        agent_id: Keyword.fetch!(opts, :agent_id),
-        claim_epoch: story.claim_epoch,
-        checkpoint_id: checkpoint.id,
-        round: round,
-        placed_by: Keyword.fetch!(opts, :placed_by)
-      })
+    %Review{
+      tenant_id: tenant_id,
+      story_id: story.id,
+      dispatch_id: Keyword.fetch!(opts, :dispatch_id),
+      runner_id: Keyword.fetch!(opts, :runner_id),
+      agent_id: Keyword.fetch!(opts, :agent_id),
+      claim_epoch: story.claim_epoch,
+      checkpoint_id: checkpoint.id,
+      round: round,
+      placed_at_seq: next_entry_seq(tenant_id, story.id) - 1,
+      placed_by: Keyword.fetch!(opts, :placed_by)
+    }
+    |> Ecto.Changeset.change()
+    |> Ecto.Changeset.unique_constraint(:dispatch_id,
+      name: :thread_reviews_tenant_id_dispatch_id_index
+    )
+    |> Repo.insert()
+    |> case do
+      {:ok, review} -> chain_review(tenant_id, story, review)
+      {:error, _taken} -> conflict("dispatch_id_conflict", "dispatch_id names another review")
+    end
+  end
 
+  defp chain_review(tenant_id, story, review) do
     # The runner's credential is a plain key no dispatch minted, and loopctl places the
     # review itself, so the lineage is an ATTESTED empty one, as `RunnerStages` states it.
     with {:ok, chain_entry} <-
@@ -929,7 +945,7 @@ defmodule Loopctl.Threads do
 
       case entry_by_review_key(tenant_id, review.id, key_of(changeset)) do
         nil -> judge_new(story, review, changeset, opts)
-        existing -> existing |> replay(changeset) |> as_judgement()
+        existing -> existing |> replay(changeset) |> as_judgement(review)
       end
     else
       {:story, nil} -> {:error, :not_found}
@@ -952,23 +968,49 @@ defmodule Loopctl.Threads do
 
   defp key_of(changeset), do: Ecto.Changeset.get_field(changeset, :idempotency_key)
 
-  defp as_judgement({:ok, entry, :existing, []}),
+  # A resend answers what was RECORDED: a verdict's resend carries the escalation its first
+  # delivery wrote, if it wrote one, so the runner hears the same outcome whichever delivery
+  # it heard.
+  defp as_judgement({:ok, %Entry{kind: :verdict} = entry, :existing, []}, review),
+    do: {:ok, %{entry: entry, escalation: recorded_escalation(review)}, :existing, []}
+
+  defp as_judgement({:ok, entry, :existing, []}, _review),
     do: {:ok, %{entry: entry, escalation: nil}, :existing, []}
 
-  defp as_judgement(error), do: error
+  defp as_judgement(error, _review), do: error
 
+  defp recorded_escalation(review) do
+    Repo.one(
+      from e in Entry,
+        where:
+          e.tenant_id == ^review.tenant_id and e.review_id == ^review.id and
+            e.kind == :escalation
+    )
+  end
+
+  # Every rule a NEW judgement meets, decided once under the lock: the claim the review
+  # belongs to is still the story's, the reviewer is still separate, and the review may still
+  # judge. `completed` is read once and reused for the ceiling a verdict may reach.
   defp judge_new(story, review, changeset, opts) do
     tenant_id = review.tenant_id
 
     with :ok <- new_write_allowed(opts),
-         :ok <- Reviews.review_open(tenant_id, review),
+         :ok <- Reviews.claim_current(story, review.claim_epoch),
          :ok <- Reviews.reviewer_separate(tenant_id, story, review.agent_id),
-         :ok <- Reviews.current_round(tenant_id, story.id, review) do
-      insert_judgement(Ecto.Changeset.get_field(changeset, :kind), story, review, changeset, opts)
+         completed = Reviews.completed(tenant_id, story),
+         :ok <- Reviews.judgeable(review, completed) do
+      insert_judgement(
+        Ecto.Changeset.get_field(changeset, :kind),
+        story,
+        review,
+        changeset,
+        opts,
+        completed
+      )
     end
   end
 
-  defp insert_judgement(:finding, story, review, changeset, opts) do
+  defp insert_judgement(:finding, story, review, changeset, opts, _completed) do
     introduced_by = Ecto.Changeset.get_field(changeset, :introduced_by)
 
     with :ok <- Reviews.introduced_by_allowed(review, introduced_by),
@@ -978,10 +1020,11 @@ defmodule Loopctl.Threads do
     end
   end
 
-  defp insert_judgement(:verdict, story, review, changeset, opts) do
+  defp insert_judgement(:verdict, story, review, changeset, opts, completed) do
     with {:ok, verdict, :created, chained} <-
            insert_entry(review.tenant_id, story.id, changeset, judge_opts(opts)),
-         {:ok, escalation, escalation_chained} <- ceiling_escalation(story, review) do
+         {:ok, escalation, escalation_chained} <-
+           ceiling_escalation(story, review, completed, verdict.seq) do
       {:ok, %{entry: verdict, escalation: escalation}, :created, chained ++ escalation_chained}
     end
   end
@@ -1000,8 +1043,8 @@ defmodule Loopctl.Threads do
   # The round this verdict just completed reached the ceiling with a material finding: the
   # escalation is RECORDED here, in the verdict's transaction, and
   # `Loopctl.Workers.ReviewCeilingWorker` moves the stage until it lands.
-  defp ceiling_escalation(story, review) do
-    case Reviews.ceiling_material(review.tenant_id, story.id, review) do
+  defp ceiling_escalation(story, review, completed, verdict_seq) do
+    case Reviews.ceiling_material(review.tenant_id, story, review, completed, verdict_seq) do
       0 ->
         {:ok, nil, []}
 

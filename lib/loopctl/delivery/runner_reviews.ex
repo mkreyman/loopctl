@@ -21,9 +21,22 @@ defmodule Loopctl.Delivery.RunnerReviews do
   The verdict ends the review, so the runner's capacity slot for it is released at once
   (`Loopctl.Runners.DispatchLedger.release_slot/3`); a release that does not land is left to
   `Loopctl.Workers.HealRunnerCapacityWorker`, which frees a slot whose session can no longer be
-  running. A verdict that recorded a `review_ceiling` escalation is followed by one immediate
-  attempt to move the stage (`Loopctl.Workers.ReviewCeilingWorker.reconcile/2`); the worker's
-  sweep is what makes it durable.
+  running. A verdict that recorded a `review_ceiling` escalation ENQUEUES one
+  `Loopctl.Workers.ReviewCeilingWorker` job for its story (unique per story), rather than
+  moving the stage inline: this runs inside the runner channel's `handle_in`, where a raised
+  database error takes down every session on the socket, and the job is the durable path
+  anyway. An enqueue that fails is logged and left to the worker's minute sweep.
+
+  Both steps are idempotent, so a RESEND of a verdict already recorded runs them again and
+  answers what was recorded, `escalated` included: the resend may be the only delivery whose
+  answer the runner ever sees, and the first delivery's release may never have landed.
+
+  ## A review session that ends without a verdict
+
+  `session_ended` for a review dispatch (`end_session/3`) records the report on the ledger row
+  and frees the slot. That is ALL it does: a review holds no claim, so there is no stage
+  effect and nothing counted against the retry ceiling. Superseded, closed, crashed or out of
+  budget, the answer is the same.
 
   ## A dispatch no longer accepted
 
@@ -32,19 +45,18 @@ defmodule Loopctl.Delivery.RunnerReviews do
 
   ## Database failures
 
-  Contention is `:busy` (`Loopctl.Delivery.Stages.answering_busy/4`), and the tenant's chain
+  Contention is `:busy` (`Loopctl.Delivery.RunnerThreadSession.read/4`, through
+  `Loopctl.Delivery.Stages.answering_busy/4`), and the tenant's chain
   refusing the append as a hash violation is `:audit_chain_append_failed`
   (`Loopctl.Delivery.RunnerStages.answering_broken_chain/3`) — the one copy of each policy.
   """
 
-  import Ecto.Query
-
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.RunnerThreads
+  alias Loopctl.Delivery.RunnerThreadSession
   alias Loopctl.Delivery.Stages
-  alias Loopctl.Repo
+  alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Runners.DispatchLedger
-  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Threads
   alias Loopctl.Threads.Entry
   alias Loopctl.Workers.ReviewCeilingWorker
@@ -81,7 +93,8 @@ defmodule Loopctl.Delivery.RunnerReviews do
   @doc """
   Records `message` — already cast by `Loopctl.ApiSpec.RunnerContract.cast_review_verdict/1` —
   as the verdict of the review `runner`'s dispatch carries: the one entry that completes its
-  round. `escalated?` is true when the verdict reached the ceiling with a material finding.
+  round. `escalated?` is true when the verdict reached the ceiling with a material finding,
+  on a resend as on the first delivery.
   """
   @spec record_verdict(Ecto.UUID.t(), runner(), map()) ::
           {:ok, %{entry: Entry.t(), replayed?: boolean(), escalated?: boolean()}}
@@ -89,8 +102,45 @@ defmodule Loopctl.Delivery.RunnerReviews do
   def record_verdict(tenant_id, runner, %{} = message) do
     with {:ok, %{entry: entry, escalation: escalation}, status, session} <-
            judge(tenant_id, runner, message, base_attrs(message, "verdict"), "review_verdict") do
-      if status == :created, do: after_verdict(tenant_id, message, session, escalation)
+      after_verdict(tenant_id, message, session, escalation)
       {:ok, %{entry: entry, replayed?: status == :existing, escalated?: escalation != nil}}
+    end
+  end
+
+  @doc """
+  Records a `session_ended` report for a REVIEW dispatch and frees the runner's slot for it.
+  `:not_review` when the dispatch this runner holds is not a review, so the caller can hand
+  the report to `Loopctl.Delivery.RunnerStages.end_session/4`; every other answer is final.
+
+  A review holds no claim, so the report has no stage effect and counts toward no retry
+  ceiling: all it can do is say the session is gone, which is what the slot waits on.
+  Idempotent on the report's digest, as an implement session's is.
+  """
+  @spec end_session(Ecto.UUID.t(), runner(), map()) ::
+          :not_review | {:ok, %{replayed?: boolean()}} | {:error, term()}
+  def end_session(tenant_id, runner, %{} = message) do
+    read = fn -> DispatchLedger.get_record(tenant_id, message.dispatch_id) end
+
+    case Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "runner review read", read) do
+      {:error, :busy} = busy ->
+        busy
+
+      %{kind: @kind, runner_id: runner_id} when runner_id == runner.id ->
+        with {:ok, {outcome, session}} <-
+               DispatchLedger.record_review_session_end(
+                 tenant_id,
+                 runner.id,
+                 message,
+                 TriageVerdictRecord.digest(message)
+               ) do
+          release(tenant_id, message.dispatch_id, session.slot_generation)
+          {:ok, %{replayed?: outcome == :replayed}}
+        end
+
+      # Another kind, another runner's row, or none: the implement path answers each of
+      # those with its own fences.
+      _not_this_runners_review ->
+        :not_review
     end
   end
 
@@ -122,46 +172,28 @@ defmodule Loopctl.Delivery.RunnerReviews do
     end
   end
 
-  # The slot first: the review is over whatever the stage machine does next.
+  # The slot first: the review is over whatever the stage machine does next. Both steps are
+  # idempotent, so a resend runs them again.
   defp after_verdict(tenant_id, message, session, escalation) do
-    _ = DispatchLedger.release_slot(tenant_id, message.dispatch_id, session.slot_generation)
-    if escalation, do: ReviewCeilingWorker.reconcile(tenant_id, session.story_id)
+    release(tenant_id, message.dispatch_id, session.slot_generation)
+    if escalation, do: ReviewCeilingWorker.enqueue(tenant_id, session.story_id)
+    :ok
+  end
+
+  defp release(tenant_id, dispatch_id, generation) do
+    _ = DispatchLedger.release_slot(tenant_id, dispatch_id, generation)
     :ok
   end
 
   # --- the session -----------------------------------------------------------------------
 
+  # The ledger row this runner holds for the message's dispatch
+  # (`Loopctl.Delivery.RunnerThreadSession.read/4`), and this module's own rule on it: only a
+  # review session judges.
   defp session(tenant_id, runner_id, message) do
-    read = fn ->
-      {:ok, row} =
-        Repo.with_tenant(tenant_id, fn ->
-          Repo.one(
-            from r in DispatchRecord,
-              where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
-              where: r.dispatch_id == ^message.dispatch_id,
-              select: %{
-                status: r.status,
-                kind: r.kind,
-                story_id: r.story_id,
-                claim_epoch: r.claim_epoch,
-                slot_generation: r.slot_generation
-              }
-          )
-        end)
-
-      {:ok, row}
-    end
-
     with {:ok, row} <-
-           Stages.answering_busy(
-             tenant_id,
-             [:loopctl, :threads, :busy],
-             "runner review read",
-             read
-           ),
-         {:ok, row} <- found(row),
-         :ok <- review_kind(row),
-         :ok <- dispatch_epoch_matches(row, message) do
+           RunnerThreadSession.read(tenant_id, runner_id, message, "runner review read"),
+         :ok <- review_kind(row) do
       {:ok,
        %{
          story_id: row.story_id,
@@ -171,14 +203,8 @@ defmodule Loopctl.Delivery.RunnerReviews do
     end
   end
 
-  defp found(nil), do: {:error, :unknown_dispatch}
-  defp found(row), do: {:ok, row}
-
   defp review_kind(%{kind: @kind}), do: :ok
   defp review_kind(_row), do: {:error, :unknown_dispatch}
-
-  defp dispatch_epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
-  defp dispatch_epoch_matches(_row, _message), do: {:error, :stale_claim_epoch}
 
   # --- answers ---------------------------------------------------------------------------
 
@@ -186,12 +212,13 @@ defmodule Loopctl.Delivery.RunnerReviews do
   defp answer({:error, reason}, _session), do: {:error, classify(reason)}
 
   defp answer({:error, :unprocessable_entity, detail}, _session),
-    do: {:error, unprocessable(detail)}
+    do: {:error, RunnerThreadSession.unprocessable(detail)}
 
   # The review rules' own refusals, by the code each carries. A 422 from them is a field the
   # contract could not state (a severity, an `introduced_by`), answered `invalid_payload`.
   @review_codes %{
     "review_closed" => :review_closed,
+    "review_claim_ended" => :review_claim_ended,
     "review_round_superseded" => :review_round_superseded,
     "reviewer_not_separate" => :reviewer_not_separate,
     "idempotency_key_reused" => :idempotency_key_reused
@@ -208,30 +235,11 @@ defmodule Loopctl.Delivery.RunnerReviews do
   defp classify(:unknown_review), do: :unknown_dispatch
   defp classify(:not_found), do: :unknown_dispatch
 
-  defp classify(%Ecto.Changeset{} = changeset), do: {:invalid, changeset_messages(changeset)}
+  defp classify(%Ecto.Changeset{} = changeset),
+    do: {:invalid, RunnerThreadSession.changeset_messages(changeset)}
 
   # `:tenant_halted`, `:dispatch_not_accepted`, `:busy` and `:audit_chain_append_failed` pass
   # through to `LoopctlWeb.RunnerChannel.Refusal` under their own names; anything else reaches
   # its catch-all, which logs it and answers `internal_error`.
   defp classify(reason), do: reason
-
-  defp unprocessable(%{code: "secret_blocked"}), do: :secret_blocked
-  defp unprocessable(%{message: message}) when is_binary(message), do: {:invalid, [message]}
-  defp unprocessable(message) when is_binary(message), do: {:invalid, [message]}
-  defp unprocessable(detail), do: {:invalid, [inspect(detail)]}
-
-  defp changeset_messages(changeset) do
-    changeset
-    |> Ecto.Changeset.traverse_errors(fn {message, opts} ->
-      Enum.reduce(opts, message, fn {key, value}, acc ->
-        String.replace(acc, "%{#{key}}", to_string_safe(value))
-      end)
-    end)
-    |> Enum.flat_map(fn {field, messages} -> Enum.map(messages, &"#{field} #{&1}") end)
-  end
-
-  defp to_string_safe(value) when is_binary(value) or is_number(value) or is_atom(value),
-    do: to_string(value)
-
-  defp to_string_safe(value), do: inspect(value)
 end

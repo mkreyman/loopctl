@@ -51,9 +51,10 @@ defmodule LoopctlWeb.ThreadReviewController do
       "loopctl places a review on `runner_id` as a runner dispatch of kind `review`, for the " <>
         "next round, on the story's LATEST checkpoint of the current claim (never a caller's " <>
         "choice). It claims nothing and mints no credential: the review's findings and " <>
-        "verdict come back over the runner socket from that runner. Round 2 always follows " <>
+        "verdict come back over the runner socket from that runner. Rounds are counted per " <>
+        "claim, so a story claimed again starts at round 1. Round 2 always follows " <>
         "round 1; round 3 only when a round-2 finding's `introduced_by` names a checkpoint " <>
-        "carrying a fix written before the round-2 verdict; never round " <>
+        "carrying a fix recorded before round 2 was placed; never round " <>
         "#{Reviews.max_rounds() + 1}. The runner's agent must be separate: not the story's " <>
         "claimant, not a checkpoint recorder, and the agent of no dispatch on the " <>
         "implementer's lineage chain. IDEMPOTENT on `dispatch_id`: resend a lost request " <>
@@ -91,11 +92,13 @@ defmodule LoopctlWeb.ThreadReviewController do
          Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"`no_checkpoint` (the current claim recorded none), `review_ceiling_reached`, " <>
+        {"`no_checkpoint` (the current claim recorded none), `review_claim_ended` (the " <>
+           "story has no live claim to review), `review_ceiling_reached`, " <>
            "`reviewer_not_separate` (the runner's agent is the claimant, recorded a " <>
            "checkpoint, or is on the implementer's lineage chain), " <>
            "`implementer_dispatch_required`, `dispatch_id_conflict`, or a runner refusal " <>
            "(`runner_not_provisioned`, `runner_declines_work`, `runner_not_connected`, " <>
+           "`repo_not_allowed`, " <>
            "`kind_not_supported`, `budget_unset`, ...)", "application/json",
          Schemas.ErrorResponse},
       422 => {"An invalid field", "application/json", Schemas.ErrorResponse},
@@ -246,9 +249,10 @@ defmodule LoopctlWeb.ThreadReviewController do
     |> json(%{error: %{status: 503, code: "tenant_halted", message: "custody is halted"}})
   end
 
-  # The PUSH's refusals, in words true of a review: nothing was claimed or minted, the review
-  # row is recorded, and the same dispatch_id pushes it again. The implement endpoint's own
-  # wording for these speaks of a claim released, which a review never took.
+  # The PUSH's refusals, in words true of a review: nothing was claimed or minted, and the same
+  # dispatch_id places it again — or, when the review was recorded before a late refusal,
+  # pushes the recorded one. The implement endpoint's own wording for these speaks of a claim
+  # released, which a review never took.
   @push_refusals %{
     runner_not_connected: 409,
     runner_ambiguous: 409,
@@ -256,6 +260,7 @@ defmodule LoopctlWeb.ThreadReviewController do
     runner_exhausted: 409,
     runner_not_provisioned: 409,
     kind_not_supported: 409,
+    repo_not_allowed: 409,
     admission_limit_reached: 429,
     runner_at_capacity: 429,
     capacity_busy: 429
@@ -272,7 +277,7 @@ defmodule LoopctlWeb.ThreadReviewController do
         code: Atom.to_string(reason),
         message:
           "The review was not pushed (#{reason}). Nothing was claimed and no credential " <>
-            "was minted; retry with the same dispatch_id and the same review is pushed."
+            "was minted; retry with the same dispatch_id once the runner can take it."
       }
     })
   end

@@ -766,6 +766,77 @@ defmodule Loopctl.Runners.DispatchLedger do
     |> flatten()
   end
 
+  @doc """
+  Records a runner's `session_ended` report on a REVIEW dispatch's row, once, and returns the
+  row's session (US-45.3, contract 1.21.0). `digest` is the caller's canonical digest of the
+  whole message, as `record_session_end/4` takes it. The caller frees the slot.
+
+  A review holds no claim, so none of an implement session's fences on the STORY apply: the
+  claim may have ended under the review, and the session still ended and still holds a slot.
+  What is checked is the row itself — a `review` dispatch this runner holds, the message's
+  epoch the one it was sent under, and a session that ran (`accepted`, or `superseded` after
+  it was). The digest is compared first, as for an implement session, so an identical resend
+  is `:replayed` and a different reason `:already_recorded`.
+  """
+  @spec record_review_session_end(Ecto.UUID.t(), Ecto.UUID.t(), map(), String.t()) ::
+          {:ok,
+           {:recorded | :replayed,
+            %{
+              kind: String.t() | nil,
+              story_id: Ecto.UUID.t(),
+              claim_epoch: integer(),
+              slot_generation: integer(),
+              replied_at: DateTime.t() | nil
+            }}}
+          | {:error,
+             :unknown_dispatch
+             | :stale_claim_epoch
+             | :dispatch_not_accepted
+             | :already_recorded
+             | :rejected_by_database
+             | :capacity_busy}
+  def record_review_session_end(tenant_id, runner_id, message, digest) do
+    context = %{operation: :record_session_end, dispatch_id: message.dispatch_id, run_id: nil}
+
+    runner_write(tenant_id, runner_id, context, fn ->
+      with {:ok, record} <- held(tenant_id, runner_id, message.dispatch_id, true) do
+        review_session_end(record, message, digest)
+      end
+    end)
+    |> flatten()
+  end
+
+  defp review_session_end(%DispatchRecord{session_ended_digest: recorded} = record, _msg, digest)
+       when is_binary(recorded) do
+    if recorded == digest,
+      do: {:replayed, session_of(record)},
+      else: {:error, :already_recorded}
+  end
+
+  defp review_session_end(%DispatchRecord{} = record, message, digest) do
+    cond do
+      record.kind != "review" ->
+        {:error, :unknown_dispatch}
+
+      record.claim_epoch != message.claim_epoch ->
+        {:error, :stale_claim_epoch}
+
+      record.status not in ["accepted", "superseded"] or is_nil(record.replied_at) ->
+        {:error, :dispatch_not_accepted}
+
+      true ->
+        record
+        |> Ecto.Changeset.change(
+          session_ended_reason: message.reason,
+          session_ended_digest: digest,
+          session_ended_at: DateTime.utc_now(),
+          counts_toward_retry_ceiling: nil
+        )
+        |> Repo.update!()
+        |> then(&{:recorded, session_of(&1)})
+    end
+  end
+
   # The lock order of `fence_then_lock/3` — the story's row under a share lock, then the
   # dispatch's — but with the fence DEFERRED: the caller compares the digest first. The story
   # is the caller's (`held_story/3` read it; a row's `story_id` never changes), checked against

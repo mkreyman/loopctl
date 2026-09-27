@@ -408,6 +408,29 @@ defmodule Loopctl.Threads.ReviewsTest do
       assert %{completed: 1} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
     end
 
+    test "a review whose claim ended writes nothing more, and nothing it said counts", ctx do
+      checkpoint(ctx, 1)
+      review = placed!(ctx)
+      finding!(ctx, review)
+
+      # A force-unclaim clears the claimant and leaves the epoch where it was.
+      set_story(ctx, assigned_agent_id: nil)
+      assert "review_claim_ended" == code(finding(ctx, review))
+      assert "review_claim_ended" == code(verdict(ctx, review))
+      assert "review_claim_ended" == code(place(ctx, agent_id: ctx.spare.id))
+
+      # A new claim moves the epoch: the review belongs to the one before it.
+      set_story(ctx, assigned_agent_id: ctx.implementer.id, claim_epoch: epoch(ctx) + 1)
+      assert "review_claim_ended" == code(verdict(ctx, review))
+
+      {:ok, kinds} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.all(from e in Entry, where: e.review_id == ^review.id, select: e.kind)
+        end)
+
+      assert kinds == [:finding]
+    end
+
     test "separation is decided again on every judgement", ctx do
       checkpoint(ctx, 1)
       review = placed!(ctx)
@@ -594,6 +617,50 @@ defmodule Loopctl.Threads.ReviewsTest do
       finding!(ctx, r2, %{"introduced_by" => "none", "severity" => "low"})
       assert %{escalation: nil} = verdict!(ctx, r2)
       assert %{next_round: nil} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
+    end
+
+    test "a fix written while round 2 streams its findings does not open round 3", ctx do
+      checkpoint(ctx, 1)
+      r1 = placed!(ctx)
+      f1 = finding!(ctx, r1, %{"severity" => "low"})
+      verdict!(ctx, r1)
+      cp2 = checkpoint(ctx, 2)
+
+      # Round 2 is placed on cp2 BEFORE any fix exists; a fix on cp2 lands mid-round, and a
+      # round-2 finding names cp2 as where its defect came in.
+      r2 = placed!(ctx)
+      finding!(ctx, r2, %{"introduced_by" => cp2.id, "severity" => "low"})
+      assert {:ok, _fix, :created} = fix(ctx, cp2, [f1.id])
+      verdict!(ctx, r2)
+
+      assert %{next_round: nil, ceiling_reached: true} =
+               Reviews.rounds(ctx.tenant_id, ctx.story.id)
+    end
+
+    test "a resent verdict answers the escalation its first delivery recorded", ctx do
+      round_one_fixed(ctx)
+      r2 = placed!(ctx)
+      finding!(ctx, r2, %{"introduced_by" => "none", "severity" => "high"})
+
+      assert {:ok, %{escalation: %Entry{id: esc_id}}, :created} = verdict(ctx, r2, "v-final")
+
+      assert {:ok, %{escalation: %Entry{id: ^esc_id}}, :existing} =
+               verdict(ctx, r2, "v-final")
+    end
+
+    test "rounds belong to a claim: a new claim starts at round 1 after a ceiling", ctx do
+      %{cp1: cp1} = round_one_fixed(ctx)
+      r2 = placed!(ctx)
+      finding!(ctx, r2, %{"introduced_by" => cp1.id, "severity" => "critical"})
+      verdict!(ctx, r2)
+      assert "review_ceiling_reached" == code(place(ctx))
+
+      # The story is released and claimed again: rewritten work.
+      set_story(ctx, claim_epoch: epoch(ctx) + 1)
+      checkpoint(ctx, 16)
+
+      assert %{completed: 0, next_round: 1} = Reviews.rounds(ctx.tenant_id, ctx.story.id)
+      assert {:ok, %{round: 1}, :created} = place(ctx)
     end
 
     test "a fix attached AFTER the round-2 verdict does not make round 3 placeable", ctx do

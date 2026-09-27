@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "01940ce4bbe07f01c9c497030c093d5fe0c4cf3a396ad5c7be5efba221ae8d19"
+  @digest "dd048ec19b7febbc09a22f2b9c197fc8f7ed75eafe90fdc8fc2a4c9d94a2a4e2"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do

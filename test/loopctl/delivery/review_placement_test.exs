@@ -21,11 +21,15 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchRecord
+  alias Loopctl.Runners.Runner
   alias Loopctl.Tenants.Tenant
   alias Loopctl.Threads
+  alias Loopctl.Threads.Entry
+  alias Loopctl.Threads.Review
   alias Loopctl.WorkBreakdown.Story
   alias LoopctlWeb.RunnerSocket
 
@@ -196,6 +200,15 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
     row
   end
 
+  defp reviews(ctx) do
+    {:ok, rows} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        Repo.all(from r in Review, where: r.story_id == ^ctx.story.id)
+      end)
+
+    rows
+  end
+
   defp story_row(ctx) do
     {:ok, story} =
       Repo.with_tenant(ctx.tenant_id, fn -> Repo.get!(Story, ctx.story.id) end)
@@ -257,6 +270,35 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
                place(ctx, dispatch_id: payload["dispatch_id"])
 
       refute_push "dispatch", _, 200
+    end
+
+    test "a push the runner would refuse records no review", ctx do
+      # The runner is at capacity: every slot it has is taken.
+      AdminRepo.update_all(
+        from(r in Runner,
+          where: r.id == ^ctx.runner.id,
+          update: [set: [in_flight: r.max_sessions]]
+        ),
+        []
+      )
+
+      assert {:error, :runner_at_capacity} = place(ctx)
+      refute_push "dispatch", _, 200
+      assert reviews(ctx) == []
+
+      # Not on a socket at all: refused before anything is recorded.
+      {_raw, offline} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id, name: "offline"})
+
+      assert {:error, :runner_not_connected} =
+               Placement.place_review(ctx.tenant_id, offline.id, ctx.story.id,
+                 api_key: ctx.operator,
+                 repo: @repo,
+                 base_branch: "master",
+                 wall_clock_seconds: 600,
+                 max_turns: 20
+               )
+
+      assert reviews(ctx) == []
     end
 
     test "an agent-role key may not request one, and a halted tenant places nothing", ctx do
@@ -355,6 +397,114 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
 
       ref = finding(ctx, dispatch_id)
       assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+    end
+
+    test "after a force-unclaim a verdict is refused review_claim_ended and records nothing",
+         ctx do
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story.id,
+        stage: :implementing,
+        claim_epoch: @epoch
+      })
+
+      %{dispatch_id: r1} = accepted_review!(ctx)
+      assert_reply verdict(ctx, r1), :ok, _, @reply_timeout
+      checkpoint(ctx, 2)
+      %{review: review, dispatch_id: r2} = accepted_review!(ctx)
+
+      ref = finding(ctx, r2, %{"introduced_by" => "none", "severity" => "critical"})
+      assert_reply ref, :ok, _, @reply_timeout
+
+      # What a force-unclaim writes (`Progress.force_unclaim_story/3`, which runs on AdminRepo
+      # and so cannot see this sandboxed story): the claimant cleared and the claim's release
+      # change, which moves the epoch on.
+      set_story(
+        ctx,
+        [agent_status: :pending, assigned_agent_id: nil] ++
+          Map.to_list(Progress.claim_release_change(story_row(ctx)))
+      )
+
+      ref = verdict(ctx, r2)
+      assert_reply ref, :error, %{reason: "review_claim_ended"}, @reply_timeout
+
+      {:ok, kinds} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.all(from e in Entry, where: e.review_id == ^review.id, select: e.kind)
+        end)
+
+      assert kinds == [:finding]
+    end
+
+    test "a resent verdict answers the recorded escalation and frees the slot again", ctx do
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story.id,
+        stage: :implementing,
+        claim_epoch: @epoch
+      })
+
+      %{dispatch_id: r1} = accepted_review!(ctx)
+      assert_reply verdict(ctx, r1), :ok, _, @reply_timeout
+      checkpoint(ctx, 2)
+      %{dispatch_id: r2} = accepted_review!(ctx)
+      ref = finding(ctx, r2, %{"introduced_by" => "none", "severity" => "high"})
+      assert_reply ref, :ok, _, @reply_timeout
+
+      assert_reply verdict(ctx, r2, 77), :ok, %{escalated: true, replayed: false}, @reply_timeout
+
+      # The first delivery's release never landed, as far as the ledger knows.
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(d in DispatchRecord, where: d.dispatch_id == ^r2)
+          |> Repo.update_all(set: [released_at: nil])
+        end)
+
+      assert_reply verdict(ctx, r2, 77), :ok, %{escalated: true, replayed: true}, @reply_timeout
+      refute is_nil(ledger_row(ctx, r2).released_at)
+    end
+
+    test "a review session that ends without a verdict frees its slot, and moves no stage",
+         ctx do
+      %{dispatch_id: first} = accepted_review!(ctx)
+      %{dispatch_id: second} = accepted_review!(ctx)
+
+      # The second review completes round 1, so the first is superseded and never judges.
+      assert_reply verdict(ctx, second), :ok, _, @reply_timeout
+
+      assert_reply finding(ctx, first),
+                   :error,
+                   %{reason: "review_round_superseded"},
+                   @reply_timeout
+
+      assert is_nil(ledger_row(ctx, first).released_at)
+
+      ended = %{"dispatch_id" => first, "claim_epoch" => @epoch, "reason" => "completed"}
+      ref = push(ctx.channel, "session_ended", ended)
+      assert_reply ref, :ok, %{kind: "review", replayed: false}, @reply_timeout
+
+      row = ledger_row(ctx, first)
+      refute is_nil(row.released_at)
+      assert row.session_ended_reason == "completed"
+      assert row.counts_toward_retry_ceiling == nil
+
+      ref = push(ctx.channel, "session_ended", ended)
+      assert_reply ref, :ok, %{kind: "review", replayed: true}, @reply_timeout
+    end
+
+    test "a review session that never ran cannot report ending", ctx do
+      {:ok, %{dispatch_id: dispatch_id}} = place(ctx)
+      assert_push "dispatch", _, @reply_timeout
+
+      ref =
+        push(ctx.channel, "session_ended", %{
+          "dispatch_id" => dispatch_id,
+          "claim_epoch" => @epoch,
+          "reason" => "crashed"
+        })
+
+      assert_reply ref, :error, %{reason: "dispatch_not_accepted"}, @reply_timeout
+      assert is_nil(ledger_row(ctx, dispatch_id).session_ended_reason)
     end
 
     test "a halted tenant's judgements are refused tenant_halted, and nothing is written", ctx do

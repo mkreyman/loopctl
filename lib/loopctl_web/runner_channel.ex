@@ -91,6 +91,11 @@ defmodule LoopctlWeb.RunnerChannel do
   first copy caused. Like `stage`, it does not check the custody halt: it records what a
   session already did.
 
+  Since 1.21.0 the same message also ends a REVIEW session
+  (`Loopctl.Delivery.RunnerReviews.end_session/3`): recorded once on its ledger row, the slot
+  freed, and nothing else — no stage effect, no retry-ceiling count. Its reply is `kind` and
+  `replayed` only.
+
   ## Change threads (contract 1.20.0, US-45.2)
 
   `"checkpoint"` (`RunnerCheckpoint`) is a commit the session pushed, and `"thread_entry"`
@@ -440,7 +445,9 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   # Why an implement session ended (contract 1.16.0, US-44.3). The runner states the fact;
-  # `RunnerStages.end_session/4` records it once and decides what it does to the story.
+  # `RunnerStages.end_session/4` records it once and decides what it does to the story. A
+  # REVIEW session's report (1.21.0) goes to `RunnerReviews.end_session/3` instead, which only
+  # frees its slot.
   #
   # IDEMPOTENT, and the ack says which it was, for the reason `triage_verdict`'s does: the
   # session that ended cannot say it again differently, so a runner refused for anything
@@ -454,11 +461,18 @@ defmodule LoopctlWeb.RunnerChannel do
       RunnerContract.cast_session_ended(payload),
       {:session_ended_bucket, @session_ended_capacity, @session_ended_refill_ms},
       fn message ->
-        with {:ok, %{row: row, replayed?: replayed?}} <-
-               RunnerStages.end_session(tenant_id, runner.id, message,
-                 actor_id: runner.api_key_id
-               ),
-             do: {:ok, Map.put(stage_ack(row), :replayed, replayed?)}
+        case RunnerReviews.end_session(tenant_id, runner, message) do
+          :not_review ->
+            end_implement_session(tenant_id, runner, message)
+
+          # A review session (1.21.0) frees its slot and touches no stage, so its ack carries
+          # no row: only what it was and whether this was a resend.
+          {:ok, %{replayed?: replayed?}} ->
+            {:ok, %{kind: RunnerReviews.kind(), replayed: replayed?}}
+
+          {:error, _reason} = refused ->
+            refused
+        end
       end
     )
   end
@@ -646,6 +660,12 @@ defmodule LoopctlWeb.RunnerChannel do
   # Rendered by `RunnerStages.row_state/1` rather than here, because the `stale_stage` refusal
   # sends the same row for the same reason (#849) and the two must not be able to drift.
   defp stage_ack(row), do: RunnerStages.row_state(row)
+
+  defp end_implement_session(tenant_id, runner, message) do
+    with {:ok, %{row: row, replayed?: replayed?}} <-
+           RunnerStages.end_session(tenant_id, runner.id, message, actor_id: runner.api_key_id),
+         do: {:ok, Map.put(stage_ack(row), :replayed, replayed?)}
+  end
 
   defp rate_limited(socket, event, min_interval_ms),
     do: refuse(socket, event, %{reason: "rate_limited", min_interval_ms: min_interval_ms})
