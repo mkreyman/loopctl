@@ -1,5 +1,6 @@
 /**
- * US-45.1 on the MCP side: thread_get, thread_checkpoint, thread_entry.
+ * US-45.1 on the MCP side: thread_get, thread_checkpoint, thread_entry; and US-45.3's
+ * thread_request_review, thread_review_get, thread_fix.
  *
  * Runs the real code in ../lib/threads.js with `apiCall` injected as a recording fake; the
  * last block source-pins index.js and the README so the wiring cannot drift from the logic.
@@ -13,7 +14,14 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { getThread, recordCheckpoint, recordEntry } from "../lib/threads.js";
+import {
+  getReview,
+  getThread,
+  recordCheckpoint,
+  recordEntry,
+  recordFix,
+  requestReview,
+} from "../lib/threads.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
@@ -162,11 +170,111 @@ describe("thread_get paging and keys", () => {
   });
 });
 
+describe("thread_request_review", () => {
+  const RUNNER = "9b2e3a1c-7425-40de-944b-e07fc1f90ae7";
+
+  test("POSTs to /thread/reviews on the ORCHESTRATOR key, sending only what was given", async () => {
+    const { calls, apiCall } = fakeApi();
+    await requestReview(
+      { story_id: STORY_ID, runner_id: RUNNER, max_turns: 20 },
+      { apiCall, env: ENV },
+    );
+
+    assert.deepEqual(calls, [
+      {
+        method: "POST",
+        path: `/api/v1/stories/${STORY_ID}/thread/reviews`,
+        body: { runner_id: RUNNER, max_turns: 20 },
+        key: "orch-key",
+        keyHint: "LOOPCTL_ORCH_KEY",
+      },
+    ]);
+  });
+
+  test("principal user travels on the user key; the agent key is never offered", async () => {
+    const { calls, apiCall } = fakeApi();
+    await requestReview(
+      { story_id: STORY_ID, runner_id: RUNNER, principal: "user" },
+      { apiCall, env: ENV },
+    );
+    assert.equal(calls[0].keyHint, "LOOPCTL_USER_KEY");
+
+    const res = await requestReview(
+      { story_id: STORY_ID, runner_id: RUNNER, principal: "agent" },
+      { apiCall, env: ENV },
+    );
+    assert.equal(res.error, true);
+    assert.equal(calls.length, 1);
+  });
+
+  test("refuses client-side without a runner, calling nothing", async () => {
+    const { calls, apiCall } = fakeApi();
+    const res = await requestReview({ story_id: STORY_ID }, { apiCall, env: ENV });
+    assert.equal(res.error, true);
+    assert.match(res.body, /runner_id/);
+    assert.equal(calls.length, 0);
+  });
+});
+
+describe("thread_review_get", () => {
+  test("GETs the review on the first configured key", async () => {
+    const { calls, apiCall } = fakeApi();
+    await getReview({ story_id: STORY_ID, review_id: "r1" }, { apiCall, env: ENV });
+    assert.deepEqual(calls[0], {
+      method: "GET",
+      path: `/api/v1/stories/${STORY_ID}/thread/reviews/r1`,
+      body: null,
+      key: "agent-key",
+      keyHint: "LOOPCTL_AGENT_KEY",
+    });
+  });
+});
+
+describe("thread_fix", () => {
+  const FIX = {
+    story_id: STORY_ID,
+    claim_epoch: 4,
+    checkpoint_id: "cp2",
+    finding_ids: ["f1"],
+    idempotency_key: "x1",
+    body: "why",
+  };
+
+  test("POSTs to /thread/fixes on the claim key, LOOPCTL_API_KEY first", async () => {
+    const { calls, apiCall } = fakeApi();
+    await recordFix(FIX, { apiCall, env: { ...ENV, LOOPCTL_API_KEY: "api-key" } });
+    assert.deepEqual(calls[0], {
+      method: "POST",
+      path: `/api/v1/stories/${STORY_ID}/thread/fixes`,
+      body: {
+        claim_epoch: 4,
+        checkpoint_id: "cp2",
+        finding_ids: ["f1"],
+        idempotency_key: "x1",
+        body: "why",
+      },
+      key: "api-key",
+      keyHint: "LOOPCTL_API_KEY",
+    });
+  });
+
+  test("refuses client-side with no findings or no epoch, calling nothing", async () => {
+    const { calls, apiCall } = fakeApi();
+    assert.equal((await recordFix({ ...FIX, finding_ids: [] }, { apiCall, env: ENV })).error, true);
+    const { claim_epoch: _drop, ...noEpoch } = FIX;
+    assert.equal((await recordFix(noEpoch, { apiCall, env: ENV })).error, true);
+    assert.equal(calls.length, 0);
+  });
+});
+
 describe("wiring", () => {
   for (const [tool, handler] of [
     ["thread_get", "threadGet"],
     ["thread_checkpoint", "threadCheckpoint"],
     ["thread_entry", "threadEntry"],
+    ["thread_request_review", "threadRequestReview"],
+    ["thread_review_get", "threadReviewGet"],
+    ["thread_fix", "threadFix"],
   ]) {
     test(`${tool} is declared, dispatched and documented`, () => {
       assert.ok(INDEX_SRC.includes(`name: "${tool}"`), `${tool} not declared`);

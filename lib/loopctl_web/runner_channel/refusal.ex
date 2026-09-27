@@ -134,10 +134,15 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # bytes that earned them: `not_claimant` and `claim_not_live` — the claim is not this
   # runner's, or is over — `checkpoint_conflict` and `idempotency_key_reused` — a resend that
   # is not the same write — and `secret_blocked`, a credential in a text field.
+  #
+  # A review's four (1.21.0, `Loopctl.Delivery.RunnerReviews`): `review_closed`,
+  # `review_round_superseded` and `reviewer_not_separate` are permanent for that review, and
+  # `tenant_halted` clears when an operator lifts the custody halt.
   @verbatim ~w(unknown_dispatch stale_claim_epoch already_replied dispatch_not_accepted
                run_mismatch stale_stage unknown_story_stage effect_conflict
                already_recorded not_claimant claim_not_live checkpoint_conflict
-               idempotency_key_reused secret_blocked)a
+               idempotency_key_reused secret_blocked tenant_halted review_closed
+               review_round_superseded reviewer_not_separate)a
 
   def for_message(reason) when reason in @verbatim, do: %{reason: Atom.to_string(reason)}
 

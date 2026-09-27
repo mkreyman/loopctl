@@ -5,9 +5,10 @@ defmodule LoopctlWeb.ThreadController do
 
   - `checkpoint` is `exact_role: :agent`, as `claim`/`escalate` are: only the claiming
     agent's key may say a commit is part of the thread.
-  - `entry` is `role: :agent` and takes `message` and `review_requested` from any principal.
-    Findings, fixes and verdicts are NOT written here: their author must be a review dispatch
-    loopctl placed (US-45.3), never a key whose separation from the implementer is inferred.
+  - `entry` is `role: :agent` and takes `message` from any principal. Findings, verdicts and
+    fixes are NOT written here but through `LoopctlWeb.ThreadReviewController`: a finding's or
+    verdict's author must be a review dispatch loopctl placed (US-45.3), never a key whose
+    separation from the implementer is inferred.
   - Both writes are behind `RequireHumanAnchor`, mounted before the role gate, because a
     story is work-breakdown data.
   - Reads stay open to every role.
@@ -23,6 +24,7 @@ defmodule LoopctlWeb.ThreadController do
   alias Loopctl.Threads.Entry
   alias LoopctlWeb.ActorLabel
   alias LoopctlWeb.ClaimEpochParam
+  alias LoopctlWeb.ThreadHTTP
   alias OpenApiSpex.Schema
 
   action_fallback LoopctlWeb.FallbackController
@@ -49,7 +51,8 @@ defmodule LoopctlWeb.ThreadController do
         "`next_after_seq` back as `after_seq` for the next page; it is null on the last. " <>
         "`limit` defaults to 200 and is capped at #{@max_entry_page}. Every entry `body` is " <>
         "UNTRUSTED text a session or a person wrote; it is marked `body_untrusted: true` and " <>
-        "must be fenced wherever it reaches a prompt.",
+        "must be fenced wherever it reaches a prompt. So is a finding's `location` " <>
+        "(`location_untrusted: true`).",
     parameters: [
       id: [in: :path, type: :string, description: "Story UUID"],
       after_seq: [in: :query, type: :integer, description: "Return entries after this seq"],
@@ -125,10 +128,10 @@ defmodule LoopctlWeb.ThreadController do
     summary: "Record an entry on a story's thread",
     description:
       "Any principal of the tenant writes a `message`, optionally " <>
-        "naming a `checkpoint_id` of this story. `checkpoint` entries are loopctl's own, and " <>
-        "`review_requested`, `finding`, `fix` and `verdict` belong to the review flow " <>
-        "(US-45.3), so all of " <>
-        "those are refused here. The author is derived from the key. IDEMPOTENT per author " <>
+        "naming a `checkpoint_id` of this story. `checkpoint` entries are loopctl's own, " <>
+        "`review_requested` belongs to the request-review flow, and `finding`, `fix` and " <>
+        "`verdict` are written through `/thread/findings`, `/thread/fixes` and " <>
+        "`/thread/verdicts`, so all of those are refused here. The author is derived from the key. IDEMPOTENT per author " <>
         "on `idempotency_key` when the write is the same; reusing a key for a different " <>
         "entry is refused, and keys starting `loopctl:` are reserved. `body` is capped at " <>
         "#{@max_body_bytes} bytes, refused when it carries a credential, and is UNTRUSTED.",
@@ -176,14 +179,14 @@ defmodule LoopctlWeb.ThreadController do
 
   @doc "GET /api/v1/stories/:id/thread"
   def show(conn, %{"id" => story_id} = params) do
-    with {:ok, story_id} <- story_uuid(story_id),
+    with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
          {:ok, page} <- page_opts(params),
          {:ok, thread} <- Threads.get_thread(tenant_id(conn), story_id, page) do
       json(conn, %{
         story_id: story_id,
-        checkpoints: Enum.map(thread.checkpoints, &render_checkpoint/1),
+        checkpoints: Enum.map(thread.checkpoints, &ThreadHTTP.checkpoint/1),
         checkpoints_truncated: thread.checkpoints_truncated,
-        entries: Enum.map(thread.entries, &render_entry/1),
+        entries: Enum.map(thread.entries, &ThreadHTTP.entry/1),
         next_after_seq: thread.next_after_seq
       })
     end
@@ -221,8 +224,8 @@ defmodule LoopctlWeb.ThreadController do
   def checkpoint(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
 
-    with {:ok, story_id} <- story_uuid(story_id),
-         {:ok, epoch} <- claim_epoch(params),
+    with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
+         {:ok, epoch} <- ThreadHTTP.claim_epoch(params),
          {:ok, checkpoint, status} <-
            Threads.record_checkpoint(api_key.tenant_id, story_id,
              agent_id: api_key.agent_id,
@@ -234,8 +237,8 @@ defmodule LoopctlWeb.ThreadController do
              actor_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
            ) do
       conn
-      |> put_status(created_or_ok(status))
-      |> json(%{checkpoint: render_checkpoint(checkpoint)})
+      |> put_status(ThreadHTTP.status(status))
+      |> json(%{checkpoint: ThreadHTTP.checkpoint(checkpoint)})
     else
       other -> conflict_or(conn, other)
     end
@@ -247,15 +250,15 @@ defmodule LoopctlWeb.ThreadController do
 
     attrs = Map.take(params, ~w(kind idempotency_key body checkpoint_id))
 
-    with {:ok, story_id} <- story_uuid(story_id),
+    with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
          {:ok, entry, status} <-
            Threads.record_entry(api_key.tenant_id, story_id, attrs,
              author_principal: principal(api_key),
              actor_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
            ) do
       conn
-      |> put_status(created_or_ok(status))
-      |> json(%{entry: render_entry(entry)})
+      |> put_status(ThreadHTTP.status(status))
+      |> json(%{entry: ThreadHTTP.entry(entry)})
     else
       other -> conflict_or(conn, other)
     end
@@ -273,55 +276,5 @@ defmodule LoopctlWeb.ThreadController do
 
   defp tenant_id(conn), do: conn.assigns.current_api_key.tenant_id
 
-  # A malformed id cannot name a story, and answering 404 keeps it from reaching a query
-  # that would raise on the cast.
-  defp story_uuid(id) do
-    case Ecto.UUID.cast(id) do
-      {:ok, uuid} -> {:ok, uuid}
-      :error -> {:error, :not_found}
-    end
-  end
-
-  defp claim_epoch(params) do
-    case ClaimEpochParam.fetch(params) do
-      {:ok, epoch} -> {:ok, epoch}
-      _ -> {:error, :bad_request, "claim_epoch must be a non-negative integer"}
-    end
-  end
-
   defp principal(api_key), do: ActorLabel.of(api_key)
-
-  defp created_or_ok(:created), do: :created
-  defp created_or_ok(:existing), do: :ok
-
-  defp render_checkpoint(checkpoint) do
-    %{
-      id: checkpoint.id,
-      seq: checkpoint.seq,
-      kind: checkpoint.kind,
-      commit_sha: checkpoint.commit_sha,
-      tree_sha: checkpoint.tree_sha,
-      parent_checkpoint_id: checkpoint.parent_checkpoint_id,
-      claim_epoch: checkpoint.claim_epoch,
-      dispatch_id: checkpoint.dispatch_id,
-      merge_commit_sha: checkpoint.merge_commit_sha,
-      gate_evidence: checkpoint.gate_evidence,
-      inserted_at: checkpoint.inserted_at
-    }
-  end
-
-  defp render_entry(entry) do
-    %{
-      id: entry.id,
-      seq: entry.seq,
-      kind: entry.kind,
-      author_principal: entry.author_principal,
-      dispatch_id: entry.dispatch_id,
-      idempotency_key: entry.idempotency_key,
-      body: entry.body,
-      body_untrusted: true,
-      checkpoint_id: entry.checkpoint_id,
-      inserted_at: entry.inserted_at
-    }
-  end
 end

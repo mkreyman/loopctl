@@ -1,6 +1,8 @@
 /**
  * Change threads (loopctl US-45.1, Epic 45): read a story's thread, record a checkpoint,
- * record an entry.
+ * record an entry; and review on it (US-45.3): request a review, read its payload, record a
+ * fix. A review's findings and verdict are NOT here: they travel over the runner socket from
+ * the runner loopctl placed the review on.
  *
  * SINGLE SOURCE OF TRUTH. index.js injects `apiCall`; the unit suite runs this code with a
  * recording fake. Keys are selected here, from the injected env, so which key a call travels
@@ -9,9 +11,10 @@
  * - thread_checkpoint travels on the key claim_story claims with: LOOPCTL_API_KEY when it is
  *   set, else LOOPCTL_AGENT_KEY (the same resolveKey order). The endpoint compares the key's
  *   agent with the story's claimant, so the checkpoint must go out on the key that claimed.
- * - thread_entry writes a `message` or `review_requested` on the key named by `principal`
- *   (agent by default; a person writes on LOOPCTL_USER_KEY). Findings, fixes and verdicts
- *   are not written through this tool: their author is a review dispatch (loopctl US-45.3).
+ * - thread_entry writes a `message` on the key named by `principal` (agent by default; a
+ *   person writes on LOOPCTL_USER_KEY).
+ * - thread_request_review travels on LOOPCTL_ORCH_KEY (LOOPCTL_USER_KEY for principal user).
+ * - thread_fix travels on the key claim_story claims with, as thread_checkpoint does.
  * - thread_get reads on the first key configured, agent first, then LOOPCTL_API_KEY, the
  *   orchestrator key and the user key: reads are open to every role.
  *
@@ -138,5 +141,93 @@ export async function recordEntry(
     compact({ kind, idempotency_key, body, checkpoint_id }),
     env[keyVar],
     keyVar,
+  );
+}
+
+// --- US-45.3: review on the thread ------------------------------------------------------
+
+export function reviewsPath(storyId) {
+  return `/api/v1/stories/${encodeURIComponent(storyId)}/thread/reviews`;
+}
+
+export function reviewPath(storyId, reviewId) {
+  return `/api/v1/stories/${encodeURIComponent(storyId)}/thread/reviews/${encodeURIComponent(reviewId)}`;
+}
+
+export function fixesPath(storyId) {
+  return `/api/v1/stories/${encodeURIComponent(storyId)}/thread/fixes`;
+}
+
+/**
+ * `POST /api/v1/stories/:id/thread/reviews` on the orchestrator key (or the user key): ask
+ * loopctl to place a review on a runner. No credential comes back; the review's findings and
+ * verdict travel over that runner's socket, never through this server.
+ */
+export async function requestReview(
+  {
+    story_id,
+    runner_id,
+    dispatch_id,
+    wall_clock_seconds,
+    max_turns,
+    repo,
+    base_branch,
+    principal = "orchestrator",
+  } = {},
+  { apiCall, env = process.env } = {},
+) {
+  if (!present(story_id)) return missing("story_id");
+  if (!present(runner_id)) return missing("runner_id");
+  if (principal !== "orchestrator" && principal !== "user") {
+    return { error: true, status: 0, body: "`principal` must be orchestrator or user." };
+  }
+
+  const keyVar = PRINCIPAL_KEYS[principal];
+  return apiCall(
+    "POST",
+    reviewsPath(story_id),
+    compact({ runner_id, dispatch_id, wall_clock_seconds, max_turns, repo, base_branch }),
+    env[keyVar],
+    keyVar,
+  );
+}
+
+/** `GET /api/v1/stories/:id/thread/reviews/:review_id` on the first key configured. */
+export async function getReview({ story_id, review_id } = {}, { apiCall, env = process.env } = {}) {
+  if (!present(story_id)) return missing("story_id");
+  if (!present(review_id)) return missing("review_id");
+  const keyVar =
+    ["LOOPCTL_AGENT_KEY", "LOOPCTL_API_KEY", "LOOPCTL_ORCH_KEY", "LOOPCTL_USER_KEY"].find(
+      (name) => env[name],
+    ) || "LOOPCTL_AGENT_KEY";
+  return apiCall("GET", reviewPath(story_id, review_id), null, env[keyVar], keyVar);
+}
+
+/** `POST /api/v1/stories/:id/thread/fixes` on the key claim_story claims with. */
+export async function recordFix(
+  { story_id, claim_epoch, checkpoint_id, finding_ids, idempotency_key, body } = {},
+  { apiCall, env = process.env } = {},
+) {
+  if (!present(story_id)) return missing("story_id");
+  if (!present(checkpoint_id)) return missing("checkpoint_id");
+  if (!present(idempotency_key)) return missing("idempotency_key");
+  if (!present(body)) return missing("body");
+  if (!Array.isArray(finding_ids) || finding_ids.length === 0) {
+    return { error: true, status: 0, body: "`finding_ids` must name at least one finding." };
+  }
+  if (!Number.isInteger(claim_epoch) || claim_epoch < 0) {
+    return {
+      error: true,
+      status: 0,
+      body: "`claim_epoch` is required: the non-negative integer your claim returned.",
+    };
+  }
+
+  return apiCall(
+    "POST",
+    fixesPath(story_id),
+    { claim_epoch, checkpoint_id, finding_ids, idempotency_key, body },
+    env[claimKeyVar(env)],
+    claimKeyVar(env),
   );
 }

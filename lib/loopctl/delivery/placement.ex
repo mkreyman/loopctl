@@ -179,9 +179,13 @@ defmodule Loopctl.Delivery.Placement do
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
+  alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Tenants
+  alias Loopctl.Threads
+  alias Loopctl.Threads.Checkpoint
+  alias Loopctl.Threads.Review
   alias Loopctl.WorkBreakdown.Stories
   alias Loopctl.WorkBreakdown.Story
 
@@ -374,6 +378,122 @@ defmodule Loopctl.Delivery.Placement do
         record -> resume(tenant_id, runner_id, dispatch, record, opts)
       end
     end
+  end
+
+  @doc """
+  Places a REVIEW of `story_id`'s change thread on `runner_id` (US-45.3): a runner dispatch of
+  kind `review`, pushed exactly as an implement dispatch is, through `Runners.dispatch/3` and
+  the ledger. It CLAIMS NOTHING and MINTS NOTHING: the story stays with its implementer, and no
+  API key exists for the review — its findings and verdict come back over the runner socket
+  from the runner that holds this dispatch (`Loopctl.Delivery.RunnerReviews`).
+
+  The review is recorded first (`Loopctl.Threads.record_review/3`, which decides the round,
+  the checkpoint and the reviewer's separation under the thread lock), then pushed. That is the
+  recoverable order: a refused push leaves an inert review row nothing can judge under, never a
+  session whose judgements have nothing to bind to.
+
+  ## Options
+
+  - `:api_key` (required) — the key the request authenticated with; orchestrator or higher.
+  - `:dispatch_id` — the ledger id to push under. Generated when absent. A repeat with the same
+    id re-pushes the same review (idempotent), so a lost response is retried with it.
+  - `:wall_clock_seconds`, `:max_turns` — the session's budget; `REVIEW_WALL_CLOCK_SECONDS` and
+    `REVIEW_MAX_TURNS` when absent.
+  - `:repo`, `:base_branch` — for a story whose project is bound to no intake source, as on
+    `place/4`; the intake source's otherwise.
+  - `:actor_label` — recorded as the review's `placed_by`.
+
+  ## Refusals
+
+  The claim path's runner refusals (`:runner_not_provisioned`, `:runner_declines_work`,
+  `:runner_exhausted`, `:not_authorized`), `:tenant_halted`, `:custody_tier_required`,
+  `:insufficient_role`, `Loopctl.Threads.record_review/3`'s (`no_checkpoint`,
+  `review_ceiling_reached`, `reviewer_not_separate`, `implementer_dispatch_required`,
+  `dispatch_id_conflict`), and everything `Runners.dispatch/3` refuses.
+  """
+  @spec place_review(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, %{review: Review.t(), dispatch_id: Ecto.UUID.t()}} | {:error, term()}
+  def place_review(tenant_id, runner_id, story_id, opts)
+      when is_binary(tenant_id) and is_binary(runner_id) and is_binary(story_id) do
+    meta = sole_live_meta(tenant_id, runner_id)
+
+    with {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
+         :ok <- review_placer(caller.role),
+         {:ok, dispatch_id} <- review_dispatch_id(Keyword.get(opts, :dispatch_id)),
+         :ok <- not_halted(tenant_id),
+         :ok <- Tenants.require_human_anchor(tenant_id),
+         :ok <- runner_accepting_work(meta),
+         :ok <- runner_not_exhausted(tenant_id, runner_id),
+         {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
+         {:ok, dispatch} <-
+           DispatchPayload.fill(tenant_id, review_dispatch(dispatch_id, story_id, opts),
+             branch_prefixes: declared_branch_prefixes(meta)
+           ),
+         {:ok, story} <- review_story(tenant_id, story_id),
+         {:ok, story_object} <- ImplementerInput.story_object(story),
+         {:ok, review, _status} <-
+           Threads.record_review(tenant_id, story_id,
+             dispatch_id: dispatch_id,
+             runner_id: runner_id,
+             agent_id: agent_id,
+             placed_by: Keyword.get(opts, :actor_label, "api:review_placement")
+           ),
+         payload = review_payload(tenant_id, dispatch, story_object, review),
+         :ok <- Runners.dispatch(tenant_id, runner_id, payload) do
+      {:ok, %{review: review, dispatch_id: dispatch_id}}
+    end
+  end
+
+  # Placing a review claims nothing and hands no credential out, so the only role question is
+  # whether the caller may drive the loop at all: an orchestrator, or a person above one.
+  defp review_placer(role) do
+    if Role.role_at_least?(role, :orchestrator), do: :ok, else: {:error, :insufficient_role}
+  end
+
+  # On the RLS repo, where the thread and its fence are read.
+  defp review_story(tenant_id, story_id) do
+    {:ok, story} = Repo.with_tenant(tenant_id, fn -> Threads.story(tenant_id, story_id) end)
+    if story, do: {:ok, story}, else: {:error, :story_not_found}
+  end
+
+  defp review_dispatch_id(nil), do: {:ok, Ecto.UUID.generate()}
+
+  defp review_dispatch_id(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, id} -> {:ok, id}
+      :error -> {:error, {:invalid, ["dispatch_id must be a UUID"]}}
+    end
+  end
+
+  defp review_dispatch(dispatch_id, story_id, opts) do
+    %{"dispatch_id" => dispatch_id, "story_id" => story_id, "kind" => "review"}
+    |> put_opt("wall_clock_seconds", Keyword.get(opts, :wall_clock_seconds))
+    |> put_opt("max_turns", Keyword.get(opts, :max_turns))
+    |> put_opt("repo", Keyword.get(opts, :repo))
+    |> put_opt("base_branch", Keyword.get(opts, :base_branch))
+  end
+
+  defp put_opt(map, _key, nil), do: map
+  defp put_opt(map, key, value), do: Map.put(map, key, value)
+
+  # The review object names what the session reads — the checkpoint the placement bound — and
+  # the review it judges under. Its epoch is the claim the review was recorded against, the one
+  # the ledger fences the push on.
+  defp review_payload(tenant_id, dispatch, story_object, %Review{} = review) do
+    {:ok, checkpoint} =
+      Repo.with_tenant(tenant_id, fn -> Repo.get!(Checkpoint, review.checkpoint_id) end)
+
+    dispatch
+    |> Map.put("claim_epoch", review.claim_epoch)
+    |> Map.put("story", story_object)
+    |> Map.put("review", %{
+      "review_id" => review.id,
+      "round" => review.round,
+      "checkpoint_id" => checkpoint.id,
+      "checkpoint_seq" => checkpoint.seq,
+      "commit_sha" => checkpoint.commit_sha,
+      "tree_sha" => checkpoint.tree_sha
+    })
   end
 
   # THE STORY OBJECT IS LOOPCTL'S TO BUILD, so a caller may not supply one. `attach_story/6`

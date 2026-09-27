@@ -6,6 +6,24 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Review on a change thread (epic 45, US-45.3, runner contract 1.21.0, migration
+  `20260926160000`). RE-VENDOR the contract and declare `review` to take review dispatches.**
+  `POST /api/v1/stories/:id/thread/reviews` (orchestrator or above, human-anchored tenants)
+  places a review on a runner as a dispatch of kind `review`, on the story's latest
+  checkpoint of the current claim; it returns no credential. The runner sends the review's
+  findings and its one verdict as the new channel messages `review_finding` and
+  `review_verdict`; there is no HTTP path for either. `GET .../thread/reviews/:review_id`
+  reads the review payload and `POST .../thread/fixes` records the claimant's fixes. Rounds
+  are counted from the thread: round 3 only when a round-2 finding names a checkpoint a
+  round-1 fix carried, never round 4, and a round 2 that ends with a material finding moves
+  the delivery stage over the new `review_ceiling` edge (reconciled every minute by
+  `ReviewCeilingWorker` until it lands). New env vars `REVIEW_WALL_CLOCK_SECONDS` and
+  `REVIEW_MAX_TURNS` (see `deploy/FLY_SECRETS.md`); with them unset a review placement
+  without explicit budgets is refused `budget_unset`. The migration widens the
+  `runner_dispatches.kind` CHECK to include `review`; its rollback refuses while any review
+  row exists. New refusal codes: `review_closed`, `review_round_superseded`,
+  `reviewer_not_separate`, `tenant_halted`. MCP server 2.106.0 adds `thread_request_review`,
+  `thread_review_get` and `thread_fix`.
 - **Runners may report checkpoints and notes on a story's change thread (epic 45, US-45.2,
   runner contract 1.20.0). RE-VENDOR the contract to send them; a runner that does not gets
   today's behaviour.** Two new optional channel messages. `checkpoint` carries `{dispatch_id,

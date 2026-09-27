@@ -156,9 +156,15 @@ defmodule Loopctl.Delivery.RunnerThreads do
     end
   end
 
-  @doc "The idempotency key of a `thread_entry`: `<dispatch_id>:<client_seq>`."
-  @spec idempotency_key(%{dispatch_id: Ecto.UUID.t(), client_seq: non_neg_integer()}) ::
-          String.t()
+  @doc """
+  The idempotency key of a `thread_entry`, and of a review's `review_finding` and
+  `review_verdict` (US-45.3): `<dispatch_id>:<client_seq>`. The rest of the message is open.
+  """
+  @spec idempotency_key(%{
+          required(:dispatch_id) => Ecto.UUID.t(),
+          required(:client_seq) => non_neg_integer(),
+          optional(atom()) => term()
+        }) :: String.t()
   def idempotency_key(%{dispatch_id: dispatch_id, client_seq: client_seq}),
     do: "#{dispatch_id}:#{client_seq}"
 

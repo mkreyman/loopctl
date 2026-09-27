@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "b57abb32bcd65ffda6e36b8b4d240990168120d743cf7052c4db141c4e0f924e"
+  @digest "01940ce4bbe07f01c9c497030c093d5fe0c4cf3a396ad5c7be5efba221ae8d19"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -76,8 +76,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.20.0"
-      assert schema["x-contract-version"] == "1.20.0"
+      assert RunnerContract.version() == "1.21.0"
+      assert schema["x-contract-version"] == "1.21.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -86,7 +86,9 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "stage" => "RunnerStageReport",
                "session_ended" => "RunnerSessionEnded",
                "checkpoint" => "RunnerCheckpoint",
-               "thread_entry" => "RunnerThreadEntry"
+               "thread_entry" => "RunnerThreadEntry",
+               "review_finding" => "RunnerReviewFinding",
+               "review_verdict" => "RunnerReviewVerdict"
              } = connection["events"]
 
       assert connection["replies"] == %{
@@ -95,7 +97,9 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "triage_verdict" => "RunnerTriageVerdictAck",
                "session_ended" => "RunnerSessionEndedAck",
                "checkpoint" => "RunnerCheckpointAck",
-               "thread_entry" => "RunnerThreadEntryAck"
+               "thread_entry" => "RunnerThreadEntryAck",
+               "review_finding" => "RunnerReviewFindingAck",
+               "review_verdict" => "RunnerReviewVerdictAck"
              }
 
       # #803: the kind lists are published so a runner reads them rather than parsing prose.
@@ -2010,9 +2014,109 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert row =~ "`checkpoint`"
       assert row =~ "`thread_entry`"
       assert row =~ "OPTIONAL"
+    end
+  end
 
-      # US-45.3 brings the review kind; this release does not make it dispatchable.
-      refute "review" in RunnerContract.json_schema()["x-connection"]["dispatchable_kinds"]
+  describe "review (contract 1.21.0, US-45.3)" do
+    defp review_dispatch(attrs \\ %{}) do
+      story_id = Ecto.UUID.generate()
+
+      Map.merge(
+        build(:runner_dispatch, %{"story_id" => story_id, "kind" => "review"})
+        |> Map.put("review", %{
+          "review_id" => Ecto.UUID.generate(),
+          "round" => 1,
+          "checkpoint_id" => Ecto.UUID.generate(),
+          "checkpoint_seq" => 1,
+          "commit_sha" => String.duplicate("a", 40),
+          "tree_sha" => String.duplicate("b", 40)
+        }),
+        attrs
+      )
+    end
+
+    test "review is dispatchable, and a runner learns it from the contract alone (AC-45.3.8)" do
+      connection = RunnerContract.json_schema()["x-connection"]
+
+      assert "review" in connection["dispatchable_kinds"]
+      assert "review" in RunnerContract.RunnerDispatch.kinds()
+      # Only a runner that DECLARES review is sent one.
+      refute "review" in connection["implied_kinds"]
+      assert connection["events"]["review"] == "RunnerReview"
+      assert %{"max_bytes" => _} = connection["limits"]["review"]
+      assert %{"capacity" => _} = connection["limits"]["review_finding_burst"]
+      assert %{"capacity" => _} = connection["limits"]["review_verdict_burst"]
+    end
+
+    test "a review dispatch must carry the review object, and only a review dispatch may" do
+      assert {:ok, %{kind: "review", review: %{round: 1}}} =
+               RunnerContract.cast_dispatch(review_dispatch())
+
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_dispatch(Map.delete(review_dispatch(), "review"))
+
+      assert "a review dispatch must carry the review object" in errors
+
+      implement = build(:runner_dispatch, %{})
+      carrying = Map.put(implement, "review", review_dispatch()["review"])
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(carrying)
+      assert "review is only allowed when kind is review" in errors
+    end
+
+    test "a review dispatch may carry the story, as an implement one does" do
+      dispatch = review_dispatch()
+
+      with_story =
+        Map.put(dispatch, "story", %{"id" => dispatch["story_id"], "title" => "t"})
+
+      assert {:ok, %{story: %{title: "t"}}} = RunnerContract.cast_dispatch(with_story)
+    end
+
+    test "findings and verdicts cast, with the severity enum and the byte cap" do
+      base = %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "claim_epoch" => 2,
+        "client_seq" => 0,
+        "body" => "breaks on retry"
+      }
+
+      assert {:ok, %{severity: "high"}} =
+               RunnerContract.cast_review_finding(Map.put(base, "severity", "high"))
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_review_finding(Map.put(base, "severity", "urgent"))
+
+      assert {:error, {:invalid, _}} = RunnerContract.cast_review_finding(base)
+      assert {:ok, %{body: "breaks on retry"}} = RunnerContract.cast_review_verdict(base)
+
+      huge = Map.put(base, "body", String.duplicate("x", 12_000))
+      assert {:error, {:invalid, [cap]}} = RunnerContract.cast_review_verdict(huge)
+      assert cap =~ "byte rule"
+    end
+
+    test "the new refusal codes are published, and exactly the right ones are permanent" do
+      for event <- ~w(review_finding review_verdict) do
+        codes = RunnerContract.error_reasons()[event]
+
+        for code <-
+              ~w(tenant_halted review_closed review_round_superseded reviewer_not_separate) do
+          assert code in codes, "#{event} does not publish #{code}"
+        end
+
+        permanent = RunnerContract.permanent_errors()[event]
+        assert "review_closed" in permanent
+        assert "reviewer_not_separate" in permanent
+        refute "tenant_halted" in permanent
+      end
+    end
+
+    test "the version's changelog row names the kind and both messages" do
+      {:docs_v1, _, _, _, %{"en" => moduledoc}, _, _} = Code.fetch_docs(RunnerContract)
+
+      assert [row] = Regex.run(~r/^\| \(1\.21\.0\) .*$/m, moduledoc)
+      assert row =~ "`review_finding`"
+      assert row =~ "`review_verdict`"
+      assert row =~ "DECLARES `review`"
     end
   end
 

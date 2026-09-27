@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.106.0 — 2026-09-26 (review on a change thread)
+
+### Added
+
+- **`thread_request_review`, `thread_review_get`, `thread_fix`** (loopctl US-45.3): an
+  orchestrator requests a review, which loopctl places on a runner as a dispatch of kind
+  `review` and which returns no credential; anyone reads a review's payload; the story's
+  claimant records the fixes that answer findings. A review's findings and verdict travel over
+  the runner socket (contract 1.21.0), never through this server.
+
+### Changed
+
+- **`thread_entry`** says where findings, verdicts and fixes are written instead.
+
 ## 2.105.0 — 2026-09-26 (change threads)
 
 ### Added

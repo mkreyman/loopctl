@@ -111,7 +111,8 @@
         "kind": {
           "enum": [
             "triage",
-            "implement"
+            "implement",
+            "review"
           ],
           "type": "string"
         },
@@ -122,6 +123,47 @@
         "repo": {
           "pattern": "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$",
           "type": "string"
+        },
+        "review": {
+          "description": "What a `review` dispatch reviews (since 1.21.0). Required on a `review` dispatch and refused on any other kind. `review_id` is the review loopctl recorded; every `review_finding` and the `review_verdict` of this dispatch are bound to it.",
+          "properties": {
+            "checkpoint_id": {
+              "description": "The checkpoint to read; `introduced_by` names checkpoints like it.",
+              "format": "uuid",
+              "type": "string"
+            },
+            "checkpoint_seq": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "commit_sha": {
+              "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+              "type": "string"
+            },
+            "review_id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "round": {
+              "description": "The review round. After round 1 every finding must carry `introduced_by`.",
+              "maximum": 3,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "tree_sha": {
+              "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "review_id",
+            "round",
+            "checkpoint_id",
+            "checkpoint_seq",
+            "commit_sha",
+            "tree_sha"
+          ],
+          "type": "object"
         },
         "story": {
           "description": "The story an `implement` dispatch is for, as TYPED FIELDS (since 1.5.0). loopctl never sends a prompt: the runner composes one from these fields with its own template, because a dispatch runs as the machine's user and a control plane able to hand a runner prose to execute is able to run anything on it. `id` must be the dispatch's own `story_id`. The whole object is at most 48000 bytes under the byte rule below, which is the cap that usually binds; loopctl REFUSES an oversize story and escalates it to a human rather than truncating one, since a dropped acceptance criterion is a story built to the wrong spec. `domain_reference` is the domain document the change belongs to, required by some repositories' own pull-request gates. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
@@ -492,6 +534,184 @@
         "lens",
         "outcome",
         "confidence"
+      ],
+      "type": "object"
+    },
+    "RunnerReview": {
+      "description": "What a `review` dispatch reviews (since 1.21.0). Required on a `review` dispatch and refused on any other kind. `review_id` is the review loopctl recorded; every `review_finding` and the `review_verdict` of this dispatch are bound to it.",
+      "properties": {
+        "checkpoint_id": {
+          "description": "The checkpoint to read; `introduced_by` names checkpoints like it.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "checkpoint_seq": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "commit_sha": {
+          "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          "type": "string"
+        },
+        "review_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "round": {
+          "description": "The review round. After round 1 every finding must carry `introduced_by`.",
+          "maximum": 3,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tree_sha": {
+          "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "review_id",
+        "round",
+        "checkpoint_id",
+        "checkpoint_seq",
+        "commit_sha",
+        "tree_sha"
+      ],
+      "type": "object"
+    },
+    "RunnerReviewFinding": {
+      "description": "A defect found by the session under an ACCEPTED `review` dispatch (since 1.21.0), recorded as a `finding` on the story's change thread and bound to the dispatch's review and the checkpoint it reads. Idempotent on `<dispatch_id>:<client_seq>` within the review. At most 60000 bytes under the byte rule. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+      "properties": {
+        "body": {
+          "description": "The failure scenario. Untrusted: recorded, never executed. At most 16384 UTF-8 BYTES, and the message cap under the byte rule is what binds. A credential-shaped value is `secret_blocked`.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "string"
+        },
+        "claim_epoch": {
+          "description": "The `claim_epoch` of the dispatch, echoed.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "client_seq": {
+          "description": "The runner's own number for this judgement within the dispatch, shared with `review_verdict`. Number each once; a resend carries the same number.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "description": "The ACCEPTED review dispatch. It names the story and the review.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "introduced_by": {
+          "description": "Absent in round 1 (`introduced_by_not_allowed` otherwise, as `invalid_payload`); REQUIRED after it: the id of a checkpoint of this story at or before the one being read, or `none`.",
+          "maxLength": 36,
+          "minLength": 1,
+          "type": "string"
+        },
+        "location": {
+          "description": "`file:line`, at most 1024 UTF-8 bytes. Untrusted.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "severity": {
+          "description": "`critical`, `high` or `medium` is MATERIAL: at the round ceiling a material finding escalates the story for a rewrite.",
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch",
+        "client_seq",
+        "body",
+        "severity"
+      ],
+      "type": "object"
+    },
+    "RunnerReviewFindingAck": {
+      "description": "The reply to an accepted `review_finding`.",
+      "properties": {
+        "entry_id": {
+          "description": "The finding's id.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "replayed": {
+          "description": "True on a resend of a finding already recorded; it writes nothing.",
+          "type": "boolean"
+        },
+        "seq": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "entry_id",
+        "seq",
+        "replayed"
+      ],
+      "type": "object"
+    },
+    "RunnerReviewVerdict": {
+      "description": "The verdict of the session under an ACCEPTED `review` dispatch (since 1.21.0): ONE per review, sent after every finding. It completes the review's round, ends the review — every later judgement is `review_closed` — and gives the dispatch's capacity slot back. Idempotent on `<dispatch_id>:<client_seq>`. At most 60000 bytes under the byte rule. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+      "properties": {
+        "body": {
+          "description": "The verdict in the session's words. Untrusted. Whether the round asked for changes is its findings, not this text.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "string"
+        },
+        "claim_epoch": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "client_seq": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch",
+        "client_seq",
+        "body"
+      ],
+      "type": "object"
+    },
+    "RunnerReviewVerdictAck": {
+      "description": "The reply to an accepted `review_verdict`.",
+      "properties": {
+        "entry_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "escalated": {
+          "description": "True when this verdict reached the round ceiling with a material finding: the story is escalated for a rewrite.",
+          "type": "boolean"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "seq": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "entry_id",
+        "seq",
+        "replayed",
+        "escalated"
       ],
       "type": "object"
     },
@@ -1619,7 +1839,8 @@
     "credential_header": "x-loopctl-runner-token",
     "dispatchable_kinds": [
       "triage",
-      "implement"
+      "implement",
+      "review"
     ],
     "error_fields": {
       "checkpoint": {
@@ -1671,6 +1892,44 @@
           "sent",
           "supported"
         ]
+      },
+      "review_finding": {
+        "audit_chain_append_failed": [],
+        "dispatch_not_accepted": [],
+        "idempotency_key_reused": [],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "review_closed": [],
+        "review_round_superseded": [],
+        "reviewer_not_separate": [],
+        "secret_blocked": [],
+        "stale_claim_epoch": [],
+        "tenant_halted": [],
+        "unknown_dispatch": []
+      },
+      "review_verdict": {
+        "audit_chain_append_failed": [],
+        "dispatch_not_accepted": [],
+        "idempotency_key_reused": [],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "review_closed": [],
+        "review_round_superseded": [],
+        "reviewer_not_separate": [],
+        "secret_blocked": [],
+        "stale_claim_epoch": [],
+        "tenant_halted": [],
+        "unknown_dispatch": []
       },
       "session_ended": {
         "already_recorded": [],
@@ -1817,6 +2076,36 @@
         "forbidden_topic",
         "unknown_topic"
       ],
+      "review_finding": [
+        "rate_limited",
+        "invalid_payload",
+        "unknown_dispatch",
+        "dispatch_not_accepted",
+        "stale_claim_epoch",
+        "tenant_halted",
+        "review_closed",
+        "review_round_superseded",
+        "reviewer_not_separate",
+        "idempotency_key_reused",
+        "secret_blocked",
+        "audit_chain_append_failed",
+        "internal_error"
+      ],
+      "review_verdict": [
+        "rate_limited",
+        "invalid_payload",
+        "unknown_dispatch",
+        "dispatch_not_accepted",
+        "stale_claim_epoch",
+        "tenant_halted",
+        "review_closed",
+        "review_round_superseded",
+        "reviewer_not_separate",
+        "idempotency_key_reused",
+        "secret_blocked",
+        "audit_chain_append_failed",
+        "internal_error"
+      ],
       "session_ended": [
         "rate_limited",
         "invalid_payload",
@@ -1894,6 +2183,9 @@
       "dispatch": "RunnerDispatch",
       "dispatch_reply": "RunnerDispatchReply",
       "join": "RunnerJoin",
+      "review": "RunnerReview",
+      "review_finding": "RunnerReviewFinding",
+      "review_verdict": "RunnerReviewVerdict",
       "session_ended": "RunnerSessionEnded",
       "stage": "RunnerStageReport",
       "status": "RunnerStatus",
@@ -1940,6 +2232,40 @@
         "trace_cursor": 50
       },
       "refusal_max_detail_length": 500,
+      "review": {
+        "fields": {},
+        "max_bytes": 4000
+      },
+      "review_finding": {
+        "fields": {
+          "body": {
+            "max_length": 16384
+          },
+          "introduced_by": {
+            "max_length": 36
+          },
+          "location": {
+            "max_length": 1024
+          }
+        },
+        "max_bytes": 60000
+      },
+      "review_finding_burst": {
+        "capacity": 12,
+        "refill_interval_ms": 250
+      },
+      "review_verdict": {
+        "fields": {
+          "body": {
+            "max_length": 16384
+          }
+        },
+        "max_bytes": 60000
+      },
+      "review_verdict_burst": {
+        "capacity": 4,
+        "refill_interval_ms": 1000
+      },
       "session_ended_burst": {
         "capacity": 4,
         "refill_interval_ms": 1000
@@ -2099,6 +2425,20 @@
         "checkpoint_conflict",
         "secret_blocked"
       ],
+      "review_finding": [
+        "review_closed",
+        "review_round_superseded",
+        "reviewer_not_separate",
+        "idempotency_key_reused",
+        "secret_blocked"
+      ],
+      "review_verdict": [
+        "review_closed",
+        "review_round_superseded",
+        "reviewer_not_separate",
+        "idempotency_key_reused",
+        "secret_blocked"
+      ],
       "thread_entry": [
         "idempotency_key_reused",
         "secret_blocked"
@@ -2109,6 +2449,8 @@
     },
     "replies": {
       "checkpoint": "RunnerCheckpointAck",
+      "review_finding": "RunnerReviewFindingAck",
+      "review_verdict": "RunnerReviewVerdictAck",
       "session_ended": "RunnerSessionEndedAck",
       "thread_entry": "RunnerThreadEntryAck",
       "trace": "RunnerTraceAck",
@@ -2219,5 +2561,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.20.0"
+  "x-contract-version": "1.21.0"
 }

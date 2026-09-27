@@ -103,6 +103,15 @@ defmodule LoopctlWeb.RunnerChannel do
   `replayed`, and an identical resend is answered `ok` with `replayed: true`. Like `stage`,
   neither checks the custody halt: each records what a session already did.
 
+  ## Reviews (contract 1.21.0, US-45.3)
+
+  `"review_finding"` (`RunnerReviewFinding`) and `"review_verdict"` (`RunnerReviewVerdict`) are
+  a review session's judgements. Each is cast by the contract, metered by its own bucket, and
+  applied by `Loopctl.Delivery.RunnerReviews`, which resolves the runner's `review` dispatch
+  from the ledger and calls `Loopctl.Threads.record_judgement/5`, the ONE write path a
+  judgement has. Unlike the thread's other messages these DO check the custody halt
+  (`tenant_halted`): a judgement decides what may merge.
+
   ## What an operator can see (issue #815)
 
   - The channel process carries `runner_id`, `runner_name`, `tenant_id`, `node` and
@@ -126,6 +135,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
+  alias Loopctl.Delivery.RunnerReviews
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.RunnerThreads
   alias Loopctl.Delivery.TriageVerdict
@@ -156,6 +166,10 @@ defmodule LoopctlWeb.RunnerChannel do
   @checkpoint_refill_ms RunnerContract.checkpoint_burst() |> Map.fetch!("refill_interval_ms")
   @entry_capacity RunnerContract.thread_entry_burst() |> Map.fetch!("capacity")
   @entry_refill_ms RunnerContract.thread_entry_burst() |> Map.fetch!("refill_interval_ms")
+  @finding_capacity RunnerContract.review_finding_burst() |> Map.fetch!("capacity")
+  @finding_refill_ms RunnerContract.review_finding_burst() |> Map.fetch!("refill_interval_ms")
+  @verdict_capacity RunnerContract.review_verdict_burst() |> Map.fetch!("capacity")
+  @verdict_refill_ms RunnerContract.review_verdict_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -197,6 +211,8 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:session_ended_bucket, :full)
        |> assign(:checkpoint_bucket, :full)
        |> assign(:thread_entry_bucket, :full)
+       |> assign(:review_finding_bucket, :full)
+       |> assign(:review_verdict_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -480,6 +496,44 @@ defmodule LoopctlWeb.RunnerChannel do
         with {:ok, %{entry: entry, replayed?: replayed?}} <-
                RunnerThreads.record_entry(tenant_id, runner, message),
              do: {:ok, %{entry_id: entry.id, seq: entry.seq, replayed: replayed?}}
+      end
+    )
+  end
+
+  # A review's finding (contract 1.21.0, US-45.3), bound to the review loopctl recorded for the
+  # dispatch and this runner. Idempotent on `<dispatch_id>:<client_seq>` within the review.
+  defp handle_message("review_finding", payload, socket) do
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    bucketed(
+      socket,
+      "review_finding",
+      RunnerContract.cast_review_finding(payload),
+      {:review_finding_bucket, @finding_capacity, @finding_refill_ms},
+      fn message ->
+        with {:ok, %{entry: entry, replayed?: replayed?}} <-
+               RunnerReviews.record_finding(tenant_id, runner, message),
+             do: {:ok, %{entry_id: entry.id, seq: entry.seq, replayed: replayed?}}
+      end
+    )
+  end
+
+  # A review's ONE verdict (contract 1.21.0, US-45.3): it completes the round and ends the
+  # review.
+  defp handle_message("review_verdict", payload, socket) do
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    bucketed(
+      socket,
+      "review_verdict",
+      RunnerContract.cast_review_verdict(payload),
+      {:review_verdict_bucket, @verdict_capacity, @verdict_refill_ms},
+      fn message ->
+        with {:ok, %{entry: entry, replayed?: replayed?, escalated?: escalated?}} <-
+               RunnerReviews.record_verdict(tenant_id, runner, message),
+             do:
+               {:ok,
+                %{entry_id: entry.id, seq: entry.seq, replayed: replayed?, escalated: escalated?}}
       end
     )
   end
