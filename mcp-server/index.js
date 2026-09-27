@@ -8378,10 +8378,11 @@ const TOOLS = [
       "(back to implementing), `unevaluated` (503 with Retry-After: a transient forge fault; " +
       "retry after the delay, nothing transitioned).\n\n" +
       "THREAD MODE — the story's current claim was PLACED under an intake source with " +
-      "`mode: thread` (set with intake_source_update; the mode is bound to the dispatch at " +
-      "placement, so a later change reaches only later placements). There is no pull request: the gate judges the latest " +
-      "checkpoint recorded under the story's CURRENT claim, on the branch that claim's " +
-      "dispatch ran on, and `pr_number` is null. The source's runners must be at runner " +
+      "`mode: thread` (set with intake_source_update; the mode and the base branch are " +
+      "bound to the dispatch at placement, so a later change reaches only later " +
+      "placements). There is no pull request: the gate judges the latest checkpoint " +
+      "recorded under the story's CURRENT claim, on the branch that claim's dispatch ran " +
+      "on, and `pr_number` is null. The source's runners must be at runner " +
       "contract 1.20.0 or later and send checkpoint messages, or every story is refused " +
       "`no_checkpoint_recorded`; a story whose claim was released after an earlier one " +
       "recorded checkpoints is refused `claim_ended`. It adds refusals `empty_change` (the " +
@@ -8390,14 +8391,17 @@ const TOOLS = [
       "The branch is judged first: a branch missing from a readable repository " +
       "(`branch_missing`), one naming a commit nobody recorded (`branch_head_unrecorded`), " +
       "one naming an earlier checkpoint of the claim (`branch_head_regressed`), or a " +
-      "checkpoint that is not the recorded head, or a base that moved since the checkpoint " +
-      "was cut (`base_moved_since_checkpoint`: rebase), means the head moved. While the claim is " +
+      "checkpoint that is not the recorded head, means the head moved. While the claim is " +
       "LIVE that is `head_moved` — back to implementing: push and record the checkpoint. " +
       "When it is NOT live (reported, review requested, lease expired) nobody can record " +
       "the fix, so it is a refusal naming `claim_not_live`, and the story escalates. A " +
       "repository the token cannot read refuses `pull_request_unavailable`. The answer " +
-      "carries `mode`, `checkpoint_id`, `checkpoint_sha` and `base_sha`; an allow is " +
-      "recorded naming the checkpoint and the base it was judged against.\n\n" +
+      "carries `mode` (the one bound at placement; null when the route could not be read), " +
+      "`checkpoint_id`, `checkpoint_sha` and `base_sha`. The diff judged is the three-dot " +
+      "diff against the merge base, so a base that moved on is not a refusal, and a " +
+      "checkpoint the base already contains is `already_merged` on a recorded allow. An " +
+      "allow records `base_sha` (that merge base); the merge executor merges only while " +
+      "the base head still equals it.\n\n" +
       "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
       "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
       "else LOOPCTL_API_KEY. 403 `custody_tier_required` on a tenant without a human anchor, " +
@@ -8639,7 +8643,9 @@ const TOOLS = [
       "`base_branch` and `mode` have no cleared state at all, so a null there is refused. " +
       "The mode is BOUND to each implement dispatch when it is placed: a change affects " +
       "only stories placed afterwards, and a story already placed keeps the mode its " +
-      "dispatch recorded, so a change is always allowed.\n\n" +
+      "dispatch recorded, so a change is always allowed. `base_branch` is bound the same " +
+      "way: a story already placed is merge-gated against the base branch its dispatch " +
+      "was sent with.\n\n" +
       "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
       "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
       "call; this is what corrects one that was not — a source enrolled before the parameter " +

@@ -41,6 +41,10 @@
     {
       "id": "AC-45.5.7",
       "description": "The stage machine has a ci to ci base_updated edge taken only for a base_update checkpoint the control plane recorded, whose first parent is the checkpoint the gate last allowed and whose tree is GitHub's clean merge of the base into it. The edge replaces head_sha with the base_update SHA and clears merge_gate_allowed_sha, keeps the story's review verdict and custody binding, and does not send the story to implementing; any other head movement still goes over base_moved. The edge must not allow a base_update head until US-45.6's CI evidence for that exact SHA is green. (Moved from US-45.4, where it was AC-45.4.4.)"
+    },
+    {
+      "id": "AC-45.5.8",
+      "description": "The executor merges only while the base branch's head still equals the base_sha the gate's allow recorded (US-45.4: the merge base the judged three-dot diff is relative to). The gate does not refuse a base that moved on, so this is the one place base freshness is enforced: when the base head differs, the executor takes the base-update path (AC-45.5.4, AC-45.5.7) and the story comes back through the gate, because squashing the checkpoint's tree onto a newer base would silently revert every base commit the judged diff never saw."
     }
   ],
   "test_cases": [
@@ -171,6 +175,24 @@
       ],
       "expected_results": [
         "story stays at ci; allow on the new head without a new review round"
+      ]
+    },
+    {
+      "id": "TC-45.5.9",
+      "verifies": [
+        "AC-45.5.8"
+      ],
+      "name": "base moved after the allow",
+      "type": "integration",
+      "preconditions": [
+        "mocked forge",
+        "a recorded thread-mode allow whose base_sha is not the base head"
+      ],
+      "steps": [
+        "run the executor"
+      ],
+      "expected_results": [
+        "no squash commit and no ref update; the base-update path runs"
       ]
     }
   ],

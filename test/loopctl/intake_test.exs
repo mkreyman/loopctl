@@ -79,6 +79,34 @@ defmodule Loopctl.IntakeTest do
     end
   end
 
+  describe "project_source_mode/2 (US-45.4)" do
+    test "the mode of the project's ONE live source; none or two is nil" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      assert Intake.project_source_mode(tenant.id, project.id) == nil
+
+      fixture(:intake_source, %{tenant_id: tenant.id, project_id: project.id, mode: :thread})
+      # Another project's source is never counted against this one.
+      fixture(:intake_source, %{tenant_id: tenant.id, repo_full_name: "acme/other"})
+      assert Intake.project_source_mode(tenant.id, project.id) == :thread
+
+      fixture(:intake_source, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        repo_full_name: "acme/second"
+      })
+
+      assert Intake.project_source_mode(tenant.id, project.id) == nil
+    end
+
+    test "another tenant's source is never read (tenant isolation)" do
+      {_secret, source} = fixture(:intake_source, %{mode: :thread})
+      other = fixture(:tenant)
+
+      assert Intake.project_source_mode(other.id, source.project_id) == nil
+    end
+  end
+
   describe "create_source/3" do
     test "an archived work project is refused" do
       tenant = fixture(:tenant)

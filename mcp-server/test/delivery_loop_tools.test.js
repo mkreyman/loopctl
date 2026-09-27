@@ -319,10 +319,22 @@ describe("merge_precondition (US-44.1)", () => {
         "branch_head_regressed",
         "claim_not_live",
         "base_sha",
-        "base_moved_since_checkpoint",
       ]) {
         assert.ok(source.includes(name), `merge_precondition never names ${name}`);
       }
+    }
+  });
+
+  test("it says a moved base is not a refusal and the executor holds base freshness (US-45.4)", () => {
+    const at = INDEX_SRC.indexOf('name: "merge_precondition"');
+    const text = INDEX_SRC.slice(at, INDEX_SRC.indexOf("inputSchema", at));
+    const row = README.split("\n").find((line) => line.startsWith("| `merge_precondition` |")) ?? "";
+
+    for (const source of [text, row]) {
+      assert.match(source, /not a refusal/, "it never says a moved base is not refused");
+      assert.match(source, /base head still equals/, "it never names the executor's base check");
+      assert.match(source, /already contains/, "it never says a contained checkpoint is merged");
+      assert.ok(!source.includes("base_moved_since_checkpoint"), "it names a reason that no longer exists");
     }
   });
 

@@ -208,16 +208,14 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   defp comparison(%{
          "merge_base_commit" => %{"sha" => merge_base},
-         "base_commit" => %{"sha" => base, "commit" => %{"tree" => %{"sha" => base_tree}}},
+         "base_commit" => %{"commit" => %{"tree" => %{"sha" => base_tree}}},
          "files" => files
        })
-       when is_binary(merge_base) and is_binary(base) and is_binary(base_tree) and
-              is_list(files) do
+       when is_binary(merge_base) and is_binary(base_tree) and is_list(files) do
     with {:ok, lines} <- changed_lines(files) do
       {:ok,
        %{
          merge_base_sha: merge_base,
-         base_sha: base,
          base_tree_sha: base_tree,
          diffstat: %{files: length(files), changed_lines: lines},
          diff: compare_diff(files)

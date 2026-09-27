@@ -67,20 +67,6 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   end
 
   # A live intake source for the story's project, on the ledger's own connection.
-  defp mode_source(tenant_id, story_id, mode) do
-    as_tenant(tenant_id, fn ->
-      story = Repo.get!(Loopctl.WorkBreakdown.Story, story_id)
-
-      Repo.insert!(%Loopctl.Intake.Source{
-        tenant_id: tenant_id,
-        project_id: story.project_id,
-        repo_full_name: "acme/mode-#{System.unique_integer([:positive])}",
-        webhook_secret: "secret",
-        mode: mode
-      })
-    end)
-  end
-
   # A release of the story's claim, as every release path in `Progress` writes it.
   defp release_claim(tenant_id, story_id) do
     as_tenant(tenant_id, fn ->
@@ -154,7 +140,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end)
   end
 
-  describe "record_sent/3" do
+  describe "record_sent/4" do
     test "writes one `sent` row carrying the dispatch's identity", %{runner: runner} do
       # The kind is set AFTER the cast: `triage` is a declared kind the cast refuses to
       # dispatch (contract 1.5.0), while the ledger stores whatever kind it is handed — which
@@ -169,35 +155,31 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
     end
 
-    test "an implement dispatch binds its source's mode at placement; a retry keeps it (US-45.4)",
+    test "an implement dispatch binds the mode it was placed under and its base branch; a retry keeps both (US-45.4)",
          %{runner: runner} do
-      payload = dispatch_payload(runner.tenant_id)
-      source = mode_source(runner.tenant_id, payload["story_id"], :thread)
-      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+      {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
+      base_branch = dispatch.base_branch
+      assert is_binary(base_branch)
 
-      assert {:ok, %{mode: "thread"}} =
-               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+      assert {:ok, %{mode: "thread", base_branch: ^base_branch}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch, mode: "thread")
 
-      # The source changes AFTER placement: the dispatch keeps the mode it was placed under.
-      as_tenant(runner.tenant_id, fn ->
-        source |> Ecto.Changeset.change(mode: :pr) |> Repo.update!()
-      end)
-
-      assert {:ok, %{mode: "thread"}} =
-               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+      # A retry carrying a different mode (the source changed since): the first send's stands.
+      assert {:ok, %{mode: "thread", base_branch: ^base_branch}} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch, mode: "pr")
     end
 
-    test "a triage dispatch records no mode, and neither does a story with no source",
+    test "a triage dispatch records no route, and an implement one given no mode records none",
          %{runner: runner} do
-      payload = dispatch_payload(runner.tenant_id)
-      mode_source(runner.tenant_id, payload["story_id"], :thread)
-      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+      {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
 
-      assert {:ok, %{mode: nil}} =
-               DispatchLedger.record_sent(runner.tenant_id, runner.id, %{
-                 dispatch
-                 | kind: "triage"
-               })
+      assert {:ok, %{mode: nil, base_branch: nil}} =
+               DispatchLedger.record_sent(
+                 runner.tenant_id,
+                 runner.id,
+                 %{dispatch | kind: "triage"},
+                 mode: "thread"
+               )
 
       assert %{mode: nil} = sent(runner, %{})
     end

@@ -16,7 +16,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-45.4.1",
-      "description": "An intake source carries a mode, pr or thread, defaulting to pr, settable through the intake_source_enroll and intake_source_update MCP tools. The mode is bound per implement dispatch at placement: the dispatch's ledger row records the source's mode when it is first sent, and the merge gate reads the mode of the story's current claim's dispatch, with a legacy row read as pr. A mode change is always allowed and affects only later placements, so existing stories behave exactly as before."
+      "description": "An intake source carries a mode, pr or thread, defaulting to pr, settable through the intake_source_enroll and intake_source_update MCP tools. The mode is bound per implement dispatch at placement: the dispatch's ledger row records the source's mode, and the base branch it was sent with, when it is first sent, and the merge gate reads both from the story's current claim's dispatch, with a legacy row read as pr and its base branch falling back to the source's current one. A mode or base-branch change is always allowed and affects only later placements, so existing stories behave exactly as before."
     },
     {
       "id": "AC-45.4.2",
@@ -24,11 +24,11 @@
     },
     {
       "id": "AC-45.4.3",
-      "description": "When the thread branch is missing from a repository the token can read, names a commit nobody recorded, names an earlier checkpoint of the current claim, the latest checkpoint is not the head the stage recorded, or the comparison's merge base is not the base branch's head, the head has moved (branch_missing, branch_head_unrecorded, branch_head_regressed, base_moved_since_checkpoint): while the claim is live the gate answers head_moved and returns the story to implementing over base_moved without escalating; when the claim is not live it refuses naming claim_not_live and escalates, because nobody can record the fix. It refuses empty_change when the checkpoint tree equals the base tree or the comparison lists no changed file, and claim_ended when the current claim recorded no checkpoint but an earlier claim did."
+      "description": "When the thread branch is missing from a repository the token can read, names a commit nobody recorded, names an earlier checkpoint of the current claim, or the latest checkpoint is not the head the stage recorded, the head has moved (branch_missing, branch_head_unrecorded, branch_head_regressed): while the claim is live the gate answers head_moved and returns the story to implementing over base_moved without escalating; when the claim is not live it refuses naming claim_not_live and escalates, because nobody can record the fix. The diff judged is the checkpoint's three-dot diff against its merge base, so a base that moved on is not a refusal; a checkpoint the base already contains is merged and judged on its recorded allow. It refuses empty_change when the checkpoint tree equals the base tree or the comparison lists no changed file, and claim_ended when the current claim recorded no checkpoint but an earlier claim did."
     },
     {
       "id": "AC-45.4.5",
-      "description": "A recorded allow names the checkpoint id and its SHA."
+      "description": "A recorded allow names the checkpoint id and its SHA, and base_sha: the merge base the judged diff is relative to, which the merge executor (US-45.5, AC-45.5.8) must still find at the base head."
     }
   ],
   "test_cases": [

@@ -114,10 +114,13 @@ defmodule LoopctlWeb.MergePreconditionController do
           repo: %OpenApiSpex.Schema{type: :string, nullable: true},
           mode: %OpenApiSpex.Schema{
             type: :string,
-            enum: ["pr", "thread"],
+            enum: ["pr", "thread", nil],
+            nullable: true,
             description:
-              "The story's intake source's mode. `thread` judges the latest RECORDED " <>
-                "checkpoint instead of a pull request, so `pr_number` is null."
+              "The mode BOUND on the claim's implement dispatch at placement, not the intake " <>
+                "source's current mode. `thread` judges the latest RECORDED checkpoint " <>
+                "instead of a pull request, so `pr_number` is null. null when the dispatch " <>
+                "route could not be read, which is always an `unevaluated` verdict."
           },
           checkpoint_id: %OpenApiSpex.Schema{
             type: :string,
@@ -146,9 +149,10 @@ defmodule LoopctlWeb.MergePreconditionController do
             type: :string,
             nullable: true,
             description:
-              "Thread mode: the commit the base branch named when the checkpoint was judged. " <>
-                "A thread-mode allow records it, so the merge executor can compare-and-swap " <>
-                "against exactly that base. Base movement is not refused here."
+              "Thread mode: the MERGE BASE the judged three-dot diff is relative to. A " <>
+                "thread-mode allow records it, and the merge executor merges only while the " <>
+                "base head still equals it; otherwise it updates the base and the story comes " <>
+                "back through this gate."
           },
           merge_sha: %OpenApiSpex.Schema{
             type: :string,
@@ -236,7 +240,9 @@ defmodule LoopctlWeb.MergePreconditionController do
         "`mode: thread`; the mode is bound to the dispatch at placement and a later change to " <>
         "the source does not reach it — needs no pull request: " <>
         "the gate judges the latest checkpoint the story's CURRENT claim recorded, on the " <>
-        "branch that claim's dispatch ran on (pinned in the dispatch ledger), and `pr_number` " <>
+        "branch that claim's dispatch ran on and against the base branch it was placed on " <>
+        "(both pinned in the dispatch ledger; a row that pinned no base branch falls back to " <>
+        "the source's current one), and `pr_number` " <>
         "is null. Its runners must be at runner contract 1.20.0 or later and send " <>
         "`checkpoint` messages, or every story is refused `no_checkpoint_recorded`. A story " <>
         "whose current claim recorded none while an earlier claim did (it was released) is " <>
@@ -246,17 +252,17 @@ defmodule LoopctlWeb.MergePreconditionController do
         "from a readable repository (`branch_missing`), one naming a commit nobody recorded " <>
         "(`branch_head_unrecorded`), one naming an EARLIER checkpoint of the claim " <>
         "(`branch_head_regressed`), a checkpoint that is not the head the stage row " <>
-        "recorded, and a base that moved since the checkpoint was cut " <>
-        "(`base_moved_since_checkpoint`: the comparison's merge base is not the base's head, " <>
-        "so a rebase is needed) all mean the head moved. While the claim is LIVE — the claimant can still " <>
+        "recorded all mean the head moved. While the claim is LIVE — the claimant can still " <>
         "record a checkpoint — that is `head_moved`, back to `implementing`, not escalated. " <>
         "When the claim is NOT live (reported, review requested, lease expired) nobody can " <>
         "record the fix, so it is a `refuse` naming `claim_not_live`, and escalates. A " <>
         "repository the token cannot read, or a 404 on the checkpoint's commit or comparison " <>
         "once the branch names it, refuses `pull_request_unavailable`. A checkpoint carrying " <>
         "a merge commit counts as `already_merged` only when that commit is on the base " <>
-        "branch. A thread-mode allow is recorded naming the checkpoint id and sha and the " <>
-        "`base_sha` it was judged against, and the verdict carries `mode`, `checkpoint_id`, " <>
+        "branch, and so does a checkpoint the base branch already contains. The diff judged " <>
+        "is the three-dot diff against the merge base, so a base that moved on is not a " <>
+        "refusal. A thread-mode allow is recorded naming the checkpoint id and sha and the " <>
+        "`base_sha` (that merge base), and the verdict carries `mode`, `checkpoint_id`, " <>
         "`checkpoint_sha` and `base_sha`. A thread read that met database contention is " <>
         "`unevaluated`.\n\n" <>
         "A `refuse` decision escalates the story on the `merge_gate` edge before " <>

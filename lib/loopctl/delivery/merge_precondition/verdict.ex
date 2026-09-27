@@ -32,10 +32,12 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
     A verdict is only ever about the diff at THIS head
-  - `base_sha` — THREAD mode: the commit the base branch named when the checkpoint was
-    judged. A thread-mode allow records it, so US-45.5's executor can compare-and-swap
-    against exactly that base
-  - `mode` — `:pr` or `:thread`, the story's intake source's (US-45.4)
+  - `base_sha` — THREAD mode: the MERGE BASE the judged diff is relative to. A thread-mode
+    allow records it, and the merge executor (US-45.5) merges only while the base head still
+    equals it, taking the base-update path otherwise
+  - `mode` — `:pr` or `:thread`: the mode BOUND on the claim's implement dispatch at
+    placement (US-45.4), not the intake source's current mode. nil when the route could not
+    be read (the verdict is then `:unevaluated`)
   - `checkpoint_id`, `checkpoint_sha` — THREAD mode: the recorded checkpoint judged. An allow
     in thread mode is recorded naming both
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
@@ -104,7 +106,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           trio_outputs_ignored: boolean(),
           retry_after: pos_integer() | nil,
           recorded_head_sha: String.t() | nil,
-          mode: :pr | :thread,
+          mode: :pr | :thread | nil,
           checkpoint_id: Ecto.UUID.t() | nil,
           checkpoint_sha: String.t() | nil
         }

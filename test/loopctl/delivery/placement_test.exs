@@ -127,6 +127,60 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert pushed.branch == "feature/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
     end
 
+    # US-45.4: the merge ROUTE is bound on the implement ledger row at placement — the mode from
+    # the same source read that filled `repo` and `base_branch`, and the base branch the
+    # dispatch was sent with — and neither is put on the wire.
+    test "the ledger row binds the source's mode and the base branch sent, off the wire", ctx do
+      %{runner: runner, story: story} = ctx
+      unboxed(fn -> bind_repo(runner.tenant_id, story, "mkreyman/thread_repo", :thread) end)
+
+      minimal = %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "story_id" => story.id,
+        "kind" => "implement",
+        "wall_clock_seconds" => 3_600,
+        "max_turns" => 50
+      }
+
+      assert {:ok, placed} = place(ctx, minimal)
+      assert_push "dispatch", pushed, @reply_timeout
+      refute Map.has_key?(pushed, :mode)
+      refute Map.has_key?(pushed, :placed_mode)
+
+      row = unboxed(fn -> DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id) end)
+      assert row.mode == "thread"
+      assert row.base_branch == "master"
+    end
+
+    test "a caller that named repo and base_branch still binds the source's mode", ctx do
+      %{runner: runner, story: story} = ctx
+      unboxed(fn -> bind_repo(runner.tenant_id, story, "mkreyman/thread_repo", :thread) end)
+
+      # The caller's own refs mean nothing resolved the source; a project-filtered read
+      # answers the mode. A caller-sent "mode" is not the route: only loopctl binds it.
+      payload =
+        story
+        |> dispatch_payload()
+        |> Map.merge(%{"base_branch" => "main", "mode" => "pr", "placed_mode" => "pr"})
+
+      assert {:ok, placed} = place(ctx, payload)
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      row = unboxed(fn -> DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id) end)
+      assert row.mode == "thread"
+      assert row.base_branch == "main"
+    end
+
+    test "a caller-named dispatch for a project with no source records no mode", ctx do
+      %{runner: runner, story: story} = ctx
+
+      assert {:ok, placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      row = unboxed(fn -> DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id) end)
+      assert row.mode == nil
+    end
+
     test "a budget nobody configured is named BEFORE anything is minted", ctx do
       %{runner: runner, story: story} = ctx
       unboxed(fn -> bind_repo(runner.tenant_id, story, "mkreyman/cron_books") end)
@@ -2064,7 +2118,7 @@ defmodule Loopctl.Delivery.PlacementTest do
 
   # The story's project bound to a repository, which is where the fill reads `repo` and
   # `base_branch` from.
-  defp bind_repo(tenant_id, story, repo) do
+  defp bind_repo(tenant_id, story, repo, mode \\ :pr) do
     now = DateTime.utc_now()
 
     AdminRepo.insert!(%Loopctl.Intake.Source{
@@ -2072,6 +2126,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       project_id: story.project_id,
       repo_full_name: repo,
       base_branch: "master",
+      mode: mode,
       webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
       inserted_at: now,
       updated_at: now

@@ -168,15 +168,15 @@ defmodule Loopctl.Delivery.PullRequestSource do
   The three-dot comparison `base...head` (US-45.4): what a pull request from `head` into
   `base` would show, without a pull request.
 
-  - `:merge_base_sha` — the merge base of the two
-  - `:base_sha`, `:base_tree_sha` — the commit `base` names NOW, and its tree. An
-    `empty_change` is judged against the tree; the sha is what an allow was judged against
+  - `:merge_base_sha` — the merge base of the two: what the diff is relative to, and the
+    `base_sha` a thread-mode allow records
+  - `:base_tree_sha` — the tree of the commit `base` names NOW. An `empty_change` is judged
+    against it
   - `:diffstat`, `:diff` — the same shapes as on `t:pull_request/0`, over the files the
     comparison lists. A list the forge truncated is `{:error, _}` in `:diff`, never a short one
   """
   @type comparison :: %{
           merge_base_sha: String.t(),
-          base_sha: String.t(),
           base_tree_sha: String.t(),
           diffstat: %{files: non_neg_integer(), changed_lines: non_neg_integer()},
           diff: diff()

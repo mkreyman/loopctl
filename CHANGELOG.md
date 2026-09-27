@@ -22,19 +22,24 @@ All notable changes to loopctl are documented here.
   recorded nothing, but an earlier, released one did). A branch missing from a readable
   repository (`branch_missing`), naming a commit nobody reported (`branch_head_unrecorded`),
   naming an earlier checkpoint of the claim (`branch_head_regressed`), or a checkpoint that
-  is not the recorded head, or a base that moved since the checkpoint was cut
-  (`base_moved_since_checkpoint`), is `head_moved` back to `implementing` while the claim is live,
-  and a refusal naming `claim_not_live` (escalated) when it is not. An unreadable repository
+  is not the recorded head, is `head_moved` back to `implementing` while the claim is live,
+  and a refusal naming `claim_not_live` (escalated) when it is not. The diff judged is the
+  checkpoint's three-dot diff against its merge base, so a base that moved on is not a
+  refusal, and a checkpoint the base already contains is `already_merged` on a recorded
+  allow. An unreadable repository
   refuses `pull_request_unavailable`. The gate's token also reads `GET /repos/:repo` after a
   404 on the branch. The verdict carries `mode`, `checkpoint_id`, `checkpoint_sha` and
-  `base_sha`, and a thread-mode allow is recorded naming the checkpoint id and sha and the
-  `base_sha` it was judged against. No stage-machine change; the runner contract is
+  `base_sha` (the merge base the judged diff is relative to), and a thread-mode allow is
+  recorded naming the checkpoint id and sha and that `base_sha`; the merge executor
+  (US-45.5) merges only while the base head still equals it. No stage-machine change; the runner contract is
   unchanged.
-  **The mode is bound at placement.** Migration `20260926150000` adds
-  `runner_dispatches.mode` (nullable, no backfill, no manual step): an implement dispatch
-  records its intake source's mode when it is first sent, and the merge gate reads the mode of
-  the current claim's dispatch, NULL meaning `pr`. Changing a source's mode is therefore always
-  allowed and affects only stories placed afterwards.
+  **The mode and base branch are bound at placement.** Migration `20260926150000` adds
+  `runner_dispatches.mode` and `runner_dispatches.base_branch` (nullable, no backfill, no
+  manual step): an implement dispatch records its intake source's mode and the base branch it
+  was sent with when it is first sent, and the merge gate reads both from the current claim's
+  dispatch, a NULL mode meaning `pr` and a NULL base branch meaning the source's current one.
+  Changing a source's mode or base branch is therefore always allowed and affects only stories
+  placed afterwards.
   For a thread-mode repository the
   gate's `GITHUB_TOKEN` also reads `git/ref/heads/*` and `git/commits/*` (contents: read,
   which the tree reads already need).

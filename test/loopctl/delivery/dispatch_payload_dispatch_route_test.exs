@@ -1,8 +1,8 @@
 defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
   @moduledoc """
-  `Loopctl.Delivery.DispatchPayload.dispatch_route/3` (US-45.4): the merge mode a story's
-  CURRENT claim was placed under, and the branch its work is on, read from the implement
-  ledger row of that claim whose session ran. The merge gate judges a story on this route,
+  `Loopctl.Delivery.DispatchPayload.dispatch_route/3` (US-45.4): the merge mode and base
+  branch a story's CURRENT claim was placed under, and the branch its work is on, read from
+  the implement ledger row of that claim its runner accepted. The merge gate judges a story on this route,
   so a later source change, a triage row, or a dispatch that never ran must not change it.
   """
 
@@ -32,6 +32,7 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
           kind: Keyword.get(fields, :kind, "implement"),
           branch: Keyword.get(fields, :branch),
           mode: Keyword.get(fields, :mode),
+          base_branch: Keyword.get(fields, :base_branch),
           status: status,
           # `runner_dispatches_reason_iff_refused`: a refused row carries its reason.
           reason: if(status == "refused", do: "unsupported_kind"),
@@ -58,6 +59,13 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     assert {:ok, %{mode: :thread, branch: "agent/b"}} = route(ctx)
   end
 
+  test "the base branch is the one the claim's dispatch was sent with; none is nil", ctx do
+    assert {:ok, %{base_branch: nil}} = route(ctx)
+
+    record(ctx, @t1, mode: "thread", base_branch: "trunk")
+    assert {:ok, %{base_branch: "trunk"}} = route(ctx)
+  end
+
   test "a row with no recorded mode, or no row at all, is pr", ctx do
     assert {:ok, %{mode: :pr}} = route(ctx)
 
@@ -74,7 +82,7 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     assert {:ok, %{branch: "agent/worked-on"}} = route(ctx, "agent/worked-on")
   end
 
-  test "the newest row whose session RAN, of the CURRENT claim, of an implement kind", ctx do
+  test "the newest ACCEPTED row, of the CURRENT claim, of an implement kind", ctx do
     record(ctx, @t1, mode: "thread", branch: "agent/ran")
     record(ctx, @t2, mode: "pr", branch: "agent/refused", status: "refused")
     record(ctx, @t2, mode: "pr", branch: "agent/sent", status: "sent")
@@ -88,8 +96,12 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
 
     assert {:ok, %{mode: :thread, branch: "agent/ran"}} = route(ctx)
 
+    # A superseded row names a claim that has moved on, never the current one's route.
     record(ctx, @t3, mode: "pr", branch: "agent/superseded", status: "superseded")
-    assert {:ok, %{mode: :pr, branch: "agent/superseded"}} = route(ctx)
+    assert {:ok, %{mode: :thread, branch: "agent/ran"}} = route(ctx)
+
+    record(ctx, @t3, mode: "pr", branch: "agent/newer")
+    assert {:ok, %{mode: :pr, branch: "agent/newer"}} = route(ctx)
   end
 
   test "another tenant's dispatch is never read (tenant isolation)", ctx do

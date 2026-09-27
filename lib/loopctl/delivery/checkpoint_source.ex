@@ -17,9 +17,10 @@ defmodule Loopctl.Delivery.CheckpointSource do
     `tree_sha` is the claimant's report; a disagreement is refused rather than believed
   - `:base_tree_sha` — the base branch's tree now. Equal to the checkpoint's, the change is
     `empty_change`: there is nothing to merge, and that is never read as merged
-  - `:base_sha` — the commit the base branch named when the comparison was read. An allow
-    records it, so the merge executor (US-45.5) can compare-and-swap against exactly the base
-    the gate judged. Base movement is NOT refused here
+  - `:base_sha` — the comparison's MERGE BASE: the base commit the judged three-dot diff is
+    relative to. An allow records it, and the merge executor (US-45.5) merges only while the
+    base head still equals it, taking the base-update path otherwise. The gate itself judges
+    the diff against that merge base, so a base that moved on is not a reason here
 
   ## The branch is read FIRST
 
@@ -58,6 +59,11 @@ defmodule Loopctl.Delivery.CheckpointSource do
   authorised it. Not reachable — or not answerable for any reason that is not transient, a
   404 for a commit GitHub never had included — it is judged as an open checkpoint, never as
   already merged. Only a transient fault (`MergePrecondition.transient?/1`) is an error.
+
+  A checkpoint whose merge base with the base branch IS the checkpoint is one the base already
+  CONTAINS: it is answered as merged too, with the checkpoint's own sha as `merge_sha` (the
+  commit the base is known to contain), whether or not a `merge_commit_sha` was recorded.
+  Judged as open instead it would read as an empty change and escalate a merge that happened.
   """
 
   alias Loopctl.Delivery.MergePrecondition
@@ -105,28 +111,36 @@ defmodule Loopctl.Delivery.CheckpointSource do
     }
   end
 
-  defp open_facts(repo, base_branch, branch, %Checkpoint{commit_sha: sha}) do
+  defp open_facts(repo, base_branch, branch, %Checkpoint{commit_sha: sha} = checkpoint) do
     case branch_head(repo, branch) do
-      {:ok, ^sha} -> checkpoint_facts(repo, base_branch, sha)
+      {:ok, ^sha} -> checkpoint_facts(repo, base_branch, checkpoint)
       {:ok, other} -> {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
       {:error, _reason} = error -> error
     end
   end
 
-  defp checkpoint_facts(repo, base_branch, sha) do
+  defp checkpoint_facts(repo, base_branch, %Checkpoint{commit_sha: sha} = checkpoint) do
     with {:ok, commit} <- source().commit(repo, sha),
          {:ok, comparison} <- source().compare(repo, base_branch, sha) do
-      {:ok,
-       Map.merge(open(sha), %{
-         branch_head_sha: sha,
-         merge_base_sha: comparison.merge_base_sha,
-         diffstat: comparison.diffstat,
-         diff: comparison.diff,
-         head_tree_sha: commit.tree_sha,
-         base_sha: comparison.base_sha,
-         base_tree_sha: comparison.base_tree_sha
-       })}
+      compared_facts(checkpoint, commit, comparison)
     end
+  end
+
+  # The base already contains the checkpoint (see the moduledoc).
+  defp compared_facts(%Checkpoint{commit_sha: sha} = checkpoint, _commit, %{merge_base_sha: sha}),
+    do: {:ok, merged_facts(checkpoint, sha)}
+
+  defp compared_facts(%Checkpoint{commit_sha: sha}, commit, comparison) do
+    {:ok,
+     Map.merge(open(sha), %{
+       branch_head_sha: sha,
+       merge_base_sha: comparison.merge_base_sha,
+       diffstat: comparison.diffstat,
+       diff: comparison.diff,
+       head_tree_sha: commit.tree_sha,
+       base_sha: comparison.merge_base_sha,
+       base_tree_sha: comparison.base_tree_sha
+     })}
   end
 
   defp open(sha), do: %{state: "open", merged?: false, merge_sha: nil, head_sha: sha}

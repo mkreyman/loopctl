@@ -134,7 +134,6 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
-  alias Loopctl.Intake
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
   alias Loopctl.Repo
@@ -165,8 +164,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   @doc """
   Records a validated dispatch as `sent`, or finds the row an earlier dispatch of the same
   `dispatch_id` wrote. See the moduledoc for the refusals.
+
+  `:mode` — the intake source's merge mode (`"pr"`, `"thread"`, or nil) the placement
+  resolved, recorded on an implement dispatch's row only (US-45.4).
   """
-  @spec record_sent(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+  @spec record_sent(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, DispatchRecord.t()}
           | {:error,
              :stale_claim_epoch
@@ -175,7 +177,7 @@ defmodule Loopctl.Runners.DispatchLedger do
              | :admission_limit_reached
              | :runner_at_capacity
              | :capacity_busy}
-  def record_sent(tenant_id, runner_id, dispatch) do
+  def record_sent(tenant_id, runner_id, dispatch, opts \\ []) do
     now = DateTime.utc_now()
 
     row = %{
@@ -192,9 +194,14 @@ defmodule Loopctl.Runners.DispatchLedger do
       # re-deriving one from a declaration the machine may have changed since.
       branch: dispatch.branch,
       status: "sent",
-      # Filled in the transaction below: the merge route this implement dispatch is placed
-      # under (US-45.4).
-      mode: nil,
+      # THE ROUTE IS BOUND AT PLACEMENT (US-45.4): the merge mode and the base branch this
+      # implement dispatch is placed under, so the merge gate later judges the story on the
+      # route it was built for, whatever its intake source is changed to in between. The mode
+      # is the one `Loopctl.Delivery.DispatchPayload.fill/3` resolved with the repository
+      # (`:mode`); the base branch is the one on the wire. Both are NULL for a non-implement
+      # dispatch, which has no merge route, and `on_conflict: :nothing` keeps the first send's.
+      mode: implement_only(dispatch, Keyword.get(opts, :mode)),
+      base_branch: implement_only(dispatch, Map.get(dispatch, :base_branch)),
       trace_acked_seq: -1,
       wall_clock_seconds: dispatch.wall_clock_seconds,
       # Born holding NO slot: the row is inserted first (that is how a retry is told from a
@@ -222,8 +229,6 @@ defmodule Loopctl.Runners.DispatchLedger do
       # this read and the row it gates.
       if current_claim_epoch(tenant_id, dispatch.story_id) != dispatch.claim_epoch,
         do: Repo.rollback(:stale_claim_epoch)
-
-      row = %{row | mode: placed_mode(tenant_id, dispatch)}
 
       # Inserted BEFORE the slot is taken, holding none. A concurrent first send of the same
       # id waits here on the unique index and then finds this transaction's committed row;
@@ -821,34 +826,8 @@ defmodule Loopctl.Runners.DispatchLedger do
     if implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
   end
 
-  # THE MODE IS BOUND AT PLACEMENT (US-45.4). An implement dispatch records the merge route
-  # of the story's intake source as it is NOW, chosen by the same rule every other reader of a
-  # project's repository uses (`Intake.select_project_source/2`), so the merge gate later
-  # judges the story on the route it was built for, whatever the source is changed to in
-  # between. NULL — read as `pr` — for a non-implement dispatch, and for a story whose project
-  # has no single live source (the placement's own repository resolution refuses that case
-  # first, unless the caller named the repository itself).
-  defp placed_mode(tenant_id, dispatch) do
-    with true <- implement_kind?(dispatch.kind),
-         project_id when is_binary(project_id) <- story_project(tenant_id, dispatch.story_id),
-         {:ok, source} <-
-           tenant_id
-           |> Intake.live_sources_query()
-           |> Repo.all()
-           |> Intake.select_project_source(project_id) do
-      Atom.to_string(source.mode)
-    else
-      _no_route -> nil
-    end
-  end
-
-  defp story_project(tenant_id, story_id) do
-    Repo.one(
-      from s in Story,
-        where: s.tenant_id == ^tenant_id and s.id == ^story_id,
-        select: s.project_id
-    )
-  end
+  defp implement_only(dispatch, value),
+    do: if(implement_kind?(dispatch.kind), do: value, else: nil)
 
   @doc """
   Whether a ledger row's `kind` is an implement session: `"implement"`, or `nil` — a row

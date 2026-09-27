@@ -1045,6 +1045,12 @@ describe("the descriptions carry what a caller needs instead of the controller",
     }
   });
 
+  test("intake_source_update says base_branch is bound at placement too", () => {
+    for (const text of [description("intake_source_update"), row("intake_source_update")]) {
+      assert.match(text, /base[ _]branch[^.]*(bound|placed under)/i, "it never says the base branch is bound");
+    }
+  });
+
   test("intake_source_revoke is named for what it does, and says the row is kept", () => {
     const text = description("intake_source_revoke");
 

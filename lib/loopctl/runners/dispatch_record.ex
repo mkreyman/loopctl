@@ -78,6 +78,10 @@ defmodule Loopctl.Runners.DispatchRecord do
     # when it was first sent (US-45.4). NULL for every other row and every row older than the
     # column, read as `pr`. Never rewritten: a retry finds the first insert's row.
     field :mode, :string
+    # The base branch the same implement dispatch was sent with (US-45.4), bound the same way.
+    # NULL for every other row and every row older than the column: the merge gate then falls
+    # back to the source's current base branch.
+    field :base_branch, :string
     field :status, :string, default: "sent"
     field :reason, :string
     field :reason_detail, :string

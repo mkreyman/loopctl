@@ -49,6 +49,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
   alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.WorkBreakdown.Story
@@ -69,6 +70,20 @@ defmodule Loopctl.Delivery.DispatchPayload do
   # 846.2): that repairs minis and breaks the next box. The control plane stops guessing; it
   # does not guess differently.
   @default_prefix "feature/"
+
+  # Where `fill/3` puts the merge mode an implement dispatch is placed under (US-45.4). An ATOM
+  # key: it never goes on the wire (`RunnerContract.cast_dispatch/1` keeps only declared
+  # fields), and no caller's JSON can supply it.
+  @placed_mode :placed_mode
+
+  @doc """
+  The key under which `fill/3` carries the intake source's mode, as a string (`"pr"`,
+  `"thread"`), or nil for a project with no single live source, to
+  `Loopctl.Runners.dispatch/3`, which records it on the ledger row
+  (`Loopctl.Runners.DispatchLedger.record_sent/4`), which keeps it on an implement row only.
+  """
+  @spec placed_mode_key() :: :placed_mode
+  def placed_mode_key, do: @placed_mode
 
   # Nothing on the wire can reach this: eight prefixes of 40 characters and a suffix under 30
   # leave it unreachable by a factor of two. It is the bound that holds when the prefixes came
@@ -182,20 +197,24 @@ defmodule Loopctl.Delivery.DispatchPayload do
     end
   end
 
-  # A dispatch whose session RAN: accepted by its runner, or superseded after running. A
-  # `sent` row may never have reached a machine and a `refused` one never ran, so neither
-  # names a route anything was built on.
-  @ran_statuses ["accepted", "superseded"]
+  # A dispatch whose session RAN is one its runner ACCEPTED. A `sent` row may never have
+  # reached a machine and a `refused` one never ran, so neither names a route anything was
+  # built on. `superseded` is not read either: a row is superseded only by a LATER claim's
+  # dispatch, so no row of the current claim can be.
+  @ran_statuses ["accepted"]
 
   @doc """
-  The ROUTE `story`'s current claim was dispatched on (US-45.4): the merge `mode` its
-  implement dispatch was placed under, and the branch its work is on. Read from the implement
-  row of the story's CURRENT `claim_epoch` whose session ran (`accepted` or `superseded`),
-  newest first, through the shared implement-kind filter
+  The ROUTE `story`'s current claim was dispatched on (US-45.4): the merge `mode` and the
+  `base_branch` its implement dispatch was placed under, and the branch its work is on. Read
+  from the implement row of the story's CURRENT `claim_epoch` that its runner ACCEPTED, newest
+  first, through the shared implement-kind filter
   (`Loopctl.Runners.DispatchLedger.where_implement_kind/1`).
 
   - `mode` — the row's recorded mode (`Loopctl.Runners.DispatchLedger.record_sent/3` binds it
     at placement). NULL, or no such row, is `:pr`, the only route there was before the column
+  - `base_branch` — the base branch the dispatch was placed on, pinned the same way. nil for a
+    row that records none (or no row); the caller then falls back to the intake source's
+    CURRENT base branch, the only base there was when such a row was written
   - `branch`, in this order, the first that is present:
     1. `stage_branch` — the `branch` effect the runner reported on the stage row at
        `worktree`, which is the branch its session actually works on
@@ -204,12 +223,14 @@ defmodule Loopctl.Delivery.DispatchPayload do
        dispatch carried whenever its runner declared none. For one that did, the forge
        answers it as missing
 
+  The read's lock wait is bounded (`Loopctl.Runners.Capacity.set_lock_timeout!/1`).
   `{:error, :busy}` for contention a caller retries out of
   (`Loopctl.Delivery.Stages.answering_busy/4`, counted as
   `[:loopctl, :delivery, :dispatch_route_busy]`); it never raises for that.
   """
   @spec dispatch_route(Ecto.UUID.t(), Story.t(), String.t() | nil) ::
-          {:ok, %{mode: :pr | :thread, branch: String.t()}} | {:error, term()}
+          {:ok, %{mode: :pr | :thread, branch: String.t(), base_branch: String.t() | nil}}
+          | {:error, term()}
   def dispatch_route(tenant_id, %Story{} = story, stage_branch) do
     Stages.answering_busy(
       tenant_id,
@@ -217,7 +238,12 @@ defmodule Loopctl.Delivery.DispatchPayload do
       "dispatch route read",
       fn ->
         tenant_id
-        |> Repo.with_tenant(fn -> Repo.one(route_query(tenant_id, story)) end)
+        |> Repo.with_tenant(fn ->
+          # A lock held on the ledger (a retention prune, a migration) costs the gate a bounded
+          # wait and an `:unevaluated` answer, never a request held open behind it.
+          Capacity.set_lock_timeout!(Repo)
+          Repo.one(route_query(tenant_id, story))
+        end)
         |> route(story, stage_branch)
       end
     )
@@ -229,16 +255,16 @@ defmodule Loopctl.Delivery.DispatchPayload do
       where: r.claim_epoch == ^story.claim_epoch and r.status in ^@ran_statuses,
       order_by: [desc: r.inserted_at],
       limit: 1,
-      select: %{mode: r.mode, branch: r.branch}
+      select: %{mode: r.mode, branch: r.branch, base_branch: r.base_branch}
     )
     |> DispatchLedger.where_implement_kind()
   end
 
   defp route({:ok, row}, story, stage_branch) do
-    row = row || %{mode: nil, branch: nil}
+    row = row || %{mode: nil, branch: nil, base_branch: nil}
 
     with {:ok, branch} <- route_branch(stage_branch, row.branch, story) do
-      {:ok, %{mode: route_mode(row.mode), branch: branch}}
+      {:ok, %{mode: route_mode(row.mode), branch: branch, base_branch: row.base_branch}}
     end
   end
 
@@ -420,18 +446,30 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   defp derive_branch(story, prefixes, :refuse), do: branch_for(story, prefixes)
 
+  # The MODE rides the same resolution as `repo` and `base_branch` (US-45.4): where this reads
+  # the source, its mode comes from that one read; where the caller supplied both refs and
+  # nothing resolved the source, one project-filtered read answers it
+  # (`Intake.project_source_mode/2`).
   defp fill_repo(tenant_id, story, dispatch) do
     if Map.has_key?(dispatch, "repo") and Map.has_key?(dispatch, "base_branch") do
-      {:ok, dispatch}
+      {:ok, put_placed_mode(dispatch, Intake.project_source_mode(tenant_id, story.project_id))}
     else
       with {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id) do
         {:ok,
          dispatch
          |> put_new("repo", source.repo_full_name)
-         |> put_new("base_branch", source.base_branch)}
+         |> put_new("base_branch", source.base_branch)
+         |> put_placed_mode(source.mode)}
       end
     end
   end
+
+  # An ATOM key, so a caller's JSON can never carry one. Carried for every kind: the ledger
+  # records it on an implement row only (`DispatchLedger.record_sent/4`), the one rule.
+  defp put_placed_mode(dispatch, mode), do: Map.put(dispatch, @placed_mode, mode_string(mode))
+
+  defp mode_string(nil), do: nil
+  defp mode_string(mode) when is_atom(mode), do: Atom.to_string(mode)
 
   # ONE READ OF THE OPERATOR'S POLICY, and the same reader the unattended driver uses, so an
   # operator's placement and the driver's cannot disagree about what a session may spend.

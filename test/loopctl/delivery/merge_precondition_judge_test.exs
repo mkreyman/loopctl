@@ -1086,8 +1086,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
             branch_head_unrecorded: [branch_head_sha: String.duplicate("9", 40)],
             branch_missing: [branch_head_sha: :missing],
             branch_head_regressed: [branch_head_sha: earlier, earlier_shas: [earlier]],
-            head_moved: [recorded_head_sha: String.duplicate("7", 40)],
-            base_moved_since_checkpoint: [base_sha: @base_head]
+            head_moved: [recorded_head_sha: String.duplicate("7", 40)]
           ] do
         verdict = judge_thread([{:claim_live?, false} | overrides])
 
@@ -1103,8 +1102,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
             branch_head_unrecorded: [branch_head_sha: String.duplicate("9", 40)],
             branch_missing: [branch_head_sha: :missing],
             branch_head_regressed: [branch_head_sha: earlier, earlier_shas: [earlier]],
-            head_moved: [recorded_head_sha: String.duplicate("7", 40)],
-            base_moved_since_checkpoint: [base_sha: @base_head]
+            head_moved: [recorded_head_sha: String.duplicate("7", 40)]
           ] do
         verdict = judge_thread([{:claim_live?, true} | overrides])
 
@@ -1138,17 +1136,27 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.decision == :unevaluated
     end
 
-    test "a base that moved since the checkpoint is base_moved_since_checkpoint" do
-      verdict = judge_thread(base_sha: @base_head)
+    test "a base that moved on is never a reason, live claim or not: base freshness is the executor's" do
+      # The executor, not the gate, holds base freshness (US-45.5, AC-45.5.8): refusing here
+      # escalated nearly every story in a busy repository whose claim was no longer live.
+      for live? <- [true, false] do
+        verdict = judge_thread(base_sha: @base_head, claim_live?: live?)
 
-      assert verdict.decision == :head_moved
-      assert {:base_moved_since_checkpoint, @base, @base_head} in verdict.reasons
+        assert verdict.decision == :allow, inspect(live?)
+        assert verdict.reasons == []
+        assert verdict.base_sha == @base_head
+      end
     end
 
-    test "pr mode never judges base freshness" do
-      verdict = judge_thread(mode: :pr, base_sha: @base_head)
+    test "a route that could not be read reports the mode as UNKNOWN, never as pr" do
+      verdict =
+        judge_thread([mode: nil],
+          checkpoint: {:ok, nil},
+          pull_request: {:error, :busy}
+        )
 
-      refute Enum.any?(verdict.reasons, &match?({:base_moved_since_checkpoint, _, _}, &1))
+      assert verdict.decision == :unevaluated
+      assert verdict.mode == nil
     end
 
     test "pr mode never reads a branch fact" do
@@ -1177,7 +1185,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       |> Map.merge(%{
         branch_head_sha: Keyword.get(overrides, :branch_head_sha, @head),
         head_tree_sha: Keyword.get(overrides, :head_tree_sha, @tree),
-        # Cut from the base's current head (the pull_request/1 merge base) unless overridden.
+        # The comparison's merge base (the pull_request/1 one) unless overridden.
         base_sha: Keyword.get(overrides, :base_sha, @base),
         base_tree_sha: Keyword.get(overrides, :base_tree_sha, @base_tree)
       })

@@ -264,7 +264,10 @@ defmodule LoopctlWeb.IntakeSourceController do
                  "(there is no unanswered state for a branch a dispatch must name), and an " <>
                  "explicit null is a 422. It must be a valid GIT BRANCH NAME, judged by the " <>
                  "same predicate as at enrolment and on `place_dispatch`: this value is " <>
-                 "handed to git on the runner."
+                 "handed to git on the runner. Like `mode`, it is BOUND to each implement " <>
+                 "dispatch when it is placed: a story already placed is merge-gated against " <>
+                 "the base branch its dispatch was sent with, and a change reaches only " <>
+                 "stories placed afterwards."
            }
          }
        }},

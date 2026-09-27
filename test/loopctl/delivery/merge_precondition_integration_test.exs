@@ -437,11 +437,13 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   describe "thread mode (US-45.4)" do
     @tree String.duplicate("e", 40)
     @base_tree String.duplicate("f", 40)
+    # The comparison's merge base: what the judged three-dot diff is relative to, and so the
+    # `base_sha` an allow records.
     @base_head String.duplicate("8", 40)
 
     setup ctx do
-      # The claim's implement dispatch, PLACED in thread mode: the gate reads the mode (and the
-      # branch) from this row, never from the intake source.
+      # The claim's implement dispatch, PLACED in thread mode on `master`: the gate reads the
+      # mode, the base branch and the branch from this row, never from the intake source.
       {_raw_key, runner} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id})
       # The fixture's unboxed run gives up this process's AdminRepo checkout; take it back.
       checkout_admin()
@@ -456,6 +458,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
             claim_epoch: 0,
             kind: "implement",
             mode: "thread",
+            base_branch: "master",
             # Released, so the row holds no slot and `runner_dispatches_unreleased_bounded`
             # has nothing to bound.
             status: "accepted",
@@ -630,23 +633,100 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:ok, %Verdict{decision: :allow, mode: :thread}} = evaluate(ctx)
     end
 
-    test "a base that moved since the checkpoint goes back to implementing while live", ctx do
-      make_claim_live(ctx)
-      stub_thread(ctx, merge_base: @base)
+    test "a route the ledger cannot answer is unevaluated with the mode UNKNOWN, never pr",
+         ctx do
+      test_pid = self()
 
-      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
-      assert {:base_moved_since_checkpoint, @base, @base_head} in reasons
-      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :implementing
+      # A lock on the ledger held elsewhere: the route read waits out its lock_timeout and
+      # answers :busy, so nothing is judged on a guessed route.
+      holder =
+        spawn(fn ->
+          :ok = Sandbox.checkout(Repo, sandbox: false)
+
+          Repo.transaction(fn ->
+            Repo.query!("LOCK TABLE runner_dispatches IN ACCESS EXCLUSIVE MODE")
+            send(test_pid, :held)
+
+            receive do
+              :release -> :ok
+            end
+          end)
+
+          Sandbox.checkin(Repo)
+        end)
+
+      assert_receive :held, 5_000
+      on_exit(fn -> send(holder, :release) end)
+
+      assert {:ok, %Verdict{decision: :unevaluated, mode: nil}} = evaluate(ctx)
+      send(holder, :release)
     end
 
-    test "a base that moved since the checkpoint is refused claim_not_live when not live",
-         ctx do
+    test "a base that moved on since the checkpoint still allows, claim live or not", ctx do
+      # The diff judged is the three-dot diff against the merge base; base freshness is the
+      # merge executor's (US-45.5, AC-45.5.8), so the allow records THAT merge base.
       stub_thread(ctx, merge_base: @base)
 
-      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
-      assert {:base_moved_since_checkpoint, @base, @base_head} in reasons
-      assert :claim_not_live in reasons
-      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+      assert {:ok, %Verdict{decision: :allow, base_sha: @base, reasons: []}} = enforce(ctx)
+      assert %{"payload" => %{"base_sha" => @base}} = allow_event_data(ctx)
+    end
+
+    test "a checkpoint the base already CONTAINS is already_merged, with no merge_commit_sha",
+         ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      # Fast-forwarded (or merged) by hand: the merge base with the base IS the checkpoint.
+      stub_thread(ctx, merge_base: @head)
+
+      assert {:ok, %Verdict{decision: :already_merged, merge_sha: @head}} = evaluate(ctx)
+    end
+
+    test "a contained checkpoint whose recorded merge commit is NOT on the base is already_merged",
+         ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      merged = String.duplicate("6", 40)
+      set_merge_commit(ctx, merged)
+      stub_thread(ctx, merge_base: @head)
+      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^merged, "master" -> {:ok, false} end)
+
+      assert {:ok, %Verdict{decision: :already_merged, merge_sha: @head}} = evaluate(ctx)
+    end
+
+    test "a contained checkpoint nobody allowed is an ungated merge, never empty_change", ctx do
+      stub_thread(ctx, merge_base: @head)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
+      assert {:ungated_merge, @head, :no_recorded_allow} in reasons
+      refute Enum.any?(reasons, &match?({:empty_change, _}, &1))
+    end
+
+    test "the BASE BRANCH is the one the claim was PLACED on, whatever the source says now",
+         ctx do
+      set_dispatch(ctx, base_branch: "trunk")
+
+      {1, _} =
+        from(s in Loopctl.Intake.Source, where: s.project_id == ^ctx.project_id)
+        |> AdminRepo.update_all(set: [base_branch: "develop"])
+
+      stub_thread(ctx, base_branch: "trunk")
+
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+    end
+
+    test "a ledger row that pinned no base branch falls back to the source's current one",
+         ctx do
+      set_dispatch(ctx, base_branch: nil)
+
+      {1, _} =
+        from(s in Loopctl.Intake.Source, where: s.project_id == ^ctx.project_id)
+        |> AdminRepo.update_all(set: [base_branch: "develop"])
+
+      stub_thread(ctx, base_branch: "develop")
+
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
     end
 
     test "a merge_commit_sha GitHub cannot find is judged as open, never an escalation", ctx do
@@ -671,24 +751,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       end)
 
       assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
-    end
-
-    test "a re-allow of the same head against a new base records the new base_sha", ctx do
-      stub_thread(ctx)
-      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
-      assert %{"payload" => %{"base_sha" => @base_head}} = allow_event_data(ctx)
-
-      moved = String.duplicate("4", 40)
-      stub_thread(ctx, base_head: moved, merge_base: moved)
-
-      assert {:ok, %Verdict{decision: :allow, base_sha: ^moved}} = enforce(ctx)
-      # The latest event matches the answer just given.
-      assert %{"payload" => %{"base_sha" => ^moved}} = allow_event_data(ctx)
-      assert allow_event_count(ctx) == 2
-
-      # The same answer again writes nothing more.
-      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
-      assert allow_event_count(ctx) == 2
     end
 
     test "a branch 404 in a repository the token CANNOT read escalates, never branch_missing",
@@ -804,8 +866,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end
   end
 
-  # The mode the claim's dispatch was PLACED under — the one the gate reads (US-45.4). Written
-  # to the ledger row directly: placement is `DispatchLedger.record_sent/3`'s, tested there.
+  # The route the claim's dispatch was PLACED under — the one the gate reads (US-45.4). Written
+  # to the ledger row directly: placement is `DispatchLedger.record_sent/4`'s, tested there.
   defp set_mode(ctx, mode), do: set_dispatch(ctx, mode: mode)
 
   defp set_dispatch(ctx, fields) do
@@ -842,20 +904,19 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
        }}
     end)
 
-    Mox.stub(MockPullRequestSource, :compare, fn @repo, "master", ^head ->
+    base_branch = Keyword.get(opts, :base_branch, "master")
+
+    Mox.stub(MockPullRequestSource, :compare, fn @repo, ^base_branch, ^head ->
       {:ok, comparison(Keyword.get(opts, :base_tree, @base_tree), opts)}
     end)
 
     Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
   end
 
-  # A checkpoint cut from the base's current head unless `:merge_base` says otherwise.
+  # The comparison, relative to `@base_head` unless `:merge_base` says otherwise.
   defp comparison(base_tree, opts) do
-    base_head = Keyword.get(opts, :base_head, @base_head)
-
     %{
-      merge_base_sha: Keyword.get(opts, :merge_base, base_head),
-      base_sha: base_head,
+      merge_base_sha: Keyword.get(opts, :merge_base, @base_head),
       base_tree_sha: base_tree,
       diffstat: %{files: 1, changed_lines: 1},
       diff: {:ok, %{files: ["lib/widgets/thing.ex"], renames: []}}
@@ -882,22 +943,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         from(c in Loopctl.Threads.Checkpoint, where: c.id == ^ctx.checkpoint.id)
         |> Repo.update_all(set: [merge_commit_sha: sha])
       end)
-  end
-
-  defp allow_event_count(ctx) do
-    {:ok, count} =
-      Repo.with_tenant(ctx.tenant_id, fn ->
-        Repo.aggregate(
-          from(e in Loopctl.Delivery.StageEvent,
-            where:
-              e.story_id == ^ctx.story_id and e.event == "effect_recorded" and
-                fragment("?->>'effect'", e.data) == "merge_gate_allowed_sha"
-          ),
-          :count
-        )
-      end)
-
-    count
   end
 
   defp allow_event_data(ctx) do

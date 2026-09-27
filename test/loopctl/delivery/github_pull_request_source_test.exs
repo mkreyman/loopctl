@@ -409,7 +409,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
       assert {:ok, cmp} = Source.compare(@repo, "master", @head)
       assert cmp.merge_base_sha == @merge_base
-      assert cmp.base_sha == "basehead"
       assert cmp.base_tree_sha == "basetree"
       assert cmp.diffstat == %{files: 2, changed_lines: 4}
 

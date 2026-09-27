@@ -77,9 +77,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   repository the token can read), `{:branch_head_unrecorded, branch, checkpoint}` (the branch
   names a commit nobody reported — a push not recorded yet, or a reclaimed runner's),
   `{:branch_head_regressed, branch, checkpoint}` (it names an EARLIER checkpoint of this
-  claim), a checkpoint that is not the head the stage row recorded, and
-  `{:base_moved_since_checkpoint, merge_base, base}` (the base moved since the checkpoint was
-  cut, so a merge would not be of what was judged — a rebase fixes it) all mean the head
+  claim), and a checkpoint that is not the head the stage row recorded all mean the head
   MOVED. Where that goes is decided by the ledger fence's own predicate,
   `Loopctl.Delivery.Claimant.live?/2`:
 
@@ -93,10 +91,24 @@ defmodule Loopctl.Delivery.MergePrecondition do
   tree, never the branch head (PRD §4 item 2). A thread read that meets database contention
   is `:busy`, which is transient: `:unevaluated`, and counted like any other.
 
+  The BASE BRANCH is the one the claim was placed on, pinned on the same ledger row as the
+  mode; a row that records none (written before the column existed) falls back to the
+  source's current base branch.
+
+  The gate judges the checkpoint's THREE-DOT diff — the change relative to its merge base with
+  the base branch — so a base that moved on since the checkpoint was cut is not a reason
+  here: in a busy repository that would be nearly every story. A checkpoint the base already
+  CONTAINS (its merge base IS the checkpoint) is merged, whether or not a `merge_commit_sha`
+  was recorded, and is judged on its recorded allow like any merged head.
+
   A thread-mode allow is recorded naming the checkpoint id and its sha, and `base_sha` — the
-  base it was judged against, so US-45.5's executor can compare-and-swap against exactly that
-  base — on the `effect_recorded` event of `merge_gate_allowed_sha`. Base movement is not
-  refused here.
+  MERGE BASE the judged diff is relative to — on the `effect_recorded` event of
+  `merge_gate_allowed_sha`. THAT IS THE MERGE EXECUTOR'S CONTRACT (US-45.5): it merges only
+  while the base head still equals the recorded `base_sha`, and otherwise takes the
+  base-update path (AC-45.5.4, AC-45.5.7) and comes back through this gate. A squash of the
+  checkpoint's tree onto a base that moved would silently revert every base commit the
+  judged diff never saw, so base freshness is enforced at the one step that writes the
+  base.
 
   ## The loop may not merge its own control plane
 
@@ -282,8 +294,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
           # omits it gets the configured list, because a guard that disappears when a fact is
           # missing is the failure this key exists to prevent.
           optional(:self_deploy_excluded) => [String.t()],
-          # US-45.4. Absent is `:pr`, which is every source enrolled before the field existed.
-          optional(:mode) => :pr | :thread,
+          # US-45.4: the mode bound on the claim's implement dispatch at placement. Absent is
+          # `:pr`; nil is a route that could not be read, reported as unknown.
+          optional(:mode) => :pr | :thread | nil,
           optional(:checkpoint) => fact(map()),
           # Whether the claimant can still record a checkpoint (`Claimant.live?/2`). Absent is
           # NOT live: a thread-mode head that moved then escalates rather than looping.
@@ -613,8 +626,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
         []
 
       %{} = pr ->
-        branch_reasons(facts, pr) ++
-          head_moved_reasons(pr, Map.get(facts, :recorded_head_sha)) ++ base_reasons(facts, pr)
+        branch_reasons(facts, pr) ++ head_moved_reasons(pr, Map.get(facts, :recorded_head_sha))
 
       _unreadable ->
         []
@@ -813,21 +825,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
       {_mode, _branch_head} ->
         []
     end
-  end
-
-  # BASE FRESHNESS (US-45.4). A thread-mode allow is granted only for a checkpoint built on
-  # the base as it is NOW: the comparison's merge base must be the base's head. Otherwise the
-  # base moved since the checkpoint was cut, and the change is routed like any other moved
-  # head — back to `implementing` to rebase while the claim is live, refused while it is not.
-  # A merge executor that updates the base itself is US-45.5's (AC-45.5.7).
-  defp base_reasons(facts, pr) do
-    merge_base = Map.get(pr, :merge_base_sha)
-    base = Map.get(pr, :base_sha)
-
-    if mode(facts) == :thread and is_binary(merge_base) and is_binary(base) and
-         merge_base != base,
-       do: [{:base_moved_since_checkpoint, merge_base, base}],
-       else: []
   end
 
   defp tree_reasons(tree, tree) when is_binary(tree), do: []
@@ -1098,21 +1095,22 @@ defmodule Loopctl.Delivery.MergePrecondition do
     source = source_for_story(story)
     repo = repo_of(source)
 
-    # The MODE is the one this claim's implement dispatch was PLACED under (US-45.4), never the
-    # source's mode now: a source changed after placement decides only what later placements
-    # get. Read with the branch, from the same ledger row.
+    # The MODE and the BASE BRANCH are the ones this claim's implement dispatch was PLACED
+    # under (US-45.4), never the source's now: a source changed after placement decides only
+    # what later placements get. Read with the branch, from the same ledger row.
     {mode, {pr_number, checkpoint, pull_request}} =
       case DispatchPayload.dispatch_route(story.tenant_id, story, stage.branch) do
-        {:ok, %{mode: :thread, branch: branch}} ->
-          {:thread, thread_facts(story, source, repo, branch)}
+        {:ok, %{mode: :thread} = route} ->
+          {:thread, thread_facts(story, source, repo, route)}
 
         {:ok, %{mode: :pr}} ->
           {:pr, pr_facts(stage, repo)}
 
-        # The route could not be read (contention): nothing is judged on a guessed route.
-        # The failure travels as the pull request fact, so `:busy` answers `:unevaluated`.
+        # The route could not be read (contention): nothing is judged on a guessed route, and
+        # the mode is reported as UNKNOWN (nil), not as `pr`. The failure travels as the pull
+        # request fact, so `:busy` answers `:unevaluated`.
         {:error, reason} ->
-          {:pr, {{:error, :not_attempted}, {:ok, nil}, {:error, reason}}}
+          {nil, {{:error, :not_attempted}, {:ok, nil}, {:error, reason}}}
       end
 
     facts = %{
@@ -1179,13 +1177,19 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # The branch is the one the story was DISPATCHED on, never re-derived here.
   # A thread-mode story whose project has no single source still has no repository: the input
   # reasons refuse it `:repository_unresolved`, and nothing is read.
-  defp thread_facts(_story, _source, {:error, _reason}, _branch),
+  defp thread_facts(_story, _source, {:error, _reason}, _route),
     do: {{:ok, nil}, {:error, :not_attempted}, {:error, :not_attempted}}
 
-  defp thread_facts(story, {:ok, source}, {:ok, repo}, branch) do
+  defp thread_facts(story, {:ok, source}, {:ok, repo}, route) do
     case Threads.claim_checkpoints(story.tenant_id, story.id) do
       {:ok, %{latest: %Checkpoint{} = checkpoint} = claim} ->
-        pull_request = CheckpointSource.pull_request(repo, source.base_branch, branch, checkpoint)
+        pull_request =
+          CheckpointSource.pull_request(
+            repo,
+            placed_base_branch(route, source),
+            route.branch,
+            checkpoint
+          )
 
         {{:ok, nil}, {:ok, checkpoint_fact(checkpoint, claim.earlier_shas)}, pull_request}
 
@@ -1199,6 +1203,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
         {{:ok, nil}, {:error, reason}, {:error, :not_attempted}}
     end
   end
+
+  # The base branch the claim was PLACED on (`dispatch_route/3`), so repointing the source
+  # afterwards cannot move the base a placed story is judged against. A ledger row written
+  # before the column existed records none, and falls back to the source's current base branch
+  # — the only base there was when it was placed.
+  defp placed_base_branch(%{base_branch: base_branch}, _source) when is_binary(base_branch),
+    do: base_branch
+
+  defp placed_base_branch(_route, source), do: source.base_branch
 
   defp checkpoint_fact(%Checkpoint{} = checkpoint, earlier_shas) do
     %{
@@ -1319,7 +1332,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   # AC-45.4.5: a thread-mode allow names the checkpoint it allowed, id and sha, on the event
   # that records it. A pr-mode allow carries nothing extra, exactly as before.
-  # `base_sha` is the base the allow was judged against, for US-45.5's compare-and-swap.
+  # `base_sha` is the MERGE BASE the judged diff is relative to — the executor merges only
+  # while the base head still equals it (see the moduledoc's thread section).
   defp allow_event_data(%Verdict{mode: :thread, checkpoint_id: id} = verdict)
        when is_binary(id),
        do: [

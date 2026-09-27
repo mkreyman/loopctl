@@ -562,6 +562,27 @@ defmodule Loopctl.Intake do
     end
   end
 
+  @doc """
+  The `mode` of `project_id`'s ONE live intake source, or nil when it has none or more than one
+  — the exactly-one rule of `select_project_source/2`, with the project filtered IN SQL so no
+  other project's sources are read. For a dispatch whose caller supplied `repo` and
+  `base_branch` itself, so nothing else resolved the source (US-45.4).
+  """
+  @spec project_source_mode(Ecto.UUID.t(), Ecto.UUID.t()) :: :pr | :thread | nil
+  def project_source_mode(tenant_id, project_id)
+      when is_binary(tenant_id) and is_binary(project_id) do
+    tenant_id
+    |> live_sources_query()
+    |> where([s], s.project_id == ^project_id)
+    |> limit(2)
+    |> select([s], s.mode)
+    |> AdminRepo.all()
+    |> case do
+      [mode] -> mode
+      _none_or_ambiguous -> nil
+    end
+  end
+
   @doc "The query for a tenant's live (unrevoked) intake sources, for any repo to run."
   @spec live_sources_query(Ecto.UUID.t()) :: Ecto.Query.t()
   def live_sources_query(tenant_id) do
