@@ -1130,7 +1130,11 @@ defmodule Loopctl.Delivery.Stages do
       is_nil(row) ->
         {:error, :not_found}
 
-      story.claim_epoch != claim_epoch or row.claim_epoch != claim_epoch ->
+      # The ROW's epoch is the story's: every write that moves `stories.claim_epoch` moves this
+      # row with it in the same transaction — a claim through `follow_claim/4`
+      # (`Progress.claim_story/3`, `BulkOperations.bulk_claim/4`), every release through
+      # `follow_release/5` — and the story is held FOR SHARE here, so neither can land mid-read.
+      row.claim_epoch != claim_epoch ->
         {:error, :stale_claim_epoch}
 
       row.stage != :ci ->
