@@ -517,6 +517,30 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec max_reason_length() :: pos_integer()
   def max_reason_length, do: @max_reason_length
 
+  # What a CONTROL writer stores, in codepoints: the bound less a deliberate margin, so the
+  # truncation is never the thing that costs an escalation its write.
+  @reason_budget @max_reason_length - 100
+
+  @doc """
+  `text` bounded for a stored escalation reason: at most `max_reason_length/0` less a
+  100-codepoint margin, cut with a trailing `…`. The one copy of that bound for every control
+  writer — the merge gate, post-deploy verification and the merge executor.
+
+  CODEPOINTS, matching Postgres `char_length` and `Loopctl.Delivery.Stages`' own bound: an NFD
+  path or an emoji is several codepoints per grapheme, and a grapheme bound would let an
+  over-long reason reach the `story_stages_text_bounds` CHECK, fail the write and leave the
+  story where it was with nothing recorded. A codepoint prefix can split a grapheme cluster;
+  that is cosmetic and the string stays valid UTF-8.
+  """
+  @spec bounded_reason(String.t()) :: String.t()
+  def bounded_reason(text) when is_binary(text) do
+    chars = String.to_charlist(text)
+
+    if length(chars) > @reason_budget,
+      do: chars |> Enum.take(@reason_budget - 1) |> List.to_string() |> Kernel.<>("…"),
+      else: text
+  end
+
   # WHICH TRANSITIONS ARE A VERDICT THE REPORTER IS TOLD ABOUT (#805 item 1).
   #
   # Keyed on the whole TRANSITION, never on the destination stage, and that is the point of

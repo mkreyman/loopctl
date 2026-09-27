@@ -954,14 +954,24 @@ defmodule Loopctl.Runners.DispatchLedger do
   """
   @spec claim_route_query(Ecto.UUID.t(), Story.t()) :: Ecto.Query.t()
   def claim_route_query(tenant_id, %Story{} = story) do
-    from(r in DispatchRecord,
+    from(r in route_rows_query(),
       where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
-      where: r.claim_epoch == ^story.claim_epoch and r.status in ^@route_statuses,
+      where: r.claim_epoch == ^story.claim_epoch,
       order_by: [desc: r.inserted_at],
       limit: 1,
       select: %{mode: r.mode, branch: r.branch, base_branch: r.base_branch}
     )
-    |> where_implement_kind()
+  end
+
+  @doc """
+  The rows a claim's ROUTE is chosen from, before the story, the claim and the newest are
+  picked: implement rows a runner ACCEPTED. `claim_route_query/2` narrows it to one story's
+  current claim; `Loopctl.Workers.ThreadMergeSweepWorker` narrows it per candidate row. One
+  copy of the rule, so the two cannot disagree about which claims are thread claims.
+  """
+  @spec route_rows_query() :: Ecto.Query.t()
+  def route_rows_query do
+    from(r in DispatchRecord, where: r.status in ^@route_statuses) |> where_implement_kind()
   end
 
   defp session_of(%DispatchRecord{} = record) do

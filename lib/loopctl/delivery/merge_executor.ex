@@ -29,7 +29,8 @@ defmodule Loopctl.Delivery.MergeExecutor do
   2. The checkpoint commit's tree, read from the forge. Not the recorded `tree_sha`:
      `tree_mismatch`, escalated, no write.
   3. FRESHNESS (AC-45.5.8): the base head must still be the allow's `base_sha`, the merge
-     base the judged three-dot diff is relative to, and the checkpoint must contain it.
+     base the judged three-dot diff is relative to (which the checkpoint contains by
+     definition).
      Otherwise the base-update path below: squashing the checkpoint's tree onto a newer base
      would silently revert every base commit the judged diff never saw.
   4. A checkpoint whose tree equals the base's is `empty_change`, escalated, never merged.
@@ -208,15 +209,29 @@ defmodule Loopctl.Delivery.MergeExecutor do
     )
 
     case Stories.get_story(tenant_id, story_id) do
-      {:ok, story} ->
-        escalate(%{tenant_id: tenant_id, story: story}, {:retries_exhausted, reason})
-
-      {:error, _reason} ->
-        {:skipped, {:retries_exhausted, reason}}
+      {:ok, story} -> last_attempt(%{tenant_id: tenant_id, story: story}, reason)
+      {:error, _reason} -> {:skipped, {:retries_exhausted, reason}}
     end
   end
 
   defp finalize(outcome, _tenant_id, _story_id, _final?), do: outcome
+
+  # The last attempt may have died AFTER the squash reached the base: an update whose answer
+  # timed out, a crash between the ref update and `merged/2`. So it asks the orphan check's
+  # question first — is the recorded squash on the base? — and adopts it (`ci -> merged`),
+  # escalating naming the sha when that write fails. Only a squash NOT on the base, or one
+  # that cannot be read, escalates `retries_exhausted`.
+  defp last_attempt(base, reason) do
+    with {:ok, sha} <- recorded_squash(base),
+         {:ok, true} <- squash_on_base(base, sha) do
+      case advance(base, {:ci, :merged, :forward}, effects: [merge_sha: sha]) do
+        :ok -> {:merged, sha}
+        {:error, error} -> orphan(base, sha, {:merged_not_recorded, error})
+      end
+    else
+      _not_on_base_or_unreadable -> escalate(base, {:retries_exhausted, reason})
+    end
+  end
 
   defp attempt(tenant_id, story_id, final?) do
     case context(tenant_id, story_id) do
@@ -394,15 +409,10 @@ defmodule Loopctl.Delivery.MergeExecutor do
   defp tree_matches(%{tree_sha: forge}, %Checkpoint{tree_sha: recorded}),
     do: {:refuse, {:tree_mismatch, forge, recorded}}
 
-  # AC-45.5.8: the base the judged diff was relative to, and still contained by the work.
-  defp fresh(%{allow: %{base_sha: base_head}} = ctx, base_head) do
-    case ctx.forge.ancestor?(ctx.session, base_head, ctx.checkpoint.commit_sha) do
-      {:ok, true} -> :fresh
-      {:ok, false} -> :stale
-      {:error, _reason} = error -> error
-    end
-  end
-
+  # AC-45.5.8: the base head must be exactly the base the judged diff was relative to. No
+  # ancestry check is needed beside it: `base_sha` is the gate's MERGE BASE of this checkpoint
+  # and the base branch, so the checkpoint contains it by definition.
+  defp fresh(%{allow: %{base_sha: base_head}}, base_head), do: :fresh
   defp fresh(_ctx, _base_head), do: :stale
 
   defp not_empty(%{tree_sha: tree}, %Checkpoint{tree_sha: tree}),
@@ -516,18 +526,14 @@ defmodule Loopctl.Delivery.MergeExecutor do
            with_temp(ctx, &ctx.forge.merge(ctx.session, &1, second, base_message(ctx))) do
       record_base_update(ctx, %{sha: head, tree_sha: tree})
     else
-      {:error, reason} ->
-        if MergePrecondition.transient?(reason),
-          do: {:retry, reason},
-          else: base_moved(ctx, {:thread_branch_moved, head})
-
-      {:ok, {:error, reason}} ->
-        if MergePrecondition.transient?(reason),
-          do: {:retry, reason},
-          else: base_moved(ctx, {:thread_branch_moved, head})
-
-      _not_ours ->
-        base_moved(ctx, {:thread_branch_moved, head})
+      # Not ours: not the executor's shape, another tree, or a base that no longer merges
+      # cleanly into the checkpoint (the original merge was clean, so ours would re-merge).
+      :no -> base_moved(ctx, {:thread_branch_moved, head})
+      {:ok, {:ok, _another_tree_or_up_to_date}} -> base_moved(ctx, {:thread_branch_moved, head})
+      {:ok, {:error, :merge_conflict}} -> base_moved(ctx, {:thread_branch_moved, head})
+      # A forge that could not answer is not an answer: retried or escalated, as elsewhere.
+      {:ok, {:error, reason}} -> failed(ctx, reason)
+      {:error, reason} -> failed(ctx, reason)
     end
   end
 
@@ -691,22 +697,8 @@ defmodule Loopctl.Delivery.MergeExecutor do
       %StoryStage{stage: stage, merge_sha: ^sha} when stage in @merge_recorded_stages ->
         {:merged, sha}
 
-      %StoryStage{stage: :ci} ->
-        escalate(now, {why, sha})
-
-      %StoryStage{stage: stage} when stage in @orphan_edge_stages ->
-        escalate_over(now, {stage, :escalated, :merged_outside_ci}, {why, sha})
-
-      other ->
-        stage = other && other.stage
-
-        Logger.error(
-          "merge_executor: #{sha} is on the base branch and the story's stage cannot record " <>
-            "it (#{inspect(stage)}); a human must reconcile it tenant_id=#{tenant_id} " <>
-            "story_id=#{story.id}"
-        )
-
-        {:skipped, {why, sha, stage}}
+      _unrecorded ->
+        escalate(now, {why, sha}, sha)
     end
   end
 
@@ -761,7 +753,29 @@ defmodule Loopctl.Delivery.MergeExecutor do
       else: escalate(ctx, reason)
   end
 
-  defp escalate(ctx, reason), do: escalate_over(ctx, {:ci, :escalated, :merge_gate}, reason)
+  # THE ONE ESCALATION, its edge chosen from where the story IS now: `merge_gate` at `ci`, and
+  # — for a merge on the base the row does not hold (`merged_sha`) — `merged_outside_ci` from
+  # `queued` or an in-flight stage. Anywhere else there is no edge to write, so it is logged
+  # at error for a human and answered `{:skipped, _}`.
+  defp escalate(ctx, reason, merged_sha \\ nil) do
+    case Stages.get(ctx.tenant_id, ctx.story.id) do
+      %StoryStage{stage: :ci} ->
+        escalate_over(ctx, {:ci, :escalated, :merge_gate}, reason)
+
+      %StoryStage{stage: stage} when is_binary(merged_sha) and stage in @orphan_edge_stages ->
+        escalate_over(ctx, {stage, :escalated, :merged_outside_ci}, reason)
+
+      row ->
+        stage = row && row.stage
+
+        Logger.error(
+          "merge_executor cannot escalate from #{inspect(stage)}: #{inspect(reason)}; a human " <>
+            "must reconcile it tenant_id=#{ctx.tenant_id} story_id=#{ctx.story.id}"
+        )
+
+        {:skipped, {reason, stage}}
+    end
+  end
 
   defp escalate_over(ctx, transition, reason) do
     case advance(ctx, transition, reason: reason_text(reason)) do
@@ -793,15 +807,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
     end
   end
 
-  # Bounded by the one declaration of the `story_stages_text_bounds` CHECK.
-  defp reason_text(reason) do
-    budget = StageMachine.max_reason_length()
-    chars = String.to_charlist("merge_executor: " <> inspect(reason))
-
-    if length(chars) > budget,
-      do: chars |> Enum.take(budget - 1) |> List.to_string() |> Kernel.<>("…"),
-      else: List.to_string(chars)
-  end
+  defp reason_text(reason), do: StageMachine.bounded_reason("merge_executor: " <> inspect(reason))
 
   defp thread_url(story), do: LoopctlWeb.Endpoint.url() <> "/api/v1/stories/#{story.id}/thread"
 

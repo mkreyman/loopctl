@@ -18,7 +18,7 @@ defmodule Loopctl.Threads do
   Two writes are loopctl's own and have NO HTTP route, because the merge executor
   (`Loopctl.Delivery.MergeExecutor`, US-45.5) is their only caller:
   `record_base_update/4` — the base merged into the thread, which bypasses the claimant fence
-  because loopctl, not the claimant, made the commit — and `record_merge_commit/5`.
+  because loopctl, not the claimant, made the commit — and `record_merge_commit/6`.
 
   The rules each applies are `Loopctl.Threads.Reviews`', which only reads. The insert, the
   lock and the replay stay private to this module, so there is no other way in.
@@ -988,8 +988,10 @@ defmodule Loopctl.Threads do
     previous = latest_checkpoint(tenant_id, story_id)
     # The parent is the previous checkpoint OF THIS CLAIM, the one this claimant built on. A
     # claim resuming at an earlier commit than the last one recorded would otherwise get a
-    # parent that git says is its descendant; a claim's first checkpoint has none.
-    parent = latest_checkpoint(tenant_id, story_id, epoch)
+    # parent that git says is its descendant; a claim's first checkpoint has none. Kind
+    # `checkpoint` only: a `base_update` is loopctl's merge commit, not the claimant's work,
+    # and is never what a claimant checkpoint descends from in the thread (US-45.5).
+    parent = latest_checkpoint(tenant_id, story_id, epoch, :checkpoint)
 
     checkpoint =
       Repo.insert!(%Checkpoint{
@@ -1033,7 +1035,7 @@ defmodule Loopctl.Threads do
     )
   end
 
-  defp latest_checkpoint(tenant_id, story_id, epoch \\ :any) do
+  defp latest_checkpoint(tenant_id, story_id, epoch \\ :any, kind \\ :any) do
     query =
       from c in Checkpoint,
         where: c.tenant_id == ^tenant_id and c.story_id == ^story_id,
@@ -1041,6 +1043,7 @@ defmodule Loopctl.Threads do
         limit: 1
 
     query = if epoch == :any, do: query, else: where(query, [c], c.claim_epoch == ^epoch)
+    query = if kind == :any, do: query, else: where(query, [c], c.kind == ^kind)
     Repo.one(query)
   end
 

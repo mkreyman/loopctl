@@ -290,17 +290,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @hard_max_files 12
   @hard_max_changed_lines 1_000
 
-  # The `story_stages_text_bounds` CHECK on `escalation_reason` is
-  # `char_length(...) BETWEEN 1 AND 4000`, and Postgres `char_length` counts CODEPOINTS —
-  # as does `Loopctl.Delivery.Stages`' own `bounded_text/2`. So the reason is bounded in
-  # codepoints, NOT graphemes: an NFD path or an emoji is several codepoints per grapheme,
-  # and a grapheme bound would let an over-long reason reach the CHECK, fail the write and
-  # leave the story sitting at `ci` with nothing recorded — the one outcome a fail-closed
-  # gate cannot have. The margin is deliberate: the truncation is the LAST thing that may
-  # cost an escalation its write.
-  # 4000 is the CHECK; 3900 is what this writes, and the 100-codepoint margin is the point.
-  @reason_budget 3_900
-
   @type fact(value) :: {:ok, value} | {:error, term()}
 
   @type facts :: %{
@@ -1870,22 +1859,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # and leave the story sitting at `ci` with nothing recorded, which is the one outcome a
   # fail-closed gate cannot have.
   defp reason_text(%Verdict{reasons: reasons, gate_a_inputs: gate_a_inputs}) do
-    bound_codepoints(
+    StageMachine.bounded_reason(
       "merge_gate (gate_a inputs: #{gate_a_inputs}): " <>
         Enum.map_join(reasons, "; ", &inspect/1)
     )
-  end
-
-  # CODEPOINTS, matching Postgres `char_length` and `Stages`' own bound — see the note on
-  # `@reason_budget`. A codepoint prefix can split a grapheme cluster; that is cosmetic and
-  # the string stays valid UTF-8, which is the trade against an escalation that will not
-  # write at all.
-  defp bound_codepoints(text) do
-    chars = String.to_charlist(text)
-
-    if length(chars) > @reason_budget,
-      do: chars |> Enum.take(@reason_budget - 1) |> List.to_string() |> Kernel.<>("…"),
-      else: text
   end
 
   # Only the SHAPE of an unexpected value is echoed into a stored reason.

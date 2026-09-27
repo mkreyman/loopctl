@@ -12,6 +12,7 @@ defmodule Loopctl.ThreadsTest do
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
+  alias Loopctl.Threads.Reviews
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -822,6 +823,28 @@ defmodule Loopctl.ThreadsTest do
 
       assert {:ok, %{latest: %{commit_sha: "6666666666666666666666666666666666666666"}}} =
                Threads.claim_checkpoints(ctx.tenant_id, ctx.story.id)
+    end
+
+    test "round 3, finding 5: after a base update the claimant's next checkpoint and a review read the claimant's work" do
+      ctx = allowed_at_ci()
+      {:ok, _bu, :created} = base_update(ctx)
+
+      set_story(ctx,
+        agent_status: :implementing,
+        claimed_until: DateTime.add(DateTime.utc_now(), 3600)
+      )
+
+      {:ok, story} = Repo.with_tenant(ctx.tenant_id, fn -> Repo.get!(Story, ctx.story.id) end)
+
+      {:ok, {:ok, reviewed}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Reviews.latest_checkpoint(ctx.tenant_id, story)
+        end)
+
+      assert reviewed.id == ctx.checkpoint.id
+
+      assert {:ok, next, :created} = checkpoint(ctx, @sha2)
+      assert next.parent_checkpoint_id == ctx.checkpoint.id
     end
 
     test "record_merge_commit/6 is a compare-and-set on the recorded commit" do

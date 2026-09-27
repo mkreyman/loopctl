@@ -146,13 +146,20 @@ defmodule Loopctl.Delivery.CheckpointSource do
          {:ok, _second} <- base_update_of(commit, sha, on_base?) do
       {:error, {:base_update_in_flight, other}}
     else
-      :no -> {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
-      {:error, _reason} = error -> error
+      # Only a TRANSIENT failure of these extra reads is worth a retry. Anything else means the
+      # head could not be shown to be a base update, and it is judged as the moved head it was
+      # before the question was asked.
+      {:error, reason} = error ->
+        if MergePrecondition.transient?(reason), do: error, else: moved(sha, other)
+
+      :no ->
+        moved(sha, other)
     end
   end
 
-  defp moved_facts(_where, sha, other, _allowed),
-    do: {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
+  defp moved_facts(_where, sha, other, _allowed), do: moved(sha, other)
+
+  defp moved(sha, other), do: {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
 
   @doc """
   Whether `commit` has the shape of the merge executor's base update of `checkpoint_sha`

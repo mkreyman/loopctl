@@ -678,6 +678,24 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert decision in [:head_moved, :refuse]
     end
 
+    test "round 3, finding 6: an unreadable extra commit read on an unrecorded head is still head_moved",
+         ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+      make_claim_live(ctx)
+
+      pushed = String.duplicate("7", 40)
+      stub_thread(ctx, branch_head: pushed)
+
+      Mox.stub(MockPullRequestSource, :commit, fn
+        @repo, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
+        @repo, ^pushed -> {:error, {:github_api_error, 404}}
+      end)
+
+      assert {:ok, %Verdict{decision: :head_moved}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :implementing
+    end
+
     test "round 2, finding 5: a claimant's single-parent commit on the allowed checkpoint is head_moved",
          ctx do
       stub_thread(ctx)
@@ -1750,20 +1768,15 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       refute {ctx.tenant_id, ctx.story_id} in sweep_candidates()
     end
 
-    test "round 2, finding 6: a story with no checkpoint (pull-request mode) is never swept",
+    test "round 3, finding 3: a story whose current claim was placed in pr mode is never swept",
          ctx do
-      {_, _} =
-        from(c in Loopctl.Threads.Checkpoint, where: c.story_id == ^ctx.story_id)
-        |> AdminRepo.delete_all()
+      assert {ctx.tenant_id, ctx.story_id} in sweep_candidates()
 
-      # Another story of the same tenant HAS one: the filter is per story, not per tenant.
-      fixture(:thread_checkpoint, %{
-        tenant_id: ctx.tenant_id,
-        story_id: Ecto.UUID.generate(),
-        seq: 1,
-        commit_sha: @base
-      })
+      set_mode(ctx, "pr")
+      refute {ctx.tenant_id, ctx.story_id} in sweep_candidates()
 
+      # A thread row of an ENDED claim does not make the current claim a thread claim.
+      set_dispatch(ctx, mode: "thread", claim_epoch: 7)
       refute {ctx.tenant_id, ctx.story_id} in sweep_candidates()
     end
 
@@ -1818,6 +1831,74 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       end)
 
       assert {:snooze, _seconds} = ThreadMergeWorker.perform(job)
+    end
+
+    test "round 3, finding 1: a last attempt whose squash reached the base adopts it", ctx do
+      # GitHub applied the update and the answer timed out, on the last attempt.
+      Mox.stub(MockMergeForge, :update_ref, fn @session, "master", @merge ->
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      stub_ancestors(%{{@merge, @base_head} => true})
+
+      assert {:merged, @merge} = MergeExecutor.run(ctx.tenant_id, ctx.story_id, true)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :merged and row.merge_sha == @merge
+    end
+
+    test "round 3, finding 2: a last attempt that finds its squash on the base after a release escalates it",
+         ctx do
+      Mox.stub(MockMergeForge, :update_ref, fn @session, "master", @merge ->
+        set_stage(ctx, :queued)
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      stub_ancestors(%{{@merge, @base_head} => true})
+
+      assert {:escalated, {{:merged_not_recorded, :stale_stage}, @merge}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id, true)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      assert row.escalation_reason =~ @merge
+    end
+
+    test "round 3, finding 2: nothing on the base and the story off ci — no edge, nothing escalated",
+         ctx do
+      Mox.stub(MockMergeForge, :session, fn @repo ->
+        set_stage(ctx, :implementing)
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      assert {:skipped, {{:retries_exhausted, _}, :implementing}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id, true)
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :implementing
+    end
+
+    test "round 3, finding 4: a forge that cannot read the unrecorded head escalates, never base_moved",
+         ctx do
+      make_claim_live(ctx)
+      head = @base_update
+      branch = ctx.branch
+      stub_base_update(ctx, self())
+
+      Mox.stub(MockMergeForge, :branch_head, fn
+        @session, "master" -> {:ok, @moved_base}
+        @session, ^branch -> {:ok, head}
+      end)
+
+      Mox.stub(MockMergeForge, :commit, fn
+        @session, @head -> {:ok, %{sha: @head, tree_sha: @tree, parents: [@base_head]}}
+        @session, ^head -> {:error, {:github_api_error, 403}}
+        @session, sha -> {:ok, %{sha: sha, tree_sha: @base_tree, parents: []}}
+      end)
+
+      assert {:escalated, {:github_api_error, 403}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
     end
 
     test "finding 2: a crash re-raises for Oban, and on the last attempt escalates", ctx do
