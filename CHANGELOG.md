@@ -34,7 +34,9 @@ All notable changes to loopctl are documented here.
   `empty_change`, `base_churn`, a ref update the ruleset refused, an allow the executor
   cannot resolve, and on the worker's last attempt `retries_exhausted`). A squash that reached
   the base while the story had left `ci` escalates over the new `merged_outside_ci` edge,
-  naming the commit. `thread-mode` workflows must run on `push` to `loop/**`
+  naming the commit. A new cron worker, `ThreadMergeSweepWorker` (every five minutes, one
+  bounded read), re-drives the merge of any thread story left at `ci` with an allow — a job
+  killed mid-run or lost to a redeploy. `thread-mode` workflows must run on `push` to `loop/**`
   for a base update to get the CI it needs; a push by the App's installation token triggers
   them.
 

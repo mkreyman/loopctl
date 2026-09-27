@@ -87,7 +87,9 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
   def ancestor?(session, ancestor, descendant) do
     with {:ok, ancestor} <- sha(ancestor),
          {:ok, descendant} <- sha(descendant) do
-      case repo_request(session, :get, "/compare/#{ancestor}...#{descendant}") do
+      # Only the status is read. `per_page=1` bounds the COMMITS listed; GitHub still returns
+      # the changed files, which it caps at 300 itself.
+      case repo_request(session, :get, "/compare/#{ancestor}...#{descendant}?per_page=1") do
         {:ok, %{"status" => status}} when status in ~w(identical ahead) -> {:ok, true}
         {:ok, %{"status" => status}} when status in ~w(behind diverged) -> {:ok, false}
         {:ok, body} -> {:error, {:unreadable_compare, shape(body)}}

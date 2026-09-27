@@ -142,6 +142,7 @@ defmodule Loopctl.Delivery.GitHubAppMergeForgeTest do
   test "ancestor? reads the compare status; a commit GitHub does not have is no ancestor" do
     stub(fn conn ->
       assert conn.request_path == "/repos/acme/widgets/compare/#{@a}...#{@b}"
+      assert conn.query_string == "per_page=1"
       json(conn, 200, %{"status" => "ahead"})
     end)
 

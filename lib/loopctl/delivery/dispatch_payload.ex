@@ -255,6 +255,19 @@ defmodule Loopctl.Delivery.DispatchPayload do
   defp route_mode(_pr_or_legacy), do: :pr
 
   @doc """
+  The base branch a claim was PLACED on, from its `dispatch_route/2`, so repointing the source
+  afterwards cannot move the base a placed story is judged against or merged onto. A ledger
+  row written before the column existed records none and falls back to `source`'s current base
+  branch — the only base there was when it was placed. The one derivation of it: the merge gate
+  and the merge executor both read it here (US-45.4, US-45.5).
+  """
+  @spec placed_base_branch(map(), map()) :: String.t()
+  def placed_base_branch(%{base_branch: base_branch}, _source) when is_binary(base_branch),
+    do: base_branch
+
+  def placed_base_branch(_route, source), do: source.base_branch
+
+  @doc """
   The branch a THREAD-mode story is judged on (US-45.4), the first that is present:
 
   1. the route's `branch` (`dispatch_route/2`), the name the CURRENT claim's dispatch put on

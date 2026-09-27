@@ -92,6 +92,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
     `:claim_not_live`, which escalates. Nobody can record the pushed commit, so sending the
     story back would loop it ci -> implementing -> ci for ever
 
+  One unrecorded head is not a move: while the checkpoint is the one the recorded allow names,
+  a head whose FIRST parent is that checkpoint is the merge executor's base update between
+  moving the thread branch and recording it (US-45.5), answered `{:base_update_in_flight,
+  head}` — transient, so `:unevaluated` and retried, never sent back to `implementing`.
+
   loopctl never adopts a head nobody reported, and a merge squashes the RECORDED checkpoint's
   tree, never the branch head (PRD §4 item 2). A thread read that meets database contention
   is `:busy`, which is transient: `:unevaluated`, and counted like any other.
@@ -856,6 +861,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   def transient?({:github_api_error, status}), do: status in @transient_statuses
   # A database read that met contention (`Loopctl.Delivery.Stages.answering_busy/4`).
   def transient?(:busy), do: true
+  # US-45.5: the executor has moved the thread branch to a base update it has not recorded yet.
+  def transient?({:base_update_in_flight, _head}), do: true
   def transient?(_reason), do: false
 
   @doc "How long the forge asked a caller to wait, when it said so at all."
@@ -1550,9 +1557,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
           with {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
             repo
             |> CheckpointSource.pull_request(
-              placed_base_branch(route, source),
+              DispatchPayload.placed_base_branch(route, source),
               branch,
-              checkpoint
+              checkpoint,
+              stage.merge_gate_allowed_sha
             )
             |> with_thread_branch(branch)
           end
@@ -1580,15 +1588,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # (`Loopctl.Delivery.RunnerThreads`), so a claim with no row has no thread to judge.
   defp placed_mode(%{mode: mode}, _source) when mode in [:pr, :thread], do: mode
   defp placed_mode(_route, _source), do: :pr
-
-  # The base branch the claim was PLACED on (`dispatch_route/2`), so repointing the source
-  # afterwards cannot move the base a placed story is judged against. A ledger row written
-  # before the column existed records none, and falls back to the source's current base branch
-  # — the only base there was when it was placed.
-  defp placed_base_branch(%{base_branch: base_branch}, _source) when is_binary(base_branch),
-    do: base_branch
-
-  defp placed_base_branch(_route, source), do: source.base_branch
 
   defp checkpoint_fact(%Checkpoint{} = checkpoint, earlier_shas) do
     %{

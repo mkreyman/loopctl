@@ -400,8 +400,12 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  defp commit_facts(%{"tree" => %{"sha" => tree}}) when is_binary(tree),
-    do: {:ok, %{tree_sha: tree}}
+  # Parents in order (US-45.5): a thread branch head whose FIRST parent is the allowed
+  # checkpoint is the merge executor's base update in flight, not a push nobody reported.
+  defp commit_facts(%{"tree" => %{"sha" => tree}} = body) when is_binary(tree) do
+    parents = for %{"sha" => sha} <- Map.get(body, "parents", []), is_binary(sha), do: sha
+    {:ok, %{tree_sha: tree, parents: parents}}
+  end
 
   defp commit_facts(body), do: {:error, {:unreadable_commit, shape(body)}}
 
@@ -897,6 +901,13 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
+  @doc false
+  # The classification below, for `Loopctl.Delivery.GitHubAppMergeForge` (US-45.5): the App's
+  # writes fail in the same shapes as these reads, and a second copy of what a 403 means is
+  # the copy that drifts.
+  @spec classify_failure(Req.Response.t()) :: term()
+  def classify_failure(%Req.Response{} = response), do: failure(response)
+
   # A 403 is TWO different things at GitHub and they need opposite answers.
   #
   # A rate limit is transient: wait and it clears, so the caller retries and the story stays
@@ -914,13 +925,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # `Retry-After` this module cannot turn into a number — an HTTP-date, which is legal — is
   # still a rate limit, and classifying it as a permission denial would escalate a story on
   # the one shape that says most clearly "come back later".
-  @doc false
-  # The classification above, for `Loopctl.Delivery.GitHubAppMergeForge` (US-45.5): the App's
-  # writes fail in the same shapes as these reads, and a second copy of what a 403 means is
-  # the copy that drifts.
-  @spec classify_failure(Req.Response.t()) :: term()
-  def classify_failure(%Req.Response{} = response), do: failure(response)
-
   defp failure(%Req.Response{status: status} = response) when status in [403, 429] do
     if status == 429 or limited?(response),
       do: {:github_rate_limited, status, delay(response)},

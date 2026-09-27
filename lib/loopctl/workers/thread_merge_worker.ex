@@ -9,15 +9,14 @@ defmodule Loopctl.Workers.ThreadMergeWorker do
   the checkpoint and the stage row itself, so a job that outlived the allow it was enqueued
   for merges nothing.
 
-  ## Unique per story while WAITING (AC-45.5.1)
+  ## Unique per story, running included (AC-45.5.1)
 
-  `states` is `:available`, `:scheduled` and `:retryable`, with `period: :infinity`: a second
-  enqueue while a job waits or backs off is the SAME job, which reads the current allow when
-  it runs. A RUNNING job does not absorb an enqueue, deliberately: an allow recorded while a
-  run executes — the gate allowing a base update the moment its CI goes green, say — must not
-  be dropped with nobody left to act on it. Two runs can therefore overlap, which is safe by
-  construction (`Loopctl.Delivery.MergeExecutor`: the fenced, compare-and-set
-  `merge_commit_sha` write and the `force: false` ref updates keep it to one merge).
+  `states` includes `:executing` and `:retryable` and `period` is `:infinity`: one run per
+  story at a time. An enqueue while a job waits, runs or backs off is the SAME job — including
+  one enqueued from inside this job's own `perform`, which is why a run that ends with the
+  story's allow changed under it (`Loopctl.Delivery.MergeExecutor.run/3` answering
+  `{:rerun, _}`) SNOOZES itself instead of enqueueing: the snoozed job runs again with the
+  allow as it is then. Snoozing does not spend an attempt.
 
   ## Retries are bounded, then escalate
 
@@ -33,12 +32,15 @@ defmodule Loopctl.Workers.ThreadMergeWorker do
     unique: [
       period: :infinity,
       keys: [:tenant_id, :story_id],
-      states: [:available, :scheduled, :retryable]
+      states: [:available, :scheduled, :executing, :retryable]
     ]
 
   require Logger
 
   alias Loopctl.Delivery.MergeExecutor
+
+  # How soon a run whose story's allow changed under it runs again.
+  @rerun_after_seconds 5
 
   @impl Oban.Worker
   def perform(%Oban.Job{
@@ -47,6 +49,7 @@ defmodule Loopctl.Workers.ThreadMergeWorker do
         max_attempts: max_attempts
       }) do
     case MergeExecutor.run(tenant_id, story_id, attempt >= max_attempts) do
+      {:rerun, _outcome} -> {:snooze, @rerun_after_seconds}
       {:retry, reason} -> {:error, reason}
       _outcome -> :ok
     end

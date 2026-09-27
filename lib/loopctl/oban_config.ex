@@ -662,6 +662,11 @@ defmodule Loopctl.ObanConfig do
            # job that was never enqueued or did not land. Every minute, local statements
            # only. Bounded per run.
            {"* * * * *", Loopctl.Workers.ReviewCeilingWorker},
+           # US-45.5: re-drives a thread story's merge when its job never finished — a node
+           # killed mid-run, a redeploy, an enqueue that failed after the allow committed. The
+           # gate enqueues the merge itself; this is the backstop. Every five minutes, one
+           # bounded AdminRepo read; a story whose job is still live is deduplicated into it.
+           {"*/5 * * * *", Loopctl.Workers.ThreadMergeSweepWorker},
            # #805: drains the issue-closure outbox — tells the reporter what happened to the
            # issue her story came from. Up to FOUR bounded GitHub calls per candidate (read,
            # label, comment, close), 80 for a full batch, which is where the worker's
