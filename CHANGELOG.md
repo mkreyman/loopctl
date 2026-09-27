@@ -14,20 +14,26 @@ All notable changes to loopctl are documented here.
   "thread"`, read by presence; null or any other value is 422, and a change is recorded as
   `intake_source_mode_set` on the audit chain. For a thread-mode story,
   `POST /stories/:id/merge-precondition` judges the latest checkpoint the story's CURRENT
-  claim recorded, on the branch the story was dispatched on (`pr_number` is null). **A
+  claim recorded, on the branch that claim's dispatch ran on (`pr_number` is null). **A
   thread-mode source needs runners at contract 1.20.0 or later sending `checkpoint`
   messages; otherwise every story is refused `no_checkpoint_recorded`.** It adds refusals
   `empty_change` (the checkpoint's tree equals the base branch's, or no file changed),
-  `checkpoint_tree_mismatch` and `no_checkpoint_recorded`. A branch missing from a readable
-  repository (`branch_missing`) or naming a commit nobody reported
-  (`branch_head_unrecorded`) is `head_moved`, back to `implementing`; an unreadable
-  repository refuses `pull_request_unavailable`. The gate's token also reads `GET
-  /repos/:repo` after a 404 on the branch. The verdict carries `mode`, `checkpoint_id` and `checkpoint_sha`, and a
-  thread-mode allow is recorded naming the checkpoint id and sha. No stage-machine change;
-  the runner contract is unchanged.
+  `checkpoint_tree_mismatch`, `no_checkpoint_recorded` and `claim_ended` (the current claim
+  recorded nothing, but an earlier, released one did). A branch missing from a readable
+  repository (`branch_missing`), naming a commit nobody reported (`branch_head_unrecorded`),
+  naming an earlier checkpoint of the claim (`branch_head_regressed`), or a checkpoint that
+  is not the recorded head is `head_moved` back to `implementing` while the claim is live,
+  and a refusal naming `claim_not_live` (escalated) when it is not. An unreadable repository
+  refuses `pull_request_unavailable`. The gate's token also reads `GET /repos/:repo` after a
+  404 on the branch. The verdict carries `mode`, `checkpoint_id`, `checkpoint_sha` and
+  `base_sha`, and a thread-mode allow is recorded naming the checkpoint id and sha and the
+  `base_sha` it was judged against. No stage-machine change; the runner contract is
+  unchanged.
   Changing a source's mode is 409 `stories_in_flight` while any story of its project is past
-  intake and not done or failed (an escalated story counts), and so is ENROLLING a mode that
-  differs from the project's previous source's, so revoke-and-re-enrol cannot bypass it.
+  intake and not yet past the merge gate (an escalated story counts; merged, deployed and
+  verified do not), and so is ENROLLING a mode that
+  differs from the project's previous source's, so revoke-and-re-enrol cannot bypass it; the
+  409 body's `story_ids` names the blocking stories.
   For a thread-mode repository the
   gate's `GITHUB_TOKEN` also reads `git/ref/heads/*` and `git/commits/*` (contents: read,
   which the tree reads already need).

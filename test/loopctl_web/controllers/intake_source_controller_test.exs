@@ -543,6 +543,8 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
         |> json_response(409)
 
       assert body["error"]["code"] == "stories_in_flight"
+      # It names the story in the way, so the operator knows what to resolve.
+      assert body["error"]["story_ids"] == [story.id]
       assert AdminRepo.get!(Source, source.id).mode == :pr
 
       # Naming the mode it already has is not a change.
@@ -556,17 +558,21 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
         from(r in Loopctl.Delivery.StoryStage, where: r.id == ^stage.id)
         |> AdminRepo.update_all(set: [stage: :escalated, escalation_reason: "why"])
 
-      assert conn
-             |> auth(ctx.operator_key)
-             |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "thread"})
-             |> json_response(409)
-             |> get_in(["error", "code"]) == "stories_in_flight"
+      escalated =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"mode" => "thread"})
+        |> json_response(409)
 
-      # A finished story is not in flight, and neither is one still at intake.
-      for settled <- [:done, :failed, :detected] do
+      assert escalated["error"]["code"] == "stories_in_flight"
+      assert escalated["error"]["story_ids"] == [story.id]
+
+      # A story past the merge gate is settled — the mode no longer affects it — and so is a
+      # finished one, and one still at intake.
+      for settled <- [:merged, :deployed, :verified, :done, :failed, :detected] do
         {1, _} =
           from(r in Loopctl.Delivery.StoryStage, where: r.id == ^stage.id)
-          |> AdminRepo.update_all(set: [stage: settled])
+          |> AdminRepo.update_all(set: [stage: settled, escalation_reason: nil])
 
         conn
         |> auth(ctx.operator_key)
@@ -620,6 +626,30 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
       |> auth(ctx.operator_key)
       |> post(~p"/api/v1/intake/sources", Map.put(create_params(ctx), "mode", "thread"))
       |> json_response(409)
+    end
+
+    test "an ALREADY-BOUND repository is the 422 it always was, before any mode check", %{
+      conn: conn
+    } do
+      ctx = operator_ctx()
+      fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      story =
+        fixture(:story, %{tenant_id: ctx.tenant.id, epic_id: epic.id, project_id: ctx.project.id})
+
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant.id,
+        story_id: story.id,
+        stage: :ci,
+        repo: AdminRepo
+      })
+
+      # Same repository, other mode, a story in flight: the binding conflict wins.
+      conn
+      |> auth(ctx.operator_key)
+      |> post(~p"/api/v1/intake/sources", Map.put(create_params(ctx), "mode", "thread"))
+      |> json_response(422)
     end
 
     test "a REVOKED thread source's mode is the one its in-flight stories run under", %{

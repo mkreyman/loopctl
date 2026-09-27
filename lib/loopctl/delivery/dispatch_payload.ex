@@ -45,6 +45,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.Delivery.DispatchDriver
+  alias Loopctl.Delivery.Stages
   alias Loopctl.GitRef
   alias Loopctl.Intake
   alias Loopctl.Repo
@@ -181,25 +182,37 @@ defmodule Loopctl.Delivery.DispatchPayload do
     end
   end
 
+  # A dispatch whose session RAN: accepted by its runner, or superseded after running. A
+  # `sent` row may never have reached a machine and a `refused` one never ran, so neither
+  # names a branch anything was pushed to.
+  @ran_statuses ["accepted", "superseded"]
+
   @doc """
-  The branch `story` was DISPATCHED on — the name its implement dispatch put on the wire and
-  the ledger pinned (`runner_dispatches.branch`, #846.2), newest dispatch first. Every reader
+  The branch `story` was DISPATCHED on under `claim_epoch` — the name the implement dispatch
+  of THAT claim put on the wire and the ledger pinned (`runner_dispatches.branch`, #846.2),
+  from a dispatch whose session ran (`accepted` or `superseded`), newest first. Every reader
   that needs a story's branch reads it here rather than deriving one, because the derivation
   depends on the prefixes a runner declared on its socket at placement time, which nothing
-  keeps.
+  keeps. The merge gate passes the claim epoch of the checkpoint it judges, so a later claim's
+  dispatch, or one that never ran, cannot name the branch that checkpoint is on.
 
-  Only a story whose every ledger row predates that column falls back to `branch_for/2`, with
-  no prefixes: the name such a dispatch carried whenever its runner declared none. For one
-  that did, that fallback names a branch the dispatch did not use, and the forge answers it
-  as missing — which sends the story back to `implementing` rather than judging the wrong
-  commit.
+  Only when no such row names a branch — every one predates the column — does this fall back
+  to `branch_for/2` with no prefixes: the name such a dispatch carried whenever its runner
+  declared none. For one that did, that fallback names a branch the dispatch did not use, and
+  the forge answers it as missing.
+
+  `{:error, :busy}` for contention a caller retries out of
+  (`Loopctl.Delivery.Stages.answering_busy/4`); it never raises for that.
   """
-  @spec story_branch(Ecto.UUID.t(), Story.t()) :: String.t()
-  def story_branch(tenant_id, %Story{} = story) do
-    {:ok, recorded} =
-      Repo.with_tenant(tenant_id, fn ->
+  @spec story_branch(Ecto.UUID.t(), Story.t(), non_neg_integer()) ::
+          {:ok, String.t()} | {:error, term()}
+  def story_branch(tenant_id, %Story{} = story, claim_epoch) do
+    Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "story branch read", fn ->
+      tenant_id
+      |> Repo.with_tenant(fn ->
         from(r in DispatchRecord,
           where: r.tenant_id == ^tenant_id and r.story_id == ^story.id,
+          where: r.claim_epoch == ^claim_epoch and r.status in ^@ran_statuses,
           where: not is_nil(r.branch),
           order_by: [desc: r.inserted_at],
           limit: 1,
@@ -209,16 +222,13 @@ defmodule Loopctl.Delivery.DispatchPayload do
         |> DispatchLedger.where_implement_kind()
         |> Repo.one()
       end)
-
-    case recorded do
-      branch when is_binary(branch) ->
-        branch
-
-      nil ->
-        {:ok, branch} = branch_for(story, [])
-        branch
-    end
+      |> recorded_or_derived(story)
+    end)
   end
+
+  defp recorded_or_derived({:ok, branch}, _story) when is_binary(branch), do: {:ok, branch}
+  defp recorded_or_derived({:ok, nil}, story), do: branch_for(story, [])
+  defp recorded_or_derived({:error, _reason} = error, _story), do: error
 
   @doc """
   The part of a branch name that makes it this story's and nobody else's.

@@ -437,6 +437,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   describe "thread mode (US-45.4)" do
     @tree String.duplicate("e", 40)
     @base_tree String.duplicate("f", 40)
+    @base_head String.duplicate("8", 40)
 
     setup ctx do
       set_mode(ctx, :thread)
@@ -478,14 +479,22 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert row.stage == :ci
       assert row.merge_gate_allowed_sha == @head
 
-      assert %{"payload" => %{"checkpoint_id" => id, "checkpoint_sha" => @head}} =
-               allow_event_data(ctx)
+      assert %{
+               "payload" => %{
+                 "checkpoint_id" => id,
+                 "checkpoint_sha" => @head,
+                 "base_sha" => @base_head
+               }
+             } = allow_event_data(ctx)
+
+      assert verdict.base_sha == @base_head
 
       assert id == ctx.checkpoint.id
     end
 
     test "TC-45.4.3 a branch head nobody reported goes back to implementing, unescalated", ctx do
       pushed = String.duplicate("9", 40)
+      make_claim_live(ctx)
       stub_thread(ctx, branch_head: pushed)
 
       assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
@@ -505,8 +514,46 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).escalation_reason =~ "empty_change"
     end
 
+    test "a moved head whose claim is NOT live escalates claim_not_live instead of looping",
+         ctx do
+      # The fixture story reported its work, so the claim no longer accepts checkpoints.
+      pushed = String.duplicate("9", 40)
+      stub_thread(ctx, branch_head: pushed)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert :claim_not_live in reasons
+      assert {:branch_head_unrecorded, pushed, @head} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "a branch naming an EARLIER checkpoint of the claim is branch_head_regressed", ctx do
+      make_claim_live(ctx)
+      later = String.duplicate("5", 40)
+
+      fixture(:thread_checkpoint, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        seq: 2,
+        commit_sha: later,
+        tree_sha: @tree
+      })
+
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(r in StoryStage, where: r.story_id == ^ctx.story_id)
+          |> Repo.update_all(set: [head_sha: later])
+        end)
+
+      # The branch went back to the claim's first checkpoint.
+      stub_thread(ctx, head: later, branch_head: @head)
+
+      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
+      assert {:branch_head_regressed, @head, later} in reasons
+    end
+
     test "a thread branch the forge does not have goes back to implementing, branch_missing",
          ctx do
+      make_claim_live(ctx)
       stub_thread(ctx)
 
       Mox.stub(MockPullRequestSource, :branch_head, fn @repo, _branch ->
@@ -586,7 +633,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
     end
 
-    test "a checkpoint an ENDED claim recorded is not judged: no_checkpoint_recorded", ctx do
+    test "a checkpoint an ENDED claim recorded is not judged: claim_ended", ctx do
       {1, _} =
         from(s in Story, where: s.id == ^ctx.story_id)
         |> AdminRepo.update_all(set: [claim_epoch: 1])
@@ -600,11 +647,13 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx)
 
       assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
-      assert Enum.any?(reasons, &match?({:no_checkpoint_recorded, _}, &1))
+      assert {:claim_ended, :no_checkpoint_under_current_claim} in reasons
+      refute Enum.any?(reasons, &match?({:no_checkpoint_recorded, _}, &1))
     end
 
     test "a branch naming another commit is judged without reading the checkpoint commit",
          ctx do
+      make_claim_live(ctx)
       stub_thread(ctx, branch_head: String.duplicate("9", 40))
 
       Mox.stub(MockPullRequestSource, :commit, fn _repo, _sha ->
@@ -637,6 +686,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end
 
     test "any other head movement is still base_moved, back to implementing", ctx do
+      make_claim_live(ctx)
       moved = String.duplicate("9", 40)
 
       fixture(:thread_checkpoint, %{
@@ -676,7 +726,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   # wrong branch or comparing against the wrong base fails here rather than passing.
   defp stub_thread(ctx, opts \\ []) do
     head = Keyword.get(opts, :head, @head)
-    branch = DispatchPayload.story_branch(ctx.tenant_id, AdminRepo.get!(Story, ctx.story_id))
+
+    {:ok, branch} =
+      DispatchPayload.story_branch(ctx.tenant_id, AdminRepo.get!(Story, ctx.story_id), 0)
 
     Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^branch ->
       {:ok, Keyword.get(opts, :branch_head, head)}
@@ -699,10 +751,25 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   defp comparison(base_tree) do
     %{
       merge_base_sha: @base,
+      base_sha: @base_head,
       base_tree_sha: base_tree,
       diffstat: %{files: 1, changed_lines: 1},
       diff: {:ok, %{files: ["lib/widgets/thing.ex"], renames: []}}
     }
+  end
+
+  # A claim that still accepts checkpoints (`Loopctl.Delivery.Claimant.live?/2`): claimed,
+  # its lease not run out, no review requested.
+  defp make_claim_live(ctx) do
+    {1, _} =
+      from(s in Story, where: s.id == ^ctx.story_id)
+      |> AdminRepo.update_all(
+        set: [
+          agent_status: :implementing,
+          claimed_until: DateTime.add(DateTime.utc_now(), 3600),
+          review_requested_at: nil
+        ]
+      )
   end
 
   defp set_merge_commit(ctx, sha) do

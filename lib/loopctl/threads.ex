@@ -142,29 +142,78 @@ defmodule Loopctl.Threads do
     end
   end
 
-  @doc """
-  The latest checkpoint the story's CURRENT claim recorded — kind `checkpoint`, under the
-  story's `claim_epoch` now — or `nil` when that claim recorded none. ONE row, by `seq`, read
-  with the story's epoch in the same query. What the merge gate judges for a THREAD-mode
-  story (US-45.4): loopctl never adopts a branch head nobody reported, and a checkpoint an
-  ENDED claim recorded is that claim's work, not the current one's. Takes no lock.
-  """
-  @spec latest_recorded_checkpoint(Ecto.UUID.t(), Ecto.UUID.t()) :: Checkpoint.t() | nil
-  def latest_recorded_checkpoint(tenant_id, story_id) do
-    {:ok, checkpoint} =
-      Repo.with_tenant(tenant_id, fn ->
-        Repo.one(
-          from c in Checkpoint,
-            join: s in Story,
-            on: s.id == c.story_id and s.tenant_id == c.tenant_id,
-            where: c.tenant_id == ^tenant_id and c.story_id == ^story_id,
-            where: c.kind == :checkpoint and c.claim_epoch == s.claim_epoch,
-            order_by: [desc: c.seq],
-            limit: 1
-        )
-      end)
+  @typedoc """
+  What the merge gate judges for a THREAD-mode story (US-45.4), read in one tenant
+  transaction:
 
-    checkpoint
+  - `:latest` — the latest checkpoint of kind `checkpoint` the story's CURRENT claim
+    recorded (its `claim_epoch` now), or `nil` when that claim recorded none. loopctl never
+    adopts a branch head nobody reported, and a checkpoint an ENDED claim recorded is that
+    claim's work, not the current one's
+  - `:earlier_shas` — the current claim's OTHER checkpoints' commits, newest first. A branch
+    naming one of them has gone back, not forward
+  - `:earlier_claim_recorded?` — whether any ENDED claim recorded a checkpoint. With no
+    `:latest`, it tells a thread whose claim was released (the gate's `claim_ended`) from one
+    that never recorded anything (`no_checkpoint_recorded`)
+  """
+  @type claim_checkpoints :: %{
+          latest: Checkpoint.t() | nil,
+          earlier_shas: [String.t()],
+          earlier_claim_recorded?: boolean()
+        }
+
+  @doc """
+  The current claim's checkpoints as `t:claim_checkpoints/0`, or `{:error, reason}` when they
+  could not be read — `{:error, :busy}` for contention a caller retries out of
+  (`Loopctl.Delivery.Stages.answering_busy/4`, the one classification of that), or
+  `{:error, :not_found}` for a story not in the tenant. Never raises for either. Takes no lock.
+  """
+  @spec claim_checkpoints(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, claim_checkpoints()} | {:error, term()}
+  def claim_checkpoints(tenant_id, story_id) do
+    Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "thread read", fn ->
+      tenant_id
+      |> Repo.with_tenant(fn -> read_claim_checkpoints(tenant_id, story_id) end)
+      |> unwrap_read()
+    end)
+  end
+
+  defp unwrap_read({:ok, {:ok, result}}), do: {:ok, result}
+  defp unwrap_read({:ok, {:error, _reason} = error}), do: error
+  defp unwrap_read({:error, _reason} = error), do: error
+
+  defp read_claim_checkpoints(tenant_id, story_id) do
+    case Repo.one(
+           from s in Story,
+             where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+             select: s.claim_epoch
+         ) do
+      nil ->
+        {:error, :not_found}
+
+      epoch ->
+        claimant = where(Checkpoint, [c], c.tenant_id == ^tenant_id and c.story_id == ^story_id)
+        claimant = where(claimant, [c], c.kind == :checkpoint)
+
+        current =
+          claimant
+          |> where([c], c.claim_epoch == ^epoch)
+          |> order_by([c], desc: c.seq)
+          |> Repo.all()
+
+        {latest, earlier} =
+          case current do
+            [latest | earlier] -> {latest, earlier}
+            [] -> {nil, []}
+          end
+
+        {:ok,
+         %{
+           latest: latest,
+           earlier_shas: Enum.map(earlier, & &1.commit_sha),
+           earlier_claim_recorded?: Repo.exists?(where(claimant, [c], c.claim_epoch != ^epoch))
+         }}
+    end
   end
 
   @doc """

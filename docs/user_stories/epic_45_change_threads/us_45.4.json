@@ -24,7 +24,7 @@
     },
     {
       "id": "AC-45.4.3",
-      "description": "When the thread branch head is not the latest checkpoint the story's current claim recorded, or the branch is missing from a repository the token can read, the gate answers head_moved with reason branch_head_unrecorded or branch_missing and returns the story to implementing over base_moved, without escalating. It refuses empty_change when the checkpoint tree equals the base tree or the comparison lists no changed file."
+      "description": "When the thread branch is missing from a repository the token can read, names a commit nobody recorded, names an earlier checkpoint of the current claim, or the latest checkpoint is not the head the stage recorded, the head has moved (branch_missing, branch_head_unrecorded, branch_head_regressed): while the claim is live the gate answers head_moved and returns the story to implementing over base_moved without escalating; when the claim is not live it refuses naming claim_not_live and escalates, because nobody can record the fix. It refuses empty_change when the checkpoint tree equals the base tree or the comparison lists no changed file, and claim_ended when the current claim recorded no checkpoint but an earlier claim did."
     },
     {
       "id": "AC-45.4.5",

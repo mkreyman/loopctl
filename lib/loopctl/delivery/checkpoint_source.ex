@@ -17,6 +17,9 @@ defmodule Loopctl.Delivery.CheckpointSource do
     `tree_sha` is the claimant's report; a disagreement is refused rather than believed
   - `:base_tree_sha` — the base branch's tree now. Equal to the checkpoint's, the change is
     `empty_change`: there is nothing to merge, and that is never read as merged
+  - `:base_sha` — the commit the base branch named when the comparison was read. An allow
+    records it, so the merge executor (US-45.5) can compare-and-swap against exactly the base
+    the gate judged. Base movement is NOT refused here
 
   ## The branch is read FIRST
 
@@ -107,6 +110,7 @@ defmodule Loopctl.Delivery.CheckpointSource do
          diffstat: comparison.diffstat,
          diff: comparison.diff,
          head_tree_sha: commit.tree_sha,
+         base_sha: comparison.base_sha,
          base_tree_sha: comparison.base_tree_sha
        })}
     end

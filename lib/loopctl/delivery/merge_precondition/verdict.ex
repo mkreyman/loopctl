@@ -32,6 +32,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
     A verdict is only ever about the diff at THIS head
+  - `base_sha` — THREAD mode: the commit the base branch named when the checkpoint was
+    judged. A thread-mode allow records it, so US-45.5's executor can compare-and-swap
+    against exactly that base
   - `mode` — `:pr` or `:thread`, the story's intake source's (US-45.4)
   - `checkpoint_id`, `checkpoint_sha` — THREAD mode: the recorded checkpoint judged. An allow
     in thread mode is recorded naming both
@@ -65,6 +68,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :pr_number,
     :head_sha,
     :merge_base_sha,
+    :base_sha,
     :merge_sha,
     :diffstat,
     :gate_a,
@@ -89,6 +93,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           pr_number: pos_integer() | nil,
           head_sha: String.t() | nil,
           merge_base_sha: String.t() | nil,
+          base_sha: String.t() | nil,
           merge_sha: String.t() | nil,
           diffstat: %{files: non_neg_integer(), changed_lines: non_neg_integer()} | nil,
           gate_a: GateA.Result.t() | nil,

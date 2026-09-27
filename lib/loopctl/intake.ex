@@ -170,7 +170,7 @@ defmodule Loopctl.Intake do
   """
   @spec create_source(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, %{source: Source.t(), webhook_secret: String.t()}}
-          | {:error, Ecto.Changeset.t() | :stories_in_flight | term()}
+          | {:error, Ecto.Changeset.t() | {:stories_in_flight, [Ecto.UUID.t()]} | term()}
   def create_source(tenant_id, attrs, opts \\ []) when is_binary(tenant_id) do
     secret = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
     project_id = Map.get(attrs, :project_id) || Map.get(attrs, "project_id")
@@ -184,7 +184,6 @@ defmodule Loopctl.Intake do
       |> put_target_epic(tenant_id, target_epic_id)
 
     with {:ok, changeset} <- valid(changeset),
-         :ok <- enrolment_mode_allowed(tenant_id, changeset),
          {:ok, source} <- insert_source(tenant_id, changeset, opts) do
       {:ok, %{source: source, webhook_secret: secret}}
     end
@@ -195,19 +194,22 @@ defmodule Loopctl.Intake do
   # one, revoked or not — or under `pr`, the default, if there was none. Without this, revoking
   # a source and enrolling the repository again in the other mode is `update_source/4`'s
   # refusal with one extra step.
-  defp enrolment_mode_allowed(tenant_id, changeset) do
-    project_id = Ecto.Changeset.get_field(changeset, :project_id)
-    mode = Ecto.Changeset.get_field(changeset, :mode)
-
-    if mode != previous_mode(tenant_id, project_id),
-      do: in_flight_refusal(tenant_id, project_id),
+  #
+  # Run INSIDE `insert_source/3`'s transaction, AFTER the insert: every existing check — the
+  # changeset's validation and the active-repository uniqueness the insert enforces — is
+  # answered first, so a real conflict such as an already-bound repository wins, and this read
+  # shares the insert's snapshot. The race `update_source/4` documents remains: the read takes
+  # no lock, so a story entering the loop between it and the commit runs under the new mode.
+  defp enrolment_mode_allowed(tenant_id, %Source{} = source) do
+    if source.mode != previous_mode(tenant_id, source),
+      do: in_flight_refusal(tenant_id, source.project_id),
       else: :ok
   end
 
-  defp previous_mode(tenant_id, project_id) do
+  defp previous_mode(tenant_id, %Source{id: id, project_id: project_id}) do
     AdminRepo.one(
       from s in Source,
-        where: s.tenant_id == ^tenant_id and s.project_id == ^project_id,
+        where: s.tenant_id == ^tenant_id and s.project_id == ^project_id and s.id != ^id,
         order_by: [desc: s.inserted_at],
         limit: 1,
         select: s.mode
@@ -326,6 +328,7 @@ defmodule Loopctl.Intake do
   defp insert_source(tenant_id, changeset, opts) do
     AdminRepo.transaction(fn ->
       with {:ok, source} <- AdminRepo.insert(changeset),
+           :ok <- enrolment_mode_allowed(tenant_id, source),
            {:ok, _entry} <-
              AuditChain.append(tenant_id, %{
                action: "intake_source_created",
@@ -394,8 +397,9 @@ defmodule Loopctl.Intake do
 
   `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it),
   `:base_branch` (NOT nullable) and `:mode` (`"pr"` or `"thread"`, NOT nullable; US-45.4). A
-  mode CHANGE is `{:error, :stories_in_flight}` while any story of the source's project is
-  past intake and not `done` or `failed` (an escalated story counts: it can be re-queued). A key that is ABSENT is left alone, which is why this
+  mode CHANGE is `{:error, {:stories_in_flight, story_ids}}` while any story of the source's
+  project is past intake and not yet past the merge gate (an escalated story counts: it can
+  be re-queued); `story_ids` names at most `max_blocking_named/0` of them. A key that is ABSENT is left alone, which is why this
   takes a map rather than two positional arguments: "absent" and "explicitly null" are
   different requests for the epic, and only the map can carry that difference.
 
@@ -409,7 +413,11 @@ defmodule Loopctl.Intake do
   """
   @spec update_source(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Source.t()}
-          | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update | :stories_in_flight}
+          | {:error,
+             Ecto.Changeset.t()
+             | :not_found
+             | :nothing_to_update
+             | {:stories_in_flight, [Ecto.UUID.t()]}}
   def update_source(tenant_id, source_id, attrs, opts \\ [])
       when is_binary(tenant_id) and is_binary(source_id) and is_map(attrs) do
     fields = for key <- [:target_epic_id, :base_branch, :mode], Map.has_key?(attrs, key), do: key
@@ -450,8 +458,10 @@ defmodule Loopctl.Intake do
   # gate reads — a pull request or a recorded checkpoint — so flipping it mid-delivery would
   # judge a story on a route it was never built for: a pr-mode story has no checkpoints, and a
   # thread-mode story has no pull request. In flight is every stage past intake (`detected`)
-  # except `done` and `failed`. `escalated` IS in flight: a human resolution re-queues it into
-  # the same loop. Naming the mode it already has is not a change and is never refused.
+  # that has not yet passed the merge gate: `merged`, `deployed`, `verified`, `done` and
+  # `failed` are settled, because the mode no longer affects them. `escalated` IS in flight: a
+  # human resolution re-queues it into the same loop. Naming the mode it already has is not a
+  # change and is never refused.
   #
   # Read, not locked: a story entering the loop between this read and the commit is judged
   # under the new mode. Closing that would need a lock every placement takes, for an operator
@@ -462,20 +472,33 @@ defmodule Loopctl.Intake do
       else: in_flight_refusal(tenant_id, source.project_id)
   end
 
-  # The one refusal both paths give, update and enrolment.
-  defp in_flight_refusal(tenant_id, project_id) do
-    settled = [:detected, :done, :failed]
+  # Stages the mode no longer affects: still at intake, or past the merge gate.
+  @mode_settled_stages [:detected, :merged, :deployed, :verified, :done, :failed]
 
-    in_flight? =
-      AdminRepo.exists?(
+  # The most blocking stories a refusal names. Enough to act on; bounded so a project with a
+  # large backlog in flight does not put all of it in one response.
+  @max_blocking_named 10
+
+  @doc "The most in-flight story ids a `stories_in_flight` refusal names."
+  @spec max_blocking_named() :: pos_integer()
+  def max_blocking_named, do: @max_blocking_named
+
+  # The one refusal both paths give, update and enrolment. It NAMES the stories in the way, so
+  # an operator knows what to resolve first.
+  defp in_flight_refusal(tenant_id, project_id) do
+    blocking =
+      AdminRepo.all(
         from st in StoryStage,
           join: s in Story,
           on: s.id == st.story_id and s.tenant_id == st.tenant_id,
           where: st.tenant_id == ^tenant_id and s.project_id == ^project_id,
-          where: st.stage not in ^settled
+          where: st.stage not in ^@mode_settled_stages,
+          order_by: [asc: st.story_id],
+          limit: ^@max_blocking_named,
+          select: st.story_id
       )
 
-    if in_flight?, do: {:error, :stories_in_flight}, else: :ok
+    if blocking == [], do: :ok, else: {:error, {:stories_in_flight, blocking}}
   end
 
   # `empty_values: []` for the reason `cast_base_branch/2` gives: a caller that SENT a value

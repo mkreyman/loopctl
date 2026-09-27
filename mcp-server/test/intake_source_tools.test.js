@@ -1040,6 +1040,7 @@ describe("the descriptions carry what a caller needs instead of the controller",
       row("intake_source_enroll"),
     ]) {
       assert.match(text, /stories_in_flight/, "it never names the refusal");
+      assert.match(text, /story_ids/, "it never says the refusal names the blocking stories");
     }
   });
 

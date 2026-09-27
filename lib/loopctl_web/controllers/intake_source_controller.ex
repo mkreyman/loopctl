@@ -152,10 +152,13 @@ defmodule LoopctlWeb.IntakeSourceController do
        }},
     responses: %{
       409 =>
-        {"`stories_in_flight`: the project has a story past intake and not done or failed " <>
-           "(escalated counts), and this enrolment's `mode` differs from the mode of the " <>
-           "project's previous source (`pr` when there was none). Revoking and enrolling " <>
-           "again does not get around it.", "application/json", Schemas.ErrorResponse},
+        {"`stories_in_flight`: the project has a story past intake and not yet past the " <>
+           "merge gate (escalated counts; merged, deployed and verified do not), and this " <>
+           "enrolment's `mode` differs from the mode of the project's previous source (`pr` " <>
+           "when there was none). Revoking and enrolling again does not get around it. The " <>
+           "error body's `story_ids` names the blocking stories, at most " <>
+           "#{Loopctl.Intake.max_blocking_named()}. An already-bound repository is still " <>
+           "the 422 it always was.", "application/json", Schemas.ErrorResponse},
       201 =>
         {"Intake source created", "application/json",
          %Schema{
@@ -240,8 +243,8 @@ defmodule LoopctlWeb.IntakeSourceController do
                  "messages, or every story is refused `no_checkpoint_recorded`. NOT " <>
                  "nullable: an explicit null or any other value is a 422. A CHANGE is " <>
                  "409 `stories_in_flight` while any story of this source's project is past " <>
-                 "intake and not done or failed (escalated counts), because the mode decides " <>
-                 "what its merge gate reads."
+                 "intake and not yet past the merge gate (escalated counts), because the mode " <>
+                 "decides what its merge gate reads; the body's `story_ids` names them."
            },
            target_epic_id: %Schema{
              type: :string,
@@ -278,8 +281,10 @@ defmodule LoopctlWeb.IntakeSourceController do
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"`stories_in_flight`: a mode change while a story of this source's project is past " <>
-           "intake and not done or failed (escalated counts). Nothing is changed, the " <>
-           "other fields included.", "application/json", Schemas.ErrorResponse},
+           "intake and not yet past the merge gate (escalated counts; merged, deployed and " <>
+           "verified do not). The error body's `story_ids` names the blocking stories, at " <>
+           "most #{Loopctl.Intake.max_blocking_named()}. Nothing is changed, the other fields " <>
+           "included.", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -319,8 +324,8 @@ defmodule LoopctlWeb.IntakeSourceController do
           webhook_path: "/api/v1/intake/github/#{source.id}"
         })
 
-      {:error, :stories_in_flight} ->
-        stories_in_flight(conn)
+      {:error, {:stories_in_flight, story_ids}} ->
+        stories_in_flight(conn, story_ids)
 
       {:error, reason} ->
         LoopctlWeb.FallbackController.call(conn, {:error, reason})
@@ -329,7 +334,7 @@ defmodule LoopctlWeb.IntakeSourceController do
 
   # RENDERED HERE for the reason `nothing_to_update` is: `FallbackController`'s catch-all
   # answers 500 for an atom it has no clause for. One body for both paths that refuse it.
-  defp stories_in_flight(conn) do
+  defp stories_in_flight(conn, story_ids) do
     conn
     |> put_status(409)
     |> json(%{
@@ -337,9 +342,11 @@ defmodule LoopctlWeb.IntakeSourceController do
         status: 409,
         code: "stories_in_flight",
         message:
-          "This source's project has a story in the delivery loop (past intake and not " <>
-            "done or failed), and the mode decides what its merge gate reads. Change the " <>
-            "mode, or enrol in another one, once no story is in flight. Nothing was changed."
+          "This source's project has a story in the delivery loop (past intake and not yet " <>
+            "past the merge gate; escalated counts), and the mode decides what its merge " <>
+            "gate reads. Change the mode, or enrol in another one, once no story is in " <>
+            "flight. Nothing was changed.",
+        story_ids: story_ids
       }
     })
   end
@@ -384,8 +391,8 @@ defmodule LoopctlWeb.IntakeSourceController do
           }
         })
 
-      {:error, :stories_in_flight} ->
-        stories_in_flight(conn)
+      {:error, {:stories_in_flight, story_ids}} ->
+        stories_in_flight(conn, story_ids)
 
       {:error, reason} ->
         LoopctlWeb.FallbackController.call(conn, {:error, reason})

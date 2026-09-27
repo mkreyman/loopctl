@@ -8378,18 +8378,24 @@ const TOOLS = [
       "(back to implementing), `unevaluated` (503 with Retry-After: a transient forge fault; " +
       "retry after the delay, nothing transitioned).\n\n" +
       "THREAD MODE — the story's intake source has `mode: thread` (set with " +
-      "intake_source_update). There is no pull request: the gate judges the story's latest " +
-      "checkpoint recorded under the story's CURRENT claim, on the branch the story was " +
-      "DISPATCHED on, and `pr_number` is null. The source's runners must be at runner " +
+      "intake_source_update). There is no pull request: the gate judges the latest " +
+      "checkpoint recorded under the story's CURRENT claim, on the branch that claim's " +
+      "dispatch ran on, and `pr_number` is null. The source's runners must be at runner " +
       "contract 1.20.0 or later and send checkpoint messages, or every story is refused " +
-      "`no_checkpoint_recorded`. It adds refusals `empty_change` (the checkpoint's tree equals the base's, or no " +
-      "file changed), `checkpoint_tree_mismatch` (the forge's tree is not the one the " +
-      "claimant recorded) and `no_checkpoint_recorded`. The branch is judged first: a branch " +
-      "the forge does not have in a readable repository (`branch_missing`) or one naming a " +
-      "commit nobody recorded (`branch_head_unrecorded`) is `head_moved` — back to " +
-      "implementing, not escalated: push and record the checkpoint. A repository the token " +
-      "cannot read refuses `pull_request_unavailable`. The answer carries `mode`, `checkpoint_id` and " +
-      "`checkpoint_sha`; an allow is recorded naming the checkpoint.\n\n" +
+      "`no_checkpoint_recorded`; a story whose claim was released after an earlier one " +
+      "recorded checkpoints is refused `claim_ended`. It adds refusals `empty_change` (the " +
+      "checkpoint's tree equals the base's, or no file changed) and " +
+      "`checkpoint_tree_mismatch` (the forge's tree is not the one the claimant recorded). " +
+      "The branch is judged first: a branch missing from a readable repository " +
+      "(`branch_missing`), one naming a commit nobody recorded (`branch_head_unrecorded`), " +
+      "one naming an earlier checkpoint of the claim (`branch_head_regressed`), or a " +
+      "checkpoint that is not the recorded head means the head moved. While the claim is " +
+      "LIVE that is `head_moved` — back to implementing: push and record the checkpoint. " +
+      "When it is NOT live (reported, review requested, lease expired) nobody can record " +
+      "the fix, so it is a refusal naming `claim_not_live`, and the story escalates. A " +
+      "repository the token cannot read refuses `pull_request_unavailable`. The answer " +
+      "carries `mode`, `checkpoint_id`, `checkpoint_sha` and `base_sha`; an allow is " +
+      "recorded naming the checkpoint and the base it was judged against.\n\n" +
       "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
       "[:orchestrator, :user]`, so an agent key is 403'd. LOOPCTL_ORCH_KEY is sent when set, " +
       "else LOOPCTL_API_KEY. 403 `custody_tier_required` on a tenant without a human anchor, " +
@@ -8528,7 +8534,8 @@ const TOOLS = [
       "evaluates the story's latest recorded checkpoint instead of a pull request. A value " +
       "other than those two, null included, is refused. Enrolling a mode that differs from " +
       "the project's previous source's (`pr` if there was none) is refused 409 " +
-      "`stories_in_flight` while any story of the project is in the delivery loop — revoking " +
+      "`stories_in_flight` (its `story_ids` names them) while any story of the project is in " +
+      "the delivery loop — revoking " +
       "and enrolling again does not get around the rule intake_source_update enforces.",
     inputSchema: {
       type: "object",
@@ -8630,8 +8637,9 @@ const TOOLS = [
       "report to a human instead of filing a story. Leave the field out instead. " +
       "`base_branch` and `mode` have no cleared state at all, so a null there is refused. " +
       "CHANGING `mode` is refused 409 `stories_in_flight` while any story of the source's " +
-      "project is in the delivery loop (past intake and not done or failed; escalated counts): the mode decides what " +
-      "that story's merge gate reads.\n\n" +
+      "project is in the delivery loop (past intake and not yet past the merge gate; " +
+      "escalated counts, merged does not): the mode decides what that story's merge gate " +
+      "reads. The error's `story_ids` names the stories to resolve first.\n\n" +
       "THIS IS THE FIX FOR A SOURCE ALREADY POINTED AT THE WRONG TRUNK. intake_source_enroll " +
       "now takes `base_branch` itself, so a `main` repository is enrolled correctly in one " +
       "call; this is what corrects one that was not — a source enrolled before the parameter " +

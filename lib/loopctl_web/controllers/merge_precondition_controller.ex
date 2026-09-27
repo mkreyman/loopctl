@@ -142,6 +142,14 @@ defmodule LoopctlWeb.MergePreconditionController do
                 "at. A verdict is `head_moved` when the two disagree."
           },
           merge_base_sha: %OpenApiSpex.Schema{type: :string, nullable: true},
+          base_sha: %OpenApiSpex.Schema{
+            type: :string,
+            nullable: true,
+            description:
+              "Thread mode: the commit the base branch named when the checkpoint was judged. " <>
+                "A thread-mode allow records it, so the merge executor can compare-and-swap " <>
+                "against exactly that base. Base movement is not refused here."
+          },
           merge_sha: %OpenApiSpex.Schema{
             type: :string,
             nullable: true,
@@ -226,20 +234,27 @@ defmodule LoopctlWeb.MergePreconditionController do
         "story all REFUSE.\n\n" <>
         "THREAD MODE (the story's intake source has `mode: thread`) needs no pull request: " <>
         "the gate judges the latest checkpoint the story's CURRENT claim recorded, on the " <>
-        "branch the story was DISPATCHED on (pinned in the dispatch ledger), and `pr_number` " <>
+        "branch that claim's dispatch ran on (pinned in the dispatch ledger), and `pr_number` " <>
         "is null. Its runners must be at runner contract 1.20.0 or later and send " <>
-        "`checkpoint` messages, or every story is refused `no_checkpoint_recorded`. It refuses " <>
-        "`empty_change` (the checkpoint's tree equals the base branch's, or no file changed), " <>
-        "`checkpoint_tree_mismatch` (the forge's tree for it is not the one recorded) and " <>
-        "`no_checkpoint_recorded`. The BRANCH is judged first: a branch the forge does not " <>
-        "have in a repository the token can read (`branch_missing`) or one naming a commit " <>
-        "nobody recorded (`branch_head_unrecorded`) is `head_moved` — back to " <>
-        "`implementing`, not escalated. A repository the token cannot read, or a 404 on the " <>
-        "checkpoint's commit or comparison once the branch names it, refuses " <>
-        "`pull_request_unavailable`. A " <>
-        "checkpoint carrying a merge commit counts as `already_merged` only when that commit " <>
-        "is on the base branch. A thread-mode allow is recorded naming the checkpoint id and " <>
-        "sha, and the verdict carries `mode`, `checkpoint_id` and `checkpoint_sha`.\n\n" <>
+        "`checkpoint` messages, or every story is refused `no_checkpoint_recorded`. A story " <>
+        "whose current claim recorded none while an earlier claim did (it was released) is " <>
+        "refused `claim_ended`. It also refuses `empty_change` (the checkpoint's tree equals " <>
+        "the base branch's, or no file changed) and `checkpoint_tree_mismatch` (the forge's " <>
+        "tree for it is not the one recorded). The BRANCH is judged first: a branch missing " <>
+        "from a readable repository (`branch_missing`), one naming a commit nobody recorded " <>
+        "(`branch_head_unrecorded`), one naming an EARLIER checkpoint of the claim " <>
+        "(`branch_head_regressed`), and a checkpoint that is not the head the stage row " <>
+        "recorded all mean the head moved. While the claim is LIVE — the claimant can still " <>
+        "record a checkpoint — that is `head_moved`, back to `implementing`, not escalated. " <>
+        "When the claim is NOT live (reported, review requested, lease expired) nobody can " <>
+        "record the fix, so it is a `refuse` naming `claim_not_live`, and escalates. A " <>
+        "repository the token cannot read, or a 404 on the checkpoint's commit or comparison " <>
+        "once the branch names it, refuses `pull_request_unavailable`. A checkpoint carrying " <>
+        "a merge commit counts as `already_merged` only when that commit is on the base " <>
+        "branch. A thread-mode allow is recorded naming the checkpoint id and sha and the " <>
+        "`base_sha` it was judged against, and the verdict carries `mode`, `checkpoint_id`, " <>
+        "`checkpoint_sha` and `base_sha`. A thread read that met database contention is " <>
+        "`unevaluated`.\n\n" <>
         "A `refuse` decision escalates the story on the `merge_gate` edge before " <>
         "responding, and returns 200: a refusal is an answer, not a request error. An " <>
         "`already_merged` decision reports a pull request GitHub already merged, with its " <>
@@ -415,6 +430,7 @@ defmodule LoopctlWeb.MergePreconditionController do
       head_sha: verdict.head_sha,
       recorded_head_sha: verdict.recorded_head_sha,
       merge_base_sha: verdict.merge_base_sha,
+      base_sha: verdict.base_sha,
       merge_sha: verdict.merge_sha,
       diffstat: verdict.diffstat,
       hard_bound: MergePrecondition.hard_bound(),

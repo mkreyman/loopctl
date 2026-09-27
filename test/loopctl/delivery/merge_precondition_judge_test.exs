@@ -990,6 +990,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     @tree String.duplicate("e", 40)
     @base_tree String.duplicate("f", 40)
     @checkpoint_id "00000000-0000-4000-8000-000000000045"
+    @base_head String.duplicate("8", 40)
 
     test "allows the recorded checkpoint with no pull request number, naming it" do
       verdict = judge_thread([])
@@ -999,6 +1000,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.pr_number == nil
       assert verdict.checkpoint_id == @checkpoint_id
       assert verdict.checkpoint_sha == @head
+      assert verdict.base_sha == @base_head
       assert verdict.head_sha == @head
     end
 
@@ -1068,6 +1070,72 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert {:head_moved, @head, moved} in verdict.reasons
     end
 
+    test "a branch naming an EARLIER checkpoint of the claim is branch_head_regressed" do
+      earlier = String.duplicate("6", 40)
+      verdict = judge_thread(branch_head_sha: earlier, earlier_shas: [earlier])
+
+      assert verdict.decision == :head_moved
+      assert {:branch_head_regressed, earlier, @head} in verdict.reasons
+      refute Enum.any?(verdict.reasons, &match?({:branch_head_unrecorded, _, _}, &1))
+    end
+
+    test "a moved head with the claim NOT live is refused claim_not_live, for every reason" do
+      earlier = String.duplicate("6", 40)
+
+      for {label, overrides} <- [
+            branch_head_unrecorded: [branch_head_sha: String.duplicate("9", 40)],
+            branch_missing: [branch_head_sha: :missing],
+            branch_head_regressed: [branch_head_sha: earlier, earlier_shas: [earlier]],
+            head_moved: [recorded_head_sha: String.duplicate("7", 40)]
+          ] do
+        verdict = judge_thread([{:claim_live?, false} | overrides])
+
+        assert verdict.decision == :refuse, inspect(label)
+        assert :claim_not_live in verdict.reasons, inspect(label)
+      end
+    end
+
+    test "a moved head with the claim LIVE goes back to implementing, for every reason" do
+      earlier = String.duplicate("6", 40)
+
+      for {label, overrides} <- [
+            branch_head_unrecorded: [branch_head_sha: String.duplicate("9", 40)],
+            branch_missing: [branch_head_sha: :missing],
+            branch_head_regressed: [branch_head_sha: earlier, earlier_shas: [earlier]],
+            head_moved: [recorded_head_sha: String.duplicate("7", 40)]
+          ] do
+        verdict = judge_thread([{:claim_live?, true} | overrides])
+
+        assert verdict.decision == :head_moved, inspect(label)
+        refute :claim_not_live in verdict.reasons, inspect(label)
+      end
+    end
+
+    test "a pr-mode head that moved goes back whatever the claim, as it always did" do
+      verdict = judge(recorded_head_sha: String.duplicate("7", 40))
+
+      assert verdict.decision == :head_moved
+    end
+
+    test "a thread whose claim was released after checkpoints were recorded is claim_ended" do
+      verdict =
+        judge_thread([],
+          checkpoint: {:error, :claim_ended},
+          pull_request: {:error, :not_attempted}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:claim_ended, :no_checkpoint_under_current_claim} in verdict.reasons
+      refute Enum.any?(verdict.reasons, &match?({:no_checkpoint_recorded, _}, &1))
+    end
+
+    test "a checkpoint read that met contention is unevaluated, never a refusal" do
+      verdict =
+        judge_thread([], checkpoint: {:error, :busy}, pull_request: {:error, :not_attempted})
+
+      assert verdict.decision == :unevaluated
+    end
+
     test "pr mode never reads a branch fact" do
       verdict = judge_thread(mode: :pr, branch_head_sha: :missing)
 
@@ -1078,7 +1146,12 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
   # The facts of a thread story at its latest recorded checkpoint, as `gather/3` resolves them
   # through `Loopctl.Delivery.CheckpointSource`.
   defp judge_thread(overrides, fact_overrides \\ []) do
-    checkpoint = %{id: @checkpoint_id, commit_sha: @head, tree_sha: @tree}
+    checkpoint = %{
+      id: @checkpoint_id,
+      commit_sha: @head,
+      tree_sha: @tree,
+      earlier_shas: Keyword.get(overrides, :earlier_shas, [])
+    }
 
     pr =
       [
@@ -1089,6 +1162,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       |> Map.merge(%{
         branch_head_sha: Keyword.get(overrides, :branch_head_sha, @head),
         head_tree_sha: Keyword.get(overrides, :head_tree_sha, @tree),
+        base_sha: @base_head,
         base_tree_sha: Keyword.get(overrides, :base_tree_sha, @base_tree)
       })
 
@@ -1099,7 +1173,11 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       recorded_allow_sha: Keyword.get(overrides, :recorded_allow_sha)
     ]
     |> facts()
-    |> Map.merge(%{mode: Keyword.get(overrides, :mode, :thread), checkpoint: {:ok, checkpoint}})
+    |> Map.merge(%{
+      mode: Keyword.get(overrides, :mode, :thread),
+      checkpoint: {:ok, checkpoint},
+      claim_live?: Keyword.get(overrides, :claim_live?, true)
+    })
     |> Map.merge(Map.new(fact_overrides))
     |> MergePrecondition.judge()
   end
