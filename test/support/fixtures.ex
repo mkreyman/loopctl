@@ -2653,8 +2653,11 @@ defmodule Loopctl.Fixtures do
             project_id: project_id,
             target_epic_id: Map.get(attrs, :target_epic_id)
           },
-          # By presence, as the context reads it: omitted keeps the `pr` default.
-          Map.take(attrs, [:mode])
+          # By presence, as the context reads it: omitted keeps the `pr` default. A THREAD
+          # source must name a required check (US-45.6), so one that names none gets `test`.
+          attrs
+          |> Map.take([:mode, :required_checks])
+          |> default_thread_checks()
         )
       )
 
@@ -3376,4 +3379,9 @@ defmodule Loopctl.Fixtures do
 
       :ok
   end
+
+  defp default_thread_checks(%{mode: mode} = attrs) when mode in [:thread, "thread"],
+    do: Map.put_new(attrs, :required_checks, ["test"])
+
+  defp default_thread_checks(attrs), do: attrs
 end

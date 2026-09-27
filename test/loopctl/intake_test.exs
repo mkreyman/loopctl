@@ -297,6 +297,93 @@ defmodule Loopctl.IntakeTest do
     end
   end
 
+  describe "required_checks (US-45.6)" do
+    setup do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      %{tenant: tenant, project: project}
+    end
+
+    defp enrol(ctx, attrs) do
+      Intake.create_source(
+        ctx.tenant.id,
+        Map.merge(%{repo_full_name: "mkreyman/infra", project_id: ctx.project.id}, attrs)
+      )
+    end
+
+    test "a thread source enrols with its required checks, and stores them", ctx do
+      assert {:ok, %{source: source}} =
+               enrol(ctx, %{mode: :thread, required_checks: ["test", "lint"]})
+
+      assert AdminRepo.get!(Source, source.id).required_checks == ["test", "lint"]
+    end
+
+    test "a thread source naming no required check is refused at enrolment", ctx do
+      assert {:error, changeset} = enrol(ctx, %{mode: :thread})
+
+      assert %{required_checks: ["a thread-mode source must name at least one"]} =
+               errors_on(changeset)
+
+      # A pr source needs none: it merges through the pull request's own protection.
+      assert {:ok, %{source: _}} = enrol(ctx, %{mode: :pr})
+    end
+
+    test "local-gate can never be a required check", ctx do
+      assert {:error, changeset} =
+               enrol(ctx, %{mode: :thread, required_checks: ["test", "local-gate"]})
+
+      assert %{required_checks: [message]} = errors_on(changeset)
+      assert message =~ "local-gate"
+    end
+
+    test "blank, duplicate and oversized names are refused", ctx do
+      # A JSON null element casts to nil: it must be a 422, never a raise (round 1, finding 3).
+      for bad <- [[""], ["  "], ["test", "test"], [String.duplicate("x", 201)], [nil], ["a", nil]] do
+        assert {:error, _changeset} = enrol(ctx, %{mode: :thread, required_checks: bad}),
+               inspect(bad)
+      end
+    end
+
+    test "switching to thread, or clearing a thread source's checks, is judged as a whole", ctx do
+      {:ok, %{source: source}} = enrol(ctx, %{})
+
+      # `mode` alone on a source with no checks: refused, whichever field was named.
+      assert {:error, changeset} =
+               Intake.update_source(ctx.tenant.id, source.id, %{mode: :thread})
+
+      assert %{required_checks: [_]} = errors_on(changeset)
+      assert AdminRepo.get!(Source, source.id).mode == :pr
+
+      assert {:ok, threaded} =
+               Intake.update_source(ctx.tenant.id, source.id, %{
+                 mode: :thread,
+                 required_checks: ["test"]
+               })
+
+      assert threaded.required_checks == ["test"]
+
+      assert {:error, _} =
+               Intake.update_source(ctx.tenant.id, source.id, %{required_checks: []})
+
+      assert AdminRepo.get!(Source, source.id).required_checks == ["test"]
+    end
+
+    test "a required_checks change is recorded on the audit chain", ctx do
+      {:ok, %{source: source}} = enrol(ctx, %{mode: :thread, required_checks: ["test"]})
+
+      assert {:ok, _} =
+               Intake.update_source(ctx.tenant.id, source.id, %{required_checks: ["test", "e2e"]})
+
+      assert [%{payload: %{"required_checks" => ["test", "e2e"]}}] =
+               AdminRepo.all(
+                 from e in Loopctl.AuditChain.Entry,
+                   where:
+                     e.tenant_id == ^ctx.tenant.id and
+                       e.action == "intake_source_required_checks_set"
+               )
+    end
+  end
+
   describe "repoint_source/4" do
     test "an active source is repointed at an epic of its project, and the act is recorded" do
       tenant = fixture(:tenant)

@@ -24,6 +24,16 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     total of its own, so a list that reaches the cap is refused as truncated rather than
     presented as the whole diff
 
+  CI evidence for a thread checkpoint (US-45.6), by the checkpoint's exact SHA:
+
+  - `GET /repos/:repo/commits/:sha/check-runs?filter=latest&per_page=100&page=:n` — every
+    check run on the commit, paged up to `@check_run_pages`; the required names are matched
+    locally
+  - `GET /repos/:repo/commits/:sha/status?per_page=100` — the latest status per context.
+    Both, because the combined status never lists check runs (GitHub Actions) and the
+    check-runs API never lists statuses. A list reporting more entries than it carried is
+    refused as truncated: a failure on a missing page would read as a pass
+
   Post-deploy verification (#803 §9) adds three more, each bounded the same way:
 
   4. `GET /repos/:repo/deployments?environment=:env&per_page=…` — a small page
@@ -57,7 +67,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   — Req retries transient failures by DEFAULT, which would multiply the ceiling silently.
   Three calls for `pull_request/2` and one for `repo_files/2`, so a precondition that makes
   all five (a pull request plus two refs) waits at most 35 seconds before it has an answer,
-  and the answer to a timeout is an ESCALATION, never a pass. Nothing here runs inside a
+  and the answer to a timeout is an ESCALATION, never a pass. A THREAD-mode evaluation makes
+  more: the branch ref, the commit, the comparison, two trees, at most `@check_run_pages`
+  pages of check runs and the combined status — nine calls, 63 seconds at the most, plus one
+  repository read after a 404 on the branch. Nothing here runs inside a
   database transaction: the caller gathers every fact before it opens one, so a slow forge
   never holds a pooled connection.
 
@@ -105,6 +118,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @connect_timeout_ms 2_000
   @receive_timeout_ms 5_000
   @files_per_page 100
+  # The combined status lists the LATEST status per context, one page of them.
+  @status_page_size 100
+  # At most this many pages of 100 check runs per commit are read (US-45.6).
+  @check_run_pages 3
 
   # GitHub's primary rate-limit window is an hour. Anything beyond that plus slack is not a
   # window rolling over, so it is not turned into a delay a caller would sleep on.
@@ -190,6 +207,102 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
       :ok
     end
   end
+
+  @impl true
+  def check_evidence(repo, sha) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, sha} <- ref(sha),
+         {:ok, runs} <- check_runs_page(repo, sha, 1, []),
+         {:ok, body} <- get(repo, "/commits/#{sha}/status?per_page=#{@status_page_size}"),
+         {:ok, statuses} <- commit_statuses(body) do
+      {:ok, %{check_runs: runs, statuses: statuses}}
+    end
+  end
+
+  # EVERY check run on the commit, `filter=latest`, paged — never one call per required name
+  # (US-45.6 review round 1, finding 7): a request per name multiplied both the worst-case
+  # wait and the forge calls each poll spends by the length of the list. The names are
+  # matched here, by `CiEvidence`. A commit carrying more runs than `@check_run_pages` pages
+  # hold is refused as truncated rather than judged on the part that fitted.
+  defp check_runs_page(repo, sha, page, acc) do
+    query = URI.encode_query(%{"filter" => "latest", "per_page" => 100, "page" => page})
+
+    with {:ok, body} <- get(repo, "/commits/#{sha}/check-runs?" <> query),
+         {:ok, total, runs} <- check_runs(body) do
+      acc = acc ++ runs
+
+      cond do
+        length(acc) >= total or runs == [] -> complete_runs(acc, total)
+        page >= @check_run_pages -> {:error, {:check_runs_truncated, total, length(acc)}}
+        true -> check_runs_page(repo, sha, page + 1, acc)
+      end
+    end
+  end
+
+  defp complete_runs(runs, total) when length(runs) >= total, do: {:ok, runs}
+  defp complete_runs(runs, total), do: {:error, {:check_runs_truncated, total, length(runs)}}
+
+  defp check_runs(%{"total_count" => total, "check_runs" => runs})
+       when is_integer(total) and is_list(runs) do
+    if Enum.all?(runs, &check_run?/1),
+      do: {:ok, total, Enum.map(runs, &check_run_fact/1)},
+      else: {:error, {:unreadable_check_runs, shape(runs)}}
+  end
+
+  defp check_runs(body), do: {:error, {:unreadable_check_runs, shape(body)}}
+
+  defp check_run_fact(run) do
+    %{
+      id: run["id"],
+      # The creating App's slug: only a trusted App's run can satisfy a required check
+      # (`Loopctl.Delivery.CiEvidence`).
+      app: get_in(run, ["app", "slug"]),
+      # The suite (one workflow run) the run belongs to: runs are judged latest-per-suite.
+      check_suite: get_in(run, ["check_suite", "id"]),
+      name: run["name"],
+      status: run["status"],
+      conclusion: run["conclusion"],
+      started_at: run["started_at"],
+      completed_at: run["completed_at"],
+      url: run["html_url"]
+    }
+  end
+
+  defp check_run?(%{"name" => name, "status" => status} = run)
+       when is_binary(name) and is_binary(status),
+       do: is_nil(run["conclusion"]) or is_binary(run["conclusion"])
+
+  defp check_run?(_run), do: false
+
+  defp commit_statuses(%{"total_count" => total, "statuses" => statuses})
+       when is_integer(total) and is_list(statuses) do
+    cond do
+      total > length(statuses) ->
+        {:error, {:statuses_truncated, total, length(statuses)}}
+
+      Enum.all?(statuses, &status?/1) ->
+        {:ok,
+         Enum.map(statuses, fn status ->
+           %{
+             context: status["context"],
+             state: status["state"],
+             at: status["updated_at"],
+             url: status["target_url"]
+           }
+         end)}
+
+      true ->
+        {:error, {:unreadable_statuses, shape(statuses)}}
+    end
+  end
+
+  defp commit_statuses(body), do: {:error, {:unreadable_statuses, shape(body)}}
+
+  defp status?(%{"context" => context, "state" => state})
+       when is_binary(context) and is_binary(state),
+       do: true
+
+  defp status?(_status), do: false
 
   @impl true
   def compare(repo, base, head) do

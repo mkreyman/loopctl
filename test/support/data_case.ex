@@ -225,6 +225,11 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # US-45.6: CI evidence for a checkpoint's commit, on the same fail-closed default.
+    Mox.stub(Loopctl.MockPullRequestSource, :check_evidence, fn _repo, _sha ->
+      {:error, :not_stubbed}
+    end)
+
     # US-45.4: the thread-mode reads, on the same fail-closed default.
     Mox.stub(Loopctl.MockPullRequestSource, :branch_head, fn _repo, _branch ->
       {:error, :not_stubbed}

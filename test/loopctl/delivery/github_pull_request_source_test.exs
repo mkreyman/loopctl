@@ -753,6 +753,112 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
+  describe "check_evidence/3 (US-45.6)" do
+    defp gh_run(id, name, conclusion),
+      do: %{
+        "id" => id,
+        "name" => name,
+        "status" => "completed",
+        "conclusion" => conclusion,
+        "app" => %{"slug" => "github-actions"},
+        "check_suite" => %{"id" => id * 10}
+      }
+
+    # Review round 1, finding 7: ONE paged read of every run on the commit, never one per name.
+    test "reads every latest run on the exact SHA in one paged call, and every status" do
+      stub(fn conn ->
+        case String.split(conn.request_path, "/") do
+          [_, "repos", "acme", "widgets", "commits", @head, "check-runs"] ->
+            query = URI.decode_query(conn.query_string)
+            assert query["filter"] == "latest"
+            assert query["per_page"] == "100"
+            refute Map.has_key?(query, "check_name")
+            assert query["page"] == "1"
+
+            json(conn, %{
+              "total_count" => 2,
+              "check_runs" => [
+                Map.put(gh_run(7, "test", "success"), "completed_at", "2026-09-27T10:00:00Z"),
+                gh_run(8, "lint / credo", "failure")
+              ]
+            })
+
+          [_, "repos", "acme", "widgets", "commits", @head, "status"] ->
+            assert conn.query_string == "per_page=100"
+
+            json(conn, %{
+              "total_count" => 1,
+              "statuses" => [
+                %{"context" => "local-gate", "state" => "success", "updated_at" => "t"}
+              ]
+            })
+        end
+      end)
+
+      assert {:ok, %{check_runs: runs, statuses: statuses}} =
+               Source.check_evidence(@repo, @head)
+
+      assert [
+               %{
+                 id: 7,
+                 name: "test",
+                 app: "github-actions",
+                 check_suite: 70,
+                 completed_at: "2026-09-27T10:00:00Z"
+               },
+               %{id: 8}
+             ] = runs
+
+      assert [%{context: "local-gate", state: "success", at: "t"}] = statuses
+    end
+
+    test "further pages are read until the total is reached" do
+      stub(fn conn ->
+        if String.ends_with?(conn.request_path, "/check-runs") do
+          page = URI.decode_query(conn.query_string)["page"]
+          run = gh_run(String.to_integer(page), "job-#{page}", "success")
+          json(conn, %{"total_count" => 2, "check_runs" => [run]})
+        else
+          json(conn, %{"total_count" => 0, "statuses" => []})
+        end
+      end)
+
+      assert {:ok, %{check_runs: [%{name: "job-1"}, %{name: "job-2"}]}} =
+               Source.check_evidence(@repo, @head)
+    end
+
+    test "a list the forge truncated is an error, never a partial answer" do
+      stub(fn conn ->
+        if String.ends_with?(conn.request_path, "/check-runs") do
+          json(conn, %{"total_count" => 1000, "check_runs" => [gh_run(1, "test", "success")]})
+        else
+          json(conn, %{"total_count" => 0, "statuses" => []})
+        end
+      end)
+
+      assert {:error, {:check_runs_truncated, 1000, 3}} =
+               Source.check_evidence(@repo, @head)
+
+      stub(fn conn ->
+        if String.ends_with?(conn.request_path, "/check-runs") do
+          json(conn, %{"total_count" => 0, "check_runs" => []})
+        else
+          json(conn, %{"total_count" => 101, "statuses" => []})
+        end
+      end)
+
+      assert {:error, {:statuses_truncated, 101, 0}} =
+               Source.check_evidence(@repo, @head)
+    end
+
+    test "an unreadable body is an error naming its shape" do
+      stub(fn conn -> json(conn, %{"message" => "nope"}) end)
+
+      assert {:error, {:unreadable_check_runs, {:map, ["message"]}}} =
+               Source.check_evidence(@repo, @head)
+    end
+  end
+
   defp stub(fun), do: Req.Test.stub(Source, fun)
 
   defp deployment_route(conn, statuses) do

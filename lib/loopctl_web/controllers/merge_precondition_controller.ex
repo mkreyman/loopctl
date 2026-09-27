@@ -155,6 +155,17 @@ defmodule LoopctlWeb.MergePreconditionController do
                 "thread-mode allow records it, and the merge executor merges only while the " <>
                 "base head still equals it, and otherwise takes its base-update path."
           },
+          ci_evidence: %OpenApiSpex.Schema{
+            type: :object,
+            nullable: true,
+            description:
+              "Thread mode (US-45.6): what CI said about the checkpoint's EXACT commit, read " <>
+                "from both the check-runs and the commit-status APIs — `sha`, `read_at`, " <>
+                "`required`, the raw `check_runs` and `statuses`, `local_gate` (recorded, " <>
+                "never counted), and the judgement `passed` / `pending` / `missing` / " <>
+                "`failed`. The same object is copied onto the checkpoint's `gate_evidence` " <>
+                "under `ci`. null when it was not read (pr mode, a moved or merged head)."
+          },
           merge_sha: %OpenApiSpex.Schema{
             type: :string,
             nullable: true,
@@ -251,7 +262,22 @@ defmodule LoopctlWeb.MergePreconditionController do
         "refused `claim_ended`; a thread loopctl could not read is refused " <>
         "`thread_unreadable`. It also refuses `empty_change` (the checkpoint's tree equals " <>
         "the base branch's, or no file changed) and `checkpoint_tree_mismatch` (the forge's " <>
-        "tree for it is not the one recorded). The BRANCH is judged first: a branch missing " <>
+        "tree for it is not the one recorded). CI is read by the checkpoint's EXACT SHA " <>
+        "(US-45.6), from both the check-runs and the commit-status APIs (only a GitHub " <>
+        "Actions check run satisfies a required check; statuses are recorded, never " <>
+        "trusted), against the " <>
+        "source's `required_checks`: a failed one refuses `required_check_failed`, one still " <>
+        "running or not yet reported is `unevaluated` (`required_check_pending` / " <>
+        "`required_check_missing`, `Retry-After` 300; neither counts toward the unevaluated " <>
+        "bound, and 24 hours after the story entered `ci` both are refused " <>
+        "`required_check_timed_out`; per name the latest run of each check suite counts and " <>
+        "every suite must pass), the required checks are the source's current list, a " <>
+        "checkpoint changing `.github/workflows/` or `.github/actions/` is refused " <>
+        "`ci_definition_changed`, a source requiring none refuses `required_checks_unset`, a " <>
+        "failed read is `ci_evidence_unavailable`, and a `local-gate` status is recorded but " <>
+        "never satisfies a required check. `ci_evidence` is what was read; it is copied onto " <>
+        "the checkpoint, and an allow whose copy did not land is refused " <>
+        "`ci_evidence_not_recorded`. The BRANCH is judged first: a branch missing " <>
         "from a readable repository (`branch_missing`), one naming a commit nobody recorded " <>
         "(`branch_head_unrecorded`), one naming an EARLIER checkpoint of the claim " <>
         "(`branch_head_regressed`), a checkpoint that is not the head the stage row " <>
@@ -446,6 +472,7 @@ defmodule LoopctlWeb.MergePreconditionController do
       recorded_head_sha: verdict.recorded_head_sha,
       merge_base_sha: verdict.merge_base_sha,
       base_sha: thread_base_sha(verdict),
+      ci_evidence: verdict.ci_evidence,
       merge_sha: verdict.merge_sha,
       diffstat: verdict.diffstat,
       hard_bound: MergePrecondition.hard_bound(),

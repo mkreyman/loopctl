@@ -308,6 +308,25 @@ defmodule Loopctl.Delivery.Stages do
     transitions
   end
 
+  @doc """
+  When `story_id` last ENTERED `stage` — the newest transition into it — or nil when it never
+  has (US-45.6: what a merge gate's CI wait is measured from).
+  """
+  @spec entered_at(Ecto.UUID.t(), Ecto.UUID.t(), atom()) :: DateTime.t() | nil
+  def entered_at(tenant_id, story_id, stage) do
+    {:ok, at} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(
+          from e in StageEvent,
+            where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
+            where: e.event == "transitioned" and e.to_stage == ^Atom.to_string(stage),
+            select: max(e.inserted_at)
+        )
+      end)
+
+    at
+  end
+
   @doc "A story's stage events, oldest first."
   @spec list_events(Ecto.UUID.t(), Ecto.UUID.t()) :: [StageEvent.t()]
   def list_events(tenant_id, story_id) do

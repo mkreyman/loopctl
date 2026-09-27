@@ -201,6 +201,16 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @doc "The three-dot comparison `base...head` (US-45.4). See `t:comparison/0`."
   @callback compare(repo(), String.t(), String.t()) :: {:ok, comparison()} | {:error, term()}
 
+  @doc """
+  The CI evidence for ONE commit (US-45.6): EVERY latest check run on it (`filter=latest`),
+  each with the slug of the App that created it, and every commit status. The required
+  names are matched by `Loopctl.Delivery.CiEvidence`, never here, so this reads the same
+  thing whatever a source requires. A list the forge truncated is an error, never a partial
+  answer: a missing failure reads as a pass.
+  """
+  @callback check_evidence(repo(), String.t()) ::
+              {:ok, Loopctl.Delivery.CiEvidence.evidence()} | {:error, term()}
+
   @doc "Every file the repository holds at `ref`."
   @callback repo_files(repo(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
 
