@@ -161,6 +161,34 @@ export function modeRefusal(mode) {
   );
 }
 
+/**
+ * The CI checks a thread-mode checkpoint must pass on its exact commit (US-45.6). A list of
+ * distinct, non-blank names; `local-gate` is refused because whoever pushed posts it. The
+ * server holds the bounds and the "a thread source must name one" rule, which depends on the
+ * stored mode this client cannot see, so only the shape is judged here.
+ */
+export function requiredChecksRefusal(checks) {
+  const ok =
+    Array.isArray(checks) &&
+    checks.every((name) => typeof name === "string" && name.trim() !== "");
+
+  if (!ok) {
+    return refuse(
+      "`required_checks` must be a list of check-run names or commit-status contexts, as " +
+        "they appear on the commit (for example [\"test\", \"lint\"]).",
+    );
+  }
+
+  if (checks.includes("local-gate")) {
+    return refuse(
+      "`local-gate` can never be a required check: whoever pushed posts it, so on a thread " +
+        "it is the implementer attesting its own work. It is recorded on the checkpoint instead.",
+    );
+  }
+
+  return null;
+}
+
 export function sourcePath(sourceId) {
   return `${SOURCES_PATH}/${encodeURIComponent(sourceId)}`;
 }
@@ -190,6 +218,7 @@ export function publicSource(source) {
     repo_full_name: source.repo_full_name,
     base_branch: source.base_branch,
     mode: source.mode,
+    required_checks: source.required_checks,
     target_epic_id: source.target_epic_id,
     revoked_at: source.revoked_at,
     inserted_at: source.inserted_at,
@@ -216,7 +245,15 @@ export function webhookUrl(baseUrl, webhookPath) {
  * shape. It never throws.
  */
 export async function enrollIntakeSource(
-  { repo_full_name, project_id, target_epic_id, base_branch, mode, secret_file } = {},
+  {
+    repo_full_name,
+    project_id,
+    target_epic_id,
+    base_branch,
+    mode,
+    required_checks,
+    secret_file,
+  } = {},
   { userKey, apiCall, baseUrl, fs = defaultFs, homedir = os.homedir() } = {},
 ) {
   if (!userKey) return refuse(MISSING_USER_KEY);
@@ -258,6 +295,11 @@ export async function enrollIntakeSource(
   // OPTIONAL, read by PRESENCE like the branch: omitted, the source takes `pr`. Named, it
   // must be one of the two modes; anything else (null included) is a 422 at the server and
   // is refused here, before a secret file is reserved.
+  if (required_checks !== undefined) {
+    const badChecks = requiredChecksRefusal(required_checks);
+    if (badChecks) return badChecks;
+  }
+
   if (mode !== undefined) {
     const badMode = modeRefusal(mode);
     if (badMode) return badMode;
@@ -313,6 +355,7 @@ export async function enrollIntakeSource(
   }
   if (base_branch !== undefined) body.base_branch = base_branch;
   if (mode !== undefined) body.mode = mode;
+  if (required_checks !== undefined) body.required_checks = required_checks;
 
   let result;
   try {
@@ -500,10 +543,16 @@ export async function updateIntakeSource(args = {}, { userKey, apiCall } = {}) {
     body.mode = args.mode;
   }
 
+  if (args.required_checks !== undefined) {
+    const badChecks = requiredChecksRefusal(args.required_checks);
+    if (badChecks) return badChecks;
+    body.required_checks = args.required_checks;
+  }
+
   if (Object.keys(body).length === 0) {
     return refuse(
       "Nothing to update. Name at least one of `target_epic_id` (null clears it), " +
-        "`base_branch` or `mode`. A body carrying none of them is refused 422 " +
+        "`base_branch`, `mode` or `required_checks`. A body carrying none of them is refused 422 " +
         "`nothing_to_update`, because a field you do not send is left exactly as it was.",
     );
   }

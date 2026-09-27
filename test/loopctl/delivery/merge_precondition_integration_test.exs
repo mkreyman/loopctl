@@ -517,6 +517,65 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert id == ctx.checkpoint.id
     end
 
+    # TC-45.6.1: green on the PARENT, pending on the checkpoint: the gate reads the
+    # checkpoint's own commit and nothing else, so it does not allow.
+    test "TC-45.6.1 CI is read for the checkpoint's exact SHA; green on another commit is not an allow",
+         ctx do
+      stub_thread(ctx)
+      parent = String.duplicate("b", 40)
+
+      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, sha, ["test"] ->
+        cond do
+          sha == @head -> {:ok, %{check_runs: [ci_run("test", nil, "in_progress")], statuses: []}}
+          sha == parent -> {:ok, %{check_runs: [ci_run("test", "success")], statuses: []}}
+        end
+      end)
+
+      assert {:ok, %Verdict{decision: :unevaluated} = verdict} = enforce(ctx)
+      assert {:required_check_pending, "test"} in verdict.reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_allowed_sha == nil
+    end
+
+    # AC-45.6.1: whatever the decision, the evidence read is copied onto the checkpoint.
+    test "the evidence is copied onto the checkpoint on an allow and on a refusal", ctx do
+      stub_thread(ctx)
+
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      assert %{"ci" => %{"sha" => @head, "passed" => ["test"], "failed" => []}} =
+               checkpoint_evidence(ctx)
+
+      stub_thread(ctx, ci: %{check_runs: [ci_run("test", "failure")], statuses: []})
+      reset_allow(ctx)
+
+      assert {:ok, %Verdict{decision: :refuse} = refused} = enforce(ctx)
+      assert {:required_check_failed, "test", "failure"} in refused.reasons
+
+      assert %{"ci" => %{"failed" => [%{"name" => "test", "why" => "failure"}]}} =
+               checkpoint_evidence(ctx)
+    end
+
+    test "checks still RUNNING never reach the unevaluated bound; missing ones do", ctx do
+      stub_thread(ctx, ci: %{check_runs: [ci_run("test", nil, "queued")], statuses: []})
+
+      for _ <- 1..(MergePrecondition.max_consecutive_unevaluated() + 2) do
+        assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
+      end
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+
+      stub_thread(ctx, ci: %{check_runs: [], statuses: []})
+
+      verdicts =
+        for _ <- 1..(MergePrecondition.max_consecutive_unevaluated() + 1) do
+          {:ok, verdict} = enforce(ctx)
+          verdict.decision
+        end
+
+      assert List.last(verdicts) == :refuse
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
     test "TC-45.4.3 a branch head nobody reported goes back to implementing, unescalated", ctx do
       pushed = String.duplicate("9", 40)
       make_claim_live(ctx)
@@ -987,7 +1046,26 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end)
 
     Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+
+    # US-45.6: CI on the CHECKPOINT's commit, green unless the test says otherwise.
+    ci = Keyword.get(opts, :ci, %{check_runs: [ci_run("test", "success")], statuses: []})
+    Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, ^head, _names -> {:ok, ci} end)
   end
+
+  defp checkpoint_evidence(ctx) do
+    AdminRepo.get!(Loopctl.Threads.Checkpoint, ctx.checkpoint.id).gate_evidence
+  end
+
+  # A refusal test after an allow: the recorded allow is for the same head, and the story is
+  # back at `ci` with nothing allowed so the gate judges afresh.
+  defp reset_allow(ctx) do
+    {1, _} =
+      from(r in StoryStage, where: r.story_id == ^ctx.story_id)
+      |> AdminRepo.update_all(set: [merge_gate_allowed_sha: nil])
+  end
+
+  defp ci_run(name, conclusion, status \\ "completed"),
+    do: %{name: name, status: status, conclusion: conclusion, url: nil}
 
   # The comparison, relative to `@base_head` unless `:merge_base` says otherwise.
   defp comparison(base_tree, opts) do
@@ -1140,7 +1218,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     fixture(:intake_source, %{
       tenant_id: tenant.id,
       project_id: project.id,
-      repo_full_name: @repo
+      repo_full_name: @repo,
+      required_checks: ["test"]
     })
 
     {:ok, %{dispatch: implementer}} =

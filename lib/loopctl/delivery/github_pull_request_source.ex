@@ -24,6 +24,16 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     total of its own, so a list that reaches the cap is refused as truncated rather than
     presented as the whole diff
 
+  CI evidence for a thread checkpoint (US-45.6), by the checkpoint's exact SHA:
+
+  - `GET /repos/:repo/commits/:sha/check-runs?check_name=:name&filter=latest&per_page=100`
+    — one per required name, so a commit with many unrelated runs never pages the one that
+    matters off the end
+  - `GET /repos/:repo/commits/:sha/status?per_page=100` — the latest status per context.
+    Both, because the combined status never lists check runs (GitHub Actions) and the
+    check-runs API never lists statuses. A list reporting more entries than it carried is
+    refused as truncated: a failure on a missing page would read as a pass
+
   Post-deploy verification (#803 §9) adds three more, each bounded the same way:
 
   4. `GET /repos/:repo/deployments?environment=:env&per_page=…` — a small page
@@ -105,6 +115,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @connect_timeout_ms 2_000
   @receive_timeout_ms 5_000
   @files_per_page 100
+  # The combined status lists the LATEST status per context, one page of them.
+  @status_page_size 100
 
   # GitHub's primary rate-limit window is an hour. Anything beyond that plus slack is not a
   # window rolling over, so it is not turned into a delay a caller would sleep on.
@@ -190,6 +202,85 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
       :ok
     end
   end
+
+  @impl true
+  def check_evidence(repo, sha, names) when is_list(names) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, sha} <- ref(sha),
+         {:ok, runs} <- named_check_runs(repo, sha, names),
+         {:ok, body} <- get(repo, "/commits/#{sha}/status?per_page=#{@status_page_size}"),
+         {:ok, statuses} <- commit_statuses(body) do
+      {:ok, %{check_runs: runs, statuses: statuses}}
+    end
+  end
+
+  defp named_check_runs(repo, sha, names) do
+    Enum.reduce_while(names, {:ok, []}, fn name, {:ok, acc} ->
+      query = URI.encode_query(%{"check_name" => name, "filter" => "latest", "per_page" => 100})
+
+      with {:ok, body} <- get(repo, "/commits/#{sha}/check-runs?" <> query),
+           {:ok, runs} <- check_runs(body) do
+        {:cont, {:ok, acc ++ runs}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp check_runs(%{"total_count" => total, "check_runs" => runs})
+       when is_integer(total) and is_list(runs) do
+    cond do
+      total > length(runs) ->
+        {:error, {:check_runs_truncated, total, length(runs)}}
+
+      Enum.all?(runs, &check_run?/1) ->
+        {:ok,
+         Enum.map(runs, fn run ->
+           %{
+             name: run["name"],
+             status: run["status"],
+             conclusion: run["conclusion"],
+             url: run["html_url"]
+           }
+         end)}
+
+      true ->
+        {:error, {:unreadable_check_runs, shape(runs)}}
+    end
+  end
+
+  defp check_runs(body), do: {:error, {:unreadable_check_runs, shape(body)}}
+
+  defp check_run?(%{"name" => name, "status" => status} = run)
+       when is_binary(name) and is_binary(status),
+       do: is_nil(run["conclusion"]) or is_binary(run["conclusion"])
+
+  defp check_run?(_run), do: false
+
+  defp commit_statuses(%{"total_count" => total, "statuses" => statuses})
+       when is_integer(total) and is_list(statuses) do
+    cond do
+      total > length(statuses) ->
+        {:error, {:statuses_truncated, total, length(statuses)}}
+
+      Enum.all?(statuses, &status?/1) ->
+        {:ok,
+         Enum.map(statuses, fn status ->
+           %{context: status["context"], state: status["state"], url: status["target_url"]}
+         end)}
+
+      true ->
+        {:error, {:unreadable_statuses, shape(statuses)}}
+    end
+  end
+
+  defp commit_statuses(body), do: {:error, {:unreadable_statuses, shape(body)}}
+
+  defp status?(%{"context" => context, "state" => state})
+       when is_binary(context) and is_binary(state),
+       do: true
+
+  defp status?(_status), do: false
 
   @impl true
   def compare(repo, base, head) do

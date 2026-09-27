@@ -201,7 +201,9 @@ defmodule Loopctl.Intake do
   defp create_attrs(repo, attrs) do
     base = %{repo_full_name: repo}
 
-    Enum.reduce([base_branch: "base_branch", mode: "mode"], base, fn {key, string_key}, acc ->
+    fields = [base_branch: "base_branch", mode: "mode", required_checks: "required_checks"]
+
+    Enum.reduce(fields, base, fn {key, string_key}, acc ->
       case fetch_either(attrs, key, string_key) do
         {:ok, value} -> Map.put(acc, key, value)
         :error -> acc
@@ -385,7 +387,10 @@ defmodule Loopctl.Intake do
           | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update}
   def update_source(tenant_id, source_id, attrs, opts \\ [])
       when is_binary(tenant_id) and is_binary(source_id) and is_map(attrs) do
-    fields = for key <- [:target_epic_id, :base_branch, :mode], Map.has_key?(attrs, key), do: key
+    fields =
+      for key <- [:target_epic_id, :base_branch, :mode, :required_checks],
+          Map.has_key?(attrs, key),
+          do: key
 
     if fields == [] do
       {:error, :nothing_to_update}
@@ -413,9 +418,25 @@ defmodule Loopctl.Intake do
 
     changeset = if mode?, do: cast_mode(changeset, Map.get(attrs, :mode)), else: changeset
 
+    # Judged over the source AS IT WILL BE whenever either half moves: a thread-mode source
+    # must name a required check, so switching to `thread` without one, or clearing the list
+    # on a thread source, is refused whichever field the request named (US-45.6).
+    changeset =
+      if mode? or :required_checks in fields,
+        do: cast_required_checks(changeset, attrs),
+        else: changeset
+
     with {:ok, changeset} <- valid(changeset) do
       write_update(tenant_id, changeset, fields, opts)
     end
+  end
+
+  defp cast_required_checks(changeset, attrs) do
+    changeset
+    |> Ecto.Changeset.cast(Map.take(attrs, [:required_checks]), [:required_checks],
+      empty_values: []
+    )
+    |> Source.validate_required_checks()
   end
 
   # `empty_values: []` for the reason `cast_base_branch/2` gives: a caller that SENT a value
@@ -449,7 +470,8 @@ defmodule Loopctl.Intake do
       with {:ok, source} <- AdminRepo.update(changeset),
            :ok <- append_if(fields, :target_epic_id, tenant_id, source, opts),
            :ok <- append_if(fields, :base_branch, tenant_id, source, opts),
-           :ok <- append_if(fields, :mode, tenant_id, source, opts) do
+           :ok <- append_if(fields, :mode, tenant_id, source, opts),
+           :ok <- append_if(fields, :required_checks, tenant_id, source, opts) do
         source
       else
         {:error, reason} -> AdminRepo.rollback(reason)
@@ -473,6 +495,9 @@ defmodule Loopctl.Intake do
 
         :mode ->
           {"intake_source_mode_set", %{"mode" => Atom.to_string(source.mode)}}
+
+        :required_checks ->
+          {"intake_source_required_checks_set", %{"required_checks" => source.required_checks}}
       end
 
     case AuditChain.append(tenant_id, %{

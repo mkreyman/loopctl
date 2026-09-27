@@ -753,6 +753,85 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
+  describe "check_evidence/3 (US-45.6)" do
+    test "reads each required name's latest runs and every status, both by the exact SHA" do
+      stub(fn conn ->
+        case conn.request_path do
+          "/repos/acme/widgets/commits/" <> rest ->
+            case String.split(rest, "/") do
+              [@head, "check-runs"] ->
+                query = URI.decode_query(conn.query_string)
+                assert query["filter"] == "latest"
+                assert query["per_page"] == "100"
+
+                json(conn, %{
+                  "total_count" => 1,
+                  "check_runs" => [
+                    %{
+                      "name" => query["check_name"],
+                      "status" => "completed",
+                      "conclusion" => "success",
+                      "html_url" => "https://github.com/run/1"
+                    }
+                  ]
+                })
+
+              [@head, "status"] ->
+                assert conn.query_string == "per_page=100"
+
+                json(conn, %{
+                  "total_count" => 1,
+                  "statuses" => [%{"context" => "local-gate", "state" => "success"}]
+                })
+            end
+        end
+      end)
+
+      assert {:ok, %{check_runs: runs, statuses: statuses}} =
+               Source.check_evidence(@repo, @head, ["test", "lint / credo"])
+
+      assert Enum.map(runs, & &1.name) == ["test", "lint / credo"]
+      assert [%{status: "completed", conclusion: "success"} | _] = runs
+      assert [%{context: "local-gate", state: "success"}] = statuses
+    end
+
+    test "a list the forge truncated is an error, never a partial answer" do
+      stub(fn conn ->
+        if String.ends_with?(conn.request_path, "/check-runs") do
+          json(conn, %{
+            "total_count" => 2,
+            "check_runs" => [
+              %{"name" => "test", "status" => "completed", "conclusion" => "success"}
+            ]
+          })
+        else
+          json(conn, %{"total_count" => 0, "statuses" => []})
+        end
+      end)
+
+      assert {:error, {:check_runs_truncated, 2, 1}} =
+               Source.check_evidence(@repo, @head, ["test"])
+
+      stub(fn conn ->
+        if String.ends_with?(conn.request_path, "/check-runs") do
+          json(conn, %{"total_count" => 0, "check_runs" => []})
+        else
+          json(conn, %{"total_count" => 101, "statuses" => []})
+        end
+      end)
+
+      assert {:error, {:statuses_truncated, 101, 0}} =
+               Source.check_evidence(@repo, @head, ["test"])
+    end
+
+    test "an unreadable body is an error naming its shape" do
+      stub(fn conn -> json(conn, %{"message" => "nope"}) end)
+
+      assert {:error, {:unreadable_check_runs, {:map, ["message"]}}} =
+               Source.check_evidence(@repo, @head, ["test"])
+    end
+  end
+
   defp stub(fun), do: Req.Test.stub(Source, fun)
 
   defp deployment_route(conn, statuses) do

@@ -8503,6 +8503,14 @@ const TOOLS = [
       "`thread_unreadable`. It adds refusals `empty_change` (the " +
       "checkpoint's tree equals the base's, or no file changed) and " +
       "`checkpoint_tree_mismatch` (the forge's tree is not the one the claimant recorded). " +
+      "CI IS READ BY THE CHECKPOINT'S EXACT SHA, from both the check-runs and the " +
+      "commit-status APIs, against the source's `required_checks`: a failed one refuses " +
+      "`required_check_failed`, one still running or not yet reported answers `unevaluated` " +
+      "(`required_check_pending` / `required_check_missing`, retry after 60s; only a missing " +
+      "one counts toward the unevaluated bound), a source requiring none refuses " +
+      "`required_checks_unset`, and an evidence read that failed is `ci_evidence_unavailable`. " +
+      "`local-gate` is recorded, never counted. The answer's `ci_evidence` is what was read, " +
+      "and it is copied onto the checkpoint. " +
       "The branch is judged first: a branch missing from a readable repository " +
       "(`branch_missing`), one naming a commit nobody recorded (`branch_head_unrecorded`), " +
       "one naming an earlier checkpoint of the claim (`branch_head_regressed`), or a " +
@@ -8659,7 +8667,8 @@ const TOOLS = [
       "other than those two, null included, is refused. " +
       "The mode is BOUND to each implement dispatch when it is placed: a change affects " +
       "only stories placed afterwards, and a story already placed keeps the mode its " +
-      "dispatch recorded, so a change is always allowed.",
+      "dispatch recorded, so a change is always allowed. A `thread` source must name " +
+      "`required_checks`, the CI checks the merge gate requires on a checkpoint's exact commit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -8707,6 +8716,16 @@ const TOOLS = [
             "later and send checkpoint messages, or every story is refused " +
             "`no_checkpoint_recorded`. Not nullable. Changed later with " +
             "intake_source_update.",
+        },
+        required_checks: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "The CI checks a THREAD-mode checkpoint must pass on its exact commit before the " +
+            "merge gate allows it: check-run names or commit-status contexts as they appear " +
+            "on the commit. A `thread` source must name at least one (422 otherwise); `pr` " +
+            "mode never reads it. At most 20 distinct, non-blank names of at most 200 bytes. " +
+            "`local-gate` is refused: whoever pushed posts it, so it is only recorded.",
         },
         secret_file: {
           type: "string",
@@ -8805,7 +8824,18 @@ const TOOLS = [
             "`pr` or `thread`: whether the merge gate reads a pull request or the story's " +
             "latest recorded thread checkpoint. `thread` needs runners at contract 1.20.0 or " +
             "later sending checkpoint messages, or every story is refused " +
-            "`no_checkpoint_recorded`. Not nullable. Omit to leave the current value alone.",
+            "`no_checkpoint_recorded`. Not nullable. Omit to leave the current value alone. " +
+            "Switching to `thread` needs `required_checks` on the source (send both).",
+        },
+        required_checks: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "The CI checks a THREAD-mode checkpoint must pass on its exact commit before the " +
+            "merge gate allows it: check-run names or commit-status contexts as they appear " +
+            "on the commit. A `thread` source must name at least one (422 otherwise); `pr` " +
+            "mode never reads it. At most 20 distinct, non-blank names of at most 200 bytes. " +
+            "`local-gate` is refused. Omit to leave the current list alone.",
         },
       },
       required: ["source_id"],

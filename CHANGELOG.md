@@ -6,6 +6,24 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A thread-mode merge requires green CI on the checkpoint's exact commit (epic 45, US-45.6,
+  migration `20260927100000`). A THREAD-mode source must now name its `required_checks`, and
+  the gate's `GITHUB_TOKEN` needs `checks: read` and `commit statuses: read` for it.** The
+  migration adds `intake_sources.required_checks` (text array, NOT NULL, default empty; no
+  backfill). `POST`/`PATCH /api/v1/intake/sources` and the `intake_source_enroll` /
+  `intake_source_update` MCP tools take it; a `thread` source naming none is 422, judged over
+  the source as it will be, `local-gate` is refused, and a change is recorded as
+  `intake_source_required_checks_set` on the audit chain. **A thread-mode source enrolled
+  before this migration has no required checks and every one of its stories is refused
+  `required_checks_unset` until one is named.** The merge gate reads the checkpoint's commit
+  from both the check-runs and the commit-status APIs: a failed required check refuses
+  `required_check_failed`; one still running or not yet reported answers `unevaluated`
+  (`required_check_pending` / `required_check_missing`, `Retry-After: 60`), and only a missing
+  one counts toward the unevaluated bound; a failed read is `ci_evidence_unavailable`. A
+  `local-gate` status is recorded and never satisfies a required check. What was read is
+  returned as `ci_evidence` and copied onto the checkpoint's `gate_evidence` under `ci`; an
+  allow whose copy did not land is refused `ci_evidence_not_recorded`. MCP server 2.108.0.
+
 - **Review on a change thread (epic 45, US-45.3, runner contract 1.21.0, migration
   `20260926160000`). RE-VENDOR the contract and declare `review` to take review dispatches.**
   `POST /api/v1/stories/:id/thread/reviews` (orchestrator or above, human-anchored tenants)

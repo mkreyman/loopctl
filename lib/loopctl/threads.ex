@@ -470,6 +470,42 @@ defmodule Loopctl.Threads do
     )
   end
 
+  @doc """
+  Copies the merge gate's evidence onto a checkpoint (US-45.6, AC-45.6.1): `record` is stored
+  under `key` in the checkpoint's `gate_evidence`, replacing that key and leaving every other
+  one. Idempotent, so a re-evaluation overwrites with what it read last.
+
+  Not a thread WRITE in the claimant's sense — the gate, not a principal, records what the
+  forge said about a commit — so it takes no story lock and no claim fence. Its lock wait is
+  bounded and contention is `{:error, :busy}`, counted as `[:loopctl, :threads, :busy]`.
+  `{:error, :not_found}` when the story has no such checkpoint.
+  """
+  @spec record_gate_evidence(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) ::
+          :ok | {:error, :not_found | term()}
+  def record_gate_evidence(tenant_id, story_id, checkpoint_id, key, record)
+      when is_binary(key) and is_map(record) do
+    Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "gate evidence write", fn ->
+      tenant_id
+      |> Repo.with_tenant(fn ->
+        Capacity.set_lock_timeout!(Repo)
+
+        from(c in Checkpoint,
+          where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
+          where: c.story_id == ^story_id,
+          update: [
+            set: [gate_evidence: fragment("? || ?", c.gate_evidence, ^%{key => record})]
+          ]
+        )
+        |> Repo.update_all([])
+      end)
+      |> case do
+        {:ok, {1, _}} -> :ok
+        {:ok, {0, _}} -> {:error, :not_found}
+        {:error, _reason} = error -> error
+      end
+    end)
+  end
+
   defp locked_story(tenant_id, story_id),
     do: Repo.one(story_query(tenant_id, story_id) |> lock("FOR SHARE"))
 

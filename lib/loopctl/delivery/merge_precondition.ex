@@ -257,6 +257,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   require Logger
 
   alias Loopctl.Delivery.CheckpointSource
+  alias Loopctl.Delivery.CiEvidence
   alias Loopctl.Delivery.Claimant
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.GateAInput
@@ -317,7 +318,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
           optional(:checkpoint) => fact(map()),
           # Whether the claimant can still record a checkpoint (`Claimant.live?/2`). Absent is
           # NOT live: a thread-mode head that moved then escalates rather than looping.
-          optional(:claim_live?) => boolean()
+          optional(:claim_live?) => boolean(),
+          # THREAD mode (US-45.6): the checks the source requires, and what CI said about the
+          # checkpoint's exact commit (`{:ok, nil}` where nothing was read).
+          optional(:required_checks) => [String.t()],
+          optional(:ci_evidence) => fact(map() | nil)
         }
 
   @type error :: :not_found | :no_stage | :wrong_stage
@@ -380,7 +385,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
       recorded_head_sha: Map.get(facts, :recorded_head_sha),
       mode: mode(facts),
       checkpoint_id: checkpoint_field(facts, :id),
-      checkpoint_sha: checkpoint_field(facts, :commit_sha)
+      checkpoint_sha: checkpoint_field(facts, :commit_sha),
+      ci_evidence: ci_record(facts)
     }
 
     # Computed ONCE, from the facts, and handed to every step that turns on it.
@@ -435,7 +441,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
           base
           | decision: :unevaluated,
             reasons: Enum.uniq(transient ++ other ++ carried),
-            retry_after: longest_retry_after(transient)
+            retry_after: longest_retry_after(transient) || ci_wait_retry_after(transient)
         }
 
       {[], [_ | _] = broken} ->
@@ -554,9 +560,38 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @spec enforce(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: {:ok, Verdict.t()} | {:error, error()}
   def enforce(tenant_id, story_id, opts) do
     with {:ok, verdict} <- evaluate(tenant_id, story_id, opts) do
-      {:ok, act(tenant_id, story_id, verdict, opts)}
+      {:ok, act(tenant_id, story_id, verdict, opts) |> note_ci_evidence(tenant_id, story_id)}
     end
   end
+
+  # AC-45.6.1: the CI evidence the verdict read is copied onto the checkpoint it was read
+  # for, whatever the decision, so the thread shows why a checkpoint did or did not merge.
+  # An allow has ALREADY copied it (`record_allow/4`, where a copy that does not land is a
+  # refusal); for any other decision a copy that does not land is logged and changes nothing,
+  # because the decision it would explain was not an authorisation.
+  defp note_ci_evidence(%Verdict{decision: :allow} = verdict, _tenant_id, _story_id),
+    do: verdict
+
+  defp note_ci_evidence(%Verdict{} = verdict, tenant_id, story_id) do
+    case copy_ci_evidence(tenant_id, story_id, verdict) do
+      :ok ->
+        verdict
+
+      {:error, reason} ->
+        Logger.warning(
+          "merge_gate ci evidence not recorded story_id=#{story_id} tenant_id=#{tenant_id} " <>
+            "checkpoint_id=#{verdict.checkpoint_id} reason=#{inspect(reason)}"
+        )
+
+        verdict
+    end
+  end
+
+  defp copy_ci_evidence(tenant_id, story_id, %Verdict{ci_evidence: %{} = record} = verdict)
+       when is_binary(verdict.checkpoint_id),
+       do: Threads.record_gate_evidence(tenant_id, story_id, verdict.checkpoint_id, "ci", record)
+
+  defp copy_ci_evidence(_tenant_id, _story_id, %Verdict{}), do: :ok
 
   # -- the judgement (pure) --------------------------------------------------------------
 
@@ -571,12 +606,14 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @thread_input_facts [
     {:repo, :repository_unresolved},
     {:checkpoint, :thread_unreadable},
-    {:pull_request, :pull_request_unavailable}
+    {:pull_request, :pull_request_unavailable},
+    {:ci_evidence, :ci_evidence_unavailable}
   ]
 
   @forge_facts [
     {:checkpoint, :thread_unreadable},
     {:pull_request, :pull_request_unavailable},
+    {:ci_evidence, :ci_evidence_unavailable},
     {:head_files, :head_files_unavailable},
     {:base_files, :base_files_unavailable}
   ]
@@ -619,11 +656,79 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp input_reason(kind, reason), do: {kind, reason}
 
   defp unevaluated_reasons(facts, moved) do
-    for {key, kind} <- consumed_facts(facts, moved),
-        reason = error_reason(facts, key),
-        transient?(reason),
-        do: {kind, reason}
+    forge =
+      for {key, kind} <- consumed_facts(facts, moved),
+          reason = error_reason(facts, key),
+          transient?(reason),
+          do: {kind, reason}
+
+    forge ++ ci_wait_reasons(facts, moved)
   end
+
+  # US-45.6: a required check still running, or not reported on the commit at all, is not a
+  # verdict: the gate answers `:unevaluated` and the loop asks again. Only on the path that
+  # would otherwise be JUDGED (nothing moved, nothing merged), and only when no required
+  # check has already FAILED — a failure is decisive whatever is still running, and is
+  # refused by `thread_reasons/2`.
+  defp ci_wait_reasons(facts, moved) do
+    with :thread <- mode(facts),
+         [] <- moved,
+         %{merged?: false} <- value(facts, :pull_request),
+         %{failed: [], pending: pending, missing: missing} <- ci_result(facts) do
+      Enum.map(pending, &{:required_check_pending, &1}) ++
+        Enum.map(missing, &{:required_check_missing, &1})
+    else
+      _judged_elsewhere -> []
+    end
+  end
+
+  # A CI wait asks again after a minute: a check run takes minutes, and a tighter loop only
+  # spends the forge's rate limit.
+  @ci_wait_retry_after 60
+
+  defp ci_wait_retry_after(transient) do
+    if Enum.any?(transient, &ci_wait?/1), do: @ci_wait_retry_after
+  end
+
+  defp ci_wait?({kind, _name}), do: kind in [:required_check_pending, :required_check_missing]
+  defp ci_wait?(_reason), do: false
+
+  @doc """
+  Whether an `:unevaluated` verdict counts toward `max_consecutive_unevaluated/0`: every one
+  does EXCEPT one whose only waits are required checks still RUNNING (US-45.6). A check run
+  ends on its own (GitHub times a job out), so a slow CI is not a fault the bound exists to
+  surface, and counting it would escalate every story whose CI outlasts a few polls. A check
+  MISSING from the commit still counts: one that never appears is a workflow that does not
+  run on the thread's branch, which a human has to fix.
+  """
+  @spec counts_toward_unevaluated_bound?(Verdict.t()) :: boolean()
+  def counts_toward_unevaluated_bound?(%Verdict{reasons: reasons}) do
+    not Enum.any?(reasons, &match?({:required_check_pending, _}, &1)) or
+      Enum.any?(reasons, fn
+        {:required_check_missing, _name} -> true
+        {_kind, reason} -> transient?(reason)
+        _other -> false
+      end)
+  end
+
+  defp ci_result(facts) do
+    case value(facts, :ci_evidence) do
+      %{evidence: evidence} -> CiEvidence.judge(required_checks(facts), evidence)
+      _not_read -> nil
+    end
+  end
+
+  defp ci_record(facts) do
+    case {value(facts, :ci_evidence), ci_result(facts)} do
+      {%{evidence: evidence, sha: sha, read_at: read_at}, %{} = result} ->
+        CiEvidence.to_record(sha, required_checks(facts), evidence, result, read_at)
+
+      _not_read ->
+        nil
+    end
+  end
+
+  defp required_checks(facts), do: Map.get(facts, :required_checks, [])
 
   # A branch that reads neither file list must not be judged on one. Both the merged branch
   # and the head-moved branch decide from the pull request alone, so a rate-limited tree
@@ -828,9 +933,26 @@ defmodule Loopctl.Delivery.MergePrecondition do
       tree = Map.get(pr, :head_tree_sha)
 
       tree_reasons(tree, checkpoint_field(facts, :tree_sha)) ++
-        empty_change_reasons(tree, Map.get(pr, :base_tree_sha), Map.get(pr, :diffstat))
+        empty_change_reasons(tree, Map.get(pr, :base_tree_sha), Map.get(pr, :diffstat)) ++
+        ci_reasons(facts)
     else
       []
+    end
+  end
+
+  # US-45.6: a thread merges with no forge rule holding it to green CI, so a source that
+  # requires nothing would merge whatever CI said; and a required check that FAILED on the
+  # checkpoint's exact commit refuses. Waits are `ci_wait_reasons/2`'s.
+  defp ci_reasons(facts) do
+    cond do
+      CiEvidence.lookup_names(required_checks(facts)) == [] ->
+        [:required_checks_unset]
+
+      result = ci_result(facts) ->
+        for {name, why} <- result.failed, do: {:required_check_failed, name, why}
+
+      true ->
+        []
     end
   end
 
@@ -1172,7 +1294,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # `trio_outputs` is recorded as having done so, and nothing it sent is read.
       gate_a_input: GateAInput.for_story(story.tenant_id, story.id),
       trio_outputs_ignored: Keyword.has_key?(opts, :trio_outputs),
-      effect_proof: Keyword.get(opts, :effect_proof)
+      effect_proof: Keyword.get(opts, :effect_proof),
+      # The CURRENT source's policy, as the gate triggers are: tightening what a thread must
+      # pass applies to the next evaluation, never only to later placements (US-45.6).
+      required_checks: source_required_checks(source)
     }
 
     # NOT fetched when the decision will not read them: the merged branch and a moved head
@@ -1185,9 +1310,35 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
     Map.merge(facts, %{
       head_files: repo_files(repo, pull_request, :head_sha, skip?),
-      base_files: repo_files(repo, pull_request, :merge_base_sha, skip?)
+      base_files: repo_files(repo, pull_request, :merge_base_sha, skip?),
+      ci_evidence: ci_evidence(facts, pull_request, skip?)
     })
   end
+
+  defp source_required_checks({:ok, %{required_checks: checks}}) when is_list(checks), do: checks
+  defp source_required_checks(_no_source), do: []
+
+  # US-45.6: the evidence for the CHECKPOINT'S exact commit, never the branch head's or a
+  # parent's. Read only where a thread is about to be judged: a moved head or a merged
+  # checkpoint decides without it, and a source requiring nothing is refused without a read.
+  defp ci_evidence(%{mode: :thread} = facts, {:ok, %{merged?: false}}, false = _skip?) do
+    names = CiEvidence.lookup_names(facts.required_checks)
+
+    # A repository or checkpoint that could not be read is already refused as itself; only
+    # the evidence read's OWN failure is this fact's.
+    with {:ok, repo} <- facts.repo,
+         {:ok, %{commit_sha: sha}} <- facts.checkpoint,
+         [_ | _] <- names do
+      case source().check_evidence(repo, sha, names) do
+        {:ok, evidence} -> {:ok, %{evidence: evidence, sha: sha, read_at: DateTime.utc_now()}}
+        {:error, _reason} = error -> error
+      end
+    else
+      _nothing_to_read -> {:ok, nil}
+    end
+  end
+
+  defp ci_evidence(_facts, _pull_request, _skip?), do: {:ok, nil}
 
   defp fetch_story(tenant_id, story_id) do
     case Stories.get_story(tenant_id, story_id) do
@@ -1342,7 +1493,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # The same shape for the unevaluated backstop: past the bound it stops being "retry" and
   # becomes a refusal, which escalates through the ordinary path.
   defp act(tenant_id, story_id, %Verdict{decision: :unevaluated} = verdict, opts) do
-    case note_unevaluated(tenant_id, story_id, verdict, opts) do
+    counted =
+      if counts_toward_unevaluated_bound?(verdict),
+        do: note_unevaluated(tenant_id, story_id, verdict, opts),
+        else: verdict
+
+    case counted do
       %Verdict{decision: :unevaluated} = waiting -> waiting
       %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
     end
@@ -1366,6 +1522,22 @@ defmodule Loopctl.Delivery.MergePrecondition do
       |> Keyword.take([:claim_epoch, :actor_label])
       |> Keyword.merge(allow_event_data(verdict))
 
+    # The evidence an allow rests on is recorded BEFORE the allow, and an allow whose evidence
+    # did not land is not an allow: a thread-mode merge is licensed by green CI on the exact
+    # commit, and the thread must be able to show it (AC-45.6.1).
+    with :ok <- evidence_for_allow(tenant_id, story_id, verdict) do
+      write_allow(tenant_id, story_id, verdict, head, write_opts, opts)
+    end
+  end
+
+  defp evidence_for_allow(tenant_id, story_id, verdict) do
+    case copy_ci_evidence(tenant_id, story_id, verdict) do
+      :ok -> :ok
+      {:error, reason} -> refuse(verdict, [{:ci_evidence_not_recorded, reason}])
+    end
+  end
+
+  defp write_allow(tenant_id, story_id, verdict, head, write_opts, opts) do
     case Stages.record_effect(tenant_id, story_id, :merge_gate_allowed_sha, head, write_opts) do
       {:ok, _row} ->
         clear_unevaluated(tenant_id, story_id, verdict, opts)

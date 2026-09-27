@@ -42,6 +42,7 @@ defmodule Loopctl.Intake.Source do
              :repo_full_name,
              :base_branch,
              :mode,
+             :required_checks,
              :target_epic_id,
              :revoked_at,
              :inserted_at,
@@ -72,6 +73,13 @@ defmodule Loopctl.Intake.Source do
     # is the change-thread route, where the gate reads the story's latest RECORDED checkpoint
     # and no pull request exists. NOT NULL, default `:pr`, so an existing source is unchanged.
     field :mode, Ecto.Enum, values: [:pr, :thread], default: :pr
+
+    # THE CHECKS A THREAD-MODE CHECKPOINT MUST PASS ON ITS EXACT COMMIT (US-45.6). A pull
+    # request's required checks are its base branch's protection, enforced by GitHub at merge
+    # time; a thread has no pull request and the loopctl App pushes the squash itself, so the
+    # merge gate reads the checks by SHA and this names which ones it requires. Check-run
+    # names or commit-status contexts, as they appear on the commit. `pr` mode never reads it.
+    field :required_checks, {:array, :string}, default: []
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
     field :revoked_at, :utc_datetime_usec
 
@@ -104,8 +112,10 @@ defmodule Loopctl.Intake.Source do
     # By PRESENCE, as the branch is: absent keeps the `:pr` default, and a caller that names
     # the field gets its value validated rather than a silent substitution.
     |> cast(attrs, [:mode], empty_values: [])
+    |> cast(attrs, [:required_checks], empty_values: [])
     |> validate_required([:repo_full_name])
     |> validate_mode()
+    |> validate_required_checks()
     |> validate_base_branch()
     |> validate_format(:repo_full_name, @repo_format, message: "must be owner/name")
     |> check_constraint(:repo_full_name, name: :intake_sources_repo_shape)
@@ -157,6 +167,69 @@ defmodule Loopctl.Intake.Source do
     changeset
     |> validate_required([:mode])
     |> check_constraint(:mode, name: :intake_sources_mode)
+  end
+
+  # The status a session posts about its OWN work (claude-config#677). On the thread path it
+  # is the implementer attesting itself, the shape chain of custody refuses (PRD §5), so it is
+  # recorded on the checkpoint and can never be a required check.
+  @local_gate "local-gate"
+  @max_required_checks 20
+  @max_check_name_bytes 200
+
+  @doc "The status context a session's own local gate posts; never requirable."
+  @spec local_gate() :: String.t()
+  def local_gate, do: @local_gate
+
+  @doc """
+  Everything `required_checks` must satisfy, for every path that writes it (US-45.6):
+
+  - a list of at most #{@max_required_checks} distinct, non-blank names of at most
+    #{@max_check_name_bytes} bytes each
+  - never `#{@local_gate}`: that status is posted by whoever pushed, so on the thread path it
+    is the implementer attesting its own work
+  - NON-EMPTY when the source is `thread`-mode: a thread merges with no pull request and no
+    forge rule, so a source requiring nothing would merge whatever CI said
+
+  Runs over the source as it WILL BE, so an update naming only `mode` or only
+  `required_checks` is judged together with the field it did not name.
+  """
+  @spec validate_required_checks(Ecto.Changeset.t()) :: Ecto.Changeset.t()
+  def validate_required_checks(%Ecto.Changeset{} = changeset) do
+    changeset
+    |> validate_required([:required_checks])
+    |> validate_length(:required_checks, max: @max_required_checks)
+    |> validate_change(:required_checks, fn :required_checks, names -> check_names(names) end)
+    |> validate_thread_requires_checks()
+  end
+
+  defp check_names(names) do
+    cond do
+      Enum.any?(names, &(String.trim(&1) == "" or byte_size(&1) > @max_check_name_bytes)) ->
+        [required_checks: "each name must be 1 to #{@max_check_name_bytes} bytes and not blank"]
+
+      @local_gate in names ->
+        [
+          required_checks:
+            {"#{@local_gate} is posted by whoever pushed and can never be a required check",
+             [validation: :local_gate_not_requirable]}
+        ]
+
+      Enum.uniq(names) != names ->
+        [required_checks: "names must be distinct"]
+
+      true ->
+        []
+    end
+  end
+
+  defp validate_thread_requires_checks(changeset) do
+    if get_field(changeset, :mode) == :thread and get_field(changeset, :required_checks) == [] do
+      add_error(changeset, :required_checks, "a thread-mode source must name at least one",
+        validation: :required_for_thread
+      )
+    else
+      changeset
+    end
   end
 
   @doc "The modes a source may take."

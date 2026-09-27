@@ -39,6 +39,9 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     be read (the verdict is then `:unevaluated`)
   - `checkpoint_id`, `checkpoint_sha` — THREAD mode: the recorded checkpoint judged. An allow
     in thread mode is recorded naming both
+  - `ci_evidence` — THREAD mode (US-45.6): what CI said about the checkpoint's exact commit,
+    as `Loopctl.Delivery.CiEvidence.to_record/5` shapes it, and what `enforce/3` copies onto
+    the checkpoint's `gate_evidence`. nil when it was not read
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
     request that was merged before this evaluation ran
   - `diffstat` — `%{files: n, changed_lines: n}`. In pr mode the forge's own totals, never
@@ -78,6 +81,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :recorded_head_sha,
     :checkpoint_id,
     :checkpoint_sha,
+    :ci_evidence,
     mode: :pr,
     custody: nil,
     gate_a_inputs: :missing,
@@ -105,6 +109,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           recorded_head_sha: String.t() | nil,
           mode: :pr | :thread | nil,
           checkpoint_id: Ecto.UUID.t() | nil,
-          checkpoint_sha: String.t() | nil
+          checkpoint_sha: String.t() | nil,
+          ci_evidence: map() | nil
         }
 end

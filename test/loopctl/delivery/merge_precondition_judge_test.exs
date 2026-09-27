@@ -1200,6 +1200,100 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     end
   end
 
+  describe "CI evidence on the checkpoint's exact commit (US-45.6)" do
+    test "a failed required check refuses, naming it and its conclusion" do
+      verdict =
+        judge_thread(ci: %{check_runs: [run("test", "completed", "failure")], statuses: []})
+
+      assert verdict.decision == :refuse
+      assert {:required_check_failed, "test", "failure"} in verdict.reasons
+    end
+
+    test "a pending required check is unevaluated, retried after a minute, never allowed" do
+      verdict = judge_thread(ci: %{check_runs: [run("test", "in_progress", nil)], statuses: []})
+
+      assert verdict.decision == :unevaluated
+      assert {:required_check_pending, "test"} in verdict.reasons
+      assert verdict.retry_after == 60
+    end
+
+    test "a required check missing from the commit is unevaluated, never allowed" do
+      verdict = judge_thread(ci: %{check_runs: [], statuses: []})
+
+      assert verdict.decision == :unevaluated
+      assert {:required_check_missing, "test"} in verdict.reasons
+    end
+
+    test "a failure decides even while another required check is still running" do
+      ci = %{
+        check_runs: [run("test", "completed", "failure"), run("lint", "queued", nil)],
+        statuses: []
+      }
+
+      verdict = judge_thread(required_checks: ["test", "lint"], ci: ci)
+
+      assert verdict.decision == :refuse
+      assert {:required_check_failed, "test", "failure"} in verdict.reasons
+      refute {:required_check_pending, "lint"} in verdict.reasons
+    end
+
+    # TC-45.6.2: the local gate alone never satisfies a required check.
+    test "only a local-gate success is not an allow" do
+      ci = %{check_runs: [], statuses: [%{context: "local-gate", state: "success"}]}
+      verdict = judge_thread(ci: ci)
+
+      assert verdict.decision == :unevaluated
+      assert {:required_check_missing, "test"} in verdict.reasons
+      assert verdict.ci_evidence["local_gate"] == "success"
+    end
+
+    test "a thread source requiring no check is refused, not allowed" do
+      verdict = judge_thread(required_checks: [])
+
+      assert verdict.decision == :refuse
+      assert :required_checks_unset in verdict.reasons
+
+      # `local-gate` alone is the same as nothing: it is never looked up.
+      assert :required_checks_unset in judge_thread(required_checks: ["local-gate"]).reasons
+    end
+
+    test "an evidence read that failed transiently is unevaluated; otherwise it refuses" do
+      transient = judge_thread([], ci_evidence: {:error, {:github_unreachable, :timeout}})
+      assert transient.decision == :unevaluated
+      assert {:ci_evidence_unavailable, {:github_unreachable, :timeout}} in transient.reasons
+
+      broken = judge_thread([], ci_evidence: {:error, {:check_runs_truncated, 120, 100}})
+      assert broken.decision == :refuse
+      assert {:ci_evidence_unavailable, {:check_runs_truncated, 120, 100}} in broken.reasons
+    end
+
+    test "an allow carries the evidence it rests on, for enforce/3 to copy" do
+      verdict = judge_thread([])
+
+      assert verdict.decision == :allow
+      assert %{"sha" => @head, "passed" => ["test"], "required" => ["test"]} = verdict.ci_evidence
+    end
+
+    test "a pr-mode verdict reads and carries no CI evidence" do
+      verdict = judge([])
+
+      assert verdict.mode == :pr
+      assert verdict.ci_evidence == nil
+      refute :required_checks_unset in verdict.reasons
+    end
+
+    test "only a wait on RUNNING checks is left out of the unevaluated bound" do
+      pending = judge_thread(ci: %{check_runs: [run("test", "queued", nil)], statuses: []})
+      refute MergePrecondition.counts_toward_unevaluated_bound?(pending)
+
+      missing = judge_thread(ci: %{check_runs: [], statuses: []})
+      assert MergePrecondition.counts_toward_unevaluated_bound?(missing)
+
+      forge = judge_thread([], ci_evidence: {:error, {:github_unreachable, :timeout}})
+      assert MergePrecondition.counts_toward_unevaluated_bound?(forge)
+    end
+  end
+
   # The facts of a thread story at its latest recorded checkpoint, as `gather/3` resolves them
   # through `Loopctl.Delivery.CheckpointSource`.
   defp judge_thread(overrides, fact_overrides \\ []) do
@@ -1232,11 +1326,21 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     |> Map.merge(%{
       mode: Keyword.get(overrides, :mode, :thread),
       checkpoint: {:ok, checkpoint},
-      claim_live?: Keyword.get(overrides, :claim_live?, true)
+      claim_live?: Keyword.get(overrides, :claim_live?, true),
+      required_checks: Keyword.get(overrides, :required_checks, ["test"]),
+      ci_evidence: {:ok, ci_read(Keyword.get(overrides, :ci, green_ci()))}
     })
     |> Map.merge(Map.new(fact_overrides))
     |> MergePrecondition.judge()
   end
+
+  # US-45.6: the checkpoint commit's CI as `gather/3` reads it.
+  defp green_ci, do: %{check_runs: [run("test", "completed", "success")], statuses: []}
+
+  defp run(name, status, conclusion), do: %{name: name, status: status, conclusion: conclusion}
+
+  defp ci_read(evidence),
+    do: %{evidence: evidence, sha: @head, read_at: ~U[2026-09-27 10:00:00Z]}
 
   defp judge(opts), do: opts |> facts() |> MergePrecondition.judge()
 

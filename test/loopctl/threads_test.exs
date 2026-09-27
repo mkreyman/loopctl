@@ -254,6 +254,61 @@ defmodule Loopctl.ThreadsTest do
     end
   end
 
+  describe "record_gate_evidence/5 (US-45.6)" do
+    test "stores the record under its key and keeps every other key" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+
+      assert :ok =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "other", %{
+                 "a" => 1
+               })
+
+      assert :ok =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", %{
+                 "sha" => @sha1
+               })
+
+      assert :ok =
+               Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", %{
+                 "sha" => @sha2
+               })
+
+      assert %{"other" => %{"a" => 1}, "ci" => %{"sha" => @sha2}} = stored_evidence(ctx, cp.id)
+    end
+
+    test "another story's checkpoint, or another tenant's, is not_found and untouched" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+      other = claimed_story()
+
+      assert {:error, :not_found} =
+               Threads.record_gate_evidence(ctx.tenant_id, other.story.id, cp.id, "ci", %{
+                 "x" => 1
+               })
+
+      assert {:error, :not_found} =
+               Threads.record_gate_evidence(other.tenant_id, ctx.story.id, cp.id, "ci", %{
+                 "x" => 1
+               })
+
+      assert stored_evidence(ctx, cp.id) == %{}
+    end
+  end
+
+  defp stored_evidence(ctx, checkpoint_id) do
+    {:ok, evidence} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        Repo.one!(
+          from c in Loopctl.Threads.Checkpoint,
+            where: c.id == ^checkpoint_id,
+            select: c.gate_evidence
+        )
+      end)
+
+    evidence
+  end
+
   describe "entries" do
     test "a retry of the same write is the same entry; another author's key is distinct" do
       ctx = claimed_story()
