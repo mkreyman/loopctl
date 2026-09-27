@@ -18,8 +18,13 @@ All notable changes to loopctl are documented here.
   `required_checks_unset` until one is named.** The merge gate reads the checkpoint's commit
   from both the check-runs and the commit-status APIs: a failed required check refuses
   `required_check_failed`; one still running or not yet reported answers `unevaluated`
-  (`required_check_pending` / `required_check_missing`, `Retry-After: 60`), and only a missing
-  one counts toward the unevaluated bound; a failed read is `ci_evidence_unavailable`. A
+  (`required_check_pending` / `required_check_missing`, `Retry-After: 60`); neither counts
+  toward the unevaluated bound, and six hours after the checkpoint was recorded both are
+  refused `required_check_timed_out`. Only the latest result under a name counts. A failed
+  read is `ci_evidence_unavailable`. The required checks are BOUND AT PLACEMENT (migration
+  `20260927100100` adds `runner_dispatches.required_checks`, nullable, no backfill; a row
+  without it reads the source's current list), so changing a source's list reaches only
+  stories placed afterwards. A
   `local-gate` status is recorded and never satisfies a required check. What was read is
   returned as `ci_evidence` and copied onto the checkpoint's `gate_evidence` under `ci`; an
   allow whose copy did not land is refused `ci_evidence_not_recorded`. MCP server 2.108.0.

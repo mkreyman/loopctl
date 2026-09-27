@@ -8506,8 +8506,10 @@ const TOOLS = [
       "CI IS READ BY THE CHECKPOINT'S EXACT SHA, from both the check-runs and the " +
       "commit-status APIs, against the source's `required_checks`: a failed one refuses " +
       "`required_check_failed`, one still running or not yet reported answers `unevaluated` " +
-      "(`required_check_pending` / `required_check_missing`, retry after 60s; only a missing " +
-      "one counts toward the unevaluated bound), a source requiring none refuses " +
+      "(`required_check_pending` / `required_check_missing`, retry after 60s; neither counts " +
+      "toward the unevaluated bound, and six hours after the checkpoint was recorded both " +
+      "are refused `required_check_timed_out`; only the latest result under a name counts, " +
+      "and the checks are the ones bound at placement), a source requiring none refuses " +
       "`required_checks_unset`, and an evidence read that failed is `ci_evidence_unavailable`. " +
       "`local-gate` is recorded, never counted. The answer's `ci_evidence` is what was read, " +
       "and it is copied onto the checkpoint. " +

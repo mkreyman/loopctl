@@ -555,25 +555,45 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
                checkpoint_evidence(ctx)
     end
 
-    test "checks still RUNNING never reach the unevaluated bound; missing ones do", ctx do
-      stub_thread(ctx, ci: %{check_runs: [ci_run("test", nil, "queued")], statuses: []})
+    # Review round 1, findings 1 and 2: a CI wait is bounded in TIME from the checkpoint,
+    # never by polls, so a slow pipeline never escalates and a stuck one still does.
+    test "a CI wait never reaches the unevaluated bound; past the time limit it escalates", ctx do
+      for ci <- [
+            %{check_runs: [ci_run("test", nil, "queued")], statuses: []},
+            %{check_runs: [], statuses: []}
+          ] do
+        stub_thread(ctx, ci: ci)
 
-      for _ <- 1..(MergePrecondition.max_consecutive_unevaluated() + 2) do
-        assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
-      end
-
-      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
-
-      stub_thread(ctx, ci: %{check_runs: [], statuses: []})
-
-      verdicts =
-        for _ <- 1..(MergePrecondition.max_consecutive_unevaluated() + 1) do
-          {:ok, verdict} = enforce(ctx)
-          verdict.decision
+        for _ <- 1..(MergePrecondition.max_consecutive_unevaluated() + 2) do
+          assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
         end
 
-      assert List.last(verdicts) == :refuse
+        assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+      end
+
+      recorded =
+        DateTime.add(DateTime.utc_now(), -(MergePrecondition.ci_wait_limit_seconds() + 60))
+
+      {1, _} =
+        from(c in Loopctl.Threads.Checkpoint, where: c.id == ^ctx.checkpoint.id)
+        |> AdminRepo.update_all(set: [inserted_at: recorded])
+
+      assert {:ok, %Verdict{decision: :refuse} = verdict} = enforce(ctx)
+      assert {:required_check_timed_out, "test", :missing} in verdict.reasons
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    # Review round 1, finding 8: the required checks are the ones bound at placement.
+    test "the required checks are the ones the claim's dispatch was PLACED with", ctx do
+      set_dispatch(ctx, required_checks: ["placed-check"])
+      stub_thread(ctx, ci: %{check_runs: [ci_run("test", "success")], statuses: []})
+
+      assert {:ok, %Verdict{decision: :unevaluated} = verdict} = enforce(ctx)
+      assert {:required_check_missing, "placed-check"} in verdict.reasons
+
+      # A row that recorded none reads the source's current list.
+      set_dispatch(ctx, required_checks: nil)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
     end
 
     test "TC-45.4.3 a branch head nobody reported goes back to implementing, unescalated", ctx do

@@ -1274,6 +1274,22 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert %{"sha" => @head, "passed" => ["test"], "required" => ["test"]} = verdict.ci_evidence
     end
 
+    # Review round 1, finding 4: contention on the evidence write is a retry, not an escalation.
+    test "an allow whose evidence write met contention is unevaluated; other failures refuse" do
+      allowed = judge_thread([])
+
+      busy = MergePrecondition.allow_evidence_outcome(allowed, {:error, :busy})
+      assert busy.decision == :unevaluated
+      assert {:ci_evidence_not_recorded, :busy} in busy.reasons
+      assert MergePrecondition.counts_toward_unevaluated_bound?(busy)
+
+      gone = MergePrecondition.allow_evidence_outcome(allowed, {:error, :not_found})
+      assert gone.decision == :refuse
+      assert {:ci_evidence_not_recorded, :not_found} in gone.reasons
+
+      assert :ok = MergePrecondition.allow_evidence_outcome(allowed, :ok)
+    end
+
     test "a pr-mode verdict reads and carries no CI evidence" do
       verdict = judge([])
 
@@ -1282,15 +1298,36 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       refute :required_checks_unset in verdict.reasons
     end
 
-    test "only a wait on RUNNING checks is left out of the unevaluated bound" do
+    # Review round 1, findings 1 and 2: a CI wait is bounded in TIME, never by polls.
+    test "a CI wait, running or missing, is left out of the unevaluated bound" do
       pending = judge_thread(ci: %{check_runs: [run("test", "queued", nil)], statuses: []})
       refute MergePrecondition.counts_toward_unevaluated_bound?(pending)
 
       missing = judge_thread(ci: %{check_runs: [], statuses: []})
-      assert MergePrecondition.counts_toward_unevaluated_bound?(missing)
+      refute MergePrecondition.counts_toward_unevaluated_bound?(missing)
 
       forge = judge_thread([], ci_evidence: {:error, {:github_unreachable, :timeout}})
       assert MergePrecondition.counts_toward_unevaluated_bound?(forge)
+    end
+
+    test "past the wait limit a check still running or never reported is refused" do
+      recorded = ~U[2026-09-27 00:00:00Z]
+      late = DateTime.add(recorded, MergePrecondition.ci_wait_limit_seconds() + 1)
+      on_time = DateTime.add(recorded, MergePrecondition.ci_wait_limit_seconds())
+
+      stuck = %{check_runs: [run("test", "in_progress", nil)], statuses: []}
+
+      refused = judge_thread([recorded_at: recorded, ci: stuck], now: late)
+      assert refused.decision == :refuse
+      assert {:required_check_timed_out, "test", :pending} in refused.reasons
+
+      never =
+        judge_thread([recorded_at: recorded, ci: %{check_runs: [], statuses: []}], now: late)
+
+      assert {:required_check_timed_out, "test", :missing} in never.reasons
+
+      waiting = judge_thread([recorded_at: recorded, ci: stuck], now: on_time)
+      assert waiting.decision == :unevaluated
     end
   end
 
@@ -1301,7 +1338,8 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       id: @checkpoint_id,
       commit_sha: @head,
       tree_sha: @tree,
-      earlier_shas: Keyword.get(overrides, :earlier_shas, [])
+      earlier_shas: Keyword.get(overrides, :earlier_shas, []),
+      recorded_at: Keyword.get(overrides, :recorded_at)
     }
 
     pr =

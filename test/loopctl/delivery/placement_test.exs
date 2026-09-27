@@ -146,10 +146,13 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert_push "dispatch", pushed, @reply_timeout
       refute Map.has_key?(pushed, :mode)
       refute Map.has_key?(pushed, :placed_mode)
+      refute Map.has_key?(pushed, :placed_required_checks)
 
       row = unboxed(fn -> DispatchLedger.get_record(runner.tenant_id, placed.dispatch_id) end)
       assert row.mode == "thread"
       assert row.base_branch == "master"
+      # US-45.6 round 1, finding 8: the required checks are bound beside the mode.
+      assert row.required_checks == ["test"]
     end
 
     test "a caller that named repo and base_branch still binds the source's mode", ctx do
@@ -2141,6 +2144,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       repo_full_name: repo,
       base_branch: "master",
       mode: mode,
+      required_checks: if(mode == :thread, do: ["test"], else: []),
       webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
       inserted_at: now,
       updated_at: now

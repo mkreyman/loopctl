@@ -53,12 +53,30 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
              judge(["test"], [run("lint", "completed", "success")])
   end
 
-  test "a failure anywhere under a name decides it, then anything still running" do
-    runs = [run("test", "completed", "success"), run("test", "completed", "failure")]
-    assert %{failed: [{"test", "failure"}], passed: []} = judge(["test"], runs)
+  # Review round 1, finding 5: only the LATEST result under a name counts, as GitHub's own
+  # required-check rule judges it.
+  test "among runs of one name the highest id decides, whatever it concluded" do
+    old_fail = Map.put(run("test", "completed", "failure"), :id, 1)
+    new_pass = Map.put(run("test", "completed", "success"), :id, 2)
+    assert %{passed: ["test"], failed: []} = judge(["test"], [new_pass, old_fail])
 
-    runs = [run("test", "completed", "success"), run("test", "in_progress")]
-    assert %{pending: ["test"], passed: []} = judge(["test"], runs)
+    rerun = Map.put(run("test", "queued"), :id, 3)
+    assert %{pending: ["test"], passed: []} = judge(["test"], [new_pass, rerun])
+  end
+
+  test "between a run and a status of one name the later one decides" do
+    stale_status = %{context: "test", state: "failure", at: "2026-09-27T09:00:00Z"}
+
+    green_run =
+      Map.merge(run("test", "completed", "success"), %{completed_at: "2026-09-27T10:00:00Z"})
+
+    assert %{passed: ["test"]} = judge(["test"], [green_run], [stale_status])
+
+    newer_status = %{stale_status | at: "2026-09-27T11:00:00Z"}
+    assert %{failed: [{"test", "failure"}]} = judge(["test"], [green_run], [newer_status])
+
+    # A run with no timestamp was just queued: nothing is newer.
+    assert %{pending: ["test"]} = judge(["test"], [run("test", "queued")], [newer_status])
   end
 
   test "each required name is judged on its own" do
@@ -92,7 +110,8 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
     record = CiEvidence.to_record("abc", ["test"], evidence, result, ~U[2026-09-27 10:00:00Z])
 
     assert record["sha"] == "abc"
-    assert record["read_at"] == "2026-09-27T10:00:00Z"
+    # Always six fractional digits, so records order correctly as text.
+    assert record["read_at"] == "2026-09-27T10:00:00.000000Z"
     assert record["local_gate"] == "success"
     assert record["failed"] == [%{"name" => "test", "why" => "failure"}]
     assert [%{"name" => "test", "conclusion" => "failure"}] = record["check_runs"]

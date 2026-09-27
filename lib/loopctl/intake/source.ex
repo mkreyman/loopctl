@@ -204,7 +204,9 @@ defmodule Loopctl.Intake.Source do
 
   defp check_names(names) do
     cond do
-      Enum.any?(names, &(String.trim(&1) == "" or byte_size(&1) > @max_check_name_bytes)) ->
+      # `{:array, :string}` casts a JSON null element to nil, so the element type is checked
+      # here, before anything calls a String function on it (a 500 otherwise).
+      not Enum.all?(names, &usable_name?/1) ->
         [required_checks: "each name must be 1 to #{@max_check_name_bytes} bytes and not blank"]
 
       @local_gate in names ->
@@ -221,6 +223,11 @@ defmodule Loopctl.Intake.Source do
         []
     end
   end
+
+  defp usable_name?(name) when is_binary(name),
+    do: String.trim(name) != "" and byte_size(name) <= @max_check_name_bytes
+
+  defp usable_name?(_not_a_string), do: false
 
   defp validate_thread_requires_checks(changeset) do
     if get_field(changeset, :mode) == :thread and get_field(changeset, :required_checks) == [] do

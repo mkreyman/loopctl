@@ -83,6 +83,8 @@ defmodule Loopctl.Runners.DispatchRecord do
     # NULL for every other row and every row older than the column: the merge gate then falls
     # back to the source's current base branch.
     field :base_branch, :string
+    # The CI checks the thread must pass (US-45.6), bound at placement like the mode.
+    field :required_checks, {:array, :string}
     field :status, :string, default: "sent"
     field :reason, :string
     field :reason_detail, :string

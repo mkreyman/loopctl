@@ -210,7 +210,9 @@ defmodule Loopctl.Threads do
                commit_sha: c.commit_sha,
                tree_sha: c.tree_sha,
                claim_epoch: c.claim_epoch,
-               merge_commit_sha: c.merge_commit_sha
+               merge_commit_sha: c.merge_commit_sha,
+               # What a merge gate's CI wait is measured from (US-45.6).
+               inserted_at: c.inserted_at
              }}
       )
 
@@ -473,7 +475,14 @@ defmodule Loopctl.Threads do
   @doc """
   Copies the merge gate's evidence onto a checkpoint (US-45.6, AC-45.6.1): `record` is stored
   under `key` in the checkpoint's `gate_evidence`, replacing that key and leaving every other
-  one. Idempotent, so a re-evaluation overwrites with what it read last.
+  one.
+
+  NEVER OVER A NEWER READ (US-45.6 review round 1, finding 6). Two evaluations can overlap,
+  and the slower one may have read earlier: without a guard it would write a stale "pending"
+  over the green record an allow was granted on. A record carrying `"read_at"` (ISO 8601 UTC,
+  which orders as text) replaces only a stored one read strictly earlier; one read no later
+  than what is stored is answered `:ok` and changes nothing, because the newer record is the
+  one that should stand.
 
   Not a thread WRITE in the claimant's sense — the gate, not a principal, records what the
   forge said about a commit — so it takes no story lock and no claim fence. Its lock wait is
@@ -487,23 +496,48 @@ defmodule Loopctl.Threads do
     Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "gate evidence write", fn ->
       tenant_id
       |> Repo.with_tenant(fn ->
-        Capacity.set_lock_timeout!(Repo)
-
-        from(c in Checkpoint,
-          where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
-          where: c.story_id == ^story_id,
-          update: [
-            set: [gate_evidence: fragment("? || ?", c.gate_evidence, ^%{key => record})]
-          ]
-        )
-        |> Repo.update_all([])
+        write_gate_evidence(tenant_id, story_id, checkpoint_id, key, record)
       end)
       |> case do
-        {:ok, {1, _}} -> :ok
-        {:ok, {0, _}} -> {:error, :not_found}
+        {:ok, answer} -> answer
         {:error, _reason} = error -> error
       end
     end)
+  end
+
+  defp write_gate_evidence(tenant_id, story_id, checkpoint_id, key, record) do
+    Capacity.set_lock_timeout!(Repo)
+    this = evidence_checkpoint(tenant_id, story_id, checkpoint_id)
+
+    written =
+      this
+      |> newer_than_stored(key, Map.get(record, "read_at"))
+      |> update([c],
+        set: [gate_evidence: fragment("? || ?", c.gate_evidence, ^%{key => record})]
+      )
+      |> Repo.update_all([])
+
+    case written do
+      {1, _} -> :ok
+      {0, _} -> if Repo.exists?(this), do: :ok, else: {:error, :not_found}
+    end
+  end
+
+  defp evidence_checkpoint(tenant_id, story_id, checkpoint_id) do
+    from(c in Checkpoint,
+      where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
+      where: c.story_id == ^story_id
+    )
+  end
+
+  defp newer_than_stored(query, _key, nil), do: query
+
+  defp newer_than_stored(query, key, read_at) when is_binary(read_at) do
+    where(
+      query,
+      [c],
+      fragment("coalesce(?->?->>'read_at', '') < ?", c.gate_evidence, ^key, ^read_at)
+    )
   end
 
   defp locked_story(tenant_id, story_id),

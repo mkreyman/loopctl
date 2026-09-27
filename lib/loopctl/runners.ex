@@ -630,7 +630,10 @@ defmodule Loopctl.Runners do
          :ok <- kind_supported(tenant_id, runner_id, meta, dispatch.kind),
          :ok <- not_exhausted(tenant_id, runner_id, dispatch.dispatch_id),
          {:ok, _record} <-
-           DispatchLedger.record_sent(tenant_id, runner_id, dispatch, mode: placed_mode) do
+           DispatchLedger.record_sent(tenant_id, runner_id, dispatch,
+             mode: placed_mode,
+             required_checks: placed_required_checks(payload)
+           ) do
       broadcast_dispatch(tenant_id, runner_id, dispatch)
     end
   end
@@ -641,6 +644,11 @@ defmodule Loopctl.Runners do
     do: Map.get(payload, DispatchPayload.placed_mode_key())
 
   defp placed_mode(_payload), do: nil
+
+  defp placed_required_checks(payload) when is_map(payload),
+    do: Map.get(payload, DispatchPayload.placed_required_checks_key())
+
+  defp placed_required_checks(_payload), do: nil
 
   defp not_exhausted(tenant_id, runner_id, dispatch_id) do
     if usage_exhausted?(tenant_id, runner_id) and

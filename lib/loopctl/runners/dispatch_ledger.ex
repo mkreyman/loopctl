@@ -202,6 +202,8 @@ defmodule Loopctl.Runners.DispatchLedger do
       # dispatch, which has no merge route, and `on_conflict: :nothing` keeps the first send's.
       mode: implement_only(dispatch, Keyword.get(opts, :mode)),
       base_branch: implement_only(dispatch, Map.get(dispatch, :base_branch)),
+      # And the CI checks its thread must pass (US-45.6), from the same source read.
+      required_checks: implement_only(dispatch, Keyword.get(opts, :required_checks)),
       trace_acked_seq: -1,
       wall_clock_seconds: dispatch.wall_clock_seconds,
       # Born holding NO slot: the row is inserted first (that is how a retry is told from a
@@ -959,7 +961,12 @@ defmodule Loopctl.Runners.DispatchLedger do
       where: r.claim_epoch == ^story.claim_epoch and r.status in ^@route_statuses,
       order_by: [desc: r.inserted_at],
       limit: 1,
-      select: %{mode: r.mode, branch: r.branch, base_branch: r.base_branch}
+      select: %{
+        mode: r.mode,
+        branch: r.branch,
+        base_branch: r.base_branch,
+        required_checks: r.required_checks
+      }
     )
     |> where_implement_kind()
   end

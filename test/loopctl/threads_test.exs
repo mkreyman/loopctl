@@ -277,6 +277,22 @@ defmodule Loopctl.ThreadsTest do
       assert %{"other" => %{"a" => 1}, "ci" => %{"sha" => @sha2}} = stored_evidence(ctx, cp.id)
     end
 
+    # Review round 1, finding 6: a slower evaluation that read earlier never overwrites.
+    test "a record read no later than the stored one changes nothing" do
+      ctx = claimed_story()
+      {:ok, cp, :created} = checkpoint(ctx)
+      newer = %{"read_at" => "2026-09-27T10:00:01.000000Z", "passed" => ["test"]}
+      older = %{"read_at" => "2026-09-27T10:00:00.000000Z", "pending" => ["test"]}
+
+      assert :ok = Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", newer)
+      assert :ok = Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", older)
+      assert %{"ci" => ^newer} = stored_evidence(ctx, cp.id)
+
+      newest = %{newer | "read_at" => "2026-09-27T10:00:02.000000Z"}
+      assert :ok = Threads.record_gate_evidence(ctx.tenant_id, ctx.story.id, cp.id, "ci", newest)
+      assert %{"ci" => ^newest} = stored_evidence(ctx, cp.id)
+    end
+
     test "another story's checkpoint, or another tenant's, is not_found and untouched" do
       ctx = claimed_story()
       {:ok, cp, :created} = checkpoint(ctx)

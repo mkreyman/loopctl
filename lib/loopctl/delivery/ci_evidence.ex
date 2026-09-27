@@ -26,8 +26,13 @@ defmodule Loopctl.Delivery.CiEvidence do
     `stale`, `error`) is `:failed`
   - no run and no status under that name is `:missing`
 
-  Where a name has more than one source, a failure anywhere is a failure, then anything still
-  running keeps it pending, and only then does a pass count.
+  ONLY THE LATEST RESULT UNDER A NAME COUNTS, as it does for GitHub's own required-check rule
+  (US-45.6 review round 1, finding 5). Two workflows can each have a job `test`, and an old
+  external status can share a name with a newer Actions run; judging a failure anywhere as
+  decisive refused a green change for ever on the stale one. Among check runs the latest is
+  the highest id (ids only grow, and a re-run queued a moment ago has no timestamp yet); the
+  combined status is already the latest per context. Between a run and a status the later
+  timestamp wins, and a run with no timestamp is the newest there is (it was just queued).
 
   ## The local gate is recorded, never trusted
 
@@ -46,11 +51,15 @@ defmodule Loopctl.Delivery.CiEvidence do
           required(:name) => String.t(),
           required(:status) => String.t(),
           required(:conclusion) => String.t() | nil,
+          optional(:id) => integer() | nil,
+          optional(:started_at) => String.t() | nil,
+          optional(:completed_at) => String.t() | nil,
           optional(:url) => String.t() | nil
         }
   @type status :: %{
           required(:context) => String.t(),
           required(:state) => String.t(),
+          optional(:at) => String.t() | nil,
           optional(:url) => String.t() | nil
         }
   @type evidence :: %{check_runs: [check_run()], statuses: [status()]}
@@ -86,17 +95,28 @@ defmodule Loopctl.Delivery.CiEvidence do
   end
 
   defp check_state(name, runs, statuses) do
-    states =
-      for(%{name: ^name} = run <- runs, do: run_state(run)) ++
-        for %{context: ^name} = status <- statuses, do: status_state(status)
+    run = runs |> Enum.filter(&(&1.name == name)) |> Enum.max_by(&run_order/1, fn -> nil end)
+    status = Enum.find(statuses, &(&1.context == name))
 
-    cond do
-      states == [] -> :missing
-      failed = Enum.find(states, &match?({:failed, _}, &1)) -> failed
-      :pending in states -> :pending
-      true -> :passed
+    case {run, status} do
+      {nil, nil} -> :missing
+      {run, nil} -> run_state(run)
+      {nil, status} -> status_state(status)
+      {run, status} -> if run_newer?(run, status), do: run_state(run), else: status_state(status)
     end
   end
+
+  defp run_order(run), do: Map.get(run, :id) || 0
+
+  defp run_newer?(run, status) do
+    case {run_at(run), Map.get(status, :at)} do
+      {nil, _status_at} -> true
+      {_run_at, nil} -> true
+      {run_at, status_at} -> run_at >= status_at
+    end
+  end
+
+  defp run_at(run), do: Map.get(run, :completed_at) || Map.get(run, :started_at)
 
   defp run_state(%{status: "completed", conclusion: conclusion})
        when conclusion in @passing_conclusions,
@@ -128,7 +148,7 @@ defmodule Loopctl.Delivery.CiEvidence do
   def to_record(sha, required, %{check_runs: runs, statuses: statuses}, result, read_at) do
     %{
       "sha" => sha,
-      "read_at" => DateTime.to_iso8601(read_at),
+      "read_at" => fixed_width_iso8601(read_at),
       "required" => required,
       "check_runs" =>
         Enum.map(runs, fn run ->
@@ -150,4 +170,10 @@ defmodule Loopctl.Delivery.CiEvidence do
       "failed" => Enum.map(result.failed, fn {name, why} -> %{"name" => name, "why" => why} end)
     }
   end
+
+  # ALWAYS six fractional digits, so two records order correctly as TEXT: the evidence write
+  # compares `read_at` in SQL (`Loopctl.Threads.record_gate_evidence/5`), and
+  # `"...:00Z"` sorts after `"...:00.5Z"` although it is earlier.
+  defp fixed_width_iso8601(%DateTime{microsecond: {micro, _precision}} = at),
+    do: DateTime.to_iso8601(%{at | microsecond: {micro, 6}})
 end

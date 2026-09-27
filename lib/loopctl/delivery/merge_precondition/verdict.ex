@@ -11,9 +11,11 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     - `:head_moved` — the pull request's head is not the one CI ran on and the story was
       verified at, so the change goes back to `implementing`. New commits are ordinary; this
       is not an escalation
-    - `:unevaluated` — a TRANSIENT forge fault. Nothing was decided and nothing transitions;
-      the caller retries. Never an escalation, because one network blip must not park a
-      story until a human acts
+    - `:unevaluated` — nothing was decided yet, and nothing transitions; the caller retries.
+      Either a TRANSIENT fault (the forge, or database contention), which one network blip
+      must not turn into a parked story, or — THREAD mode (US-45.6) — required CI checks
+      still running or not yet reported on the checkpoint's commit. Only the first counts
+      toward the consecutive-unevaluated bound; a CI wait is bounded in time instead
   - `reasons` — every reason the decision is what it is, all of them rather than the first,
     so one escalation names the whole list. Empty on `:allow` and on an authorised
     `:already_merged`
@@ -26,8 +28,8 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
   - `recorded_head_sha` — the head the STAGE ROW carries: what CI ran on and the story was
     verified at. Known even when the forge cannot be reached, which is why the
     consecutive-unevaluated count is kept per THIS head rather than the forge's
-  - `retry_after` — on `:unevaluated`, the seconds the FORGE asked a caller to wait, when it
-    said so at all. The endpoint sends it as `Retry-After`; the dominant cause of an
+  - `retry_after` — on `:unevaluated`, the seconds the forge asked a caller to wait, when it
+    said so at all, or loopctl's own 60 for a CI wait. The endpoint sends it as `Retry-After`; the dominant cause of an
     unevaluated verdict is a rate limit, so an unbounded retry would amplify the very
     condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.

@@ -33,6 +33,7 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
           branch: Keyword.get(fields, :branch),
           mode: Keyword.get(fields, :mode),
           base_branch: Keyword.get(fields, :base_branch),
+          required_checks: Keyword.get(fields, :required_checks),
           status: status,
           # `runner_dispatches_reason_iff_refused`: a refused row carries its reason.
           reason: if(status == "refused", do: "unsupported_kind"),
@@ -68,6 +69,13 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
 
     record(ctx, @t1, mode: "thread", base_branch: "trunk")
     assert {:ok, %{base_branch: "trunk"}} = route(ctx)
+  end
+
+  test "the required checks are the ones the claim's dispatch recorded (US-45.6)", ctx do
+    assert {:ok, %{required_checks: nil}} = route(ctx)
+
+    record(ctx, @t1, mode: "thread", required_checks: ["test", "lint"])
+    assert {:ok, %{required_checks: ["test", "lint"]}} = route(ctx)
   end
 
   test "a row that recorded no mode is pr; NO row is nil, for the caller's source fallback",

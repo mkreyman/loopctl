@@ -266,8 +266,10 @@ defmodule LoopctlWeb.MergePreconditionController do
         "(US-45.6), from both the check-runs and the commit-status APIs, against the " <>
         "source's `required_checks`: a failed one refuses `required_check_failed`, one still " <>
         "running or not yet reported is `unevaluated` (`required_check_pending` / " <>
-        "`required_check_missing`, `Retry-After` 60; only a missing one counts toward the " <>
-        "unevaluated bound), a source requiring none refuses `required_checks_unset`, a " <>
+        "`required_check_missing`, `Retry-After` 60; neither counts toward the unevaluated " <>
+        "bound, and six hours after the checkpoint was recorded both are refused " <>
+        "`required_check_timed_out`), the required checks are the ones bound on the claim's " <>
+        "dispatch at placement, a source requiring none refuses `required_checks_unset`, a " <>
         "failed read is `ci_evidence_unavailable`, and a `local-gate` status is recorded but " <>
         "never satisfies a required check. `ci_evidence` is what was read; it is copied onto " <>
         "the checkpoint, and an allow whose copy did not land is refused " <>

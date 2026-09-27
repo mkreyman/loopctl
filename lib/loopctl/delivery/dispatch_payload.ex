@@ -74,6 +74,8 @@ defmodule Loopctl.Delivery.DispatchPayload do
   # key: it never goes on the wire (`RunnerContract.cast_dispatch/1` keeps only declared
   # fields), and no caller's JSON can supply it.
   @placed_mode :placed_mode
+  # Beside it, the source's required CI checks (US-45.6), bound the same way.
+  @placed_required_checks :placed_required_checks
 
   @doc """
   The key under which `fill/3` carries the intake source's mode, as a string (`"pr"`,
@@ -83,6 +85,10 @@ defmodule Loopctl.Delivery.DispatchPayload do
   """
   @spec placed_mode_key() :: :placed_mode
   def placed_mode_key, do: @placed_mode
+
+  @doc "Where `fill/3` carries the source's `required_checks` beside the mode (US-45.6)."
+  @spec placed_required_checks_key() :: :placed_required_checks
+  def placed_required_checks_key, do: @placed_required_checks
 
   # Nothing on the wire can reach this: eight prefixes of 40 characters and a suffix under 30
   # leave it unreachable by a factor of two. It is the bound that holds when the prefixes came
@@ -226,7 +232,8 @@ defmodule Loopctl.Delivery.DispatchPayload do
            %{
              mode: :pr | :thread | nil,
              branch: String.t() | nil,
-             base_branch: String.t() | nil
+             base_branch: String.t() | nil,
+             required_checks: [String.t()] | nil
            }}
           | {:error, term()}
   def dispatch_route(tenant_id, %Story{} = story) do
@@ -247,7 +254,9 @@ defmodule Loopctl.Delivery.DispatchPayload do
     )
   end
 
-  defp route({:ok, nil}), do: {:ok, %{mode: nil, branch: nil, base_branch: nil}}
+  defp route({:ok, nil}),
+    do: {:ok, %{mode: nil, branch: nil, base_branch: nil, required_checks: nil}}
+
   defp route({:ok, row}), do: {:ok, %{row | mode: route_mode(row.mode)}}
   defp route({:error, _reason} = error), do: error
 
@@ -455,25 +464,34 @@ defmodule Loopctl.Delivery.DispatchPayload do
   # with none.
   defp fill_repo(tenant_id, story, dispatch) do
     if Map.has_key?(dispatch, "repo") and Map.has_key?(dispatch, "base_branch") do
-      {:ok, put_placed_mode(dispatch, source_mode(tenant_id, story.project_id))}
+      {:ok, put_placed_route(dispatch, single_source(tenant_id, story.project_id))}
     else
       with {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id) do
         {:ok,
          dispatch
          |> put_new("repo", source.repo_full_name)
          |> put_new("base_branch", source.base_branch)
-         |> put_placed_mode(source.mode)}
+         |> put_placed_route(source)}
       end
     end
+  end
+
+  defp put_placed_route(dispatch, nil),
+    do: dispatch |> put_placed_mode(nil) |> Map.put(@placed_required_checks, nil)
+
+  defp put_placed_route(dispatch, source) do
+    dispatch
+    |> put_placed_mode(source.mode)
+    |> Map.put(@placed_required_checks, source.required_checks)
   end
 
   # An ATOM key, so a caller's JSON can never carry one. Carried for every kind: the ledger
   # records it on an implement row only (`DispatchLedger.record_sent/4`), the one rule.
   defp put_placed_mode(dispatch, mode), do: Map.put(dispatch, @placed_mode, mode_string(mode))
 
-  defp source_mode(tenant_id, project_id) do
+  defp single_source(tenant_id, project_id) do
     case Intake.source_for_project(tenant_id, project_id) do
-      {:ok, source} -> source.mode
+      {:ok, source} -> source
       {:error, _no_single_source} -> nil
     end
   end

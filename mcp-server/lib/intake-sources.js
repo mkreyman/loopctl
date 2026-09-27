@@ -295,14 +295,17 @@ export async function enrollIntakeSource(
   // OPTIONAL, read by PRESENCE like the branch: omitted, the source takes `pr`. Named, it
   // must be one of the two modes; anything else (null included) is a 422 at the server and
   // is refused here, before a secret file is reserved.
-  if (required_checks !== undefined) {
-    const badChecks = requiredChecksRefusal(required_checks);
-    if (badChecks) return badChecks;
-  }
-
   if (mode !== undefined) {
     const badMode = modeRefusal(mode);
     if (badMode) return badMode;
+  }
+
+  // OPTIONAL too (US-45.6): the CI checks a thread checkpoint must pass. Its SHAPE is judged
+  // here, before a secret file is reserved; whether a thread source names enough of them
+  // depends on the stored mode, which only the server knows.
+  if (required_checks !== undefined) {
+    const badChecks = requiredChecksRefusal(required_checks);
+    if (badChecks) return badChecks;
   }
 
   if (typeof secret_file !== "string" || secret_file.trim() === "") {
