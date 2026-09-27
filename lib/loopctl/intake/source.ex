@@ -215,7 +215,11 @@ defmodule Loopctl.Intake.Source do
       # `{:array, :string}` casts a JSON null element to nil, so the element type is checked
       # here, before anything calls a String function on it (a 500 otherwise).
       not Enum.all?(names, &usable_name?/1) ->
-        [required_checks: "each name must be 1 to #{@max_check_name_bytes} bytes and not blank"]
+        [
+          required_checks:
+            "each name must be a string of 1 to #{@max_check_name_bytes} bytes with no " <>
+              "surrounding whitespace"
+        ]
 
       @local_gate in names ->
         [
@@ -232,8 +236,10 @@ defmodule Loopctl.Intake.Source do
     end
   end
 
+  # Surrounding whitespace is refused, not trimmed: a job name never carries it, so `"test "`
+  # could never match and every thread would wait out the CI limit on a typo.
   defp usable_name?(name) when is_binary(name),
-    do: String.trim(name) != "" and byte_size(name) <= @max_check_name_bytes
+    do: name != "" and String.trim(name) == name and byte_size(name) <= @max_check_name_bytes
 
   defp usable_name?(_not_a_string), do: false
 

@@ -1,80 +1,73 @@
 defmodule Loopctl.Delivery.CiEvidence do
   @moduledoc """
-  What CI says about ONE commit, judged against a list of required checks (US-45.6). Pure.
+  What CI said about ONE commit of a thread, judged against the required checks (US-45.6).
+  Pure.
 
-  A thread-mode story merges the checkpoint's exact commit with no pull request, so the merge
-  gate cannot lean on a forge rule to hold the merge to green CI: it reads the evidence for
-  the checkpoint's SHA itself (`Loopctl.Delivery.PullRequestSource.check_evidence/3`) and
-  this module decides what it says.
+  A thread-mode story merges the checkpoint's exact commit with no pull request, so no forge
+  rule holds the merge to green CI: the merge gate reads the evidence itself
+  (`Loopctl.Delivery.PullRequestSource.check_evidence/3`) and this module decides what it
+  says.
 
-  ## What may satisfy a required check: a GitHub Actions check run, and nothing else
+  ## What may satisfy a required check: a job of the thread's own push run
 
-  Both the check-runs and the commit-status APIs are READ, by SHA, and both are recorded on
-  the checkpoint — GitHub Actions reports check runs, which the combined status never lists.
-  But only a CHECK RUN created by GitHub Actions (`@trusted_check_apps`) can satisfy a
-  required name (US-45.6 review round 2, finding 1). A commit status can be posted by anyone
-  holding `statuses: write` on the repository, which includes the implementer's own runner
-  (it posts `local-gate`), so letting a status satisfy a required name let the implementer
-  post `test = success` over a failing run and merge its own work — the self-attestation this
-  gate exists to refuse, one name over from `local-gate`. A check run needs a GitHub App to
-  create; the implementer holds none. Statuses are therefore evidence to READ, never to trust.
+  Only a JOB of a GitHub Actions WORKFLOW RUN that a PUSH of the thread's branch at exactly
+  this commit triggered. Anything weaker is something the implementer can produce itself:
 
-  Evidence for ANY OTHER commit never counts: nothing here reads a branch, a parent or a pull
-  request, only the one SHA the caller names.
+  - a commit STATUS can be posted by anyone holding `statuses: write`, which includes the
+    implementer's runner (it posts `local-gate`)
+  - a CHECK RUN, even one attributed to the `github-actions` app, can be created on any commit
+    under any name by a workflow on ANOTHER branch the implementer pushed, through its
+    `GITHUB_TOKEN`
+  - a workflow run triggered some other way (`workflow_dispatch`, a different branch) runs
+    workflow files the checkpoint's review never saw
+
+  A push run of the thread branch runs the workflow files of the checkpoint's own tree, and a
+  checkpoint that CHANGES those files is refused before this is consulted
+  (`ci_definition_changed` in `Loopctl.Delivery.MergePrecondition`), so the definitions a
+  trusted job ran are the base's.
+
+  What those jobs EXECUTE is repository code — test files, scripts — which the implementer
+  writes, exactly as it writes the change itself. Tampering there is a defect in the change,
+  and the review of the thread (US-45.3) is what judges it; this module proves that the
+  required jobs ran on this commit and passed, not that they test the right thing.
 
   ## How one required check is judged
 
-  Trusted runs under a name are grouped by CHECK SUITE (one workflow run's suite), and in
-  each suite only the LATEST run counts — the highest id, because ids only grow and a re-run
-  queued a moment ago has no timestamp yet — so a re-run that went green supersedes the
-  failure it re-ran. ACROSS suites nothing supersedes anything: two workflows that each have
-  a job `test` are two checks under one name, and a green one must never hide a red one. So
-  a name is `:failed` when any suite's latest run failed, `:pending` when none failed and
-  any is still running, and `:passed` only when every suite's latest run passed. Each run is:
+  Per workflow file, only the job with the name and the highest id counts: job ids only grow,
+  so that is the newest attempt of the newest run, and a re-run that went green supersedes
+  the failure it re-ran (the jobs read is `filter=latest` as well). ACROSS workflows nothing supersedes anything: two workflows
+  with a job `test` are two checks under one name, and a green one must never hide a red one.
+  So a name is `:failed` when any workflow's job failed, `:pending` when none failed and any
+  is still running, `:passed` only when every one passed, and `:missing` when no trusted job
+  carries it. A job:
 
   - not `completed` is `:pending`
-  - `completed` concluding `success`, `neutral` or `skipped` (what GitHub itself counts as
-    passing a required check) is `:passed`
-  - any other conclusion (`failure`, `cancelled`, `timed_out`, `action_required`, `stale`) is
-    `:failed`
-  - no trusted run under that name is `:missing`, whatever statuses say
+  - `completed` with conclusion `success` is `:passed` — and NOTHING ELSE is. A job GitHub
+    `skipped` did not run: a required job skipped because a job it `needs:` failed, or because
+    an `if:` the commit controls said so, must never read as green
+  - any other conclusion is `:failed`, naming it
 
   ## The local gate is recorded, never trusted
 
-  `local-gate` (`Loopctl.Intake.Source.local_gate/0`) is reported under `local_gate` and never
-  looked up as a required check, even by a caller that lists it: the intake source refuses to
-  store it, and this module drops it from the list as the backstop.
+  `local-gate` (`Loopctl.Intake.Source.local_gate/0`) is read from the commit statuses, best
+  effort, and reported under `local_gate` (`"unread"` when the statuses could not be read). It
+  is never looked up as a required check, even by a caller that lists it: the intake source
+  refuses to store it, and this module drops it from the list as the backstop.
   """
 
   alias Loopctl.Intake.Source
 
-  @passing_conclusions ["success", "neutral", "skipped"]
-
-  # The apps whose check runs may satisfy a required check. See the moduledoc.
-  @trusted_check_apps ["github-actions"]
-
-  @doc "The GitHub App slugs whose check runs may satisfy a required check."
-  @spec trusted_check_apps() :: [String.t()]
-  def trusted_check_apps, do: @trusted_check_apps
-
-  @type check_run :: %{
+  @type job :: %{
           required(:name) => String.t(),
           required(:status) => String.t(),
           required(:conclusion) => String.t() | nil,
           optional(:id) => integer() | nil,
-          optional(:app) => String.t() | nil,
-          optional(:check_suite) => integer() | nil,
-          optional(:started_at) => String.t() | nil,
-          optional(:completed_at) => String.t() | nil,
+          optional(:run_id) => integer() | nil,
+          optional(:workflow) => String.t() | nil,
           optional(:url) => String.t() | nil
         }
-  @type status :: %{
-          required(:context) => String.t(),
-          required(:state) => String.t(),
-          optional(:at) => String.t() | nil,
-          optional(:url) => String.t() | nil
-        }
-  @type evidence :: %{check_runs: [check_run()], statuses: [status()]}
+  @type status :: %{required(:context) => String.t(), required(:state) => String.t()}
+  @type evidence :: %{jobs: [job()], statuses: [status()] | {:unread, term()}}
   @type result :: %{
           passed: [String.t()],
           pending: [String.t()],
@@ -89,14 +82,14 @@ defmodule Loopctl.Delivery.CiEvidence do
 
   @doc "Judges `evidence` for one commit against `required`. See the moduledoc."
   @spec judge([String.t()], evidence()) :: result()
-  def judge(required, %{check_runs: runs, statuses: statuses}) do
+  def judge(required, %{jobs: jobs, statuses: statuses}) do
     acc = %{passed: [], pending: [], missing: [], failed: []}
 
     judged =
       required
       |> lookup_names()
       |> Enum.reduce(acc, fn name, acc ->
-        case check_state(name, runs) do
+        case check_state(name, jobs) do
           {:failed, conclusion} -> Map.update!(acc, :failed, &[{name, conclusion} | &1])
           state -> Map.update!(acc, state, &[name | &1])
         end
@@ -106,13 +99,13 @@ defmodule Loopctl.Delivery.CiEvidence do
     Map.put(judged, :local_gate, local_gate_state(statuses))
   end
 
-  defp check_state(name, runs) do
+  defp check_state(name, jobs) do
     states =
-      runs
-      |> Enum.filter(&(&1.name == name and Map.get(&1, :app) in @trusted_check_apps))
-      |> Enum.group_by(&Map.get(&1, :check_suite))
-      |> Enum.map(fn {_suite, suite_runs} ->
-        suite_runs |> Enum.max_by(&(Map.get(&1, :id) || 0)) |> run_state()
+      jobs
+      |> Enum.filter(&(&1.name == name))
+      |> Enum.group_by(&Map.get(&1, :workflow))
+      |> Enum.map(fn {_workflow, named} ->
+        named |> Enum.max_by(&(Map.get(&1, :id) || 0)) |> job_state()
       end)
 
     cond do
@@ -123,14 +116,14 @@ defmodule Loopctl.Delivery.CiEvidence do
     end
   end
 
-  defp run_state(%{status: "completed", conclusion: conclusion})
-       when conclusion in @passing_conclusions,
-       do: :passed
+  defp job_state(%{status: "completed", conclusion: "success"}), do: :passed
 
-  defp run_state(%{status: "completed", conclusion: conclusion}),
+  defp job_state(%{status: "completed", conclusion: conclusion}),
     do: {:failed, conclusion || "none"}
 
-  defp run_state(_running), do: :pending
+  defp job_state(_running), do: :pending
+
+  defp local_gate_state({:unread, _reason}), do: "unread"
 
   defp local_gate_state(statuses) do
     local_gate = Source.local_gate()
@@ -145,35 +138,29 @@ defmodule Loopctl.Delivery.CiEvidence do
   The evidence and its judgement as stored on the checkpoint's `gate_evidence` under `"ci"`
   (AC-45.6.1): string keys, so it reads back as it was written.
 
-  Only what the judgement READ is kept: the runs under a required name and the `local-gate`
-  status. A commit can carry hundreds of unrelated runs, and keeping them made the record
-  change whenever any of them moved, so an unchanged judgement was rewritten on every poll.
+  Only what the judgement READ is kept: the jobs under a required name and the `local-gate`
+  state. A commit can carry many unrelated jobs, and keeping them made the record change
+  whenever any of them moved, so an unchanged judgement was rewritten on every poll.
   """
   @spec to_record(String.t(), [String.t()], evidence(), result(), DateTime.t()) :: map()
-  def to_record(sha, required, %{check_runs: runs, statuses: statuses}, result, read_at) do
+  def to_record(sha, required, %{jobs: jobs}, result, read_at) do
     names = lookup_names(required)
-    runs = Enum.filter(runs, &(&1.name in names))
-    statuses = Enum.filter(statuses, &(&1.context == Source.local_gate()))
 
     %{
       "sha" => sha,
       "read_at" => fixed_width_iso8601(read_at),
       "required" => required,
-      "check_runs" =>
-        Enum.map(runs, fn run ->
+      "jobs" =>
+        for job <- jobs, job.name in names do
           %{
-            "name" => run.name,
-            "app" => Map.get(run, :app),
-            "check_suite" => Map.get(run, :check_suite),
-            "status" => run.status,
-            "conclusion" => run.conclusion,
-            "url" => Map.get(run, :url)
+            "name" => job.name,
+            "workflow" => Map.get(job, :workflow),
+            "run_id" => Map.get(job, :run_id),
+            "status" => job.status,
+            "conclusion" => job.conclusion,
+            "url" => Map.get(job, :url)
           }
-        end),
-      "statuses" =>
-        Enum.map(statuses, fn status ->
-          %{"context" => status.context, "state" => status.state, "url" => Map.get(status, :url)}
-        end),
+        end,
       "local_gate" => result.local_gate,
       "passed" => result.passed,
       "pending" => result.pending,
@@ -183,8 +170,8 @@ defmodule Loopctl.Delivery.CiEvidence do
   end
 
   # ALWAYS six fractional digits, so two records order correctly as TEXT: the evidence write
-  # compares `read_at` in SQL (`Loopctl.Threads.record_gate_evidence/5`), and
-  # `"...:00Z"` sorts after `"...:00.5Z"` although it is earlier.
+  # compares `read_at` (`Loopctl.Threads.record_gate_evidence/5`), and `"...:00Z"` sorts after
+  # `"...:00.5Z"` although it is earlier.
   defp fixed_width_iso8601(%DateTime{microsecond: {micro, _precision}} = at),
     do: DateTime.to_iso8601(%{at | microsecond: {micro, 6}})
 end

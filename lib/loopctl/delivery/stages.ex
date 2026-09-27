@@ -144,6 +144,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Runner
   alias Loopctl.WorkBreakdown.Story
@@ -309,13 +310,18 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
-  When `story_id` last ENTERED `stage` — the newest transition into it — or nil when it never
-  has (US-45.6: what a merge gate's CI wait is measured from).
+  When `story_id` last ENTERED `stage` — the newest transition into it — as `{:ok, at}`, or
+  `{:ok, nil}` when it never has (US-45.6: what a merge gate's CI wait is measured from). Its
+  lock wait is bounded and contention is `{:error, :busy}`, counted as
+  `[:loopctl, :delivery, :stage_read_busy]`.
   """
-  @spec entered_at(Ecto.UUID.t(), Ecto.UUID.t(), atom()) :: DateTime.t() | nil
+  @spec entered_at(Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
+          {:ok, DateTime.t() | nil} | {:error, term()}
   def entered_at(tenant_id, story_id, stage) do
-    {:ok, at} =
+    answering_busy(tenant_id, [:loopctl, :delivery, :stage_read_busy], "stage entry read", fn ->
       Repo.with_tenant(tenant_id, fn ->
+        Capacity.set_lock_timeout!(Repo)
+
         Repo.one(
           from e in StageEvent,
             where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
@@ -323,8 +329,7 @@ defmodule Loopctl.Delivery.Stages do
             select: max(e.inserted_at)
         )
       end)
-
-    at
+    end)
   end
 
   @doc "A story's stage events, oldest first."

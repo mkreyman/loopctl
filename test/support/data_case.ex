@@ -226,7 +226,7 @@ defmodule Loopctl.DataCase do
     end)
 
     # US-45.6: CI evidence for a checkpoint's commit, on the same fail-closed default.
-    Mox.stub(Loopctl.MockPullRequestSource, :check_evidence, fn _repo, _sha ->
+    Mox.stub(Loopctl.MockPullRequestSource, :check_evidence, fn _repo, _sha, _branch ->
       {:error, :not_stubbed}
     end)
 

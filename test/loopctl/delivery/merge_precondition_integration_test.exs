@@ -524,10 +524,10 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx)
       parent = String.duplicate("b", 40)
 
-      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, sha ->
+      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, sha, _branch ->
         cond do
-          sha == @head -> {:ok, %{check_runs: [ci_run("test", nil, "in_progress")], statuses: []}}
-          sha == parent -> {:ok, %{check_runs: [ci_run("test", "success")], statuses: []}}
+          sha == @head -> {:ok, %{jobs: [ci_run("test", nil, "in_progress")], statuses: []}}
+          sha == parent -> {:ok, %{jobs: [ci_run("test", "success")], statuses: []}}
         end
       end)
 
@@ -545,7 +545,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert %{"ci" => %{"sha" => @head, "passed" => ["test"], "failed" => []}} =
                checkpoint_evidence(ctx)
 
-      stub_thread(ctx, ci: %{check_runs: [ci_run("test", "failure")], statuses: []})
+      stub_thread(ctx, ci: %{jobs: [ci_run("test", "failure")], statuses: []})
       reset_allow(ctx)
 
       assert {:ok, %Verdict{decision: :refuse} = refused} = enforce(ctx)
@@ -559,8 +559,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     # never by polls, so a slow pipeline never escalates and a stuck one still does.
     test "a CI wait never reaches the unevaluated bound; past the time limit it escalates", ctx do
       for ci <- [
-            %{check_runs: [ci_run("test", nil, "queued")], statuses: []},
-            %{check_runs: [], statuses: []}
+            %{jobs: [ci_run("test", nil, "queued")], statuses: []},
+            %{jobs: [], statuses: []}
           ] do
         stub_thread(ctx, ci: ci)
 
@@ -585,7 +585,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     # Round 3: the required checks are the source's CURRENT list, so correcting the list
     # (a renamed job) reaches a story already in flight.
     test "the required checks are the source's current list, read live", ctx do
-      stub_thread(ctx, ci: %{check_runs: [ci_run("unit", "success")], statuses: []})
+      stub_thread(ctx, ci: %{jobs: [ci_run("unit", "success")], statuses: []})
 
       assert {:ok, %Verdict{decision: :unevaluated} = waiting} = enforce(ctx)
       assert {:required_check_missing, "test"} in waiting.reasons
@@ -603,7 +603,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       blips = MergePrecondition.max_consecutive_unevaluated() - 1
 
       fault = fn ->
-        Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha ->
+        Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha, _branch ->
           {:error, {:github_unreachable, :timeout}}
         end)
 
@@ -612,14 +612,30 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       fault.()
 
-      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha ->
-        {:ok, %{check_runs: [ci_run("test", nil, "queued")], statuses: []}}
+      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha, _branch ->
+        {:ok, %{jobs: [ci_run("test", nil, "queued")], statuses: []}}
       end)
 
       assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
 
       fault.()
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+    end
+
+    # Round 1 of #910, finding 8: with no recorded entry into ci, the wait is measured from the
+    # checkpoint's recording, so it is bounded for every story.
+    test "a story with no recorded ci entry is bounded from its checkpoint instead", ctx do
+      stub_thread(ctx, ci: %{jobs: [], statuses: []})
+
+      recorded =
+        DateTime.add(DateTime.utc_now(), -(MergePrecondition.ci_wait_limit_seconds() + 60))
+
+      {1, _} =
+        from(c in Loopctl.Threads.Checkpoint, where: c.id == ^ctx.checkpoint.id)
+        |> AdminRepo.update_all(set: [inserted_at: recorded])
+
+      assert {:ok, %Verdict{decision: :refuse} = verdict} = enforce(ctx)
+      assert {:required_check_timed_out, "test", :missing} in verdict.reasons
     end
 
     test "TC-45.4.3 a branch head nobody reported goes back to implementing, unescalated", ctx do
@@ -1094,8 +1110,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
 
     # US-45.6: CI on the CHECKPOINT's commit, green unless the test says otherwise.
-    ci = Keyword.get(opts, :ci, %{check_runs: [ci_run("test", "success")], statuses: []})
-    Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, ^head -> {:ok, ci} end)
+    ci = Keyword.get(opts, :ci, %{jobs: [ci_run("test", "success")], statuses: []})
+    # The read names the thread branch: only its push runs are trusted.
+    Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, ^head, ^branch -> {:ok, ci} end)
   end
 
   # Records the story's transition into `ci` at `at` (the CI wait's origin).

@@ -26,13 +26,14 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   CI evidence for a thread checkpoint (US-45.6), by the checkpoint's exact SHA:
 
-  - `GET /repos/:repo/commits/:sha/check-runs?filter=latest&per_page=100&page=:n` — every
-    check run on the commit, paged up to `@check_run_pages`; the required names are matched
-    locally
-  - `GET /repos/:repo/commits/:sha/status?per_page=100` — the latest status per context.
-    Both, because the combined status never lists check runs (GitHub Actions) and the
-    check-runs API never lists statuses. A list reporting more entries than it carried is
-    refused as truncated: a failure on a missing page would read as a pass
+  - `GET /repos/:repo/actions/runs?head_sha=:sha&branch=:branch&event=push` — the workflow
+    runs a PUSH of the thread branch at exactly this commit triggered: the only runs whose
+    jobs may satisfy a required check
+  - `GET /repos/:repo/actions/runs/:id/jobs?filter=latest` — one per such run, its jobs' latest
+    attempt
+  - `GET /repos/:repo/commits/:sha/status?per_page=100` — best effort, for the recorded
+    `local-gate` state only. A list reporting more entries than it carried is refused as
+    truncated
 
   Post-deploy verification (#803 §9) adds three more, each bounded the same way:
 
@@ -68,9 +69,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   Three calls for `pull_request/2` and one for `repo_files/2`, so a precondition that makes
   all five (a pull request plus two refs) waits at most 35 seconds before it has an answer,
   and the answer to a timeout is an ESCALATION, never a pass. A THREAD-mode evaluation makes
-  more: the branch ref, the commit, the comparison, two trees, at most `@check_run_pages`
-  pages of check runs and the combined status — nine calls, 63 seconds at the most, plus one
-  repository read after a 404 on the branch. Nothing here runs inside a
+  more: the branch ref, the commit, the comparison, two trees, the workflow runs, one jobs
+  read per workflow run and the combined status — about eight calls for a repository with a
+  couple of workflows, plus one repository read after a 404 on the branch. Nothing here runs inside a
   database transaction: the caller gathers every fact before it opens one, so a slow forge
   never holds a pooled connection.
 
@@ -120,8 +121,11 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @files_per_page 100
   # The combined status lists the LATEST status per context, one page of them.
   @status_page_size 100
-  # At most this many pages of 100 check runs per commit are read (US-45.6).
-  @check_run_pages 3
+  # US-45.6: the push-triggered workflow runs of one commit fit one page, and so do one run's
+  # jobs; more is refused as truncated rather than judged on a part.
+  @workflow_run_page 100
+  @job_page 100
+  @max_workflow_runs 10
 
   # GitHub's primary rate-limit window is an hour. Anything beyond that plus slack is not a
   # window rolling over, so it is not turned into a delay a caller would sleep on.
@@ -209,94 +213,138 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   @impl true
-  def check_evidence(repo, sha) do
+  def check_evidence(repo, sha, branch) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, sha} <- ref(sha),
-         {:ok, runs} <- check_runs_page(repo, sha, 1, []),
-         {:ok, body} <- get(repo, "/commits/#{sha}/status?per_page=#{@status_page_size}"),
-         {:ok, statuses} <- commit_statuses(body) do
-      {:ok, %{check_runs: runs, statuses: statuses}}
+         {:ok, branch} <- ref(branch),
+         {:ok, runs} <- push_runs(repo, sha, branch),
+         {:ok, jobs} <- jobs_of(repo, runs) do
+      {:ok, %{jobs: jobs, statuses: commit_statuses(repo, sha)}}
     end
   end
 
-  # EVERY check run on the commit, `filter=latest`, paged — never one call per required name
-  # (US-45.6 review round 1, finding 7): a request per name multiplied both the worst-case
-  # wait and the forge calls each poll spends by the length of the list. The names are
-  # matched here, by `CiEvidence`. A commit carrying more runs than `@check_run_pages` pages
-  # hold is refused as truncated rather than judged on the part that fitted.
-  defp check_runs_page(repo, sha, page, acc) do
-    query = URI.encode_query(%{"filter" => "latest", "per_page" => 100, "page" => page})
+  # The WORKFLOW RUNS a push of `branch` at exactly `sha` triggered — the only runs whose jobs
+  # can satisfy a required check (`Loopctl.Delivery.CiEvidence`). Filtered by the API and then
+  # again here, so a filter the forge ignored cannot widen what is trusted.
+  defp push_runs(repo, sha, branch) do
+    query =
+      URI.encode_query(%{
+        "head_sha" => sha,
+        "branch" => branch,
+        "event" => "push",
+        "per_page" => @workflow_run_page
+      })
 
-    with {:ok, body} <- get(repo, "/commits/#{sha}/check-runs?" <> query),
-         {:ok, total, runs} <- check_runs(body) do
-      acc = acc ++ runs
-
-      cond do
-        length(acc) >= total or runs == [] -> complete_runs(acc, total)
-        page >= @check_run_pages -> {:error, {:check_runs_truncated, total, length(acc)}}
-        true -> check_runs_page(repo, sha, page + 1, acc)
-      end
+    with {:ok, body} <- get(repo, "/actions/runs?" <> query),
+         {:ok, runs} <- workflow_runs(body) do
+      {:ok,
+       Enum.filter(runs, fn run ->
+         run["head_sha"] == sha and run["head_branch"] == branch and run["event"] == "push"
+       end)}
+      |> bounded_runs()
     end
   end
 
-  defp complete_runs(runs, total) when length(runs) >= total, do: {:ok, runs}
-  defp complete_runs(runs, total), do: {:error, {:check_runs_truncated, total, length(runs)}}
+  # One jobs read per run: a push that triggered more workflows than this is refused rather
+  # than costing an unbounded number of calls on every poll.
+  defp bounded_runs({:ok, runs}) when length(runs) > @max_workflow_runs,
+    do: {:error, {:too_many_workflow_runs, length(runs)}}
 
-  defp check_runs(%{"total_count" => total, "check_runs" => runs})
+  defp bounded_runs(ok), do: ok
+
+  defp workflow_runs(%{"total_count" => total, "workflow_runs" => runs})
        when is_integer(total) and is_list(runs) do
-    if Enum.all?(runs, &check_run?/1),
-      do: {:ok, total, Enum.map(runs, &check_run_fact/1)},
-      else: {:error, {:unreadable_check_runs, shape(runs)}}
+    cond do
+      not Enum.all?(
+        runs,
+        &match?(%{"id" => id, "path" => path} when is_integer(id) and is_binary(path), &1)
+      ) ->
+        {:error, {:unreadable_workflow_runs, shape(runs)}}
+
+      total > length(runs) ->
+        {:error, {:workflow_runs_truncated, total, length(runs)}}
+
+      true ->
+        {:ok, runs}
+    end
   end
 
-  defp check_runs(body), do: {:error, {:unreadable_check_runs, shape(body)}}
+  defp workflow_runs(body), do: {:error, {:unreadable_workflow_runs, shape(body)}}
 
-  defp check_run_fact(run) do
+  # Each run's jobs, latest attempt only (`filter=latest`), tagged with the run and its
+  # workflow file. De-duplicated by job id and checked against the total, so a page boundary
+  # that moved between reads can neither repeat a job nor hide one.
+  defp jobs_of(repo, runs) do
+    Enum.reduce_while(runs, {:ok, []}, fn run, {:ok, acc} ->
+      query = URI.encode_query(%{"filter" => "latest", "per_page" => @job_page})
+
+      with {:ok, body} <- get(repo, "/actions/runs/#{run["id"]}/jobs?" <> query),
+           {:ok, jobs} <- run_jobs(body, run) do
+        {:cont, {:ok, acc ++ jobs}}
+      else
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp run_jobs(%{"total_count" => total, "jobs" => jobs}, run)
+       when is_integer(total) and is_list(jobs) do
+    jobs = Enum.uniq_by(jobs, & &1["id"])
+
+    cond do
+      not Enum.all?(jobs, &job?/1) ->
+        {:error, {:unreadable_jobs, shape(jobs)}}
+
+      total > length(jobs) ->
+        {:error, {:jobs_truncated, total, length(jobs)}}
+
+      true ->
+        {:ok, Enum.map(jobs, &job_fact(&1, run))}
+    end
+  end
+
+  defp run_jobs(body, _run), do: {:error, {:unreadable_jobs, shape(body)}}
+
+  defp job?(%{"id" => id, "name" => name, "status" => status} = job)
+       when is_integer(id) and is_binary(name) and is_binary(status),
+       do: is_nil(job["conclusion"]) or is_binary(job["conclusion"])
+
+  defp job?(_job), do: false
+
+  defp job_fact(job, run) do
     %{
-      id: run["id"],
-      # The creating App's slug: only a trusted App's run can satisfy a required check
-      # (`Loopctl.Delivery.CiEvidence`).
-      app: get_in(run, ["app", "slug"]),
-      # The suite (one workflow run) the run belongs to: runs are judged latest-per-suite.
-      check_suite: get_in(run, ["check_suite", "id"]),
-      name: run["name"],
-      status: run["status"],
-      conclusion: run["conclusion"],
-      started_at: run["started_at"],
-      completed_at: run["completed_at"],
-      url: run["html_url"]
+      id: job["id"],
+      name: job["name"],
+      status: job["status"],
+      conclusion: job["conclusion"],
+      run_id: run["id"],
+      workflow: run["path"],
+      url: job["html_url"]
     }
   end
 
-  defp check_run?(%{"name" => name, "status" => status} = run)
-       when is_binary(name) and is_binary(status),
-       do: is_nil(run["conclusion"]) or is_binary(run["conclusion"])
-
-  defp check_run?(_run), do: false
-
-  defp commit_statuses(%{"total_count" => total, "statuses" => statuses})
-       when is_integer(total) and is_list(statuses) do
-    cond do
-      total > length(statuses) ->
-        {:error, {:statuses_truncated, total, length(statuses)}}
-
-      Enum.all?(statuses, &status?/1) ->
-        {:ok,
-         Enum.map(statuses, fn status ->
-           %{
-             context: status["context"],
-             state: status["state"],
-             at: status["updated_at"],
-             url: status["target_url"]
-           }
-         end)}
-
-      true ->
-        {:error, {:unreadable_statuses, shape(statuses)}}
+  # The commit statuses, BEST EFFORT: they feed only the recorded `local-gate` field and never
+  # a decision, so a token without `commit statuses: read`, or a commit carrying more contexts
+  # than one page, records them as unread rather than failing the evaluation.
+  defp commit_statuses(repo, sha) do
+    with {:ok, body} <- get(repo, "/commits/#{sha}/status?per_page=#{@status_page_size}"),
+         {:ok, statuses} <- statuses_of(body) do
+      statuses
+    else
+      {:error, reason} -> {:unread, reason}
     end
   end
 
-  defp commit_statuses(body), do: {:error, {:unreadable_statuses, shape(body)}}
+  defp statuses_of(%{"total_count" => total, "statuses" => statuses})
+       when is_integer(total) and is_list(statuses) do
+    cond do
+      not Enum.all?(statuses, &status?/1) -> {:error, {:unreadable_statuses, shape(statuses)}}
+      total > length(statuses) -> {:error, {:statuses_truncated, total, length(statuses)}}
+      true -> {:ok, Enum.map(statuses, &%{context: &1["context"], state: &1["state"]})}
+    end
+  end
+
+  defp statuses_of(body), do: {:error, {:unreadable_statuses, shape(body)}}
 
   defp status?(%{"context" => context, "state" => state})
        when is_binary(context) and is_binary(state),

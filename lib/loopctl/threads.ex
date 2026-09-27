@@ -210,7 +210,9 @@ defmodule Loopctl.Threads do
                commit_sha: c.commit_sha,
                tree_sha: c.tree_sha,
                claim_epoch: c.claim_epoch,
-               merge_commit_sha: c.merge_commit_sha
+               merge_commit_sha: c.merge_commit_sha,
+               # The merge gate's CI-wait fallback origin (US-45.6).
+               inserted_at: c.inserted_at
              }}
       )
 

@@ -754,108 +754,134 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
   # -- helpers ---------------------------------------------------------------------------
 
   describe "check_evidence/3 (US-45.6)" do
-    defp gh_run(id, name, conclusion),
-      do: %{
-        "id" => id,
-        "name" => name,
-        "status" => "completed",
-        "conclusion" => conclusion,
-        "app" => %{"slug" => "github-actions"},
-        "check_suite" => %{"id" => id * 10}
-      }
+    @branch "loop/story-7-abcd1234"
 
-    # Review round 1, finding 7: ONE paged read of every run on the commit, never one per name.
-    test "reads every latest run on the exact SHA in one paged call, and every status" do
+    defp gh_run(id, extra \\ %{}) do
+      Map.merge(
+        %{
+          "id" => id,
+          "path" => ".github/workflows/ci.yml",
+          "head_sha" => @head,
+          "head_branch" => @branch,
+          "event" => "push"
+        },
+        extra
+      )
+    end
+
+    defp gh_job(id, name, conclusion),
+      do: %{"id" => id, "name" => name, "status" => "completed", "conclusion" => conclusion}
+
+    # The three reads, each answered by `answers`, keyed by what it asks for.
+    defp stub_ci(answers) do
       stub(fn conn ->
         case String.split(conn.request_path, "/") do
-          [_, "repos", "acme", "widgets", "commits", @head, "check-runs"] ->
-            query = URI.decode_query(conn.query_string)
-            assert query["filter"] == "latest"
-            assert query["per_page"] == "100"
-            refute Map.has_key?(query, "check_name")
-            assert query["page"] == "1"
+          [_, "repos", "acme", "widgets", "actions", "runs"] ->
+            send(self(), {:runs_query, URI.decode_query(conn.query_string)})
+            json(conn, answers.runs)
 
-            json(conn, %{
-              "total_count" => 2,
-              "check_runs" => [
-                Map.put(gh_run(7, "test", "success"), "completed_at", "2026-09-27T10:00:00Z"),
-                gh_run(8, "lint / credo", "failure")
-              ]
-            })
+          [_, "repos", "acme", "widgets", "actions", "runs", id, "jobs"] ->
+            assert URI.decode_query(conn.query_string)["filter"] == "latest"
+            json(conn, Map.fetch!(answers.jobs, String.to_integer(id)))
 
           [_, "repos", "acme", "widgets", "commits", @head, "status"] ->
-            assert conn.query_string == "per_page=100"
-
-            json(conn, %{
-              "total_count" => 1,
-              "statuses" => [
-                %{"context" => "local-gate", "state" => "success", "updated_at" => "t"}
-              ]
-            })
+            answer_statuses(conn, answers.statuses)
         end
       end)
-
-      assert {:ok, %{check_runs: runs, statuses: statuses}} =
-               Source.check_evidence(@repo, @head)
-
-      assert [
-               %{
-                 id: 7,
-                 name: "test",
-                 app: "github-actions",
-                 check_suite: 70,
-                 completed_at: "2026-09-27T10:00:00Z"
-               },
-               %{id: 8}
-             ] = runs
-
-      assert [%{context: "local-gate", state: "success", at: "t"}] = statuses
     end
 
-    test "further pages are read until the total is reached" do
-      stub(fn conn ->
-        if String.ends_with?(conn.request_path, "/check-runs") do
-          page = URI.decode_query(conn.query_string)["page"]
-          run = gh_run(String.to_integer(page), "job-#{page}", "success")
-          json(conn, %{"total_count" => 2, "check_runs" => [run]})
-        else
-          json(conn, %{"total_count" => 0, "statuses" => []})
-        end
-      end)
+    defp answer_statuses(conn, {:status, code}),
+      do: conn |> Plug.Conn.put_status(code) |> json(%{})
 
-      assert {:ok, %{check_runs: [%{name: "job-1"}, %{name: "job-2"}]}} =
-               Source.check_evidence(@repo, @head)
+    defp answer_statuses(conn, body), do: json(conn, body)
+
+    test "reads the jobs of the push runs of THIS branch at THIS commit, tagged with the run" do
+      stub_ci(%{
+        runs: %{"total_count" => 1, "workflow_runs" => [gh_run(5)]},
+        jobs: %{5 => %{"total_count" => 1, "jobs" => [gh_job(50, "test", "success")]}},
+        statuses: %{
+          "total_count" => 1,
+          "statuses" => [%{"context" => "local-gate", "state" => "success"}]
+        }
+      })
+
+      assert {:ok, %{jobs: [job], statuses: [%{context: "local-gate"}]}} =
+               Source.check_evidence(@repo, @head, @branch)
+
+      assert %{id: 50, name: "test", run_id: 5, workflow: ".github/workflows/ci.yml"} = job
+
+      assert_received {:runs_query, query}
+      assert query["head_sha"] == @head
+      assert query["branch"] == @branch
+      assert query["event"] == "push"
     end
 
-    test "a list the forge truncated is an error, never a partial answer" do
-      stub(fn conn ->
-        if String.ends_with?(conn.request_path, "/check-runs") do
-          json(conn, %{"total_count" => 1000, "check_runs" => [gh_run(1, "test", "success")]})
-        else
-          json(conn, %{"total_count" => 0, "statuses" => []})
-        end
-      end)
+    # Round 1 of #910, finding 2: a run the API filter let through for another branch, event or
+    # commit is dropped here too — only the thread's own push runs are trusted.
+    test "a run for another branch, event or commit is never read" do
+      stub_ci(%{
+        runs: %{
+          "total_count" => 3,
+          "workflow_runs" => [
+            gh_run(6, %{"head_branch" => "evil"}),
+            gh_run(7, %{"event" => "workflow_dispatch"}),
+            gh_run(8, %{"head_sha" => String.duplicate("9", 40)})
+          ]
+        },
+        jobs: %{},
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
 
-      assert {:error, {:check_runs_truncated, 1000, 3}} =
-               Source.check_evidence(@repo, @head)
-
-      stub(fn conn ->
-        if String.ends_with?(conn.request_path, "/check-runs") do
-          json(conn, %{"total_count" => 0, "check_runs" => []})
-        else
-          json(conn, %{"total_count" => 101, "statuses" => []})
-        end
-      end)
-
-      assert {:error, {:statuses_truncated, 101, 0}} =
-               Source.check_evidence(@repo, @head)
+      assert {:ok, %{jobs: []}} = Source.check_evidence(@repo, @head, @branch)
     end
 
-    test "an unreadable body is an error naming its shape" do
+    # Round 1 of #910, finding 3: a job repeated across a moved page boundary is counted once,
+    # and a list short of its total is refused.
+    test "jobs are de-duplicated by id and a short list is refused as truncated" do
+      stub_ci(%{
+        runs: %{"total_count" => 1, "workflow_runs" => [gh_run(5)]},
+        jobs: %{
+          5 => %{
+            "total_count" => 2,
+            "jobs" => [gh_job(50, "test", "success"), gh_job(50, "test", "success")]
+          }
+        },
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:error, {:jobs_truncated, 2, 1}} = Source.check_evidence(@repo, @head, @branch)
+    end
+
+    test "more workflow runs than the bound is refused rather than read" do
+      runs = for id <- 1..11, do: gh_run(id)
+
+      stub_ci(%{
+        runs: %{"total_count" => 11, "workflow_runs" => runs},
+        jobs: %{},
+        statuses: %{"total_count" => 0, "statuses" => []}
+      })
+
+      assert {:error, {:too_many_workflow_runs, 11}} =
+               Source.check_evidence(@repo, @head, @branch)
+    end
+
+    # Round 1 of #910, finding 4: the statuses feed only the recorded local-gate state.
+    test "statuses that cannot be read are recorded as unread, never a failed read" do
+      stub_ci(%{
+        runs: %{"total_count" => 1, "workflow_runs" => [gh_run(5)]},
+        jobs: %{5 => %{"total_count" => 1, "jobs" => [gh_job(50, "test", "success")]}},
+        statuses: {:status, 403}
+      })
+
+      assert {:ok, %{jobs: [_], statuses: {:unread, _reason}}} =
+               Source.check_evidence(@repo, @head, @branch)
+    end
+
+    test "an unreadable runs body is an error naming its shape" do
       stub(fn conn -> json(conn, %{"message" => "nope"}) end)
 
-      assert {:error, {:unreadable_check_runs, {:map, ["message"]}}} =
-               Source.check_evidence(@repo, @head)
+      assert {:error, {:unreadable_workflow_runs, {:map, ["message"]}}} =
+               Source.check_evidence(@repo, @head, @branch)
     end
   end
 

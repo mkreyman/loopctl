@@ -338,7 +338,16 @@ defmodule Loopctl.IntakeTest do
 
     test "blank, duplicate and oversized names are refused", ctx do
       # A JSON null element casts to nil: it must be a 422, never a raise (round 1, finding 3).
-      for bad <- [[""], ["  "], ["test", "test"], [String.duplicate("x", 201)], [nil], ["a", nil]] do
+      for bad <- [
+            [""],
+            ["  "],
+            ["test", "test"],
+            [String.duplicate("x", 201)],
+            [nil],
+            ["a", nil],
+            ["test "],
+            [" lint"]
+          ] do
         assert {:error, _changeset} = enrol(ctx, %{mode: :thread, required_checks: bad}),
                inspect(bad)
       end

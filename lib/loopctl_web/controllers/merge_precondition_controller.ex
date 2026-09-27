@@ -263,17 +263,22 @@ defmodule LoopctlWeb.MergePreconditionController do
         "`thread_unreadable`. It also refuses `empty_change` (the checkpoint's tree equals " <>
         "the base branch's, or no file changed) and `checkpoint_tree_mismatch` (the forge's " <>
         "tree for it is not the one recorded). CI is read by the checkpoint's EXACT SHA " <>
-        "(US-45.6), from both the check-runs and the commit-status APIs (only a GitHub " <>
-        "Actions check run satisfies a required check; statuses are recorded, never " <>
-        "trusted), against the " <>
+        "(US-45.6): only a job of a GitHub Actions workflow run that a PUSH of the thread " <>
+        "branch at that commit triggered satisfies a required check, and only by concluding " <>
+        "`success` (a skipped job fails); commit statuses are recorded, never trusted; " <>
+        "against the " <>
         "source's `required_checks`: a failed one refuses `required_check_failed`, one still " <>
         "running or not yet reported is `unevaluated` (`required_check_pending` / " <>
-        "`required_check_missing`, `Retry-After` 300; neither counts toward the unevaluated " <>
-        "bound, and 24 hours after the story entered `ci` both are refused " <>
-        "`required_check_timed_out`; per name the latest run of each check suite counts and " <>
-        "every suite must pass), the required checks are the source's current list, a " <>
+        "`required_check_missing`, `Retry-After` #{MergePrecondition.ci_wait_retry_after()}; " <>
+        "neither counts toward the unevaluated bound, and " <>
+        "#{div(MergePrecondition.ci_wait_limit_seconds(), 3600)} hours after the story " <>
+        "entered `ci` (or, with no recorded entry, the checkpoint was recorded) both are " <>
+        "refused " <>
+        "`required_check_timed_out`; per name the latest run of each workflow counts and " <>
+        "every workflow must pass), the required checks are the source's current list, a " <>
         "checkpoint changing `.github/workflows/` or `.github/actions/` is refused " <>
-        "`ci_definition_changed`, a source requiring none refuses `required_checks_unset`, a " <>
+        "`ci_definition_changed` (and one whose diff could not be listed " <>
+        "`ci_definition_unknown`), a source requiring none refuses `required_checks_unset`, a " <>
         "failed read is `ci_evidence_unavailable`, and a `local-gate` status is recorded but " <>
         "never satisfies a required check. `ci_evidence` is what was read; it is copied onto " <>
         "the checkpoint, and an allow whose copy did not land is refused " <>

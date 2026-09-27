@@ -174,7 +174,7 @@ export function requiredChecksRefusal(checks) {
 
   if (!ok) {
     return refuse(
-      "`required_checks` must be a list of GitHub Actions check-run names, as they appear " +
+      "`required_checks` must be a list of GitHub Actions job names, as they appear " +
         "on the commit (for example [\"test\", \"lint\"]).",
     );
   }

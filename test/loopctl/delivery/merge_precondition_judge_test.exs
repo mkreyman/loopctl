@@ -1203,14 +1203,14 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
   describe "CI evidence on the checkpoint's exact commit (US-45.6)" do
     test "a failed required check refuses, naming it and its conclusion" do
       verdict =
-        judge_thread(ci: %{check_runs: [run("test", "completed", "failure")], statuses: []})
+        judge_thread(ci: %{jobs: [run("test", "completed", "failure")], statuses: []})
 
       assert verdict.decision == :refuse
       assert {:required_check_failed, "test", "failure"} in verdict.reasons
     end
 
     test "a pending required check is unevaluated, retried after five minutes, never allowed" do
-      verdict = judge_thread(ci: %{check_runs: [run("test", "in_progress", nil)], statuses: []})
+      verdict = judge_thread(ci: %{jobs: [run("test", "in_progress", nil)], statuses: []})
 
       assert verdict.decision == :unevaluated
       assert {:required_check_pending, "test"} in verdict.reasons
@@ -1218,7 +1218,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     end
 
     test "a required check missing from the commit is unevaluated, never allowed" do
-      verdict = judge_thread(ci: %{check_runs: [], statuses: []})
+      verdict = judge_thread(ci: %{jobs: [], statuses: []})
 
       assert verdict.decision == :unevaluated
       assert {:required_check_missing, "test"} in verdict.reasons
@@ -1226,7 +1226,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
 
     test "a failure decides even while another required check is still running" do
       ci = %{
-        check_runs: [run("test", "completed", "failure"), run("lint", "queued", nil)],
+        jobs: [run("test", "completed", "failure"), run("lint", "queued", nil)],
         statuses: []
       }
 
@@ -1239,7 +1239,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
 
     # TC-45.6.2: the local gate alone never satisfies a required check.
     test "only a local-gate success is not an allow" do
-      ci = %{check_runs: [], statuses: [%{context: "local-gate", state: "success"}]}
+      ci = %{jobs: [], statuses: [%{context: "local-gate", state: "success"}]}
       verdict = judge_thread(ci: ci)
 
       assert verdict.decision == :unevaluated
@@ -1290,9 +1290,25 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       end
     end
 
+    # Round 1 of #910, finding 7: a diff that could not be listed fails CLOSED here.
+    test "a checkpoint whose diff could not be listed is refused ci_definition_unknown" do
+      verdict = judge_thread(diff_override: {:error, {:file_list_truncated, 300}})
+
+      assert verdict.decision == :refuse
+      assert {:ci_definition_unknown, {:file_list_truncated, 300}} in verdict.reasons
+    end
+
+    # Round 1 of #910, finding 5: contention reading the ci entry is a retry, not a crash.
+    test "a ci-entry read that met contention is unevaluated" do
+      verdict = judge_thread([], ci_entered_at: {:error, :busy})
+
+      assert verdict.decision == :unevaluated
+      assert {:ci_entry_unreadable, :busy} in verdict.reasons
+    end
+
     # Review round 2, finding 3: a CI wait holds back only an allow.
     test "a refusal is decided now, not held back while CI is still running" do
-      running = %{check_runs: [run("test", "queued", nil)], statuses: []}
+      running = %{jobs: [run("test", "queued", nil)], statuses: []}
       verdict = judge_thread(head_tree_sha: String.duplicate("f", 40), ci: running)
 
       assert verdict.decision == :refuse
@@ -1343,10 +1359,10 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
 
     # Review round 1, findings 1 and 2: a CI wait is bounded in TIME, never by polls.
     test "a CI wait, running or missing, is left out of the unevaluated bound" do
-      pending = judge_thread(ci: %{check_runs: [run("test", "queued", nil)], statuses: []})
+      pending = judge_thread(ci: %{jobs: [run("test", "queued", nil)], statuses: []})
       refute MergePrecondition.counts_toward_unevaluated_bound?(pending)
 
-      missing = judge_thread(ci: %{check_runs: [], statuses: []})
+      missing = judge_thread(ci: %{jobs: [], statuses: []})
       refute MergePrecondition.counts_toward_unevaluated_bound?(missing)
 
       forge = judge_thread([], ci_evidence: {:error, {:github_unreachable, :timeout}})
@@ -1358,18 +1374,18 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       late = DateTime.add(entered, MergePrecondition.ci_wait_limit_seconds() + 1)
       on_time = DateTime.add(entered, MergePrecondition.ci_wait_limit_seconds())
 
-      stuck = %{check_runs: [run("test", "in_progress", nil)], statuses: []}
+      stuck = %{jobs: [run("test", "in_progress", nil)], statuses: []}
 
-      refused = judge_thread([ci: stuck], ci_entered_at: entered, now: late)
+      refused = judge_thread([ci: stuck], ci_entered_at: {:ok, entered}, now: late)
       assert refused.decision == :refuse
       assert {:required_check_timed_out, "test", :pending} in refused.reasons
 
       never =
-        judge_thread([ci: %{check_runs: [], statuses: []}], ci_entered_at: entered, now: late)
+        judge_thread([ci: %{jobs: [], statuses: []}], ci_entered_at: {:ok, entered}, now: late)
 
       assert {:required_check_timed_out, "test", :missing} in never.reasons
 
-      waiting = judge_thread([ci: stuck], ci_entered_at: entered, now: on_time)
+      waiting = judge_thread([ci: stuck], ci_entered_at: {:ok, entered}, now: on_time)
       assert waiting.decision == :unevaluated
     end
   end
@@ -1414,6 +1430,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       checkpoint: {:ok, checkpoint},
       claim_live?: Keyword.get(overrides, :claim_live?, true),
       required_checks: Keyword.get(overrides, :required_checks, ["test"]),
+      ci_entered_at: {:ok, nil},
       ci_evidence: {:ok, ci_read(Keyword.get(overrides, :ci, green_ci()))}
     })
     |> Map.merge(Map.new(fact_overrides))
@@ -1421,7 +1438,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
   end
 
   # US-45.6: the checkpoint commit's CI as `gather/3` reads it.
-  defp green_ci, do: %{check_runs: [run("test", "completed", "success")], statuses: []}
+  defp green_ci, do: %{jobs: [run("test", "completed", "success")], statuses: []}
 
   defp run(name, status, conclusion),
     do: %{name: name, status: status, conclusion: conclusion, app: "github-actions"}

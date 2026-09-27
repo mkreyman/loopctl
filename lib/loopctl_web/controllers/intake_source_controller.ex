@@ -31,13 +31,14 @@ defmodule LoopctlWeb.IntakeSourceController do
   tags(["Intake"])
 
   @required_checks_doc "The CI checks a THREAD-mode checkpoint must pass on its exact commit before " <>
-                         "the merge gate allows it (US-45.6): GitHub Actions check-run names as " <>
+                         "the merge gate allows it (US-45.6): GitHub Actions JOB names as " <>
                          "they appear on the commit. A `thread` source must name at " <>
                          "least one (422 otherwise, whichever of `mode` and `required_checks` " <>
                          "the request named); `pr` mode never reads it. At most " <>
                          "#{Source.max_required_checks()} distinct, non-blank names of at most " <>
-                         "#{Source.max_check_name_bytes()} bytes. Only a GitHub Actions check " <>
-                         "run satisfies one; a commit status is recorded, never trusted. Each " <>
+                         "#{Source.max_check_name_bytes()} bytes, no surrounding whitespace. Only a " <>
+                         "job of a GitHub Actions workflow run that a push of the thread " <>
+                         "branch triggered, concluding `success`, satisfies one. Each " <>
                          "required job must run on every push to the thread branches (no path " <>
                          "filter or job-level `if:`): one that never appears is refused after " <>
                          "the merge gate's CI wait. " <>

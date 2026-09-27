@@ -438,10 +438,10 @@ defmodule Loopctl.Delivery.StagesTest do
       {story, _row} = at_stage(:pr_open)
       opts = [claim_epoch: story.claim_epoch]
 
-      assert Stages.entered_at(story.tenant_id, story.id, :ci) == nil
+      assert Stages.entered_at(story.tenant_id, story.id, :ci) == {:ok, nil}
 
       {:ok, _} = Stages.advance(story.tenant_id, story.id, {:pr_open, :ci}, opts)
-      first = Stages.entered_at(story.tenant_id, story.id, :ci)
+      {:ok, first} = Stages.entered_at(story.tenant_id, story.id, :ci)
       assert %DateTime{} = first
 
       {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :implementing, :ci_red}, opts)
@@ -452,15 +452,15 @@ defmodule Loopctl.Delivery.StagesTest do
         {:ok, _} = Stages.advance(story.tenant_id, story.id, {from, to}, opts)
       end)
 
-      second = Stages.entered_at(story.tenant_id, story.id, :ci)
+      {:ok, second} = Stages.entered_at(story.tenant_id, story.id, :ci)
       assert DateTime.compare(second, first) == :gt
 
       # A later transition OUT of the stage does not move when it was entered.
       {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :implementing, :ci_red}, opts)
-      assert Stages.entered_at(story.tenant_id, story.id, :ci) == second
+      assert Stages.entered_at(story.tenant_id, story.id, :ci) == {:ok, second}
 
       # Another tenant's story is never read.
-      assert Stages.entered_at(fixture(:tenant).id, story.id, :ci) == nil
+      assert Stages.entered_at(fixture(:tenant).id, story.id, :ci) == {:ok, nil}
     end
   end
 

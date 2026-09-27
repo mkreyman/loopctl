@@ -8503,15 +8503,18 @@ const TOOLS = [
       "`thread_unreadable`. It adds refusals `empty_change` (the " +
       "checkpoint's tree equals the base's, or no file changed) and " +
       "`checkpoint_tree_mismatch` (the forge's tree is not the one the claimant recorded). " +
-      "CI IS READ BY THE CHECKPOINT'S EXACT SHA, from both the check-runs and the " +
-      "commit-status APIs, against the source's `required_checks`; only a GitHub Actions " +
-      "check run satisfies one (a status is recorded, never trusted): a failed one refuses " +
-      "`required_check_failed`, one still running or not yet reported answers `unevaluated` " +
-      "(`required_check_pending` / `required_check_missing`, retry after 300s; neither counts " +
-      "toward the unevaluated bound, and 24 hours after the story entered ci both are " +
-      "refused `required_check_timed_out`; per name the latest run of each check suite " +
-      "counts and every suite must pass), a checkpoint changing `.github/workflows/` or " +
-      "`.github/actions/` is refused `ci_definition_changed`, a source requiring none refuses " +
+      "CI IS READ BY THE CHECKPOINT'S EXACT SHA against the source's `required_checks`: only " +
+      "a job of a GitHub Actions workflow run that a PUSH of the thread branch at that commit " +
+      "triggered satisfies one, and only by concluding `success` (a skipped job fails; " +
+      "statuses and other check runs are never trusted). A failed one refuses " +
+      "`required_check_failed`; one still running or not yet reported answers `unevaluated` " +
+      "(`required_check_pending` / `required_check_missing`, retry after the answer's " +
+      "Retry-After; neither counts toward the unevaluated bound, and past the gate's CI wait " +
+      "limit from the story's entry into ci both are refused `required_check_timed_out`; per " +
+      "name the newest run of each workflow counts and every workflow must pass). A " +
+      "checkpoint changing `.github/workflows/` or `.github/actions/` is refused " +
+      "`ci_definition_changed` (`ci_definition_unknown` when its diff could not be listed), " +
+      "a source requiring none refuses " +
       "`required_checks_unset`, and an evidence read that failed is `ci_evidence_unavailable`. " +
       "`local-gate` is recorded, never counted. The answer's `ci_evidence` is what was read, " +
       "and it is copied onto the checkpoint. " +
@@ -8726,7 +8729,7 @@ const TOOLS = [
           items: { type: "string" },
           description:
             "The CI checks a THREAD-mode checkpoint must pass on its exact commit before the " +
-            "merge gate allows it: GitHub Actions check-run names as they appear " +
+            "merge gate allows it: GitHub Actions job names as they appear " +
             "on the commit. A `thread` source must name at least one (422 otherwise); `pr` " +
             "mode never reads it. Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused: whoever pushed posts it, so it is only recorded.",
@@ -8836,7 +8839,7 @@ const TOOLS = [
           items: { type: "string" },
           description:
             "The CI checks a THREAD-mode checkpoint must pass on its exact commit before the " +
-            "merge gate allows it: GitHub Actions check-run names as they appear " +
+            "merge gate allows it: GitHub Actions job names as they appear " +
             "on the commit. A `thread` source must name at least one (422 otherwise); `pr` " +
             "mode never reads it. Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused. Omit to leave the current list alone.",

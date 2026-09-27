@@ -323,7 +323,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
           # checkpoint's exact commit (`{:ok, nil}` where nothing was read).
           optional(:required_checks) => [String.t()],
           optional(:ci_evidence) => fact(map() | nil),
-          optional(:ci_entered_at) => DateTime.t() | nil,
+          optional(:ci_entered_at) => fact(DateTime.t() | nil),
           optional(:now) => DateTime.t()
         }
 
@@ -616,13 +616,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
     {:repo, :repository_unresolved},
     {:checkpoint, :thread_unreadable},
     {:pull_request, :pull_request_unavailable},
-    {:ci_evidence, :ci_evidence_unavailable}
+    {:ci_evidence, :ci_evidence_unavailable},
+    {:ci_entered_at, :ci_entry_unreadable}
   ]
 
   @forge_facts [
     {:checkpoint, :thread_unreadable},
     {:pull_request, :pull_request_unavailable},
     {:ci_evidence, :ci_evidence_unavailable},
+    {:ci_entered_at, :ci_entry_unreadable},
     {:head_files, :head_files_unavailable},
     {:base_files, :base_files_unavailable}
   ]
@@ -716,7 +718,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   def ci_wait_limit_seconds, do: @ci_wait_limit_seconds
 
   defp ci_wait_exceeded?(facts) do
-    case {Map.get(facts, :ci_entered_at), Map.get(facts, :now)} do
+    case {value(facts, :ci_entered_at), Map.get(facts, :now)} do
       {%DateTime{} = entered, %DateTime{} = now} ->
         DateTime.diff(now, entered) > @ci_wait_limit_seconds
 
@@ -729,6 +731,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # the forge (about nine calls), and a pipeline takes minutes to hours, so a tighter loop
   # only spends the shared token's rate limit (round 2, finding 6).
   @ci_wait_retry_after 300
+
+  @doc "The `Retry-After` a CI wait answers with, in seconds (US-45.6)."
+  @spec ci_wait_retry_after() :: pos_integer()
+  def ci_wait_retry_after, do: @ci_wait_retry_after
 
   # A CI wait holds back only an ALLOW (round 2, finding 3). Everything else the change was
   # judged on is decided now: a refusal (a tree mismatch, an empty change, the size bound, a
@@ -1009,6 +1015,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
+  # A diff that could not be listed (truncated at the compare cap, unreadable) may touch CI
+  # definitions for all the gate can tell: refused as unknown here, by this guard, rather than
+  # left to whichever other rule happens to refuse an unreadable diff.
+  defp ci_definition_reasons({:error, reason}), do: [{:ci_definition_unknown, reason}]
   defp ci_definition_reasons(_no_diff), do: []
 
   defp ci_definition?(name) when is_binary(name),
@@ -1393,7 +1403,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # which names the fix — setting the list again — and is not a dead end.
       required_checks: source_required_checks(source),
       # When the story entered `ci`: what a CI wait is measured from.
-      ci_entered_at: if(mode == :thread, do: Stages.entered_at(story.tenant_id, story.id, :ci)),
+      ci_entered_at: ci_entered_at(mode, story, checkpoint),
       now: DateTime.utc_now()
     }
 
@@ -1412,21 +1422,43 @@ defmodule Loopctl.Delivery.MergePrecondition do
     })
   end
 
+  # When the CI wait started: the story's entry into `ci`, read under a bounded lock wait
+  # (contention is `{:error, :busy}`, a retry). A story that reached `ci` with no recorded
+  # transition — a backfill, a repair — falls back to its checkpoint's recording, which is
+  # always known, so the wait is bounded for every story (round 1 of #910, finding 8).
+  defp ci_entered_at(:thread, story, checkpoint) do
+    case Stages.entered_at(story.tenant_id, story.id, :ci) do
+      {:ok, %DateTime{} = entered} -> {:ok, entered}
+      {:ok, nil} -> {:ok, checkpoint_recorded_at(checkpoint)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp ci_entered_at(_mode, _story, _checkpoint), do: {:ok, nil}
+
+  defp checkpoint_recorded_at({:ok, %{recorded_at: %DateTime{} = at}}), do: at
+  defp checkpoint_recorded_at(_checkpoint), do: nil
+
   defp source_required_checks({:ok, %{required_checks: checks}}) when is_list(checks), do: checks
   defp source_required_checks(_no_source), do: []
 
   # US-45.6: the evidence for the CHECKPOINT'S exact commit, never the branch head's or a
   # parent's. Read only where a thread is about to be judged: a moved head or a merged
   # checkpoint decides without it, and a source requiring nothing is refused without a read.
-  defp ci_evidence(%{mode: :thread} = facts, {:ok, %{merged?: false}}, false = _skip?) do
+  defp ci_evidence(
+         %{mode: :thread} = facts,
+         {:ok, %{merged?: false, thread_branch: branch}},
+         false = _skip?
+       ) do
     names = CiEvidence.lookup_names(facts.required_checks)
 
     # A repository or checkpoint that could not be read is already refused as itself; only
-    # the evidence read's OWN failure is this fact's.
+    # the evidence read's OWN failure is this fact's. The BRANCH is the one the thread is
+    # judged on: only the runs a push of it triggered are trusted (`CiEvidence`).
     with {:ok, repo} <- facts.repo,
          {:ok, %{commit_sha: sha}} <- facts.checkpoint,
          [_ | _] <- names do
-      case source().check_evidence(repo, sha) do
+      case source().check_evidence(repo, sha, branch) do
         {:ok, evidence} -> {:ok, %{evidence: evidence, sha: sha, read_at: DateTime.utc_now()}}
         {:error, _reason} = error -> error
       end
@@ -1436,6 +1468,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
   end
 
   defp ci_evidence(_facts, _pull_request, _skip?), do: {:ok, nil}
+
+  # The branch travels with the thread's facts so the CI read can name it.
+  defp with_thread_branch({:ok, %{} = facts}, branch),
+    do: {:ok, Map.put(facts, :thread_branch, branch)}
+
+  defp with_thread_branch(other, _branch), do: other
 
   defp fetch_story(tenant_id, story_id) do
     case Stories.get_story(tenant_id, story_id) do
@@ -1470,12 +1508,13 @@ defmodule Loopctl.Delivery.MergePrecondition do
         # The branch is resolved HERE, for a thread only: a pull request names its own head.
         pull_request =
           with {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
-            CheckpointSource.pull_request(
-              repo,
+            repo
+            |> CheckpointSource.pull_request(
               placed_base_branch(route, source),
               branch,
               checkpoint
             )
+            |> with_thread_branch(branch)
           end
 
         {{:ok, nil}, {:ok, checkpoint_fact(checkpoint, claim.earlier_shas)}, pull_request}
@@ -1514,6 +1553,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp checkpoint_fact(%Checkpoint{} = checkpoint, earlier_shas) do
     %{
       id: checkpoint.id,
+      # The CI wait's fallback origin, for a story with no recorded entry into `ci`.
+      recorded_at: checkpoint.inserted_at,
       commit_sha: checkpoint.commit_sha,
       tree_sha: checkpoint.tree_sha,
       earlier_shas: earlier_shas
