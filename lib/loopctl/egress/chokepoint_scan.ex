@@ -85,6 +85,16 @@ defmodule Loopctl.Egress.ChokepointScan do
         "intake source, never from a tenant-supplied URL. The writes carry NO tenant and NO " <>
         "reporter content outbound: the comment body is one of two compile-time constants " <>
         "in Loopctl.Delivery.Resolution, and the label is one of two constants beside them.",
+    "Loopctl.Delivery.GitHubAppMergeForge" =>
+      "The merge executor (US-45.5) acting as loopctl's GitHub App on a thread-mode " <>
+        "story's repository: mints an installation token, reads refs, commits and " <>
+        "comparisons, creates the squash commit, moves the base ref by fast-forward, and " <>
+        "merges the base into a temporary loop/ branch the thread branch is fast-forwarded to. Operator-plane, a fixed vendor host, and " <>
+        "the repository is resolved server-side from the story's intake source. It is not " <>
+        "model-provider egress. It DOES carry tenant content outbound, to the tenant's own " <>
+        "repository: the squash message holds the story's number and title, reduced to one " <>
+        "printable line by Loopctl.Delivery.MergeMessage, and the story's thread URL — no " <>
+        "session or reporter text.",
     "Loopctl.Secrets.FlyAdapter" =>
       "Operator-plane secret management against the Fly GraphQL API. Fixed host, not " <>
         "tenant-content egress, and never reachable from a tenant-supplied URL.",

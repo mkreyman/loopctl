@@ -180,12 +180,6 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   @max_consecutive_deploy_pending 30
   @max_consecutive_total 40
 
-  # Matches `Loopctl.Delivery.MergePrecondition`'s: the `story_stages_text_bounds` CHECK is
-  # 4000 CODEPOINTS, and the margin is deliberate. A reason too long to store would roll the
-  # transition back and leave the story at `deployed` with nothing recorded, which is the one
-  # outcome a fail-closed gate cannot have.
-  @reason_budget 3_900
-
   @type fact(value) :: {:ok, value} | {:error, term()}
 
   @typedoc "Which kind of waiting an `:unresolved` result is, and therefore which bound it has."
@@ -808,21 +802,10 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # reading the escalation must not have to go and look them up. `{deployed, verified}` is
   # not a reason-required transition, but the note is recorded on its event all the same.
   defp reason_text(%Result{merge_sha: merge_sha, deployed_sha: deployed, reasons: reasons}) do
-    bound_codepoints(
+    StageMachine.bounded_reason(
       "post_deploy (merge_sha: #{inspect(merge_sha)}, deployed_sha: #{inspect(deployed)}): " <>
         Enum.map_join(reasons, "; ", &inspect/1)
     )
-  end
-
-  # CODEPOINTS, matching Postgres `char_length` and `Stages`' own bound. A codepoint prefix
-  # can split a grapheme cluster; that is cosmetic and the string stays valid UTF-8, which
-  # is the trade against an escalation that will not write at all.
-  defp bound_codepoints(text) do
-    chars = String.to_charlist(text)
-
-    if length(chars) > @reason_budget,
-      do: chars |> Enum.take(@reason_budget - 1) |> List.to_string() |> Kernel.<>("…"),
-      else: text
   end
 
   # Only the SHAPE of an unexpected value is echoed into a stored reason.

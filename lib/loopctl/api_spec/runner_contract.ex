@@ -322,6 +322,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   same `client_seq` with other content) — permanently, because acknowledging it would tell the
   runner its new content was recorded when it was not.
 
+  **AFTER A BASE UPDATE THE THREAD BRANCH HEAD IS LOOPCTL'S** (US-45.5; no wire change). When
+  the base branch moves under a checkpoint the merge gate allowed, loopctl's merge executor
+  merges the base INTO the thread branch as its GitHub App, records that merge commit as a
+  `base_update` checkpoint, and keeps the story at `ci` over control's `base_updated` edge (a
+  runner never reports it). The thread branch head is then that merge commit, not the
+  session's last push. A session that goes on working on the story must FETCH the thread
+  branch and build on its head before pushing again: a push from the old head is not a
+  fast-forward, and a forced one is a head nobody reported, which the gate sends back. Report
+  the next commit as an ordinary `checkpoint`; in the thread its parent is the previous
+  CLAIMANT checkpoint, never the base update.
+
   **EVERY `note` AND `body` IS SCANNED FOR CREDENTIALS** before anything is written, because
   an entry is served to every role of the tenant and nothing can edit or remove one. A
   credential-shaped value is `secret_blocked`, permanently for those bytes: remove the value

@@ -92,6 +92,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
     `:claim_not_live`, which escalates. Nobody can record the pushed commit, so sending the
     story back would loop it ci -> implementing -> ci for ever
 
+  One unrecorded head is not a move: while the checkpoint is the one the recorded allow names,
+  a head whose FIRST parent is that checkpoint is the merge executor's base update between
+  moving the thread branch and recording it (US-45.5), answered `{:base_update_in_flight,
+  head}` — transient, so `:unevaluated` and retried, never sent back to `implementing`.
+
   loopctl never adopts a head nobody reported, and a merge squashes the RECORDED checkpoint's
   tree, never the branch head (PRD §4 item 2). A thread read that meets database contention
   is `:busy`, which is transient: `:unevaluated`, and counted like any other.
@@ -115,17 +120,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   A thread-mode allow is recorded naming the checkpoint id and its sha, and `base_sha` — the
   MERGE BASE the judged diff is relative to — on the `effect_recorded` event of
-  `merge_gate_allowed_sha`. THAT IS THE MERGE EXECUTOR'S CONTRACT (US-45.5): it merges only
-  while the base head still equals the recorded `base_sha`, and otherwise takes the
-  base-update path (AC-45.5.4, AC-45.5.7). A squash of the checkpoint's tree onto a base that
-  moved would silently revert every base commit the judged diff never saw, so base freshness
-  is enforced at the one step that writes the base.
+  `merge_gate_allowed_sha`, and then enqueues `Loopctl.Workers.ThreadMergeWorker`. THAT IS THE
+  MERGE EXECUTOR'S CONTRACT (`Loopctl.Delivery.MergeExecutor`, US-45.5): it merges only while
+  the base head still equals the recorded `base_sha`, and otherwise takes the base-update path
+  (AC-45.5.4, AC-45.5.7). A squash of the checkpoint's tree onto a base that moved would
+  silently revert every base commit the judged diff never saw, so base freshness is enforced
+  at the one step that writes the base.
 
-  THIS GATE JUDGES CLAIMANT CHECKPOINTS ONLY (`kind: :checkpoint`,
-  `Loopctl.Threads.claim_checkpoints/2`). A `base_update` checkpoint — the executor's merge of
-  the base into the thread — is written by US-45.5, and until that story makes
-  `claim_checkpoints/2` treat the latest `base_update` reaching the allowed checkpoint as the
-  judged head (AC-45.5.9) the gate does not see one.
+  The checkpoint judged is `Loopctl.Threads.claim_checkpoints/2`'s `latest`: the claim's latest
+  claimant checkpoint, or a `base_update` — the executor's merge of the base into the thread —
+  whose parents reach the checkpoint this gate last allowed (AC-45.5.9). Such a base update is
+  the same change on a newer base, so it keeps its review and custody and is judged here like
+  any checkpoint, green CI on its exact sha included. Any other `base_update` is invisible.
 
   ## The loop may not merge its own control plane
 
@@ -247,7 +253,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   - `:allow` — `record_effect(:merge_gate_allowed_sha, head)`. A write that does not land
     turns the allow into a refusal, because an allow nobody recorded is an allow nobody can
     later account for
-  - `:already_merged` and `:unevaluated` — nothing
+  - `:already_merged` and `:unevaluated` — nothing (a thread-mode `:already_merged` enqueues
+    the merge executor, which records the adopted merge; US-45.5)
 
   The merge itself is still the CALLER's: it merges and then advances `{:ci, :merged}`
   carrying the sha the forge returned, because the merge commit does not exist until the
@@ -274,6 +281,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
   alias Loopctl.WorkBreakdown.Stories
+  alias Loopctl.Workers.ThreadMergeWorker
 
   # Design §5: "the 12-file / 1,000-line bound". A CEILING over the configured limits, not
   # a default for them — configuration may tighten it and may not loosen it. Without this,
@@ -281,17 +289,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # document is exactly the thing an agent-driven loop must not be able to talk around.
   @hard_max_files 12
   @hard_max_changed_lines 1_000
-
-  # The `story_stages_text_bounds` CHECK on `escalation_reason` is
-  # `char_length(...) BETWEEN 1 AND 4000`, and Postgres `char_length` counts CODEPOINTS —
-  # as does `Loopctl.Delivery.Stages`' own `bounded_text/2`. So the reason is bounded in
-  # codepoints, NOT graphemes: an NFD path or an emoji is several codepoints per grapheme,
-  # and a grapheme bound would let an over-long reason reach the CHECK, fail the write and
-  # leave the story sitting at `ci` with nothing recorded — the one outcome a fail-closed
-  # gate cannot have. The margin is deliberate: the truncation is the LAST thing that may
-  # cost an escalation its write.
-  # 4000 is the CHECK; 3900 is what this writes, and the 100-codepoint margin is the point.
-  @reason_budget 3_900
 
   @type fact(value) :: {:ok, value} | {:error, term()}
 
@@ -853,6 +850,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   def transient?({:github_api_error, status}), do: status in @transient_statuses
   # A database read that met contention (`Loopctl.Delivery.Stages.answering_busy/4`).
   def transient?(:busy), do: true
+  # US-45.5: the executor has moved the thread branch to a base update it has not recorded yet.
+  def transient?({:base_update_in_flight, _head}), do: true
   def transient?(_reason), do: false
 
   @doc "How long the forge asked a caller to wait, when it said so at all."
@@ -1547,9 +1546,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
           with {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
             repo
             |> CheckpointSource.pull_request(
-              placed_base_branch(route, source),
+              DispatchPayload.placed_base_branch(route, source),
               branch,
-              checkpoint
+              checkpoint,
+              stage.merge_gate_allowed_sha
             )
             |> with_thread_branch(branch)
           end
@@ -1577,15 +1577,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # (`Loopctl.Delivery.RunnerThreads`), so a claim with no row has no thread to judge.
   defp placed_mode(%{mode: mode}, _source) when mode in [:pr, :thread], do: mode
   defp placed_mode(_route, _source), do: :pr
-
-  # The base branch the claim was PLACED on (`dispatch_route/2`), so repointing the source
-  # afterwards cannot move the base a placed story is judged against. A ledger row written
-  # before the column existed records none, and falls back to the source's current base branch
-  # — the only base there was when it was placed.
-  defp placed_base_branch(%{base_branch: base_branch}, _source) when is_binary(base_branch),
-    do: base_branch
-
-  defp placed_base_branch(_route, source), do: source.base_branch
 
   defp checkpoint_fact(%Checkpoint{} = checkpoint, earlier_shas) do
     %{
@@ -1648,9 +1639,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   # `:unevaluated` and `:already_merged` transition NOTHING. `:unevaluated` because there is
   # no verdict to act on and a network blip must not park a story on a human; an authorised
-  # `:already_merged` because the caller's next act is recording the merge it adopted.
-  defp act(tenant_id, story_id, %Verdict{decision: :already_merged} = verdict, opts),
-    do: clear_unevaluated(tenant_id, story_id, verdict, opts)
+  # `:already_merged` because the caller's next act is recording the merge it adopted. In
+  # THREAD mode that caller is the merge executor, so it is enqueued: its own already-merged
+  # path advances `ci -> merged` on the commit the base contains (US-45.5, TC-45.5.1).
+  defp act(tenant_id, story_id, %Verdict{decision: :already_merged} = verdict, opts) do
+    merge_thread(tenant_id, story_id, clear_unevaluated(tenant_id, story_id, verdict, opts))
+  end
 
   defp act(tenant_id, story_id, %Verdict{decision: :allow} = verdict, opts) do
     # A conversion re-enters `act/4` rather than returning: the controller's contract is
@@ -1660,7 +1654,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # because the epoch does not move across a `ci -> implementing -> ci` cycle. The
     # recursion terminates: the second call carries `:refuse`.
     case record_allow(tenant_id, story_id, verdict, opts) do
-      %Verdict{decision: :allow} = allowed -> allowed
+      %Verdict{decision: :allow} = allowed -> merge_thread(tenant_id, story_id, allowed)
       %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
     end
   end
@@ -1689,6 +1683,19 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp act(tenant_id, story_id, %Verdict{decision: :refuse} = verdict, opts) do
     transition(tenant_id, story_id, verdict, escalation_transition(), opts)
   end
+
+  # US-45.5: a RECORDED thread-mode allow is what the merge executor acts on, so it is enqueued
+  # here — after the allow landed, never before — and on a thread-mode `:already_merged`,
+  # which only a recorded allow produces. On every such verdict, replays included: a caller
+  # asking the gate again after an enqueue that did not land enqueues again, and a waiting job
+  # absorbs the resend. A pull request is merged by whoever opened it, not by loopctl.
+  defp merge_thread(tenant_id, story_id, %Verdict{mode: :thread, checkpoint_id: id} = allowed)
+       when is_binary(id) do
+    :ok = ThreadMergeWorker.enqueue(tenant_id, story_id)
+    allowed
+  end
+
+  defp merge_thread(_tenant_id, _story_id, %Verdict{} = allowed), do: allowed
 
   # An allow is a RECORDED fact or it is not an allow. Without this the gate's authorisation
   # lives only in the response, and an already-merged pull request cannot be told from one
@@ -1852,22 +1859,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # and leave the story sitting at `ci` with nothing recorded, which is the one outcome a
   # fail-closed gate cannot have.
   defp reason_text(%Verdict{reasons: reasons, gate_a_inputs: gate_a_inputs}) do
-    bound_codepoints(
+    StageMachine.bounded_reason(
       "merge_gate (gate_a inputs: #{gate_a_inputs}): " <>
         Enum.map_join(reasons, "; ", &inspect/1)
     )
-  end
-
-  # CODEPOINTS, matching Postgres `char_length` and `Stages`' own bound — see the note on
-  # `@reason_budget`. A codepoint prefix can split a grapheme cluster; that is cosmetic and
-  # the string stays valid UTF-8, which is the trade against an escalation that will not
-  # write at all.
-  defp bound_codepoints(text) do
-    chars = String.to_charlist(text)
-
-    if length(chars) > @reason_budget,
-      do: chars |> Enum.take(@reason_budget - 1) |> List.to_string() |> Kernel.<>("…"),
-      else: text
   end
 
   # Only the SHAPE of an unexpected value is echoed into a stored reason.

@@ -353,6 +353,16 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  # US-45.5: the backstop that re-drives a thread merge whose job never finished. Without the
+  # entry, a job killed on its last attempt leaves an allowed story at `ci` for ever.
+  test "the ThreadMergeSweepWorker runs every five minutes and is not parked" do
+    plugins = Application.get_env(:loopctl, Oban)[:plugins]
+    {Oban.Plugins.Cron, cron_opts} = Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+    assert {"*/5 * * * *", Loopctl.Workers.ThreadMergeSweepWorker} in cron_opts[:crontab]
+    refute Loopctl.Workers.ThreadMergeSweepWorker in Loopctl.ObanConfig.parked_crons()
+  end
+
   describe "StoryCompletionWorker crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

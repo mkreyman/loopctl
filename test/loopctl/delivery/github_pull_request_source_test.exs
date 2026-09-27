@@ -369,7 +369,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       assert {:error, {:github_api_error, 404}} = Source.repository_readable(@repo)
     end
 
-    test "commit/2 returns the commit's tree" do
+    test "commit/2 returns the commit's tree and its parents in order" do
       stub(fn conn ->
         assert conn.request_path == "/repos/acme/widgets/git/commits/#{@head}"
 
@@ -379,7 +379,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         })
       end)
 
-      assert {:ok, %{tree_sha: "t1"}} = Source.commit(@repo, @head)
+      assert {:ok, %{tree_sha: "t1", parents: ["p1", "p2"]}} = Source.commit(@repo, @head)
     end
 
     test "compare/3 reads the merge base, the base's tree and a diffstat over every file" do

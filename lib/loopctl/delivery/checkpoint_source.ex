@@ -86,28 +86,30 @@ defmodule Loopctl.Delivery.CheckpointSource do
   its implement ledger row (the source's current one only for a row that pinned none);
   `branch` is the one the current claim's dispatch named.
   """
-  @spec pull_request(String.t(), String.t(), String.t(), Checkpoint.t()) ::
+  @spec pull_request(String.t(), String.t(), String.t(), Checkpoint.t(), String.t() | nil) ::
           {:ok, map()} | {:error, term()}
-  def pull_request(repo, base_branch, branch, %Checkpoint{merge_commit_sha: merged} = cp)
+  def pull_request(repo, base_branch, branch, checkpoint, allowed_sha \\ nil)
+
+  def pull_request(repo, base_branch, branch, %Checkpoint{merge_commit_sha: merged} = cp, allowed)
       when is_binary(merged) do
     case source().contains?(repo, merged, base_branch) do
       {:ok, true} -> {:ok, merged_facts(cp, merged)}
-      {:ok, false} -> open_facts(repo, base_branch, branch, cp)
-      {:error, reason} -> uncontained(reason, repo, base_branch, branch, cp)
+      {:ok, false} -> open_facts(repo, base_branch, branch, cp, allowed)
+      {:error, reason} -> uncontained(reason, {repo, base_branch, branch, cp, allowed})
     end
   end
 
-  def pull_request(repo, base_branch, branch, %Checkpoint{} = checkpoint),
-    do: open_facts(repo, base_branch, branch, checkpoint)
+  def pull_request(repo, base_branch, branch, %Checkpoint{} = checkpoint, allowed),
+    do: open_facts(repo, base_branch, branch, checkpoint, allowed)
 
   # The containment question could not be answered. Only a TRANSIENT fault is an error — it is
   # retried. Anything else, a 404 for a merge commit GitHub never had included, falls through
   # to judging the checkpoint as open, as the moduledoc promises: an unconfirmed merge is
   # never read as merged.
-  defp uncontained(reason, repo, base_branch, branch, checkpoint) do
+  defp uncontained(reason, {repo, base_branch, branch, checkpoint, allowed}) do
     if MergePrecondition.transient?(reason),
       do: {:error, reason},
-      else: open_facts(repo, base_branch, branch, checkpoint)
+      else: open_facts(repo, base_branch, branch, checkpoint, allowed)
   end
 
   defp merged_facts(checkpoint, merged) do
@@ -122,14 +124,62 @@ defmodule Loopctl.Delivery.CheckpointSource do
     }
   end
 
-  defp open_facts(repo, base_branch, branch, %Checkpoint{commit_sha: sha} = checkpoint) do
+  defp open_facts(repo, base_branch, branch, %Checkpoint{commit_sha: sha} = checkpoint, allowed) do
     case branch_head(repo, branch) do
       {:ok, ^sha} -> checkpoint_facts(repo, base_branch, checkpoint)
       {:ok, :missing} -> missing_facts(repo, base_branch, checkpoint)
-      {:ok, other} -> {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
+      {:ok, other} -> moved_facts({repo, base_branch}, sha, other, allowed)
       {:error, _reason} = error -> error
     end
   end
+
+  # A branch head nobody recorded is a moved head — UNLESS the checkpoint is the one the gate
+  # ALLOWED and that head has the SHAPE of the merge executor's base update
+  # (`base_update_of/3`): between moving the thread branch and recording it (US-45.5).
+  # Answered as a transient fault, `{:base_update_in_flight, head}`, so the gate retries
+  # rather than sending the story back. A claimant's commit on top of the checkpoint has one
+  # parent and is a moved head, as before.
+  defp moved_facts({repo, base_branch}, sha, other, sha) do
+    on_base? = &source().contains?(repo, &1, base_branch)
+
+    with {:ok, commit} <- source().commit(repo, other),
+         {:ok, _second} <- base_update_of(commit, sha, on_base?) do
+      {:error, {:base_update_in_flight, other}}
+    else
+      # Only a TRANSIENT failure of these extra reads is worth a retry. Anything else means the
+      # head could not be shown to be a base update, and it is judged as the moved head it was
+      # before the question was asked.
+      {:error, reason} = error ->
+        if MergePrecondition.transient?(reason), do: error, else: moved(sha, other)
+
+      :no ->
+        moved(sha, other)
+    end
+  end
+
+  defp moved_facts(_where, sha, other, _allowed), do: moved(sha, other)
+
+  defp moved(sha, other), do: {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
+
+  @doc """
+  Whether `commit` has the shape of the merge executor's base update of `checkpoint_sha`
+  (US-45.5): EXACTLY two parents, the first the checkpoint and the second a commit on the
+  base branch, which `on_base?` answers (`{:ok, boolean}` or an error). `{:ok, second}`, `:no`,
+  or the error. The one predicate for the gate's in-flight answer and the executor's
+  recovery of its own base update — anything else, a claimant's single-parent commit on the
+  checkpoint included, is a moved head.
+  """
+  @spec base_update_of(map(), String.t(), (String.t() -> {:ok, boolean()} | {:error, term()})) ::
+          {:ok, String.t()} | :no | {:error, term()}
+  def base_update_of(%{parents: [checkpoint_sha, second]}, checkpoint_sha, on_base?) do
+    case on_base?.(second) do
+      {:ok, true} -> {:ok, second}
+      {:ok, false} -> :no
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def base_update_of(_commit, _checkpoint_sha, _on_base?), do: :no
 
   defp checkpoint_facts(repo, base_branch, %Checkpoint{commit_sha: sha} = checkpoint) do
     with {:ok, commit} <- source().commit(repo, sha),

@@ -161,3 +161,8 @@ Mox.defmock(Loopctl.MockClusterDnsResolver, for: Loopctl.ClusterReadiness.Resolv
 # answers `{:error, :not_stubbed}` for both callbacks, so a test that forgets to set an
 # expectation gets the fail-closed answer (an escalation) rather than a merge.
 Mox.defmock(Loopctl.MockPullRequestSource, for: Loopctl.Delivery.PullRequestSource)
+
+# US-45.5: the merge executor's writes as loopctl's GitHub App. The DataCase default stub
+# answers `{:error, :not_stubbed}` to every callback, so a test that reaches the forge without
+# saying so gets an escalation, never a merge.
+Mox.defmock(Loopctl.MockMergeForge, for: Loopctl.Delivery.MergeForge)

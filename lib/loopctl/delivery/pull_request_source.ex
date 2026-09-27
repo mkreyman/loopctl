@@ -162,7 +162,7 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @typedoc """
   One commit, as much of it as the thread-mode merge gate judges (US-45.4): its tree.
   """
-  @type commit :: %{tree_sha: String.t()}
+  @type commit :: %{tree_sha: String.t(), parents: [String.t()]}
 
   @typedoc """
   The three-dot comparison `base...head` (US-45.4): what a pull request from `head` into

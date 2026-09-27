@@ -400,8 +400,12 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  defp commit_facts(%{"tree" => %{"sha" => tree}}) when is_binary(tree),
-    do: {:ok, %{tree_sha: tree}}
+  # Parents in order (US-45.5): a thread branch head whose FIRST parent is the allowed
+  # checkpoint is the merge executor's base update in flight, not a push nobody reported.
+  defp commit_facts(%{"tree" => %{"sha" => tree}} = body) when is_binary(tree) do
+    parents = for %{"sha" => sha} <- Map.get(body, "parents", []), is_binary(sha), do: sha
+    {:ok, %{tree_sha: tree, parents: parents}}
+  end
 
   defp commit_facts(body), do: {:error, {:unreadable_commit, shape(body)}}
 
@@ -896,6 +900,13 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
       {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
     end
   end
+
+  @doc false
+  # The classification below, for `Loopctl.Delivery.GitHubAppMergeForge` (US-45.5): the App's
+  # writes fail in the same shapes as these reads, and a second copy of what a 403 means is
+  # the copy that drifts.
+  @spec classify_failure(Req.Response.t()) :: term()
+  def classify_failure(%Req.Response{} = response), do: failure(response)
 
   # A 403 is TWO different things at GitHub and they need opposite answers.
   #

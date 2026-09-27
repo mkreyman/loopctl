@@ -7,9 +7,12 @@ defmodule Loopctl.ThreadsTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AuditChain.Entry, as: ChainEntry
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Repo
   alias Loopctl.Threads
+  alias Loopctl.Threads.Checkpoint
   alias Loopctl.Threads.Entry
+  alias Loopctl.Threads.Reviews
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
@@ -621,5 +624,326 @@ defmodule Loopctl.ThreadsTest do
                author_principal: "agent:#{b.agent.id}",
                actor_lineage: []
              )
+  end
+
+  describe "control-plane writes (US-45.5)" do
+    @merge String.duplicate("d", 40)
+    @merge_tree String.duplicate("9", 40)
+
+    # A thread story at `ci` whose recorded allow names checkpoint `@sha1`, as the merge gate
+    # leaves it: the row's `merge_gate_allowed_sha` and the `effect_recorded` event naming the
+    # checkpoint (`Stages.last_allow_query/2`).
+    defp allowed_at_ci do
+      ctx = claimed_story()
+
+      cp =
+        fixture(:thread_checkpoint, %{
+          tenant_id: ctx.tenant_id,
+          story_id: ctx.story.id,
+          seq: 1,
+          commit_sha: @sha1,
+          tree_sha: @tree,
+          claim_epoch: @epoch
+        })
+
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story.id,
+        stage: :ci,
+        claim_epoch: @epoch,
+        head_sha: @sha1
+      })
+
+      {:ok, _} =
+        Stages.record_effect(ctx.tenant_id, ctx.story.id, :merge_gate_allowed_sha, @sha1,
+          claim_epoch: @epoch,
+          event_data: %{"checkpoint_id" => cp.id, "checkpoint_sha" => @sha1, "base_sha" => @sha2}
+        )
+
+      Map.put(ctx, :checkpoint, cp)
+    end
+
+    defp base_update(ctx, parent_id \\ nil) do
+      Threads.record_base_update(ctx.tenant_id, ctx.story.id, parent_id || ctx.checkpoint.id,
+        commit_sha: @merge,
+        tree_sha: @merge_tree
+      )
+    end
+
+    test "TC-45.5.8 a base update is recorded and the story stays at ci on it, review and custody kept" do
+      ctx = allowed_at_ci()
+      set_story(ctx, verified_status: :verified)
+
+      assert {:ok, bu, :created} = base_update(ctx)
+      assert bu.kind == :base_update and bu.parent_checkpoint_id == ctx.checkpoint.id
+      assert bu.claim_epoch == @epoch and is_nil(bu.dispatch_id)
+
+      row = Stages.get(ctx.tenant_id, ctx.story.id)
+      assert row.stage == :ci
+      assert row.head_sha == @merge
+      assert is_nil(row.merge_gate_allowed_sha)
+      assert row.attempts == %{"base_updated" => 1}
+
+      {:ok, story} = Repo.with_tenant(ctx.tenant_id, fn -> Repo.get!(Story, ctx.story.id) end)
+      assert story.verified_status == :verified
+      assert story.assigned_agent_id == ctx.agent.id
+
+      # The entry is the executor's, and the chain names the base update and its parent.
+      {:ok, entry} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.one!(from e in Entry, where: e.checkpoint_id == ^bu.id)
+        end)
+
+      assert entry.author_principal == Threads.merge_executor_principal()
+
+      {:ok, [chained]} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.all(
+            from c in ChainEntry,
+              where: c.entity_id == ^ctx.story.id and c.action == "thread_checkpoint_recorded"
+          )
+        end)
+
+      assert chained.payload["checkpoint_kind"] == "base_update"
+      assert chained.payload["parent_checkpoint_id"] == ctx.checkpoint.id
+    end
+
+    test "the same base update again is the one recorded; another tree is a conflict" do
+      ctx = allowed_at_ci()
+      {:ok, bu, :created} = base_update(ctx)
+
+      assert {:ok, ^bu, :existing} = base_update(ctx)
+
+      assert {:error, {:conflict, "checkpoint_conflict", _}} =
+               Threads.record_base_update(ctx.tenant_id, ctx.story.id, ctx.checkpoint.id,
+                 commit_sha: @merge,
+                 tree_sha: String.duplicate("8", 40)
+               )
+    end
+
+    test "only for the checkpoint the allow names, at ci, under the current claim; nothing written otherwise" do
+      ctx = allowed_at_ci()
+
+      other =
+        fixture(:thread_checkpoint, %{
+          tenant_id: ctx.tenant_id,
+          story_id: ctx.story.id,
+          seq: 2,
+          commit_sha: @sha2,
+          claim_epoch: @epoch
+        })
+
+      assert {:error, :allow_not_for_parent} = base_update(ctx, other.id)
+
+      set_story(ctx, claim_epoch: @epoch + 1)
+      assert {:error, :stale_claim_epoch} = base_update(ctx)
+      set_story(ctx, claim_epoch: @epoch)
+
+      {:ok, _} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(s in Loopctl.Delivery.StoryStage, where: s.story_id == ^ctx.story.id)
+          |> Repo.update_all(set: [stage: :implementing])
+        end)
+
+      assert {:error, :stale_stage} = base_update(ctx)
+
+      {:ok, kinds} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.all(from c in Checkpoint, where: c.story_id == ^ctx.story.id, select: c.kind)
+        end)
+
+      assert Enum.sort(kinds) == [:checkpoint, :checkpoint]
+    end
+
+    test "a parent an ENDED claim recorded is refused, even at the commit the allow names" do
+      ctx = allowed_at_ci()
+
+      # The current claim resumed at the same commit and the stage row followed it: the allow
+      # names that sha, but the ended claim's checkpoint is not the one the gate judged.
+      set_story(ctx, claim_epoch: @epoch + 1)
+
+      {:ok, _} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(s in Loopctl.Delivery.StoryStage, where: s.story_id == ^ctx.story.id)
+          |> Repo.update_all(set: [claim_epoch: @epoch + 1])
+        end)
+
+      assert {:error, :stale_claim_epoch} = base_update(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story.id).head_sha == @sha1
+    end
+
+    test "TC-45.5.10 claim_checkpoints judges a base update reaching the allowed checkpoint, and no other" do
+      ctx = allowed_at_ci()
+
+      # An unrelated base update — its parent is a checkpoint the gate never allowed — is
+      # invisible, and the allowed checkpoint stays the judged head.
+      other =
+        fixture(:thread_checkpoint, %{
+          tenant_id: ctx.tenant_id,
+          story_id: ctx.story.id,
+          seq: 2,
+          commit_sha: @sha2,
+          claim_epoch: @epoch - 1
+        })
+
+      fixture(:thread_checkpoint, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story.id,
+        seq: 3,
+        kind: :base_update,
+        commit_sha: String.duplicate("7", 40),
+        parent_checkpoint_id: other.id,
+        claim_epoch: @epoch
+      })
+
+      assert {:ok, %{latest: %{id: id}, earlier_shas: []}} =
+               Threads.claim_checkpoints(ctx.tenant_id, ctx.story.id)
+
+      assert id == ctx.checkpoint.id
+
+      # The executor's base update of the allowed checkpoint is the judged head.
+      {:ok, bu, :created} = base_update(ctx)
+
+      assert {:ok, %{latest: %{id: judged}, earlier_shas: [@sha1]}} =
+               Threads.claim_checkpoints(ctx.tenant_id, ctx.story.id)
+
+      assert judged == bu.id
+
+      # A second base move merges into the FIRST base update: its parents still reach the
+      # checkpoint the gate last allowed, through it.
+      fixture(:thread_checkpoint, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story.id,
+        seq: 5,
+        kind: :base_update,
+        commit_sha: String.duplicate("6", 40),
+        parent_checkpoint_id: bu.id,
+        claim_epoch: @epoch
+      })
+
+      assert {:ok, %{latest: %{commit_sha: "6666666666666666666666666666666666666666"}}} =
+               Threads.claim_checkpoints(ctx.tenant_id, ctx.story.id)
+    end
+
+    test "round 3, finding 5: after a base update the claimant's next checkpoint and a review read the claimant's work" do
+      ctx = allowed_at_ci()
+      {:ok, _bu, :created} = base_update(ctx)
+
+      set_story(ctx,
+        agent_status: :implementing,
+        claimed_until: DateTime.add(DateTime.utc_now(), 3600)
+      )
+
+      {:ok, story} = Repo.with_tenant(ctx.tenant_id, fn -> Repo.get!(Story, ctx.story.id) end)
+
+      {:ok, {:ok, reviewed}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Reviews.latest_checkpoint(ctx.tenant_id, story)
+        end)
+
+      assert reviewed.id == ctx.checkpoint.id
+
+      assert {:ok, next, :created} = checkpoint(ctx, @sha2)
+      assert next.parent_checkpoint_id == ctx.checkpoint.id
+    end
+
+    test "record_merge_commit/6 is a compare-and-set on the recorded commit" do
+      ctx = allowed_at_ci()
+      cp = ctx.checkpoint
+
+      record = fn expected, sha ->
+        Threads.record_merge_commit(ctx.tenant_id, ctx.story.id, cp.id, expected, sha, @epoch)
+      end
+
+      assert :ok = record.(nil, @merge)
+      assert :ok = record.(nil, @merge)
+      assert {:error, {:merge_commit_moved, @merge}} = record.(nil, @sha2)
+      assert :ok = record.(@merge, @sha2)
+
+      {:ok, stored} =
+        Repo.with_tenant(ctx.tenant_id, fn -> Repo.get!(Checkpoint, cp.id).merge_commit_sha end)
+
+      assert stored == @sha2
+    end
+
+    test "record_merge_commit/6 is fenced: not at ci, another claim, or a withdrawn allow writes nothing" do
+      ctx = allowed_at_ci()
+      cp = ctx.checkpoint
+
+      record = fn epoch ->
+        Threads.record_merge_commit(ctx.tenant_id, ctx.story.id, cp.id, nil, @merge, epoch)
+      end
+
+      assert {:error, {:not_mergeable, :stale_claim_epoch}} = record.(@epoch - 1)
+
+      set_stage_row(ctx, stage: :implementing)
+      assert {:error, {:not_mergeable, {:not_at_ci, :implementing}}} = record.(@epoch)
+
+      set_stage_row(ctx, stage: :ci, merge_gate_allowed_sha: @sha2)
+      assert {:error, {:not_mergeable, :allow_withdrawn}} = record.(@epoch)
+
+      {:ok, stored} =
+        Repo.with_tenant(ctx.tenant_id, fn -> Repo.get!(Checkpoint, cp.id).merge_commit_sha end)
+
+      assert is_nil(stored)
+    end
+
+    test "base_update_depth/3 counts the base updates back to the claimant checkpoint" do
+      ctx = allowed_at_ci()
+      assert {:ok, 0} = Threads.base_update_depth(ctx.tenant_id, ctx.story.id, ctx.checkpoint.id)
+
+      {:ok, bu, :created} = base_update(ctx)
+      assert {:ok, 1} = Threads.base_update_depth(ctx.tenant_id, ctx.story.id, bu.id)
+
+      second =
+        fixture(:thread_checkpoint, %{
+          tenant_id: ctx.tenant_id,
+          story_id: ctx.story.id,
+          seq: 9,
+          kind: :base_update,
+          commit_sha: String.duplicate("5", 40),
+          parent_checkpoint_id: bu.id,
+          claim_epoch: @epoch
+        })
+
+      assert {:ok, 2} = Threads.base_update_depth(ctx.tenant_id, ctx.story.id, second.id)
+
+      # Another tenant sees no chain at all.
+      other = claimed_story()
+      assert {:ok, 0} = Threads.base_update_depth(other.tenant_id, ctx.story.id, second.id)
+    end
+
+    test "tenant B can neither record a base update nor a merge commit on tenant A's thread" do
+      a = allowed_at_ci()
+      b = claimed_story()
+
+      assert {:error, :not_found} =
+               Threads.record_base_update(b.tenant_id, a.story.id, a.checkpoint.id,
+                 commit_sha: @merge,
+                 tree_sha: @merge_tree
+               )
+
+      assert {:error, {:not_mergeable, :not_found}} =
+               Threads.record_merge_commit(
+                 b.tenant_id,
+                 a.story.id,
+                 a.checkpoint.id,
+                 nil,
+                 @merge,
+                 @epoch
+               )
+
+      {:ok, cp} = Repo.with_tenant(a.tenant_id, fn -> Repo.get!(Checkpoint, a.checkpoint.id) end)
+      assert is_nil(cp.merge_commit_sha)
+      assert Stages.get(a.tenant_id, a.story.id).head_sha == @sha1
+    end
+  end
+
+  defp set_stage_row(ctx, fields) do
+    {:ok, _} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        from(s in Loopctl.Delivery.StoryStage, where: s.story_id == ^ctx.story.id)
+        |> Repo.update_all(set: fields)
+      end)
   end
 end

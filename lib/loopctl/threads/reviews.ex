@@ -153,13 +153,16 @@ defmodule Loopctl.Threads.Reviews do
   # ---------------------------------------------------------------------------
 
   @doc false
-  # The story's latest checkpoint, provided the CURRENT claim recorded it.
+  # The story's latest CLAIMANT checkpoint, provided the current claim recorded it. A review
+  # reads the claimant's work: a `base_update` is loopctl's merge of the base into it
+  # (US-45.5), the same change on a newer base, and never itself what a review judges.
   @spec latest_checkpoint(Ecto.UUID.t(), Story.t()) :: {:ok, Checkpoint.t()} | refusal()
   def latest_checkpoint(tenant_id, story) do
     latest =
       Repo.one(
         from c in Checkpoint,
           where: c.tenant_id == ^tenant_id and c.story_id == ^story.id,
+          where: c.kind == :checkpoint,
           order_by: [desc: c.seq],
           limit: 1
       )

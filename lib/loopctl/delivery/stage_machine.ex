@@ -89,6 +89,23 @@ defmodule Loopctl.Delivery.StageMachine do
     as it refuses the release edges, and neither is runner-reportable.
   - `:human_resolution` — escalated -> queued | done | failed, and ONLY for a human
     principal (see `Loopctl.Delivery.Stages.advance/4`).
+  - `:base_updated` — ci -> ci, when the merge executor (US-45.5) found the base branch moved
+    since the gate's allow and merged it INTO the thread as the GitHub App. The story's
+    change is the same diff against a newer merge base, so it keeps its review verdict and its
+    custody binding and does not go back to `implementing`: the edge replaces `head_sha` with
+    the `base_update` checkpoint's sha and clears the allow, and the merge gate judges the
+    new head again, CI included. TRANSACTION-ONLY like the release edges: `advance/4` refuses
+    it from every caller, and it is taken only by `Loopctl.Threads.record_base_update/4`, in
+    the transaction that records the `base_update` checkpoint, for a checkpoint whose first
+    parent is the one the stage row's allow names (`Loopctl.Delivery.Stages.follow_base_update/4`).
+    Any other head movement is still `:base_moved`. Counted in `attempts`, so a thread's base
+    moves are visible on its row.
+  - `:merged_outside_ci` — `queued` or an in-flight stage -> escalated, when the merge
+    executor (US-45.5) finds the squash it wrote ON the base branch while the story is no
+    longer at `ci`: the claim was released or the stage moved between the executor's last
+    check and its ref update, or the ref update's answer was lost and the stage write after it
+    failed. The base branch holds a merge the stage row does not, and only a human can decide
+    what that story is now. CONTROL-ONLY: not runner-reportable, and `ci` has `:merge_gate`.
 
   `done` and `failed` are terminal; `escalated` is terminal except for `:human_resolution`.
   """
@@ -183,6 +200,11 @@ defmodule Loopctl.Delivery.StageMachine do
   # is not in `@runner_reportable_edges`: a runner cannot assert a review outcome.
   @review_ceiling for from <- @in_flight, do: {from, :escalated, :review_ceiling}
 
+  # A merge the executor wrote that the stage row never recorded (US-45.5). From `queued` as
+  # well, because a release is the commonest way the story leaves `ci` under the executor.
+  @merged_outside_ci for from <- (@in_flight -- [:ci]) ++ [:queued],
+                         do: {from, :escalated, :merged_outside_ci}
+
   @transitions @forward ++
                  [
                    {:ci, :implementing, :ci_red},
@@ -193,12 +215,14 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:triaged, :escalated, :triage_escalate},
                    {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
-                   {:merged, :implementing, :merge_refused}
+                   {:merged, :implementing, :merge_refused},
+                   {:ci, :ci, :base_updated}
                  ] ++
                  @budget_exceeded ++
                  @released ++
                  @human_resolution ++
-                 @session_escalated ++ @budget_reported ++ @release_escalated ++ @review_ceiling
+                 @session_escalated ++
+                 @budget_reported ++ @release_escalated ++ @review_ceiling ++ @merged_outside_ci
 
   # The part of the machine a RUNNER may report over the channel: one definition, from which
   # `runner_transitions/0`'s doc, the wire enums and the published
@@ -430,6 +454,8 @@ defmodule Loopctl.Delivery.StageMachine do
           | :operator_released
           | :human_resolution
           | :session_escalated
+          | :base_updated
+          | :merged_outside_ci
 
   @type effect ::
           :runner_id
@@ -490,6 +516,30 @@ defmodule Loopctl.Delivery.StageMachine do
   """
   @spec max_reason_length() :: pos_integer()
   def max_reason_length, do: @max_reason_length
+
+  # What a CONTROL writer stores, in codepoints: the bound less a deliberate margin, so the
+  # truncation is never the thing that costs an escalation its write.
+  @reason_budget @max_reason_length - 100
+
+  @doc """
+  `text` bounded for a stored escalation reason: at most `max_reason_length/0` less a
+  100-codepoint margin, cut with a trailing `…`. The one copy of that bound for every control
+  writer — the merge gate, post-deploy verification and the merge executor.
+
+  CODEPOINTS, matching Postgres `char_length` and `Loopctl.Delivery.Stages`' own bound: an NFD
+  path or an emoji is several codepoints per grapheme, and a grapheme bound would let an
+  over-long reason reach the `story_stages_text_bounds` CHECK, fail the write and leave the
+  story where it was with nothing recorded. A codepoint prefix can split a grapheme cluster;
+  that is cosmetic and the string stays valid UTF-8.
+  """
+  @spec bounded_reason(String.t()) :: String.t()
+  def bounded_reason(text) when is_binary(text) do
+    chars = String.to_charlist(text)
+
+    if length(chars) > @reason_budget,
+      do: chars |> Enum.take(@reason_budget - 1) |> List.to_string() |> Kernel.<>("…"),
+      else: text
+  end
 
   # WHICH TRANSITIONS ARE A VERDICT THE REPORTER IS TOLD ABOUT (#805 item 1).
   #
@@ -735,6 +785,11 @@ defmodule Loopctl.Delivery.StageMachine do
   def clears(:merged, :implementing, :merge_refused), do: @merge_keyed ++ @head_keyed
 
   def clears(_from, :implementing, edge) when edge != :forward, do: @head_keyed
+
+  # The base merged into the thread (US-45.5): a new head, so everything bound to the old one
+  # goes — the allow above all, which was granted for a commit that is no longer the head.
+  # The transaction taking the edge writes the new `head_sha` (`Stages.follow_base_update/4`).
+  def clears(:ci, :ci, :base_updated), do: @head_keyed
 
   def clears(_from, _to, _edge), do: []
 
