@@ -824,22 +824,70 @@ defmodule Loopctl.ThreadsTest do
                Threads.claim_checkpoints(ctx.tenant_id, ctx.story.id)
     end
 
-    test "record_merge_commit/5 is a compare-and-set on the recorded commit" do
+    test "record_merge_commit/6 is a compare-and-set on the recorded commit" do
       ctx = allowed_at_ci()
       cp = ctx.checkpoint
 
-      assert :ok = Threads.record_merge_commit(ctx.tenant_id, ctx.story.id, cp.id, nil, @merge)
-      assert :ok = Threads.record_merge_commit(ctx.tenant_id, ctx.story.id, cp.id, nil, @merge)
+      record = fn expected, sha ->
+        Threads.record_merge_commit(ctx.tenant_id, ctx.story.id, cp.id, expected, sha, @epoch)
+      end
 
-      assert {:error, {:merge_commit_moved, @merge}} =
-               Threads.record_merge_commit(ctx.tenant_id, ctx.story.id, cp.id, nil, @sha2)
-
-      assert :ok = Threads.record_merge_commit(ctx.tenant_id, ctx.story.id, cp.id, @merge, @sha2)
+      assert :ok = record.(nil, @merge)
+      assert :ok = record.(nil, @merge)
+      assert {:error, {:merge_commit_moved, @merge}} = record.(nil, @sha2)
+      assert :ok = record.(@merge, @sha2)
 
       {:ok, stored} =
         Repo.with_tenant(ctx.tenant_id, fn -> Repo.get!(Checkpoint, cp.id).merge_commit_sha end)
 
       assert stored == @sha2
+    end
+
+    test "record_merge_commit/6 is fenced: not at ci, another claim, or a withdrawn allow writes nothing" do
+      ctx = allowed_at_ci()
+      cp = ctx.checkpoint
+
+      record = fn epoch ->
+        Threads.record_merge_commit(ctx.tenant_id, ctx.story.id, cp.id, nil, @merge, epoch)
+      end
+
+      assert {:error, {:not_mergeable, :stale_claim_epoch}} = record.(@epoch - 1)
+
+      set_stage_row(ctx, stage: :implementing)
+      assert {:error, {:not_mergeable, {:not_at_ci, :implementing}}} = record.(@epoch)
+
+      set_stage_row(ctx, stage: :ci, merge_gate_allowed_sha: @sha2)
+      assert {:error, {:not_mergeable, :allow_withdrawn}} = record.(@epoch)
+
+      {:ok, stored} =
+        Repo.with_tenant(ctx.tenant_id, fn -> Repo.get!(Checkpoint, cp.id).merge_commit_sha end)
+
+      assert is_nil(stored)
+    end
+
+    test "base_update_depth/3 counts the base updates back to the claimant checkpoint" do
+      ctx = allowed_at_ci()
+      assert {:ok, 0} = Threads.base_update_depth(ctx.tenant_id, ctx.story.id, ctx.checkpoint.id)
+
+      {:ok, bu, :created} = base_update(ctx)
+      assert {:ok, 1} = Threads.base_update_depth(ctx.tenant_id, ctx.story.id, bu.id)
+
+      second =
+        fixture(:thread_checkpoint, %{
+          tenant_id: ctx.tenant_id,
+          story_id: ctx.story.id,
+          seq: 9,
+          kind: :base_update,
+          commit_sha: String.duplicate("5", 40),
+          parent_checkpoint_id: bu.id,
+          claim_epoch: @epoch
+        })
+
+      assert {:ok, 2} = Threads.base_update_depth(ctx.tenant_id, ctx.story.id, second.id)
+
+      # Another tenant sees no chain at all.
+      other = claimed_story()
+      assert {:ok, 0} = Threads.base_update_depth(other.tenant_id, ctx.story.id, second.id)
     end
 
     test "tenant B can neither record a base update nor a merge commit on tenant A's thread" do
@@ -852,12 +900,27 @@ defmodule Loopctl.ThreadsTest do
                  tree_sha: @merge_tree
                )
 
-      assert {:error, :not_found} =
-               Threads.record_merge_commit(b.tenant_id, a.story.id, a.checkpoint.id, nil, @merge)
+      assert {:error, {:not_mergeable, :not_found}} =
+               Threads.record_merge_commit(
+                 b.tenant_id,
+                 a.story.id,
+                 a.checkpoint.id,
+                 nil,
+                 @merge,
+                 @epoch
+               )
 
       {:ok, cp} = Repo.with_tenant(a.tenant_id, fn -> Repo.get!(Checkpoint, a.checkpoint.id) end)
       assert is_nil(cp.merge_commit_sha)
       assert Stages.get(a.tenant_id, a.story.id).head_sha == @sha1
     end
+  end
+
+  defp set_stage_row(ctx, fields) do
+    {:ok, _} =
+      Repo.with_tenant(ctx.tenant_id, fn ->
+        from(s in Loopctl.Delivery.StoryStage, where: s.story_id == ^ctx.story.id)
+        |> Repo.update_all(set: fields)
+      end)
   end
 end

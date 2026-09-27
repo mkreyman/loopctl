@@ -10,8 +10,10 @@ All notable changes to loopctl are documented here.
   `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` to enable it; until both are set every
   thread-mode allow ESCALATES `merge_executor: :app_unconfigured` and nothing thread-mode
   merges.** No migration. Install the App on each thread-mode repository with
-  `contents: write` (the executor asks for a token scoped to that one repository and that one
-  permission), and give the base branch a ruleset whose only bypass actor is the App. When the
+  `contents: write` and `workflows: write` (the executor asks for a token scoped to that one
+  repository and those two permissions; `workflows` because a base update can bring
+  `.github/workflows/` changes onto a thread branch), and give the base branch a ruleset whose
+  only bypass actor is the App. When the
   merge gate records a thread-mode allow it enqueues `ThreadMergeWorker` (Oban `default`
   queue, unique per story), which squashes the ALLOWED checkpoint's tree onto the base head
   (one commit, the base head its only parent, a message carrying the story number and title,
@@ -22,10 +24,17 @@ All notable changes to loopctl are documented here.
   branch as the App, records that as a `base_update` checkpoint, and keeps the story at `ci`
   over the new `base_updated` edge — review verdict and custody kept, the allow cleared — so
   the gate judges the new head again once CI on it is green; a conflict goes back to
-  `implementing` over `base_moved` (or escalates `claim_not_live` when nobody can fix it).
-  Every other refusal escalates over `merge_gate` with a `merge_executor:` reason
-  (`tree_mismatch`, `empty_change`, a ref update the ruleset refused, and after the worker's
-  last retry `forge_unavailable`). `thread-mode` workflows must run on `push` to `loop/**`
+  `implementing` over `base_moved` (or escalates `claim_not_live` when nobody can fix it). The
+  base update runs on a temporary branch `loop/loopctl-base-update-*` created at the checkpoint
+  and deleted afterwards (a ruleset on `loop/**` that blocks deletion leaves them behind,
+  harmlessly), and the thread branch only fast-forwards to it. One change is base-updated at
+  most 3 times in a row before it escalates `base_churn`: freshness is exact on purpose, and
+  without a bound a base that moves faster than CI would loop for ever. Every other refusal
+  escalates over `merge_gate` with a `merge_executor:` reason (`tree_mismatch`,
+  `empty_change`, `base_churn`, a ref update the ruleset refused, an allow the executor
+  cannot resolve, and on the worker's last attempt `retries_exhausted`). A squash that reached
+  the base while the story had left `ci` escalates over the new `merged_outside_ci` edge,
+  naming the commit. `thread-mode` workflows must run on `push` to `loop/**`
   for a base update to get the CI it needs; a push by the App's installation token triggers
   them.
 

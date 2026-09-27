@@ -1113,6 +1113,38 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
+  Whether the stage row still AUTHORISES a squash of `sha` (US-45.5): at `ci`, under the
+  story's current claim `claim_epoch`, with `merge_gate_allowed_sha == sha`. Read under a
+  `FOR SHARE` lock on the story and then the row — the order every writer here takes — INSIDE
+  the caller's `Loopctl.Repo` tenant transaction, so a release, a transition or a cleared
+  allow cannot commit until that transaction ends. `:ok`, or `{:error, reason}` naming what
+  moved: `:not_found`, `:stale_claim_epoch`, `{:not_at_ci, stage}`, `:allow_withdrawn`.
+  """
+  @spec mergeable_in(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer(), String.t()) ::
+          :ok | {:error, term()}
+  def mergeable_in(tenant_id, story_id, claim_epoch, sha) do
+    story = share_lock_story(tenant_id, story_id)
+    row = story && row_query(tenant_id, story_id) |> lock("FOR SHARE") |> Repo.one()
+
+    cond do
+      is_nil(row) ->
+        {:error, :not_found}
+
+      story.claim_epoch != claim_epoch or row.claim_epoch != claim_epoch ->
+        {:error, :stale_claim_epoch}
+
+      row.stage != :ci ->
+        {:error, {:not_at_ci, row.stage}}
+
+      row.merge_gate_allowed_sha != sha ->
+        {:error, :allow_withdrawn}
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
   The story's most recent merge-gate allow, as recorded on its `effect_recorded` event:
   `%{sha, checkpoint_id, base_sha, claim_epoch}`, the last three `nil` for a pull-request
   allow (`Loopctl.Delivery.MergePrecondition` records them for a thread only). A query, run

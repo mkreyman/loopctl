@@ -56,6 +56,17 @@ defmodule Loopctl.Delivery.StageMachineTest do
     refute StageMachine.reason_required?(:ci, :base_updated)
   end
 
+  test "merged_outside_ci escalates from queued and every in-flight stage but ci, and is control's" do
+    from =
+      for {f, :escalated, :merged_outside_ci} <- StageMachine.transitions(), do: f
+
+    assert Enum.sort(from) ==
+             Enum.sort((StageMachine.in_flight_stages() -- [:ci]) ++ [:queued])
+
+    refute :merged_outside_ci in StageMachine.runner_reportable_edges()
+    assert StageMachine.chained?(:queued, :escalated, :merged_outside_ci)
+  end
+
   test "done and failed have no way out, and escalated only a human's" do
     for {from, _to, edge} <- StageMachine.transitions(), from in [:done, :failed, :escalated] do
       assert from == :escalated and edge == :human_resolution

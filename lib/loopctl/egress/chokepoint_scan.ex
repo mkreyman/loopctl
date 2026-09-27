@@ -89,7 +89,7 @@ defmodule Loopctl.Egress.ChokepointScan do
       "The merge executor (US-45.5) acting as loopctl's GitHub App on a thread-mode " <>
         "story's repository: mints an installation token, reads refs, commits and " <>
         "comparisons, creates the squash commit, moves the base ref by fast-forward, and " <>
-        "merges the base into the thread branch. Operator-plane, a fixed vendor host, and " <>
+        "merges the base into a temporary loop/ branch the thread branch is fast-forwarded to. Operator-plane, a fixed vendor host, and " <>
         "the repository is resolved server-side from the story's intake source. It is not " <>
         "model-provider egress. It DOES carry tenant content outbound, to the tenant's own " <>
         "repository: the squash message holds the story's number and title, reduced to one " <>

@@ -3,25 +3,29 @@ defmodule Loopctl.Delivery.MergeExecutor do
   loopctl merges a THREAD-mode story itself (US-45.5, Epic 45 PRD §4 items 3-5): it squashes
   the checkpoint the merge gate allowed onto the base branch as loopctl's GitHub App, by
   compare-and-swap. Run by `Loopctl.Workers.ThreadMergeWorker`, which
-  `Loopctl.Delivery.MergePrecondition` enqueues when it records a thread-mode allow.
+  `Loopctl.Delivery.MergePrecondition` enqueues when it records a thread-mode allow, and on a
+  thread-mode `already_merged` verdict, whose adoption this module records.
 
   ## It trusts nothing the enqueue said
 
   The job carries only the story. Every run re-reads, before touching the forge: the stage row
-  at `ci` with a `merge_gate_allowed_sha`; the allow's own event naming a checkpoint
-  (`Loopctl.Delivery.Stages.last_allow_query/2`) whose sha is that one; the claim placed in
-  `thread` mode; and the judged checkpoint (`Loopctl.Threads.claim_checkpoints/2`) being
-  EXACTLY the allowed one. Anything else merges nothing and answers `{:skipped, reason}`:
-  there is no allow for what is there now, so there is nothing for the executor to do, and
-  the gate's next evaluation decides what the story needs.
+  at `ci` with a `merge_gate_allowed_sha`; the claim placed in `thread` mode; the allow's own
+  event naming a checkpoint (`Loopctl.Delivery.Stages.last_allow_query/2`) whose sha is that
+  one; and the judged checkpoint (`Loopctl.Threads.claim_checkpoints/2`) being EXACTLY the
+  allowed one. Only a state the executor does not apply to SKIPS: no story or stage row, not
+  at `ci`, no allow, a pull-request claim, an allow for a checkpoint that is no longer the
+  judged head. Anything else it cannot resolve at `ci` — an allow whose event names no
+  checkpoint, a missing intake source, a branch it cannot name — ESCALATES naming the reason,
+  because the gate authorised a merge that nothing would otherwise perform.
 
   ## The squash (AC-45.5.2)
 
-  1. The base head. A `merge_commit_sha` already recorded on the checkpoint that the base
-     CONTAINS is `:already_merged` (AC-45.5.3): the story moves to `merged` at it, and nothing
-     is written to the forge. That is the retry of a ref update whose acknowledgement was
-     lost, and the question it asks — is that commit an ancestor of the base — survives other
-     merges landing in between, which a tree comparison would not.
+  1. The base head. A `merge_commit_sha` recorded on the checkpoint, or the checkpoint's own
+     commit, that the base CONTAINS is `:already_merged` (AC-45.5.3): the story moves to
+     `merged` at it and nothing is written to the forge. That is the retry of a ref update
+     whose acknowledgement was lost, and the adoption of a gate `already_merged`; the question
+     it asks — is that commit an ancestor of the base — survives other merges landing in
+     between, which a tree comparison would not.
   2. The checkpoint commit's tree, read from the forge. Not the recorded `tree_sha`:
      `tree_mismatch`, escalated, no write.
   3. FRESHNESS (AC-45.5.8): the base head must still be the allow's `base_sha`, the merge
@@ -32,40 +36,65 @@ defmodule Loopctl.Delivery.MergeExecutor do
   5. The squash commit: the checkpoint's tree, the base head as its ONLY parent, the message
      of `Loopctl.Delivery.MergeMessage`. A commit recorded earlier with exactly that tree and
      parent is reused, so a retry converges on one commit.
-  6. Its sha is RECORDED on the checkpoint (`Loopctl.Threads.record_merge_commit/5`, a
-     compare-and-set) BEFORE the ref moves.
+  6. Its sha is RECORDED on the checkpoint (`Loopctl.Threads.record_merge_commit/6`), and that
+     write is FENCED: under the story's and the stage row's locks the story must still be at
+     `ci`, under the claim this run read, with the allow naming the checkpoint. A story
+     released, moved or re-judged since the run began is never merged.
   7. The ref update, `force: false`. That is the compare-and-swap: GitHub refuses a move that
      is not a fast-forward, so a base that moved since step 1 cannot be overwritten, and the
      base-update path runs instead (AC-45.5.4).
 
   ## The base-update path (AC-45.5.4)
 
-  The thread branch must still name the checkpoint (otherwise the head moved, and that is
-  `:base_moved`). The App merges the base INTO the thread branch (`POST /repos/:repo/merges`);
-  a commit whose first parent is the checkpoint is recorded as a `base_update` checkpoint and
-  the story stays at `ci` over `:base_updated`, in one transaction
-  (`Loopctl.Threads.record_base_update/4`), keeping its review verdict and custody. The gate
-  judges that head again, green CI on its exact sha included (AC-45.5.9). A conflict goes back
-  to `implementing` over `:base_moved`.
+  1. The BOUND: one change is base-updated at most `max_consecutive_base_updates/0` times in a
+     row, counted along its checkpoint's parents (`Loopctl.Threads.base_update_depth/3`).
+     Freshness is exact equality on purpose, and in a repository whose base moves faster than
+     one CI run that would update, wait for CI, find the base moved and update again for ever;
+     at the bound it escalates `base_churn` with the count, for a human.
+  2. The thread branch must still name the checkpoint, else `:base_moved`.
+  3. A TEMPORARY branch `loop/loopctl-base-update-<story>-<random>` is created at the
+     checkpoint and the App merges the base INTO it (`POST /repos/:repo/merges`). Merging into
+     the thread branch by name would race the claimant's pushes between the read and the
+     merge.
+  4. The thread branch is moved to the merge commit with `force: false`: a fast-forward from
+     the checkpoint, refused if anybody pushed in between — that refusal is `:base_moved`.
+  5. Only then is the merge recorded as a `base_update` checkpoint, and the story stays at
+     `ci` over `:base_updated`, in one transaction (`Loopctl.Threads.record_base_update/4`),
+     keeping its review verdict and custody. The gate judges that head again, green CI on its
+     exact sha included (AC-45.5.9). A conflict goes back to `implementing` over
+     `:base_moved`, or escalates `claim_not_live` when nobody can fix it.
+  6. The temporary branch is deleted, best effort. One left behind — a delete the forge
+     refused, a ruleset on `loop/**` blocking deletion — is harmless: it names a commit that is
+     also on the thread branch, nothing reads it, and a warning names it. Creating and merging
+     into it is a push to `loop/**`, so a CI run may be spent on it; the gate trusts only runs
+     a push of the THREAD branch triggered.
 
   ## Failure, retries and races (SOUL rule 9)
 
-  - A TRANSIENT forge fault (`MergePrecondition.transient?/1`) is `{:retry, reason}`: the
-    worker returns an error and Oban retries. The final attempt escalates it
-    (`forge_unavailable`) rather than leaving an allowed story sitting at `ci`.
+  - A TRANSIENT fault (`MergePrecondition.transient?/1`) is `{:retry, reason}`: the worker
+    returns an error and Oban retries. On the worker's LAST attempt every outcome that is not
+    resolved — a retry, a crash, an escalation that did not write — escalates
+    `retries_exhausted` in ONE place (`run/3`), so no allowed story is left at `ci` after the
+    job is discarded.
   - Any other refusal escalates over `{:ci, :escalated, :merge_gate}`, naming the reason with
     a `merge_executor` prefix — `app_unconfigured` (the App's env unset), `tree_mismatch`,
-    `empty_change`, a ref update GitHub refused for another reason (a ruleset), and so on.
+    `empty_change`, `base_churn`, a ref update GitHub refused for another reason (a ruleset).
+  - The ref update is an HTTP call and cannot run under the fence's lock, so a release can
+    still land between step 6 and step 7. A merge that reached the base while the stage row
+    does not hold it — the stage write after it failed, or a later run finds the recorded
+    commit on the base with the story no longer at `ci` — ESCALATES naming the sha: over
+    `:merge_gate` at `ci`, over `:merged_outside_ci` from `queued` or an in-flight stage. It
+    is never skipped: the base holds a change the stage row does not.
   - A lost acknowledgement anywhere is answered by re-reading, never by remembering: a lost
-    ref-update ack by step 1, a lost stage write by the same, a lost `merge_commit_sha`
-    write by step 5 reusing nothing and recording afresh.
-  - Two runs cannot overlap: the worker is unique per story while one is waiting, running or
-    retrying. If they could, the ref update is still a compare-and-swap and the recorded
-    commit a compare-and-set, so at most one squash reaches the base.
-  - A base merge whose acknowledgement is lost has MOVED the thread branch with nothing
-    recorded. The retry sees a branch head nobody reported and sends the story back over
-    `:base_moved`, never adopting it: loopctl cannot tell its own merge from a zombie's push
-    after the fact, and only GitHub's answer to the merge request certifies the tree.
+    ref-update ack by step 1, a lost stage write by the same.
+  - Two runs CAN overlap: the worker's uniqueness excludes a running job, so an allow recorded
+    during a run is never dropped. That is safe: step 6's fence and compare-and-set and step
+    7's compare-and-swap keep it to one squash on the base, and two base updates cannot both
+    fast-forward the thread branch from the same checkpoint.
+  - A base update whose thread-ref acknowledgement is lost has MOVED the thread branch with
+    nothing recorded. The retry sees a branch head nobody reported and sends the story back
+    over `:base_moved`, never adopting it: loopctl cannot tell its own merge from a zombie's
+    push after the fact, and only GitHub's answer certifies the tree.
   """
 
   require Logger
@@ -75,6 +104,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
   alias Loopctl.Delivery.MergeForge
   alias Loopctl.Delivery.MergeMessage
   alias Loopctl.Delivery.MergePrecondition
+  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
@@ -85,8 +115,11 @@ defmodule Loopctl.Delivery.MergeExecutor do
 
   @actor_label "control:merge_executor"
 
-  # The `story_stages_text_bounds` CHECK, with room, as the gate budgets its own reasons.
-  @reason_budget 3_900
+  # See the moduledoc's base-update path, step 1.
+  @max_consecutive_base_updates 3
+
+  # Where a merge found outside `ci` escalates over `:merged_outside_ci` (at `ci`, `:merge_gate`).
+  @orphan_edge_stages (StageMachine.in_flight_stages() -- [:ci]) ++ [:queued]
 
   @type outcome ::
           {:merged, String.t()}
@@ -98,17 +131,52 @@ defmodule Loopctl.Delivery.MergeExecutor do
           | {:retry, term()}
 
   @doc """
-  One run for `story_id`. `final?` is true on the worker's last attempt, where a transient
-  fault escalates instead of asking for a retry.
+  One run for `story_id`. `final?` is true on the worker's last attempt: there, every outcome
+  still asking for a retry escalates `retries_exhausted`, a crash included.
   """
   @spec run(Ecto.UUID.t(), Ecto.UUID.t(), boolean()) :: outcome()
   def run(tenant_id, story_id, final? \\ false) do
+    tenant_id |> attempt(story_id) |> finalize(tenant_id, story_id, final?)
+  rescue
+    error ->
+      if final?,
+        do: finalize({:retry, {:crashed, error.__struct__}}, tenant_id, story_id, true),
+        else: reraise(error, __STACKTRACE__)
+  end
+
+  @doc "The consecutive base updates of one change before the executor escalates `base_churn`."
+  @spec max_consecutive_base_updates() :: pos_integer()
+  def max_consecutive_base_updates, do: @max_consecutive_base_updates
+
+  # THE ONE PLACE the last attempt is decided. Only `{:retry, _}` reaches here unresolved:
+  # every other outcome already wrote what it means.
+  defp finalize({:retry, reason}, tenant_id, story_id, true) do
+    Logger.error(
+      "merge_executor out of attempts, escalating: #{inspect(reason)} tenant_id=#{tenant_id} " <>
+        "story_id=#{story_id}"
+    )
+
+    case Stories.get_story(tenant_id, story_id) do
+      {:ok, story} ->
+        escalate(%{tenant_id: tenant_id, story: story}, {:retries_exhausted, reason})
+
+      {:error, _reason} ->
+        {:skipped, {:retries_exhausted, reason}}
+    end
+  end
+
+  defp finalize(outcome, _tenant_id, _story_id, _final?), do: outcome
+
+  defp attempt(tenant_id, story_id) do
     case context(tenant_id, story_id) do
       {:ok, ctx} ->
-        ctx
-        |> Map.put(:final?, final?)
-        |> execute()
-        |> log(ctx)
+        ctx |> execute() |> log(ctx)
+
+      {:not_at_ci, base, row} ->
+        orphan_check(base, row)
+
+      {:escalate, base, reason} ->
+        escalate(base, reason)
 
       {:skip, reason} ->
         Logger.info(
@@ -119,66 +187,88 @@ defmodule Loopctl.Delivery.MergeExecutor do
         {:skipped, reason}
 
       {:error, reason} ->
-        if MergePrecondition.transient?(reason), do: {:retry, reason}, else: {:skipped, reason}
+        {:retry, reason}
     end
   end
-
-  @doc "The label the executor's stage writes and thread entries carry."
-  @spec actor_label() :: String.t()
-  def actor_label, do: @actor_label
 
   # -- what the run is allowed to act on --------------------------------------------------
 
   defp context(tenant_id, story_id) do
-    with {:ok, story} <- Stories.get_story(tenant_id, story_id),
-         {:ok, stage} <- stage_at_ci(tenant_id, story_id, story),
-         {:ok, allow} <- recorded_allow(tenant_id, story_id, stage),
-         {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story),
+    with {:ok, story} <- story(tenant_id, story_id),
+         base = %{tenant_id: tenant_id, story: story},
+         {:ok, stage} <- stage_at_ci(base),
+         :ok <- allowed(stage) do
+      resolve(base, stage)
+    end
+  end
+
+  defp story(tenant_id, story_id) do
+    case Stories.get_story(tenant_id, story_id) do
+      {:ok, story} -> {:ok, story}
+      {:error, :not_found} -> {:skip, :no_story}
+    end
+  end
+
+  defp stage_at_ci(%{story: %{claim_epoch: epoch} = story} = base) do
+    case Stages.get(base.tenant_id, story.id) do
+      nil -> {:skip, :no_stage}
+      %StoryStage{stage: :ci, claim_epoch: ^epoch} = row -> {:ok, row}
+      %StoryStage{stage: :ci} -> {:skip, :stale_claim_epoch}
+      %StoryStage{} = row -> {:not_at_ci, base, row}
+    end
+  end
+
+  defp allowed(%StoryStage{merge_gate_allowed_sha: nil}), do: {:skip, :no_allow}
+  defp allowed(%StoryStage{}), do: :ok
+
+  # Past this point the story is at `ci` with an allow, so what cannot be resolved ESCALATES
+  # (or retries, when it is transient): the gate authorised a merge nothing would perform.
+  defp resolve(%{tenant_id: tenant_id, story: story} = base, stage) do
+    with {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story),
          :ok <- thread_mode(route),
-         {:ok, checkpoint} <- allowed_checkpoint(tenant_id, story_id, allow),
+         {:ok, allow} <- recorded_allow(tenant_id, story.id, stage),
+         {:ok, checkpoint} <- allowed_checkpoint(tenant_id, story.id, allow),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
          {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
       {:ok,
-       %{
-         tenant_id: tenant_id,
-         story: story,
+       Map.merge(base, %{
          allow: allow,
          checkpoint: checkpoint,
          repo: source.repo_full_name,
          base_branch: route.base_branch || source.base_branch,
          branch: branch
-       }}
+       })}
+    else
+      {:skip, _reason} = skip -> skip
+      {:error, reason} -> unresolved(base, reason)
     end
   end
 
-  defp stage_at_ci(tenant_id, story_id, %{claim_epoch: epoch}) do
-    case Stages.get(tenant_id, story_id) do
-      nil -> {:skip, :no_stage}
-      %StoryStage{stage: :ci, claim_epoch: ^epoch} = row -> {:ok, row}
-      %StoryStage{stage: :ci} -> {:skip, :stale_claim_epoch}
-      %StoryStage{stage: stage} -> {:skip, {:not_at_ci, stage}}
-    end
-  end
-
-  # The row's allow AND the event that recorded it, which names the checkpoint and the base.
-  defp recorded_allow(_tenant_id, _story_id, %StoryStage{merge_gate_allowed_sha: nil}),
-    do: {:skip, :no_allow}
-
-  defp recorded_allow(tenant_id, story_id, %StoryStage{merge_gate_allowed_sha: sha}) do
-    {:ok, allow} =
-      Repo.with_tenant(tenant_id, fn -> Repo.one(Stages.last_allow_query(tenant_id, story_id)) end)
-
-    case allow do
-      %{sha: ^sha, checkpoint_id: id, base_sha: base} when is_binary(id) and is_binary(base) ->
-        {:ok, allow}
-
-      _other ->
-        {:skip, :allow_names_no_checkpoint}
-    end
+  defp unresolved(base, reason) do
+    if MergePrecondition.transient?(reason),
+      do: {:error, reason},
+      else: {:escalate, base, reason}
   end
 
   defp thread_mode(%{mode: :thread}), do: :ok
   defp thread_mode(_route), do: {:skip, :not_thread_mode}
+
+  # The row's allow AND the event that recorded it, which names the checkpoint and the base.
+  defp recorded_allow(tenant_id, story_id, %StoryStage{merge_gate_allowed_sha: sha}) do
+    case Repo.with_tenant(tenant_id, fn ->
+           Repo.one(Stages.last_allow_query(tenant_id, story_id))
+         end) do
+      {:ok, %{sha: ^sha, checkpoint_id: id, base_sha: base} = allow}
+      when is_binary(id) and is_binary(base) ->
+        {:ok, allow}
+
+      {:ok, _other} ->
+        {:error, :allow_names_no_checkpoint}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   # AC-45.5.1: the checkpoint the gate judges NOW must be the one the allow names.
   defp allowed_checkpoint(tenant_id, story_id, allow) do
@@ -229,21 +319,23 @@ defmodule Loopctl.Delivery.MergeExecutor do
       {:already_merged, sha} -> already(ctx, sha)
       :stale -> update_base(ctx)
       {:refuse, reason} -> escalate(ctx, reason)
+      {:not_mergeable, reason} -> {:skipped, {:not_mergeable, reason}}
       {:error, reason} -> failed(ctx, reason)
     end
   end
 
-  defp already_merged(%{checkpoint: %Checkpoint{merge_commit_sha: nil}}, _base_head),
-    do: :continue
-
+  # The recorded squash, then the checkpoint's own commit (a fast-forward the gate adopted as
+  # `already_merged` under its allow): whichever the base contains is the merge.
   defp already_merged(ctx, base_head) do
-    sha = ctx.checkpoint.merge_commit_sha
-
-    case ctx.forge.ancestor?(ctx.session, sha, base_head) do
-      {:ok, true} -> {:already_merged, sha}
-      {:ok, false} -> :continue
-      {:error, _reason} = error -> error
-    end
+    [ctx.checkpoint.merge_commit_sha, ctx.checkpoint.commit_sha]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reduce_while(:continue, fn sha, :continue ->
+      case ctx.forge.ancestor?(ctx.session, sha, base_head) do
+        {:ok, true} -> {:halt, {:already_merged, sha}}
+        {:ok, false} -> {:cont, :continue}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp tree_matches(%{tree_sha: tree}, %Checkpoint{tree_sha: tree}), do: :ok
@@ -294,6 +386,8 @@ defmodule Loopctl.Delivery.MergeExecutor do
     end
   end
 
+  # The fence (moduledoc, squash step 6). A story that moved since this run read it is not
+  # this run's to merge; one whose recorded commit another run replaced is not either.
   defp record_merge_commit(ctx, merge_sha) do
     %{tenant_id: tenant_id, story: story, checkpoint: checkpoint} = ctx
 
@@ -302,11 +396,12 @@ defmodule Loopctl.Delivery.MergeExecutor do
            story.id,
            checkpoint.id,
            checkpoint.merge_commit_sha,
-           merge_sha
+           merge_sha,
+           story.claim_epoch
          ) do
       :ok -> :ok
+      {:error, {:not_mergeable, reason}} -> {:not_mergeable, reason}
       {:error, :busy} -> {:error, :busy}
-      # Another run recorded a different commit: this one must not move the ref with its own.
       {:error, reason} -> {:error, {:merge_commit_not_recorded, reason}}
     end
   end
@@ -316,33 +411,64 @@ defmodule Loopctl.Delivery.MergeExecutor do
   defp update_base(ctx) do
     %{forge: forge, session: session, checkpoint: checkpoint} = ctx
 
-    with {:ok, head} <- forge.branch_head(session, ctx.branch),
+    with :ok <- churn_bound(ctx),
+         {:ok, head} <- forge.branch_head(session, ctx.branch),
          :ok <- branch_names_checkpoint(head, checkpoint),
-         {:ok, merged} <- forge.merge(session, ctx.branch, ctx.base_branch, base_message(ctx)) do
-      record_base_update(ctx, merged)
+         temp = temp_branch(ctx.story),
+         :ok <- forge.create_ref(session, temp, checkpoint.commit_sha) do
+      result = merge_into_thread(ctx, temp)
+      drop_temp(ctx, temp)
+      result
     else
       {:moved, reason} -> base_moved(ctx, reason)
-      {:error, :merge_conflict} -> base_moved(ctx, :merge_conflict)
+      {:refuse, reason} -> escalate(ctx, reason)
       {:error, reason} -> failed(ctx, reason)
+    end
+  end
+
+  defp merge_into_thread(ctx, temp) do
+    %{forge: forge, session: session} = ctx
+
+    with {:ok, merged} <- forge.merge(session, temp, ctx.base_branch, base_message(ctx)),
+         {:ok, commit} <- merged_onto_checkpoint(merged, ctx.checkpoint),
+         :ok <- forge.update_ref(session, ctx.branch, commit.sha) do
+      record_base_update(ctx, commit)
+    else
+      {:refuse, reason} -> escalate(ctx, reason)
+      {:error, :merge_conflict} -> base_moved(ctx, :merge_conflict)
+      # The claimant pushed between the read and this fast-forward.
+      {:error, :not_fast_forward} -> base_moved(ctx, :thread_branch_moved)
+      {:error, reason} -> failed(ctx, reason)
+    end
+  end
+
+  defp churn_bound(ctx) do
+    case Threads.base_update_depth(ctx.tenant_id, ctx.story.id, ctx.checkpoint.id) do
+      {:ok, depth} when depth >= @max_consecutive_base_updates -> {:refuse, {:base_churn, depth}}
+      {:ok, _depth} -> :ok
+      {:error, _reason} = error -> error
     end
   end
 
   defp branch_names_checkpoint(sha, %Checkpoint{commit_sha: sha}), do: :ok
   defp branch_names_checkpoint(sha, _checkpoint), do: {:moved, {:thread_branch_moved, sha}}
 
-  defp record_base_update(ctx, :up_to_date),
-    do: escalate(ctx, {:base_update_unexpected, :up_to_date})
+  # AC-45.5.7: the merge must be GitHub's clean merge of the base into the allowed checkpoint.
+  # The temporary branch was created AT the checkpoint, so any other first parent means
+  # somebody wrote to it, and nothing of that commit is adopted.
+  defp merged_onto_checkpoint(:up_to_date, _checkpoint),
+    do: {:refuse, {:base_update_unexpected, :up_to_date}}
 
-  # AC-45.5.7: only GitHub's merge whose FIRST parent is the allowed checkpoint is a base
-  # update. Anything else means the branch moved between the read and the merge.
-  defp record_base_update(%{checkpoint: %Checkpoint{commit_sha: parent}} = ctx, %{
-         sha: sha,
-         tree_sha: tree,
-         parents: [parent | _]
-       }) do
+  defp merged_onto_checkpoint(%{parents: [parent | _]} = commit, %Checkpoint{commit_sha: parent}),
+    do: {:ok, commit}
+
+  defp merged_onto_checkpoint(%{parents: parents}, _checkpoint),
+    do: {:refuse, {:base_update_unexpected, {:first_parent, List.first(parents)}}}
+
+  defp record_base_update(ctx, commit) do
     case Threads.record_base_update(ctx.tenant_id, ctx.story.id, ctx.checkpoint.id,
-           commit_sha: sha,
-           tree_sha: tree,
+           commit_sha: commit.sha,
+           tree_sha: commit.tree_sha,
            actor_label: @actor_label
          ) do
       {:ok, _checkpoint, _status} ->
@@ -358,12 +484,125 @@ defmodule Loopctl.Delivery.MergeExecutor do
     end
   end
 
-  defp record_base_update(ctx, %{parents: parents}),
-    do: base_moved(ctx, {:thread_branch_moved, List.first(parents)})
+  # A random suffix, so a retry never collides with a ref an earlier attempt left behind.
+  defp temp_branch(story) do
+    "loop/loopctl-base-update-#{String.slice(story.id, 0, 8)}-" <>
+      Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
+  end
+
+  defp drop_temp(ctx, temp) do
+    case ctx.forge.delete_ref(ctx.session, temp) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "merge_executor left a temporary branch behind: #{temp} reason=#{inspect(reason)} " <>
+            "tenant_id=#{ctx.tenant_id} story_id=#{ctx.story.id}"
+        )
+    end
+  end
 
   defp base_message(ctx) do
     "Merge #{ctx.base_branch} into #{ctx.branch} (loopctl base update)\n\n" <>
       "Loopctl-Story: #{ctx.story.id}"
+  end
+
+  # -- a merge the stage row does not hold ------------------------------------------------------
+
+  # The story is not at `ci`. That is ordinary unless the checkpoint the gate last allowed has a
+  # squash recorded that the base CONTAINS: then a merge landed that the row never recorded.
+  defp orphan_check(base, row) do
+    with {:ok, sha} <- recorded_squash(base),
+         :unrecorded <- merged_row(row, sha),
+         {:ok, true} <- squash_on_base(base, sha) do
+      orphan(base, sha, :merged_outside_ci)
+    else
+      {:error, reason} -> unresolved_orphan(base, row, reason)
+      _not_an_orphan -> {:skipped, {:not_at_ci, row.stage}}
+    end
+  end
+
+  defp recorded_squash(%{tenant_id: tenant_id, story: story}) do
+    tenant_id
+    |> Repo.with_tenant(fn -> squash_of_last_allow(tenant_id, story.id) end)
+    |> case do
+      {:ok, answer} -> answer
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp squash_of_last_allow(tenant_id, story_id) do
+    with %{checkpoint_id: id} when is_binary(id) <-
+           Repo.one(Stages.last_allow_query(tenant_id, story_id)),
+         %Checkpoint{merge_commit_sha: sha} when is_binary(sha) <-
+           Threads.checkpoint_of(tenant_id, story_id, id) do
+      {:ok, sha}
+    else
+      _none -> :none
+    end
+  end
+
+  defp merged_row(%StoryStage{stage: :merged, merge_sha: sha}, sha), do: :recorded
+  defp merged_row(_row, _sha), do: :unrecorded
+
+  defp squash_on_base(%{tenant_id: tenant_id, story: story}, sha) do
+    forge = MergeForge.impl()
+
+    with {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story),
+         {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
+         {:ok, session} <- forge.session(source.repo_full_name),
+         {:ok, head} <- forge.branch_head(session, route.base_branch || source.base_branch) do
+      forge.ancestor?(session, sha, head)
+    end
+  end
+
+  defp unresolved_orphan(base, row, reason) do
+    if MergePrecondition.transient?(reason) do
+      {:retry, reason}
+    else
+      Logger.warning(
+        "merge_executor could not check for a merge outside ci: #{inspect(reason)} " <>
+          "tenant_id=#{base.tenant_id} story_id=#{base.story.id}"
+      )
+
+      {:skipped, {:not_at_ci, row.stage}}
+    end
+  end
+
+  # A merge on the base the stage row does not hold. Escalated from wherever the story is now,
+  # under its CURRENT claim, naming the sha — never skipped.
+  defp orphan(%{tenant_id: tenant_id, story: story}, sha, why) do
+    now = %{tenant_id: tenant_id, story: current(tenant_id, story)}
+
+    case Stages.get(tenant_id, story.id) do
+      %StoryStage{stage: :merged, merge_sha: ^sha} ->
+        {:merged, sha}
+
+      %StoryStage{stage: :ci} ->
+        escalate(now, {why, sha})
+
+      %StoryStage{stage: stage} when stage in @orphan_edge_stages ->
+        escalate_over(now, {stage, :escalated, :merged_outside_ci}, {why, sha})
+
+      other ->
+        stage = other && other.stage
+
+        Logger.error(
+          "merge_executor: #{sha} is on the base branch and the story's stage cannot record " <>
+            "it (#{inspect(stage)}); a human must reconcile it tenant_id=#{tenant_id} " <>
+            "story_id=#{story.id}"
+        )
+
+        {:skipped, {why, sha, stage}}
+    end
+  end
+
+  defp current(tenant_id, story) do
+    case Stories.get_story(tenant_id, story.id) do
+      {:ok, story} -> story
+      {:error, :not_found} -> story
+    end
   end
 
   # -- outcomes --------------------------------------------------------------------------------
@@ -371,7 +610,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
   defp merged(ctx, sha) do
     case advance(ctx, {:ci, :merged, :forward}, effects: [merge_sha: sha]) do
       :ok -> {:merged, sha}
-      {:error, reason} -> after_merge_failure(ctx, sha, reason)
+      {:error, reason} -> orphan(ctx, sha, {:merged_not_recorded, reason})
     end
   end
 
@@ -379,16 +618,6 @@ defmodule Loopctl.Delivery.MergeExecutor do
     case merged(ctx, sha) do
       {:merged, ^sha} -> {:already_merged, sha}
       other -> other
-    end
-  end
-
-  # The ref moved and the stage write did not land. A retry re-reads and adopts the recorded
-  # commit (`already_merged/2`); a row some other writer already moved to `merged` at this
-  # sha is the same outcome.
-  defp after_merge_failure(ctx, sha, reason) do
-    case Stages.get(ctx.tenant_id, ctx.story.id) do
-      %StoryStage{stage: :merged, merge_sha: ^sha} -> {:merged, sha}
-      _other -> {:retry, {:merged_not_recorded, reason}}
     end
   end
 
@@ -407,15 +636,15 @@ defmodule Loopctl.Delivery.MergeExecutor do
   end
 
   defp failed(ctx, reason) do
-    cond do
-      not MergePrecondition.transient?(reason) -> escalate(ctx, reason)
-      ctx.final? -> escalate(ctx, {:forge_unavailable, reason})
-      true -> {:retry, reason}
-    end
+    if MergePrecondition.transient?(reason),
+      do: {:retry, reason},
+      else: escalate(ctx, reason)
   end
 
-  defp escalate(ctx, reason) do
-    case advance(ctx, {:ci, :escalated, :merge_gate}, reason: reason_text(reason)) do
+  defp escalate(ctx, reason), do: escalate_over(ctx, {:ci, :escalated, :merge_gate}, reason)
+
+  defp escalate_over(ctx, transition, reason) do
+    case advance(ctx, transition, reason: reason_text(reason)) do
       :ok ->
         {:escalated, reason}
 
@@ -444,11 +673,13 @@ defmodule Loopctl.Delivery.MergeExecutor do
     end
   end
 
+  # Bounded by the one declaration of the `story_stages_text_bounds` CHECK.
   defp reason_text(reason) do
+    budget = StageMachine.max_reason_length()
     chars = String.to_charlist("merge_executor: " <> inspect(reason))
 
-    if length(chars) > @reason_budget,
-      do: chars |> Enum.take(@reason_budget - 1) |> List.to_string() |> Kernel.<>("…"),
+    if length(chars) > budget,
+      do: chars |> Enum.take(budget - 1) |> List.to_string() |> Kernel.<>("…"),
       else: List.to_string(chars)
   end
 

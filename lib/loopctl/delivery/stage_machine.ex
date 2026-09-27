@@ -100,6 +100,12 @@ defmodule Loopctl.Delivery.StageMachine do
     parent is the one the stage row's allow names (`Loopctl.Delivery.Stages.follow_base_update/4`).
     Any other head movement is still `:base_moved`. Counted in `attempts`, so a thread's base
     moves are visible on its row.
+  - `:merged_outside_ci` — `queued` or an in-flight stage -> escalated, when the merge
+    executor (US-45.5) finds the squash it wrote ON the base branch while the story is no
+    longer at `ci`: the claim was released or the stage moved between the executor's last
+    check and its ref update, or the ref update's answer was lost and the stage write after it
+    failed. The base branch holds a merge the stage row does not, and only a human can decide
+    what that story is now. CONTROL-ONLY: not runner-reportable, and `ci` has `:merge_gate`.
 
   `done` and `failed` are terminal; `escalated` is terminal except for `:human_resolution`.
   """
@@ -194,6 +200,11 @@ defmodule Loopctl.Delivery.StageMachine do
   # is not in `@runner_reportable_edges`: a runner cannot assert a review outcome.
   @review_ceiling for from <- @in_flight, do: {from, :escalated, :review_ceiling}
 
+  # A merge the executor wrote that the stage row never recorded (US-45.5). From `queued` as
+  # well, because a release is the commonest way the story leaves `ci` under the executor.
+  @merged_outside_ci for from <- (@in_flight -- [:ci]) ++ [:queued],
+                         do: {from, :escalated, :merged_outside_ci}
+
   @transitions @forward ++
                  [
                    {:ci, :implementing, :ci_red},
@@ -210,7 +221,8 @@ defmodule Loopctl.Delivery.StageMachine do
                  @budget_exceeded ++
                  @released ++
                  @human_resolution ++
-                 @session_escalated ++ @budget_reported ++ @release_escalated ++ @review_ceiling
+                 @session_escalated ++
+                 @budget_reported ++ @release_escalated ++ @review_ceiling ++ @merged_outside_ci
 
   # The part of the machine a RUNNER may report over the channel: one definition, from which
   # `runner_transitions/0`'s doc, the wire enums and the published
@@ -443,6 +455,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :human_resolution
           | :session_escalated
           | :base_updated
+          | :merged_outside_ci
 
   @type effect ::
           :runner_id

@@ -239,6 +239,8 @@ defmodule Loopctl.DataCase do
           ancestor?: 3,
           create_commit: 2,
           update_ref: 3,
+          create_ref: 3,
+          delete_ref: 2,
           merge: 4
         ] do
       Mox.stub(Loopctl.MockMergeForge, name, not_stubbed(arity))

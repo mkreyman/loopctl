@@ -75,6 +75,48 @@ defmodule Loopctl.Delivery.GitHubAppMergeForgeTest do
     assert {:error, {:github_api_error, 422}} = Forge.update_ref(@session, "master", @a)
   end
 
+  test "finding 6: the installation token is scoped to one repository, contents and workflows" do
+    assert Forge.token_request(@repo) == %{
+             repositories: ["widgets"],
+             permissions: %{contents: "write", workflows: "write"}
+           }
+  end
+
+  test "finding 9: a 422's text never leaves the adapter, only its classification" do
+    stub(fn conn -> json(conn, 422, %{"message" => "ruleset secret-ish text here"}) end)
+
+    for result <- [
+          Forge.update_ref(@session, "master", @a),
+          Forge.create_ref(@session, "loop/x", @a),
+          Forge.merge(@session, "loop/x", "master", "m"),
+          Forge.delete_ref(@session, "loop/x")
+        ] do
+      assert result == {:error, {:github_api_error, 422}}
+    end
+  end
+
+  test "create_ref and delete_ref address refs/heads, and an existing ref is its own answer" do
+    stub(fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/repos/acme/widgets/git/refs"
+      assert body(conn) == %{"ref" => "refs/heads/loop/tmp", "sha" => @a}
+      json(conn, 201, %{"ref" => "refs/heads/loop/tmp"})
+    end)
+
+    assert :ok = Forge.create_ref(@session, "loop/tmp", @a)
+
+    stub(fn conn -> json(conn, 422, %{"message" => "Reference already exists"}) end)
+    assert {:error, :ref_exists} = Forge.create_ref(@session, "loop/tmp", @a)
+
+    stub(fn conn ->
+      assert conn.method == "DELETE"
+      assert conn.request_path == "/repos/acme/widgets/git/refs/heads/loop/tmp"
+      Plug.Conn.send_resp(conn, 204, "")
+    end)
+
+    assert :ok = Forge.delete_ref(@session, "loop/tmp")
+  end
+
   test "merge answers the merge commit, up to date, or a conflict" do
     stub(fn conn ->
       assert conn.request_path == "/repos/acme/widgets/merges"

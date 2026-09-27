@@ -9,21 +9,22 @@ defmodule Loopctl.Workers.ThreadMergeWorker do
   the checkpoint and the stage row itself, so a job that outlived the allow it was enqueued
   for merges nothing.
 
-  ## Unique per story, running included (AC-45.5.1)
+  ## Unique per story while WAITING (AC-45.5.1)
 
-  `states` includes `:executing` and `:retryable` and `period` is `:infinity`: a second
-  enqueue while a run is waiting, running or backing off is the SAME job, so two executors
-  never race one story. A second allow arriving then is picked up by that job, since it reads
-  the current allow rather than the one it was enqueued for. A completed job does not block
-  the next allow — the base-update path ends its run with the story waiting on CI for the
-  new head, and the gate's allow on that head enqueues afresh.
+  `states` is `:available`, `:scheduled` and `:retryable`, with `period: :infinity`: a second
+  enqueue while a job waits or backs off is the SAME job, which reads the current allow when
+  it runs. A RUNNING job does not absorb an enqueue, deliberately: an allow recorded while a
+  run executes — the gate allowing a base update the moment its CI goes green, say — must not
+  be dropped with nobody left to act on it. Two runs can therefore overlap, which is safe by
+  construction (`Loopctl.Delivery.MergeExecutor`: the fenced, compare-and-set
+  `merge_commit_sha` write and the `force: false` ref updates keep it to one merge).
 
   ## Retries are bounded, then escalate
 
-  A transient forge fault returns an error and Oban retries with its backoff; the LAST
-  attempt escalates instead (`forge_unavailable`), so an allowed story never sits at `ci`
-  after the job is discarded. Every other outcome — merged, escalated, sent back, skipped —
-  is `:ok`.
+  A transient fault returns an error and Oban retries with its backoff; on the LAST attempt the
+  executor escalates whatever is still unresolved, a crash included (`retries_exhausted`), so
+  an allowed story never sits at `ci` after the job is discarded. Every other outcome —
+  merged, escalated, sent back, skipped — is `:ok`.
   """
 
   use Oban.Worker,
@@ -32,7 +33,7 @@ defmodule Loopctl.Workers.ThreadMergeWorker do
     unique: [
       period: :infinity,
       keys: [:tenant_id, :story_id],
-      states: [:available, :scheduled, :executing, :retryable]
+      states: [:available, :scheduled, :retryable]
     ]
 
   require Logger

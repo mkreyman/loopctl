@@ -20,8 +20,11 @@ defmodule Loopctl.Delivery.MergeForge do
   Every callback answers `{:error, reason}` in `PullRequestSource`'s classification —
   `{:github_unreachable, _}`, `{:github_rate_limited, status, delay}`, `{:github_api_error,
   status}` — so `Loopctl.Delivery.MergePrecondition.transient?/1` decides retry or escalate
-  for both clients the same way. Two answers are FACTS rather than failures and have their own
-  shape: a ref update GitHub refuses as not a fast-forward, and a base merge that conflicts.
+  for both clients the same way. Three answers are FACTS rather than failures and have their
+  own shape: a ref update GitHub refuses as not a fast-forward, a base merge that conflicts,
+  and a branch that already exists. A reason carries the response's SHAPE only — a status and
+  one of those names — never text the forge wrote, because the executor escalates it into a
+  stored reason and the audit chain.
   """
 
   @typedoc "An installation token bound to one repository. Opaque to the executor."
@@ -61,6 +64,16 @@ defmodule Loopctl.Delivery.MergeForge do
   """
   @callback update_ref(session(), branch :: String.t(), sha :: String.t()) ::
               :ok | {:error, :not_fast_forward} | error()
+
+  @doc """
+  Creates branch `branch` at `sha` (`POST /repos/:repo/git/refs`). A branch that already exists
+  is `{:error, :ref_exists}`. The executor's base update runs on a temporary branch this makes.
+  """
+  @callback create_ref(session(), branch :: String.t(), sha :: String.t()) ::
+              :ok | {:error, :ref_exists} | error()
+
+  @doc "Deletes branch `branch` (`DELETE /repos/:repo/git/refs/heads/:branch`)."
+  @callback delete_ref(session(), branch :: String.t()) :: :ok | error()
 
   @doc """
   Merges `head` INTO `base` on the forge (`POST /repos/:repo/merges`), moving `base`. The

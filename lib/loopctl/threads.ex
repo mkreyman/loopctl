@@ -607,27 +607,43 @@ defmodule Loopctl.Threads do
 
   @doc """
   Records the squash commit the merge executor created for `checkpoint_id` as its
-  `merge_commit_sha`, BEFORE the executor moves the base ref (US-45.5, AC-45.5.2), so a
-  retry whose acknowledgement was lost can ask whether that commit reached the base.
+  `merge_commit_sha`, the step IMMEDIATELY before the executor moves the base ref (US-45.5,
+  AC-45.5.2), so a retry whose acknowledgement was lost can ask whether that commit reached
+  the base.
 
-  A compare-and-set: it writes only while the stored value is still `expected` (`nil` for a
-  first squash, the previous sha when a stale one is replaced). Otherwise it writes nothing
-  and answers `{:error, {:merge_commit_moved, stored}}`, so two executors racing cannot each
-  believe their own commit is the recorded one. Writing the value already stored is `:ok`.
-  No HTTP route; takes no story lock, only the checkpoint's row, with a bounded wait
-  (`{:error, :busy}` on contention). `{:error, :not_found}` for no such checkpoint.
+  FENCED, and the fence is checked first, on every call, a resend of the same sha included:
+  the story must still be at `ci` under claim `claim_epoch` with its allow naming this
+  checkpoint's commit (`Loopctl.Delivery.Stages.mergeable_in/4`, under the story's and the
+  row's locks). Otherwise `{:error, {:not_mergeable, reason}}` and nothing is written, so an
+  executor whose story was released, moved or re-judged since it read them never moves the
+  base. The ref update itself is an HTTP call and cannot run under this lock; what a change
+  landing between this commit and that call leaves behind is the executor's to detect (a merge
+  found on the base with the story not at `ci`).
+
+  Then a compare-and-set: it writes only while the stored value is still `expected` (`nil`
+  for a first squash). Otherwise `{:error, {:merge_commit_moved, stored}}`, so two executors
+  cannot each believe their own commit is the recorded one. The value already stored is `:ok`.
+  No HTTP route. Lock waits are bounded (`{:error, :busy}`); `{:error, {:not_mergeable,
+  :not_found}}` for a story or checkpoint not in the tenant.
   """
   @spec record_merge_commit(
           Ecto.UUID.t(),
           Ecto.UUID.t(),
           Ecto.UUID.t(),
           String.t() | nil,
-          String.t()
+          String.t(),
+          non_neg_integer()
         ) :: :ok | {:error, term()}
-  def record_merge_commit(tenant_id, story_id, checkpoint_id, expected, merge_commit_sha) do
+  def record_merge_commit(tenant_id, story_id, checkpoint_id, expected, merge_commit_sha, epoch) do
     with :ok <- valid_sha(merge_commit_sha, "merge_commit_sha") do
       write = fn ->
-        merge_commit_locked(tenant_id, story_id, checkpoint_id, expected, merge_commit_sha)
+        merge_commit_locked(
+          tenant_id,
+          story_id,
+          checkpoint_id,
+          {expected, merge_commit_sha},
+          epoch
+        )
       end
 
       Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "merge commit write", fn ->
@@ -639,34 +655,69 @@ defmodule Loopctl.Threads do
   defp unwrap_write({:ok, answer}), do: answer
   defp unwrap_write({:error, _reason} = error), do: error
 
-  defp merge_commit_locked(tenant_id, story_id, checkpoint_id, expected, merge_commit_sha) do
+  defp merge_commit_locked(tenant_id, story_id, checkpoint_id, {expected, merge_sha}, epoch) do
     Capacity.set_lock_timeout!(Repo)
 
-    stored =
-      Repo.one(
-        from c in Checkpoint,
-          where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
-          where: c.story_id == ^story_id,
-          lock: "FOR UPDATE",
-          select: %{sha: c.merge_commit_sha}
-      )
+    with {:checkpoint, %Checkpoint{} = checkpoint} <-
+           {:checkpoint, checkpoint_of(tenant_id, story_id, checkpoint_id)},
+         :ok <- Stages.mergeable_in(tenant_id, story_id, epoch, checkpoint.commit_sha) do
+      stored =
+        Repo.one(
+          from c in Checkpoint,
+            where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id,
+            lock: "FOR UPDATE",
+            select: c.merge_commit_sha
+        )
 
-    case stored do
-      nil ->
-        {:error, :not_found}
+      compare_and_set_merge_commit(tenant_id, checkpoint_id, stored, expected, merge_sha)
+    else
+      {:checkpoint, nil} -> {:error, {:not_mergeable, :not_found}}
+      {:error, reason} -> {:error, {:not_mergeable, reason}}
+    end
+  end
 
-      %{sha: ^merge_commit_sha} ->
-        :ok
+  defp compare_and_set_merge_commit(_tenant_id, _id, merge_sha, _expected, merge_sha), do: :ok
 
-      %{sha: ^expected} ->
-        {1, _} =
-          from(c in Checkpoint, where: c.id == ^checkpoint_id and c.tenant_id == ^tenant_id)
-          |> Repo.update_all(set: [merge_commit_sha: merge_commit_sha, updated_at: now()])
+  defp compare_and_set_merge_commit(tenant_id, id, expected, expected, merge_sha) do
+    {1, _} =
+      from(c in Checkpoint, where: c.id == ^id and c.tenant_id == ^tenant_id)
+      |> Repo.update_all(set: [merge_commit_sha: merge_sha, updated_at: now()])
 
-        :ok
+    :ok
+  end
 
-      %{sha: other} ->
-        {:error, {:merge_commit_moved, other}}
+  defp compare_and_set_merge_commit(_tenant_id, _id, stored, _expected, _merge_sha),
+    do: {:error, {:merge_commit_moved, stored}}
+
+  @doc """
+  How many `base_update` checkpoints lead, parent to parent, from `checkpoint_id` back to the
+  claimant checkpoint they were merged into: `0` for a claimant checkpoint. The executor's
+  bound on consecutive base updates of one change reads it (US-45.5). Bounded by the story's
+  own rows; a cycle is impossible (a checkpoint's parent is recorded before it) and guarded.
+  """
+  @spec base_update_depth(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def base_update_depth(tenant_id, story_id, checkpoint_id) do
+    Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], "thread read", fn ->
+      tenant_id
+      |> Repo.with_tenant(fn ->
+        Repo.all(
+          from c in Checkpoint,
+            where: c.tenant_id == ^tenant_id and c.story_id == ^story_id,
+            select: {c.id, {c.kind, c.parent_checkpoint_id}}
+        )
+      end)
+      |> case do
+        {:ok, rows} -> {:ok, depth(Map.new(rows), checkpoint_id, 0)}
+        {:error, _reason} = error -> error
+      end
+    end)
+  end
+
+  defp depth(by_id, id, count) do
+    case Map.get(by_id, id) do
+      {:base_update, parent} when count < map_size(by_id) -> depth(by_id, parent, count + 1)
+      _claimant_or_unknown -> count
     end
   end
 

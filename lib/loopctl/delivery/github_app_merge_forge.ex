@@ -13,7 +13,9 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
   A session is minted per executor run: an App JWT (RS256, signed with `:public_key`, valid
   nine minutes and back-dated one against clock skew), then `GET /repos/:repo/installation`
   and `POST /app/installations/:id/access_tokens`, asking for a token scoped to that ONE
-  repository with `contents: write` and nothing else. A token lives an hour and a run takes
+  repository with `contents: write` and `workflows: write` and nothing else. `workflows` is
+  needed because merging the base into a thread branch can bring changes under
+  `.github/workflows/` onto it, and GitHub refuses a ref update carrying those without it. A token lives an hour and a run takes
   seconds, so nothing is cached: a cached token is one more thing that can be stale.
 
   ## Bounds
@@ -52,10 +54,7 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
              request(:get, "/repos/#{repo}/installation", bearer(jwt)),
            {:ok, %{"token" => token}} when is_binary(token) <-
              request(:post, "/app/installations/#{id}/access_tokens", bearer(jwt),
-               json: %{
-                 repositories: [repo |> String.split("/") |> List.last()],
-                 permissions: %{contents: "write"}
-               }
+               json: token_request(repo)
              ) do
         {:ok, %{repo: repo, token: token}}
       else
@@ -122,7 +121,34 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
              json: %{sha: sha, force: false}
            ) do
         {:ok, _body} -> :ok
-        {:error, {:unprocessable, message}} -> unprocessable_ref(message)
+        {:error, {:unprocessable, :not_fast_forward}} -> {:error, :not_fast_forward}
+        {:error, {:unprocessable, _other}} -> {:error, {:github_api_error, 422}}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  @impl true
+  def create_ref(session, branch, sha) do
+    with {:ok, branch} <- ref(branch),
+         {:ok, sha} <- sha(sha) do
+      case repo_request(session, :post, "/git/refs",
+             json: %{ref: "refs/heads/" <> branch, sha: sha}
+           ) do
+        {:ok, _body} -> :ok
+        {:error, {:unprocessable, :ref_exists}} -> {:error, :ref_exists}
+        {:error, {:unprocessable, _other}} -> {:error, {:github_api_error, 422}}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
+  @impl true
+  def delete_ref(session, branch) do
+    with {:ok, branch} <- ref(branch) do
+      case repo_request(session, :delete, "/git/refs/heads/#{branch}") do
+        {:ok, _no_content} -> :ok
+        {:error, {:unprocessable, _code}} -> {:error, {:github_api_error, 422}}
         {:error, _reason} = error -> error
       end
     end
@@ -138,10 +164,21 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
         {:ok, :no_content} -> {:ok, :up_to_date}
         {:ok, body} -> commit_of(body)
         {:error, {:github_api_error, 409}} -> {:error, :merge_conflict}
-        {:error, {:unprocessable, _message}} -> {:error, {:github_api_error, 422}}
+        {:error, {:unprocessable, _code}} -> {:error, {:github_api_error, 422}}
         {:error, _reason} = error -> error
       end
     end
+  end
+
+  @doc false
+  # The installation token asked for: ONE repository, and only the two permissions the
+  # executor's writes need. Public so a test can pin the scope without the App's env.
+  @spec token_request(String.t()) :: map()
+  def token_request(repo) do
+    %{
+      repositories: [repo |> String.split("/") |> List.last()],
+      permissions: %{contents: "write", workflows: "write"}
+    }
   end
 
   @doc false
@@ -198,15 +235,6 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
     end
   end
 
-  # GitHub answers 422 to a non-fast-forward ref update ("Update is not a fast forward") and
-  # to a ruleset refusing it. Only the first is the compare-and-swap losing; the second is a
-  # configuration fault for a human, so it keeps an error shape the executor escalates.
-  defp unprocessable_ref(message) do
-    if is_binary(message) and Regex.match?(~r/fast[- ]forward/i, message),
-      do: {:error, :not_fast_forward},
-      else: {:error, {:github_api_error, 422}}
-  end
-
   # The Git Data API's commit (`tree.sha`, `parents[].sha`) and the REST commit the merges
   # endpoint returns (`commit.tree.sha`) both reach one shape.
   defp commit_of(%{"sha" => sha, "parents" => parents} = body)
@@ -235,7 +263,7 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
         {:ok, :no_content}
 
       {:ok, %Req.Response{status: 422, body: body}} ->
-        {:error, {:unprocessable, message(body)}}
+        {:error, {:unprocessable, unprocessable_code(body)}}
 
       {:ok, %Req.Response{} = response} ->
         {:error, GitHubPullRequestSource.classify_failure(response)}
@@ -245,8 +273,20 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
     end
   end
 
-  defp message(%{"message" => message}) when is_binary(message), do: message
-  defp message(_body), do: nil
+  # A 422's body is forge-written text, so it is CLASSIFIED here and never carried: only the
+  # atom leaves this module. GitHub answers 422 to a ref update that is not a fast-forward
+  # ("Update is not a fast forward"), to a ref that already exists ("Reference already
+  # exists"), and to a ruleset refusing either. Only the first two are facts the executor acts
+  # on; everything else is `:other`, which escalates as `{:github_api_error, 422}`.
+  defp unprocessable_code(%{"message" => message}) when is_binary(message) do
+    cond do
+      Regex.match?(~r/fast[- ]forward/i, message) -> :not_fast_forward
+      Regex.match?(~r/reference already exists/i, message) -> :ref_exists
+      true -> :other
+    end
+  end
+
+  defp unprocessable_code(_body), do: :other
 
   defp req_options(auth) do
     maybe_add_plug(
@@ -274,7 +314,9 @@ defmodule Loopctl.Delivery.GitHubAppMergeForge do
   end
 
   defp repo_name(repo) when is_binary(repo) do
-    if Regex.match?(@repo_name, repo), do: {:ok, repo}, else: {:error, {:invalid_repo, repo}}
+    if Regex.match?(@repo_name, repo),
+      do: {:ok, repo},
+      else: {:error, {:invalid_repo, shape(repo)}}
   end
 
   defp repo_name(repo), do: {:error, {:invalid_repo, shape(repo)}}

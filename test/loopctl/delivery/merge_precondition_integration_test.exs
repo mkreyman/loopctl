@@ -1119,8 +1119,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       # The retry finds the base moved ON — past the merge commit — and asks whether the
       # recorded commit is an ancestor of it, not whether the trees match.
       stub_base_head(@moved_base)
-
-      Mox.stub(MockMergeForge, :ancestor?, fn @session, @merge, @moved_base -> {:ok, true} end)
+      stub_ancestors(%{{@merge, @moved_base} => true})
 
       Mox.stub(MockMergeForge, :create_commit, fn _session, _commit ->
         flunk("an already-merged checkpoint is not squashed again")
@@ -1130,6 +1129,17 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :merged and row.merge_sha == @merge
+    end
+
+    test "finding 4: a checkpoint the base already contains (a gated fast-forward) is adopted",
+         ctx do
+      stub_ancestors(%{{@head, @base_head} => true})
+      Mox.stub(MockMergeForge, :create_commit, fn _s, _c -> flunk("nothing to squash") end)
+
+      assert {:already_merged, @head} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :merged and row.merge_sha == @head
     end
 
     test "a retry on an unmoved base reuses the commit it recorded rather than minting another",
@@ -1150,20 +1160,91 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:merged, @merge} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
     end
 
+    test "finding 1: a story that left ci before the ref update is never merged", ctx do
+      test_pid = self()
+
+      # The story is released between the run's read and its fenced write.
+      Mox.stub(MockMergeForge, :create_commit, fn @session, _commit ->
+        set_stage(ctx, :queued)
+        {:ok, @merge}
+      end)
+
+      Mox.stub(MockMergeForge, :update_ref, fn _s, _b, _sha ->
+        send(test_pid, :ref_moved)
+        :ok
+      end)
+
+      assert {:skipped, {:not_mergeable, {:not_at_ci, :queued}}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+
+      refute_received :ref_moved
+      assert is_nil(merge_commit(ctx))
+    end
+
+    test "finding 1: an allow withdrawn before the ref update is never merged", ctx do
+      Mox.stub(MockMergeForge, :create_commit, fn @session, _commit ->
+        reset_allow(ctx)
+        {:ok, @merge}
+      end)
+
+      Mox.stub(MockMergeForge, :update_ref, fn _s, _b, _sha -> flunk("no ref update") end)
+
+      assert {:skipped, {:not_mergeable, :allow_withdrawn}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+    end
+
+    test "finding 1: a merge whose stage write fails escalates naming the sha, from where the story is",
+         ctx do
+      # The ref moved, then the story was released before `ci -> merged` could be written.
+      Mox.stub(MockMergeForge, :update_ref, fn @session, "master", @merge ->
+        set_stage(ctx, :queued)
+        :ok
+      end)
+
+      assert {:escalated, {{:merged_not_recorded, :stale_stage}, @merge}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      assert row.escalation_reason =~ @merge
+    end
+
+    test "finding 1: a later run that finds the recorded squash on the base outside ci escalates it",
+         ctx do
+      set_merge_commit(ctx, @merge)
+      set_stage(ctx, :implementing)
+      stub_ancestors(%{{@merge, @base_head} => true})
+
+      assert {:escalated, {:merged_outside_ci, @merge}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      assert row.escalation_reason =~ "merged_outside_ci"
+
+      # Not on the base: ordinary, and skipped.
+      set_stage(ctx, :implementing)
+      stub_ancestors(%{})
+
+      assert {:skipped, {:not_at_ci, :implementing}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+    end
+
     test "TC-45.5.2 a refused fast-forward merges the base into the thread: base_update, story at ci",
          ctx do
+      test_pid = self()
       verified_before = AdminRepo.get!(Story, ctx.story_id).verified_status
-      branch = ctx.branch
-
-      Mox.stub(MockMergeForge, :update_ref, fn @session, "master", @merge ->
-        {:error, :not_fast_forward}
-      end)
-
-      Mox.stub(MockMergeForge, :merge, fn @session, ^branch, "master", _message ->
-        {:ok, %{sha: @base_update, tree_sha: @base_update_tree, parents: [@head, @moved_base]}}
-      end)
+      stub_base_update(ctx, test_pid)
 
       assert :base_updated = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+
+      # Finding 8: a temporary branch AT the checkpoint takes the merge, the thread branch is
+      # fast-forwarded to it, and the temporary branch is deleted.
+      assert_received {:temp_created, temp, @head}
+      assert String.starts_with?(temp, "loop/loopctl-base-update-")
+      assert_received {:merged_into, ^temp}
+      assert_received {:thread_moved, @base_update}
+      assert_received {:temp_deleted, ^temp}
 
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :ci
@@ -1178,11 +1259,60 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert AdminRepo.get!(Story, ctx.story_id).verified_status == verified_before
     end
 
+    test "finding 8: a thread branch pushed to during the base update is base_moved, nothing recorded",
+         ctx do
+      make_claim_live(ctx)
+      test_pid = self()
+      stub_base_update(ctx, test_pid)
+      branch = ctx.branch
+
+      Mox.stub(MockMergeForge, :update_ref, fn
+        @session, "master", @merge -> {:error, :not_fast_forward}
+        @session, ^branch, @base_update -> {:error, :not_fast_forward}
+      end)
+
+      assert {:base_moved, :thread_branch_moved} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+      assert_received {:temp_deleted, _temp}
+
+      assert {:ok, %{latest: %{id: id}}} = Threads.claim_checkpoints(ctx.tenant_id, ctx.story_id)
+      assert id == ctx.checkpoint.id
+    end
+
+    test "finding 5: past the bound on consecutive base updates it escalates base_churn", ctx do
+      # Three base updates of the same change, the last one allowed and judged.
+      chain =
+        Enum.reduce(1..3, ctx.checkpoint, fn n, parent ->
+          fixture(:thread_checkpoint, %{
+            tenant_id: ctx.tenant_id,
+            story_id: ctx.story_id,
+            seq: n + 1,
+            kind: :base_update,
+            commit_sha: String.duplicate("#{n}", 40),
+            parent_checkpoint_id: parent.id
+          })
+        end)
+
+      reset_allow(ctx)
+      record_thread_allow(ctx, chain, chain.commit_sha)
+      set_head(ctx, chain.commit_sha)
+      stub_base_head(@moved_base)
+
+      Mox.stub(MockMergeForge, :commit, fn
+        @session, sha -> {:ok, %{sha: sha, tree_sha: @tree, parents: [@base_head]}}
+      end)
+
+      Mox.stub(MockMergeForge, :create_ref, fn _s, _b, _sha -> flunk("no fourth base update") end)
+
+      max = MergeExecutor.max_consecutive_base_updates()
+      assert {:escalated, {:base_churn, ^max}} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).escalation_reason =~ "base_churn"
+    end
+
     test "TC-45.5.9 a base that moved after the allow is never squashed onto; the base update runs",
          ctx do
       test_pid = self()
-      stub_base_head(@moved_base)
-      branch = ctx.branch
+      stub_base_update(ctx, test_pid)
+      stub_base_head(@moved_base, ctx.branch)
 
       # Even a checkpoint that CONTAINS the new base head is not squashed onto it: the judged
       # diff was relative to the allow's `base_sha`, and only that base is fresh.
@@ -1193,24 +1323,14 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         {:ok, @merge}
       end)
 
-      Mox.stub(MockMergeForge, :update_ref, fn _session, _branch, _sha ->
-        send(test_pid, :ref_moved)
-        :ok
-      end)
-
-      Mox.stub(MockMergeForge, :merge, fn @session, ^branch, "master", _message ->
-        {:ok, %{sha: @base_update, tree_sha: @base_update_tree, parents: [@head, @moved_base]}}
-      end)
-
       assert :base_updated = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
       refute_received :squashed
-      refute_received :ref_moved
       assert Stages.get(ctx.tenant_id, ctx.story_id).head_sha == @base_update
     end
 
     test "a base merge that conflicts goes back to implementing over base_moved", ctx do
       make_claim_live(ctx)
-      stub_base_head(@moved_base)
+      stub_base_head(@moved_base, ctx.branch)
       Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> {:error, :merge_conflict} end)
 
       assert {:base_moved, :merge_conflict} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
@@ -1222,7 +1342,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     test "a conflict with nobody able to fix it escalates claim_not_live instead of looping",
          ctx do
-      stub_base_head(@moved_base)
+      stub_base_head(@moved_base, ctx.branch)
       Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> {:error, :merge_conflict} end)
 
       assert {:escalated, {:claim_not_live, :merge_conflict}} =
@@ -1235,7 +1355,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     test "a thread branch that moved off the checkpoint is not merged into; base_moved", ctx do
       make_claim_live(ctx)
-      stub_base_head(@moved_base)
       branch = ctx.branch
       other = String.duplicate("5", 40)
 
@@ -1244,31 +1363,32 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         @session, ^branch -> {:ok, other}
       end)
 
-      Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m ->
-        flunk("no merge into a moved head")
-      end)
+      Mox.stub(MockMergeForge, :create_ref, fn _s, _b, _sha -> flunk("no base update") end)
 
       assert {:base_moved, {:thread_branch_moved, ^other}} =
                MergeExecutor.run(ctx.tenant_id, ctx.story_id)
     end
 
-    test "a base merge whose first parent is not the checkpoint is not recorded as a base update",
+    test "a base merge whose first parent is not the checkpoint is escalated, never recorded",
          ctx do
-      make_claim_live(ctx)
       stub_base_head(@moved_base, ctx.branch)
       pushed = String.duplicate("4", 40)
 
-      # The branch moved between the read and the merge: GitHub merged into somebody's push.
-      Mox.stub(MockMergeForge, :merge, fn _s, _b, "master", _m ->
+      # Somebody wrote to the temporary branch between its creation and the merge.
+      Mox.stub(MockMergeForge, :merge, fn _s, _temp, "master", _m ->
         {:ok, %{sha: @base_update, tree_sha: @base_update_tree, parents: [pushed, @moved_base]}}
       end)
 
-      assert {:base_moved, {:thread_branch_moved, ^pushed}} =
+      Mox.stub(MockMergeForge, :update_ref, fn
+        @session, "master", _sha -> :ok
+        _s, _branch, @base_update -> flunk("an unexpected merge never reaches the thread")
+      end)
+
+      assert {:escalated, {:base_update_unexpected, {:first_parent, ^pushed}}} =
                MergeExecutor.run(ctx.tenant_id, ctx.story_id)
 
       assert {:ok, %{latest: %{id: id}}} = Threads.claim_checkpoints(ctx.tenant_id, ctx.story_id)
       assert id == ctx.checkpoint.id
-      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :implementing
     end
 
     test "TC-45.5.4 without the App's credentials it escalates app_unconfigured and merges nothing",
@@ -1311,6 +1431,24 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
     end
 
+    test "finding 3: an allow at ci that the executor cannot resolve escalates, never skips",
+         ctx do
+      Mox.stub(MockMergeForge, :session, fn _repo -> flunk("no forge call") end)
+
+      # An allow whose event names no checkpoint (a pull-request-shaped allow on a thread).
+      reset_allow(ctx)
+
+      {:ok, _row} =
+        Stages.record_effect(ctx.tenant_id, ctx.story_id, :merge_gate_allowed_sha, @head,
+          claim_epoch: 0
+        )
+
+      assert {:escalated, :allow_names_no_checkpoint} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
     test "TC-45.5.6 a forge tree that is not the recorded tree escalates tree_mismatch, no ref update",
          ctx do
       forge_tree = String.duplicate("3", 40)
@@ -1339,7 +1477,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:escalated, {:empty_change, @tree}} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
     end
 
-    test "a transient fault retries, and on the last attempt escalates forge_unavailable", ctx do
+    test "finding 2: a transient fault retries, and the last attempt escalates retries_exhausted",
+         ctx do
       Mox.stub(MockMergeForge, :branch_head, fn _s, _b -> {:error, {:github_api_error, 503}} end)
 
       assert {:retry, {:github_api_error, 503}} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
@@ -1357,7 +1496,17 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :escalated
-      assert row.escalation_reason =~ "forge_unavailable"
+      assert row.escalation_reason =~ "retries_exhausted"
+    end
+
+    test "finding 2: a crash re-raises for Oban, and on the last attempt escalates", ctx do
+      Mox.stub(MockMergeForge, :session, fn _repo -> raise "forge client blew up" end)
+
+      assert_raise RuntimeError, fn -> MergeExecutor.run(ctx.tenant_id, ctx.story_id) end
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+
+      assert {:escalated, {:retries_exhausted, {:crashed, RuntimeError}}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id, true)
     end
 
     test "the gate's thread allow runs the executor (the enqueue is wired)", ctx do
@@ -1370,6 +1519,19 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :escalated
       assert row.escalation_reason =~ "app_unconfigured"
+    end
+
+    test "finding 4: a thread already_merged verdict runs the executor, which records the merge",
+         ctx do
+      stub_thread(ctx)
+      set_merge_commit(ctx, @merge)
+      Mox.stub(MockPullRequestSource, :contains?, fn @repo, @merge, "master" -> {:ok, true} end)
+      stub_ancestors(%{{@merge, @base_head} => true})
+
+      assert {:ok, %Verdict{decision: :already_merged, merge_sha: @merge}} = enforce(ctx)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :merged and row.merge_sha == @merge
     end
 
     test "TC-45.5.8 after a base update the gate allows the new head with no new review round, and it merges",
@@ -1479,16 +1641,42 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   # The executor's refused fast-forward, then GitHub's clean merge of the moved base into the
   # checkpoint: the story is at `ci` on the base update, its allow cleared.
   defp base_update_to_ci(ctx) do
-    Mox.stub(MockMergeForge, :update_ref, fn _s, "master", @merge ->
-      {:error, :not_fast_forward}
+    stub_base_update(ctx, self())
+    assert :base_updated = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+    Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> flunk("no second base merge") end)
+  end
+
+  # A base update that succeeds: the squash's ref update is not a fast-forward, a temporary
+  # branch at the checkpoint takes GitHub's clean merge of the moved base, the thread branch
+  # fast-forwards to it. Each step reports to `test_pid`.
+  defp stub_base_update(ctx, test_pid) do
+    branch = ctx.branch
+
+    Mox.stub(MockMergeForge, :create_ref, fn @session,
+                                             "loop/loopctl-base-update-" <> _ = temp,
+                                             sha ->
+      send(test_pid, {:temp_created, temp, sha})
+      :ok
     end)
 
-    Mox.stub(MockMergeForge, :merge, fn _s, _b, "master", _m ->
+    Mox.stub(MockMergeForge, :merge, fn @session, temp, "master", _m ->
+      send(test_pid, {:merged_into, temp})
       {:ok, %{sha: @base_update, tree_sha: @base_update_tree, parents: [@head, @moved_base]}}
     end)
 
-    assert :base_updated = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
-    Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> flunk("no second base merge") end)
+    Mox.stub(MockMergeForge, :update_ref, fn
+      @session, "master", @merge ->
+        {:error, :not_fast_forward}
+
+      @session, ^branch, @base_update ->
+        send(test_pid, {:thread_moved, @base_update})
+        :ok
+    end)
+
+    Mox.stub(MockMergeForge, :delete_ref, fn @session, temp ->
+      send(test_pid, {:temp_deleted, temp})
+      :ok
+    end)
   end
 
   defp record_thread_allow(ctx, checkpoint, sha) do
@@ -1518,6 +1706,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     stub_ancestors(%{{@base_head, @head} => true})
     Mox.stub(MockMergeForge, :create_commit, fn @session, _commit -> {:ok, @merge} end)
     Mox.stub(MockMergeForge, :update_ref, fn @session, "master", _sha -> :ok end)
+    Mox.stub(MockMergeForge, :create_ref, fn @session, _temp, @head -> :ok end)
+    Mox.stub(MockMergeForge, :delete_ref, fn @session, _temp -> :ok end)
     Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> flunk("no base merge expected") end)
   end
 
@@ -1537,6 +1727,18 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
   defp merge_commit(ctx) do
     AdminRepo.get!(Loopctl.Threads.Checkpoint, ctx.checkpoint.id).merge_commit_sha
+  end
+
+  defp set_stage(ctx, stage) do
+    {1, _} =
+      from(r in StoryStage, where: r.story_id == ^ctx.story_id)
+      |> AdminRepo.update_all(set: [stage: stage])
+  end
+
+  defp set_head(ctx, sha) do
+    {1, _} =
+      from(r in StoryStage, where: r.story_id == ^ctx.story_id)
+      |> AdminRepo.update_all(set: [head_sha: sha])
   end
 
   defp set_mode(ctx, mode), do: set_dispatch(ctx, mode: mode)

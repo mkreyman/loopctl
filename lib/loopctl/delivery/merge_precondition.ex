@@ -248,7 +248,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   - `:allow` — `record_effect(:merge_gate_allowed_sha, head)`. A write that does not land
     turns the allow into a refusal, because an allow nobody recorded is an allow nobody can
     later account for
-  - `:already_merged` and `:unevaluated` — nothing
+  - `:already_merged` and `:unevaluated` — nothing (a thread-mode `:already_merged` enqueues
+    the merge executor, which records the adopted merge; US-45.5)
 
   The merge itself is still the CALLER's: it merges and then advances `{:ci, :merged}`
   carrying the sha the forge returned, because the merge commit does not exist until the
@@ -1650,9 +1651,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   # `:unevaluated` and `:already_merged` transition NOTHING. `:unevaluated` because there is
   # no verdict to act on and a network blip must not park a story on a human; an authorised
-  # `:already_merged` because the caller's next act is recording the merge it adopted.
-  defp act(tenant_id, story_id, %Verdict{decision: :already_merged} = verdict, opts),
-    do: clear_unevaluated(tenant_id, story_id, verdict, opts)
+  # `:already_merged` because the caller's next act is recording the merge it adopted. In
+  # THREAD mode that caller is the merge executor, so it is enqueued: its own already-merged
+  # path advances `ci -> merged` on the commit the base contains (US-45.5, TC-45.5.1).
+  defp act(tenant_id, story_id, %Verdict{decision: :already_merged} = verdict, opts) do
+    merge_thread(tenant_id, story_id, clear_unevaluated(tenant_id, story_id, verdict, opts))
+  end
 
   defp act(tenant_id, story_id, %Verdict{decision: :allow} = verdict, opts) do
     # A conversion re-enters `act/4` rather than returning: the controller's contract is
@@ -1693,10 +1697,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
   end
 
   # US-45.5: a RECORDED thread-mode allow is what the merge executor acts on, so it is enqueued
-  # here and nowhere else — after the allow landed, never before. On every allow, a replay of
-  # the same one included: a caller asking the gate again after an enqueue that did not land
-  # enqueues again, and the job is unique per story, so the resend costs nothing. A pull
-  # request is merged by whoever opened it, not by loopctl.
+  # here — after the allow landed, never before — and on a thread-mode `:already_merged`,
+  # which only a recorded allow produces. On every such verdict, replays included: a caller
+  # asking the gate again after an enqueue that did not land enqueues again, and a waiting job
+  # absorbs the resend. A pull request is merged by whoever opened it, not by loopctl.
   defp merge_thread(tenant_id, story_id, %Verdict{mode: :thread, checkpoint_id: id} = allowed)
        when is_binary(id) do
     :ok = ThreadMergeWorker.enqueue(tenant_id, story_id)
