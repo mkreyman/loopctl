@@ -196,7 +196,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     with {:ok, repo} <- repo_name(repo),
          {:ok, base} <- ref(base),
          {:ok, head} <- ref(head),
-         {:ok, body} <- get(repo, "/compare/#{base}...#{head}") do
+         # `per_page` pages the COMMIT list, never `files`, which GitHub caps separately
+         # (`@compare_file_cap`): one commit keeps the body small without shortening the diff.
+         {:ok, body} <- get(repo, "/compare/#{base}...#{head}?per_page=1") do
       comparison(body)
     end
   end

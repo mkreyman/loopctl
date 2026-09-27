@@ -536,8 +536,12 @@ defmodule Loopctl.Intake do
              | {:ambiguous_intake_source, Ecto.UUID.t(), pos_integer()}}
   def source_for_project(tenant_id, project_id)
       when is_binary(tenant_id) and is_binary(project_id) do
+    # The project is filtered IN SQL, so a tenant's other sources are never loaded; the
+    # exactly-one rule stays `select_project_source/2`'s, the one derivation of it.
     tenant_id
-    |> list_sources()
+    |> live_sources_query()
+    |> where([s], s.project_id == ^project_id)
+    |> AdminRepo.all()
     |> select_project_source(project_id)
   end
 
@@ -559,27 +563,6 @@ defmodule Loopctl.Intake do
       [source] -> {:ok, source}
       [] -> {:error, {:no_intake_source, project_id}}
       sources -> {:error, {:ambiguous_intake_source, project_id, length(sources)}}
-    end
-  end
-
-  @doc """
-  The `mode` of `project_id`'s ONE live intake source, or nil when it has none or more than one
-  — the exactly-one rule of `select_project_source/2`, with the project filtered IN SQL so no
-  other project's sources are read. For a dispatch whose caller supplied `repo` and
-  `base_branch` itself, so nothing else resolved the source (US-45.4).
-  """
-  @spec project_source_mode(Ecto.UUID.t(), Ecto.UUID.t()) :: :pr | :thread | nil
-  def project_source_mode(tenant_id, project_id)
-      when is_binary(tenant_id) and is_binary(project_id) do
-    tenant_id
-    |> live_sources_query()
-    |> where([s], s.project_id == ^project_id)
-    |> limit(2)
-    |> select([s], s.mode)
-    |> AdminRepo.all()
-    |> case do
-      [mode] -> mode
-      _none_or_ambiguous -> nil
     end
   end
 

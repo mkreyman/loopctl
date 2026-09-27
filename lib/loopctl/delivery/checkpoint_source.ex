@@ -60,10 +60,19 @@ defmodule Loopctl.Delivery.CheckpointSource do
   404 for a commit GitHub never had included — it is judged as an open checkpoint, never as
   already merged. Only a transient fault (`MergePrecondition.transient?/1`) is an error.
 
+  ## A checkpoint the base already contains
+
   A checkpoint whose merge base with the base branch IS the checkpoint is one the base already
-  CONTAINS: it is answered as merged too, with the checkpoint's own sha as `merge_sha` (the
-  commit the base is known to contain), whether or not a `merge_commit_sha` was recorded.
-  Judged as open instead it would read as an empty change and escalate a merge that happened.
+  CONTAINS. It is answered as merged with `on_base?: true` and the checkpoint's own sha as
+  `merge_sha` (the commit the base is known to contain), whether or not a `merge_commit_sha`
+  was recorded, and `MergePrecondition` decides what that means: `already_merged` only when a
+  recorded allow names the checkpoint, and otherwise `checkpoint_on_base_without_allow` — the
+  commit the branch was cut from with no work on it, or a fast-forward nobody gated.
+
+  The check runs on a MISSING branch too, before it is answered `:missing`: a branch deleted
+  after its checkpoint was fast-forwarded onto the base is contained, not missing. The
+  comparison there is best-effort — only a transient fault is an error; any other answer
+  (a checkpoint GitHub never had, say) leaves the branch `:missing`.
   """
 
   alias Loopctl.Delivery.MergePrecondition
@@ -114,6 +123,7 @@ defmodule Loopctl.Delivery.CheckpointSource do
   defp open_facts(repo, base_branch, branch, %Checkpoint{commit_sha: sha} = checkpoint) do
     case branch_head(repo, branch) do
       {:ok, ^sha} -> checkpoint_facts(repo, base_branch, checkpoint)
+      {:ok, :missing} -> missing_facts(repo, base_branch, checkpoint)
       {:ok, other} -> {:ok, Map.merge(open(sha), %{branch_head_sha: other})}
       {:error, _reason} = error -> error
     end
@@ -128,7 +138,7 @@ defmodule Loopctl.Delivery.CheckpointSource do
 
   # The base already contains the checkpoint (see the moduledoc).
   defp compared_facts(%Checkpoint{commit_sha: sha} = checkpoint, _commit, %{merge_base_sha: sha}),
-    do: {:ok, merged_facts(checkpoint, sha)}
+    do: {:ok, on_base_facts(checkpoint)}
 
   defp compared_facts(%Checkpoint{commit_sha: sha}, commit, comparison) do
     {:ok,
@@ -144,6 +154,26 @@ defmodule Loopctl.Delivery.CheckpointSource do
   end
 
   defp open(sha), do: %{state: "open", merged?: false, merge_sha: nil, head_sha: sha}
+
+  # The branch is gone. A checkpoint the base contains was fast-forwarded (or cut from the
+  # base) and the branch deleted since, which is not the same fact as "never pushed".
+  defp missing_facts(repo, base_branch, %Checkpoint{commit_sha: sha} = checkpoint) do
+    case source().compare(repo, base_branch, sha) do
+      {:ok, %{merge_base_sha: ^sha}} ->
+        {:ok, on_base_facts(checkpoint)}
+
+      {:error, reason} = error ->
+        if MergePrecondition.transient?(reason), do: error, else: missing(sha)
+
+      {:ok, _not_contained} ->
+        missing(sha)
+    end
+  end
+
+  defp missing(sha), do: {:ok, Map.merge(open(sha), %{branch_head_sha: :missing})}
+
+  defp on_base_facts(%Checkpoint{commit_sha: sha} = checkpoint),
+    do: checkpoint |> merged_facts(sha) |> Map.put(:on_base?, true)
 
   # A branch the forge does not have is a FACT about the thread — nothing was pushed, or it
   # was deleted — not a forge failure, so it is `:missing` rather than an error that would

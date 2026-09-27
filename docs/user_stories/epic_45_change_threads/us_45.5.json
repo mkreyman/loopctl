@@ -44,7 +44,11 @@
     },
     {
       "id": "AC-45.5.8",
-      "description": "The executor merges only while the base branch's head still equals the base_sha the gate's allow recorded (US-45.4: the merge base the judged three-dot diff is relative to). The gate does not refuse a base that moved on, so this is the one place base freshness is enforced: when the base head differs, the executor takes the base-update path (AC-45.5.4, AC-45.5.7) and the story comes back through the gate, because squashing the checkpoint's tree onto a newer base would silently revert every base commit the judged diff never saw."
+      "description": "The executor merges only while the base branch's head still equals the base_sha the gate's allow recorded (US-45.4: the merge base the judged three-dot diff is relative to). The gate does not refuse a base that moved on, so this is the one place base freshness is enforced: when the base head differs, the executor takes the base-update path (AC-45.5.4, AC-45.5.7) and the story comes back through the gate (AC-45.5.9), because squashing the checkpoint's tree onto a newer base would silently revert every base commit the judged diff never saw."
+    },
+    {
+      "id": "AC-45.5.9",
+      "description": "When base_update checkpoints arrive, Threads.claim_checkpoints treats the latest base_update of the current claim whose ancestry reaches the checkpoint the gate last allowed as the judged head, so the story comes back through the merge gate (US-45.4) on it. Until then the gate reads claimant checkpoints (kind checkpoint) only, and a base_update is invisible to it."
     }
   ],
   "test_cases": [
@@ -193,6 +197,24 @@
       ],
       "expected_results": [
         "no squash commit and no ref update; the base-update path runs"
+      ]
+    },
+    {
+      "id": "TC-45.5.10",
+      "verifies": [
+        "AC-45.5.9"
+      ],
+      "name": "gate judges the base update",
+      "type": "integration",
+      "preconditions": [
+        "a recorded allow for checkpoint C",
+        "a base_update checkpoint whose first parent is C"
+      ],
+      "steps": [
+        "run the merge gate"
+      ],
+      "expected_results": [
+        "the base_update is the judged head; an unrelated base_update is not"
       ]
     }
   ],

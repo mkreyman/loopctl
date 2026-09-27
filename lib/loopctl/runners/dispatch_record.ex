@@ -76,7 +76,8 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :branch, :string
     # The merge route an IMPLEMENT dispatch was placed under — the story's intake source `mode`
     # when it was first sent (US-45.4). NULL for every other row and every row older than the
-    # column, read as `pr`. Never rewritten: a retry finds the first insert's row.
+    # column, read as `pr` (no accepted row at all falls back to the source's current mode).
+    # Never rewritten: a retry finds the first insert's row.
     field :mode, :string
     # The base branch the same implement dispatch was sent with (US-45.4), bound the same way.
     # NULL for every other row and every row older than the column: the merge gate then falls

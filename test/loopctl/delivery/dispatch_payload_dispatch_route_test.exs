@@ -1,8 +1,8 @@
 defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
   @moduledoc """
-  `Loopctl.Delivery.DispatchPayload.dispatch_route/3` (US-45.4): the merge mode and base
-  branch a story's CURRENT claim was placed under, and the branch its work is on, read from
-  the implement ledger row of that claim its runner accepted. The merge gate judges a story on this route,
+  `Loopctl.Delivery.DispatchPayload.dispatch_route/2` and `thread_branch/3` (US-45.4): the
+  merge mode, base branch and branch a story's CURRENT claim was placed under, read from the
+  implement ledger row of that claim its runner accepted, and the branch a thread is judged on. The merge gate judges a story on this route,
   so a later source change, a triage row, or a dispatch that never ran must not change it.
   """
 
@@ -46,8 +46,12 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     row
   end
 
-  defp route(ctx, stage_branch \\ nil),
-    do: DispatchPayload.dispatch_route(ctx.story.tenant_id, ctx.story, stage_branch)
+  defp route(ctx), do: DispatchPayload.dispatch_route(ctx.story.tenant_id, ctx.story)
+
+  defp thread_branch(ctx, stage_branch \\ nil) do
+    {:ok, route} = route(ctx)
+    DispatchPayload.thread_branch(route, ctx.story, stage_branch)
+  end
 
   @t1 ~U[2026-09-26 10:00:00.000000Z]
   @t2 ~U[2026-09-26 11:00:00.000000Z]
@@ -66,20 +70,22 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     assert {:ok, %{base_branch: "trunk"}} = route(ctx)
   end
 
-  test "a row with no recorded mode, or no row at all, is pr", ctx do
-    assert {:ok, %{mode: :pr}} = route(ctx)
+  test "a row that recorded no mode is pr; NO row is nil, for the caller's source fallback",
+       ctx do
+    assert {:ok, %{mode: nil, branch: nil, base_branch: nil}} = route(ctx)
 
     record(ctx, @t1, branch: "agent/b")
     assert {:ok, %{mode: :pr}} = route(ctx)
   end
 
-  test "branch order: the stage's reported branch, then the dispatch's, then derived", ctx do
+  test "thread branch order: the stage's reported branch, then the dispatch's, then derived",
+       ctx do
     {:ok, derived} = DispatchPayload.branch_for(ctx.story, [])
-    assert {:ok, %{branch: ^derived}} = route(ctx)
+    assert {:ok, ^derived} = thread_branch(ctx)
 
     record(ctx, @t1, branch: "agent/dispatched")
-    assert {:ok, %{branch: "agent/dispatched"}} = route(ctx)
-    assert {:ok, %{branch: "agent/worked-on"}} = route(ctx, "agent/worked-on")
+    assert {:ok, "agent/dispatched"} = thread_branch(ctx)
+    assert {:ok, "agent/worked-on"} = thread_branch(ctx, "agent/worked-on")
   end
 
   test "the newest ACCEPTED row, of the CURRENT claim, of an implement kind", ctx do
@@ -108,6 +114,7 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     record(ctx, @t1, mode: "thread", branch: "agent/mine")
     other = fixture(:stage_story, %{})
 
-    assert {:ok, %{mode: :pr}} = DispatchPayload.dispatch_route(other.tenant_id, ctx.story, nil)
+    assert {:ok, %{mode: nil, branch: nil}} =
+             DispatchPayload.dispatch_route(other.tenant_id, ctx.story)
   end
 end

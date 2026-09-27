@@ -205,33 +205,39 @@ defmodule Loopctl.Delivery.DispatchPayload do
 
   @doc """
   The ROUTE `story`'s current claim was dispatched on (US-45.4): the merge `mode` and the
-  `base_branch` its implement dispatch was placed under, and the branch its work is on. Read
-  from the implement row of the story's CURRENT `claim_epoch` that its runner ACCEPTED, newest
-  first, through the shared implement-kind filter
+  `base_branch` its implement dispatch was placed under, and the branch it named. Read from the
+  implement row of the story's CURRENT `claim_epoch` that its runner ACCEPTED, newest first,
+  through the shared implement-kind filter
   (`Loopctl.Runners.DispatchLedger.where_implement_kind/1`).
 
-  - `mode` — the row's recorded mode (`Loopctl.Runners.DispatchLedger.record_sent/3` binds it
-    at placement). NULL, or no such row, is `:pr`, the only route there was before the column
+  Every field is a RECORDED fact, never a derivation; a caller that needs a fallback applies
+  it, and one that does not need a field never pays for resolving it:
+
+  - `mode` — the row's recorded mode (`Loopctl.Runners.DispatchLedger.record_sent/4` binds it
+    at placement). A row that records none is `:pr`: written before the column existed, when
+    `pr` was the only route, or placed where no single source resolved one. `nil` when there is
+    NO accepted row for the claim; the caller then falls back to the intake source's CURRENT
+    mode, as it does for the base branch
   - `base_branch` — the base branch the dispatch was placed on, pinned the same way. nil for a
     row that records none (or no row); the caller then falls back to the intake source's
-    CURRENT base branch, the only base there was when such a row was written
-  - `branch`, in this order, the first that is present:
-    1. `stage_branch` — the `branch` effect the runner reported on the stage row at
-       `worktree`, which is the branch its session actually works on
-    2. the row's `branch`, the name the dispatch put on the wire (#846.2)
-    3. `branch_for/2` with no prefixes, for a story no row names a branch for: the name such a
-       dispatch carried whenever its runner declared none. For one that did, the forge
-       answers it as missing
+    CURRENT base branch
+  - `branch` — the name the dispatch put on the wire (#846.2), or nil. `thread_branch/3`
+    resolves the branch a thread is judged on from it
 
   The read's lock wait is bounded (`Loopctl.Runners.Capacity.set_lock_timeout!/1`).
   `{:error, :busy}` for contention a caller retries out of
   (`Loopctl.Delivery.Stages.answering_busy/4`, counted as
   `[:loopctl, :delivery, :dispatch_route_busy]`); it never raises for that.
   """
-  @spec dispatch_route(Ecto.UUID.t(), Story.t(), String.t() | nil) ::
-          {:ok, %{mode: :pr | :thread, branch: String.t(), base_branch: String.t() | nil}}
+  @spec dispatch_route(Ecto.UUID.t(), Story.t()) ::
+          {:ok,
+           %{
+             mode: :pr | :thread | nil,
+             branch: String.t() | nil,
+             base_branch: String.t() | nil
+           }}
           | {:error, term()}
-  def dispatch_route(tenant_id, %Story{} = story, stage_branch) do
+  def dispatch_route(tenant_id, %Story{} = story) do
     Stages.answering_busy(
       tenant_id,
       [:loopctl, :delivery, :dispatch_route_busy],
@@ -244,7 +250,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
           Capacity.set_lock_timeout!(Repo)
           Repo.one(route_query(tenant_id, story))
         end)
-        |> route(story, stage_branch)
+        |> route()
       end
     )
   end
@@ -260,26 +266,38 @@ defmodule Loopctl.Delivery.DispatchPayload do
     |> DispatchLedger.where_implement_kind()
   end
 
-  defp route({:ok, row}, story, stage_branch) do
-    row = row || %{mode: nil, branch: nil, base_branch: nil}
-
-    with {:ok, branch} <- route_branch(stage_branch, row.branch, story) do
-      {:ok, %{mode: route_mode(row.mode), branch: branch, base_branch: row.base_branch}}
-    end
-  end
-
-  defp route({:error, _reason} = error, _story, _stage_branch), do: error
+  defp route({:ok, nil}), do: {:ok, %{mode: nil, branch: nil, base_branch: nil}}
+  defp route({:ok, row}), do: {:ok, %{row | mode: route_mode(row.mode)}}
+  defp route({:error, _reason} = error), do: error
 
   defp route_mode("thread"), do: :thread
   defp route_mode(_pr_or_legacy), do: :pr
 
-  defp route_branch(stage_branch, _row_branch, _story) when is_binary(stage_branch),
+  @doc """
+  The branch a THREAD-mode story is judged on (US-45.4), the first that is present:
+
+  1. `stage_branch` — the `branch` effect the runner reported on the stage row at `worktree`,
+     which is the branch its session actually works on
+  2. the route's `branch` (`dispatch_route/2`), the name the dispatch put on the wire
+  3. `branch_for/2` with no prefixes, for a story nothing names a branch for: the name such a
+     dispatch carried whenever its runner declared none. For one that did, the forge answers
+     it as missing
+
+  Only thread mode asks: a pull request names its own head, so the pr path never resolves one.
+  """
+  @spec thread_branch(
+          %{:branch => String.t() | nil, optional(atom()) => term()},
+          Story.t(),
+          String.t() | nil
+        ) ::
+          {:ok, String.t()} | {:error, {:no_conforming_branch, [String.t()]}}
+  def thread_branch(_route, %Story{}, stage_branch) when is_binary(stage_branch),
     do: {:ok, stage_branch}
 
-  defp route_branch(_stage_branch, row_branch, _story) when is_binary(row_branch),
-    do: {:ok, row_branch}
+  def thread_branch(%{branch: branch}, %Story{}, _stage_branch) when is_binary(branch),
+    do: {:ok, branch}
 
-  defp route_branch(_stage_branch, _row_branch, story), do: branch_for(story, [])
+  def thread_branch(_route, %Story{} = story, _stage_branch), do: branch_for(story, [])
 
   @doc """
   The part of a branch name that makes it this story's and nobody else's.
@@ -447,12 +465,12 @@ defmodule Loopctl.Delivery.DispatchPayload do
   defp derive_branch(story, prefixes, :refuse), do: branch_for(story, prefixes)
 
   # The MODE rides the same resolution as `repo` and `base_branch` (US-45.4): where this reads
-  # the source, its mode comes from that one read; where the caller supplied both refs and
-  # nothing resolved the source, one project-filtered read answers it
-  # (`Intake.project_source_mode/2`).
+  # the source, its mode comes from that one read; where the caller supplied both refs, the
+  # same resolution runs for the mode alone, and a project with no single live source places
+  # with none.
   defp fill_repo(tenant_id, story, dispatch) do
     if Map.has_key?(dispatch, "repo") and Map.has_key?(dispatch, "base_branch") do
-      {:ok, put_placed_mode(dispatch, Intake.project_source_mode(tenant_id, story.project_id))}
+      {:ok, put_placed_mode(dispatch, source_mode(tenant_id, story.project_id))}
     else
       with {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id) do
         {:ok,
@@ -467,6 +485,13 @@ defmodule Loopctl.Delivery.DispatchPayload do
   # An ATOM key, so a caller's JSON can never carry one. Carried for every kind: the ledger
   # records it on an implement row only (`DispatchLedger.record_sent/4`), the one rule.
   defp put_placed_mode(dispatch, mode), do: Map.put(dispatch, @placed_mode, mode_string(mode))
+
+  defp source_mode(tenant_id, project_id) do
+    case Intake.source_for_project(tenant_id, project_id) do
+      {:ok, source} -> source.mode
+      {:error, _no_single_source} -> nil
+    end
+  end
 
   defp mode_string(nil), do: nil
   defp mode_string(mode) when is_atom(mode), do: Atom.to_string(mode)

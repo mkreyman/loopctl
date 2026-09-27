@@ -1159,6 +1159,41 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.mode == nil
     end
 
+    test "a thread that could not be READ is thread_unreadable, never no_checkpoint_recorded" do
+      verdict =
+        judge_thread([],
+          checkpoint: {:error, :not_found},
+          pull_request: {:error, :not_attempted}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:thread_unreadable, :not_found} in verdict.reasons
+      refute Enum.any?(verdict.reasons, &match?({:no_checkpoint_recorded, _}, &1))
+    end
+
+    test "a checkpoint the base contains is already_merged ONLY under an allow naming it" do
+      on_base = %{
+        state: "closed",
+        merged?: true,
+        on_base?: true,
+        merge_sha: @head,
+        head_sha: @head,
+        merge_base_sha: @head,
+        diffstat: %{files: 0, changed_lines: 0},
+        diff: {:ok, %{files: [], renames: []}}
+      }
+
+      allowed = judge_thread([recorded_allow_sha: @head], pull_request: {:ok, on_base})
+      assert allowed.decision == :already_merged
+
+      for allow <- [nil, String.duplicate("6", 40)] do
+        verdict = judge_thread([recorded_allow_sha: allow], pull_request: {:ok, on_base})
+
+        assert verdict.decision == :refuse, inspect(allow)
+        assert verdict.reasons == [{:checkpoint_on_base_without_allow, @head}]
+      end
+    end
+
     test "pr mode never reads a branch fact" do
       verdict = judge_thread(mode: :pr, branch_head_sha: :missing)
 

@@ -72,6 +72,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
   - `{:claim_ended, _}` — the current claim recorded no checkpoint but an earlier claim did:
     the story was released (force-unclaimed, rejected, reclaimed) and its new claim has not
     reported yet
+  - `{:thread_unreadable, reason}` — the thread's checkpoints could not be READ for a reason
+    that is not contention. Refused like `pull_request_unavailable`: the remedy is loopctl's,
+    never the runner's contract version
+  - `{:checkpoint_on_base_without_allow, checkpoint}` — the base already CONTAINS the
+    checkpoint (see below) and no recorded allow names it
 
   The BRANCH FACT is judged first. `{:branch_missing, checkpoint}` (a 404 on the branch in a
   repository the token can read), `{:branch_head_unrecorded, branch, checkpoint}` (the branch
@@ -93,22 +98,34 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   The BASE BRANCH is the one the claim was placed on, pinned on the same ledger row as the
   mode; a row that records none (written before the column existed) falls back to the
-  source's current base branch.
+  source's current base branch. A claim with NO accepted implement row falls back to the
+  source's current MODE the same way, so a thread-source story with no route is judged as a
+  thread and told what is missing, never judged as a pull request it never had. The branch
+  itself (`DispatchPayload.thread_branch/3`) is resolved for a thread only: a pull request
+  names its own head.
 
   The gate judges the checkpoint's THREE-DOT diff — the change relative to its merge base with
   the base branch — so a base that moved on since the checkpoint was cut is not a reason
   here: in a busy repository that would be nearly every story. A checkpoint the base already
-  CONTAINS (its merge base IS the checkpoint) is merged, whether or not a `merge_commit_sha`
-  was recorded, and is judged on its recorded allow like any merged head.
+  CONTAINS (its merge base IS the checkpoint), whether or not a `merge_commit_sha` was
+  recorded and whether or not its branch still exists, is `:already_merged` ONLY when a
+  recorded allow names it. Otherwise it is `checkpoint_on_base_without_allow`: the commit the
+  branch was cut from with nothing done on it, or a fast-forward nobody gated. Neither is a
+  merge AROUND the gate, so neither raises the `ungated_merge` alarm.
 
   A thread-mode allow is recorded naming the checkpoint id and its sha, and `base_sha` — the
   MERGE BASE the judged diff is relative to — on the `effect_recorded` event of
   `merge_gate_allowed_sha`. THAT IS THE MERGE EXECUTOR'S CONTRACT (US-45.5): it merges only
   while the base head still equals the recorded `base_sha`, and otherwise takes the
-  base-update path (AC-45.5.4, AC-45.5.7) and comes back through this gate. A squash of the
-  checkpoint's tree onto a base that moved would silently revert every base commit the
-  judged diff never saw, so base freshness is enforced at the one step that writes the
-  base.
+  base-update path (AC-45.5.4, AC-45.5.7). A squash of the checkpoint's tree onto a base that
+  moved would silently revert every base commit the judged diff never saw, so base freshness
+  is enforced at the one step that writes the base.
+
+  THIS GATE JUDGES CLAIMANT CHECKPOINTS ONLY (`kind: :checkpoint`,
+  `Loopctl.Threads.claim_checkpoints/2`). A `base_update` checkpoint — the executor's merge of
+  the base into the thread — is written by US-45.5, and until that story makes
+  `claim_checkpoints/2` treat the latest `base_update` reaching the allowed checkpoint as the
+  judged head (AC-45.5.9) the gate does not see one.
 
   ## The loop may not merge its own control plane
 
@@ -553,12 +570,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # a thread with no checkpoint is refused rather than judged against a branch nobody reported.
   @thread_input_facts [
     {:repo, :repository_unresolved},
-    {:checkpoint, :no_checkpoint_recorded},
+    {:checkpoint, :thread_unreadable},
     {:pull_request, :pull_request_unavailable}
   ]
 
   @forge_facts [
-    {:checkpoint, :no_checkpoint_recorded},
+    {:checkpoint, :thread_unreadable},
     {:pull_request, :pull_request_unavailable},
     {:head_files, :head_files_unavailable},
     {:base_files, :base_files_unavailable}
@@ -571,7 +588,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # The checkpoint read is consumed on every path: a thread-mode read that could not be made
   # (contention, `:busy`) is a retry, never a verdict. In pr mode the fact is `{:ok, nil}`.
   @merged_facts [
-    {:checkpoint, :no_checkpoint_recorded},
+    {:checkpoint, :thread_unreadable},
     {:pull_request, :pull_request_unavailable}
   ]
 
@@ -588,10 +605,15 @@ defmodule Loopctl.Delivery.MergePrecondition do
         do: input_reason(kind, reason)
   end
 
-  # A thread whose CURRENT claim recorded nothing while an earlier claim did was released —
-  # force-unclaimed, rejected, reclaimed — and is told so, rather than that nothing was ever
-  # recorded (US-45.4).
-  defp input_reason(:no_checkpoint_recorded, :claim_ended),
+  # The checkpoint fact names WHY there is nothing to judge (US-45.4). A thread that recorded
+  # nothing is `no_checkpoint_recorded`, whose remedy is the runner's contract version. One
+  # whose CURRENT claim recorded nothing while an earlier claim did was released —
+  # force-unclaimed, rejected, reclaimed — and is told so. Any other failure to READ the thread
+  # is `thread_unreadable`, refused like `pull_request_unavailable`: sending an operator to
+  # check a runner's contract for a read loopctl itself could not make is the wrong remedy.
+  defp input_reason(:thread_unreadable, :none), do: {:no_checkpoint_recorded, :none}
+
+  defp input_reason(:thread_unreadable, :claim_ended),
     do: {:claim_ended, :no_checkpoint_under_current_claim}
 
   defp input_reason(kind, reason), do: {kind, reason}
@@ -704,7 +726,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
         diffstat: Map.get(pr, :diffstat)
     }
 
-    case ungated_reasons(pr, Map.get(facts, :recorded_allow_sha)) do
+    case merged_reasons(pr, Map.get(facts, :recorded_allow_sha)) do
       [] -> %{verdict | decision: :already_merged, reasons: []}
       reasons -> refuse(verdict, reasons ++ carried)
     end
@@ -762,6 +784,17 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # A merge nobody authorised. The sha is still reported on the verdict and named in the
   # reason, so the fact is not lost — but the decision is a REFUSAL, because the last gate
   # before an outward effect must never report clean for an effect it did not license.
+  # A THREAD checkpoint the base already contains (`CheckpointSource`, `on_base?`) is merged
+  # only when a recorded allow names it. Otherwise it is the commit the branch was cut from
+  # (nothing was done) or a fast-forward nobody gated — and in neither case did anything merge
+  # AROUND the gate, so it is `checkpoint_on_base_without_allow`, never the ungated-merge alarm.
+  defp merged_reasons(%{on_base?: true, head_sha: head}, head), do: []
+
+  defp merged_reasons(%{on_base?: true, head_sha: head}, _allowed),
+    do: [{:checkpoint_on_base_without_allow, head}]
+
+  defp merged_reasons(pr, allowed), do: ungated_reasons(pr, allowed)
+
   defp ungated_reasons(%{merge_sha: nil}, _allowed),
     do: [:merged_without_sha]
 
@@ -1097,14 +1130,14 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
     # The MODE and the BASE BRANCH are the ones this claim's implement dispatch was PLACED
     # under (US-45.4), never the source's now: a source changed after placement decides only
-    # what later placements get. Read with the branch, from the same ledger row.
+    # what later placements get. Read from the same ledger row as the dispatched branch.
     {mode, {pr_number, checkpoint, pull_request}} =
-      case DispatchPayload.dispatch_route(story.tenant_id, story, stage.branch) do
-        {:ok, %{mode: :thread} = route} ->
-          {:thread, thread_facts(story, source, repo, route)}
-
-        {:ok, %{mode: :pr}} ->
-          {:pr, pr_facts(stage, repo)}
+      case DispatchPayload.dispatch_route(story.tenant_id, story) do
+        {:ok, route} ->
+          case placed_mode(route, source) do
+            :thread -> {:thread, thread_facts(story, stage, source, repo, route)}
+            :pr -> {:pr, pr_facts(stage, repo)}
+          end
 
         # The route could not be read (contention): nothing is judged on a guessed route, and
         # the mode is reported as UNKNOWN (nil), not as `pr`. The failure travels as the pull
@@ -1177,19 +1210,22 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # The branch is the one the story was DISPATCHED on, never re-derived here.
   # A thread-mode story whose project has no single source still has no repository: the input
   # reasons refuse it `:repository_unresolved`, and nothing is read.
-  defp thread_facts(_story, _source, {:error, _reason}, _route),
+  defp thread_facts(_story, _stage, _source, {:error, _reason}, _route),
     do: {{:ok, nil}, {:error, :not_attempted}, {:error, :not_attempted}}
 
-  defp thread_facts(story, {:ok, source}, {:ok, repo}, route) do
+  defp thread_facts(story, stage, {:ok, source}, {:ok, repo}, route) do
     case Threads.claim_checkpoints(story.tenant_id, story.id) do
       {:ok, %{latest: %Checkpoint{} = checkpoint} = claim} ->
+        # The branch is resolved HERE, for a thread only: a pull request names its own head.
         pull_request =
-          CheckpointSource.pull_request(
-            repo,
-            placed_base_branch(route, source),
-            route.branch,
-            checkpoint
-          )
+          with {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
+            CheckpointSource.pull_request(
+              repo,
+              placed_base_branch(route, source),
+              branch,
+              checkpoint
+            )
+          end
 
         {{:ok, nil}, {:ok, checkpoint_fact(checkpoint, claim.earlier_shas)}, pull_request}
 
@@ -1204,7 +1240,16 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  # The base branch the claim was PLACED on (`dispatch_route/3`), so repointing the source
+  # The mode the claim was PLACED under (`DispatchPayload.dispatch_route/2`). A claim with NO
+  # accepted implement row falls back to the source's CURRENT mode, as the base branch does, so
+  # a thread-source story nobody has placed yet is told `no_checkpoint_recorded` rather than
+  # being judged as a pull request it never had. No source at all is `:pr`, whose input
+  # reasons refuse the missing repository.
+  defp placed_mode(%{mode: mode}, _source) when mode in [:pr, :thread], do: mode
+  defp placed_mode(_route, {:ok, source}), do: source.mode
+  defp placed_mode(_route, _no_source), do: :pr
+
+  # The base branch the claim was PLACED on (`dispatch_route/2`), so repointing the source
   # afterwards cannot move the base a placed story is judged against. A ledger row written
   # before the column existed records none, and falls back to the source's current base branch
   # — the only base there was when it was placed.

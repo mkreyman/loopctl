@@ -385,6 +385,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     test "compare/3 reads the merge base, the base's tree and a diffstat over every file" do
       stub(fn conn ->
         assert conn.request_path == "/repos/acme/widgets/compare/master...#{@head}"
+        # Only the commit list is paged, so the file list stays complete.
+        assert conn.query_string == "per_page=1"
 
         json(conn, %{
           "merge_base_commit" => %{"sha" => @merge_base},

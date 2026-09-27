@@ -695,12 +695,94 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:ok, %Verdict{decision: :already_merged, merge_sha: @head}} = evaluate(ctx)
     end
 
-    test "a contained checkpoint nobody allowed is an ungated merge, never empty_change", ctx do
+    test "an ungated fast-forward of the checkpoint is checkpoint_on_base_without_allow, never the ungated-merge alarm",
+         ctx do
       stub_thread(ctx, merge_base: @head)
 
       assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
-      assert {:ungated_merge, @head, :no_recorded_allow} in reasons
+      assert {:checkpoint_on_base_without_allow, @head} in reasons
+      refute Enum.any?(reasons, &match?({:ungated_merge, _, _}, &1))
       refute Enum.any?(reasons, &match?({:empty_change, _}, &1))
+    end
+
+    test "a checkpoint that IS the base it was cut from (no work) is checkpoint_on_base_without_allow",
+         ctx do
+      # Nothing was done: the checkpoint is the base commit, tree and all.
+      stub_thread(ctx, merge_base: @head, base_tree: @tree)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:checkpoint_on_base_without_allow, @head} in reasons
+      refute Enum.any?(reasons, &match?({:ungated_merge, _, _}, &1))
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "a deleted branch whose checkpoint the base contains is already_merged under its allow",
+         ctx do
+      stub_thread(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      stub_thread(ctx, merge_base: @head)
+      stub_branch_deleted()
+
+      assert {:ok, %Verdict{decision: :already_merged, merge_sha: @head}} = evaluate(ctx)
+    end
+
+    test "a deleted branch whose checkpoint the base contains, with no allow, is not merged",
+         ctx do
+      stub_thread(ctx, merge_base: @head)
+      stub_branch_deleted()
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
+      assert {:checkpoint_on_base_without_allow, @head} in reasons
+      refute Enum.any?(reasons, &match?({:branch_missing, _}, &1))
+    end
+
+    test "a deleted branch whose contained-check hits a TRANSIENT fault is unevaluated", ctx do
+      stub_thread(ctx)
+      stub_branch_deleted()
+
+      Mox.stub(MockPullRequestSource, :compare, fn @repo, "master", @head ->
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      assert {:ok, %Verdict{decision: :unevaluated}} = evaluate(ctx)
+    end
+
+    test "a claim with NO accepted dispatch takes the source's CURRENT mode: thread", ctx do
+      {1, _} =
+        from(s in Loopctl.Intake.Source, where: s.project_id == ^ctx.project_id)
+        |> AdminRepo.update_all(set: [mode: :thread])
+
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(r in Loopctl.Runners.DispatchRecord, where: r.id == ^ctx.dispatch_row.id)
+          |> Repo.delete_all()
+        end)
+
+      {:ok, {_n, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(c in Loopctl.Threads.Checkpoint, where: c.story_id == ^ctx.story_id)
+          |> Repo.delete_all()
+        end)
+
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _number ->
+        flunk("a thread-source story with no route was judged as a pull request")
+      end)
+
+      assert {:ok, %Verdict{decision: :refuse, mode: :thread, reasons: reasons}} = evaluate(ctx)
+      assert {:no_checkpoint_recorded, :none} in reasons
+    end
+
+    test "a claim with NO accepted dispatch on a pr source is judged as a pull request", ctx do
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(r in Loopctl.Runners.DispatchRecord, where: r.id == ^ctx.dispatch_row.id)
+          |> Repo.delete_all()
+        end)
+
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+
+      assert {:ok, %Verdict{decision: :allow, mode: :pr, pr_number: 4242}} = evaluate(ctx)
     end
 
     test "the BASE BRANCH is the one the claim was PLACED on, whatever the source says now",
@@ -886,12 +968,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     stage = Stages.get(ctx.tenant_id, ctx.story_id)
 
-    {:ok, %{branch: branch}} =
-      DispatchPayload.dispatch_route(
-        ctx.tenant_id,
-        AdminRepo.get!(Story, ctx.story_id),
-        stage.branch
-      )
+    story = AdminRepo.get!(Story, ctx.story_id)
+    {:ok, route} = DispatchPayload.dispatch_route(ctx.tenant_id, story)
+    {:ok, branch} = DispatchPayload.thread_branch(route, story, stage.branch)
 
     Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^branch ->
       {:ok, Keyword.get(opts, :branch_head, head)}
@@ -935,6 +1014,15 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
           review_requested_at: nil
         ]
       )
+  end
+
+  # The thread branch 404s in a repository the token can read: deleted.
+  defp stub_branch_deleted do
+    Mox.stub(MockPullRequestSource, :branch_head, fn @repo, _branch ->
+      {:error, {:github_api_error, 404}}
+    end)
+
+    Mox.stub(MockPullRequestSource, :repository_readable, fn @repo -> :ok end)
   end
 
   defp set_merge_commit(ctx, sha) do

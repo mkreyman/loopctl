@@ -18,15 +18,17 @@ All notable changes to loopctl are documented here.
   thread-mode source needs runners at contract 1.20.0 or later sending `checkpoint`
   messages; otherwise every story is refused `no_checkpoint_recorded`.** It adds refusals
   `empty_change` (the checkpoint's tree equals the base branch's, or no file changed),
-  `checkpoint_tree_mismatch`, `no_checkpoint_recorded` and `claim_ended` (the current claim
-  recorded nothing, but an earlier, released one did). A branch missing from a readable
+  `checkpoint_tree_mismatch`, `no_checkpoint_recorded`, `claim_ended` (the current claim
+  recorded nothing, but an earlier, released one did) and `thread_unreadable` (loopctl could
+  not read the thread). A branch missing from a readable
   repository (`branch_missing`), naming a commit nobody reported (`branch_head_unrecorded`),
   naming an earlier checkpoint of the claim (`branch_head_regressed`), or a checkpoint that
   is not the recorded head, is `head_moved` back to `implementing` while the claim is live,
   and a refusal naming `claim_not_live` (escalated) when it is not. The diff judged is the
   checkpoint's three-dot diff against its merge base, so a base that moved on is not a
-  refusal, and a checkpoint the base already contains is `already_merged` on a recorded
-  allow. An unreadable repository
+  refusal. A checkpoint the base already contains, its branch deleted or not, is
+  `already_merged` only under a recorded allow naming it, and otherwise refused
+  `checkpoint_on_base_without_allow`. An unreadable repository
   refuses `pull_request_unavailable`. The gate's token also reads `GET /repos/:repo` after a
   404 on the branch. The verdict carries `mode`, `checkpoint_id`, `checkpoint_sha` and
   `base_sha` (the merge base the judged diff is relative to), and a thread-mode allow is
@@ -37,7 +39,8 @@ All notable changes to loopctl are documented here.
   `runner_dispatches.mode` and `runner_dispatches.base_branch` (nullable, no backfill, no
   manual step): an implement dispatch records its intake source's mode and the base branch it
   was sent with when it is first sent, and the merge gate reads both from the current claim's
-  dispatch, a NULL mode meaning `pr` and a NULL base branch meaning the source's current one.
+  dispatch, a NULL mode meaning `pr` and a NULL base branch meaning the source's current one;
+  a claim with no accepted dispatch at all takes the source's current mode and base branch.
   Changing a source's mode or base branch is therefore always allowed and affects only stories
   placed afterwards.
   For a thread-mode repository the

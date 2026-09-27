@@ -8385,7 +8385,8 @@ const TOOLS = [
       "on, and `pr_number` is null. The source's runners must be at runner " +
       "contract 1.20.0 or later and send checkpoint messages, or every story is refused " +
       "`no_checkpoint_recorded`; a story whose claim was released after an earlier one " +
-      "recorded checkpoints is refused `claim_ended`. It adds refusals `empty_change` (the " +
+      "recorded checkpoints is refused `claim_ended`, and a thread loopctl could not read " +
+      "`thread_unreadable`. It adds refusals `empty_change` (the " +
       "checkpoint's tree equals the base's, or no file changed) and " +
       "`checkpoint_tree_mismatch` (the forge's tree is not the one the claimant recorded). " +
       "The branch is judged first: a branch missing from a readable repository " +
@@ -8396,10 +8397,13 @@ const TOOLS = [
       "When it is NOT live (reported, review requested, lease expired) nobody can record " +
       "the fix, so it is a refusal naming `claim_not_live`, and the story escalates. A " +
       "repository the token cannot read refuses `pull_request_unavailable`. The answer " +
-      "carries `mode` (the one bound at placement; null when the route could not be read), " +
+      "carries `mode` (the one bound at placement, or the source's current mode when the " +
+      "claim has no accepted dispatch; null only when the ledger read met contention), " +
       "`checkpoint_id`, `checkpoint_sha` and `base_sha`. The diff judged is the three-dot " +
       "diff against the merge base, so a base that moved on is not a refusal, and a " +
-      "checkpoint the base already contains is `already_merged` on a recorded allow. An " +
+      "checkpoint the base already contains (its branch deleted or not) is " +
+      "`already_merged` only under a recorded allow naming it, and otherwise refused " +
+      "`checkpoint_on_base_without_allow`. An " +
       "allow records `base_sha` (that merge base); the merge executor merges only while " +
       "the base head still equals it.\n\n" +
       "REFUSALS. Needs an ORCHESTRATOR- or USER-role key: the action is `exact_role: " +
