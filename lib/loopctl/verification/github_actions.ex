@@ -11,12 +11,17 @@ defmodule Loopctl.Verification.GitHubActions do
   require Logger
 
   @per_page 100
-  # Completed conclusions. `cancelled` fails rather than waits: a superseded run of the same
-  # workflow is dropped below by recency, so a cancelled newest run is no evidence of a pass.
-  # Any other (`action_required`, a run waiting for someone to approve it) is neither, and
-  # reads as in progress.
-  @passed ~w(success skipped neutral)
-  @failed ~w(failure timed_out cancelled startup_failure stale)
+  # The runs that can carry CI evidence for a commit: those its own push or pull request
+  # triggered. A scheduled, dispatched or workflow_run-triggered run on the same commit
+  # (a deploy, a nightly) is not the commit's CI and neither passes nor fails it.
+  @ci_events ~w(push pull_request)
+  # Of a completed run, only `success` passes and these fail. `skipped`, `neutral` and
+  # `cancelled` are no evidence either way: a skipped run ran no tests, and a run is
+  # cancelled when a newer commit on the same ref supersedes it (cancel-in-progress), so
+  # its tests never finished. They are dropped, and a commit left with no run at all has
+  # no CI verdict.
+  @failed ~w(failure timed_out startup_failure stale)
+  @no_evidence ~w(skipped neutral cancelled)
 
   # #913: CI is read from the commit's Actions workflow runs, not its check runs. The
   # check-runs endpoint needs `checks: read`, which GitHub does not offer to fine-grained
@@ -32,12 +37,16 @@ defmodule Loopctl.Verification.GitHubActions do
 
     case Req.get(url, req_options()) do
       {:ok, %{status: 200, body: %{"workflow_runs" => runs, "total_count" => total}}}
-      when total > length(runs) ->
-        # More runs than one page holds: summarising the page could miss a failure.
-        {:error, {:workflow_runs_truncated, total}}
+      when is_list(runs) and is_integer(total) ->
+        cond do
+          # More runs than one page holds: judging the page could miss a failure.
+          total > length(runs) -> {:error, {:workflow_runs_truncated, total}}
+          Enum.all?(runs, &is_map/1) -> summarize(runs)
+          true -> {:error, :unreadable_workflow_runs}
+        end
 
-      {:ok, %{status: 200, body: %{"workflow_runs" => runs}}} ->
-        {:ok, summarize_runs(runs)}
+      {:ok, %{status: 200}} ->
+        {:error, :unreadable_workflow_runs}
 
       {:ok, %{status: status}} ->
         {:error, {:github_api_error, status}}
@@ -60,7 +69,7 @@ defmodule Loopctl.Verification.GitHubActions do
   end
 
   defp req_options do
-    opts = [headers: github_headers(), retry: false]
+    opts = [headers: github_headers()]
 
     # The `Req.Test` seam, as in `Loopctl.Delivery.GitHubPullRequestSource`, so the mapping
     # above is exercised against real response bytes.
@@ -100,28 +109,30 @@ defmodule Loopctl.Verification.GitHubActions do
     end
   end
 
-  # One verdict per workflow, from its newest run: a re-run or a second trigger of the same
-  # workflow on this commit supersedes the older one. Then every workflow must have passed.
-  # No runs at all is NOT a pass - GitHub creates them a moment after the push, so it reads
-  # as in progress and the worker waits, within its run window, like any unfinished CI.
-  defp summarize_runs(runs) do
+  # One verdict per workflow, from its newest run (the highest run id): a re-run or a second
+  # trigger of the same workflow on this commit supersedes the older one. A failed newest
+  # run fails the commit; an unfinished one (queued, in progress, waiting for approval)
+  # keeps it in progress, which the worker bounds; otherwise every remaining run passed.
+  defp summarize(runs) do
     latest =
       runs
+      |> Enum.filter(&(&1["event"] in @ci_events))
       |> Enum.group_by(& &1["workflow_id"])
-      |> Enum.map(fn {_, per_workflow} ->
-        Enum.max_by(per_workflow, &{&1["run_number"], &1["run_attempt"]})
-      end)
+      |> Enum.map(fn {_, per_workflow} -> Enum.max_by(per_workflow, & &1["id"]) end)
+      |> Enum.reject(&(&1["status"] == "completed" and &1["conclusion"] in @no_evidence))
 
     cond do
-      Enum.any?(latest, &(&1["status"] == "completed" and &1["conclusion"] in @failed)) ->
-        %{status: "completed", conclusion: "failure", url: ""}
+      latest == [] ->
+        {:error, :no_workflow_runs}
 
-      latest != [] and
-          Enum.all?(latest, &(&1["status"] == "completed" and &1["conclusion"] in @passed)) ->
-        %{status: "completed", conclusion: "success", url: ""}
+      Enum.any?(latest, &(&1["status"] == "completed" and &1["conclusion"] in @failed)) ->
+        {:ok, %{status: "completed", conclusion: "failure", url: ""}}
+
+      Enum.all?(latest, &(&1["status"] == "completed" and &1["conclusion"] == "success")) ->
+        {:ok, %{status: "completed", conclusion: "success", url: ""}}
 
       true ->
-        %{status: "in_progress", conclusion: nil, url: ""}
+        {:ok, %{status: "in_progress", conclusion: nil, url: ""}}
     end
   end
 end

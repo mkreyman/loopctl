@@ -123,4 +123,65 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       assert reloaded.started_at
     end
   end
+
+  describe "the CI wait (#913)" do
+    defp unfinished_ci do
+      Req.Test.stub(Loopctl.Verification.GitHubActions, fn conn ->
+        Req.Test.json(conn, %{
+          "total_count" => 1,
+          "workflow_runs" => [
+            %{
+              "id" => 1,
+              "workflow_id" => 1,
+              "event" => "push",
+              "status" => "waiting",
+              "conclusion" => nil
+            }
+          ]
+        })
+      end)
+    end
+
+    defp started_run(tenant, story) do
+      {:ok, run} =
+        Verification.create_run(tenant.id, story.id, %{commit_sha: String.duplicate("a", 40)})
+
+      {:ok, run} = Verification.start_run(run)
+      run
+    end
+
+    defp perform(run, tenant),
+      do:
+        VerificationRunnerWorker.perform(%Oban.Job{
+          args: %{"run_id" => run.id, "tenant_id" => tenant.id}
+        })
+
+    test "unfinished CI snoozes a run inside the window" do
+      %{tenant: tenant, story: story} = setup_ctx()
+      unfinished_ci()
+      run = started_run(tenant, story)
+
+      assert perform(run, tenant) == {:snooze, 60}
+    end
+
+    test "CI still unfinished past the window ends the run with no verdict, never a pass" do
+      %{tenant: tenant, story: story} = setup_ctx()
+      unfinished_ci()
+      run = tenant |> started_run(story) |> backdate!(25 * 60 * 60)
+
+      assert perform(run, tenant) == :ok
+
+      assert {:ok, %{status: "error", ac_results: %{"reason" => "ci_unfinished"}}} =
+               Verification.get_run(tenant.id, run.id)
+    end
+
+    test "a lookup with no verdict logs its reason before falling back" do
+      %{tenant: tenant, story: story} = setup_ctx()
+      Req.Test.stub(Loopctl.Verification.GitHubActions, &Plug.Conn.send_resp(&1, 403, "{}"))
+      run = started_run(tenant, story)
+
+      log = ExUnit.CaptureLog.capture_log(fn -> perform(run, tenant) end)
+      assert log =~ "no CI verdict for run #{run.id}: {:github_api_error, 403}"
+    end
+  end
 end

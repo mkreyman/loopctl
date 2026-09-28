@@ -72,7 +72,7 @@ defmodule Loopctl.Egress.ChokepointScan do
         "pin (pinned_request_opts + redirect: false). It is allowlisted for the same " <>
         "reason Loopctl.Provider is — it is the wrapper, not a call site that bypasses one.",
     "Loopctl.Verification.GitHubActions" =>
-      "Reads GitHub check-run status for verification. Operator-plane, fixed vendor " <>
+      "Reads a commit's GitHub Actions workflow runs for verification. Operator-plane, fixed vendor " <>
         "host, carries no tenant content outbound.",
     "Loopctl.Delivery.GitHubPullRequestSource" =>
       "Reads a pull request's state, diffstat, changed names, file tree and deployments " <>

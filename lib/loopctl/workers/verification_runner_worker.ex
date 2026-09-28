@@ -38,7 +38,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   can never complete an in-flight run mid-execution. In particular a run that has
   begun and is snoozing on `in_progress` CI (`{:snooze, 60}`) is `status: "running"`
   with `started_at` set, so even if its `inserted_at` ages past the window across
-  snoozes it is NOT killed mid-flight — it stays on the normal path until CI resolves.
+  snoozes it is NOT killed by this gate. Its CI wait has its own bound: once it is older
+  than the same window (by `inserted_at`) with CI still unfinished, it completes `"error"`
+  (`reason: "ci_unfinished"`), never a pass.
 
   Neither `"skipped"` nor `"error"` ever touches `stories.verified_status` — the run
   status is observational only; the chain-of-custody verify action is entirely
@@ -146,7 +148,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       from(s in "stories",
         join: p in "projects",
         on: s.project_id == p.id,
-        where: s.id == ^run.story_id and s.tenant_id == ^tenant_id,
+        # A schemaless query: the ids must be cast, or Postgrex refuses the string UUIDs
+        # and every run that reaches this read errors before CI is consulted.
+        where:
+          s.id == type(^run.story_id, :binary_id) and
+            s.tenant_id == type(^tenant_id, :binary_id),
         select: p.repo_url,
         limit: 1
       )
@@ -181,16 +187,35 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         {:ok, :ci_checked}
 
       {:ok, %{status: "in_progress"}} ->
-        {:snooze, 60}
+        if ci_wait_over?(run) do
+          # CI that never finishes (a run waiting for an approval nobody gives, a stuck
+          # runner) must not hold the run open for ever: after the same window the stale
+          # gate uses, it ends with no verdict, never a pass.
+          Logger.warning("VerificationRunner: CI for run #{run.id} still unfinished; giving up")
+          {:ok, _} = Verification.complete_run(run, "error", %{"reason" => "ci_unfinished"})
+          {:ok, :ci_checked}
+        else
+          {:snooze, 60}
+        end
 
       {:ok, %{conclusion: other}} ->
         Logger.warning("VerificationRunner: unexpected CI conclusion: #{inspect(other)}")
         {:error, :ci_unavailable}
 
-      {:error, _reason} ->
+      {:error, reason} ->
+        # Logged, because the fallback below hides it: a token without `actions: read`
+        # would otherwise turn every lookup into a silent local test run.
+        Logger.warning("VerificationRunner: no CI verdict for run #{run.id}: #{inspect(reason)}")
         {:error, :ci_unavailable}
     end
   end
+
+  # From `inserted_at`, not `started_at`: every snooze re-enters `perform/1`, which restarts
+  # the run and resets `started_at`, so that clock never ages.
+  defp ci_wait_over?(%{inserted_at: %DateTime{} = inserted_at}),
+    do: DateTime.diff(DateTime.utc_now(), inserted_at, :second) > max_run_age_seconds()
+
+  defp ci_wait_over?(_run), do: false
 
   # L3: independent test re-execution — clone repo, run tests, check results
   defp do_local_test_run(run, repo_url) do

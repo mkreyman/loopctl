@@ -242,13 +242,20 @@ All notable changes to loopctl are documented here.
 ### Changed
 
 - **Story verification reads CI from Actions workflow runs, not check runs (loopctl#913).
-  `GITHUB_TOKEN` needs `actions: read`; it no longer needs `checks: read`.** GitHub does
-  not offer `checks: read` to a fine-grained personal access token, so on a private
-  repository every verification CI lookup 403'd and fell back to the local runner.
-  Verification now reads `GET /repos/:owner/:repo/actions/runs?head_sha=`, takes each
-  workflow's newest run, and passes a commit only when every workflow passed. A commit
-  with no runs yet is in progress, not a pass. More than 100 runs on one commit is
-  refused (`workflow_runs_truncated`) rather than judged from a partial page.
+  `GITHUB_TOKEN` needs `actions: read`, in every mode; it no longer needs `checks: read`.**
+  GitHub does not offer `checks: read` to a fine-grained personal access token, so on a
+  private repository every verification CI lookup 403'd and fell back to the local runner.
+  Verification now reads `GET /repos/:owner/:repo/actions/runs?head_sha=`: only runs the
+  commit's own push or pull request triggered count, each workflow's newest run decides, and
+  a commit passes only when every such run succeeded. A skipped, neutral or cancelled run is
+  no evidence either way. A commit with no counting run, more than one page of runs, or an
+  unreadable response gets no CI verdict: the reason is logged as a warning and the run falls
+  back as before. CI still unfinished once a run is older than
+  `verification_max_run_age_seconds` now ends it `error` (`ci_unfinished`) instead of
+  waiting for ever.
+  Before this, no started run reached the CI read at all: the worker's project lookup passed
+  string UUIDs to a schemaless query, which Postgrex refused, so every run ended `error`
+  with a `failed:` log line. Runs recorded before this release carry no CI verdict.
 
 - **Merge import reports orphans only on request (#880). Breaking for a caller that reads
   `stories_orphaned`.** `POST /api/v1/projects/:id/import?merge=true` omits the key unless
