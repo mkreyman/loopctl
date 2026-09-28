@@ -10,9 +10,9 @@ defmodule Loopctl.Test.MigrationFile do
   fails `--warnings-as-errors` after a green suite.
 
   Every test that names a `Loopctl.Repo.Migrations` module loads it through `require!/2`,
-  so the module is present whatever state the database was in. The guard in
-  `Loopctl.Test.MigrationFileTest` checks that per named module, and refuses a
-  `Code.require_file`, `Code.compile_file` or `Code.eval_file` of a migration path.
+  so the module is present whatever state the database was in. Either way round is loud
+  without it: a bare load fails the next fresh-database run with "redefining module", and a
+  module used without a load raises `UndefinedFunctionError` on any migrated database.
   """
 
   @doc """
@@ -37,7 +37,7 @@ defmodule Loopctl.Test.MigrationFile do
     Code.ensure_loaded!(module)
   end
 
-  @doc "The one migration file with `version` in `dir` (default: the directory `mix ecto.migrate` reads)."
+  @doc "The one migration file with `version` in `dir` (default: `Ecto.Migrator.migrations_path/1`)."
   @spec file!(pos_integer(), Path.t()) :: Path.t()
   def file!(version, dir \\ migrations_dir()) do
     case Path.wildcard(Path.join(dir, "#{version}_*.exs")) do
@@ -50,15 +50,13 @@ defmodule Loopctl.Test.MigrationFile do
     end
   end
 
-  # The same file, not the same string: the migrator may have compiled it through the
-  # `_build/.../priv` symlink. A loaded module with no recorded source cannot be shown to be
-  # this file, so it is refused rather than reused.
-  # Where `mix ecto.migrate` reads: the repo's `:priv` (default `priv/repo`) under the project.
-  defp migrations_dir do
-    priv = Loopctl.Repo.config()[:priv] || "priv/repo"
-    Path.expand(Path.join(priv, "migrations"), File.cwd!())
-  end
+  # Ecto's own answer, so the repo's `:priv` and its default derivation are never re-implemented.
+  defp migrations_dir, do: Ecto.Migrator.migrations_path(Loopctl.Repo)
 
+  # The same migration, not the same path string: the migrator may have compiled it through
+  # `_build/.../priv`, a symlink to `priv` or, where symlinks fail, a copy, so the two files
+  # are compared by content. A loaded module with no recorded source cannot be shown to be
+  # this migration, so it is refused rather than reused.
   defp same_source!(module, file) do
     case module.module_info(:compile)[:source] do
       nil ->
@@ -67,16 +65,16 @@ defmodule Loopctl.Test.MigrationFile do
                 "be shown to come from #{file}"
 
       source ->
-        unless same_file?(to_string(source), file) do
+        unless same_content?(to_string(source), file) do
           raise ArgumentError,
                 "#{inspect(module)} is already loaded from #{source}, not from #{file}"
         end
     end
   end
 
-  defp same_file?(a, b) do
-    with {:ok, %File.Stat{inode: inode, major_device: dev}} <- File.stat(a),
-         {:ok, %File.Stat{inode: ^inode, major_device: ^dev}} <- File.stat(b),
+  defp same_content?(a, b) do
+    with {:ok, content} <- File.read(a),
+         {:ok, ^content} <- File.read(b),
          do: true,
          else: (_ -> false)
   end

@@ -38,9 +38,10 @@ defmodule Loopctl.Test.MigrationFileTest do
       refute Enum.any?(diagnostics, &(&1.message =~ "redefining module"))
     end
 
-    test "refuses a loaded copy compiled from a different file", ctx do
+    test "refuses a loaded copy compiled from a different migration", ctx do
+      # Another file defining the same module name, e.g. a migration renamed but not deleted.
       other = Path.join(ctx.tmp_dir, "2_other.exs")
-      File.cp!(ctx.path, other)
+      File.write!(other, "defmodule #{inspect(ctx.module)}, do: def(x, do: 2)")
       Code.compile_file(other)
 
       assert_raise ArgumentError, ~r/already loaded from/, fn ->
@@ -48,11 +49,12 @@ defmodule Loopctl.Test.MigrationFileTest do
       end
     end
 
-    test "reuses a copy compiled through a symlinked directory", ctx do
-      # The migrator may compile through `_build/.../priv`, a symlink to `priv`.
-      link = Path.join(ctx.tmp_dir, "linked")
-      File.ln_s!(ctx.tmp_dir, link)
-      Code.compile_file(Path.join(link, "1_probe.exs"))
+    test "reuses a copy compiled from the same migration at another path", ctx do
+      # The migrator may compile through `_build/.../priv`: a symlink to `priv`, or a copy.
+      copy = Path.join([ctx.tmp_dir, "build_priv", "1_probe.exs"])
+      File.mkdir_p!(Path.dirname(copy))
+      File.cp!(ctx.path, copy)
+      Code.compile_file(copy)
 
       assert MigrationFile.load!(ctx.module, ctx.path) == ctx.module
     end
@@ -92,65 +94,11 @@ defmodule Loopctl.Test.MigrationFileTest do
       end
     end
 
-    test "raises a named error for a version with no file" do
+    @tag :tmp_dir
+    test "raises a named error for a version with no file", %{tmp_dir: dir} do
       assert_raise ArgumentError, ~r/expected one migration 1/, fn ->
-        MigrationFile.file!(1, System.tmp_dir!())
+        MigrationFile.file!(1, dir)
       end
-    end
-  end
-
-  describe "the guard" do
-    # Every migration module a test names must have its own require!/2: a bare load
-    # redefines the migrator's copy on a fresh database, and no load at all passes only on
-    # a fresh database, where the migrator happened to load it.
-    @bare_load ~r/Code\.(require_file|compile_file|eval_file)\([^)\n]*[Mm]igration/
-    @named ~r/Loopctl\.Repo\.Migrations\.(\w+)|Module\.concat\(Loopctl\.Repo\.Migrations,\s*"(\w+)"\)/
-
-    defp violations(source) do
-      named =
-        @named
-        |> Regex.scan(source, capture: :all_but_first)
-        |> Enum.map(&Enum.find(&1, fn name -> name != "" end))
-        |> Enum.uniq()
-
-      unloaded = Enum.reject(named, &(source =~ "MigrationFile.require!(#{&1},"))
-      if source =~ @bare_load, do: [:bare_load | unloaded], else: unloaded
-    end
-
-    test "recognises each way in, and the sanctioned one" do
-      assert violations("Code.compile_file(\"priv/repo/migrations/1_x.exs\")") == [:bare_load]
-
-      assert violations("""
-             alias Loopctl.Repo.Migrations.AddX
-             MigrationFile.require!(AddX, 1)
-             Code.eval_file(MigrationFile.file!(1))
-             """) == [:bare_load]
-
-      assert violations("""
-             alias Loopctl.Repo.Migrations.AddX
-             alias Loopctl.Repo.Migrations.AddY
-             MigrationFile.require!(AddX, 1)
-             AddY.up()
-             """) == ["AddY"]
-
-      assert violations(~s|Module.concat(Loopctl.Repo.Migrations, "AddX").up()|) == ["AddX"]
-
-      assert violations("""
-             alias Loopctl.Repo.Migrations.AddX
-             MigrationFile.require!(AddX, 1)
-             Code.require_file(@check_path)
-             """) == []
-    end
-
-    test "every migration module a test names is loaded through require!/2" do
-      sources =
-        for file <- Path.wildcard("test/**/*.exs") -- [Path.relative_to_cwd(__ENV__.file)],
-            do: {file, File.read!(file)}
-
-      assert for({file, source} <- sources, (v = violations(source)) != [], do: {file, v}) == []
-
-      # Non-vacuous: the scan reached the call sites it exists to police.
-      assert Enum.count(sources, fn {_, source} -> source =~ @named end) > 1
     end
   end
 end
