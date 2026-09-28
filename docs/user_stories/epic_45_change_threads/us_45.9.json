@@ -1,0 +1,78 @@
+{
+  "id": "US-45.9",
+  "title": "An interactive session implements in a change thread and a runner reviews it",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "high",
+  "phase": "change_threads",
+  "background": "Change threads reach only work placed on runners (#917). Most of the fleet's changes are made by interactive sessions, which stay PR-shaped. A session can already claim a story and record checkpoints, fixes and entries over HTTP (US-45.1, US-45.3), but three rules stop its claim from ever merging in thread mode: review placement requires a claim made by a dispatch (`Reviews.implementer_dispatched/1`); the merge gate reads a claim with no accepted implement row as `pr` (#908, so that flipping a source cannot re-route in-flight work); and the merge executor fences on the delivery stage row (`Stages.mergeable_in/4`), which a hand-made story does not have. The REVIEWER stays a runner. Epic 45 dropped key-holding reviewers on purpose (`Loopctl.Threads.Reviews` moduledoc: #901 and #905), and the runner socket is the one channel an implementing session cannot write to.",
+  "story": {
+    "as_a": "interactive session implementing a story on a thread-mode repository",
+    "i_want_to": "claim the story in thread mode, push checkpoints, have a runner review them and have the App land the allowed checkpoint",
+    "so_that": "review rounds, fix-to-finding links and CI bound to the merged SHA cover the fleet's interactive work, not only runner dispatches"
+  },
+  "rationale": "Closing three rules is far smaller and far safer than a second kind of reviewer. Each rule's own reason stays true: mode is still bound once and never re-read, separation is still decided under the thread lock, and the merge fence still ties a merge to one claim and one SHA.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.9.1",
+      "description": "A claim made WITHOUT a runner placement (`claim_story`, any role that may claim) of a story whose project has exactly one live intake source records that source's `mode` on the claim, once, when the claim is made. The merge gate reads a claim's mode from its placement when it has one and from this record otherwise, and never from the source's current mode. A claim made before this change, or of a story with no intake source, stays `pr`. Releasing or re-claiming the story records afresh."
+    },
+    {
+      "id": "AC-45.9.2",
+      "description": "Review placement accepts a claim not made by a dispatch. Separation for it is decided by agent identity, as the custody gates decide it for a pre-dispatch story: the reviewing runner's agent is refused `reviewer_not_separate` when it is the claimant or recorded a checkpoint of the thread. A claim made by a dispatch keeps the lineage-chain comparison unchanged. Both are decided at placement and again on every judgement."
+    },
+    {
+      "id": "AC-45.9.3",
+      "description": "A thread-mode interactive claim has a delivery stage row to merge through. Claiming a story that has none in thread mode creates it at the stage the merge gate requires, under the claim's epoch, in the claim's transaction. A `pr`-mode claim creates nothing."
+    },
+    {
+      "id": "AC-45.9.4",
+      "description": "The rest of the thread is unchanged for an interactive claim: the checkpoint fence (the claimant, the current epoch, a live lease), round counting per claim, the ceiling, fixes against findings, human findings, CI evidence, the merge gate's allow and the executor's squash. An interactive claim that loses its lease loses its thread exactly as a runner's does."
+    },
+    {
+      "id": "AC-45.9.5",
+      "description": "The comment in `MergePrecondition` claiming that a checkpoint can only be recorded under an accepted implement row is corrected, and the `Loopctl.Threads.Reviews` moduledoc describes both separation paths."
+    },
+    {
+      "id": "AC-45.9.6",
+      "description": "The MCP tool descriptions for `claim_story`, `thread_checkpoint` and `thread_request_review` say that an interactive claim of a thread-mode story is a thread, how it is reviewed, and what each refuses."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.9.1",
+      "verifies": ["AC-45.9.1"],
+      "name": "mode is bound at claim and never re-read",
+      "type": "unit",
+      "preconditions": ["a thread-mode source"],
+      "steps": ["claim interactively; flip the source to pr; evaluate the merge gate; release and claim again"],
+      "expected_results": ["thread, thread, then pr after the new claim"]
+    },
+    {
+      "id": "TC-45.9.2",
+      "verifies": ["AC-45.9.2"],
+      "name": "a runner reviews an interactive claim; the claimant cannot",
+      "type": "unit",
+      "preconditions": ["an interactive thread claim with a checkpoint"],
+      "steps": ["place a review on a runner whose agent is not the claimant; place one whose agent is the claimant; judge on the first after its agent records a checkpoint"],
+      "expected_results": ["placed; reviewer_not_separate; reviewer_not_separate"]
+    },
+    {
+      "id": "TC-45.9.3",
+      "verifies": ["AC-45.9.3", "AC-45.9.4"],
+      "name": "end to end, interactive claim to executor merge",
+      "type": "integration",
+      "preconditions": ["a hand-made story with no stage row on a thread-mode source; a runner that reviews"],
+      "steps": ["claim, checkpoint, request review, verdict clean, CI green, run the executor"],
+      "expected_results": ["a stage row exists from the claim; the gate allows; the executor squashes the checkpoint"]
+    }
+  ],
+  "technical_notes": [
+    "The claim-time mode record belongs beside `claim_epoch` on the story or its stage row; it is written only in `Progress.claim_story/3`'s transaction and cleared by every release path that clears the claim.",
+    "Mutation-test the wiring: the mode record's write and read, both separation paths, and the stage-row creation."
+  ],
+  "dependencies": ["US-45.3", "US-45.4", "US-45.5", "US-45.6"],
+  "estimated_hours": 8
+}
