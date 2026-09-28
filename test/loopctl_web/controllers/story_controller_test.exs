@@ -403,6 +403,26 @@ defmodule LoopctlWeb.StoryControllerTest do
   end
 
   describe "DELETE /api/v1/stories/:id" do
+    test "a story that entered the lifecycle is 422, not a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      fixture(:stage_dispatch, %{
+        tenant_id: tenant.id,
+        agent_id: agent.id,
+        story_id: story.id,
+        repo: Loopctl.AdminRepo
+      })
+
+      conn = conn |> auth_conn(raw_key) |> delete(~p"/api/v1/stories/#{story.id}")
+
+      assert %{"error" => _} = json_response(conn, 422)
+    end
+
     test "deletes a story", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})

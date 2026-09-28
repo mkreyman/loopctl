@@ -5,6 +5,7 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
 
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Epics
+  alias Loopctl.WorkBreakdown.Story
 
   describe "create_epic/3" do
     test "creates an epic with valid attributes" do
@@ -187,13 +188,47 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
       story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
-      lifecycle_dispatch(tenant, story)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      fixture(:stage_dispatch, %{
+        tenant_id: tenant.id,
+        agent_id: agent.id,
+        story_id: story.id,
+        repo: Loopctl.AdminRepo
+      })
 
       assert {:error, %Ecto.Changeset{errors: [id: {message, _}]}} =
                Epics.delete_epic(tenant.id, epic)
 
-      assert message =~ "entered the delivery lifecycle"
+      assert message == Story.lifecycle_message(:epic)
       assert {:ok, _} = Epics.get_epic(tenant.id, epic.id)
+    end
+
+    test "an epic whose story has a change-thread record is refused too" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      fixture(:thread_checkpoint, %{
+        tenant_id: tenant.id,
+        story_id: story.id,
+        seq: 1,
+        commit_sha: String.duplicate("a", 40),
+        repo: Loopctl.AdminRepo
+      })
+
+      assert {:error, %Ecto.Changeset{errors: [id: {_, _}]}} = Epics.delete_epic(tenant.id, epic)
+      assert {:ok, _} = Epics.get_epic(tenant.id, epic.id)
+    end
+
+    test "a blank title is a 422 changeset, never a NOT NULL raise" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      assert {:error, %Ecto.Changeset{errors: [title: _]}} =
+               Epics.update_epic(tenant.id, epic, %{title: "  "})
     end
 
     test "creates audit log entry on delete" do
@@ -327,24 +362,5 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
       epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id, number: 2})
       assert {:error, :not_found} = Epics.get_epic(tenant_a.id, epic_b.id)
     end
-  end
-
-  # A dispatch naming the story: the custody record a story gains once it enters the delivery
-  # lifecycle, referenced with `on_delete: :nothing` (loopctl #923).
-  defp lifecycle_dispatch(tenant, story) do
-    agent = fixture(:agent, %{tenant_id: tenant.id})
-    id = Ecto.UUID.generate()
-    now = DateTime.utc_now()
-
-    Loopctl.AdminRepo.insert!(%Loopctl.Dispatches.Dispatch{
-      id: id,
-      tenant_id: tenant.id,
-      role: :agent,
-      agent_id: agent.id,
-      story_id: story.id,
-      lineage_path: [id],
-      expires_at: DateTime.add(now, 3_600),
-      created_at: now
-    })
   end
 end

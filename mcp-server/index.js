@@ -75,6 +75,7 @@ import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.j
 import {
   createEpic as createEpicRequest,
   deleteEpic as deleteEpicRequest,
+  deleteStory as deleteStoryRequest,
   epicProgress as epicProgressRequest,
   getEpic as getEpicRequest,
   listEpics as listEpicsRequest,
@@ -1095,10 +1096,23 @@ async function getStory({ story_id }) {
 }
 
 // --- Epics (loopctl #876) ---
-// Reads travel on the default key (any role passes). Create and update send LOOPCTL_ORCH_KEY
-// VERBATIM when it is set (`orchestratorKeyArgs`), so a global LOOPCTL_API_KEY of a lesser
-// role cannot displace the key the tool names, and the global key when it is not. Delete is
-// pinned to LOOPCTL_USER_KEY (`exactKey`), as every user-role tool is: it cascades.
+// Reads travel on the default key (any role passes). Create and update go through
+// `orchestratorPinnedApiCall`: LOOPCTL_ORCH_KEY VERBATIM when it is set, so a global
+// LOOPCTL_API_KEY of a lesser role cannot displace the key the tool names, and the global key
+// when it is not. The deletes go through `userKeyApiCall`, pinned as every user-role tool is:
+// they destroy rows.
+
+function orchestratorPinnedApiCall(method, path, body) {
+  const orch = orchestratorKeyArgs();
+  return apiCall(method, path, body, orch.override, orch.options);
+}
+
+function userKeyApiCall(method, path, body) {
+  return apiCall(method, path, body, process.env.LOOPCTL_USER_KEY, {
+    exactKey: true,
+    keyHint: "LOOPCTL_USER_KEY",
+  });
+}
 
 async function listEpics(args) {
   return toContent(await listEpicsRequest(args, { apiCall }));
@@ -1113,37 +1127,19 @@ async function epicProgress(args) {
 }
 
 async function createEpic(args) {
-  return toContent(
-    await createEpicRequest(args, {
-      apiCall: (method, path, body) => {
-        const orch = orchestratorKeyArgs();
-        return apiCall(method, path, body, orch.override, orch.options);
-      },
-    }),
-  );
+  return toContent(await createEpicRequest(args, { apiCall: orchestratorPinnedApiCall }));
 }
 
 async function updateEpic(args) {
-  return toContent(
-    await updateEpicRequest(args, {
-      apiCall: (method, path, body) => {
-        const orch = orchestratorKeyArgs();
-        return apiCall(method, path, body, orch.override, orch.options);
-      },
-    }),
-  );
+  return toContent(await updateEpicRequest(args, { apiCall: orchestratorPinnedApiCall }));
 }
 
 async function deleteEpic(args) {
-  return toContent(
-    await deleteEpicRequest(args, {
-      apiCall: (method, path, body) =>
-        apiCall(method, path, body, process.env.LOOPCTL_USER_KEY, {
-          exactKey: true,
-          keyHint: "LOOPCTL_USER_KEY",
-        }),
-    }),
-  );
+  return toContent(await deleteEpicRequest(args, { apiCall: userKeyApiCall }));
+}
+
+async function deleteStory(args) {
+  return toContent(await deleteStoryRequest(args, { apiCall: userKeyApiCall }));
 }
 
 // --- Workflow Tools (agent key) ---
@@ -4288,7 +4284,11 @@ const TOOLS = [
       type: "object",
       properties: {
         project_id: { type: "string", description: "The work project's UUID." },
-        number: { type: "integer", description: "The epic's number; cannot change later." },
+        number: {
+          type: "integer",
+          minimum: 1,
+          description: "The epic's number, at least 1; cannot change later.",
+        },
         title: { type: "string", description: "The epic's title." },
         description: { type: "string", description: "Optional description." },
         phase: { type: "string", description: "Optional phase." },
@@ -4316,8 +4316,8 @@ const TOOLS = [
     description:
       "CORRECT AN EPIC (PATCH /api/v1/epics/:id, loopctl #876): any of `title`, " +
       "`description`, `phase`, `position`, `metadata`. `number` cannot change. The endpoint " +
-      "DROPS absent and null fields, so a field cannot be erased here: a null, and a call " +
-      "naming no field, are both refused locally. `metadata` is REPLACED WHOLE, never merged: read the epic first " +
+      "DROPS absent and null fields and casts a blank string to null, so a field cannot be " +
+      "erased here: a null, a blank string and a call naming no field are refused locally. `metadata` is REPLACED WHOLE, never merged: read the epic first " +
       "(get_epic) and send the whole map. Needs LOOPCTL_ORCH_KEY (orchestrator or above) on " +
       "a human-anchored tenant. Refusals: 403, 404, 422 for an invalid field.",
     inputSchema: {
@@ -4342,14 +4342,30 @@ const TOOLS = [
       "displaced by LOOPCTL_API_KEY. Refusals: 403 for a lesser key or a tenant that is not " +
       "human-anchored, 404 for an epic not in your tenant, 422 when an active intake source " +
       "targets the epic (revoke it first: intake_source_revoke), 422 when any story in it " +
-      "entered the delivery lifecycle (its dispatches, capability tokens and verification " +
-      "runs are custody record and do not cascade, so such an epic is not deletable).",
+      "entered the delivery lifecycle or holds a change-thread record (dispatches, capability " +
+      "tokens, verification runs, checkpoints, entries, reviews are custody record and are " +
+      "not deleted, so such an epic is not deletable).",
     inputSchema: {
       type: "object",
       properties: {
         epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
       },
       required: ["epic_id"],
+    },
+  },
+  {
+    name: "delete_story",
+    description:
+      "DELETE ONE STORY (DELETE /api/v1/stories/:id, loopctl #923). IRREVERSIBLE. Answers 204 " +
+      "with no body. Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant, sent " +
+      "verbatim. Refusals: 403 for a lesser key, 404 for a story not in your tenant, 422 when " +
+      "the story entered the delivery lifecycle (dispatches, capability tokens, verification " +
+      "runs) or holds a change-thread record (checkpoints, entries, reviews): that is custody " +
+      "record and is not deleted. A malformed `story_id` is refused locally.",
+    inputSchema: {
+      type: "object",
+      properties: { story_id: { type: "string", description: "The story's UUID." } },
+      required: ["story_id"],
     },
   },
   {
@@ -9843,6 +9859,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await updateEpic(args);
     case "delete_epic":
       return await deleteEpic(args);
+    case "delete_story":
+      return await deleteStory(args);
     case "epic_progress":
       return await epicProgress(args);
 

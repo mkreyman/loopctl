@@ -80,9 +80,9 @@ export async function createEpic(
   const refused = badId("project_id", project_id);
   if (refused) return refused;
 
-  // The server casts an integer string as Ecto does ("7" is 7), so this accepts what it accepts.
-  if (!Number.isInteger(number) && !(typeof number === "string" && /^\d+$/.test(number))) {
-    return refuse("`number` is required and must be an integer; it cannot change later.");
+  // An integer, as the input schema declares, and at least 1, which the server requires.
+  if (!Number.isInteger(number) || number < 1) {
+    return refuse("`number` is required and must be an integer of at least 1; it is fixed for good.");
   }
 
   if (typeof title !== "string" || title.trim() === "") {
@@ -120,6 +120,15 @@ export async function updateEpic(args = {}, { apiCall } = {}) {
       );
     }
 
+    // A BLANK string is refused too: the server casts it to null, which erases the field (or,
+    // for `title`, is a 422), so it is the same no-erase rule in another shape.
+    if (typeof value === "string" && value.trim() === "") {
+      return refuse(
+        `\`${field}\` cannot be blank: the server casts a blank string to null, which this ` +
+          "endpoint cannot write. Send the value you want, or leave it out.",
+      );
+    }
+
     body[field] = value;
   }
 
@@ -139,4 +148,14 @@ export async function deleteEpic({ epic_id } = {}, { apiCall } = {}) {
 
 export async function epicProgress({ epic_id } = {}, { apiCall } = {}) {
   return badId("epic_id", epic_id) ?? apiCall("GET", epicProgressPath(epic_id));
+}
+
+export function storyPath(storyId) {
+  return `/api/v1/stories/${encodeURIComponent(storyId)}`;
+}
+
+// `delete_story` lives beside `delete_epic`: the same refusals (a story that entered the
+// delivery lifecycle, or holds a change-thread record, is not deletable), the same key.
+export async function deleteStory({ story_id } = {}, { apiCall } = {}) {
+  return badId("story_id", story_id) ?? apiCall("DELETE", storyPath(story_id), null);
 }

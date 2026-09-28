@@ -2352,21 +2352,31 @@ defmodule Loopctl.Fixtures do
     parent = Map.get(attrs, :parent)
     now = DateTime.utc_now()
 
-    {:ok, dispatch} =
-      Loopctl.Repo.with_tenant(tenant_id, fn ->
-        Loopctl.Repo.insert!(%Loopctl.Dispatches.Dispatch{
-          id: id,
-          tenant_id: tenant_id,
-          parent_dispatch_id: parent && parent.id,
-          role: Map.get(attrs, :role, :agent),
-          agent_id: Map.fetch!(attrs, :agent_id),
-          lineage_path: if(parent, do: parent.lineage_path ++ [id], else: [id]),
-          expires_at: DateTime.add(now, 3_600),
-          created_at: now
-        })
-      end)
+    row = %Loopctl.Dispatches.Dispatch{
+      id: id,
+      tenant_id: tenant_id,
+      parent_dispatch_id: parent && parent.id,
+      role: Map.get(attrs, :role, :agent),
+      agent_id: Map.fetch!(attrs, :agent_id),
+      # A dispatch naming a story is that story's custody record (loopctl #923).
+      story_id: Map.get(attrs, :story_id),
+      lineage_path: if(parent, do: parent.lineage_path ++ [id], else: [id]),
+      expires_at: DateTime.add(now, 3_600),
+      created_at: now
+    }
 
-    dispatch
+    # `repo: Loopctl.AdminRepo` for a caller whose code under test reads or deletes on
+    # AdminRepo, which cannot see a row the RLS `Repo` connection wrote.
+    case Map.get(attrs, :repo, Loopctl.Repo) do
+      Loopctl.Repo ->
+        {:ok, dispatch} =
+          Loopctl.Repo.with_tenant(tenant_id, fn -> Loopctl.Repo.insert!(row) end)
+
+        dispatch
+
+      repo ->
+        repo.insert!(row)
+    end
   end
 
   # A runner (and its key) on the RLS `Loopctl.Repo` sandbox connection, for a

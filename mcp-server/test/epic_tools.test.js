@@ -19,6 +19,7 @@ import {
   getEpic,
   listEpics,
   updateEpic,
+  deleteStory,
 } from "../lib/epics.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +36,7 @@ const TOOLS = [
   ["update_epic", "updateEpic"],
   ["delete_epic", "deleteEpic"],
   ["epic_progress", "epicProgress"],
+  ["delete_story", "deleteStory"],
 ];
 
 function fakeApi(response = { ok: true }) {
@@ -72,12 +74,9 @@ describe("epic requests", () => {
       { method: "POST", path: `/api/v1/projects/${PROJECT}/epics`, body: { number: 7, title: "Intake" } },
     ]);
 
-    const stringNumber = fakeApi();
-    await createEpic({ project_id: PROJECT, number: "8", title: "Cast as the server casts" }, stringNumber);
-    assert.equal(stringNumber.calls.length, 1);
-
     for (const args of [
-      { project_id: PROJECT, number: "8a", title: "not an integer string" },
+      { project_id: PROJECT, number: "8", title: "a string, where the schema declares an integer" },
+      { project_id: PROJECT, number: 0, title: "the server requires at least 1" },
       { project_id: PROJECT, title: "no number" },
       { project_id: PROJECT, number: 7 },
     ]) {
@@ -104,6 +103,16 @@ describe("epic requests", () => {
     );
   });
 
+  test("delete_story DELETEs the story and refuses a malformed id", async () => {
+    const api = fakeApi();
+    await deleteStory({ story_id: EPIC }, api);
+    assert.deepEqual(api.calls, [{ method: "DELETE", path: `/api/v1/stories/${EPIC}`, body: null }]);
+
+    const bad = fakeApi();
+    assert.equal((await deleteStory({ story_id: "nope" }, bad)).error, true);
+    assert.equal(bad.calls.length, 0);
+  });
+
   test("update_epic sends the named fields and refuses a null or a call naming none", async () => {
     const api = fakeApi();
     await updateEpic({ epic_id: EPIC, title: "Renamed" }, api);
@@ -111,7 +120,12 @@ describe("epic requests", () => {
       { method: "PATCH", path: `/api/v1/epics/${EPIC}`, body: { title: "Renamed" } },
     ]);
 
-    for (const args of [{ epic_id: EPIC }, { epic_id: EPIC, title: "t", description: null }]) {
+    for (const args of [
+      { epic_id: EPIC },
+      { epic_id: EPIC, title: "t", description: null },
+      { epic_id: EPIC, title: "   " },
+      { epic_id: EPIC, phase: "" },
+    ]) {
       const refused = fakeApi();
       const result = await updateEpic(args, refused);
       assert.equal(result.error, true);
@@ -149,18 +163,22 @@ describe("epic tools are wired", () => {
   }
 
   test("writes carry the key their gate needs, and a global key cannot displace it", () => {
-    const body = (handler) => {
-      const start = INDEX_SRC.indexOf(`async function ${handler}(args)`);
-      assert.ok(start >= 0, handler);
+    const body = (name) => {
+      const start = INDEX_SRC.search(new RegExp(`(async )?function ${name}\\(`));
+      assert.ok(start >= 0, name);
       return INDEX_SRC.slice(start, INDEX_SRC.indexOf("\n}\n", start));
     };
 
     for (const handler of ["createEpic", "updateEpic"]) {
-      assert.match(body(handler), /orchestratorKeyArgs\(\)/, handler);
-      assert.match(body(handler), /orch\.override, orch\.options/, handler);
+      assert.match(body(handler), /apiCall: orchestratorPinnedApiCall/, handler);
     }
 
-    assert.match(body("deleteEpic"), /process\.env\.LOOPCTL_USER_KEY/);
-    assert.match(body("deleteEpic"), /exactKey: true/);
+    for (const handler of ["deleteEpic", "deleteStory"]) {
+      assert.match(body(handler), /apiCall: userKeyApiCall/, handler);
+    }
+
+    assert.match(body("orchestratorPinnedApiCall"), /orch\.override, orch\.options/);
+    assert.match(body("userKeyApiCall"), /process\.env\.LOOPCTL_USER_KEY/);
+    assert.match(body("userKeyApiCall"), /exactKey: true/);
   });
 });

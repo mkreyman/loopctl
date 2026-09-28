@@ -282,12 +282,41 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
       story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
-      lifecycle_dispatch(tenant, story)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      fixture(:stage_dispatch, %{
+        tenant_id: tenant.id,
+        agent_id: agent.id,
+        story_id: story.id,
+        repo: Loopctl.AdminRepo
+      })
 
       assert {:error, %Ecto.Changeset{errors: [id: {message, _}]}} =
                Stories.delete_story(tenant.id, story)
 
-      assert message =~ "entered the delivery lifecycle"
+      assert message == Story.lifecycle_message(:story)
+      assert {:ok, _} = Stories.get_story(tenant.id, story.id)
+    end
+
+    test "a story with a change-thread record is refused too: those tables have no FK" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      fixture(:thread_checkpoint, %{
+        tenant_id: tenant.id,
+        story_id: story.id,
+        seq: 1,
+        commit_sha: String.duplicate("a", 40),
+        repo: Loopctl.AdminRepo
+      })
+
+      assert {:error, %Ecto.Changeset{errors: [id: {message, _}]}} =
+               Stories.delete_story(tenant.id, story)
+
+      assert message == Story.lifecycle_message(:story)
+      assert {:ok, _} = Stories.get_story(tenant.id, story.id)
     end
 
     test "creates audit log entry on delete" do
@@ -581,24 +610,5 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
     after
       0 -> Enum.reverse(acc)
     end
-  end
-
-  # A dispatch naming the story: the custody record a story gains once it enters the delivery
-  # lifecycle, referenced with `on_delete: :nothing` (loopctl #923).
-  defp lifecycle_dispatch(tenant, story) do
-    agent = fixture(:agent, %{tenant_id: tenant.id})
-    id = Ecto.UUID.generate()
-    now = DateTime.utc_now()
-
-    Loopctl.AdminRepo.insert!(%Loopctl.Dispatches.Dispatch{
-      id: id,
-      tenant_id: tenant.id,
-      role: :agent,
-      agent_id: agent.id,
-      story_id: story.id,
-      lineage_path: [id],
-      expires_at: DateTime.add(now, 3_600),
-      created_at: now
-    })
   end
 end

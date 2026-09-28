@@ -15,6 +15,7 @@ defmodule Loopctl.WorkBreakdown.Epics do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.Stories
   alias Loopctl.WorkBreakdown.Story
 
   @doc """
@@ -217,12 +218,25 @@ defmodule Loopctl.WorkBreakdown.Epics do
 
     multi =
       Multi.new()
-      # A CHANGESET, not the bare struct, so the one FK onto `epics` that is RESTRICT rather
-      # than cascade comes back as a 422 naming the field instead of an `Ecto.ConstraintError`
-      # the fallback controller cannot render. `intake_sources.target_epic_id` is that FK
-      # (#803): an intake source pointing at this epic must be repointed or revoked first,
-      # which is the whole reason the reference restricts rather than nilifying — nilify would
-      # silently turn that source's next report into an escalation.
+      # The change-thread records of the epic's stories key on a bare `story_id`, so the
+      # database cannot refuse this delete for them: checked here, first (loopctl #923).
+      |> Multi.run(:thread_custody, fn repo, _changes ->
+        story_ids =
+          repo.all(
+            from(s in Story,
+              where: s.epic_id == ^epic.id and s.tenant_id == ^tenant_id,
+              select: s.id
+            )
+          )
+
+        Stories.refuse_thread_custody(repo, tenant_id, story_ids, epic, :epic)
+      end)
+      # A CHANGESET, not the bare struct, so every reference that restricts rather than
+      # cascades comes back as a 422 naming the field instead of an `Ecto.ConstraintError`
+      # the fallback controller cannot render (`epic_delete_changeset/1`): an active intake
+      # source targeting this epic, which must be revoked first — restricting rather than
+      # nilifying, since nilify would silently turn that source's next report into an
+      # escalation (#803) — and the custody record of any story in it.
       |> Multi.delete(:epic, epic_delete_changeset(epic))
       |> Audit.log_in_multi(:audit, fn %{epic: deleted} ->
         %{
@@ -245,7 +259,7 @@ defmodule Loopctl.WorkBreakdown.Epics do
       {:ok, %{epic: deleted}} ->
         {:ok, deleted}
 
-      {:error, :epic, changeset, _changes} ->
+      {:error, step, changeset, _changes} when step in [:epic, :thread_custody] ->
         {:error, changeset}
     end
   end
@@ -418,6 +432,6 @@ defmodule Loopctl.WorkBreakdown.Epics do
       message: "is the target epic of an active intake source; revoke that source first"
     )
     # The cascade to the epic's stories meets the references that do not cascade.
-    |> Story.lifecycle_reference_constraints(:id)
+    |> Story.lifecycle_reference_constraints(:id, :epic)
   end
 end

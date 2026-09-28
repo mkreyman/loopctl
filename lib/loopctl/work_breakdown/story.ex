@@ -310,23 +310,38 @@ defmodule Loopctl.WorkBreakdown.Story do
   # record a story gains once it enters the delivery lifecycle — its dispatches, the capability
   # tokens a claim mints, its verification runs. Deleting such a story, or the epic holding it,
   # would destroy that record, so Postgres refuses; named here, the refusal is a 422 rather
-  # than an `Ecto.ConstraintError` no fallback can render (loopctl #923).
+  # than an `Ecto.ConstraintError` no fallback can render (loopctl #923). The list is bound to
+  # the database by `test/loopctl/work_breakdown/story_lifecycle_references_test.exs`, which
+  # reads every non-cascading foreign key onto `stories` from `pg_constraint`.
   @lifecycle_references ~w(dispatches_story_id_fkey capability_tokens_story_id_fkey
                            verification_runs_story_id_fkey)a
 
+  @doc "The non-cascading foreign keys onto `stories` that a delete must name."
+  @spec lifecycle_references() :: [atom()]
+  def lifecycle_references, do: @lifecycle_references
+
   @doc """
   Names every non-cascading reference onto a story on `changeset`, a DELETE of a story or of
-  something that cascades to stories, so a violation is a 422 on `field` naming the remedy.
+  an epic (which cascades to its stories), so a violation is a 422 on `field` saying why.
+  `subject` is what the message is about: `:story` or `:epic`.
   """
-  @spec lifecycle_reference_constraints(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
-  def lifecycle_reference_constraints(changeset, field) do
+  @spec lifecycle_reference_constraints(Ecto.Changeset.t(), atom(), :story | :epic) ::
+          Ecto.Changeset.t()
+  def lifecycle_reference_constraints(changeset, field, subject) do
     Enum.reduce(@lifecycle_references, changeset, fn name, acc ->
       Ecto.Changeset.foreign_key_constraint(acc, field,
         name: name,
-        message:
-          "has a story that entered the delivery lifecycle (dispatches, capability tokens or " <>
-            "verification runs reference it), and that custody record cannot be deleted"
+        message: lifecycle_message(subject)
       )
     end)
   end
+
+  @doc "The refusal a delete of a story, or of an epic holding one, gives for custody record."
+  @spec lifecycle_message(:story | :epic) :: String.t()
+  def lifecycle_message(:story),
+    do: "entered the delivery lifecycle, and its custody record cannot be deleted"
+
+  def lifecycle_message(:epic),
+    do:
+      "has a story that entered the delivery lifecycle, and its custody record cannot be deleted"
 end
