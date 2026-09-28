@@ -23,13 +23,12 @@ defmodule Loopctl.Credo.Check.CosineQueryReintroductionTest do
 
   @check_path Path.expand("../../../.credo/checks/cosine_query_reintroduction.ex", __DIR__)
 
-  alias Loopctl.Credo.Check.CosineQueryReintroduction
-  alias Loopctl.Test.RequireOnce
-
   # Load the out-of-lib check source into the test VM once. `CosineLintExceptions` is
   # ordinary `lib/` code (compiled in :test), so it's already available for the check's
   # allowlist read.
-  RequireOnce.require!(@check_path)
+  Code.require_file(@check_path)
+
+  alias Loopctl.Credo.Check.CosineQueryReintroduction
 
   # Credo is a `runtime: false` dep, so its application (which supervises the
   # `Credo.Service.*` GenServers that `Credo.Test.Case`'s `to_source_file/2` and

@@ -13,7 +13,7 @@ defmodule Loopctl.Repo.ReshapeChannelPostsRefsMigrationTest do
   ## How the migration is driven
 
   The migration file under `priv/repo/migrations` is not compiled into the app, so
-  it is loaded here at runtime (`Loopctl.Test.RequireOnce.require!/1`) and driven with
+  it is loaded here at runtime (`Code.require_file`) and driven with
   `Ecto.Migration.Runner.run/8` DIRECTLY — the same entry point
   `Ecto.Migrator.attempt/7` uses — rather than via `Ecto.Migrator.up`. `Runner.run`
   performs the operation in THIS process, so the UPDATE executes inside the sandbox
@@ -28,7 +28,6 @@ defmodule Loopctl.Repo.ReshapeChannelPostsRefsMigrationTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelPost
-  alias Loopctl.Test.RequireOnce
 
   @migration_version 20_260_718_010_000
   @migration_file Path.wildcard(
@@ -42,7 +41,7 @@ defmodule Loopctl.Repo.ReshapeChannelPostsRefsMigrationTest do
                   )
                   |> hd()
 
-  RequireOnce.require!(@migration_file)
+  Code.require_file(@migration_file)
 
   alias Loopctl.Repo.Migrations.ReshapeChannelPostsRefsToList
 

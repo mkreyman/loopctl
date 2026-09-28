@@ -60,7 +60,6 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Embeddings
   alias Loopctl.Repo.HnswIndex
-  alias Loopctl.Test.RequireOnce
 
   @migration_version 20_260_805_120_000
   @migration_file Path.wildcard(
@@ -74,7 +73,7 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
                   )
                   |> hd()
 
-  RequireOnce.require!(@migration_file)
+  Code.require_file(@migration_file)
 
   alias Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex
 

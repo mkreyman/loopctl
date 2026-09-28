@@ -21,12 +21,15 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
   @config_file Path.join(@config_dir, "test.exs")
   @module_file Path.join(@config_dir, "worktree_partition.exs")
 
+  # Idempotent: `config/test.exs` already required this at boot. Guarded so the file is
+  # never evaluated TWICE, which would redefine the module and warn — and `mix precommit`
+  # runs `test --warnings-as-errors`.
+  unless Code.ensure_loaded?(Loopctl.Config.WorktreePartition) do
+    Code.require_file(Path.join(@config_dir, "worktree_partition.exs"))
+  end
+
   alias Loopctl.Config.WorktreePartition
   alias Loopctl.DeliveryGates.GitEnv
-  alias Loopctl.Test.RequireOnce
-
-  # Idempotent: `config/test.exs` already required this at boot (`RequireOnce`).
-  RequireOnce.require!(Path.join(@config_dir, "worktree_partition.exs"))
 
   @wt "/home/mkreyman/workspace/x/.claude/worktrees"
 

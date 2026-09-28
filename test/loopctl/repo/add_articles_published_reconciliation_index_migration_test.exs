@@ -23,7 +23,6 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
-  alias Loopctl.Test.RequireOnce
 
   @index "articles_tenant_embeddable_inserted_id_idx"
   @migration_version 20_260_825_130_000
@@ -38,7 +37,7 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
                   )
                   |> hd()
 
-  RequireOnce.require!(@migration_file)
+  Code.require_file(@migration_file)
 
   alias Loopctl.Repo.Migrations.AddArticlesPublishedReconciliationIndex
 

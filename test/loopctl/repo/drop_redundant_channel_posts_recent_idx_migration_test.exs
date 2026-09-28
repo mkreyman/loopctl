@@ -46,7 +46,6 @@ defmodule Loopctl.Repo.DropRedundantChannelPostsRecentIdxMigrationTest do
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
   alias Loopctl.Coordination
-  alias Loopctl.Test.RequireOnce
 
   @migration_version 20_260_718_130_000
   @migration_file Path.wildcard(
@@ -60,7 +59,7 @@ defmodule Loopctl.Repo.DropRedundantChannelPostsRecentIdxMigrationTest do
                   )
                   |> hd()
 
-  RequireOnce.require!(@migration_file)
+  Code.require_file(@migration_file)
 
   alias Loopctl.Repo.Migrations.DropRedundantChannelPostsRecentIdx
 
