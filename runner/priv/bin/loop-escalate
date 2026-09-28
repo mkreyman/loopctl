@@ -11,9 +11,11 @@
 #
 # A headless `claude -p` session has no AskUserQuestion at all, and nothing fires when the
 # model wanted to ask: no tool call is attempted, so no hook sees it (measured, KB 16d4ff67).
-# Escalation therefore has to be something the session CALLS. The runner pre-allows exactly
-# this script's absolute path, names it in the session's appended system prompt, and watches
-# the file it writes: an escalation stops the session and the run ends `escalated`.
+# Escalation therefore has to be something the session CALLS. Nothing pre-allows it — the session
+# runs with the operator's permissions, so no rule is needed — but the session can only call what
+# it knows about: the runner names this script's absolute path in the session's appended system
+# prompt, and that prompt is the ONLY place it learns it. The runner watches the file it writes:
+# an escalation stops the session and the run ends `escalated`.
 #
 # Writes one JSON line to $LOOP_RUN_DIR/escalations.ndjson. The reason is the session's own
 # words, recorded as data; it is capped so a runaway session cannot fill the disk.

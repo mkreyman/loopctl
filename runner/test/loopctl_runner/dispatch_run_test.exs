@@ -103,9 +103,62 @@ defmodule LoopctlRunner.DispatchRunTest do
   end
 
   describe "the end of a run" do
-    test "a finished run's reason is exactly the merge-nothing sentence" do
-      assert DispatchRun.end_reason(%{status: "succeeded", escalations: []}) ==
-               "first end-to-end run: implementation finished, merging nothing by design"
+    test "only a run with no session, or one that escalated, reports -> escalated" do
+      assert DispatchRun.end_reports(%{status: "failed", reached: "claimed"}) == [:escalated]
+      assert DispatchRun.end_reports(%{status: "refused", reached: "worktree"}) == [:escalated]
+
+      assert DispatchRun.end_reports(%{
+               status: "escalated",
+               reached: "implementing",
+               escalations: ["a business call"]
+             }) == [:escalated, :session_ended]
+
+      for summary <- [
+            %{status: "succeeded", reached: "implementing", escalations: []},
+            %{status: "wall_clock_exceeded", reached: "implementing"},
+            # A crash summary names no stage: a session may well have been running.
+            %{status: "crashed", error: "the run's process died"}
+          ] do
+        assert DispatchRun.end_reports(summary) == [:session_ended]
+      end
+    end
+
+    test "session_ended's reason is read off the status, and fits the contract" do
+      for {status, reason} <- [
+            {"succeeded", "completed"},
+            {"escalated", "completed"},
+            {"wall_clock_exceeded", "wall_clock_exceeded"},
+            {"max_turns_exceeded", "max_turns_exceeded"},
+            {"failed", "crashed"},
+            {"parked", "crashed"},
+            {"not_group_leader", "crashed"},
+            {"crashed", "crashed"},
+            {nil, "crashed"}
+          ] do
+        assert {:ok, payload} = DispatchRun.session_ended(@dispatch, %{status: status})
+
+        assert payload == %{
+                 "dispatch_id" => @dispatch["dispatch_id"],
+                 "claim_epoch" => 3,
+                 "reason" => reason
+               }
+
+        assert Contract.validate("RunnerSessionEnded", payload) == :ok
+      end
+    end
+
+    test "a session_ended refusal is read against the contract's permanent list" do
+      assert DispatchRun.session_ended_refusal("rate_limited") == :rate_limited
+      assert DispatchRun.session_ended_refusal("internal_error") == :internal_error
+      assert DispatchRun.session_ended_refusal("already_recorded") == :done
+
+      for reason <- ~w(invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
+                       unknown_story_stage audit_chain_append_failed) do
+        assert DispatchRun.session_ended_refusal(reason) == :permanent
+      end
+
+      assert DispatchRun.session_ended_refusal("something_new") == :unknown
+      assert DispatchRun.session_ended_refusal(nil) == :unknown
     end
 
     test "any other end states the status, the exit reason and the escalation text" do

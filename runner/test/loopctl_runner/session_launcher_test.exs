@@ -197,6 +197,17 @@ defmodule LoopctlRunner.SessionLauncherTest do
     assert Session.exit_reason(:wall_clock_exceeded, 0) == :wall_clock_exceeded
   end
 
+  test "exit_reason/3: the CLI's error_max_turns result is a turn budget, never over a runner stop" do
+    assert Session.exit_reason(nil, 1, "error_max_turns") == :max_turns_exceeded
+    assert Session.exit_reason(:parked, 143, "error_max_turns") == :max_turns_exceeded
+    assert Session.exit_reason(nil, 1, "success") == :exited
+
+    assert Session.exit_reason(:wall_clock_exceeded, 143, "error_max_turns") ==
+             :wall_clock_exceeded
+
+    assert Session.exit_reason(:escalated, 0, "error_max_turns") == :escalated
+  end
+
   test "a detached command naming the launcher script is still ended when the owner dies", ctx do
     System.put_env("FAKE_CLAUDE_MODE", "hang_named")
     test = self()

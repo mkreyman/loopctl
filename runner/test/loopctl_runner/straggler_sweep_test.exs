@@ -234,8 +234,101 @@ defmodule LoopctlRunner.StragglerSweepTest do
 
     assert ProcessGroup.recorded(ctx.ledger) == [stubborn]
     assert {:killed, [^stubborn], [command]} = TestStragglers.sweep(nil, ctx.ledger, 2_000)
-    assert command =~ "sleep 1002"
+    # The EXECUTABLE names it; its argv ("1002") is dropped with everything else, because argv is
+    # where a credential rides. See the argv test below.
+    assert command =~ "sleep"
     refute os_pid_alive?(stubborn)
+  end
+
+  test "argv is dropped WHOLE, because an argv can carry a credential", ctx do
+    # The sweep reads `ps` to NAME a straggler, and for a triage session that command line is the
+    # whole agents JSON plus the run's verdict token — a credential, in argv, printed into a test
+    # report.
+    #
+    # THE FIRST VERSION OF THIS TEST PASSED WHILE LEAKING, and the assertions below are shaped by
+    # that. A 120-byte head-cut kept ~97 bytes of the token, and `refute command =~ secret`
+    # compared the WHOLE 404-byte value, which a 97-byte prefix does not match — green, leaking.
+    # So: the value is RANDOM rather than a run of one character (a repeated character makes every
+    # window of it identical and a window check meaningless), and no window of it may survive.
+    secret = "tok_" <> Base.encode32(:crypto.strong_rand_bytes(60), padding: false)
+
+    {:ok, pid} =
+      Task.start(fn ->
+        # The secret rides as an extra ARGV entry, which is what `ps` reads and what a real
+        # verdict token does today; `sh -c` keeps it there without interpreting it. The trailing
+        # `; :` keeps `sh` itself alive: macOS's sh is bash, which EXECs a lone command, so
+        # `sh -c "sleep 30"` becomes `sleep 30` and the secret leaves argv before `pgrep` looks.
+        {_out, _} = System.cmd("sh", ["-c", "sleep 30; :", secret], stderr_to_stdout: true)
+      end)
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
+
+    os_pid =
+      wait_for_pid(fn ->
+        {out, _} = System.cmd("pgrep", ["-f", secret], stderr_to_stdout: true)
+        out |> String.split("\n", trim: true) |> List.first()
+      end)
+
+    start = LoopctlRunner.Owner.start_time(os_pid)
+    File.write!(ctx.ledger, "#{os_pid} #{start}\n")
+
+    assert {_outcome, [^os_pid], [command]} = TestStragglers.sweep(nil, ctx.ledger, 2_000)
+    # Named well enough to act on: the pid and the executable.
+    assert command =~ "#{os_pid} "
+    assert command =~ "sh"
+
+    # NOTHING of the argv survives — not the whole value, and not any window of it. A prefix is
+    # what the head-cut leaked, so a whole-value refutation is the assertion that could not fail.
+    refute command =~ secret
+
+    for window <- secret |> String.graphemes() |> Enum.chunk_every(8, 1, :discard) do
+      refute String.contains?(command, Enum.join(window)),
+             "a window of the argv survived into the straggler report"
+    end
+
+    # ...and the drop is SAID, or a reader cannot tell a short command line from a cut one.
+    assert command =~ "bytes of argv dropped"
+  end
+
+  test "an executable whose path has a space is named whole, and its argv is still dropped",
+       ctx do
+    # The executable used to be the command line up to its first space, so `/tmp/a b/my sh -c ...`
+    # was named `/tmp/a` and the rest of its own path was counted as argv. A symlink to sh stands
+    # in for an app bundle's binary: macOS kills a copied system binary at exec, and `ps` names a
+    # symlinked one by the path it was run as.
+    dir = Path.join(tmp_dir!("sweep space"), "with space")
+    File.mkdir_p!(dir)
+    shell = Path.join(dir, "my sh")
+    File.ln_s!("/bin/sh", shell)
+    secret = "tok_" <> Base.encode32(:crypto.strong_rand_bytes(20), padding: false)
+
+    {:ok, pid} =
+      Task.start(fn ->
+        {_out, _} = System.cmd(shell, ["-c", "sleep 30; :", secret], stderr_to_stdout: true)
+      end)
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
+
+    os_pid =
+      wait_for_pid(fn ->
+        {out, _} = System.cmd("pgrep", ["-f", secret], stderr_to_stdout: true)
+        out |> String.split("\n", trim: true) |> List.first()
+      end)
+
+    File.write!(ctx.ledger, "#{os_pid} #{LoopctlRunner.Owner.start_time(os_pid)}\n")
+
+    assert {_outcome, [^os_pid], [command]} = TestStragglers.sweep(nil, ctx.ledger, 2_000)
+    # Whole on macOS (`comm` is the path), the basename on Linux (`comm` is the name): either way
+    # the part after the space survives, which the first-space split cut off.
+    assert command =~ "my sh"
+    refute command =~ secret
+    refute command =~ "sleep 30"
+    assert command =~ "bytes of argv dropped"
+  end
+
+  defp wait_for_pid(fun) do
+    :ok = wait_until(fn -> is_binary(fun.()) end, 5_000)
+    fun.() |> String.trim() |> String.to_integer()
   end
 
   test "nothing to sweep is not an error", ctx do

@@ -40,38 +40,15 @@ defmodule LoopctlRunner.SessionReleaseEnvTest do
            ]
   end
 
-  describe "unset_names/2: which subtractions a caller may override" do
-    # Values are placeholders: tests never record real environment values.
-    @daemon %{
-      "NPM_TOKEN" => "v",
-      "SECRET_KEY_BASE" => "v",
-      "ANTHROPIC_API_KEY" => "v",
-      "GIT_SSH_COMMAND" => "v",
-      "HOME" => "/home/u"
-    }
+  test "unset_names/0 is the billing key and repo-locating names, and no more" do
+    # Parity with an attended session: nothing else in the daemon's environment is withheld.
+    unset = Session.unset_names()
+    assert "ANTHROPIC_API_KEY" in unset
+    assert "GIT_DIR" in unset
 
-    test "a SHAPE-matched name the caller supplies is not unset" do
-      # session_env is the escape hatch: per repo, mode 600, revocable. The heuristic cannot tell
-      # a Phoenix test secret from a credential, and the operator can.
-      assert "SECRET_KEY_BASE" in Session.unset_names(@daemon, [])
-      refute "SECRET_KEY_BASE" in Session.unset_names(@daemon, [{"SECRET_KEY_BASE", "v"}])
-      # Only the one named: supplying one shaped name keeps nothing else.
-      assert "NPM_TOKEN" in Session.unset_names(@daemon, [{"SECRET_KEY_BASE", "v"}])
-    end
-
-    test "an UNCONDITIONAL name stays unset however it is supplied" do
-      # The name lists are not a heuristic and have no case for an exception: there is no session
-      # that wants the runner's API key or a program git executes. Config refuses these in
-      # session_env, and a caller reaching Session.run/1 with :env directly does not get past it.
-      supplied = [{"ANTHROPIC_API_KEY", "v"}, {"GIT_SSH_COMMAND", "v"}]
-      unset = Session.unset_names(@daemon, supplied)
-      assert "ANTHROPIC_API_KEY" in unset
-      assert "GIT_SSH_COMMAND" in unset
-    end
-
-    test "a name of no interest is never unset, supplied or not" do
-      refute "HOME" in Session.unset_names(@daemon, [])
-      refute "HOME" in Session.unset_names(@daemon, [{"HOME", "/home/u"}])
+    for name <-
+          ~w(SSH_AUTH_SOCK GH_TOKEN GPG_AGENT_INFO GIT_ASKPASS GIT_SSH_COMMAND GIT_SSH NPM_TOKEN HOME) do
+      refute name in unset, "#{name} is withheld from a session"
     end
   end
 

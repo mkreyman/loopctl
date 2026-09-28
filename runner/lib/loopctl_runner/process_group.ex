@@ -241,6 +241,53 @@ defmodule LoopctlRunner.ProcessGroup do
     end
   end
 
+  # What the runner's OWN commands never inherit (`run/5`): the session's billing key, from the one
+  # place that names it, plus credentials and credential-acquisition paths the runner's own git
+  # and probes do not need. A session is scrubbed differently, and far less (`Session.unset_names/0`):
+  # it inherits the operator's environment as an attended session does. These are the runner acting
+  # for itself, so a name here reaches one of its commands only through `inherit:`.
+  #
+  # SSH_AUTH_SOCK, SSH_AGENT_PID and GPG_AGENT_INFO are sockets to agents holding the operator's
+  # keys. GH_TOKEN and GITHUB_TOKEN are forge tokens. The askpass pair is a credential-ACQUISITION
+  # path: git falls through GIT_ASKPASS -> core.askPass -> SSH_ASKPASS, so both names are needed,
+  # and `Worktree.fetch_base/2` closes the config rung itself with an empty `core.askPass`.
+  @runner_credential_env ~w(SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO GH_TOKEN GITHUB_TOKEN
+                            GIT_ASKPASS SSH_ASKPASS)
+
+  @doc "Every name `run/5` unsets by NAME. The shape deny (`credential_shaped_env/1`) is separate."
+  @spec scrubbed_env() :: [String.t()]
+  def scrubbed_env, do: Session.credential_env() ++ @runner_credential_env
+
+  # THE NAME LIST ABOVE CANNOT ENUMERATE AN OPERATOR'S LOGIN SHELL: `mix loopctl.serve` runs the
+  # daemon from it, where 41 names matching token/secret/key/password/api/credential were counted on
+  # minis, 2026-09-16. A heuristic, not a guarantee: it catches the conventional spellings and
+  # misses a credential named for what it opens (a bare `NPM_AUTH`, a `PGPASSFILE`).
+  @credential_shapes ~w(TOKEN SECRET PASSWORD PASSWD PASSPHRASE CREDENTIAL API_KEY PRIVATE_KEY)
+
+  @doc """
+  Whether `name` has the SHAPE of a credential, whatever this runner knows about it by name.
+
+  Matched case-insensitively against the conventional spellings, plus a `_KEY` suffix or infix,
+  which is what `AWS_SECRET_ACCESS_KEY`, `HEX_API_KEY` and `FLY_API_TOKEN` have in common and
+  what `HOME`, `PATH`, `LANG`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` do not.
+  """
+  @spec credential_shaped?(String.t()) :: boolean()
+  def credential_shaped?(name) do
+    up = String.upcase(name)
+
+    Enum.any?(@credential_shapes, &String.contains?(up, &1)) or
+      String.ends_with?(up, "_KEY") or String.contains?(up, "_KEY_")
+  end
+
+  @doc "The names in `env` that have a credential's shape, sorted."
+  @spec credential_shaped_env(%{String.t() => String.t()}) :: [String.t()]
+  def credential_shaped_env(env) do
+    env
+    |> Map.keys()
+    |> Enum.filter(&credential_shaped?/1)
+    |> Enum.sort()
+  end
+
   @doc """
   Runs a short-lived command with a hard timeout, killing it on expiry.
 
@@ -269,7 +316,7 @@ defmodule LoopctlRunner.ProcessGroup do
     # `--` takes out one occurrence only.
     scrubbed =
       Enum.reject(
-        Session.credential_env() ++ Session.credential_shaped_env(System.get_env()),
+        scrubbed_env() ++ credential_shaped_env(System.get_env()),
         &(&1 in inherit)
       )
 
@@ -279,17 +326,16 @@ defmodule LoopctlRunner.ProcessGroup do
         :exit_status,
         :stderr_to_stdout,
         args: args,
-        # The same scrub a session gets, from the same source rather than a copy: this Port also
-        # runs the CLI (the liveness probe is `claude agents --json`), and a hand-kept one-name
-        # list here was a second security list with nothing binding it to the first — it still
-        # said ANTHROPIC_API_KEY alone after that list grew to eight names and a shape deny.
-        # `Session.git_program_env/0` is deliberately NOT unset, though this Port does run git. The
-        # runner's own `Worktree.fetch_base/2` goes through here and must reach origin with the
-        # operator's ssh program: it passes GIT_SSH_COMMAND itself, with BatchMode added, and
-        # inherits a GIT_SSH program as it is; scrubbing that would swap in plain ssh. The runner's
-        # own submodule step (`run_group/4`) fetches for the operator from his own checkout, and
-        # `GIT_SSH_COMMAND` is how an operator reaches a submodule over SSH. A session has them
-        # unset because what a session runs is not the operator's to vouch for.
+        # THE RUNNER'S OWN SCRUB, NOT A SESSION'S. A session inherits the operator's environment
+        # (`Session.unset_names/0`); what runs here is the runner acting for itself — the liveness
+        # probe (`claude agents --json`), the base fetch, the submodule step — and none of it needs
+        # a credential it does not name through `inherit:`. GIT_SSH_COMMAND and GIT_SSH are
+        # deliberately NOT unset, though this Port does run git. The runner's own `Worktree.fetch_base/2` goes
+        # through here and must reach origin with the operator's ssh program: it passes
+        # GIT_SSH_COMMAND itself, with BatchMode added, and inherits a GIT_SSH program as it is;
+        # scrubbing that would swap in plain ssh. The runner's own submodule step (`run_group/4`)
+        # fetches for the operator from his own checkout, and `GIT_SSH_COMMAND` is how an operator
+        # reaches a submodule over SSH.
         env:
           Enum.map(scrubbed, &{to_charlist(&1), false}) ++
             for {name, value} <- env, name not in scrubbed do

@@ -44,6 +44,36 @@ defmodule LoopctlRunner.StreamEventsTest do
     assert result.type == "claude.result.success" and result.data["num_turns"] == 2
   end
 
+  test "the last result line's subtype is kept, and nothing else sets it" do
+    {emit, _events} = recorder()
+    state = StreamEvents.new(9)
+    assert StreamEvents.result(state) == nil
+
+    feed = fn lines, state ->
+      Enum.reduce(lines, state, &StreamEvents.handle_line(&1, &2, emit))
+    end
+
+    state =
+      feed.(
+        [
+          ~s({"type":"result","subtype":"success","is_error":false,"num_turns":1}),
+          ~s({"type":"assistant","subtype":"error_max_turns","message":{"content":[]}}),
+          "not json"
+        ],
+        state
+      )
+
+    assert StreamEvents.result(state) == "success"
+
+    state =
+      feed.(
+        [~s({"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":5})],
+        state
+      )
+
+    assert StreamEvents.result(state) == "error_max_turns"
+  end
+
   test "nested dispatches nest" do
     events =
       feed([

@@ -23,7 +23,7 @@ defmodule LoopctlRunner.DispatchRun do
   cap cannot have its tail trimmed into a clean-looking one.
   """
 
-  alias LoopctlRunner.{Config, Contract, DispatchPrompt, Story}
+  alias LoopctlRunner.{Config, Contract, DispatchPolicy, DispatchPrompt, Session, Story, Worktree}
 
   @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
 
@@ -47,11 +47,36 @@ defmodule LoopctlRunner.DispatchRun do
 
   @max_reason Map.fetch!(Map.fetch!(Contract.connection(), "limits"), "stage_max_reason_length")
 
-  @finished_reason "first end-to-end run: implementation finished, merging nothing by design"
+  # What a `session_ended` refusal means, read from the contract rather than listed here: the
+  # reasons it publishes for the event, and which of them `permanent_errors` says never clear —
+  # for every event (`*`) and for this one. `dispatch_not_accepted` also carries a CONDITION
+  # (permanent unless an accept this runner sent is still unacknowledged), which cannot hold here:
+  # a run starts only once loopctl has acknowledged its accept, so by the time its session has
+  # ended there is no accept outstanding, and the reason is as permanent as `*` says.
+  @session_ended_errors Map.fetch!(Map.fetch!(Contract.connection(), "errors"), "session_ended")
+  @permanent_errors Map.fetch!(Contract.connection(), "permanent_errors")
+  @session_ended_permanent Map.fetch!(@permanent_errors, "*") ++
+                             Map.get(@permanent_errors, "session_ended", [])
 
-  @doc "The escalation reason of a run that finished its implementation."
-  @spec finished_reason() :: String.t()
-  def finished_reason, do: @finished_reason
+  # Every refusal the contract publishes for the event is handled by name or known permanent. A
+  # vendoring that adds a transient one fails the build here, where deciding is cheap, instead of
+  # being given up at runtime as unknown.
+  unhandled =
+    @session_ended_errors -- (~w(rate_limited internal_error) ++ @session_ended_permanent)
+
+  if unhandled != [] do
+    raise "the vendored contract publishes #{Enum.join(unhandled, ", ")} for a session_ended, " <>
+            "which DispatchRun neither handles by name nor knows to be permanent"
+  end
+
+  @session_ended_reasons Contract.schema_def("RunnerSessionEnded")
+                         |> get_in(["properties", "reason", "enum"])
+
+  for reason <- ~w(completed wall_clock_exceeded max_turns_exceeded crashed) do
+    unless reason in @session_ended_reasons do
+      raise "DispatchRun reports session_ended #{reason}, which the vendored contract does not publish"
+    end
+  end
 
   @doc """
   The dispatch's story object: `{:ok, story}` with only the known keys, `:none` when the
@@ -156,30 +181,65 @@ defmodule LoopctlRunner.DispatchRun do
   defp text(_value, _bounds), do: {:error, "is not a string"}
 
   @doc """
-  The `Story` an accepted dispatch runs: the policy's fields, a local id derived from the
-  dispatch, the prompt from `LoopctlRunner.DispatchPrompt`, and the runner config's own
-  `allowed_tools`, never the dispatch's.
+  The `Story` an accepted dispatch runs: the policy's fields and a local id derived from the
+  dispatch. Its prompt is deferred (`Story.from_map/3`): `LoopctlRunner.Run.execute/3` builds it
+  with `prompt/4`'s function once the worktree exists, and nothing builds one before that.
   """
-  @spec story(map(), map(), map(), Config.t()) :: {:ok, Story.t()} | {:error, String.t()}
-  def story(dispatch, fields, story_object, %Config{} = config) do
+  @spec story(map(), map(), Config.t()) :: {:ok, Story.t()} | {:error, String.t()}
+  def story(dispatch, fields, %Config{} = config) do
     Story.from_map(
       %{
         "id" => story_id(dispatch["story_id"]),
         "repo" => fields.repo,
         "base" => fields.base,
         "branch" => fields.branch,
-        "prompt" =>
-          DispatchPrompt.build(story_object, %{
-            repo: dispatch["repo"],
-            branch: fields.branch,
-            base: fields.base
-          }),
         "wall_clock_s" => fields.wall_clock_s,
-        "max_turns" => fields.max_turns,
-        "allowed_tools" => config.allowed_tools
+        "max_turns" => fields.max_turns
       },
-      config
+      config,
+      prompt: :deferred
     )
+  end
+
+  # `.loopctl/mode` holds one word; anything much longer is not a mode, and is refused unread.
+  @max_mode_bytes 64
+
+  @doc """
+  What `Run.execute/3` calls, through `:prompt`, once the worktree is cut, with the commit it was
+  cut from (`Worktree.create/4`'s `cut_from`): the session's prompt, or the refusal that stops the
+  run before a session starts.
+
+  The delivery mode is `.loopctl/mode` as THAT commit holds it (`Worktree.commit_file/4`) — the
+  tree the session starts in, and written by no session — normalised and checked by
+  `DispatchPolicy.delivery_mode/1`; a `thread` mode then needs its push helper
+  (`DispatchPolicy.push_helper/2`) and a checkpoint reporter
+  (`DispatchPolicy.checkpoint_reporting/2`). Any refusal fails the dispatch closed.
+
+  `finish` may carry `:push_script` (`Session.push_script/0` when absent) and
+  `:checkpoint_reporter` (`LoopctlRunner.CheckpointStream` when absent), which a test replaces.
+  """
+  @spec prompt(map(), map(), map(), keyword()) ::
+          (String.t() -> {:ok, String.t()} | {:refuse, String.t(), String.t()})
+  def prompt(dispatch, fields, story_object, finish \\ []) do
+    push_script = Keyword.get_lazy(finish, :push_script, &Session.push_script/0)
+    reporter = Keyword.get(finish, :checkpoint_reporter, LoopctlRunner.CheckpointStream)
+
+    where = %{
+      repo: dispatch["repo"],
+      branch: fields.branch,
+      base: fields.base,
+      push_script: push_script
+    }
+
+    fn cut_from ->
+      read = Worktree.commit_file(fields.repo_path, cut_from, ".loopctl/mode", @max_mode_bytes)
+
+      with {:ok, mode} <- DispatchPolicy.delivery_mode(read),
+           :ok <- DispatchPolicy.push_helper(mode, push_script),
+           :ok <- DispatchPolicy.checkpoint_reporting(mode, reporter) do
+        {:ok, DispatchPrompt.build(story_object, Map.put(where, :mode, mode))}
+      end
+    end
   end
 
   @doc """
@@ -235,13 +295,94 @@ defmodule LoopctlRunner.DispatchRun do
   end
 
   @doc """
-  The reason a run's stage stream ends `escalated` with: exactly `finished_reason/0` for a run
-  that finished its implementation, and otherwise the run's outcome — its status, why the
-  session ended, and what the session escalated with if it called loop-escalate.
+  What a run's end is reported as, in the order it goes out, from the run's summary (or the
+  `status`, `reached` and escalations a later Control reads back from `state.json`):
+
+    * `[:escalated]` — no session ever started: the run got no worktree (`reached` `claimed`) or
+      its prompt was refused (`worktree`). There is no session to say `session_ended` about, so
+      the `-> escalated` stage report is the whole of its end.
+    * `[:escalated, :session_ended]` — the session ran `loop-escalate`: the story is escalated,
+      which is what the session asked for, and then its session is reported ended (see
+      `session_ended/2` for why both go).
+    * `[:session_ended]` — every other run: the session's end is a fact to report, and what
+      happens to the story next is control's to decide from it.
+  """
+  @spec end_reports(map()) :: [:escalated | :session_ended]
+  def end_reports(summary) do
+    cond do
+      summary[:reached] in ["claimed", "worktree"] -> [:escalated]
+      summary[:escalations] not in [nil, []] -> [:escalated, :session_ended]
+      true -> [:session_ended]
+    end
+  end
+
+  @doc """
+  The `RunnerSessionEnded` for a dispatch whose session is over, validated against the contract.
+
+  The `reason` comes from the run's status alone, so the payload a later Control rebuilds from
+  `state.json` is the one this Control composed — a resend with a different reason is refused
+  `already_recorded`:
+
+    * `completed` — the session exited 0 on its own (`succeeded`), or ran `loop-escalate`
+      (`escalated`). An escalating session also gets its `-> escalated` report, and that report is
+      sent FIRST; `session_ended` still follows because the contract calls it "A FACT, not a
+      request — control decides the story's next stage from `reason`: `completed` changes
+      nothing". So `completed` cannot move a story the escalation just moved, and it is still the
+      truth about the session: it stopped because it handed the story to a human.
+    * `wall_clock_exceeded`, `max_turns_exceeded` — the run hit that budget (`Session` reports the
+      turn budget from the CLI's own `error_max_turns` result line).
+    * `crashed` — anything else: a session that exited non-zero on its own, a run that raised or
+      died, and the runner's own stops that are no budget (`parked`, `not_group_leader`). The
+      contract's `crashed` is "any end the runner did not choose and that is not one of the
+      others"; a park is the runner ENDING a session that had already stopped making progress,
+      which it did not choose either, and `crashed` is what re-queues such a story rather than
+      leaving it to a lease reclaim.
+
+  `usage_exhausted` is never sent: nothing the runner reads today tells a session that hit its
+  account's usage limit from any other failing exit, so claiming it would be a guess — and it
+  releases the claim WITHOUT counting an attempt, which is exactly the guess that must not be
+  wrong. Such a session is reported `crashed`.
+  """
+  @spec session_ended(map(), map()) :: {:ok, map()} | {:error, [String.t()]}
+  def session_ended(dispatch, summary) do
+    payload = %{
+      "dispatch_id" => dispatch["dispatch_id"],
+      "claim_epoch" => dispatch["claim_epoch"],
+      "reason" => session_end_reason(summary[:status])
+    }
+
+    with :ok <- Contract.validate("RunnerSessionEnded", payload), do: {:ok, payload}
+  end
+
+  defp session_end_reason(status) when status in ["succeeded", "escalated"], do: "completed"
+
+  defp session_end_reason(status) when status in ["wall_clock_exceeded", "max_turns_exceeded"],
+    do: status
+
+  defp session_end_reason(_status), do: "crashed"
+
+  @doc """
+  How to answer a refusal of a `session_ended`, by its `reason`: `:rate_limited` waits out the
+  interval and sends the same bytes again; `:internal_error` is a bounded retry; `:done` is
+  `already_recorded` — the dispatch's session end is on record already (with another reason, or
+  loopctl would have answered the resend `ok`), so there is nothing left to send; `:permanent` is
+  every other reason `x-connection.permanent_errors` names; `:unknown` is anything else, given up
+  like a permanent one, since resending on a reason this build does not know is a guess.
+  """
+  @spec session_ended_refusal(term()) ::
+          :rate_limited | :internal_error | :done | :permanent | :unknown
+  def session_ended_refusal("rate_limited"), do: :rate_limited
+  def session_ended_refusal("internal_error"), do: :internal_error
+  def session_ended_refusal("already_recorded"), do: :done
+  def session_ended_refusal(reason) when reason in @session_ended_permanent, do: :permanent
+  def session_ended_refusal(_reason), do: :unknown
+
+  @doc """
+  The reason a run's `-> escalated` report carries (`end_reports/1` says which runs send one): the
+  run's outcome — its status, why the session ended, and what the session escalated with if it
+  called loop-escalate.
   """
   @spec end_reason(map()) :: String.t()
-  def end_reason(%{status: "succeeded"}), do: @finished_reason
-
   def end_reason(summary) do
     parts =
       [

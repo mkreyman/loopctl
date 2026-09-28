@@ -3,7 +3,7 @@
 # putting this directory first on PATH. Behaviour is chosen by environment:
 #
 #   FAKE_STATE_DIR     where it records what it saw (required)
-#   FAKE_CLAUDE_MODE   stream | hang | exit_leaving_child
+#   FAKE_CLAUDE_MODE   stream | max_turns | hang | exit_leaving_child | ...
 #   FAKE_EXIT          exit code for stream mode (default 0)
 #   FAKE_AGENTS        busy | idle | fail — what `claude agents --json` reports
 #
@@ -167,6 +167,12 @@ case "${FAKE_CLAUDE_MODE:-stream}" in
         echo "this line is not json"
         printf '%s' '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"'"$sid"'"}'
         exit "${FAKE_EXIT:-0}"
+        ;;
+    max_turns)
+        # What the CLI prints when --max-turns runs out (the subtype 2.1.283 emits), then exits 1.
+        echo "$init"
+        echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":5,"session_id":"'"$sid"'"}'
+        exit 1
         ;;
     quiet_then_result)
         # Silent past the park window, then finishes WHILE the runner's agents probe runs.

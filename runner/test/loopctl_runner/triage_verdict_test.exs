@@ -58,11 +58,11 @@ defmodule LoopctlRunner.TriageVerdictTest do
     end
 
     test "it is NOT a validation failure, because refusing one loses more than it saves" do
-      # loopctl records `escalation_reasons` verbatim and routes on `outcome` alone, so a thin
-      # escalate still reaches a human with its evidence and missing_information. Refused here it
-      # would be `verdict_invalid` instead — the run reporting that it produced nothing — and the
-      # session cannot be asked again: `loop-verdict` links the file into place before anything
-      # validates it, and a run records one verdict.
+      # loopctl records the verdict's `escalation_reasons` verbatim (what gates is each lens's list
+      # in `lens_verdicts`), so a thin escalate still reaches a human with its evidence and
+      # missing_information. Refused here it would be `verdict_invalid` instead — the run reporting
+      # that it produced nothing — and the session cannot be asked again: `loop-verdict` links the
+      # file into place before anything validates it, and a run records one verdict.
       thin = verdict(%{"escalation_reasons" => [@gating]})
 
       assert TriageVerdict.bare_escalation?(thin)

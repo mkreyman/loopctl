@@ -185,8 +185,9 @@ defmodule LoopctlRunner.TriageVerdict do
 
   IT IS NOT ONE OF `validate/1`'s CHECKS, deliberately, and the asymmetry is the whole argument.
   The three there are things loopctl would refuse on the wire, where refusing locally costs the run
-  nothing it had. This one loopctl accepts: it records `escalation_reasons` verbatim and routes on
-  `outcome` alone. Refusing it here would turn a verdict that escalates CORRECTLY — with its
+  nothing it had. This one loopctl accepts: it records the verdict's `escalation_reasons` verbatim
+  (what gates, since 1.15.0, is each lens's own list in `lens_verdicts`), and an `escalate` goes to
+  a person either way. Refusing it here would turn a verdict that escalates CORRECTLY — with its
   evidence, its `missing_information`, and a human on the other end — into `verdict_invalid`, which
   is the run reporting that it produced nothing at all. Nor can the session make it good: nothing
   validates a verdict until `loop-verdict` has already linked it into place, a run records one, and

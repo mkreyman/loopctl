@@ -10,28 +10,14 @@ defmodule LoopctlRunner.TriageToolsTest do
     end
   end
 
-  defp values_of(argv, flag) do
-    argv
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.filter(fn [name, _value] -> name == flag end)
-    |> Enum.map(fn [_name, value] -> value end)
-  end
-
   test "an argv missing any containment flag is refused at launch" do
     # Before the seam every launch went through claude_args/3, which pins these. A supplied argv
     # that omits one launches an unattended session with the operator's settings, hooks, plugins
     # and MCP servers — and nothing else in Session would notice.
     for {flag, _} <- [
-          {"--setting-sources", ""},
-          {"--permission-mode", "dontAsk"},
-          {"--disallowedTools", "mcp__*"},
-          {"--mcp-config", ""},
-          # The values of these two are the run type's own, so the guard pins only their
-          # presence — and their absence is not cosmetic: without --tools the session's pool
-          # goes back to Agent, Workflow, Skill, SendMessage, WebFetch and every plugin tool
-          # (--disallowedTools mcp__* covers only the MCP half), and without --max-turns an
+          {"--permission-mode", "bypassPermissions"},
+          # Pinned to presence, not value: the budget is the run type's own, and without it an
           # unattended session has no turn ceiling at all.
-          {"--tools", ""},
           {"--max-turns", ""}
         ] do
       argv =
@@ -135,42 +121,26 @@ defmodule LoopctlRunner.TriageToolsTest do
     assert message =~ "the-tracked-id"
   end
 
-  test "the escalate command the system prompt names is one the session may run" do
-    # Shipping the instruction without the rule would deny it silently under dontAsk: no
-    # escalation line, no verdict, and a run that grinds to its turn limit.
-    assert "Bash(#{Session.escalate_script()}:*)" in TriageTools.rules()
-  end
+  test "the READINGS are read-only by declaration, which is the guarantee that survived" do
+    # The session is not prevented from writing any more — no --tools, no rules, same posture as
+    # an implement session. What still holds is that each lens declares its own tools, so the
+    # parts that do the reading cannot write however the session was launched.
+    assert Enum.sort(TriageTools.lens_tools()) == ~w(Glob Grep Read)
 
-  test "a triage session cannot write anything, which an implement session can" do
-    # The prompt tells the session to treat the checkout as read-only; this is what makes it so.
-    refute "Edit" in TriageTools.tools()
-    refute "Write" in TriageTools.tools()
-    assert Enum.sort(TriageTools.withheld()) == ["Edit", "Write"]
-    assert "Edit" in Session.session_tools()
-
-    refute Enum.any?(TriageTools.rules(), &String.starts_with?(&1, "Write("))
-    refute Enum.any?(TriageTools.rules(), &String.starts_with?(&1, "Edit("))
-  end
-
-  test "Bash exists for exactly two commands: the verdict, and the escalate the prompt names" do
-    bash = Enum.sort(Enum.filter(TriageTools.rules(), &String.starts_with?(&1, "Bash(")))
-
-    assert bash ==
-             Enum.sort([
-               "Bash(#{TriagePrompt.verdict_script()}:*)",
-               "Bash(#{Session.escalate_script()}:*)"
-             ])
-  end
-
-  test "the file tools are scoped to the checkout" do
-    for tool <- ~w(Read Glob Grep) do
-      assert "#{tool}(./**)" in TriageTools.rules()
+    for {_name, lens} <- Jason.decode!(TriageTools.agents_json()) do
+      assert Enum.sort(lens["tools"]) == ~w(Glob Grep Read)
     end
   end
 
+  test "the verdict command needs no rule, and the prompt still names it" do
+    # It used to need an --allowedTools entry or the call was denied silently. Nothing denies it
+    # now; what must still hold is that the session is TOLD the path, or a verdict has no way out.
+    assert TriagePrompt.system_prompt() =~ TriagePrompt.verdict_script()
+  end
+
   test "the lenses are shipped, not inherited, and each is read-only" do
-    # A session runs under --setting-sources "", so ~/.claude/agents is not there to inherit:
-    # without these it would have nothing to dispatch and would do all three readings itself.
+    # A machine need not have ~/.claude/agents at all, and a session that found none there would
+    # have nothing to dispatch and would do all three readings itself, reporting nothing amiss.
     assert TriageTools.lenses() == ~w(triage-analyst triage-architect triage-engineer)
 
     lenses = Jason.decode!(TriageTools.agents_json())
@@ -264,21 +234,22 @@ defmodule LoopctlRunner.TriageToolsTest do
     # Every check is on the flag's VALUE, not on the value appearing somewhere: a refactor that
     # dropped the flags would leave the values as positional arguments — read as prompt text,
     # granting nothing — and a membership assertion would stay green through it.
-    assert value_of(argv, "--permission-mode") == "dontAsk"
+    assert value_of(argv, "--permission-mode") == "bypassPermissions"
     assert value_of(argv, "--permission-prompts") == "none"
-    assert value_of(argv, "--mcp-config") == ~s({"mcpServers":{}})
-    assert value_of(argv, "--disallowedTools") == "mcp__*"
     assert value_of(argv, "--max-turns") == "40"
     assert value_of(argv, "--model") == "claude-opus-5"
-    assert "--strict-mcp-config" in argv
-    # No settings source: no operator hooks, plugins or permission rules, and no agent files.
-    assert value_of(argv, "--setting-sources") == ""
-    assert value_of(argv, "--tools") == "Read,Glob,Grep,Agent,Bash"
+    # Every MCP server the operator has configured is INHERITED, loopctl's included: excluding
+    # them would break the story-lifecycle skills, which are built on those very tools.
+    refute "--strict-mcp-config" in argv
+    refute "--mcp-config" in argv
+    refute "--disallowedTools" in argv
+    refute "--setting-sources" in argv
+    refute "--tools" in argv
 
     assert Jason.decode!(value_of(argv, "--agents")) |> Map.keys() |> Enum.sort() ==
              TriageTools.lenses()
 
-    assert Enum.sort(values_of(argv, "--allowedTools")) == Enum.sort(TriageTools.rules())
+    refute "--allowedTools" in argv
     assert value_of(argv, "--append-system-prompt") == TriagePrompt.system_prompt()
     refute Session.escalation_prompt() in argv
     assert List.last(argv) == "the prompt"

@@ -8,11 +8,6 @@
   "branch_prefixes": [
     "loop/"
   ],
-  "allowed_tools": [
-    "Bash(mix test:*)",
-    "Bash(mix compile:*)",
-    "Bash(mix format:*)"
-  ],
   "max_wall_clock_s": 3600,
   "max_turns": 200,
   "park_after_s": 600,

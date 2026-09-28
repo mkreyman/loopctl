@@ -16,10 +16,22 @@ defmodule LoopctlRunner.StreamEvents do
   """
 
   @type emit_fun :: (String.t(), non_neg_integer() | nil, map() -> non_neg_integer())
-  @type state :: %{session: non_neg_integer(), tool_uses: %{optional(String.t()) => integer()}}
+  @type state :: %{
+          session: non_neg_integer(),
+          tool_uses: %{optional(String.t()) => integer()},
+          result: String.t() | nil
+        }
 
   @spec new(non_neg_integer()) :: state()
-  def new(session_seq), do: %{session: session_seq, tool_uses: %{}}
+  def new(session_seq), do: %{session: session_seq, tool_uses: %{}, result: nil}
+
+  @doc """
+  The `subtype` of the last `result` line the CLI printed, or nil before one: its own statement
+  of why it stopped (`success`, `error_max_turns`, ...), which `LoopctlRunner.Session` reads to
+  tell a session that ran out of turns from one that failed.
+  """
+  @spec result(state()) :: String.t() | nil
+  def result(%{result: result}), do: result
 
   @doc "Handles one complete stdout line."
   @spec handle_line(binary(), state(), emit_fun()) :: state()
@@ -38,8 +50,13 @@ defmodule LoopctlRunner.StreamEvents do
     {parent, orphan?} = parent_for(message, state)
     data = summarize(message) |> put_orphan(orphan?)
     seq = emit.(event_type(message), parent, data)
-    register_tool_uses(message, seq, state, emit)
+    message |> register_tool_uses(seq, state, emit) |> note_result(message)
   end
+
+  defp note_result(state, %{"type" => "result", "subtype" => subtype}) when is_binary(subtype),
+    do: %{state | result: subtype}
+
+  defp note_result(state, _message), do: state
 
   defp parent_for(%{"parent_tool_use_id" => id}, state) when is_binary(id) do
     case Map.fetch(state.tool_uses, id) do

@@ -51,7 +51,8 @@ defmodule LoopctlRunner.Worktree do
   # build or `deps.get` recreates, and which (node_modules) are large enough to take it past its bound.
   @unscanned ~w(deps _build node_modules .elixir_ls .lexical)
   # The operator's ssh agent and forge token, as the runner has them. `ProcessGroup.run/5` scrubs
-  # the list a SESSION must not inherit, and that list names all four; `fetch_base/2` is the
+  # credentials from the runner's own commands, and its list (`ProcessGroup.scrubbed_env/0`) names
+  # all four; `fetch_base/2` is the
   # runner's own fetch, which authenticates as the operator does, so it INHERITS them — the
   # runner's own values, never ones a caller chose, and an unset one stays unset. With BatchMode on,
   # a passphrase-protected key reachable only through the agent would otherwise fail every ssh
@@ -91,7 +92,8 @@ defmodule LoopctlRunner.Worktree do
           base: String.t(),
           reused: boolean(),
           start: String.t() | nil,
-          fetch: fetch()
+          fetch: fetch(),
+          cut_from: String.t()
         }
   @type removal :: %{
           worktree: :removed | :absent | {:kept, String.t()} | {:error, String.t()},
@@ -490,6 +492,12 @@ defmodule LoopctlRunner.Worktree do
 
   `start` is the revision a new branch was cut from (nil when adopted) and `fetch` whether the
   fetch of `origin`'s base worked, so a trace shows a branch cut from a stale local base.
+
+  `cut_from` is the commit the tree holds from its base and no session wrote, read from the tree
+  itself on every path: a new or reset tree's HEAD, read before any session runs in it, and for an
+  adopted tree the merge base of its HEAD and the base — local and `origin`'s, whichever resolve,
+  since the branch may have been cut from either. Its HEAD may carry an earlier session's commits;
+  a merge base is a commit of the base's own history that the tree also holds.
   """
   @spec create(String.t(), String.t(), String.t(), String.t()) ::
           {:ok, created()} | {:error, String.t()}
@@ -555,7 +563,7 @@ defmodule LoopctlRunner.Worktree do
 
     with :ok <- own_tree(repo_path, path),
          {:ok, _} <- git(path, ["checkout", "-q", "--no-track", "-B", branch, start]) do
-      {:ok, %{path: path, branch: branch, base: base, reused: false, start: start}}
+      cut_from(path, %{path: path, branch: branch, base: base, reused: false, start: start})
     else
       {:error, out} -> {:error, "cannot reset #{path} to #{start}: #{out}"}
     end
@@ -580,9 +588,14 @@ defmodule LoopctlRunner.Worktree do
 
   defp adopt(path, branch, base) do
     case git(path, ["rev-parse", "--abbrev-ref", "HEAD"]) do
-      {:ok, ^branch} -> {:ok, %{path: path, branch: branch, base: base, reused: true, start: nil}}
-      {:ok, other} -> {:error, "#{path} exists on branch #{other}, not #{branch}"}
-      {:error, out} -> {:error, "#{path} exists but is not a worktree: #{out}"}
+      {:ok, ^branch} ->
+        cut_from(path, %{path: path, branch: branch, base: base, reused: true, start: nil})
+
+      {:ok, other} ->
+        {:error, "#{path} exists on branch #{other}, not #{branch}"}
+
+      {:error, out} ->
+        {:error, "#{path} exists but is not a worktree: #{out}"}
     end
   end
 
@@ -594,9 +607,96 @@ defmodule LoopctlRunner.Worktree do
 
     with {:ok, _} <- commit(repo_path, start),
          {:ok, _} <- git(repo_path, ["worktree", "add", "--no-track", "-b", branch, path, start]) do
-      {:ok, %{path: path, branch: branch, base: base, reused: false, start: start}}
+      case cut_from(path, %{path: path, branch: branch, base: base, reused: false, start: start}) do
+        {:ok, created} -> {:ok, created}
+        {:error, why} -> {:error, undo_add(repo_path, path, branch, why)}
+      end
     else
       {:error, out} -> {:error, "cannot create worktree from #{start}: #{out}"}
+    end
+  end
+
+  # The caller owns nothing an error returns, so a tree and branch this call just added are removed
+  # here, and the error says whether that worked: one left behind is named, never silently kept.
+  # `retire/3`, not `remove/4`: a branch just cut from origin's base is ahead of a stale local
+  # base, and `remove/4` keeps a branch with commits beyond the base it is given.
+  defp undo_add(repo_path, path, branch, why) do
+    case retire(repo_path, path, branch) do
+      %{worktree: :removed, branch: :deleted} ->
+        why <> "; the new worktree and branch were removed"
+
+      removal ->
+        why <>
+          "; removing the new worktree #{path} and branch #{branch} failed: " <>
+          inspect(removal)
+    end
+  end
+
+  # A tree the runner just cut or reset starts at its HEAD. An adopted one started at the fork of
+  # its HEAD from the base; which copy of the base it forked from is not recorded, so both that
+  # resolve are given and git answers with the later fork (`merge-base A B C` is the merge base of
+  # A and a merge of B and C).
+  defp cut_from(path, %{reused: false} = created),
+    do: cut_from(path, created, ["rev-parse", "--verify", "HEAD^{commit}"])
+
+  defp cut_from(path, %{reused: true, base: base} = created) do
+    case Enum.filter([base, origin_ref(base)], &resolves?(path, &1)) do
+      [] -> {:error, "cannot tell which commit #{path} was cut from: #{base} does not resolve"}
+      bases -> cut_from(path, created, ["merge-base", "HEAD" | Enum.uniq(bases)])
+    end
+  end
+
+  defp cut_from(path, created, args) do
+    case git_stdout(path, args) do
+      {:ok, commit} -> {:ok, Map.put(created, :cut_from, String.trim(commit))}
+      {:error, why} -> {:error, "cannot tell which commit #{path} was cut from: #{why}"}
+    end
+  end
+
+  @doc """
+  `file` as `commit` holds it — never a working tree's, which the session can write:
+  `{:ok, content}`, `:absent` when the commit has no such path, or `{:error, reason}`.
+
+  The read is bounded: the entry must be a regular file in the tree (a symlink, a directory or a
+  submodule is an error, and nothing on disk is opened, so a FIFO cannot block it), and its size
+  is checked before its bytes are read. Only git's stdout is read as the answer; its stderr is
+  kept apart and only ever quoted in an error.
+  """
+  @spec commit_file(String.t(), String.t(), String.t(), pos_integer()) ::
+          {:ok, binary()} | :absent | {:error, String.t()}
+  def commit_file(repo_path, commit, file, max_bytes) do
+    with {:ok, oid} <- tree_entry(repo_path, commit, file),
+         :ok <- blob_size(repo_path, oid, file, max_bytes) do
+      case git_stdout(repo_path, ["cat-file", "blob", oid]) do
+        {:ok, content} -> {:ok, content}
+        {:error, why} -> {:error, "cannot read #{file} at #{commit}: #{why}"}
+      end
+    end
+  end
+
+  defp tree_entry(repo_path, commit, file) do
+    case git_stdout(repo_path, ["ls-tree", commit, "--", file]) do
+      {:ok, ""} ->
+        :absent
+
+      {:ok, line} ->
+        case line |> String.trim_trailing("\n") |> String.split(["\s", "\t"], parts: 4) do
+          [mode, "blob", oid, ^file] when mode in ["100644", "100755"] -> {:ok, oid}
+          _ -> {:error, "#{file} is not a regular file at #{commit}"}
+        end
+
+      {:error, why} ->
+        {:error, "cannot list #{file} at #{commit}: #{why}"}
+    end
+  end
+
+  defp blob_size(repo_path, oid, file, max_bytes) do
+    with {:ok, size} <- git_stdout(repo_path, ["cat-file", "-s", oid]),
+         {size, ""} when size <= max_bytes <- size |> String.trim() |> Integer.parse() do
+      :ok
+    else
+      {:error, why} -> {:error, "cannot size #{file}: #{why}"}
+      _ -> {:error, "#{file} is larger than #{max_bytes} bytes"}
     end
   end
 
@@ -1188,6 +1288,59 @@ defmodule LoopctlRunner.Worktree do
     case System.cmd("git", ["-C", dir | args], stderr_to_stdout: true, env: clear_repo_env()) do
       {out, 0} -> {:ok, String.trim(out)}
       {out, _} -> {:error, String.trim(out)}
+    end
+  end
+
+  # git with stdout as the ANSWER, untrimmed, and stderr kept apart: a warning git prints (an
+  # ambiguous ref, say) must never be read as part of a commit id or a file's bytes. System.cmd
+  # can only merge stderr into stdout, so a shell sends it to a file of its own — inside a
+  # directory only this user can enter, under an unguessable name, because a predictable path in
+  # a shared temp directory is one another user can plant a symlink at first.
+  defp git_stdout(dir, args) do
+    env = Enum.map(@repo_locating_env, &{&1, nil})
+
+    with {:ok, private} <- private_dir() do
+      err = Path.join(private, "stderr")
+
+      try do
+        case System.cmd("sh", ["-c", ~s(exec git "$@" 2>"$0"), err, "-C", dir | args], env: env) do
+          {out, 0} -> {:ok, out}
+          {_out, status} -> {:error, stderr(err, status)}
+        end
+      after
+        File.rm_rf(private)
+      end
+    end
+  end
+
+  # mkdtemp's contract: `mkdir` fails on a name that exists, so a directory it made is this call's
+  # own — and one it did not make is never touched — and it is closed to everyone else before
+  # anything is written in it.
+  defp private_dir do
+    name = "loopctl-git-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    private = Path.join(System.tmp_dir!(), name)
+
+    case File.mkdir(private) do
+      :ok -> close_to_others(private)
+      {:error, reason} -> {:error, "cannot make a directory for git's stderr: #{reason}"}
+    end
+  end
+
+  defp close_to_others(private) do
+    case File.chmod(private, 0o700) do
+      :ok ->
+        {:ok, private}
+
+      {:error, reason} ->
+        File.rm_rf(private)
+        {:error, "cannot make #{private} private for git's stderr: #{reason}"}
+    end
+  end
+
+  defp stderr(err, status) do
+    case File.read(err) do
+      {:ok, text} when text != "" -> String.trim(text)
+      _ -> "git exited #{status}"
     end
   end
 end

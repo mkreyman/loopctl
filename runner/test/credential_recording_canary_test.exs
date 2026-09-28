@@ -1,6 +1,7 @@
 defmodule LoopctlRunner.CredentialRecordingCanaryTest do
   @moduledoc """
-  Binds the fake CLI's environment recording to the names `Session` actually unsets.
+  Binds the fake CLI's environment recording to the names `Session` unsets and the credentials a
+  session inherits.
 
   Every test that proves a credential does not reach a session does it by refuting a line in the
   fixture's `env` file, so a name the fixture does not RECORD makes that refutation pass whether
@@ -15,14 +16,14 @@ defmodule LoopctlRunner.CredentialRecordingCanaryTest do
 
   alias LoopctlRunner.{Session, TestSupport}
 
-  # Names no category or shape of the fixture's is allowed to depend on: if the shape deny in
-  # `Session.credential_shaped?/1` matches them, the fixture must record them too, or the test
-  # that proves the shape deny works would pass with the deny deleted.
-  @shape_probes ~w(NPM_TOKEN AWS_SECRET_ACCESS_KEY HEX_API_KEY PGPASSWORD FLY_API_TOKEN
-                   SOME_VENDOR_PRIVATE_KEY DB_PASSWD SIGNING_KEY_ID)
+  # Credentials a session now INHERITS, which `RunTest` proves by asserting them PRESENT: the
+  # fixture must record them, or that assertion could never pass and would be deleted as flaky.
+  @inherited ~w(SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO GH_TOKEN GITHUB_TOKEN GIT_ASKPASS
+                SSH_ASKPASS GIT_SSH_COMMAND GIT_SSH NPM_TOKEN AWS_SECRET_ACCESS_KEY HEX_API_KEY
+                PGPASSWORD)
 
-  test "the fixture records every name the session unsets, and every shape the deny matches" do
-    names = Session.credential_env() ++ Session.git_program_env() ++ @shape_probes
+  test "the fixture records every name the session unsets, and every credential it inherits" do
+    names = Session.credential_env() ++ @inherited
     recorded = record(names)
 
     for name <- names do
@@ -32,24 +33,9 @@ defmodule LoopctlRunner.CredentialRecordingCanaryTest do
     end
   end
 
-  test "the shape probes are ones the deny actually matches" do
-    # Without this the test above degrades into a statement about the fixture alone: a probe the
-    # deny does not match is not evidence about anything a session is protected from.
-    for name <- @shape_probes do
-      assert Session.credential_shaped?(name), "#{name} is not matched by the shape deny"
-    end
-  end
-
-  test "ordinary session furniture is neither shape-denied nor recorded" do
-    # The other half of a deny's correctness: a shape that matches everything protects nothing
-    # and breaks the runner. HOME and PATH in particular are what mix, hex and asdf resolve out
-    # of, and XDG_RUNTIME_DIR is inherited deliberately.
+  test "ordinary session furniture is not recorded as a credential" do
     keep = ~w(HOME PATH LANG SHELL USER LOGNAME PWD XDG_RUNTIME_DIR XDG_DATA_DIRS
               DBUS_SESSION_BUS_ADDRESS TERM MIX_ENV)
-
-    for name <- keep do
-      refute Session.credential_shaped?(name), "#{name} would be unset for every session"
-    end
 
     recorded = record(keep)
 

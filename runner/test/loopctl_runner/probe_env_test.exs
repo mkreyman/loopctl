@@ -2,10 +2,11 @@ defmodule LoopctlRunner.ProbeEnvTest do
   @moduledoc """
   The liveness probe is the SECOND Port that launches the CLI, and it had its own security list.
 
-  `ProcessGroup.run/3` spawns `claude agents --json` while a session is running. It used to unset
-  one name, hand-copied, with nothing tying it to the list a session gets — so that list grew to
-  eight names and a shape deny while this one still said `ANTHROPIC_API_KEY`. This test is what
-  makes the binding falsifiable rather than a comment claiming it.
+  `ProcessGroup.run/5` spawns `claude agents --json` while a session is running. It used to unset
+  one name, hand-copied, with nothing tying it to any other list, and the two drifted. It now runs
+  the runner's own scrub — the session's billing key from `Session.credential_env/0`, the runner's
+  credential names and the shape deny — and this test is what makes that falsifiable rather than
+  a comment claiming it.
   """
 
   # Mutates the OS environment, which spawned processes inherit.
@@ -13,7 +14,7 @@ defmodule LoopctlRunner.ProbeEnvTest do
 
   alias LoopctlRunner.ProcessGroup
 
-  test "the probe's Port gets the same credential scrub a session does" do
+  test "the probe's Port gets the runner's credential scrub, by name and by shape" do
     nonce = Integer.to_string(System.unique_integer([:positive]))
 
     vars = [

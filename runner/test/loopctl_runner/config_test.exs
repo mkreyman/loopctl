@@ -84,6 +84,19 @@ defmodule LoopctlRunner.ConfigTest do
                Config.from_map(config_map(root, %{"branch_prefixes" => []}))
     end
 
+    test "on a prefix loopctl's join schema would refuse, since every join declares them", %{
+      root: root
+    } do
+      # A dot is not in the contract's prefix pattern, so this config would fail EVERY join.
+      assert {:error, "config branch_prefixes cannot be declared to loopctl: " <> _} =
+               Config.from_map(config_map(root, %{"branch_prefixes" => ["feat.x/"]}))
+
+      nine = for n <- 1..9, do: "p#{n}/"
+
+      assert {:error, "config branch_prefixes cannot be declared to loopctl: " <> _} =
+               Config.from_map(config_map(root, %{"branch_prefixes" => nine}))
+    end
+
     test "on a non-positive budget", %{root: root} do
       assert {:error, "config max_turns must be a positive integer"} =
                Config.from_map(config_map(root, %{"max_turns" => 0}))
@@ -110,6 +123,35 @@ defmodule LoopctlRunner.ConfigTest do
         )
 
       assert out =~ ~s({:error, "cannot resolve grant_dir: HOME is not set"})
+    end
+  end
+
+  describe "an obsolete key" do
+    test "allowed_tools loads, with one warning naming it obsolete and ignored", %{root: root} do
+      # Configs already on the dev machines carry it: refusing them would stop those daemons over
+      # a key that grants nothing now that no --allowedTools is composed.
+      path = Path.join(root, "runner.json")
+
+      File.write!(
+        path,
+        JSON.encode!(config_map(root, %{"allowed_tools" => ["Bash(mix test:*)"]}))
+      )
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn -> assert {:ok, %Config{}} = Config.load(path) end)
+
+      assert [_one] =
+               Regex.scan(~r/#{Regex.escape(path)}: allowed_tools is obsolete and ignored/, log)
+    end
+
+    test "is not warned about when absent", %{root: root} do
+      path = Path.join(root, "runner.json")
+      File.write!(path, JSON.encode!(config_map(root)))
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn -> assert {:ok, %Config{}} = Config.load(path) end)
+
+      refute log =~ path
     end
   end
 
@@ -175,12 +217,6 @@ defmodule LoopctlRunner.ConfigTest do
             %{repo => %{"LOOPCTL_LAUNCHER_SETSID" => "1"}},
             %{repo => %{"ANTHROPIC_API_KEY" => "x"}},
             %{repo => %{"GIT_DIR" => "/tmp"}},
-            # A credential port_env/4 unsets: configured here it would be dropped silently,
-            # and only under the daemon.
-            %{repo => %{"SSH_AUTH_SOCK" => "/tmp/agent"}},
-            %{repo => %{"GH_TOKEN" => "x"}},
-            %{repo => %{"GPG_AGENT_INFO" => "/tmp/agent:0:1"}},
-            %{repo => %{"SSH_ASKPASS" => "/tmp/askpass"}},
             %{repo => %{"RELEASE_COOKIE" => "x"}},
             %{repo => %{"ERL_CRASH_DUMP_SECONDS" => "0"}},
             %{repo => %{"ROOTDIR" => "/tmp"}},
@@ -219,90 +255,25 @@ defmodule LoopctlRunner.ConfigTest do
       assert {:ok, _} = Config.load(plain)
     end
 
-    test "a SHAPE-matched name is allowed here: this is the escape hatch for the heuristic" do
-      # The shape deny is a heuristic over an environment nobody enumerated, and it over-matches
-      # real cases — SECRET_KEY_BASE for a test env, a key that is publishable by design. Naming
-      # one here is the operator making the judgement the shape cannot, for ONE repo, in a file
-      # only they write. Refusing it left them no way to keep it at all.
-      root = tmp_dir!("session-env-shaped")
-      repo = config_map(root)["repos"] |> Map.keys() |> hd()
-
-      env = %{repo => %{"SECRET_KEY_BASE" => "x", "STRIPE_PUBLISHABLE_KEY" => "y"}}
-      assert {:ok, config} = Config.from_map(with_env(root, env))
-
-      assert [{"SECRET_KEY_BASE", "x"}, {"STRIPE_PUBLISHABLE_KEY", "y"}] =
-               Config.session_env_for(config, repo, "story-a", "0123456789abcdef")
-
-      # ...and they really are names the shape deny matches, or this proves nothing.
-      assert LoopctlRunner.Session.credential_shaped?("SECRET_KEY_BASE")
-      assert LoopctlRunner.Session.credential_shaped?("STRIPE_PUBLISHABLE_KEY")
-    end
-
-    test "the refusal says WHICH rule refused, because one of them is a breaking change" do
-      # A repo that set GH_TOKEN here loaded yesterday and does not today, and the failure is not
-      # local: Config.load/1 refuses the WHOLE config, which aborts rel/install.sh's preflight. A
-      # message identical to a mistyped value sends the operator to look at the value.
+    test "a credential is accepted, since a session keeps it; the refusals name their rule" do
+      # A session inherits every credential an attended one has (only ANTHROPIC_API_KEY is unset,
+      # and ANTHROPIC_* is runner-managed), so a value here reaches the session and is allowed.
       root = tmp_dir!("session-env-message")
       repo = config_map(root)["repos"] |> Map.keys() |> hd()
 
-      assert {:error, credential} =
-               Config.from_map(with_env(root, %{repo => %{"GH_TOKEN" => "x"}}))
+      for name <- ~w(GH_TOKEN SSH_AUTH_SOCK NPM_TOKEN) do
+        assert {:ok, _} = Config.from_map(with_env(root, %{repo => %{name => "x"}})), name
+      end
 
-      assert credential =~ "session_env.#{repo}.GH_TOKEN"
-      # The reason must be TRUE for this name: GH_TOKEN is unset whatever the environment holds.
-      # The message used to claim that certainty for SHAPE-matched names too, where it is false —
-      # port_env/4 unsets a shaped name only when the daemon's environment carries it — and it
-      # sent the operator to change LoopctlRunner.Session, where no mechanism to help them exists.
-      assert credential =~ "UNCONDITIONALLY"
-      refute credential =~ "LoopctlRunner.Session"
-
-      # A shaped name is no longer refused at all: naming it here is how it is kept.
-      assert {:ok, _} = Config.from_map(with_env(root, %{repo => %{"NPM_TOKEN" => "x"}}))
-
-      # The other causes keep their own wording, so the three are told apart.
+      # The causes keep their own wording, so an operator is sent to the name or to the value.
       assert {:error, managed} =
                Config.from_map(with_env(root, %{repo => %{"GIT_DIR" => "/tmp"}}))
 
       assert managed =~ "the runner manages itself"
-      refute managed =~ "UNCONDITIONALLY"
 
       assert {:error, value} = Config.from_map(with_env(root, %{repo => %{"OK" => 1}}))
       assert value =~ "is not a string value"
-      refute value =~ "UNCONDITIONALLY"
-    end
-  end
-
-  test "an allowed_tools rule for a tool sessions cannot have is refused at load" do
-    root = tmp_dir!("tools-rule")
-
-    for ok <- [["Bash(mix test:*)", "Read(./**)", "Edit(./lib/**)", "Bash(git status)"], []] do
-      assert {:ok, _} = Config.from_map(Map.put(config_map(root), "allowed_tools", ok))
-    end
-
-    for bad <- ["WebFetch", "Skill", "Agent", "mcp__loopctl__get_story", "WebSearch(x)"] do
-      assert {:error, msg} = Config.from_map(Map.put(config_map(root), "allowed_tools", [bad]))
-      assert msg =~ "names a tool sessions do not have"
-    end
-  end
-
-  test "a rule wider than it reads is refused at load: unscoped file tools, shells, bare Bash" do
-    root = tmp_dir!("tools-scope")
-
-    for {bad, why} <- [
-          {"Write", "not scoped to the worktree"},
-          {"Edit(~/**)", "not scoped to the worktree"},
-          {"Read(/etc/**)", "not scoped to the worktree"},
-          {"Write(./../outside/**)", "not scoped to the worktree"},
-          {"Grep(./)", "not scoped to the worktree"},
-          {"Bash", "does not name one command"},
-          {"Bash(*)", "does not name one command"},
-          {"Bash(bash:*)", "does not name one command"},
-          {"Bash(sh -c:*)", "does not name one command"},
-          {"Bash(/usr/bin/env:*)", "does not name one command"},
-          {"Bash(python3:*)", "does not name one command"}
-        ] do
-      assert {:error, msg} = Config.from_map(Map.put(config_map(root), "allowed_tools", [bad]))
-      assert msg =~ why, inspect(bad)
+      refute value =~ "the runner manages itself"
     end
   end
 end

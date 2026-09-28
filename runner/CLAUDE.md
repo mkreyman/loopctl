@@ -54,9 +54,10 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   an environment variable a `claude` session inherits, or a URL.
 - **The runner arms the subagent git grant for an implement session — the one run on a branch of
   its own (`own_worktree: true`) — and removes it at teardown** (`LoopctlRunner.GitGrant`).
-  `block-subagent-git.sh` is a user-settings hook, so in any session that loads the operator's
-  settings an engineer agent the session dispatches has its commit refused without it — while its
-  report reads as having chosen not to commit. Session-scoped by uuid, so an orphan authorises an
+  `block-subagent-git.sh` is a user-settings hook, and every loop session loads the operator's
+  settings, so an engineer agent the session dispatches has its commit refused without it — while
+  its report reads as having chosen not to commit. `LOOP_GIT_GRANT` tells the session where its
+  grant is, and is unset for a session with none. Session-scoped by uuid, so an orphan authorises an
   id nothing will hold again. The argv is checked BEFORE the grant is armed, and anything that
   raises after arming disarms it. Each grant records its OWNER, the pid and start time of the BEAM
   that armed it (`LoopctlRunner.Owner`, which never raises and reads "cannot tell" as alive), and
@@ -104,20 +105,59 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   `implement` dispatch carries, so a new kind needs its payload and its own accept path first.
 - **The daemon starts only under `LOOPCTL_RUNNER_DAEMON=1`**, so `mix loopctl.run` never joins
   the pool.
-- **A loop session asks for a human by running `priv/bin/loop-escalate`**, the one command the
-  runner always pre-allows. No hook can observe a question a headless session wanted to ask, so
-  escalation must stay a command it calls; the run ends `escalated`.
-- **Unattended sessions can only run pre-allowed tools.** `--permission-mode dontAsk` runs only
-  what an `--allowedTools` rule names, under `--setting-sources ""` so no operator or repository
-  settings add rules, hooks or plugins; the file tools are scoped to the worktree; a story's
-  `allowed_tools` must each appear in the runner config's `allowed_tools`. Never `auto`: its
-  classifier approves what it judges safe, and the first end-to-end run committed, ran docker
-  and gh, and read `~/.claude` under it.
+- **A loop session asks for a human by running `priv/bin/loop-escalate`**, whose path the system
+  prompt names — and the prompt is the ONLY path, so if that text stops reaching it a session has
+  no way to ask and grinds silently to its turn limit. No hook can observe a question a headless
+  session wanted to ask, so escalation must stay a command it calls; the run ends `escalated`.
+- **Unattended sessions run with the same authority as a locally dispatched agent, and inherit
+  the operator's user-scoped Claude setup.** `--permission-mode bypassPermissions`, no
+  `--allowedTools` composed at all, and no `--setting-sources ""`. Mark, 2026-09-16: *"All agents
+  must run with the yolo mode, the same as I'm running all my sessions now!"* and *"everything
+  must inherit my entire user scoped claude setup."* The measurement that produced the old rule
+  stands and is worth keeping: the first end-to-end run, under `--permission-mode auto`,
+  committed through a bash wrapper, ran `docker exec psql` and `gh`, and read `~/.claude`. What
+  changed is the conclusion. That is the BLAST RADIUS of a session on this machine, and it is the
+  same radius a dispatched `elixir-engineer` has had all along — same OS user, same keys, same
+  shell. Treating "nobody is watching" as if it shrank the radius confused it with DETECTION
+  TIME, which is a different problem and is addressed by the wall clock, the liveness park and
+  `loop-escalate`, none of them a permission flag. Committing is now the goal, not the hazard:
+  automating a filed ticket end to end is what this repo is for. `auto` is still wrong and for
+  its own reason — its classifier approves what it judges safe, which is neither this posture nor
+  the old one. **What would overturn this:** Mark saying so, or a session acting on story text
+  in a way a permission mode would actually have stopped.
+- **What remains is not a permission.** `--permission-prompts none` (there is no human on the
+  other end: asking cannot be ANSWERED, and without it a session blocks for ever on a dialog
+  nobody sees), `--max-turns` (a budget loopctl sets per story), and the `claude-headless.sh`
+  launcher with `ANTHROPIC_API_KEY` unset (a BILLING control, ~USD 300 in one night, KB
+  `b38ef90e` — not part of anyone's Claude setup). The argv carries no tool list, no allow- or
+  deny-list, and no settings or MCP override.
+- **Deny by NAME with a reason per name; never deny a class and grant exceptions back.** That
+  inverts who has to notice a mistake: a class deny takes every capability in the class —
+  `Agent`, `SendMessage`, `WebFetch` and `Skill` under a fixed tool list, tidewave and playwright
+  under an MCP wildcard — and each stays missing until someone asks the right question.
+- **loopctl's MCP tools are not excluded, and the tempting argument against that is wrong.** A
+  session holding `claim_story`/`contract_story` could move the story it was dispatched to
+  implement — but the story-lifecycle protocol IS those tools, so excluding them would disable
+  `loopctl-contract`, `loopctl-status`, `loopctl-mcp` and `/loopctl:implement`. A local
+  `elixir-engineer` holds them today. If the custody model needs more, that is loopctl's to solve.
+- **No tool is excluded, tidewave included.** A session inherits the repo's `.mcp.json` from the
+  tree the runner starts it in, as an attended session in that tree does. Repos resolve tidewave
+  per worktree (their `.mcp.json` launching through a per-tree port script), an attended worktree
+  session carries no exclusion, and parity forbids one here (Mark, 2026-09-27: *"unattended sessions should enjoy the same permissions as
+  attended sessions -- no less."*). A repo whose `.mcp.json` hardcodes the main tree's URL has that defect
+  in attended worktrees too, and it is that repo's to fix. **What would overturn this:** Mark
+  saying so.
 - **A session inherits none of the runner's release environment** (`RELEASE_*`, the release's
-  `PATH` entries): `Session.release_env/1` and `release_path/1`.
-- **The Bash allow-list is not a sandbox.** `mix test` runs whatever code the session wrote, as
-  this user. The allow-list stops the session's own commands; isolation beyond that needs an OS
-  boundary the runner does not have yet.
+  `PATH` entries): `Session.release_env/1` and `release_path/1`. Otherwise it gets the environment
+  an attended session has — agent sockets and forge tokens included — less `ANTHROPIC_API_KEY`
+  and the variables that redirect git (`Session.unset_names/0`). Mark, 2026-09-27: *"unattended
+  sessions should enjoy the same permissions as attended sessions -- no less."*
+  The runner's OWN commands — the liveness probe, its fetch, its submodule git — are the other way
+  round: credentials are scrubbed by name and by shape (`ProcessGroup.run/5`,
+  `ProcessGroup.scrubbed_env/0`), and a name reaches one only when its caller inherits it.
+- **Nothing here is a sandbox.** `mix test` runs whatever code the session wrote, as this user,
+  and there is no longer any rule stopping the session's own commands either. Isolation needs an
+  OS boundary the runner does not have.
 - **Parking is never "no writes under `subagents/`"** (design §8). See `LoopctlRunner.Liveness`.
 - **A triage run works in a DETACHED worktree, never in the operator's live checkout.** It is the
   repo's one reused tree (`Worktree.triage_tree_path/2`, under `runs_dir/.triage-trees`, so his
@@ -131,8 +171,52 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   checkout git will not read is `checkout_unreadable`; a tree the runner could not cut is its own
   `no_verdict_written`.
 - **Fail closed.** A missing or malformed config refuses every dispatch.
-- **The runner commits, pushes and merges nothing** in step 1. Teardown keeps a branch unless
-  `origin`'s base already carries its content, rather than deleting work.
+- **The SESSION finishes the work, as the repository's delivery mode says; the runner reports
+  where it got to.** The dispatch prompt states the mode, read once the tree exists from
+  `.loopctl/mode` in the commit the worktree was cut from — a new or reset tree's HEAD before any
+  session runs, or for an adopted tree the merge base of its HEAD with the base, local and
+  `origin`'s, a commit the tree itself holds — never from the working tree, which the session can
+  write, and never from an unfetched remote ref that can differ from the tree (`Worktree.create/4`'s `cut_from`, `Worktree.commit_file/4`, `DispatchRun.prompt/4`).
+  A BOM, whitespace and case are set aside; only an explicit `thread` or `pr` runs. **A repository
+  with no `.loopctl/mode` is refused** (`repository has no .loopctl/mode`, reason `other`, never
+  `kind_not_supported`), because `pr` means the session merges on its own and a repository that
+  never opted in has not asked for that; an empty file or any other value is refused the same way
+  (`DispatchPolicy.delivery_mode/1`). In a `thread` repository the session commits and pushes
+  ONLY through `priv/bin/loop-push`, whose absolute path the prompt names
+  (`Session.push_script/0`), and opens no pull request, merges nothing and never force-pushes —
+  loopctl's merge executor merges the checkpoints the runner reports. In a `pr` repository it
+  follows the operator's delivery loop, which it inherits with `SOUL.md` and the user `CLAUDE.md`
+  — Mark, 2026-09-16: *"the same claude setup means the same claude setup as the local agents.
+  with the same rules and workflows. the same soul.md, the same claude.md, etc"* — opening the PR
+  with `gh pr create --base <the dispatch's base>` and merging only into that base. The branch and
+  the worktree stay the runner's: the pr-mode prompt tells the session not to remove the worktree,
+  delete the local branch or check the base out in it, and so to merge without `--delete-branch`.
+  `LOOP_BRANCH` names the story's branch in the session's environment, because `loop-push` refuses
+  to run without it. The contract carries the whole ladder (`claimed → worktree → implementing →
+  reviewing → pr_open → ci → merged → deployed`, since 1.12.0). The RUNNER itself commits,
+  pushes and merges nothing, and its teardown deletes a branch only when `origin`'s base already
+  carries its content.
+- **Thread mode waits on #60 and then #59.** #60 adds `priv/bin/loop-push`; #59 adds
+  `LoopctlRunner.CheckpointStream`, which reports each pushed commit as the checkpoint loopctl's
+  merge executor merges. Until both are in, a thread-mode run is refused before a session starts:
+  `push helper missing` without the first (`DispatchPolicy.push_helper/2`), `checkpoint reporting
+  not available` without the second (`DispatchPolicy.checkpoint_reporting/2`), rather than
+  started on a prompt naming a command that is not there, or pushing work nothing ever merges.
+- **The story-lifecycle protocol lives in the operator's skills and commands, NOT in this repo.**
+  `loopctl-contract`, `loopctl-status`, `loopctl-mcp`, `loopctl-plan`, `loopctl-verify-artifacts`
+  and `/loopctl:implement` already carry contract, claim, stage reporting and verification, and a
+  session inheriting the setup gets all of them. Do not reimplement any of it here, and do not add
+  a runner-side command for reporting stages: the session reports its own through the loopctl MCP
+  tools those skills call. The runner reports only the two stages it can OBSERVE — `claimed →
+  worktree` when it cuts the tree, `worktree → implementing` when the session starts — plus the
+  SESSION's end as `session_ended` (`completed`, `wall_clock_exceeded`, `max_turns_exceeded` or
+  `crashed`, read off the run's status by `DispatchRun.session_ended/2`), from which control
+  decides the story's next stage. **Never report a delivered story `-> escalated`**: that label
+  cannot leave `deployed` and says a human is needed when none is. The runner sends `-> escalated`
+  only when it is the truth — the session ran `loop-escalate` (then `session_ended` follows, and
+  its `completed` "changes nothing", per the contract) or no session ever started (no worktree, a
+  refused prompt). `terminal_reported` in `state.json` records that the run's LAST end report
+  settled, which is what a restarted daemon reads before reporting it again.
 - **Tests never record environment VALUES.** The dev machines carry live credentials in the
   environment, and a failing assertion prints whatever it compared.
 

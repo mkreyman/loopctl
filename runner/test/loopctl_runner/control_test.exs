@@ -57,7 +57,7 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.12.0"
+    assert join["contract_version"] == "1.21.0"
     # Declared on EVERY join, from the same list the kind check reads.
     assert join["kinds"] == LoopctlRunner.Control.kinds()
     assert join["kinds"] == ["implement"]
@@ -65,6 +65,9 @@ defmodule LoopctlRunner.ControlTest do
     # no declaration at all and falls back to its permanent ledger.
     refute join["kinds"] == []
     assert join["repos"] == ["mkreyman/home_care_billing"]
+    # The SAME set DispatchPolicy enforces (contract 1.14.0): an undeclared prefix makes loopctl
+    # derive branches this machine refuses.
+    assert join["branch_prefixes"] == ctx.config.branch_prefixes
     assert %{"sampled_at" => _, "free_disk_mb" => _} = join["sample"]
 
     assert_receive {:test_loopctl, {:status, status}}, 5_000
@@ -707,6 +710,17 @@ defmodule LoopctlRunner.ControlTest do
       :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
     end
 
+    test "a rate-limited batch whose interval is not a positive integer is still resent", ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "rate_limited", min_interval_ms: 1.5}}])
+      dispatched_run(ctx, 0..2)
+      pid = shipping_control(ctx)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => events}}}, 5_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => ^events}}}, 3_000
+      assert Process.alive?(pid)
+    end
+
     test "an event loopctl refuses as too large is resent without its data", ctx do
       run_id = ctx.run_id
       TestLoopctl.put(:trace_replies, [{:error, %{reason: "event_data_too_large", seq: 1}}])
@@ -1158,7 +1172,12 @@ defmodule LoopctlRunner.ControlTest do
     alias LoopctlRunner.{DispatchRun, Run, RunState, Session}
 
     setup ctx do
-      git_repo!(Path.join(ctx.root, "repo"))
+      repo = git_repo!(Path.join(ctx.root, "repo"))
+      # Only a repository that states its mode runs; a test about another mode commits over it.
+      File.mkdir_p!(Path.join(repo, ".loopctl"))
+      File.write!(Path.join([repo, ".loopctl", "mode"]), "pr\n")
+      git!(repo, ["add", ".loopctl/mode"])
+      git!(repo, ["commit", "-q", "-m", "mode"])
       fake = Path.join(ctx.root, "fake")
       File.mkdir_p!(fake)
       supervisor = start_supervised!(Task.Supervisor)
@@ -1244,6 +1263,21 @@ defmodule LoopctlRunner.ControlTest do
       end
     end
 
+    defp next_session_ended(timeout \\ 15_000) do
+      receive do
+        {:test_loopctl, {:session_ended, payload}} -> payload
+      after
+        timeout -> flunk("no session_ended within #{timeout}ms")
+      end
+    end
+
+    # What a run whose session ran loop-escalate finishes with.
+    defp escalated_summary,
+      do: %{status: "escalated", reached: "implementing", escalations: ["a business call"]}
+
+    defp end_recorded(run_dir, value),
+      do: fn -> match?({:ok, %{"terminal_reported" => ^value}}, RunState.read(run_dir)) end
+
     test "an accepted dispatch runs, reports its stages in order and ships its trace", ctx do
       {pid, topic} = accepting_control(ctx, "stream")
       dispatch = story_dispatch()
@@ -1269,23 +1303,21 @@ defmodule LoopctlRunner.ControlTest do
 
       assert %{"from" => "worktree", "to" => "implementing"} = next_stage()
 
-      assert next_stage() == %{
+      # The session delivers, so the run reports its END, not a stage: no `-> escalated`.
+      assert next_session_ended() == %{
                "dispatch_id" => id,
                "claim_epoch" => 3,
-               "from" => "implementing",
-               "to" => "escalated",
-               "edge" => "session_escalated",
-               "reason" => DispatchRun.finished_reason()
+               "reason" => "completed"
              }
 
       # The run's state is bound to the dispatch, so its trace ships.
-      assert [{_run_dir, state}] = RunState.all(ctx.config.runs_dir)
+      assert [{run_dir, state}] = RunState.all(ctx.config.runs_dir)
       assert %{"dispatch_id" => ^id, "claim_epoch" => 3, "status" => "succeeded"} = state
       assert state["story_id"] == dispatch["story_id"]
       run_id = state["run_id"]
       assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 10_000
 
-      # The session got the fenced story, and the runner's allowed tools only.
+      # The session got the fenced story.
       argv = File.read!(Path.join(ctx.fake, "argv"))
 
       assert argv =~
@@ -1293,7 +1325,148 @@ defmodule LoopctlRunner.ControlTest do
 
       runs_done(pid)
       refute_receive {:test_loopctl, {:stage, _}}, 300
+      refute_receive {:test_loopctl, {:session_ended, _}}, 300
       :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
+      :ok = wait_until(end_recorded(run_dir, true))
+    end
+
+    # Commits `.loopctl/mode` holding `content` on the fixture's master, which is the base every
+    # dispatch here names; the fixture has no origin, so the base as given is what is read.
+    defp commit_mode!(ctx, content) do
+      repo = Path.join(ctx.root, "repo")
+      File.mkdir_p!(Path.join(repo, ".loopctl"))
+      File.write!(Path.join([repo, ".loopctl", "mode"]), content)
+      git!(repo, ["add", ".loopctl/mode"])
+      git!(repo, ["commit", "-q", "-m", "mode"])
+      repo
+    end
+
+    defp push_helper!(ctx) do
+      helper = Path.join(ctx.root, "loop-push")
+      File.write!(helper, "#!/bin/sh\nexit 0\n")
+      File.chmod!(helper, 0o755)
+      helper
+    end
+
+    # Any module this build has stands in for the checkpoint reporter PR #59 adds.
+    @reporter __MODULE__
+
+    test "a repository in thread mode gets the thread prompt and LOOP_BRANCH", ctx do
+      commit_mode!(ctx, "thread\n")
+      helper = push_helper!(ctx)
+
+      {pid, topic} =
+        accepting_control(ctx, "stream", %{},
+          push_script: helper,
+          checkpoint_reporter: @reporter
+        )
+
+      dispatch = story_dispatch()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert %{"to" => "worktree"} = next_stage()
+      assert %{"to" => "implementing"} = next_stage()
+      assert %{"reason" => "completed"} = next_session_ended()
+      runs_done(pid)
+
+      argv = File.read!(Path.join(ctx.fake, "argv"))
+      assert argv =~ "Delivery mode: thread\n"
+      assert argv =~ helper
+      refute argv =~ "Delivery mode: pr\n"
+
+      # loop-push refuses to run without the branch it may push.
+      assert File.read!(Path.join(ctx.fake, "env")) =~
+               ~r/^LOOP_BRANCH=#{Regex.escape(dispatch["branch"])}$/m
+    end
+
+    test "the mode is the commit the tree was cut from, not an unfetched origin ref", ctx do
+      # refs/remotes/origin/master says pr and was never fetched past; the local master the
+      # worktree is cut from says thread. The session starts in thread's tree, so thread it is.
+      repo = Path.join(ctx.root, "repo")
+      git!(repo, ["update-ref", "refs/remotes/origin/master", git!(repo, ["rev-parse", "HEAD"])])
+      commit_mode!(ctx, "thread\n")
+
+      {pid, topic} =
+        accepting_control(ctx, "stream", %{},
+          push_script: push_helper!(ctx),
+          checkpoint_reporter: @reporter
+        )
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+      assert %{"to" => "worktree"} = next_stage()
+      assert %{"to" => "implementing"} = next_stage()
+      assert %{"reason" => "completed"} = next_session_ended()
+      runs_done(pid)
+
+      assert File.read!(Path.join(ctx.fake, "argv")) =~ "Delivery mode: thread\n"
+    end
+
+    test "a repository with no .loopctl/mode is refused before a session, never run as pr", ctx do
+      repo = Path.join(ctx.root, "repo")
+      git!(repo, ["rm", "-q", ".loopctl/mode"])
+      git!(repo, ["commit", "-q", "-m", "no mode"])
+
+      {pid, topic} = accepting_control(ctx, "stream")
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert %{"to" => "worktree"} = next_stage()
+
+      assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
+      assert reason =~ "run ended refused"
+      assert reason =~ "other: repository has no .loopctl/mode"
+      runs_done(pid)
+      refute_receive {:test_loopctl, {:session_ended, _}}, 500
+
+      refute File.exists?(Path.join(ctx.fake, "argv"))
+    end
+
+    test "a thread repository on a build without checkpoint reporting is refused", ctx do
+      commit_mode!(ctx, "thread\n")
+
+      # The default reporter: LoopctlRunner.CheckpointStream, which this branch does not have.
+      {pid, topic} = accepting_control(ctx, "stream", %{}, push_script: push_helper!(ctx))
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+      assert %{"to" => "worktree"} = next_stage()
+
+      assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
+      assert reason =~ "checkpoint reporting not available"
+      runs_done(pid)
+
+      refute File.exists?(Path.join(ctx.fake, "argv"))
+    end
+
+    test "a thread repository on a release without loop-push is refused before a session", ctx do
+      commit_mode!(ctx, "thread\n")
+      missing = Path.join(ctx.root, "no-such-loop-push")
+
+      {pid, topic} = accepting_control(ctx, "stream", %{}, push_script: missing)
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert %{"to" => "worktree"} = next_stage()
+
+      assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
+      assert reason =~ "run ended refused"
+      assert reason =~ "push helper missing: #{missing}"
+      runs_done(pid)
+      # No session existed, so there is no session end to report.
+      refute_receive {:test_loopctl, {:session_ended, _}}, 500
+
+      refute File.exists?(Path.join(ctx.fake, "argv"))
+    end
+
+    test "a malformed .loopctl/mode is refused naming it, never read as pr", ctx do
+      commit_mode!(ctx, "threads\n")
+
+      {pid, topic} = accepting_control(ctx, "stream")
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+      assert %{"to" => "worktree"} = next_stage()
+
+      assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
+      assert reason =~ "run ended refused"
+      assert reason =~ ~s(malformed delivery mode "threads")
+      runs_done(pid)
+
+      refute File.exists?(Path.join(ctx.fake, "argv"))
     end
 
     test "a run that does not finish reports its outcome, escalation text included", ctx do
@@ -1306,6 +1479,8 @@ defmodule LoopctlRunner.ControlTest do
       assert reason =~ "run ended escalated"
       assert reason =~ "session exit reason escalated"
       assert reason =~ "The story contradicts an existing KB decision."
+      # Behind the escalation: the session's end, which `completed` reports without moving it.
+      assert %{"reason" => "completed"} = next_session_ended()
       runs_done(pid)
     end
 
@@ -1323,6 +1498,88 @@ defmodule LoopctlRunner.ControlTest do
       assert reason =~ "run ended failed"
       assert reason =~ "already exists without a worktree"
       runs_done(pid)
+      refute_receive {:test_loopctl, {:session_ended, _}}, 500
+    end
+
+    test "a session that runs out of turns is reported max_turns_exceeded", ctx do
+      {pid, topic} = accepting_control(ctx, "max_turns")
+      dispatch = story_dispatch()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert %{"to" => "worktree"} = next_stage()
+      assert %{"to" => "implementing"} = next_stage()
+
+      assert next_session_ended() == %{
+               "dispatch_id" => dispatch["dispatch_id"],
+               "claim_epoch" => 3,
+               "reason" => "max_turns_exceeded"
+             }
+
+      runs_done(pid)
+      refute_receive {:test_loopctl, {:stage, _}}, 300
+    end
+
+    test "a run whose task dies before it has a run directory is escalated from claimed", ctx do
+      # No run directory was announced, so no session can have started: there is no session to
+      # report ended, and the story goes to a human rather than back to the queue.
+      {pid, topic} =
+        accepting_control(ctx, "stream", %{}, run: fn _config, _story, _opts -> exit(:boom) end)
+
+      capture_log(fn ->
+        dispatch = story_dispatch()
+        TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+        assert %{"dispatch_id" => id, "from" => "claimed", "to" => "escalated"} = next_stage()
+        assert id == dispatch["dispatch_id"]
+        runs_done(pid)
+        refute_receive {:test_loopctl, {:session_ended, _}}, 300
+      end)
+    end
+
+    test "a run whose task dies after its session escalated is reported escalated", ctx do
+      runs_dir = ctx.config.runs_dir
+
+      # What a run killed mid-session leaves: the stage it recorded, and its session's escalation.
+      run = fn _config, _story, opts ->
+        run_dir = Path.join(runs_dir, "killed-after-escalating")
+        File.mkdir_p!(run_dir)
+        File.write!(Path.join(run_dir, "escalations.ndjson"), ~s({"reason":"a business call"}\n))
+        RunState.update(run_dir, %{"status" => "running", "reached" => "implementing"})
+        opts[:on_stage].({:started, %{run_id: Session.uuid4(), run_dir: run_dir}})
+        exit(:boom)
+      end
+
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: run)
+
+      capture_log(fn ->
+        TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+
+        assert %{"to" => "escalated", "reason" => reason} = next_stage()
+        assert reason =~ "the session escalated: a business call"
+        # `crashed` would release the claim over the escalation and re-queue the story.
+        assert %{"reason" => "completed"} = next_session_ended()
+        runs_done(pid)
+      end)
+
+      # Closed as it was reported, so a later Control reading it back reports the same end.
+      assert {:ok, %{"status" => "escalated"}} =
+               RunState.read(Path.join(runs_dir, "killed-after-escalating"))
+    end
+
+    test "each budget and ending is the reason its summary names", ctx do
+      {pid, _topic} = accepting_control(ctx, "stream")
+
+      for {summary, reason} <- [
+            {%{status: "wall_clock_exceeded", reached: "implementing"}, "wall_clock_exceeded"},
+            {%{status: "failed", reached: "implementing"}, "crashed"},
+            {%{status: "parked", reached: "implementing"}, "crashed"}
+          ] do
+        binding = DispatchRun.binding(story_dispatch())
+        send(pid, {:run_stage, binding, {:finished, summary}})
+        assert next_session_ended(5_000)["reason"] == reason
+      end
+
+      refute_receive {:test_loopctl, {:stage, _}}, 300
     end
 
     test "an accept loopctl refuses never starts the run, and frees its capacity", ctx do
@@ -1429,11 +1686,9 @@ defmodule LoopctlRunner.ControlTest do
         {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
       )
 
-      assert %{"from" => "implementing", "to" => "escalated", "reason" => reason} =
-               next_stage(5_000)
-
-      assert reason == DispatchRun.finished_reason()
-      :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
+      assert %{"reason" => "completed"} = next_session_ended(5_000)
+      refute_receive {:test_loopctl, {:stage, _}}, 300
+      :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 0 end, 3_000)
     end
 
     test "a run outliving its Control reports its stages to the one that replaces it", ctx do
@@ -1456,8 +1711,7 @@ defmodule LoopctlRunner.ControlTest do
 
       assert %{"dispatch_id" => ^id, "from" => "claimed", "to" => "worktree"} = next_stage()
       assert %{"from" => "worktree", "to" => "implementing"} = next_stage()
-      assert %{"to" => "escalated", "reason" => reason} = next_stage()
-      assert reason == DispatchRun.finished_reason()
+      assert %{"dispatch_id" => ^id, "reason" => "completed"} = next_session_ended()
     end
 
     test "a null list item is refused as other, and Control keeps running", ctx do
@@ -1524,10 +1778,7 @@ defmodule LoopctlRunner.ControlTest do
       {pid, _topic} = accepting_control(ctx, "stream")
       binding = DispatchRun.binding(story_dispatch())
 
-      send(
-        pid,
-        {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
-      )
+      send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
 
       assert %{"from" => "implementing", "to" => "escalated", "reason" => reason} = next_stage()
 
@@ -1540,7 +1791,9 @@ defmodule LoopctlRunner.ControlTest do
                "reason" => reason
              }
 
-      assert reason == DispatchRun.finished_reason()
+      assert reason =~ "the session escalated: a business call"
+      # The escalation settled, and the session's end goes behind it.
+      assert %{"reason" => "completed"} = next_session_ended()
       refute_receive {:test_loopctl, {:stage, _}}, 800
       assert Control.info(pid).stage_reports_pending == 0
     end
@@ -1550,14 +1803,14 @@ defmodule LoopctlRunner.ControlTest do
       TestLoopctl.put(:stage_replies, [:ok, :ok, stale, :ok])
 
       capture_log(fn ->
-        {pid, topic} = accepting_control(ctx, "stream")
+        {pid, topic} = accepting_control(ctx, "escalate_and_exit")
         TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
 
         assert %{"to" => "worktree"} = next_stage()
         assert %{"to" => "implementing"} = next_stage()
         assert %{"from" => "implementing", "to" => "escalated"} = next_stage()
         assert %{"from" => "claimed", "to" => "escalated", "reason" => reason} = next_stage()
-        assert reason == DispatchRun.finished_reason()
+        assert reason =~ "run ended escalated"
         runs_done(pid)
         refute_receive {:test_loopctl, {:stage, _}}, 1_000
         assert Control.info(pid).stage_reports_pending == 0
@@ -1583,10 +1836,7 @@ defmodule LoopctlRunner.ControlTest do
         send(pid, {:run_stage, binding, {:implementing, %{}}})
         assert %{"from" => "worktree", "to" => "implementing"} = next_stage(5_000)
 
-        send(
-          pid,
-          {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
-        )
+        send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
 
         assert %{"from" => "implementing", "to" => "escalated"} = next_stage(5_000)
         assert %{"from" => "worktree", "to" => "escalated"} = next_stage(5_000)
@@ -1594,7 +1844,7 @@ defmodule LoopctlRunner.ControlTest do
         assert %{"from" => "reviewing", "to" => "escalated", "reason" => reason} =
                  next_stage(5_000)
 
-        assert reason == DispatchRun.finished_reason()
+        assert reason =~ "run ended escalated"
         refute_receive {:test_loopctl, {:stage, _}}, 800
         :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
       end)
@@ -1614,10 +1864,7 @@ defmodule LoopctlRunner.ControlTest do
           {pid, _topic} = accepting_control(ctx, "stream")
           binding = DispatchRun.binding(dispatch)
 
-          send(
-            pid,
-            {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
-          )
+          send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
 
           assert %{"from" => "implementing", "to" => "escalated"} = next_stage()
           # Nothing is tried from `escalated`, nor from anywhere else.
@@ -1642,10 +1889,7 @@ defmodule LoopctlRunner.ControlTest do
           {pid, _topic} = accepting_control(ctx, "stream")
           binding = DispatchRun.binding(dispatch)
 
-          send(
-            pid,
-            {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
-          )
+          send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
 
           assert %{"from" => "implementing", "to" => "escalated"} = next_stage()
           refute_receive {:test_loopctl, {:stage, _}}, 1_000
@@ -1691,31 +1935,228 @@ defmodule LoopctlRunner.ControlTest do
 
       {pid, _topic} = accepting_control(ctx, "stream")
 
-      assert next_stage(5_000) == %{
+      assert next_session_ended(5_000) == %{
                "dispatch_id" => dispatch["dispatch_id"],
                "claim_epoch" => 3,
-               "from" => "implementing",
-               "to" => "escalated",
-               "edge" => "session_escalated",
-               "reason" => DispatchRun.finished_reason()
+               "reason" => "completed"
              }
 
-      :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
-
-      reported? = fn -> match?({:ok, %{"terminal_reported" => true}}, RunState.read(run_dir)) end
-      :ok = wait_until(reported?)
+      :ok = wait_until(end_recorded(run_dir, true))
+      refute_received {:test_loopctl, {:stage, _}}
 
       # Recorded, so the next Control does not report it again.
       GenServer.stop(pid)
       {second, _ref} = start_accepting(ctx, %{}, [])
       :ok = wait_until(fn -> Control.info(second).joined end, 5_000)
-      refute_receive {:test_loopctl, {:stage, _}}, 800
+      refute_receive {:test_loopctl, {:session_ended, _}}, 800
+      refute_received {:test_loopctl, {:stage, _}}
     end
 
-    test "a terminal report refused from a stage already tried is recorded and not reported again",
+    test "a fresh Control reports an escalated run's escalation, then its session's end", ctx do
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "escalated-run")
+      File.mkdir_p!(run_dir)
+      File.write!(Path.join(run_dir, "escalations.ndjson"), ~s({"reason":"a business call"}\n))
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "escalated",
+          "reached" => "implementing"
+        })
+      )
+
+      {_pid, _topic} = accepting_control(ctx, "stream")
+
+      assert %{"from" => "implementing", "to" => "escalated", "reason" => reason} =
+               next_stage(5_000)
+
+      assert reason =~ "the session escalated: a business call"
+      assert %{"reason" => "completed"} = next_session_ended(5_000)
+      :ok = wait_until(end_recorded(run_dir, true))
+    end
+
+    test "an escalation recorded does not record the run's end while its session_ended is not",
+         ctx do
+      internal = {:error, %{reason: "internal_error"}}
+      TestLoopctl.put(:session_ended_replies, [internal, internal])
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "escalated-unsettled-run")
+      File.mkdir_p!(run_dir)
+      File.write!(Path.join(run_dir, "escalations.ndjson"), ~s({"reason":"a business call"}\n))
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "escalated",
+          "reached" => "implementing"
+        })
+      )
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream", %{}, internal_error_attempts: 2)
+        assert %{"to" => "escalated"} = next_stage(5_000)
+        for _ <- 1..2, do: assert(%{"reason" => "completed"} = next_session_ended(5_000))
+        :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 0 end, 3_000)
+      end)
+
+      # The escalation was acknowledged, but the run's LAST end report was not: a restarted
+      # Control must still send it.
+      assert {:ok, state} = RunState.read(run_dir)
+      refute Map.has_key?(state, "terminal_reported")
+    end
+
+    test "a run whose owner died after its session escalated is reported escalated, not crashed",
          ctx do
       dispatch = story_dispatch()
-      run_dir = Path.join(ctx.config.runs_dir, "refused-run")
+      run_dir = Path.join(ctx.config.runs_dir, "dead-owner-escalated-run")
+      File.mkdir_p!(run_dir)
+      File.write!(Path.join(run_dir, "escalations.ndjson"), ~s({"reason":"a business call"}\n))
+
+      # "running", and no owner that is alive: the run never recorded its end.
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "running"
+        })
+      )
+
+      {_pid, _topic} = accepting_control(ctx, "stream")
+
+      assert %{"from" => "implementing", "to" => "escalated", "reason" => reason} =
+               next_stage(5_000)
+
+      assert reason =~ "the session escalated: a business call"
+      # `crashed` would release the claim over runner_lost and re-queue the story.
+      assert %{"reason" => "completed"} = next_session_ended(5_000)
+      :ok = wait_until(end_recorded(run_dir, true))
+    end
+
+    test "a run whose owner died with no escalation is still reported crashed", ctx do
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "dead-owner-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "running"
+        })
+      )
+
+      {_pid, _topic} = accepting_control(ctx, "stream")
+      assert %{"reason" => "crashed"} = next_session_ended(5_000)
+      refute_receive {:test_loopctl, {:stage, _}}, 300
+    end
+
+    test "a fresh Control reports a run over its wall clock with that reason", ctx do
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "wall-clock-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "wall_clock_exceeded",
+          "reached" => "implementing"
+        })
+      )
+
+      {_pid, _topic} = accepting_control(ctx, "stream")
+      assert %{"reason" => "wall_clock_exceeded"} = next_session_ended(5_000)
+      refute_receive {:test_loopctl, {:stage, _}}, 300
+    end
+
+    test "a session_ended whose reply is lost is resent as the same bytes after a rejoin", ctx do
+      TestLoopctl.put(:session_ended_replies, [:none, :replayed])
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: :warning) end)
+
+      log =
+        capture_log(fn ->
+          {pid, _topic} = accepting_control(ctx, "stream")
+          binding = DispatchRun.binding(story_dispatch())
+          send(pid, {:run_stage, binding, {:finished, %{status: "succeeded"}}})
+
+          first = next_session_ended(5_000)
+          :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 1 end, 3_000)
+
+          TestLoopctl.disconnect_runner()
+          :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+          assert next_session_ended(5_000) == first
+          :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 0 end, 3_000)
+          refute_receive {:test_loopctl, {:session_ended, _}}, 500
+        end)
+
+      assert log =~ "it was a resend, and loopctl applied nothing a second time"
+    end
+
+    test "the session's end waits behind every stage report still to go", ctx do
+      # Reported while the channel is down, both are held; after the rejoin the stage goes first,
+      # because a `crashed` end releases the claim and a stage report sent after it is refused.
+      {pid, _topic} = accepting_control(ctx, "stream")
+      binding = DispatchRun.binding(story_dispatch())
+
+      capture_log(fn ->
+        TestLoopctl.disconnect_runner()
+        :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+
+        send(
+          pid,
+          {:run_stage, binding, {:finished, %{status: "failed", reached: "implementing"}}}
+        )
+
+        :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+        assert_receive {:test_loopctl, {event, _payload}} when event in [:stage, :session_ended],
+                       5_000
+
+        assert event == :stage
+        assert %{"reason" => "crashed"} = next_session_ended(5_000)
+      end)
+    end
+
+    test "a rate-limited session_ended waits the interval it names, then goes again", ctx do
+      limited = {:error, %{reason: "rate_limited", min_interval_ms: 400}}
+      TestLoopctl.put(:session_ended_replies, [limited, :ok])
+      {pid, _topic} = accepting_control(ctx, "stream")
+      binding = DispatchRun.binding(story_dispatch())
+      send(pid, {:run_stage, binding, {:finished, %{status: "succeeded"}}})
+
+      first = next_session_ended(5_000)
+      sent = System.monotonic_time(:millisecond)
+      assert next_session_ended(3_000) == first
+      assert System.monotonic_time(:millisecond) - sent >= 400
+      :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 0 end, 3_000)
+      refute_receive {:test_loopctl, {:session_ended, _}}, 500
+    end
+
+    test "a rate-limited session_ended whose interval is not a positive integer goes again",
+         ctx do
+      limited = {:error, %{reason: "rate_limited", min_interval_ms: "400"}}
+      TestLoopctl.put(:session_ended_replies, [limited, :ok])
+      {pid, _topic} = accepting_control(ctx, "stream")
+      binding = DispatchRun.binding(story_dispatch())
+      send(pid, {:run_stage, binding, {:finished, %{status: "succeeded"}}})
+
+      first = next_session_ended(5_000)
+      assert next_session_ended(3_000) == first
+      :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 0 end, 3_000)
+    end
+
+    test "internal_error on a session_ended is retried to the ceiling, left for a restart", ctx do
+      internal = {:error, %{reason: "internal_error"}}
+      TestLoopctl.put(:session_ended_replies, [internal, internal, internal])
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "internal-run")
       File.mkdir_p!(run_dir)
 
       RunState.update(
@@ -1724,6 +2165,62 @@ defmodule LoopctlRunner.ControlTest do
           "run_id" => Session.uuid4(),
           "status" => "succeeded",
           "reached" => "implementing"
+        })
+      )
+
+      log =
+        capture_log(fn ->
+          {pid, _topic} = accepting_control(ctx, "stream", %{}, internal_error_attempts: 3)
+          for _ <- 1..3, do: assert(%{"reason" => "completed"} = next_session_ended(5_000))
+          refute_receive {:test_loopctl, {:session_ended, _}}, 800
+          assert Control.info(pid).session_ended_pending == 0
+        end)
+
+      assert log =~ ~r/giving up on session_ended for dispatch \S+ after 3 internal_error/
+      # Only this process gave up: nothing is recorded, so the next Control sends it again.
+      assert {:ok, state} = RunState.read(run_dir)
+      refute Map.has_key?(state, "terminal_reported")
+    end
+
+    test "a permanent refusal of a session_ended is recorded and not sent again", ctx do
+      for {refusal, recorded} <- [{"stale_claim_epoch", "refused"}, {"already_recorded", true}] do
+        TestLoopctl.put(:session_ended_replies, [{:error, %{reason: refusal}}])
+        dispatch = story_dispatch()
+        run_dir = Path.join(ctx.config.runs_dir, "permanent-#{refusal}")
+        File.mkdir_p!(run_dir)
+
+        RunState.update(
+          run_dir,
+          Map.merge(DispatchRun.binding(dispatch), %{
+            "run_id" => Session.uuid4(),
+            "status" => "failed",
+            "reached" => "implementing"
+          })
+        )
+
+        capture_log(fn ->
+          {pid, _topic} = accepting_control(ctx, "stream")
+          assert %{"reason" => "crashed"} = next_session_ended(5_000)
+          :ok = wait_until(end_recorded(run_dir, recorded))
+          refute_receive {:test_loopctl, {:session_ended, _}}, 500
+          GenServer.stop(pid)
+        end)
+      end
+    end
+
+    test "a terminal report refused from a stage already tried is recorded and not reported again",
+         ctx do
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "refused-run")
+      File.mkdir_p!(run_dir)
+
+      # A run that never got a worktree: its terminal `escalated` is the whole of its end.
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "failed",
+          "reached" => "claimed"
         })
       )
 
@@ -1920,7 +2417,8 @@ defmodule LoopctlRunner.ControlTest do
       refute_received {:run_started, _}
     end
 
-    test "stale_stage on an intermediate report stops the intermediates, not the terminal", ctx do
+    test "stale_stage on an intermediate report stops the intermediates, not the run's end",
+         ctx do
       TestLoopctl.put(:stage_replies, [{:error, %{reason: "stale_stage", stage: "implementing"}}])
       dispatch = story_dispatch()
 
@@ -1930,9 +2428,8 @@ defmodule LoopctlRunner.ControlTest do
           TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
 
           assert %{"from" => "claimed", "to" => "worktree"} = next_stage()
-          # worktree -> implementing is not reported; the run's end is, from the believed stage.
-          assert %{"to" => "escalated", "reason" => reason} = next_stage()
-          assert reason == DispatchRun.finished_reason()
+          # worktree -> implementing is not reported; the run's end is.
+          assert %{"reason" => "completed"} = next_session_ended()
           runs_done(pid)
           refute_receive {:test_loopctl, {:stage, _}}, 1_000
           assert Process.alive?(pid)
@@ -1953,7 +2450,7 @@ defmodule LoopctlRunner.ControlTest do
       dispatch = story_dispatch()
 
       capture_log(fn ->
-        {pid, topic} = accepting_control(ctx, "stream")
+        {pid, topic} = accepting_control(ctx, "escalate_and_exit")
         TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
 
         assert %{"from" => "claimed", "to" => "worktree"} = next_stage()
@@ -1961,14 +2458,14 @@ defmodule LoopctlRunner.ControlTest do
         # NOT "worktree", which is where this stream believed the story was and what the old code
         # would have sent: the refusal said `reviewing`, and the terminal report goes from there.
         assert %{"from" => "reviewing", "to" => "escalated", "reason" => reason} = next_stage()
-        assert reason == DispatchRun.finished_reason()
+        assert reason =~ "run ended escalated"
         runs_done(pid)
         refute_receive {:test_loopctl, {:stage, _}}, 1_000
         assert Control.info(pid).stage_reports_pending == 0
       end)
     end
 
-    test "a report given up after internal_error blocks neither later reports nor the terminal",
+    test "a report given up after internal_error blocks neither later reports nor the run's end",
          ctx do
       internal = {:error, %{reason: "internal_error"}}
       TestLoopctl.put(:stage_replies, [internal, internal, internal, :ok, :ok])
@@ -1979,13 +2476,9 @@ defmodule LoopctlRunner.ControlTest do
           TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
 
           for _ <- 1..3, do: assert(%{"to" => "worktree"} = next_stage())
-          # The stream is alive: the next intermediate report still goes, then the terminal.
+          # The stream is alive: the next intermediate report still goes, then the run's end.
           assert %{"from" => "worktree", "to" => "implementing"} = next_stage()
-
-          assert %{"from" => "implementing", "to" => "escalated", "reason" => reason} =
-                   next_stage()
-
-          assert reason == DispatchRun.finished_reason()
+          assert %{"reason" => "completed"} = next_session_ended()
           runs_done(pid)
           refute_receive {:test_loopctl, {:stage, _}}, 1_000
           assert Control.info(pid).stage_reports_pending == 0
@@ -2002,7 +2495,7 @@ defmodule LoopctlRunner.ControlTest do
       log =
         capture_log(fn ->
           {pid, topic} =
-            accepting_control(ctx, "stream", %{},
+            accepting_control(ctx, "escalate_and_exit", %{},
               internal_error_attempts: 2,
               terminal_internal_error_attempts: 4
             )
@@ -2011,8 +2504,16 @@ defmodule LoopctlRunner.ControlTest do
           assert %{"to" => "worktree"} = next_stage()
           assert %{"to" => "implementing"} = next_stage()
           for _ <- 1..4, do: assert(%{"to" => "escalated"} = next_stage())
+          # The session's end still goes behind the escalation given up.
+          assert %{"reason" => "completed"} = next_session_ended()
           runs_done(pid)
           refute_receive {:test_loopctl, {:stage, _}}, 1_500
+          :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 0 end, 3_000)
+
+          # ...but the escalation was never recorded, so neither is the run's end: a restarted
+          # Control reports both again.
+          [{_run_dir, state}] = RunState.all(ctx.config.runs_dir)
+          refute Map.has_key?(state, "terminal_reported")
         end)
 
       assert log =~
@@ -2173,6 +2674,23 @@ defmodule LoopctlRunner.ControlTest do
     Control.set_draining(pid, false)
     assert_receive {:test_loopctl, {:status_rate_limited, _}}, 3_000
     assert_receive {:test_loopctl, {:status, _}}, 3_000
+  end
+
+  test "a rate-limited status whose interval is not a positive integer waits the floor instead",
+       ctx do
+    # loopctl's data: a string here would crash Process.send_after/3, and this process with it.
+    TestLoopctl.put(:status_min_interval_ms, "soon")
+    slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+    {pid, _ref} = start_control(slow)
+    assert_receive {:test_loopctl, {:join, _, _}}, 5_000
+    :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+    Control.set_draining(pid, true)
+    assert_receive {:test_loopctl, {:status, _}}, 3_000
+    Control.set_draining(pid, false)
+    assert_receive {:test_loopctl, {:status_rate_limited, _}}, 3_000
+    assert_receive {:test_loopctl, {:status, _}}, 3_000
+    assert Process.alive?(pid)
   end
 
   test "the runner reports draining while it cannot accept dispatches", ctx do

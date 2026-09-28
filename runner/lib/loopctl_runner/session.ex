@@ -8,16 +8,59 @@ defmodule LoopctlRunner.Session do
   process carrying this session's `LOOP_SESSION_ID` marker, because the CLI's Bash tool
   detaches its commands into new sessions (see `LoopctlRunner.ProcessGroup`).
 
-  Unattended flags (design §8): `--permission-mode dontAsk --permission-prompts none` runs only
-  what is pre-allowed and removes `AskUserQuestion`, which makes waiting on a human impossible
-  rather than costly, `--setting-sources ""` keeps the operator's and the repository's settings
-  out, and `--max-turns` is the hard stop. Not `--bare`, which would drop the login.
+  THIS SESSION IS A LOCAL AGENT. Mark, 2026-09-16, in three instructions that settled it: *"All
+  agents must run with the yolo mode, the same as I'm running all my sessions now!"*, *"everything
+  must inherit my entire user scoped claude setup"*, and *"the same claude setup means the same
+  claude setup as the local agents. with the same rules and workflows. the same soul.md, the same
+  claude.md, etc"*. So it runs `--permission-mode bypassPermissions`, composes no `--allowedTools`,
+  passes no `--setting-sources` and excludes no tool or MCP server. It inherits `SOUL.md`, the user
+  `CLAUDE.md`, the hooks, the plugins, the agents, the skills and the MCP set. How it FINISHES is
+  the repository's delivery mode, which its prompt states (`LoopctlRunner.DispatchPrompt`): in a
+  `thread` repository it commits and pushes through `loop-push` (`push_script/0`) and loopctl's
+  merge executor merges the checkpoints it records; in a `pr` repository it runs the operator's
+  delivery loop — open the PR, review, fix every finding, merge on green — because that is what
+  those files say to do.
 
-  What a session can use at all is contained separately (`session_tools/0`): six built-in
-  tools, no MCP server and no plugin tool. An implement session needs a shell and the file
-  tools, and nothing that reaches beyond the worktree: no subagents, no loopctl MCP tools, no
-  web. A triage session will need its read-only lenses as agents; it gets its own contained set
-  when its contract exists (design §8), never this one widened.
+  WHAT REMAINS IS NOT A PERMISSION. Each answers "what is physically true of an unattended
+  process", never "what should an agent be allowed to do":
+
+    * `--permission-prompts none` — there is no human on the other end. Not "may not ask": asking
+      cannot be ANSWERED, and without this a session blocks for ever on a dialog nobody sees.
+    * `--max-turns` — a budget loopctl sets per story.
+    * `claude-headless.sh` with `ANTHROPIC_API_KEY` unset — a BILLING control, measured at ~USD 300
+      in one night when an environment key silently outranked the claude.ai login (KB b38ef90e).
+      Not part of anyone's Claude setup. IT IS NOT THE LAST WORD ON THE ENVIRONMENT, though the
+      unset order makes it look like one: the inherited settings are loaded AFTER both this and
+      `port_env/5`'s scrub, and an `env` block in the inherited settings is applied to the
+      session's environment, so it is a third injection path that neither control can see. What
+      that block carries is the operator's configuration, not a property of this design.
+
+  WHY LOOPCTL'S MCP TOOLS ARE NOT EXCLUDED, since the argument for it is easy to rebuild. It was going to be
+  `--disallowedTools mcp__loopctl__*`, on the ground that a session holding `claim_story` and
+  `contract_story` could move the very story it was dispatched to implement, making the actor and
+  the record-keeper one process. That is wrong twice over. The story-lifecycle protocol — the
+  `loopctl-contract`, `loopctl-status` and `loopctl-mcp` skills, and `/loopctl:implement` — IS
+  BUILT ON THOSE TOOLS, so excluding them would have disabled the very workflow it claimed to
+  protect. And a locally dispatched `elixir-engineer` holds them today with nobody objecting; if
+  the custody model needs a guarantee the tools cannot give, that is loopctl's to solve in
+  loopctl, not something this runner papers over by amputating tools.
+
+  THE GENERAL RULE, learned the expensive way in one hour: DENY BY NAME, WITH A REASON PER NAME.
+  The first instinct was to deny a class — all MCP, a fixed tool pool — and grant exceptions back;
+  that inverts who has to notice a mistake, and it took three corrections to find the two
+  capabilities it had silently removed (tidewave, then playwright, then `Agent` and `SendMessage`
+  hiding inside `--tools`).
+
+  THE DELIVERY LOOP'S OWN GATES NOW APPLY INSIDE A SESSION, and the first real run is where we
+  learn what that costs. The review-round counter, the merge gate (which refuses `gh pr merge` on a
+  branch with no counted round) and the drip-feed gate are all hooks in the inherited settings.
+  That is wanted — it is the same loop a local session runs — but a session can be BLOCKED by a
+  gate it cannot answer, and that will look like a stall rather than a refusal.
+
+  THE STORY LIFECYCLE IS NOT THIS REPO'S. Contract, claim, stage reporting, verification: all of
+  it lives in the operator's skills and commands, written for exactly this job. Do not reimplement
+  any of it here. The runner cuts the worktree, launches the session, watches the process, tears
+  the tree down, and reports the two stages it can actually observe.
   """
 
   use GenServer
@@ -45,7 +88,13 @@ defmodule LoopctlRunner.Session do
           session_id: String.t(),
           os_pid: pos_integer(),
           exit_status: non_neg_integer(),
-          reason: :exited | :wall_clock_exceeded | :parked | :not_group_leader | :escalated,
+          reason:
+            :exited
+            | :wall_clock_exceeded
+            | :max_turns_exceeded
+            | :parked
+            | :not_group_leader
+            | :escalated,
           duration_ms: non_neg_integer()
         }
 
@@ -95,10 +144,22 @@ defmodule LoopctlRunner.Session do
   def escalate_script, do: Application.app_dir(:loopctl_runner, "priv/bin/loop-escalate")
 
   @doc """
+  The absolute path of the command a session in a `thread` repository pushes its branch with.
+
+  It fetches before every push, merges what origin has that the branch lacks, and never forces,
+  because loopctl's merge executor may move a thread branch itself. It pushes only the branch
+  named by `LOOP_BRANCH`, which `port_env/5` sets, and refuses to run without it.
+  """
+  @spec push_script() :: String.t()
+  def push_script, do: Application.app_dir(:loopctl_runner, "priv/bin/loop-push")
+
+  @doc """
   Appended to the session's system prompt: how to ask for a human, since it cannot ask.
 
   A headless session has no AskUserQuestion and no hook observes a question it wanted to ask
-  (KB 16d4ff67), so escalation is a command it calls: exactly one absolute path, pre-allowed.
+  (KB 16d4ff67), so escalation is a command it calls: exactly one absolute path, named in the
+  prompt. Nothing denies it any more; the path still has to REACH the prompt or a session has no
+  way to ask.
   """
   @spec escalation_prompt() :: String.t()
   def escalation_prompt do
@@ -116,39 +177,12 @@ defmodule LoopctlRunner.Session do
     """
   end
 
-  # What an unattended session can use at all, as opposed to what it may run without asking.
-  # --allowedTools is an allow list: it grants, it does not remove. Measured on Claude Code
-  # 2.1.270 (KB c6452b2b, and on minis with this runner's own flags): without these, a session
-  # also had Agent, Workflow, Skill, SendMessage, RemoteTrigger, WebFetch, the cron tools, every
-  # configured MCP server (loopctl's destructive tools, with this machine's keys) and every
-  # function-hook plugin tool. A session that reads story text must have none of that:
-  #   --tools            the built-ins it keeps;
-  #   --strict-mcp-config --mcp-config '{"mcpServers":{}}'   no configured MCP server;
-  #   --disallowedTools "mcp__*"                              no plugin tool, present or future.
-  # Fixed here, never taken from a story or the config, so nothing a dispatch carries can widen it.
-  @session_tools ~w(Read Edit Write Glob Grep Bash)
-
-  # What a session may run without asking, which under dontAsk is everything it may run at all.
-  # --permission-mode auto was the first choice and it contained nothing: its classifier approves
-  # whatever it judges safe, so the first end-to-end run (2026-09-14) committed through a bash
-  # wrapper, ran docker exec psql and gh, and read ~/.claude. Probed on Claude Code 2.1.270 with
-  # claude-opus-5, the same prompt, one flag changed:
-  #   auto     touch, bash -c, `git status && touch` and a Write outside the cwd all ran;
-  #   dontAsk  each was denied, and only the rules below and the story's allowed_tools ran.
-  # --setting-sources "" loads no user, project or local settings: no permission allow rules the
-  # operator or the repository added (a session could otherwise write .claude/settings.json and
-  # grant itself more), no hooks, no plugins. The login is kept, unlike --bare.
-  # The file tools are scoped to the worktree, the session's cwd: outside it, Read, Grep and
-  # Write were denied in the same probe.
-  @file_rules ~w[Read(./**) Glob(./**) Grep(./**) Edit(./**) Write(./**)]
-
-  @doc "The built-in tools every session is limited to."
-  @spec session_tools() :: [String.t()]
-  def session_tools, do: @session_tools
-
-  @doc "The file-tool rules every session gets, scoped to its worktree."
-  @spec file_rules() :: [String.t()]
-  def file_rules, do: @file_rules
+  # NOTHING LIMITS THE TOOL POOL: the argv names no tool set, so a session has every tool a locally
+  # dispatched agent has — `Agent` to dispatch the engineer agent a repo's CLAUDE.md names,
+  # `SendMessage` to ask a peer session, `WebFetch` and `WebSearch` to read documentation, `Skill`
+  # to load a repo skill. If a tool ever has to be withheld, deny it BY NAME with a reason per
+  # name: denying a class and granting exceptions back leaves every capability in that class
+  # missing until somebody asks the right question.
 
   # The argv a run wants. `:argv` is the seam a run with a different contained set uses — a
   # triage run passes `LoopctlRunner.TriageTools.claude_args/4`'s result, which has its own tools,
@@ -164,35 +198,26 @@ defmodule LoopctlRunner.Session do
     end
   end
 
-  # Every launch used to go through `claude_args/3`, which pins the containment. A supplied argv
-  # is checked for the same flags rather than trusted to repeat them: one missing
-  # `--setting-sources` launches an unattended session with the operator's settings, hooks,
-  # plugins and MCP servers, and nothing else in this module would notice. The session id is
+  # A supplied argv is checked for the flags that are mechanically necessary rather than
+  # trusted to repeat them. They are not permission controls: without `--permission-prompts none`
+  # a session blocks for ever on a dialog nobody will see, and a session running under an id other
+  # than the one this module tracks makes a healthy session read as parked, after which the runner
+  # terminates it. The session id is
   # checked by VALUE — an argv that merely mentions it (in the prompt, in the agents JSON) while
   # omitting the flag leaves the CLI generating its own, and the marker, LOOP_SESSION_ID and the
   # liveness transcript then key to an id nothing runs under: a healthy session reads as parked,
   # and the runner terminates it.
   @required_argv %{
     "--session-id" => :session_id,
-    "--permission-mode" => "dontAsk",
-    "--permission-prompts" => "none",
-    "--setting-sources" => "",
-    "--mcp-config" => ~s({"mcpServers":{}}),
-    "--disallowedTools" => "mcp__*"
+    "--permission-mode" => "bypassPermissions",
+    "--permission-prompts" => "none"
   }
 
-  # Pinned to a VALUE above; these two are pinned only to being there, because their values are
-  # the run type's own — a triage session's tool pool is not an implement session's. Missing
-  # `--max-turns` leaves an unattended session with no turn ceiling at all, and missing `--tools`
-  # hands its pool back Agent, Workflow, Skill, SendMessage, WebFetch and every plugin tool
-  # (`--disallowedTools mcp__*` covers only the MCP half).
-  @required_present ~w(--tools --max-turns)
+  # Pinned only to being there, because its value is the run type's own: a story's turn budget is
+  # not a triage run's. Missing, an unattended session has no turn ceiling at all.
+  @required_present ~w(--max-turns)
 
   defp checked(argv, session_id) do
-    unless "--strict-mcp-config" in argv do
-      raise ArgumentError, "a session's argv must carry --strict-mcp-config"
-    end
-
     Enum.each(@required_present, fn flag ->
       case value_after(argv, flag) do
         value when is_binary(value) and value != "" ->
@@ -247,24 +272,13 @@ defmodule LoopctlRunner.Session do
       "--session-id",
       session_id,
       "--permission-mode",
-      "dontAsk",
+      "bypassPermissions",
       "--permission-prompts",
       "none",
-      "--setting-sources",
-      "",
       "--max-turns",
-      Integer.to_string(story.max_turns),
-      "--tools",
-      Enum.join(@session_tools, ","),
-      "--strict-mcp-config",
-      "--mcp-config",
-      ~s({"mcpServers":{}}),
-      "--disallowedTools",
-      "mcp__*"
+      Integer.to_string(story.max_turns)
     ] ++
       if(story.model, do: ["--model", story.model], else: []) ++
-      Enum.flat_map(@file_rules ++ story.allowed_tools, &["--allowedTools", &1]) ++
-      ["--allowedTools", "Bash(#{escalate_script()}:*)"] ++
       ["--append-system-prompt", system_prompt] ++
       ["--", story.prompt]
   end
@@ -287,8 +301,9 @@ defmodule LoopctlRunner.Session do
     tree_file = Path.join(run_dir, "stderr.log.tree")
     RunState.update(run_dir, %{session_id: session_id, tree_file: tree_file, status: "running"})
 
-    # INERT UNTIL #64 LANDS, on purpose: until a loop session loads the operator's setup nothing in
-    # it reads this grant. It ships first so the two changes land and revert independently.
+    # LIVE, because a session loads the operator's user settings: `block-subagent-git.sh` is one of
+    # their hooks, and without this grant it refuses the commit of every engineer agent the session
+    # dispatches, while that agent's report reads as having chosen not to commit.
     #
     # ARMED ONLY FOR A RUN ON A BRANCH OF ITS OWN (`:own_worktree`), which is the only place the
     # grant's reason holds (`LoopctlRunner.GitGrant`): an engineer agent committing to the branch
@@ -314,6 +329,7 @@ defmodule LoopctlRunner.Session do
               run_dir,
               session_id,
               config,
+              story,
               # WHERE the grant is, when one was prepared — not that there is one: the file is the
               # grant, and arming it comes after this fork (`LoopctlRunner.GitGrant`). The session
               # can compute the path anyway from its own id and HOME, so this hands over nothing
@@ -412,222 +428,60 @@ defmodule LoopctlRunner.Session do
     end
   end
 
-  # Credentials the runner's own environment may carry, which a session must not inherit. The
-  # Port environment is built by SUBTRACTION, not construction: the session inherits the daemon's
-  # whole environment and keeps everything this list does not name, so a credential missing from
-  # here reaches the session silently.
-  #
-  # ANTHROPIC_API_KEY outranks the claude.ai login, which is why `claude-headless.sh` unsets it
-  # too (Config refuses any other launcher) — this is the same removal one layer earlier.
-  # SSH_AUTH_SOCK and SSH_AGENT_PID are live in the daemon's environment on a dev machine
-  # (measured on minis, 2026-09-16): an agent socket holding the operator's GitHub identity, next
-  # to a worktree whose `origin` is `git@github.com:...` and whose `.git` is the parent's. NO
-  # SECOND LAYER IS ADDED BY REMOVING THEM, and an earlier draft of this comment implied one: on
-  # the Linux boxes the identity GitHub accepts is `~/.ssh/id_ed25519` as a PLAIN FILE under the
-  # inherited HOME, which ssh reads with no agent involved. So this closes the agent path while
-  # the key-file path stays open, and what still stands between a session and a push as the
-  # operator is `git push` being off the allow-list — one layer, as before. Closing the rest
-  # needs the deploy key's `IdentitiesOnly=yes` with an explicit `IdentityFile`, or a HOME of the
-  # session's own, neither of which is here yet. The agent goes because no session wants it in
-  # either design: the planned deploy key passes `IdentityAgent=none`, which refuses it outright.
-  # GPG_AGENT_INFO is the same class as the ssh agent and is also live on a dev machine: a socket
-  # to an agent holding the operator's private keys. UNSETTING IT IS NECESSARY AND NOT SUFFICIENT,
-  # and the limit belongs here rather than in whoever next reads the list: it is the LEGACY
-  # discovery path, which modern GnuPG ignores in favour of a fixed socket under XDG_RUNTIME_DIR
-  # ($XDG_RUNTIME_DIR/gnupg/S.gpg-agent), and XDG_RUNTIME_DIR is inherited on purpose (it is a
-  # capability the session may need, and unsetting it breaks more than it closes). So this entry
-  # closes the old path and leaves the current one open; the remedy for the rest is the OS
-  # boundary this runner does not have yet, not another name here.
-  # GH_TOKEN, GITHUB_TOKEN and the askpass pair are in no runner environment today and are named
-  # defensively, so a machine that later gains one does not hand it over. The askpass pair is a
-  # credential-ACQUISITION path rather than a credential: it names a program git and ssh run to
-  # obtain one, so an unattended session could acquire the operator's credential with no terminal
-  # anywhere in the picture. Both names are needed, because git falls through GIT_ASKPASS ->
-  # core.askPass -> SSH_ASKPASS: removing one alone just moves the path down one rung. IT DOES
-  # NOT CLOSE THE LADDER, though an earlier draft here claimed it did: rung 2 is `core.askPass`
-  # in `~/.gitconfig`, which no unset touches because it is a FILE, reached through the inherited
-  # HOME. ssh, with no config-file rung of its own, does fail closed; git falls to rung 2 and
-  # then asks a terminal it does not have.
-  @credential_env ~w(ANTHROPIC_API_KEY SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO GH_TOKEN
-                     GITHUB_TOKEN GIT_ASKPASS SSH_ASKPASS)
+  # The one credential a session does not inherit, and it is a BILLING control rather than a
+  # permission: ANTHROPIC_API_KEY outranks the claude.ai login (~USD 300 in one night, KB
+  # b38ef90e), which is why `claude-headless.sh` unsets it too (Config refuses any other launcher)
+  # — this is the same removal one layer earlier. Everything else in the daemon's environment
+  # reaches the session, as it reaches an attended one. Mark, 2026-09-27: "unattended sessions
+  # should enjoy the same permissions as attended sessions -- no less."
+  @credential_env ~w(ANTHROPIC_API_KEY)
 
-  @doc "Every credential name `port_env/4` unsets by NAME. The shape deny is separate."
+  @doc "Every credential name `port_env/5` unsets."
   @spec credential_env() :: [String.t()]
   def credential_env, do: @credential_env
 
   @doc """
-  Whether `name` is a credential `port_env/4` unsets. `Config` refuses these in `session_env` for
-  the same reason it refuses `release_env_name?/1`: the unset wins over a repo's value, and only
-  under the daemon, so a configured credential would vanish where nothing could see it.
+  What `port_env/5` unsets: the billing credential and the variables that point git at another
+  repository. Unconditional: a caller's `:env` does not keep one.
   """
-  @spec credential_env_name?(String.t()) :: boolean()
-  def credential_env_name?(name), do: name in @credential_env
+  @spec unset_names() :: [String.t()]
+  def unset_names, do: @credential_env ++ Worktree.repo_locating_env()
 
-  # THE NAME LIST ABOVE IS CALIBRATED TO ONE ENVIRONMENT AND THERE ARE TWO. Under systemd the
-  # daemon's environment is the unit's, which carries no credential at all; `mix loopctl.serve`
-  # (Mix.Tasks.Loopctl.Serve) sets LOOPCTL_RUNNER_DAEMON=1, joins the pool and accepts dispatches
-  # from the OPERATOR'S LOGIN SHELL, where 41 names matching token/secret/key/password/api/
-  # credential were counted on minis, 2026-09-16 — none of them on the list, every one of them
-  # subtracted from nothing and handed to a session with a Bash tool.
-  #
-  # THIS IS A HEURISTIC OVER A HOSTILE-BY-DEFAULT ENVIRONMENT, not a guarantee. It catches the
-  # conventional spellings and misses a credential named for what it opens (a bare `NPM_AUTH`, a
-  # `PGPASSFILE` pointing at a file) — a shape deny cannot do better, because the set it must
-  # exclude is open. THE REAL FIX IS TO CONSTRUCT THE ENVIRONMENT INSTEAD OF SUBTRACTING FROM IT:
-  # enumerate what a session legitimately needs (PATH, HOME, LANG, the asdf and XDG furniture)
-  # and pass only that, which turns every unknown name into a default-deny. That is a bigger
-  # change than this one and it fails LOUDLY when the enumeration is short — the runner stops
-  # building rather than leaking — which is why it is the right answer and not a drop-in.
-  @credential_shapes ~w(TOKEN SECRET PASSWORD PASSWD PASSPHRASE CREDENTIAL API_KEY PRIVATE_KEY)
-
-  @doc """
-  Whether `name` has the SHAPE of a credential, whatever this runner knows about it by name.
-
-  Matched case-insensitively against the conventional spellings, plus a `_KEY` suffix or infix,
-  which is what `AWS_SECRET_ACCESS_KEY`, `HEX_API_KEY` and `FLY_API_TOKEN` have in common and
-  what `HOME`, `PATH`, `LANG`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` do not.
-  """
-  @spec credential_shaped?(String.t()) :: boolean()
-  def credential_shaped?(name) do
-    up = String.upcase(name)
-
-    Enum.any?(@credential_shapes, &String.contains?(up, &1)) or
-      String.ends_with?(up, "_KEY") or String.contains?(up, "_KEY_")
-  end
-
-  @doc """
-  The names in `env` that have a credential's shape, sorted — what the name list cannot enumerate.
-  """
-  @spec credential_shaped_env(%{String.t() => String.t()}) :: [String.t()]
-  def credential_shaped_env(env) do
-    env
-    |> Map.keys()
-    |> Enum.filter(&credential_shaped?/1)
-    |> Enum.sort()
-  end
-
-  # A DIFFERENT CLASS from the list above, and "is it a credential?" is the wrong test for it:
-  # these name a PROGRAM GIT EXECUTES for every transport operation. Whatever puts a value in the
-  # daemon's environment gets arbitrary code run by every git call an unattended session makes,
-  # with no credential anywhere in the picture — and a value that merely redirects `ssh` also
-  # decides which identity git authenticates with, so it overrides a deploy key silently.
-  # `Config` needs no companion check here: `@reserved_env` already refuses every `GIT_` name in
-  # `session_env`, which is why `credential_env_name?/1` stays about credentials only.
-  @git_program_env ~w(GIT_SSH_COMMAND GIT_SSH)
-
-  @doc "Every name `port_env/4` unsets because it names a program git executes."
-  @spec git_program_env() :: [String.t()]
-  def git_program_env, do: @git_program_env
-
-  @doc """
-  What `port_env/4` unsets, for the daemon's `env` and the `{name, value}` pairs a caller supplies.
-
-  TWO RULES, AND THEY DIFFER ON PURPOSE. The name lists are UNCONDITIONAL: every name in them is
-  unset whatever anyone supplies, because each is a credential this runner knows by name or a
-  program git executes, and there is no session that wants one. The SHAPE deny is a heuristic over
-  an environment nobody enumerated, and a heuristic is wrong sometimes — `SECRET_KEY_BASE` for a
-  test env, a `*_PUBLISHABLE_KEY` that is public by design, a `*_TOKENS` tuning knob. So a shaped
-  name a caller supplies DELIBERATELY is not unset: the operator naming it in the config's
-  `session_env` has made the judgement the shape cannot, for the one repo that needs it.
-
-  That escape hatch is deliberately `session_env` and deliberately not a keep-list in this module.
-  A keep-list here would apply to every repo, session and machine, for ever, with nobody
-  revisiting it — an unscoped exemption is a silent global disable (KB 7a9afe2e), and enumerating
-  safe spellings fails the same way enumerating dangerous ones does (KB 909ba2b2). `session_env`
-  is per repo, in a mode-600 file only the operator writes, and revocable in one place.
-  """
-  @spec unset_names(%{String.t() => String.t()}, [{String.t(), String.t() | false}]) ::
-          [String.t()]
-  def unset_names(env, extra) do
-    supplied = MapSet.new(extra, fn {name, _value} -> name end)
-    shaped = Enum.reject(credential_shaped_env(env), &MapSet.member?(supplied, &1))
-
-    @credential_env ++ @git_program_env ++ shaped ++ Worktree.repo_locating_env()
-  end
-
-  defp port_env(run_dir, session_id, config, extra) do
-    base = [
-      {"LOOP_ESCALATE", escalate_script()},
-      {"LOOP_MODE", "1"},
-      {"LOOP_RUN_DIR", run_dir},
-      {"LOOP_STORY_FILE", Path.join(run_dir, "story.json")},
-      {"LOOP_SESSION_ID", session_id},
-      {"LOOP_KILL_GRACE_S", Integer.to_string(config.kill_grace_s)},
-      {"LOOP_TREE_POLL_S", Integer.to_string(config.tree_poll_s)},
-      {"LOOP_TREE_FILE", Path.join(run_dir, "stderr.log.tree")}
-    ]
+  defp port_env(run_dir, session_id, config, story, extra) do
+    base =
+      [
+        {"LOOP_ESCALATE", escalate_script()},
+        {"LOOP_MODE", "1"},
+        {"LOOP_RUN_DIR", run_dir},
+        {"LOOP_STORY_FILE", Path.join(run_dir, "story.json")},
+        {"LOOP_SESSION_ID", session_id},
+        {"LOOP_KILL_GRACE_S", Integer.to_string(config.kill_grace_s)},
+        {"LOOP_TREE_POLL_S", Integer.to_string(config.tree_poll_s)},
+        {"LOOP_TREE_FILE", Path.join(run_dir, "stderr.log.tree")}
+      ] ++ branch_env(story)
 
     env = System.get_env()
-    unset = unset_names(env, extra)
-    log_shaped(session_id, credential_shaped_env(env), unset)
 
     # The repo's own session_env comes after PATH, so a configured PATH still wins; the names
     # release_env/1 unsets are refused in session_env by Config, so nothing there is lost.
-    #
-    # THE DEPLOY KEY CANNOT BE WIRED BY EITHER OBVIOUS ROUTE, and both are closed for different
-    # reasons. GIT_SSH_COMMAND is unset UNCONDITIONALLY above, so a value supplied in the BASE
-    # environment — `Environment=` in rel/systemd/loopctl-runner.service, `EnvironmentVariables`
-    # in the launchd plist, which is where a per-machine key would naturally go — never reaches a
-    # session at all. And the unsets are appended AFTER `extra`, so for a name in both THE UNSET
-    # WINS and a value passed through `:env` is removed again; re-ordering these two `Enum.map`s
-    # is what would fix that half, and it would NOT recover the service-definition half.
-    # Whoever wires the deploy key must supply the command by a path the unset cannot reach — an
-    # explicit option this module reads, not an environment variable it also deletes.
-    #
-    # The one exception to that ordering, and it is expressed as a SUBTRACTION rather than a
-    # re-order: a SHAPED name the caller supplies is never put in `unset` at all (`unset_names/2`),
-    # so it survives whatever the order is. Re-ordering these two `Enum.map`s would have made
-    # EVERY unset overridable by any `:env` caller — ANTHROPIC_API_KEY included — which is a much
-    # larger grant than the one being made.
-    #
-    # Unsetting GIT_SSH_COMMAND is itself a WIDENING and is kept deliberately: git falls back to
-    # plain `ssh`, which reads the inherited `~/.ssh/config` and offers the operator's key, so
-    # this removes an operator's restriction as readily as an attacker's redirection. It stays
-    # because the value is also arbitrary code git executes, and because nothing legitimately
-    # sets it today; the moment something does, it needs the explicit path above.
-    # `LoopctlRunner.RunTest` has a characterisation test naming today's `extra` behaviour.
-    # A `false` value in `extra` unsets that name, as it does for an Erlang Port.
+    # A `false` value in `extra` unsets that name, as it does for an Erlang Port: it is how the
+    # grant's variable is kept from a session that has no grant.
     Enum.map(base ++ release_path(env) ++ extra, fn
       {k, false} -> {to_charlist(k), false}
       {k, v} -> {to_charlist(k), to_charlist(v)}
     end) ++
-      Enum.map(unset ++ release_env(env), &{to_charlist(&1), false})
+      Enum.map(unset_names() ++ release_env(env), &{to_charlist(&1), false})
   end
 
-  # A silent irreversible subtraction is worse than a loud one even when it is right: without this
-  # an operator meets the shape deny as a build that fails for no stated reason, with the name
-  # they need nowhere in any log. NAMES ONLY, never values — this is written on every session
-  # start, on a machine whose environment carries live credentials.
-  defp log_shaped(session_id, shaped, unset) do
-    {dropped, kept} = Enum.split_with(shaped, &(&1 in unset))
-    # The advice is only true for names session_env would ACCEPT. A name on @credential_env is
-    # unset unconditionally and Config refuses it there, so recommending it produces a config that
-    # will not load — which raises in daemon_children!/0 and aborts the release preflight, for a
-    # name this line suggested. A lowercase one has no hatch either: the shape test upcases and
-    # the config's name format does not.
-    {hatchable, unconditional} = Enum.split_with(dropped, &Config.session_env_allows?/1)
+  # The branch `loop-push` (`push_script/0`) is allowed to push, which it refuses to run without:
+  # the session's own, the one the runner cut its worktree on. A run with no branch of its own (a
+  # triage run's story carries "") gets none, so loop-push has nothing to push there. (A Port
+  # drops a variable whose value is empty anyway, measured on OTP 28; the guard says so here
+  # rather than leaving it to that.)
+  defp branch_env(%Story{branch: branch}) when is_binary(branch) and branch != "",
+    do: [{"LOOP_BRANCH", branch}]
 
-    case notes(hatchable, unconditional, kept) do
-      [] -> :ok
-      notes -> Logger.info("session #{session_id}: " <> Enum.join(notes, "; "))
-    end
-  end
-
-  defp notes(hatchable, unconditional, kept) do
-    [
-      if(hatchable != [],
-        do:
-          "unsetting #{length(hatchable)} credential-shaped name(s): " <>
-            Enum.join(hatchable, ", ") <>
-            " (name one in this repo's session_env to keep it)"
-      ),
-      if(unconditional != [],
-        do: "unset unconditionally, with no way to keep them: " <> Enum.join(unconditional, ", ")
-      ),
-      if(kept != [], do: "kept by session_env: " <> Enum.join(kept, ", "))
-    ]
-    |> Enum.reject(&is_nil/1)
-  end
+  defp branch_env(_story), do: []
 
   @doc """
   The names in `env` that belong to the runner's own release, which a session must not inherit.
@@ -693,7 +547,7 @@ defmodule LoopctlRunner.Session do
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     state = state |> flush_partial() |> record_escalations()
-    reason = exit_reason(state.reason, status)
+    reason = exit_reason(state.reason, status, StreamEvents.result(state.stream))
     stragglers = reap_stragglers(state)
 
     Trace.emit(state.trace, "session.exited", state.session_seq, %{
@@ -891,15 +745,25 @@ defmodule LoopctlRunner.Session do
   end
 
   @doc """
-  Why a session ended, given the stop already under way (if any) and the exit status.
+  Why a session ended, given the stop already under way (if any), the exit status and the
+  `subtype` of the CLI's last `result` line (`StreamEvents.result/1`).
 
   A CLI that exits 0 exited on its own, even if a park stop had begun: that stop's TERM
-  would have ended the launcher with 143.
+  would have ended the launcher with 143. A CLI whose result line says `error_max_turns` ran out
+  of the `--max-turns` budget (the subtype 2.1.283 prints), which the runner could not otherwise
+  tell from any other failing exit; it outranks a park for the same reason an exit 0 does — the
+  CLI had already stopped on its own — and never a wall-clock stop or an escalation, which the
+  runner or the session chose.
   """
-  @spec exit_reason(atom() | nil, non_neg_integer()) :: atom()
-  def exit_reason(:parked, 0), do: :exited
-  def exit_reason(nil, _status), do: :exited
-  def exit_reason(reason, _status), do: reason
+  @spec exit_reason(atom() | nil, non_neg_integer(), String.t() | nil) :: atom()
+  def exit_reason(reason, status, result \\ nil)
+
+  def exit_reason(reason, _status, "error_max_turns") when reason in [nil, :parked],
+    do: :max_turns_exceeded
+
+  def exit_reason(:parked, 0, _result), do: :exited
+  def exit_reason(nil, _status, _result), do: :exited
+  def exit_reason(reason, _status, _result), do: reason
 
   defp verdict_data({:parked, evidence}), do: Map.put(evidence, "verdict", "parked")
 

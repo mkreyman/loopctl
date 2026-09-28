@@ -725,7 +725,7 @@ defmodule LoopctlRunner.TriageRun do
       Logger.error(
         "this run's escalate verdict carries no words a person can act on: every " <>
           "escalation_reason is one of the bare codes, or there are none. It is being sent as " <>
-          "stated — loopctl records the field verbatim and routes on the outcome — but whoever " <>
+          "stated — loopctl records the field verbatim and a person receives it — but whoever " <>
           "opens it gets a classification and nothing to read"
       )
     end
@@ -743,6 +743,10 @@ defmodule LoopctlRunner.TriageRun do
 
   defp incomplete(_run_dir, %{reason: :wall_clock_exceeded}),
     do: reported("wall_clock_exceeded", "the session ran out of wall clock")
+
+  # The contract has no turn-budget reason: the session stopped, uncrashed, having written none.
+  defp incomplete(_run_dir, %{reason: :max_turns_exceeded}),
+    do: reported("no_verdict_written", "the session ran out of turns")
 
   defp incomplete(_run_dir, %{reason: reason}) when reason in [:parked, :not_group_leader],
     do: reported("no_verdict_written", "the runner stopped the session: #{reason}")

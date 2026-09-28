@@ -2,7 +2,18 @@ defmodule LoopctlRunner.RunTest do
   # Mutates PATH and FAKE_* in the OS environment, which every spawned process inherits.
   use ExUnit.Case, async: false
 
-  alias LoopctlRunner.{GitGrant, Owner, Run, RunState, Session, Story, Trace, WorktreeLock}
+  alias LoopctlRunner.{
+    DispatchRun,
+    GitGrant,
+    Owner,
+    Run,
+    RunState,
+    Session,
+    Story,
+    Trace,
+    WorktreeLock
+  }
+
   import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
 
@@ -118,10 +129,7 @@ defmodule LoopctlRunner.RunTest do
           root,
           state,
           [{"FAKE_CLAUDE_MODE", "stream"}],
-          %{"allowed_tools" => ["Edit(./lib/**)"], "prompt" => "- do the thing"},
-          %{
-            "allowed_tools" => ["Edit(./lib/**)"]
-          }
+          %{"prompt" => "- do the thing"}
         )
       end)
 
@@ -140,26 +148,31 @@ defmodule LoopctlRunner.RunTest do
     refute env =~ ~r/^ANTHROPIC_API_KEY PRESENT$/m
     refute env =~ ~r/^(RELEASE_ROOT|RELEASE_COOKIE|EMU|RELEASE_PATH) PRESENT$/m
     assert env =~ ~r/^LOOP_MODE=1$/m
+    # The branch loop-push may push, which it refuses to run without: the story's own.
+    assert env =~ ~r|^LOOP_BRANCH=loop/s1$|m
     argv = File.read!(Path.join(state, "argv"))
-    # Only what is pre-allowed runs, under no operator or repository settings.
-    assert argv =~ "--permission-mode\ndontAsk\n"
+    # The session runs with the authority a locally dispatched agent has, and inherits the
+    # operator's user-scoped setup: no permission mode that denies, no pre-allow list, no
+    # --setting-sources fence (Mark, 2026-09-16: all agents run yolo, inheriting his setup).
+    assert argv =~ "--permission-mode\nbypassPermissions\n"
     assert argv =~ "--permission-prompts\nnone\n"
-    assert argv =~ "--setting-sources\n\n"
+    refute argv =~ "--setting-sources"
+    refute argv =~ "--allowedTools"
+    # `auto` is a different thing and still wrong: its classifier approves what it judges safe,
+    # which is how the 2026-09-14 run ran docker exec psql.
     refute argv =~ "\nauto\n"
 
-    for rule <- LoopctlRunner.Session.file_rules() do
-      assert argv =~ "--allowedTools\n#{rule}\n"
-    end
-
-    # The session's tools are limited, not merely allowed: every restricting flag reaches claude.
-    assert argv =~ "--tools\nRead,Edit,Write,Glob,Grep,Bash\n"
-    assert argv =~ "--strict-mcp-config\n--mcp-config\n{\"mcpServers\":{}}\n"
-    assert argv =~ "--disallowedTools\nmcp__*\n"
+    # NOTHING is withheld: no tool pool, no MCP exclusion. A session gets Agent (so it can
+    # dispatch the engineer agent this repo tells it to), SendMessage, WebFetch, Skill and every
+    # MCP server the operator has configured, exactly as a local agent does.
+    refute argv =~ "--tools"
+    refute argv =~ "--strict-mcp-config"
+    refute argv =~ "--mcp-config"
+    refute argv =~ "--disallowedTools"
     assert argv =~ "--session-id\n#{result.session.session_id}\n"
-    assert argv =~ "--allowedTools\nEdit(./lib/**)\n"
-    assert argv =~ "--allowedTools\nBash(#{LoopctlRunner.Session.escalate_script()}:*)\n"
     assert argv =~ "--append-system-prompt\n"
     assert argv =~ LoopctlRunner.Session.escalate_script()
+    assert File.exists?(LoopctlRunner.Session.escalate_script())
     assert File.read!(Path.join(state, "story_file")) == "regular\n"
     assert String.ends_with?(argv, "--\n- do the thing\n")
     refute argv =~ "--bare"
@@ -224,99 +237,39 @@ defmodule LoopctlRunner.RunTest do
     refute env =~ ~r/^GIT_(INDEX_FILE|DIR) PRESENT$/m
   end
 
-  test "the operator's agent socket and forge tokens reach no session", %{
+  test "the operator's agent sockets, forge tokens and credentials reach the session", %{
     root: root,
     state: state
   } do
-    # Set HERE, not merely asserted absent: a bare refutation of a name nothing sets would pass
-    # with the whole unset list deleted. Some of these ARE in the shell that runs `mix test` and
-    # some are not, which is exactly why they are set rather than assumed either way — and why
-    # `with_env/2` puts the real values back instead of deleting them. Values are inert and built
-    # at runtime (a token-named variable assigned a literal reads to a secret scanner as a leak);
-    # nothing ever asserts on a value, only on whether the NAME arrived.
-    nonce = Integer.to_string(System.unique_integer([:positive]))
-
-    vars = [
-      # Live in the daemon's environment on a dev machine: an agent holding the operator's
-      # GitHub identity, one allow-list entry away from a push as him.
-      {"SSH_AUTH_SOCK", "/tmp/not-a-real-agent-socket-" <> nonce},
-      {"SSH_AGENT_PID", "0"},
-      # The same class, and also live on a dev machine — though only the legacy discovery path:
-      # modern GnuPG finds the agent under XDG_RUNTIME_DIR, which stays inherited.
-      {"GPG_AGENT_INFO", "/tmp/not-a-real-gpg-socket-" <> nonce <> ":0:1"},
-      {"GH_TOKEN", "not-a-real-value-" <> nonce},
-      {"GITHUB_TOKEN", "not-a-real-value-" <> nonce},
-      # Not a credential but the path to one: the program git and ssh run to obtain a
-      # passphrase, which is how an unattended session acquires one with no terminal involved.
-      {"GIT_ASKPASS", "/tmp/not-a-real-askpass-" <> nonce},
-      {"SSH_ASKPASS", "/tmp/not-a-real-askpass-" <> nonce}
-    ]
-
-    result = with_env(vars, fn -> run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}]) end)
-
-    assert result.status == "succeeded"
-    env = File.read!(Path.join(state, "env"))
-
-    for {name, _} <- vars do
-      refute env =~ ~r/^#{name} PRESENT$/m, "#{name} reached the session"
-    end
-
-    # The session still got the environment it is supposed to have: the assertions above are
-    # about a subtraction, and would also hold if the launch had never happened.
-    assert env =~ ~r/^LOOP_MODE=1$/m
-  end
-
-  test "a credential the runner has never heard of is unset by SHAPE", %{root: root, state: state} do
-    # The name list is calibrated to the systemd daemon's environment, which carries no
-    # credential at all. `mix loopctl.serve` is a daemon too and runs in the operator's LOGIN
-    # shell, where 41 names of this shape were counted — none of them on any list, all of them
-    # handed to a session with a Bash tool. Inert values, and never asserted on.
+    # PARITY: an unattended session gets the environment an attended one has. Mark, 2026-09-27:
+    # "unattended sessions should enjoy the same permissions as attended sessions -- no less."
+    # Set HERE, not assumed present, so each PRESENT below is this test's doing; `with_env/2` puts
+    # the real values back. Values are inert, built at runtime, and never asserted on — only
+    # whether the NAME arrived.
     nonce = Integer.to_string(System.unique_integer([:positive]))
 
     vars =
       Enum.map(
-        # The last two are matched by the `_KEY` suffix and infix arms and by nothing else, so
-        # dropping that arm has to show up here rather than only in the shape unit test.
-        ~w(NPM_TOKEN AWS_SECRET_ACCESS_KEY HEX_API_KEY PGPASSWORD SOME_VENDOR_PRIVATE_KEY
-           SIGNING_KEY DEPLOY_KEY_PATH),
+        ~w(SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO GH_TOKEN GITHUB_TOKEN GIT_ASKPASS
+           SSH_ASKPASS NPM_TOKEN AWS_SECRET_ACCESS_KEY HEX_API_KEY PGPASSWORD),
         &{&1, "not-a-real-value-" <> nonce}
       )
 
-    result = with_env(vars, fn -> run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}]) end)
+    result =
+      with_env([{"ANTHROPIC_API_KEY", "not-a-real-value-" <> nonce} | vars], fn ->
+        run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}])
+      end)
 
     assert result.status == "succeeded"
     env = File.read!(Path.join(state, "env"))
 
     for {name, _} <- vars do
-      refute env =~ ~r/^#{name} PRESENT$/m, "#{name} reached the session"
+      assert env =~ ~r/^#{name} PRESENT$/m, "#{name} did not reach the session"
     end
 
-    assert env =~ ~r/^LOOP_MODE=1$/m
-  end
-
-  test "a shaped name in session_env survives, though the same name in the environment does not",
-       %{root: root, state: state} do
-    # The escape hatch, end to end and against the ordering trap: SANDBOX_API_KEY is in the
-    # DAEMON's environment (where the shape deny would unset it) AND in this repo's session_env
-    # (where the operator said this repo's session needs it). The sibling test above proves the
-    # first half alone loses it, so its arrival here is the configuration and nothing else.
-    nonce = Integer.to_string(System.unique_integer([:positive]))
-    assert LoopctlRunner.Session.credential_shaped?("SANDBOX_API_KEY")
-
-    result =
-      with_env([{"SANDBOX_API_KEY", "not-a-real-value-" <> nonce}], fn ->
-        run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
-          "session_env" => %{"fixture" => %{"SANDBOX_API_KEY" => "from-session-env"}}
-        })
-      end)
-
-    assert result.status == "succeeded"
-    env = File.read!(Path.join(state, "env"))
-    # By NAME: the fixture records a credential-shaped variable's presence and never its value,
-    # so what is proved here is that the name reached the session. That its VALUE is the
-    # configured one rather than the inherited one is the next test, on a name whose value the
-    # fixture may record because it is a test probe and not a credential.
-    assert env =~ ~r/^SANDBOX_API_KEY PRESENT$/m
+    # The one exception, and it is a BILLING control rather than a permission (~USD 300, KB
+    # b38ef90e): the key outranks the claude.ai login.
+    refute env =~ ~r/^ANTHROPIC_API_KEY PRESENT$/m
   end
 
   test "a session_env value wins over the same name inherited from the daemon", %{
@@ -340,105 +293,38 @@ defmodule LoopctlRunner.RunTest do
     refute env =~ ~r/^RUNNER_ENV_PROBE=from-the-daemon-environment$/m
   end
 
-  test "the shaped names being unset are LOGGED, by name and never by value", %{
-    root: root,
-    state: state
-  } do
-    # A silent irreversible subtraction is worse than a loud one even when it is right: without
-    # this an operator meets the shape deny as a build failing for no stated reason, with the
-    # name they need in no log anywhere. Values never appear — this line is written on every
-    # session start, on machines whose environment carries live credentials.
-    nonce = Integer.to_string(System.unique_integer([:positive]))
-    dropped_value = "not-a-real-value-" <> nonce
+  test "the escalation command reaches the SYSTEM PROMPT, which is now the only thing naming it" do
+    # With the pre-allow rule gone nothing denies `loop-escalate` — and nothing tells the session
+    # it exists either. The prompt is the whole path now: if this text stops reaching it, a
+    # session with no way to ask for a human grinds silently to its turn limit, which is the
+    # failure the escalation mechanism exists to prevent. Asserted on the VALUE of the flag, not
+    # on the path appearing somewhere in argv: a path in the wrong argument grants nothing.
+    story = %LoopctlRunner.Story{
+      id: "s1",
+      repo: "fixture",
+      repo_path: "/tmp",
+      base: "master",
+      branch: "loop/s1",
+      prompt: "do the thing",
+      wall_clock_s: 60,
+      max_turns: 5
+    }
 
-    # The suite runs at :warning (test_helper.exs) and this line is deliberately :info — it is
-    # written on every session start, and a warning on every routine run trains operators to
-    # ignore warnings. Sync tests never run beside async ones, so the level is this test's alone.
-    previous = Logger.level()
-    Logger.configure(level: :info)
-    on_exit(fn -> Logger.configure(level: previous) end)
+    argv = LoopctlRunner.Session.claude_args(story, "sid")
+    index = Enum.find_index(argv, &(&1 == "--append-system-prompt"))
+    system_prompt = Enum.at(argv, index + 1)
 
-    log =
-      capture_log(fn ->
-        result =
-          with_env([{"NPM_TOKEN", dropped_value}, {"SANDBOX_API_KEY", dropped_value}], fn ->
-            run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
-              "session_env" => %{"fixture" => %{"SANDBOX_API_KEY" => "from-session-env"}}
-            })
-          end)
-
-        assert result.status == "succeeded"
-      end)
-
-    assert log =~ "NPM_TOKEN"
-    assert log =~ "kept by session_env: SANDBOX_API_KEY"
-    # It names the way back, or the operator has a mystery instead of a decision.
-    assert log =~ "session_env to keep it"
-    refute log =~ dropped_value
-    refute log =~ "from-session-env"
-
-    # ANTHROPIC_API_KEY is shape-matched AND unconditional, and it is set for this run by the
-    # test above it. The advice must never point at a name session_env would refuse: following
-    # it produces a config that will not load, which aborts the release preflight.
-    assert log =~ "unset unconditionally, with no way to keep them"
-    assert Regex.run(~r/unsetting [0-9]+ credential-shaped name\(s\): ([^(]*)/, log)
-    [_, advised] = Regex.run(~r/unsetting [0-9]+ credential-shaped name\(s\): ([^(]*)/, log)
-
-    for name <- advised |> String.split(", ") |> Enum.map(&String.trim/1), name != "" do
-      assert LoopctlRunner.Config.session_env_allows?(name),
-             "the drop log advised session_env for #{name}, which the config would refuse"
-    end
+    assert system_prompt =~ LoopctlRunner.Session.escalate_script()
+    assert File.exists?(LoopctlRunner.Session.escalate_script())
   end
 
-  test "the drop log degenerates into nothing when every shaped name is kept", %{
+  test "a git transport override reaches the session, as it reaches an attended one", %{
     root: root,
     state: state
   } do
-    # Guarded on what was DROPPED, not on what was shaped: otherwise a run where session_env
-    # supplies every shaped name present printed "unsetting 0 credential-shaped name(s): " with
-    # an empty list and advice to do the thing that had already been done.
-    previous = Logger.level()
-    Logger.configure(level: :info)
-    on_exit(fn -> Logger.configure(level: previous) end)
-
-    # Deterministic on any machine: this one's own environment carries shaped names, so without
-    # clearing them `dropped` is never empty here and the case under test never arises. They are
-    # restored by with_env/2, values included.
-    cleared =
-      Enum.map(
-        LoopctlRunner.Session.credential_shaped_env(System.get_env()) -- ["SANDBOX_API_KEY"],
-        &{&1, nil}
-      )
-
-    log =
-      capture_log(fn ->
-        result =
-          with_env([{"SANDBOX_API_KEY", "not-a-real-value"} | cleared], fn ->
-            run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
-              "session_env" => %{"fixture" => %{"SANDBOX_API_KEY" => "from-session-env"}}
-            })
-          end)
-
-        assert result.status == "succeeded"
-      end)
-
-    # The line was emitted at all, so the refutations below are about its CONTENT. Without this
-    # they would also pass on a run that logged nothing.
-    assert log =~ "kept by session_env: SANDBOX_API_KEY"
-    refute log =~ "unsetting 0"
-    refute log =~ "name(s): ;"
-    refute log =~ ~r/name\(s\): \s*(;|\.|$)/m
-  end
-
-  test "a git transport override in the runner's environment reaches no session", %{
-    root: root,
-    state: state
-  } do
-    # A different class from the credentials above: these name the PROGRAM git executes, so an
-    # inherited value runs arbitrary code on every git call a session makes, and a value that
-    # merely redirects ssh picks the identity git authenticates with. Set here, not merely
-    # refuted, for the same reason as the test above. Inert: /bin/true accepts ssh's arguments
-    # and does nothing, and the value is never asserted on.
+    # Parity (Mark, 2026-09-27): an attended session inherits whatever ssh or git transport the
+    # operator configured, so an unattended one does too. Inert: /bin/true accepts ssh's
+    # arguments and does nothing, and the value is never asserted on.
     vars = [{"GIT_SSH_COMMAND", "/bin/true"}, {"GIT_SSH", "/bin/true"}]
 
     result = with_env(vars, fn -> run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}]) end)
@@ -447,33 +333,131 @@ defmodule LoopctlRunner.RunTest do
     env = File.read!(Path.join(state, "env"))
 
     for {name, _} <- vars do
-      refute env =~ ~r/^#{name} PRESENT$/m, "#{name} reached the session"
+      assert env =~ ~r/^#{name} PRESENT$/m, "#{name} was withheld from the session"
     end
-
-    assert env =~ ~r/^LOOP_MODE=1$/m
   end
 
-  test "characterisation, not a desired property: a deliberate :env value loses to the unset list",
+  test "a :prompt function is called once the worktree exists, and is what the session gets",
        %{root: root, state: state} do
-    # WHAT THIS RECORDS, so a future reader knows it is a trap and not a guarantee: port_env/4
-    # appends the unsets AFTER the caller's `:env`, so for a name in both the unset wins and the
-    # supplied value never reaches the session. Harmless today — Config refuses every unset name
-    # in session_env and nothing else supplies one — and a live hazard for the planned deploy
-    # key, which sets GIT_SSH_COMMAND on purpose and would be silently dropped. When that change
-    # makes an explicit value win, THIS TEST IS SUPPOSED TO GO RED: invert it, do not delete it.
+    # A dispatch's prompt is built after `Worktree.create`, never at accept time, and story.json —
+    # the run directory's account of what the session got — is rewritten with it.
     restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    test = self()
+    path = Path.join([root, "repo", ".claude/worktrees/loop-s1"])
+
+    build = fn cut_from ->
+      send(test, {:built, File.dir?(path), cut_from})
+      {:ok, "the built prompt"}
+    end
 
     result =
       try do
         config = config!(root)
-        {:ok, story} = Story.from_map(story_map(), config)
-        Run.execute(config, story, env: [{"GIT_SSH_COMMAND", "/bin/true"}])
+
+        {:ok, story} =
+          Story.from_map(Map.delete(story_map(), "prompt"), config, prompt: :deferred)
+
+        Run.execute(config, story, prompt: build)
       after
         restore.()
       end
 
     assert result.status == "succeeded"
-    refute File.read!(Path.join(state, "env")) =~ ~r/^GIT_SSH_COMMAND PRESENT$/m
+    # Given the commit the tree was cut from: the base's, which no session has written.
+    base = git!(Path.join(root, "repo"), ["rev-parse", "master"])
+    assert_received {:built, true, ^base}
+    assert String.ends_with?(File.read!(Path.join(state, "argv")), "--\nthe built prompt\n")
+
+    assert %{"prompt" => "the built prompt"} =
+             JSON.decode!(File.read!(Path.join(result.run_dir, "story.json")))
+  end
+
+  test "a refused :prompt starts no session, tears the worktree down and says why", %{
+    root: root,
+    state: state
+  } do
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    test = self()
+
+    result =
+      try do
+        config = config!(root)
+
+        {:ok, story} =
+          Story.from_map(Map.delete(story_map(), "prompt"), config, prompt: :deferred)
+
+        Run.execute(config, story,
+          prompt: fn _cut_from -> {:refuse, "other", "malformed delivery mode \"threads\""} end,
+          on_stage: &send(test, {:stage, &1})
+        )
+      after
+        restore.()
+      end
+
+    assert result.status == "refused"
+    assert result.error == "other: malformed delivery mode \"threads\""
+    assert result.session == nil
+    assert result.teardown.worktree == :removed
+    # No session was launched, so the fake CLI recorded nothing.
+    refute File.exists?(Path.join(state, "argv"))
+    # Every run directory has its story; this one's never got a prompt.
+    assert %{"id" => "s1", "prompt" => nil} =
+             JSON.decode!(File.read!(Path.join(result.run_dir, "story.json")))
+
+    assert_received {:stage, {:worktree, _}}
+    refute_received {:stage, {:implementing, _}}
+    assert_received {:stage, {:finished, %{status: "refused", reached: "worktree"}}}
+
+    assert "session.refused" in types(events!(result))
+
+    assert {:ok, %{"status" => "refused", "reached" => "worktree"}} =
+             RunState.read(result.run_dir)
+  end
+
+  test "a :prompt that raises tears the worktree down, and the run crashes", %{
+    root: root,
+    state: state
+  } do
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    path = Path.join([root, "repo", ".claude/worktrees/loop-s1"])
+    test = self()
+
+    try do
+      config = config!(root)
+      {:ok, story} = Story.from_map(Map.delete(story_map(), "prompt"), config, prompt: :deferred)
+
+      assert_raise RuntimeError, "builder broke", fn ->
+        Run.execute(config, story,
+          prompt: fn _cut_from ->
+            send(test, {:tree_during_build, File.dir?(path)})
+            raise "builder broke"
+          end
+        )
+      end
+    after
+      restore.()
+    end
+
+    assert_received {:tree_during_build, true}
+    refute File.dir?(path)
+    refute File.exists?(Path.join(state, "argv"))
+  end
+
+  test "a story with no prompt and no :prompt is a crash, never a session on nothing", %{
+    root: root,
+    state: state
+  } do
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    try do
+      config = config!(root)
+      {:ok, story} = Story.from_map(Map.delete(story_map(), "prompt"), config, prompt: :deferred)
+      assert_raise ArgumentError, ~r/has no prompt/, fn -> Run.execute(config, story) end
+    after
+      restore.()
+    end
+
+    refute File.exists?(Path.join(state, "argv"))
   end
 
   test "a non-zero exit fails the run and still tears down", %{root: root, state: state} do
@@ -925,13 +909,18 @@ defmodule LoopctlRunner.RunTest do
           "repo" => "mkreyman/fixture"
         }
 
-        {:ok, story} =
-          DispatchRun.story(dispatch, fields, %{"id" => story_id, "title" => "t"}, config)
-
-        story
+        {:ok, story} = DispatchRun.story(dispatch, fields, config)
+        {story, DispatchRun.prompt(dispatch, fields, %{"id" => story_id, "title" => "t"})}
       end
 
-    [first, second] = stories
+    # Only a repository that states its mode runs.
+    repo = Path.join(root, "repo")
+    File.mkdir_p!(Path.join(repo, ".loopctl"))
+    File.write!(Path.join([repo, ".loopctl", "mode"]), "pr\n")
+    git!(repo, ["add", ".loopctl/mode"])
+    git!(repo, ["commit", "-q", "-m", "mode"])
+
+    [{first, first_prompt}, {second, second_prompt}] = stories
     assert first.id == second.id
     assert first.id == "story-" <> story_id
 
@@ -939,10 +928,10 @@ defmodule LoopctlRunner.RunTest do
              Worktree.path_for(second.repo_path, second.id)
 
     try do
-      earlier = Run.execute(config, first)
+      earlier = Run.execute(config, first, prompt: first_prompt)
       assert {:kept, _} = earlier.teardown.worktree
 
-      later = Run.execute(config, second)
+      later = Run.execute(config, second, prompt: second_prompt)
       assert later.status == "succeeded"
 
       assert [%{"data" => %{"reused" => true}}] =
@@ -1043,8 +1032,79 @@ defmodule LoopctlRunner.RunTest do
       restore.()
     end
 
-    assert_received {:stage, {:finished, %{status: "crashed", error: "exit: " <> _}}}
+    # It had a worktree and no session, so its end is an escalation, not a session_ended.
+    assert_received {:stage, {:finished, %{status: "crashed", error: "exit: " <> _} = summary}}
+    assert summary.reached == "worktree"
+    assert DispatchRun.end_reports(summary) == [:escalated]
     refute_received {:stage, {:finished, _}}
+  end
+
+  test "a run that crashes before it has a worktree reports reaching claimed", %{
+    root: root,
+    state: state
+  } do
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    config = config!(root)
+    {:ok, story} = Story.from_map(story_map(), config)
+    test = self()
+
+    on_stage = fn
+      {:started, _} -> raise "gone before the worktree"
+      event -> send(test, {:stage, event})
+    end
+
+    try do
+      assert_raise RuntimeError, fn -> Run.execute(config, story, on_stage: on_stage) end
+    after
+      restore.()
+    end
+
+    assert_received {:stage, {:finished, %{status: "crashed", reached: "claimed"} = summary}}
+    assert DispatchRun.end_reports(summary) == [:escalated]
+  end
+
+  test "a run that crashes after its session escalated ends escalated, not crashed", %{
+    root: root,
+    state: state
+  } do
+    # What a session that ran loop-escalate leaves in the run directory, then a crash before the
+    # run can finish: the escalation must survive it, or the story is re-queued over it.
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    config = config!(root)
+    {:ok, story} = Story.from_map(story_map(), config)
+    test = self()
+
+    on_stage = fn
+      {:started, %{run_dir: run_dir}} ->
+        send(self(), {:run_dir, run_dir})
+
+      {:implementing, _} ->
+        run_dir = receive(do: ({:run_dir, dir} -> dir))
+        File.write!(Path.join(run_dir, "escalations.ndjson"), ~s({"reason":"a business call"}\n))
+        send(test, {:run_dir_was, run_dir})
+        raise "crashed after escalating"
+
+      event ->
+        send(test, {:stage, event})
+    end
+
+    try do
+      assert_raise RuntimeError, fn -> Run.execute(config, story, on_stage: on_stage) end
+    after
+      restore.()
+    end
+
+    assert_received {:stage, {:finished, summary}}
+
+    assert %{status: "escalated", reached: "implementing", escalations: ["a business call"]} =
+             summary
+
+    assert DispatchRun.end_reports(summary) == [:escalated, :session_ended]
+    # Recorded as reported, so a Control that did not see the run end reports the same end.
+    assert_received {:run_dir_was, run_dir}
+
+    assert {:ok, %{"status" => "escalated", "reached" => "implementing"}} =
+             RunState.read(run_dir)
   end
 
   test "a raise inside a run frees the worktree lock", %{root: root, state: state} do

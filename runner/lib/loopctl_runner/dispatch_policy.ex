@@ -28,6 +28,12 @@ defmodule LoopctlRunner.DispatchPolicy do
        budget or a larger one.
 
   An accepted dispatch comes back as the fields a `LoopctlRunner.Story` is built from.
+
+  The refusals that read what the dispatch does not carry are decided once the run has cut its
+  worktree: `delivery_mode/1` (the repository's `.loopctl/mode`, read from the commit the worktree
+  was cut from), and for a `thread` session `push_helper/2` (its only way to push) and
+  `checkpoint_reporting/2` (how loopctl learns what it pushed). Each refuses `other`, and each
+  fails closed: a run it refuses starts no session.
   """
 
   alias LoopctlRunner.{Config, ControlConfig}
@@ -152,4 +158,72 @@ defmodule LoopctlRunner.DispatchPolicy do
     do:
       {:refuse, "token_budget_exceeds_limit",
        "token budget #{inspect(budget)} against this runner's limit of #{max}"}
+
+  @doc """
+  The delivery mode stated by a repository's `.loopctl/mode`, given what
+  `LoopctlRunner.Worktree.commit_file/4` read from the commit the worktree was cut from: a
+  byte-order mark stripped, then whitespace trimmed and case folded, and it must then say
+  `thread` or `pr`. Everything else refuses the dispatch `other` — no file (`repository has no
+  .loopctl/mode`), an empty one, another word, text that is not UTF-8, a file that could not be
+  read — because a mode decides whether the session opens and merges a pull request, and a
+  repository that never opted in has not asked for that.
+  """
+  @spec delivery_mode({:ok, binary()} | :absent | {:error, String.t()}) ::
+          {:ok, String.t()} | {:refuse, String.t(), String.t()}
+  def delivery_mode(:absent), do: {:refuse, "other", "repository has no .loopctl/mode"}
+
+  def delivery_mode({:error, why}),
+    do: {:refuse, "other", "the delivery mode in .loopctl/mode could not be read: " <> why}
+
+  def delivery_mode({:ok, raw}) do
+    stated = raw |> String.replace_prefix("\uFEFF", "") |> String.trim()
+
+    cond do
+      not String.valid?(stated) ->
+        {:refuse, "other", "malformed delivery mode in .loopctl/mode: not UTF-8 text"}
+
+      String.downcase(stated) in ["thread", "pr"] ->
+        {:ok, String.downcase(stated)}
+
+      true ->
+        {:refuse, "other",
+         "malformed delivery mode #{inspect(String.slice(stated, 0, 40))} in .loopctl/mode: " <>
+           "expected thread or pr"}
+    end
+  end
+
+  @doc """
+  Whether a session in `mode` has what it needs to finish: a `thread` session pushes ONLY through
+  `push_script` (`LoopctlRunner.Session.push_script/0`), so a release without that executable is
+  refused `other` rather than started on a prompt naming a command that does not exist.
+  """
+  @spec push_helper(String.t(), String.t()) :: :ok | {:refuse, String.t(), String.t()}
+  def push_helper("thread", push_script) do
+    case File.stat(push_script) do
+      {:ok, %File.Stat{type: :regular, mode: mode}} when Bitwise.band(mode, 0o100) != 0 ->
+        :ok
+
+      _ ->
+        {:refuse, "other",
+         "push helper missing: #{push_script} is not an executable file in this release"}
+    end
+  end
+
+  def push_helper(_mode, _push_script), do: :ok
+
+  @doc """
+  Whether a `thread` session's pushes can reach loopctl: its merge executor merges only the
+  checkpoints the runner reports, so a thread session on a build with no checkpoint reporter
+  (`reporter`, `LoopctlRunner.CheckpointStream` in production, from PR #59) would push work
+  nothing ever merges. Such a run is refused `other`; a `pr` session reports nothing and needs
+  none.
+  """
+  @spec checkpoint_reporting(String.t(), module()) :: :ok | {:refuse, String.t(), String.t()}
+  def checkpoint_reporting("thread", reporter) do
+    if Code.ensure_loaded?(reporter),
+      do: :ok,
+      else: {:refuse, "other", "checkpoint reporting not available"}
+  end
+
+  def checkpoint_reporting(_mode, _reporter), do: :ok
 end

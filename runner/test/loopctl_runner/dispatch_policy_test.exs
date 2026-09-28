@@ -198,4 +198,80 @@ defmodule LoopctlRunner.DispatchPolicyTest do
     assert {:error, _} = ControlConfig.from_map(Map.put(base, "accepts_dispatches", "yes"))
     assert {:error, _} = ControlConfig.from_map(Map.put(base, "max_token_budget", 0))
   end
+
+  describe "delivery_mode/1" do
+    test "thread and pr, after a byte-order mark, whitespace and case are set aside" do
+      for raw <- ["thread", "thread\n", "  Thread \r\n", "\uFEFFthread\n", "THREAD"] do
+        assert DispatchPolicy.delivery_mode({:ok, raw}) == {:ok, "thread"}, inspect(raw)
+      end
+
+      for raw <- ["pr", "PR\n", "\uFEFF pr "] do
+        assert DispatchPolicy.delivery_mode({:ok, raw}) == {:ok, "pr"}, inspect(raw)
+      end
+    end
+
+    test "no file refuses: pr merges on its own, and a repository that never opted in did not ask" do
+      assert DispatchPolicy.delivery_mode(:absent) ==
+               {:refuse, "other", "repository has no .loopctl/mode"}
+    end
+
+    test "an empty file refuses too: only an explicit thread or pr runs" do
+      for raw <- ["", "\n", "\uFEFF  \n"] do
+        assert {:refuse, "other", detail} = DispatchPolicy.delivery_mode({:ok, raw}), inspect(raw)
+        assert detail =~ "malformed delivery mode \"\" in .loopctl/mode"
+      end
+    end
+
+    test "any other value refuses, naming what was found, never falling back to pr" do
+      for raw <- ["threads", "thread pr", "yolo\n", "prr"] do
+        assert {:refuse, "other", detail} = DispatchPolicy.delivery_mode({:ok, raw})
+        assert detail =~ "malformed delivery mode #{inspect(String.trim(raw))}", inspect(raw)
+      end
+
+      assert {:refuse, "other", "malformed delivery mode in .loopctl/mode: not UTF-8 text"} =
+               DispatchPolicy.delivery_mode({:ok, <<0xFF, 0xFE>>})
+    end
+
+    test "a mode that could not be read refuses too" do
+      assert {:refuse, "other", detail} = DispatchPolicy.delivery_mode({:error, "too large"})
+      assert detail =~ "could not be read: too large"
+    end
+  end
+
+  describe "push_helper/2" do
+    setup do
+      {:ok, dir: tmp_dir!("push-helper")}
+    end
+
+    test "a thread session needs an executable push helper", %{dir: dir} do
+      helper = Path.join(dir, "loop-push")
+
+      assert {:refuse, "other", "push helper missing: " <> _} =
+               DispatchPolicy.push_helper("thread", helper)
+
+      File.write!(helper, "#!/bin/sh\n")
+      File.chmod!(helper, 0o644)
+      assert {:refuse, "other", _} = DispatchPolicy.push_helper("thread", helper)
+
+      File.chmod!(helper, 0o755)
+      assert DispatchPolicy.push_helper("thread", helper) == :ok
+    end
+
+    test "a pr session does not", %{dir: dir} do
+      assert DispatchPolicy.push_helper("pr", Path.join(dir, "absent")) == :ok
+    end
+  end
+
+  describe "checkpoint_reporting/2" do
+    test "a thread session needs a checkpoint reporter this build has" do
+      assert DispatchPolicy.checkpoint_reporting("thread", LoopctlRunner.NoSuchReporter) ==
+               {:refuse, "other", "checkpoint reporting not available"}
+
+      assert DispatchPolicy.checkpoint_reporting("thread", DispatchPolicy) == :ok
+    end
+
+    test "a pr session does not" do
+      assert DispatchPolicy.checkpoint_reporting("pr", LoopctlRunner.NoSuchReporter) == :ok
+    end
+  end
 end

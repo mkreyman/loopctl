@@ -51,9 +51,9 @@ defmodule LoopctlRunner.WorktreeFetchEnvTest do
     assert File.read!(record) =~ ~r/^args=-o IdentitiesOnly=yes -o BatchMode=yes /m
   end
 
-  test "the runner's own fetch keeps the operator's ssh agent, which a session's scrub names" do
-    # ProcessGroup.run/4 unsets what a SESSION must not inherit, and that list names the agent
-    # socket. This fetch is the runner authenticating as the operator: under BatchMode a key
+  test "the runner's own fetch keeps the operator's ssh agent, which the runner's scrub names" do
+    # ProcessGroup.run/5 unsets credentials for the runner's own commands, and that list names the
+    # agent socket. This fetch is the runner authenticating as the operator: under BatchMode a key
     # reachable only through the agent would fail every fetch without it. Presence only, never a
     # value: the recorded line says whether the name arrived.
     repo = git_repo!(Path.join(tmp_dir!("fetch-agent"), "repo"))
@@ -139,7 +139,7 @@ defmodule LoopctlRunner.WorktreeFetchEnvTest do
     test "a credential helper is told not to interact, and gets the operator's forge token",
          ctx do
       # A helper still runs, and Git Credential Manager opens a window unless told not to. `gh`'s
-      # helper authenticates with GH_TOKEN or GITHUB_TOKEN, which a session's scrub names. Presence
+      # helper authenticates with GH_TOKEN or GITHUB_TOKEN, which the runner's scrub names. Presence
       # only, never a value: the recorded lines say whether each name arrived.
       record = Path.join(Path.dirname(ctx.repo), "helper-record")
       helper = Path.join(Path.dirname(ctx.repo), "helper")

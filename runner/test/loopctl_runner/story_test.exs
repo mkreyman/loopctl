@@ -52,22 +52,30 @@ defmodule LoopctlRunner.StoryTest do
                Story.from_map(story_map(%{"base" => "--upload-pack=x"}), config)
     end
 
-    test "a tool permission the runner does not allow", %{root: root} do
-      config = config!(root, %{"allowed_tools" => ["Bash(mix test:*)"]})
+    test "an allowed_tools key is ignored, whatever it holds", %{config: config} do
+      # Nothing composes --allowedTools any more, so the key grants nothing and reaches no
+      # session: refusing a dispatch over it would tell loopctl this runner will not run the
+      # story, for a capability question that does not exist.
+      for tools <- [["Bash(mix test:*)"], "Bash", ["Bash", 1]] do
+        assert {:ok, %Story{} = story} =
+                 Story.from_map(story_map(%{"allowed_tools" => tools}), config)
 
-      assert {:ok, %Story{allowed_tools: ["Bash(mix test:*)"]}} =
-               Story.from_map(story_map(%{"allowed_tools" => ["Bash(mix test:*)"]}), config)
-
-      assert {:error, "story allowed_tools [\"Bash\"] are not in the runner allow-list"} =
-               Story.from_map(
-                 story_map(%{"allowed_tools" => ["Bash(mix test:*)", "Bash"]}),
-                 config
-               )
+        refute Map.has_key?(Story.to_map(story), :allowed_tools)
+      end
     end
 
     test "a blank prompt", %{config: config} do
       assert {:error, "story prompt must be non-empty"} =
                Story.from_map(story_map(%{"prompt" => "  "}), config)
     end
+  end
+
+  test "a deferred prompt is nil until its run builds one; otherwise a missing one is refused", %{
+    config: config
+  } do
+    no_prompt = Map.delete(story_map(), "prompt")
+
+    assert {:ok, %Story{prompt: nil}} = Story.from_map(no_prompt, config, prompt: :deferred)
+    assert {:error, "story prompt must be non-empty"} = Story.from_map(no_prompt, config)
   end
 end

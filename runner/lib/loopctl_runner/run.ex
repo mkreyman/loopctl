@@ -11,7 +11,8 @@ defmodule LoopctlRunner.Run do
   worktree lock). Its directory under `runs_dir` has a readable name instead,
   `<story id>-<UTC stamp>-<first 8 hex of the run id>`:
 
-      <dir>/story.json      the validated story
+      <dir>/story.json      the validated story, written at run start and again once a
+                            `:prompt` builder has built the prompt its session is given
       <dir>/state.json      side-effect identities and status (RunState)
       <dir>/trace.ndjson    the parent-linked event stream (Trace)
       <dir>/stdout.ndjson   the CLI's stream-json, verbatim
@@ -31,12 +32,14 @@ defmodule LoopctlRunner.Run do
   }
 
   @type result :: %{
-          run_id: String.t(),
-          run_dir: String.t(),
-          status: String.t(),
-          session: Session.result() | nil,
-          teardown: map() | nil,
-          error: String.t() | nil
+          required(:run_id) => String.t(),
+          required(:run_dir) => String.t(),
+          required(:status) => String.t(),
+          required(:session) => Session.result() | nil,
+          required(:teardown) => map() | nil,
+          required(:error) => String.t() | nil,
+          # Set by a run that stopped short of the stage its teardown implies: a refused prompt.
+          optional(:reached) => String.t()
         }
 
   @typedoc """
@@ -44,7 +47,8 @@ defmodule LoopctlRunner.Run do
   `state.json` exists; `{:worktree, %{branch, worktree_path}}` once the worktree exists;
   `{:implementing, %{}}` as the session starts; and `{:finished, summary}` however the run ends
   (a raise included, just before it is re-raised), whose summary names the stage the run
-  `reached`. A run that never gets a worktree goes from `:started` straight to `:finished`.
+  `reached`. A run that never gets a worktree goes from `:started` straight to `:finished`, and one
+  whose prompt is refused from `:worktree` to `:finished`.
   """
   @type stage_event ::
           {:started, %{run_id: String.t(), run_dir: String.t()}}
@@ -56,8 +60,13 @@ defmodule LoopctlRunner.Run do
   Runs the story to the end and returns its result.
 
   Options: `:env` (extra session environment), `:keep_worktree`, `:binding` (a map written into
-  the initial `state.json` before anything else happens, e.g. the dispatch this run serves), and
-  `:on_stage` (a one-argument function called with each `t:stage_event/0`).
+  the initial `state.json` before anything else happens, e.g. the dispatch this run serves),
+  `:on_stage` (a one-argument function called with each `t:stage_event/0`), and `:prompt` (a
+  one-argument function given the commit the worktree was cut from and returning `{:ok, prompt}`
+  or `{:refuse, reason, detail}`, called once the worktree exists and replacing `story.prompt`:
+  `LoopctlRunner.DispatchRun.prompt/4`). A refusal starts no session: the worktree is torn down
+  and the run ends `refused`, its error naming the reason. A builder that raises tears the
+  worktree down too, and the run crashes.
   """
   @summary_key {__MODULE__, :finished_summary}
 
@@ -67,33 +76,63 @@ defmodule LoopctlRunner.Run do
     # ends: a return, a raise, an exit or a throw, inside the worktree step or after it. The
     # summary it carries is left in the process dictionary by whichever path ended the run.
     Process.delete(@summary_key)
+    # The contract identifies a run by UUID; the directory keeps a name a person can find.
+    run_id = Session.uuid4()
+    run_dir = Path.join(config.runs_dir, run_dir_name(story, run_id))
 
     try do
-      run(config, story, opts)
+      run(config, story, run_id, run_dir, opts)
     catch
       kind, reason ->
-        Process.put(@summary_key, crash_summary(kind, reason))
+        Process.put(@summary_key, unfinished(run_dir, crash_error(kind, reason)))
         :erlang.raise(kind, reason, __STACKTRACE__)
     after
       stage(
         opts,
         {:finished,
-         Process.delete(@summary_key) ||
-           %{status: "crashed", error: "the run ended without a summary", escalations: []}}
+         Process.delete(@summary_key) || unfinished(run_dir, "the run ended without a summary")}
       )
     end
   end
 
   # The kind is what a reader needs first: an exit or a throw has no exception message.
-  defp crash_summary(kind, reason) do
+  defp crash_error(kind, reason),
+    do: "#{kind}: " <> String.slice(Exception.format_banner(kind, reason), 0, 500)
+
+  @doc """
+  The summary of a run that did not finish on its own — it raised, exited, or its process or its
+  owner died — from what it left on disk, the only account of it that outlives it: the stage it
+  recorded reaching (`state.json` `reached`, written BEFORE each stage's side effect, so a run
+  never recorded as `implementing` started no session) and what its session escalated with.
+
+  A session that ran `loop-escalate` handed the story to a human, so its run is `escalated` however
+  it ended after; `crashed` would lose the escalation and re-queue the story. A run with no
+  readable state got no further than its claim, so it reached `claimed`. A state from before
+  `reached` was recorded as the run progresses carries none, and gives `nil`: its caller keeps
+  the default it always had.
+  """
+  @spec unfinished(String.t() | nil, String.t()) :: map()
+  def unfinished(run_dir, error) do
+    escalations = if run_dir, do: escalations(run_dir), else: []
+
     %{
-      status: "crashed",
-      error: "#{kind}: " <> String.slice(Exception.format_banner(kind, reason), 0, 500),
-      escalations: []
+      status: if(escalations == [], do: "crashed", else: "escalated"),
+      error: error,
+      escalations: escalations,
+      reached: recorded_reached(run_dir)
     }
   end
 
-  defp run(config, story, opts) do
+  defp recorded_reached(nil), do: "claimed"
+
+  defp recorded_reached(run_dir) do
+    case RunState.read(run_dir) do
+      {:ok, %{} = state} -> state["reached"]
+      _ -> "claimed"
+    end
+  end
+
+  defp run(config, story, run_id, run_dir, opts) do
     # THIS BEAM'S IDENTITY FIRST, before anything is written. A run recorded without its owner's
     # start reads dead to every check, so the next run's reap would kill this one's session; with
     # no start to record, nothing is started.
@@ -116,11 +155,11 @@ defmodule LoopctlRunner.Run do
         owner: {:ok, owner}
       )
 
-    # The contract identifies a run by UUID; the directory keeps a name a person can find.
-    run_id = Session.uuid4()
-    run_dir = Path.join(config.runs_dir, run_dir_name(story, run_id))
     File.mkdir_p!(run_dir)
-    File.write!(Path.join(run_dir, "story.json"), JSON.encode!(Story.to_map(story)))
+
+    # Every run directory has its story from the start. A prompt a `:prompt` builder makes later
+    # is written over it when it exists (`build_prompt/4`); until then the story says it has none.
+    write_story(run_dir, story)
 
     {:ok, trace} = Trace.start_link(Path.join(run_dir, "trace.ndjson"), run_id)
 
@@ -142,6 +181,7 @@ defmodule LoopctlRunner.Run do
         "run_id" => run_id,
         "run_seq" => run_seq,
         "status" => "starting",
+        "reached" => "claimed",
         "repo_path" => story.repo_path
       })
       |> Map.merge(owner)
@@ -180,6 +220,13 @@ defmodule LoopctlRunner.Run do
     Map.merge(result, %{run_id: run_id, run_dir: run_dir})
   end
 
+  # The stage is recorded before it is announced and before what it stands for happens, so a run
+  # that dies in it is reported from where it really was (`unfinished/2`).
+  defp reach(run_dir, opts, reached, event) do
+    RunState.update(run_dir, %{reached: reached})
+    stage(opts, event)
+  end
+
   defp stage(opts, event) do
     case Keyword.get(opts, :on_stage) do
       nil -> :ok
@@ -196,10 +243,18 @@ defmodule LoopctlRunner.Run do
       exit_reason: result.session && Atom.to_string(result.session.reason),
       exit_status: result.session && result.session.exit_status,
       escalations: escalations(run_dir),
-      # The last stage the run reached: a run that got no worktree never started a session.
-      reached: if(result.teardown, do: "implementing", else: "claimed")
+      reached: reached(result)
     }
   end
+
+  # The last stage the run reached: a run that got no worktree never started a session, and one
+  # whose prompt was refused got a worktree and no further.
+  defp reached(%{reached: reached}), do: reached
+  defp reached(%{teardown: nil}), do: "claimed"
+  defp reached(_result), do: "implementing"
+
+  defp write_story(run_dir, story),
+    do: File.write!(Path.join(run_dir, "story.json"), JSON.encode!(Story.to_map(story)))
 
   @doc false
   @spec escalations(String.t()) :: [String.t()]
@@ -216,10 +271,11 @@ defmodule LoopctlRunner.Run do
     end
   end
 
-  # Best effort: whatever raised may be the run directory itself going away.
+  # Best effort: whatever raised may be the run directory itself going away. The status is the one
+  # the run's end is reported with, so a later Control reading it back reports the same end.
   defp record_crash(run_dir, trace, run_seq, error) do
     Trace.emit(trace, "run.crashed", run_seq, %{"error" => error})
-    RunState.update(run_dir, %{status: "crashed"})
+    RunState.update(run_dir, %{status: unfinished(run_dir, error).status})
     Trace.close(trace)
   rescue
     _ -> :ok
@@ -267,17 +323,20 @@ defmodule LoopctlRunner.Run do
           )
         )
 
-        stage(opts, {:worktree, %{branch: story.branch, worktree_path: path}})
-
-        run_session(
-          config,
-          story,
+        reach(
           run_dir,
-          trace,
-          run_seq,
-          path,
-          opts
+          opts,
+          "worktree",
+          {:worktree, %{branch: story.branch, worktree_path: path}}
         )
+
+        case prompted(story, created.cut_from, run_dir, trace, run_seq, path, opts) do
+          {:ok, story} ->
+            run_session(config, story, run_dir, trace, run_seq, path, opts)
+
+          {:refuse, reason, detail} ->
+            refuse_session(story, run_dir, trace, run_seq, path, opts, "#{reason}: #{detail}")
+        end
 
       {:error, reason} ->
         Trace.emit(trace, "worktree.failed", run_seq, %{"error" => reason})
@@ -285,10 +344,68 @@ defmodule LoopctlRunner.Run do
     end
   end
 
+  # A dispatch's prompt is built here, once the tree exists, and never before: what it states — the
+  # delivery mode, read from the commit the tree was cut from — and whether the run may start at
+  # all are decided by the builder. The tree already exists, so a builder that raises (or exits,
+  # or throws) tears it down the way a refusal does before the run crashes on.
+  defp prompted(story, cut_from, run_dir, trace, run_seq, path, opts) do
+    build_prompt(story, cut_from, run_dir, opts)
+  catch
+    kind, reason ->
+      teardown = teardown(story, trace, run_seq, path, opts)
+      record_worktree(run_dir, story, path, teardown, opts)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp build_prompt(story, cut_from, run_dir, opts) do
+    case Keyword.get(opts, :prompt) do
+      nil when story.prompt == nil ->
+        raise ArgumentError, "story #{story.id} has no prompt and the run was given no :prompt"
+
+      nil ->
+        {:ok, story}
+
+      build ->
+        with {:ok, prompt} <- build.(cut_from) do
+          story = %{story | prompt: prompt}
+          write_story(run_dir, story)
+          {:ok, story}
+        end
+    end
+  end
+
+  # What actually happened, not what was intended: a failed removal stays findable by the reaper
+  # instead of being recorded as gone.
+  defp record_worktree(run_dir, story, path, teardown, opts) do
+    RunState.update(run_dir, %{
+      worktree: %{
+        path: path,
+        branch: story.branch,
+        base: story.base,
+        status: worktree_status(teardown, opts)
+      }
+    })
+  end
+
+  # No session: the worktree goes the way it would after one, and the run records why.
+  defp refuse_session(story, run_dir, trace, run_seq, path, opts, error) do
+    Trace.emit(trace, "session.refused", run_seq, %{"error" => error})
+    teardown = teardown(story, trace, run_seq, path, opts)
+    record_worktree(run_dir, story, path, teardown, opts)
+
+    %{status: "refused", session: nil, teardown: teardown, error: error, reached: "worktree"}
+  end
+
+  defp worktree_status(teardown, opts) do
+    if Keyword.get(opts, :keep_worktree, false),
+      do: "kept",
+      else: Worktree.status_after(teardown)
+  end
+
   defp run_session(config, story, run_dir, trace, run_seq, path, opts) do
     # Teardown runs even when the session monitor crashes. A BEAM that dies outright
     # never gets here: that is the launcher watchdog's job, then the reaper's.
-    stage(opts, {:implementing, %{}})
+    reach(run_dir, opts, "implementing", {:implementing, %{}})
 
     {session, error} =
       try do
@@ -313,17 +430,7 @@ defmodule LoopctlRunner.Run do
       end
 
     teardown = teardown(story, trace, run_seq, path, opts)
-
-    # What actually happened, not what was intended: a failed removal stays findable by
-    # the reaper instead of being recorded as gone.
-    worktree_status =
-      if Keyword.get(opts, :keep_worktree, false),
-        do: "kept",
-        else: Worktree.status_after(teardown)
-
-    RunState.update(run_dir, %{
-      worktree: %{path: path, branch: story.branch, base: story.base, status: worktree_status}
-    })
+    record_worktree(run_dir, story, path, teardown, opts)
 
     %{status: session_status(session), session: session, teardown: teardown, error: error}
   end

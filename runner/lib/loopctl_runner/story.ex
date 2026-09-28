@@ -19,8 +19,7 @@ defmodule LoopctlRunner.Story do
     :prompt,
     :wall_clock_s,
     :max_turns,
-    :model,
-    allowed_tools: []
+    :model
   ]
 
   @type t :: %__MODULE__{
@@ -29,11 +28,10 @@ defmodule LoopctlRunner.Story do
           repo_path: String.t(),
           base: String.t(),
           branch: String.t(),
-          prompt: String.t(),
+          prompt: String.t() | nil,
           wall_clock_s: pos_integer(),
           max_turns: pos_integer(),
-          model: String.t() | nil,
-          allowed_tools: [String.t()]
+          model: String.t() | nil
         }
 
   @id_format ~r/\A[a-z0-9][a-z0-9._-]{0,62}\z/
@@ -47,17 +45,24 @@ defmodule LoopctlRunner.Story do
     end
   end
 
-  @spec from_map(map(), Config.t()) :: {:ok, t()} | {:error, String.t()}
-  def from_map(map, %Config{} = config) when is_map(map) do
+  @doc """
+  The story `map` describes, validated against `config`. With `prompt: :deferred` the map carries
+  no prompt and the story's is nil: a dispatch's prompt can only be built once its run has cut the
+  worktree (`LoopctlRunner.Run.execute/3`'s `:prompt`), and a placeholder here would be a prompt
+  nobody meant.
+  """
+  @spec from_map(map(), Config.t(), keyword()) :: {:ok, t()} | {:error, String.t()}
+  def from_map(map, config, opts \\ [])
+
+  def from_map(map, %Config{} = config, opts) when is_map(map) do
     with {:ok, id} <- matching(map, "id", @id_format),
          {:ok, repo, repo_path} <- repo(map, config),
          {:ok, base} <- matching(map, "base", @ref_format),
          {:ok, branch} <- branch(map, config),
-         {:ok, prompt} <- prompt(map),
+         {:ok, prompt} <- prompt(map, Keyword.get(opts, :prompt)),
          {:ok, wall_clock_s} <- bounded(map, "wall_clock_s", config.max_wall_clock_s),
          {:ok, max_turns} <- bounded(map, "max_turns", config.max_turns),
-         {:ok, model} <- model(map),
-         {:ok, tools} <- allowed_tools(map, config) do
+         {:ok, model} <- model(map) do
       {:ok,
        %__MODULE__{
          id: id,
@@ -68,13 +73,12 @@ defmodule LoopctlRunner.Story do
          prompt: prompt,
          wall_clock_s: wall_clock_s,
          max_turns: max_turns,
-         model: model,
-         allowed_tools: tools
+         model: model
        }}
     end
   end
 
-  def from_map(_, _), do: {:error, "story must be a JSON object"}
+  def from_map(_, _, _), do: {:error, "story must be a JSON object"}
 
   @doc "The story as JSON-encodable data, for the run directory."
   @spec to_map(t()) :: map()
@@ -118,7 +122,9 @@ defmodule LoopctlRunner.Story do
     end
   end
 
-  defp prompt(map) do
+  defp prompt(_map, :deferred), do: {:ok, nil}
+
+  defp prompt(map, nil) do
     case Map.get(map, "prompt") do
       prompt when is_binary(prompt) ->
         if String.trim(prompt) == "",
@@ -140,22 +146,6 @@ defmodule LoopctlRunner.Story do
 
       _ ->
         {:error, "story #{key} must be a positive integer"}
-    end
-  end
-
-  defp allowed_tools(map, config) do
-    case Map.get(map, "allowed_tools", []) do
-      tools when is_list(tools) ->
-        case Enum.reject(tools, &(&1 in config.allowed_tools)) do
-          [] ->
-            {:ok, tools}
-
-          refused ->
-            {:error, "story allowed_tools #{inspect(refused)} are not in the runner allow-list"}
-        end
-
-      _ ->
-        {:error, "story allowed_tools must be a list"}
     end
   end
 

@@ -238,10 +238,58 @@ defmodule LoopctlRunner.TestStragglers do
         pids = Enum.map(pins, &elem(&1, 0))
 
         # Read before the signal: a process that has been killed has no command line left
-        # to name it by.
-        commands = Enum.map(pids, &"#{&1} #{ProcessGroup.command(&1) || "(already gone)"}")
+        # to name it by. ARGV IS DROPPED WHOLE — see `describe/1`.
+        commands = Enum.map(pids, &"#{&1} #{describe(&1)}")
 
         {terminate_only(pins, grace_ms), pids, commands}
+    end
+  end
+
+  # THE EXECUTABLE AND NOTHING ELSE. What this line is FOR is naming a straggler so a person can
+  # tell what leaked — a `claude` from a `mix test` from a browser — and argv is not needed for
+  # that. Argv IS where a credential rides: a triage session's carries the whole agents JSON and
+  # that run's verdict token, in a place any `ps` can read.
+  #
+  # A LENGTH CAP WAS THE FIRST FIX AND IT LEAKED, which is why this one drops argv rather than
+  # trimming it. `binary_part(command, 0, 120)` keeps the HEAD, and the head of
+  # `sh -c "sleep 30" <token>` is the shell plus the first ~97 bytes OF THE TOKEN — a cut that is
+  # structural AND POSITIONAL, and only the first property is the safe one. Nor is anything here
+  # looking for something secret-shaped: a redactor that pattern-matches fails OPEN on a value
+  # carrying a regex metacharacter and prints the credential in full with no error (KB cf9bc09a).
+  #
+  # The executable is `ps -o comm=`, asked for on its own, never the command line split at its
+  # first space: an executable whose path has a space in it (`/Applications/Some App.app/...`) would
+  # be cut there, and what followed the cut — the rest of the path AND the argv — counted as
+  # dropped. The command line is read only to say how much was dropped, and nothing of it is kept.
+  defp describe(pid) do
+    case executable(pid) do
+      nil -> "(already gone)"
+      executable -> executable <> dropped(ProcessGroup.command(pid), executable)
+    end
+  end
+
+  defp executable(pid) do
+    case System.cmd("ps", ["-o", "comm=", "-p", "#{pid}"], stderr_to_stdout: true) do
+      {out, 0} ->
+        case String.trim(out) do
+          "" -> nil
+          executable -> executable
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  # What follows the executable on the command line, counted and never shown. When the command
+  # line does not begin with the executable as `ps` names it (argv[0] is the program's to set),
+  # the whole of it is counted.
+  defp dropped(nil, _executable), do: ""
+
+  defp dropped(command, executable) do
+    case command |> String.replace_prefix(executable, "") |> String.trim_leading() do
+      "" -> ""
+      argv -> " (+#{byte_size(argv)} bytes of argv dropped: an argv can carry a credential)"
     end
   end
 

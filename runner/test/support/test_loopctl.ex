@@ -20,6 +20,9 @@ defmodule LoopctlRunner.TestLoopctl do
       runner_id: "0b1c7a52-6a4c-4f7e-9d7b-1a2b3c4d5e6f",
       join_replies: [],
       last_status_ms: nil,
+      # The min_interval_ms a rate-limited status refusal names: loopctl's 1s floor, or whatever
+      # malformed value a test wants the runner to survive.
+      status_min_interval_ms: 1_000,
       # :ok, {:delay, ms} for a slow link, :none for a push that is never answered, {:body, map}
       # for an ok reply carrying a body, or a list of those consumed one push at a time (the
       # last one then repeats).
@@ -41,6 +44,10 @@ defmodule LoopctlRunner.TestLoopctl do
       # Replies to stage pushes, oldest first: :ok (validate and ack), :none for a push left
       # unanswered, or {:error, reason_map}; once used up every stage is acknowledged.
       stage_replies: [],
+      # Replies to session_ended pushes, oldest first: :ok (ack as recorded), :replayed (ack a
+      # resend), :none for a push left unanswered, or {:error, reason_map}; once used up every
+      # one is acknowledged as recorded.
+      session_ended_replies: [],
       # Replies to triage_verdict pushes, oldest first: :ok (record and ack), :replayed (ack a
       # resend, applying nothing), :bare_ok for an ok with no body, :none for a push left
       # unanswered, or {:error, reason_map}.
@@ -84,6 +91,16 @@ defmodule LoopctlRunner.TestLoopctl do
     Agent.get_and_update(__MODULE__, fn
       %{stage_replies: [reply | rest]} = state -> {reply, %{state | stage_replies: rest}}
       state -> {:ok, state}
+    end)
+  end
+
+  def next_session_ended_reply do
+    Agent.get_and_update(__MODULE__, fn
+      %{session_ended_replies: [reply | rest]} = state ->
+        {reply, %{state | session_ended_replies: rest}}
+
+      state ->
+        {:ok, state}
     end)
   end
 
@@ -203,7 +220,8 @@ defmodule LoopctlRunner.TestLoopctl do
 
       if last && now - last < 1_000 do
         TestLoopctl.notify({:status_rate_limited, payload})
-        {:reply, {:error, %{reason: "rate_limited", min_interval_ms: 1_000}}, socket}
+        interval = TestLoopctl.get(:status_min_interval_ms)
+        {:reply, {:error, %{reason: "rate_limited", min_interval_ms: interval}}, socket}
       else
         TestLoopctl.put(:last_status_ms, now)
         accept_status(payload, socket)
@@ -270,6 +288,25 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
+    # loopctl's once-per-dispatch recording is not modelled: the reply is scripted. An implement
+    # session's ack carries the row, as loopctl's does.
+    def handle_in("session_ended", payload, socket) do
+      TestLoopctl.notify({:session_ended, payload})
+
+      case Contract.validate("RunnerSessionEnded", payload) do
+        :ok ->
+          case TestLoopctl.next_session_ended_reply() do
+            :ok -> {:reply, {:ok, session_ended_ack(false)}, socket}
+            :replayed -> {:reply, {:ok, session_ended_ack(true)}, socket}
+            :none -> {:noreply, socket}
+            {:error, reply} -> {:reply, {:error, reply}, socket}
+          end
+
+        {:error, details} ->
+          {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
+      end
+    end
+
     # loopctl's own recording is not modelled; what IS modelled is the refusal the schema cannot
     # express, because it is the trap this message carries: exactly one of verdict and incomplete,
     # or invalid_payload — which is permanent, so a runner that gets it wrong loses the run's only
@@ -310,6 +347,9 @@ defmodule LoopctlRunner.TestLoopctl do
         {:error, reply} -> {:reply, {:error, reply}, socket}
       end
     end
+
+    defp session_ended_ack(replayed?),
+      do: %{replayed: replayed?, stage: "implementing", claim_epoch: 3, lock_version: 1}
 
     defp verdict_ack(replayed?) do
       %{recorded_at: DateTime.utc_now() |> DateTime.to_iso8601(), replayed: replayed?}

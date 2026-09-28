@@ -62,7 +62,7 @@ never as a query parameter. Rotating that key through `/api_keys` is refused; ro
 `DELETE /api/v1/runners/:id` and re-enrolling.
 
 **Contract.** The wire contract is JSON Schema, `priv/runner_contract/v1.json` in mkreyman/loopctl
-(`contract_version` 1.12.0), vendored into this repo rather than re-typed. The join payload must
+(`contract_version` 1.21.0), vendored into this repo rather than re-typed. The join payload must
 declare `machine` exactly equal to the enrolled name. It SHOULD also declare `kinds`, the
 dispatch kinds this machine runs: the field is optional, and since 1.6.0 a PRESENT AND NON-EMPTY
 one is the only thing loopctl consults for that runner. Absent or empty is read as
@@ -140,8 +140,9 @@ draft. Both halves are prose in the contract, expressible in neither the schema'
 this validator, so the EMITTER enforces them and a mistake surfaces as a refusal on the wire.
 
 **Nothing emits this yet, and declaring the kind is not the remaining work.** `triage` is outside
-`Control.kinds()`, so loopctl sends none. Beyond the runner's accept path and its own contained
-tool set, the three trio agent definitions (`~/.claude/agents/triage-{analyst,architect,engineer}.md`)
+`Control.kinds()`, so loopctl sends none; a pending triage start an earlier build accepted still
+runs, in a detached worktree of its own rather than the repository's live checkout. Beyond the
+runner's accept path and its own contained tool set, the three trio agent definitions (`~/.claude/agents/triage-{analyst,architect,engineer}.md`)
 still emit the OLD shape — a `verdict` key rather than `outcome`, and a `0.0–1.0` confidence
 rather than the enum — none has `Write` in its `tools:` line, and `--json-schema` constrains a
 run's final result rather than a subagent's return. Those bodies have to carry the contract as a
@@ -275,33 +276,67 @@ an arbitrary prompt executed as the user with that machine's credentials.
 
 ## 8. Unattended sessions
 
-**Launch with `--permission-mode dontAsk --permission-prompts none --setting-sources ""`.**
-`--permission-prompts none` *removes* `AskUserQuestion` from the tool list and cancels MCP
-elicitations — making the wrong thing impossible rather than costly. Requires 2.1.259+. Add
-`--max-turns` as the hard stop.
+**Launch with `--permission-mode bypassPermissions --permission-prompts none`, and nothing else
+that restricts.** A session runs with the authority a locally dispatched agent has and inherits the
+operator's user-scoped setup: `SOUL.md`, the user `CLAUDE.md`, the hooks, the plugins, the agents,
+the skills and the MCP set. Mark, 2026-09-16, in three instructions: *"All agents must run with the
+yolo mode, the same as I'm running all my sessions now!"*, *"everything must inherit my entire user
+scoped claude setup"*, and *"the same claude setup means the same claude setup as the local agents.
+with the same rules and workflows. the same soul.md, the same claude.md, etc"*.
 
-**`dontAsk` is what makes the allow-list a limit.** It runs only what an `--allowedTools` rule
-names and denies the rest without a prompt. An unattended session can only run what is
-pre-allowed, so a story names its tool rules (`"allowed_tools": ["Bash(mix test:*)"]`), the runner
-refuses any rule not in its own configured allow-list, and passes the rest as `--allowedTools`,
-after its own file rules `Read|Glob|Grep|Edit|Write(./**)`, which scope the file tools to the
-worktree.
+**Three flags remain, and none is a permission.** `--permission-prompts none` *removes*
+`AskUserQuestion` and cancels MCP elicitations — asking cannot be ANSWERED here, so a session that
+could ask would block for ever (requires 2.1.259+). `--max-turns` is a budget loopctl sets per
+story. And `claude-headless.sh` with `ANTHROPIC_API_KEY` unset is a BILLING control (~USD 300 in
+one night, KB `b38ef90e`), not part of anyone's Claude setup.
 
-This section named `auto` until 2026-09-14, and `auto` contains nothing: its classifier approves
-whatever it judges safe, and `--permission-prompts none` only denies what would still have
-prompted. The first end-to-end run, under it, committed through a bash wrapper, ran `docker exec
-psql` and `gh issue view`, and read `~/.claude`. Probed on 2.1.270 with the same prompt and one
-flag changed: under `auto`, `touch`, `bash -c`, `git status && touch` and a Write outside the cwd
-all ran; under `dontAsk`, each was denied (KB `c6452b2b`).
+**How a session finishes is the repository's delivery mode, and its prompt states it.** The mode is
+`.loopctl/mode` as the commit the worktree was cut from holds it — the new tree's HEAD before any
+session runs, or for an adopted tree the merge base of its HEAD and the base — read once the tree
+is cut and never from the working tree, which the session can write, nor from an unfetched remote
+ref, which can differ from what the tree holds; the read is bounded and opens nothing on disk. A
+byte-order mark, surrounding whitespace and case are set aside. `thread` means commit, push only
+through `priv/bin/loop-push` (fetch first, merge origin's commits, never force; it pushes only the
+branch `LOOP_BRANCH` names), open no pull request and merge nothing, because loopctl's merge
+executor merges the checkpoints the runner reports. `pr` means the operator's delivery loop, which
+the session inherits with his setup, with the pull request opened against the dispatch's base
+(`gh pr create --base <base>`) and merged only into it — except that the branch and the worktree
+are the runner's, so the session removes neither, checks the base out in neither, and merges
+without `--delete-branch`. **Nothing else runs, absence included**: a repository with no
+`.loopctl/mode` is refused `repository has no .loopctl/mode`, because `pr` merges autonomously and
+a repository that never opted in has not asked for that; an empty file or any other value is
+refused naming what it said. A `thread` repository is also refused on a build without `loop-push`
+(PR #60) or without checkpoint reporting (PR #59), which land in that order before thread mode is
+usable. Pr mode's promise that the runner removes a shipped branch's worktree holds because
+teardown decides by merged content.
 
-**`--setting-sources ""` keeps the operator's harness out.** Without it the session loaded the
-user's settings: their permission allow rules, hooks and plugins, and a delivery loop written for
-a human that told it to commit. It also ignores the repository's `.claude/settings.json`, which a
-session could otherwise write to grant itself more. Unlike `--bare`, it keeps the login.
+**`auto` is not used, for its own reason.** Its classifier approves whatever it judges safe:
+probed on 2.1.270 with one flag changed, `touch`, `bash -c`, `git status && touch` and a Write
+outside the cwd all ran under it while `dontAsk` denied each (KB `c6452b2b`), and the first
+end-to-end run, under `auto`, committed through a bash wrapper, ran `docker exec psql` and
+`gh issue view`, and read `~/.claude`.
 
-**The allow-list is not a sandbox.** An allowed `mix test` runs whatever code the session wrote,
-as this user. The allow-list bounds the session's own commands; anything stronger needs an OS
-boundary (a separate user, a container) that the runner does not have yet.
+What that measures is the BLAST RADIUS of a session on this machine — and it is the same radius a
+dispatched `elixir-engineer` has had all along: same OS user, same keys, same shell. Treating
+"nobody is watching" as if it shrank the radius confused it with DETECTION TIME, which is a
+different problem addressed by the wall clock, the liveness park and `loop-escalate`. And
+committing, the thing that run was faulted for, is now the GOAL: automating a filed ticket end to
+end is what this system is for.
+
+**Deny by NAME with a reason per name; never deny a class and grant exceptions back.** A class
+deny takes every capability in the class — tidewave and playwright under an MCP wildcard, `Agent`,
+`SendMessage`, `WebFetch` and `Skill` under a fixed tool list — and each stays missing until
+someone asks the right question.
+
+**No tool is excluded.** A session inherits the target repo's `.mcp.json` from the tree the runner
+starts it in, as an attended session in that tree does. A repo resolves tidewave per worktree (its
+`.mcp.json` launching through a per-tree port script), an attended worktree session carries no
+exclusion, and parity forbids one here. A repo whose `.mcp.json` hardcodes the main tree's URL has
+that defect in attended worktrees too, and it is that repo's to fix.
+
+**Nothing here is a sandbox.** `mix test` runs whatever code the session wrote, as this user, and
+no rule bounds the session's own commands either. Anything stronger needs an OS boundary (a
+separate user, a container) that the runner does not have yet.
 
 Do not reach for a `PreToolUse` deny hook instead. That is one rung down and retryable: the retry
 control lives on `PermissionDenied`, which does not fire for `PreToolUse` denials, so nothing
@@ -313,10 +348,11 @@ bounds an unattended session re-asking. And never pair it with `permissionDecisi
 model wanted to ask: no tool call is attempted, so neither `PreToolUse` nor `PermissionDenied`
 sees anything (measured on 2.1.270, KB `16d4ff67`). The runner therefore:
 
-- ships `priv/bin/loop-escalate` and pre-allows exactly that absolute path
-  (`--allowedTools "Bash(<path>:*)"`, verified to run under `--permission-prompts none`). A run
-  that mints an `escalate.token` requires it as the command's first argument; an implement run
-  mints none and is unchanged;
+- ships `priv/bin/loop-escalate` and names that absolute path in the system prompt. It needed an
+  `--allowedTools "Bash(<path>:*)"` rule until 2026-09-16; nothing denies it now, and the PROMPT
+  is therefore the only path — if that text stops reaching it, a session with no way to ask grinds
+  silently to its turn limit. A run that mints an `escalate.token` requires it as the command's
+  first argument; an implement run mints none and is unchanged;
 - tells the session through `--append-system-prompt` to run it, with the decision and the reason,
   and stop, whenever a request is ambiguous, contradicts existing behaviour, removes deliberate
   behaviour, or needs a business call;
@@ -329,9 +365,9 @@ capped, and never executed.
 
 The runner passes `LOOP_MODE=1` and `LOOP_STORY_FILE` (a regular file written just before the
 session starts) in the environment. claude-config's loop mode keys on both, and on the story
-file's freshness, to stand `gate-unmerged-pr` down for loop sessions; under
-`--setting-sources ""` no user hook loads at all, so those variables now matter only to what the
-session's own commands read.
+file's freshness, to stand `gate-unmerged-pr` down for loop sessions — which matters again since
+2026-09-16: the operator's hooks are INHERITED now, so that gate does load, and these variables are
+what stand it down as they were written to.
 
 **Parking detection.** Do not use "no writes under `subagents/` in N minutes" — measured on
 mac-mini, **0 of 1,543 project directories** contain one, because that directory exists only when
@@ -364,26 +400,27 @@ which covers a runner killed with `kill -9`; reap orphans at runner boot behind 
 Linux a Port child is already a session leader, so a bare `setsid(2)` fails with EPERM — check
 leadership rather than assume it.)
 
-**The session's cwd must be the worktree** — `block-foreign-repo-write.sh` keys on
-`git rev-parse --git-common-dir`, so `--add-dir` from elsewhere blocks every write.
+**The session's cwd must be the worktree.** It is also what a repo's per-tree `.mcp.json` resolves
+its dev server from. (`block-foreign-repo-write.sh` keys on `git rev-parse --git-common-dir`; it is inherited again now,
+though nothing scopes a session's writes to the worktree any more.)
 
-**Contain what the session can use, not only what it may run.** `--allowedTools` grants; it removes
-nothing. Measured on Claude Code 2.1.270 (KB c6452b2b): with only the flags above, a session also
-had Agent, Workflow, Skill, SendMessage, RemoteTrigger, WebFetch, every configured MCP server —
-loopctl's destructive tools, with the machine's keys — and every plugin tool. An implement session
-is therefore launched with `--tools Read,Edit,Write,Glob,Grep,Bash`, `--strict-mcp-config
---mcp-config '{"mcpServers":{}}'` and `--disallowedTools "mcp__*"`, fixed in the runner and never
-widened by a story or the config. A triage session (§4) needs its read-only lenses as agents, so it
-gets its own contained set (`LoopctlRunner.TriageTools`) — designed with its contract, not this
-set widened: `Read`, `Glob`, `Grep`, `Agent`, and `Bash` for exactly TWO commands: the verdict
-and the escalate its system prompt names. No `Edit` and no `Write` at all, and still no MCP. Both
-commands take a per-run token that reaches the SESSION's prompt and nothing else, because
+**A session's tool pool is NOT contained, and the measurement that argued for containing it is
+still true.** Measured on Claude Code 2.1.270 (KB c6452b2b): with only the flags above, a session
+has Agent, Workflow, Skill, SendMessage, RemoteTrigger, WebFetch, every configured MCP server —
+loopctl's own among them, with the machine's keys — and every plugin tool. That is the point: a
+local agent has all of it, and the loopctl MCP tools in particular ARE the story-lifecycle
+protocol (`loopctl-contract`, `loopctl-status`, `/loopctl:implement`), so excluding them would
+disable the workflow an exclusion would claim to protect. A triage session (§4) runs the same
+posture; what makes IT read-only is not a flag on the session but each lens DECLARING its own
+tools (`Read`, `Glob`, `Grep`) — the boundary that survives a posture change. Its own `Bash` can
+write, which is stated plainly in `LoopctlRunner.TriageTools`. Its verdict and escalate commands
+take a per-run token that reaches the SESSION's prompt and nothing else, because
 `--agents` leaves the built-in agent types dispatchable and a subagent inherits the session's
-allow-rules — without it, a fourth reading could state the run's verdict or end the run. **The runner supplies the lens definitions itself, as
-`--agents` JSON**, because it cannot inherit them: they are user-scope files
-(`~/.claude/agents/triage-*.md`) and `--setting-sources ""` is what keeps the operator's settings
-out, so a session launched without them has nothing to dispatch and the trio silently degrades to
-one session doing all three readings. Shipping them from the runner also makes the lens set a
+posture — which under `bypassPermissions` bounds nothing, so a lens's OWN declared tools are what
+keep a reading read-only. **The runner supplies the lens definitions itself, as `--agents` JSON**:
+a machine need not carry `~/.claude/agents/triage-*.md` at all, and a session launched without
+them has nothing to dispatch and the trio silently degrades to one session doing all three
+readings. Shipping them from the runner also makes the lens set a
 thing this repo tests rather than a thing a machine happens to have, and the triage prompt NAMES
 them, since a session given lenses and not told to use them degrades the same way. Each lens
 DECLARES its own `tools` (`Read`, `Glob`, `Grep`): a definition without them inherits broad
@@ -395,17 +432,19 @@ nothing, and `general-purpose` — which declares no tool restriction of its own
 from a contained session, told to write with Write or `Bash touch`, and also created nothing. What does NOT hold is limiting the Agent tool to the lenses — the
 built-in agent types (`general-purpose`, `Explore`, `Plan`) stay listed beside them, and
 `--agents` adds rather than replaces. The containment is therefore the permission rules a
-subagent inherits and the tools each lens declares, never the agent list. **No MCP means no knowledge base**: a dispatched session
-never holds this machine's loopctl keys, so a lens that wants the KB gets what the runner puts in
-its prompt, or nothing. Its verdict leaves through `priv/bin/loop-verdict`, the one command it is
-pre-allowed, for the same reason escalation is a command: a verdict scraped out of a session's
-prose would be parsed from text that has just read the reporter's untrusted text.
+subagent inherits and the tools each lens declares, never the agent list. A session DOES hold this machine's MCP set now, loopctl's
+included, so a lens that wants the knowledge base can reach it — and the story-lifecycle skills
+that need those tools work for the same reason. Its verdict still leaves through
+`priv/bin/loop-verdict`, named in the prompt rather than pre-allowed, for the same reason
+escalation is a command: a verdict scraped out of a session's prose would be parsed from text that
+has just read the reporter's untrusted text.
 
-**Not `--bare`** — it drops the login, so the session cannot run at all. `--setting-sources ""`
-is what keeps the operator's settings out while keeping the login, so NO guard hook loads either:
-the loop-mode variable the runner sets (`LOOP_MODE`, `LOOP_STORY_FILE`) no longer stands
-`gate-unmerged-pr.sh` down, because that hook is not there to stand down. The variables remain for
-what the session's own commands read.
+**Not `--bare`** — it drops the login, so the session cannot run at all. The operator's settings
+are now INHERITED rather than excluded, so every guard hook loads: `block-subagent-git.sh`, the
+review-round counter, the merge gate and the drip-feed gate all apply inside a session, and the
+loop-mode variables (`LOOP_MODE`, `LOOP_STORY_FILE`) stand `gate-unmerged-pr.sh` down as they were
+written to. A session can therefore be BLOCKED by a gate it cannot answer; the first real run is
+where that is learned.
 
 ## 9. Merge, and what Larisa sees
 

@@ -411,6 +411,20 @@ defmodule LoopctlRunner.WorktreeTest do
                System.cmd("git", ["-C", path, "config", "branch.loop/s1.merge"], env: env)
     end
 
+    test "its cut_from is origin's commit, and stays so once adopted with a session's commit",
+         %{repo: repo, path: path} = ctx do
+      shipped = ctx.shipped
+      assert {:ok, %{cut_from: ^shipped}} = Worktree.create(repo, path, "loop/s1", "master")
+      commit!(path, "wip.txt", "an earlier session's commit")
+
+      # The local base is behind: a merge base with it alone would name a commit older than the
+      # one this tree was cut from, and read a stale `.loopctl/mode`.
+      refute git!(repo, ["rev-parse", "master"]) == shipped
+
+      assert {:ok, %{reused: true, cut_from: ^shipped}} =
+               Worktree.create(repo, path, "loop/s1", "master")
+    end
+
     test "is cut from the local base when it holds a commit origin's lacks", %{
       repo: repo,
       path: path
@@ -967,6 +981,186 @@ defmodule LoopctlRunner.WorktreeTest do
       # The hook itself works: it is the runner's git that does not run it.
       git!(repo, ["checkout", "-q", "--detach"])
       assert File.exists?(ran)
+    end
+  end
+
+  # Every directory a git_stdout call is running in, this test's and any other's.
+  defp stderr_dirs do
+    tmp = System.tmp_dir!()
+
+    for name <- File.ls!(tmp),
+        String.starts_with?(name, "loopctl-git-"),
+        path = Path.join(tmp, name),
+        File.dir?(path),
+        do: path
+  end
+
+  defp held_dirs(before) do
+    new = stderr_dirs() -- before
+    Process.sleep(200)
+    Enum.filter(new, &File.dir?/1)
+  end
+
+  describe "cut_from" do
+    test "a new tree's is its HEAD, the base's commit, read before any session", %{
+      repo: repo,
+      path: path
+    } do
+      base = git!(repo, ["rev-parse", "master"])
+      assert {:ok, %{cut_from: ^base}} = Worktree.create(repo, path, "loop/s1", "master")
+      assert git!(path, ["rev-parse", "HEAD"]) == base
+    end
+
+    test "an adopted tree's is its merge base with the base, never an earlier session's commit",
+         %{repo: repo, path: path} do
+      {:ok, %{cut_from: cut}} = Worktree.create(repo, path, "loop/s1", "master")
+      # An earlier session committed a mode of its own choosing on the story's branch.
+      File.mkdir_p!(Path.join(path, ".loopctl"))
+      File.write!(Path.join([path, ".loopctl", "mode"]), "thread\n")
+      git!(path, ["add", ".loopctl/mode"])
+      git!(path, ["commit", "-q", "-m", "session"])
+      refute git!(path, ["rev-parse", "HEAD"]) == cut
+
+      assert {:ok, %{reused: true, cut_from: ^cut}} =
+               Worktree.create(repo, path, "loop/s1", "master")
+    end
+
+    test "a tree reset in place is read again: its new HEAD, not the commit it was first cut from",
+         %{repo: repo, path: path} do
+      {:ok, %{cut_from: first}} = Worktree.create(repo, path, "loop/s1", "master")
+      commit!(repo, "later.txt", "the base moved on")
+      moved = git!(repo, ["rev-parse", "master"])
+      refute moved == first
+
+      assert {:ok, %{reused: false, cut_from: ^moved}} =
+               Worktree.create(repo, path, "loop/s1", "master")
+    end
+  end
+
+  test "a tree whose cut cannot be read is removed with its branch, and the error says so", %{
+    repo: repo,
+    path: path
+  } do
+    # A post-checkout hook points the new tree's HEAD at a branch that does not exist, so
+    # `worktree add` succeeds and reading the commit it was cut from then fails.
+    hooks = Path.join(Path.dirname(repo), "hooks")
+    File.mkdir_p!(hooks)
+    hook = Path.join(hooks, "post-checkout")
+
+    File.write!(hook, """
+    #!/bin/sh
+    printf 'ref: refs/heads/unborn-by-hook\\n' > "$(git rev-parse --git-dir)/HEAD"
+    """)
+
+    File.chmod!(hook, 0o755)
+    git!(repo, ["config", "core.hooksPath", hooks])
+
+    assert {:error, why} = Worktree.create(repo, path, "loop/s1", "master")
+    assert why =~ "cannot tell which commit"
+    assert why =~ "the new worktree and branch were removed"
+    refute File.dir?(path)
+    assert git!(repo, ["branch", "--list", "loop/s1"]) == ""
+    # The main checkout is the only tree git still knows.
+    assert [_main] = Regex.scan(~r/^worktree /m, git!(repo, ["worktree", "list", "--porcelain"]))
+  end
+
+  describe "commit_file/4" do
+    defp commit_mode!(repo, fun) do
+      File.mkdir_p!(Path.join(repo, ".loopctl"))
+      fun.(Path.join([repo, ".loopctl", "mode"]))
+      git!(repo, ["add", "-A", ".loopctl"])
+      git!(repo, ["commit", "-q", "-m", "mode"])
+      git!(repo, ["rev-parse", "HEAD"])
+    end
+
+    test "reads the commit named, not a later one and not a working tree", %{repo: repo} do
+      cut = commit_mode!(repo, &File.write!(&1, "pr\n"))
+      commit_mode!(repo, &File.write!(&1, "thread\n"))
+      # And a working tree that says something else again, uncommitted.
+      File.write!(Path.join([repo, ".loopctl", "mode"]), "yolo\n")
+
+      assert Worktree.commit_file(repo, cut, ".loopctl/mode", 64) == {:ok, "pr\n"}
+    end
+
+    test "a path the commit does not have is absent, whatever the working tree holds", %{
+      repo: repo
+    } do
+      File.mkdir_p!(Path.join(repo, ".loopctl"))
+      File.write!(Path.join([repo, ".loopctl", "mode"]), "thread\n")
+      assert Worktree.commit_file(repo, "master", ".loopctl/mode", 64) == :absent
+    end
+
+    test "git's stderr is never read as the answer", %{repo: repo} do
+      commit_mode!(repo, &File.write!(&1, "pr\n"))
+      # A tag and a branch of one name: git warns that the name is ambiguous, on stderr, and
+      # still answers. Merged into stdout, the warning would be parsed as the tree entry.
+      git!(repo, ["tag", "master"])
+      assert Worktree.commit_file(repo, "master", ".loopctl/mode", 64) == {:ok, "pr\n"}
+    end
+
+    test "a file over the bound is refused unread", %{repo: repo} do
+      commit_mode!(repo, &File.write!(&1, String.duplicate("thread ", 20)))
+      assert {:error, why} = Worktree.commit_file(repo, "master", ".loopctl/mode", 64)
+      assert why =~ "larger than 64 bytes"
+    end
+
+    test "a symlink or a directory at the path is refused, and nothing on disk is opened", %{
+      repo: repo
+    } do
+      commit_mode!(repo, &File.ln_s!("/dev/zero", &1))
+      assert {:error, why} = Worktree.commit_file(repo, "master", ".loopctl/mode", 64)
+      assert why =~ "is not a regular file"
+
+      git!(repo, ["rm", "-q", ".loopctl/mode"])
+
+      commit_mode!(repo, fn path ->
+        File.mkdir_p!(path)
+        File.write!(Path.join(path, "x"), "")
+      end)
+
+      assert {:error, why} = Worktree.commit_file(repo, "master", ".loopctl/mode", 64)
+      assert why =~ "is not a regular file"
+    end
+
+    test "git's stderr goes to a directory only this user can enter, and nothing is left", %{
+      repo: repo
+    } do
+      commit_mode!(repo, &File.write!(&1, "pr\n"))
+      # git opens the alternates file on its first object lookup; a FIFO there holds it open, so
+      # what it was given for its stderr can be looked at while it runs.
+      fifo = Path.join([repo, ".git", "objects", "info", "alternates"])
+      File.mkdir_p!(Path.dirname(fifo))
+      {_, 0} = System.cmd("mkfifo", [fifo])
+      before = stderr_dirs()
+
+      read = Task.async(fn -> Worktree.commit_file(repo, "master", ".loopctl/mode", 64) end)
+
+      # Other tests' reads come and go in milliseconds; the held one is the one that stays.
+      :ok = wait_until(fn -> match?([_], held_dirs(before)) end, 5_000)
+      [private] = held_dirs(before)
+
+      assert %File.Stat{type: :directory, mode: mode} = File.lstat!(private)
+      assert Bitwise.band(mode, 0o777) == 0o700
+      # The shell opened git's stderr before exec'ing git, so it is there while git is held.
+      assert File.regular?(Path.join(private, "stderr"))
+
+      # The read makes more than one git call: later ones find an empty file, and the held one is
+      # released through the FIFO's new name.
+      held = fifo <> ".held"
+      File.rename!(fifo, held)
+      File.write!(fifo, "")
+      File.write!(held, "")
+      assert Task.await(read) == {:ok, "pr\n"}
+      refute File.exists?(private)
+    end
+
+    test "a commit that does not exist is an error carrying git's stderr, never absent", %{
+      repo: repo
+    } do
+      assert {:error, why} = Worktree.commit_file(repo, "nope", ".loopctl/mode", 64)
+      assert why =~ "cannot list .loopctl/mode at nope"
+      assert why =~ "nope"
+      refute why =~ "git exited"
     end
   end
 end

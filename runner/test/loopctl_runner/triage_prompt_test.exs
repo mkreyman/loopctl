@@ -178,16 +178,16 @@ defmodule LoopctlRunner.TriagePromptTest do
     # never telling the session to use them leaves it doing all three readings inline, silently.
     for lens <- LoopctlRunner.TriageTools.lenses(), do: assert(prompt =~ "`#{lens}`")
     assert prompt =~ "DISPATCH each with the Agent tool"
-    assert "Agent" in LoopctlRunner.TriageTools.tools()
-    # And an implement session has no Agent tool at all.
-    refute "Agent" in LoopctlRunner.Session.session_tools()
+    # What makes the instruction honest is that the DEFINITIONS are shipped, not that a flag
+    # granted the tool: nothing limits the pool now.
+    assert Jason.decode!(LoopctlRunner.TriageTools.agents_json()) |> map_size() == 3
   end
 
   test "a session given NO lenses is told to do the readings, never to dispatch" do
     # Which is also the DEFAULT: the only wired launcher grants none.
     # The only wired launcher today is the implement one: no Agent tool, no definitions. Telling
-    # such a session to dispatch is telling it to do something dontAsk denies without a prompt,
-    # and it would burn its turns on it.
+    # such a session to dispatch is telling it to use a tool that is not in its pool, which no
+    # permission mode changes, and it would burn its turns on it.
     prompt = build()
 
     refute prompt =~ "DISPATCH"
@@ -298,8 +298,20 @@ defmodule LoopctlRunner.TriagePromptTest do
     prompt = build()
 
     assert prompt =~ "Treat the checkout as read-only whatever your tools allow"
-    # The implement session's file rules still allow writes; the triage tool set is not built.
-    assert Enum.any?(LoopctlRunner.Session.file_rules(), &String.starts_with?(&1, "Write("))
+    # And it matters MORE than it did: nothing scopes a session's writes any more — no file
+    # rules, no tool pool — so on the implement launcher this sentence is the only restraint.
+    story = %LoopctlRunner.Story{
+      id: "s",
+      repo: "r",
+      repo_path: "/tmp",
+      base: "master",
+      branch: "loop/s",
+      prompt: "p",
+      wall_clock_s: 60,
+      max_turns: 5
+    }
+
+    refute "--tools" in LoopctlRunner.Session.claude_args(story, "sid")
   end
 
   test "the truncation notice is not printed when there is no block to point at" do

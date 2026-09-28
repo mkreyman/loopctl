@@ -13,10 +13,12 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.12.0. The triage dispatch arrived in 1.7.0 and is NOT
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.21.0. The triage dispatch arrived in 1.7.0 and is NOT
 dispatchable here yet: the prompt a triage session reads and the verdict it states are built
 (`LoopctlRunner.TriagePrompt`, `LoopctlRunner.TriageVerdict`), while the accept path that would
-run one is not. This runner declares only `implement`, so loopctl sends it nothing else.
+run one is not, and neither are the per-lens `lens_verdicts` (contract 1.15.0) without which Gate A
+escalates every triage verdict. This runner declares only `implement`, so loopctl sends it nothing
+else.
 
 The daemon has a dispatch accept path, off by default. With `control.accepts_dispatches` false
 (the default) it reports `draining: true` and refuses every `dispatch` with `dispatches_disabled`.
@@ -25,16 +27,39 @@ capacity, free disk, repo, branch prefix, wall clock, turns, token budget), must
 dispatch, and must carry a well-formed `story` object (typed on the dispatch since contract 1.5.0); anything
 else is refused
 with a reason. An accepted dispatch runs `claude -p` in a worktree on the dispatch's branch, with a
-prompt built from a fixed local template in which every story field is fenced as untrusted data,
-and the runner config's own `allowed_tools`, under `--permission-mode dontAsk` so nothing else
-runs, with no user or repository settings loaded and none of the runner's release environment.
-The session implements and tests; it commits, pushes, opens PRs and merges nothing.
+prompt built from a fixed local template in which every story field is fenced as untrusted data.
+The session runs `--permission-mode bypassPermissions` and inherits the operator's user-scoped
+Claude setup — the same authority and the same rules a locally dispatched agent has. It implements
+and tests, then finishes as the repository's delivery mode says, which the prompt states. The mode
+is `.loopctl/mode` in the commit the worktree was cut from, never the working tree's: in a `thread`
+repository it commits and pushes through `priv/bin/loop-push` and opens no PR, and loopctl's merge
+executor merges; with `pr` it runs the operator's delivery loop — a PR opened with `gh pr create
+--base <base>`, review, merge into that base only — leaving the worktree and the branch, which are
+the runner's, for the runner to remove once the branch has shipped. A repository with no
+`.loopctl/mode`, an empty one or any other value is refused before a session starts
+(`repository has no .loopctl/mode` for the first): only an explicit `thread` or `pr` runs.
+**Thread mode needs PR #60 (`priv/bin/loop-push`) and then PR #59 (checkpoint reporting)**: until
+both land a thread-mode run is refused `push helper missing` or `checkpoint reporting not
+available`. Teardown removes a shipped branch's worktree by merged content. The runner itself
+commits nothing. The session inherits the environment an attended session has, except the runner's own release environment and
+`ANTHROPIC_API_KEY` (a billing control).
 
-Each accepted run reports its delivery stages to loopctl (`stage`): `claimed -> worktree`,
-`worktree -> implementing`, and, however the run ends, `-> escalated` with edge
-`session_escalated`. This first end-to-end run merges nothing by design, so `escalated` is its
-deliberate terminal: a run that finished says "first end-to-end run: implementation finished,
-merging nothing by design", and any other end names its status, exit reason and escalation text.
+Each accepted run reports the two delivery stages the runner observes (`stage`): `claimed ->
+worktree` and `worktree -> implementing`. The stages after that are the session's to report,
+because the session delivers. However the run ends, the runner then reports the SESSION's end with
+`session_ended` (contract 1.16.0): `completed` for a session that exited 0 on its own,
+`wall_clock_exceeded` or `max_turns_exceeded` for one that hit that budget, and `crashed` for any
+other end — a non-zero exit, a park, a run that died. Control decides the story's next stage from
+that reason. `-> escalated` (edge `session_escalated`) is reported only where it is the truth: for
+a session that ran `loop-escalate`, before its `session_ended` (whose `completed` the contract says
+"changes nothing", so it cannot undo the escalation), and for a run that never started a session
+(no worktree, or a refused prompt), which has no session end to report. `usage_exhausted` is never
+sent: nothing the runner reads tells a usage limit from any other failing exit.
+
+`session_ended` goes once per dispatch, behind the stage reports, and is resent as the same bytes
+until it settles — after a lost reply, a rejoin, or by a restarted daemon, which reports the end of
+every finished run whose `state.json` lacks `terminal_reported`. loopctl answers a resend `ok`
+with `replayed` true.
 
 The daemon also ships run traces (`trace` and `trace_cursor`): after every join it asks loopctl
 where each run's stored trace ends and sends the lines after it, in batches within the
@@ -133,11 +158,12 @@ What the log says in each failure:
 | a dispatch is refused `other` | `the dispatch carries no story`, `the dispatch story <field> ...` for a malformed story, or `the dispatch does not make a runnable story: ...` |
 | a dispatch names a kind this runner does not declare | refused `kind_not_supported`, detail `this runner runs only: implement` |
 | a dispatch arrives again | `dispatch <id> was already accepted and started here; answering accepted again, starting nothing`; a different `claim_epoch` is refused `other` |
-| an accepted run moves | `stage report sent: claimed -> worktree`, then `loopctl recorded the stage claimed -> worktree`, and the same for `worktree -> implementing` and `-> escalated`. Reports outstanding when the channel closes are resent after the rejoin |
-| an accepted run ends | the escalation marker is the `-> escalated` report with edge `session_escalated`; its reason is `first end-to-end run: implementation finished, merging nothing by design` for a finished run, otherwise `run ended <status>; session exit reason ...; the session escalated: <text>` |
+| an accepted run moves | `stage report sent: claimed -> worktree`, then `loopctl recorded the stage claimed -> worktree`, and the same for `worktree -> implementing`. Reports outstanding when the channel closes are resent after the rejoin |
+| an accepted run ends | `session_ended sent: <reason>`, then `loopctl recorded session_ended (<reason>)` — with `; it was a resend, and loopctl applied nothing a second time` on a replay. A session that escalated first reports `-> escalated` with edge `session_escalated` and reason `run ended escalated; session exit reason ...; the session escalated: <text>`; a run with no session reports only that `-> escalated`, naming its status |
+| loopctl refuses a `session_ended` | `rate_limited` waits the `min_interval_ms` it names and resends; `internal_error` is resent at most 3 times, then `giving up on session_ended for dispatch <id> ...` (a restart sends it again); `already_recorded` is `loopctl already holds a different session_ended ...` at warning level; any other reason is `loopctl refused session_ended ...` at error level, recorded, and not resent |
 | loopctl refuses a stage | `refused the stage <from> -> <to> for dispatch <id> as stale_stage` (or with another reason), at error level; no later stage of that run is reported (`stage <from> -> <to> not reported`) |
 | loopctl answers `internal_error` | resent with a backoff, at most 3 times, then `giving up on the stage ...`, `giving up on the dispatch_reply ...` or `giving up on this run's ... trace pushes` at error level; a trace given up this way ships again after a restart |
-| a run's task dies without reporting | `the run of dispatch <id> died: <reason>`; its `state.json` is marked `crashed` and it is reported `-> escalated` as crashed |
+| a run's task dies without reporting | `the run of dispatch <id> died: <reason>`; its `state.json` is marked `escalated` if its session escalated, otherwise `crashed`, and it is reported from the stage that file recorded it reaching: `-> escalated` alone if no session started, `-> escalated` then `session_ended` `completed` if its session escalated, otherwise `session_ended` `crashed` |
 | loopctl did not record an accept | `dispatch <id> accepted: run of ... starts once loopctl records it`, then either `dispatch <id> recorded as accepted: run of ... started` or `loopctl did not record this runner's accept of dispatch <id> (<reason>); its run is not started` at error level. A run starts only after loopctl records its accept |
 | the daemon restarted with runs going | runs keep going and report to the new daemon (`a run this Control did not start reported ...`), waiting up to a minute for it to register; a redelivered dispatch already bound in a `state.json` is answered `accepted` again and starts nothing |
 | the daemon restarted with work unfinished | `resending the accept of pending dispatch <id>` for each file in `runs_dir/.pending/` (an accepted dispatch whose run had not started), and `reporting the unacknowledged end of dispatch <id>'s run` for each finished run whose `state.json` lacks `terminal_reported` |

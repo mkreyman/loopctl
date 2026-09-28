@@ -83,9 +83,15 @@ defmodule LoopctlRunner.TriageRunTest do
 
     argv = File.read!(Path.join(ctx.state, "argv"))
 
-    assert argv =~ "--tools\nRead,Glob,Grep,Agent,Bash\n"
-    refute argv =~ "Write(./**)"
-    refute argv =~ "Edit(./**)"
+    # A triage session's containment is now its LENSES, not its own flags: it runs the same
+    # posture an implement session does, and what is shipped that an implement launch does not
+    # ship is the lens definitions, each declaring a read-only tool set of its own.
+    refute argv =~ "--tools"
+    refute argv =~ "--allowedTools"
+    assert argv =~ "--permission-mode\nbypassPermissions\n"
+    refute argv =~ "--disallowedTools"
+    # No branch of its own, so nothing for loop-push to push: no LOOP_BRANCH.
+    refute File.read!(Path.join(ctx.state, "env")) =~ ~r/^LOOP_BRANCH=/m
     assert argv =~ "--agents\n"
     assert result.session.exit_status == 0
   end
@@ -258,6 +264,11 @@ defmodule LoopctlRunner.TriageRunTest do
     result = execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_EXIT", "9"}])
     assert {:incomplete, "session_crashed", detail} = result.outcome
     assert detail =~ "exited 9"
+  end
+
+  test "a session out of turns wrote no verdict; it did not crash, though it exits 1", ctx do
+    result = execute(ctx, [{"FAKE_CLAUDE_MODE", "max_turns"}])
+    assert {:incomplete, "no_verdict_written", "the session ran out of turns"} = result.outcome
   end
 
   test "bytes that are not a verdict are incomplete as invalid, never sent", ctx do

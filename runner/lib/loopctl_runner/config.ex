@@ -21,7 +21,6 @@ defmodule LoopctlRunner.Config do
     :claude_projects_dir,
     :repos,
     :branch_prefixes,
-    allowed_tools: [],
     session_env: %{},
     # WHERE THE SUBAGENT GIT GRANTS LIVE, as data rather than as a call to `System.user_home!/0`
     # buried in `Run.execute/3`. It is here because the SUITE exercises the production path: with
@@ -46,7 +45,6 @@ defmodule LoopctlRunner.Config do
           claude_projects_dir: String.t(),
           repos: %{optional(String.t()) => String.t()},
           branch_prefixes: [String.t()],
-          allowed_tools: [String.t()],
           session_env: %{optional(String.t()) => %{optional(String.t()) => String.t()}},
           grant_dir: String.t() | nil,
           control: LoopctlRunner.ControlConfig.t() | nil,
@@ -91,8 +89,18 @@ defmodule LoopctlRunner.Config do
          {:ok, map} <- decode(raw),
          {:ok, config} <- from_map(map),
          :ok <- readable_by_owner_only(path, config) do
+      warn_obsolete(map, path)
       {:ok, config}
     end
+  end
+
+  # An earlier release read `allowed_tools` as the permission rules a story could request; nothing
+  # composes `--allowedTools` now, so the key grants nothing. Loading still succeeds, because
+  # configs already on the dev machines carry it, and refusing them would stop those daemons over a
+  # key that no longer does anything.
+  defp warn_obsolete(map, path) do
+    if Map.has_key?(map, "allowed_tools"),
+      do: Logger.warning("config #{path}: allowed_tools is obsolete and ignored; remove it")
   end
 
   @doc """
@@ -134,11 +142,10 @@ defmodule LoopctlRunner.Config do
 
   defp same_file?(_a, _b), do: false
 
-  # `session_env` is the sanctioned place to keep a credential a session needs — it is the whole
-  # escape hatch for the shape deny (`Session.unset_names/2`) — and both that doc and the comment
-  # on `session_env/2` justify it as a file only the operator can read. Nothing made that true:
-  # under a default umask `runner.json` is 0644, so an operator following the drop log would put a
-  # real credential in a world-readable file on a machine carrying live credentials already. Same
+  # `session_env` is where a repo's credential for its sessions goes (a test secret, a sandbox
+  # key), which is only sound in a file only the operator can read. Nothing made that true: under
+  # a default umask `runner.json` is 0644, so a real credential would sit in a world-readable file
+  # on a machine carrying live credentials already. Same
   # test as `ControlConfig.read_token/1` uses for the channel token, and checked only when
   # `session_env` carries something: a config without it holds no secret of its own, and refusing
   # one would stop daemons over a property they never relied on.
@@ -168,7 +175,6 @@ defmodule LoopctlRunner.Config do
          {:ok, launcher} <- launcher(map),
          {:ok, repos} <- repos(map),
          {:ok, prefixes} <- branch_prefixes(map),
-         {:ok, tools} <- allowed_tools(map),
          {:ok, session_env} <- session_env(map, repos),
          {:ok, control} <- control(map),
          {:ok, grant_dir} <- grant_dir(map),
@@ -182,7 +188,6 @@ defmodule LoopctlRunner.Config do
            claude_launcher: launcher,
            repos: repos,
            branch_prefixes: prefixes,
-           allowed_tools: tools,
            session_env: session_env,
            control: control,
            grant_dir: grant_dir
@@ -281,97 +286,38 @@ defmodule LoopctlRunner.Config do
 
   defp put_repo({name, _}, _acc), do: {:halt, {:error, "config repos.#{name} must be a path"}}
 
+  # The prefixes are DECLARED on every join (contract 1.14.0: a runner enforcing a prefix it does
+  # not declare refuses every dispatch, each refusal costing the story's claim), so a list the
+  # join schema would refuse must be refused HERE, at load, rather than failing every join. The
+  # rules are read from the vendored contract, never re-typed.
   defp branch_prefixes(map) do
     case Map.get(map, "branch_prefixes") do
       [_ | _] = prefixes ->
-        if Enum.all?(prefixes, &(is_binary(&1) and String.length(&1) > 1)),
-          do: {:ok, prefixes},
-          else: {:error, "config branch_prefixes entries must be strings of 2+ characters"}
+        cond do
+          not Enum.all?(prefixes, &(is_binary(&1) and String.length(&1) > 1)) ->
+            {:error, "config branch_prefixes entries must be strings of 2+ characters"}
+
+          (errors = declarable_errors(prefixes)) != [] ->
+            {:error,
+             "config branch_prefixes cannot be declared to loopctl: " <> Enum.join(errors, "; ")}
+
+          true ->
+            {:ok, prefixes}
+        end
 
       _ ->
         {:error, "config branch_prefixes must be a non-empty list"}
     end
   end
 
-  # Tool permission rules a story may request, e.g. "Bash(mix test:*)". Sessions run under
-  # --permission-mode dontAsk, where these rules are the whole of what a session may do (see
-  # LoopctlRunner.Session), so a rule wider than it looks is refused at load rather than trusted:
-  #   - a tool the session cannot have at all (`Session.session_tools/0`) would load cleanly and
-  #     be denied in every session, silently;
-  #   - a file-tool rule must be scoped under the worktree, "./": a bare "Write" or
-  #     "Edit(~/**)" writes anywhere this user can;
-  #   - a Bash rule must name its command, and not one that runs other commands: a bare "Bash"
-  #     or "Bash(bash:*)" is the first end-to-end run's commit, docker and gh over again. The
-  #     list below is a backstop for a slip in the config, not the boundary; the boundary is
-  #     that each rule names one command.
-  # Absent means none.
-  @file_tools ~w(Read Glob Grep Edit Write)
-  @command_runners ~w(bash sh zsh dash fish env exec eval xargs sudo nohup timeout nice
-                      python python3 perl ruby node npx elixir iex erl escript)
+  defp declarable_errors(prefixes) do
+    schema = LoopctlRunner.Contract.schema_def("RunnerJoin")["properties"]["branch_prefixes"]
 
-  defp allowed_tools(map) do
-    case Map.get(map, "allowed_tools", []) do
-      tools when is_list(tools) ->
-        cond do
-          not Enum.all?(tools, &(is_binary(&1) and &1 != "")) ->
-            {:error, "config allowed_tools entries must be non-empty strings"}
-
-          problem = Enum.find_value(tools, &rule_problem/1) ->
-            {:error, "config allowed_tools " <> problem}
-
-          true ->
-            {:ok, tools}
-        end
-
-      _ ->
-        {:error, "config allowed_tools must be a list"}
+    case LoopctlRunner.Contract.validate_against(schema, prefixes, "branch_prefixes") do
+      :ok -> []
+      {:error, errors} -> errors
     end
   end
-
-  defp rule_problem(rule) do
-    {tool, spec} = rule_parts(rule)
-
-    cond do
-      tool not in LoopctlRunner.Session.session_tools() ->
-        "#{inspect(rule)} names a tool sessions do not have; they have " <>
-          Enum.join(LoopctlRunner.Session.session_tools(), ", ")
-
-      tool in @file_tools and not worktree_path?(spec) ->
-        "#{inspect(rule)} is not scoped to the worktree; write it as #{tool}(./<path>)"
-
-      tool == "Bash" and not named_command?(spec) ->
-        "#{inspect(rule)} does not name one command; write it as Bash(<command>:*), " <>
-          "and not a shell or interpreter"
-
-      true ->
-        nil
-    end
-  end
-
-  # "Bash(mix test:*)" is {"Bash", "mix test:*"}; "Read" is {"Read", nil}.
-  defp rule_parts(rule) do
-    case Regex.run(~r/\A([^(]+)\((.*)\)\z/s, rule) do
-      [_, tool, spec] -> {tool, spec}
-      nil -> {rule |> String.split("(", parts: 2) |> hd(), nil}
-    end
-  end
-
-  defp worktree_path?("./" <> path),
-    do: path != "" and ".." not in Path.split(path) and not String.contains?(path, "\\")
-
-  defp worktree_path?(_spec), do: false
-
-  defp named_command?(spec) when is_binary(spec) do
-    case spec |> String.trim_leading() |> String.split([" ", ":"], parts: 2) do
-      [command | _] ->
-        command =~ ~r/\A[A-Za-z0-9._\/-]+\z/ and Path.basename(command) not in @command_runners
-
-      _ ->
-        false
-    end
-  end
-
-  defp named_command?(_spec), do: false
 
   # Per repo, extra environment for that repo's sessions: {"repo": {"NAME": "value"}}. In a value,
   # "{story}" becomes 8 hex of a hash of the story id, stable across that story's runs, and "{run}"
@@ -381,10 +327,7 @@ defmodule LoopctlRunner.Config do
   # creates, so {run} leaves a new database behind on every run, while {story} reuses one per
   # story, as its worktree is. A name the runner sets or reads itself (LOOP_*, LOOPCTL_*,
   # ANTHROPIC_*, GIT_*) is refused, as is one a session never inherits from the release
-  # (Session.release_env_name?/1: RELEASE_*, EMU, ROOTDIR...) or because it is unconditionally
-  # unset as a credential (Session.credential_env_name?/1: SSH_AUTH_SOCK, GH_TOKEN...), and a repo
-  # not in repos. A name matching the SHAPE deny is allowed: naming it here is how an operator
-  # keeps it for one repo, which is the whole escape hatch (Session.unset_names/2).
+  # (Session.release_env_name?/1: RELEASE_*, EMU, ROOTDIR...), and a repo not in repos.
   @env_name ~r/\A[A-Z_][A-Z0-9_]{0,63}\z/
   @reserved_env ["LOOP_", "LOOPCTL_", "ANTHROPIC_", "GIT_"]
 
@@ -422,10 +365,9 @@ defmodule LoopctlRunner.Config do
   defp repo_env(repo, _vars, _repos),
     do: {:error, "config session_env.#{repo} must be an object"}
 
-  # Nil when the pair is allowed, otherwise WHY it is refused. One message for every cause read
-  # identically whether an operator mistyped a value or a name became a refused credential in this
-  # release, and the second is a breaking change that aborts rel/install.sh's whole preflight: a
-  # config that loaded yesterday stops loading, and the message pointed at the value.
+  # Nil when the pair is allowed, otherwise WHY it is refused: one message for every cause sends an
+  # operator who named a managed variable to look at its value, and a refused config aborts
+  # rel/install.sh's whole preflight.
   defp env_var_refusal(name, value) do
     cond do
       not env_name?(name) ->
@@ -434,10 +376,6 @@ defmodule LoopctlRunner.Config do
       runner_managed_name?(name) ->
         "is a name the runner manages itself and unsets for every session, so a value here " <>
           "would be dropped silently; remove it"
-
-      credential_name?(name) ->
-        "is a credential this runner unsets for every session UNCONDITIONALLY, so a value here " <>
-          "would be dropped silently and no session would ever see it; remove it"
 
       not env_value?(value) ->
         "is not a string value of at most 1024 bytes"
@@ -452,32 +390,12 @@ defmodule LoopctlRunner.Config do
   # carrying a session_env. It reads correctly in English, which is how it survives review. The
   # chain this was split out of was safe only because `not` applied to whole predicate CALLS
   # there; the moment a condition becomes an infix expression it needs its own parentheses.
-  @doc """
-  Whether `session_env` would ACCEPT `name` — i.e. whether naming it there actually keeps it.
-
-  `Session` asks before advising an operator to use the hatch: a drop log that recommends a name
-  this would refuse sends them to a config that then fails to load, which raises in
-  `Application.daemon_children!/0` and aborts the release preflight. One source of truth rather
-  than a second copy of the rule in the module doing the advising.
-  """
-  @spec session_env_allows?(String.t()) :: boolean()
-  def session_env_allows?(name),
-    do: env_name?(name) and not runner_managed_name?(name) and not credential_name?(name)
-
   defp env_name?(name), do: is_binary(name) and name =~ @env_name
 
   defp runner_managed_name?(name) do
     Enum.any?(@reserved_env, &String.starts_with?(name, &1)) or
       LoopctlRunner.Session.release_env_name?(name)
   end
-
-  # ONLY the unconditional list. A SHAPE-matched name is deliberately allowed here, and refusing
-  # it was a defect in two ways: the shape deny is conditional — `port_env/4` unsets a shaped name
-  # only when the DAEMON's environment carries it, and under systemd it carries none — so the
-  # refusal claimed a certainty it did not have; and `session_env` IS the escape hatch for the
-  # judgement the heuristic cannot make (per repo, mode-600, revocable), so refusing it left an
-  # operator with no way at all to keep a `SECRET_KEY_BASE` or a `*_PUBLISHABLE_KEY`.
-  defp credential_name?(name), do: LoopctlRunner.Session.credential_env_name?(name)
 
   defp env_value?(value),
     do: is_binary(value) and byte_size(value) <= 1024 and not String.contains?(value, <<0>>)

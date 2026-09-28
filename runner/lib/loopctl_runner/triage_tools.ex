@@ -2,32 +2,41 @@ defmodule LoopctlRunner.TriageTools do
   @moduledoc """
   What a triage session may use, and the three lenses it judges through (design §8).
 
-  Designed with the triage contract rather than taken from the implement set and narrowed: a
-  triage session reads and decides, so it gets strictly less. Its cwd is a detached worktree of the
-  checkout (`LoopctlRunner.TriageRun`), and it has no `Edit` and no `Write` there at all — an
-  implement session's file rules allow both inside its worktree, and nothing a triage session
-  decides needs a file written. Its `Bash` exists for TWO commands and no others: `priv/bin/loop-verdict`,
-  which is how a verdict leaves, and `priv/bin/loop-escalate`, which the system prompt names for a
-  session that cannot work at all — shipping that instruction without the rule would deny the call
-  silently. Both take this run's token, so a subagent cannot decide the run's outcome either way.
-  Every other command is denied without a prompt under `dontAsk`.
+  A TRIAGE SESSION IS NO LONGER PREVENTED FROM WRITING, and the whole truth belongs here rather
+  than in a sentence someone re-reads when triage becomes a declared kind. It runs the same
+  posture an implement session does (`LoopctlRunner.Session`'s moduledoc says why): no
+  `--allowedTools`, no `--tools`, nothing denied. So its `Bash` — which it must have, because
+  `priv/bin/loop-verdict` is how a verdict leaves and `priv/bin/loop-escalate` is what the system
+  prompt names for a session that cannot work at all — can run `echo something > lib/foo.ex`, and
+  its `Edit` and `Write` are real. "Read-only" for the SESSION is now an instruction in the prompt
+  and nothing else.
 
-  **The lenses are shipped from here, as `--agents` JSON.** They cannot be inherited: the triage
-  agent definitions are user-scope files (`~/.claude/agents/triage-*.md`) and a session runs under
-  `--setting-sources ""`, which is what keeps the operator's settings, hooks and plugins out. A
-  session launched without them would have nothing to dispatch and would quietly do all three
-  readings itself — the failure the design calls out, and one nothing would report. Shipping them
-  here also makes the lens set something this repo tests rather than something a machine happens
-  to have.
+  WHAT STILL ENFORCES IT IS THE PART THAT DOES THE READING. The three lenses declare their own
+  `tools` — `Read`, `Glob`, `Grep`, no `Bash`, no `Edit`, no `Write` (`@lens_tools`) — so they are
+  read-only BY DEFINITION rather than by a flag on the session that dispatches them. That is the
+  boundary that survives a posture change, and the flag was the one that did not: a restriction
+  written where it can be lifted by an unrelated decision was in the wrong place. Both commands
+  still take this run's token, so a subagent cannot decide the run's outcome either way.
+
+  WHAT A WRITE CAN REACH IS A SCRATCH TREE. The session's cwd is a detached worktree of the
+  checkout (`LoopctlRunner.TriageRun`), never the operator's live checkout, and the runner removes
+  that tree whatever it holds, so a triage session that writes changes nothing anyone keeps.
+
+  **The lenses are shipped from here, as `--agents` JSON.** A session now inherits the operator's
+  user-scoped setup, so `~/.claude/agents/triage-*.md` may also be present — shipping them here
+  anyway is what makes the lens set something this repo TESTS rather than something a machine
+  happens to have, and what keeps a machine missing those files from quietly doing all three
+  readings in one session, which is the failure the design calls out and one nothing would report.
 
   What this set does NOT do is limit the `Agent` tool to these lenses: `--agents` ADDS to the
   built-in agent types rather than replacing them, so `general-purpose` and the rest stay
-  dispatchable (measured 2026-09-15). That costs nothing here because a subagent inherits this
-  session's permission rules. Measured with `general-purpose` itself, which declares no tool
-  restriction of its own: dispatched from a contained session and told to create a file with
-  Write or with `Bash touch`, it was denied and created nothing. (A lens being denied proves
-  less — its own declaration explains that.) So the boundary is the session's rules plus each
-  lens's own tools, never the agent list.
+  dispatchable (measured 2026-09-15). THAT USED TO COST NOTHING AND NOW COSTS SOMETHING. A
+  subagent inherits its session's permission posture, which was `dontAsk` when this was measured:
+  `general-purpose` itself, which declares no tool restriction of its own, dispatched from a
+  contained session and told to create a file with Write or with `Bash touch`, it was denied and
+  created nothing. Under `bypassPermissions` that same dispatch is allowed. The boundary left is
+  each lens's OWN declared tools (`@lens_tools`) — which is why they are declared and not merely
+  described — and nothing bounds a `general-purpose` dispatch but the session's tool pool.
 
   Each lens DECLARES a read-only tool set of its own rather than being told to behave as one, and
   none of them states the verdict: the session that dispatched
@@ -35,10 +44,7 @@ defmodule LoopctlRunner.TriageTools do
   disagree" unrepresentable, which is the one signal triage exists to surface.
   """
 
-  alias LoopctlRunner.{Session, TriagePrompt}
-
-  # Read, search and dispatch the lenses — and Bash for exactly one command. No Edit, no Write.
-  @tools ~w(Read Glob Grep Agent Bash)
+  alias LoopctlRunner.TriagePrompt
 
   # THE SAME VOCABULARY THE SESSION PROMPT USES, from the same place: `TriagePrompt.reason_codes/0`,
   # which reads the gating half out of the vendored contract. Transcribing them here as well is the
@@ -89,10 +95,6 @@ defmodule LoopctlRunner.TriageTools do
                   &"  - #{&1} — #{Map.fetch!(@lens_conditions, &1)}."
                 )
 
-  # Scoped to the session's cwd, its detached worktree, like an implement session's, minus
-  # everything that writes.
-  @file_rules ~w[Read(./**) Glob(./**) Grep(./**)]
-
   # DECLARED, not described. A lens whose definition carries no `tools` inherits broad
   # capability, and "a repository you may only read" in its prompt is then prose rather than an
   # enforcement boundary — measured on 2026-09-15, where a probe session pointed this out about
@@ -102,9 +104,10 @@ defmodule LoopctlRunner.TriageTools do
 
   # The four rules claude-config#588 measured into its operator copies of these same three lenses:
   # verdict disagreement across the trio fell from 21 of 26 to 2 of 26 on a real intake corpus.
-  # They cannot be inherited — a session runs with --setting-sources "" so ~/.claude/agents is
-  # never read, which is the isolation working — so they are carried here, and loopctl-runner#41
-  # is the durable record of that port.
+  # A session now DOES read ~/.claude/agents (--setting-sources "" is gone), so these may also be
+  # present on a machine — carrying them here is what makes the rules this repo's, tested here and
+  # identical on a machine that has never seen the operator's copies; loopctl-runner#41 is the
+  # durable record of that port.
   #
   # ADAPTED, not copied: over there each lens states its own verdict block and emits
   # escalation_reasons itself. Here a lens REPORTS and the session states the one verdict, so a
@@ -241,27 +244,6 @@ defmodule LoopctlRunner.TriageTools do
     }
   }
 
-  @doc "The built-in tools a triage session is limited to."
-  @spec tools() :: [String.t()]
-  def tools, do: @tools
-
-  @doc """
-  Every `--allowedTools` rule a triage session gets: the read-only file tools scoped to its cwd,
-  the detached worktree it runs in, and Bash for the verdict and escalation commands alone.
-  """
-  @spec rules() :: [String.t()]
-  def rules do
-    @file_rules ++
-      [
-        "Bash(#{LoopctlRunner.TriagePrompt.verdict_script()}:*)",
-        # The system prompt tells a session to run this when it cannot work at all — a checkout
-        # that will not read, tools that will not run. Shipping that instruction without the rule
-        # would deny the call silently under dontAsk, write no escalation line, and leave the run
-        # to grind to its turn limit with neither a verdict nor an escalation.
-        "Bash(#{Session.escalate_script()}:*)"
-      ]
-  end
-
   @doc "The lens definitions, as the JSON `--agents` takes."
   @spec agents_json() :: String.t()
   def agents_json, do: Jason.encode!(@lenses)
@@ -284,30 +266,22 @@ defmodule LoopctlRunner.TriageTools do
       "--session-id",
       session_id,
       "--permission-mode",
-      "dontAsk",
+      "bypassPermissions",
       "--permission-prompts",
       "none",
-      "--setting-sources",
-      "",
       "--max-turns",
       Integer.to_string(Keyword.fetch!(opts, :max_turns)),
-      "--tools",
-      Enum.join(@tools, ","),
-      "--strict-mcp-config",
-      "--mcp-config",
-      ~s({"mcpServers":{}}),
-      "--disallowedTools",
-      "mcp__*",
       "--agents",
       agents_json()
     ] ++
       if(opts[:model], do: ["--model", opts[:model]], else: []) ++
-      Enum.flat_map(rules(), &["--allowedTools", &1]) ++
       ["--append-system-prompt", system_prompt] ++
       ["--", prompt]
   end
 
-  @doc "The built-in tools an IMPLEMENT session has that a triage session does not."
-  @spec withheld() :: [String.t()]
-  def withheld, do: Session.session_tools() -- @tools
+  # The read-only guarantee that is left, asserted where it lives: in each lens's own declaration.
+  # Nothing about the SESSION enforces it any more.
+  @doc "The tools a lens declares, which is what makes the readings read-only."
+  @spec lens_tools() :: [String.t()]
+  def lens_tools, do: @lens_tools
 end

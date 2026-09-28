@@ -38,13 +38,13 @@ defmodule LoopctlRunner.TriagePrompt do
   # stops the gate firing with nothing to notice; read from the file, a rewording arrives as a
   # vendoring and this prompt follows it.
   #
-  # WHAT THIS DOES NOT DO TODAY, stated because the opposite is the easy thing to assume: a
-  # `triage_verdict` message does NOT reach that gate. Gate A's input is a trio_outputs fact from
-  # the INTERACTIVE trio, and the wire path reads `outcome` alone — loopctl records
-  # `escalation_reasons` verbatim and matches nothing in it, which the field's own description says
-  # in the same breath as publishing the list. So nothing here is silently failing to gate right
-  # now; these codes are carried for the day a runner's verdict is what feeds Gate A, which is the
-  # whole point of the trio running unattended.
+  # WHERE THEY GATE, since contract 1.15.0: in each lens's `RunnerLensVerdict.escalation_reasons`,
+  # carried in the message's `lens_verdicts` — NOT in the verdict's own `escalation_reasons`, which
+  # loopctl records verbatim. Gate A reads `lens_verdicts` at triage and again at merge, and a
+  # `triage_verdict` sent WITHOUT them escalates at triage because the gate cannot be evaluated.
+  # This runner builds no `lens_verdicts` yet, and that is safe only because `triage` is not in
+  # `Control`'s kinds, so no triage dispatch reaches it. Adding the kind without building one lens
+  # verdict per lens would escalate EVERY triage, a confident `proceed` included.
   @gating_codes Map.fetch!(Contract.connection(), "triage_gating_reasons")
 
   # NOT published as gating, and that is what it is: Gate A collects every other code as a soft
@@ -159,10 +159,11 @@ defmodule LoopctlRunner.TriagePrompt do
   @spec build(map(), String.t(), keyword()) :: String.t()
   def build(triage, repo, opts \\ []) when is_map(triage) and is_binary(repo) do
     # Both are what the CALLER granted, and neither has a convenient default. Defaulting the
-    # lenses to the dispatch branch would hand it to the implement launcher, which has no Agent
-    # tool — a silent denial and a run that burns its turns. Defaulting the token to a placeholder
-    # would render a verdict command that cannot run: the script exits 2 on a wrong token, and the
-    # prompt forbids `loop-escalate` for a report it can judge, so the run would produce nothing.
+    # lenses to the dispatch branch would hand it to the implement launcher, which passes no lens
+    # definitions — nothing to dispatch, and a run that burns its turns. Defaulting the token to a
+    # placeholder would render a verdict command that cannot run: the script exits 2 on a wrong
+    # token, and the prompt forbids `loop-escalate` for a report it can judge, so the run would
+    # produce nothing.
     lenses = Keyword.get(opts, :lenses, [])
     token = Keyword.fetch!(opts, :token)
     # Its own token, because the two commands are gated separately: minting an escalate token
@@ -301,13 +302,11 @@ defmodule LoopctlRunner.TriagePrompt do
   end
 
   # What the session was ACTUALLY given decides what it is told to do. A session launched without
-  # the Agent tool and without definitions — the implement launcher, which is the only wired one
-  # today — must not be told to dispatch: the call would be denied silently under dontAsk and the
-  # run would burn its turns on an instruction the harness refuses.
-  # Anything that says "your lenses" is FALSE on the branch that dispatches none — which is the
-  # only wired one today, since the implement launcher has no Agent tool. `readings/2` exists for
-  # exactly that reason: an instruction to dispatch, given to a session that cannot, is denied
-  # silently and burns turns. A rule added later must not route around it.
+  # lens definitions — the implement launcher — must not be told to dispatch "your lenses": there
+  # are no such agents, and the run would burn its turns on an instruction it cannot carry out. Its
+  # Agent tool is real — nothing limits an implement session's pool — which is why the test is what
+  # was PASSED, not what the session may use. `readings/2` exists for exactly that reason, and a
+  # tool added later must not route around it.
   defp lens_note([]), do: ""
 
   defp lens_note(_lenses),

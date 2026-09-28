@@ -7,9 +7,8 @@ defmodule LoopctlRunner.GitGrant do
   that loads them. Without the grant, the engineer agent a loop session dispatches — which this
   repo's CLAUDE.md tells a session to do — has its `git commit` refused, and the agent's REPORT
   then reads as having chosen not to commit rather than as having been blocked. A capability lost
-  silently, wearing the shape of a judgement call. A session launched under `--setting-sources ""`
-  loads no user hook and has no `Agent` tool, so there the grant is inert: it is armed regardless,
-  so the grant does not wait on the launch posture and the posture does not wait on the grant.
+  silently, wearing the shape of a judgement call. Every loop session loads those settings
+  (`LoopctlRunner.Session`), so the hook is live in every one.
 
   Scoped to the session's own uuid, which is the id the hook keys on: its payload's session id is
   the `--session-id` `LoopctlRunner.Session` generates. An orphan left by a hard kill authorises a
