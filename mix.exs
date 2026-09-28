@@ -18,30 +18,53 @@ defmodule Loopctl.MixProject do
       # security gate, in `precommit` and the Security CI job. It caught the
       # 2026-07 postgrex/decimal/cowlib advisories that the previously-wired
       # mix_audit (curated GHSA mirror) missed and that its runtime clone could
-      # fail-open on. Advisories with NO reachable fix are acknowledged here;
-      # hex.audit warns when an entry stops matching, so stale ones surface.
+      # fail-open on. Acknowledged here: advisories with no published fix, and
+      # ones whose fix is DECLINED for a stated reason, each with its recheck
+      # condition inline. hex.audit only WARNS when an entry stops matching, so a
+      # stale entry does not fail CI; the mint pin in deps/0 is what keeps the
+      # declined fix from arriving silently.
       hex: [
         ignore_advisories: [
-          # cowlib 2.19.0 — no patched release exists for ANY of the three
-          # advisories below: each is introduced at an old version with no
-          # `fixed` event, and 2.19.0 is the newest cowlib on hex, so there is
-          # nothing to bump to. cowlib is compiled into the release as an
-          # optional transitive of phoenix / websock_adapter / open_api_spex /
-          # telemetry_metrics_prometheus, but the ONLY component that starts a
-          # Cowboy listener is the TelemetryMetricsPrometheus reporter on the
-          # internal :9568 metrics port (prod-only, Fly private 6PN). The public
-          # API serves on Bandit (config/config.exs, Bandit.PhoenixAdapter),
-          # never cowboy. That metrics endpoint sets no cookies, reflects no
-          # untrusted structured headers, and emits no Link headers — loopctl
-          # never calls cow_link — so none of the three vectors is reachable.
-          # Recheck when cowlib > 2.19.0.
-          # CVE-2026-43966 (GHSA-w4f7-4cxr-rv3c, MEDIUM): HTTP response splitting.
+          # cowlib 2.20.0 — no patched release exists for either advisory below:
+          # each is introduced at an old version with no `fixed` event, and as of
+          # 2026-09-28 2.20.0 (which fixed CVE-2026-43971) is the newest cowlib on hex.
+          # cowlib is compiled in as a hard transitive of telemetry_metrics_prometheus
+          # (via plug_cowboy and cowboy), but the ONLY Cowboy listener is that
+          # reporter on the internal :9568 metrics port (prod-only, Fly private 6PN);
+          # the public API serves on Bandit (config/config.exs, Bandit.PhoenixAdapter).
+          # Recheck when cowlib > 2.20.0.
+          # CVE-2026-43966 (GHSA-w4f7-4cxr-rv3c, MEDIUM): HTTP response splitting in
+          # cow_http_struct_hd:escape_string/2. The metrics endpoint emits no
+          # structured headers built from untrusted input.
           "CVE-2026-43966",
-          # CVE-2026-43969 (GHSA-g2wm-735q-3f56, LOW): cookie header injection.
+          # CVE-2026-43969 (GHSA-g2wm-735q-3f56, LOW): Cookie REQUEST header injection
+          # in cow_cookie:cookie/1, the client-side encoder. Nothing in the release
+          # calls it: there is no cowlib-based HTTP client (no gun).
           "CVE-2026-43969",
-          # CVE-2026-43971 (MEDIUM): Link header directive smuggling via
-          # unescaped target/rel/attribute keys in cow_link:link/1.
-          "CVE-2026-43971"
+          # mint 1.10.1 — the fix, 1.11.0, is DECLINED and pinned out in deps/0.
+          # 1.11.0 stopped closing a connection on a receive timeout, and Finch 0.23.0
+          # (the newest as of 2026-09-28) returns that connection to its pool, so the
+          # next request on it crashes with a CaseClauseError on the late response
+          # (test/loopctl/net/finch_timeout_reuse_test.exs pins it). That would turn
+          # every outbound timeout into a crash. Recheck when a Finch release closes a
+          # connection on a receive timeout: that test then passes on mint >= 1.11.0.
+          # CVE-2026-91043 (HIGH): HTTP/2 HPACK cookie fields bypass
+          # max_header_list_size. HTTP/2 only; Req's Finch pools fall back to
+          # `protocols: [:http1]` and no Req call opts into :http2
+          # (test/loopctl/net/no_outbound_http2_test.exs fails if one does).
+          "CVE-2026-91043",
+          # CVE-2026-92103 (MEDIUM): HTTP/2 oversized frames buffered before
+          # max_frame_size is enforced. HTTP/2 only, as above.
+          "CVE-2026-92103",
+          # CVE-2026-94194 (MEDIUM): HTTP/1 chunked framing when chunked is not the
+          # final coding, enabling response smuggling THROUGH AN INTERMEDIARY. That is
+          # REACHABLE in principle: a tenant's webhook URL may sit behind a CDN or a
+          # relay that other tenants' URLs share (one Finch pool per host). The
+          # impact is bounded to the delivery log: a webhook response is recorded
+          # (status and body, `Loopctl.Webhooks.ReqDelivery`) and never acted on, so a
+          # smuggled response can at worst put one tenant's relay response in
+          # another's delivery record. Accepted against the crash above.
+          "CVE-2026-94194"
         ]
       ],
       dialyzer: [
@@ -129,6 +152,8 @@ defmodule Loopctl.MixProject do
 
       # HTTP client
       {:req, "~> 0.5"},
+      # Pinned below 1.11.0: see the mint entry in hex ignore_advisories above.
+      {:mint, ">= 1.10.1 and < 1.11.0"},
 
       # Background jobs
       {:oban, "~> 2.19"},
