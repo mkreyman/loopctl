@@ -1,16 +1,3 @@
-# On a FRESH test database the `mix test` alias's `ecto.migrate` runs in this VM and
-# `Code.compile_file`s every pending migration, leaving each `Loopctl.Repo.Migrations.*`
-# module loaded. The migration tests then `Code.require_file` those same files, and the
-# "redefining module" warnings that produces fail `--warnings-as-errors` AFTER a green
-# suite. On a migrated database nothing is pending and nothing is loaded, so the gate only
-# failed on fresh databases (CI, a new worktree). Unload the migrator's copies before any
-# test file compiles, so every require sees the module for the first time either way.
-for {module, _} <- :code.all_loaded(),
-    String.starts_with?(Atom.to_string(module), "Elixir.Loopctl.Repo.Migrations.") do
-  :code.purge(module)
-  :code.delete(module)
-end
-
 ExUnit.start()
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)

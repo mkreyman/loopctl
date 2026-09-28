@@ -234,15 +234,22 @@ defmodule Loopctl.MixProject do
     ]
   end
 
+  @migrate_out_of_vm "cmd env MIX_ENV=test mix ecto.migrate --quiet"
+
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
-      test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
+      # Migrate in its OWN VM (`cmd`). In this one, `Ecto.Migrator` `Code.compile_file`s every
+      # pending migration, and the migration tests that later `Code.require_file` the same
+      # file redefine its modules: "redefining module" fails `--warnings-as-errors` after a
+      # green suite, on any fresh test database. Costs one VM boot (~0.8s, measured
+      # 2026-09-28 with nothing pending). Bound to `Loopctl.TestAliasMigrateTest`.
+      test: ["ecto.create --quiet", @migrate_out_of_vm, "test"],
       # Run ONLY the cross-context journey tests (test/e2e/*, tagged :e2e). `--only`
       # overrides the default :e2e exclude in test_helper.exs.
-      "test.e2e": ["ecto.create --quiet", "ecto.migrate --quiet", "test --only e2e"],
+      "test.e2e": ["ecto.create --quiet", @migrate_out_of_vm, "test --only e2e"],
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.deploy": ["tailwind loopctl --minify", "esbuild loopctl --minify", "phx.digest"],
       precommit: [
