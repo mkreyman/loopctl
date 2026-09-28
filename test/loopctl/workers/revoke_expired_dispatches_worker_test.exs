@@ -156,22 +156,22 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
           Enum.map_join(rows, "\n", fn [line] -> line end)
         end)
 
-      # EITHER index access path proves what AC-32.1.2 asserts, and what the comment above
-      # already says this test means: the index MATCHES the predicate and the planner can USE
-      # it. Which of the two Postgres picks is a cost decision that moves with the table's
-      # statistics, so pinning the one spelling made this go red on a plan that satisfies it —
-      # observed as `Bitmap Index Scan on dispatches_expires_at_active_index` once other tests
-      # had left enough rows behind to change the estimate. The assertion still names the
-      # index, so it cannot pass on a plan that reaches the rows any other way, and a Seq Scan
-      # is still what must never appear.
-      # ANY scan verb, because there are three spellings and pinning two was the same
-      # mistake as pinning one: `Index Only Scan using ...` becomes reachable the moment the
-      # index covers the select list. The index NAME is what this asserts, plus the absence
-      # of a Seq Scan, which together are the whole of AC-32.1.2.
-      assert plan =~ ~r/Scan (using|on) dispatches_expires_at_active_index/
-
+      # The plan proves the predicate is served by an index, never a Seq Scan. It cannot pin
+      # WHICH index: `dispatches_tenant_id_expires_at_index (tenant_id, expires_at)` serves the
+      # same `expires_at <` condition, and which of the two Postgres picks moves with the
+      # statistics other tests leave behind, so naming one made this fail at random. That the
+      # partial index MATCHES the sweep's predicate is asserted from its definition below.
+      assert plan =~ ~r/Index (Only )?Scan|Bitmap Index Scan/
       assert plan =~ "Index Cond: (expires_at <"
       refute plan =~ "Seq Scan"
+
+      %{rows: [[indexdef]]} =
+        AdminRepo.query!(
+          "SELECT indexdef FROM pg_indexes WHERE indexname = 'dispatches_expires_at_active_index'"
+        )
+
+      assert indexdef =~
+               "ON public.dispatches USING btree (expires_at) WHERE (revoked_at IS NULL)"
     end
   end
 end

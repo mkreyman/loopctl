@@ -490,18 +490,22 @@ defmodule Loopctl.Delivery.SessionEndTest do
     end
 
     test "a lock that was not free is the one retry, and is not logged at error" do
+      tenant_id = Ecto.UUID.generate()
+
       log =
         capture_log([level: :error], fn ->
           assert {:error, :busy} =
                    RunnerStages.budget_escalation_refused(
                      :busy,
-                     Ecto.UUID.generate(),
+                     tenant_id,
                      @refused_session,
                      @refused_msg
                    )
         end)
 
-      assert log == ""
+      # This call's own line, by its tenant: capture_log collects every process's logs, so
+      # an async neighbour's error would make a whole-log `== ""` fail at random.
+      refute log =~ "tenant_id=#{tenant_id}"
     end
   end
 end
