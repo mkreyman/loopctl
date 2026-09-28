@@ -60,7 +60,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.19.0) A dispatch control PLACES may carry `deadline_at` (`RunnerDispatch.deadline_at`): an instant the runner must END THE SESSION BY — the EARLIER of its own start + `wall_clock_seconds` and `deadline_at`. It is placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS` (#879) — a RE-SEND moves it to the re-send's time + its `wall_clock_seconds` + the grace — so the time before the session starts comes out of the grace, not the wall clock; only a start-up longer than the grace shortens the session. loopctl's lease sweep never releases the claim on the story before it (an operator's force-unclaim can), so a runner that stops by it — even one cut off from control — never runs on a story the sweep released and loopctl placed again. OPTIONAL on the wire, and a holder of any earlier contract ignores it (undeclared keys are dropped) — but it is NOT PROTECTED by it: the claim is now capped at this instant whether or not the runner reads it, so a runner on an earlier contract whose start-up takes longer than the grace can still be running when the sweep releases the story. RE-VENDOR to read it | | | | |
   | (1.20.0) A SESSION REPORTS ITS WORK AS IT HAPPENS, on the story's change thread (epic 45, US-45.2). Two new messages: `checkpoint` (`RunnerCheckpoint`: `dispatch_id`, `claim_epoch`, `commit_sha`, `tree_sha`, optional `note`) for each commit the session pushed, and `thread_entry` (`RunnerThreadEntry`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, optional `checkpoint_id`) for each note it wants on the thread. Both name an ACCEPTED `implement` dispatch at its `claim_epoch`; a checkpoint is recorded only for the story's current claimant while its claim is live. Both are IDEMPOTENT: a resend of the same checkpoint, or of the same `client_seq` with the same content, is answered `ok` with `replayed: true`, and a DIFFERENT write reusing either is `checkpoint_conflict` or `idempotency_key_reused`. Each has its own bucket (`checkpoint_burst`, `thread_entry_burst`) and its own byte budget (`x-connection.limits.checkpoint`, `x-connection.limits.thread_entry`). OPTIONAL — a runner that sends neither gets exactly today's behaviour. RE-VENDOR to send them: a 1.19.0 copy has neither event, no `RunnerCheckpointAck`, no `RunnerThreadEntryAck` and no bucket for either | | | | |
   | (1.21.0) REVIEW IS DISPATCHABLE (epic 45, US-45.3). `x-connection.dispatchable_kinds` adds `review`: loopctl places a review of a story's change thread as a runner dispatch of kind `review`, carrying the story (`RunnerStory`, as an implement dispatch does) and a `review` object (`RunnerReview`: `review_id`, `round`, and the checkpoint to read — `checkpoint_id`, `checkpoint_seq`, `commit_sha`, `tree_sha`). It CLAIMS NOTHING: `claim_epoch` is the implementer's claim, echoed back like any dispatch's, and the review never writes code. The session answers with two new messages: `review_finding` (`RunnerReviewFinding`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, `severity`, optional `location` and `introduced_by`) for each defect it found, and ONE `review_verdict` (`RunnerReviewVerdict`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`) that completes the review's round and ends it; the slot is freed by the session's `session_ended`, not by the verdict. Both are bound to the review loopctl recorded for THIS dispatch and THIS runner, and are idempotent on `<dispatch_id>:<client_seq>`. New refusal codes: `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`. `session_ended` now also ends a REVIEW session: recorded once, the slot freed, no stage effect and no retry-ceiling count, answered with `kind: "review"` and `replayed` only (`RunnerSessionEndedAck` requires only `replayed` from this version; an implement session's ack still carries every row field). Only a runner that DECLARES `review` on join is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run reviews: a 1.20.0 copy has no `review` kind, no `RunnerReview`, no `review_finding` and no `review_verdict` | | | | |
-  | (1.22.0) WHICH PERMANENT REFUSALS END THE CLAIM is published, as `x-connection.claim_ending_errors` (loopctl#920): a `"*"` list (`unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, the last still under its `permanent_error_conditions` entry) plus per-event additions (`checkpoint`: `not_claimant`, `claim_not_live`; `review_finding` and `review_verdict`: `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`). On one of them stop sending for that dispatch; on any other permanent refusal drop that message and send the next. Additive: no message, field or code changes. RE-VENDOR to derive the set instead of typing it | | | | |
+  | (1.22.0) WHICH PERMANENT REFUSALS END THE CLAIM is published, as `x-connection.claim_ending_errors` (loopctl#920), shaped exactly like `permanent_errors`: `"*"` is `stale_claim_epoch`; `checkpoint` adds `not_claimant`; `review_finding` and `review_verdict` add `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`. On one of them send that dispatch no more work and end its session with `session_ended`; on any other permanent refusal drop that message and send the next. `claim_not_live`, `dispatch_not_accepted` and `unknown_dispatch` are deliberately NOT claim-ending: each is also answered while the claim is live. Additive: no message, field or code changes. RE-VENDOR to derive the set instead of typing it | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -426,10 +426,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     Branch on this rather than on a list copied into a runner's own source; everything not
     in it is worth resending unchanged.
   - `claim_ending_errors` (`claim_ending_errors/0`, since 1.22.0) — which of those END THE
-    CLAIM the message ran under: stop sending for that dispatch at once. Every other permanent
-    refusal refuses that one message only; drop it and send the next. Shaped like
-    `permanent_errors` (`"*"` for every event that publishes the code, plus per-event
-    additions).
+    CLAIM the message ran under: send that dispatch no more `stage`, `checkpoint`,
+    `thread_entry`, `review_finding` or `review_verdict`, and end its session with
+    `session_ended`, which is what frees the slot. Every other permanent refusal refuses that
+    one message only; drop it and send the next. Shaped exactly like `permanent_errors`
+    (`"*"` for every event, plus per-event additions).
 
   - `triage_gating_reasons` (`Loopctl.DeliveryGates.GateA.gating_reason_codes/0`) — the
     `escalation_reasons` entries the control-side gate matches as WHOLE STRINGS. Published
@@ -3423,6 +3424,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   #
   # `"*"` is what holds for every event; an event's own entry ADDS to it and never subtracts,
   # so a code cannot be permanent globally and transient for one message.
+  # The four codes that say a REVIEW can take no more judgements (1.21.0): permanent for both
+  # judgement messages, and the review-dispatch half of `@claim_ending_errors` (1.22.0). One
+  # literal, so a fifth cannot reach one map or one message and not the others.
+  @review_ending_codes ~w(review_closed review_claim_ended review_round_superseded
+                          reviewer_not_separate)
+
   @permanent_errors %{
     "*" => ~w(invalid_payload not_authorized unsupported_contract_version machine_mismatch
          forbidden_topic unknown_topic unknown_event unknown_dispatch stale_claim_epoch
@@ -3438,40 +3445,47 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # story, or the write is
     # not the one already recorded, or it carries a credential. `tenant_halted` is NOT here:
     # it clears when an operator lifts the halt.
-    "review_finding" =>
-      ~w(review_closed review_claim_ended review_round_superseded reviewer_not_separate
-         idempotency_key_reused secret_blocked),
-    "review_verdict" =>
-      ~w(review_closed review_claim_ended review_round_superseded reviewer_not_separate
-         idempotency_key_reused secret_blocked)
+    "review_finding" => @review_ending_codes ++ ~w(idempotency_key_reused secret_blocked),
+    "review_verdict" => @review_ending_codes ++ ~w(idempotency_key_reused secret_blocked)
   }
 
   # WHICH OF THOSE END THE CLAIM (1.22.0, loopctl#920), rather than refuse one message. A
-  # runner needs the split and cannot derive it: on a claim-ending refusal it stops reporting
-  # for that dispatch at once, while on any other permanent refusal it drops that one message
-  # and sends the next. Asked for by the `loopctl-runner` session (its PR 59) on the same
-  # ground as `permanent_errors`: it had hand-typed this set from the descriptions, and a
-  # claim-ending code added here later would have read to it as a per-message refusal — drop,
-  # send the next, refused again, down the whole queue — instead of stopping once.
+  # runner needs the split and cannot derive it. On a claim-ending refusal the WORK of that
+  # dispatch is over: send it no more `stage`, `checkpoint`, `thread_entry`, `review_finding`
+  # or `review_verdict`, and END THE SESSION with `session_ended`, which is fenced on the
+  # dispatch and is what frees the runner's slot and records how the session ended. On any
+  # other permanent refusal, drop that one message and send the next. Asked for by the
+  # `loopctl-runner` session (its PR 59) on the ground `permanent_errors` was: it had
+  # hand-typed this set, and a claim-ending code added later would have read to it as a
+  # per-message refusal, retried down the whole queue.
   #
-  # Shaped like `permanent_errors`: `"*"` holds for every event that PUBLISHES the code
-  # (`error_reasons/0`), and an event's own key adds to it. Every code here is permanent for
-  # its event — a claim that has ended does not come back by resending — and the test binds
-  # that. `dispatch_not_accepted` keeps its condition (`permanent_error_conditions`): while an
-  # accept the runner sent is unacknowledged it is not final, so it ends nothing yet.
+  # Shaped EXACTLY like `permanent_errors`: `"*"` holds for every event and an event's own key
+  # adds to it (`claim_ending_error?/2` reads it the same way `permanent_error?/2` reads that).
+  # Every code is permanent for its event, and a test binds that.
   #
-  # What is deliberately NOT here: `audit_chain_append_failed` (permanent, but the TENANT's
-  # chain is failing, not this claim), `unknown_story_stage`, `secret_blocked` and the
-  # idempotency conflicts (one message's bytes), and `stale_stage`, whose terminal case its own
-  # condition already states. For a review, "the claim" is the REVIEW the dispatch runs: its
-  # four codes say that review can take no more judgements.
+  # Only codes that say the claim is over WHATEVER message drew them:
+  #
+  # - `stale_claim_epoch` — the story's claim moved on; for a review, the implementer's claim
+  #   it was placed under did.
+  # - `not_claimant` on `checkpoint` — the story's claim is not this runner's agent.
+  # - the four review codes — that review takes no more judgements.
+  #
+  # And NOT, each for a case where the claim is still live:
+  #
+  # - `claim_not_live` — also answered while REVIEW IS REQUESTED (`Claimant.live?/2`): the
+  #   claim and its epoch stand, and the session still reports its stages and ends.
+  # - `dispatch_not_accepted` — conditional (`permanent_error_conditions`): while an accept
+  #   the runner sent is unacknowledged the run is about to be accepted, not over.
+  # - `unknown_dispatch` — also answered to a message naming a dispatch of the wrong KIND,
+  #   a fault in that one message that says nothing about the dispatch it should have named.
+  # - `audit_chain_append_failed` (the tenant's chain, not this claim), `unknown_story_stage`,
+  #   `secret_blocked` and the idempotency conflicts (one message's bytes), and `stale_stage`,
+  #   whose terminal case its own condition states.
   @claim_ending_errors %{
-    "*" => ~w(unknown_dispatch stale_claim_epoch dispatch_not_accepted),
-    "checkpoint" => ~w(not_claimant claim_not_live),
-    "review_finding" =>
-      ~w(review_closed review_claim_ended review_round_superseded reviewer_not_separate),
-    "review_verdict" =>
-      ~w(review_closed review_claim_ended review_round_superseded reviewer_not_separate)
+    "*" => ~w(stale_claim_epoch),
+    "checkpoint" => ~w(not_claimant),
+    "review_finding" => @review_ending_codes,
+    "review_verdict" => @review_ending_codes
   }
 
   # THE ONE CONDITIONAL MEMBER OF THE LIST ABOVE, published rather than left in a moduledoc a
@@ -3597,25 +3611,25 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   @doc """
   The permanent refusal codes that END THE CLAIM a message ran under, per event (1.22.0),
-  rather than refusing that one message.
+  rather than refusing that one message: send that dispatch no more work, and end its session
+  with `session_ended`.
 
-  `"*"` holds for every event whose `error_reasons/0` publish the code; an event's own key
-  ADDS to it. Every code is also in `permanent_errors/0` for that event.
-  `claim_ending_error?/2` is the reading of it.
+  Shaped like `permanent_errors/0`: `"*"` holds for every event and an event's own key ADDS to
+  it. Every code is also in `permanent_errors/0` for that event. `claim_ending_error?/2` is
+  the reading of it.
   """
   @spec claim_ending_errors() :: %{String.t() => [String.t()]}
   def claim_ending_errors, do: @claim_ending_errors
 
   @doc """
-  True when `reason`, answered to `event`, means the claim that message ran under is over: stop
-  sending for that dispatch. False for every other refusal, permanent ones included, which
-  refuse only the message that drew them.
+  True when `reason`, answered to `event`, means the claim that message ran under is over:
+  send that dispatch no more work, and end its session with `session_ended`. False for every
+  other refusal, permanent ones included, which refuse only the message that drew them.
   """
   @spec claim_ending_error?(String.t(), String.t()) :: boolean()
   def claim_ending_error?(event, reason) do
-    reason in Map.get(@error_reasons, event, []) and
-      (reason in Map.fetch!(@claim_ending_errors, "*") or
-         reason in Map.get(@claim_ending_errors, event, []))
+    reason in Map.fetch!(@claim_ending_errors, "*") or
+      reason in Map.get(@claim_ending_errors, event, [])
   end
 
   @doc """

@@ -1840,13 +1840,10 @@
   "x-connection": {
     "claim_ending_errors": {
       "*": [
-        "unknown_dispatch",
-        "stale_claim_epoch",
-        "dispatch_not_accepted"
+        "stale_claim_epoch"
       ],
       "checkpoint": [
-        "not_claimant",
-        "claim_not_live"
+        "not_claimant"
       ],
       "review_finding": [
         "review_closed",

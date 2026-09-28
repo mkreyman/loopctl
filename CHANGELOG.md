@@ -8,9 +8,12 @@ All notable changes to loopctl are documented here.
 
 - **Runner contract 1.22.0: which refusals end the claim (loopctl#920).** The contract
   export's `x-connection.claim_ending_errors` names the permanent refusal codes that end the
-  claim a message ran under, per event, beside `permanent_errors`; every other permanent
+  claim a message ran under, per event, beside `permanent_errors`: on one, a runner sends that
+  dispatch no more work and ends its session with `session_ended`; every other permanent
   refusal refuses only that message. Additive. RE-VENDOR the contract to derive the set
-  rather than typing it.
+  rather than typing it; a runner's own list should drop `claim_not_live`,
+  `dispatch_not_accepted` and `unknown_dispatch`, which are also answered while the claim is
+  live.
 
 - **The thread page and browser login (epic 45, US-45.7).** `GET /threads/:story_id` shows a
   story's change thread — checkpoints with their CI evidence, entries as untrusted text,

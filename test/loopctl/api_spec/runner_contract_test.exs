@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "b476dcc8c7415417e1bf25c684f49ab6e6b2d41da5b254d0069785f9ffc0e87f"
+  @digest "8c86fde81c3964d9e76b893f5f449667f6523b29818c6579e4fcd3a4673932c1"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -2954,7 +2954,6 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   describe "claim_ending_errors (1.22.0, loopctl#920)" do
     test "every claim-ending code is published and permanent for the event it ends" do
       reasons = RunnerContract.error_reasons()
-      ending = RunnerContract.claim_ending_errors()
 
       pairs =
         for {event, codes} <- reasons,
@@ -2969,38 +2968,36 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "#{code} ends the #{event} claim but is not permanent for it"
       end
 
-      for {event, codes} <- ending, event != "*", code <- codes do
+      for {event, codes} <- RunnerContract.claim_ending_errors(),
+          event != "*",
+          code <- codes do
         assert code in Map.fetch!(reasons, event), "#{event} does not publish #{code}"
-      end
-
-      for code <- Map.fetch!(ending, "*") do
-        assert Enum.any?(reasons, fn {_event, codes} -> code in codes end)
       end
     end
 
-    test "the claim ends on the codes the runner hand-typed, and never on one message's bytes" do
-      for code <- ~w(unknown_dispatch stale_claim_epoch dispatch_not_accepted not_claimant
-                     claim_not_live) do
-        assert RunnerContract.claim_ending_error?("checkpoint", code)
+    test "the claim ends on a moved epoch, another claimant, or a closed review" do
+      for event <- ~w(stage checkpoint thread_entry review_finding session_ended) do
+        assert RunnerContract.claim_ending_error?(event, "stale_claim_epoch")
       end
+
+      assert RunnerContract.claim_ending_error?("checkpoint", "not_claimant")
 
       for code <- ~w(review_closed review_claim_ended review_round_superseded
-                     reviewer_not_separate) do
-        assert RunnerContract.claim_ending_error?("review_finding", code)
-        assert RunnerContract.claim_ending_error?("review_verdict", code)
+                     reviewer_not_separate),
+          event <- ~w(review_finding review_verdict) do
+        assert RunnerContract.claim_ending_error?(event, code)
       end
+    end
 
-      assert RunnerContract.claim_ending_error?("session_ended", "stale_claim_epoch")
-      assert RunnerContract.claim_ending_error?("thread_entry", "unknown_dispatch")
-
-      for code <- ~w(checkpoint_conflict secret_blocked audit_chain_append_failed
-                     invalid_payload rate_limited) do
+    test "never on a refusal the claim can outlive, nor on one message's bytes" do
+      # `claim_not_live` is also review requested, `dispatch_not_accepted` an accept still in
+      # flight, `unknown_dispatch` a message of the wrong kind: the claim is live in each.
+      for code <- ~w(claim_not_live dispatch_not_accepted unknown_dispatch checkpoint_conflict
+                     secret_blocked audit_chain_append_failed invalid_payload rate_limited) do
         refute RunnerContract.claim_ending_error?("checkpoint", code)
       end
 
-      # A code an event does not publish ends nothing there, "*" or not.
-      refute RunnerContract.claim_ending_error?("join", "stale_claim_epoch")
-      refute RunnerContract.claim_ending_error?("thread_entry", "claim_not_live")
+      refute RunnerContract.claim_ending_error?("review_finding", "tenant_halted")
     end
 
     test "the export publishes it beside permanent_errors" do
