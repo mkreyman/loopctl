@@ -32,6 +32,9 @@ import {
   buildCorpusCreateBody,
   buildCorpusIndexBody,
   buildCorpusSearchBody,
+  importPath,
+  importPayloadRefusal,
+  importRefusal,
 } from "./lib/http-helpers.js";
 import {
   createWitnessClient,
@@ -1025,15 +1028,25 @@ async function createStory({ project_id, epic_number, epic_id, story }) {
   return toContent(result);
 }
 
-async function importStories({ project_id, payload, payload_path, merge }) {
+async function importStories({ project_id, payload, payload_path, merge, report_orphans }) {
+  // The cheap argument check first, before a payload file is read (#880).
+  const refused = importRefusal({ merge, report_orphans });
+  if (refused) return toContent({ error: true, status: 0, body: refused });
+
   const effectivePayload = await resolvePayload(payload, payload_path);
   if (effectivePayload && effectivePayload.error) {
     return toContent(effectivePayload);
   }
-  const query = merge ? "?merge=true" : "";
+
+  // The payload is the request BODY, and the server reads flags there too: a payload carrying
+  // its own would override or contradict the arguments, so it is refused, not sent.
+  const payloadRefused = importPayloadRefusal(effectivePayload);
+  if (payloadRefused) return toContent({ error: true, status: 0, body: payloadRefused });
+
+  // `report_orphans` asks a merge for `stories_orphaned` (#880); without it the key is absent.
   const result = await apiCall(
     "POST",
-    `/api/v1/projects/${project_id}/import${query}`,
+    importPath(project_id, { merge, report_orphans }),
     effectivePayload,
     process.env.LOOPCTL_ORCH_KEY
   );
@@ -4467,6 +4480,9 @@ const TOOLS = [
     description:
       "Import stories into a project from a structured payload (Epic 12 import format). " +
       "Pass `merge: true` to add stories to epics that already exist (otherwise duplicates return 409). " +
+      "A merge answers counts; `stories_orphaned` (the project's stories the payload does not " +
+      "mention; nothing is detached) is in the response ONLY with `report_orphans: true`, " +
+      "which is a signal only on a full round-trip of an export (#880). " +
       "For large payloads, use `payload_path` to read JSON from disk instead of passing it inline.",
     inputSchema: {
       type: "object",
@@ -4490,6 +4506,15 @@ const TOOLS = [
           description:
             "When true, existing epics/stories are updated and new ones added. " +
             "When false or omitted, duplicates return 409.",
+          default: false,
+        },
+        report_orphans: {
+          type: "boolean",
+          description:
+            "Merge only. When true the response carries `stories_orphaned`: the project's " +
+            "stories this payload does not mention. Nothing is detached either way. It is a " +
+            "signal only when the payload is a FULL round-trip of an export; on a partial " +
+            "merge every unmentioned story is listed. When false or omitted the key is absent.",
           default: false,
         },
       },

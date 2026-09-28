@@ -161,7 +161,7 @@ defmodule LoopctlWeb.MergeImportControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/projects/#{project.id}/import?merge=true", payload)
+        |> post(~p"/api/v1/projects/#{project.id}/import?merge=true&report_orphans=true", payload)
 
       body = json_response(conn, 200)
       orphaned = body["import"]["stories_orphaned"]
@@ -174,6 +174,134 @@ defmodule LoopctlWeb.MergeImportControllerTest do
       assert AdminRepo.exists?(
                from(s in Story, where: s.number == "1.3" and s.tenant_id == ^tenant.id)
              )
+    end
+
+    test "a partial merge reports no orphans unless asked (#880)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      full = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Epic",
+            "stories" => [
+              %{"number" => "1.1", "title" => "One"},
+              %{"number" => "1.2", "title" => "Two"}
+            ]
+          }
+        ]
+      }
+
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/projects/#{project.id}/import", full)
+      |> json_response(201)
+
+      partial = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Epic",
+            "stories" => [%{"number" => "1.3", "title" => "Three"}]
+          }
+        ]
+      }
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/import?merge=true", partial)
+        |> json_response(200)
+
+      assert body["import"]["stories_created"] == 1
+      refute Map.has_key?(body["import"], "stories_orphaned")
+    end
+
+    test "report_orphans as a JSON boolean is honoured, and any other value is 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      seed = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Epic",
+            "stories" => [%{"number" => "1.1", "title" => "One"}]
+          }
+        ]
+      }
+
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/projects/#{project.id}/import", seed)
+      |> json_response(201)
+
+      partial = %{"epics" => [%{"number" => 1, "title" => "Epic", "stories" => []}]}
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(
+          ~p"/api/v1/projects/#{project.id}/import?merge=true",
+          Map.put(partial, "report_orphans", true)
+        )
+        |> json_response(200)
+
+      assert [%{"number" => "1.1"}] = body["import"]["stories_orphaned"]
+
+      assert build_conn()
+             |> auth_conn(raw_key)
+             |> post(
+               ~p"/api/v1/projects/#{project.id}/import?merge=true&report_orphans=1",
+               partial
+             )
+             |> json_response(422)
+
+      # One reading for both flags: merge as a body boolean is a merge, not a fresh import.
+      assert %{"import" => %{"stories_orphaned" => [_]}} =
+               build_conn()
+               |> auth_conn(raw_key)
+               |> post(
+                 ~p"/api/v1/projects/#{project.id}/import",
+                 Map.merge(partial, %{"merge" => true, "report_orphans" => true})
+               )
+               |> json_response(200)
+
+      # Given in both the query and the body, the two must agree; the body takes booleans only.
+      for {query, body_flags} <- [
+            {"merge=true&report_orphans=true", %{"report_orphans" => false}},
+            {"merge=true", %{"merge" => false}},
+            {"merge=true", %{"report_orphans" => "true"}}
+          ] do
+        assert build_conn()
+               |> auth_conn(raw_key)
+               |> post(
+                 "/api/v1/projects/#{project.id}/import?#{query}",
+                 Map.merge(partial, body_flags)
+               )
+               |> json_response(422)
+      end
+
+      # Agreeing in both is fine.
+      assert %{"import" => %{"stories_orphaned" => [_]}} =
+               build_conn()
+               |> auth_conn(raw_key)
+               |> post(
+                 "/api/v1/projects/#{project.id}/import?merge=true&report_orphans=true",
+                 Map.put(partial, "report_orphans", true)
+               )
+               |> json_response(200)
+
+      # Orphans are a merge's report, and a flag misspelled is refused, not read as off.
+      for query <- ["report_orphans=true", "merge=1"] do
+        assert build_conn()
+               |> auth_conn(raw_key)
+               |> post("/api/v1/projects/#{project.id}/import?#{query}", partial)
+               |> json_response(422)
+      end
     end
 
     test "merge with new epic creates it with all stories", %{conn: conn} do

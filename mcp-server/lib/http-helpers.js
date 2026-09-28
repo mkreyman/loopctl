@@ -361,3 +361,63 @@ export function buildCorpusSearchBody({ query, query_vector, lanes, limit } = {}
   if (limit != null) body.limit = limit;
   return body;
 }
+
+// `true`/`false` or their strings, and nothing else (loopctl #880); `undefined` for anything
+// else, which `importRefusal` turns into a refusal before a path is ever built.
+function importFlag(value) {
+  if (value === undefined || value === null || value === false || value === "false") return false;
+  if (value === true || value === "true") return true;
+  return undefined;
+}
+
+/**
+ * Why an `import_stories` call must not be sent, or `null`. `merge` and `report_orphans` take
+ * `true`/`false` (or their strings) and nothing else, as the server does (loopctl #880): a value
+ * that is neither is REFUSED rather than read as off, which would silently run a fresh import
+ * or drop the orphan list a caller asked for; and `report_orphans` without `merge` is refused,
+ * since orphans are a merge's report.
+ *
+ * @param {{ merge?: unknown, report_orphans?: unknown }} [args]
+ * @returns {string | null}
+ */
+export function importRefusal({ merge, report_orphans } = {}) {
+  if (importFlag(merge) === undefined) return "`merge` must be true or false.";
+  if (importFlag(report_orphans) === undefined) return "`report_orphans` must be true or false.";
+  if (importFlag(report_orphans) && !importFlag(merge)) {
+    return "`report_orphans` needs `merge: true`: orphans are a merge's report.";
+  }
+  return null;
+}
+
+/**
+ * Why an `import_stories` payload must not be sent as the body, or `null`: it carries its own
+ * `merge` or `report_orphans`, which the server reads from the body as well (loopctl #880) and
+ * which would override or contradict the tool's arguments. Pass the flags as arguments.
+ *
+ * @param {unknown} payload
+ * @returns {string | null}
+ */
+export function importPayloadRefusal(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const carried = ["merge", "report_orphans"].filter((key) => key in payload);
+  return carried.length === 0
+    ? null
+    : `The payload carries ${carried.map((k) => `\`${k}\``).join(" and ")}; pass ` +
+        "import flags as the tool's arguments, not inside the payload.";
+}
+
+/**
+ * Path for `import_stories`, for arguments `importRefusal` accepted. ONE template literal, the
+ * shape `test/tool-surface.js` resolves to the route; the id is encoded so it cannot rewrite
+ * the query.
+ *
+ * @param {string} projectId
+ * @param {{ merge?: unknown, report_orphans?: unknown }} [args]
+ * @returns {string}
+ */
+export function importPath(projectId, { merge, report_orphans } = {}) {
+  return `/api/v1/projects/${encodeURIComponent(projectId)}/import${buildQuery([
+    ["merge", importFlag(merge) ? "true" : null],
+    ["report_orphans", importFlag(report_orphans) ? "true" : null],
+  ])}`;
+}
