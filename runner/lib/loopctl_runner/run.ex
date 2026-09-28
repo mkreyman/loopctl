@@ -20,6 +20,7 @@ defmodule LoopctlRunner.Run do
   """
 
   alias LoopctlRunner.{
+    ClaimEnded,
     Config,
     Owner,
     Reaper,
@@ -457,17 +458,27 @@ defmodule LoopctlRunner.Run do
       else: Worktree.status_after(teardown)
   end
 
+  @claim_ended "loopctl ended the claim this run was dispatched under before its session started"
+
   # THE deadline guard before the session, immediately before `implementing` is announced: cutting
   # the tree and building the prompt take time, and a stage reported for a session that will not
   # start is a stage loopctl moves the story on for. Nothing checks after it: a session started
   # here is bounded by its own stop timer (`Story.stop_after/4`).
+  #
+  # Beside it, the CLAIM (contract 1.22.0): one loopctl ended while the tree was cut
+  # (`LoopctlRunner.ClaimEnded`) gets no session, since its work is not to be sent and its session
+  # is to be stopped; the run ends `claim_ended` from `worktree`, an escalation Control does not send.
   defp run_session(config, story, run_dir, trace, run_seq, path, opts) do
-    case Story.check_deadline(story.deadline_at, story.wall_clock_s, config, DateTime.utc_now()) do
-      :ok ->
-        start_session(config, story, run_dir, trace, run_seq, path, opts)
+    if ClaimEnded.ended?(config.runs_dir, Keyword.get(opts, :binding, %{})) do
+      no_session(story, run_dir, trace, run_seq, path, opts, "claim_ended", @claim_ended)
+    else
+      case Story.check_deadline(story.deadline_at, story.wall_clock_s, config, DateTime.utc_now()) do
+        :ok ->
+          start_session(config, story, run_dir, trace, run_seq, path, opts)
 
-      {:passed, detail} ->
-        no_session(story, run_dir, trace, run_seq, path, opts, "deadline_passed", detail)
+        {:passed, detail} ->
+          no_session(story, run_dir, trace, run_seq, path, opts, "deadline_passed", detail)
+      end
     end
   end
 

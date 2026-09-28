@@ -55,6 +55,26 @@ defmodule LoopctlRunner.TriageRunTest do
     assert {:ok, %{"status" => "verdict", "kind" => "triage"}} = RunStateRead.read(result.run_dir)
   end
 
+  test "a triage whose claim ended before its session starts none", ctx do
+    binding = %{"dispatch_id" => LoopctlRunner.Session.uuid4(), "claim_epoch" => 3}
+
+    :ok =
+      LoopctlRunner.ClaimEnded.record(
+        ctx.config.runs_dir,
+        binding["dispatch_id"],
+        3,
+        "trace",
+        "x"
+      )
+
+    result = execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], binding: binding)
+
+    assert {:incomplete, "no_verdict_written", detail} = result.outcome
+    assert detail =~ "ended the claim"
+    assert result.session == nil
+    refute File.exists?(Path.join(ctx.state, "argv"))
+  end
+
   test "an escalate carrying only bare codes is SENT, and said about", ctx do
     # The one moment the runner holds such a verdict and knows it is about to go. It is not
     # refused: `TriageVerdict.bare_escalation?/1` carries the argument, and the short of it is that

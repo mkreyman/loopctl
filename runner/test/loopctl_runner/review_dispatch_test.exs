@@ -226,16 +226,18 @@ defmodule LoopctlRunner.ReviewDispatchTest do
       end
     end
 
-    test "one about the review ends it, one about the message drops it, a halt is resent" do
+    test "a claim-ending one ends the claim, a run-ending one the stream, the rest the message" do
       for event <- ReviewDispatch.events() do
         for reason <- ~w(review_closed review_claim_ended review_round_superseded
-                         reviewer_not_separate unknown_dispatch stale_claim_epoch
-                         dispatch_not_accepted) do
-          assert ReviewDispatch.classify(event, reason) == :stop, "#{event} #{reason}"
+                         reviewer_not_separate unknown_dispatch stale_claim_epoch) do
+          assert ReviewDispatch.classify(event, reason) == :claim_ended, "#{event} #{reason}"
         end
 
+        assert ReviewDispatch.classify(event, "dispatch_not_accepted") == :stop
+
+        # 1.22.0's two per-message codes drop only the message that drew them.
         for reason <- ~w(secret_blocked idempotency_key_reused invalid_payload
-                         audit_chain_append_failed) do
+                         audit_chain_append_failed claim_epoch_mismatch wrong_dispatch_kind) do
           assert ReviewDispatch.classify(event, reason) == :drop, "#{event} #{reason}"
         end
 
@@ -248,16 +250,27 @@ defmodule LoopctlRunner.ReviewDispatchTest do
     end
 
     test "a halt is not permanent in the contract, and every stop and drop is" do
-      permanent = Contract.connection()["permanent_errors"]
-
       for event <- ReviewDispatch.events() do
-        all = permanent["*"] ++ Map.get(permanent, event, [])
-        refute "tenant_halted" in all
+        permanent = Contract.permanent_errors(event)
+        refute "tenant_halted" in permanent
 
-        assert Enum.all?(
-                 ReviewDispatch.stop_reasons() ++ ReviewDispatch.drop_reasons(),
-                 &(&1 in all)
-               )
+        for reason <- ReviewDispatch.errors(event),
+            ReviewDispatch.classify(event, reason) in [:claim_ended, :stop, :drop] do
+          assert reason in permanent, "#{event} #{reason}"
+        end
+      end
+    end
+
+    test "the claim-ending set is the contract's, key for key" do
+      # Read, never re-typed: the refusals a review stream ends its claim on are exactly what the
+      # vendored contract publishes for the event.
+      for event <- ReviewDispatch.events() do
+        claim_ending =
+          for reason <- ReviewDispatch.errors(event),
+              ReviewDispatch.classify(event, reason) == :claim_ended,
+              do: reason
+
+        assert Enum.sort(claim_ending) == Enum.sort(Contract.claim_ending_errors(event))
       end
     end
 

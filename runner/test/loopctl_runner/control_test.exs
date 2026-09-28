@@ -57,7 +57,7 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.21.0"
+    assert join["contract_version"] == "1.22.0"
     # Declared on EVERY join, from the same list the kind check reads.
     assert join["kinds"] == LoopctlRunner.Control.kinds()
     assert join["kinds"] == ["implement", "review"]
@@ -699,6 +699,26 @@ defmodule LoopctlRunner.ControlTest do
       refute_receive {:test_loopctl, {:trace_cursor, %{"run_id" => ^run_id}}}, 10
     end
 
+    test "a per-message refusal every batch would draw gives the run's trace up, not retried",
+         ctx do
+      # 1.22.0's `claim_epoch_mismatch`: permanent, and about the epoch every batch of the run
+      # carries, so the next batch would draw it too. Read into `given_up/0` from the contract;
+      # retried as the unexpected reply it was before, it would be pushed for ever.
+      run_id = ctx.run_id
+      assert "claim_epoch_mismatch" in Control.given_up()
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "claim_epoch_mismatch"}}])
+      run_dir = dispatched_run(ctx, 0..2)
+      shipping_control(ctx)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
+
+      assert %{"abandoned" => "claim_epoch_mismatch"} =
+               JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+
+      refute_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 800
+    end
+
     test "a rate-limited batch is resent, not skipped", ctx do
       run_id = ctx.run_id
       TestLoopctl.put(:trace_replies, [{:error, %{reason: "rate_limited", min_interval_ms: 50}}])
@@ -1278,6 +1298,15 @@ defmodule LoopctlRunner.ControlTest do
       end
     end
 
+    # Every session_ended already received, taken out of the mailbox.
+    defp drain_session_ended(acc \\ []) do
+      receive do
+        {:test_loopctl, {:session_ended, _}} = message -> drain_session_ended([message | acc])
+      after
+        0 -> acc
+      end
+    end
+
     defp next_session_ended(timeout \\ 15_000) do
       receive do
         {:test_loopctl, {:session_ended, payload}} -> payload
@@ -1675,6 +1704,10 @@ defmodule LoopctlRunner.ControlTest do
       assert log =~
                "did not record this runner's accept of dispatch #{refused["dispatch_id"]} " <>
                  "(stale_claim_epoch); its run is not started"
+
+      # Nothing ran under that claim, so its end is neither recorded nor treated as a stop.
+      refute LoopctlRunner.ClaimEnded.ended?(ctx.config.runs_dir, refused["dispatch_id"], 3)
+      refute log =~ "which ends"
     end
 
     test "the run starts only once loopctl acknowledges the accept", ctx do
@@ -1912,6 +1945,559 @@ defmodule LoopctlRunner.ControlTest do
         refute_receive {:test_loopctl, {:stage, _}}, 800
         :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
       end)
+    end
+
+    test "a stage report refused as ending the claim stops the session, and only session_ended goes",
+         ctx do
+      # contract 1.22.0, `claim_ending_errors.stage`, read rather than typed. The claim ends on the
+      # FIRST report, while the run builds its prompt: either the run reads the claim's marker
+      # before its session and starts none, or the session had just started and is stopped. Either
+      # way the run is over well inside the 30s a hang session would otherwise run.
+      reasons = Contract.claim_ending_errors("stage")
+      assert reasons != []
+
+      for reason <- reasons do
+        TestLoopctl.put(:stage_replies, [{:error, %{reason: reason}}])
+        dispatch = story_dispatch()
+
+        log =
+          capture_log(fn ->
+            {pid, topic} = accepting_control(ctx, "hang", %{}, session_stop_retry_ms: 100)
+            TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+            assert %{"from" => "claimed", "to" => "worktree"} = next_stage()
+            :ok = wait_until(fn -> Control.info(pid).runs_in_flight == [] end, 15_000)
+
+            # Nothing more of its work: no `-> implementing`, and no `-> escalated` either. A
+            # session that had started is reported `crashed`, one that never did is not reported.
+            refute_receive {:test_loopctl, {:stage, _}}, 500
+
+            for {:test_loopctl, {:session_ended, ended}} <- drain_session_ended(),
+                do: assert(ended["reason"] == "crashed")
+
+            GenServer.stop(pid)
+          end)
+
+        # One marker for the claim, so a run of it and a Control that starts over both honour it.
+        assert LoopctlRunner.ClaimEnded.ended?(ctx.config.runs_dir, dispatch["dispatch_id"], 3)
+
+        assert log =~ "(#{reason}), which ends the claim it ran under", reason
+      end
+    end
+
+    test "a claim that ended mid-run takes no terminal escalation, and its session_ended goes",
+         ctx do
+      # "send that dispatch no more messages of its work (the events keyed here)": `stage` is
+      # keyed, so the run's `-> escalated` is not sent after the claim ended — only the
+      # `session_ended` that "follows its own rules".
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100)
+        binding = DispatchRun.binding(story_dispatch())
+
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        assert %{"from" => "worktree", "to" => "implementing"} = next_stage()
+        # The refusal is settled BEFORE the run ends, so the escalation is one queued after the
+        # claim ended rather than one already queued and dropped with it.
+        :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
+
+        send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
+        assert %{"reason" => "completed"} = next_session_ended()
+        refute_receive {:test_loopctl, {:stage, _}}, 800
+        :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
+      end)
+    end
+
+    test "a claim ended while a stage report is in flight drops it, and session_ended alone goes",
+         ctx do
+      # The report is never answered; the claim ends meanwhile on a TRACE refusal. Its reply,
+      # whenever it comes, answers nothing that is still owed — and waiting for it would hold the
+      # `session_ended` behind a push that may never be answered.
+      TestLoopctl.put(:stage_replies, [:none])
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100)
+
+        binding =
+          DispatchRun.binding(
+            story_dispatch(%{"dispatch_id" => @dispatch_id, "claim_epoch" => 4})
+          )
+
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        assert %{"from" => "worktree", "to" => "implementing"} = next_stage()
+
+        dispatched_run(Map.put(ctx, :run_id, Session.uuid4()), 0..2)
+        :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 10_000)
+
+        summary = %{status: "succeeded", reached: "implementing"}
+        send(pid, {:run_stage, binding, {:finished, summary}})
+
+        assert next_session_ended() == %{
+                 "dispatch_id" => @dispatch_id,
+                 "claim_epoch" => 4,
+                 "reason" => "completed"
+               }
+
+        refute_receive {:test_loopctl, {:stage, _}}, 500
+      end)
+    end
+
+    test "a stage report refused with a per-message code drops that report only", ctx do
+      # 1.22.0's `claim_epoch_mismatch` and `wrong_dispatch_kind` — and every other permanent
+      # refusal that neither ends the claim nor carries a condition — refuse the message that drew
+      # them and nothing else: never resent, the NEXT report still goes, and the session — which
+      # takes ~2.5s here — runs to its own end rather than being stopped.
+      for reason <- ~w(claim_epoch_mismatch wrong_dispatch_kind) do
+        refute reason in Contract.claim_ending_errors("stage")
+        TestLoopctl.put(:stage_replies, [{:error, %{reason: reason}}])
+
+        log =
+          capture_log(fn ->
+            {pid, topic} =
+              accepting_control(ctx, "quiet_then_result", %{}, session_stop_retry_ms: 100)
+
+            TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+
+            assert %{"from" => "claimed", "to" => "worktree"} = next_stage()
+            # From the stage the row is at (`claimed`) when the refusal came first; from the
+            # dropped report's `to` when this one was already queued behind it.
+            assert %{"to" => "implementing"} = next_stage()
+            assert %{"reason" => "completed"} = next_session_ended(20_000)
+            runs_done(pid)
+            refute_receive {:test_loopctl, {:stage, _}}, 300
+            GenServer.stop(pid)
+          end)
+
+        assert log =~ "(#{reason}); that report is dropped, and the next one still goes", reason
+        refute log =~ "which ends the", reason
+      end
+    end
+
+    test "dispatch_not_accepted on a stage report with no accept outstanding ends the run", ctx do
+      # `permanent_error_conditions`: with no accept of ours in flight, "give the run up". The run
+      # ends — its session stopped, its intermediates stopped — but the claim stands, so its end is
+      # still reported: here the `session_ended` of the session that was stopped.
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
+      dispatch = story_dispatch()
+
+      log =
+        capture_log(fn ->
+          {pid, topic} = accepting_control(ctx, "hang", %{}, session_stop_retry_ms: 100)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+          assert %{"from" => "claimed", "to" => "worktree"} = next_stage()
+          assert %{"reason" => "crashed"} = next_session_ended(20_000)
+          runs_done(pid)
+          refute_receive {:test_loopctl, {:stage, _}}, 500
+          GenServer.stop(pid)
+        end)
+
+      assert log =~
+               "(dispatch_not_accepted, with no accept of this runner's outstanding), " <>
+                 "which ends the run"
+    end
+
+    test "a run ended while its claim stands still reports its whole end", ctx do
+      # Where the run's end differs from the claim's: loopctl still holds this claim, so the
+      # escalation the run ended with and its `session_ended` both go, answered by their own rules.
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100)
+        binding = DispatchRun.binding(story_dispatch())
+
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        assert %{"from" => "worktree", "to" => "implementing"} = next_stage()
+        :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
+
+        send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
+        assert %{"from" => "implementing", "to" => "escalated"} = next_stage()
+        assert %{"reason" => "completed"} = next_session_ended()
+      end)
+    end
+
+    test "a stale_stage naming a stage no transition leaves ends the run mid-session", ctx do
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "stale_stage", stage: "escalated"}}])
+
+      log =
+        capture_log(fn ->
+          {pid, topic} = accepting_control(ctx, "hang", %{}, session_stop_retry_ms: 100)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+
+          assert %{"from" => "claimed", "to" => "worktree"} = next_stage()
+          assert %{"reason" => "crashed"} = next_session_ended(20_000)
+          runs_done(pid)
+          refute_receive {:test_loopctl, {:stage, _}}, 500
+          GenServer.stop(pid)
+        end)
+
+      assert log =~ "the story is at escalated, which no transition leaves), which ends the run"
+    end
+
+    test "dispatch_not_accepted on a stage report waits while this runner's accept is in flight",
+         ctx do
+      # The accept for the same dispatch and epoch is never answered, so it is still outstanding:
+      # the refusal is the one case worth retrying, and the report goes again.
+      dispatch = story_dispatch()
+      TestLoopctl.put(:dispatch_reply_replies, [:none])
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "dispatch_not_accepted"}}, :ok])
+
+      capture_log(fn ->
+        {pid, topic} = accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100)
+        TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+        assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+
+        binding = DispatchRun.binding(dispatch)
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        first = next_stage()
+        assert %{"from" => "worktree", "to" => "implementing"} = first
+        assert next_stage() == first
+        :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
+      end)
+    end
+
+    test "a trace batch refused dispatch_not_accepted with no accept outstanding ends the run",
+         ctx do
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
+      dispatch = story_dispatch()
+
+      log =
+        capture_log(fn ->
+          {pid, topic} = accepting_control(ctx, "hang", %{}, session_stop_retry_ms: 100)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+          assert %{"reason" => "crashed"} = next_session_ended(20_000)
+          runs_done(pid)
+          GenServer.stop(pid)
+        end)
+
+      assert log =~
+               "loopctl refused trace for dispatch #{dispatch["dispatch_id"]} " <>
+                 "(dispatch_not_accepted, with no accept of this runner's outstanding), " <>
+                 "which ends the run"
+    end
+
+    test "a claim-ending trace refusal of an OLDER epoch ends that claim, not the newer stream's",
+         ctx do
+      # The stream here is the dispatch's claim at epoch 4; the refused trace is a run of the same
+      # dispatch at epoch 3. The refusal ends epoch 3's claim — recorded beside that run — and
+      # nothing of epoch 4's: its run still reports its whole end.
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+
+      log =
+        capture_log(fn ->
+          {pid, _topic} = accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100)
+
+          binding =
+            DispatchRun.binding(
+              story_dispatch(%{"dispatch_id" => @dispatch_id, "claim_epoch" => 4})
+            )
+
+          send(pid, {:run_stage, binding, {:implementing, %{}}})
+          assert %{"claim_epoch" => 4, "to" => "implementing"} = next_stage()
+
+          old =
+            dispatched_run(Map.put(ctx, :run_id, Session.uuid4()), 0..2, %{"claim_epoch" => 3})
+
+          :ok =
+            wait_until(
+              fn -> LoopctlRunner.ClaimEnded.ended?(ctx.config.runs_dir, @dispatch_id, 3) end,
+              10_000
+            )
+
+          assert old
+
+          send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
+          assert %{"claim_epoch" => 4, "to" => "escalated"} = next_stage()
+          assert %{"claim_epoch" => 4, "reason" => "completed"} = next_session_ended()
+        end)
+
+      # Nothing of epoch 3 runs here: the expected end of a claim this process holds nothing of,
+      # not an error or a warning.
+      refute log =~ "which ends that claim"
+    end
+
+    test "a stream-less run's stop keeps looking while the run is in flight, and ends with it",
+         ctx do
+      # No stream: a run a predecessor started. The claim ends on its trace, and the stop follows
+      # the run directories it read once — for as long as any is still in flight, whatever its kind.
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100)
+
+        live =
+          dispatched_run(
+            Map.put(ctx, :run_id, Session.uuid4()),
+            0..2,
+            Map.merge(%{"status" => "running"}, owner!())
+          )
+
+        :ok = wait_until(fn -> Control.info(pid).session_stops_pending == 1 end, 10_000)
+        Process.sleep(600)
+        assert Control.info(pid).session_stops_pending == 1
+
+        RunState.update(live, %{"status" => "succeeded"})
+        :ok = wait_until(fn -> Control.info(pid).session_stops_pending == 0 end, 5_000)
+      end)
+    end
+
+    test "a claim's end cancels the backoff of the report it dropped", ctx do
+      # The report is rate-limited and waiting out a 5s backoff when the claim ends. What it waited
+      # for is never sent, so the `session_ended` behind it goes at once, not after the backoff.
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "rate_limited"}}])
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+
+      capture_log(fn ->
+        {pid, _topic} =
+          accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100, stage_retry_ms: 5_000)
+
+        binding =
+          DispatchRun.binding(
+            story_dispatch(%{"dispatch_id" => @dispatch_id, "claim_epoch" => 4})
+          )
+
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        assert %{"to" => "implementing"} = next_stage()
+
+        run = dispatched_run(Map.put(ctx, :run_id, Session.uuid4()), 0..2)
+        assert run
+
+        :ok =
+          wait_until(
+            fn -> LoopctlRunner.ClaimEnded.ended?(ctx.config.runs_dir, @dispatch_id, 4) end,
+            3_000
+          )
+
+        send(
+          pid,
+          {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+        )
+
+        assert %{"claim_epoch" => 4, "reason" => "completed"} = next_session_ended(2_000)
+        refute_receive {:test_loopctl, {:stage, _}}, 300
+        assert Control.info(pid).stage_reports_pending == 0
+      end)
+    end
+
+    test "a dispatch whose claim is recorded over starts no session and sends none of its work",
+         ctx do
+      # The marker is there before the run: its stream is opened ending that claim, and the run reads
+      # the marker immediately before its session and starts none. Its only end, an escalation, is
+      # not sent and is recorded refused.
+      dispatch = story_dispatch()
+      id = dispatch["dispatch_id"]
+
+      :ok =
+        LoopctlRunner.ClaimEnded.record(ctx.config.runs_dir, id, 3, "stage", "stale_claim_epoch")
+
+      capture_log(fn ->
+        {pid, topic} = accepting_control(ctx, "hang", %{}, session_stop_retry_ms: 100)
+        TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+        # The run's own end, not "nothing in flight", which holds before the dispatch is read.
+        :ok =
+          wait_until(
+            fn ->
+              Enum.any?(RunState.all(ctx.config.runs_dir), fn {_, state} ->
+                state["dispatch_id"] == id and state["status"] == "claim_ended"
+              end)
+            end,
+            15_000
+          )
+
+        :ok = wait_until(fn -> Control.info(pid).runs_in_flight == [] end, 15_000)
+        refute_receive {:test_loopctl, {:stage, _}}, 500
+        refute_received {:test_loopctl, {:session_ended, _}}
+      end)
+
+      assert [{run_dir, %{"status" => "claim_ended"} = state}] =
+               for(
+                 {_, %{"dispatch_id" => ^id}} = run <- RunState.all(ctx.config.runs_dir),
+                 do: run
+               )
+
+      refute Map.has_key?(state, "session_id")
+      :ok = wait_until(end_recorded(run_dir, "refused"), 3_000)
+    end
+
+    test "a dropped intermediate report leaves the stream at the stage the row is at", ctx do
+      # `worktree -> implementing` is refused for itself alone; loopctl's row stays at `worktree`,
+      # so the run's end is reported from there, not from the stage that was never recorded.
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "claim_epoch_mismatch"}}])
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream")
+        binding = DispatchRun.binding(story_dispatch())
+
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        assert %{"from" => "worktree", "to" => "implementing"} = next_stage()
+        :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
+
+        send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
+        assert %{"from" => "worktree", "to" => "escalated"} = next_stage()
+      end)
+    end
+
+    test "a stop drops a run whose session is gone, while that run tears down", ctx do
+      # The run is still in flight, but its process group is dead: nothing is left to stop, so the
+      # stop does not keep re-running end_session on it through its teardown.
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+      {dead, 0} = System.cmd("sh", ["-c", "echo $$"])
+      dead = dead |> String.trim() |> String.to_integer()
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100)
+
+        dispatched_run(
+          Map.put(ctx, :run_id, Session.uuid4()),
+          0..2,
+          Map.merge(%{"status" => "running", "pgid" => dead}, owner!())
+        )
+
+        :ok =
+          wait_until(
+            fn -> LoopctlRunner.ClaimEnded.ended?(ctx.config.runs_dir, @dispatch_id, 4) end,
+            10_000
+          )
+
+        :ok = wait_until(fn -> Control.info(pid).session_stops_pending == 0 end, 3_000)
+      end)
+    end
+
+    test "a restarted Control honours a claim end recorded beside a finished run", ctx do
+      # A run that never got a worktree owes only its terminal `escalated`; the claim it ran under
+      # was seen to end by a previous Control. Nothing of its work is sent, and the end is recorded
+      # refused, so no later Control sends it either.
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "claim-ended-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "failed",
+          "reached" => "claimed"
+        })
+      )
+
+      :ok =
+        LoopctlRunner.ClaimEnded.record(
+          ctx.config.runs_dir,
+          dispatch["dispatch_id"],
+          3,
+          "stage",
+          "stale_claim_epoch"
+        )
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream")
+        :ok = wait_until(end_recorded(run_dir, "refused"), 5_000)
+        refute_receive {:test_loopctl, {:stage, _}}, 800
+        assert Control.info(pid).stage_reports_pending == 0
+      end)
+    end
+
+    test "a restarted Control honours a claim end recorded beside a live run's directory", ctx do
+      # The run outlived the Control that saw its claim end; its next message opens a stream here,
+      # and that stream takes nothing of its work but the `session_ended`.
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "claim-ended-live")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "succeeded",
+          "reached" => "implementing",
+          "terminal_reported" => true
+        })
+      )
+
+      :ok =
+        LoopctlRunner.ClaimEnded.record(
+          ctx.config.runs_dir,
+          dispatch["dispatch_id"],
+          3,
+          "trace",
+          "unknown_dispatch"
+        )
+
+      capture_log(fn ->
+        {pid, _topic} = accepting_control(ctx, "stream", %{}, session_stop_retry_ms: 100)
+        binding = DispatchRun.binding(dispatch)
+        send(pid, {:run_stage, binding, {:implementing, %{}}})
+        send(pid, {:run_stage, binding, {:finished, escalated_summary()}})
+
+        assert %{"reason" => "completed"} = next_session_ended()
+        refute_receive {:test_loopctl, {:stage, _}}, 800
+      end)
+    end
+
+    test "a trace batch refused as ending the claim stops the live run's session", ctx do
+      # The refusal is scripted only once the session is running (its process group recorded):
+      # scripted from the start it can land while the tree is still cut, and then the run reads
+      # the claim's marker and starts no session at all — correct, and not what this test is
+      # about. The batches carrying the session's own events are the ones refused.
+      dispatch = story_dispatch()
+      id = dispatch["dispatch_id"]
+      assert "stale_claim_epoch" in Contract.claim_ending_errors("trace")
+
+      session_running? = fn ->
+        Enum.any?(RunState.all(ctx.config.runs_dir), fn {_dir, state} ->
+          state["dispatch_id"] == id and is_integer(state["pgid"])
+        end)
+      end
+
+      log =
+        capture_log(fn ->
+          {pid, topic} = accepting_control(ctx, "hang", %{}, session_stop_retry_ms: 100)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+          # A real worktree is cut before the session: 60s under load.
+          :ok = wait_until(session_running?, 60_000)
+          TestLoopctl.put(:trace_replies, [{id, {:error, %{reason: "stale_claim_epoch"}}}])
+
+          assert %{"reason" => "crashed", "dispatch_id" => ^id} = next_session_ended(60_000)
+          runs_done(pid)
+          refute_receive {:test_loopctl, {:stage, %{"to" => "escalated"}}}, 300
+          GenServer.stop(pid)
+        end)
+
+      assert log =~
+               "loopctl refused trace for dispatch #{id} " <>
+                 "(stale_claim_epoch), which ends the claim it ran under"
+    end
+
+    test "a repeated accept refused as ending the claim stops the run already going under it",
+         ctx do
+      # The first accept is recorded and the run starts; the dispatch delivered again at the SAME
+      # epoch is answered `accepted` again, and loopctl refusing THAT with a claim-ending code
+      # (`claim_ending_errors.dispatch_reply`) means the claim the run holds is over.
+      TestLoopctl.put(:dispatch_reply_replies, [:ok, {:error, %{reason: "unknown_dispatch"}}])
+      assert "unknown_dispatch" in Contract.claim_ending_errors("dispatch_reply")
+      dispatch = story_dispatch()
+
+      log =
+        capture_log(fn ->
+          {pid, topic} = accepting_control(ctx, "hang", %{}, session_stop_retry_ms: 100)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+          assert %{"to" => "worktree"} = next_stage()
+          assert %{"to" => "implementing"} = next_stage()
+
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+          assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+          assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+
+          assert %{"reason" => "crashed"} = next_session_ended(20_000)
+          runs_done(pid)
+          GenServer.stop(pid)
+        end)
+
+      assert log =~ "(unknown_dispatch), which ends the claim it ran under"
     end
 
     test "a stale_stage naming a stage no transition leaves ends the run rather than retrying",

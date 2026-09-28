@@ -61,9 +61,7 @@ defmodule LoopctlRunner.DispatchRun do
   # a run starts only once loopctl has acknowledged its accept, so by the time its session has
   # ended there is no accept outstanding, and the reason is as permanent as `*` says.
   @session_ended_errors Map.fetch!(Map.fetch!(Contract.connection(), "errors"), "session_ended")
-  @permanent_errors Map.fetch!(Contract.connection(), "permanent_errors")
-  @session_ended_permanent Map.fetch!(@permanent_errors, "*") ++
-                             Map.get(@permanent_errors, "session_ended", [])
+  @session_ended_permanent Contract.permanent_errors("session_ended")
 
   # Every refusal the contract publishes for the event is handled by name or known permanent. A
   # vendoring that adds a transient one fails the build here, where deciding is cheap, instead of

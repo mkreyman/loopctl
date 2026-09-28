@@ -51,8 +51,28 @@ defmodule LoopctlRunner.PendingVerdicts do
 
   def delete(run_dir) do
     File.rm(file(run_dir))
+    File.rm(resent_file(run_dir))
     :ok
   end
+
+  # Contract 1.22.0: a verdict refused `stale_claim_epoch` is resent ONCE, with the same bytes,
+  # before it is given up. That it was resent is recorded beside the message, and goes with it, so
+  # a Control that starts over a message it already resent gives it up on the next such refusal
+  # rather than resending it again. A marker of its own, never a field in the message file: that
+  # file holds exactly the bytes that went out.
+  @resent_file "verdict_message.resent"
+
+  defp resent_file(run_dir), do: Path.join(run_dir, @resent_file)
+
+  @doc "Records that the message owed for `run_dir` was resent after a `stale_claim_epoch`."
+  @spec mark_resent(String.t() | nil) :: :ok | {:error, term()}
+  def mark_resent(nil), do: :ok
+  def mark_resent(run_dir), do: AtomicFile.write(resent_file(run_dir), "")
+
+  @doc "Whether the message owed for `run_dir` was already resent after a `stale_claim_epoch`."
+  @spec resent?(String.t() | nil) :: boolean()
+  def resent?(nil), do: false
+  def resent?(run_dir), do: File.exists?(resent_file(run_dir))
 
   @doc """
   The message owed for one run: `{:ok, payload}`, `:none`, or `{:error, reason}` when a file is

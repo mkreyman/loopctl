@@ -558,9 +558,13 @@ defmodule LoopctlRunner.ControlReviewTest do
       assert why =~ "gave up after 300ms on the composition"
     end
 
-    test "a refusal about the review ends it: nothing more is sent but its session_ended", ctx do
-      for reason <- ~w(review_closed review_claim_ended review_round_superseded
-                       reviewer_not_separate) do
+    test "a claim-ending refusal ends it: nothing more is sent but its session_ended", ctx do
+      # Every code the contract says ends the claim a finding ran under (1.22.0), read from the
+      # vendored table rather than typed here.
+      reasons = Contract.claim_ending_errors("review_finding")
+      assert "review_closed" in reasons and "stale_claim_epoch" in reasons
+
+      for reason <- reasons do
         TestLoopctl.put(:review_finding_replies, [{:error, %{reason: reason}}])
         dispatch = review_dispatch(ctx)
 
@@ -586,7 +590,7 @@ defmodule LoopctlRunner.ControlReviewTest do
             dir
           end)
 
-        assert log =~ "(#{reason}): this review takes nothing more", reason
+        assert log =~ "(#{reason}), which ends the claim it ran under", reason
         # Recorded, so a Control starting over the run does not send them again.
         assert ReviewJudgements.settled(dir) == 3, reason
         refute Map.has_key?(elem(RunState.read(dir), 1), "review_verdict_undelivered"), reason
@@ -610,7 +614,9 @@ defmodule LoopctlRunner.ControlReviewTest do
     end
 
     test "a refusal about the message drops it, and the next judgement still goes", ctx do
-      for reason <- ~w(secret_blocked idempotency_key_reused) do
+      # 1.22.0's two per-message codes among them: never resent, never the claim's end.
+      for reason <- ~w(secret_blocked idempotency_key_reused claim_epoch_mismatch
+                       wrong_dispatch_kind) do
         TestLoopctl.put(:review_finding_replies, [{:error, %{reason: reason}}, :ok])
         dispatch = review_dispatch(ctx)
 

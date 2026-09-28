@@ -25,6 +25,7 @@ defmodule LoopctlRunner.ControlTriageTest do
     Session,
     TestLoopctl,
     TriageDispatch,
+    TriageRun,
     TriageVerdict
   }
 
@@ -717,6 +718,273 @@ defmodule LoopctlRunner.ControlTriageTest do
       # Nothing will move this refusal, so a copy left on disk would be resent by every restart
       # from now on and refused again each time.
       assert PendingVerdicts.all(ctx.config.runs_dir) == []
+    end
+
+    test "stale_claim_epoch is resent once as the same bytes, and a second one gives it up",
+         ctx do
+      # 1.22.0 `permanent_error_conditions.stale_claim_epoch`: on a triage_verdict it is permanent
+      # for THAT message only — "resend the verdict once, with the same bytes, before giving it up".
+      stale = {:error, %{reason: "stale_claim_epoch"}}
+      TestLoopctl.put(:triage_verdict_replies, [stale, stale])
+      dispatch = triage_dispatch()
+      run_dir = run_dir!(ctx, dispatch)
+
+      log =
+        capture_log(fn ->
+          {pid, _topic} =
+            running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_verdict_retry_ms: 100)
+
+          outcome(pid, dispatch, {:verdict, @verdict}, run_dir)
+          first = next_verdict()
+          assert next_verdict() == first
+          refute_receive {:test_loopctl, {:triage_verdict, _}}, 800
+          assert Control.info(pid).triage_verdict_backlog == 0
+        end)
+
+      assert log =~ "resending the same bytes once"
+
+      assert log =~
+               "giving up on the triage verdict for dispatch #{dispatch["dispatch_id"]} " <>
+                 "(stale_claim_epoch): refused so again after its one resend"
+
+      assert PendingVerdicts.all(ctx.config.runs_dir) == []
+    end
+
+    test "that a verdict was resent is recorded beside it while the resend is in flight", ctx do
+      TestLoopctl.put(:triage_verdict_replies, [{:error, %{reason: "stale_claim_epoch"}}, :none])
+      dispatch = triage_dispatch()
+      run_dir = run_dir!(ctx, dispatch)
+
+      capture_log(fn ->
+        {pid, _topic} =
+          running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_verdict_retry_ms: 100)
+
+        outcome(pid, dispatch, {:verdict, @verdict}, run_dir)
+        first = next_verdict()
+        assert next_verdict() == first
+        assert PendingVerdicts.resent?(run_dir)
+        GenServer.stop(pid)
+      end)
+    end
+
+    test "a verdict with no run directory remembers its one resend in memory", ctx do
+      # Nothing on disk to keep the mark beside, so this process's own memory is what bounds it.
+      stale = {:error, %{reason: "stale_claim_epoch"}}
+      TestLoopctl.put(:triage_verdict_replies, [stale, stale])
+
+      capture_log(fn ->
+        {pid, _topic} =
+          running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_verdict_retry_ms: 100)
+
+        outcome(pid, triage_dispatch(), {:verdict, @verdict})
+        first = next_verdict()
+        assert next_verdict() == first
+        refute_receive {:test_loopctl, {:triage_verdict, _}}, 800
+      end)
+    end
+
+    test "a stale_claim_epoch resend that lands is the end of it", ctx do
+      TestLoopctl.put(:triage_verdict_replies, [{:error, %{reason: "stale_claim_epoch"}}, :ok])
+
+      capture_log(fn ->
+        {pid, _topic} =
+          running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_verdict_retry_ms: 100)
+
+        outcome(pid, triage_dispatch(), {:verdict, @verdict})
+        first = next_verdict()
+        assert next_verdict() == first
+        refute_receive {:test_loopctl, {:triage_verdict, _}}, 800
+        :ok = wait_until(fn -> Control.info(pid).triage_verdicts_pending == 0 end, 5_000)
+      end)
+    end
+
+    test "1.22.0's per-message codes give the verdict up at once, never resent", ctx do
+      for reason <- ~w(claim_epoch_mismatch wrong_dispatch_kind) do
+        TestLoopctl.put(:triage_verdict_replies, [{:error, %{reason: reason}}])
+
+        log =
+          capture_log(fn ->
+            {pid, _topic} =
+              running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_verdict_retry_ms: 100)
+
+            outcome(pid, triage_dispatch(), {:verdict, @verdict})
+            next_verdict()
+            refute_receive {:test_loopctl, {:triage_verdict, _}}, 600
+            GenServer.stop(pid)
+          end)
+
+        assert log =~ "(#{reason}): nothing will change it", reason
+      end
+    end
+
+    test "a triage session whose claim a trace refusal ended is stopped, and sends no verdict",
+         ctx do
+      # 1.22.0 `claim_ending_errors.trace`: the claim is over, so the session is stopped and its
+      # verdict — work of that dispatch — is never sent; it is settled without a round trip.
+      dispatch = triage_dispatch()
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "unknown_dispatch"}}])
+
+      log =
+        capture_log(fn ->
+          {pid, _topic} =
+            running_control(ctx, [{"FAKE_CLAUDE_MODE", "hang"}], session_stop_retry_ms: 100)
+
+          assert_receive {:test_loopctl, {:trace, _}}, 10_000
+          :ok = wait_until(fn -> Control.info(pid).runs_in_flight == [] end, 20_000)
+          refute_receive {:test_loopctl, {:triage_verdict, _}}, 800
+          assert Control.info(pid).triage_verdicts_pending == 0
+        end)
+
+      assert log =~
+               "the triage verdict of dispatch #{dispatch["dispatch_id"]} is not sent: " <>
+                 "loopctl ended the claim it ran under"
+
+      assert PendingVerdicts.all(ctx.config.runs_dir) == []
+    end
+
+    test "a claim-ending refusal of a repeated accept stops the stream-less triage session",
+         ctx do
+      # A triage run has no stage stream. Delivered again at the same epoch, its dispatch is
+      # answered `accepted` again, and that answer refused `unknown_dispatch` — claim-ending for a
+      # dispatch_reply — ends the claim the running session holds: it is stopped, and its verdict
+      # is never sent.
+      dispatch = triage_dispatch()
+      id = dispatch["dispatch_id"]
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+      TestLoopctl.put(:dispatch_reply_replies, [:ok, {:error, %{reason: "unknown_dispatch"}}])
+
+      log =
+        capture_log(fn ->
+          {pid, topic} =
+            running_control(ctx, [{"FAKE_CLAUDE_MODE", "hang"}], session_stop_retry_ms: 100)
+
+          session_running? = fn ->
+            Enum.any?(RunState.all(ctx.config.runs_dir), fn {_dir, state} ->
+              state["dispatch_id"] == id and is_integer(state["pgid"])
+            end)
+          end
+
+          :ok = wait_until(session_running?, 15_000)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+          :ok = wait_until(fn -> Control.info(pid).runs_in_flight == [] end, 20_000)
+          refute_receive {:test_loopctl, {:triage_verdict, _}}, 800
+        end)
+
+      assert log =~
+               "loopctl refused dispatch_reply (unknown_dispatch) for dispatch #{id} at " <>
+                 "claim_epoch 3, which ends that claim: the session of"
+
+      assert log =~ "the triage verdict of dispatch #{id} is not sent"
+    end
+
+    test "a Control starting over stops the triage session whose claim was recorded over", ctx do
+      # The Control that learnt of the claim's end is gone; the triage run it started is not, and
+      # has no stage stream for anything to open. The next Control reads the claims recorded over
+      # and stops the session of every run of them still in flight, whatever its kind.
+      dispatch = triage_dispatch()
+      id = dispatch["dispatch_id"]
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+
+      session_running? = fn ->
+        Enum.any?(RunState.all(ctx.config.runs_dir), fn {_dir, state} ->
+          state["dispatch_id"] == id and is_integer(state["pgid"])
+        end)
+      end
+
+      log =
+        capture_log(fn ->
+          {first, _topic} =
+            running_control(ctx, [{"FAKE_CLAUDE_MODE", "hang"}], session_stop_retry_ms: 100)
+
+          :ok = wait_until(session_running?, 15_000)
+          GenServer.stop(first)
+          :ok = LoopctlRunner.ClaimEnded.record(ctx.config.runs_dir, id, 3, "trace", "x")
+          # A claim that ended a week and more ago: the starting Control prunes it.
+          stale = Session.uuid4()
+          :ok = LoopctlRunner.ClaimEnded.record(ctx.config.runs_dir, stale, 1, "trace", "x")
+          stale_marker = Path.join([ctx.config.runs_dir, ".claims", "#{stale}-1"])
+          File.touch!(stale_marker, System.os_time(:second) - 8 * 24 * 3600)
+
+          {_second, _topic} = start_control(ctx, session_stop_retry_ms: 100)
+
+          :ok =
+            wait_until(
+              fn -> Task.Supervisor.children(ctx.run_supervisor) == [] end,
+              15_000
+            )
+
+          refute File.exists?(stale_marker)
+          assert LoopctlRunner.ClaimEnded.ended?(ctx.config.runs_dir, id, 3)
+
+          refute_receive {:test_loopctl, {:triage_verdict, _}}, 500
+        end)
+
+      assert log =~
+               "dispatch #{id}'s claim 3 was recorded over, and a run of it is still in flight"
+    end
+
+    test "failing to record that a verdict was resent is said, and the resend still goes", ctx do
+      TestLoopctl.put(:triage_verdict_replies, [{:error, %{reason: "stale_claim_epoch"}}, :ok])
+      gone = Path.join(ctx.root, "no-such-run-dir")
+
+      log =
+        capture_log(fn ->
+          {pid, _topic} =
+            running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_verdict_retry_ms: 100)
+
+          outcome(pid, triage_dispatch(), {:verdict, @verdict}, gone)
+          first = next_verdict()
+          assert next_verdict() == first
+        end)
+
+      assert log =~ "could not record beside the triage verdict that it was resent"
+    end
+
+    test "a restart sends no pending verdict whose claim was recorded ended", ctx do
+      dispatch = triage_dispatch()
+      run_dir = run_dir!(ctx, dispatch)
+      {:ok, recorded} = TriageDispatch.verdict_message(dispatch, {:verdict, @verdict})
+      :ok = PendingVerdicts.write(run_dir, recorded)
+
+      :ok =
+        LoopctlRunner.ClaimEnded.record(
+          ctx.config.runs_dir,
+          dispatch["dispatch_id"],
+          3,
+          "trace",
+          "x"
+        )
+
+      capture_log(fn ->
+        {_pid, _topic} = running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+        assert :ok = wait_until(fn -> PendingVerdicts.all(ctx.config.runs_dir) == [] end, 5_000)
+        refute_receive {:test_loopctl, {:triage_verdict, _}}, 800
+      end)
+    end
+
+    test "a verdict already resent once before a restart is given up on the next stale_claim_epoch",
+         ctx do
+      dispatch = triage_dispatch()
+      run_dir = run_dir!(ctx, dispatch)
+      {:ok, recorded} = TriageDispatch.verdict_message(dispatch, {:verdict, @verdict})
+      :ok = PendingVerdicts.write(run_dir, recorded)
+      :ok = PendingVerdicts.mark_resent(run_dir)
+      TestLoopctl.put(:triage_verdict_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+
+      log =
+        capture_log(fn ->
+          {_pid, _topic} =
+            running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_verdict_retry_ms: 100)
+
+          assert next_verdict() == recorded
+          refute_receive {:test_loopctl, {:triage_verdict, _}}, 800
+          assert :ok = wait_until(fn -> PendingVerdicts.all(ctx.config.runs_dir) == [] end, 5_000)
+        end)
+
+      assert log =~ "refused so again after its one resend"
+      refute PendingVerdicts.resent?(run_dir)
     end
 
     test "a refusal this build does not know is given up on, not guessed at", ctx do

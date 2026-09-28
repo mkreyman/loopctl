@@ -130,10 +130,21 @@ defmodule LoopctlRunner.TestLoopctl do
     end)
   end
 
-  def next_trace_reply do
+  # A scripted reply may name the dispatch it is for, `{dispatch_id, reply}`: a batch of any other
+  # dispatch (a run a previous test left shipping) neither takes it nor is refused by it.
+  def next_trace_reply(dispatch_id \\ nil) do
     Agent.get_and_update(__MODULE__, fn
-      %{trace_replies: [reply | rest]} = state -> {reply, %{state | trace_replies: rest}}
-      state -> {:ok, state}
+      %{trace_replies: [{^dispatch_id, reply} | rest]} = state ->
+        {reply, %{state | trace_replies: rest}}
+
+      %{trace_replies: [{id, _reply} | _]} = state when is_binary(id) ->
+        {:ok, state}
+
+      %{trace_replies: [reply | rest]} = state ->
+        {reply, %{state | trace_replies: rest}}
+
+      state ->
+        {:ok, state}
     end)
   end
 
@@ -445,7 +456,7 @@ defmodule LoopctlRunner.TestLoopctl do
     end
 
     defp scripted_trace_reply(payload, socket) do
-      case TestLoopctl.next_trace_reply() do
+      case TestLoopctl.next_trace_reply(payload["dispatch_id"]) do
         :ok ->
           run_id = payload["run_id"]
           seqs = TestLoopctl.get(:trace_seqs)

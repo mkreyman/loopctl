@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.ReviewDispatch do
   @moduledoc """
   What an accepted `review` dispatch becomes on this machine, and the messages its run sends back
-  (contract 1.21.0): the `review` object read from the dispatch, the `review_finding` and
+  (contract 1.21.0; refusals as of 1.22.0): the `review` object read from the dispatch, the `review_finding` and
   `review_verdict` payloads, the form the session's two commands check their input against, and
   how a refusal of either message is read. Pure functions; `LoopctlRunner.Control` performs them,
   as it performs `LoopctlRunner.DispatchRun`'s for an implement dispatch and
@@ -27,23 +27,27 @@ defmodule LoopctlRunner.ReviewDispatch do
 
   ## Refusals
 
-  Read from the contract: `x-connection.errors` names what can come back for each event, and
-  `x-connection.permanent_errors` (`"*"` and the event's own list) which never clear. What the
-  contract does NOT say is what a permanent refusal means for the REST of the dispatch's messages,
-  and that is the one thing written here, by name:
+  Read from the contract, and nothing about what a refusal MEANS is written here:
+  `x-connection.errors` names what can come back for each event, `x-connection.permanent_errors`
+  (`"*"` and the event's own list) which never clear, and `x-connection.claim_ending_errors`
+  (1.22.0) which of those end the claim the message ran under:
 
-    * `:stop` — the refusal is about the review or the dispatch, so every later judgement would be
-      refused the same way: `review_closed`, `review_claim_ended`, `review_round_superseded`,
-      `reviewer_not_separate`, and the dispatch-level `unknown_dispatch`, `stale_claim_epoch` and
-      `dispatch_not_accepted`. The last carries a CONDITION (permanent unless an accept this
-      runner sent is still unacknowledged) that cannot hold here: a review run starts only once
-      loopctl has acknowledged its accept;
-    * `:drop` — the refusal is about THIS message: `secret_blocked`, `idempotency_key_reused`,
-      `invalid_payload`, `audit_chain_append_failed`. The next one may well go;
+    * `:claim_ended` — the event's `claim_ending_errors` (`review_closed`, `review_claim_ended`,
+      `review_round_superseded`, `reviewer_not_separate`, `unknown_dispatch` and
+      `stale_claim_epoch` in 1.22.0): "send that dispatch no more messages of its work ... and stop
+      its session", while its `session_ended` still goes;
+    * `:stop` — a published CONDITION that ends the run without ending the claim, which is only
+      `dispatch_not_accepted`: "permanent unless an accept YOU sent for this dispatch is still
+      unacknowledged", which cannot hold here, since a review run starts only once loopctl has
+      acknowledged its accept, so the run is over and the stream ends. A vendoring that publishes
+      another condition for either event fails the build until it is given its own reading;
+    * `:drop` — every OTHER permanent refusal, which "refuses only the message that drew it":
+      `secret_blocked`, `idempotency_key_reused`, `invalid_payload`, `audit_chain_append_failed`,
+      and 1.22.0's `claim_epoch_mismatch` and `wrong_dispatch_kind`. The next one may well go;
     * `:halted` — `tenant_halted`, which is NOT permanent: "the tenant's custody halt, and clears
       when an operator lifts it". The same bytes are sent again.
 
-  A vendoring that publishes a refusal this module places in neither list fails the build.
+  A vendoring that publishes a refusal that is none of these fails the build.
   """
 
   alias LoopctlRunner.{ByteRule, Contract}
@@ -57,7 +61,6 @@ defmodule LoopctlRunner.ReviewDispatch do
   @connection Contract.connection()
   @limits Map.fetch!(@connection, "limits")
   @errors Map.fetch!(@connection, "errors")
-  @permanent_errors Map.fetch!(@connection, "permanent_errors")
 
   # Fetched, never `get_in`: a renamed key answers nil, and `bytes <= nil` is true under term
   # ordering, so the one check the schema cannot express would disappear at the next vendoring.
@@ -92,29 +95,57 @@ defmodule LoopctlRunner.ReviewDispatch do
       Map.fetch!(Map.fetch!(@limits, "review_verdict_burst"), "refill_interval_ms")
   }
 
-  @stop ~w(review_closed review_claim_ended review_round_superseded reviewer_not_separate
-           unknown_dispatch stale_claim_epoch dispatch_not_accepted)
-  @drop ~w(secret_blocked idempotency_key_reused invalid_payload audit_chain_append_failed)
+  @claim_ending Map.new(@events, &{&1, Contract.claim_ending_errors(&1)})
+
+  # A condition published for a refusal of the event that neither ends the claim nor is permanent
+  # for this event outright. Each one is a READING this module has to implement, and it implements
+  # one: dispatch_not_accepted's, which cannot hold for a review (its run starts only once loopctl
+  # acknowledged the accept), so the run is over. Derived and then pinned, so a new condition fails
+  # the build instead of being read as that one.
+  @conditions @connection |> Map.fetch!("permanent_error_conditions") |> Map.keys()
+
+  @stop Map.new(@events, fn event ->
+          {event,
+           Enum.filter(@conditions, &(&1 in Map.fetch!(@errors, event))) --
+             (Map.fetch!(@claim_ending, event) ++ Contract.event_permanent_errors(event))}
+        end)
+
   @halted ~w(tenant_halted)
+
+  @drop Map.new(@events, fn event ->
+          permanent = Contract.permanent_errors(event)
+
+          {event,
+           Enum.filter(Map.fetch!(@errors, event), &(&1 in permanent)) --
+             (Map.fetch!(@claim_ending, event) ++ Map.fetch!(@stop, event))}
+        end)
 
   for event <- @events do
     errors = Map.fetch!(@errors, event)
-    permanent = Map.fetch!(@permanent_errors, "*") ++ Map.get(@permanent_errors, event, [])
-    unhandled = errors -- (~w(rate_limited internal_error) ++ @halted ++ @stop ++ @drop)
+    permanent = Contract.permanent_errors(event)
+
+    unless Map.fetch!(@stop, event) == ["dispatch_not_accepted"] do
+      raise "the vendored contract publishes conditions for " <>
+              "#{inspect(Map.fetch!(@stop, event))} on a #{event}, and ReviewDispatch reads only " <>
+              "dispatch_not_accepted's; give each new one its own reading before the vendoring lands"
+    end
+
+    # Every published refusal is answered: resent (rate_limited, internal_error, a halt) or
+    # permanent, which the sets above split by what it ends.
+    unhandled = errors -- (~w(rate_limited internal_error) ++ @halted ++ permanent)
 
     if unhandled != [] do
       raise "the vendored contract publishes #{Enum.join(unhandled, ", ")} for a #{event}, which " <>
-              "ReviewDispatch places neither among the refusals that stop the review nor among " <>
-              "those that drop one message"
+              "is neither permanent nor a refusal ReviewDispatch resends"
     end
 
-    # A stop or a drop is only ever a PERMANENT refusal: resending on one the contract calls
-    # transient would be the right answer, and giving up on it the wrong one.
-    not_permanent = Enum.filter(errors, &(&1 in (@stop ++ @drop))) -- permanent
+    # A claim end is only ever a PERMANENT refusal: resending on one the contract calls transient
+    # would be the right answer, and giving up the dispatch the wrong one.
+    not_permanent = Map.fetch!(@claim_ending, event) -- permanent
 
     if not_permanent != [] do
-      raise "ReviewDispatch gives up on #{Enum.join(not_permanent, ", ")} for a #{event}, which " <>
-              "the vendored contract no longer calls permanent"
+      raise "the vendored contract ends the claim on #{Enum.join(not_permanent, ", ")} for a " <>
+              "#{event}, and does not call it permanent"
     end
 
     halted_permanent = Enum.filter(@halted, &(&1 in permanent))
@@ -378,33 +409,22 @@ defmodule LoopctlRunner.ReviewDispatch do
 
   @doc """
   How to answer a refusal of `event` by its `reason` (see the moduledoc): `:rate_limited`,
-  `:internal_error`, `:halted`, `:stop`, `:drop`, or `:unknown` for a reason this build does not
-  know. `Control` resends an `:unknown` like an `:internal_error` rather than dropping it: a
-  dropped finding is a round the verdict completes without it, and a resend of the same bytes is
-  safe, since each judgement is idempotent on `<dispatch_id>:<client_seq>`.
+  `:internal_error`, `:halted`, `:claim_ended`, `:stop`, `:drop`, or `:unknown` for a reason this
+  build does not know. `Control` resends an `:unknown` like an `:internal_error` rather than
+  dropping it: a dropped finding is a round the verdict completes without it, and a resend of the
+  same bytes is safe, since each judgement is idempotent on `<dispatch_id>:<client_seq>`.
   """
   @spec classify(String.t(), term()) ::
-          :rate_limited | :internal_error | :halted | :stop | :drop | :unknown
+          :rate_limited | :internal_error | :halted | :claim_ended | :stop | :drop | :unknown
   def classify(event, reason) when event in @events do
-    permanent = Map.fetch!(@permanent_errors, "*") ++ Map.get(@permanent_errors, event, [])
-
     cond do
       reason == "rate_limited" -> :rate_limited
       reason == "internal_error" -> :internal_error
       reason in @halted -> :halted
-      reason in @stop and reason in permanent -> :stop
-      reason in @drop and reason in permanent -> :drop
+      reason in Map.fetch!(@claim_ending, event) -> :claim_ended
+      reason in Map.fetch!(@stop, event) -> :stop
+      reason in Map.fetch!(@drop, event) -> :drop
       true -> :unknown
     end
   end
-
-  @doc "The refusals that end the review's stream, and those that drop only the message refused."
-  @spec stop_reasons() :: [String.t()]
-  def stop_reasons, do: @stop
-
-  @spec drop_reasons() :: [String.t()]
-  def drop_reasons, do: @drop
-
-  @spec halted_reasons() :: [String.t()]
-  def halted_reasons, do: @halted
 end

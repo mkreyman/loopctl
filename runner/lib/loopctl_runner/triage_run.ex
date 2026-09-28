@@ -77,6 +77,7 @@ defmodule LoopctlRunner.TriageRun do
   require Logger
 
   alias LoopctlRunner.{
+    ClaimEnded,
     Config,
     Contract,
     Owner,
@@ -408,18 +409,29 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
+  @claim_ended "loopctl ended the claim this triage was dispatched under before its session started"
+
   # THE deadline guard before the session: minting, fetching and cutting take time, and a session
   # started past it would be stopped at once. Nothing checks after it: a session started here is
   # bounded by its own stop timer (`Story.stop_after/4`). Inside the tree's `try`, so the tree is
   # released as after any session.
+  #
+  # Beside it, the CLAIM (contract 1.22.0): one loopctl ended before the session started
+  # (`LoopctlRunner.ClaimEnded`) gets none, and its outcome says so; Control never sends it.
   defp judge(config, prompt, tree, run_dir, run_id, trace, seq, opts) do
-    case check_deadline(config, opts) do
-      :ok ->
-        judge_session(config, prompt, tree, run_dir, run_id, trace, seq, opts)
+    if ClaimEnded.ended?(config.runs_dir, Keyword.get(opts, :binding, %{})) do
+      Trace.emit(trace, "triage.claim_ended", seq, %{})
+      outcome = {:incomplete, "no_verdict_written", @claim_ended}
+      %{run_id: run_id, run_dir: run_dir, session: nil, outcome: outcome}
+    else
+      case check_deadline(config, opts) do
+        :ok ->
+          judge_session(config, prompt, tree, run_dir, run_id, trace, seq, opts)
 
-      {:passed, detail} ->
-        Trace.emit(trace, "triage.deadline_passed", seq, %{"error" => detail})
-        %{run_id: run_id, run_dir: run_dir, session: nil, outcome: {:deadline_passed, detail}}
+        {:passed, detail} ->
+          Trace.emit(trace, "triage.deadline_passed", seq, %{"error" => detail})
+          %{run_id: run_id, run_dir: run_dir, session: nil, outcome: {:deadline_passed, detail}}
+      end
     end
   end
 

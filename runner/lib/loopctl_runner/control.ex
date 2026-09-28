@@ -1,4 +1,6 @@
 defmodule LoopctlRunner.Control do
+  # How long a claim's end is kept (`ClaimEnded.prune/3`): far past any run of that claim.
+  @claim_marker_max_age_s 7 * 24 * 3600
   @moduledoc """
   The runner's outbound connection to loopctl (build order step 1b, design §2 and §7).
 
@@ -117,14 +119,44 @@ defmodule LoopctlRunner.Control do
 
   Stage replies: `ok` sends the next; `rate_limited` and `internal_error` retry with a backoff, the
   latter 3 times for an intermediate report (then that report is given up and the next goes) and
-  8 times for the terminal one. A stream whose intermediate reports stop (`stale_stage` or another
-  refusal) still sends its end, since that is what frees loopctl's slot;
+  8 times for the terminal one. Any other PERMANENT refusal the contract publishes for a stage
+  report refuses that report only (1.22.0): it is dropped, never resent, and the next report goes.
+  A stream whose intermediate reports stop (an ordinary `stale_stage`, or a reply this build
+  cannot read) still sends its end, since that is what frees loopctl's slot;
   `stale_stage` on the terminal report CARRIES THE ROW it refused (contract 1.11.0), so the report
   is sent again from the `stage` it names, and never from the same stage twice. A stage no
   transition leaves is where that stops: `permanent_error_conditions` calls stale_stage permanent
   there, because the story has reached a stage no runner can report out of. Reports not yet
   acknowledged when the channel closes are resent after the rejoin, in order; a replay whose first
-  copy committed is answered `ok`.
+  copy committed is answered `ok`. A refusal that ENDS THE CLAIM is not one of these: see below.
+
+  Two refusals END THE RUN, per `permanent_error_conditions`: `stale_stage` naming a stage no
+  transition leaves, and `dispatch_not_accepted` — on a stage report or a trace batch — while no
+  accept of this runner's for the dispatch is outstanding (while one is, the report waits for it).
+  The intermediate reports stop and the session is stopped as below, but the claim stands, so the
+  run's end is still reported whole.
+
+  ## A claim loopctl ended (contract 1.22.0)
+
+  Read from `x-connection.claim_ending_errors`, per event, and never written here: a refusal in the
+  set of the event it answered — `unknown_dispatch` or `stale_claim_epoch` on a `stage`, a `trace`
+  batch or a `dispatch_reply`, and on a `review_finding` or `review_verdict` the review's own
+  (`LoopctlRunner.ReviewDispatch.classify/2`) — means the claim that message ran under is over. So
+  nothing more of that dispatch's work is sent: its queued stage reports, a terminal `escalated`
+  among them, and its judgements are dropped, and one in flight is left unanswered. The end is
+  recorded first as ONE marker for the claim (`LoopctlRunner.ClaimEnded`), which a run of it reads
+  immediately before starting its session — so a claim that ended while its tree was cut starts
+  none — and which a Control that starts over reads to stop any session of it still running, and
+  to send none of its work, a triage verdict included. Every run of that dispatch AND epoch
+  already in its session here — with a stream or not, of any kind — has it stopped, as the reaper
+  stops an orphan's, in a task under the run supervisor, looking again every
+  `session_stop_retry_ms` only while a followed run's session is still to stop. Its
+  `session_ended` still goes when it does, treated by that event's own rules. An accept refused
+  before its run started ends nothing here: nothing runs under it. An event the
+  table does not key — `session_ended`,
+  `trace_cursor` — has no claim-ending refusal. Every OTHER permanent refusal refuses only the
+  message that drew it, 1.22.0's `claim_epoch_mismatch` and `wrong_dispatch_kind` included, and
+  nothing is resent on one. The set holds because the join declares the contract version vendored.
 
   ## Triage verdicts
 
@@ -154,7 +186,11 @@ defmodule LoopctlRunner.Control do
   backlog a `dispatch_reply` uses, `internal_error` is retried to the terminal ceiling, and a
   permanent refusal is logged as an error and given up, since the contract says nothing will move
   it. `dispatch_not_accepted` is permanent unless an accept this runner sent for that dispatch is
-  still unacknowledged, which is the one case worth waiting for. A verdict loopctl had not
+  still unacknowledged, which is the one case worth waiting for. `stale_claim_epoch` is permanent
+  for that message only (1.22.0): the story was reclaimed twice while the verdict was recorded, and
+  loopctl repairs the epoch from the verdict itself, so the same bytes are resent once before the
+  verdict is given up — once across restarts too, recorded beside the message
+  (`LoopctlRunner.PendingVerdicts.mark_resent/1`). A verdict loopctl had not
   recorded when the channel closed is resent after the rejoin: the message is idempotent per
   dispatch, and a byte-identical resend is answered `ok` with `replayed` true — which is logged,
   because an `ok` that recorded the verdict and an `ok` that applied nothing are otherwise the
@@ -191,13 +227,15 @@ defmodule LoopctlRunner.Control do
   EVERYTHING still owed is given up — the verdict with it, never sent past an unsent finding —
   logged as an error naming the head and why, recorded beside the run
   (`review_verdict_undelivered`) for the operator, and the `session_ended` goes. The permanent
-  refusals are read from the contract and split by what they are about
-  (`LoopctlRunner.ReviewDispatch.classify/2`): one about the REVIEW or the dispatch —
-  `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate` among
-  them — means the round is over on loopctl's side, so the stream ends; one about the MESSAGE
-  (`secret_blocked`, `idempotency_key_reused`) drops that message, and a verdict dropped so is
-  recorded beside the run (`review_verdict_undelivered`) for the operator. Both are logged as
-  errors, and neither changes anything sent after them. What settled is recorded beside the run
+  refusals are read from the contract and split by what they end
+  (`LoopctlRunner.ReviewDispatch.classify/2`): one in the event's `claim_ending_errors` —
+  `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`,
+  `unknown_dispatch`, `stale_claim_epoch` — ends the claim (above), so the stream ends;
+  `dispatch_not_accepted`, whose condition cannot hold for a run started on an acknowledged
+  accept, ends the stream too; every other one drops that message only (`secret_blocked`,
+  `idempotency_key_reused`, `claim_epoch_mismatch`, `wrong_dispatch_kind` among them), and a
+  verdict dropped so is recorded beside the run (`review_verdict_undelivered`) for the operator.
+  All are logged as errors. What settled is recorded beside the run
   (`review_settled`), so a Control that starts over the run sends exactly what is still owed,
   from the composed bytes on disk.
 
@@ -230,8 +268,9 @@ defmodule LoopctlRunner.Control do
   directories. Refusals are handled by reason: `rate_limited` waits; a size refusal splits the
   batch or ships the named event without its data; `invalid_payload` narrows the batch to one
   event and ships that event as a stub (all three logged as errors, since every batch is
-  already checked against the contract and the byte rule); and a dispatch loopctl will no
-  longer take gives the run up. A settle that cannot be written to disk is kept in memory and
+  already checked against the contract and the byte rule); and any other permanent refusal
+  (`given_up/0`, read from the contract) gives the run up, since every batch of the run carries
+  the binding it refused — and one that ends the claim ends the dispatch's work as above. A settle that cannot be written to disk is kept in memory and
   logged once; it never takes the connection down.
 
   ## Refusals
@@ -268,6 +307,7 @@ defmodule LoopctlRunner.Control do
   require Logger
 
   alias LoopctlRunner.{
+    ClaimEnded,
     Config,
     Contract,
     ControlConfig,
@@ -277,6 +317,7 @@ defmodule LoopctlRunner.Control do
     Owner,
     PendingStarts,
     PendingVerdicts,
+    ProcessGroup,
     Reaper,
     ReviewDispatch,
     ReviewJudgements,
@@ -322,6 +363,10 @@ defmodule LoopctlRunner.Control do
   # waits for ever holds it for ever; an hour outlasts a deploy or a custody halt lifted the same
   # day, and anything longer is for the operator, who is told.
   @judgement_retry_budget_ms 3_600_000
+  # How long a stop of a claim-ended dispatch's session waits before it looks again, while the run
+  # has not yet reported its end: a session that had not started when the claim ended is started
+  # by the run after it, and is stopped by the next look.
+  @session_stop_retry_ms 1_000
   # The kinds this runner runs, declared on every join (`RunnerJoin.kinds`, contract 1.6.0) and
   # checked against every dispatch. ONE list, read by both: a declaration the kind check does not
   # honour is a self-contradiction loopctl suppresses for the rest of the connection, and a kind
@@ -509,6 +554,14 @@ defmodule LoopctlRunner.Control do
             # A dead run's session being ended off this process before its end is reported:
             # task ref => {dispatch_id, run_dir, what to finish} (`end_session_first/4`).
             session_enders: %{},
+            # The session of a dispatch whose CLAIM loopctl ended (contract 1.22.0) being stopped
+            # off this process: task ref => {dispatch_id, claim_epoch, run dirs}
+            # (`stop_run_session/4`), and the claims whose stop is still going (task or timer),
+            # and how long a stop that found the run still going waits before it looks again.
+            session_stops: %{},
+            session_stopping: MapSet.new(),
+            session_stop_retry_ms:
+              Keyword.get(opts, :session_stop_retry_ms, @session_stop_retry_ms),
             # dispatch_id => the stage stream (see stage_stream/1); push ref => dispatch_id.
             stage_streams: %{},
             stage_refs: %{},
@@ -571,6 +624,9 @@ defmodule LoopctlRunner.Control do
             verdict_backlog: [],
             verdict_timer: nil,
             verdict_errors: %{},
+            # Dispatches whose verdict was refused `stale_claim_epoch` and resent once already
+            # (`verdict_refused/4`): the second such refusal gives it up.
+            verdict_resent: MapSet.new(),
             triage_verdict_retry_ms:
               Keyword.get(opts, :triage_verdict_retry_ms, triage_verdict_retry_ms()),
             # The trace shipper (TraceShip): the acknowledged seq per run, learned by a cursor
@@ -605,6 +661,7 @@ defmodule LoopctlRunner.Control do
           |> restore_pending_starts(MapSet.new(started_runs, fn {id, _epoch} -> id end))
           |> restore_pending_verdicts()
           |> recover_terminal_reports()
+          |> restart_claim_stops()
 
         {:ok, socket, {:continue, :connect}}
 
@@ -1033,6 +1090,19 @@ defmodule LoopctlRunner.Control do
       when is_map_key(socket.assigns.session_enders, ref),
       do: {:noreply, session_ender_done(socket, ref, {:died, reason})}
 
+  def handle_info({ref, ended}, socket)
+      when is_reference(ref) and is_map_key(socket.assigns.session_stops, ref) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, session_stop_done(socket, ref, {:ended, ended})}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, socket)
+      when is_map_key(socket.assigns.session_stops, ref),
+      do: {:noreply, session_stop_done(socket, ref, {:died, reason})}
+
+  def handle_info({:retry_session_stop, id, epoch, run_dirs}, socket),
+    do: {:noreply, launch_session_stop(socket, id, epoch, run_dirs)}
+
   def handle_info(_message, socket), do: {:noreply, socket}
 
   @impl Slipstream
@@ -1085,7 +1155,9 @@ defmodule LoopctlRunner.Control do
           a.stage_streams |> Map.values() |> Enum.map(&length(&1.queue)) |> Enum.sum(),
         session_ended_pending: Enum.count(Map.values(a.stage_streams), & &1.session_ended),
         review_judgements_pending:
-          a.stage_streams |> Map.values() |> Enum.map(&length(&1.judgements)) |> Enum.sum()
+          a.stage_streams |> Map.values() |> Enum.map(&length(&1.judgements)) |> Enum.sum(),
+        # Claims whose sessions are being stopped because loopctl ended the claim or the run.
+        session_stops_pending: MapSet.size(a.session_stopping)
       })
 
     {:reply, info, socket}
@@ -1155,6 +1227,12 @@ defmodule LoopctlRunner.Control do
     end
   end
 
+  # The refusals that end the claim a dispatch_reply ran under (contract 1.22.0). A refused ACCEPT
+  # starts nothing (`settle_reply/3`); what this adds is the run ALREADY going under that claim —
+  # an accept repeated for a dispatch this process started — whose work stops with it.
+  @reply_claim_ending Contract.claim_ending_errors("dispatch_reply")
+  @reply_settled_meanwhile @reply_claim_ending ++ ["already_replied"]
+
   defp dispatch_reply_refused(socket, reply, {payload, _story_id, carried?} = entry, ids) do
     case reply do
       {:error, %{"reason" => "rate_limited"}} ->
@@ -1171,17 +1249,25 @@ defmodule LoopctlRunner.Control do
       {:error, %{"reason" => "internal_error"} = refusal} ->
         reply_internal_error(socket, entry, refusal, ids)
 
-      # A reply carried across a rejoin may find the question settled meanwhile: the claim moved
-      # on, or the first copy was recorded after all. That is the expected end of a resend.
+      # A reply carried across a rejoin may find the question settled meanwhile: the claim is
+      # over (the contract's claim-ending set for the event), or the first copy was recorded after
+      # all (`already_replied`). That is the expected end of a resend.
       {:error, %{"reason" => reason}}
-      when carried? and reason in ["stale_claim_epoch", "already_replied", "unknown_dispatch"] ->
+      when carried? and reason in @reply_settled_meanwhile ->
         Logger.info("loopctl no longer needs the resent dispatch_reply (#{reason})", ids)
-        settle_reply(socket, payload, {:refused, reason})
+
+        socket
+        |> settle_reply(payload, {:refused, reason})
+        |> reply_claim_ended(payload, reason)
 
       {:error, %{"reason" => reason} = refusal} ->
-        # unknown_dispatch, stale_claim_epoch, already_replied: resending cannot change them.
+        # Every other refusal is permanent or unknown, and resending cannot change it. One that
+        # ends the claim also stops whatever runs under it (`end_claim/5`).
         Logger.warning("loopctl refused the dispatch_reply (#{reason}): #{inspect(refusal)}", ids)
-        settle_reply(socket, payload, {:refused, reason})
+
+        socket
+        |> settle_reply(payload, {:refused, reason})
+        |> reply_claim_ended(payload, reason)
 
       # A bare :error (an error reply with an empty body) or one without a reason: still a
       # refusal, and not one resending is known to fix.
@@ -1194,6 +1280,19 @@ defmodule LoopctlRunner.Control do
         settle_reply(socket, payload, {:refused, "no reason given"})
     end
   end
+
+  #
+  # Only for a claim something RUNS under here: an accept refused before its run started drops the
+  # pending start (`settle_reply/3`), and with no run there is no work to hold back, no session to
+  # stop and nothing for a later run to honour.
+  defp reply_claim_ended(socket, %{"dispatch_id" => id, "claim_epoch" => epoch}, reason)
+       when reason in @reply_claim_ending do
+    if Map.get(socket.assigns.started_dispatches, id) == epoch,
+      do: end_claim(socket, id, epoch, "dispatch_reply", reason),
+      else: socket
+  end
+
+  defp reply_claim_ended(socket, _payload, _reason), do: socket
 
   # An internal_error is retried through the backlog, but only a few times: unlike rate_limited
   # it promises nothing about waiting. Giving up is an error, because loopctl's ledger row then
@@ -1300,21 +1399,6 @@ defmodule LoopctlRunner.Control do
                            )
 
   defp triage_verdict_retry_ms, do: @triage_verdict_retry_ms
-
-  # `verdict_refused/4`'s `:conditional` branch implements ONE condition — dispatch_not_accepted's,
-  # whose evidence is an accept of ours still unacknowledged (`accept_outstanding?/3`). Pinned,
-  # because `TriageDispatch` derives that set and the derivation subtracts only the EVENT's
-  # permanent list, never `permanent_errors["*"]`: a vendoring that gave a "*"-permanent code a
-  # condition would make `classify/1` answer `:conditional` for it, and this runner would then
-  # resend the verdict on whether its accept is outstanding — evidence about an entirely different
-  # question — for the life of the claim. A new condition is a branch to write, so it fails here.
-  @verdict_conditional TriageDispatch.conditional()
-
-  unless Enum.sort(@verdict_conditional) == ["dispatch_not_accepted"] do
-    raise "the contract publishes conditions for #{inspect(Enum.sort(@verdict_conditional))} on a " <>
-            "triage_verdict, and this module implements only dispatch_not_accepted's; give each " <>
-            "new one its own branch before the vendoring lands"
-  end
 
   # The round trip of a status push. A slow one is logged when its reply lands; one still
   # unanswered past the slow threshold is logged at each tick by warn_unanswered/1.
@@ -2023,7 +2107,7 @@ defmodule LoopctlRunner.Control do
     binding = Map.take(state, ["dispatch_id", "claim_epoch", "story_id"])
 
     socket
-    |> put_stream(id, stage_stream(binding, state["reached"] || "implementing"))
+    |> put_stream(id, open_stream(socket, binding, state["reached"] || "implementing"))
     |> end_session_first(id, run_dir, {:recovered, run_dir, state})
   end
 
@@ -2134,7 +2218,7 @@ defmodule LoopctlRunner.Control do
               kind: "implement"
             }),
           run_refs: Map.put(a.run_refs, task.ref, id),
-          stage_streams: Map.put(a.stage_streams, id, stage_stream(dispatch, "claimed"))
+          stage_streams: Map.put(a.stage_streams, id, open_stream(socket, dispatch, "claimed"))
         )
 
       # A review opens the same stream an implement run does, and reports through the same
@@ -2165,7 +2249,7 @@ defmodule LoopctlRunner.Control do
               kind: "review"
             }),
           run_refs: Map.put(a.run_refs, task.ref, id),
-          stage_streams: Map.put(a.stage_streams, id, stage_stream(dispatch, "claimed"))
+          stage_streams: Map.put(a.stage_streams, id, open_stream(socket, dispatch, "claimed"))
         )
 
       # A triage run opens no stage stream: the contract's stages move a STORY through its
@@ -2259,6 +2343,10 @@ defmodule LoopctlRunner.Control do
   #
   # `stopped` never stops the run's end: a terminal `escalated` and a `session_ended` are what give
   # loopctl's slot back, so they are sent on every stream however its intermediate reports fared.
+  # `claim_ended` (contract 1.22.0, `end_claim/5`) is the one thing that does: loopctl refused one
+  # of the dispatch's messages with a code that ends the claim it ran under, so nothing more of its
+  # work goes — no stage report, terminal ones included, and no judgement — and only its
+  # `session_ended` is still sent.
   # `session_ended` goes only once the queue is EMPTY — after every stage report — because a
   # `crashed` one releases the claim, and a stage report sent after that is refused as stale.
   #
@@ -2284,8 +2372,22 @@ defmodule LoopctlRunner.Control do
       escalation_unsettled: false,
       judgements: [],
       judgement_since: nil,
-      run_dir: nil
+      run_dir: nil,
+      claim_ended: false,
+      stop_session: false
     }
+
+  # Every stream is opened through here, so each honours a claim recorded over
+  # (`LoopctlRunner.ClaimEnded`): it takes nothing of that claim's work but the `session_ended`. A
+  # session of it still running was stopped where the end was learnt, or when this Control started
+  # (`restart_claim_stops/1`).
+  defp open_stream(socket, dispatch, stage) do
+    stream = stage_stream(dispatch, stage)
+
+    if ClaimEnded.ended?(socket.assigns.config.runs_dir, dispatch),
+      do: %{stream | claim_ended: true, stopped: true, stop_session: true},
+      else: stream
+  end
 
   defp put_stream(socket, id, stream),
     do: assign(socket, stage_streams: Map.put(socket.assigns.stage_streams, id, stream))
@@ -2303,7 +2405,7 @@ defmodule LoopctlRunner.Control do
             dispatch_id: id
           )
 
-          put_stream(socket, id, stage_stream(binding, from))
+          put_stream(socket, id, open_stream(socket, binding, from))
 
         _ ->
           socket
@@ -2351,6 +2453,14 @@ defmodule LoopctlRunner.Control do
       %{ended: false} = stream ->
         socket = put_stream(socket, id, %{stream | ended: true})
 
+        # A claim loopctl already ended takes no escalation; one that was the run's LAST end report
+        # is recorded refused, as its refusal would have been, so a later Control does not send it.
+        record_refused_end(
+          socket,
+          stream,
+          stream.claim_ended and DispatchRun.end_reports(summary) == [:escalated]
+        )
+
         Enum.reduce(DispatchRun.end_reports(summary), socket, fn
           :escalated, socket ->
             queue_stage(socket, id, "escalated",
@@ -2376,6 +2486,15 @@ defmodule LoopctlRunner.Control do
     stream = socket.assigns.stage_streams[id]
 
     case summary[:run_dir] do
+      _run_dir when stream.claim_ended ->
+        Logger.info(
+          "the review run of dispatch #{id} sends no judgement: loopctl ended the claim it ran " <>
+            "under; its session_ended still goes",
+          stage_ids(stream)
+        )
+
+        socket
+
       nil ->
         Logger.error(
           "the review run of dispatch #{id} left no run directory; no judgement is sent",
@@ -2479,6 +2598,15 @@ defmodule LoopctlRunner.Control do
   defp queue_stage(socket, id, to, opts \\ []) do
     case socket.assigns.stage_streams[id] do
       nil ->
+        socket
+
+      %{claim_ended: true} = stream ->
+        Logger.info(
+          "stage #{stream.stage} -> #{to} not reported: loopctl ended the claim this dispatch ran " <>
+            "under",
+          stage_ids(stream)
+        )
+
         socket
 
       %{stopped: true} = stream when to != "escalated" ->
@@ -2811,6 +2939,14 @@ defmodule LoopctlRunner.Control do
     settle_judgement(socket, id, stream)
   end
 
+  defp judgement_refused(socket, id, stream, :claim_ended, refusal) do
+    [{event, payload} | _] = stream.judgements
+
+    socket
+    |> put_stream(id, stop_judgements_on_disk(stream))
+    |> end_claim(id, payload["claim_epoch"], event, refusal["reason"])
+  end
+
   defp judgement_refused(socket, id, stream, :stop, refusal) do
     [{event, payload} | _] = stream.judgements
 
@@ -2900,23 +3036,37 @@ defmodule LoopctlRunner.Control do
   # Nothing more of this review is sent — loopctl ended the round, or this runner gave up: every
   # judgement left is settled as it stands, so a restart does not send it either, and the
   # `session_ended` behind them goes as it was composed. A composition never made settles nothing.
-  defp stop_judgements(socket, id, %{judgements: judgements} = stream) do
-    case List.last(judgements) do
-      {_event, last} -> ReviewJudgements.settle(stream.run_dir, last["client_seq"] + 1)
-      :compose -> :ok
-    end
-
+  defp stop_judgements(socket, id, stream) do
     socket
-    |> put_stream(id, %{
-      stream
-      | judgements: [],
-        rate_limited: 0,
-        internal_errors: 0,
-        judgement_since: nil
-    })
+    |> put_stream(id, stop_judgements_on_disk(stream))
     |> drop_stream_if_done(id)
     |> send_next_stage(id)
   end
+
+  defp stop_judgements_on_disk(%{judgements: judgements} = stream) do
+    case List.last(judgements) do
+      {_event, last} -> ReviewJudgements.settle(stream.run_dir, last["client_seq"] + 1)
+      _compose_or_none -> :ok
+    end
+
+    %{stream | judgements: [], rate_limited: 0, internal_errors: 0, judgement_since: nil}
+  end
+
+  # The refusals of a stage report that end the claim it ran under (contract 1.22.0). Every other
+  # permanent one refuses only that report, and is `stage_refused/5`'s.
+  @stage_claim_ending Contract.claim_ending_errors("stage")
+
+  # Every other PERMANENT refusal of a stage report "refuses only the message that drew it"
+  # (`claim_ending_remedy`): the contract's permanent set for the event, less the claim-ending
+  # codes and the codes whose permanence carries a condition, each of which has its own branch.
+  @stage_per_message Enum.filter(
+                       Map.fetch!(Map.fetch!(Contract.connection(), "errors"), "stage"),
+                       &(&1 in Contract.permanent_errors("stage"))
+                     ) --
+                       (@stage_claim_ending ++
+                          Map.keys(
+                            Map.fetch!(Contract.connection(), "permanent_error_conditions")
+                          ))
 
   defp stage_reply(socket, id, %{queue: [payload | _]} = stream, reply) do
     case reply do
@@ -2928,6 +3078,15 @@ defmodule LoopctlRunner.Control do
 
       {:error, %{"reason" => "stale_stage"} = refusal} ->
         stale_stage(socket, id, stream, payload, refusal)
+
+      {:error, %{"reason" => reason} = refusal} when reason in @stage_claim_ending ->
+        stage_claim_ended(socket, id, stream, payload, refusal)
+
+      {:error, %{"reason" => "dispatch_not_accepted"}} ->
+        stage_not_accepted(socket, id, stream, payload)
+
+      {:error, %{"reason" => reason}} when reason in @stage_per_message ->
+        stage_dropped(socket, id, stream, payload, reason)
 
       _ ->
         if acked?(reply),
@@ -2963,8 +3122,7 @@ defmodule LoopctlRunner.Control do
   defp mark_terminal_reported(socket, %{dispatch: %{"dispatch_id" => id} = dispatch}, value) do
     epoch = dispatch["claim_epoch"]
 
-    for {run_dir, %{"dispatch_id" => ^id, "claim_epoch" => ^epoch}} <-
-          RunState.all(socket.assigns.config.runs_dir) do
+    for {run_dir, _state} <- claim_runs(socket, id, epoch) do
       RunState.update(run_dir, %{terminal_reported: value})
     end
 
@@ -2990,6 +3148,68 @@ defmodule LoopctlRunner.Control do
     })
     |> drop_stream_if_done(id)
     |> send_next_stage(id)
+  end
+
+  # The claim is over: the refused report is settled as refused — recorded so when it was the run's
+  # last end report — and `end_claim/5` stops everything else of the dispatch's work but its
+  # `session_ended`, and its session with it.
+  defp stage_claim_ended(socket, id, %{queue: [_ | rest]} = stream, payload, refusal) do
+    record_refused_end(socket, stream, last_end_report?(stream, payload))
+
+    socket
+    |> put_stream(id, %{stream | queue: rest, rate_limited: 0, internal_errors: 0})
+    |> end_claim(id, payload["claim_epoch"], "stage", refusal["reason"])
+  end
+
+  # A permanent refusal that is not the claim's or the run's end refuses THAT report only: it is
+  # dropped, never resent, and the next report goes. The terminal one is `stage_refused/5`'s.
+  defp stage_dropped(socket, id, stream, payload, reason) do
+    if terminal?(payload) do
+      stage_refused(socket, id, stream, payload, reason)
+    else
+      Logger.error(
+        "loopctl refused the stage #{payload["from"]} -> #{payload["to"]} for dispatch #{id} " <>
+          "(#{reason}); that report is dropped, and the next one still goes",
+        stage_ids(stream)
+      )
+
+      advance(socket, id, %{stream | stage: stage_after_drop(stream, payload)})
+    end
+  end
+
+  # The report was never recorded, so loopctl's row is still at its `from`: the stream goes back
+  # there, which is what the next report, and the terminal one, are built from. Only when nothing
+  # was queued after it — a later report already queued was built from the dropped one's `to`, and
+  # the `stale_stage` it draws carries the row (`resync_stage/3`).
+  defp stage_after_drop(%{stage: to}, %{"from" => from, "to" => to}), do: from
+  defp stage_after_drop(%{stage: stage}, _payload), do: stage
+
+  # `dispatch_not_accepted` is permanent "unless an accept YOU sent for this dispatch is still
+  # unacknowledged": then the report waits for that accept, resent with the stream's backoff.
+  # Otherwise the run is over (`end_run/5`); the refused report is settled as refused.
+  defp stage_not_accepted(socket, id, %{queue: [_ | rest]} = stream, payload) do
+    epoch = payload["claim_epoch"]
+
+    if accept_outstanding?(socket, id, epoch) do
+      Logger.info(
+        "stage #{payload["from"]} -> #{payload["to"]} waits for this runner's accept of " <>
+          "dispatch #{id} to be recorded",
+        stage_ids(stream)
+      )
+
+      retry_stage(socket, id, %{stream | rate_limited: stream.rate_limited + 1})
+    else
+      record_refused_end(socket, stream, last_end_report?(stream, payload))
+
+      socket
+      |> put_stream(id, %{stream | queue: rest, rate_limited: 0, internal_errors: 0})
+      |> end_run(
+        id,
+        epoch,
+        "stage",
+        "dispatch_not_accepted, with no accept of this runner's outstanding"
+      )
+    end
   end
 
   # A refusal nothing can fix. On an intermediate report it stops the intermediate reports, which
@@ -3059,17 +3279,33 @@ defmodule LoopctlRunner.Control do
                            "stale_stage"
                          )
 
-  defp stale_stage(socket, id, stream, payload, refusal) do
-    if terminal?(payload) do
-      retry_terminal(socket, id, stream, payload, refusal)
-    else
-      stage_refused(
-        socket,
-        id,
-        resync_stage(stream, refusal, id),
-        payload,
-        "stale_stage #{inspect(refusal)}"
-      )
+  defp stale_stage(socket, id, %{queue: [_ | rest]} = stream, payload, refusal) do
+    stage = refusal["stage"]
+
+    cond do
+      terminal?(payload) ->
+        retry_terminal(socket, id, stream, payload, refusal)
+
+      # An intermediate report refused with the story at a stage no runner can report out of: the
+      # published condition says "Stop, and end the run" — its session with it.
+      is_binary(stage) and stage not in @reportable_froms ->
+        socket
+        |> put_stream(id, %{stream | queue: rest, rate_limited: 0, internal_errors: 0})
+        |> end_run(
+          id,
+          payload["claim_epoch"],
+          "stage",
+          "stale_stage: the story is at #{stage}, which no transition leaves"
+        )
+
+      true ->
+        stage_refused(
+          socket,
+          id,
+          resync_stage(stream, refusal, id),
+          payload,
+          "stale_stage #{inspect(refusal)}"
+        )
     end
   end
 
@@ -3471,6 +3707,328 @@ defmodule LoopctlRunner.Control do
     socket |> assign(session_enders: enders) |> finish_end(id, next)
   end
 
+  # --- A claim loopctl ended (contract 1.22.0, `x-connection.claim_ending_errors`) ---
+
+  # "The claim the refused message ran under is over: send that dispatch no more messages of its
+  # work (the events keyed here) and stop its session. An implement or review session still sends
+  # its `session_ended` when its process exits, as always". Keyed by the dispatch AND the epoch the
+  # refused message carried: a message of another claim says nothing about this one, and a stream
+  # of another epoch for the same dispatch is not this claim's.
+  #
+  # The end is recorded FIRST, as one marker for the claim (`LoopctlRunner.ClaimEnded`): a run of it
+  # reads that marker immediately before starting its session and starts none, and a Control that
+  # starts over honours it. The stream of THIS claim, when there is one, drops what it still owes
+  # (`claim_over/3`), and every run of the claim still in flight has its session stopped — a
+  # stream-less triage run, a run a predecessor started, or one of an older epoch alike.
+  defp end_claim(socket, id, epoch, event, reason) do
+    with {:error, why} <-
+           ClaimEnded.record(socket.assigns.config.runs_dir, id, epoch, event, reason) do
+      Logger.warning(
+        "could not record that dispatch #{id}'s claim #{epoch} ended (#{inspect(why)}); a run " <>
+          "of it could still start its session, and a restart will not know it",
+        dispatch_id: id,
+        claim_epoch: epoch
+      )
+    end
+
+    case socket.assigns.stage_streams[id] do
+      %{dispatch: %{"claim_epoch" => ^epoch}, claim_ended: true} ->
+        socket |> drop_stream_if_done(id) |> send_next_stage(id)
+
+      %{dispatch: %{"claim_epoch" => ^epoch}} = stream ->
+        Logger.error(
+          "loopctl refused #{event} for dispatch #{id} (#{reason}), which ends the claim it ran " <>
+            "under: nothing more of its work is sent, " <>
+            if(stream.ended,
+              do: "its session is already over",
+              else: "a session of it is stopped and one not yet started never starts"
+            ) <> ", and the session_ended of a session that ran still goes",
+          stage_ids(stream)
+        )
+
+        socket
+        |> claim_over(id, stream)
+        |> stop_run_session(id, epoch, live_claim_run_dirs(socket, id, epoch))
+        |> drop_stream_if_done(id)
+        |> send_next_stage(id)
+
+      _none_of_this_claim ->
+        stop_claim_elsewhere(socket, id, epoch, "#{event} (#{reason})")
+    end
+  end
+
+  # No stream of the claim here: nothing queued to drop. An error only when a run of it is still
+  # going on this machine and is stopped; otherwise it is the expected end of a claim this process
+  # holds nothing of.
+  defp stop_claim_elsewhere(socket, id, epoch, what) do
+    case live_claim_run_dirs(socket, id, epoch) do
+      [] ->
+        Logger.info(
+          "loopctl refused #{what} for dispatch #{id} at claim_epoch #{epoch}, which ends that " <>
+            "claim; nothing of it is running here",
+          dispatch_id: id,
+          claim_epoch: epoch
+        )
+
+        socket
+
+      run_dirs ->
+        Logger.error(
+          "loopctl refused #{what} for dispatch #{id} at claim_epoch #{epoch}, which ends that " <>
+            "claim: the session of #{Enum.join(run_dirs, ", ")} is stopped",
+          dispatch_id: id,
+          claim_epoch: epoch
+        )
+
+        stop_run_session(socket, id, epoch, run_dirs)
+    end
+  end
+
+  # A Control that starts over stops the session of every run still in flight whose claim a
+  # predecessor saw end — every kind, triage included, stream or none: one reading of the runs,
+  # matched against the (few) claims recorded over.
+  defp restart_claim_stops(socket) do
+    runs_dir = socket.assigns.config.runs_dir
+    ClaimEnded.prune(runs_dir, System.os_time(:second), @claim_marker_max_age_s)
+    ended = MapSet.new(ClaimEnded.all(runs_dir))
+
+    runs_dir
+    |> RunState.all()
+    |> Enum.filter(fn {_dir, state} ->
+      live?(state) and MapSet.member?(ended, {state["dispatch_id"], state["claim_epoch"]})
+    end)
+    |> Enum.group_by(
+      fn {_dir, state} -> {state["dispatch_id"], state["claim_epoch"]} end,
+      fn {dir, _state} -> dir end
+    )
+    |> Enum.reduce(socket, fn {{id, epoch}, run_dirs}, socket ->
+      Logger.warning(
+        "dispatch #{id}'s claim #{epoch} was recorded over, and a run of it is still in flight: " <>
+          "stopping its session",
+        dispatch_id: id,
+        claim_epoch: epoch
+      )
+
+      stop_run_session(socket, id, epoch, run_dirs)
+    end)
+  end
+
+  defp claim_over(socket, id, stream) do
+    # A terminal `escalated` that was the run's LAST end report — no `session_ended` behind it — is
+    # recorded refused, as its refusal would have been, so a later Control does not send it.
+    record_refused_end(
+      socket,
+      stream,
+      stream.ended and Enum.any?(stream.queue, &terminal?/1) and stream.session_ended == nil
+    )
+
+    stream = %{stream | stopped: true, claim_ended: true, stop_session: true}
+    drop_owed(socket, id, stream, fn _payload -> false end, false)
+  end
+
+  # Records the run's end refused when `last?`: the report refused — or dropped with its claim —
+  # was the run's LAST end report, so a later Control does not send it.
+  defp record_refused_end(socket, stream, true),
+    do: mark_terminal_reported(socket, stream, "refused")
+
+  defp record_refused_end(_socket, _stream, false), do: :ok
+
+  # What a stream still owes is cut down to the stage reports `keep?` keeps, and its judgements to
+  # none unless `keep_judgements?` (those dropped are settled on disk, so a restart does not send
+  # them). When the HEAD of that work is dropped, what was waiting on it goes too: a push in flight
+  # is orphaned rather than awaited — its ref forgotten, so its reply lands on nothing, where it
+  # would otherwise be read as the answer to a `session_ended` queued behind it — and a retry timer
+  # is cancelled, so the next message is not held behind a backoff meant for one never sent. A
+  # `session_ended`, in flight or waiting, is always kept, with its own timer.
+  defp drop_owed(socket, id, stream, keep?, keep_judgements?) do
+    head =
+      case stream do
+        %{queue: [head | _]} -> if keep?.(head), do: :kept, else: :dropped
+        %{judgements: [_ | _]} -> if keep_judgements?, do: :kept, else: :dropped
+        _session_ended_or_nothing -> :kept
+      end
+
+    stream = if keep_judgements?, do: stream, else: stop_judgements_on_disk(stream)
+
+    stream = %{
+      stream
+      | queue: Enum.filter(stream.queue, keep?),
+        rate_limited: 0,
+        internal_errors: 0
+    }
+
+    case head do
+      :kept ->
+        put_stream(socket, id, stream)
+
+      :dropped ->
+        cancel_stage_timer(stream.timer)
+
+        socket
+        |> assign(stage_refs: Map.delete(socket.assigns.stage_refs, stream.push))
+        |> put_stream(id, %{stream | push: nil, timer: nil})
+    end
+  end
+
+  defp cancel_stage_timer({timer, _token}), do: Process.cancel_timer(timer)
+  defp cancel_stage_timer(nil), do: false
+
+  # `permanent_error_conditions` says two refusals END THE RUN without ending the claim:
+  # `stale_stage` naming a stage no transition leaves, and `dispatch_not_accepted` with no accept
+  # of this runner's in flight. The session is stopped as a claim-ending refusal stops it
+  # (`stop_run_session/4`), and the intermediate stage reports stop, since the run they describe is
+  # over. What differs from a claim's end is what is still SENT: the claim stands, so the run's end
+  # — a terminal `escalated`, a review's judgements, its `session_ended` — is reported as it
+  # would be, and loopctl answers each by its own rules. Held in memory only. A run of the claim
+  # with no stream of that epoch here has its session stopped all the same.
+  defp end_run(socket, id, epoch, event, why) do
+    case socket.assigns.stage_streams[id] do
+      %{dispatch: %{"claim_epoch" => ^epoch}, stop_session: false} = stream ->
+        Logger.error(
+          "loopctl refused #{event} for dispatch #{id} (#{why}), which ends the run: no further " <>
+            "intermediate stage is reported, " <>
+            if(stream.ended, do: "its session is already over", else: "its session is stopped") <>
+            ", and its end is still reported",
+          stage_ids(stream)
+        )
+
+        socket
+        |> drop_owed(id, %{stream | stopped: true, stop_session: true}, &terminal?/1, true)
+        |> stop_run_session(id, epoch, live_claim_run_dirs(socket, id, epoch))
+        |> drop_stream_if_done(id)
+        |> send_next_stage(id)
+
+      %{dispatch: %{"claim_epoch" => ^epoch}} ->
+        socket |> drop_stream_if_done(id) |> send_next_stage(id)
+
+      _none_of_this_claim ->
+        stop_run_session(socket, id, epoch, live_claim_run_dirs(socket, id, epoch))
+    end
+  end
+
+  # The runs of one claim still in flight on this machine: bound to the dispatch at that epoch,
+  # `starting` or `running`, their owner alive. Read once, when the stop begins; the stop then
+  # follows only those directories (`launch_session_stop/4`).
+  defp live_claim_run_dirs(socket, id, epoch) do
+    for {run_dir, state} <- claim_runs(socket, id, epoch), live?(state), do: run_dir
+  end
+
+  # Every run on disk bound to the dispatch at that epoch: the one place that filter is written.
+  defp claim_runs(socket, id, epoch) do
+    for {_dir, %{"dispatch_id" => ^id, "claim_epoch" => ^epoch}} = run <-
+          RunState.all(socket.assigns.config.runs_dir),
+        do: run
+  end
+
+  # The session is ended off this process, as `end_session_first/4` ends a dead run's: by the
+  # reaper's own means, in a task under the run supervisor. One stop at a time per claim, and none
+  # at all when no run of it is in flight. Used when loopctl ended the claim (`end_claim/5`) or the
+  # run (`end_run/5`).
+  defp stop_run_session(socket, _id, _epoch, []), do: socket
+
+  defp stop_run_session(socket, id, epoch, run_dirs) do
+    if MapSet.member?(socket.assigns.session_stopping, {id, epoch}) do
+      socket
+    else
+      socket
+      |> assign(session_stopping: MapSet.put(socket.assigns.session_stopping, {id, epoch}))
+      |> launch_session_stop(id, epoch, run_dirs)
+    end
+  end
+
+  defp launch_session_stop(socket, id, epoch, run_dirs) do
+    a = socket.assigns
+    grace_ms = a.config.kill_grace_s * 1000
+
+    task =
+      Task.Supervisor.async_nolink(a.run_supervisor, fn ->
+        end_run_sessions(run_dirs, grace_ms)
+      end)
+
+    assign(socket, session_stops: Map.put(a.session_stops, task.ref, {id, epoch, run_dirs}))
+  end
+
+  # In the task: each run's session ended (`Reaper.end_session/2` leaves a run not in flight
+  # alone), and which of the runs are STILL in flight afterwards.
+  defp end_run_sessions(run_dirs, grace_ms) do
+    ended =
+      for run_dir <- run_dirs,
+          {:ok, state} <- [RunState.read(run_dir)],
+          do: {run_dir, end_session_of(state, grace_ms)}
+
+    still =
+      for run_dir <- run_dirs,
+          {:ok, state} <- [RunState.read(run_dir)],
+          live?(state) and session_pending_or_alive?(state),
+          do: run_dir
+
+    {ended, still}
+  end
+
+  # Whether a run's session is still to stop: not started yet (no process group recorded — a run
+  # that passed its claim check just before the claim ended starts one), or started and still
+  # alive. One whose session is gone is not looked at again while it tears down.
+  defp session_pending_or_alive?(%{"pgid" => pgid}) when is_integer(pgid),
+    do: ProcessGroup.alive?(pgid)
+
+  defp session_pending_or_alive?(_state), do: true
+
+  # One run's failure to be ended is that run's answer, not the stop's: the others are still ended,
+  # and whether it is in flight is still asked, so the looking goes on only while it is.
+  defp end_session_of(state, grace_ms) do
+    Reaper.end_session(state, grace_ms)
+  rescue
+    exception -> "could not be ended: #{inspect(exception.__struct__)}"
+  end
+
+  # A run that passed its claim check just before the claim ended starts its session afterwards,
+  # so while a followed run is in flight with its session not started or still alive, the stop
+  # looks again after `session_stop_retry_ms`. A run whose session is gone is dropped from the
+  # looking; for every kind of run alike. A stop task that died is tried again on the same runs.
+  defp session_stop_done(socket, ref, outcome) do
+    {{id, epoch, run_dirs}, stops} = Map.pop(socket.assigns.session_stops, ref)
+    socket = assign(socket, session_stops: stops)
+
+    retry =
+      case outcome do
+        {:ended, {ended, still}} ->
+          for {run_dir, what} <- ended, what not in ["not in flight", "gone"] do
+            Logger.info("the session of #{run_dir}, whose claim or run loopctl ended: #{what}",
+              dispatch_id: id,
+              claim_epoch: epoch
+            )
+          end
+
+          still
+
+        {:died, reason} ->
+          Logger.error(
+            "stopping the session of dispatch #{id}, whose claim or run loopctl ended, failed " <>
+              "(#{inspect(reason, limit: 5)}); trying again",
+            dispatch_id: id,
+            claim_epoch: epoch
+          )
+
+          run_dirs
+      end
+
+    case retry do
+      [] ->
+        assign(socket,
+          session_stopping: MapSet.delete(socket.assigns.session_stopping, {id, epoch})
+        )
+
+      run_dirs ->
+        Process.send_after(
+          self(),
+          {:retry_session_stop, id, epoch, run_dirs},
+          socket.assigns.session_stop_retry_ms
+        )
+
+        socket
+    end
+  end
+
   defp finish_end(socket, id, {:task_ended, %{kind: "triage"} = run, reason}),
     do: triage_run_ended(socket, id, run, reason)
 
@@ -3737,7 +4295,32 @@ defmodule LoopctlRunner.Control do
     socket
   end
 
+  # A verdict whose claim loopctl already ended (`LoopctlRunner.ClaimEnded`, recorded beside a run
+  # of that dispatch and epoch) is not sent: "send that dispatch no more messages of its work". It
+  # is settled as given up without a round trip, so neither this process nor a restart sends it.
+  # Asked of every run of the claim, not only the verdict's own: the refusal that ended it may have
+  # answered another run's trace.
   defp push_verdict(socket, payload, run_dir, carried? \\ false) do
+    if claim_recorded_ended?(socket, payload) do
+      Logger.warning(
+        "the triage verdict of dispatch #{payload["dispatch_id"]} is not sent: loopctl ended the " <>
+          "claim it ran under; it is given up",
+        verdict_ids(payload)
+      )
+
+      settle_verdict(socket, payload, run_dir)
+    else
+      send_verdict(socket, payload, run_dir, carried?)
+    end
+  end
+
+  defp claim_recorded_ended?(socket, %{"dispatch_id" => id, "claim_epoch" => epoch})
+       when is_binary(id) and is_integer(epoch),
+       do: ClaimEnded.ended?(socket.assigns.config.runs_dir, id, epoch)
+
+  defp claim_recorded_ended?(_socket, _payload), do: false
+
+  defp send_verdict(socket, payload, run_dir, carried?) do
     case push_event(socket, socket.assigns.topic, "triage_verdict", payload) do
       {:ok, ref} ->
         Logger.info("triage_verdict sent", verdict_ids(payload))
@@ -3820,7 +4403,7 @@ defmodule LoopctlRunner.Control do
       :internal_error ->
         verdict_internal_error(socket, entry, reply, ids)
 
-      # `dispatch_not_accepted`'s condition, and ONLY it — see `@verdict_conditional`. The evidence
+      # `dispatch_not_accepted`'s condition (`TriageDispatch` pins which reads which). The evidence
       # is the one thing only this runner holds: the row is not `accepted`, which covers an accept
       # of ours still in flight as well as one loopctl refused or superseded for good.
       :conditional ->
@@ -3838,6 +4421,10 @@ defmodule LoopctlRunner.Control do
           give_up_verdict(socket, entry, reason, reply, "no accept of it is outstanding", ids)
         end
 
+      # stale_claim_epoch (1.22.0): the same bytes once more, then given up.
+      :resend_once ->
+        verdict_resend_once(socket, entry, reason, reply, ids)
+
       :permanent ->
         give_up_verdict(socket, entry, reason, reply, "nothing will change it", ids)
 
@@ -3853,20 +4440,55 @@ defmodule LoopctlRunner.Control do
     end
   end
 
+  # 1.22.0: permanent for THIS message only — the story was reclaimed twice while the verdict was
+  # being recorded, and loopctl repairs a reclaim-moved epoch from the verdict itself — so the same
+  # bytes go once more, and a second such refusal gives the verdict up. That it was resent is kept
+  # beside the message (`PendingVerdicts.mark_resent/1`), so a restart does not resend it again.
+  defp verdict_resend_once(socket, {payload, run_dir, _carried?} = entry, reason, reply, ids) do
+    id = payload["dispatch_id"]
+
+    if MapSet.member?(socket.assigns.verdict_resent, id) or PendingVerdicts.resent?(run_dir) do
+      give_up_verdict(socket, entry, reason, reply, "refused so again after its one resend", ids)
+    else
+      Logger.warning(
+        "loopctl refused the triage verdict (#{reason}); resending the same bytes once after " <>
+          "#{socket.assigns.triage_verdict_retry_ms}ms",
+        ids
+      )
+
+      with {:error, why} <- PendingVerdicts.mark_resent(run_dir) do
+        Logger.warning(
+          "could not record beside the triage verdict that it was resent (#{inspect(why)}); a " <>
+            "restart may resend it once more",
+          ids
+        )
+      end
+
+      socket
+      |> assign(
+        verdict_resent: MapSet.put(socket.assigns.verdict_resent, id),
+        verdict_backlog: socket.assigns.verdict_backlog ++ [entry]
+      )
+      |> schedule_verdict_backlog()
+    end
+  end
+
   defp refusal_reason({:error, %{"reason" => reason}}), do: reason
   defp refusal_reason(_reply), do: nil
 
   # Normally an error: the verdict is everything the run produced, and giving it up leaves
   # loopctl's ledger row waiting on this dispatch for as long as the claim holds.
   #
-  # Not for a RESENT one whose dispatch has since gone away. A message carried across a rejoin or
-  # restored at startup can arrive after the claim moved on or the dispatch was forgotten, and
-  # that is the expected end of a resend rather than something to wake an operator for — the same
-  # demotion `dispatch_reply_refused/4` makes, for the same reasons, on the same argument.
+  # Not for a RESENT one whose claim has since ended — the contract's claim-ending set for the
+  # event, `unknown_dispatch` as of 1.22.0. A message carried across a rejoin or restored at
+  # startup can arrive after the dispatch was forgotten, and that is the expected end of a resend
+  # rather than something to wake an operator for — the same demotion `dispatch_reply_refused/4`
+  # makes, for the same reasons, on the same argument. `stale_claim_epoch` is not in it since
+  # 1.22.0: on a verdict it means the story was reclaimed twice mid-record, which is worth a line.
   #
   # The stored copy goes either way. Every refusal that reaches here is one no resend can move, so
   # a file left behind would be re-sent by every restart from now on, each one refused again.
-  @settled_meanwhile ~w(unknown_dispatch stale_claim_epoch)
+  @settled_meanwhile Contract.claim_ending_errors("triage_verdict")
 
   defp give_up_verdict(socket, {payload, run_dir, carried?}, reason, reply, why, ids) do
     if carried? and reason in @settled_meanwhile do
@@ -3914,7 +4536,8 @@ defmodule LoopctlRunner.Control do
     PendingVerdicts.delete(run_dir)
 
     assign(socket,
-      verdict_errors: Map.delete(socket.assigns.verdict_errors, payload["dispatch_id"])
+      verdict_errors: Map.delete(socket.assigns.verdict_errors, payload["dispatch_id"]),
+      verdict_resent: MapSet.delete(socket.assigns.verdict_resent, payload["dispatch_id"])
     )
   end
 
@@ -4261,12 +4884,17 @@ defmodule LoopctlRunner.Control do
         trace_positions: Map.put(socket.assigns.trace_positions, run.run_id, position)
       )
 
-  # loopctl keeps no refusal state; what each of these means is fixed by its ledger fence, which
-  # runs story epoch, batch epoch, accepted, run binding in that order. unknown_dispatch means
-  # the row is not this runner's and never will be (the row is written before a dispatch is
-  # broadcast); stale_claim_epoch means the claim moved on; run_mismatch means the run is bound
-  # elsewhere. None of them changes, so each gives the run up at once.
-  @given_up ~w(unknown_dispatch stale_claim_epoch run_mismatch)
+  # Every PERMANENT refusal a trace batch can draw, read from the contract, less the two handled
+  # by name below: `invalid_payload`, which narrows the batch before anything is given up, and
+  # `dispatch_not_accepted`, whose permanence is conditional. Each of the rest is about the RUN's
+  # binding, which every batch of the run carries unchanged, so the next batch would draw it too:
+  # the run is given up at once. As of 1.22.0 that is `unknown_dispatch` and `stale_claim_epoch`,
+  # which END THE CLAIM (`claim_ending_errors`), and `run_mismatch` and `claim_epoch_mismatch`,
+  # which refuse only the batch — but refuse every one of them.
+  @trace_errors Map.fetch!(Map.fetch!(Contract.connection(), "errors"), "trace")
+  @trace_permanent Contract.permanent_errors("trace")
+  @given_up Enum.filter(@trace_errors, &(&1 in @trace_permanent)) --
+              ~w(invalid_payload dispatch_not_accepted)
 
   @doc "The trace refusals that give a run up at once."
   @spec given_up() :: [String.t()]
@@ -4311,9 +4939,12 @@ defmodule LoopctlRunner.Control do
   defp trace_refused(socket, %{run: run} = push, %{"reason" => "invalid_payload"} = refusal),
     do: narrow_or_escalate(socket, push, refusal, 1, "invalid", run)
 
-  defp trace_refused(socket, %{run: run}, %{"reason" => reason} = refusal)
+  defp trace_refused(socket, %{run: run} = push, %{"reason" => reason} = refusal)
        when reason in @given_up do
-    socket |> give_up(run, reason, refusal) |> schedule_trace(TraceShip.min_interval_ms("trace"))
+    socket
+    |> give_up(run, reason, refusal)
+    |> trace_claim_ended(push, reason)
+    |> schedule_trace(TraceShip.min_interval_ms("trace"))
   end
 
   # dispatch_not_accepted flips only when this runner's accept dispatch_reply commits. While an
@@ -4331,6 +4962,7 @@ defmodule LoopctlRunner.Control do
     else
       socket
       |> give_up(run, "dispatch_not_accepted", refusal)
+      |> trace_run_ended(run)
       |> schedule_trace(TraceShip.min_interval_ms("trace"))
     end
   end
@@ -4369,6 +5001,29 @@ defmodule LoopctlRunner.Control do
   end
 
   defp trace_refused(socket, push, refusal), do: trace_unexpected(socket, push, {:error, refusal})
+
+  # A batch refused with a code that ends the claim it ran under (contract 1.22.0) ends the
+  # dispatch's work and its session, not only its trace (`end_claim/5`, keyed by the run's dispatch
+  # AND epoch). Looked up by the EVENT the push was, so a `trace_cursor` — which the table does not
+  # key, and so ends no claim — never does.
+  defp trace_claim_ended(socket, %{kind: kind, run: run}, reason) do
+    event = if kind == :batch, do: "trace", else: "trace_cursor"
+
+    if reason in Contract.claim_ending_errors(event),
+      do: end_claim(socket, run.dispatch_id, run.claim_epoch, event, reason),
+      else: socket
+  end
+
+  # `dispatch_not_accepted` with no accept of ours in flight ends the RUN (`end_run/5`).
+  defp trace_run_ended(socket, run),
+    do:
+      end_run(
+        socket,
+        run.dispatch_id,
+        run.claim_epoch,
+        "trace",
+        "dispatch_not_accepted, with no accept of this runner's outstanding"
+      )
 
   # The refusal means the ledger row is not `accepted`, and only ONE of the states that covers is
   # worth retrying: `sent`, where the accept this runner pushed has not landed yet. `refused` and

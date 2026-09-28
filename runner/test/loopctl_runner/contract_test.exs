@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.21.0",
+        "contract_version" => "1.22.0",
         "kinds" => ["implement"],
         "machine" => "minis",
         "cores" => 16,
@@ -20,8 +20,8 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.21.0 and names the socket and header the client uses" do
-    assert Contract.version() == "1.21.0"
+  test "the vendored contract is v1.22.0 and names the socket and header the client uses" do
+    assert Contract.version() == "1.22.0"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",
@@ -870,6 +870,53 @@ defmodule LoopctlRunner.ContractTest do
              |> Map.fetch!("dispatch_not_accepted") =~ "claim_epoch"
 
       refute "dispatch_not_accepted" in LoopctlRunner.Control.given_up()
+    end
+
+    test "permanent_errors is the \"*\" codes and the event's own; event_permanent_errors only its own" do
+      table = Contract.connection() |> Map.fetch!("permanent_errors")
+
+      for {event, own} <- Map.delete(table, "*") do
+        assert Contract.permanent_errors(event) == table["*"] ++ own
+        assert Contract.event_permanent_errors(event) == own
+      end
+
+      refute Map.has_key?(table, "session_ended")
+      assert Contract.permanent_errors("session_ended") == table["*"]
+      assert Contract.event_permanent_errors("session_ended") == []
+
+      # The distinction the second exists for: permanent outright for this event, conditional in "*".
+      assert "stale_stage" in Contract.event_permanent_errors("triage_verdict")
+    end
+
+    test "claim_ending_errors reads the published table, and an unkeyed event ends no claim" do
+      # 1.22.0. Every code in the table is published for its event and permanent for it: a claim
+      # end that could clear would be the wrong answer to give up a dispatch on.
+      connection = Contract.connection()
+      table = Map.fetch!(connection, "claim_ending_errors")
+      permanent = Map.fetch!(connection, "permanent_errors")
+      assert map_size(table) > 0
+
+      for {event, codes} <- table do
+        assert Contract.claim_ending_errors(event) == codes
+
+        for code <- codes do
+          assert code in get_in(connection, ["errors", event]), "#{event} #{code}"
+          assert code in (permanent["*"] ++ Map.get(permanent, event, [])), "#{event} #{code}"
+        end
+      end
+
+      # Not keyed, so none: the session's own end is never a claim-ending refusal.
+      refute Map.has_key?(table, "session_ended")
+      assert Contract.claim_ending_errors("session_ended") == []
+      assert Contract.claim_ending_errors("trace_cursor") == []
+
+      # The two per-message codes 1.22.0 introduced are permanent everywhere and end no claim.
+      for code <- ~w(claim_epoch_mismatch wrong_dispatch_kind) do
+        assert code in permanent["*"]
+        refute Enum.any?(Map.values(table), &(code in &1))
+      end
+
+      assert connection["claim_ending_remedy"] =~ "stop its session"
     end
 
     test "error_fields answers per event and per code, and raises rather than reading nil" do

@@ -60,9 +60,7 @@ defmodule LoopctlRunner.TriageDispatch do
                 raise("the vendored contract publishes no maxLength for a triage verdict detail")
 
   @errors Map.fetch!(Map.fetch!(Contract.connection(), "errors"), "triage_verdict")
-  @permanent_errors Map.fetch!(Contract.connection(), "permanent_errors")
-  @permanent Map.fetch!(@permanent_errors, "*") ++
-               Map.get(@permanent_errors, "triage_verdict", [])
+  @permanent Contract.permanent_errors("triage_verdict")
   # A condition is read ONLY for a reason this event does not already call permanent outright, and
   # that subtraction is load-bearing as of 1.11.0: `stale_stage` gained a condition — read the row
   # off the refusal and report from where it says — while `permanent_errors.triage_verdict` names
@@ -72,7 +70,26 @@ defmodule LoopctlRunner.TriageDispatch do
   # whether its accept is still outstanding, and a resent verdict — the case where it IS — would
   # be pushed again for the life of the claim at a row nothing will ever move.
   @conditional Map.keys(Map.fetch!(Contract.connection(), "permanent_error_conditions")) --
-                 Map.get(@permanent_errors, "triage_verdict", [])
+                 Contract.event_permanent_errors("triage_verdict")
+
+  # Each published condition is a different READING, and only its prose says which, so the reading
+  # is named here and the set it applies to is pinned: a vendoring that publishes another condition
+  # for this event fails the build rather than being answered with evidence about a different
+  # question.
+  #
+  #   * dispatch_not_accepted: resend while an accept of ours is still outstanding (`:conditional`);
+  #   * stale_claim_epoch (1.22.0): "On `triage_verdict` it is permanent for THAT message only ...
+  #     resend the verdict once, with the same bytes, before giving it up" (`:resend_once`).
+  @readings %{"dispatch_not_accepted" => :conditional, "stale_claim_epoch" => :resend_once}
+
+  unless Enum.sort(@conditional) == Enum.sort(Map.keys(@readings)) do
+    raise "the vendored contract publishes conditions for #{inspect(Enum.sort(@conditional))} " <>
+            "on a triage_verdict, and TriageDispatch reads #{inspect(Enum.sort(Map.keys(@readings)))}; " <>
+            "give each new one its own reading before the vendoring lands"
+  end
+
+  @resend_once for {reason, :resend_once} <- @readings, do: reason
+  @accept_conditional for {reason, :conditional} <- @readings, do: reason
 
   # The reasons `classify/1` answers for by name.
   @named ~w(rate_limited internal_error) ++ @conditional
@@ -94,13 +111,14 @@ defmodule LoopctlRunner.TriageDispatch do
   def errors, do: @errors
 
   @doc """
-  The reasons `classify/1` answers `:conditional` for: published conditions, less what this event
-  calls permanent outright.
+  The reasons whose permanence carries a published condition for this event: published conditions,
+  less what this event calls permanent outright. `classify/1` answers `:conditional` or
+  `:resend_once` for each, by the reading its condition states.
 
-  Exposed because the CALLER implements each condition, and one caller today implements exactly
-  one. A condition it does not know is worse than an unknown refusal: `:conditional` means
-  "resend if the caller's own evidence says so", and evidence gathered for a different question
-  is a guess wearing a verdict's clothes.
+  The CALLER implements each reading (`LoopctlRunner.Control.verdict_refused/4`), and this set is
+  pinned against the readings this module names (`@readings`), so a vendoring that publishes a
+  condition with no reading fails the build here: a condition answered with evidence gathered for
+  a different question is a guess wearing a verdict's clothes.
   """
   @spec conditional() :: [String.t()]
   def conditional, do: @conditional
@@ -238,15 +256,22 @@ defmodule LoopctlRunner.TriageDispatch do
       unacknowledged (`x-connection.permanent_error_conditions`), which only the caller knows. A
       reason `permanent_errors` names for THIS event is never conditional, whatever conditions it
       also carries: `stale_stage` carries one for a `stage` report and none for a verdict;
-    * `:permanent` — nothing will change it, so the message is given up;
+    * `:resend_once` — `stale_claim_epoch` (1.22.0): permanent for THAT message only, since the
+      story was reclaimed twice while the verdict was being recorded and loopctl repairs the epoch
+      from the verdict itself, so the caller sends the same bytes once more before giving it up;
+    * `:permanent` — nothing will change it, so the message is given up. That includes the
+      event's `claim_ending_errors` (`unknown_dispatch`): the verdict is the run's last message, so
+      its session is already over and there is nothing more of its work to hold back;
     * `:unknown` — a reason with no name, or one this build does not know. Given up, because
       resending on a reason whose meaning is unknown is as much a guess as not resending, and the
       log line is what gets it handled at the next vendoring.
   """
-  @spec classify(term()) :: :rate_limited | :internal_error | :conditional | :permanent | :unknown
+  @spec classify(term()) ::
+          :rate_limited | :internal_error | :conditional | :resend_once | :permanent | :unknown
   def classify("rate_limited"), do: :rate_limited
   def classify("internal_error"), do: :internal_error
-  def classify(reason) when reason in @conditional, do: :conditional
+  def classify(reason) when reason in @accept_conditional, do: :conditional
+  def classify(reason) when reason in @resend_once, do: :resend_once
   def classify(reason) when reason in @permanent, do: :permanent
   def classify(_reason), do: :unknown
 end

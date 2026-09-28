@@ -460,6 +460,35 @@ defmodule LoopctlRunner.RunTest do
     refute File.exists?(Path.join(state, "argv"))
   end
 
+  test "a run whose claim ended before its session starts none, and says so", %{
+    root: root,
+    state: state
+  } do
+    # contract 1.22.0: the claim's marker is read immediately before the session, where the
+    # deadline is, so a claim that ended while the tree was cut never gets a session at all.
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    try do
+      config = config!(root)
+      {:ok, story} = Story.from_map(story_map(%{}), config)
+      binding = %{"dispatch_id" => Session.uuid4(), "claim_epoch" => 3}
+
+      :ok =
+        LoopctlRunner.ClaimEnded.record(config.runs_dir, binding["dispatch_id"], 3, "stage", "x")
+
+      result = Run.execute(config, story, binding: binding)
+
+      assert result.status == "claim_ended"
+      assert result.session == nil
+      refute File.exists?(Path.join(state, "argv"))
+
+      assert {:ok, %{"status" => "claim_ended", "reached" => "worktree"}} =
+               RunState.read(result.run_dir)
+    after
+      restore.()
+    end
+  end
+
   test "a non-zero exit fails the run and still tears down", %{root: root, state: state} do
     result = run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_EXIT", "7"}])
     assert result.status == "failed"

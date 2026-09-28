@@ -59,6 +59,7 @@ defmodule LoopctlRunner.ReviewRun do
   require Logger
 
   alias LoopctlRunner.{
+    ClaimEnded,
     Config,
     DispatchRun,
     Owner,
@@ -254,19 +255,30 @@ defmodule LoopctlRunner.ReviewRun do
     end
   end
 
+  @claim_ended "loopctl ended the claim this review was dispatched under before its session started"
+
   # THE deadline guard before the session, immediately before it starts: fetching, cutting and
   # syncing submodules take time, and a session started past it would be stopped almost at once.
   # Nothing checks after it: a session started here is bounded by its own stop timer
   # (`Story.stop_after/4`, from the `deadline_at` its story carries). Inside the tree's `try`, so the
   # tree is released as after any session.
+  #
+  # Beside it, the CLAIM (contract 1.22.0): one loopctl ended before the session started
+  # (`LoopctlRunner.ClaimEnded`) gets none. The review still ends with its `session_ended`, which
+  # is what frees the slot; Control sends none of its judgements.
   defp judged_session(config, work, story, where, opts) do
-    case check_deadline(config, work) do
-      :ok ->
-        session = session(config, story, where, opts)
-        %{status: Run.session_status(session), session: session, error: session_error(session)}
+    if ClaimEnded.ended?(config.runs_dir, Keyword.get(opts, :binding, %{})) do
+      Trace.emit(where.trace, "review.claim_ended", where.seq, %{})
+      %{status: "claim_ended", session: nil, error: @claim_ended}
+    else
+      case check_deadline(config, work) do
+        :ok ->
+          session = session(config, story, where, opts)
+          %{status: Run.session_status(session), session: session, error: session_error(session)}
 
-      {:passed, detail} ->
-        deadline_passed(where.trace, where.seq, detail)
+        {:passed, detail} ->
+          deadline_passed(where.trace, where.seq, detail)
+      end
     end
   end
 

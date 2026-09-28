@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.Contract do
   @moduledoc """
   The loopctl runner wire contract, vendored from mkreyman/loopctl
-  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.21.0).
+  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.22.0).
 
   The file is copied, never re-typed: the server casts every payload against the same
   document, drops unknown fields at every depth, and refuses a mismatched major version.
@@ -56,6 +56,50 @@ defmodule LoopctlRunner.Contract do
     |> Map.fetch!(event)
     |> Map.fetch!(code)
   end
+
+  @doc """
+  The refusals of `event` that END THE CLAIM its message ran under, from
+  `x-connection.claim_ending_errors` (1.22.0): the runner sends that dispatch nothing more of its
+  work and stops its session, and its `session_ended` still goes by its own rules
+  (`x-connection.claim_ending_remedy`). Every other permanent refusal refuses only the message
+  that drew it.
+
+  An event the table does not key has NO claim-ending refusal — `session_ended` among them — so
+  that is `[]`, never an error. The table itself is fetched: a vendoring that stops publishing it
+  must fail loudly, not read as "nothing ends a claim" on every event.
+
+  The set holds only for a runner that JOINED declaring 1.22.0 or later, which this one does: its
+  join declares `version/0`, the version it vendors.
+  """
+  @spec claim_ending_errors(String.t()) :: [String.t()]
+  def claim_ending_errors(event) do
+    @schema
+    |> Map.fetch!("x-connection")
+    |> Map.fetch!("claim_ending_errors")
+    |> Map.get(event, [])
+  end
+
+  @doc """
+  The refusals of `event` that never clear, from `x-connection.permanent_errors`: the codes
+  permanent for every event (`"*"`) and the event's own. An event with no list of its own has only
+  the `"*"` codes. The table and its `"*"` entry are fetched, so a vendoring that stops publishing
+  them fails loudly instead of reading as "nothing is permanent".
+  """
+  @spec permanent_errors(String.t()) :: [String.t()]
+  def permanent_errors(event),
+    do: Map.fetch!(permanent_table(), "*") ++ event_permanent_errors(event)
+
+  @doc """
+  Only `event`'s OWN entry in `x-connection.permanent_errors`, without the `"*"` codes. The one
+  question it answers apart from `permanent_errors/1`: whether a code carrying a published
+  CONDITION is nonetheless permanent outright for this event (`stale_stage` on a `triage_verdict`),
+  which the `"*"` list cannot say, since it names codes whose permanence is conditional.
+  """
+  @spec event_permanent_errors(String.t()) :: [String.t()]
+  def event_permanent_errors(event), do: Map.get(permanent_table(), event, [])
+
+  defp permanent_table,
+    do: @schema |> Map.fetch!("x-connection") |> Map.fetch!("permanent_errors")
 
   @doc "One `$defs` entry of the vendored contract, e.g. \"RunnerStory\"."
   @spec schema_def(String.t()) :: map()

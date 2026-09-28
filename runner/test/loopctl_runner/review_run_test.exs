@@ -223,6 +223,35 @@ defmodule LoopctlRunner.ReviewRunTest do
     assert head == ctx.commit
   end
 
+  test "a review whose claim ended before its session starts none, and still owes its end",
+       ctx do
+    work = work(ctx)
+
+    binding = %{
+      "dispatch_id" => Session.uuid4(),
+      "claim_epoch" => 2,
+      "story_id" => work.story["id"]
+    }
+
+    :ok =
+      LoopctlRunner.ClaimEnded.record(ctx.config.runs_dir, binding["dispatch_id"], 2, "x", "y")
+
+    test = self()
+
+    restore = fake_env!(ctx.state, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_AGENTS", "busy"}])
+
+    result =
+      try do
+        ReviewRun.execute(ctx.config, work, binding: binding, on_stage: &send(test, {:stage, &1}))
+      after
+        restore.()
+      end
+
+    assert result.status == "claim_ended"
+    refute File.exists?(Path.join(ctx.state, "argv"))
+    assert_receive {:stage, {:finished, %{kind: "review", status: "claim_ended"}}}
+  end
+
   test "a commit whose tree is not the one loopctl recorded starts no session", ctx do
     other = String.duplicate("c", 40)
     work = work(ctx, %{"tree_sha" => other})

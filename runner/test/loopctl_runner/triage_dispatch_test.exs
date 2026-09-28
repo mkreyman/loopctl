@@ -171,6 +171,12 @@ defmodule LoopctlRunner.TriageDispatchTest do
       assert TriageDispatch.classify("already_recorded") == :permanent
       # Permanent for THIS event only; the contract lists it under `triage_verdict`.
       assert TriageDispatch.classify("stale_stage") == :permanent
+      # 1.22.0: permanent for THAT message only, resent once with the same bytes.
+      assert TriageDispatch.classify("stale_claim_epoch") == :resend_once
+      # The new per-message codes, and the event's one claim-ending code: given up, never resent.
+      assert TriageDispatch.classify("claim_epoch_mismatch") == :permanent
+      assert TriageDispatch.classify("wrong_dispatch_kind") == :permanent
+      assert TriageDispatch.classify("unknown_dispatch") == :permanent
       assert TriageDispatch.classify("not_a_reason") == :unknown
       assert TriageDispatch.classify(nil) == :unknown
     end
@@ -203,8 +209,16 @@ defmodule LoopctlRunner.TriageDispatchTest do
       # event's permanent list and never `permanent_errors["*"]`, so a condition published for a
       # "*"-permanent code would arrive here as :conditional and be answered with evidence about a
       # different question, for the life of the claim. Control raises at compile time on exactly
-      # this list; asserting it here is what names the reason a reader needs.
-      assert TriageDispatch.conditional() == ["dispatch_not_accepted"]
+      # this list; asserting it here is what names the reason a reader needs. 1.22.0 added
+      # stale_claim_epoch's, which `Control` reads as "resend once with the same bytes".
+      assert Enum.sort(TriageDispatch.conditional()) == [
+               "dispatch_not_accepted",
+               "stale_claim_epoch"
+             ]
+
+      assert Contract.connection()
+             |> get_in(["permanent_error_conditions", "stale_claim_epoch"]) =~
+               "resend the verdict once, with the same bytes"
     end
 
     # The compile-time guard's claim, asserted where a reader can see it: a refusal this build
