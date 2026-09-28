@@ -1029,6 +1029,12 @@ jobs:
       - name: Run scale tests (TC-27.1.1 through TC-27.1.4, AC-27.1.7)
         run: SCALE_TESTS=true mix test --only scale test/loopctl/knowledge/scale_seed_test.exs
 
+      # US-32.1 AC-32.1.2: the revoke sweep's natural plan over a committed, ANALYZEd,
+      # production-shaped dispatches table. Here and not in the default suite because an
+      # ANALYZE writes reltuples in place and would skew every other test's plans there.
+      - name: Run revoke-sweep plan guard (AC-32.1.2)
+        run: SCALE_TESTS=true mix test --only scale test/loopctl/workers/revoke_expired_dispatches_plan_scale_test.exs
+
       # US-41.1 AC-41.1.12(i) — the per-dimension ANN plan GATE. It EXPLAINs the real
       # request-path inner ANN (BOTH article search and agent-memory recall — each has
       # its own per-dimension index and its own verbatim `::vector(N)` cast) over a
