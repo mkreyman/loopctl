@@ -22,23 +22,40 @@ defmodule Loopctl.MixProject do
       # hex.audit warns when an entry stops matching, so stale ones surface.
       hex: [
         ignore_advisories: [
-          # cowlib 2.20.0 — no patched release exists for either advisory
-          # below: each is introduced at an old version with no `fixed` event,
-          # and 2.20.0 (which fixed CVE-2026-43971) is the newest cowlib on
-          # hex, so there is nothing to bump to. cowlib is compiled into the release as an
-          # optional transitive of phoenix / websock_adapter / open_api_spex /
-          # telemetry_metrics_prometheus, but the ONLY component that starts a
-          # Cowboy listener is the TelemetryMetricsPrometheus reporter on the
-          # internal :9568 metrics port (prod-only, Fly private 6PN). The public
-          # API serves on Bandit (config/config.exs, Bandit.PhoenixAdapter),
-          # never cowboy. That metrics endpoint sets no cookies, reflects no
-          # untrusted structured headers, and emits no Link headers — loopctl
-          # never calls cow_link — so neither vector is reachable.
+          # cowlib 2.20.0 — no patched release exists for either advisory below:
+          # each is introduced at an old version with no `fixed` event, and
+          # 2.20.0 (which fixed CVE-2026-43971) is the newest cowlib on hex.
+          # cowlib is compiled in as a hard transitive of telemetry_metrics_prometheus
+          # (via plug_cowboy and cowboy), but the ONLY Cowboy listener is that
+          # reporter on the internal :9568 metrics port (prod-only, Fly private 6PN);
+          # the public API serves on Bandit (config/config.exs, Bandit.PhoenixAdapter).
           # Recheck when cowlib > 2.20.0.
-          # CVE-2026-43966 (GHSA-w4f7-4cxr-rv3c, MEDIUM): HTTP response splitting.
+          # CVE-2026-43966 (GHSA-w4f7-4cxr-rv3c, MEDIUM): HTTP response splitting in
+          # cow_http_struct_hd:escape_string/2. The metrics endpoint emits no
+          # structured headers built from untrusted input.
           "CVE-2026-43966",
-          # CVE-2026-43969 (GHSA-g2wm-735q-3f56, LOW): cookie header injection.
-          "CVE-2026-43969"
+          # CVE-2026-43969 (GHSA-g2wm-735q-3f56, LOW): Cookie REQUEST header injection
+          # in cow_cookie:cookie/1, the client-side encoder. Nothing in the release
+          # calls it: there is no cowlib-based HTTP client (no gun).
+          "CVE-2026-43969",
+          # mint 1.10.1 — NOT bumped to 1.11.0, which fixes the three below, because
+          # 1.11.0 stopped closing a connection on a receive timeout and Finch 0.23.0
+          # (the newest) then reuses that connection, so the next request crashes
+          # with a CaseClauseError on the late response (reproduced on #926). All
+          # three are client-side, triggered by a malicious server, and unreachable
+          # here: loopctl's outbound HTTP is Req over Finch pools with Finch's default
+          # `protocols: [:http1]` (no config sets http2), and egress connects directly
+          # to pinned IPs (`Loopctl.Egress.Policy`) with no intermediary. Recheck when
+          # Finch closes a connection on a receive timeout, then take mint >= 1.11.0.
+          # CVE-2026-91043 (HIGH): HTTP/2 HPACK cookie fields bypass
+          # max_header_list_size. HTTP/2 only.
+          "CVE-2026-91043",
+          # CVE-2026-92103 (MEDIUM): HTTP/2 oversized frames buffered before
+          # max_frame_size is enforced. HTTP/2 only.
+          "CVE-2026-92103",
+          # CVE-2026-94194 (MEDIUM): HTTP/1 chunked framing when chunked is not the
+          # final coding, enabling response smuggling THROUGH INTERMEDIARIES.
+          "CVE-2026-94194"
         ]
       ],
       dialyzer: [
