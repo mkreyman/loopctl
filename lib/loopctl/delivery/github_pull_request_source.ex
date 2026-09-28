@@ -77,9 +77,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   timeout is a transient `:unevaluated`, never a pass. Plus one repository read after a 404 on
   the branch.
 
-  Story verification (#913, `commit_ci_runs/2`) makes two workflow-run reads, one per event,
-  plus one tag-ref read per distinct pushed name (at most `@max_workflow_runs`): usually
-  three reads, 21 seconds before an answer, and a timeout is no CI evidence, never a pass. Nothing here runs inside a
+  Story verification (#913, `commit_ci_runs/2`) makes two workflow-run reads, one per event:
+  14 seconds before an answer, and a timeout is no CI evidence, never a pass. Nothing here runs inside a
   database transaction: the caller gathers every fact before it opens one, so a slow forge
   never holds a pooled connection.
 
@@ -113,7 +112,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   ## Authentication
 
-  `GITHUB_TOKEN`, through `Loopctl.Verification.GitHubActions.auth_headers/1` — one rule
+  `GITHUB_TOKEN`, through `auth_headers/1` — one rule
   for the whole application, including its blank-value handling. Unset means anonymous
   calls, which work for a public repository until GitHub's per-IP hourly limit bites and
   then escalate rather than pass.
@@ -122,7 +121,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @behaviour Loopctl.Delivery.PullRequestSource
 
   alias Loopctl.GitSha
-  alias Loopctl.Verification.GitHubActions
 
   @api_base "https://api.github.com"
   @connect_timeout_ms 2_000
@@ -284,15 +282,31 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   @doc """
+  The `Authorization` header for `token`, or none when there is no usable token.
+
+  Takes the VALUE so the rule is unit-testable. A BLANK value is not a token, and used to
+  be treated as one: `if token do` is truthy for `""`, so a variable set-but-empty (the
+  shape a templated deploy config produces) sent `Authorization: Bearer ` and GitHub 401'd
+  every lookup — strictly WORSE than sending nothing, which at least works for a public
+  repository.
+  """
+  @spec auth_headers(String.t() | nil) :: [{String.t(), String.t()}]
+  def auth_headers(nil), do: []
+
+  def auth_headers(token) when is_binary(token) do
+    case String.trim(token) do
+      "" -> []
+      trimmed -> [{"authorization", "Bearer #{trimmed}"}]
+    end
+  end
+
+  @doc """
   Every CI workflow run of commit `sha`, for story verification (#913).
 
-  The runs a `push` to a BRANCH or a `pull_request` triggered, on any branch, since
-  verification judges a commit rather than a thread branch. Each event is asked for
-  separately, filtered by the API and again here, so a busy `schedule`, `workflow_run` or
-  `dynamic` history on the same commit can neither truncate the read nor count as its CI. A
-  push of a TAG is reported with the tag's name as `head_branch`; those runs are publish or
-  release workflows, not CI, and are dropped (a tag and a branch sharing one name would drop
-  that branch's runs too).
+  The runs a `push` or a `pull_request` triggered, on any branch, since verification judges a
+  commit rather than a thread branch. Each event is asked for separately and filtered again
+  here, so a busy `schedule`, `workflow_run` or `dynamic` history on the same commit can
+  neither truncate the read nor be counted.
 
   Per workflow, event and branch, the NEWEST run that was not cancelled is returned, or the
   newest cancelled one when every run was: a re-run keeps its run id and reports its latest
@@ -306,7 +320,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     with {:ok, repo} <- repo_name(repo),
          {:ok, sha} <- ref(sha),
          {:ok, pushes} <- commit_runs(repo, sha, "push"),
-         {:ok, pushes} <- branch_pushes(repo, pushes),
          {:ok, pull_requests} <- commit_runs(repo, sha, "pull_request") do
       {:ok,
        (pushes ++ pull_requests)
@@ -325,35 +338,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     with {:ok, body} <- get(repo, "/actions/runs?" <> query),
          {:ok, runs} <- workflow_runs(body) do
       {:ok, Enum.filter(runs, &(&1["head_sha"] == sha and &1["event"] == event))}
-    end
-  end
-
-  # One ref read per distinct pushed name, bounded like the jobs reads.
-  defp branch_pushes(repo, runs) do
-    names = runs |> Enum.map(& &1["head_branch"]) |> Enum.uniq()
-
-    if length(names) > @max_workflow_runs do
-      {:error, {:too_many_pushed_refs, length(names)}}
-    else
-      Enum.reduce_while(names, {:ok, runs}, &drop_tag_pushes(repo, &1, &2))
-    end
-  end
-
-  defp drop_tag_pushes(repo, name, {:ok, kept}) do
-    case tag?(repo, name) do
-      {:ok, true} -> {:cont, {:ok, Enum.reject(kept, &(&1["head_branch"] == name))}}
-      {:ok, false} -> {:cont, {:ok, kept}}
-      error -> {:halt, error}
-    end
-  end
-
-  defp tag?(repo, name) do
-    with {:ok, name} <- ref(name) do
-      case get(repo, "/git/ref/tags/" <> name) do
-        {:ok, _body} -> {:ok, true}
-        {:error, {:github_api_error, 404}} -> {:ok, false}
-        error -> error
-      end
     end
   end
 
@@ -1178,7 +1162,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   defp headers do
-    GitHubActions.auth_headers(System.get_env("GITHUB_TOKEN")) ++
+    auth_headers(System.get_env("GITHUB_TOKEN")) ++
       [
         {"accept", "application/vnd.github+json"},
         {"x-github-api-version", "2022-11-28"},

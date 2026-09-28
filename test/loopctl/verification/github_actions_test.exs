@@ -6,12 +6,17 @@ defmodule Loopctl.Verification.GitHubActionsTest do
 
   describe "auth_headers/1" do
     test "a usable token becomes a bearer header" do
-      assert GitHubActions.auth_headers("ghp_abc") == [{"authorization", "Bearer ghp_abc"}]
-      assert GitHubActions.auth_headers(" ghp_abc\n") == [{"authorization", "Bearer ghp_abc"}]
+      assert GitHubPullRequestSource.auth_headers("ghp_abc") == [
+               {"authorization", "Bearer ghp_abc"}
+             ]
+
+      assert GitHubPullRequestSource.auth_headers(" ghp_abc\n") == [
+               {"authorization", "Bearer ghp_abc"}
+             ]
     end
 
     test "no token sends no authorization header" do
-      assert GitHubActions.auth_headers(nil) == []
+      assert GitHubPullRequestSource.auth_headers(nil) == []
     end
 
     test "a BLANK token sends none either — an empty bearer is worse than none" do
@@ -20,7 +25,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       # every check-run lookup, so verification reported github_api_error instead of a CI
       # verdict — strictly worse than the anonymous path, which works for a public repo.
       for blank <- ["", "   ", "\n", "\t "] do
-        assert GitHubActions.auth_headers(blank) == [],
+        assert GitHubPullRequestSource.auth_headers(blank) == [],
                "a blank token must not become a bearer header"
       end
     end
@@ -31,74 +36,55 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       %{status: status, conclusion: conclusion, url: url}
     end
 
-    test "every run concluded success is a pass" do
+    test "a successful run passes the commit" do
       assert {:ok, %{status: "completed", conclusion: "success"}} =
-               GitHubActions.summarize_workflow_runs([
-                 run("completed", "success"),
-                 run("completed", "success")
-               ])
+               GitHubActions.summarize_workflow_runs([run("completed", "success")])
     end
 
-    test "no runs is no evidence, never a pass and never a wait" do
-      assert {:error, :no_workflow_runs} = GitHubActions.summarize_workflow_runs([])
-    end
-
-    test "a run still going keeps the commit in progress" do
-      assert {:ok, %{status: "in_progress"}} =
-               GitHubActions.summarize_workflow_runs([
-                 run("completed", "success"),
-                 run("queued", nil)
-               ])
-    end
-
-    test "a failing run is a failure that links to the run" do
-      for conclusion <- ["failure", "timed_out", "action_required", "startup_failure"] do
+    test "a failed run fails it, with that run's URL, whatever else is present" do
+      for conclusion <- ["failure", "timed_out", "startup_failure"],
+          other <- [run("completed", "success"), run("queued", nil), run("waiting", nil)] do
         assert {:ok, %{conclusion: "failure", url: "https://x/failed"}} =
                  GitHubActions.summarize_workflow_runs([
-                   run("completed", "success"),
+                   other,
                    run("completed", conclusion, "https://x/failed")
                  ]),
-               "#{conclusion} must not pass"
+               "#{conclusion} beside #{inspect(other)} must fail"
       end
     end
 
-    test "a skipped or neutral run did not run CI and is left out" do
-      assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.summarize_workflow_runs([
-                 run("completed", "success"),
-                 run("completed", "skipped"),
-                 run("completed", "neutral")
-               ])
-
-      assert {:error, :no_workflow_runs} =
-               GitHubActions.summarize_workflow_runs([run("completed", "skipped")])
+    test "a run still queued or running, with no failure yet, is a wait" do
+      for status <- ["queued", "in_progress", "requested", "pending"] do
+        assert {:ok, %{status: "in_progress"}} =
+                 GitHubActions.summarize_workflow_runs([
+                   run("completed", "success"),
+                   run(status, nil)
+                 ])
+      end
     end
 
-    test "a run waiting on an environment approval is no evidence, not an endless wait" do
-      assert {:error, :ci_waiting} =
-               GitHubActions.summarize_workflow_runs([
-                 run("completed", "success"),
-                 run("waiting", nil)
-               ])
-
-      assert {:ok, %{conclusion: "failure"}} =
-               GitHubActions.summarize_workflow_runs([
-                 run("waiting", nil),
-                 run("completed", "failure")
-               ])
+    test "a run that reached no result never outweighs a success" do
+      for other <- [
+            run("waiting", nil),
+            run("completed", "cancelled"),
+            run("completed", "action_required"),
+            run("completed", "skipped"),
+            run("completed", "neutral")
+          ] do
+        assert {:ok, %{conclusion: "success"}} =
+                 GitHubActions.summarize_workflow_runs([run("completed", "success"), other]),
+               "#{inspect(other)} must not spoil a green run"
+      end
     end
 
-    test "a cancelled run is no evidence, not a failure, unless another run failed" do
-      assert {:error, :ci_cancelled} =
-               GitHubActions.summarize_workflow_runs([
-                 run("completed", "success"),
-                 run("completed", "cancelled")
-               ])
+    test "no runs, or only runs that reached no result, is no CI evidence, never a pass" do
+      assert {:error, :no_ci_evidence} = GitHubActions.summarize_workflow_runs([])
 
-      assert {:ok, %{conclusion: "failure"}} =
+      assert {:error, :no_ci_evidence} =
                GitHubActions.summarize_workflow_runs([
                  run("completed", "cancelled"),
-                 run("completed", "failure")
+                 run("completed", "action_required"),
+                 run("waiting", nil)
                ])
     end
   end
@@ -119,10 +105,9 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       }
     end
 
-    # Answers each event's runs page as GitHub would (filtered by `event`, with that event's
-    # own total) and a tag-ref read with 200 for a name in `tags`, 404 otherwise.
+    # Answers each event's runs page as GitHub would: filtered by `event`, with that event's
+    # own total.
     defp stub_runs(runs, opts \\ []) do
-      tags = Keyword.get(opts, :tags, [])
       totals = Keyword.get(opts, :totals, %{})
       test_pid = self()
 
@@ -138,18 +123,12 @@ defmodule Loopctl.Verification.GitHubActionsTest do
               "total_count" => Map.get(totals, event, length(page)),
               "workflow_runs" => page
             })
-
-          "/repos/mkreyman/infra/git/ref/tags/" <> name ->
-            tag_ref(conn, name in tags, name)
         end
       end)
     end
 
     defp runs_page(runs, _event, true), do: runs
     defp runs_page(runs, event, _filters), do: Enum.filter(runs, &(&1["event"] == event))
-
-    defp tag_ref(conn, true, name), do: Req.Test.json(conn, %{"ref" => "refs/tags/" <> name})
-    defp tag_ref(conn, false, _name), do: Plug.Conn.send_resp(conn, 404, "{}")
 
     test "reads the commit's push and pull_request workflow runs, never its check runs" do
       stub_runs([
@@ -206,19 +185,6 @@ defmodule Loopctl.Verification.GitHubActionsTest do
                GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
     end
 
-    test "a push of a TAG is a release, not the commit's CI" do
-      stub_runs(
-        [
-          api_run(1, ".github/workflows/ci.yml", "push", "main", "success"),
-          api_run(2, ".github/workflows/publish.yml", "push", "mcp-v1.2.3", "failure")
-        ],
-        tags: ["mcp-v1.2.3"]
-      )
-
-      assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
-    end
-
     test "runs of another commit are not this commit's CI" do
       stub_runs([
         api_run(1, ".github/workflows/ci.yml", "push", "main", "success"),
@@ -268,7 +234,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
             "https://github.com/mkreyman/loopctl.com",
             "git@github.com:mkreyman/loopctl.com.git"
           ] do
-        assert {:error, :no_workflow_runs} = GitHubActions.get_status(url, @sha)
+        assert {:error, :no_ci_evidence} = GitHubActions.get_status(url, @sha)
       end
     end
 

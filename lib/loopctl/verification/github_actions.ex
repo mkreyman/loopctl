@@ -17,8 +17,12 @@ defmodule Loopctl.Verification.GitHubActions do
 
   alias Loopctl.Delivery.GitHubPullRequestSource
 
-  # Conclusions of a run that did not run the commit's CI at all.
-  @not_run ["skipped", "neutral"]
+  # A completed run that ran and failed. Every other non-success conclusion did not run the
+  # commit's CI to a result.
+  @failed ["failure", "timed_out", "startup_failure"]
+
+  # Still going. `waiting` is not here: an approval can take weeks.
+  @running ["queued", "in_progress", "requested", "pending"]
 
   @impl true
   def get_status(repo_url, commit_sha) do
@@ -43,71 +47,42 @@ defmodule Loopctl.Verification.GitHubActions do
   end
 
   @doc """
-  The `Authorization` header for `token`, or none when there is no usable token.
-
-  Takes the VALUE so the rule is unit-testable. A BLANK value is not a token, and used to
-  be treated as one: `if token do` is truthy for `""`, so a variable set-but-empty (the
-  shape a templated deploy config produces) sent `Authorization: Bearer ` and GitHub 401'd
-  every lookup. Verification then reported `github_api_error` instead of a CI verdict —
-  strictly WORSE than sending nothing, which at least works for a public repo.
-  """
-  @spec auth_headers(String.t() | nil) :: [{String.t(), String.t()}]
-  def auth_headers(token)
-
-  def auth_headers(nil), do: []
-
-  def auth_headers(token) when is_binary(token) do
-    case String.trim(token) do
-      "" -> []
-      trimmed -> [{"authorization", "Bearer #{trimmed}"}]
-    end
-  end
-
-  @doc """
   The CI verdict for a commit's workflow runs, as `GitHubPullRequestSource.commit_ci_runs/2`
-  returns them.
+  returns them. One rule, in order, and it does not try to tell a CI workflow from a deploy
+  or release workflow, which nothing in a run says:
 
-    * any run queued or running - `in_progress`; the caller snoozes until it finishes;
-    * a completed run that concluded `skipped` or `neutral` did not run the commit's CI and
-      is left out;
-    * any other completed run that did not succeed and was not cancelled - `failure`, with
-      that run's URL;
-    * otherwise a run `waiting` on an environment approval - `{:error, :ci_waiting}`: it can
-      wait for weeks, so it is no evidence rather than a wait;
-    * otherwise a `cancelled` run - `{:error, :ci_cancelled}`. A run cancelled by a newer
-      push (`cancel-in-progress`) says nothing about this commit;
-    * nothing left at all - `{:error, :no_workflow_runs}`: a repository without Actions CI,
-      or a commit a path filter skipped, is no evidence either, never a pass. (An empty
-      list once read as SUCCESS, since `Enum.all?/2` of nothing is true.)
-    * otherwise - `success`.
+    1. any run that concluded `failure`, `timed_out` or `startup_failure` - `failure`, with
+       that run's URL. A known failure is recorded at once, never held behind a run that is
+       still queued;
+    2. any run queued or running - `in_progress`; the caller snoozes until it finishes;
+    3. any run that concluded `success` - `success`;
+    4. otherwise - `{:error, :no_ci_evidence}`: no runs at all (a repository without Actions
+       CI, or a commit a path filter skipped), or only runs that did not run the commit's
+       CI to a result - `cancelled`, `skipped`, `neutral`, `action_required`, `stale`, or
+       `waiting` on an approval. An empty list once read as SUCCESS, since `Enum.all?/2` of
+       nothing is true.
 
-  Every error is no CI evidence, and the caller falls back to local re-execution.
+  A run that did not reach a result never outweighs one that did: a deploy workflow waiting
+  on an approval, or cancelled by a newer merge, leaves a green CI run green.
   """
   @spec summarize_workflow_runs([map()]) ::
           {:ok, %{status: String.t(), conclusion: String.t() | nil, url: String.t()}}
-          | {:error, :ci_waiting | :ci_cancelled | :no_workflow_runs}
+          | {:error, :no_ci_evidence}
   def summarize_workflow_runs(runs) do
-    counted =
-      Enum.filter(runs, &(&1.status == "completed" and &1.conclusion not in @not_run))
+    completed = Enum.filter(runs, &(&1.status == "completed"))
 
     cond do
-      Enum.any?(runs, &(&1.status not in ["completed", "waiting"])) ->
-        {:ok, %{status: "in_progress", conclusion: nil, url: ""}}
-
-      failed = Enum.find(counted, &(&1.conclusion not in ["success", "cancelled"])) ->
+      failed = Enum.find(completed, &(&1.conclusion in @failed)) ->
         {:ok, %{status: "completed", conclusion: "failure", url: failed.url || ""}}
 
-      Enum.any?(runs, &(&1.status == "waiting")) ->
-        {:error, :ci_waiting}
+      Enum.any?(runs, &(&1.status in @running)) ->
+        {:ok, %{status: "in_progress", conclusion: nil, url: ""}}
 
-      Enum.any?(counted, &(&1.conclusion == "cancelled")) ->
-        {:error, :ci_cancelled}
-
-      counted == [] ->
-        {:error, :no_workflow_runs}
+      Enum.any?(completed, &(&1.conclusion == "success")) ->
+        {:ok, %{status: "completed", conclusion: "success", url: ""}}
 
       true ->
-        {:ok, %{status: "completed", conclusion: "success", url: ""}}
+        {:error, :no_ci_evidence}
     end
   end
 end

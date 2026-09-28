@@ -210,24 +210,31 @@ All notable changes to loopctl are documented here.
 ### Changed
 
 - **Story verification reads Actions workflow runs; `GITHUB_TOKEN` needs `actions: read`, not
-  Checks (#913).** Verification's CI lookup read a commit's check runs, which needs the Checks
-  permission. GitHub grants that to Apps only, so a fine-grained token cannot hold it, and every
-  lookup on a private repository returned 403. It now reads the commit's workflow runs, with
-  the same reader as the thread merge gate. **Before upgrading, give `GITHUB_TOKEN`
-  `actions: read`**, or verification reports no CI evidence and falls back to local test
-  re-execution. Three verdicts changed:
-  - a commit with no workflow runs is no longer verified as passing;
-  - a cancelled run is no evidence rather than a failure;
-  - a timed-out run fails instead of waiting indefinitely;
-  - a run waiting on an environment approval, and a push of a tag (a release workflow), are
-    no longer counted as the commit's CI;
-  - a GitHub rate limit is waited out instead of triggering a local re-run.
+  Checks (#913).** Verification's CI lookup used to read a commit's check runs, which needs
+  the Checks permission. GitHub grants that permission only to Apps, so a fine-grained token
+  cannot hold it, and every lookup on a private repository was refused with 403. It now
+  reads the commit's push and pull_request workflow runs through the thread merge gate's
+  reader. **Give `GITHUB_TOKEN` `actions: read` before upgrading**; without it, verification
+  finds no CI evidence and falls back to local test re-execution.
 
-  A run with no CI verdict now records why in `ac_results.ci_unavailable_reason`, and a CI
-  verdict records the failing run's `url`. **Before this, every verification run that had a
-  commit crashed before reaching CI**: a schemaless query was passed an uncast UUID. Runs
-  recorded as failed with a Postgrex "expected a binary of 16 bytes" error were never
-  judged.
+  The verdict now follows one rule, applied in order:
+  1. A failed, timed-out or unstartable run fails the commit, with that run's `url` recorded.
+  2. Otherwise, a run that is still queued or running means wait.
+  3. Otherwise, a successful run passes the commit.
+  4. Anything else is no CI evidence: no runs at all, or only runs that were cancelled,
+     skipped, are waiting on an approval, or need one.
+
+  Consequences of the new rule:
+  - An empty run list no longer verifies a commit.
+  - A deploy that is still waiting, or was cancelled, no longer spoils a green run.
+  - A GitHub rate limit is waited out, for the forge's delay or a 60-second floor, instead of
+    starting a local re-run.
+  - When there is no CI verdict, the reason is recorded as a short code in
+    `ac_results.ci_unavailable_reason`.
+
+  **Every verification run that had a commit used to crash before reaching CI**, because a
+  schemaless query was passed an uncast UUID. Runs that failed with a Postgrex "expected a
+  binary of 16 bytes" error were never judged.
 
 - **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**
   A triage-accepted story, a release whose re-contract did not land, and an escalation resolved

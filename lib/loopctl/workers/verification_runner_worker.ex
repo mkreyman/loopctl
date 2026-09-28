@@ -187,19 +187,40 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       {:ok, %{status: "in_progress"}} ->
         {:snooze, 60}
 
-      # A rate limit clears on its own: wait it out rather than clone and re-run the suite.
-      {:error, {:github_rate_limited, _status, delay}} when is_integer(delay) and delay > 0 ->
-        {:snooze, delay}
+      # A rate limit clears on its own: wait it out rather than clone and re-run the suite,
+      # for the forge's delay when it gave a usable one and a floor when it did not.
+      {:error, {:github_rate_limited, _status, delay}} ->
+        {:snooze, rate_limit_snooze(delay)}
 
       {:ok, %{conclusion: other}} ->
         Logger.warning("VerificationRunner: unexpected CI conclusion: #{inspect(other)}")
-        {:error, {:ci_unavailable, {:unexpected_conclusion, other}}}
+        {:error, {:ci_unavailable, "unexpected_conclusion"}}
 
       {:error, reason} ->
-        Logger.warning("VerificationRunner: no CI verdict for run #{run.id}: #{inspect(reason)}")
-        {:error, {:ci_unavailable, reason}}
+        code = reason_code(reason)
+        Logger.warning("VerificationRunner: no CI verdict for run #{run.id}: #{code}")
+        {:error, {:ci_unavailable, code}}
     end
   end
+
+  @rate_limit_floor_seconds 60
+
+  defp rate_limit_snooze(delay) when is_integer(delay) and delay > 0, do: delay
+  defp rate_limit_snooze(_unusable), do: @rate_limit_floor_seconds
+
+  # The reason as a short operator-facing code, and never its terms: those can carry the
+  # project's repo_url, which may embed a credential.
+  defp reason_code(reason) when is_atom(reason), do: Atom.to_string(reason)
+
+  defp reason_code(reason) when is_tuple(reason) and is_atom(elem(reason, 0)) do
+    case reason do
+      {tag, status} when is_integer(status) -> "#{tag}:#{status}"
+      {tag, status, _detail} when is_integer(status) -> "#{tag}:#{status}"
+      _other -> Atom.to_string(elem(reason, 0))
+    end
+  end
+
+  defp reason_code(_reason), do: "unknown"
 
   # The run the verdict came from, so an operator can open the failing workflow.
   defp ci_results(%{url: url}) when is_binary(url) and url != "",
@@ -218,7 +239,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         {:ok, _} =
           Verification.complete_run(run, results.status, %{
             "source" => "local_test_runner",
-            "ci_unavailable_reason" => inspect(ci_reason),
+            "ci_unavailable_reason" => ci_reason,
             "tests_run" => results.tests_run,
             "tests_passed" => results.tests_passed,
             "tests_failed" => results.tests_failed
@@ -232,7 +253,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         {:ok, _} =
           Verification.complete_run(run, "error", %{
             "local_error" => inspect(reason),
-            "ci_unavailable_reason" => inspect(ci_reason)
+            "ci_unavailable_reason" => ci_reason
           })
 
         :ok

@@ -166,13 +166,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
             ],
             else: []
 
-        case conn.request_path do
-          "/repos/mkreyman/infra/actions/runs" ->
-            Req.Test.json(conn, %{"total_count" => length(runs), "workflow_runs" => runs})
-
-          _tag_ref ->
-            Plug.Conn.send_resp(conn, 404, "{}")
-        end
+        Req.Test.json(conn, %{"total_count" => length(runs), "workflow_runs" => runs})
       end)
 
       {run, job} = ci_run(setup_ctx())
@@ -194,6 +188,23 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       assert {:snooze, 120} = VerificationRunnerWorker.perform(job)
     end
 
+    test "a rate limit with no usable delay still waits, for a floor" do
+      stub_ci(&Plug.Conn.send_resp(&1, 429, "{}"))
+
+      {_run, job} = ci_run(setup_ctx())
+      assert {:snooze, 60} = VerificationRunnerWorker.perform(job)
+    end
+
+    test "a refused read records a code, never the terms of the reason" do
+      stub_ci(&Plug.Conn.send_resp(&1, 403, "{}"))
+
+      {run, job} = ci_run(setup_ctx())
+      assert :ok = VerificationRunnerWorker.perform(job)
+
+      {:ok, done} = Verification.get_run(run.tenant_id, run.id)
+      assert done.ac_results["ci_unavailable_reason"] == "github_api_error:403"
+    end
+
     test "no CI evidence falls back AND records why, so a missing token scope is visible" do
       stub_ci(&Req.Test.json(&1, %{"total_count" => 0, "workflow_runs" => []}))
 
@@ -201,7 +212,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       assert :ok = VerificationRunnerWorker.perform(job)
 
       {:ok, done} = Verification.get_run(run.tenant_id, run.id)
-      assert done.ac_results["ci_unavailable_reason"] == inspect(:no_workflow_runs)
+      assert done.ac_results["ci_unavailable_reason"] == "no_ci_evidence"
     end
   end
 end
