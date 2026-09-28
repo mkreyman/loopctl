@@ -455,10 +455,9 @@ defmodule LoopctlRunner.TraceShip do
   defp safe(value), do: value
 
   defp fit(event) do
-    if ByteRule.bytes(event["data"]) > @max_data_bytes or
-         ByteRule.bytes(event) > @max_event_bytes,
-       do: omit_data(event),
-       else: event
+    if ByteRule.bytes(event["data"]) > @max_data_bytes or ByteRule.bytes(event) > @max_event_bytes,
+      do: omit_data(event),
+      else: event
   end
 
   defp omit_data(event) do

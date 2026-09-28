@@ -44,10 +44,7 @@ defmodule LoopctlRunner.TestLoopctl do
       # Replies to triage_verdict pushes, oldest first: :ok (record and ack), :replayed (ack a
       # resend, applying nothing), :bare_ok for an ok with no body, :none for a push left
       # unanswered, or {:error, reason_map}.
-      triage_verdict_replies: [],
-      # Replies to checkpoint pushes, oldest first: :ok (validate and ack), :none for a push left
-      # unanswered, or {:error, reason_map}; once used up every checkpoint is acknowledged.
-      checkpoint_replies: []
+      triage_verdict_replies: []
     }
 
     case Agent.start(fn -> state end, name: __MODULE__) do
@@ -87,16 +84,6 @@ defmodule LoopctlRunner.TestLoopctl do
     Agent.get_and_update(__MODULE__, fn
       %{stage_replies: [reply | rest]} = state -> {reply, %{state | stage_replies: rest}}
       state -> {:ok, state}
-    end)
-  end
-
-  def next_checkpoint_reply do
-    Agent.get_and_update(__MODULE__, fn
-      %{checkpoint_replies: [reply | rest]} = state ->
-        {reply, %{state | checkpoint_replies: rest}}
-
-      state ->
-        {:ok, state}
     end)
   end
 
@@ -293,23 +280,6 @@ defmodule LoopctlRunner.TestLoopctl do
       case verdict_problem(payload) do
         nil -> scripted_verdict_reply(socket)
         refusal -> {:reply, {:error, refusal}, socket}
-      end
-    end
-
-    # loopctl's claim and idempotency checks are not modelled: the reply is scripted.
-    def handle_in("checkpoint", payload, socket) do
-      TestLoopctl.notify({:checkpoint, payload})
-
-      case Contract.validate("RunnerCheckpoint", payload) do
-        :ok ->
-          case TestLoopctl.next_checkpoint_reply() do
-            :ok -> {:reply, {:ok, %{checkpoint_id: payload["commit_sha"], seq: 1}}, socket}
-            :none -> {:noreply, socket}
-            {:error, reply} -> {:reply, {:error, reply}, socket}
-          end
-
-        {:error, details} ->
-          {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
       end
     end
 
