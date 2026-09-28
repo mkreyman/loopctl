@@ -234,11 +234,15 @@ defmodule Loopctl.Threads.Reviews do
   # lineage chain — an ancestor of the implementer, the implementer itself, or anything below.
   @spec reviewer_separate(Ecto.UUID.t(), Story.t(), Ecto.UUID.t()) :: :ok | refusal()
   def reviewer_separate(tenant_id, story, agent_id) do
-    if story.assigned_agent_id == agent_id or
-         recorded_checkpoint?(tenant_id, story, agent_id) or
-         on_implementer_chain?(tenant_id, story, agent_id),
-       do: not_separate(),
-       else: :ok
+    if story.assigned_agent_id == agent_id or recorded_checkpoint?(tenant_id, story, agent_id) do
+      not_separate()
+    else
+      case on_implementer_chain?(tenant_id, story, agent_id) do
+        false -> :ok
+        true -> not_separate()
+        :unresolvable -> unresolvable_lineage()
+      end
+    end
   end
 
   defp recorded_checkpoint?(tenant_id, story, agent_id) do
@@ -255,10 +259,14 @@ defmodule Loopctl.Threads.Reviews do
   defp on_implementer_chain?(_tenant_id, %Story{implementer_dispatch_id: nil}, _agent_id),
     do: false
 
+  # A DECLARED implementer dispatch whose lineage cannot be loaded (deleted, unreadable) is
+  # `:unresolvable` and refuses, never passes: the custody gates fail closed on exactly this
+  # (`unresolvable_dispatch_lineage`), and with the dispatch-required refusal gone this check
+  # is the only thing standing between the implementer's own tree and its review.
   defp on_implementer_chain?(tenant_id, story, agent_id) do
     case implementer_lineage(tenant_id, story.implementer_dispatch_id) do
       [] ->
-        false
+        :unresolvable
 
       [root | _] = implementer ->
         from(d in Dispatch,
@@ -278,6 +286,15 @@ defmodule Loopctl.Threads.Reviews do
         select: d.lineage_path
     ) || []
   end
+
+  defp unresolvable_lineage,
+    do:
+      refuse(
+        :conflict,
+        "unresolvable_dispatch_lineage",
+        "the dispatch that made this claim is recorded but its lineage cannot be read, so " <>
+          "no reviewer can be shown separate from it"
+      )
 
   defp not_separate,
     do:

@@ -366,16 +366,13 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
       assert %ClaimRoute{mode: "thread", base_branch: "master"} = route(ctx, story)
     end
 
-    test "the thread branch takes the prefix the tenant's live runners declare" do
+    test "the thread branch is the PRD's loop/<story>, whatever a connected runner declares" do
       ctx = setup_story()
       topic = Runners.pool_topic(ctx.tenant.id)
-      runner_id = Ecto.UUID.generate()
-
-      {:ok, _} =
-        Presence.track(self(), topic, runner_id, %{branch_prefixes: ["bot/"]})
+      {:ok, _} = Presence.track(self(), topic, Ecto.UUID.generate(), %{branch_prefixes: ["bot/"]})
 
       story = claim(ctx)
-      assert %ClaimRoute{branch: "bot/" <> _} = route(ctx, story)
+      assert %ClaimRoute{branch: "loop/" <> _} = route(ctx, story)
     end
 
     test "the claim response names the route to push to", %{conn: conn} do
@@ -397,6 +394,64 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
           actor_role: :agent
         )
       end
+    end
+
+    test "a resend of a report that landed answers the row, replayed; a different one names the record",
+         %{conn: conn} do
+      ctx = setup_story()
+      story = claim(ctx)
+
+      for {from, to} <- [
+            {"claimed", "worktree"},
+            {"worktree", "implementing"},
+            {"implementing", "reviewing"},
+            {"reviewing", "pr_open"}
+          ] do
+        build_conn() |> report(ctx.raw, story, step(story, from, to)) |> json_response(200)
+      end
+
+      body = step(story, "pr_open", "ci", %{"effects" => %{"head_sha" => @sha}})
+
+      assert %{"replayed" => false} =
+               conn |> report(ctx.raw, story, body) |> json_response(200)
+
+      assert %{"replayed" => true, "stage" => %{"stage" => "ci"}} =
+               build_conn() |> report(ctx.raw, story, body) |> json_response(200)
+
+      other =
+        step(story, "pr_open", "ci", %{"effects" => %{"head_sha" => String.duplicate("b", 40)}})
+
+      assert %{
+               "error" => %{
+                 "code" => "stale_stage",
+                 "stage" => "ci",
+                 "recorded_effects" => %{"head_sha" => @sha}
+               }
+             } =
+               build_conn() |> report(ctx.raw, story, other) |> json_response(409)
+    end
+
+    test "a claim with no resolved lineage never defaults one: the move waits for the claimant",
+         %{conn: conn} do
+      ctx = setup_story()
+
+      story =
+        unboxed(fn ->
+          {:ok, story} =
+            Progress.claim_story(ctx.tenant.id, ctx.story.id,
+              agent_id: ctx.agent.id,
+              actor_label: "agent:test"
+            )
+
+          story
+        end)
+
+      assert %StoryStage{stage: :queued} = row(ctx)
+
+      assert %{"stage" => %{"stage" => "worktree"}} =
+               conn
+               |> report(ctx.raw, story, step(story, "claimed", "worktree"))
+               |> json_response(200)
     end
   end
 end

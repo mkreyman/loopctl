@@ -159,6 +159,9 @@ defmodule Loopctl.WorkBreakdown.Story do
     # see mint_cap/4 in Loopctl.Progress, which logs loudly when a KEYED tenant
     # fails to mint, because that tenant's next call would 403 missing_capability).
     field :minted_capability, :map, virtual: true
+    # US-45.9: the route an interactive claim recorded (`Loopctl.Delivery.ClaimRoute`), set only
+    # on the struct `Progress.claim_story/3` returns.
+    field :claim_route, :map, virtual: true
 
     timestamps()
   end

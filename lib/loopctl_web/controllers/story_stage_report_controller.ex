@@ -3,14 +3,20 @@ defmodule LoopctlWeb.StoryStageReportController do
   US-45.9: the CLAIMANT of an interactive thread claim reports its own story's stage
   transitions, as a runner reports a placed claim's over its socket.
 
-  It is given exactly a runner's vocabulary and nothing more. The body is cast by the runner
-  channel's own validator (`Loopctl.ApiSpec.RunnerContract.cast_stage/1`), so only
-  `StageMachine.runner_transitions/0` and the reportable effects pass, and the transition is
-  written by the one writer (`Loopctl.Delivery.Stages.advance/4`) under the claim's epoch.
-  Before any of that the caller must be the story's claimant, under the epoch it names, with a
-  live lease, on a claim whose recorded route (`Loopctl.Delivery.ClaimRoute`) is an
+  It is given a runner's vocabulary up to `ci` and nothing more. The body is cast by the runner
+  channel's own validator (`Loopctl.ApiSpec.RunnerContract.cast_stage/1`), then narrowed to
+  `StageMachine.claimant_reportable?/3`: the runner's transitions short of the merge, which
+  loopctl records itself in thread mode. The transition is written by the one writer
+  (`Loopctl.Delivery.Stages.advance/4`) under the claim's epoch. Before that the caller must be
+  the story's claimant under the epoch it names (`Loopctl.Delivery.Claimant.check/3`), on a
+  live claim (`Claimant.live?/2`), whose recorded route (`Loopctl.Delivery.ClaimRoute`) is an
   interactive THREAD route. A placed claim has a runner to report for it and is refused, so
   there is never a second reporter for one claim.
+
+  A RESEND of a report that already landed (its response was lost) answers the row with
+  `replayed: true` when the row is at the report's destination under its epoch with the
+  effects it carried; a report that disagrees with what is recorded names the recorded
+  effects, so the caller can tell "already applied" from "someone else moved it".
 
   When the claim's own `queued -> claimed` did not land (a bulk claim, or the claim's attempt
   failed), the first report from `claimed` makes it first
@@ -108,13 +114,13 @@ defmodule LoopctlWeb.StoryStageReportController do
     tenant_id = api_key.tenant_id
 
     with {:ok, story} <- fetch_story(tenant_id, story_id),
-         :ok <- claimant(story, api_key),
          {:ok, route} <- interactive_thread_route(tenant_id, story),
          {:ok, stage} <- cast(params, route),
+         :ok <- Claimant.check(story, api_key.agent_id, stage.claim_epoch),
          :ok <- claimant_reportable(stage),
          :ok <- live_claim(story),
-         {:ok, row} <- report(tenant_id, story, stage, api_key, conn) do
-      json(conn, %{stage: StoryEscalationController.render_stage(row)})
+         {:ok, row, replayed?} <- report(tenant_id, story, stage, api_key, conn) do
+      json(conn, %{stage: StoryEscalationController.render_stage(row), replayed: replayed?})
     else
       {:error, {status, code, message}} -> refusal(conn, status, code, message)
       {:error, reason} when is_map_key(@advance_refusals, reason) -> advance_refusal(conn, reason)
@@ -139,12 +145,6 @@ defmodule LoopctlWeb.StoryStageReportController do
         {:error, :not_found}
     end
   end
-
-  defp claimant(%Story{assigned_agent_id: agent_id}, %{agent_id: agent_id})
-       when is_binary(agent_id),
-       do: :ok
-
-  defp claimant(_story, _api_key), do: {:error, :not_claimant}
 
   defp interactive_thread_route(tenant_id, story) do
     case InteractiveClaims.current_route(tenant_id, story) do
@@ -199,17 +199,51 @@ defmodule LoopctlWeb.StoryStageReportController do
   defp report(tenant_id, story, stage, api_key, conn) do
     identity = identity(api_key, conn)
 
+    effects = Map.to_list(Map.get(stage, :effects, %{}))
+
     with :ok <- ensure_claimed(tenant_id, story, stage, identity) do
-      Stages.advance(tenant_id, story.id, {stage.from, stage.to, stage.edge},
-        claim_epoch: stage.claim_epoch,
-        effects: Map.to_list(Map.get(stage, :effects, %{})),
-        reason: Map.get(stage, :reason),
-        actor_label: identity[:actor_label],
-        actor_role: :agent,
-        actor_lineage: identity[:actor_lineage]
-      )
+      case Stages.advance(tenant_id, story.id, {stage.from, stage.to, stage.edge},
+             claim_epoch: stage.claim_epoch,
+             effects: effects,
+             reason: Map.get(stage, :reason),
+             actor_label: identity[:actor_label],
+             actor_role: :agent,
+             actor_lineage: identity[:actor_lineage]
+           ) do
+        {:ok, row} ->
+          {:ok, row, false}
+
+        {:error, reason} when reason in [:stale_stage, :effect_conflict] ->
+          replay(tenant_id, story, stage, effects)
+
+        other ->
+          other
+      end
     end
   end
+
+  # A report that did not apply, read against the row as it stands: the SAME report landed
+  # already (a resend after a lost response) answers the row; anything else is refused with
+  # the row's stage and recorded effects, so the caller need not read again to know which.
+  defp replay(tenant_id, story, stage, effects) do
+    row = Stages.get(tenant_id, story.id)
+
+    if row && row.stage == stage.to && row.claim_epoch == stage.claim_epoch &&
+         Enum.all?(effects, fn {key, value} -> Map.get(row, key) == value end) do
+      {:ok, row, true}
+    else
+      {:error,
+       {:conflict, "stale_stage",
+        %{
+          message: "the story is not where this report says it is, or records other effects",
+          stage: row && row.stage,
+          recorded_effects: recorded(row, effects)
+        }}}
+    end
+  end
+
+  defp recorded(nil, _effects), do: %{}
+  defp recorded(row, effects), do: Map.new(effects, fn {key, _} -> {key, Map.get(row, key)} end)
 
   # The claim's own `queued -> claimed`, made here when it did not land at the claim.
   defp ensure_claimed(tenant_id, story, %{from: :claimed}, identity) do
@@ -235,6 +269,18 @@ defmodule LoopctlWeb.StoryStageReportController do
       actor_role: :agent,
       actor_lineage: lineage
     ]
+  end
+
+  defp refusal(conn, status, code, %{message: message} = detail) do
+    conn
+    |> put_status(status)
+    |> json(%{
+      error:
+        Map.merge(
+          %{status: Status.code(status), code: code, message: message},
+          Map.delete(detail, :message)
+        )
+    })
   end
 
   defp refusal(conn, status, code, message) do

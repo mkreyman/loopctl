@@ -70,11 +70,17 @@ defmodule Loopctl.BulkOperations do
         # And ONE read for the dependencies, for the same reason (#890): per story, it would
         # lengthen how long every lock in the batch is held.
         blocked = Dependencies.unmet_story_ids(tenant_id, Map.keys(locked_stories))
+        # And ONE read of the projects' intake sources, for each claim's route (US-45.9).
+        sources =
+          InteractiveClaims.sources_by_project(
+            tenant_id,
+            locked_stories |> Map.values() |> Enum.map(& &1.project_id)
+          )
 
         process_claims(
           sorted_ids,
           locked_stories,
-          %{held: held, blocked: blocked},
+          %{held: held, blocked: blocked, sources: sources},
           agent_id,
           tenant_id,
           actor_id,
@@ -380,7 +386,7 @@ defmodule Loopctl.BulkOperations do
 
   defp process_claim(story, batch_reads, agent_id, tenant_id, actor_id, actor_label) do
     with :ok <- validate_claim_preconditions(story, batch_reads),
-         {:ok, updated} <- apply_claim(story, agent_id) do
+         {:ok, updated} <- apply_claim(story, agent_id, batch_reads.sources) do
       audit_claim(tenant_id, story, updated, actor_id, actor_label)
       emit_claim_event(tenant_id, story, updated, agent_id)
       %{story_id: story.id, status: "success"}
@@ -539,7 +545,7 @@ defmodule Loopctl.BulkOperations do
   # Private: Apply Operations
   # ===================================================================
 
-  defp apply_claim(story, agent_id) do
+  defp apply_claim(story, agent_id, sources) do
     now = DateTime.utc_now()
 
     # The same lease and epoch Progress.claim_story/3 writes (#803), so a bulk claim is
@@ -552,7 +558,7 @@ defmodule Loopctl.BulkOperations do
       )
     )
     |> AdminRepo.update()
-    |> follow_claim()
+    |> follow_claim(Map.fetch!(sources, story.project_id))
   end
 
   # #803: the stage row follows the claim's epoch inside bulk claim's transaction, like the
@@ -561,19 +567,24 @@ defmodule Loopctl.BulkOperations do
   # US-45.9: a bulk claim is an INTERACTIVE claim, so it records its route the same way. It
   # never moves the stage row itself; the claimant's first stage report does
   # (`Loopctl.Delivery.InteractiveClaims.enter_claimed/3`).
-  defp follow_claim({:ok, claimed} = result) do
+  #
+  # The route is an upsert on its own key (`InteractiveClaims`), so the only way it fails is a
+  # database fault, and that has already aborted the batch's transaction: it is MATCHED, so
+  # the fault raises and rolls the batch back, rather than reported as one story's error
+  # while its claim had already been written.
+  defp follow_claim({:ok, claimed} = result, source_result) do
     {:ok, stage} =
       Stages.follow_claim(claimed.tenant_id, claimed.id, claimed.claim_epoch,
         actor_label: "bulk:claim"
       )
 
-    case InteractiveClaims.record_route(claimed.tenant_id, claimed, stage) do
-      {:ok, _route} -> result
-      {:error, _refused} = error -> error
-    end
+    {:ok, _route} =
+      InteractiveClaims.record_route(claimed.tenant_id, claimed, stage, source_result)
+
+    result
   end
 
-  defp follow_claim(error), do: error
+  defp follow_claim(error, _source_result), do: error
 
   defp apply_verification(story) do
     now = DateTime.utc_now()

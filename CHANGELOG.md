@@ -207,8 +207,6 @@ All notable changes to loopctl are documented here.
   rescues it (`Loopctl.ObanConfig.lifeline_rescue_after_ms/0`). The terminal gate reads the
   tenant's LATEST run, where it used to block on any retained discarded or cancelled job.
 
-### Added
-
 - **Interactive change threads (epic 45, US-45.9, #917).** A session that claims a story
   itself (`claim_story`, no runner placement) on a thread-mode repository now gets a change
   thread, as a runner placement does:
@@ -218,8 +216,9 @@ All notable changes to loopctl are documented here.
     later claims.
   - A thread claim of a story queued by triage moves its stage row `queued -> claimed`.
   - The new `POST /api/v1/stories/:id/stage/transitions` (agent key, the claimant only) lets
-    it report the rest of its stages as a runner would, limited to the transitions a runner
-    may report.
+    it report the rest of its stages as a runner would, up to `ci`: never `merged` or after,
+    which loopctl's App makes and records. The claim response names the route (`route`) to
+    push checkpoints to.
   - A runner reviews it. Review placement no longer refuses a claim made without a dispatch
     (`implementer_dispatch_required` is gone); the reviewer is separated from it by agent
     identity.

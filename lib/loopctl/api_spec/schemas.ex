@@ -1683,6 +1683,20 @@ defmodule Loopctl.ApiSpec.Schemas do
               "tenant with no audit signing key, where capabilities are not enforced. " <>
               "A keyed tenant that ignores a returned capability will receive " <>
               "403 missing_capability on the next call."
+        },
+        route: %Schema{
+          type: :object,
+          nullable: true,
+          description:
+            "US-45.9, on `claim` only: the route a claim the session made ITSELF recorded, " <>
+              "bound at the claim. `mode` is `thread` or `pr`; `base_branch` is the branch the " <>
+              "work is judged and merged against; `branch` (thread only) is where its " <>
+              "checkpoints are pushed. Absent for a project with no single intake source.",
+          properties: %{
+            mode: %Schema{type: :string, enum: ["pr", "thread"]},
+            base_branch: %Schema{type: :string},
+            branch: %Schema{type: :string, nullable: true}
+          }
         }
       },
       example: %{

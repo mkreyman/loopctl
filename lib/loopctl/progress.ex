@@ -384,18 +384,31 @@ defmodule Loopctl.Progress do
          tenant_id,
          opts
        ) do
-    case InteractiveClaims.enter_claimed(tenant_id, story,
-           actor_label: Keyword.get(opts, :actor_label),
-           actor_role: Keyword.get(opts, :actor_role, :agent),
-           actor_lineage: Keyword.get(opts, :lineage, [])
-         ) do
-      {:ok, _row} ->
-        :ok
+    # The claiming key's lineage is required for this chained move and is NEVER defaulted:
+    # a caller that did not resolve one skips the move (logged), and the claimant's first
+    # stage report makes it with the lineage the controller resolves. Raising here would
+    # hand the caller an error for a claim that has already committed.
+    case Keyword.fetch(opts, :lineage) do
+      {:ok, lineage} ->
+        case InteractiveClaims.enter_claimed(tenant_id, story,
+               actor_label: Keyword.get(opts, :actor_label),
+               actor_role: Keyword.get(opts, :actor_role, :agent),
+               actor_lineage: lineage
+             ) do
+          {:ok, _row} ->
+            :ok
 
-      {:error, reason} ->
+          {:error, reason} ->
+            Logger.warning(
+              "interactive claim of #{story.id} did not enter claimed: #{inspect(reason)}; " <>
+                "the claimant's first stage report retries it"
+            )
+        end
+
+      :error ->
         Logger.warning(
-          "interactive claim of #{story.id} did not enter claimed: #{inspect(reason)}; " <>
-            "the claimant's first stage report retries it"
+          "interactive claim of #{story.id} carried no resolved lineage; the claimant's " <>
+            "first stage report enters claimed"
         )
     end
 
@@ -414,10 +427,11 @@ defmodule Loopctl.Progress do
       else: {:ok, :not_held}
   end
 
-  defp claim_result({:ok, %{story: updated, mint_cap: cap}}) do
+  defp claim_result({:ok, %{story: updated, mint_cap: cap} = changes}) do
     # #621: the token is returned on the struct's virtual :minted_capability
-    # field so the caller can present it to POST /start.
-    {:ok, %{updated | minted_capability: cap}}
+    # field so the caller can present it to POST /start. US-45.9: an interactive claim's
+    # route rides on the virtual :claim_route, so the caller need not read it again.
+    {:ok, %{updated | minted_capability: cap, claim_route: Map.get(changes, :route)}}
   end
 
   # Already logged with the underlying reason in mint_cap/4. The story is

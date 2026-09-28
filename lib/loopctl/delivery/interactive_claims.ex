@@ -40,12 +40,14 @@ defmodule Loopctl.Delivery.InteractiveClaims do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
-  alias Loopctl.Runners
   alias Loopctl.WorkBreakdown.Story
 
-  # The prefix an interactive thread branch is cut under when no live runner of the tenant
-  # declares one: the convention the thread-mode rulesets are written for.
-  @default_thread_prefix "loop/"
+  # THE thread branch namespace, fixed by the Epic 45 PRD: a thread's branch is
+  # `loop/<story-id>`, the `loop/**` rulesets and the CI triggers are written for it, and a
+  # runner's thread branch is cut the same way. Not a runner's declared prefix: that is a
+  # constraint on what one machine pushes, read live from whichever runners are connected, and
+  # an interactive claim is no runner's.
+  @thread_prefix "loop/"
 
   @doc """
   Records the route of `story`'s new claim, inside the claim's transaction. `stage_row` is
@@ -56,40 +58,72 @@ defmodule Loopctl.Delivery.InteractiveClaims do
   """
   @spec record_route(Ecto.UUID.t(), Story.t(), StoryStage.t() | nil) ::
           {:ok, ClaimRoute.t() | nil} | {:error, term()}
-  def record_route(tenant_id, %Story{} = story, stage_row) do
-    unless AdminRepo.in_transaction?(),
-      do: raise(ArgumentError, "record_route/3 runs inside the claiming transaction")
+  def record_route(tenant_id, %Story{} = story, stage_row),
+    do:
+      record_route(
+        tenant_id,
+        story,
+        stage_row,
+        Intake.source_for_project(tenant_id, story.project_id)
+      )
 
-    case Intake.source_for_project(tenant_id, story.project_id) do
+  @doc """
+  `record_route/3` with the project's source already resolved, for a caller that resolves
+  every project of a batch in one read under its locks (`sources_by_project/2`).
+  """
+  @spec record_route(
+          Ecto.UUID.t(),
+          Story.t(),
+          StoryStage.t() | nil,
+          {:ok, term()} | {:error, term()}
+        ) ::
+          {:ok, ClaimRoute.t() | nil} | {:error, term()}
+  def record_route(tenant_id, %Story{} = story, stage_row, source_result) do
+    unless AdminRepo.in_transaction?(),
+      do: raise(ArgumentError, "record_route/4 runs inside the claiming transaction")
+
+    case source_result do
       {:ok, source} -> insert(tenant_id, story, route_for(source, story, stage_row))
       {:error, _no_single_source} -> {:ok, nil}
     end
   end
 
+  @doc """
+  Each of `project_ids`' single live intake source, in ONE read, as
+  `Intake.source_for_project/2` would answer it for each.
+  """
+  @spec sources_by_project(Ecto.UUID.t(), [Ecto.UUID.t()]) :: %{Ecto.UUID.t() => term()}
+  def sources_by_project(tenant_id, project_ids) do
+    import Ecto.Query
+
+    ids = Enum.uniq(project_ids)
+
+    sources =
+      tenant_id
+      |> Intake.live_sources_query()
+      |> where([s], s.project_id in ^ids)
+      |> AdminRepo.all()
+
+    Map.new(ids, &{&1, Intake.select_project_source(sources, &1)})
+  end
+
   defp route_for(%{mode: :thread} = source, story, %StoryStage{stage: :queued}) do
-    case DispatchPayload.branch_for(story, thread_prefixes(story.tenant_id)) do
-      {:ok, branch} -> %{mode: "thread", base_branch: source.base_branch, branch: branch}
-      {:error, _no_branch} -> pr_route(source)
+    case DispatchPayload.branch_for(story, [@thread_prefix]) do
+      {:ok, branch} ->
+        %{mode: "thread", base_branch: source.base_branch, branch: branch}
+
+      {:error, reason} ->
+        # Not silent: the claim stands as a pr claim, and the log says why it is not a thread.
+        Logger.warning(
+          "interactive claim of #{story.id} records a pr route: no thread branch " <>
+            "(#{inspect(reason)})"
+        )
+
+        pr_route(source)
     end
   end
 
   defp route_for(source, _story, _stage_row), do: pr_route(source)
-
-  # The prefixes the tenant's LIVE runners declare, read at the claim and stored nowhere (the
-  # rule `Runners.declared_branch_prefixes/1` states): the repository's rulesets are written
-  # for the branches its runners push, so an interactive branch is cut the same way. Sorted by
-  # runner id so the same pool answers the same prefix. None declared: the convention.
-  defp thread_prefixes(tenant_id) do
-    declared =
-      tenant_id
-      |> Runners.pool()
-      |> Enum.sort_by(fn {runner_id, _presence} -> runner_id end)
-      |> Enum.flat_map(fn {_runner_id, %{metas: metas}} -> metas end)
-      |> Enum.flat_map(&Runners.declared_branch_prefixes/1)
-      |> Enum.uniq()
-
-    if declared == [], do: [@default_thread_prefix], else: declared
-  end
 
   defp pr_route(source), do: %{mode: "pr", base_branch: source.base_branch, branch: nil}
 
