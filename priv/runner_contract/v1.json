@@ -1839,25 +1839,41 @@
   "title": "loopctl runner contract",
   "x-connection": {
     "claim_ending_errors": {
-      "*": [
-        "stale_claim_epoch"
-      ],
       "checkpoint": [
+        "stale_claim_epoch",
         "not_claimant"
       ],
+      "dispatch_reply": [
+        "stale_claim_epoch"
+      ],
       "review_finding": [
+        "stale_claim_epoch",
         "review_closed",
         "review_claim_ended",
         "review_round_superseded",
         "reviewer_not_separate"
       ],
       "review_verdict": [
+        "stale_claim_epoch",
         "review_closed",
         "review_claim_ended",
         "review_round_superseded",
         "reviewer_not_separate"
+      ],
+      "stage": [
+        "stale_claim_epoch"
+      ],
+      "thread_entry": [
+        "stale_claim_epoch"
+      ],
+      "trace": [
+        "stale_claim_epoch"
+      ],
+      "triage_verdict": [
+        "stale_claim_epoch"
       ]
     },
+    "claim_ending_remedy": "The claim the refused message ran under is over: send that dispatch no more messages of its work (the events keyed here) and stop its session. An implement or review session still sends its one `session_ended` when its process exits, as always, and whatever that is answered is final: never resend it. Every OTHER permanent refusal refuses only the message that drew it, EXCEPT where `permanent_error_conditions` says the run is over (`stale_stage` naming a stage no runner can report out of, `dispatch_not_accepted` with no accept of yours in flight): those end the run too.",
     "credential_header": "x-loopctl-runner-token",
     "dispatchable_kinds": [
       "triage",

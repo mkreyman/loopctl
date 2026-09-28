@@ -8,9 +8,9 @@ All notable changes to loopctl are documented here.
 
 - **Runner contract 1.22.0: which refusals end the claim (loopctl#920).** The contract
   export's `x-connection.claim_ending_errors` names the permanent refusal codes that end the
-  claim a message ran under, per event, beside `permanent_errors`: on one, a runner sends that
-  dispatch no more work and ends its session with `session_ended`; every other permanent
-  refusal refuses only that message. Additive. RE-VENDOR the contract to derive the set
+  claim a message ran under, per work event, beside `permanent_errors`, and
+  `claim_ending_remedy` says what a runner does on one: send that dispatch no more of its work
+  and stop its session, whose one `session_ended` on exit is sent as always. Additive. RE-VENDOR the contract to derive the set
   rather than typing it; a runner's own list should drop `claim_not_live`,
   `dispatch_not_accepted` and `unknown_dispatch`, which are also answered while the claim is
   live.

@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "8c86fde81c3964d9e76b893f5f449667f6523b29818c6579e4fcd3a4673932c1"
+  @digest "10fae06810884c10bccbb32650f70993ebabe867dc92456074188f155f100a9f"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -2954,29 +2954,21 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   describe "claim_ending_errors (1.22.0, loopctl#920)" do
     test "every claim-ending code is published and permanent for the event it ends" do
       reasons = RunnerContract.error_reasons()
+      ending = RunnerContract.claim_ending_errors()
 
-      pairs =
-        for {event, codes} <- reasons,
-            code <- codes,
-            RunnerContract.claim_ending_error?(event, code),
-            do: {event, code}
+      assert ending != %{}
 
-      assert pairs != []
+      for {event, codes} <- ending, code <- codes do
+        assert code in Map.fetch!(reasons, event), "#{event} does not publish #{code}"
 
-      for {event, code} <- pairs do
         assert RunnerContract.permanent_error?(event, code),
                "#{code} ends the #{event} claim but is not permanent for it"
-      end
-
-      for {event, codes} <- RunnerContract.claim_ending_errors(),
-          event != "*",
-          code <- codes do
-        assert code in Map.fetch!(reasons, event), "#{event} does not publish #{code}"
       end
     end
 
     test "the claim ends on a moved epoch, another claimant, or a closed review" do
-      for event <- ~w(stage checkpoint thread_entry review_finding session_ended) do
+      for event <- ~w(dispatch_reply trace stage triage_verdict checkpoint thread_entry
+                      review_finding review_verdict) do
         assert RunnerContract.claim_ending_error?(event, "stale_claim_epoch")
       end
 
@@ -2986,6 +2978,12 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                      reviewer_not_separate),
           event <- ~w(review_finding review_verdict) do
         assert RunnerContract.claim_ending_error?(event, code)
+      end
+    end
+
+    test "session_ended is not work: no refusal of it asks for another message" do
+      for code <- Map.fetch!(RunnerContract.error_reasons(), "session_ended") do
+        refute RunnerContract.claim_ending_error?("session_ended", code)
       end
     end
 
@@ -3000,9 +2998,11 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       refute RunnerContract.claim_ending_error?("review_finding", "tenant_halted")
     end
 
-    test "the export publishes it beside permanent_errors" do
-      assert RunnerContract.json_schema()["x-connection"]["claim_ending_errors"] ==
-               RunnerContract.claim_ending_errors()
+    test "the export publishes the map and the remedy beside permanent_errors" do
+      connection = RunnerContract.json_schema()["x-connection"]
+      assert connection["claim_ending_errors"] == RunnerContract.claim_ending_errors()
+      assert connection["claim_ending_remedy"] == RunnerContract.claim_ending_remedy()
+      assert connection["claim_ending_remedy"] =~ "session_ended"
     end
   end
 end
