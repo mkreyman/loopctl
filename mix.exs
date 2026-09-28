@@ -234,22 +234,62 @@ defmodule Loopctl.MixProject do
     ]
   end
 
-  @migrate_out_of_vm "cmd env MIX_ENV=test mix ecto.migrate --quiet"
+  @doc false
+  # The `test` aliases' migrate step. `Ecto.Migrator` `Code.compile_file`s every pending
+  # migration into the VM it runs in, and the migration tests that later
+  # `Code.require_file` the same files redefine those modules: "redefining module" fails
+  # `--warnings-as-errors` after a green suite, on any fresh test database. So a pending
+  # migration is run in a VM of its own. Which are pending is read from file names, which
+  # compiles nothing, and on an already-migrated database no second VM starts. The child is
+  # this install's own `elixir` and `mix`, with this install's ERTS first on its PATH, so it
+  # runs the toolchain the parent runs even where a shell would not find one.
+  # Bound to `Loopctl.TestAliasMigrateTest`.
+  def migrate_out_of_vm(_args) do
+    Mix.Task.run("app.config")
+
+    if Enum.any?(Application.get_env(:loopctl, :ecto_repos, []), &pending_migrations?/1) do
+      elixir_bin = :elixir |> :code.lib_dir() |> Path.join("../../bin") |> Path.expand()
+
+      {_, status} =
+        System.cmd(
+          Path.join(elixir_bin, "elixir"),
+          [Path.join(elixir_bin, "mix"), "ecto.migrate", "--quiet"],
+          env: [
+            {"MIX_ENV", to_string(Mix.env())},
+            # The elixir script execs `erl` by PATH, so this ERTS goes first on it.
+            {"PATH",
+             Enum.join(
+               [Path.join(:code.root_dir(), "bin"), elixir_bin, System.get_env("PATH", "")],
+               ":"
+             )}
+          ],
+          into: IO.stream(),
+          stderr_to_stdout: true
+        )
+
+      if status != 0, do: Mix.raise("ecto.migrate in its own VM exited with status #{status}")
+    end
+  end
+
+  defp pending_migrations?(repo) do
+    {:ok, pending?, _} =
+      Ecto.Migrator.with_repo(repo, fn repo ->
+        Enum.any?(Ecto.Migrator.migrations(repo), &match?({:down, _, _}, &1))
+      end)
+
+    pending?
+  end
 
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.create", "ecto.migrate"],
-      # Migrate in its OWN VM (`cmd`). In this one, `Ecto.Migrator` `Code.compile_file`s every
-      # pending migration, and the migration tests that later `Code.require_file` the same
-      # file redefine its modules: "redefining module" fails `--warnings-as-errors` after a
-      # green suite, on any fresh test database. Costs one VM boot (~0.8s, measured
-      # 2026-09-28 with nothing pending). Bound to `Loopctl.TestAliasMigrateTest`.
-      test: ["ecto.create --quiet", @migrate_out_of_vm, "test"],
+      # Pending migrations run in a VM of their own: see migrate_out_of_vm/1.
+      test: ["ecto.create --quiet", &__MODULE__.migrate_out_of_vm/1, "test"],
       # Run ONLY the cross-context journey tests (test/e2e/*, tagged :e2e). `--only`
       # overrides the default :e2e exclude in test_helper.exs.
-      "test.e2e": ["ecto.create --quiet", @migrate_out_of_vm, "test --only e2e"],
+      "test.e2e": ["ecto.create --quiet", &__MODULE__.migrate_out_of_vm/1, "test --only e2e"],
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.deploy": ["tailwind loopctl --minify", "esbuild loopctl --minify", "phx.digest"],
       precommit: [
