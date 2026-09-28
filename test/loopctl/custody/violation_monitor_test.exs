@@ -187,10 +187,13 @@ defmodule Loopctl.Custody.ViolationMonitorTest do
     end
 
     test "a valid positive integer passes through untouched and logs nothing" do
-      assert capture_log(fn ->
+      # Refutes the monitor's OWN warning rather than an empty capture: `capture_log/1` also
+      # catches what a concurrent async test logs in the same window (a webhook worker's
+      # refusal reddened this on CI), which says nothing about this function.
+      refute capture_log(fn ->
                assert ViolationMonitor.validate_positive_integer(5, 3, :custody_halt_threshold) ==
                         5
-             end) == ""
+             end) =~ "custody_halt_config_invalid"
     end
 
     test "an invalid value warns ONCE per process, not once per read" do
