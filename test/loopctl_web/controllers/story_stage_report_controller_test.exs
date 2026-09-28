@@ -17,11 +17,14 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
   alias Loopctl.BulkOperations
   alias Loopctl.Delivery.ClaimRoute
   alias Loopctl.Delivery.DispatchPayload
+  alias Loopctl.Delivery.InteractiveClaims
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Source
   alias Loopctl.Progress
   alias Loopctl.Repo
+  alias Loopctl.Runners
+  alias Loopctl.Runners.Presence
   alias Loopctl.WorkBreakdown.Stories
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.ThreadMergeSweepWorker
@@ -298,6 +301,102 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
                |> json_response(409)
 
       assert %StoryStage{stage: :claimed} = sandboxed_row(ctx)
+    end
+
+    test "the claimant may not report the merge: loopctl records it", %{conn: conn} do
+      ctx = setup_story()
+      story = claim(ctx)
+
+      unboxed(fn ->
+        from(r in StoryStage, where: r.story_id == ^story.id)
+        |> AdminRepo.update_all(set: [stage: :ci, head_sha: @sha])
+      end)
+
+      body = step(story, "ci", "merged", %{"effects" => %{"merge_sha" => @sha}})
+
+      assert %{"error" => %{"code" => "invalid_payload"}} =
+               conn |> report(ctx.raw, story, body) |> json_response(422)
+
+      assert %StoryStage{stage: :ci} = sandboxed_row(ctx)
+    end
+
+    test "a claim that requested review is no longer live, as for its checkpoints", %{conn: conn} do
+      ctx = setup_story()
+      story = claim(ctx)
+
+      unboxed(fn ->
+        from(s in Story, where: s.id == ^story.id)
+        |> AdminRepo.update_all(set: [review_requested_at: DateTime.utc_now()])
+      end)
+
+      assert %{"error" => %{"code" => "claim_not_live"}} =
+               conn
+               |> report(ctx.raw, story, step(story, "claimed", "worktree"))
+               |> json_response(409)
+    end
+
+    test "another tenant's agent cannot see the story at all", %{conn: conn} do
+      ctx = setup_story()
+      story = claim(ctx)
+      stranger = setup_story()
+
+      assert conn
+             |> report(stranger.raw, story, step(story, "claimed", "worktree"))
+             |> json_response(404)
+    end
+  end
+
+  describe "the route under the claim" do
+    test "a leftover row at the claim's epoch is overwritten, never refused" do
+      ctx = setup_story()
+      next_epoch = ctx.story.claim_epoch + 1
+
+      unboxed(fn ->
+        AdminRepo.insert!(%ClaimRoute{
+          tenant_id: ctx.tenant.id,
+          story_id: ctx.story.id,
+          claim_epoch: next_epoch,
+          mode: "pr",
+          base_branch: "stale"
+        })
+      end)
+
+      story = claim(ctx)
+      assert story.claim_epoch == next_epoch
+      assert %ClaimRoute{mode: "thread", base_branch: "master"} = route(ctx, story)
+    end
+
+    test "the thread branch takes the prefix the tenant's live runners declare" do
+      ctx = setup_story()
+      topic = Runners.pool_topic(ctx.tenant.id)
+      runner_id = Ecto.UUID.generate()
+
+      {:ok, _} =
+        Presence.track(self(), topic, runner_id, %{branch_prefixes: ["bot/"]})
+
+      story = claim(ctx)
+      assert %ClaimRoute{branch: "bot/" <> _} = route(ctx, story)
+    end
+
+    test "the claim response names the route to push to", %{conn: conn} do
+      ctx = setup_story()
+
+      assert %{"route" => %{"mode" => "thread", "branch" => "loop/" <> _}} =
+               conn
+               |> auth(ctx.raw)
+               |> post(~p"/api/v1/stories/#{ctx.story.id}/claim", %{})
+               |> json_response(200)
+    end
+
+    test "the claimed move demands a resolved lineage rather than defaulting one" do
+      ctx = setup_story()
+
+      assert_raise KeyError, fn ->
+        InteractiveClaims.enter_claimed(ctx.tenant.id, ctx.story,
+          actor_label: "test",
+          actor_role: :agent
+        )
+      end
     end
   end
 end

@@ -20,6 +20,7 @@ defmodule LoopctlWeb.StoryStatusController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Capabilities
+  alias Loopctl.Delivery.InteractiveClaims
   alias Loopctl.Dispatches
   alias Loopctl.LogValue
   alias Loopctl.Progress
@@ -423,7 +424,7 @@ defmodule LoopctlWeb.StoryStatusController do
     case Progress.claim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         role = conn.assigns.current_api_key.role
-        respond_with_story(conn, story, role)
+        respond_with_story(conn, story, role, claim_route(tenant_id, story))
 
       {:error, :must_contract_first} ->
         {:error, :must_contract_first}
@@ -781,8 +782,18 @@ defmodule LoopctlWeb.StoryStatusController do
   # the caller needs for its NEXT custody op — under a top-level `capability` key
   # rather than inside the story object, since it is a credential for the caller
   # and not story state. Absent (rather than null) when nothing was minted.
-  defp respond_with_story(conn, story, role) do
-    body = %{story: story, next_actions: StateMachine.next_actions(story, role)}
+  # US-45.9: the route an interactive claim recorded, so the session knows which branch its
+  # checkpoints go on and which base it was bound to. A placed claim's route is its runner's.
+  defp claim_route(tenant_id, story) do
+    case InteractiveClaims.current_route(tenant_id, story) do
+      nil -> %{}
+      route -> %{route: Map.take(route, [:mode, :base_branch, :branch])}
+    end
+  end
+
+  defp respond_with_story(conn, story, role, extra \\ %{}) do
+    body =
+      Map.merge(%{story: story, next_actions: StateMachine.next_actions(story, role)}, extra)
 
     body =
       case story.minted_capability do

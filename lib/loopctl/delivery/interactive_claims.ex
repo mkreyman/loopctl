@@ -40,11 +40,12 @@ defmodule Loopctl.Delivery.InteractiveClaims do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
+  alias Loopctl.Runners
   alias Loopctl.WorkBreakdown.Story
 
-  # The prefix an interactive thread branch is cut under: the one the thread-mode runners
-  # declare, so a session's branch and a runner's look alike to the forge and to the rulesets.
-  @thread_prefix "loop/"
+  # The prefix an interactive thread branch is cut under when no live runner of the tenant
+  # declares one: the convention the thread-mode rulesets are written for.
+  @default_thread_prefix "loop/"
 
   @doc """
   Records the route of `story`'s new claim, inside the claim's transaction. `stage_row` is
@@ -66,7 +67,7 @@ defmodule Loopctl.Delivery.InteractiveClaims do
   end
 
   defp route_for(%{mode: :thread} = source, story, %StoryStage{stage: :queued}) do
-    case DispatchPayload.branch_for(story, [@thread_prefix]) do
+    case DispatchPayload.branch_for(story, thread_prefixes(story.tenant_id)) do
       {:ok, branch} -> %{mode: "thread", base_branch: source.base_branch, branch: branch}
       {:error, _no_branch} -> pr_route(source)
     end
@@ -74,9 +75,28 @@ defmodule Loopctl.Delivery.InteractiveClaims do
 
   defp route_for(source, _story, _stage_row), do: pr_route(source)
 
+  # The prefixes the tenant's LIVE runners declare, read at the claim and stored nowhere (the
+  # rule `Runners.declared_branch_prefixes/1` states): the repository's rulesets are written
+  # for the branches its runners push, so an interactive branch is cut the same way. Sorted by
+  # runner id so the same pool answers the same prefix. None declared: the convention.
+  defp thread_prefixes(tenant_id) do
+    declared =
+      tenant_id
+      |> Runners.pool()
+      |> Enum.sort_by(fn {runner_id, _presence} -> runner_id end)
+      |> Enum.flat_map(fn {_runner_id, %{metas: metas}} -> metas end)
+      |> Enum.flat_map(&Runners.declared_branch_prefixes/1)
+      |> Enum.uniq()
+
+    if declared == [], do: [@default_thread_prefix], else: declared
+  end
+
   defp pr_route(source), do: %{mode: "pr", base_branch: source.base_branch, branch: nil}
 
   defp insert(tenant_id, story, route) do
+    # AN UPSERT on the claim's own key: the claim being made now defines its route. A row at
+    # this epoch can only be a leftover (a restore that replayed epochs), and refusing the claim
+    # over it would abort the claim's whole transaction, a bulk claim's batch included.
     %ClaimRoute{
       tenant_id: tenant_id,
       story_id: story.id,
@@ -85,7 +105,11 @@ defmodule Loopctl.Delivery.InteractiveClaims do
       base_branch: route.base_branch,
       branch: route.branch
     }
-    |> AdminRepo.insert()
+    |> AdminRepo.insert(
+      on_conflict: {:replace, [:mode, :base_branch, :branch]},
+      conflict_target: [:tenant_id, :story_id, :claim_epoch],
+      returning: true
+    )
   end
 
   @doc """
@@ -106,8 +130,11 @@ defmodule Loopctl.Delivery.InteractiveClaims do
         Stages.advance(tenant_id, story.id, {:queued, :claimed},
           claim_epoch: story.claim_epoch,
           actor_label: Keyword.get(opts, :actor_label),
-          actor_role: Keyword.get(opts, :actor_role, :agent),
-          actor_lineage: Keyword.get(opts, :actor_lineage, [])
+          actor_role: Keyword.fetch!(opts, :actor_role),
+          # FETCHED, never defaulted: `Stages.advance/4` refuses a chained transition whose
+          # caller did not state a lineage, and a default here would turn a caller that forgot
+          # to resolve one into an attested empty lineage on the chain.
+          actor_lineage: Keyword.fetch!(opts, :actor_lineage)
         )
     end
   end

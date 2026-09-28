@@ -4439,7 +4439,8 @@ const TOOLS = [
       "change thread (US-45.9): push checkpoints to the loop/ branch and record them with " +
       "thread_checkpoint, move the story's stage with thread_stage_report, get a runner " +
       "review with thread_request_review, and loopctl's App merges the checkpoint the gate " +
-      "allows. The mode, base branch and branch are bound when you claim. On a loopctl with claim leases " +
+      "allows. The mode, base branch and branch are bound when you claim, and the result's " +
+      "`route` names them: push your checkpoints to `route.branch`. On a loopctl with claim leases " +
       "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
       "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
       "is released back to pending under you. Refused 409 story_held when the story's " +

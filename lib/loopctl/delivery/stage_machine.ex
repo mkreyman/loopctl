@@ -640,6 +640,23 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec runner_reportable?(stage(), stage(), edge()) :: boolean()
   def runner_reportable?(from, to, edge), do: {from, to, edge} in @runner_transitions
 
+  # The claimant of an INTERACTIVE thread claim (US-45.9) reports what a runner reports up to
+  # `ci` and nothing past it. In thread mode loopctl's App makes the merge
+  # (`Loopctl.Delivery.MergeExecutor`) and records `ci -> merged` itself; a runner reporting
+  # `merged` describes a pull request IT merged, which a thread never has. Letting the
+  # implementing session report `merged`, `deployed` or `merge_refused` would let it record a
+  # merge the gate never allowed and no executor made.
+  @claimant_transitions for {from, to, _edge} = t <- @runner_transitions,
+                            from != :merged and to not in [:merged, :deployed],
+                            do: t
+
+  @doc """
+  Whether the claimant of an interactive thread claim may report `{from, to, edge}`: a
+  runner-reportable transition that neither enters `merged` or `deployed` nor leaves `merged`.
+  """
+  @spec claimant_reportable?(atom(), atom(), atom()) :: boolean()
+  def claimant_reportable?(from, to, edge), do: {from, to, edge} in @claimant_transitions
+
   @doc "Every stage that appears as the SOURCE of a runner-reportable transition."
   @spec runner_from_stages() :: [stage()]
   def runner_from_stages, do: @runner_from_stages

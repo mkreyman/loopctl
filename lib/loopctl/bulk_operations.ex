@@ -567,9 +567,10 @@ defmodule Loopctl.BulkOperations do
         actor_label: "bulk:claim"
       )
 
-    {:ok, _route} = InteractiveClaims.record_route(claimed.tenant_id, claimed, stage)
-
-    result
+    case InteractiveClaims.record_route(claimed.tenant_id, claimed, stage) do
+      {:ok, _route} -> result
+      {:error, _refused} = error -> error
+    end
   end
 
   defp follow_claim(error), do: error

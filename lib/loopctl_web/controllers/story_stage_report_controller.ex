@@ -23,8 +23,10 @@ defmodule LoopctlWeb.StoryStageReportController do
 
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.Delivery.Claimant
   alias Loopctl.Delivery.ClaimRoute
   alias Loopctl.Delivery.InteractiveClaims
+  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Dispatches
@@ -46,15 +48,18 @@ defmodule LoopctlWeb.StoryStageReportController do
     description:
       "US-45.9. The claimant of an INTERACTIVE claim of a thread-mode story (claimed with " <>
         "`claim_story`, not placed on a runner) reports its story's stage transitions here, " <>
-        "as a runner reports a placed claim's: the same transitions " <>
-        "(`StageMachine.runner_transitions/0`), the same reportable effects (a checkpoint's " <>
-        "`head_sha` entering `ci`), the same reason rules. The body is the runner " <>
-        "`stage` message without `dispatch_id`. Refused 403 `not_claimant` for any caller " <>
-        "but the claimant, 409 `stale_claim_epoch` for another claim's epoch, 409 " <>
-        "`claim_not_live` for an expired lease (renew it with `renew_story_claim`), 409 " <>
+        "as a runner reports a placed claim's, up to `ci`: the runner's transitions short of " <>
+        "the merge (`StageMachine.claimant_reportable?/3`: loopctl records `merged` itself), " <>
+        "the same reportable effects (a checkpoint's `head_sha` entering `ci`), the same " <>
+        "reason rules. The body is the runner `stage` message without `dispatch_id`. " <>
+        "Refused 404 for a story not in your tenant, 409 `not_claimant` for any caller but " <>
+        "the claimant, 409 `stale_claim_epoch` for another claim's epoch, 409 " <>
+        "`claim_not_live` for a claim that is no longer live (its lease lapsed: renew it with " <>
+        "`renew_story_claim`; or it requested review), 409 " <>
         "`not_interactive_thread_claim` for a placed claim or a `pr` route, 409 `stale_stage` " <>
-        "when the row is not at `from`, 422 `invalid_payload` for a transition or effect a " <>
-        "runner could not report. Agent-role key only.",
+        "when the row is not at `from`, 409 `effect_conflict`, 422 `invalid_payload` for a " <>
+        "transition or effect the claimant may not report, 503 `busy` under lock contention " <>
+        "(retry). Agent-role key only.",
     parameters: [
       id: [in: :path, type: :string, description: "Story UUID", required: true]
     ],
@@ -74,9 +79,10 @@ defmodule LoopctlWeb.StoryStageReportController do
        }},
     responses: %{
       200 => {"The story's stage row", "application/json", %Schema{type: :object}},
-      403 => {"Not the claimant", "application/json", %Schema{type: :object}},
+      404 => {"No such story in your tenant", "application/json", %Schema{type: :object}},
       409 => {"Refused", "application/json", %Schema{type: :object}},
-      422 => {"Invalid payload", "application/json", %Schema{type: :object}}
+      422 => {"Invalid payload", "application/json", %Schema{type: :object}},
+      503 => {"Busy: retry", "application/json", %Schema{type: :object}}
     }
   )
 
@@ -105,7 +111,8 @@ defmodule LoopctlWeb.StoryStageReportController do
          :ok <- claimant(story, api_key),
          {:ok, route} <- interactive_thread_route(tenant_id, story),
          {:ok, stage} <- cast(params, route),
-         :ok <- live_lease(story),
+         :ok <- claimant_reportable(stage),
+         :ok <- live_claim(story),
          {:ok, row} <- report(tenant_id, story, stage, api_key, conn) do
       json(conn, %{stage: StoryEscalationController.render_stage(row)})
     else
@@ -172,13 +179,22 @@ defmodule LoopctlWeb.StoryStageReportController do
   # The epoch is not pre-checked here: `Stages.advance/4` reads the story's epoch under its own
   # lock and refuses another claim's `:stale_claim_epoch`, and that read is the fence.
 
-  defp live_lease(%Story{claimed_until: %DateTime{} = until}) do
-    if DateTime.compare(until, DateTime.utc_now()) == :gt,
+  # A runner may also report the merge and what follows it; the implementing claimant may not
+  # (`StageMachine.claimant_reportable?/3`).
+  defp claimant_reportable(%{from: from, to: to, edge: edge}) do
+    if StageMachine.claimant_reportable?(from, to, edge),
       do: :ok,
-      else: {:error, :claim_not_live}
+      else:
+        {:error,
+         {:unprocessable_entity, "invalid_payload",
+          "the claimant of a thread reports up to ci: loopctl records the merge itself"}}
   end
 
-  defp live_lease(_story), do: {:error, :claim_not_live}
+  # The one definition of a live claim the thread's own writes use (a checkpoint, a fix), so
+  # the two paths never disagree about the same claim.
+  defp live_claim(story) do
+    if Claimant.live?(story, DateTime.utc_now()), do: :ok, else: {:error, :claim_not_live}
+  end
 
   defp report(tenant_id, story, stage, api_key, conn) do
     identity = identity(api_key, conn)
@@ -212,11 +228,7 @@ defmodule LoopctlWeb.StoryStageReportController do
   defp ensure_claimed(_tenant_id, _story, _stage, _identity), do: :ok
 
   defp identity(api_key, conn) do
-    lineage =
-      case Dispatches.dispatch_for_api_key(api_key.tenant_id, api_key.id) do
-        {:ok, dispatch} -> dispatch.lineage_path
-        :none -> []
-      end
+    lineage = Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
 
     [
       actor_label: Keyword.get(AuditContext.from_conn(conn), :actor_label),
