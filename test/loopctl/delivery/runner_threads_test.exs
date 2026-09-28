@@ -240,11 +240,11 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
       assert {:error, :not_claimant} = checkpoint(ctx)
     end
 
-    test "a claim whose lease ran out is claim_lease_lapsed: renewable until the reclaim sweep" do
+    test "a claim whose lease ran out is claim_not_live" do
       ctx = session()
       set_story(ctx.story, claimed_until: DateTime.add(DateTime.utc_now(), -60))
 
-      assert {:error, :claim_lease_lapsed} = checkpoint(ctx)
+      assert {:error, :claim_not_live} = checkpoint(ctx)
     end
 
     test "after the claim moved on, a new commit is refused and the recorder's resend is not" do

@@ -52,7 +52,12 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
           keyword()
         ) ::
           {:ok, row()}
-          | {:error, :busy | :unknown_dispatch | :wrong_dispatch_kind | :claim_epoch_mismatch}
+          | {:error,
+             :busy
+             | :unknown_dispatch
+             | :wrong_dispatch_kind
+             | :stale_claim_epoch
+             | :claim_epoch_mismatch}
   def read(tenant_id, runner_id, message, what, opts \\ []) do
     read = fn ->
       {:ok, row} =

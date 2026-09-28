@@ -258,7 +258,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   @doc """
   `end_session/4` for a row `held_dispatch/3` already read. Only an IMPLEMENT session ends a
   story's session here: `DispatchLedger.record_session_end/4` refuses any other kind
-  `:unknown_dispatch` under the row lock.
+  `:wrong_dispatch_kind` under the row lock.
   """
   @spec end_held_session(
           Ecto.UUID.t(),

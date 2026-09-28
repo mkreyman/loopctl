@@ -271,12 +271,6 @@ defmodule LoopctlWeb.FallbackController do
   # US-45.1: the epoch is current but the claim no longer accepts the implementer's work: its
   # lease lapsed, review was requested, or the story left a claimed status. Renewing fixes
   # none of the last two, so the message does not tell the caller to renew.
-  #
-  # `Loopctl.Threads` names the first two apart since runner contract 1.22.0 (loopctl#920),
-  # for the runner channel. The HTTP answer stays the one code it has always been.
-  def call(conn, {:error, reason}) when reason in [:review_requested, :claim_lease_lapsed],
-    do: call(conn, {:error, :claim_not_live})
-
   def call(conn, {:error, :claim_not_live}) do
     conn
     |> put_status(:conflict)

@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "6ce20a39409478dc749d0eb7ea992ab8bffc81a91ccbeba4e9b073c8a052f551"
+  @digest "bac83f7c1e00ce0611fc61dbaa992fd0856823515a51f343fac6582ac6b770a9"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -2961,7 +2961,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "trace" => live_or_gone,
                "stage" => live_or_gone,
                "triage_verdict" => ~w(unknown_dispatch),
-               "checkpoint" => live_or_gone ++ ~w(not_claimant claim_not_live),
+               "checkpoint" => live_or_gone ++ ~w(not_claimant),
                "thread_entry" => live_or_gone,
                "review_finding" => live_or_gone ++ review,
                "review_verdict" => live_or_gone ++ review
@@ -2979,7 +2979,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       end
     end
 
-    test "a split code ends no claim; the message faults are permanent, the live claims not" do
+    test "a split code ends no claim, and is permanent for its one message" do
       reasons = RunnerContract.error_reasons()
       ending = RunnerContract.claim_ending_errors() |> Map.values() |> List.flatten()
 
@@ -2993,10 +2993,13 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
         assert RunnerContract.permanent_error?(event, code)
       end
 
-      for code <- ~w(review_requested claim_lease_lapsed) do
-        assert code in reasons["checkpoint"]
-        refute RunnerContract.permanent_error?("checkpoint", code)
-      end
+      assert RunnerContract.split_codes() == %{
+               "claim_epoch_mismatch" => "stale_claim_epoch",
+               "wrong_dispatch_kind" => "unknown_dispatch"
+             }
+
+      # Answered once review is requested, while the session still reports its stages.
+      refute "claim_not_live" in RunnerContract.claim_ending_errors()["checkpoint"]
     end
 
     test "a runner older than 1.22.0, or of no readable version, is sent the code it replaced" do

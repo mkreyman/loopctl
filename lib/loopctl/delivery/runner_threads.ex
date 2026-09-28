@@ -91,8 +91,6 @@ defmodule Loopctl.Delivery.RunnerThreads do
           | :claim_epoch_mismatch
           | :not_claimant
           | :claim_not_live
-          | :review_requested
-          | :claim_lease_lapsed
           | :checkpoint_conflict
           | :idempotency_key_reused
           | :secret_blocked

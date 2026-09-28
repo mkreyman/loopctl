@@ -766,10 +766,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   ## A FIRST report is fenced like every other runner message
 
   In order: an `implement` dispatch (a triage session ends through `triage_verdict`, and a
-  triage dispatch holds no claim a `crashed` could release — so, as a dispatch this message can
-  be about, it does not exist: `:unknown_dispatch`); the message's epoch is the dispatch's and
-  the story's, read under a share lock in this transaction (`:stale_claim_epoch`, and a row
-  whose story moved on is marked `superseded` exactly as a reply or trace would mark it); and
+  triage dispatch holds no claim a `crashed` could release: `:wrong_dispatch_kind`); the
+  message's epoch is the dispatch's (`:claim_epoch_mismatch` on a claim that stands,
+  `:stale_claim_epoch` on one the story moved past, nothing written either way); the
+  dispatch's epoch is the story's, read under a share lock in this transaction
+  (`:stale_claim_epoch`, and a row whose story moved on is marked `superseded` exactly as a
+  reply or trace would mark it); and
   the dispatch was ACCEPTED (`:dispatch_not_accepted` — no session ran, so none ended).
 
   A value Postgres refuses is `:rejected_by_database` and a lock that could not be had is
@@ -955,11 +957,13 @@ defmodule Loopctl.Runners.DispatchLedger do
   claim stands and only that message is wrong: `:claim_epoch_mismatch`.
 
   For the pre-checks that compare a message against its dispatch before any transaction
-  (`Loopctl.Delivery.RunnerStages`, `Loopctl.Delivery.RunnerThreadSession`,
-  `Loopctl.Delivery.TriageVerdict`). Called only on a mismatch, so the read costs nothing on
-  the ordinary path. It reads through `current_claim_epoch/2`, the reader the write fences use,
-  so the pre-check and the fence cannot disagree about whether a claim moved; the answer only
-  picks a refusal code, and a claim that moves after the read is refused by the fence next time.
+  (`Loopctl.Delivery.RunnerStages`, `Loopctl.Delivery.RunnerThreadSession`; not
+  `Loopctl.Delivery.TriageVerdict`, whose mismatch is always the message's). Called only on a mismatch, so the read costs nothing on
+  the ordinary path. It reads through `current_claim_epoch/3`, the reader the write fences use,
+  but WITHOUT their lock: the answer only picks a refusal code, so it must not wait behind a
+  claim holding the story, and a claim that moves after the read is refused by the fence next
+  time. `in_tenant/2` returns what the function did, and this one never rolls back; contention
+  raises and is `:busy` through `Stages.answering_busy/4`.
   """
   @spec epoch_refusal(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
           {:error, :stale_claim_epoch | :claim_epoch_mismatch | :busy}
@@ -967,15 +971,15 @@ defmodule Loopctl.Runners.DispatchLedger do
     # A read in the channel's own process: contention answers `:busy` (sent as
     # `rate_limited`) rather than raising and taking the socket down with it.
     Stages.answering_busy(tenant_id, [:loopctl, :runners, :busy], "epoch refusal read", fn ->
-      tenant_id
-      |> in_tenant(fn -> current_claim_epoch(tenant_id, story_id) end)
-      |> epoch_refusal_for(dispatch_epoch)
+      {:ok, current} =
+        in_tenant(tenant_id, fn -> current_claim_epoch(tenant_id, story_id, :none) end)
+
+      epoch_refusal_for(current, dispatch_epoch)
     end)
   end
 
-  defp epoch_refusal_for({:ok, epoch}, epoch), do: {:error, :claim_epoch_mismatch}
-  defp epoch_refusal_for({:ok, _moved_or_gone}, _epoch), do: {:error, :stale_claim_epoch}
-  defp epoch_refusal_for({:error, _reason}, _epoch), do: {:error, :busy}
+  defp epoch_refusal_for(epoch, epoch), do: {:error, :claim_epoch_mismatch}
+  defp epoch_refusal_for(_moved_or_gone, _epoch), do: {:error, :stale_claim_epoch}
 
   @doc """
   Whether a row of `kind` answers for `wanted`, the kind a session accessor asks for:
@@ -1083,6 +1087,7 @@ defmodule Loopctl.Runners.DispatchLedger do
           | {:error,
              :unknown_dispatch
              | :stale_claim_epoch
+             | :claim_epoch_mismatch
              | :already_replied
              | :rejected_by_database
              | :capacity_busy}
@@ -1237,6 +1242,7 @@ defmodule Loopctl.Runners.DispatchLedger do
           | {:error,
              :unknown_dispatch
              | :stale_claim_epoch
+             | :claim_epoch_mismatch
              | :dispatch_not_accepted
              | :run_mismatch
              | :rejected_by_database
@@ -1567,8 +1573,8 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
-  defp current_claim_epoch(tenant_id, story_id) do
-    case locked_story(tenant_id, story_id, :share) do
+  defp current_claim_epoch(tenant_id, story_id, lock \\ :share) do
+    case locked_story(tenant_id, story_id, lock) do
       %{claim_epoch: epoch} -> epoch
       nil -> nil
     end
@@ -1578,6 +1584,17 @@ defmodule Loopctl.Runners.DispatchLedger do
     from(s in Story,
       where: s.id == ^story_id and s.tenant_id == ^tenant_id,
       lock: "FOR SHARE",
+      select: %{claim_epoch: s.claim_epoch}
+    )
+    |> Repo.one()
+  end
+
+  # No lock: for a read that only picks a refusal code (`epoch_refusal/3`), which must not
+  # wait behind a claim or release holding the story `FOR UPDATE` and turn a permanent
+  # refusal into `rate_limited`.
+  defp locked_story(tenant_id, story_id, :none) do
+    from(s in Story,
+      where: s.id == ^story_id and s.tenant_id == ^tenant_id,
       select: %{claim_epoch: s.claim_epoch}
     )
     |> Repo.one()

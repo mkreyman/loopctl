@@ -174,20 +174,11 @@ defmodule Loopctl.ThreadsTest do
       ctx = claimed_story()
       future = DateTime.add(DateTime.utc_now(), 600)
 
-      # Each reason named apart (contract 1.22.0): the first two leave the claim standing.
       set_story(ctx, claimed_until: DateTime.add(DateTime.utc_now(), -60))
-      assert {:error, :claim_lease_lapsed} = checkpoint(ctx)
-
-      # Past its CAP the lapsed lease cannot be renewed (`lease_cap_reached`): the claim is over.
-      set_story(ctx, claim_lease_cap: DateTime.add(DateTime.utc_now(), -60))
       assert {:error, :claim_not_live} = checkpoint(ctx)
 
-      set_story(ctx, claim_lease_cap: future)
-      assert {:error, :claim_lease_lapsed} = checkpoint(ctx)
-      set_story(ctx, claim_lease_cap: nil)
-
       set_story(ctx, claimed_until: future, review_requested_at: DateTime.utc_now())
-      assert {:error, :review_requested} = checkpoint(ctx)
+      assert {:error, :claim_not_live} = checkpoint(ctx)
 
       set_story(ctx, review_requested_at: nil, agent_status: :reported_done)
       assert {:error, :claim_not_live} = checkpoint(ctx)

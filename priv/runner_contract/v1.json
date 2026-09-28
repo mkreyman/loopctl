@@ -1842,8 +1842,7 @@
       "checkpoint": [
         "unknown_dispatch",
         "stale_claim_epoch",
-        "not_claimant",
-        "claim_not_live"
+        "not_claimant"
       ],
       "dispatch_reply": [
         "unknown_dispatch",
@@ -1881,7 +1880,7 @@
         "unknown_dispatch"
       ]
     },
-    "claim_ending_remedy": "The claim the refused message ran under is over: send that dispatch no more messages of its work (the events keyed here) and stop its session. An implement or review session still sends its `session_ended` when its process exits, as always, and treats its answer by `session_ended`'s own rules: `rate_limited` is resent, and any permanent refusal of it is final. Every OTHER permanent refusal refuses only the message that drew it, EXCEPT where `permanent_error_conditions` says the run is over (`stale_stage` naming a stage no runner can report out of, `dispatch_not_accepted` with no accept of yours in flight): those end the run too.",
+    "claim_ending_remedy": "The claim the refused message ran under is over: send that dispatch no more messages of its work (the events keyed here) and stop its session. An implement or review session still sends its `session_ended` when its process exits, as always, and treats its answer by `session_ended`'s own rules: `rate_limited` is resent, and any permanent refusal of it is final. Every OTHER permanent refusal refuses only the message that drew it, EXCEPT where `permanent_error_conditions` says the run is over (`stale_stage` naming a stage no runner can report out of, `dispatch_not_accepted` with no accept of yours in flight): those end the run too. The set holds for a runner that JOINED declaring 1.22.0 or later: an older join is sent the pre-1.22.0 codes, several of which are answered while the claim stands, so declare the version you vendor.",
     "credential_header": "x-loopctl-runner-token",
     "dispatchable_kinds": [
       "triage",
@@ -1893,7 +1892,6 @@
         "audit_chain_append_failed": [],
         "checkpoint_conflict": [],
         "claim_epoch_mismatch": [],
-        "claim_lease_lapsed": [],
         "claim_not_live": [],
         "dispatch_not_accepted": [],
         "internal_error": [],
@@ -1904,7 +1902,6 @@
         "rate_limited": [
           "min_interval_ms"
         ],
-        "review_requested": [],
         "secret_blocked": [],
         "stale_claim_epoch": [],
         "unknown_dispatch": [],
@@ -2125,8 +2122,6 @@
         "audit_chain_append_failed",
         "claim_epoch_mismatch",
         "wrong_dispatch_kind",
-        "review_requested",
-        "claim_lease_lapsed",
         "internal_error"
       ],
       "dispatch_reply": [

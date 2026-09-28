@@ -219,8 +219,10 @@ defmodule Loopctl.Delivery.TriageVerdict do
   @type error ::
           :story_draft_invalid
           | :unknown_dispatch
+          | :wrong_dispatch_kind
           | :dispatch_not_accepted
           | :stale_claim_epoch
+          | :claim_epoch_mismatch
           | :already_recorded
           | :unknown_story_stage
           | :triage_not_bound
@@ -283,7 +285,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # what says which kind this dispatch is; without the check, the runner holding a story's
   # IMPLEMENT dispatch could record a triage verdict for it — with lens verdicts of its own
   # choosing — and the merge gate would then judge that runner's pull request on them.
-  # `unknown_dispatch` because, as a triage dispatch, it does not exist.
+  # `wrong_dispatch_kind` (contract 1.22.0): this runner's dispatch, of another kind.
   # The dispatch's own epoch, checked before a transaction is opened, exactly as
   # `Loopctl.Delivery.RunnerStages` checks it. The FENCE is the story's epoch read under a
   # lock inside `Stages.advance/4`; this refuses a message that does not even match the

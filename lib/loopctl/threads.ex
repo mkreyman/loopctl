@@ -99,8 +99,6 @@ defmodule Loopctl.Threads do
     :claim_epoch,
     :agent_status,
     :claimed_until,
-    # Whether a lapsed lease can still be renewed (`lease/1`, contract 1.22.0).
-    :claim_lease_cap,
     :review_requested_at,
     :implementer_dispatch_id
   ]
@@ -1288,30 +1286,11 @@ defmodule Loopctl.Threads do
     ) || []
   end
 
-  # WHY the claim takes no more work, in three reasons, because a runner acts on them
-  # differently (contract 1.22.0, loopctl#920): review requested and a RENEWABLE lapsed lease
-  # leave the claim standing (a reject sends it back, and `renew_story_claim` accepts a lapsed
-  # lease until the reclaim sweep runs), while `:claim_not_live` is a claim nothing can bring
-  # back under this epoch: a story that has LEFT the claimed statuses, or a lapsed lease past
-  # its cap, which `Progress.renew_claim` refuses `lease_cap_reached` (a placed claim's
-  # `claimed_until` IS its cap). The HTTP surface answers all three as `claim_not_live`, as it
-  # always has (`LoopctlWeb.FallbackController`).
   defp lease(story) do
-    now = DateTime.utc_now()
-
-    cond do
-      Claimant.live?(story, now) -> :ok
-      story.agent_status not in Loopctl.Progress.claimed_statuses() -> {:error, :claim_not_live}
-      not is_nil(story.review_requested_at) -> {:error, :review_requested}
-      cap_reached?(story, now) -> {:error, :claim_not_live}
-      true -> {:error, :claim_lease_lapsed}
-    end
+    if Claimant.live?(story, DateTime.utc_now()),
+      do: :ok,
+      else: {:error, :claim_not_live}
   end
-
-  defp cap_reached?(%Story{claim_lease_cap: %DateTime{} = cap}, now),
-    do: not DateTime.after?(cap, now)
-
-  defp cap_reached?(%Story{}, _now), do: false
 
   # The same checkpoint, resent: the tree must match, and a note, when sent, must be the one
   # recorded. Anything else is a different write, refused rather than acknowledged.
