@@ -1,0 +1,93 @@
+{
+  "id": "US-45.9",
+  "title": "An interactive session implements in a change thread and a runner reviews it",
+  "epic": {
+    "id": "epic_45",
+    "name": "Change Threads"
+  },
+  "priority": "high",
+  "phase": "change_threads",
+  "background": "Change threads reach only work placed on runners (#917). A session can already claim a story and record checkpoints, fixes and entries over HTTP (US-45.1, US-45.3), but its claim never merges in thread mode, for two structural reasons. First, every reader of a claim's route (the merge gate, the merge executor, the thread merge sweep, the thread page's diff) derives mode, base branch and branch from the claim's accepted implement row on the dispatch ledger (`DispatchLedger.claim_route_query`, `DispatchPayload.dispatch_route`), and an interactive claim has none, so all of them read it as `pr` against the source's CURRENT base. Second, the stage row only moves on a runner's stage reports: nothing takes an interactive claim through implementing to `ci` or records its head, so the gate answers `wrong_stage` or `head_moved` for ever. The REVIEWER stays a runner: Epic 45 dropped key-holding reviewers on purpose (`Loopctl.Threads.Reviews` moduledoc: #901 and #905), and the runner socket is the one channel an implementing session cannot write to.",
+  "story": {
+    "as_a": "interactive session implementing a story on a thread-mode repository",
+    "i_want_to": "claim the story in thread mode, push checkpoints, move my own claim's stage as a runner would, have a runner review it and have the App land the allowed checkpoint",
+    "so_that": "review rounds, fix-to-finding links and CI bound to the merged SHA cover the fleet's interactive work, not only runner dispatches"
+  },
+  "rationale": "The claimant of an interactive claim plays the part a runner plays for a placed one, with no authority a runner lacks: its route is recorded once where every reader already looks, and its stage moves are the runner-reportable edges and nothing more. Each rule Epic 45 relies on keeps its reason: mode, base and branch are bound once and never re-read; separation is decided under the thread lock; the merge fence ties a merge to one claim, one epoch and one SHA.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-45.9.1",
+      "description": "An INTERACTIVE claim is one made by `claim_story` without a runner placement: `Loopctl.Delivery.Placement` claims with an explicit placement marker, and every other claim path, `BulkOperations.bulk_claim/4` included, is interactive. When the story's project has exactly one live intake source, an interactive claim records the claim's route (the source's `mode` and `base_branch` at that moment, and the thread branch `loop/<story>` in thread mode) in the claim's transaction, where `claim_route_query` and `dispatch_route` read it. The merge gate, the executor, the thread merge sweep and `checkpoint_diff` then see it exactly as they see a placed claim's route, and no reader re-reads the source. A claim made before this change, or of a story with no intake source, records nothing and stays `pr`. Every release path ends the route with the claim."
+    },
+    {
+      "id": "AC-45.9.2",
+      "description": "The claimant of an interactive THREAD claim may report stage transitions for its own claim over HTTP, limited to `StageMachine`'s runner-reportable edges, under the claim's current epoch with a live lease, carrying `head_sha` where a runner's report carries it. An interactive thread claim of a story whose stage row is at `queued` moves it to `implementing` in the claim's transaction, and a story with no row gets one at `implementing`. A `pr` claim does neither. The CI-wait clock therefore starts when the claimant reports `ci` for a checkpoint, never at the claim."
+    },
+    {
+      "id": "AC-45.9.3",
+      "description": "Review placement accepts an interactive claim whose claimant holds no dispatch lineage (a legacy environment key, for as long as those exist; a dispatch-minted key already passes `implementer_dispatched/1`). Separation for it is by agent identity, as the custody gates decide it for a pre-dispatch story: the reviewing runner's agent is refused `reviewer_not_separate` when it is the claimant or recorded a checkpoint of the thread under any claim. The lineage-chain comparison is unchanged for a dispatched claim. Both are decided at placement and on every judgement."
+    },
+    {
+      "id": "AC-45.9.4",
+      "description": "The rest of the thread is unchanged for an interactive claim: the checkpoint fence, rounds per claim, the ceiling, fixes, human findings, CI evidence, the merge gate's allow and the executor's squash. An interactive claim's lease is not kept alive by a runner, so it expires unless the claimant renews it (`renew_story_claim`); on expiry the claim, its route and its thread end exactly as a runner's do."
+    },
+    {
+      "id": "AC-45.9.5",
+      "description": "The `MergePrecondition` comment that a checkpoint can only be recorded under an accepted implement row is corrected; the `Loopctl.Threads.Reviews` moduledoc describes both separation paths; the new stage-report endpoint has its OpenAPI operation and an MCP tool in the same PR; and the MCP descriptions of `claim_story`, `thread_checkpoint`, `thread_request_review` and `renew_story_claim` say that an interactive claim of a thread-mode story is a thread, that its claimant reports its stages and renews its lease, and what each refuses."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-45.9.1",
+      "verifies": ["AC-45.9.1"],
+      "name": "the route is bound at claim and read by every reader",
+      "type": "unit",
+      "preconditions": ["a thread-mode source with base master"],
+      "steps": ["claim interactively; repoint the source to pr and base release; read the route through the gate, the executor, the sweep query and checkpoint_diff; release and claim again"],
+      "expected_results": ["thread on master for all four readers; pr on release after the new claim"]
+    },
+    {
+      "id": "TC-45.9.2",
+      "verifies": ["AC-45.9.1"],
+      "name": "placement and bulk claims are told apart",
+      "type": "unit",
+      "preconditions": ["a thread-mode source"],
+      "steps": ["claim through Placement; bulk-claim another story"],
+      "expected_results": ["the placed claim's route is its ledger row's; the bulk claim records an interactive route"]
+    },
+    {
+      "id": "TC-45.9.3",
+      "verifies": ["AC-45.9.2"],
+      "name": "the claimant moves its own stage and nothing more",
+      "type": "unit",
+      "preconditions": ["an intake-born story at queued; an interactive thread claim"],
+      "steps": ["claim; report implementing to ci with the checkpoint's head; report an edge outside the runner allowlist; report as a non-claimant; report under an old epoch"],
+      "expected_results": ["queued becomes implementing at claim; ci with head_sha recorded and entered_at at the report; the other three refused"]
+    },
+    {
+      "id": "TC-45.9.4",
+      "verifies": ["AC-45.9.3"],
+      "name": "a runner reviews an interactive claim; a former checkpoint author cannot",
+      "type": "unit",
+      "preconditions": ["an interactive thread claim by agent A with a checkpoint"],
+      "steps": ["place a review on runner agent R; release, claim again as agent R, checkpoint, release, claim as A, place a review on R"],
+      "expected_results": ["placed; then reviewer_not_separate, because R recorded a checkpoint of this thread under an earlier claim"]
+    },
+    {
+      "id": "TC-45.9.5",
+      "verifies": ["AC-45.9.2", "AC-45.9.4"],
+      "name": "end to end, interactive claim to executor merge",
+      "type": "integration",
+      "preconditions": ["a hand-made story with no stage row on a thread-mode source; a runner that reviews"],
+      "steps": ["claim, checkpoint, report ci, request review, verdict clean, CI green, run the executor"],
+      "expected_results": ["a row at implementing from the claim; the gate allows; the executor squashes the checkpoint onto the base recorded at the claim"]
+    }
+  ],
+  "technical_notes": [
+    "Record the interactive route where claim_route_query already selects from, so the four readers change by one derivation and not four; the placement marker is an explicit option Placement passes, never inferred from dispatch_id, since a dispatch-keyed interactive claim carries one too.",
+    "The stage-report endpoint reuses the runner stage path's allowlist and effects (StageMachine runner-reportable edges, the effect stages for head_sha); it adds no edge.",
+    "Mutation-test the wiring: the placement marker, the route write and each reader, the stage allowlist, the epoch and claimant checks, and both separation paths."
+  ],
+  "dependencies": ["US-45.1", "US-45.3", "US-45.4", "US-45.5", "US-45.6", "US-45.7"],
+  "estimated_hours": 12
+}
