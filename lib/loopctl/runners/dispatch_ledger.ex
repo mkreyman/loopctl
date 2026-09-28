@@ -607,8 +607,8 @@ defmodule Loopctl.Runners.DispatchLedger do
   The session a runner is running under `dispatch_id`: `{:ok, %{kind:, story_id:,
   claim_epoch:, slot_generation:}}` for an ACCEPTED dispatch this runner holds in this tenant.
 
-  KIND-SCOPED, IMPLEMENT BY DEFAULT: a row of another kind reads as none
-  (`:unknown_dispatch`), so a consumer cannot forget the kind. A review dispatch (US-45.3)
+  KIND-SCOPED, IMPLEMENT BY DEFAULT: a row of another kind is refused
+  (`:wrong_dispatch_kind`, contract 1.22.0), so a consumer cannot forget the kind. A review dispatch (US-45.3)
   carries the implementer's story and `claim_epoch`, and a triage dispatch holds no claim, so
   neither may reach an implement path through a fence on epoch or story. A caller that wants
   another kind asks for it: `kind: "triage"` (`Loopctl.Delivery.TriageVerdict`), or `kind:
@@ -624,8 +624,10 @@ defmodule Loopctl.Runners.DispatchLedger do
   whose epoch does not even match the dispatch it names, before that transaction is opened.
 
   `:unknown_dispatch` for a row another runner or another tenant holds, exactly as for one
-  that does not exist. `:dispatch_not_accepted` for a row still `sent`, `refused` or
-  `superseded`: no session is running, so there is no transition to report.
+  that does not exist. `:wrong_dispatch_kind` for this runner's row of another kind: a fault
+  in the message, not a dispatch that is over. `:dispatch_not_accepted` for a row still
+  `sent`, `refused` or `superseded`: no session is running, so there is no transition to
+  report.
   """
   @spec accepted_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok,
@@ -635,7 +637,7 @@ defmodule Loopctl.Runners.DispatchLedger do
              claim_epoch: integer(),
              slot_generation: integer()
            }}
-          | {:error, :unknown_dispatch | :dispatch_not_accepted}
+          | {:error, :unknown_dispatch | :wrong_dispatch_kind | :dispatch_not_accepted}
   def accepted_session(tenant_id, runner_id, dispatch_id, opts \\ []) do
     {:ok, result} =
       in_tenant(tenant_id, fn ->
@@ -650,16 +652,20 @@ defmodule Loopctl.Runners.DispatchLedger do
             slot_generation: r.slot_generation
           }
         )
-        |> of_kind(Keyword.get(opts, :kind, :implement))
         |> Repo.one()
       end)
 
+    wanted = Keyword.get(opts, :kind, :implement)
+
     case result do
       nil -> {:error, :unknown_dispatch}
-      %{status: "accepted"} = row -> {:ok, Map.delete(row, :status)}
-      %{} -> {:error, :dispatch_not_accepted}
+      %{kind: kind} -> accepted_row(result, kind_answers?(kind, wanted))
     end
   end
+
+  defp accepted_row(_row, false), do: {:error, :wrong_dispatch_kind}
+  defp accepted_row(%{status: "accepted"} = row, true), do: {:ok, Map.delete(row, :status)}
+  defp accepted_row(%{}, true), do: {:error, :dispatch_not_accepted}
 
   @doc """
   The story a dispatch `runner_id` holds in this tenant is for, and the dispatch's KIND,
@@ -848,10 +854,10 @@ defmodule Loopctl.Runners.DispatchLedger do
   defp review_session_end(%DispatchRecord{} = record, message, digest) do
     cond do
       record.kind != "review" ->
-        {:error, :unknown_dispatch}
+        {:error, :wrong_dispatch_kind}
 
       record.claim_epoch != message.claim_epoch ->
-        {:error, :stale_claim_epoch}
+        {:error, :claim_epoch_mismatch}
 
       record.status not in ["accepted", "superseded"] or is_nil(record.replied_at) ->
         {:error, :dispatch_not_accepted}
@@ -895,9 +901,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   defp session_end(%DispatchRecord{} = record, message, attrs, current) do
+    # The story fence BEFORE the message's own epoch: a claim that moved is
+    # `:stale_claim_epoch` whatever epoch the message carries, and only a message naming the
+    # wrong epoch for a claim still standing is `:claim_epoch_mismatch` (contract 1.22.0).
     with :ok <- implement_dispatch(record),
-         :ok <- epoch_matches(record, message.claim_epoch),
          :ok <- story_fence(record, current),
+         :ok <- epoch_matches(record, message.claim_epoch),
          :ok <- accepted(record) do
       record
       |> Ecto.Changeset.change(
@@ -912,7 +921,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   defp implement_dispatch(%DispatchRecord{kind: kind}) do
-    if implement_kind?(kind), do: :ok, else: {:error, :unknown_dispatch}
+    if implement_kind?(kind), do: :ok, else: {:error, :wrong_dispatch_kind}
   end
 
   defp implement_only(dispatch, value),
@@ -934,11 +943,50 @@ defmodule Loopctl.Runners.DispatchLedger do
   def where_implement_kind(query),
     do: where(query, [r], is_nil(r.kind) or r.kind in ^@implement_kinds)
 
-  # The kind a session accessor answers for: `:implement` (the default everywhere), a named
-  # kind, or `:any`.
-  defp of_kind(query, :implement), do: where_implement_kind(query)
-  defp of_kind(query, :any), do: query
-  defp of_kind(query, kind) when is_binary(kind), do: where(query, [r], r.kind == ^kind)
+  @doc """
+  The refusal for a message whose `claim_epoch` is not its own dispatch's, decided by the
+  STORY (contract 1.22.0, loopctl#920). When the dispatch's claim is no longer the story's —
+  the story moved past it, or is gone — the claim is over: `:stale_claim_epoch`. Otherwise the
+  claim stands and only that message is wrong: `:claim_epoch_mismatch`.
+
+  For the pre-checks that compare a message against its dispatch before any transaction
+  (`Loopctl.Delivery.RunnerStages`, `Loopctl.Delivery.RunnerThreadSession`,
+  `Loopctl.Delivery.TriageVerdict`). Called only on a mismatch, so the read costs nothing on
+  the ordinary path. Unlocked: the answer only picks a refusal code, and a claim that moves
+  after the read is refused by the write's own fence the next time.
+  """
+  @spec epoch_refusal(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+          {:error, :stale_claim_epoch | :claim_epoch_mismatch}
+  def epoch_refusal(tenant_id, story_id, dispatch_epoch) do
+    {:ok, current} =
+      in_tenant(tenant_id, fn ->
+        Repo.one(
+          from(s in Story,
+            where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+            select: s.claim_epoch
+          )
+        )
+      end)
+
+    if current == dispatch_epoch,
+      do: {:error, :claim_epoch_mismatch},
+      else: {:error, :stale_claim_epoch}
+  end
+
+  @doc """
+  Whether a row of `kind` answers for `wanted`, the kind a session accessor asks for:
+  `:implement` (the default everywhere, `implement_kind?/1`), a named kind, or `:any`.
+
+  For the accessors that read the row WHATEVER its kind and then decide, so that a row of the
+  wrong kind is `:wrong_dispatch_kind` (contract 1.22.0, loopctl#920) rather than
+  `:unknown_dispatch`: a message naming this runner's OWN dispatch of another kind is a fault
+  in that message, while `:unknown_dispatch` says the dispatch is not this runner's or is gone.
+  Neither answer reads another runner's or tenant's row, so the split leaks nothing.
+  """
+  @spec kind_answers?(String.t() | nil, :implement | :any | String.t()) :: boolean()
+  def kind_answers?(_kind, :any), do: true
+  def kind_answers?(kind, :implement), do: implement_kind?(kind)
+  def kind_answers?(kind, wanted) when is_binary(wanted), do: kind == wanted
 
   # A dispatch whose session RAN is one its runner ACCEPTED. A `sent` row may never have
   # reached a machine and a `refused` one never ran, so neither names a route anything was
@@ -1490,14 +1538,17 @@ defmodule Loopctl.Runners.DispatchLedger do
         where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
         where: r.dispatch_id == ^dispatch_id
       )
-      |> of_kind(Keyword.fetch!(opts, :kind))
 
     query = if Keyword.get(opts, :lock, false), do: lock(query, "FOR UPDATE"), else: query
 
     case Repo.one(query) do
       nil -> {:error, :unknown_dispatch}
-      record -> {:ok, record}
+      record -> held_of_kind(record, Keyword.fetch!(opts, :kind))
     end
+  end
+
+  defp held_of_kind(%DispatchRecord{kind: kind} = record, wanted) do
+    if kind_answers?(kind, wanted), do: {:ok, record}, else: {:error, :wrong_dispatch_kind}
   end
 
   # The fence against a zombie runner (issue #803). The authoritative epoch is the story's
@@ -1558,8 +1609,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   defp epoch_matches(%DispatchRecord{status: "superseded"}, _epoch),
     do: {:error, :stale_claim_epoch}
 
+  # A live row the message names under ANOTHER epoch than its own: that one message is wrong
+  # (contract 1.22.0, loopctl#920). `:stale_claim_epoch` is kept for the claim having moved —
+  # the superseded clause above and `story_fence/2` — so a runner can tell the two apart.
   defp epoch_matches(%DispatchRecord{claim_epoch: epoch}, epoch), do: :ok
-  defp epoch_matches(%DispatchRecord{}, _epoch), do: {:error, :stale_claim_epoch}
+  defp epoch_matches(%DispatchRecord{}, _epoch), do: {:error, :claim_epoch_mismatch}
 
   defp accepted(%DispatchRecord{status: "accepted"}), do: :ok
   defp accepted(%DispatchRecord{}), do: {:error, :dispatch_not_accepted}

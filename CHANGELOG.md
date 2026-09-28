@@ -6,6 +6,17 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner contract 1.22.0: one refusal code, one meaning, and which refusals end the claim
+  (loopctl#920). RE-VENDOR, and declare 1.22.0 on join, to receive the new codes.** Four
+  codes were each answered both when a claim was over and when it was not; their live halves
+  now have codes of their own: `claim_epoch_mismatch` (a message whose epoch is not its own
+  dispatch's, while the claim stands), `wrong_dispatch_kind` (this runner's dispatch of another
+  kind), and on `checkpoint` `review_requested` and `claim_lease_lapsed` (neither permanent).
+  `stale_claim_epoch`, `unknown_dispatch` and `claim_not_live` now mean only that the claim is
+  over. A runner that joins declaring an older contract keeps receiving the old codes. The
+  export adds `x-connection.claim_ending_errors` (per work event) and `claim_ending_remedy`.
+  The HTTP surface is unchanged.
+
 - **The thread page and browser login (epic 45, US-45.7).** `GET /threads/:story_id` shows a
   story's change thread — checkpoints with their CI evidence, entries as untrusted text,
   findings — and fetches a checkpoint's diff (the base branch that checkpoint's claim was placed

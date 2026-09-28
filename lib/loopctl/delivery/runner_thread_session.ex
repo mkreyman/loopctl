@@ -49,7 +49,8 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
           String.t(),
           keyword()
         ) ::
-          {:ok, row()} | {:error, :busy | :unknown_dispatch | :stale_claim_epoch}
+          {:ok, row()}
+          | {:error, :busy | :unknown_dispatch | :wrong_dispatch_kind | :claim_epoch_mismatch}
   def read(tenant_id, runner_id, message, what, opts \\ []) do
     read = fn ->
       {:ok, row} =
@@ -66,7 +67,6 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
               session_ended?: not is_nil(r.session_ended_at)
             }
           )
-          |> of_kind(Keyword.get(opts, :kind, :implement))
           |> Repo.one()
         end)
 
@@ -74,20 +74,30 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
     end
 
     with {:ok, row} <- Stages.answering_busy(tenant_id, [:loopctl, :threads, :busy], what, read),
-         {:ok, row} <- found(row),
-         :ok <- dispatch_epoch_matches(row, message) do
+         {:ok, row} <- found(row, Keyword.get(opts, :kind, :implement)),
+         :ok <- dispatch_epoch_matches(tenant_id, row, message) do
       {:ok, row}
     end
   end
 
-  defp of_kind(query, :implement), do: DispatchLedger.where_implement_kind(query)
-  defp of_kind(query, kind) when is_binary(kind), do: where(query, [r], r.kind == ^kind)
+  # This runner's row of ANOTHER kind is a fault in the message that named it, not a dispatch
+  # that is over (contract 1.22.0, loopctl#920): `:wrong_dispatch_kind`, never
+  # `:unknown_dispatch`, which a runner may read as the dispatch being gone.
+  defp found(nil, _wanted), do: {:error, :unknown_dispatch}
 
-  defp found(nil), do: {:error, :unknown_dispatch}
-  defp found(row), do: {:ok, row}
+  defp found(%{kind: kind} = row, wanted) do
+    if DispatchLedger.kind_answers?(kind, wanted),
+      do: {:ok, row},
+      else: {:error, :wrong_dispatch_kind}
+  end
 
-  defp dispatch_epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
-  defp dispatch_epoch_matches(_row, _message), do: {:error, :stale_claim_epoch}
+  # The MESSAGE's epoch against its own dispatch's. WHICH refusal is the story's call
+  # (`DispatchLedger.epoch_refusal/3`, contract 1.22.0): a claim that moved on is
+  # `:stale_claim_epoch`, one still standing makes it this message's `:claim_epoch_mismatch`.
+  defp dispatch_epoch_matches(_tenant_id, %{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
+
+  defp dispatch_epoch_matches(tenant_id, row, _message),
+    do: DispatchLedger.epoch_refusal(tenant_id, row.story_id, row.claim_epoch)
 
   @doc """
   A write's structured 422 as the channel publishes it: `:secret_blocked` for a credential,

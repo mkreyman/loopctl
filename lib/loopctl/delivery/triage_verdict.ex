@@ -263,7 +263,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
            DispatchLedger.accepted_session(tenant_id, runner_id, message.dispatch_id,
              kind: "triage"
            ),
-         :ok <- epoch_matches(session, message),
+         :ok <- epoch_matches(tenant_id, session, message),
          {:ok, leave} <- route(message),
          {:ok, row} <- bound(tenant_id, session.story_id, message.dispatch_id),
          {:ok, record, replayed?} <- record(tenant_id, session, message) do
@@ -288,8 +288,11 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # `Loopctl.Delivery.RunnerStages` checks it. The FENCE is the story's epoch read under a
   # lock inside `Stages.advance/4`; this refuses a message that does not even match the
   # dispatch it names, for the cost of a read the caller already made.
-  defp epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
-  defp epoch_matches(_session, _message), do: {:error, :stale_claim_epoch}
+  # WHICH refusal is the story's call (`DispatchLedger.epoch_refusal/3`, contract 1.22.0).
+  defp epoch_matches(_tenant_id, %{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
+
+  defp epoch_matches(tenant_id, session, _message),
+    do: DispatchLedger.epoch_refusal(tenant_id, session.story_id, session.claim_epoch)
 
   defp route(%{incomplete: reason}) when is_binary(reason) do
     # EVERY incomplete reason escalates. A triage run that produced nothing usable needs a

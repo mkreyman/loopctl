@@ -144,7 +144,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
       ref = push(channel, "triage_verdict", verdict_payload(dispatch_id, lenses))
 
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
       assert verdict_count(runner.tenant_id) == 0
     end
   end
@@ -200,8 +200,26 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           })
         )
 
-      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
       assert Stages.get(runner.tenant_id, story.id).stage == :implementing
+    end
+
+    test "a runner that joined on a contract older than 1.22.0 is sent the code it knows", ctx do
+      %{channel: channel, dispatch_id: dispatch_id} = ctx
+
+      :sys.replace_state(channel.channel_pid, fn socket ->
+        put_in(socket.assigns.meta.contract_version, "1.21.0")
+      end)
+
+      message =
+        stage_message(dispatch_id, %{
+          "from" => "implementing",
+          "to" => "reviewing",
+          "claim_epoch" => @epoch + 1
+        })
+
+      ref = push(channel, "stage", message)
+      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
     end
 
     test "a transition the machine has no edge for never reaches the database", ctx do
@@ -621,7 +639,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           ended(dispatch_id, "completed", %{"claim_epoch" => @epoch + 1})
         )
 
-      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
 
       ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
       assert_reply ref, :ok, _, @reply_timeout
@@ -632,7 +650,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       ref = push(channel, "session_ended", ended(Ecto.UUID.generate(), "completed"))
       assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
 
-      for reason <- ~w(stale_claim_epoch already_recorded unknown_dispatch) do
+      for reason <- ~w(claim_epoch_mismatch already_recorded unknown_dispatch) do
         assert reason in RunnerContract.error_reasons()["session_ended"]
       end
     end

@@ -139,11 +139,18 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # `review_claim_ended`, `review_round_superseded` and `reviewer_not_separate` are permanent
   # for that review, and
   # `tenant_halted` clears when an operator lifts the custody halt.
+  #
+  # The four live-claim halves split out of overloaded codes (1.22.0, loopctl#920), so a
+  # runner can tell a claim that is over from one message that was wrong:
+  # `claim_epoch_mismatch` (was `stale_claim_epoch`), `wrong_dispatch_kind` (was
+  # `unknown_dispatch`), `review_requested` and `claim_lease_lapsed` (were `claim_not_live`).
+  # A runner that joined on an older contract is sent the old code (`RunnerContract.for_version/2`).
   @verbatim ~w(unknown_dispatch stale_claim_epoch already_replied dispatch_not_accepted
                run_mismatch stale_stage unknown_story_stage effect_conflict
                already_recorded not_claimant claim_not_live checkpoint_conflict
                idempotency_key_reused secret_blocked tenant_halted review_closed
-               review_claim_ended review_round_superseded reviewer_not_separate)a
+               review_claim_ended review_round_superseded reviewer_not_separate
+               claim_epoch_mismatch wrong_dispatch_kind review_requested claim_lease_lapsed)a
 
   def for_message(reason) when reason in @verbatim, do: %{reason: Atom.to_string(reason)}
 

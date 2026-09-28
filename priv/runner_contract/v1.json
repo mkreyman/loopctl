@@ -1838,6 +1838,50 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "loopctl runner contract",
   "x-connection": {
+    "claim_ending_errors": {
+      "checkpoint": [
+        "unknown_dispatch",
+        "stale_claim_epoch",
+        "not_claimant",
+        "claim_not_live"
+      ],
+      "dispatch_reply": [
+        "unknown_dispatch",
+        "stale_claim_epoch"
+      ],
+      "review_finding": [
+        "unknown_dispatch",
+        "stale_claim_epoch",
+        "review_closed",
+        "review_claim_ended",
+        "review_round_superseded",
+        "reviewer_not_separate"
+      ],
+      "review_verdict": [
+        "unknown_dispatch",
+        "stale_claim_epoch",
+        "review_closed",
+        "review_claim_ended",
+        "review_round_superseded",
+        "reviewer_not_separate"
+      ],
+      "stage": [
+        "unknown_dispatch",
+        "stale_claim_epoch"
+      ],
+      "thread_entry": [
+        "unknown_dispatch",
+        "stale_claim_epoch"
+      ],
+      "trace": [
+        "unknown_dispatch",
+        "stale_claim_epoch"
+      ],
+      "triage_verdict": [
+        "unknown_dispatch"
+      ]
+    },
+    "claim_ending_remedy": "The claim the refused message ran under is over: send that dispatch no more messages of its work (the events keyed here) and stop its session. An implement or review session still sends its one `session_ended` when its process exits, as always, and whatever that is answered is final: never resend it. Every OTHER permanent refusal refuses only the message that drew it, EXCEPT where `permanent_error_conditions` says the run is over (`stale_stage` naming a stage no runner can report out of, `dispatch_not_accepted` with no accept of yours in flight): those end the run too.",
     "credential_header": "x-loopctl-runner-token",
     "dispatchable_kinds": [
       "triage",
@@ -1848,6 +1892,8 @@
       "checkpoint": {
         "audit_chain_append_failed": [],
         "checkpoint_conflict": [],
+        "claim_epoch_mismatch": [],
+        "claim_lease_lapsed": [],
         "claim_not_live": [],
         "dispatch_not_accepted": [],
         "internal_error": [],
@@ -1858,12 +1904,15 @@
         "rate_limited": [
           "min_interval_ms"
         ],
+        "review_requested": [],
         "secret_blocked": [],
         "stale_claim_epoch": [],
-        "unknown_dispatch": []
+        "unknown_dispatch": [],
+        "wrong_dispatch_kind": []
       },
       "dispatch_reply": {
         "already_replied": [],
+        "claim_epoch_mismatch": [],
         "internal_error": [],
         "invalid_payload": [
           "details"
@@ -1897,6 +1946,7 @@
       },
       "review_finding": {
         "audit_chain_append_failed": [],
+        "claim_epoch_mismatch": [],
         "dispatch_not_accepted": [],
         "idempotency_key_reused": [],
         "internal_error": [],
@@ -1913,10 +1963,12 @@
         "secret_blocked": [],
         "stale_claim_epoch": [],
         "tenant_halted": [],
-        "unknown_dispatch": []
+        "unknown_dispatch": [],
+        "wrong_dispatch_kind": []
       },
       "review_verdict": {
         "audit_chain_append_failed": [],
+        "claim_epoch_mismatch": [],
         "dispatch_not_accepted": [],
         "idempotency_key_reused": [],
         "internal_error": [],
@@ -1933,11 +1985,13 @@
         "secret_blocked": [],
         "stale_claim_epoch": [],
         "tenant_halted": [],
-        "unknown_dispatch": []
+        "unknown_dispatch": [],
+        "wrong_dispatch_kind": []
       },
       "session_ended": {
         "already_recorded": [],
         "audit_chain_append_failed": [],
+        "claim_epoch_mismatch": [],
         "dispatch_not_accepted": [],
         "internal_error": [],
         "invalid_payload": [
@@ -1948,10 +2002,12 @@
         ],
         "stale_claim_epoch": [],
         "unknown_dispatch": [],
-        "unknown_story_stage": []
+        "unknown_story_stage": [],
+        "wrong_dispatch_kind": []
       },
       "stage": {
         "audit_chain_append_failed": [],
+        "claim_epoch_mismatch": [],
         "dispatch_not_accepted": [],
         "effect_conflict": [
           "effects"
@@ -1972,7 +2028,8 @@
           "effects"
         ],
         "unknown_dispatch": [],
-        "unknown_story_stage": []
+        "unknown_story_stage": [],
+        "wrong_dispatch_kind": []
       },
       "status": {
         "internal_error": [],
@@ -1985,6 +2042,7 @@
       },
       "thread_entry": {
         "audit_chain_append_failed": [],
+        "claim_epoch_mismatch": [],
         "dispatch_not_accepted": [],
         "idempotency_key_reused": [],
         "internal_error": [],
@@ -1996,13 +2054,15 @@
         ],
         "secret_blocked": [],
         "stale_claim_epoch": [],
-        "unknown_dispatch": []
+        "unknown_dispatch": [],
+        "wrong_dispatch_kind": []
       },
       "trace": {
         "batch_too_large": [
           "max_events",
           "max_bytes"
         ],
+        "claim_epoch_mismatch": [],
         "dispatch_not_accepted": [],
         "event_data_too_large": [
           "seq",
@@ -2032,6 +2092,7 @@
       "triage_verdict": {
         "already_recorded": [],
         "audit_chain_append_failed": [],
+        "claim_epoch_mismatch": [],
         "dispatch_not_accepted": [],
         "internal_error": [],
         "invalid_payload": [
@@ -2043,7 +2104,8 @@
         "stale_claim_epoch": [],
         "stale_stage": [],
         "unknown_dispatch": [],
-        "unknown_story_stage": []
+        "unknown_story_stage": [],
+        "wrong_dispatch_kind": []
       },
       "unknown_event": {
         "unknown_event": []
@@ -2061,6 +2123,10 @@
         "checkpoint_conflict",
         "secret_blocked",
         "audit_chain_append_failed",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind",
+        "review_requested",
+        "claim_lease_lapsed",
         "internal_error"
       ],
       "dispatch_reply": [
@@ -2069,6 +2135,7 @@
         "unknown_dispatch",
         "stale_claim_epoch",
         "already_replied",
+        "claim_epoch_mismatch",
         "internal_error"
       ],
       "join": [
@@ -2094,6 +2161,8 @@
         "idempotency_key_reused",
         "secret_blocked",
         "audit_chain_append_failed",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind",
         "internal_error"
       ],
       "review_verdict": [
@@ -2110,6 +2179,8 @@
         "idempotency_key_reused",
         "secret_blocked",
         "audit_chain_append_failed",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind",
         "internal_error"
       ],
       "session_ended": [
@@ -2121,6 +2192,8 @@
         "already_recorded",
         "unknown_story_stage",
         "audit_chain_append_failed",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind",
         "internal_error"
       ],
       "stage": [
@@ -2133,6 +2206,8 @@
         "unknown_story_stage",
         "effect_conflict",
         "audit_chain_append_failed",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind",
         "internal_error"
       ],
       "status": [
@@ -2149,6 +2224,8 @@
         "idempotency_key_reused",
         "secret_blocked",
         "audit_chain_append_failed",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind",
         "internal_error"
       ],
       "trace": [
@@ -2160,6 +2237,7 @@
         "stale_claim_epoch",
         "dispatch_not_accepted",
         "run_mismatch",
+        "claim_epoch_mismatch",
         "internal_error"
       ],
       "trace_cursor": [
@@ -2177,6 +2255,8 @@
         "unknown_story_stage",
         "stale_stage",
         "audit_chain_append_failed",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind",
         "internal_error"
       ],
       "unknown_event": [
@@ -2404,6 +2484,7 @@
     },
     "permanent_error_conditions": {
       "dispatch_not_accepted": "Permanent unless an accept YOU sent for this dispatch is still unacknowledged. The refusal means the ledger row is not `accepted`, which covers `sent` (your accept has not landed yet - in flight, rate-limited, or carried across a rejoin, and the one case worth retrying), and `refused` and `superseded`, which are final and which no later accept can move. So retry, with backoff, only while an accept for this dispatch is outstanding AND you have not since refused it and its `claim_epoch` has not moved; otherwise give the run up, because nothing will move the row.",
+      "stale_claim_epoch": "Permanent, and on every work event but one it means the claim is over (`claim_ending_errors`). On `triage_verdict` it is permanent for THAT message only: the verdict's story was reclaimed twice while it was being recorded, and loopctl repairs a reclaim-moved epoch from the verdict itself, so resend the verdict once, with the same bytes, before giving it up.",
       "stale_stage": "Transient for `stage` in the ordinary case: the row moved, so read the row off this refusal and send the transition that applies from the `stage` it names. It is PERMANENT when no entry of `x-connection.stage_transitions` has that `stage` as its `from` - the story has reached a stage no runner can report out of, which a session reaches by escalating through the HTTP surface while its run continues. Stop, and end the run. For `triage_verdict` it is permanent unconditionally and carries no row: the story has left `detected` and the verdict's first transition can never match again."
     },
     "permanent_errors": {
@@ -2423,7 +2504,9 @@
         "run_mismatch",
         "effect_conflict",
         "audit_chain_append_failed",
-        "unknown_story_stage"
+        "unknown_story_stage",
+        "claim_epoch_mismatch",
+        "wrong_dispatch_kind"
       ],
       "checkpoint": [
         "not_claimant",
@@ -2569,5 +2652,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.21.0"
+  "x-contract-version": "1.22.0"
 }

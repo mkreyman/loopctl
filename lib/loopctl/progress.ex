@@ -1463,6 +1463,10 @@ defmodule Loopctl.Progress do
   # once reported, the work is in custody review and a lapsed lease must not reset it.
   @claimed_statuses [:assigned, :implementing]
 
+  @doc "The agent statuses a claim holds its story in: a story in any other has left its claim."
+  @spec claimed_statuses() :: [atom()]
+  def claimed_statuses, do: @claimed_statuses
+
   @doc """
   The claim lease length in seconds: `:story_claim_lease_seconds`, set from
   `STORY_CLAIM_LEASE_SECONDS`, default #{@default_claim_lease_seconds} (24 hours).

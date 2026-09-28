@@ -1796,7 +1796,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     test "a stale claim_epoch is refused",
          %{runner: runner, channel: channel, dispatch: dispatch} do
       ref = push(channel, "dispatch_reply", accept(dispatch, %{"claim_epoch" => 1}))
-      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
       assert status_of(runner, dispatch) == "sent"
     end
 
@@ -1973,7 +1973,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
 
       ref = send_trace(channel, batch(dispatch, run_id, [0], %{"claim_epoch" => 7}))
-      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
 
       reset_intervals(channel)
       ref = push(channel, "trace_cursor", %{"run_id" => run_id})

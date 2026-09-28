@@ -1286,10 +1286,21 @@ defmodule Loopctl.Threads do
     ) || []
   end
 
+  # WHY the claim takes no more work, in three reasons, because a runner acts on them
+  # differently (contract 1.22.0, loopctl#920): review requested and a lapsed lease leave the
+  # claim standing (a reject sends it back, and `renew_story_claim` accepts a lapsed lease
+  # until the reclaim sweep runs), while `:claim_not_live` is now only a story that has LEFT
+  # the claimed statuses, which nothing brings back under this epoch. The HTTP surface answers
+  # all three as `claim_not_live`, as it always has (`LoopctlWeb.FallbackController`).
   defp lease(story) do
-    if Claimant.live?(story, DateTime.utc_now()),
-      do: :ok,
-      else: {:error, :claim_not_live}
+    now = DateTime.utc_now()
+
+    cond do
+      Claimant.live?(story, now) -> :ok
+      story.agent_status not in Loopctl.Progress.claimed_statuses() -> {:error, :claim_not_live}
+      not is_nil(story.review_requested_at) -> {:error, :review_requested}
+      true -> {:error, :claim_lease_lapsed}
+    end
   end
 
   # The same checkpoint, resent: the tree must match, and a note, when sent, must be the one

@@ -673,10 +673,16 @@ defmodule LoopctlWeb.RunnerChannel do
 
   # Every refusal of a runner message goes through here: the reply the runner sees, one
   # telemetry event, and — for anything but routine backpressure — a log line.
+  # The ONE place a refusal leaves the channel, so the one place a code this runner's contract
+  # does not know is put back to the code it does (`RunnerContract.for_version/2`, 1.22.0).
   defp refuse(socket, event, %{reason: reason} = reply) do
+    reason = RunnerContract.for_version(reason, joined_version(socket))
     report_refusal(socket, event, reason)
-    {:reply, {:error, reply}, socket}
+    {:reply, {:error, %{reply | reason: reason}}, socket}
   end
+
+  defp joined_version(%{assigns: %{meta: %{contract_version: version}}}), do: version
+  defp joined_version(_socket), do: nil
 
   defp refuse_join(socket, %{reason: reason} = reply) do
     report_refusal(socket, "join", reason)

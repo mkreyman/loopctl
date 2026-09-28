@@ -571,7 +571,7 @@ defmodule Loopctl.Threads.ReviewsTest do
       assert {:error, :not_claimant} = fix(ctx, cp2, [ctx.f1.id], %{}, agent_id: ctx.spare.id)
 
       set_story(ctx, claimed_until: DateTime.add(DateTime.utc_now(), -60))
-      assert {:error, :claim_not_live} = fix(ctx, cp2, [ctx.f1.id])
+      assert {:error, :claim_lease_lapsed} = fix(ctx, cp2, [ctx.f1.id])
     end
 
     test "findings must be this story's, of completed rounds, and a checkpoint is required",

@@ -137,7 +137,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   def apply(tenant_id, runner_id, %{} = stage) do
     with {:ok, session} <-
            DispatchLedger.accepted_session(tenant_id, runner_id, stage.dispatch_id),
-         :ok <- dispatch_epoch_matches(session, stage) do
+         :ok <- dispatch_epoch_matches(tenant_id, session, stage) do
       advance(tenant_id, runner_id, session, stage)
     end
   end
@@ -145,9 +145,13 @@ defmodule Loopctl.Delivery.RunnerStages do
   # The dispatch's own epoch, checked before a transaction is opened. It is NOT the fence —
   # `Stages.advance/4` reads the story's current epoch under a share lock, which is the value
   # that decides — but a message that does not even match the dispatch it names is refused
-  # here for the cost of a read the caller already made.
-  defp dispatch_epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
-  defp dispatch_epoch_matches(_session, _stage), do: {:error, :stale_claim_epoch}
+  # here for the cost of a read the caller already made. WHICH refusal is the story's call
+  # (`DispatchLedger.epoch_refusal/3`, contract 1.22.0): a claim that moved on is
+  # `:stale_claim_epoch`, one still standing makes it this message's `:claim_epoch_mismatch`.
+  defp dispatch_epoch_matches(_tenant_id, %{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
+
+  defp dispatch_epoch_matches(tenant_id, session, _stage),
+    do: DispatchLedger.epoch_refusal(tenant_id, session.story_id, session.claim_epoch)
 
   defp advance(tenant_id, runner_id, session, stage) do
     opts = [

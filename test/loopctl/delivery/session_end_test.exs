@@ -240,10 +240,20 @@ defmodule Loopctl.Delivery.SessionEndTest do
       assert ledger(ctx.record).session_ended_reason == nil
     end
 
-    test "an epoch that is not even the dispatch's is stale" do
+    test "a report naming the story's NEW epoch from a dispatch it moved past is stale" do
+      ctx = session(:implementing)
+      bump_story_epoch(ctx.story)
+
+      # The message carries the epoch the story is at now, but its dispatch served the one
+      # before: that claim is over, which the story fence says first (contract 1.22.0).
+      assert {:error, :stale_claim_epoch} =
+               end_session(ctx, "wall_clock_exceeded", %{claim_epoch: @epoch + 1})
+    end
+
+    test "an epoch that is not even the dispatch's is claim_epoch_mismatch: the claim stands" do
       ctx = session(:implementing)
 
-      assert {:error, :stale_claim_epoch} =
+      assert {:error, :claim_epoch_mismatch} =
                end_session(ctx, "wall_clock_exceeded", %{claim_epoch: @epoch - 1})
 
       assert stage_of(ctx.story).stage == :implementing
@@ -253,7 +263,7 @@ defmodule Loopctl.Delivery.SessionEndTest do
     test "a triage dispatch is not one this message can be about" do
       ctx = session(:implementing, kind: "triage")
 
-      assert {:error, :unknown_dispatch} = end_session(ctx, "crashed")
+      assert {:error, :wrong_dispatch_kind} = end_session(ctx, "crashed")
       assert ledger(ctx.record).session_ended_reason == nil
     end
 

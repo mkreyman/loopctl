@@ -140,7 +140,7 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
     test "refuses a message whose epoch is not the dispatch's, before any write" do
       %{story: story, runner: runner, record: record} = session(:implementing)
 
-      assert {:error, :stale_claim_epoch} =
+      assert {:error, :claim_epoch_mismatch} =
                RunnerStages.apply(
                  story.tenant_id,
                  runner.id,

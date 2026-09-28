@@ -194,10 +194,21 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
       # The story's CURRENT claim is the runner's agent at the epoch the message names, so the
       # thread's own fence would pass it. The dispatch the message names ran under the epoch
       # before, and a checkpoint must not be recorded under a claim its dispatch did not hold.
+      # That dispatch's claim is OVER, so the refusal says so (contract 1.22.0).
       set_story(ctx.story, claim_epoch: @epoch + 1)
 
       assert {:error, :stale_claim_epoch} = checkpoint(ctx, %{claim_epoch: @epoch + 1})
       assert thread(ctx).checkpoints == []
+    end
+
+    test "a message naming another epoch than its standing dispatch's is claim_epoch_mismatch" do
+      ctx = session()
+
+      # The dispatch's claim is the story's: only this one message is wrong (contract 1.22.0).
+      assert {:error, :claim_epoch_mismatch} = checkpoint(ctx, %{claim_epoch: @epoch + 1})
+      assert {:error, :claim_epoch_mismatch} = entry(ctx, %{claim_epoch: @epoch - 1})
+      assert thread(ctx).checkpoints == []
+      assert thread(ctx).entries == []
     end
 
     test "a dispatch whose story is gone is unknown_dispatch, for both messages" do
@@ -213,11 +224,11 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
       assert {:error, :unknown_dispatch} = entry(ctx)
     end
 
-    test "a triage dispatch is unknown_dispatch: a triage session has no claim to report on" do
+    test "a triage dispatch is wrong_dispatch_kind: a triage session has no claim to report on" do
       ctx = session(kind: "triage")
 
-      assert {:error, :unknown_dispatch} = checkpoint(ctx)
-      assert {:error, :unknown_dispatch} = entry(ctx)
+      assert {:error, :wrong_dispatch_kind} = checkpoint(ctx)
+      assert {:error, :wrong_dispatch_kind} = entry(ctx)
       assert thread(ctx).entries == []
     end
 
@@ -229,11 +240,11 @@ defmodule Loopctl.Delivery.RunnerThreadsTest do
       assert {:error, :not_claimant} = checkpoint(ctx)
     end
 
-    test "a claim whose lease ran out is claim_not_live" do
+    test "a claim whose lease ran out is claim_lease_lapsed: renewable until the reclaim sweep" do
       ctx = session()
       set_story(ctx.story, claimed_until: DateTime.add(DateTime.utc_now(), -60))
 
-      assert {:error, :claim_not_live} = checkpoint(ctx)
+      assert {:error, :claim_lease_lapsed} = checkpoint(ctx)
     end
 
     test "after the claim moved on, a new commit is refused and the recorder's resend is not" do
