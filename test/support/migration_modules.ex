@@ -15,16 +15,24 @@ defmodule Loopctl.Test.MigrationModules do
   share the namespace.
   """
 
-  @migrations_dir Path.expand("priv/repo/migrations")
+  @doc """
+  The directory `mix ecto.migrate` compiles migrations from, resolved when called, the way
+  the task resolves it (`Mix.EctoSQL.source_repo_priv/1` plus `migrations`), so a repo
+  `:priv` override or a `_build` reused from another checkout cannot point it elsewhere.
+  """
+  @spec migrations_dir() :: Path.t()
+  def migrations_dir, do: Path.join(Mix.EctoSQL.source_repo_priv(Loopctl.Repo), "migrations")
 
-  @doc "Purges and deletes every loaded module whose source file lies under `dir`."
+  @doc "Deletes and purges every loaded module whose source file lies under `dir`."
   @spec unload_compiled_from(Path.t()) :: [module()]
-  def unload_compiled_from(dir \\ @migrations_dir) do
+  def unload_compiled_from(dir \\ migrations_dir()) do
     prefix = Path.expand(dir) <> "/"
 
     for {module, _} <- :code.all_loaded(), compiled_under?(module, prefix) do
-      :code.purge(module)
+      # delete makes the current code old; purge then removes it. The other order leaves
+      # the migrator's copy resident as old code.
       :code.delete(module)
+      :code.purge(module)
       module
     end
   end

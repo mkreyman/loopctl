@@ -15,6 +15,13 @@ defmodule Loopctl.Test.MigrationModulesTest do
     helper = Module.concat([Loopctl.MigrationProbeHelper, "H#{suffix}"])
     outside = Module.concat([Loopctl.Repo.Migrations, "Outside#{suffix}"])
 
+    on_exit(fn ->
+      for module <- [migration, helper, outside] do
+        :code.delete(module)
+        :code.purge(module)
+      end
+    end)
+
     file = Path.join(dir, "1_probe.exs")
 
     File.write!(file, """
@@ -33,17 +40,26 @@ defmodule Loopctl.Test.MigrationModulesTest do
     assert Enum.sort([migration, helper]) == Enum.sort(unloaded)
     refute :code.is_loaded(migration)
     refute :code.is_loaded(helper)
+    refute :erlang.check_old_code(migration)
     assert {:file, _} = :code.is_loaded(outside)
 
-    # The failure this exists for: compiling the same file again must not redefine.
-    warnings = ExUnit.CaptureIO.capture_io(:stderr, fn -> Code.compile_file(file) end)
-    refute warnings =~ "redefining module"
+    # The failure this exists for: compiling the same file again must not redefine. Only
+    # this compile's diagnostics, not the VM-global stderr other async tests write to.
+    {_, diagnostics} = Code.with_diagnostics(fn -> Code.compile_file(file) end)
+    refute Enum.any?(diagnostics, &(&1.message =~ "redefining module"))
+  end
+
+  test "the default directory is the one holding this repo's migrations" do
+    dir = MigrationModules.migrations_dir()
+
+    assert Path.type(dir) == :absolute
+    assert File.exists?(Path.join(dir, "20260927120000_add_thread_page.exs"))
   end
 
   test "test_helper.exs unloads the migrations directory before ExUnit starts" do
     helper = File.read!("test/test_helper.exs")
-    [before_start | _] = String.split(helper, "ExUnit.start()", parts: 2)
 
+    assert [before_start, _] = Regex.split(~r/ExUnit\.start\(/, helper, parts: 2)
     assert before_start =~ ~r/^Loopctl\.Test\.MigrationModules\.unload_compiled_from\(\)$/m
   end
 end

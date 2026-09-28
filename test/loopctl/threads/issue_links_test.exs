@@ -173,11 +173,12 @@ defmodule Loopctl.Threads.IssueLinksTest do
 
   describe "the migration's one-time backfill" do
     test "links in-flight threads only, and never a closed issue or a base_update-only thread" do
-      # The migration module is not compiled with the app: require it, and name it at
+      # The migration module is not compiled with the app: load it once, and name it at
       # runtime, since the compiler cannot see a module that `priv/` defines.
       migration = Module.concat(Loopctl.Repo.Migrations, "AddThreadPage")
 
-      Code.require_file("priv/repo/migrations/20260927120000_add_thread_page.exs")
+      unless Code.ensure_loaded?(migration),
+        do: Code.require_file("priv/repo/migrations/20260927120000_add_thread_page.exs")
 
       backfill = migration.backfill_sql()
 
