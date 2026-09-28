@@ -66,6 +66,7 @@ defmodule Loopctl.WorkBreakdown.RestrictedDelete do
 
   def message(:epic),
     do:
-      "has a story referenced by records that are kept on purpose (such as dispatches, " <>
-        "capability tokens or verification runs), so it cannot be deleted"
+      "is referenced, directly or through one of its stories, by records that are kept on " <>
+        "purpose (such as dispatches, capability tokens or verification runs), so it cannot " <>
+        "be deleted"
 end

@@ -203,8 +203,10 @@ async function apiCall(
   //     `requestAuthenticatorRevokeChallenge`, `revokeAuthenticator`), and the shared
   //     `runnerDeps()` / `deliveryDeps()` factories — the latter covering
   //     `place_dispatch` and `resolve_escalation`, which need an unlineaged human
-  //     principal, and `userKeyApiCall` for `delete_epic` and `delete_story`.
-  //     `grep -n 'exactKey: true' index.js` is the current list. None of
+  //     principal. `grep -n 'exactKey: true' index.js` is the current list, and it also
+  //     finds `pinnedApiCall`, the epic and story writes' CONDITIONAL pin, which falls back
+  //     to the default key when its variable is unset and is described where it is defined.
+  //     None of the unconditional family
   //     them may silently run under a global key of another role (review #12).
   //   - The `exact_role: :orchestrator` CUSTODY verbs pass it CONDITIONALLY, and
   //     nothing here decides that: `orchestratorKeyArgs` (`lib/custody-key.js`)
@@ -1107,24 +1109,25 @@ async function getStory({ story_id }) {
 // global LOOPCTL_API_KEY cannot displace it: they destroy rows. (`delete_project` is not
 // pinned this way.)
 
-// `role: :orchestrator` WITH the hierarchy (epic_controller.ex), so a user key passes too:
-// the first of LOOPCTL_ORCH_KEY and LOOPCTL_USER_KEY that is set goes VERBATIM, and with
-// neither the global key goes through `resolveKey` as usual.
-function orchestratorPinnedApiCall(method, path, body) {
-  const keyHint = epicWriteKeyHint();
+// ONE pinning rule for the epic and story writes: the env var `hint()` names is sent VERBATIM
+// when it is set, so a global LOOPCTL_API_KEY of a lesser role cannot displace it, and with none
+// set the default selection (`resolveKey`) applies. Unlike the unconditional user-key family
+// described above `apiCall`, these fall back rather than refuse: their gates use the role
+// hierarchy (`role:`, never `exact_role:`), so a sufficient global key passes.
+function pinnedApiCall(hint) {
+  return (method, path, body) => {
+    const keyHint = hint();
 
-  return keyHint
-    ? apiCall(method, path, body, process.env[keyHint], { exactKey: true, keyHint })
-    : apiCall(method, path, body);
+    return keyHint
+      ? apiCall(method, path, body, process.env[keyHint], { exactKey: true, keyHint })
+      : apiCall(method, path, body);
+  };
 }
 
-function userKeyApiCall(method, path, body) {
-  const keyHint = deleteKeyHint();
-
-  return keyHint
-    ? apiCall(method, path, body, process.env[keyHint], { exactKey: true, keyHint })
-    : apiCall(method, path, body);
-}
+// Create and update: LOOPCTL_ORCH_KEY, else LOOPCTL_USER_KEY (`epicWriteKeyHint`).
+const orchestratorPinnedApiCall = pinnedApiCall(epicWriteKeyHint);
+// The deletes: LOOPCTL_USER_KEY (`deleteKeyHint`).
+const userKeyApiCall = pinnedApiCall(deleteKeyHint);
 
 async function listEpics(args) {
   return toContent(await listEpicsRequest(args, { apiCall }));
@@ -4288,7 +4291,8 @@ const TOOLS = [
       "CREATE AN EPIC in a work project (POST /api/v1/projects/:project_id/epics, loopctl " +
       "#876) and return it, `id` included. `number` (an integer, fixed for good) and `title` " +
       "are required; `description`, `phase`, `position` (default 0) and `metadata` are " +
-      "optional. Needs LOOPCTL_ORCH_KEY (orchestrator or above) on a human-anchored tenant. " +
+      "optional. Needs an orchestrator-or-above key on a human-anchored tenant: " +
+      "LOOPCTL_ORCH_KEY, else LOOPCTL_USER_KEY, sent verbatim, else the default key. " +
       "Refusals: 403 for an agent key or a tenant that is not human-anchored, 404 for a " +
       "project not in your tenant, 422 for a kb scope (epics live in work projects) or a " +
       "duplicate or invalid field.",
@@ -4331,8 +4335,8 @@ const TOOLS = [
       "DROPS absent and null fields, so a null and a call naming no field are refused " +
       "locally; send an EMPTY STRING to clear `description` or `phase` (a blank `title` is a " +
       "422). `metadata` is REPLACED WHOLE, never merged: read the epic first " +
-      "(get_epic) and send the whole map. Needs LOOPCTL_ORCH_KEY (orchestrator or above) on " +
-      "a human-anchored tenant. Refusals: 403, 404, 422 for an invalid field.",
+      "(get_epic) and send the whole map. Needs an orchestrator-or-above key on a " +
+      "human-anchored tenant: LOOPCTL_ORCH_KEY, else LOOPCTL_USER_KEY, else the default key. Refusals: 403, 404, 422 for an invalid field.",
     inputSchema: {
       type: "object",
       properties: {

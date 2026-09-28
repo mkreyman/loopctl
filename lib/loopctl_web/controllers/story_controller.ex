@@ -473,8 +473,10 @@ defmodule LoopctlWeb.StoryController do
         {:ok, _deleted} ->
           send_resp(conn, :no_content, "")
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          {:error, changeset}
+        # A 422 changeset, or `:not_found` for a row a racing delete already removed: both
+        # rendered by the fallback controller.
+        {:error, _refusal} = error ->
+          error
       end
     end
   end

@@ -203,9 +203,8 @@ describe("epic tools are wired", () => {
       assert.match(body(handler), /apiCall: userKeyApiCall/, handler);
     }
 
-    assert.match(body("orchestratorPinnedApiCall"), /epicWriteKeyHint\(\)/);
-    assert.match(body("orchestratorPinnedApiCall"), /exactKey: true, keyHint/);
-    assert.match(body("userKeyApiCall"), /deleteKeyHint\(\)/);
-    assert.match(body("userKeyApiCall"), /exactKey: true, keyHint/);
+    assert.match(INDEX_SRC, /const orchestratorPinnedApiCall = pinnedApiCall\(epicWriteKeyHint\);/);
+    assert.match(INDEX_SRC, /const userKeyApiCall = pinnedApiCall\(deleteKeyHint\);/);
+    assert.match(body("pinnedApiCall"), /exactKey: true, keyHint/);
   });
 });

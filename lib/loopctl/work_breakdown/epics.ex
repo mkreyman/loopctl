@@ -417,7 +417,5 @@ defmodule Loopctl.WorkBreakdown.Epics do
       name: :intake_sources_target_epic_fkey,
       message: "is the target epic of an active intake source; revoke that source first"
     )
-
-    # The cascade to the epic's stories meets the references that do not cascade.
   end
 end
