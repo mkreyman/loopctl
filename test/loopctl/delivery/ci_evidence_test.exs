@@ -118,6 +118,29 @@ defmodule Loopctl.Delivery.CiEvidenceTest do
              CiEvidence.judge(["test"], %{runs: runs, jobs: [green], statuses: []})
   end
 
+  # US-26.4.6 review round 1, finding 6: a jobless run that concluded success, skipped or
+  # neutral ran nothing and failed nothing (every job's `if:` false, a path filter), so it is
+  # no evidence about any name: the name is missing, never failed.
+  test "a jobless run that concluded success, skipped or neutral fails nothing" do
+    for conclusion <- ["success", "skipped", "neutral"] do
+      runs = [%{id: 12, workflow: "ci.yml", status: "completed", conclusion: conclusion}]
+
+      assert %{missing: ["test"], failed: []} =
+               CiEvidence.judge(["test"], %{runs: runs, jobs: [], statuses: []}),
+             conclusion
+
+      refute CiEvidence.dead_run?(hd(runs)), conclusion
+    end
+
+    for conclusion <- ["failure", "cancelled", "timed_out", "action_required", nil] do
+      runs = [%{id: 12, workflow: "ci.yml", status: "completed", conclusion: conclusion}]
+      expected = "run_" <> (conclusion || "none")
+
+      assert %{failed: [{"test", ^expected}]} =
+               CiEvidence.judge(["test"], %{runs: runs, jobs: [], statuses: []})
+    end
+  end
+
   test "each required name is judged on its own" do
     jobs = [
       job("test", "completed", "success", %{id: 1}),

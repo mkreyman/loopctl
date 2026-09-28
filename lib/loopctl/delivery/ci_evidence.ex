@@ -58,6 +58,9 @@ defmodule Loopctl.Delivery.CiEvidence do
 
   alias Loopctl.Intake.Source
 
+  # A jobless run that concluded one of these ran nothing and failed nothing (`dead_run?/1`).
+  @harmless_jobless_conclusions ~w(success skipped neutral)
+
   @type job :: %{
           required(:name) => String.t(),
           required(:status) => String.t(),
@@ -83,13 +86,9 @@ defmodule Loopctl.Delivery.CiEvidence do
 
   @doc "Judges `evidence` for one commit against `required`. See the moduledoc."
   @spec judge([String.t()], evidence()) :: result()
-  def judge(required, %{jobs: jobs, statuses: statuses} = evidence) do
+  def judge(required, %{statuses: statuses} = evidence) do
     # The newest run of each workflow, and its jobs, computed ONCE per judgement.
-    runs = newest_runs(Map.get(evidence, :runs), jobs)
-    newest_ids = MapSet.new(runs, & &1.id)
-    job_run_ids = MapSet.new(jobs, &run_id/1)
-    counted = Enum.filter(jobs, &(run_id(&1) in newest_ids))
-    jobless = Enum.reject(runs, &(&1.id in job_run_ids))
+    %{jobs: counted, jobless_runs: jobless} = counted(evidence)
     acc = %{passed: [], pending: [], missing: [], failed: []}
 
     judged =
@@ -106,22 +105,59 @@ defmodule Loopctl.Delivery.CiEvidence do
     Map.put(judged, :local_gate, local_gate_state(statuses))
   end
 
+  @doc """
+  What `judge/2` COUNTS from `evidence`: the jobs of each workflow's newest run, and the newest
+  runs that carry no job at all. Public so a caller that has to POINT at the evidence — story
+  verification records the failing job's or the judged run's URL (US-26.4.6) — points at a job
+  this judgement counted, never at one a newer run of its workflow superseded.
+  """
+  @spec counted(evidence()) :: %{jobs: [job()], jobless_runs: [map()]}
+  def counted(%{jobs: jobs} = evidence) do
+    runs = newest_runs(Map.get(evidence, :runs), jobs)
+    newest_ids = MapSet.new(runs, & &1.id)
+    job_run_ids = MapSet.new(jobs, &run_id/1)
+
+    %{
+      jobs: Enum.filter(jobs, &(run_id(&1) in newest_ids)),
+      jobless_runs: Enum.reject(runs, &(&1.id in job_run_ids))
+    }
+  end
+
   # Every job carrying the name, in each workflow's newest run. A newest run with NO jobs yet
   # that is still running may be about to create one, so it holds the name pending (#910 round
-  # 3, finding 3). One that ENDED with no jobs at all (`startup_failure`, an invalid workflow)
+  # 3, finding 3). One that DIED with no jobs at all (`startup_failure`, an invalid workflow)
   # fails the name when no job carries it — otherwise it read as missing and waited out the CI
-  # limit before anyone was told CI never ran (finding 4).
+  # limit before anyone was told CI never ran (finding 4). Only a DEAD one (`dead_run?/1`): a
+  # workflow that concluded `success`, `skipped` or `neutral` with no jobs (every job's `if:`
+  # false, a path filter) ran nothing and failed nothing, so it is no evidence about any name.
   defp check_state(name, jobs, jobless) do
     states =
       for(%{name: ^name} = job <- jobs, do: job_state(job)) ++
         for %{status: status} <- jobless, status != "completed", do: :pending
 
-    dead = for %{status: "completed", conclusion: conclusion} <- jobless, do: conclusion || "none"
+    dead = for run <- jobless, dead_run?(run), do: run_conclusion(run)
 
     combine(states, dead)
   end
 
-  defp combine([], [conclusion | _]), do: {:failed, "run_" <> conclusion}
+  @doc """
+  Whether a run from `counted/1`'s `jobless_runs` ENDED without running what it should have —
+  completed with a conclusion other than `success`, `skipped` or `neutral` (`startup_failure`,
+  `failure`, `cancelled`, `timed_out`, `action_required`, none at all). Such a run fails every
+  required name no job carries, as `run_<conclusion>` (`run_conclusion/1`). Public so a caller
+  pointing at the evidence (story verification's failing URL) points at a run that COUNTED.
+  """
+  @spec dead_run?(map()) :: boolean()
+  def dead_run?(%{status: "completed"} = run),
+    do: Map.get(run, :conclusion) not in @harmless_jobless_conclusions
+
+  def dead_run?(_run), do: false
+
+  @doc "The `run_<conclusion>` a dead jobless run fails a name with (see `dead_run?/1`)."
+  @spec run_conclusion(map()) :: String.t()
+  def run_conclusion(run), do: "run_" <> (Map.get(run, :conclusion) || "none")
+
+  defp combine([], [conclusion | _]), do: {:failed, conclusion}
   defp combine([], []), do: :missing
 
   defp combine(states, _dead) do

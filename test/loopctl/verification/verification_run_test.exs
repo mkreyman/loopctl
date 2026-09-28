@@ -2,9 +2,9 @@ defmodule Loopctl.Verification.VerificationRunTest do
   @moduledoc """
   commit_sha validation — advisory ie-04 (GHSA-pv74-gwwh-g92x).
 
-  A hex-only git object id cannot contain `/`, `..`, or a leading `-`, which
-  closes the path-traversal and `git checkout` argument-injection vectors before
-  the value ever reaches `Loopctl.Verification.TestRunner`.
+  A hex-only git object id cannot contain `/`, `..`, `?` or a leading `-`, which
+  keeps a caller-supplied value from reshaping a GitHub API URL story
+  verification builds from it.
   """
 
   use Loopctl.DataCase, async: true

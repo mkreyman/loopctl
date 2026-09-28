@@ -79,7 +79,14 @@ defmodule Loopctl.Intake.Source do
     # time; a thread has no pull request and the loopctl App pushes the squash itself, so the
     # merge gate reads the checks by SHA and this names which ones it requires: GitHub Actions
     # JOB names, as they appear on the commit (a commit-status context can never satisfy one;
-    # see `Loopctl.Delivery.CiEvidence`). `pr` mode never reads it.
+    # see `Loopctl.Delivery.CiEvidence`). STORY VERIFICATION reads it in EITHER mode
+    # (US-26.4.6): it judges the story's commit against these names by the merge gate's rules.
+    # It first needs an entry for the tenant in `VERIFICATION_OPERATOR_TOKEN_TENANTS`
+    # (`credential_unavailable` otherwise, whatever this list holds); then a `pr` source that
+    # names none records `no_required_checks` and reads nothing, which is how it opts in, and a
+    # source that names some has its (tenant, repository) pair checked against that list before
+    # any GitHub read (`credential_unavailable` if the pair is not an entry). The merge gate
+    # still reads it for `thread` mode only.
     field :required_checks, {:array, :string}, default: []
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
     field :revoked_at, :utc_datetime_usec

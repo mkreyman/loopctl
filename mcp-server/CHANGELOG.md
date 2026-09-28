@@ -5,6 +5,30 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.111.2 — 2026-09-28 (required_checks: the allowlist comes first)
+
+### Changed
+
+- **`intake_source_enroll`** and **`intake_source_update`** say what story verification needs
+  before `required_checks` matters (loopctl #913, US-26.4.6), in the order it checks: an entry
+  for the tenant in the operator's `VERIFICATION_OPERATOR_TOKEN_TENANTS` (with none, every run
+  records `credential_unavailable`, whatever the list holds); then a `pr` source that names
+  none records `no_required_checks`; then a source that names some has its (tenant,
+  repository) pair checked against that list before any GitHub read. Descriptions only; no
+  argument changed.
+
+## 2.111.1 — 2026-09-28 (verification reads required_checks)
+
+### Changed
+
+- **`intake_source_enroll`** and **`intake_source_update`** describe `required_checks` for what
+  it now also governs (loopctl #913, US-26.4.6): story verification judges a story's commit by
+  those checks in EITHER mode, satisfied only by a job of a push run of the story's branch. A
+  `pr` source that names none records `no_required_checks` and reads nothing. Descriptions
+  only; no argument changed.
+- The `merge_precondition` README row says CI is read from the GitHub Actions runs and jobs
+  APIs, not check-runs and commit-status.
+
 ## 2.111.0 — 2026-09-28 (merge import orphans)
 
 ### Changed

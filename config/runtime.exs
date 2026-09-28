@@ -642,6 +642,18 @@ if config_env() == :prod do
          |> Enum.map(&String.trim/1)
          |> Enum.reject(&(&1 == ""))
 
+  # US-26.4.6: the (tenant, repository) pairs story verification may read GitHub for with the
+  # operator's GITHUB_TOKEN, comma-separated, each `<tenant_uuid>:<owner>/<repo>`. Unset or
+  # empty: none, and every verification records `credential_unavailable` with nothing read. A
+  # malformed entry is dropped by `Loopctl.Verification.OperatorCredential.allowlist/0`. See
+  # `Loopctl.Verification.Credential` for why this is an allowlist of PAIRS.
+  config :loopctl,
+         :verification_operator_token_tenants,
+         (System.get_env("VERIFICATION_OPERATOR_TOKEN_TENANTS") || "")
+         |> String.split(",", trim: true)
+         |> Enum.map(&String.trim/1)
+         |> Enum.reject(&(&1 == ""))
+
   # NOTE (Epic 28, #179): the global `:anthropic_provider` / `:knowledge_classifier_model`
   # config keys were REMOVED. Tenant knowledge-LLM work (content extraction,
   # classification, merge synthesis, review extraction) now resolves each tenant's

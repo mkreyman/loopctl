@@ -132,12 +132,21 @@ config :loopctl, :heavy_read_statement_timeout_ms, 250
 # connection); integration tests assert on the buffer contents directly.
 config :loopctl, Loopctl.TouchBuffer, flush_interval_ms: :timer.hours(1)
 
-# Keep the L3 local test runner DISABLED in tests (it clones repos + runs
-# `mix test` on untrusted code). TestRunner's tests exercise the disabled path
-# and the validation-rejection paths WITHOUT ever cloning a real repo; input
-# validation runs before this gate, so validation-rejection is asserted
-# independently of the flag.
-config :loopctl, :enable_local_test_runner, false
+# US-26.4.6: story verification's credential seam, as a Mox mock whose DataCase default is
+# fail-closed (no credential). The allowlist below is read only by
+# `Loopctl.Verification.OperatorCredential`'s own test, which names these fixed ids; no fixture
+# ever creates a tenant with either. The last three entries are malformed and must be dropped:
+# no repository half, a repository half that is not owner/name, and a tenant half that is not
+# a UUID.
+config :loopctl, :verification_credential, Loopctl.MockVerificationCredential
+
+config :loopctl, :verification_operator_token_tenants, [
+  "0000a110-0000-4000-8000-00000000a110:acme/widgets",
+  "  0000A110-0000-4000-8000-00000000B220 : Acme/Gadgets  ",
+  "0000a110-0000-4000-8000-00000000c330",
+  "0000a110-0000-4000-8000-00000000d440:not a repo",
+  "not-a-uuid:acme/widgets"
+]
 
 # LCP-1 §9.3 signed-profile enforcement: resolve the deployment profile from a
 # process-dictionary stub in tests (async-safe), so a test can force `signed` for

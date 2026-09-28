@@ -17,7 +17,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-26.4.6.1",
-      "description": "The repository is resolved ONLY from the story's project's intake source (`Intake.source_for_project/2`), never from `projects.repo_url`, for the CI read and for the local fallback's clone alike. No live source records `ci_unavailable_reason` `no_intake_source`; more than one records `ambiguous_intake_source`; either reads nothing."
+      "description": "The repository is resolved ONLY from the story's project's intake source (`Intake.source_for_project/2`), never from `projects.repo_url`. No live source records `ci_unavailable_reason` `no_intake_source`; more than one records `ambiguous_intake_source`; either reads nothing."
     },
     {
       "id": "AC-26.4.6.2",
@@ -25,11 +25,11 @@
     },
     {
       "id": "AC-26.4.6.3",
-      "description": "A commit that changes CI definitions (`.github/workflows/`, `.github/actions/`, any `action.yml`, compared with the story's base branch) is refused `ci_definition_changed` exactly as the merge gate refuses it, and an unreadable diff `ci_definition_unknown`. Neither is a pass or a fail: both record no verdict and never fall back to the local runner."
+      "description": "Before judging CI, verification checks the change ONCE per run against the story's base branch, by the thread merge gate's own rules and through its own code: an EMPTY change — the commit's tree is the base's tree, or its three-dot diff with the base lists no file (`Loopctl.Delivery.EmptyChange.reasons/3`, which the merge gate calls too; an old green commit of the base, and an empty commit on top of one, both look like this) — is refused `empty_change`; a commit that changes CI definitions (`.github/workflows/`, `.github/actions/`, any `action.yml`) is refused `ci_definition_changed` exactly as the merge gate refuses it (`Loopctl.Delivery.CiDefinition.reasons/1`), and an unreadable diff `ci_definition_unknown`. Passing the check is recorded on the run (`change_checked_at`), so a merge landing during the CI wait cannot turn a checked commit into a refused one. Story verification runs BEFORE the merge: the run is enqueued by the custody verify call, and the merge gate allows nothing until the story is verified. A stage row loopctl cannot read, or a passed check it cannot record, is a wait, never a verdict. None of these refusals is a pass or a fail: each records no verdict."
     },
     {
       "id": "AC-26.4.6.4",
-      "description": "The verdict is `CiEvidence.judge/2` over the intake source's `required_checks`, in either mode: every required name concluded success is `pass`; a failed name, including a jobless run that ended (`run_<conclusion>`), is `fail`; a pending or `:missing` name is a wait. `required_checks` becomes meaningful for pr-mode sources too (its field comment, the enrollment tool's description and FLY_SECRETS/OpenAPI say so); a source with none records `no_required_checks` and reads nothing, which is the opt-in."
+      "description": "The verdict is `CiEvidence.judge/2` over the intake source's `required_checks`, in either mode: every required name concluded success is `pass`; a failed name, including a jobless run that ended (`run_<conclusion>`), is `fail`; a pending or `:missing` name is a wait. `required_checks` becomes meaningful for pr-mode sources too (its field comment, the enrollment tool's description and FLY_SECRETS/OpenAPI say so). The tenant must have an entry in `VERIFICATION_OPERATOR_TOKEN_TENANTS` first (AC-26.4.6.8): a tenant with none records `credential_unavailable` whatever the source names. Then a pr source naming none records `no_required_checks` and reads nothing, which is the opt-in, whichever repository the tenant's entry names; the (tenant, repository) pair is checked after that, before any GitHub read."
     },
     {
       "id": "AC-26.4.6.5",
@@ -37,19 +37,19 @@
     },
     {
       "id": "AC-26.4.6.6",
-      "description": "The local fallback (TestRunner) runs only when CI gives a final no-verdict for a reason that is not a refusal (AC-26.4.6.3) and not a missing configuration (AC-26.4.6.1, .2, .4), never on a wait. It clones the intake source's repository through the same credential seam as the CI read (AC-26.4.6.8)."
+      "description": "The local fallback is removed rather than wired in: `Loopctl.Verification.TestRunner` and its `:enable_local_test_runner` flag are deleted, and a final no-verdict records its code and ends the run. The runner had no environment it could safely run in, because it would execute tenant code with loopctl's environment and filesystem. A local re-execution returns only with an isolated, egress-restricted runner."
     },
     {
       "id": "AC-26.4.6.7",
-      "description": "An abbreviated commit SHA is resolved once, through `GET /repos/:repo/commits/:ref` (the git-data API accepts full ids only), and the full id is persisted on the run, so later polls of the same run read no commit. An ambiguous prefix (422) or no such commit (404) is a permanent no-verdict (`ambiguous_sha`, `unknown_commit`)."
+      "description": "An abbreviated commit SHA is resolved once, through `GET /repos/:repo/commits/:ref` (the git-data API accepts full ids only), and the full id is persisted on the run, so later polls of the same run read no commit. Measured against GitHub on 2026-09-28: that endpoint answers 422 'No commit found for SHA' for an unknown prefix and an unknown full id alike (it does not distinguish an ambiguous prefix from an unknown one), and 404 for a repository that is missing or unreadable. So a 422 is `unresolved_sha` and a 404 `repository_unreadable`, both permanent no-verdicts."
     },
     {
       "id": "AC-26.4.6.8",
-      "description": "Every GitHub read and the clone go through one credential seam. Until the per-tenant credential decision (#915, 'Needs Mark') is made, that seam carries the operator `GITHUB_TOKEN` ONLY for tenants named in an operator allowlist (a new env var, default empty, documented in FLY_SECRETS.md): any other tenant records `credential_unavailable` and nothing is read. Enrollment does not prove a tenant controls the repository it names, so the operator token must not read on an unproven tenant's behalf."
+      "description": "Every GitHub read goes through one credential seam. Until the per-tenant credential decision (#915, 'Needs Mark') is made, that seam carries the operator `GITHUB_TOKEN` ONLY for (tenant, repository) pairs named in an operator allowlist (a new env var of `<tenant_uuid>:<owner>/<repo>` entries, default empty, documented in FLY_SECRETS.md): a run whose tenant and intake-source repository do not match one entry records `credential_unavailable` and nothing is read. Whether the tenant has ANY entry is checked before any other configuration, so a tenant with none records this even when its source names no `required_checks`; the pair itself is checked once the story's repository is resolved, before any GitHub read. The seam LICENSES the read and carries no token: the forge adapter reads `GITHUB_TOKEN` itself, and carrying a per-tenant token needs the `PullRequestSource` callbacks to take one. Enrollment does not prove a tenant controls the repository it names, so the operator token must not read on an unproven tenant's behalf — and naming the tenant alone would let a trusted tenant enrol a repository that is not its own."
     },
     {
       "id": "AC-26.4.6.9",
-      "description": "ac_results records the evidence URL of the failing job on fail and of the judged run on pass, both inside the tenant's own intake-source repository. On no verdict it records a short reason code carrying no URL and no repository name; the worker's rescue arm and the local fallback's error stop writing `Exception.message/1` and `inspect/1` output."
+      "description": "ac_results records the evidence URL of the failing job on fail and of the judged run on pass, both inside the tenant's own intake-source repository. On no verdict it records a short reason code carrying no URL and no repository name; the worker's rescue arm stops writing `Exception.message/1` and `inspect/1` output."
     },
     {
       "id": "AC-26.4.6.10",
@@ -78,11 +78,11 @@
     {
       "id": "TC-26.4.6.3",
       "verifies": ["AC-26.4.6.3"],
-      "name": "a workflow edit is refused",
+      "name": "the change check is the merge gate's, once per run",
       "type": "unit",
-      "preconditions": ["the commit changes .github/workflows/ci.yml"],
-      "steps": ["verify it"],
-      "expected_results": ["no verdict, ci_definition_changed, no local run"]
+      "preconditions": ["separate runs: a commit changing .github/workflows/ci.yml; an old base commit and an empty commit on one; a head whose tree is the base's with a non-empty diff; a run checked once whose next comparison is empty; a passed check whose stamp write meets a row lock"],
+      "steps": ["verify each"],
+      "expected_results": ["ci_definition_changed; empty_change for both; empty_change; judged with no second comparison; a wait that leaves the fault streak alone, then checked again and judged"]
     },
     {
       "id": "TC-26.4.6.4",
@@ -91,7 +91,7 @@
       "type": "unit",
       "preconditions": ["separate runs"],
       "steps": ["a 502 once then success; 502 past the consecutive bound; a 404; a missing name past the age window"],
-      "expected_results": ["pass after a snooze; forge_unavailable; unknown code at once; ci_wait_exhausted. No local run on a wait"]
+      "expected_results": ["pass after a snooze; forge_unavailable; unknown code at once; ci_wait_exhausted"]
     },
     {
       "id": "TC-26.4.6.5",

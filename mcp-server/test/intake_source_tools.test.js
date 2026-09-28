@@ -1094,6 +1094,30 @@ describe("the descriptions carry what a caller needs instead of the controller",
     }
   });
 
+  test("both write tools say required_checks is read by story verification in pr mode too (US-26.4.6)", () => {
+    for (const name of ["intake_source_enroll", "intake_source_update"]) {
+      const tool = loadTools().find((t) => t.name === name);
+      const text = tool.inputSchema.properties.required_checks.description;
+      assert.match(text, /story verification/, name);
+      assert.match(text, /no_required_checks/, name);
+      assert.match(text, /PUSH run of the story's branch/, name);
+      // Round 4, finding 2: the order the worker checks, exactly. ANY entry for the tenant
+      // first; then the pr opt-in; then the (tenant, repository) pair, before a GitHub read.
+      assert.match(text, /entry for this tenant[\s\S]*VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks[\s\S]*\(tenant, repository\) pair[\s\S]*before any GitHub read/, name);
+      assert.ok(!/tenant and (this )?repository in/.test(text), `${name} still says the pair gates no_required_checks`);
+      assert.ok(!/mode never reads it/.test(text), `${name} still says pr mode never reads it`);
+    }
+    for (const name of ["intake_source_enroll", "intake_source_update"]) {
+      assert.match(row(name), /no_required_checks/, `${name}'s README row`);
+      assert.match(
+        row(name),
+        /VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks[\s\S]*\(tenant, repository\) pair[\s\S]*before any GitHub read/,
+        `${name}'s README row`,
+      );
+      assert.ok(!/tenant and (this )?repository (are )?in/.test(row(name)), `${name}'s README row still says the pair gates no_required_checks`);
+    }
+  });
+
   test("both write tools say a thread source needs runners at contract 1.20.0 (US-45.4)", () => {
     for (const name of ["intake_source_enroll", "intake_source_update"]) {
       const tool = loadTools().find((t) => t.name === name);
