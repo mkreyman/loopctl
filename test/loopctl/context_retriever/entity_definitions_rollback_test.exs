@@ -45,17 +45,16 @@ defmodule Loopctl.ContextRetriever.EntityDefinitionsRollbackTest do
   """
   use ExUnit.Case, async: false
 
-  alias Loopctl.Test.MigrationFile
-
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
+  alias Loopctl.Test.RequireOnce
 
   @version 20_260_711_120_000
 
   @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
   migration_file = Path.wildcard(Path.join(@migrations_dir, "#{@version}_*.exs")) |> hd()
-  MigrationFile.require!(migration_file)
+  RequireOnce.require!(migration_file)
 
   alias Loopctl.Repo.Migrations.CreateEntityDefinitions
 
