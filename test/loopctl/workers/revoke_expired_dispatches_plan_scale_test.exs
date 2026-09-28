@@ -2,8 +2,8 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
   @moduledoc """
   Epic 32, US-32.1, AC-32.1.2: the query `RevokeExpiredDispatchesWorker` actually issues is
   served by the partial index `dispatches_expires_at_active_index`, chosen by the DEFAULT
-  planner (no `enable_seqscan = off`), and does not also read the tenant-leading composite
-  `dispatches_tenant_id_expires_at_index`, which the sweep cannot seek. The query reads one
+  planner (no `enable_seqscan = off`), and is the ONLY index in the plan, so a bitmap that
+  also reads the tenant-leading composite or any other index whole fails. The query reads one
   table, so a plan that uses the index cannot also Seq Scan it. With a small live set the
   planner reaches the index by an Index Scan, with a larger one by a Bitmap Index Scan; both
   seek it.
@@ -43,7 +43,6 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
   @moduletag :scale
 
   @index "dispatches_expires_at_active_index"
-  @composite "dispatches_tenant_id_expires_at_index"
   @revoked_history 20_000
   @live 50
   @backlog 20
@@ -67,38 +66,16 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
       end)
     end)
 
-    unboxed(fn -> seed!(Ecto.UUID.dump!(tenant.id)) end)
+    unboxed(fn -> seed!(tenant.id) end)
     {:ok, tenant: tenant}
   end
 
   defp seed!(tenant_id) do
-    AdminRepo.query!(
-      """
-      INSERT INTO dispatches (tenant_id, role, expires_at, revoked_at)
-      SELECT $1::uuid, 'agent',
-             now() - make_interval(hours => g),
-             now() - make_interval(hours => g) - interval '1 minute'
-      FROM generate_series(1, $2::int) g
-      """,
-      [tenant_id, @revoked_history]
-    )
-
-    AdminRepo.query!(
-      """
-      INSERT INTO dispatches (tenant_id, role, expires_at)
-      SELECT $1::uuid, 'agent', now() + make_interval(mins => g)
-      FROM generate_series(1, $2::int) g
-      """,
-      [tenant_id, @live]
-    )
-
-    AdminRepo.query!(
-      """
-      INSERT INTO dispatches (tenant_id, role, expires_at)
-      SELECT $1::uuid, 'agent', now() - make_interval(secs => g)
-      FROM generate_series(1, $2::int) g
-      """,
-      [tenant_id, @backlog]
+    fixture(:dispatch_sweep_history,
+      tenant_id: tenant_id,
+      revoked: @revoked_history,
+      live: @live,
+      backlog: @backlog
     )
 
     # Plan against the table's clean state, which is what CI's fresh database has. A
@@ -107,7 +84,18 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
     # Measured 2026-09-28 after repeated local runs: the partial index held 70 entries in
     # 131 pages, which priced its scan at 540 against about 590 for a Seq Scan, and the
     # planner went either way from run to run. REINDEX rebuilds it at its real size;
-    # CONCURRENTLY, so writers elsewhere in the database are not blocked behind it.
+    # CONCURRENTLY, so writers elsewhere in the database are not blocked behind it. An
+    # interrupted concurrent rebuild leaves an INVALID `<index>_ccnew*` behind that every
+    # later insert keeps maintaining, so any such leftover is dropped first.
+    %{rows: leftovers} =
+      AdminRepo.query!(
+        "SELECT c.relname FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid " <>
+          "WHERE c.relname LIKE $1 AND NOT i.indisvalid",
+        [@index <> "_cc%"]
+      )
+
+    for [name] <- leftovers, do: AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{name}")
+
     AdminRepo.query!("REINDEX INDEX CONCURRENTLY #{@index}")
     AdminRepo.query!("VACUUM ANALYZE dispatches")
   end
@@ -135,8 +123,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
 
       sweep = PlanAssertions.only_query_matching(captured, ~r/\ASELECT .* FROM "dispatches"/s)
 
-      PlanAssertions.assert_index_used(sweep, @index)
-      PlanAssertions.refute_index_used(sweep, @composite)
+      PlanAssertions.assert_only_index_used(sweep, "dispatches", @index)
     end)
   end
 end

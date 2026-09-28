@@ -391,20 +391,54 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
-  The inverse of `assert_index_used/2`: raises, with the plan, if `name` appears anywhere in
-  it. Pair the two to require one index and rule out another, for example a Bitmap Heap Scan
-  whose BitmapAnd reads a second, whole index alongside the one asserted.
+  Asserts `name` is the ONLY index anywhere in the plan. Stronger than
+  `assert_index_used/2`: a Bitmap Heap Scan whose BitmapAnd also reads another index whole
+  (a tenant-leading composite, the primary key) fails, and so does a plan naming no index.
+
+  Checks first that `name` exists, so a renamed or dropped index fails here instead of
+  passing, and that `relation`'s statistics are current (`assert_stats_current!/1`).
   """
-  def refute_index_used(queryable_or_sql, name) when is_binary(name) do
+  def assert_only_index_used(queryable_or_sql, relation, name)
+      when is_binary(relation) and is_binary(name) do
+    %{rows: [[exists?]]} =
+      AdminRepo.query!("SELECT to_regclass($1) IS NOT NULL", ["public." <> name])
+
+    unless exists?, do: raise(ExUnit.AssertionError, message: "No index named #{inspect(name)}")
+
+    assert_stats_current!(relation)
     {root, raw} = explain_json(queryable_or_sql)
 
-    if name in index_names(root) do
+    case root |> index_names() |> Enum.uniq() do
+      [^name] ->
+        :ok
+
+      names ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected #{inspect(name)} to be the only index in the plan, got #{inspect(names)}. " <>
+              "Plan:\n#{elide(raw)}"
+    end
+  end
+
+  @doc """
+  Raises unless `relation` holds rows and the planner's row count for it, written by the
+  last ANALYZE, is within 10% of the rows actually there. The count comes from
+  `pg_class.reltuples`, which ANALYZE sets synchronously, not from the asynchronous
+  statistics collector. A plan assertion on stale statistics can pass by accident.
+  """
+  def assert_stats_current!(relation) when is_binary(relation) do
+    %{rows: [[reltuples, actual]]} =
+      AdminRepo.query!(
+        "SELECT c.reltuples::bigint, (SELECT count(*) FROM #{relation}) " <>
+          "FROM pg_class c WHERE c.oid = to_regclass($1)",
+        ["public." <> relation]
+      )
+
+    unless actual > 0 and abs(reltuples - actual) <= actual / 10 do
       raise ExUnit.AssertionError,
         message:
-          "Expected the plan NOT to use index #{inspect(name)}, but it does. " <>
-            "Plan:\n#{elide(raw)}"
-    else
-      :ok
+          "#{relation} statistics are not current (planner sees #{reltuples} rows, " <>
+            "#{actual} are there); ANALYZE it before asserting a plan"
     end
   end
 

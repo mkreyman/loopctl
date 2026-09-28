@@ -1874,6 +1874,48 @@ defmodule Loopctl.Fixtures do
     |> AdminRepo.insert!()
   end
 
+  # COMMITTED bulk seed for plan tests (`:scale`, outside the sandbox): a dispatches table in
+  # the shape a running one settles into, since every swept dispatch stays in it past expiry.
+  # `revoked` rows are expired and revoked, `live` rows expire hours from now (never during
+  # the test), `backlog` rows expired seconds ago and are unrevoked, what the next sweep
+  # takes. Raw INSERT ... SELECT because the counts are in the tens of thousands. Requires
+  # attrs `tenant_id` and the three counts; returns them.
+  def fixture(:dispatch_sweep_history, attrs) do
+    attrs = Map.new(attrs)
+    tenant_id = Ecto.UUID.dump!(Map.fetch!(attrs, :tenant_id))
+
+    AdminRepo.query!(
+      """
+      INSERT INTO dispatches (tenant_id, role, expires_at, revoked_at)
+      SELECT $1::uuid, 'agent',
+             now() - make_interval(hours => g),
+             now() - make_interval(hours => g) - interval '1 minute'
+      FROM generate_series(1, $2::int) g
+      """,
+      [tenant_id, Map.fetch!(attrs, :revoked)]
+    )
+
+    AdminRepo.query!(
+      """
+      INSERT INTO dispatches (tenant_id, role, expires_at)
+      SELECT $1::uuid, 'agent', now() + make_interval(hours => g)
+      FROM generate_series(1, $2::int) g
+      """,
+      [tenant_id, Map.fetch!(attrs, :live)]
+    )
+
+    AdminRepo.query!(
+      """
+      INSERT INTO dispatches (tenant_id, role, expires_at)
+      SELECT $1::uuid, 'agent', now() - make_interval(secs => g)
+      FROM generate_series(1, $2::int) g
+      """,
+      [tenant_id, Map.fetch!(attrs, :backlog)]
+    )
+
+    attrs
+  end
+
   def fixture(:tenant_llm_settings, attrs) do
     attrs = Enum.into(attrs, %{})
 

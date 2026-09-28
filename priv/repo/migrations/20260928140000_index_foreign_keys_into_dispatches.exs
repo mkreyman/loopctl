@@ -14,9 +14,12 @@ defmodule Loopctl.Repo.Migrations.IndexForeignKeysIntoDispatches do
   # the indexes bigger.
   #
   # CONCURRENTLY, with the DDL transaction and migration lock off, because `dispatches` is a
-  # hot write path. Each index is dropped first (CONCURRENTLY, IF EXISTS) so an interrupted
-  # build's INVALID leftover is rebuilt rather than matched by name and skipped, the same
-  # reasoning as 20260713000000_add_dispatches_expires_at_active_index.
+  # hot write path. An interrupted CONCURRENTLY build leaves an INVALID index that
+  # `IF NOT EXISTS` would match by name and skip, so each index is dropped first, but ONLY
+  # when it exists invalid or in another shape (`stale?/2`, the same reconciliation as
+  # 20260919100000_add_runner_unsupported_kind_index). Dropping unconditionally would, on a
+  # re-run after the second build failed, drop the first index while it was valid and leave
+  # the hot table without it for a whole rebuild.
   @disable_ddl_transaction true
   @disable_migration_lock true
 
@@ -28,7 +31,8 @@ defmodule Loopctl.Repo.Migrations.IndexForeignKeysIntoDispatches do
 
   def up do
     for {name, table, column} <- @indexes do
-      execute("DROP INDEX CONCURRENTLY IF EXISTS #{name}")
+      if stale?(name, shape(table, column)),
+        do: execute("DROP INDEX CONCURRENTLY IF EXISTS #{name}")
 
       execute("""
       CREATE INDEX CONCURRENTLY IF NOT EXISTS #{name}
@@ -41,6 +45,27 @@ defmodule Loopctl.Repo.Migrations.IndexForeignKeysIntoDispatches do
   def down do
     for {name, _table, _column} <- @indexes do
       execute("DROP INDEX CONCURRENTLY IF EXISTS #{name}")
+    end
+  end
+
+  defp shape(table, column) do
+    ~r/ON public\.#{table} USING btree \(#{column}\) WHERE \(#{column} IS NOT NULL\)$/
+  end
+
+  # True when an index of this name exists but is INVALID or not the shape above; false
+  # when it is absent (the CREATE builds it) or already valid in this shape (nothing to do).
+  defp stale?(name, shape) do
+    sql = """
+    SELECT pg_get_indexdef(c.oid), x.indisvalid
+      FROM pg_class c
+      JOIN pg_index x ON x.indexrelid = c.oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = 'public'
+    """
+
+    case repo().query!(sql, [name]).rows do
+      [[indexdef, true]] -> not (indexdef =~ shape)
+      rows -> rows != []
     end
   end
 end
