@@ -4,18 +4,16 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # Epic 32 (scalability), US-32.1.
   #
   # `Loopctl.Workers.RevokeExpiredDispatchesWorker` runs every 60s via Oban Cron and
-  # issues a TENANT-AGNOSTIC (cross-tenant, BYPASSRLS via AdminRepo) sweep:
-  #
-  #     from(d in Dispatch,
-  #       where: is_nil(d.revoked_at) and d.expires_at < ^now,
-  #       select: %{id: d.id, api_key_id: d.api_key_id})
+  # issues a TENANT-AGNOSTIC (cross-tenant, BYPASSRLS via AdminRepo) sweep whose WHERE
+  # clause is `revoked_at IS NULL AND expires_at < now` (see its `perform/1`).
   #
   # The only expiry-related index on `dispatches` is the composite
   # (tenant_id, expires_at) from 20260411234856_create_dispatches. Its LEADING column
-  # `tenant_id` is absent from the sweep predicate, so Postgres cannot use it → a full
-  # seq scan of the continuously-growing `dispatches` table every minute. The sweep MUST
-  # stay cross-tenant (it finds expired dispatches across all tenants), so it can never
-  # use a tenant-leading index.
+  # `tenant_id` is absent from the sweep predicate, so Postgres cannot SEEK on it: it can
+  # only read that index whole or seq-scan the continuously-growing `dispatches` table,
+  # every minute. The sweep MUST stay
+  # cross-tenant (it finds expired dispatches across all tenants), so a tenant-leading
+  # index can never be SEEKED for it.
   #
   # This partial index matches the sweep predicate exactly — the WHERE
   # `revoked_at IS NULL` clause keeps it tiny (only live, un-revoked rows) and lets the
@@ -29,11 +27,14 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # (other per-tenant lookups still use it).
   # VERIFICATION (AC-32.1.2) — EXPLAIN of the worker's exact predicate
   # (`WHERE revoked_at IS NULL AND expires_at < now()`) uses this partial index,
-  # not a Seq Scan. Two captures:
+  # not a Seq Scan. Two captures, each taken once by hand when this migration was
+  # written; neither is asserted in the suite. The ExUnit guard
+  # `RevokeExpiredDispatchesWorkerTest` asserts the index's shape and predicate from
+  # `pg_index`, because the planner's choice in the shared test table moves with the rows
+  # concurrent tests have in flight.
   #
   #   * Empty table, planner forced to reveal usability (`SET LOCAL
-  #     enable_seqscan = off`) — the deterministic form asserted by the ExUnit
-  #     guard `RevokeExpiredDispatchesWorkerTest`:
+  #     enable_seqscan = off`), which proves eligibility rather than choice:
   #
   #       Index Scan using dispatches_expires_at_active_index on dispatches d0
   #         Index Cond: (expires_at < now())
