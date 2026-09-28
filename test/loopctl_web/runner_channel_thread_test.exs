@@ -170,11 +170,11 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       ref =
         push(channel, "checkpoint", checkpoint_msg(dispatch_id, %{"claim_epoch" => @epoch + 1}))
 
-      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
       assert thread(ctx).checkpoints == []
     end
 
-    test "a dispatch that is not an implement is refused unknown_dispatch", ctx do
+    test "a dispatch that is not an implement is refused wrong_dispatch_kind", ctx do
       %{channel: channel, runner: runner, story: story} = ctx
 
       triage =
@@ -187,10 +187,10 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
         })
 
       ref = push(channel, "checkpoint", checkpoint_msg(triage.dispatch_id))
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
 
       ref = push(channel, "thread_entry", entry_msg(triage.dispatch_id))
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
 
       assert thread(ctx).entries == []
     end
@@ -314,7 +314,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
 
       ref = push(channel, "thread_entry", entry_msg(dispatch_id, %{"claim_epoch" => @epoch + 1}))
 
-      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
       assert thread(ctx).entries == []
     end
 

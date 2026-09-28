@@ -545,8 +545,8 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     test "a reply at another claim_epoch is stale and changes nothing", %{runner: runner} do
       record = sent(runner, %{"claim_epoch" => 2})
 
-      assert {:error, :stale_claim_epoch} = reply(runner, record, %{"claim_epoch" => 1})
-      assert {:error, :stale_claim_epoch} = reply(runner, record, %{"claim_epoch" => 3})
+      assert {:error, :claim_epoch_mismatch} = reply(runner, record, %{"claim_epoch" => 1})
+      assert {:error, :claim_epoch_mismatch} = reply(runner, record, %{"claim_epoch" => 3})
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).status == "sent"
     end
   end
@@ -684,7 +684,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
         %{dispatch_id: record.dispatch_id, claim_epoch: record.claim_epoch, reason: "crashed"}
       end
 
-      assert {:error, :unknown_dispatch} =
+      assert {:error, :wrong_dispatch_kind} =
                DispatchLedger.record_review_session_end(
                  runner.tenant_id,
                  runner.id,
@@ -692,13 +692,32 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
                  "d1"
                )
 
-      assert {:error, :unknown_dispatch} =
+      assert {:error, :wrong_dispatch_kind} =
                DispatchLedger.record_session_end(runner.tenant_id, runner.id, message.(review), %{
                  reason: "crashed",
                  digest: "d2",
                  counts_toward_retry_ceiling: true,
                  story_id: review.story_id
                })
+    end
+
+    test "a review session end naming another epoch than its dispatch's is claim_epoch_mismatch",
+         %{runner: runner} do
+      implement = accepted(runner)
+      review = sent(runner, %{"story_id" => implement.story_id}, %{kind: "review"})
+      {:ok, review} = reply(runner, review)
+
+      assert {:error, :claim_epoch_mismatch} =
+               DispatchLedger.record_review_session_end(
+                 runner.tenant_id,
+                 runner.id,
+                 %{
+                   dispatch_id: review.dispatch_id,
+                   claim_epoch: review.claim_epoch + 1,
+                   reason: "completed"
+                 },
+                 "review-digest"
+               )
     end
 
     test "its budget kill is not read as the implementer's session end", %{runner: runner} do
@@ -940,7 +959,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       record: record,
       run_id: run_id
     } do
-      assert {:error, :stale_claim_epoch} =
+      assert {:error, :claim_epoch_mismatch} =
                trace(runner, record, run_id, [0], %{"claim_epoch" => record.claim_epoch + 1})
 
       assert stored_seqs(runner.tenant_id, run_id) == []

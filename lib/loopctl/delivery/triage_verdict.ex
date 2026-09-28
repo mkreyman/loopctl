@@ -219,8 +219,10 @@ defmodule Loopctl.Delivery.TriageVerdict do
   @type error ::
           :story_draft_invalid
           | :unknown_dispatch
+          | :wrong_dispatch_kind
           | :dispatch_not_accepted
           | :stale_claim_epoch
+          | :claim_epoch_mismatch
           | :already_recorded
           | :unknown_story_stage
           | :triage_not_bound
@@ -283,13 +285,19 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # what says which kind this dispatch is; without the check, the runner holding a story's
   # IMPLEMENT dispatch could record a triage verdict for it — with lens verdicts of its own
   # choosing — and the merge gate would then judge that runner's pull request on them.
-  # `unknown_dispatch` because, as a triage dispatch, it does not exist.
-  # The dispatch's own epoch, checked before a transaction is opened, exactly as
-  # `Loopctl.Delivery.RunnerStages` checks it. The FENCE is the story's epoch read under a
-  # lock inside `Stages.advance/4`; this refuses a message that does not even match the
-  # dispatch it names, for the cost of a read the caller already made.
+  # Refused `wrong_dispatch_kind` (contract 1.22.0) by `DispatchLedger.accepted_session/4`,
+  # asked for `kind: "triage"` above: this runner's dispatch, of another kind.
+  #
+  # The dispatch's own epoch, checked before a transaction is opened. The FENCE is the
+  # story's epoch read under a lock inside `Stages.advance/4`; this refuses a message that
+  # does not even match the dispatch it names. A verdict naming another epoch than its own
+  # dispatch's is that MESSAGE's fault, answered
+  # `:claim_epoch_mismatch` (contract 1.22.0) whatever the story did since. Not the story's
+  # call as on `stage`: here `:stale_claim_epoch` is kept for the leave path, where a resend of
+  # the same bytes is how a reclaim-moved epoch is repaired (`permanent_error_conditions`), and
+  # a same-bytes resend of a mismatched message could never succeed.
   defp epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
-  defp epoch_matches(_session, _message), do: {:error, :stale_claim_epoch}
+  defp epoch_matches(_session, _message), do: {:error, :claim_epoch_mismatch}
 
   defp route(%{incomplete: reason}) when is_binary(reason) do
     # EVERY incomplete reason escalates. A triage run that produced nothing usable needs a

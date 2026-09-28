@@ -448,7 +448,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       assert Enum.any?(thread.entries, &(&1.id == entry_id and &1.review_id == review.id))
     end
 
-    test "only a review dispatch judges: an implement dispatch is unknown_dispatch", ctx do
+    test "only a review dispatch judges: an implement dispatch is wrong_dispatch_kind", ctx do
       payload =
         build(:runner_dispatch, %{
           "story_id" => ctx.story.id,
@@ -469,10 +469,10 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       assert_reply ref, :ok, _, @reply_timeout
 
       ref = finding(ctx, payload["dispatch_id"])
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
 
       ref = verdict(ctx, payload["dispatch_id"])
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
     end
 
     test "a review bound to an id an implement dispatch then took judges nothing", ctx do
@@ -511,7 +511,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       assert_reply ref, :ok, _, @reply_timeout
 
       ref = finding(ctx, dispatch_id)
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
     end
 
     test "after a force-unclaim a verdict is refused review_claim_ended and records nothing",
@@ -668,7 +668,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
           "to" => "reviewing"
         })
 
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
 
       {:ok, row} =
         Repo.with_tenant(ctx.tenant_id, fn ->

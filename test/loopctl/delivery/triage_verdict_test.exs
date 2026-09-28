@@ -316,7 +316,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
   end
 
   describe "apply/3" do
-    test "a verdict naming an implement dispatch is unknown_dispatch, and moves nothing" do
+    test "a verdict naming an implement dispatch is wrong_dispatch_kind, and moves nothing" do
       %{story: story, runner: runner} = session()
 
       implement =
@@ -328,7 +328,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
           kind: "implement"
         })
 
-      assert {:error, :unknown_dispatch} =
+      assert {:error, :wrong_dispatch_kind} =
                TriageVerdict.apply(
                  story.tenant_id,
                  runner.id,
@@ -1474,16 +1474,28 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
     end
 
-    test "a stale claim epoch is refused before anything is written" do
+    test "an epoch not the dispatch's is claim_epoch_mismatch, refused before anything is written" do
       %{story: story, runner: runner, record: record} = session()
 
       message = %{verdict_message(record, verdict("story")) | claim_epoch: @epoch + 1}
 
-      assert {:error, :stale_claim_epoch} =
+      assert {:error, :claim_epoch_mismatch} =
                TriageVerdict.apply(story.tenant_id, runner.id, message)
 
       assert records(story.tenant_id) == []
       assert stage_of(story) == :detected
+    end
+
+    test "a mismatched epoch stays the message's fault after the story moved" do
+      %{story: story, runner: runner, record: record} = session()
+      bump_story_epoch(story)
+
+      # `stale_claim_epoch` is kept for the leave path, whose same-bytes resend repairs a
+      # reclaim; a message that never matched its dispatch could not be repaired that way.
+      message = %{verdict_message(record, verdict("story")) | claim_epoch: @epoch + 1}
+
+      assert {:error, :claim_epoch_mismatch} =
+               TriageVerdict.apply(story.tenant_id, runner.id, message)
     end
 
     test "a dispatch this runner does not hold is unknown" do

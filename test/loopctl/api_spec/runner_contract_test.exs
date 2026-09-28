@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "37fcafef03d1113dcb8d21c5226882d69667f7720e6b00197df743f8e0264b8a"
+  @digest "bac83f7c1e00ce0611fc61dbaa992fd0856823515a51f343fac6582ac6b770a9"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -76,8 +76,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.21.0"
-      assert schema["x-contract-version"] == "1.21.0"
+      assert RunnerContract.version() == "1.22.0"
+      assert schema["x-contract-version"] == "1.22.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -2949,5 +2949,84 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     |> Regex.scan(reasons, capture: :all_but_first)
     |> List.flatten()
     |> MapSet.new()
+  end
+
+  describe "one code, one meaning, then claim_ending_errors (1.22.0, loopctl#920)" do
+    test "the claim-ending set is exactly this" do
+      live_or_gone = ~w(unknown_dispatch stale_claim_epoch)
+      review = ~w(review_closed review_claim_ended review_round_superseded reviewer_not_separate)
+
+      assert RunnerContract.claim_ending_errors() == %{
+               "dispatch_reply" => live_or_gone,
+               "trace" => live_or_gone,
+               "stage" => live_or_gone,
+               "triage_verdict" => ~w(unknown_dispatch),
+               "checkpoint" => live_or_gone ++ ~w(not_claimant),
+               "thread_entry" => live_or_gone,
+               "review_finding" => live_or_gone ++ review,
+               "review_verdict" => live_or_gone ++ review
+             }
+    end
+
+    test "every claim-ending code is published and permanent for the event it ends" do
+      reasons = RunnerContract.error_reasons()
+
+      for {event, codes} <- RunnerContract.claim_ending_errors(), code <- codes do
+        assert code in Map.fetch!(reasons, event), "#{event} does not publish #{code}"
+
+        assert RunnerContract.permanent_error?(event, code),
+               "#{code} ends the #{event} claim but is not permanent for it"
+      end
+    end
+
+    test "a split code ends no claim, and is permanent for its one message" do
+      reasons = RunnerContract.error_reasons()
+      ending = RunnerContract.claim_ending_errors() |> Map.values() |> List.flatten()
+
+      for {split, _legacy} <- RunnerContract.split_codes() do
+        assert Enum.any?(reasons, fn {_event, codes} -> split in codes end)
+        refute split in ending
+      end
+
+      for code <- ~w(claim_epoch_mismatch wrong_dispatch_kind),
+          event <- ~w(stage checkpoint thread_entry review_finding) do
+        assert RunnerContract.permanent_error?(event, code)
+      end
+
+      assert RunnerContract.split_codes() == %{
+               "claim_epoch_mismatch" => "stale_claim_epoch",
+               "wrong_dispatch_kind" => "unknown_dispatch"
+             }
+
+      # Answered once review is requested, while the session still reports its stages.
+      refute "claim_not_live" in RunnerContract.claim_ending_errors()["checkpoint"]
+    end
+
+    test "a runner older than 1.22.0, or of no readable version, is sent the code it replaced" do
+      for {split, legacy} <- RunnerContract.split_codes() do
+        assert RunnerContract.for_version(split, "1.22.0") == split
+        assert RunnerContract.for_version(split, "1.23.1") == split
+        assert RunnerContract.for_version(split, "1.21.0") == legacy
+        assert RunnerContract.for_version(split, nil) == legacy
+        assert RunnerContract.for_version(split, "garbage") == legacy
+      end
+
+      assert RunnerContract.for_version("stale_stage", "1.0.0") == "stale_stage"
+    end
+
+    test "session_ended has no key, and triage_verdict's resend is its repair" do
+      refute Map.has_key?(RunnerContract.claim_ending_errors(), "session_ended")
+      refute "stale_claim_epoch" in RunnerContract.claim_ending_errors()["triage_verdict"]
+      assert RunnerContract.permanent_error_conditions()["stale_claim_epoch"] =~ "triage_verdict"
+    end
+
+    test "the export publishes the map and the remedy" do
+      connection = RunnerContract.json_schema()["x-connection"]
+      assert connection["claim_ending_errors"] == RunnerContract.claim_ending_errors()
+      assert connection["claim_ending_remedy"] == RunnerContract.claim_ending_remedy()
+      assert connection["claim_ending_remedy"] =~ "session_ended"
+      # `session_ended` keeps its own rules: a transient answer is still resent.
+      assert connection["claim_ending_remedy"] =~ "`rate_limited` is resent"
+    end
   end
 end

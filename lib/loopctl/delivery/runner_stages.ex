@@ -117,8 +117,10 @@ defmodule Loopctl.Delivery.RunnerStages do
 
   @type error ::
           :unknown_dispatch
+          | :wrong_dispatch_kind
           | :dispatch_not_accepted
           | :stale_claim_epoch
+          | :claim_epoch_mismatch
           | {:stale_stage, StoryStage.t()}
           | :unknown_story_stage
           | {:effect_conflict, map()}
@@ -137,7 +139,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   def apply(tenant_id, runner_id, %{} = stage) do
     with {:ok, session} <-
            DispatchLedger.accepted_session(tenant_id, runner_id, stage.dispatch_id),
-         :ok <- dispatch_epoch_matches(session, stage) do
+         :ok <- dispatch_epoch_matches(tenant_id, session, stage) do
       advance(tenant_id, runner_id, session, stage)
     end
   end
@@ -145,9 +147,18 @@ defmodule Loopctl.Delivery.RunnerStages do
   # The dispatch's own epoch, checked before a transaction is opened. It is NOT the fence —
   # `Stages.advance/4` reads the story's current epoch under a share lock, which is the value
   # that decides — but a message that does not even match the dispatch it names is refused
-  # here for the cost of a read the caller already made.
-  defp dispatch_epoch_matches(%{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
-  defp dispatch_epoch_matches(_session, _stage), do: {:error, :stale_claim_epoch}
+  # here for the cost of a read the caller already made. WHICH refusal is the story's call
+  # (`DispatchLedger.epoch_refusal/4`, contract 1.22.0): a claim that moved on is
+  # `:stale_claim_epoch`, one still standing makes it this message's `:claim_epoch_mismatch`.
+  defp dispatch_epoch_matches(_tenant_id, %{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
+
+  defp dispatch_epoch_matches(tenant_id, session, _stage),
+    do:
+      DispatchLedger.epoch_refusal(tenant_id, session.story_id, session.claim_epoch, [
+        :loopctl,
+        :delivery,
+        :stage_busy
+      ])
 
   defp advance(tenant_id, runner_id, session, stage) do
     opts = [
@@ -193,8 +204,10 @@ defmodule Loopctl.Delivery.RunnerStages do
 
   @type end_error ::
           :unknown_dispatch
+          | :wrong_dispatch_kind
           | :dispatch_not_accepted
           | :stale_claim_epoch
+          | :claim_epoch_mismatch
           | :already_recorded
           | :unknown_story_stage
           | :audit_chain_append_failed
@@ -211,9 +224,11 @@ defmodule Loopctl.Delivery.RunnerStages do
   returns the story's stage row as it stands afterwards, with whether this message was a
   resend of one already recorded. See "Session end" in the moduledoc for what each reason does.
 
-  Refused before anything is recorded: `:unknown_dispatch` (not this runner's, or not an
-  implement dispatch), `:unknown_story_stage` (the story has no stage row), and — for a FIRST
-  report only — `:stale_claim_epoch` and `:dispatch_not_accepted`. A second report whose bytes
+  Refused before anything is recorded: `:unknown_dispatch` (not this runner's),
+  `:wrong_dispatch_kind` (not an implement dispatch), `:unknown_story_stage` (the story has no
+  stage row), and — for a FIRST report only — `:stale_claim_epoch` (the claim moved),
+  `:claim_epoch_mismatch` (the message's epoch is not its dispatch's, on a claim still
+  standing) and `:dispatch_not_accepted`. A second report whose bytes
   differ from the first is `:already_recorded`, whatever has happened since. `:busy` and
   `:capacity_busy` mean a lock was not free, or a budget escalation's row kept moving: the
   record may or may not have landed, and the resend completes the work either way.
@@ -248,7 +263,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   @doc """
   `end_session/4` for a row `held_dispatch/3` already read. Only an IMPLEMENT session ends a
   story's session here: `DispatchLedger.record_session_end/4` refuses any other kind
-  `:unknown_dispatch` under the row lock.
+  `:wrong_dispatch_kind` under the row lock.
   """
   @spec end_held_session(
           Ecto.UUID.t(),
