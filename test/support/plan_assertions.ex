@@ -395,17 +395,30 @@ defmodule Loopctl.PlanAssertions do
   `assert_index_used/2`: a Bitmap Heap Scan whose BitmapAnd also reads another index whole
   (a tenant-leading composite, the primary key) fails, and so does a plan naming no index.
 
-  Checks first that `name` exists, so a renamed or dropped index fails here instead of
-  passing, and that `relation`'s statistics are current (`assert_stats_current!/1`).
+  Checks first that `name` is a valid index ON `relation` (both in `public`), so a renamed,
+  dropped, invalid or mismatched index fails here instead of passing vacuously, and that
+  `column`'s planner statistics describe the rows actually in `relation`
+  (`assert_column_stats_current!/2`).
   """
-  def assert_only_index_used(queryable_or_sql, relation, name)
-      when is_binary(relation) and is_binary(name) do
-    %{rows: [[exists?]]} =
-      AdminRepo.query!("SELECT to_regclass($1) IS NOT NULL", ["public." <> name])
+  def assert_only_index_used(queryable_or_sql, relation, name, column)
+      when is_binary(relation) and is_binary(name) and is_binary(column) do
+    %{rows: valid} =
+      AdminRepo.query!(
+        """
+        SELECT 1 FROM pg_index i
+        WHERE i.indexrelid = to_regclass('public.' || quote_ident($1))
+          AND i.indrelid = to_regclass('public.' || quote_ident($2))
+          AND i.indisvalid
+        """,
+        [name, relation]
+      )
 
-    unless exists?, do: raise(ExUnit.AssertionError, message: "No index named #{inspect(name)}")
+    if valid == [] do
+      raise ExUnit.AssertionError,
+        message: "#{inspect(name)} is not a valid index on public.#{relation}"
+    end
 
-    assert_stats_current!(relation)
+    assert_column_stats_current!(relation, column)
     {root, raw} = explain_json(queryable_or_sql)
 
     case root |> index_names() |> Enum.uniq() do
@@ -421,26 +434,48 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
-  Raises unless `relation` holds rows and the planner's row count for it, written by the
-  last ANALYZE, is within 10% of the rows actually there. The count comes from
-  `pg_class.reltuples`, which ANALYZE sets synchronously, not from the asynchronous
-  statistics collector. A plan assertion on stale statistics can pass by accident.
+  Raises unless the last ANALYZE of `public.relation` saw the rows there now, judged on
+  `column`: its `pg_stats.null_frac` must be within 0.02 of the column's actual NULL
+  fraction. Column statistics are what the planner's selectivity comes from, and only
+  ANALYZE writes them; `pg_class.reltuples`, which a plain VACUUM or an index build also
+  writes, cannot tell stale column statistics from fresh ones. `assert_fresh_stats!/0` and
+  `assert_fresh_stats_audit!/0` answer a weaker question for their corpora (was the table
+  ever analyzed), and are left as they are.
   """
-  def assert_stats_current!(relation) when is_binary(relation) do
-    %{rows: [[reltuples, actual]]} =
+  def assert_column_stats_current!(relation, column)
+      when is_binary(relation) and is_binary(column) do
+    %{rows: rows} =
       AdminRepo.query!(
-        "SELECT c.reltuples::bigint, (SELECT count(*) FROM #{relation}) " <>
-          "FROM pg_class c WHERE c.oid = to_regclass($1)",
-        ["public." <> relation]
+        """
+        SELECT s.null_frac,
+               (SELECT count(*) FILTER (WHERE (to_jsonb(t) -> $2) = 'null'::jsonb)::float8
+                       / nullif(count(*), 0)
+                  FROM #{quoted_relation(relation)} t)
+          FROM pg_stats s
+         WHERE s.schemaname = 'public' AND s.tablename = $1 AND s.attname = $2
+        """,
+        [relation, column]
       )
 
-    unless actual > 0 and abs(reltuples - actual) <= actual / 10 do
-      raise ExUnit.AssertionError,
-        message:
-          "#{relation} statistics are not current (planner sees #{reltuples} rows, " <>
-            "#{actual} are there); ANALYZE it before asserting a plan"
+    case rows do
+      [[stats_frac, actual_frac]] when is_float(actual_frac) ->
+        unless abs(stats_frac - actual_frac) <= 0.02 do
+          raise ExUnit.AssertionError,
+            message:
+              "public.#{relation}.#{column} statistics are stale (null_frac #{stats_frac}, " <>
+                "actual #{actual_frac}); ANALYZE it before asserting a plan"
+        end
+
+      _none ->
+        raise ExUnit.AssertionError,
+          message:
+            "public.#{relation} is empty or #{column} has never been ANALYZEd; " <>
+              "a plan assertion on it means nothing"
     end
   end
+
+  defp quoted_relation(relation),
+    do: "public.\"" <> String.replace(relation, "\"", "\"\"") <> "\""
 
   @doc """
   Asserts every scan on `articles` is DOMINATED by a `Limit` node whose `Plan Rows`

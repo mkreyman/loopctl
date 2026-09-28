@@ -49,7 +49,7 @@ defmodule Loopctl.Repo.Migrations.IndexForeignKeysIntoDispatches do
   end
 
   defp shape(table, column) do
-    ~r/ON public\.#{table} USING btree \(#{column}\) WHERE \(#{column} IS NOT NULL\)$/
+    ~r/^CREATE INDEX \S+ ON public\.#{table} USING btree \(#{column}\) WHERE \(#{column} IS NOT NULL\)$/
   end
 
   # True when an index of this name exists but is INVALID or not the shape above; false

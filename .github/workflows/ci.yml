@@ -1021,6 +1021,7 @@ jobs:
         run: mix ecto.create && mix ecto.migrate
 
       - name: Grant RLS roles access to tables
+        id: scale_grant
         run: |
           PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -c "
             GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
@@ -1035,8 +1036,8 @@ jobs:
       # ANALYZE writes reltuples in place and would skew every other test's plans there.
       - name: Run revoke-sweep plan guard (AC-32.1.2)
         # Independent of the gates around it, so one gate's failure does not hide another's,
-        # but never on a database that did not finish migrating.
-        if: ${{ !cancelled() && steps.scale_setup_db.outcome == 'success' }}
+        # but never on a database that did not finish migrating and granting.
+        if: ${{ !cancelled() && steps.scale_setup_db.outcome == 'success' && steps.scale_grant.outcome == 'success' }}
         run: SCALE_TESTS=true mix test --only scale test/loopctl/workers/revoke_expired_dispatches_plan_scale_test.exs
 
       # US-41.1 AC-41.1.12(i) — the per-dimension ANN plan GATE. It EXPLAINs the real
@@ -1054,7 +1055,7 @@ jobs:
       # This step is the gate; AC-41.1.12(ii)'s production EXPLAIN is an artifact report,
       # not CI.
       - name: Run per-dimension ANN plan gate (TC-41.1.2, AC-41.1.12(i))
-        if: ${{ !cancelled() && steps.scale_setup_db.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.scale_setup_db.outcome == 'success' && steps.scale_grant.outcome == 'success' }}
         run: |
           SCALE_TESTS=true mix test --only scale \
             test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs

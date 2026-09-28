@@ -1877,7 +1877,8 @@ defmodule Loopctl.Fixtures do
   # COMMITTED bulk seed for plan tests (`:scale`, outside the sandbox): a dispatches table in
   # the shape a running one settles into, since every swept dispatch stays in it past expiry.
   # `revoked` rows are expired and revoked, `live` rows expire hours from now (never during
-  # the test), `backlog` rows expired seconds ago and are unrevoked, what the next sweep
+  # the test), `backlog` rows expired minutes ago and are unrevoked (well clear of any clock
+  # skew between the app and the database), what the next sweep
   # takes. Raw INSERT ... SELECT because the counts are in the tens of thousands. Requires
   # attrs `tenant_id` and the three counts; returns them.
   def fixture(:dispatch_sweep_history, attrs) do
@@ -1907,7 +1908,7 @@ defmodule Loopctl.Fixtures do
     AdminRepo.query!(
       """
       INSERT INTO dispatches (tenant_id, role, expires_at)
-      SELECT $1::uuid, 'agent', now() - make_interval(secs => g)
+      SELECT $1::uuid, 'agent', now() - make_interval(mins => g)
       FROM generate_series(1, $2::int) g
       """,
       [tenant_id, Map.fetch!(attrs, :backlog)]

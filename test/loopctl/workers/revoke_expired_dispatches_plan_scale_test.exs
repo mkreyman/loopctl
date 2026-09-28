@@ -90,8 +90,9 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
     %{rows: leftovers} =
       AdminRepo.query!(
         "SELECT c.relname FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid " <>
-          "WHERE c.relname LIKE $1 AND NOT i.indisvalid",
-        [@index <> "_cc%"]
+          "WHERE i.indrelid = 'public.dispatches'::regclass AND NOT i.indisvalid " <>
+          "AND c.relname ~ ('^' || $1 || '_cc(new|old)[0-9]*$')",
+        [@index]
       )
 
     for [name] <- leftovers, do: AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{name}")
@@ -123,7 +124,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
 
       sweep = PlanAssertions.only_query_matching(captured, ~r/\ASELECT .* FROM "dispatches"/s)
 
-      PlanAssertions.assert_only_index_used(sweep, "dispatches", @index)
+      PlanAssertions.assert_only_index_used(sweep, "dispatches", @index, "revoked_at")
     end)
   end
 end
