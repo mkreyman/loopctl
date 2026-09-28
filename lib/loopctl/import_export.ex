@@ -6,7 +6,8 @@ defmodule Loopctl.ImportExport do
   - **Fresh import** (`import_project/4`): Creates all epics, stories, and
     dependencies in a single transaction. Rejects if duplicate numbers exist.
   - **Merge import** (`merge_import_project/4`): Creates new entities, updates
-    existing ones (matched by number), preserves status fields, and reports orphans.
+    existing ones (matched by number), preserves status fields, and reports orphans only
+    when asked (`report_orphans`, #880).
   - **Export** (`export_project/2`): Serializes a project to a JSON-compatible
     map in the import format for round-trip fidelity.
 

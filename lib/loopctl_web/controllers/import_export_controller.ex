@@ -42,8 +42,10 @@ defmodule LoopctlWeb.ImportExportController do
         type: :boolean,
         description:
           "Merge mode only (#880): include `stories_orphaned`, the project's stories the " <>
-            "payload does not mention. Meaningful for a FULL round-trip of an export; on a " <>
-            "partial merge every unmentioned story is listed. Absent, the key is omitted."
+            "payload does not mention (nothing is detached). Meaningful for a FULL round-trip " <>
+            "of an export; on a partial merge every unmentioned story is listed. Also read " <>
+            "from the JSON body as a boolean. Absent or false, the key is omitted; any value " <>
+            "but true or false is 422."
       ]
     ],
     request_body: {"Import data", "application/json", Schemas.ImportRequest},
@@ -51,6 +53,11 @@ defmodule LoopctlWeb.ImportExportController do
       201 =>
         {"Import summary", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      200 =>
+        {"Merge summary (merge=true): `epics_created`, `epics_updated`, `stories_created`, " <>
+           "`stories_updated`, `dependencies_created`, `dependencies_existing`, and " <>
+           "`stories_orphaned` ([{number, title}]) only when `report_orphans` is true",
+         "application/json", %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       404 => {"Project not found", "application/json", Schemas.ErrorResponse},
       409 => {"Conflict", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
@@ -136,9 +143,26 @@ defmodule LoopctlWeb.ImportExportController do
   end
 
   defp do_merge_import(conn, tenant_id, project_id, params, audit_opts) do
-    audit_opts = Keyword.put(audit_opts, :report_orphans, params["report_orphans"] == "true")
+    with {:ok, report_orphans} <- report_orphans(params) do
+      merge_import(conn, tenant_id, project_id, params, [
+        {:report_orphans, report_orphans} | audit_opts
+      ])
+    end
+  end
 
-    case ImportExport.merge_import_project(tenant_id, project_id, params, audit_opts) do
+  # `report_orphans` from the query string ("true"/"false") or the JSON body (a boolean); the
+  # body wins where both are given, as Phoenix merges it over the query. Anything else is
+  # refused rather than read as false, which would silently drop the list a caller asked for.
+  defp report_orphans(params) do
+    case Map.get(params, "report_orphans") do
+      value when value in [nil, false, "false"] -> {:ok, false}
+      value when value in [true, "true"] -> {:ok, true}
+      _other -> {:error, :unprocessable_entity, "report_orphans must be true or false"}
+    end
+  end
+
+  defp merge_import(conn, tenant_id, project_id, params, opts) do
+    case ImportExport.merge_import_project(tenant_id, project_id, params, opts) do
       {:ok, summary} ->
         json(conn, %{import: summary})
 

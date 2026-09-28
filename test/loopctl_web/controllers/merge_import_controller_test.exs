@@ -219,6 +219,48 @@ defmodule LoopctlWeb.MergeImportControllerTest do
       refute Map.has_key?(body["import"], "stories_orphaned")
     end
 
+    test "report_orphans as a JSON boolean is honoured, and any other value is 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      seed = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Epic",
+            "stories" => [%{"number" => "1.1", "title" => "One"}]
+          }
+        ]
+      }
+
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/projects/#{project.id}/import", seed)
+      |> json_response(201)
+
+      partial = %{"epics" => [%{"number" => 1, "title" => "Epic", "stories" => []}]}
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(
+          ~p"/api/v1/projects/#{project.id}/import?merge=true",
+          Map.put(partial, "report_orphans", true)
+        )
+        |> json_response(200)
+
+      assert [%{"number" => "1.1"}] = body["import"]["stories_orphaned"]
+
+      assert build_conn()
+             |> auth_conn(raw_key)
+             |> post(
+               ~p"/api/v1/projects/#{project.id}/import?merge=true&report_orphans=1",
+               partial
+             )
+             |> json_response(422)
+    end
+
     test "merge with new epic creates it with all stories", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})

@@ -4,14 +4,6 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
-### Changed
-
-- **Merge import reports orphans only on request (#880). Breaking for a caller that reads
-  `stories_orphaned`.** `POST /api/v1/projects/:id/import?merge=true` omits the key unless
-  `report_orphans=true` is passed; on a partial merge it listed every story the payload did
-  not mention, which is every other story in the project. Pass the flag when round-tripping a
-  full export.
-
 ### Added
 
 - **Runner contract 1.22.0: one refusal code, one meaning, and which refusals end the claim
@@ -248,6 +240,13 @@ All notable changes to loopctl are documented here.
     MCP server 2.109.0 adds `thread_stage_report`.
 
 ### Changed
+
+- **Merge import reports orphans only on request (#880). Breaking for a caller that reads
+  `stories_orphaned`.** `POST /api/v1/projects/:id/import?merge=true` omits the key unless
+  `report_orphans` is true (the `?report_orphans=true` query parameter or a JSON boolean in
+  the body; anything but true or false is 422); on a partial merge it listed every story the
+  payload did not mention, which is every other story in the project. Pass the flag when
+  round-tripping a full export.
 
 - **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**
   A triage-accepted story, a release whose re-contract did not land, and an escalation resolved

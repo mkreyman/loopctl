@@ -32,6 +32,7 @@ import {
   buildCorpusCreateBody,
   buildCorpusIndexBody,
   buildCorpusSearchBody,
+  importPath,
 } from "./lib/http-helpers.js";
 import {
   createWitnessClient,
@@ -1031,10 +1032,9 @@ async function importStories({ project_id, payload, payload_path, merge, report_
     return toContent(effectivePayload);
   }
   // `report_orphans` asks a merge for `stories_orphaned` (#880); without it the key is absent.
-  const query = merge ? (report_orphans ? "?merge=true&report_orphans=true" : "?merge=true") : "";
   const result = await apiCall(
     "POST",
-    `/api/v1/projects/${project_id}/import${query}`,
+    importPath(project_id, { merge, report_orphans }),
     effectivePayload,
     process.env.LOOPCTL_ORCH_KEY
   );
@@ -4468,6 +4468,9 @@ const TOOLS = [
     description:
       "Import stories into a project from a structured payload (Epic 12 import format). " +
       "Pass `merge: true` to add stories to epics that already exist (otherwise duplicates return 409). " +
+      "A merge answers counts; `stories_orphaned` (the project's stories the payload does not " +
+      "mention; nothing is detached) is in the response ONLY with `report_orphans: true`, " +
+      "which is a signal only on a full round-trip of an export (#880). " +
       "For large payloads, use `payload_path` to read JSON from disk instead of passing it inline.",
     inputSchema: {
       type: "object",

@@ -361,3 +361,20 @@ export function buildCorpusSearchBody({ query, query_vector, lanes, limit } = {}
   if (limit != null) body.limit = limit;
   return body;
 }
+
+/**
+ * Path for `import_stories`. `report_orphans` asks a MERGE for `stories_orphaned` (loopctl
+ * #880) and is sent only for `true` or the string "true": a non-boolean the tool received
+ * (the server does not type-check arguments against the schema) must not turn the list on.
+ *
+ * @param {string} projectId
+ * @param {{ merge?: unknown, report_orphans?: unknown }} [args]
+ * @returns {string}
+ */
+export function importPath(projectId, { merge, report_orphans } = {}) {
+  const on = (value) => value === true || value === "true";
+  return `/api/v1/projects/${projectId}/import${buildQuery([
+    ["merge", on(merge) ? "true" : null],
+    ["report_orphans", on(merge) && on(report_orphans) ? "true" : null],
+  ])}`;
+}
