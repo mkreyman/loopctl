@@ -1101,18 +1101,20 @@ describe("the descriptions carry what a caller needs instead of the controller",
       assert.match(text, /story verification/, name);
       assert.match(text, /no_required_checks/, name);
       assert.match(text, /PUSH run of the story's branch/, name);
-      // Round 3, finding 3: the allowlist is checked first, so the opt-in is only reached by a
-      // tenant and repository the operator named.
-      assert.match(text, /VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*only then[\s\S]*no_required_checks/, name);
+      // Round 4, finding 2: the order the worker checks, exactly. ANY entry for the tenant
+      // first; then the pr opt-in; then the (tenant, repository) pair, before a GitHub read.
+      assert.match(text, /entry for this tenant[\s\S]*VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks[\s\S]*\(tenant, repository\) pair[\s\S]*before any GitHub read/, name);
+      assert.ok(!/tenant and (this )?repository in/.test(text), `${name} still says the pair gates no_required_checks`);
       assert.ok(!/mode never reads it/.test(text), `${name} still says pr mode never reads it`);
     }
     for (const name of ["intake_source_enroll", "intake_source_update"]) {
       assert.match(row(name), /no_required_checks/, `${name}'s README row`);
       assert.match(
         row(name),
-        /VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks/,
+        /VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks[\s\S]*\(tenant, repository\) pair[\s\S]*before any GitHub read/,
         `${name}'s README row`,
       );
+      assert.ok(!/tenant and (this )?repository (are )?in/.test(row(name)), `${name}'s README row still says the pair gates no_required_checks`);
     }
   });
 

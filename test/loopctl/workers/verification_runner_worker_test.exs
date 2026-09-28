@@ -34,7 +34,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   setup do
     test_pid = self()
 
-    for {fun, arity} <- [compare: 3, check_evidence: 3, resolve_commit: 2] do
+    for {fun, arity} <- [commit: 2, compare: 3, check_evidence: 3, resolve_commit: 2] do
       stub(MockPullRequestSource, fun, fn_recording(test_pid, {:forge_read, fun}, arity))
     end
 
@@ -236,6 +236,27 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
 
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "credential_unavailable"
+      refute_read()
+    end
+
+    # Round 4, finding 2: the order the docs state. The tenant has an entry, for ANOTHER
+    # repository: the opt-in is still reached, and the pair is never asked.
+    test "a tenant named for another repository whose pr source names none: no_required_checks" do
+      ctx = setup_ctx()
+      test_pid = self()
+      stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
+
+      stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        send(test_pid, :pair_asked)
+        {:error, :credential_unavailable}
+      end)
+
+      fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+      run = run!(ctx)
+
+      assert :ok = perform(ctx, run)
+      assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "no_required_checks"
+      refute_received :pair_asked
       refute_read()
     end
 

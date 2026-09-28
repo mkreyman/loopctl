@@ -12,14 +12,9 @@ defmodule Loopctl.Repo.Migrations.AddVerificationRunCiPollState do
     whichever read faulted; only a poll that ends in a CI answer (a pending check) resets it to
     0 — not a read answered earlier in a faulting poll, and not resolving an abbreviated SHA —
     and contention in loopctl's own database neither counts nor resets it.
-  - `ci_definition_checked_at` — when this run's commit passed the change check (its
-    three-dot diff with the base is not empty and touches no CI definition), for a story the
-    merge gate has not already compared. The check runs ONCE per run: a merge landing during
-    the run's CI wait empties that diff, and must not turn a commit already checked into a
-    refused one (AC-26.4.6.3). NULL until the check passes.
 
-  All safe for existing rows: NOT NULL DEFAULT 0 fills the counter, and no run ever needed the
-  SHA or the timestamp column before. No RLS change: the table's policy covers new columns.
+  Both nullable-safe for existing rows: NOT NULL DEFAULT 0 fills the counter, and no run ever
+  needed the SHA column before. No RLS change: the table's policy covers new columns.
   """
 
   use Ecto.Migration
@@ -28,7 +23,6 @@ defmodule Loopctl.Repo.Migrations.AddVerificationRunCiPollState do
     alter table(:verification_runs) do
       add :resolved_commit_sha, :text
       add :ci_forge_faults, :integer, null: false, default: 0
-      add :ci_definition_checked_at, :utc_datetime_usec
     end
   end
 end

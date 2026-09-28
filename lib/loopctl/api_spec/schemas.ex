@@ -3658,8 +3658,7 @@ defmodule Loopctl.ApiSpec.Schemas do
               "repository, and `fail` adds `failed_check` and `conclusion`. With no verdict " <>
               "(`error`), `ci_unavailable_reason` is a short code with no URL and no " <>
               "repository name (e.g. `credential_unavailable`, `no_intake_source`, " <>
-              "`no_required_checks`, `no_story_branch`, `commit_not_merge_gated` (the merge " <>
-              "gate allowed another commit of the story), `empty_change`, " <>
+              "`no_required_checks`, `no_story_branch`, `empty_change`, " <>
               "`ci_definition_changed`, `ci_wait_exhausted`, `forge_unavailable`, " <>
               "`database_busy`, " <>
               "and for an abbreviated `commit_sha` `unresolved_sha` or " <>

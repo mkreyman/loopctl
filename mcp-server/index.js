@@ -9023,11 +9023,13 @@ const TOOLS = [
             "merge gate allows it, and the checks story verification judges a story's commit " +
             "by in EITHER mode: GitHub Actions job names as they appear on the commit, satisfied " +
             "only by a job of a PUSH run of the story's branch. A `thread` source must name at " +
-            "least one (422 otherwise). Verification first needs this tenant and repository " +
-            "in the operator's VERIFICATION_OPERATOR_TOKEN_TENANTS (`credential_unavailable` " +
-            "otherwise, whatever this list holds); only then does a `pr` source that names " +
-            "none record `no_required_checks` and read nothing: naming them is how a pr " +
-            "source opts in. Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
+            "least one (422 otherwise). Verification first needs an entry for this tenant in " +
+            "the operator's VERIFICATION_OPERATOR_TOKEN_TENANTS (`credential_unavailable` " +
+            "otherwise, whatever this list holds); then a `pr` source that names none records " +
+            "`no_required_checks` and reads nothing (naming them is how a pr source opts in), " +
+            "and a source that names some has its (tenant, repository) pair checked against " +
+            "that list before any GitHub read (`credential_unavailable` if the pair is not an " +
+            "entry). Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused: whoever pushed posts it, so it is only recorded.",
         },
         secret_file: {
@@ -9138,11 +9140,13 @@ const TOOLS = [
             "merge gate allows it, and the checks story verification judges a story's commit " +
             "by in EITHER mode: GitHub Actions job names as they appear on the commit, satisfied " +
             "only by a job of a PUSH run of the story's branch. A `thread` source must name at " +
-            "least one (422 otherwise). Verification first needs this tenant and repository " +
-            "in the operator's VERIFICATION_OPERATOR_TOKEN_TENANTS (`credential_unavailable` " +
-            "otherwise, whatever this list holds); only then does a `pr` source that names " +
-            "none record `no_required_checks` and read nothing: naming them is how a pr " +
-            "source opts in. Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
+            "least one (422 otherwise). Verification first needs an entry for this tenant in " +
+            "the operator's VERIFICATION_OPERATOR_TOKEN_TENANTS (`credential_unavailable` " +
+            "otherwise, whatever this list holds); then a `pr` source that names none records " +
+            "`no_required_checks` and reads nothing (naming them is how a pr source opts in), " +
+            "and a source that names some has its (tenant, repository) pair checked against " +
+            "that list before any GitHub read (`credential_unavailable` if the pair is not an " +
+            "entry). Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused. Omit to leave the current list alone.",
         },
       },

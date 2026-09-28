@@ -14,32 +14,25 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
      forge until each is settled: the run's commit (`no_commit_sha`); whether the tenant is
      named for ANY repository (`Loopctl.Verification.Credential.any_for_tenant?/1`;
      `credential_unavailable`), before any read of the story, so an unnamed tenant costs no
-     database read; the story's repository, required checks, branch and stage row
+     database read; the story's repository, required checks and branch
      (`Loopctl.Verification.CiTarget`; `no_intake_source`, `ambiguous_intake_source`,
      `no_required_checks`, `no_story_branch`); and the credential for that tenant AND that
-     repository (`Credential.for_read/2`; `credential_unavailable`). So a tenant with no
-     allowlist entry records `credential_unavailable` even when its source names no required
-     checks: `no_required_checks` is only ever reached by an allowlisted tenant.
+     repository (`Credential.for_read/2`; `credential_unavailable`), before any forge read. So
+     a tenant with no allowlist entry at all records `credential_unavailable` even when its
+     source names no required checks; a tenant with an entry, whose pr source names none,
+     records `no_required_checks` whichever repository its entry names.
   5. An abbreviated SHA is resolved to its full id ONCE and persisted on the run
      (`resolved_commit_sha`); every later poll reuses it.
-  6. WHICH COMMIT MAY BE JUDGED. When the story's stage row carries `merge_gate_allowed_sha`,
-     the commit the merge gate judged and allowed, verification judges THAT commit and no
-     other: a run whose full id is any other commit records `commit_not_merge_gated`, with no
-     CI read. Being on the base afterwards is then expected — verification of a merged commit
-     is the loop's normal order (merged, deployed, verified) — so the base is not compared
-     again where the gate compared it: a THREAD-mode allow, whose gate refused an empty change
-     and a change to CI definitions itself. A pr-mode gate compares neither, so a pr-mode
-     commit, and any commit the gate never allowed, gets the change check below.
-  7. THE CHANGE CHECK (`CiBehaviour.check_change/1`), ONCE per run: an empty three-dot diff
-     with the base is `empty_change`, a change to CI definitions `ci_definition_changed` (or
-     `ci_definition_unknown`). Passing it stamps `ci_definition_checked_at` on the run, and a
-     stamped run is never compared again, so a merge that lands during the CI wait — which
-     empties that diff — cannot turn a checked commit into a refused one. What it does mean:
-     A STORY OUTSIDE THE THREAD MERGE GATE (a pr-mode story, or one the gate never allowed)
-     MUST BE VERIFIED BEFORE ITS MERGE. Its first poll after a merge that put the commit itself
-     on the base (a merge commit, a fast-forward) finds an empty diff and records
-     `empty_change`; a squash leaves the change visible.
-  8. The CI adapter (`Loopctl.Verification.CiBehaviour`) answers one of its declared
+  6. THE CHANGE CHECK (`CiBehaviour.check_change/1`), ONCE per run, by the thread merge
+     gate's own change rules: an empty change (the commit's tree is the base's, or its
+     three-dot diff with the base lists no file) is `empty_change`, a change to CI definitions
+     `ci_definition_changed` (or `ci_definition_unknown`). Passing it stamps
+     `change_checked_at` on the run, and a stamped run is never compared again, so a merge
+     that lands during the CI wait — which empties that diff — cannot turn a checked commit
+     into a refused one. Story verification runs BEFORE the merge: the run is enqueued by the
+     custody verify call (`LoopctlWeb.StoryVerificationController`), and the merge gate allows
+     nothing until the story is `verified` (`Loopctl.Delivery.MergePrecondition`, custody).
+  7. The CI adapter (`Loopctl.Verification.CiBehaviour`) answers one of its declared
      outcomes, and this worker branches on those alone.
 
   ## Waiting, and what ends a wait
@@ -58,8 +51,14 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     read would never reach the bound; nor does resolving an abbreviated SHA, which happens
     once per run.
   - `{:wait, :database_busy}` — loopctl's own database met contention resolving the story's
-    branch (`CiTarget`). Not a forge fault: it neither counts nor resets `ci_forge_faults`.
-    Past the age window it records `database_busy`.
+    branch (`CiTarget`), or writing the run: every write this worker makes to it (starting it,
+    the resolved SHA, the change-check stamp, the fault count, a disposition) is bounded
+    (`Loopctl.Verification`, "Bounded writes"), and one that could not be made leaves the run
+    exactly as it was, so the next poll redoes the work. Not a forge fault: it neither counts
+    nor resets `ci_forge_faults`. Past the age window, a wait resolving the branch or
+    recording the resolved SHA or the stamp records `database_busy`; a write that fails
+    while the run starts or the poll settles (a verdict, a fault count, a disposition) only
+    snoozes.
 
   A CI wait, and a database wait, SNOOZES the job, backing off with the run's age: a tenth of
   it, between 60 seconds and 15 minutes, so a run polls about once a minute while its CI is
@@ -75,7 +74,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   repository). On no verdict it carries `ci_unavailable_reason`, a short code with no URL and
   no repository name, and nothing else: a final no-verdict ends the run. No exception message
   and no `inspect/1` output is ever written there; the rescue arm records `internal_error`
-  and logs the exception.
+  and logs the exception. A disposition is one `UPDATE` (`Verification.complete_run/3`), so a
+  write that fails leaves none of it.
 
   ## Stale-run age gate (US-36.1)
 
@@ -131,9 +131,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     if stale_run?(run) do
       skip_stale_run(run)
     else
-      case Verification.start_run(run) do
+      case written(Verification.start_run(run)) do
         {:ok, started} -> execute(started, tenant_id)
-        {:error, reason} -> {:error, reason}
+        {:wait, :database_busy} -> {:snooze, snooze_seconds(run)}
       end
     end
   end
@@ -155,13 +155,12 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         "(age #{age_seconds}s > #{max_run_age_seconds()}s) — no CI read"
     )
 
-    {:ok, _} =
-      Verification.complete_run(run, "skipped", %{
-        "reason" => "stale_run_skipped",
-        "age_seconds" => age_seconds
-      })
-
-    {:cancel, :stale_run}
+    run
+    |> Verification.complete_run("skipped", %{
+      "reason" => "stale_run_skipped",
+      "age_seconds" => age_seconds
+    })
+    |> settled(run, {:cancel, :stale_run})
   end
 
   defp max_run_age_seconds do
@@ -179,9 +178,12 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
           Exception.format(:error, error, __STACKTRACE__)
       )
 
-      :ok = no_verdict(run, "internal_error")
       # The run has its disposition, so a retry would only find it terminal (#931 finding g).
-      {:cancel, :internal_error}
+      # A disposition loopctl could not write is a snooze, and the next poll runs again.
+      case no_verdict(run, "internal_error") do
+        :ok -> {:cancel, :internal_error}
+        snooze -> snooze
+      end
   end
 
   # -- resolving what to read -------------------------------------------------------------
@@ -193,46 +195,29 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
          {:ok, target} <- CiTarget.gather(tenant_id, run.story_id),
          {:ok, credential} <- credential(tenant_id, target.repo),
          {:ok, run, full} <- full_sha(run, target.repo, sha, credential) do
-      {gate, target} = Map.split(target, [:mode, :merge_gate_allowed_sha])
-      judge(run, Map.merge(target, %{sha: full, credential: credential}), gate)
+      judge(run, Map.merge(target, %{sha: full, credential: credential}))
     else
       outcome -> {run, outcome}
     end
   end
 
-  defp judge(run, request, gate) do
-    with {:ok, compare?} <- merge_gate(gate, request.sha),
-         {:ok, run} <- change_checked(run, request, compare?) do
-      {run, @ci_adapter.verdict(request)}
-    else
+  defp judge(run, request) do
+    case change_checked(run, request) do
+      {:ok, run} -> {run, @ci_adapter.verdict(request)}
       outcome -> {run, outcome}
     end
   end
 
-  # Which commit may be judged, and whether the base must still be compared (moduledoc, 6).
-  # `sha` is the FULL id, after any resolution, and so is the allow (40 or 64 hex).
-  defp merge_gate(%{merge_gate_allowed_sha: nil}, _sha), do: {:ok, true}
-  defp merge_gate(%{merge_gate_allowed_sha: sha, mode: :thread}, sha), do: {:ok, false}
-  defp merge_gate(%{merge_gate_allowed_sha: sha}, sha), do: {:ok, true}
-  defp merge_gate(_gate, _sha), do: {:refused, "commit_not_merge_gated"}
-
-  # The change check, once per run (moduledoc, 7). Only a pass is stamped: a refusal ends the
+  # The change check, once per run (moduledoc, 6). Only a pass is stamped: a refusal ends the
   # run, and a wait asks again next poll.
-  defp change_checked(run, _request, false), do: {:ok, run}
-  defp change_checked(%{ci_definition_checked_at: %DateTime{}} = run, _request, _), do: {:ok, run}
+  defp change_checked(%{change_checked_at: %DateTime{}} = run, _request), do: {:ok, run}
 
-  defp change_checked(run, request, true) do
-    case @ci_adapter.check_change(request) do
-      :ok ->
-        {:ok, run} =
-          Verification.record_poll(run, %{ci_definition_checked_at: DateTime.utc_now()})
-
-        {:ok, run}
-
-      outcome ->
-        outcome
-    end
+  defp change_checked(run, request) do
+    with :ok <- @ci_adapter.check_change(request), do: stamp_change_checked(run)
   end
+
+  defp stamp_change_checked(run),
+    do: written(Verification.record_poll(run, %{change_checked_at: DateTime.utc_now()}))
 
   defp commit_sha(%{commit_sha: sha}) when is_binary(sha) and sha != "", do: {:ok, sha}
   defp commit_sha(_run), do: {:unconfigured, "no_commit_sha"}
@@ -268,38 +253,34 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       {:ok, run, sha}
     else
       case @ci_adapter.resolve_commit(repo, sha, credential) do
-        {:ok, full} ->
-          {:ok, run} = Verification.record_poll(run, %{resolved_commit_sha: full})
-          {:ok, run, full}
-
-        outcome ->
-          outcome
+        {:ok, full} -> record_resolved(run, full)
+        outcome -> outcome
       end
     end
+  end
+
+  defp record_resolved(run, full) do
+    with {:ok, run} <- written(Verification.record_poll(run, %{resolved_commit_sha: full})),
+         do: {:ok, run, full}
   end
 
   # -- settling one outcome ----------------------------------------------------------------
 
   defp settle({run, {:pass, evidence}}) do
-    {:ok, _} =
-      Verification.complete_run(run, "pass", %{
-        "source" => "ci",
-        "evidence_url" => evidence.url
-      })
-
-    :ok
+    run
+    |> Verification.complete_run("pass", %{"source" => "ci", "evidence_url" => evidence.url})
+    |> settled(run, :ok)
   end
 
   defp settle({run, {:fail, evidence}}) do
-    {:ok, _} =
-      Verification.complete_run(run, "fail", %{
-        "source" => "ci",
-        "evidence_url" => evidence.url,
-        "failed_check" => evidence.check,
-        "conclusion" => evidence.conclusion
-      })
-
-    :ok
+    run
+    |> Verification.complete_run("fail", %{
+      "source" => "ci",
+      "evidence_url" => evidence.url,
+      "failed_check" => evidence.check,
+      "conclusion" => evidence.conclusion
+    })
+    |> settled(run, :ok)
   end
 
   defp settle({run, {:wait, :ci_pending}}) do
@@ -307,8 +288,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       no_verdict(run, "ci_wait_exhausted")
     else
       # The poll ended in a CI answer: a fault streak, if any, is over.
-      {:ok, _} = reset_faults(run)
-      {:snooze, snooze_seconds(run)}
+      run |> reset_faults() |> settled(run, {:snooze, snooze_seconds(run)})
     end
   end
 
@@ -319,8 +299,12 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     if faults > MergePrecondition.max_consecutive_unevaluated() or expired?(run.inserted_at) do
       no_verdict(run, "forge_unavailable")
     else
-      {:ok, _} = Verification.record_poll(run, %{ci_forge_faults: faults})
-      {:snooze, faults |> fault_backoff_seconds() |> max(forge_delay(retry_after))}
+      run
+      |> Verification.record_poll(%{ci_forge_faults: faults})
+      |> settled(
+        run,
+        {:snooze, faults |> fault_backoff_seconds() |> max(forge_delay(retry_after))}
+      )
     end
   end
 
@@ -340,10 +324,26 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   defp reset_faults(run), do: Verification.record_poll(run, %{ci_forge_faults: 0})
 
   defp no_verdict(run, code) do
-    {:ok, _} =
-      Verification.complete_run(run, "error", %{"source" => "ci", "ci_unavailable_reason" => code})
+    run
+    |> Verification.complete_run("error", %{"source" => "ci", "ci_unavailable_reason" => code})
+    |> settled(run, :ok)
+  end
 
-    :ok
+  # Every write this worker makes to its run is bounded (`Loopctl.Verification`, "Bounded
+  # writes"). One loopctl's database could not make is `{:wait, :database_busy}`: loopctl's
+  # own database, not the forge and not a verdict, so it leaves the run, and its fault streak,
+  # exactly as they were, and the next poll redoes the work. A refused changeset is a fault in
+  # loopctl, and raises.
+  defp written({:ok, run}), do: {:ok, run}
+  defp written({:error, :busy}), do: {:wait, :database_busy}
+
+  # A write made while settling: `done` once it is made; a snooze on the database cadence when
+  # it could not be. Never `settle/1` again, so a write that cannot be made never recurses.
+  defp settled(write, run, done) do
+    case written(write) do
+      {:ok, _written} -> done
+      {:wait, :database_busy} -> {:snooze, snooze_seconds(run)}
+    end
   end
 
   # A tenth of the run's age, between one and fifteen minutes (#931 finding i).

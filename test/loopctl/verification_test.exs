@@ -83,6 +83,22 @@ defmodule Loopctl.VerificationTest do
     end
   end
 
+  describe "record_poll/2" do
+    # A bounded write rolls a refused changeset back and answers it as `{:error, changeset}`,
+    # never as `{:ok, _}` and never as `:busy`, with nothing recorded.
+    test "a refused value is its changeset error, and the run is unchanged" do
+      %{tenant: tenant, story: story} = setup_ctx()
+      {:ok, run} = Verification.create_run(tenant.id, story.id)
+
+      for attrs <- [%{resolved_commit_sha: "abc1234"}, %{ci_forge_faults: -1}] do
+        assert {:error, %Ecto.Changeset{valid?: false}} = Verification.record_poll(run, attrs)
+      end
+
+      assert %{resolved_commit_sha: nil, ci_forge_faults: 0} =
+               AdminRepo.get!(VerificationRun, run.id)
+    end
+  end
+
   describe "list_runs/3" do
     test "returns runs for a story" do
       %{tenant: tenant, story: story} = setup_ctx()

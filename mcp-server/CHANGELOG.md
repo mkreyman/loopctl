@@ -10,10 +10,12 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Changed
 
 - **`intake_source_enroll`** and **`intake_source_update`** say what story verification needs
-  before `required_checks` matters (loopctl #913, US-26.4.6): the tenant and the repository
-  named in the operator's `VERIFICATION_OPERATOR_TOKEN_TENANTS`. Without that every run records
-  `credential_unavailable`, whatever the list holds; only then does a `pr` source that names
-  none record `no_required_checks`. Descriptions only; no argument changed.
+  before `required_checks` matters (loopctl #913, US-26.4.6), in the order it checks: an entry
+  for the tenant in the operator's `VERIFICATION_OPERATOR_TOKEN_TENANTS` (with none, every run
+  records `credential_unavailable`, whatever the list holds); then a `pr` source that names
+  none records `no_required_checks`; then a source that names some has its (tenant,
+  repository) pair checked against that list before any GitHub read. Descriptions only; no
+  argument changed.
 
 ## 2.111.1 — 2026-09-28 (verification reads required_checks)
 

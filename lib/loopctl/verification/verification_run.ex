@@ -43,12 +43,12 @@ defmodule Loopctl.Verification.VerificationRun do
     field :machine_id, :string
     # US-26.4.6: the full id of an abbreviated `commit_sha`, resolved once and reused by every
     # later poll; and transient forge faults in a row, which bound a wait on an unreachable
-    # forge; and when the commit passed the once-per-run change check (empty diff, CI
+    # forge; and when the commit passed the once-per-run change check (empty change, CI
     # definitions), so a merge during the wait cannot turn a checked commit into a refused one.
     # All written by `Loopctl.Verification.record_poll/2` only.
     field :resolved_commit_sha, :string
     field :ci_forge_faults, :integer, default: 0
-    field :ci_definition_checked_at, :utc_datetime_usec
+    field :change_checked_at, :utc_datetime_usec
 
     timestamps()
   end

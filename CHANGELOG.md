@@ -13,17 +13,13 @@ All notable changes to loopctl are documented here.
   exactly as the thread merge gate judges a checkpoint: the repository is the story's intake
   source (never `projects.repo_url`), the evidence is the jobs of PUSH runs of the story's own
   branch at the exact commit, a commit that edits `.github/workflows/`, `.github/actions/` or
-  any `action.yml` is refused `ci_definition_changed`, and the verdict is the source's
-  `required_checks`. **Which commit is judged:** once the merge gate has allowed a commit (the
-  stage row's `merge_gate_allowed_sha`), verification judges THAT commit, and a run naming any
-  other records `commit_not_merge_gated`. A THREAD story's allowed commit is judged merged or
-  not, because the thread gate compared the change with the base itself. Every other run —
-  a pr-mode story, whose gate compares nothing, and a story the gate never allowed — gets a
-  change check once per run: an empty diff with the base is `empty_change`. So **a story
-  outside the thread merge gate must be verified before its merge** (a squash merge leaves the
-  change visible; a merge commit or fast-forward does not), and a merge landing during the
-  run's CI wait changes nothing once the check has passed. A run with no CI verdict records
-  why and ends. **Removed:** the local test runner
+  any `action.yml` is refused `ci_definition_changed`, an EMPTY change (the commit's tree is
+  the base's, or its three-dot diff with the base lists no file) is refused `empty_change` —
+  both by the merge gate's own rules — and the verdict is the source's `required_checks`. The
+  change check runs once per run and is recorded, so a merge landing during the run's CI wait
+  cannot turn a checked commit into a refused one. Verification runs BEFORE the merge: the run
+  is enqueued by the custody verify call, and the merge gate allows nothing until the story is
+  verified. A run with no CI verdict records why and ends. **Removed:** the local test runner
   (`Loopctl.Verification.TestRunner`) and its `:enable_local_test_runner` config flag, which
   nothing called any more; it would run tenant code with loopctl's own environment. Delete
   the flag from any config that still sets it. **Operator action:**
@@ -35,10 +31,11 @@ All notable changes to loopctl are documented here.
     verification on.
   - **`GITHUB_TOKEN` permissions:** verification needs `actions: read` and `contents: read`;
     `checks: read` is no longer used.
-  - **`required_checks` now matters for `pr`-mode sources**, once the tenant and repository
-    are in `VERIFICATION_OPERATOR_TOKEN_TENANTS` (without that every run is
-    `credential_unavailable` first): a pr source naming none then records
-    `no_required_checks` (the opt-in). A check satisfied only by an `on: pull_request` run never
+  - **`required_checks` now matters for `pr`-mode sources**, once the tenant has an entry in
+    `VERIFICATION_OPERATOR_TOKEN_TENANTS` (with none, every run is `credential_unavailable`
+    first): a pr source naming none then records `no_required_checks` (the opt-in), whichever
+    repository the tenant's entry names. The tenant and repository PAIR is checked after that
+    and before any GitHub read. A check satisfied only by an `on: pull_request` run never
     counts; the job must run on push of the story's branch.
   - **`ac_results` shape:** a verdict carries `evidence_url` (the failing job or the judged
     run, inside the source's repository); no verdict carries `ci_unavailable_reason`, a short
@@ -46,9 +43,10 @@ All notable changes to loopctl are documented here.
     text is written any more. Waits are bounded: `ci_wait_exhausted` at
     `verification_max_run_age_seconds`, `forge_unavailable` after the merge gate's
     consecutive-fault bound.
-  - Migration `20260928120000_add_verification_run_ci_poll_state` adds
-    `verification_runs.resolved_commit_sha`, `ci_forge_faults` and `ci_definition_checked_at`
-    (no manual step).
+  - Migrations `20260928120000_add_verification_run_ci_poll_state`
+    (`verification_runs.resolved_commit_sha`, `ci_forge_faults`) and
+    `20260928150000_add_verification_run_change_checked_at` (`change_checked_at`); no manual
+    step.
 
 - **Runner contract 1.22.0: one refusal code, one meaning, and which refusals end the claim
   (loopctl#920). RE-VENDOR, and declare 1.22.0 on join, to receive the new codes.** Two

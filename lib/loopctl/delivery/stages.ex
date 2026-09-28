@@ -294,8 +294,8 @@ defmodule Loopctl.Delivery.Stages do
   @doc """
   `get/2` for a caller that must not fail on contention: its lock wait is bounded, and
   contention is `{:error, :busy}`, counted as `[:loopctl, :delivery, :stage_read_busy]`
-  (US-26.4.6: story verification reads the merge gate's allow here, and a row it cannot read
-  is a wait, never a verdict).
+  (US-26.4.6: story verification reads the story's branch here, and a row it cannot read is
+  a wait, never a verdict).
   """
   @spec fetch(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, StoryStage.t() | nil} | {:error, term()}
   def fetch(tenant_id, story_id) do

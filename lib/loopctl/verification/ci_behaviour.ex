@@ -70,8 +70,9 @@ defmodule Loopctl.Verification.CiBehaviour do
               {:ok, String.t()} | wait() | {:refused, String.t()} | {:no_verdict, String.t()}
 
   @doc """
-  Whether the commit is a change this CI can vouch for, from its three-dot comparison with the
-  base branch: `:ok`, or a refusal (`empty_change`, `ci_definition_changed`,
+  Whether the commit is a change this CI can vouch for, by the thread merge gate's change
+  rules (the commit's tree against the base's, and its three-dot comparison with the base
+  branch): `:ok`, or a refusal (`empty_change`, `ci_definition_changed`,
   `ci_definition_unknown`), a wait or a permanent no-verdict. The worker asks it once per run
   and records that it passed, so a merge landing during the CI wait — which empties that
   diff — cannot turn a commit already checked into a refused one.

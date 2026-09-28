@@ -268,6 +268,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.Delivery.CiEvidence
   alias Loopctl.Delivery.Claimant
   alias Loopctl.Delivery.DispatchPayload
+  alias Loopctl.Delivery.EmptyChange
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.PullRequestSource
@@ -1080,13 +1081,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp tree_reasons(tree, tree) when is_binary(tree), do: []
   defp tree_reasons(forge, recorded), do: [{:checkpoint_tree_mismatch, forge, recorded}]
 
-  # Two ways a change is empty: its tree IS the base's, or the comparison lists no file.
-  defp empty_change_reasons(tree, tree, _diffstat) when is_binary(tree),
-    do: [{:empty_change, tree}]
-
-  defp empty_change_reasons(_tree, _base, %{files: 0}), do: [{:empty_change, :no_changed_files}]
-  defp empty_change_reasons(_tree, base, _diffstat) when is_binary(base), do: []
-  defp empty_change_reasons(_tree, base, _diffstat), do: [{:base_tree_unreadable, shape(base)}]
+  # Two ways a change is empty: its tree IS the base's, or the comparison lists no file. The
+  # rule is `EmptyChange.reasons/3`, shared with story verification (US-26.4.6) so the two
+  # readings of one commit cannot disagree about what an empty change is.
+  defp empty_change_reasons(tree, base, diffstat), do: EmptyChange.reasons(tree, base, diffstat)
 
   defp mode(facts), do: Map.get(facts, :mode, :pr)
 

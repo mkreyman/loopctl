@@ -4,6 +4,18 @@ defmodule Loopctl.Verification do
 
   Manages the lifecycle of independent re-execution runs that verify
   a story's acceptance criteria against committed code.
+
+  ## Bounded writes
+
+  `start_run/1`, `record_poll/2` and `complete_run/3` are the verification runner's writes to
+  its own run, and each runs inside a transaction with its lock wait bounded
+  (`Loopctl.Runners.Capacity.set_lock_timeout!/1`). Database contention (a lock wait that ran
+  out, a statement cancelled, a lost connection) is `{:error, :busy}` rather than a raise,
+  counted as `[:loopctl, :verification, :run_write_busy]`
+  (`Loopctl.Delivery.Stages.answering_busy/4`, the one classification of that). A refused
+  changeset is its `{:error, changeset}`, rolled back. On `{:error, :busy}` the runner waits
+  and redoes the poll: nothing was written, or a lost connection committed it, which the next
+  poll finds on the run.
   """
 
   import Ecto.Query
@@ -12,6 +24,8 @@ defmodule Loopctl.Verification do
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.Stages
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Verification.VerificationRun
   alias Loopctl.Workers.VerificationRunnerWorker
 
@@ -107,35 +121,44 @@ defmodule Loopctl.Verification do
 
   @doc """
   Marks a run as started. `started_at` is written ONCE: a run re-entered after a snooze keeps
-  the moment it first started (US-26.4.6).
+  the moment it first started (US-26.4.6). A bounded write (moduledoc, "Bounded writes").
   """
   @spec start_run(VerificationRun.t()) :: {:ok, VerificationRun.t()} | {:error, term()}
   def start_run(run) do
-    update_run(run, %{status: "running", started_at: run.started_at || DateTime.utc_now()})
+    bounded_write(run, "verification run start", fn ->
+      update_run(run, %{status: "running", started_at: run.started_at || DateTime.utc_now()})
+    end)
   end
 
   @doc """
   Records what one CI poll learned that the next poll of the same run needs (US-26.4.6): the
   full id of an abbreviated commit SHA (`:resolved_commit_sha`, a full git object id or
   refused), the count of transient forge faults in a row (`:ci_forge_faults`), and when the
-  commit passed the once-per-run change check (`:ci_definition_checked_at`). None is castable
-  from any request.
+  commit passed the once-per-run change check (`:change_checked_at`). None is castable from
+  any request. A bounded write (moduledoc, "Bounded writes").
   """
   @spec record_poll(VerificationRun.t(), map()) :: {:ok, VerificationRun.t()} | {:error, term()}
   def record_poll(run, attrs) do
+    bounded_write(run, "verification poll write", fn ->
+      run |> poll_changeset(attrs) |> AdminRepo.update()
+    end)
+  end
+
+  defp poll_changeset(run, attrs) do
     run
     |> Ecto.Changeset.change(
-      Map.take(attrs, [:resolved_commit_sha, :ci_forge_faults, :ci_definition_checked_at])
+      Map.take(attrs, [:resolved_commit_sha, :ci_forge_faults, :change_checked_at])
     )
     |> Ecto.Changeset.validate_change(:resolved_commit_sha, fn :resolved_commit_sha, sha ->
       if Loopctl.GitSha.valid?(sha), do: [], else: [resolved_commit_sha: "must be a full id"]
     end)
     |> Ecto.Changeset.validate_number(:ci_forge_faults, greater_than_or_equal_to: 0)
-    |> AdminRepo.update()
   end
 
   @doc """
-  Marks a run as completed with results.
+  Marks a run as completed with results: status, `completed_at` and `ac_results` in ONE
+  `UPDATE`, so a write that fails leaves no part of the disposition behind. A bounded write
+  (moduledoc, "Bounded writes").
 
   `"skipped"` (US-36.1) is a deliberate non-error terminal disposition for a run
   retired without executing (e.g. a stale backlog job age-gated before any CI call);
@@ -144,10 +167,29 @@ defmodule Loopctl.Verification do
   @spec complete_run(VerificationRun.t(), String.t(), map()) ::
           {:ok, VerificationRun.t()} | {:error, term()}
   def complete_run(run, status, ac_results) when status in ["pass", "fail", "error", "skipped"] do
-    update_run(run, %{
-      status: status,
-      completed_at: DateTime.utc_now(),
-      ac_results: ac_results
-    })
+    bounded_write(run, "verification run completion", fn ->
+      update_run(run, %{
+        status: status,
+        completed_at: DateTime.utc_now(),
+        ac_results: ac_results
+      })
+    end)
+  end
+
+  # Moduledoc, "Bounded writes".
+  defp bounded_write(run, what, write) do
+    Stages.answering_busy(run.tenant_id, [:loopctl, :verification, :run_write_busy], what, fn ->
+      AdminRepo.transaction(fn -> bounded(write) end)
+    end)
+  end
+
+  # Inside the transaction: the lock wait bounded, and a refused write rolled back.
+  defp bounded(write) do
+    Capacity.set_lock_timeout!(AdminRepo)
+
+    case write.() do
+      {:ok, written} -> written
+      {:error, reason} -> AdminRepo.rollback(reason)
+    end
   end
 end

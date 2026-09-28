@@ -5,14 +5,16 @@ defmodule Loopctl.Verification.GitHubActions do
   It judges a commit by EXACTLY the merge gate's rules, through the merge gate's own code, so a
   verification run means what a merge decision means (issue #913):
 
-  1. `check_change/1` compares the change with the story's base branch (`compare/3`). An EMPTY
-     three-dot diff is refused `empty_change`, the merge gate's own code for the same shape:
-     nothing shows the story's work is in the commit, which is what an old green commit of the
-     base, or an empty commit on top of one, looks like. A commit that edits its own CI
-     definitions is refused `ci_definition_changed` — or `ci_definition_unknown` when that
-     cannot be told — by `Loopctl.Delivery.CiDefinition.reasons/1`, the rule the merge gate
-     refuses by. The worker asks this once per run, and not at all for a commit the thread
-     merge gate allowed, which it already compared
+  1. `check_change/1` reads the commit's tree (`commit/2`) and compares the change with the
+     story's base branch (`compare/3`), then applies the thread merge gate's two change rules
+     through the gate's own code. An EMPTY change — the commit's tree is the base's, or the
+     three-dot diff lists no file — is refused `empty_change` by
+     `Loopctl.Delivery.EmptyChange.reasons/3`: nothing shows the story's work is in the
+     commit, which is what an old green commit of the base, or an empty commit on top of one,
+     looks like (a base tree the forge answered unreadably is `forge_unreadable`, never a
+     pass). A commit that edits its own CI definitions is refused `ci_definition_changed` —
+     or `ci_definition_unknown` when that cannot be told — by
+     `Loopctl.Delivery.CiDefinition.reasons/1`. The worker asks this once per run
   2. `verdict/1` reads the evidence, `check_evidence/3` for the story's branch and the commit:
      the jobs of PUSH runs of that branch at that SHA, never another branch's runs, a fork's
      `pull_request` run or a `workflow_dispatch`. Anything else is something the implementer
@@ -47,6 +49,7 @@ defmodule Loopctl.Verification.GitHubActions do
 
   alias Loopctl.Delivery.CiDefinition
   alias Loopctl.Delivery.CiEvidence
+  alias Loopctl.Delivery.EmptyChange
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Verification.Credential
@@ -63,9 +66,10 @@ defmodule Loopctl.Verification.GitHubActions do
 
   @impl true
   def check_change(%{credential: %Credential{kind: :operator_token}} = request) do
-    with {:ok, comparison} <-
+    with {:ok, commit} <- read(source().commit(request.repo, request.sha)),
+         {:ok, comparison} <-
            read(source().compare(request.repo, request.base_branch, request.sha)) do
-      change(comparison)
+      change(commit, comparison)
     end
   end
 
@@ -87,14 +91,21 @@ defmodule Loopctl.Verification.GitHubActions do
 
   def verdict(_request), do: {:refused, "credential_unavailable"}
 
-  # An empty three-dot diff is refused, never judged: nothing shows the story's work is in the
-  # commit. It is what the base's own old green commit looks like, and an empty commit on top
-  # of one — whose merge base is not itself, so only the diff tells.
-  defp change(%{diffstat: %{files: 0}}), do: {:refused, "empty_change"}
+  # The merge gate's two rules, through its own code and in its order: an empty change
+  # (`EmptyChange.reasons/3`), then a change to CI definitions (`CiDefinition.reasons/1`).
+  # Neither is ever judged on CI.
+  defp change(commit, comparison) do
+    empty =
+      EmptyChange.reasons(
+        Map.get(commit, :tree_sha),
+        Map.get(comparison, :base_tree_sha),
+        Map.get(comparison, :diffstat)
+      )
 
-  defp change(comparison) do
-    case CiDefinition.reasons(Map.get(comparison, :diff)) do
+    case empty ++ CiDefinition.reasons(Map.get(comparison, :diff)) do
       [] -> :ok
+      [{:empty_change, _how} | _rest] -> {:refused, "empty_change"}
+      [{:base_tree_unreadable, _shape} | _rest] -> {:no_verdict, "forge_unreadable"}
       [{:ci_definition_changed, _names} | _rest] -> {:refused, "ci_definition_changed"}
       [{:ci_definition_unknown, _reason} | _rest] -> {:refused, "ci_definition_unknown"}
     end

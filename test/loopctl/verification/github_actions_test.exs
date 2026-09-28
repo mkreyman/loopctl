@@ -22,6 +22,8 @@ defmodule Loopctl.Verification.GitHubActionsTest do
   @repo "acme/widgets"
   @sha String.duplicate("a", 40)
   @fork_point String.duplicate("b", 40)
+  @head_tree String.duplicate("e", 40)
+  @base_tree String.duplicate("f", 40)
   @branch "loop/story-7-abcd1234"
   @credential %Credential{kind: :operator_token}
 
@@ -44,12 +46,19 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       {:ok,
        %{
          merge_base_sha: @fork_point,
+         base_tree_sha: @base_tree,
          diffstat: %{files: length(files), changed_lines: 3 * length(files)},
          diff: {:ok, %{files: files, renames: renames}}
        }}
 
-  defp expect_compare(answer) do
+  # The change check reads the commit's tree, then compares it with the base.
+  defp expect_compare(answer, tree \\ @head_tree) do
+    expect_commit({:ok, %{tree_sha: tree, parents: [@fork_point]}})
     expect(MockPullRequestSource, :compare, fn @repo, "master", @sha -> answer end)
+  end
+
+  defp expect_commit(answer) do
+    expect(MockPullRequestSource, :commit, fn @repo, @sha -> answer end)
   end
 
   defp job(id, run_id, name, status, conclusion, workflow \\ ".github/workflows/ci.yml") do
@@ -235,6 +244,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
         {:ok,
          %{
            merge_base_sha: @fork_point,
+           base_tree_sha: @base_tree,
            diffstat: %{files: 300, changed_lines: 900},
            diff: {:error, {:file_list_truncated, 300}}
          }}
@@ -252,6 +262,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
           {:ok,
            %{
              merge_base_sha: merge_base,
+             base_tree_sha: @base_tree,
              diffstat: %{files: 0, changed_lines: 0},
              diff: {:ok, %{files: [], renames: []}}
            }}
@@ -259,6 +270,27 @@ defmodule Loopctl.Verification.GitHubActionsTest do
 
         assert GitHubActions.check_change(request()) == {:refused, "empty_change"}
       end
+    end
+
+    # Round 4, finding 5: the merge gate's rule has two halves, and this is the other one. A
+    # head whose tree IS the base's is empty whatever its three-dot diff lists.
+    test "a head whose tree is the base's is empty_change, whatever the diff lists" do
+      expect_compare(compare(["lib/widgets/thing.ex"]), @base_tree)
+      assert GitHubActions.check_change(request()) == {:refused, "empty_change"}
+    end
+
+    test "a base tree the forge answered unreadably is forge_unreadable, never a pass" do
+      {:ok, comparison} = compare(["lib/widgets/thing.ex"])
+      expect_compare({:ok, Map.delete(comparison, :base_tree_sha)})
+      assert GitHubActions.check_change(request()) == {:no_verdict, "forge_unreadable"}
+    end
+
+    test "a fault reading the commit is classified, and nothing is compared" do
+      expect_commit({:error, {:github_api_error, 502}})
+      assert GitHubActions.check_change(request()) == {:wait, {:transient, nil}}
+
+      expect_commit({:error, {:github_api_error, 404}})
+      assert GitHubActions.check_change(request()) == {:no_verdict, "forge_not_found"}
     end
 
     test "a change to anything else passes the check, with no CI read" do

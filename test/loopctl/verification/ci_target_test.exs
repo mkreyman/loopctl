@@ -15,8 +15,6 @@ defmodule Loopctl.Verification.CiTargetTest do
   @source %{repo_full_name: "acme/widgets", base_branch: "main"}
   @required ["test"]
 
-  defp stage(branch), do: %{branch: branch, merge_gate_allowed_sha: nil}
-
   test "the repository is the intake source's and the base is the placed one" do
     route = %{mode: :pr, branch: "loop/x", base_branch: "release"}
 
@@ -26,45 +24,8 @@ defmodule Loopctl.Verification.CiTargetTest do
              repo: "acme/widgets",
              branch: "loop/x",
              base_branch: "release",
-             required_checks: ["test"],
-             mode: :pr,
-             merge_gate_allowed_sha: nil
+             required_checks: ["test"]
            }
-  end
-
-  # Round 3: the merge gate's allow comes from the stage row, and `mode` says whether the gate
-  # compared the change itself (a thread placement) or not.
-  test "the stage row's allow is the commit to judge, and the mode is the placement's" do
-    allowed = String.duplicate("c", 40)
-    stage = %{branch: "loop/stage", merge_gate_allowed_sha: allowed}
-
-    assert {:ok, %{merge_gate_allowed_sha: ^allowed, mode: :pr}} =
-             CiTarget.resolve(
-               @story,
-               @source,
-               @required,
-               %{mode: :pr, branch: nil, base_branch: nil},
-               stage
-             )
-
-    assert {:ok, %{merge_gate_allowed_sha: ^allowed, mode: :thread}} =
-             CiTarget.resolve(
-               @story,
-               @source,
-               @required,
-               %{mode: :thread, branch: "loop/wire", base_branch: nil},
-               stage
-             )
-
-    # A claim with no accepted dispatch (mode nil) is judged as a pull request.
-    assert {:ok, %{mode: :pr}} =
-             CiTarget.resolve(
-               @story,
-               @source,
-               @required,
-               %{mode: nil, branch: "b", base_branch: nil},
-               nil
-             )
   end
 
   test "a route that recorded no base falls back to the source's base branch" do
@@ -85,7 +46,7 @@ defmodule Loopctl.Verification.CiTargetTest do
                @source,
                @required,
                %{mode: :pr, branch: "wire", base_branch: nil},
-               stage("stage")
+               "stage"
              )
 
     assert {:ok, %{branch: "stage"}} =
@@ -94,7 +55,7 @@ defmodule Loopctl.Verification.CiTargetTest do
                @source,
                @required,
                %{mode: :pr, branch: nil, base_branch: nil},
-               stage("stage")
+               "stage"
              )
   end
 
@@ -117,7 +78,7 @@ defmodule Loopctl.Verification.CiTargetTest do
       {:ok, expected} = DispatchPayload.thread_branch(route, @story, stage)
 
       assert {:ok, %{branch: ^expected}} =
-               CiTarget.resolve(@story, @source, @required, route, stage && stage(stage))
+               CiTarget.resolve(@story, @source, @required, route, stage)
     end
   end
 end
