@@ -11,8 +11,9 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
       already-revoked rows untouched, and does so cross-tenant by design;
     * index shape — the partial index is a valid single-column btree on `expires_at`
       with the predicate `revoked_at IS NULL`, read from `pg_index`. Which index the
-      planner CHOOSES is not asserted here: in the shared test table the choice moves
-      with the rows concurrent tests have in flight.
+      planner CHOOSES is asserted in `RevokeExpiredDispatchesPlanScaleTest` (CI's scale
+      job), not here: in the shared test table the choice moves with the rows concurrent
+      tests have in flight.
 
   Dispatches are created through the real `Loopctl.Dispatches.create_dispatch/3`
   API (which mints + links a real api_key) so the cascade parity is exercised,
@@ -110,8 +111,8 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
 
   describe "partial index dispatches_expires_at_active_index" do
     # The index's own definition, read from the catalog. Which index the planner chooses is
-    # not asserted: in this async module the choice moves with the rows other tests have in
-    # flight.
+    # asserted in RevokeExpiredDispatchesPlanScaleTest: in this async module the choice moves
+    # with the rows other tests have in flight.
     test "is a valid single-column btree on expires_at with the predicate revoked_at IS NULL" do
       %{rows: [[valid?, keys, key_count, method, table, predicate]]} =
         AdminRepo.query!("""
