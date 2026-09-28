@@ -23,7 +23,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
   @sha String.duplicate("a", 40)
   @fork_point String.duplicate("b", 40)
   @branch "loop/story-7-abcd1234"
-  @credential %Credential{kind: :operator_token, token: "t"}
+  @credential %Credential{kind: :operator_token}
 
   defp request(extra \\ %{}) do
     Map.merge(
@@ -254,11 +254,21 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       assert GitHubActions.verdict(request()) == {:refused, "ci_definition_unknown"}
     end
 
-    # Review round 1, finding 7: a commit already ON the base is JUDGED. The definition it
-    # ran is the base's own; what lands on the base is the merge gate's to guard.
-    test "a commit the base already contains is judged on its CI" do
+    # Round 2, finding 4: a commit already ON the base has an empty three-dot diff whatever it
+    # contains, so nothing shows the story's work is in it. An old green commit of the base is
+    # refused, and its CI is never read (no `check_evidence` expectation: Mox fails the read).
+    test "a commit the base already contains is refused commit_on_base, and CI is never read" do
       expect(MockPullRequestSource, :compare, fn @repo, "master", @sha ->
         {:ok, %{merge_base_sha: @sha, diff: {:ok, %{files: [], renames: []}}}}
+      end)
+
+      assert GitHubActions.verdict(request()) == {:refused, "commit_on_base"}
+    end
+
+    # The other way: a commit that is NOT the merge base is judged, even with no file changed.
+    test "a commit past the merge base is judged, even with an empty diff" do
+      expect(MockPullRequestSource, :compare, fn @repo, "master", @sha ->
+        {:ok, %{merge_base_sha: @fork_point, diff: {:ok, %{files: [], renames: []}}}}
       end)
 
       stub_evidence(
@@ -281,17 +291,17 @@ defmodule Loopctl.Verification.GitHubActionsTest do
           ] do
         expect(MockPullRequestSource, :compare, fn _repo, _base, _sha -> {:error, reason} end)
 
-        assert GitHubActions.verdict(request()) == {:wait, {:transient, delay, false}},
+        assert GitHubActions.verdict(request()) == {:wait, {:transient, delay}},
                inspect(reason)
       end
     end
 
-    # Review round 1, finding 8: the comparison WAS answered, so the evidence read's fault is
-    # the first of a new streak, and the adapter says so.
-    test "a transient fault after an answered comparison says the call was answered" do
+    # Round 2, finding 1: a fault on the evidence read is the same wait as one on the
+    # comparison. That the comparison answered first is nothing the worker's streak counts.
+    test "a transient fault on the evidence read is the same wait as one on the comparison" do
       clean_compare()
       stub_evidence({:error, {:github_api_error, 503}})
-      assert GitHubActions.verdict(request()) == {:wait, {:transient, nil, true}}
+      assert GitHubActions.verdict(request()) == {:wait, {:transient, nil}}
     end
 
     test "a permanent answer is a no-verdict code with no number in it" do
@@ -336,7 +346,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       end)
 
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
-               {:wait, {:transient, nil, false}}
+               {:wait, {:transient, nil}}
 
       expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" -> {:ok, @sha} end)
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) == {:ok, @sha}

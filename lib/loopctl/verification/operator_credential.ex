@@ -23,13 +23,21 @@ defmodule Loopctl.Verification.OperatorCredential do
   def for_read(tenant_id, repo_full_name)
       when is_binary(tenant_id) and is_binary(repo_full_name) do
     if {String.downcase(tenant_id), String.downcase(repo_full_name)} in allowlist() do
-      {:ok, %Credential{kind: :operator_token, token: System.get_env("GITHUB_TOKEN")}}
+      {:ok, %Credential{kind: :operator_token}}
     else
       {:error, :credential_unavailable}
     end
   end
 
   def for_read(_tenant_id, _repo_full_name), do: {:error, :credential_unavailable}
+
+  @impl true
+  def any_for_tenant?(tenant_id) when is_binary(tenant_id) do
+    tenant = String.downcase(tenant_id)
+    Enum.any?(allowlist(), fn {named, _repo} -> named == tenant end)
+  end
+
+  def any_for_tenant?(_tenant_id), do: false
 
   @doc """
   The (tenant, repository) pairs the operator token may read for, normalised to lower case.

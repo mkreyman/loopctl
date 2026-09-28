@@ -13,8 +13,11 @@ All notable changes to loopctl are documented here.
   exactly as the thread merge gate judges a checkpoint: the repository is the story's intake
   source (never `projects.repo_url`), the evidence is the jobs of PUSH runs of the story's own
   branch at the exact commit, a commit that edits `.github/workflows/`, `.github/actions/` or
-  any `action.yml` is refused `ci_definition_changed`, and the verdict is the source's
-  `required_checks`. **Operator action:**
+  any `action.yml` is refused `ci_definition_changed`, a commit already on the base branch is
+  refused `commit_on_base` (verify before merge: its diff with the base is empty, so nothing
+  shows the story's work is in it), and the verdict is the source's `required_checks`. A run
+  with no CI verdict records why and ends; it is never re-executed locally, whatever
+  `:enable_local_test_runner` says. **Operator action:**
   - **New env var `VERIFICATION_OPERATOR_TOKEN_TENANTS`, default EMPTY: comma-separated
     `<tenant_uuid>:<owner>/<repo>` PAIRS.** A run is read with the operator's `GITHUB_TOKEN`
     only when its tenant AND its intake-source repository match one entry; every other run
@@ -34,12 +37,6 @@ All notable changes to loopctl are documented here.
     consecutive-fault bound.
   - Migration `20260928120000_add_verification_run_ci_poll_state` adds
     `verification_runs.resolved_commit_sha` and `ci_forge_faults` (no manual step).
-  - **If you enable the local fallback** (`:enable_local_test_runner`, off by default): every
-    command it runs now needs coreutils `timeout` on `PATH` and is bounded by it (a run that
-    outlives a budget records `local_error: local_timeout`), and runs with loopctl's
-    environment scrubbed to `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `MIX_HOME`,
-    `HEX_HOME`, `ASDF_DIR` and `ASDF_DATA_DIR` — proxy variables included in what is dropped,
-    so a sandbox must restrict egress at its network.
 
 - **Runner contract 1.22.0: one refusal code, one meaning, and which refusals end the claim
   (loopctl#920). RE-VENDOR, and declare 1.22.0 on join, to receive the new codes.** Two

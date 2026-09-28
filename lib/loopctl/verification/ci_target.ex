@@ -18,8 +18,8 @@ defmodule Loopctl.Verification.CiTarget do
     the FORK, and push runs of a same-named branch in the base repository are not its CI
   - the BASE BRANCH is the one the claim was placed on (`DispatchPayload.placed_base_branch/2`)
 
-  Each refusal is `{:unconfigured, code}`: a missing configuration, which reads nothing and
-  never falls back to the local runner. A dispatch-route read that met database contention is
+  Each refusal is `{:unconfigured, code}`: a missing configuration, which reads nothing from
+  the forge. A dispatch-route read that met database contention is
   `{:wait, :database_busy}`: a wait of its own, because it is loopctl's database and not the
   forge, so it neither counts toward nor ends the worker's forge-fault streak.
   """

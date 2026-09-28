@@ -8,8 +8,9 @@ defmodule Loopctl.Verification.GitHubActions do
   1. the change is compared with the story's base branch (`compare/3`) and a commit that edits
      its own CI definitions is refused `ci_definition_changed` — or `ci_definition_unknown`
      when that cannot be told — by `Loopctl.Delivery.CiDefinition.reasons/1`, the rule the
-     merge gate refuses by. A commit already ON the base branch is judged: the definition it
-     ran is the base's own, and what lands on the base is the merge gate's to guard
+     merge gate refuses by. A commit already ON the base branch is refused `commit_on_base`:
+     its three-dot diff is empty whatever it contains, so nothing shows the story's work is
+     in it. Verify before merge, the merge gate's own order
   2. the evidence is `check_evidence/3` for the story's branch and the commit: the jobs of
      PUSH runs of that branch at that SHA, never another branch's runs, a fork's
      `pull_request` run or a `workflow_dispatch`. Anything else is something the implementer
@@ -25,7 +26,7 @@ defmodule Loopctl.Verification.GitHubActions do
   ## Reason codes
 
   A fixed set of strings with no numbers in them, so none reads as an HTTP status:
-  `ci_definition_changed`, `ci_definition_unknown`, `no_required_checks`,
+  `ci_definition_changed`, `ci_definition_unknown`, `commit_on_base`, `no_required_checks`,
   `credential_unavailable`, `unresolved_sha` and `repository_unreadable` (resolving an
   abbreviated SHA: a 422, which GitHub answers for an unknown prefix and an ambiguous one
   alike, and a 404, a repository missing or unreadable), `forge_unauthorized` (401), `forge_forbidden` (a 403 that is not a
@@ -52,7 +53,7 @@ defmodule Loopctl.Verification.GitHubActions do
   def resolve_commit(repo, sha, %Credential{kind: :operator_token}) do
     case source().resolve_commit(repo, sha) do
       {:ok, full} -> {:ok, full}
-      {:error, reason} -> classify(reason, :resolve, false)
+      {:error, reason} -> classify(reason, :resolve)
     end
   end
 
@@ -65,13 +66,11 @@ defmodule Loopctl.Verification.GitHubActions do
       # judge an empty list — over which every check "passed".
       {:refused, "no_required_checks"}
     else
-      # The evidence read's fault comes AFTER the comparison was answered, so it says so: the
-      # worker's fault streak counts forge reads in a row that went unanswered.
       with {:ok, comparison} <-
-             read(source().compare(request.repo, request.base_branch, request.sha), false),
-           :ok <- ci_definition(comparison),
+             read(source().compare(request.repo, request.base_branch, request.sha)),
+           :ok <- ci_definition(comparison, request.sha),
            {:ok, evidence} <-
-             read(source().check_evidence(request.repo, request.sha, request.branch), true) do
+             read(source().check_evidence(request.repo, request.sha, request.branch)) do
         judge(request, evidence)
       end
     end
@@ -79,11 +78,13 @@ defmodule Loopctl.Verification.GitHubActions do
 
   def verdict(_request), do: {:refused, "credential_unavailable"}
 
-  # A commit already ON the base (the merge base IS the commit) has an empty three-dot diff,
-  # and is JUDGED, not refused. The refusal exists because a branch could run a CI definition
-  # the base does not; once the commit is on the base, the definition it ran is the base's
-  # own, and what lands on the base is the merge gate's to guard.
-  defp ci_definition(comparison) do
+  # A commit already ON the base (the merge base IS the commit) is refused, never judged. Its
+  # three-dot diff is empty whatever it contains, so nothing shows the story's work is in it:
+  # an implementer could point the story's branch at an old green commit of the base and be
+  # verified with none of their work. Verify before merge, the merge gate's own order.
+  defp ci_definition(%{merge_base_sha: sha}, sha), do: {:refused, "commit_on_base"}
+
+  defp ci_definition(comparison, _sha) do
     case CiDefinition.reasons(Map.get(comparison, :diff)) do
       [] -> :ok
       [{:ci_definition_changed, _names} | _rest] -> {:refused, "ci_definition_changed"}
@@ -154,13 +155,12 @@ defmodule Loopctl.Verification.GitHubActions do
 
   defp actions_url(repo), do: "https://github.com/#{repo}/actions"
 
-  defp read({:ok, value}, _answered), do: {:ok, value}
-  defp read({:error, reason}, answered), do: classify(reason, :read, answered)
+  defp read({:ok, value}), do: {:ok, value}
+  defp read({:error, reason}), do: classify(reason, :read)
 
-  # `answered`: whether an earlier read of the same call was answered (see `CiBehaviour`).
-  defp classify(reason, stage, answered) do
+  defp classify(reason, stage) do
     if MergePrecondition.transient?(reason),
-      do: {:wait, {:transient, MergePrecondition.retry_after(reason), answered}},
+      do: {:wait, {:transient, MergePrecondition.retry_after(reason)}},
       else: {:no_verdict, code(reason, stage)}
   end
 

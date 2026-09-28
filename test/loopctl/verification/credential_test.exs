@@ -55,7 +55,7 @@ defmodule Loopctl.Verification.CredentialTest do
       assert Enum.sort(OperatorCredential.allowlist()) ==
                Enum.sort([{@named, "acme/widgets"}, {@named_padded, "acme/gadgets"}])
 
-      # The bare-UUID entry (the old format) licenses no repository at all.
+      # A bare tenant UUID licenses no repository at all.
       bare = "0000a110-0000-4000-8000-00000000c330"
 
       for repo <- ["acme/widgets", ""],
@@ -63,30 +63,20 @@ defmodule Loopctl.Verification.CredentialTest do
     end
   end
 
-  describe "the token never leaks" do
-    test "inspecting a credential omits the token" do
-      refute inspect(%Credential{kind: :operator_token, token: "ghp_secret"}) =~ "ghp_secret"
+  # Round 2, finding 9: the worker asks this before any read of the story.
+  describe "OperatorCredential.any_for_tenant?/1" do
+    test "a tenant named in a well-formed entry, for any repository, trimmed and in any case" do
+      assert OperatorCredential.any_for_tenant?(@named)
+      assert OperatorCredential.any_for_tenant?(@named_padded)
+      assert OperatorCredential.any_for_tenant?(String.upcase(@named))
     end
 
-    test "git_env scopes the header to github.com, refuses redirects and never prompts" do
-      env = Map.new(Credential.git_env(%Credential{kind: :operator_token, token: " ghp_x \n"}))
-
-      assert env["GIT_TERMINAL_PROMPT"] == "0"
-      assert env["GIT_CONFIG_COUNT"] == "2"
-      assert env["GIT_CONFIG_KEY_0"] == "http.followRedirects"
-      assert env["GIT_CONFIG_VALUE_0"] == "false"
-      assert env["GIT_CONFIG_KEY_1"] == "http.https://github.com/.extraheader"
-
-      assert env["GIT_CONFIG_VALUE_1"] ==
-               "AUTHORIZATION: basic " <> Base.encode64("x-access-token:ghp_x")
-    end
-
-    test "no token and a blank token send no header at all" do
-      for token <- [nil, "", "  "] do
-        env = Map.new(Credential.git_env(%Credential{kind: :operator_token, token: token}))
-        assert env["GIT_CONFIG_COUNT"] == "1", inspect(token)
-        refute Enum.any?(Map.values(env), &(&1 =~ "AUTHORIZATION")), inspect(token)
-      end
+    test "a tenant named nowhere, or only in a malformed entry, is not" do
+      refute OperatorCredential.any_for_tenant?(Ecto.UUID.generate())
+      refute OperatorCredential.any_for_tenant?("0000a110-0000-4000-8000-00000000c330")
+      refute OperatorCredential.any_for_tenant?("0000a110-0000-4000-8000-00000000d440")
+      refute OperatorCredential.any_for_tenant?("not-a-uuid")
+      refute OperatorCredential.any_for_tenant?(nil)
     end
   end
 end

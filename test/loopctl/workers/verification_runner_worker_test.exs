@@ -2,17 +2,17 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   @moduledoc """
   `Loopctl.Workers.VerificationRunnerWorker.perform/1`, for every path that settles WITHOUT a
   story branch: the stale-run age gate (US-36.1), terminal-run re-entry, and the configuration
-  refusals of US-26.4.6 that read nothing from the forge. The credential is asked for the
-  (tenant, repository) pair only once the branch is known, so `credential_unavailable` and the
-  rescue arm (reached through the credential seam) are integration tests too.
+  refusals of US-26.4.6 that read nothing from the forge, including a tenant named for no
+  repository at all. The credential for the (tenant, repository) PAIR is asked only once the
+  branch is known, so that refusal and the rescue arm (reached through the credential seam)
+  are integration tests.
 
   The paths that DO read the forge need a branch, which lives on the RLS `Loopctl.Repo`
   (the dispatch ledger and the stage row) while the run and its story live on `AdminRepo` —
   two sandbox owners that cannot see each other's rows. Those are in
   `Loopctl.Workers.VerificationRunnerWorkerIntegrationTest`, on committed rows.
 
-  Every forge read and every local run is RECORDED by the stubs below, so a test can refute
-  that one happened.
+  Every forge read is RECORDED by the stubs below, so a test can refute that one happened.
   """
   use Loopctl.DataCase, async: true
 
@@ -22,7 +22,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
-  alias Loopctl.MockVerificationLocalRunner
   alias Loopctl.Verification
   alias Loopctl.Verification.Credential
   alias Loopctl.Verification.VerificationRun
@@ -39,11 +38,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       stub(MockPullRequestSource, fun, fn_recording(test_pid, {:forge_read, fun}, arity))
     end
 
-    stub(MockVerificationLocalRunner, :run_tests, fn url, _sha, _credential ->
-      send(test_pid, {:local_run, url})
-      {:error, :runner_disabled}
-    end)
-
     :ok
   end
 
@@ -54,8 +48,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
     do: fn _, _, _ -> send(pid, message) && {:error, :not_stubbed} end
 
   defp with_credential do
+    stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
+
     stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
-      {:ok, %Credential{kind: :operator_token, token: nil}}
+      {:ok, %Credential{kind: :operator_token}}
     end)
   end
 
@@ -95,10 +91,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
     run
   end
 
-  defp refute_read do
-    refute_received {:forge_read, _}
-    refute_received {:local_run, _}
-  end
+  defp refute_read, do: refute_received({:forge_read, _})
 
   describe "stale-run age gate (bounds the backlog burst-drain)" do
     test "a never-started run older than the window is cancelled with no read" do
@@ -231,6 +224,30 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
 
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "no_required_checks"
+      refute_read()
+    end
+
+    # Round 2, finding 9: the tenant is checked before CiTarget reads anything. The story here
+    # has NO intake source, so a run that reached CiTarget would record no_intake_source; and
+    # the pair would be licensed, so only the tenant check stands in the way.
+    test "a tenant named for no repository records credential_unavailable before CiTarget" do
+      ctx = setup_ctx()
+      test_pid = self()
+
+      stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        send(test_pid, :pair_asked)
+        {:ok, %Credential{kind: :operator_token}}
+      end)
+
+      run = run!(ctx)
+      assert :ok = perform(ctx, run)
+
+      assert reload(ctx, run).ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "credential_unavailable"
+             }
+
+      refute_received :pair_asked
       refute_read()
     end
 

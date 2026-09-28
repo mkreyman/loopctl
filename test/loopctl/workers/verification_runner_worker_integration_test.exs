@@ -37,11 +37,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
-  alias Loopctl.MockVerificationLocalRunner
   alias Loopctl.Repo
   alias Loopctl.Verification
   alias Loopctl.Verification.Credential
-  alias Loopctl.Verification.TestRunner
   alias Loopctl.Verification.VerificationRun
   alias Loopctl.Workers.VerificationRunnerWorker
 
@@ -80,14 +78,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
     test_pid = self()
 
+    stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
+
     stub(MockVerificationCredential, :for_read, fn tenant_id, repo ->
       send(test_pid, {:credential_asked, tenant_id, repo})
-      {:ok, %Credential{kind: :operator_token, token: nil}}
-    end)
-
-    stub(MockVerificationLocalRunner, :run_tests, fn url, sha, _credential ->
-      send(test_pid, {:local_run, url, sha})
-      {:error, :runner_disabled}
+      {:ok, %Credential{kind: :operator_token}}
     end)
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id, test_pid: test_pid}
@@ -243,33 +238,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       assert reload(ctx, run).status == "fail"
       refute_wrong_reads()
     end
-
-    # #915 round 3, finding 4: the fallback clones the intake source's repository, never
-    # `projects.repo_url`, at the commit's full id.
-    test "the local fallback clones the intake source's repository", ctx do
-      stage_branch!(ctx, @branch)
-      stub_forge(ctx, %{evidence: {:error, {:github_api_error, 403}}})
-
-      stub(MockVerificationLocalRunner, :run_tests, fn url, sha, %Credential{} ->
-        send(ctx.test_pid, {:local_run, url, sha})
-        {:ok, %{status: "pass", tests_run: 3, tests_passed: 3, tests_failed: 0, output: "x"}}
-      end)
-
-      run = run!(ctx)
-      assert :ok = perform(ctx, run)
-
-      assert_received {:local_run, "https://github.com/acme/widgets.git", @sha}
-      reloaded = reload(ctx, run)
-      assert reloaded.status == "pass"
-
-      assert reloaded.ac_results == %{
-               "source" => "local_test_runner",
-               "ci_unavailable_reason" => "forge_forbidden",
-               "tests_run" => 3,
-               "tests_passed" => 3,
-               "tests_failed" => 0
-             }
-    end
   end
 
   # -- TC-26.4.6.6 / AC-26.4.6.8 -------------------------------------------------------------
@@ -298,7 +266,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       # Allowlisted for ANOTHER repository only: this story's is not licensed.
       stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
         if repo == "acme/other",
-          do: {:ok, %Credential{kind: :operator_token, token: nil}},
+          do: {:ok, %Credential{kind: :operator_token}},
           else: {:error, :credential_unavailable}
       end)
 
@@ -315,7 +283,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
       refute_received {:compare, _}
       refute_received {:evidence, _}
-      refute_received {:local_run, _, _}
     end
 
     # #931 finding g: the rescue arm records a code, never the exception.
@@ -340,40 +307,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
   end
 
-  # Review round 1, finding 4: a local run that hangs past the worker's bound (one second in
-  # config/test.exs) is killed, and the run still gets a disposition.
-  describe "a hung local fallback" do
-    test "is killed at the worker's bound and recorded local_timeout", ctx do
-      stage_branch!(ctx, @branch)
-      stub_forge(ctx, %{compare: {:error, {:github_api_error, 404}}, evidence: green()})
-
-      stub(MockVerificationLocalRunner, :run_tests, fn _url, _sha, %Credential{} ->
-        Process.sleep(30_000)
-        {:ok, %{status: "pass", tests_run: 1, tests_passed: 1, tests_failed: 0, output: ""}}
-      end)
-
-      run = run!(ctx)
-      started = System.monotonic_time(:millisecond)
-      assert :ok = perform(ctx, run)
-      assert System.monotonic_time(:millisecond) - started < 10_000
-
-      reloaded = reload(ctx, run)
-      assert reloaded.status == "error"
-
-      assert reloaded.ac_results == %{
-               "source" => "ci",
-               "ci_unavailable_reason" => "forge_not_found",
-               "local_error" => "local_timeout"
-             }
-    end
-
-    test "the job's own timeout is above the local bound and every command budget" do
-      timeout = VerificationRunnerWorker.timeout(%Oban.Job{})
-      assert timeout > VerificationRunnerWorker.local_run_timeout_ms()
-      assert timeout > :timer.seconds(TestRunner.max_run_seconds())
-    end
-  end
-
   # -- TC-26.4.6.2 --------------------------------------------------------------------------
 
   describe "TC-26.4.6.2 required checks decide, one run per outcome" do
@@ -394,7 +327,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       run = run!(ctx)
       assert {:snooze, 60} = perform(ctx, run)
       assert reload(ctx, run).status == "running"
-      refute_received {:local_run, _, _}
     end
 
     test "test failed is a fail, whatever an unrelated workflow said", ctx do
@@ -441,7 +373,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   # -- TC-26.4.6.3 --------------------------------------------------------------------------
 
   describe "TC-26.4.6.3 a workflow edit is refused" do
-    test "no verdict, ci_definition_changed, no evidence read and no local run", ctx do
+    test "no verdict, ci_definition_changed, and no evidence read", ctx do
       stage_branch!(ctx, @branch)
       stub_forge(ctx, %{diff: [".github/workflows/ci.yml"], evidence: green()})
 
@@ -451,10 +383,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       assert %{status: "error", ac_results: ac} = reload(ctx, run)
       assert ac == %{"source" => "ci", "ci_unavailable_reason" => "ci_definition_changed"}
       refute_received {:evidence, _}
-      refute_received {:local_run, _, _}
     end
 
-    test "an unreadable diff is ci_definition_unknown, and no local run", ctx do
+    test "an unreadable diff is ci_definition_unknown", ctx do
       stage_branch!(ctx, @branch)
 
       stub_forge(ctx, %{
@@ -466,7 +397,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       run = run!(ctx)
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "ci_definition_unknown"
-      refute_received {:local_run, _, _}
     end
   end
 
@@ -487,7 +417,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       waiting = reload(ctx, run)
       assert waiting.status == "running"
       assert waiting.ci_forge_faults == 1
-      refute_received {:local_run, _, _}
 
       assert :ok = perform(ctx, waiting)
       assert reload(ctx, run).status == "pass"
@@ -507,25 +436,34 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         assert reload(ctx, run).ci_forge_faults == n
       end
 
-      refute_received {:local_run, _, _}
-      assert reload(ctx, run).ci_forge_faults == bound
-
       assert :ok = perform(ctx, run)
       reloaded = reload(ctx, run)
       assert reloaded.status == "error"
-      assert reloaded.ac_results["ci_unavailable_reason"] == "forge_unavailable"
-      # A final no-verdict that is not a refusal asks the (disabled) local runner.
-      assert reloaded.ac_results["local_error"] == "runner_disabled"
+
+      # A final no-verdict records its code and ends the run: nothing else is recorded.
+      assert reloaded.ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "forge_unavailable"
+             }
     end
 
-    test "a comparison answered before the evidence read faulted ends the streak", ctx do
+    # Round 2, finding 1: the comparison answers every poll and the evidence read faults every
+    # poll. That the comparison answered resets nothing, so the streak still reaches the bound.
+    test "an evidence read that faults every poll reaches forge_unavailable at the bound", ctx do
       stub_forge(ctx, %{evidence: {:error, {:github_api_error, 503}}})
+      run = run!(ctx)
+      bound = MergePrecondition.max_consecutive_unevaluated()
 
-      run = ctx |> run!() |> set_faults!(4)
-      # The compare answered, so this fault is the FIRST of a new streak: 1, and 60 seconds.
-      assert {:snooze, 60} = perform(ctx, run)
-      assert_received {:compare, @sha}
-      assert reload(ctx, run).ci_forge_faults == 1
+      for n <- 1..bound do
+        assert {:snooze, _} = perform(ctx, run), "fault #{n}"
+        assert_received {:compare, @sha}
+        assert reload(ctx, run).ci_forge_faults == n
+      end
+
+      assert :ok = perform(ctx, run)
+
+      assert %{status: "error", ac_results: %{"ci_unavailable_reason" => "forge_unavailable"}} =
+               reload(ctx, run)
     end
 
     test "a forge-supplied retry-after is honoured up to an hour", ctx do
@@ -562,8 +500,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
                "source" => "ci",
                "ci_unavailable_reason" => "database_busy"
              }
-
-      refute_received {:local_run, _, _}
     end
 
     test "an answered wait resets the fault streak", ctx do
@@ -582,12 +518,14 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       assert reload(ctx, run).ci_forge_faults == 0
     end
 
-    test "a 404 records its code at once", ctx do
+    test "a 404 records its code at once, and ends the run", ctx do
       stub_forge(ctx, %{compare: {:error, {:github_api_error, 404}}, evidence: green()})
 
       run = run!(ctx)
       assert :ok = perform(ctx, run)
-      assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "forge_not_found"
+
+      assert %{status: "error", ac_results: ac} = reload(ctx, run)
+      assert ac == %{"source" => "ci", "ci_unavailable_reason" => "forge_not_found"}
     end
 
     test "a missing required check past the age window records ci_wait_exhausted", ctx do
@@ -598,12 +536,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "ci_wait_exhausted"
     end
 
-    test "inside the window a missing check waits, with no local run", ctx do
+    test "inside the window a missing check waits", ctx do
       stub_forge(ctx, %{evidence: evidence([], [])})
 
       run = ctx |> run!() |> age!(23 * 60 * 60)
       assert {:snooze, _} = perform(ctx, run)
-      refute_received {:local_run, _, _}
     end
 
     test "a transient fault past the age window records forge_unavailable", ctx do
@@ -675,21 +612,22 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       refute_received {:evidence, @short}
     end
 
-    test "resolving a resolved commit ends the fault streak", ctx do
+    # Round 2, finding 1: resolving happens once per run and is not a CI answer, so it leaves
+    # the streak alone. The comparison after it faulted: the fifth fault, not a new first.
+    test "resolving an abbreviated SHA leaves the fault streak alone", ctx do
       stage_branch!(ctx, @branch)
       stub_forge(ctx, %{compare: {:error, {:github_api_error, 502}}, evidence: green()})
       expect(MockPullRequestSource, :resolve_commit, 1, fn @repo, @short -> {:ok, @sha} end)
 
       run = ctx |> run!(@short) |> set_faults!(4)
-      # The resolution answered; the comparison after it faulted: the first of a new streak.
-      assert {:snooze, 60} = perform(ctx, run)
+      assert {:snooze, 900} = perform(ctx, run)
 
       reloaded = reload(ctx, run)
       assert reloaded.resolved_commit_sha == @sha
-      assert reloaded.ci_forge_faults == 1
+      assert reloaded.ci_forge_faults == 5
     end
 
-    test "an unresolvable prefix and an unreadable repository are permanent, no local run",
+    test "an unresolvable prefix and an unreadable repository are permanent",
          ctx do
       stage_branch!(ctx, @branch)
       stub_forge(ctx, %{evidence: green()})
@@ -704,7 +642,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         assert reload(ctx, run).ac_results == %{"source" => "ci", "ci_unavailable_reason" => code}
       end
 
-      refute_received {:local_run, _, _}
       refute_received {:evidence, _}
     end
   end

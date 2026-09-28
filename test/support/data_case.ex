@@ -235,14 +235,12 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
-    # US-26.4.6: story verification reads nothing without a credential, and its local
-    # fallback runs nothing. A test that wants either says so.
+    # US-26.4.6: story verification reads nothing without a credential. A test that wants one
+    # says so, for the tenant check and the (tenant, repository) pair both.
+    Mox.stub(Loopctl.MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> false end)
+
     Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
       {:error, :credential_unavailable}
-    end)
-
-    Mox.stub(Loopctl.MockVerificationLocalRunner, :run_tests, fn _url, _sha, _credential ->
-      {:error, :runner_disabled}
     end)
 
     # US-45.5: the merge executor's App writes, on the same fail-closed default.
