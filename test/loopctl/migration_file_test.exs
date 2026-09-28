@@ -48,15 +48,38 @@ defmodule Loopctl.Test.MigrationFileTest do
       end
     end
 
+    test "reuses a copy compiled through a symlinked directory", ctx do
+      # The migrator may compile through `_build/.../priv`, a symlink to `priv`.
+      link = Path.join(ctx.tmp_dir, "linked")
+      File.ln_s!(ctx.tmp_dir, link)
+      Code.compile_file(Path.join(link, "1_probe.exs"))
+
+      assert MigrationFile.load!(ctx.module, ctx.path) == ctx.module
+    end
+
+    test "refuses a loaded copy with no recorded source", ctx do
+      {:ok, module, binary} =
+        :compile.forms([{:attribute, 1, :module, ctx.module}], [:deterministic])
+
+      {:module, ^module} = :code.load_binary(module, ~c"nofile", binary)
+
+      assert_raise ArgumentError, ~r/no recorded source/, fn ->
+        MigrationFile.load!(ctx.module, ctx.path)
+      end
+    end
+
     test "raises when the file does not define the module", %{path: path} do
       assert_raise ArgumentError, fn -> MigrationFile.load!(Loopctl.NoSuchMigration, path) end
     end
   end
 
   describe "file!/1" do
-    test "resolves a version to its one migration file" do
-      assert MigrationFile.file!(20_260_927_120_000) ==
-               Path.expand("priv/repo/migrations/20260927120000_add_thread_page.exs")
+    @tag :tmp_dir
+    test "resolves a version to its one migration file", %{tmp_dir: dir} do
+      File.touch!(Path.join(dir, "7_a.exs"))
+      File.touch!(Path.join(dir, "70_b.exs"))
+
+      assert MigrationFile.file!(7, dir) == Path.join(dir, "7_a.exs")
     end
 
     @tag :tmp_dir
@@ -70,46 +93,64 @@ defmodule Loopctl.Test.MigrationFileTest do
     end
 
     test "raises a named error for a version with no file" do
-      assert_raise ArgumentError, ~r/expected one migration 1/, fn -> MigrationFile.file!(1) end
+      assert_raise ArgumentError, ~r/expected one migration 1/, fn ->
+        MigrationFile.file!(1, System.tmp_dir!())
+      end
     end
   end
 
   describe "the guard" do
-    # A test that names a migration module must load it through require!/2: a bare load
+    # Every migration module a test names must have its own require!/2: a bare load
     # redefines the migrator's copy on a fresh database, and no load at all passes only on
     # a fresh database, where the migrator happened to load it.
-    @loaders ["Code.require_file", "Code.compile_file", "Code.eval_file"]
+    @bare_load ~r/Code\.(require_file|compile_file|eval_file)\([^)\n]*[Mm]igration/
+    @named ~r/Loopctl\.Repo\.Migrations\.(\w+)|Module\.concat\(Loopctl\.Repo\.Migrations,\s*"(\w+)"\)/
 
-    defp violation?(source) do
-      source =~ ~r/Loopctl\.Repo\.Migrations\b/ and
-        (not (source =~ "MigrationFile.require!(") or
-           Enum.any?(@loaders, &String.contains?(source, &1)))
+    defp violations(source) do
+      named =
+        @named
+        |> Regex.scan(source, capture: :all_but_first)
+        |> Enum.map(&Enum.find(&1, fn name -> name != "" end))
+        |> Enum.uniq()
+
+      unloaded = Enum.reject(named, &(source =~ "MigrationFile.require!(#{&1},"))
+      if source =~ @bare_load, do: [:bare_load | unloaded], else: unloaded
     end
 
     test "recognises each way in, and the sanctioned one" do
-      assert violation?("alias Loopctl.Repo.Migrations.AddX\nCode.require_file(f)")
-      assert violation?("alias Loopctl.Repo.Migrations.AddX\nCode.compile_file(f)")
-      assert violation?("x = &Code.eval_file/1\nLoopctl.Repo.Migrations.AddX.up()")
-      assert violation?("Loopctl.Repo.Migrations.AddX.backfill_sql()")
-      # A loader is refused even beside a sanctioned call.
-      assert violation?(
-               "MigrationFile.require!(AddX, 1)\nCode.eval_file(f)\nLoopctl.Repo.Migrations"
-             )
+      assert violations("Code.compile_file(\"priv/repo/migrations/1_x.exs\")") == [:bare_load]
 
-      refute violation?("alias Loopctl.Repo.Migrations.AddX\nMigrationFile.require!(AddX, 1)")
-      assert violation?("Module.concat(Loopctl.Repo.Migrations, \"AddX\").up()")
-      refute violation?("Code.require_file(\"config/worktree_partition.exs\")")
+      assert violations("""
+             alias Loopctl.Repo.Migrations.AddX
+             MigrationFile.require!(AddX, 1)
+             Code.eval_file(MigrationFile.file!(1))
+             """) == [:bare_load]
+
+      assert violations("""
+             alias Loopctl.Repo.Migrations.AddX
+             alias Loopctl.Repo.Migrations.AddY
+             MigrationFile.require!(AddX, 1)
+             AddY.up()
+             """) == ["AddY"]
+
+      assert violations(~s|Module.concat(Loopctl.Repo.Migrations, "AddX").up()|) == ["AddX"]
+
+      assert violations("""
+             alias Loopctl.Repo.Migrations.AddX
+             MigrationFile.require!(AddX, 1)
+             Code.require_file(@check_path)
+             """) == []
     end
 
-    test "every test that names a migration module loads it through require!/2" do
+    test "every migration module a test names is loaded through require!/2" do
       sources =
         for file <- Path.wildcard("test/**/*.exs") -- [Path.relative_to_cwd(__ENV__.file)],
             do: {file, File.read!(file)}
 
-      assert for({file, source} <- sources, violation?(source), do: file) == []
+      assert for({file, source} <- sources, (v = violations(source)) != [], do: {file, v}) == []
 
       # Non-vacuous: the scan reached the call sites it exists to police.
-      assert Enum.count(sources, fn {_, source} -> source =~ "MigrationFile.require!(" end) > 1
+      assert Enum.count(sources, fn {_, source} -> source =~ @named end) > 1
     end
   end
 end

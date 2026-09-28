@@ -15,11 +15,15 @@ defmodule Loopctl.Threads.IssueLinksTest do
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
+  alias Loopctl.Repo.Migrations.AddThreadPage
   alias Loopctl.Test.MigrationFile
   alias Loopctl.Threads
   alias Loopctl.Threads.IssueLink
   alias Loopctl.Threads.IssueLinks
   alias Loopctl.WorkBreakdown.Story
+
+  # The migration is not compiled with the app.
+  MigrationFile.require!(AddThreadPage, 20_260_927_120_000)
 
   setup :verify_on_exit!
 
@@ -174,13 +178,7 @@ defmodule Loopctl.Threads.IssueLinksTest do
 
   describe "the migration's one-time backfill" do
     test "links in-flight threads only, and never a closed issue or a base_update-only thread" do
-      # The migration module is not compiled with the app: load it once, and name it at
-      # runtime, since the compiler cannot see a module that `priv/` defines.
-      migration = Module.concat(Loopctl.Repo.Migrations, "AddThreadPage")
-
-      MigrationFile.require!(migration, 20_260_927_120_000)
-
-      backfill = migration.backfill_sql()
+      backfill = AddThreadPage.backfill_sql()
 
       in_flight =
         for stage <- StageMachine.in_flight_stages(),
