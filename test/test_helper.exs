@@ -1,7 +1,7 @@
 # A fresh test database leaves the migrator's copies of pending migrations loaded, and a
 # migration test requiring the same file would then warn "redefining module" and fail
 # --warnings-as-errors after a green suite. See Loopctl.Test.MigrationModules.
-Loopctl.Test.MigrationModules.unload_compiled_from()
+Loopctl.Test.MigrationModules.unload_migrator_copies()
 
 ExUnit.start()
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
