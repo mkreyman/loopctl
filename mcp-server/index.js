@@ -1095,9 +1095,10 @@ async function getStory({ story_id }) {
 }
 
 // --- Epics (loopctl #876) ---
-// Reads travel on the default key (any role passes). Create and update pass
-// LOOPCTL_ORCH_KEY as an ordinary override: `role: :orchestrator` WITH the hierarchy, as for
-// update_story. Delete passes LOOPCTL_USER_KEY: `role: :user`, and it cascades to stories.
+// Reads travel on the default key (any role passes). Create and update send LOOPCTL_ORCH_KEY
+// VERBATIM when it is set (`orchestratorKeyArgs`), so a global LOOPCTL_API_KEY of a lesser
+// role cannot displace the key the tool names, and the global key when it is not. Delete is
+// pinned to LOOPCTL_USER_KEY (`exactKey`), as every user-role tool is: it cascades.
 
 async function listEpics(args) {
   return toContent(await listEpicsRequest(args, { apiCall }));
@@ -1114,8 +1115,10 @@ async function epicProgress(args) {
 async function createEpic(args) {
   return toContent(
     await createEpicRequest(args, {
-      apiCall: (method, path, body) =>
-        apiCall(method, path, body, process.env.LOOPCTL_ORCH_KEY),
+      apiCall: (method, path, body) => {
+        const orch = orchestratorKeyArgs();
+        return apiCall(method, path, body, orch.override, orch.options);
+      },
     }),
   );
 }
@@ -1123,8 +1126,10 @@ async function createEpic(args) {
 async function updateEpic(args) {
   return toContent(
     await updateEpicRequest(args, {
-      apiCall: (method, path, body) =>
-        apiCall(method, path, body, process.env.LOOPCTL_ORCH_KEY),
+      apiCall: (method, path, body) => {
+        const orch = orchestratorKeyArgs();
+        return apiCall(method, path, body, orch.override, orch.options);
+      },
     }),
   );
 }
@@ -1133,7 +1138,10 @@ async function deleteEpic(args) {
   return toContent(
     await deleteEpicRequest(args, {
       apiCall: (method, path, body) =>
-        apiCall(method, path, body, process.env.LOOPCTL_USER_KEY),
+        apiCall(method, path, body, process.env.LOOPCTL_USER_KEY, {
+          exactKey: true,
+          keyHint: "LOOPCTL_USER_KEY",
+        }),
     }),
   );
 }
@@ -4250,7 +4258,8 @@ const TOOLS = [
     name: "list_epics",
     description:
       "LIST A PROJECT'S EPICS (GET /api/v1/projects/:project_id/epics, loopctl #876): each " +
-      "epic's `id`, `number`, `title`, `phase` and status fields, paginated (`page`, " +
+      "epic's `id`, `number`, `title`, `description`, `phase`, `position`, `metadata`, " +
+      "`story_count` and `completion_percentage`, paginated (`page`, " +
       "`page_size`), optionally filtered by `phase`. The way to learn an epic's id, e.g. the " +
       "`target_epic_id` an intake source needs. Any key. Refusals: 404 for a project not in " +
       "your tenant; a malformed `project_id` is refused locally.",
@@ -4307,8 +4316,8 @@ const TOOLS = [
     description:
       "CORRECT AN EPIC (PATCH /api/v1/epics/:id, loopctl #876): any of `title`, " +
       "`description`, `phase`, `position`, `metadata`. `number` cannot change. The endpoint " +
-      "DROPS absent and null fields, so a field cannot be erased here and a call naming none " +
-      "is refused locally. `metadata` is REPLACED WHOLE, never merged: read the epic first " +
+      "DROPS absent and null fields, so a field cannot be erased here: a null, and a call " +
+      "naming no field, are both refused locally. `metadata` is REPLACED WHOLE, never merged: read the epic first " +
       "(get_epic) and send the whole map. Needs LOOPCTL_ORCH_KEY (orchestrator or above) on " +
       "a human-anchored tenant. Refusals: 403, 404, 422 for an invalid field.",
     inputSchema: {
@@ -4329,8 +4338,12 @@ const TOOLS = [
     description:
       "DELETE AN EPIC AND EVERY STORY IN IT (DELETE /api/v1/epics/:id, loopctl #876). " +
       "IRREVERSIBLE: the delete cascades to the epic's stories. Answers 204 with no body. " +
-      "Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant. Refusals: 403 for a " +
-      "lesser key or a tenant that is not human-anchored, 404 for an epic not in your tenant.",
+      "Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant; sent verbatim, never " +
+      "displaced by LOOPCTL_API_KEY. Refusals: 403 for a lesser key or a tenant that is not " +
+      "human-anchored, 404 for an epic not in your tenant, 422 when an active intake source " +
+      "targets the epic (revoke it first: intake_source_revoke), 422 when any story in it " +
+      "entered the delivery lifecycle (its dispatches, capability tokens and verification " +
+      "runs are custody record and do not cascade, so such an epic is not deletable).",
     inputSchema: {
       type: "object",
       properties: {

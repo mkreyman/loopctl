@@ -270,7 +270,10 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
     multi =
       Multi.new()
-      |> Multi.delete(:story, story)
+      |> Multi.delete(
+        :story,
+        story |> Ecto.Changeset.change() |> Story.lifecycle_reference_constraints(:id)
+      )
       |> Audit.log_in_multi(:audit, fn %{story: deleted} ->
         %{
           tenant_id: tenant_id,

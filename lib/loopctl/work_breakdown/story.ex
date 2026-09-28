@@ -305,4 +305,28 @@ defmodule Loopctl.WorkBreakdown.Story do
       :error -> 0
     end
   end
+
+  # The references onto `stories` that do NOT cascade (`on_delete: :nothing`): the custody
+  # record a story gains once it enters the delivery lifecycle — its dispatches, the capability
+  # tokens a claim mints, its verification runs. Deleting such a story, or the epic holding it,
+  # would destroy that record, so Postgres refuses; named here, the refusal is a 422 rather
+  # than an `Ecto.ConstraintError` no fallback can render (loopctl #923).
+  @lifecycle_references ~w(dispatches_story_id_fkey capability_tokens_story_id_fkey
+                           verification_runs_story_id_fkey)a
+
+  @doc """
+  Names every non-cascading reference onto a story on `changeset`, a DELETE of a story or of
+  something that cascades to stories, so a violation is a 422 on `field` naming the remedy.
+  """
+  @spec lifecycle_reference_constraints(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def lifecycle_reference_constraints(changeset, field) do
+    Enum.reduce(@lifecycle_references, changeset, fn name, acc ->
+      Ecto.Changeset.foreign_key_constraint(acc, field,
+        name: name,
+        message:
+          "has a story that entered the delivery lifecycle (dispatches, capability tokens or " <>
+            "verification runs reference it), and that custody record cannot be deleted"
+      )
+    end)
+  end
 end

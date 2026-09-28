@@ -216,11 +216,15 @@ defmodule LoopctlWeb.StoryController do
 
   operation(:delete,
     summary: "Delete story",
-    description: "Deletes a story. Requires user+ role.",
+    description:
+      "Deletes a story. Requires user+ role. Refused 422 when the story entered the delivery " <>
+        "lifecycle: its dispatches, capability tokens and verification runs are custody " <>
+        "record and do not cascade.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Not deletable", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )

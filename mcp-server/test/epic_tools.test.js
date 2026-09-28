@@ -47,6 +47,12 @@ function fakeApi(response = { ok: true }) {
 }
 
 describe("epic requests", () => {
+  test("a null optional argument is not sent as the string null", async () => {
+    const api = fakeApi();
+    await listEpics({ project_id: PROJECT, phase: null, page: null }, api);
+    assert.equal(api.calls[0].path, `/api/v1/projects/${PROJECT}/epics`);
+  });
+
   test("list_epics GETs the project's epics with its query", async () => {
     const api = fakeApi();
     await listEpics({ project_id: PROJECT, page: 2, page_size: 5, phase: "build" }, api);
@@ -66,9 +72,13 @@ describe("epic requests", () => {
       { method: "POST", path: `/api/v1/projects/${PROJECT}/epics`, body: { number: 7, title: "Intake" } },
     ]);
 
+    const stringNumber = fakeApi();
+    await createEpic({ project_id: PROJECT, number: "8", title: "Cast as the server casts" }, stringNumber);
+    assert.equal(stringNumber.calls.length, 1);
+
     for (const args of [
+      { project_id: PROJECT, number: "8a", title: "not an integer string" },
       { project_id: PROJECT, title: "no number" },
-      { project_id: PROJECT, number: "7", title: "string number" },
       { project_id: PROJECT, number: 7 },
     ]) {
       const refused = fakeApi();
@@ -94,17 +104,19 @@ describe("epic requests", () => {
     );
   });
 
-  test("update_epic sends the named fields and refuses a call naming none", async () => {
+  test("update_epic sends the named fields and refuses a null or a call naming none", async () => {
     const api = fakeApi();
-    await updateEpic({ epic_id: EPIC, title: "Renamed", description: null }, api);
+    await updateEpic({ epic_id: EPIC, title: "Renamed" }, api);
     assert.deepEqual(api.calls, [
       { method: "PATCH", path: `/api/v1/epics/${EPIC}`, body: { title: "Renamed" } },
     ]);
 
-    const empty = fakeApi();
-    const result = await updateEpic({ epic_id: EPIC, description: null }, empty);
-    assert.equal(result.error, true);
-    assert.equal(empty.calls.length, 0);
+    for (const args of [{ epic_id: EPIC }, { epic_id: EPIC, title: "t", description: null }]) {
+      const refused = fakeApi();
+      const result = await updateEpic(args, refused);
+      assert.equal(result.error, true);
+      assert.equal(refused.calls.length, 0);
+    }
   });
 
   test("a malformed or missing id is refused locally and never sent", async () => {
@@ -136,16 +148,19 @@ describe("epic tools are wired", () => {
     });
   }
 
-  test("writes carry the key their gate needs", () => {
-    for (const [handler, key] of [
-      ["createEpic", "LOOPCTL_ORCH_KEY"],
-      ["updateEpic", "LOOPCTL_ORCH_KEY"],
-      ["deleteEpic", "LOOPCTL_USER_KEY"],
-    ]) {
+  test("writes carry the key their gate needs, and a global key cannot displace it", () => {
+    const body = (handler) => {
       const start = INDEX_SRC.indexOf(`async function ${handler}(args)`);
       assert.ok(start >= 0, handler);
-      const body = INDEX_SRC.slice(start, INDEX_SRC.indexOf("\n}\n", start));
-      assert.match(body, new RegExp(`process\\.env\\.${key}`), handler);
+      return INDEX_SRC.slice(start, INDEX_SRC.indexOf("\n}\n", start));
+    };
+
+    for (const handler of ["createEpic", "updateEpic"]) {
+      assert.match(body(handler), /orchestratorKeyArgs\(\)/, handler);
+      assert.match(body(handler), /orch\.override, orch\.options/, handler);
     }
+
+    assert.match(body("deleteEpic"), /process\.env\.LOOPCTL_USER_KEY/);
+    assert.match(body("deleteEpic"), /exactKey: true/);
   });
 });

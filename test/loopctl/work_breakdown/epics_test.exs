@@ -182,6 +182,20 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
       assert {:error, :not_found} = Epics.get_epic(tenant.id, epic.id)
     end
 
+    test "an epic whose story entered the lifecycle is a 422 changeset, not a raise" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+      lifecycle_dispatch(tenant, story)
+
+      assert {:error, %Ecto.Changeset{errors: [id: {message, _}]}} =
+               Epics.delete_epic(tenant.id, epic)
+
+      assert message =~ "entered the delivery lifecycle"
+      assert {:ok, _} = Epics.get_epic(tenant.id, epic.id)
+    end
+
     test "creates audit log entry on delete" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
@@ -313,5 +327,24 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
       epic_b = fixture(:epic, %{tenant_id: tenant_b.id, project_id: project_b.id, number: 2})
       assert {:error, :not_found} = Epics.get_epic(tenant_a.id, epic_b.id)
     end
+  end
+
+  # A dispatch naming the story: the custody record a story gains once it enters the delivery
+  # lifecycle, referenced with `on_delete: :nothing` (loopctl #923).
+  defp lifecycle_dispatch(tenant, story) do
+    agent = fixture(:agent, %{tenant_id: tenant.id})
+    id = Ecto.UUID.generate()
+    now = DateTime.utc_now()
+
+    Loopctl.AdminRepo.insert!(%Loopctl.Dispatches.Dispatch{
+      id: id,
+      tenant_id: tenant.id,
+      role: :agent,
+      agent_id: agent.id,
+      story_id: story.id,
+      lineage_path: [id],
+      expires_at: DateTime.add(now, 3_600),
+      created_at: now
+    })
   end
 end

@@ -111,11 +111,16 @@ defmodule LoopctlWeb.EpicController do
 
   operation(:delete,
     summary: "Delete epic",
-    description: "Deletes an epic and cascades to stories. Requires user+ role.",
+    description:
+      "Deletes an epic and cascades to stories. Requires user+ role. Refused 422 when an " <>
+        "active intake source targets the epic, or when any of its stories entered the " <>
+        "delivery lifecycle: its dispatches, capability tokens and verification runs are " <>
+        "custody record and do not cascade.",
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Not deletable", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )

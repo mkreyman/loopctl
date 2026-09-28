@@ -16,16 +16,18 @@
  *     `metadata` (default {}); `number` is required and cannot change afterwards.
  *   - update takes `title`, `description`, `phase`, `position`, `metadata` and DROPS every
  *     nil, so a field cannot be nulled through it, and a request naming none of them is a
- *     200 that changes nothing. That shape is refused here, as `update_story` refuses it.
- *     `metadata` is REPLACED whole, never merged.
+ *     200 that changes nothing. Both shapes (a null, and no field) are refused here, as
+ *     `update_story` refuses them. `metadata` is REPLACED whole, never merged.
  *   - index pages (`page`, `page_size`) and filters by `phase`.
  *
  * KEYS, from the controller's plugs: reads are `role: :agent` (any key); create and update
  * are `role: :orchestrator` with the hierarchy, and human-anchored; delete is `role: :user`,
- * human-anchored, and CASCADES to the epic's stories.
+ * human-anchored, and CASCADES to the epic's stories — refused 422 when a story in it entered
+ * the delivery lifecycle (its custody record does not cascade) or an active intake source
+ * targets the epic.
  */
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+import { uuid as uuidRefusal } from "./delivery-loop.js";
 
 const UPDATABLE = ["title", "description", "phase", "position", "metadata"];
 
@@ -33,19 +35,10 @@ function refuse(body) {
   return { error: true, status: 0, body };
 }
 
-// A malformed id is refused locally rather than sent: the server's 404 for it reads the same
-// as "no such epic in your tenant". The value is not echoed, since a tool result lands in the
-// transcript and a malformed id is often something pasted into the wrong argument.
+// A malformed id is refused locally rather than sent, through the SAME guard the other tools
+// use (`lib/delivery-loop.js`'s `uuid`), so a bad id reads the same whichever tool it reached.
 function badId(name, value) {
-  if (typeof value !== "string" || value.trim() === "") {
-    return refuse(`\`${name}\` is required.`);
-  }
-
-  if (!UUID_RE.test(value)) {
-    return refuse(`\`${name}\` must be a UUID; the value given is not one.`);
-  }
-
-  return null;
+  return uuidRefusal(value, name);
 }
 
 // Each builder is ONE template literal, which is the shape `test/tool-surface.js` resolves to
@@ -64,9 +57,11 @@ export function epicProgressPath(epicId) {
 
 function epicsQuery({ page, page_size, phase } = {}) {
   const params = new URLSearchParams();
-  if (page !== undefined) params.set("page", String(page));
-  if (page_size !== undefined) params.set("page_size", String(page_size));
-  if (phase !== undefined) params.set("phase", String(phase));
+  // `!= null`, not `!== undefined`: a client sending an optional argument as null means
+  // "not named", and `phase=null` would filter on the literal phase "null".
+  if (page != null) params.set("page", String(page));
+  if (page_size != null) params.set("page_size", String(page_size));
+  if (phase != null) params.set("phase", String(phase));
   const query = params.toString();
   return query === "" ? "" : `?${query}`;
 }
@@ -85,7 +80,8 @@ export async function createEpic(
   const refused = badId("project_id", project_id);
   if (refused) return refused;
 
-  if (!Number.isInteger(number)) {
+  // The server casts an integer string as Ecto does ("7" is 7), so this accepts what it accepts.
+  if (!Number.isInteger(number) && !(typeof number === "string" && /^\d+$/.test(number))) {
     return refuse("`number` is required and must be an integer; it cannot change later.");
   }
 
@@ -112,13 +108,25 @@ export async function updateEpic(args = {}, { apiCall } = {}) {
 
   const body = {};
   for (const field of UPDATABLE) {
-    if (args[field] !== undefined && args[field] !== null) body[field] = args[field];
+    const value = args[field];
+    if (value === undefined) continue;
+
+    // Refused, as `update_story` refuses it: a caller writing null means to CLEAR the field,
+    // and the endpoint drops every nil and answers 200 with the field unchanged.
+    if (value === null) {
+      return refuse(
+        `\`${field}\` cannot be set to null through this endpoint: it drops every null and ` +
+          "answers 200 with the field unchanged. Send the value you want, or leave it out.",
+      );
+    }
+
+    body[field] = value;
   }
 
   if (Object.keys(body).length === 0) {
     return refuse(
-      `Name at least one of ${UPDATABLE.join(", ")}: the endpoint drops every absent or null ` +
-        "field, so a request with none of them answers 200 and changes nothing.",
+      `Name at least one of ${UPDATABLE.join(", ")}: the endpoint drops every absent field, ` +
+        "so a request with none of them answers 200 and changes nothing.",
     );
   }
 
