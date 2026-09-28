@@ -78,7 +78,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   the branch.
 
   Story verification (#913, `commit_ci_runs/3`) makes two workflow-run reads, one per event,
-  concurrently: 7 seconds before an answer, and a timeout is no CI evidence, never a pass. Nothing here runs inside a
+  concurrently, after one commit read when the recorded SHA is abbreviated: 14 seconds before
+  an answer, and a timeout is no CI evidence, never a pass. Nothing here runs inside a
   database transaction: the caller gathers every fact before it opens one, so a slow forge
   never holds a pooled connection.
 
@@ -313,11 +314,26 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   def commit_ci_runs(repo, sha, preferred) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, sha} <- ref(sha),
+         {:ok, sha} <- full_sha(repo, sha),
          {:ok, runs} <- runs_of_events(repo, sha, ["push", "pull_request"]) do
       {:ok,
        runs
        |> newest_per(&{&1["path"], &1["event"], &1["head_branch"]}, preferred)
        |> Enum.map(&Map.put(run_fact(&1), :url, &1["html_url"]))}
+    end
+  end
+
+  # The runs filter (`head_sha`) and the check against it match a FULL object id only, and a
+  # verification run may record an abbreviated one (`VerificationRun`, 7-64 hex): resolve it
+  # first, or its runs are never found.
+  defp full_sha(_repo, sha) when byte_size(sha) in [40, 64], do: {:ok, sha}
+
+  defp full_sha(repo, sha) do
+    with {:ok, body} <- get(repo, "/commits/" <> sha) do
+      case body do
+        %{"sha" => full} when is_binary(full) and byte_size(full) in [40, 64] -> {:ok, full}
+        _other -> {:error, {:unreadable_commit, shape(body)}}
+      end
     end
   end
 

@@ -61,18 +61,20 @@ defmodule Loopctl.Verification.GitHubActions do
        still queued;
     2. any run queued or running - `in_progress`; the caller snoozes until it finishes;
     3. any run that concluded `success` - `success`;
-    4. otherwise - `{:error, :no_ci_evidence}`: no runs at all (a repository without Actions
-       CI, or a commit a path filter skipped), or only runs that did not run the commit's
-       CI to a result - `cancelled`, `skipped`, `neutral`, `action_required`, `stale`, or
-       `waiting` on an approval. An empty list once read as SUCCESS, since `Enum.all?/2` of
-       nothing is true.
+    4. no runs at all - `{:error, :no_workflow_runs}`: GitHub creates a push's runs seconds
+       after the push, so the caller waits a little before treating it as a repository
+       without Actions CI or a commit a path filter skipped. (An empty list once read as
+       SUCCESS, since `Enum.all?/2` of nothing is true.)
+    5. otherwise - `{:error, :no_ci_evidence}`: only runs that did not run the commit's CI
+       to a result - `cancelled`, `skipped`, `neutral`, `action_required`, `stale`, or
+       `waiting` on an approval.
 
   A run that did not reach a result never outweighs one that did: a deploy workflow waiting
   on an approval, or cancelled by a newer merge, leaves a green CI run green.
   """
   @spec summarize_workflow_runs([map()]) ::
           {:ok, %{status: String.t(), conclusion: String.t() | nil, url: String.t()}}
-          | {:error, :no_ci_evidence}
+          | {:error, :no_workflow_runs | :no_ci_evidence}
   def summarize_workflow_runs(runs) do
     completed = Enum.filter(runs, &(&1.status == "completed"))
 
@@ -85,6 +87,9 @@ defmodule Loopctl.Verification.GitHubActions do
 
       Enum.any?(completed, &(&1.conclusion == "success")) ->
         {:ok, %{status: "completed", conclusion: "success", url: ""}}
+
+      runs == [] ->
+        {:error, :no_workflow_runs}
 
       true ->
         {:error, :no_ci_evidence}

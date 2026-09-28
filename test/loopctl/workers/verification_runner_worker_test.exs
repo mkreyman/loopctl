@@ -278,14 +278,52 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       assert done.ac_results["ci_unavailable_reason"] == "github_api_error:403"
     end
 
-    test "no CI evidence falls back AND records why, so a missing token scope is visible" do
+    test "a commit with no workflow runs yet is given time for GitHub to create them" do
+      stub_ci(&Req.Test.json(&1, %{"total_count" => 0, "workflow_runs" => []}))
+
+      {_run, job} = ci_run(setup_ctx())
+      assert {:snooze, 60} = VerificationRunnerWorker.perform(job)
+    end
+
+    test "still no workflow runs after the grace period falls back AND records why" do
       stub_ci(&Req.Test.json(&1, %{"total_count" => 0, "workflow_runs" => []}))
 
       {run, job} = ci_run(setup_ctx())
+      backdate!(run, 11 * 60)
       assert :ok = VerificationRunnerWorker.perform(job)
 
       {:ok, done} = Verification.get_run(run.tenant_id, run.id)
-      assert done.ac_results["ci_unavailable_reason"] == "no_ci_evidence"
+      assert done.ac_results["ci_unavailable_reason"] == "no_workflow_runs"
+    end
+
+    test "a run that has waited a while polls less often, never more than every 15 minutes" do
+      stub_ci(&Req.Test.json(&1, %{"total_count" => 0, "workflow_runs" => []}))
+
+      stub_ci(fn conn ->
+        runs =
+          if conn.query_params["event"] == "push",
+            do: [
+              %{
+                "id" => 1,
+                "path" => ".github/workflows/ci.yml",
+                "event" => "push",
+                "head_branch" => "main",
+                "head_sha" => @sha,
+                "status" => "queued",
+                "conclusion" => nil
+              }
+            ],
+            else: []
+
+        Req.Test.json(conn, %{"total_count" => length(runs), "workflow_runs" => runs})
+      end)
+
+      {run, job} = ci_run(setup_ctx())
+      backdate!(run, 3_005)
+      assert {:snooze, 300} = VerificationRunnerWorker.perform(job)
+
+      backdate!(run, 20 * 60 * 60)
+      assert {:snooze, 900} = VerificationRunnerWorker.perform(job)
     end
   end
 end

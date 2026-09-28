@@ -78,7 +78,8 @@ defmodule Loopctl.Verification.GitHubActionsTest do
     end
 
     test "no runs, or only runs that reached no result, is no CI evidence, never a pass" do
-      assert {:error, :no_ci_evidence} = GitHubActions.summarize_workflow_runs([])
+      # Its own code: the caller gives GitHub a moment to create a push's runs.
+      assert {:error, :no_workflow_runs} = GitHubActions.summarize_workflow_runs([])
 
       assert {:error, :no_ci_evidence} =
                GitHubActions.summarize_workflow_runs([
@@ -90,7 +91,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
   end
 
   describe "get_status/2 (#913)" do
-    @sha "abc123"
+    @sha "abc1230000000000000000000000000000000000"
 
     defp api_run(id, path, event, branch, conclusion, sha \\ @sha) do
       %{
@@ -222,6 +223,35 @@ defmodule Loopctl.Verification.GitHubActionsTest do
 
       assert {:error, {:github_api_error, 403}} =
                GitHubActions.get_status("mkreyman/infra", @sha)
+    end
+
+    test "an abbreviated SHA is resolved to the full one before its runs are read" do
+      full = String.duplicate("a", 40)
+      test_pid = self()
+
+      Req.Test.stub(GitHubPullRequestSource, fn conn ->
+        case conn.request_path do
+          "/repos/mkreyman/infra/commits/aaaaaaa" ->
+            Req.Test.json(conn, %{"sha" => full})
+
+          "/repos/mkreyman/infra/actions/runs" ->
+            send(test_pid, {:runs_for, conn.query_params["head_sha"]})
+
+            runs =
+              if conn.query_params["event"] == "push",
+                do: [
+                  api_run(1, ".github/workflows/ci.yml", "push", "main", "success", full)
+                ],
+                else: []
+
+            Req.Test.json(conn, %{"total_count" => length(runs), "workflow_runs" => runs})
+        end
+      end)
+
+      assert {:ok, %{conclusion: "success"}} =
+               GitHubActions.get_status("mkreyman/infra", "aaaaaaa")
+
+      assert_received {:runs_for, ^full}
     end
 
     test "a newer run that reached no result does not hide an older failure" do

@@ -3,8 +3,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   US-26.4.2 — Processes verification runs.
 
   Dequeues pending runs, fetches the commit SHA, and checks CI status
-  via the configured CI adapter (GitHub Actions by default). Falls back
-  to marking as manual-review-needed if CI is unavailable.
+  via the configured CI adapter (GitHub Actions by default), reading ONLY the repository of
+  the project's intake source. When CI gives no verdict it falls back to independent local
+  re-execution (`Loopctl.Verification.TestRunner`, off by default), and records why CI gave
+  none in `ac_results.ci_unavailable_reason`.
 
   ## Stale-run age gate (US-36.1)
 
@@ -36,9 +38,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   dedicated `"skipped"` disposition (see `Loopctl.Verification.complete_run/3`).
   Restricting the gate to not-yet-started runs keeps it a pure backlog-drain bound: it
   can never complete an in-flight run mid-execution. In particular a run that has
-  begun and is snoozing on `in_progress` CI (`{:snooze, 60}`) is `status: "running"`
-  with `started_at` set, so even if its `inserted_at` ages past the window across
-  snoozes it is NOT killed mid-flight — it stays on the normal path until CI resolves.
+  begun and is snoozing on `in_progress` CI is `status: "running"` with `started_at`
+  set, so this gate never skips it. The SAME window bounds how long a started run may wait
+  on CI: once its `inserted_at` is older, the next poll completes it `"error"` with
+  `ci_wait_exhausted` instead of snoozing again, so a queued workflow nobody runs cannot
+  keep it polling. One clock, one setting.
 
   Neither `"skipped"` nor `"error"` ever touches `stories.verified_status` — the run
   status is observational only; the chain-of-custody verify action is entirely
@@ -200,32 +204,48 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       {:error, {:github_rate_limited, _status, delay}} ->
         wait_or_give_up(run, rate_limit_snooze(delay))
 
+      {:error, :no_workflow_runs} ->
+        if awaiting_first_runs?(run),
+          do: wait_or_give_up(run, 60),
+          else: no_verdict(run, :no_workflow_runs)
+
       {:ok, %{conclusion: other}} ->
         Logger.warning("VerificationRunner: unexpected CI conclusion: #{inspect(other)}")
         {:error, {:ci_unavailable, "unexpected_conclusion"}}
 
       {:error, reason} ->
-        code = reason_code(reason)
-        Logger.warning("VerificationRunner: no CI verdict for run #{run.id}: #{code}")
-        {:error, {:ci_unavailable, code}}
+        no_verdict(run, reason)
     end
+  end
+
+  defp no_verdict(run, reason) do
+    code = reason_code(reason)
+    Logger.warning("VerificationRunner: no CI verdict for run #{run.id}: #{code}")
+    {:error, {:ci_unavailable, code}}
   end
 
   @rate_limit_floor_seconds 60
 
-  # How long a run may wait on CI, measured from when it was created: every snooze runs
-  # `start_run/1` again, so `started_at` cannot bound it. Past this a queued workflow (an
-  # offline self-hosted runner) or a quota that never recovers ends the run as `error`
-  # instead of polling GitHub every minute for ever.
-  @ci_wait_budget_seconds 24 * 60 * 60
-
+  # A started run waits on CI for at most the run-age window, measured from when it was
+  # created (every snooze runs `start_run/1` again, so `started_at` cannot bound it), and
+  # polls less often the longer it has waited: every poll spends reads on the same token
+  # the merge gate reads with. A minute at first, then a tenth of its age, capped at 15.
   defp wait_or_give_up(run, snooze) do
-    if DateTime.diff(DateTime.utc_now(), run.inserted_at, :second) > @ci_wait_budget_seconds do
+    age = DateTime.diff(DateTime.utc_now(), run.inserted_at, :second)
+
+    if age > max_run_age_seconds() do
       {:ok, _} = Verification.complete_run(run, "error", %{"reason" => "ci_wait_exhausted"})
       {:ok, :ci_checked}
     else
-      {:snooze, snooze}
+      {:snooze, max(snooze, min(div(age, 10), 900))}
     end
+  end
+
+  # How long a commit with no workflow runs yet is given for GitHub to create them.
+  @no_runs_grace_seconds 10 * 60
+
+  defp awaiting_first_runs?(run) do
+    DateTime.diff(DateTime.utc_now(), run.inserted_at, :second) <= @no_runs_grace_seconds
   end
 
   defp rate_limit_snooze(delay) when is_integer(delay) and delay > 0, do: delay

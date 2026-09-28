@@ -214,13 +214,16 @@ All notable changes to loopctl are documented here.
   the Checks permission. GitHub grants that permission only to Apps, so a fine-grained token
   cannot hold it, and every lookup on a private repository was refused with 403. It now
   reads the commit's push and pull_request workflow runs through the thread merge gate's
-  reader. **Give `GITHUB_TOKEN` `actions: read` before upgrading**; without it, verification
-  finds no CI evidence and falls back to local test re-execution.
+  reader. **Give `GITHUB_TOKEN` `actions: read` before upgrading**; without it, every
+  lookup records `ci_unavailable_reason` `github_api_error:403` (or `:404` on a private
+  repository) and falls back to local test re-execution, which is off by default.
 
   **Verification now reads CI only from the repository of the project's intake source**, and
   never from the project's `repo_url`. A tenant can set `repo_url` to any repository, and the
-  read carries the operator's token. A project with no intake source gets no CI read; its
-  runs record `no_intake_source` and fall back to local re-execution.
+  read carries the operator's token. A project with no intake source gets no CI read: its
+  runs record `no_intake_source` and fall back to local re-execution, so with that off they
+  end as `error`. Verification was not producing verdicts for anyone before this change
+  (see below), so no project loses one it had.
 
   The verdict now follows one rule, applied in order:
   1. A failed, timed-out or unstartable run fails the commit, with that run's `url` recorded.
@@ -234,8 +237,10 @@ All notable changes to loopctl are documented here.
   - A deploy that is still waiting, or was cancelled, no longer spoils a green run.
   - A GitHub rate limit is waited out, for the forge's delay or a 60-second floor, instead of
     starting a local re-run.
-  - A run that is still waiting on CI a day after it was created ends as `error` with
-    `ci_wait_exhausted`, instead of polling indefinitely.
+  - A commit with no workflow runs yet is given ten minutes for GitHub to create them.
+  - A run still waiting on CI once it is older than `verification_max_run_age_seconds`
+    (24 hours by default) ends as `error` with `ci_wait_exhausted`. While it waits it polls
+    less often as it ages, up to every 15 minutes.
   - When there is no CI verdict, the reason is recorded as a short code in
     `ac_results.ci_unavailable_reason`.
 
