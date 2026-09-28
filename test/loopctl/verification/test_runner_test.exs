@@ -110,4 +110,29 @@ defmodule Loopctl.Verification.TestRunnerTest do
       assert {:error, :runner_disabled} = TestRunner.run_tests(@valid_url, @valid_sha)
     end
   end
+
+  describe "run_tests/3, the LocalRunner callback (US-26.4.6)" do
+    alias Loopctl.Verification.Credential
+
+    @credential %Credential{kind: :operator_token, token: "ghp_never_used"}
+
+    test "the credentialed entry point is gated the same way: validated, then disabled" do
+      assert {:error, :invalid_commit_sha} =
+               TestRunner.run_tests(
+                 "https://github.com/acme/app.git",
+                 "--upload-pack=x",
+                 @credential
+               )
+
+      assert {:error, :invalid_repo_url} =
+               TestRunner.run_tests("file:///etc", String.duplicate("a", 40), @credential)
+
+      assert {:error, :runner_disabled} =
+               TestRunner.run_tests(
+                 "https://github.com/acme/app.git",
+                 String.duplicate("a", 40),
+                 @credential
+               )
+    end
+  end
 end

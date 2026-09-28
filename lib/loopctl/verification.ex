@@ -105,10 +105,30 @@ defmodule Loopctl.Verification do
     |> AdminRepo.update()
   end
 
-  @doc "Marks a run as started."
+  @doc """
+  Marks a run as started. `started_at` is written ONCE: a run re-entered after a snooze keeps
+  the moment it first started (US-26.4.6).
+  """
   @spec start_run(VerificationRun.t()) :: {:ok, VerificationRun.t()} | {:error, term()}
   def start_run(run) do
-    update_run(run, %{status: "running", started_at: DateTime.utc_now()})
+    update_run(run, %{status: "running", started_at: run.started_at || DateTime.utc_now()})
+  end
+
+  @doc """
+  Records what one CI poll learned that the next poll of the same run needs (US-26.4.6): the
+  full id of an abbreviated commit SHA (`:resolved_commit_sha`, a full git object id or
+  refused) and the count of transient forge faults in a row (`:ci_forge_faults`). Neither is
+  castable from any request.
+  """
+  @spec record_poll(VerificationRun.t(), map()) :: {:ok, VerificationRun.t()} | {:error, term()}
+  def record_poll(run, attrs) do
+    run
+    |> Ecto.Changeset.change(Map.take(attrs, [:resolved_commit_sha, :ci_forge_faults]))
+    |> Ecto.Changeset.validate_change(:resolved_commit_sha, fn :resolved_commit_sha, sha ->
+      if Loopctl.GitSha.valid?(sha), do: [], else: [resolved_commit_sha: "must be a full id"]
+    end)
+    |> Ecto.Changeset.validate_number(:ci_forge_faults, greater_than_or_equal_to: 0)
+    |> AdminRepo.update()
   end
 
   @doc """

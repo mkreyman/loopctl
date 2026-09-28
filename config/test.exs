@@ -139,6 +139,19 @@ config :loopctl, Loopctl.TouchBuffer, flush_interval_ms: :timer.hours(1)
 # independently of the flag.
 config :loopctl, :enable_local_test_runner, false
 
+# US-26.4.6: story verification's credential seam and local fallback, as Mox mocks whose
+# DataCase defaults are fail-closed (no credential, a disabled runner). The allowlist below is
+# read only by `Loopctl.Verification.OperatorCredential`'s own test, which names this fixed id;
+# no fixture ever creates a tenant with it.
+config :loopctl, :verification_credential, Loopctl.MockVerificationCredential
+config :loopctl, :verification_local_runner, Loopctl.MockVerificationLocalRunner
+
+config :loopctl, :verification_operator_token_tenants, [
+  "0000a110-0000-4000-8000-00000000a110",
+  "  0000A110-0000-4000-8000-00000000B220  ",
+  "not-a-uuid"
+]
+
 # LCP-1 §9.3 signed-profile enforcement: resolve the deployment profile from a
 # process-dictionary stub in tests (async-safe), so a test can force `signed` for
 # its own process without mutating VM-global SystemConfig. Default (no override)

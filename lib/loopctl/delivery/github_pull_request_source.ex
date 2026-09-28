@@ -24,6 +24,12 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     total of its own, so a list that reaches the cap is refused as truncated rather than
     presented as the whole diff
 
+  Story verification (US-26.4.6) adds one, and reads CI through `check_evidence/3` below
+  exactly as the merge gate does:
+
+  - `GET /repos/:repo/commits/:ref` with `Accept: application/vnd.github.sha` — the full id of
+    an abbreviated commit SHA, once per verification run
+
   CI evidence for a thread checkpoint (US-45.6), by the checkpoint's exact SHA:
 
   - `GET /repos/:repo/actions/runs?head_sha=:sha&branch=:branch&event=push` — the workflow
@@ -223,6 +229,38 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
          {:ok, _body} <- get(repo, "") do
       :ok
     end
+  end
+
+  # US-26.4.6: an abbreviated commit SHA, resolved to its full id through
+  # `GET /repos/:repo/commits/:ref` with the `sha` media type, which answers the id as plain
+  # text rather than the whole commit and its file list. The answer must be a full id that
+  # EXTENDS the prefix asked for: a forge answering some other commit is not an answer.
+  @impl true
+  def resolve_commit(repo, ref) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, ref} <- hex_prefix(ref),
+         {:ok, body} <- get(repo, "/commits/#{ref}", sha_headers()) do
+      full = if is_binary(body), do: String.trim(body), else: body
+
+      if GitSha.valid?(full) and String.starts_with?(full, ref),
+        do: {:ok, full},
+        else: {:error, {:unreadable_commit_sha, shape(body)}}
+    end
+  end
+
+  defp hex_prefix(ref) when is_binary(ref) do
+    if Regex.match?(~r/\A[0-9a-f]{4,64}\z/, ref),
+      do: {:ok, ref},
+      else: {:error, {:invalid_ref, printable(ref)}}
+  end
+
+  defp hex_prefix(ref), do: {:error, {:invalid_ref, shape(ref)}}
+
+  defp sha_headers do
+    Enum.map(headers(), fn
+      {"accept", _} -> {"accept", "application/vnd.github.sha"}
+      header -> header
+    end)
   end
 
   @impl true
@@ -953,10 +991,11 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   defp tree(body, _ref), do: {:error, {:unreadable_tree, shape(body)}}
 
-  defp get(repo, path) do
+  defp get(repo, path, headers \\ nil) do
     url = @api_base <> "/repos/" <> repo <> path
+    opts = if headers, do: Keyword.put(req_options(), :headers, headers), else: req_options()
 
-    case Req.get(url, req_options()) do
+    case Req.get(url, opts) do
       {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
       {:ok, %Req.Response{} = response} -> {:error, failure(response)}
       {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}

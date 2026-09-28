@@ -227,6 +227,13 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback check_evidence(repo(), String.t(), String.t()) ::
               {:ok, Loopctl.Delivery.CiEvidence.evidence()} | {:error, term()}
 
+  @doc """
+  The full object id of the commit `ref` names (US-26.4.6). An abbreviated SHA is resolved
+  here, once, because the git-data and Actions reads accept only a full id. A prefix that
+  names more than one commit or none is the forge's answer, returned as its error.
+  """
+  @callback resolve_commit(repo(), String.t()) :: {:ok, String.t()} | {:error, term()}
+
   @doc "Every file the repository holds at `ref`."
   @callback repo_files(repo(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
 

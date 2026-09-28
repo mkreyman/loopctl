@@ -31,15 +31,20 @@ defmodule LoopctlWeb.IntakeSourceController do
   tags(["Intake"])
 
   @required_checks_doc "The CI checks a THREAD-mode checkpoint must pass on its exact commit before " <>
-                         "the merge gate allows it (US-45.6): GitHub Actions JOB names as " <>
-                         "they appear on the commit. A `thread` source must name at " <>
+                         "the merge gate allows it (US-45.6), and the checks STORY VERIFICATION " <>
+                         "judges a story's commit by in EITHER mode (US-26.4.6): GitHub Actions " <>
+                         "JOB names as they appear on the commit. A `thread` source must name at " <>
                          "least one (422 otherwise, whichever of `mode` and `required_checks` " <>
-                         "the request named); `pr` mode never reads it. At most " <>
+                         "the request named). A `pr` source may name none, and then story " <>
+                         "verification records `no_required_checks` and reads nothing — naming " <>
+                         "them is how a pr-mode source opts in. At most " <>
                          "#{Source.max_required_checks()} distinct, non-blank names of at most " <>
                          "#{Source.max_check_name_bytes()} bytes, no surrounding whitespace. Only a " <>
-                         "job of a GitHub Actions workflow run that a push of the thread " <>
-                         "branch triggered, concluding `success`, satisfies one. Each " <>
-                         "required job must run on every push to the thread branches (no path " <>
+                         "job of a GitHub Actions workflow run that a push of the story's " <>
+                         "branch triggered, concluding `success`, satisfies one — for a pr " <>
+                         "source too, so a check that runs only `on: pull_request` never " <>
+                         "satisfies verification. Each required job must run on every push " <>
+                         "to the story branches (no path " <>
                          "filter or job-level `if:`): one that never appears is refused after " <>
                          "the merge gate's CI wait. " <>
                          "`local-gate` is refused (422): " <>

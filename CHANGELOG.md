@@ -6,6 +6,32 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Story verification records a CI verdict, by the merge gate's rules (US-26.4.6, #913).
+  Before this, verification NEVER produced a CI verdict:** the worker passed an uncast UUID to
+  a schemaless query, so every run with a commit crashed before any CI read, and its lookup
+  used the check-runs endpoint, which a fine-grained token cannot reach. A run is now judged
+  exactly as the thread merge gate judges a checkpoint: the repository is the story's intake
+  source (never `projects.repo_url`), the evidence is the jobs of PUSH runs of the story's own
+  branch at the exact commit, a commit that edits `.github/workflows/`, `.github/actions/` or
+  any `action.yml` is refused `ci_definition_changed`, and the verdict is the source's
+  `required_checks`. **Operator action:**
+  - **New env var `VERIFICATION_OPERATOR_TOKEN_TENANTS`, default EMPTY.** Only the tenants it
+    names are read with the operator's `GITHUB_TOKEN`; every other run records
+    `credential_unavailable` and reads nothing. Name your own tenant(s) to turn verification on.
+  - **`GITHUB_TOKEN` permissions:** verification needs `actions: read` and `contents: read`;
+    `checks: read` is no longer used.
+  - **`required_checks` now matters for `pr`-mode sources:** a source naming none records
+    `no_required_checks` (the opt-in). A check satisfied only by an `on: pull_request` run never
+    counts; the job must run on push of the story's branch.
+  - **`ac_results` shape:** a verdict carries `evidence_url` (the failing job or the judged
+    run, inside the source's repository); no verdict carries `ci_unavailable_reason`, a short
+    code (`no_commit_sha`, which used to be under `reason`, is now there too). No exception
+    text is written any more. Waits are bounded: `ci_wait_exhausted` at
+    `verification_max_run_age_seconds`, `forge_unavailable` after the merge gate's
+    consecutive-fault bound.
+  - Migration `20260928120000_add_verification_run_ci_poll_state` adds
+    `verification_runs.resolved_commit_sha` and `ci_forge_faults` (no manual step).
+
 - **Runner contract 1.22.0: one refusal code, one meaning, and which refusals end the claim
   (loopctl#920). RE-VENDOR, and declare 1.22.0 on join, to receive the new codes.** Two
   codes were each answered both when a claim was over and when one message was wrong; those

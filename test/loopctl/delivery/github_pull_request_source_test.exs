@@ -753,6 +753,46 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
+  describe "resolve_commit/2 (US-26.4.6)" do
+    defp sha_response(conn, status, body) do
+      conn
+      |> Plug.Conn.put_resp_content_type("application/vnd.github.sha")
+      |> Plug.Conn.send_resp(status, body)
+    end
+
+    test "asks for the plain-text sha media type and returns the full id the prefix names" do
+      stub(fn conn ->
+        assert conn.request_path == "/repos/acme/widgets/commits/aaaaaaa"
+        assert Plug.Conn.get_req_header(conn, "accept") == ["application/vnd.github.sha"]
+        sha_response(conn, 200, @head <> "\n")
+      end)
+
+      assert {:ok, @head} = Source.resolve_commit(@repo, "aaaaaaa")
+    end
+
+    test "an answer that does not extend the prefix asked for is not an answer" do
+      stub(fn conn -> sha_response(conn, 200, @merge_base) end)
+
+      assert {:error, {:unreadable_commit_sha, _shape}} =
+               Source.resolve_commit(@repo, "aaaaaaa")
+    end
+
+    test "422 and 404 come back as the forge's own statuses, for the caller to name" do
+      stub(fn conn -> Plug.Conn.resp(conn, 422, ~s({"message":"ambiguous"})) end)
+      assert {:error, {:github_api_error, 422}} = Source.resolve_commit(@repo, "aaaaaaa")
+
+      stub(fn conn -> Plug.Conn.resp(conn, 404, "{}") end)
+      assert {:error, {:github_api_error, 404}} = Source.resolve_commit(@repo, "aaaaaaa")
+    end
+
+    test "a ref that is not a hex prefix is refused before any request" do
+      stub(fn _conn -> flunk("a non-hex ref reached the forge") end)
+
+      assert {:error, {:invalid_ref, _}} = Source.resolve_commit(@repo, "HEAD~1")
+      assert {:error, {:invalid_ref, _}} = Source.resolve_commit(@repo, "../../x")
+    end
+  end
+
   describe "check_evidence/3 (US-45.6)" do
     @branch "loop/story-7-abcd1234"
 

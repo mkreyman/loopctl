@@ -264,6 +264,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   require Logger
 
   alias Loopctl.Delivery.CheckpointSource
+  alias Loopctl.Delivery.CiDefinition
   alias Loopctl.Delivery.CiEvidence
   alias Loopctl.Delivery.Claimant
   alias Loopctl.Delivery.DispatchPayload
@@ -1013,36 +1014,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # A THREAD THAT CHANGES ITS OWN CI IS NEVER MERGED ON THAT CI (US-45.6 review round 3).
   # GitHub Actions runs the workflow files of the commit under test, so a checkpoint that
   # edits `.github/workflows/` — or a composite action they call — can make its own required
-  # checks report green: the implementer attesting its own work through a check run it never
-  # needed an App to create. A human merges such a change. Matched on every name the diff
-  # carries, renames' old and new names included, so moving a workflow file is caught too,
-  # and on any composite action's `action.yml`, wherever it sits.
-  @ci_definition_prefixes [".github/workflows/", ".github/actions/"]
-
-  defp ci_definition_reasons({:ok, %{files: files} = diff}) do
-    renamed = for {from, to} <- Map.get(diff, :renames, []), name <- [from, to], do: name
-
-    case Enum.filter(Enum.uniq(files ++ renamed), &ci_definition?/1) do
-      [] -> []
-      touched -> [{:ci_definition_changed, Enum.sort(touched)}]
-    end
-  end
-
-  # A diff that could not be listed (truncated at the compare cap, unreadable) may touch CI
-  # definitions for all the gate can tell: refused as unknown here, by this guard, rather than
-  # left to whichever other rule happens to refuse an unreadable diff.
-  defp ci_definition_reasons({:error, reason}), do: [{:ci_definition_unknown, reason}]
-  defp ci_definition_reasons(_no_diff), do: []
-
-  # A composite action can live anywhere a workflow's `uses: ./path` points, so its definition
-  # file is matched by NAME wherever it sits (#910 round 2, finding 5); reusable workflows can
-  # only live under `.github/workflows/`, which the prefix covers.
-  defp ci_definition?(name) when is_binary(name) do
-    Enum.any?(@ci_definition_prefixes, &String.starts_with?(name, &1)) or
-      Path.basename(name) in ["action.yml", "action.yaml"]
-  end
-
-  defp ci_definition?(_name), do: false
+  # checks report green. A human merges such a change. The rule is `CiDefinition.reasons/1`,
+  # shared with story verification (US-26.4.6) so the two readings of one commit cannot
+  # disagree about what a CI definition is; a diff that could not be listed is refused
+  # `ci_definition_unknown` by it, rather than left to whichever other rule happens to refuse
+  # an unreadable diff.
+  defp ci_definition_reasons(diff), do: CiDefinition.reasons(diff)
 
   # US-45.6: a thread merges with no forge rule holding it to green CI, so a source that
   # requires nothing would merge whatever CI said; and a required check that FAILED on the

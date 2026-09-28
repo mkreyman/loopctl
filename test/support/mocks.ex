@@ -166,3 +166,10 @@ Mox.defmock(Loopctl.MockPullRequestSource, for: Loopctl.Delivery.PullRequestSour
 # answers `{:error, :not_stubbed}` to every callback, so a test that reaches the forge without
 # saying so gets an escalation, never a merge.
 Mox.defmock(Loopctl.MockMergeForge, for: Loopctl.Delivery.MergeForge)
+
+# US-26.4.6: story verification's credential seam and its local fallback. The DataCase default
+# stubs are fail-CLOSED — no credential (so nothing is read) and a disabled runner — so a test
+# that reaches either without saying so records `credential_unavailable` or `runner_disabled`,
+# never a verdict.
+Mox.defmock(Loopctl.MockVerificationCredential, for: Loopctl.Verification.Credential)
+Mox.defmock(Loopctl.MockVerificationLocalRunner, for: Loopctl.Verification.LocalRunner)

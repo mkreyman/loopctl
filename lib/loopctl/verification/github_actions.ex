@@ -1,50 +1,175 @@
 defmodule Loopctl.Verification.GitHubActions do
   @moduledoc """
-  US-26.4.3 — GitHub Actions CI integration.
+  US-26.4.3, redesigned by US-26.4.6 — story verification's CI adapter, over GitHub Actions.
 
-  Queries GitHub's API for commit check status and test results.
-  Uses the GITHUB_TOKEN env var for authentication.
+  It judges a commit by EXACTLY the merge gate's rules, through the merge gate's own code, so a
+  verification run means what a merge decision means (issue #913):
+
+  1. the change is compared with the story's base branch (`compare/3`) and a commit that edits
+     its own CI definitions is refused `ci_definition_changed` — or `ci_definition_unknown`
+     when that cannot be told — by `Loopctl.Delivery.CiDefinition.reasons/1`, the rule the
+     merge gate refuses by. A commit already ON the base branch has an empty three-dot diff
+     whatever it changed, so it is `ci_definition_unknown` too rather than vacuously clean
+  2. the evidence is `check_evidence/3` for the story's branch and the commit: the jobs of
+     PUSH runs of that branch at that SHA, never another branch's runs, a fork's
+     `pull_request` run or a `workflow_dispatch`. Anything else is something the implementer
+     can produce itself (`Loopctl.Delivery.CiEvidence`)
+  3. the verdict is `CiEvidence.judge/2` over the intake source's `required_checks`
+
+  Every read goes through `Loopctl.Delivery.PullRequestSource.impl/0` — the same adapter, the
+  same timeouts, and the same classification of what a failure means. `transient?/1` and
+  `retry_after/1` of `Loopctl.Delivery.MergePrecondition` decide wait versus final; this
+  module turns that into `Loopctl.Verification.CiBehaviour`'s declared outcomes, so the worker
+  never sees a GitHub error term.
+
+  ## Reason codes
+
+  A fixed set of strings with no numbers in them, so none reads as an HTTP status:
+  `ci_definition_changed`, `ci_definition_unknown`, `no_required_checks`,
+  `credential_unavailable`, `ambiguous_sha` and `unknown_commit` (resolving an abbreviated
+  SHA: a 422 and a 404), `forge_unauthorized` (401), `forge_forbidden` (a 403 that is not a
+  rate limit), `forge_not_found` (404), `forge_unprocessable` (422), `forge_rejected` (any
+  other status that is not transient), `too_many_workflow_runs`, `workflow_runs_truncated`,
+  `jobs_truncated`, `invalid_repository`, `invalid_ref` and `forge_unreadable`.
+
+  ## Evidence URLs
+
+  Built from the repository name and the numeric run and job ids, never echoed from the
+  forge's response, so every recorded URL is inside the tenant's own intake-source
+  repository.
   """
 
   @behaviour Loopctl.Verification.CiBehaviour
 
-  require Logger
+  alias Loopctl.Delivery.CiDefinition
+  alias Loopctl.Delivery.CiEvidence
+  alias Loopctl.Delivery.MergePrecondition
+  alias Loopctl.Delivery.PullRequestSource
+  alias Loopctl.Verification.Credential
 
   @impl true
-  def get_status(repo_url, commit_sha) do
-    {owner, repo} = parse_repo_url(repo_url)
-
-    case Req.get("https://api.github.com/repos/#{owner}/#{repo}/commits/#{commit_sha}/check-runs",
-           headers: github_headers()
-         ) do
-      {:ok, %{status: 200, body: %{"check_runs" => runs}}} ->
-        overall = summarize_runs(runs)
-        {:ok, overall}
-
-      {:ok, %{status: status}} ->
-        {:error, {:github_api_error, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+  def resolve_commit(repo, sha, %Credential{kind: :operator_token}) do
+    case source().resolve_commit(repo, sha) do
+      {:ok, full} -> {:ok, full}
+      {:error, reason} -> classify(reason, :resolve)
     end
   end
 
-  @impl true
-  def get_test_results(_repo_url, _run_id) do
-    {:ok, []}
-  end
+  def resolve_commit(_repo, _sha, _credential), do: {:refused, "credential_unavailable"}
 
-  defp parse_repo_url(url) do
-    case Regex.run(~r|github\.com[:/]([^/]+)/([^/.]+)|, url) do
-      [_, owner, repo] -> {owner, repo}
-      _ -> {"unknown", "unknown"}
+  @impl true
+  def verdict(%{credential: %Credential{kind: :operator_token}} = request) do
+    if CiEvidence.lookup_names(request.required_checks) == [] do
+      # The worker refuses this before asking; refused here too, so the adapter can never
+      # judge an empty list — over which every check "passed".
+      {:refused, "no_required_checks"}
+    else
+      with {:ok, comparison} <-
+             read(source().compare(request.repo, request.base_branch, request.sha)),
+           :ok <- ci_definition(comparison, request.sha),
+           {:ok, evidence} <-
+             read(source().check_evidence(request.repo, request.sha, request.branch)) do
+        judge(request, evidence)
+      end
     end
   end
 
-  defp github_headers do
-    auth_headers(System.get_env("GITHUB_TOKEN")) ++
-      [{"accept", "application/vnd.github+json"}, {"user-agent", "loopctl-verification"}]
+  def verdict(_request), do: {:refused, "credential_unavailable"}
+
+  defp ci_definition(%{merge_base_sha: sha}, sha), do: {:refused, "ci_definition_unknown"}
+
+  defp ci_definition(comparison, _sha) do
+    case CiDefinition.reasons(Map.get(comparison, :diff)) do
+      [] -> :ok
+      [{:ci_definition_changed, _names} | _rest] -> {:refused, "ci_definition_changed"}
+      [{:ci_definition_unknown, _reason} | _rest] -> {:refused, "ci_definition_unknown"}
+    end
   end
+
+  defp judge(request, evidence) do
+    result = CiEvidence.judge(request.required_checks, evidence)
+    counted = CiEvidence.counted(evidence)
+
+    cond do
+      result.failed != [] ->
+        [{name, why} | _rest] = result.failed
+
+        {:fail, %{url: failing_url(request.repo, name, counted), check: name, conclusion: why}}
+
+      result.pending != [] or result.missing != [] ->
+        {:wait, :ci_pending}
+
+      true ->
+        {:pass, %{url: passing_url(request.repo, result.passed, counted)}}
+    end
+  end
+
+  # The failing JOB, among the jobs the judgement counted. A name that failed because its run
+  # ended with no jobs at all (`run_<conclusion>`) points at that run.
+  defp failing_url(repo, name, %{jobs: jobs, jobless_runs: jobless}) do
+    failed_job =
+      Enum.find(jobs, fn job ->
+        job.name == name and job.status == "completed" and job.conclusion != "success"
+      end)
+
+    cond do
+      failed_job -> job_url(repo, failed_job)
+      run = Enum.find(jobless, &(&1.status == "completed")) -> run_url(repo, Map.get(run, :id))
+      true -> actions_url(repo)
+    end
+  end
+
+  # The judged run: the run of the first required check's job.
+  defp passing_url(repo, [name | _rest], %{jobs: jobs}) do
+    case Enum.find(jobs, &(&1.name == name)) do
+      nil -> actions_url(repo)
+      job -> run_url(repo, Map.get(job, :run_id))
+    end
+  end
+
+  defp passing_url(repo, [], _counted), do: actions_url(repo)
+
+  defp job_url(repo, job) do
+    case {Map.get(job, :run_id), Map.get(job, :id)} do
+      {run_id, id} when is_integer(run_id) and is_integer(id) ->
+        run_url(repo, run_id) <> "/job/#{id}"
+
+      {run_id, _id} ->
+        run_url(repo, run_id)
+    end
+  end
+
+  defp run_url(repo, run_id) when is_integer(run_id), do: actions_url(repo) <> "/runs/#{run_id}"
+  defp run_url(repo, _run_id), do: actions_url(repo)
+
+  defp actions_url(repo), do: "https://github.com/#{repo}/actions"
+
+  defp read({:ok, value}), do: {:ok, value}
+  defp read({:error, reason}), do: classify(reason, :read)
+
+  defp classify(reason, stage) do
+    if MergePrecondition.transient?(reason),
+      do: {:wait, {:transient, MergePrecondition.retry_after(reason)}},
+      else: {:no_verdict, code(reason, stage)}
+  end
+
+  # Resolving an abbreviated SHA is the one read where a 404 and a 422 are about the COMMIT
+  # (AC-26.4.6.7); anywhere else they are about the repository, a ref or the token.
+  defp code({:github_api_error, 404}, :resolve), do: "unknown_commit"
+  defp code({:github_api_error, 422}, :resolve), do: "ambiguous_sha"
+  defp code({:github_api_error, 401}, _stage), do: "forge_unauthorized"
+  defp code({:github_api_error, 403}, _stage), do: "forge_forbidden"
+  defp code({:github_api_error, 404}, _stage), do: "forge_not_found"
+  defp code({:github_api_error, 422}, _stage), do: "forge_unprocessable"
+  defp code({:github_api_error, _status}, _stage), do: "forge_rejected"
+  defp code({:too_many_workflow_runs, _count}, _stage), do: "too_many_workflow_runs"
+  defp code({:workflow_runs_truncated, _total, _read}, _stage), do: "workflow_runs_truncated"
+  defp code({:jobs_truncated, _total, _read}, _stage), do: "jobs_truncated"
+  defp code({:invalid_repo, _repo}, _stage), do: "invalid_repository"
+  defp code({:invalid_ref, _ref}, _stage), do: "invalid_ref"
+  defp code(_other, _stage), do: "forge_unreadable"
+
+  defp source, do: PullRequestSource.impl()
 
   @doc """
   The `Authorization` header for `token`, or none when there is no usable token.
@@ -52,8 +177,8 @@ defmodule Loopctl.Verification.GitHubActions do
   Takes the VALUE so the rule is unit-testable. A BLANK value is not a token, and used to
   be treated as one: `if token do` is truthy for `""`, so a variable set-but-empty (the
   shape a templated deploy config produces) sent `Authorization: Bearer ` and GitHub 401'd
-  every lookup. Verification then reported `github_api_error` instead of a CI verdict —
-  strictly WORSE than sending nothing, which at least works for a public repo.
+  every lookup — strictly WORSE than sending nothing, which at least works for a public
+  repo. `Loopctl.Delivery.GitHubPullRequestSource` authenticates through it.
   """
   @spec auth_headers(String.t() | nil) :: [{String.t(), String.t()}]
   def auth_headers(token)
@@ -64,21 +189,6 @@ defmodule Loopctl.Verification.GitHubActions do
     case String.trim(token) do
       "" -> []
       trimmed -> [{"authorization", "Bearer #{trimmed}"}]
-    end
-  end
-
-  defp summarize_runs(runs) do
-    statuses = Enum.map(runs, & &1["conclusion"])
-
-    cond do
-      Enum.all?(statuses, &(&1 == "success")) ->
-        %{status: "completed", conclusion: "success", url: ""}
-
-      Enum.any?(statuses, &(&1 == "failure")) ->
-        %{status: "completed", conclusion: "failure", url: ""}
-
-      true ->
-        %{status: "in_progress", conclusion: nil, url: ""}
     end
   end
 end

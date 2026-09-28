@@ -1094,6 +1094,20 @@ describe("the descriptions carry what a caller needs instead of the controller",
     }
   });
 
+  test("both write tools say required_checks is read by story verification in pr mode too (US-26.4.6)", () => {
+    for (const name of ["intake_source_enroll", "intake_source_update"]) {
+      const tool = loadTools().find((t) => t.name === name);
+      const text = tool.inputSchema.properties.required_checks.description;
+      assert.match(text, /story verification/, name);
+      assert.match(text, /no_required_checks/, name);
+      assert.match(text, /PUSH run of the story's branch/, name);
+      assert.ok(!/mode never reads it/.test(text), `${name} still says pr mode never reads it`);
+    }
+    for (const name of ["intake_source_enroll", "intake_source_update"]) {
+      assert.match(row(name), /no_required_checks/, `${name}'s README row`);
+    }
+  });
+
   test("both write tools say a thread source needs runners at contract 1.20.0 (US-45.4)", () => {
     for (const name of ["intake_source_enroll", "intake_source_update"]) {
       const tool = loadTools().find((t) => t.name === name);

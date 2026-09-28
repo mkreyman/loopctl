@@ -41,6 +41,11 @@ defmodule Loopctl.Verification.VerificationRun do
     field :ac_results, :map, default: %{}
     field :logs_url, :string
     field :machine_id, :string
+    # US-26.4.6: the full id of an abbreviated `commit_sha`, resolved once and reused by every
+    # later poll; and transient forge faults in a row, which bound a wait on an unreachable
+    # forge. Both written by `Loopctl.Verification.record_poll/2` only.
+    field :resolved_commit_sha, :string
+    field :ci_forge_faults, :integer, default: 0
 
     timestamps()
   end

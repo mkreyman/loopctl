@@ -230,6 +230,21 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # US-26.4.6: an abbreviated commit SHA's resolution, on the same fail-closed default.
+    Mox.stub(Loopctl.MockPullRequestSource, :resolve_commit, fn _repo, _ref ->
+      {:error, :not_stubbed}
+    end)
+
+    # US-26.4.6: story verification reads nothing without a credential, and its local
+    # fallback runs nothing. A test that wants either says so.
+    Mox.stub(Loopctl.MockVerificationCredential, :for_tenant, fn _tenant_id ->
+      {:error, :credential_unavailable}
+    end)
+
+    Mox.stub(Loopctl.MockVerificationLocalRunner, :run_tests, fn _url, _sha, _credential ->
+      {:error, :runner_disabled}
+    end)
+
     # US-45.5: the merge executor's App writes, on the same fail-closed default.
     Mox.stub(Loopctl.MockMergeForge, :session, fn _repo -> {:error, :not_stubbed} end)
 

@@ -1,69 +1,99 @@
 defmodule Loopctl.Workers.VerificationRunnerWorker do
   @moduledoc """
-  US-26.4.2 — Processes verification runs.
+  US-26.4.2, redesigned by US-26.4.6 — executes one verification run: records a CI verdict for
+  the run's commit by the merge gate's evidence rules, or a short reason why there is none.
 
-  Dequeues pending runs, fetches the commit SHA, and checks CI status
-  via the configured CI adapter (GitHub Actions by default). Falls back
-  to marking as manual-review-needed if CI is unavailable.
+  ## What one poll does
+
+  1. A run that already has a disposition (`pass`, `fail`, `error`, `skipped`) is left exactly
+     as it is. A job re-entered for it never reopens it or rewrites its `started_at`.
+  2. A never-started run older than `verification_max_run_age_seconds` is retired `skipped`
+     without any read (the stale-run age gate, below).
+  3. The run is started once; `started_at` is written on the first poll only.
+  4. The reads are resolved from loopctl's records, in an order that reads nothing from the
+     forge until each is settled: the run's commit (`no_commit_sha`), the tenant's credential
+     (`Loopctl.Verification.Credential`; `credential_unavailable`), and the story's
+     repository, required checks and branch (`Loopctl.Verification.CiTarget`;
+     `no_intake_source`, `ambiguous_intake_source`, `no_required_checks`, `no_story_branch`).
+  5. An abbreviated SHA is resolved to its full id ONCE and persisted on the run
+     (`resolved_commit_sha`); every later poll reuses it.
+  6. The CI adapter (`Loopctl.Verification.CiBehaviour`) answers one of its declared
+     outcomes, and this worker branches on those alone.
+
+  ## Waiting, and what ends a wait
+
+  - `{:wait, :ci_pending}` — a required check still running or not reported. Waits until
+    `verification_max_run_age_seconds` from the run's CREATION, then records
+    `ci_wait_exhausted`. So a started run IS ended by the age window when it is still waiting
+    at the end of it.
+  - `{:wait, {:transient, _}}` — the forge could not be asked. Counted on the run
+    (`ci_forge_faults`); past the merge gate's consecutive-fault bound
+    (`Loopctl.Delivery.MergePrecondition.max_consecutive_unevaluated/0`) in a row, or past
+    the age window, it records `forge_unavailable`. Any answered read resets the count.
+
+  A wait SNOOZES the job, backing off with the run's age: a tenth of it, between 60 seconds and
+  15 minutes, so a run polls about once a minute while its CI is fresh and a few times an hour
+  once it has waited for hours. A forge that named its own delay (a rate limit) is waited at
+  least that long, up to an hour.
+
+  ## When the local runner is asked
+
+  Only on a FINAL no-verdict the adapter returned for a reason that is neither a refusal
+  (`ci_definition_changed`, `ci_definition_unknown`) nor a missing configuration (step 4), and
+  only when the commit's full id is known — so never on a wait, and never for a commit whose
+  abbreviated SHA could not be resolved. It clones the intake source's repository through the
+  same credential seam (`Loopctl.Verification.LocalRunner`). It is disabled by default.
+
+  ## What is recorded
+
+  `ac_results` carries `source`, and on `pass` the judged run's URL, on `fail` the failing
+  job's URL and check (`evidence_url`, always inside the tenant's own intake-source
+  repository). On no verdict it carries `ci_unavailable_reason`, a short code with no URL and
+  no repository name, and after a local fallback its counts or a `local_error` code. No
+  exception message and no `inspect/1` output is ever written there; the rescue arm records
+  `internal_error` and logs the exception.
 
   ## Stale-run age gate (US-36.1)
 
-  The `:verification` queue was registered by US-36.1 after being an unconsumed
-  (dead) queue since Epic 26 — `Loopctl.Verification.create_run_and_enqueue/3` has
-  been atomically inserting a `pending` run + an `available` Oban job all along, but
-  with no consumer those jobs accumulated (and `Oban.Plugins.Pruner` prunes only
-  TERMINAL jobs, so the `available` backlog was never pruned). The moment a consumer
-  registers, Oban drains that entire backlog at once. Width 1 bounds the RATE, not
-  the total volume — and each drained job would otherwise call a GitHub Actions API
-  and, on CI-unavailable, clone the repo and run its suite against a possibly-stale
-  SHA (`Loopctl.Verification.TestRunner`), writing pass/fail completions for
-  long-idle runs. That work is pointless for a run enqueued days ago.
+  The `:verification` queue was an unconsumed queue from Epic 26 until US-36.1 registered it,
+  so a backlog of `pending` runs and `available` jobs had accumulated. `perform/1` therefore
+  retires a NOT-YET-STARTED run older than `verification_max_run_age_seconds` (default 24h)
+  as `"skipped"` (`reason: "stale_run_skipped"`) and cancels the job with no read and no
+  clone. `"skipped"`, not `"error"`: a deliberate non-execution carries no fault and no
+  verification signal (see `Loopctl.Verification.complete_run/3`).
 
-  `perform/1` therefore age-gates on the run's `inserted_at`, but ONLY for a run that
-  has not yet started (`started_at == nil`): a not-yet-started run older than
-  `verification_max_run_age_seconds` (default 24h, config-tunable) is completed with
-  the terminal `"skipped"` disposition (`reason: "stale_run_skipped"`) and the job is
-  `:cancel`led WITHOUT any CI call or repo clone. This bounds the one-time drain to
-  cheap DB writes: a genuinely fresh run (enqueued moments ago by the live
-  `POST /stories/:id/verifications` action) is always inside the window and runs
-  normally; a stale accumulated backlog job is retired without side effects. The
-  window is retunable via `config :loopctl, :verification_max_run_age_seconds`.
-
-  ### Why `"skipped"`, not `"error"`, and why the `started_at == nil` guard
-
-  A stale-skipped run carries NO verification signal and NO fault — retiring it as
-  `"error"` would conflate a deliberate skip with a genuine failure, so it gets the
-  dedicated `"skipped"` disposition (see `Loopctl.Verification.complete_run/3`).
-  Restricting the gate to not-yet-started runs keeps it a pure backlog-drain bound: it
-  can never complete an in-flight run mid-execution. In particular a run that has
-  begun and is snoozing on `in_progress` CI (`{:snooze, 60}`) is `status: "running"`
-  with `started_at` set, so even if its `inserted_at` ages past the window across
-  snoozes it is NOT killed mid-flight — it stays on the normal path until CI resolves.
-
-  Neither `"skipped"` nor `"error"` ever touches `stories.verified_status` — the run
-  status is observational only; the chain-of-custody verify action is entirely
-  separate (`LoopctlWeb.StoryVerificationController`). This gate is therefore fail-safe
-  for L3 custody: it cannot cause a run to falsely PASS, nor mark a story verified.
+  No run status here ever touches `stories.verified_status`: the chain-of-custody verify action
+  is entirely separate (`LoopctlWeb.StoryVerificationController`).
   """
 
   use Oban.Worker, queue: :verification, max_attempts: 3
 
   require Logger
 
+  alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Verification
+  alias Loopctl.Verification.CiTarget
+  alias Loopctl.Verification.Credential
 
   @ci_adapter Application.compile_env(:loopctl, :ci_adapter, Loopctl.Verification.GitHubActions)
 
-  # Default staleness window for a verification run. A run whose `inserted_at` is
-  # older than this is skipped (see the "Stale-run age gate" moduledoc section).
-  # 24h: a day-old commit's CI status / freshly-cloned test suite carries no
-  # verification signal, and the accumulated pre-registration backlog is exactly
-  # this class of run.
+  # 24h: a day-old commit's CI status carries no verification signal worth waiting for, and
+  # the accumulated pre-registration backlog is exactly this class of run.
   @default_max_run_age_seconds 24 * 60 * 60
+
+  @terminal ~w(pass fail error skipped)
+
+  @min_snooze_seconds 60
+  @max_snooze_seconds 15 * 60
+  @max_forge_delay_seconds 60 * 60
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"run_id" => run_id, "tenant_id" => tenant_id}}) do
     case Verification.get_run(tenant_id, run_id) do
+      # A run with a disposition is never reopened (#931 finding h).
+      {:ok, %{status: status}} when status in @terminal ->
+        :ok
+
       {:ok, run} ->
         process_run(run, tenant_id)
 
@@ -73,43 +103,34 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     end
   end
 
-  # Age-gate first (see the "Stale-run age gate" moduledoc section): a run older than
-  # the freshness window is retired without ever starting, so no CI call / repo clone.
   defp process_run(run, tenant_id) do
     if stale_run?(run) do
       skip_stale_run(run)
     else
       case Verification.start_run(run) do
-        {:ok, started} -> execute_verification(started, tenant_id)
+        {:ok, started} -> execute(started, tenant_id)
         {:error, reason} -> {:error, reason}
       end
     end
   end
 
-  # A run is stale when it has NOT yet started (`started_at == nil`) AND was inserted
-  # more than `max_run_age_seconds/0` ago. Uses `inserted_at` (set atomically with the
-  # Oban job in `create_run_and_enqueue/3`), so age reflects enqueue time regardless of
-  # how long the job sat unconsumed. The `started_at == nil` guard scopes the gate to
-  # the un-started backlog it exists to drain: an already-started run (e.g. one snoozing
-  # on in_progress CI) is never killed mid-flight even if it ages past the window.
+  # Un-started only: a started run that ages out while waiting is ended by `settle/1` with
+  # the reason it was waiting for, not retired as a skip.
   defp stale_run?(%{started_at: started_at}) when not is_nil(started_at), do: false
 
-  defp stale_run?(%{inserted_at: inserted_at}) when not is_nil(inserted_at) do
-    DateTime.diff(DateTime.utc_now(), inserted_at, :second) > max_run_age_seconds()
-  end
+  defp stale_run?(%{inserted_at: inserted_at}) when not is_nil(inserted_at),
+    do: expired?(inserted_at)
 
   defp stale_run?(_run), do: false
 
   defp skip_stale_run(run) do
-    age_seconds = DateTime.diff(DateTime.utc_now(), run.inserted_at, :second)
+    age_seconds = age(run)
 
     Logger.info(
       "VerificationRunner: skipping stale run #{run.id} for story #{run.story_id} " <>
         "(age #{age_seconds}s > #{max_run_age_seconds()}s) — no CI call / repo clone"
     )
 
-    # `"skipped"`, NOT `"error"`: a deliberate non-execution carries no fault and no
-    # verification signal (see the moduledoc + Verification.complete_run/3).
     {:ok, _} =
       Verification.complete_run(run, "skipped", %{
         "reason" => "stale_run_skipped",
@@ -123,97 +144,197 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     Application.get_env(:loopctl, :verification_max_run_age_seconds, @default_max_run_age_seconds)
   end
 
-  defp execute_verification(run, tenant_id) do
+  defp execute(run, tenant_id) do
     Logger.info("VerificationRunner: executing run #{run.id} for story #{run.story_id}")
-
-    if run.commit_sha do
-      check_ci_status(run, tenant_id)
-    else
-      {:ok, _} = Verification.complete_run(run, "error", %{"reason" => "no_commit_sha"})
-      :ok
-    end
+    run |> verify(tenant_id) |> settle()
   rescue
     error ->
-      Logger.error("VerificationRunner: run #{run.id} failed: #{Exception.message(error)}")
-      Verification.complete_run(run, "error", %{"error" => Exception.message(error)})
-      {:error, Exception.message(error)}
-  end
-
-  defp check_ci_status(run, tenant_id) do
-    import Ecto.Query
-
-    repo_url =
-      from(s in "stories",
-        join: p in "projects",
-        on: s.project_id == p.id,
-        where: s.id == ^run.story_id and s.tenant_id == ^tenant_id,
-        select: p.repo_url,
-        limit: 1
+      # The exception goes to the LOG only: ac_results is tenant-visible and records a code.
+      Logger.error(
+        "VerificationRunner: run #{run.id} crashed: " <>
+          Exception.format(:error, error, __STACKTRACE__)
       )
-      |> Loopctl.AdminRepo.one()
 
-    if repo_url do
-      case do_ci_check(run, repo_url) do
-        {:ok, :ci_checked} ->
-          :ok
+      {:ok, _} = no_verdict(run, "internal_error")
+      # The run has its disposition, so a retry would only find it terminal (#931 finding g).
+      {:cancel, :internal_error}
+  end
 
-        {:error, :ci_unavailable} ->
-          # L3 fallback: independent test re-execution
-          do_local_test_run(run, repo_url)
+  # -- resolving what to read -------------------------------------------------------------
 
-        other ->
-          other
-      end
+  defp verify(run, tenant_id) do
+    ctx = %{run: run, repo: nil, sha: nil, credential: nil}
+
+    with {:ok, sha} <- commit_sha(run),
+         {:ok, credential} <- credential(tenant_id),
+         ctx = %{ctx | credential: credential},
+         {:ok, target} <- CiTarget.gather(tenant_id, run.story_id),
+         ctx = %{ctx | repo: target.repo},
+         {:ok, run, full} <- full_sha(run, target.repo, sha, credential) do
+      request = Map.merge(target, %{sha: full, credential: credential})
+      {%{ctx | run: run, sha: full}, @ci_adapter.verdict(request)}
     else
-      {:ok, _} = Verification.complete_run(run, "error", %{"reason" => "no_repo_url"})
-      :ok
+      {:resolved, run, outcome} -> {%{ctx | run: run}, outcome}
+      outcome -> {ctx, outcome}
     end
   end
 
-  defp do_ci_check(run, repo_url) do
-    case @ci_adapter.get_status(repo_url, run.commit_sha) do
-      {:ok, %{conclusion: "success"}} ->
-        {:ok, _} = Verification.complete_run(run, "pass", %{"source" => "ci"})
-        {:ok, :ci_checked}
+  defp commit_sha(%{commit_sha: sha}) when is_binary(sha) and sha != "", do: {:ok, sha}
+  defp commit_sha(_run), do: {:unconfigured, "no_commit_sha"}
 
-      {:ok, %{conclusion: "failure"}} ->
-        {:ok, _} = Verification.complete_run(run, "fail", %{"source" => "ci"})
-        {:ok, :ci_checked}
-
-      {:ok, %{status: "in_progress"}} ->
-        {:snooze, 60}
-
-      {:ok, %{conclusion: other}} ->
-        Logger.warning("VerificationRunner: unexpected CI conclusion: #{inspect(other)}")
-        {:error, :ci_unavailable}
-
-      {:error, _reason} ->
-        {:error, :ci_unavailable}
+  defp credential(tenant_id) do
+    case Credential.for_tenant(tenant_id) do
+      {:ok, %Credential{} = credential} -> {:ok, credential}
+      {:error, :credential_unavailable} -> {:unconfigured, "credential_unavailable"}
     end
   end
 
-  # L3: independent test re-execution — clone repo, run tests, check results
-  defp do_local_test_run(run, repo_url) do
-    alias Loopctl.Verification.TestRunner
+  # AC-26.4.6.7: a full id is used as it is; an abbreviated one is resolved ONCE and the
+  # answer persisted, so no later poll of this run reads the commit again.
+  defp full_sha(%{resolved_commit_sha: full} = run, _repo, _sha, _credential)
+       when is_binary(full),
+       do: {:ok, run, full}
 
-    Logger.info("VerificationRunner: falling back to local test execution for #{run.id}")
+  defp full_sha(run, repo, sha, credential) do
+    if Loopctl.GitSha.valid?(sha) do
+      {:ok, run, sha}
+    else
+      case @ci_adapter.resolve_commit(repo, sha, credential) do
+        {:ok, full} ->
+          {:ok, run} = Verification.record_poll(run, %{resolved_commit_sha: full})
+          {:ok, run, full}
 
-    case TestRunner.run_tests(repo_url, run.commit_sha) do
+        outcome ->
+          {:resolved, run, outcome}
+      end
+    end
+  end
+
+  # -- settling one outcome ----------------------------------------------------------------
+
+  defp settle({%{run: run}, {:pass, evidence}}) do
+    {:ok, _} =
+      Verification.complete_run(run, "pass", %{
+        "source" => "ci",
+        "evidence_url" => evidence.url
+      })
+
+    :ok
+  end
+
+  defp settle({%{run: run}, {:fail, evidence}}) do
+    {:ok, _} =
+      Verification.complete_run(run, "fail", %{
+        "source" => "ci",
+        "evidence_url" => evidence.url,
+        "failed_check" => evidence.check,
+        "conclusion" => evidence.conclusion
+      })
+
+    :ok
+  end
+
+  defp settle({%{run: run} = ctx, {:wait, :ci_pending}}) do
+    if expired?(run.inserted_at) do
+      final(ctx, "ci_wait_exhausted")
+    else
+      # The forge answered: a fault streak, if any, is over.
+      {:ok, _} = reset_faults(run)
+      {:snooze, snooze_seconds(run)}
+    end
+  end
+
+  defp settle({%{run: run} = ctx, {:wait, {:transient, retry_after}}}) do
+    faults = (run.ci_forge_faults || 0) + 1
+
+    if faults > MergePrecondition.max_consecutive_unevaluated() or expired?(run.inserted_at) do
+      final(ctx, "forge_unavailable")
+    else
+      {:ok, _} = Verification.record_poll(run, %{ci_forge_faults: faults})
+      {:snooze, run |> snooze_seconds() |> max(forge_delay(retry_after))}
+    end
+  end
+
+  # A refusal and a missing configuration record no verdict and never fall back.
+  defp settle({%{run: run}, {kind, code}}) when kind in [:refused, :unconfigured] do
+    {:ok, _} = no_verdict(run, code)
+    :ok
+  end
+
+  defp settle({ctx, {:no_verdict, code}}), do: final(ctx, code)
+
+  defp reset_faults(%{ci_forge_faults: 0} = run), do: {:ok, run}
+  defp reset_faults(run), do: Verification.record_poll(run, %{ci_forge_faults: 0})
+
+  # A final no-verdict for a reason CI could not overcome: the local runner is asked when the
+  # commit's full id and the repository are known, and never otherwise.
+  defp final(%{run: run, repo: repo, sha: sha, credential: credential}, code)
+       when is_binary(repo) and is_binary(sha) and not is_nil(credential) do
+    Logger.info("VerificationRunner: run #{run.id} has no CI verdict (#{code}); local fallback")
+
+    case local_runner().run_tests(clone_url(repo), sha, credential) do
       {:ok, results} ->
         {:ok, _} =
           Verification.complete_run(run, results.status, %{
             "source" => "local_test_runner",
+            "ci_unavailable_reason" => code,
             "tests_run" => results.tests_run,
             "tests_passed" => results.tests_passed,
             "tests_failed" => results.tests_failed
           })
 
-        :ok
-
       {:error, reason} ->
-        Logger.error("VerificationRunner: local test run failed: #{inspect(reason)}")
-        {:ok, _} = Verification.complete_run(run, "error", %{"local_error" => inspect(reason)})
-        :ok
+        {:ok, _} =
+          Verification.complete_run(run, "error", %{
+            "source" => "ci",
+            "ci_unavailable_reason" => code,
+            "local_error" => local_error(reason)
+          })
     end
+
+    :ok
   end
+
+  defp final(%{run: run}, code) do
+    {:ok, _} = no_verdict(run, code)
+    :ok
+  end
+
+  defp no_verdict(run, code),
+    do:
+      Verification.complete_run(run, "error", %{"source" => "ci", "ci_unavailable_reason" => code})
+
+  defp local_error(:runner_disabled), do: "runner_disabled"
+  defp local_error(:invalid_commit_sha), do: "invalid_commit_sha"
+  defp local_error(:invalid_repo_url), do: "invalid_repo_url"
+  defp local_error({:clone_failed, _output}), do: "clone_failed"
+  defp local_error({:fetch_failed, _output}), do: "fetch_failed"
+  defp local_error({:checkout_failed, _output}), do: "checkout_failed"
+  defp local_error(_other), do: "local_runner_error"
+
+  # Built from the intake source's `owner/name` only (validated `Loopctl.Intake.Source`
+  # format), so the clone can only ever reach the repository the CI read judged.
+  defp clone_url(repo), do: "https://github.com/" <> repo <> ".git"
+
+  defp local_runner do
+    Application.get_env(:loopctl, :verification_local_runner, Loopctl.Verification.TestRunner)
+  end
+
+  # A tenth of the run's age, between one and fifteen minutes (#931 finding i).
+  defp snooze_seconds(run) do
+    run |> age() |> div(10) |> max(@min_snooze_seconds) |> min(@max_snooze_seconds)
+  end
+
+  defp forge_delay(seconds) when is_integer(seconds) and seconds > 0,
+    do: min(seconds, @max_forge_delay_seconds)
+
+  defp forge_delay(_none), do: 0
+
+  defp age(%{inserted_at: %DateTime{} = at}), do: DateTime.diff(DateTime.utc_now(), at, :second)
+  defp age(_run), do: 0
+
+  defp expired?(%DateTime{} = inserted_at),
+    do: DateTime.diff(DateTime.utc_now(), inserted_at, :second) > max_run_age_seconds()
+
+  defp expired?(_inserted_at), do: false
 end

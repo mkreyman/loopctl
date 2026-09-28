@@ -9020,9 +9020,12 @@ const TOOLS = [
           items: { type: "string" },
           description:
             "The CI checks a THREAD-mode checkpoint must pass on its exact commit before the " +
-            "merge gate allows it: GitHub Actions job names as they appear " +
-            "on the commit. A `thread` source must name at least one (422 otherwise); `pr` " +
-            "mode never reads it. Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
+            "merge gate allows it, and the checks story verification judges a story's commit " +
+            "by in EITHER mode: GitHub Actions job names as they appear on the commit, satisfied " +
+            "only by a job of a PUSH run of the story's branch. A `thread` source must name at " +
+            "least one (422 otherwise). A `pr` source may name none, and then verification " +
+            "records `no_required_checks` and reads nothing: naming them is how a pr source " +
+            "opts in. Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused: whoever pushed posts it, so it is only recorded.",
         },
         secret_file: {
@@ -9130,9 +9133,12 @@ const TOOLS = [
           items: { type: "string" },
           description:
             "The CI checks a THREAD-mode checkpoint must pass on its exact commit before the " +
-            "merge gate allows it: GitHub Actions job names as they appear " +
-            "on the commit. A `thread` source must name at least one (422 otherwise); `pr` " +
-            "mode never reads it. Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
+            "merge gate allows it, and the checks story verification judges a story's commit " +
+            "by in EITHER mode: GitHub Actions job names as they appear on the commit, satisfied " +
+            "only by a job of a PUSH run of the story's branch. A `thread` source must name at " +
+            "least one (422 otherwise). A `pr` source may name none, and then verification " +
+            "records `no_required_checks` and reads nothing: naming them is how a pr source " +
+            "opts in. Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused. Omit to leave the current list alone.",
         },
       },

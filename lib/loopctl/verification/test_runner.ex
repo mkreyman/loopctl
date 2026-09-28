@@ -73,9 +73,12 @@ defmodule Loopctl.Verification.TestRunner do
   egress-restricted sandbox (see the disable flag above).
   """
 
+  @behaviour Loopctl.Verification.LocalRunner
+
   require Logger
 
   alias Loopctl.Net.UrlGuard
+  alias Loopctl.Verification.Credential
   alias Loopctl.Verification.VerificationRun
 
   @allowed_repo_schemes ~w(https http)
@@ -95,7 +98,18 @@ defmodule Loopctl.Verification.TestRunner do
   ```
   """
   @spec run_tests(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
-  def run_tests(repo_url, commit_sha) do
+  def run_tests(repo_url, commit_sha),
+    do: run_tests(repo_url, commit_sha, %Credential{kind: :operator_token, token: nil})
+
+  @doc """
+  `run_tests/2` with the verification credential (US-26.4.6): the clone and the fetch
+  authenticate through `Credential.git_env/1`, the same seam the CI read went through, so a
+  private repository the tenant was licensed to read is cloned with that licence and nothing
+  else.
+  """
+  @impl true
+  @spec run_tests(String.t(), String.t(), Credential.t()) :: {:ok, map()} | {:error, term()}
+  def run_tests(repo_url, commit_sha, %Credential{} = credential) do
     # Validate BEFORE building a path or spawning any subprocess. A bad SHA or
     # URL must never reach `git`, `mix`, or `File.rm_rf/1`. The runner-enabled
     # gate is checked AFTER validation (validation is pure and side-effect-free)
@@ -108,7 +122,7 @@ defmodule Loopctl.Verification.TestRunner do
       work_dir = build_work_dir()
 
       try do
-        with :ok <- clone_repo(repo_url, commit_sha, work_dir),
+        with :ok <- clone_repo(repo_url, commit_sha, work_dir, Credential.git_env(credential)),
              {:ok, output} <- execute_mix_test(work_dir) do
           results = parse_test_output(output)
           {:ok, results}
@@ -229,22 +243,29 @@ defmodule Loopctl.Verification.TestRunner do
     end
   end
 
-  defp clone_repo(repo_url, commit_sha, work_dir) do
+  # A shallow clone holds only the default branch's tip, so checking out any other commit
+  # failed `checkout_failed` for every commit that was not the tip. The commit is FETCHED by
+  # id instead (GitHub serves any reachable commit that way), which needs the full id the
+  # verification worker resolved (AC-26.4.6.7).
+  defp clone_repo(repo_url, commit_sha, work_dir, env) do
     # `--` before positional args: a `-`-leading repo_url can't become a flag.
-    case System.cmd("git", ["clone", "--depth", "1", "--", repo_url, work_dir],
-           stderr_to_stdout: true
-         ) do
-      {_, 0} ->
-        case System.cmd("git", ["checkout", commit_sha],
-               cd: work_dir,
-               stderr_to_stdout: true
-             ) do
-          {_, 0} -> :ok
-          {output, _} -> {:error, {:checkout_failed, output}}
-        end
+    clone = ["clone", "--depth", "1", "--no-checkout", "--", repo_url, work_dir]
 
-      {output, _} ->
-        {:error, {:clone_failed, output}}
+    with :ok <- git(clone, [env: env], :clone_failed),
+         :ok <-
+           git(
+             ["fetch", "--depth", "1", "origin", commit_sha],
+             [cd: work_dir, env: env],
+             :fetch_failed
+           ) do
+      git(["checkout", commit_sha], [cd: work_dir], :checkout_failed)
+    end
+  end
+
+  defp git(args, opts, failure) do
+    case System.cmd("git", args, [stderr_to_stdout: true] ++ opts) do
+      {_output, 0} -> :ok
+      {output, _status} -> {:error, {failure, output}}
     end
   end
 

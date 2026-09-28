@@ -83,13 +83,9 @@ defmodule Loopctl.Delivery.CiEvidence do
 
   @doc "Judges `evidence` for one commit against `required`. See the moduledoc."
   @spec judge([String.t()], evidence()) :: result()
-  def judge(required, %{jobs: jobs, statuses: statuses} = evidence) do
+  def judge(required, %{statuses: statuses} = evidence) do
     # The newest run of each workflow, and its jobs, computed ONCE per judgement.
-    runs = newest_runs(Map.get(evidence, :runs), jobs)
-    newest_ids = MapSet.new(runs, & &1.id)
-    job_run_ids = MapSet.new(jobs, &run_id/1)
-    counted = Enum.filter(jobs, &(run_id(&1) in newest_ids))
-    jobless = Enum.reject(runs, &(&1.id in job_run_ids))
+    %{jobs: counted, jobless_runs: jobless} = counted(evidence)
     acc = %{passed: [], pending: [], missing: [], failed: []}
 
     judged =
@@ -104,6 +100,24 @@ defmodule Loopctl.Delivery.CiEvidence do
       |> Map.new(fn {key, names} -> {key, Enum.reverse(names)} end)
 
     Map.put(judged, :local_gate, local_gate_state(statuses))
+  end
+
+  @doc """
+  What `judge/2` COUNTS from `evidence`: the jobs of each workflow's newest run, and the newest
+  runs that carry no job at all. Public so a caller that has to POINT at the evidence — story
+  verification records the failing job's or the judged run's URL (US-26.4.6) — points at a job
+  this judgement counted, never at one a newer run of its workflow superseded.
+  """
+  @spec counted(evidence()) :: %{jobs: [job()], jobless_runs: [map()]}
+  def counted(%{jobs: jobs} = evidence) do
+    runs = newest_runs(Map.get(evidence, :runs), jobs)
+    newest_ids = MapSet.new(runs, & &1.id)
+    job_run_ids = MapSet.new(jobs, &run_id/1)
+
+    %{
+      jobs: Enum.filter(jobs, &(run_id(&1) in newest_ids)),
+      jobless_runs: Enum.reject(runs, &(&1.id in job_run_ids))
+    }
   end
 
   # Every job carrying the name, in each workflow's newest run. A newest run with NO jobs yet

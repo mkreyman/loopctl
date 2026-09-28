@@ -3645,9 +3645,24 @@ defmodule Loopctl.ApiSpec.Schemas do
         id: %Schema{type: :string, format: :uuid},
         story_id: %Schema{type: :string, format: :uuid},
         commit_sha: %Schema{type: :string, nullable: true},
-        status: %Schema{type: :string, enum: ["pending", "running", "pass", "fail", "error"]},
+        status: %Schema{
+          type: :string,
+          enum: ["pending", "running", "pass", "fail", "error", "skipped"]
+        },
         runner_type: %Schema{type: :string, nullable: true},
-        ac_results: %Schema{type: :object},
+        ac_results: %Schema{
+          type: :object,
+          description:
+            "US-26.4.6. `source` is `ci` or `local_test_runner`. On `pass` / `fail` from CI, " <>
+              "`evidence_url` is the judged run's or the failing job's URL, always inside the " <>
+              "story's intake-source repository, and `fail` adds `failed_check` and " <>
+              "`conclusion`. With no verdict, `ci_unavailable_reason` is a short code with no " <>
+              "URL and no repository name (e.g. `credential_unavailable`, `no_intake_source`, " <>
+              "`no_required_checks`, `no_story_branch`, `ci_definition_changed`, " <>
+              "`ci_wait_exhausted`, `forge_unavailable`), plus `local_error` or the local " <>
+              "runner's counts when it was asked. A stale backlog run is `skipped` with " <>
+              "`reason: stale_run_skipped`."
+        },
         started_at: %Schema{type: :string, format: :"date-time", nullable: true},
         completed_at: %Schema{type: :string, format: :"date-time", nullable: true}
       }
