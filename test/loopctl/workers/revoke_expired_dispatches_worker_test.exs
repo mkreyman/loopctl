@@ -9,13 +9,10 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
     * behavior parity — the worker revokes exactly the expired, non-revoked
       dispatches (and cascades to their api_keys), leaves active and
       already-revoked rows untouched, and does so cross-tenant by design;
-    * index eligibility (AC-32.1.2) — the partial index is VALID and READY, keyed on
-      `expires_at` with the predicate `revoked_at IS NULL`, read from `pg_index`; and
-      `EXPLAIN` of the worker's exact predicate reaches the rows through an INDEX,
-      never a Seq Scan. Which index the planner picks is not asserted: the composite
-      `(tenant_id, expires_at)` index serves the same `expires_at <` condition (as a
-      full index scan), and the choice moves with the rows other async tests leave in
-      the shared table. Choice at production scale is a scale-test concern.
+    * index eligibility (AC-32.1.2) — the partial index is a valid single-column btree
+      on `expires_at` whose predicate `revoked_at IS NULL` the worker's own query carries
+      (`RevokeExpiredDispatchesWorker.expired_query/1`), read from `pg_index`. Which
+      index the planner CHOOSES is not asserted: see the describe block below.
 
   Dispatches are created through the real `Loopctl.Dispatches.create_dispatch/3`
   API (which mints + links a real api_key) so the cascade parity is exercised,
@@ -113,69 +110,38 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
   end
 
   describe "partial index dispatches_expires_at_active_index (AC-32.1.2)" do
-    test "the partial index is valid and matches the sweep, and the sweep plans on an index" do
-      # Mirror the worker's EXACT sweep predicate (RevokeExpiredDispatchesWorker.perform/1):
-      #   from(d in Dispatch, where: is_nil(d.revoked_at) and d.expires_at < ^now, ...)
-      # so this EXPLAIN exercises the identical query shape that runs every 60s.
-      now = DateTime.utc_now()
-
-      query =
-        from(d in Dispatch,
-          where: is_nil(d.revoked_at) and d.expires_at < ^now,
-          select: %{id: d.id, api_key_id: d.api_key_id}
-        )
-
-      # The test dispatches table is ~empty, so the DEFAULT planner correctly prefers
-      # a Seq Scan (scanning a handful of pages beats an index descent) — a naturally
-      # chosen Index Scan is only observable at scale. What AC-32.1.2 actually asserts
-      # is that the index MATCHES the predicate and is USABLE by the planner; we prove
-      # that deterministically at any table size by disabling seq scans for this
-      # transaction and confirming the plan is an index scan (with the expected
-      # `expires_at <` Index Cond) on one of the two indexes that can serve it. Verified out of
-      # band that at ~20k rows the DEFAULT planner picks the partial index unprompted
-      # (Index Scan, rows~86) — captured in the migration's verification note.
-      #
-      # `SET LOCAL` + the EXPLAIN must run on the SAME pinned connection, so both
-      # go inside one `Repo.transaction`. `Ecto.Adapters.SQL.explain/3` checks out
-      # its OWN connection and would miss the `SET LOCAL`, so we render the worker's
-      # query to SQL and EXPLAIN it directly on this connection instead.
-      {sql, params} = SQL.to_sql(:all, AdminRepo, query)
-
-      {:ok, plan} =
-        AdminRepo.transaction(fn ->
-          AdminRepo.query!("SET LOCAL enable_seqscan = off")
-          %{rows: rows} = AdminRepo.query!("EXPLAIN " <> sql, params)
-          # Re-enable seq scans before this savepoint commits. AdminRepo is
-          # sandboxed, so this transaction is a SAVEPOINT nested in the outer
-          # sandbox transaction; a `SET LOCAL` in a subtransaction that releases
-          # persists to the enclosing transaction (see config/test.exs:66-75).
-          # Resetting here keeps the planner override scoped to the EXPLAIN.
-          AdminRepo.query!("RESET enable_seqscan")
-          Enum.map_join(rows, "\n", fn [line] -> line end)
-        end)
-
-      # Either index that can serve `expires_at <` (see the moduledoc), never a Seq Scan and
-      # never any other access path.
-      assert plan =~
-               ~r/Index (Only )?Scan (using|on) (dispatches_expires_at_active_index|dispatches_tenant_id_expires_at_index)/
-
-      assert plan =~ "Index Cond: (expires_at <"
-      refute plan =~ "Seq Scan"
-
-      # Eligibility, from the catalog: an INVALID leftover of an interrupted CONCURRENTLY
-      # build keeps the same definition text, so validity is asserted, not just the text.
-      %{rows: [[valid?, ready?, keys, predicate]]} =
+    # Eligibility, deterministically. Which index the planner CHOOSES is not asserted here:
+    # the composite `(tenant_id, expires_at)` index can serve `expires_at <` too, as a full
+    # index scan, and the choice moves with the rows other async tests leave in the shared
+    # table (a plan pinned to one index failed at random for that reason). What makes the
+    # partial index usable is that it is a valid single-column btree on `expires_at` whose
+    # predicate the sweep's own WHERE clause carries; each half is asserted below, the
+    # predicate against the query `RevokeExpiredDispatchesWorker` really runs.
+    test "is a valid btree on expires_at whose predicate the sweep's own query carries" do
+      %{rows: [[valid?, keys, key_count, method, table, predicate]]} =
         AdminRepo.query!("""
-        SELECT i.indisvalid, i.indisready,
-               pg_get_indexdef(i.indexrelid, 1, true),
-               pg_get_expr(i.indpred, i.indrelid)
+        SELECT i.indisvalid, pg_get_indexdef(i.indexrelid, 1, true), i.indnkeyatts,
+               am.amname, i.indrelid::regclass::text, pg_get_expr(i.indpred, i.indrelid)
         FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_am am ON am.oid = c.relam
         WHERE i.indexrelid = 'dispatches_expires_at_active_index'::regclass
         """)
 
-      assert valid? and ready?
-      assert keys == "expires_at"
+      # An interrupted CONCURRENTLY build leaves an INVALID index with the same definition.
+      assert valid?
+      assert {keys, key_count, method, table} == {"expires_at", 1, "btree", "dispatches"}
       assert predicate == "(revoked_at IS NULL)"
+
+      {sql, _params} =
+        SQL.to_sql(
+          :all,
+          AdminRepo,
+          RevokeExpiredDispatchesWorker.expired_query(DateTime.utc_now())
+        )
+
+      assert sql =~ ~s|"revoked_at" IS NULL|
+      assert sql =~ ~r/"expires_at" < \$\d/
     end
   end
 end

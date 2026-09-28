@@ -14,9 +14,9 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # (tenant_id, expires_at) from 20260411234856_create_dispatches. Its LEADING column
   # `tenant_id` is absent from the sweep predicate, so Postgres cannot SEEK on it: at best
   # it reads the whole index (it does, on a small table), and otherwise seq-scans the
-  # continuously-growing `dispatches` table every minute. The sweep MUST
-  # stay cross-tenant (it finds expired dispatches across all tenants), so it can never
-  # use a tenant-leading index.
+  # continuously-growing `dispatches` table every minute. The sweep MUST stay
+  # cross-tenant (it finds expired dispatches across all tenants), so a tenant-leading
+  # index can never be SEEKED for it.
   #
   # This partial index matches the sweep predicate exactly — the WHERE
   # `revoked_at IS NULL` clause keeps it tiny (only live, un-revoked rows) and lets the
@@ -33,13 +33,15 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # not a Seq Scan. Two captures:
   #
   #   * Empty table, planner forced to reveal usability (`SET LOCAL
-  #     enable_seqscan = off`). The ExUnit guard `RevokeExpiredDispatchesWorkerTest`
-  #     no longer pins this plan (the shared test table makes the choice between this and
-  #     the composite index move); it asserts this index's validity and predicate from
-  #     `pg_index`, and an index plan:
+  #     enable_seqscan = off`), captured once when this migration was written:
   #
   #       Index Scan using dispatches_expires_at_active_index on dispatches d0
   #         Index Cond: (expires_at < now())
+  #
+  #     The ExUnit guard `RevokeExpiredDispatchesWorkerTest` does not assert a plan: the
+  #     shared test table makes the choice between this and the composite index move. It
+  #     asserts this index's shape and predicate from `pg_index`, against the worker's
+  #     own query.
   #
   #   * ~20k seeded rows (small selective expired set), DEFAULT planner
   #     (enable_seqscan on) — the index is chosen UNPROMPTED at scale:

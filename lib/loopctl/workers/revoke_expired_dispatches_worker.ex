@@ -16,18 +16,24 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorker do
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
 
+  @doc false
+  # The sweep's query, public so the test binds the partial index
+  # `dispatches_expires_at_active_index` to the predicate this worker actually runs.
+  @spec expired_query(DateTime.t()) :: Ecto.Query.t()
+  def expired_query(now) do
+    from(d in Dispatch,
+      where: is_nil(d.revoked_at) and d.expires_at < ^now,
+      select: %{id: d.id, tenant_id: d.tenant_id, api_key_id: d.api_key_id}
+    )
+  end
+
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
     now = DateTime.utc_now()
 
     # Find expired, non-revoked dispatches. CROSS-TENANT by design — this is a sweep, so
     # `tenant_id` comes back on every row and the write below is grouped by it.
-    expired =
-      from(d in Dispatch,
-        where: is_nil(d.revoked_at) and d.expires_at < ^now,
-        select: %{id: d.id, tenant_id: d.tenant_id, api_key_id: d.api_key_id}
-      )
-      |> AdminRepo.all()
+    expired = now |> expired_query() |> AdminRepo.all()
 
     if expired != [] do
       revoke_expired_batch(expired, now)

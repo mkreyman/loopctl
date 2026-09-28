@@ -478,8 +478,7 @@ defmodule Loopctl.Delivery.SessionEndTest do
                    )
         end)
 
-      # This call's own line, by its tenant, as the `:busy` test below refutes it: that
-      # refutation is only as good as this format, so it is pinned here.
+      # This call's own line, by its tenant (capture_log collects every process's logs).
       assert log =~
                ~r/\[error\] budget escalation refused .*answered permanently: tenant_id=#{tenant_id} /
     end
@@ -495,22 +494,25 @@ defmodule Loopctl.Delivery.SessionEndTest do
     end
 
     test "a lock that was not free is the one retry, and is not logged at error" do
-      tenant_id = Ecto.UUID.generate()
+      session = %{story_id: Ecto.UUID.generate()}
+      message = %{dispatch_id: Ecto.UUID.generate()}
 
       log =
         capture_log([level: :error], fn ->
           assert {:error, :busy} =
                    RunnerStages.budget_escalation_refused(
                      :busy,
-                     tenant_id,
-                     @refused_session,
-                     @refused_msg
+                     Ecto.UUID.generate(),
+                     session,
+                     message
                    )
         end)
 
-      # This call's own line, by its tenant: capture_log collects every process's logs, so
-      # an async neighbour's error would make a whole-log `== ""` fail at random.
-      refute log =~ "tenant_id=#{tenant_id}"
+      # This call's own ids, not the whole capture: capture_log collects every process's
+      # logs, so an async neighbour's error would make a whole-log `== ""` fail at random.
+      # Any error line about this refusal names its story or its dispatch.
+      refute log =~ session.story_id
+      refute log =~ message.dispatch_id
     end
   end
 end
