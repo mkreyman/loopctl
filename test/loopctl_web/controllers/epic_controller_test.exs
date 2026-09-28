@@ -306,7 +306,7 @@ defmodule LoopctlWeb.EpicControllerTest do
   end
 
   describe "DELETE /api/v1/epics/:id" do
-    test "an epic whose story entered the lifecycle is 422, not a 500", %{conn: conn} do
+    test "an epic whose story custody records reference is 422, not a 500", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       project = fixture(:project, %{tenant_id: tenant.id})

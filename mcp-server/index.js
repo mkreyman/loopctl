@@ -1099,8 +1099,9 @@ async function getStory({ story_id }) {
 // Reads travel on the default key (any role passes). Create and update go through
 // `orchestratorPinnedApiCall`: LOOPCTL_ORCH_KEY VERBATIM when it is set, so a global
 // LOOPCTL_API_KEY of a lesser role cannot displace the key the tool names, and the global key
-// when it is not. The deletes go through `userKeyApiCall`, pinned as every user-role tool is:
-// they destroy rows.
+// when it is not. The deletes go through `userKeyApiCall`, pinned to LOOPCTL_USER_KEY so a
+// global LOOPCTL_API_KEY cannot displace it: they destroy rows. (`delete_project` is not
+// pinned this way.)
 
 function orchestratorPinnedApiCall(method, path, body) {
   const orch = orchestratorKeyArgs();
@@ -4341,10 +4342,9 @@ const TOOLS = [
       "Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant; sent verbatim, never " +
       "displaced by LOOPCTL_API_KEY. Refusals: 403 for a lesser key or a tenant that is not " +
       "human-anchored, 404 for an epic not in your tenant, 422 when an active intake source " +
-      "targets the epic (revoke it first: intake_source_revoke), 422 when any story in it " +
-      "entered the delivery lifecycle or holds a change-thread record (dispatches, capability " +
-      "tokens, verification runs, checkpoints, entries, reviews are custody record and are " +
-      "not deleted, so such an epic is not deletable).",
+      "targets the epic (revoke it first: intake_source_revoke), 422 when a dispatch, " +
+      "capability token or verification run references any story in it (those do not " +
+      "cascade). A story's change-thread ledger is NOT deleted with it: it outlives the story.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4359,9 +4359,9 @@ const TOOLS = [
       "DELETE ONE STORY (DELETE /api/v1/stories/:id, loopctl #923). IRREVERSIBLE. Answers 204 " +
       "with no body. Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant, sent " +
       "verbatim. Refusals: 403 for a lesser key, 404 for a story not in your tenant, 422 when " +
-      "the story entered the delivery lifecycle (dispatches, capability tokens, verification " +
-      "runs) or holds a change-thread record (checkpoints, entries, reviews): that is custody " +
-      "record and is not deleted. A malformed `story_id` is refused locally.",
+      "a dispatch, capability token or verification run references the story (those do not " +
+      "cascade). Its change-thread ledger outlives it. A malformed `story_id` is refused " +
+      "locally.",
     inputSchema: {
       type: "object",
       properties: { story_id: { type: "string", description: "The story's UUID." } },

@@ -403,7 +403,7 @@ defmodule LoopctlWeb.StoryControllerTest do
   end
 
   describe "DELETE /api/v1/stories/:id" do
-    test "a story that entered the lifecycle is 422, not a 500", %{conn: conn} do
+    test "a story custody records reference is 422, not a 500", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       project = fixture(:project, %{tenant_id: tenant.id})

@@ -19,9 +19,6 @@ defmodule Loopctl.WorkBreakdown.Stories do
   alias Loopctl.Audit
   alias Loopctl.Intake.Record, as: IntakeRecord
   alias Loopctl.Repo
-  alias Loopctl.Threads.Checkpoint
-  alias Loopctl.Threads.Entry
-  alias Loopctl.Threads.Review
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
 
@@ -273,9 +270,6 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
     multi =
       Multi.new()
-      |> Multi.run(:thread_custody, fn repo, _changes ->
-        refuse_thread_custody(repo, tenant_id, [story.id], story, :story)
-      end)
       |> Multi.delete(
         :story,
         story |> Ecto.Changeset.change() |> Story.lifecycle_reference_constraints(:id, :story)
@@ -301,41 +295,8 @@ defmodule Loopctl.WorkBreakdown.Stories do
       {:ok, %{story: deleted}} ->
         {:ok, deleted}
 
-      {:error, step, changeset, _changes} when step in [:story, :thread_custody] ->
+      {:error, :story, changeset, _changes} ->
         {:error, changeset}
-    end
-  end
-
-  @doc """
-  `{:ok, :none}` when no story in `story_ids` has a change-thread record — a checkpoint, an
-  entry or a review — and otherwise `{:error, changeset}` refusing the delete of `struct` on
-  `:id` (loopctl #923). Those tables key on a bare `story_id` with no foreign key, so the
-  database cannot refuse the delete for them as it does for dispatches: without this, deleting
-  a story that went through a change thread would orphan its review ledger. Run on `repo`
-  inside the deleting transaction, before the delete.
-  """
-  @spec refuse_thread_custody(
-          module(),
-          Ecto.UUID.t(),
-          [Ecto.UUID.t()] | Ecto.Query.t(),
-          struct(),
-          :story | :epic
-        ) :: {:ok, :none} | {:error, Ecto.Changeset.t()}
-  def refuse_thread_custody(repo, tenant_id, story_ids, struct, subject) do
-    held? =
-      Enum.any?([Checkpoint, Entry, Review], fn schema ->
-        repo.exists?(
-          from(t in schema, where: t.tenant_id == ^tenant_id and t.story_id in ^story_ids)
-        )
-      end)
-
-    if held? do
-      {:error,
-       struct
-       |> Ecto.Changeset.change()
-       |> Ecto.Changeset.add_error(:id, Story.lifecycle_message(subject))}
-    else
-      {:ok, :none}
     end
   end
 

@@ -267,6 +267,16 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
   end
 
   describe "delete_story/3" do
+    test "a blank title on update is a 422 changeset, never a NOT NULL raise" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      assert {:error, %Ecto.Changeset{errors: [title: _]}} =
+               Stories.update_story(tenant.id, story, %{title: "  "})
+    end
+
     test "deletes a story" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
@@ -277,7 +287,7 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
       assert {:error, :not_found} = Stories.get_story(tenant.id, story.id)
     end
 
-    test "a story that entered the lifecycle is a 422 changeset, not a raise" do
+    test "a story custody records reference is a 422 changeset, not a raise" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
@@ -288,27 +298,6 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
         tenant_id: tenant.id,
         agent_id: agent.id,
         story_id: story.id,
-        repo: Loopctl.AdminRepo
-      })
-
-      assert {:error, %Ecto.Changeset{errors: [id: {message, _}]}} =
-               Stories.delete_story(tenant.id, story)
-
-      assert message == Story.lifecycle_message(:story)
-      assert {:ok, _} = Stories.get_story(tenant.id, story.id)
-    end
-
-    test "a story with a change-thread record is refused too: those tables have no FK" do
-      tenant = fixture(:tenant)
-      project = fixture(:project, %{tenant_id: tenant.id})
-      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
-      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
-
-      fixture(:thread_checkpoint, %{
-        tenant_id: tenant.id,
-        story_id: story.id,
-        seq: 1,
-        commit_sha: String.duplicate("a", 40),
         repo: Loopctl.AdminRepo
       })
 

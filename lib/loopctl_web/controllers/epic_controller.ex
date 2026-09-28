@@ -113,9 +113,8 @@ defmodule LoopctlWeb.EpicController do
     summary: "Delete epic",
     description:
       "Deletes an epic and cascades to stories. Requires user+ role. Refused 422 when an " <>
-        "active intake source targets the epic, or when any of its stories entered the " <>
-        "delivery lifecycle: its dispatches, capability tokens and verification runs are " <>
-        "custody record and do not cascade.",
+        "active intake source targets the epic, or when a dispatch, capability token or " <>
+        "verification run references any of its stories: those references do not cascade.",
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},

@@ -217,9 +217,8 @@ defmodule LoopctlWeb.StoryController do
   operation(:delete,
     summary: "Delete story",
     description:
-      "Deletes a story. Requires user+ role. Refused 422 when the story entered the delivery " <>
-        "lifecycle: its dispatches, capability tokens and verification runs are custody " <>
-        "record and do not cascade.",
+      "Deletes a story. Requires user+ role. Refused 422 when a dispatch, capability token " <>
+        "or verification run references the story: those references do not cascade.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},

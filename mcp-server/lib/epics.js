@@ -22,9 +22,9 @@
  *
  * KEYS, from the controller's plugs: reads are `role: :agent` (any key); create and update
  * are `role: :orchestrator` with the hierarchy, and human-anchored; delete is `role: :user`,
- * human-anchored, and CASCADES to the epic's stories — refused 422 when a story in it entered
- * the delivery lifecycle (its custody record does not cascade) or an active intake source
- * targets the epic.
+ * human-anchored, and CASCADES to the epic's stories — refused 422 when a dispatch, capability
+ * token or verification run references a story in it (those do not cascade) or an active
+ * intake source targets the epic. `delete_story` is here too, for the one story.
  */
 
 import { uuid as uuidRefusal } from "./delivery-loop.js";
@@ -154,8 +154,7 @@ export function storyPath(storyId) {
   return `/api/v1/stories/${encodeURIComponent(storyId)}`;
 }
 
-// `delete_story` lives beside `delete_epic`: the same refusals (a story that entered the
-// delivery lifecycle, or holds a change-thread record, is not deletable), the same key.
+// `delete_story` lives beside `delete_epic`: the same foreign-key refusals, the same key.
 export async function deleteStory({ story_id } = {}, { apiCall } = {}) {
   return badId("story_id", story_id) ?? apiCall("DELETE", storyPath(story_id), null);
 }

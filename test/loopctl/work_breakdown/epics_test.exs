@@ -183,7 +183,7 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
       assert {:error, :not_found} = Epics.get_epic(tenant.id, epic.id)
     end
 
-    test "an epic whose story entered the lifecycle is a 422 changeset, not a raise" do
+    test "an epic whose story custody records reference is a 422 changeset, not a raise" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
@@ -201,24 +201,6 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
                Epics.delete_epic(tenant.id, epic)
 
       assert message == Story.lifecycle_message(:epic)
-      assert {:ok, _} = Epics.get_epic(tenant.id, epic.id)
-    end
-
-    test "an epic whose story has a change-thread record is refused too" do
-      tenant = fixture(:tenant)
-      project = fixture(:project, %{tenant_id: tenant.id})
-      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
-      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
-
-      fixture(:thread_checkpoint, %{
-        tenant_id: tenant.id,
-        story_id: story.id,
-        seq: 1,
-        commit_sha: String.duplicate("a", 40),
-        repo: Loopctl.AdminRepo
-      })
-
-      assert {:error, %Ecto.Changeset{errors: [id: {_, _}]}} = Epics.delete_epic(tenant.id, epic)
       assert {:ok, _} = Epics.get_epic(tenant.id, epic.id)
     end
 

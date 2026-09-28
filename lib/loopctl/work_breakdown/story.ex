@@ -211,6 +211,9 @@ defmodule Loopctl.WorkBreakdown.Story do
       :estimated_hours,
       :metadata
     ])
+    # A blank title casts to nil; required, it is a 422 rather than the NOT NULL violation
+    # (a 500) it used to reach (loopctl #923).
+    |> validate_required([:title])
     |> validate_length(:title, max: 500)
     |> validate_length(:description, max: 50_000)
     |> validate_metadata()
@@ -336,12 +339,18 @@ defmodule Loopctl.WorkBreakdown.Story do
     end)
   end
 
-  @doc "The refusal a delete of a story, or of an epic holding one, gives for custody record."
+  @doc """
+  The refusal a delete of a story, or of an epic holding one, gives when those references
+  exist. It names the records, never a lifecycle state: nothing here reads the story's status,
+  only the rows that reference it. The change-thread ledger is NOT among them — it keys on a
+  bare `story_id` so it OUTLIVES the story (`20260926120000_create_thread_ledger.exs`).
+  """
   @spec lifecycle_message(:story | :epic) :: String.t()
   def lifecycle_message(:story),
-    do: "entered the delivery lifecycle, and its custody record cannot be deleted"
+    do: "is referenced by custody records (dispatches, capability tokens or verification runs)"
 
   def lifecycle_message(:epic),
     do:
-      "has a story that entered the delivery lifecycle, and its custody record cannot be deleted"
+      "has a story referenced by custody records (dispatches, capability tokens or " <>
+        "verification runs)"
 end
