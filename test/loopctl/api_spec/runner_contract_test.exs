@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "37fcafef03d1113dcb8d21c5226882d69667f7720e6b00197df743f8e0264b8a"
+  @digest "b476dcc8c7415417e1bf25c684f49ab6e6b2d41da5b254d0069785f9ffc0e87f"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -76,8 +76,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.21.0"
-      assert schema["x-contract-version"] == "1.21.0"
+      assert RunnerContract.version() == "1.22.0"
+      assert schema["x-contract-version"] == "1.22.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -2949,5 +2949,63 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     |> Regex.scan(reasons, capture: :all_but_first)
     |> List.flatten()
     |> MapSet.new()
+  end
+
+  describe "claim_ending_errors (1.22.0, loopctl#920)" do
+    test "every claim-ending code is published and permanent for the event it ends" do
+      reasons = RunnerContract.error_reasons()
+      ending = RunnerContract.claim_ending_errors()
+
+      pairs =
+        for {event, codes} <- reasons,
+            code <- codes,
+            RunnerContract.claim_ending_error?(event, code),
+            do: {event, code}
+
+      assert pairs != []
+
+      for {event, code} <- pairs do
+        assert RunnerContract.permanent_error?(event, code),
+               "#{code} ends the #{event} claim but is not permanent for it"
+      end
+
+      for {event, codes} <- ending, event != "*", code <- codes do
+        assert code in Map.fetch!(reasons, event), "#{event} does not publish #{code}"
+      end
+
+      for code <- Map.fetch!(ending, "*") do
+        assert Enum.any?(reasons, fn {_event, codes} -> code in codes end)
+      end
+    end
+
+    test "the claim ends on the codes the runner hand-typed, and never on one message's bytes" do
+      for code <- ~w(unknown_dispatch stale_claim_epoch dispatch_not_accepted not_claimant
+                     claim_not_live) do
+        assert RunnerContract.claim_ending_error?("checkpoint", code)
+      end
+
+      for code <- ~w(review_closed review_claim_ended review_round_superseded
+                     reviewer_not_separate) do
+        assert RunnerContract.claim_ending_error?("review_finding", code)
+        assert RunnerContract.claim_ending_error?("review_verdict", code)
+      end
+
+      assert RunnerContract.claim_ending_error?("session_ended", "stale_claim_epoch")
+      assert RunnerContract.claim_ending_error?("thread_entry", "unknown_dispatch")
+
+      for code <- ~w(checkpoint_conflict secret_blocked audit_chain_append_failed
+                     invalid_payload rate_limited) do
+        refute RunnerContract.claim_ending_error?("checkpoint", code)
+      end
+
+      # A code an event does not publish ends nothing there, "*" or not.
+      refute RunnerContract.claim_ending_error?("join", "stale_claim_epoch")
+      refute RunnerContract.claim_ending_error?("thread_entry", "claim_not_live")
+    end
+
+    test "the export publishes it beside permanent_errors" do
+      assert RunnerContract.json_schema()["x-connection"]["claim_ending_errors"] ==
+               RunnerContract.claim_ending_errors()
+    end
   end
 end

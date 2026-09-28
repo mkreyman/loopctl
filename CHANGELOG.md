@@ -6,6 +6,12 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner contract 1.22.0: which refusals end the claim (loopctl#920).** The contract
+  export's `x-connection.claim_ending_errors` names the permanent refusal codes that end the
+  claim a message ran under, per event, beside `permanent_errors`; every other permanent
+  refusal refuses only that message. Additive. RE-VENDOR the contract to derive the set
+  rather than typing it.
+
 - **The thread page and browser login (epic 45, US-45.7).** `GET /threads/:story_id` shows a
   story's change thread — checkpoints with their CI evidence, entries as untrusted text,
   findings — and fetches a checkpoint's diff (the base branch that checkpoint's claim was placed
