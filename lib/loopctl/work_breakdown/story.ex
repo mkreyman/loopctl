@@ -211,6 +211,9 @@ defmodule Loopctl.WorkBreakdown.Story do
       :estimated_hours,
       :metadata
     ])
+    # A blank title casts to nil; required, it is a 422 rather than the NOT NULL violation
+    # (a 500) it used to reach (PR #924).
+    |> validate_required([:title])
     |> validate_length(:title, max: 500)
     |> validate_length(:description, max: 50_000)
     |> validate_metadata()

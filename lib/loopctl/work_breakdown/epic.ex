@@ -79,6 +79,10 @@ defmodule Loopctl.WorkBreakdown.Epic do
   def update_changeset(epic, attrs) do
     epic
     |> cast(attrs, [:title, :description, :phase, :position, :metadata])
+    # A blank title casts to nil; required, it is a 422 rather than the NOT NULL violation
+    # (a 500) it used to reach (PR #924). Not position or metadata: a blank position casts to
+    # 0 and a blank metadata changes nothing, so neither can reach NULL.
+    |> validate_required([:title])
     |> validate_length(:title, max: 500)
     |> validate_length(:description, max: 50_000)
     |> validate_number(:position, greater_than_or_equal_to: 0)

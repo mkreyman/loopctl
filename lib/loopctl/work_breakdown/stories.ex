@@ -20,6 +20,7 @@ defmodule Loopctl.WorkBreakdown.Stories do
   alias Loopctl.Intake.Record, as: IntakeRecord
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.RestrictedDelete
   alias Loopctl.WorkBreakdown.Story
 
   @doc """
@@ -263,14 +264,16 @@ defmodule Loopctl.WorkBreakdown.Stories do
   - `{:error, changeset}` on failure
   """
   @spec delete_story(Ecto.UUID.t(), Story.t(), keyword()) ::
-          {:ok, Story.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Story.t()} | {:error, :not_found | Ecto.Changeset.t()}
   def delete_story(tenant_id, %Story{} = story, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
     multi =
       Multi.new()
-      |> Multi.delete(:story, story)
+      # The delete as its own step (`RestrictedDelete.delete/3`): a story already gone is
+      # `:not_found`, a non-cascading reference is a 422 changeset, never a raise.
+      |> Multi.run(:story, fn repo, _changes -> RestrictedDelete.delete(repo, story, :story) end)
       |> Audit.log_in_multi(:audit, fn %{story: deleted} ->
         %{
           tenant_id: tenant_id,
@@ -289,11 +292,8 @@ defmodule Loopctl.WorkBreakdown.Stories do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{story: deleted}} ->
-        {:ok, deleted}
-
-      {:error, :story, changeset, _changes} ->
-        {:error, changeset}
+      {:ok, %{story: deleted}} -> {:ok, deleted}
+      {:error, :story, refusal, _changes} -> {:error, refusal}
     end
   end
 

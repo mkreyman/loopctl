@@ -111,11 +111,15 @@ defmodule LoopctlWeb.EpicController do
 
   operation(:delete,
     summary: "Delete epic",
-    description: "Deletes an epic and cascades to stories. Requires user+ role.",
+    description:
+      "Deletes an epic and cascades to stories. Requires user+ role. Refused 422 when an " <>
+        "active intake source targets the epic, or when a dispatch, capability token or " <>
+        "verification run references any of its stories: those references do not cascade.",
     parameters: [id: [in: :path, type: :string, description: "Epic UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Not deletable", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -261,8 +265,10 @@ defmodule LoopctlWeb.EpicController do
         {:ok, _deleted} ->
           send_resp(conn, :no_content, "")
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          {:error, changeset}
+        # A 422 changeset, or `:not_found` for a row a racing delete already removed: both
+        # rendered by the fallback controller.
+        {:error, _refusal} = error ->
+          error
       end
     end
   end

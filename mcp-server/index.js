@@ -63,7 +63,10 @@ import {
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
 } from "./lib/delivery-loop.js";
-import { updateStory as updateStoryRequest } from "./lib/story-update.js";
+import {
+  deleteStory as deleteStoryRequest,
+  updateStory as updateStoryRequest,
+} from "./lib/story-update.js";
 import {
   enrollIntakeSource,
   listIntakeSources,
@@ -72,6 +75,16 @@ import {
 } from "./lib/intake-sources.js";
 import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-version.js";
 import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
+import {
+  createEpic as createEpicRequest,
+  deleteEpic as deleteEpicRequest,
+  deleteKeyHint,
+  epicWriteKeyHint,
+  epicProgress as epicProgressRequest,
+  getEpic as getEpicRequest,
+  listEpics as listEpicsRequest,
+  updateEpic as updateEpicRequest,
+} from "./lib/epics.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -190,7 +203,10 @@ async function apiCall(
   //     `requestAuthenticatorRevokeChallenge`, `revokeAuthenticator`), and the shared
   //     `runnerDeps()` / `deliveryDeps()` factories — the latter covering
   //     `place_dispatch` and `resolve_escalation`, which need an unlineaged human
-  //     principal. `grep -n 'exactKey: true' index.js` is the current list. None of
+  //     principal. `grep -n 'exactKey: true' index.js` is the current list, and it also
+  //     finds `pinnedApiCall`, the epic and story writes' CONDITIONAL pin, which falls back
+  //     to the default key when its variable is unset and is described where it is defined.
+  //     None of the unconditional family
   //     them may silently run under a global key of another role (review #12).
   //   - The `exact_role: :orchestrator` CUSTODY verbs pass it CONDITIONALLY, and
   //     nothing here decides that: `orchestratorKeyArgs` (`lib/custody-key.js`)
@@ -1084,6 +1100,61 @@ async function listBlockedStories({ project_id, page, page_size }) {
 async function getStory({ story_id }) {
   const result = await apiCall("GET", `/api/v1/stories/${story_id}`);
   return toContent(result);
+}
+
+// --- Epics (loopctl #876) ---
+// Reads travel on the default key (any role passes). Create and update go through
+// `orchestratorPinnedApiCall`: the named orchestrator or user key VERBATIM, so a global
+// LOOPCTL_API_KEY of a lesser role cannot displace it, and the global key when neither is set. The deletes go through `userKeyApiCall`, pinned to LOOPCTL_USER_KEY so a
+// global LOOPCTL_API_KEY cannot displace it: they destroy rows. (`delete_project` is not
+// pinned this way.)
+
+// ONE pinning rule for the epic and story writes: the env var `hint()` names is sent VERBATIM
+// when it is set, so a global LOOPCTL_API_KEY of a lesser role cannot displace it, and with none
+// set the default selection (`resolveKey`) applies. Unlike the unconditional user-key family
+// described above `apiCall`, these fall back rather than refuse: their gates use the role
+// hierarchy (`role:`, never `exact_role:`), so a sufficient global key passes.
+function pinnedApiCall(hint) {
+  return (method, path, body) => {
+    const keyHint = hint();
+
+    return keyHint
+      ? apiCall(method, path, body, process.env[keyHint], { exactKey: true, keyHint })
+      : apiCall(method, path, body);
+  };
+}
+
+// Create and update: LOOPCTL_ORCH_KEY, else LOOPCTL_USER_KEY (`epicWriteKeyHint`).
+const orchestratorPinnedApiCall = pinnedApiCall(epicWriteKeyHint);
+// The deletes: LOOPCTL_USER_KEY (`deleteKeyHint`).
+const userKeyApiCall = pinnedApiCall(deleteKeyHint);
+
+async function listEpics(args) {
+  return toContent(await listEpicsRequest(args, { apiCall }));
+}
+
+async function getEpic(args) {
+  return toContent(await getEpicRequest(args, { apiCall }));
+}
+
+async function epicProgress(args) {
+  return toContent(await epicProgressRequest(args, { apiCall }));
+}
+
+async function createEpic(args) {
+  return toContent(await createEpicRequest(args, { apiCall: orchestratorPinnedApiCall }));
+}
+
+async function updateEpic(args) {
+  return toContent(await updateEpicRequest(args, { apiCall: orchestratorPinnedApiCall }));
+}
+
+async function deleteEpic(args) {
+  return toContent(await deleteEpicRequest(args, { apiCall: userKeyApiCall }));
+}
+
+async function deleteStory(args) {
+  return toContent(await deleteStoryRequest(args, { apiCall: userKeyApiCall }));
 }
 
 // --- Workflow Tools (agent key) ---
@@ -4192,6 +4263,140 @@ const TOOLS = [
         },
       },
       required: ["story"],
+    },
+  },
+  {
+    name: "list_epics",
+    description:
+      "LIST A PROJECT'S EPICS (GET /api/v1/projects/:project_id/epics, loopctl #876): each " +
+      "epic's `id`, `number`, `title`, `description`, `phase`, `position`, `metadata`, " +
+      "`story_count` and `completion_percentage`, paginated (`page`, " +
+      "`page_size`), optionally filtered by `phase`. The way to learn an epic's id, e.g. the " +
+      "`target_epic_id` an intake source needs. Any key. Refusals: 404 for a project not in " +
+      "your tenant; a malformed `project_id` is refused locally.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "The project's UUID." },
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: { type: "integer", description: "Items per page." },
+        phase: { type: "string", description: "Only epics in this phase." },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "create_epic",
+    description:
+      "CREATE AN EPIC in a work project (POST /api/v1/projects/:project_id/epics, loopctl " +
+      "#876) and return it, `id` included. `number` (an integer, fixed for good) and `title` " +
+      "are required; `description`, `phase`, `position` (default 0) and `metadata` are " +
+      "optional. Needs an orchestrator-or-above key on a human-anchored tenant: " +
+      "LOOPCTL_ORCH_KEY, else LOOPCTL_USER_KEY, sent verbatim, else the default key. " +
+      "Refusals: 403 for an agent key or a tenant that is not human-anchored, 404 for a " +
+      "project not in your tenant, 422 for a kb scope (epics live in work projects) or a " +
+      "duplicate or invalid field.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "The work project's UUID." },
+        number: {
+          type: "integer",
+          minimum: 1,
+          description: "The epic's number, at least 1; cannot change later.",
+        },
+        title: { type: "string", description: "The epic's title." },
+        description: { type: "string", description: "Optional description." },
+        phase: { type: "string", description: "Optional phase." },
+        position: { type: "integer", description: "Optional ordering position (default 0)." },
+        metadata: { type: "object", description: "Optional metadata map." },
+      },
+      required: ["project_id", "number", "title"],
+    },
+  },
+  {
+    name: "get_epic",
+    description:
+      "READ ONE EPIC with its stories (GET /api/v1/epics/:id, loopctl #876). Any key. " +
+      "Refusals: 404 for an epic not in your tenant; a malformed `epic_id` is refused locally.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
+      },
+      required: ["epic_id"],
+    },
+  },
+  {
+    name: "update_epic",
+    description:
+      "CORRECT AN EPIC (PATCH /api/v1/epics/:id, loopctl #876): any of `title`, " +
+      "`description`, `phase`, `position`, `metadata`. `number` cannot change. The endpoint " +
+      "DROPS absent and null fields, so a null and a call naming no field are refused " +
+      "locally; send an EMPTY STRING to clear `description` or `phase` (a blank `title` is a " +
+      "422). `metadata` is REPLACED WHOLE, never merged: read the epic first " +
+      "(get_epic) and send the whole map. Needs an orchestrator-or-above key on a " +
+      "human-anchored tenant: LOOPCTL_ORCH_KEY, else LOOPCTL_USER_KEY, else the default key. Refusals: 403, 404, 422 for an invalid field.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
+        title: { type: "string" },
+        description: { type: "string" },
+        phase: { type: "string" },
+        position: { type: "integer" },
+        metadata: { type: "object", description: "Replaces the stored map whole." },
+      },
+      required: ["epic_id"],
+    },
+  },
+  {
+    name: "delete_epic",
+    description:
+      "DELETE AN EPIC AND EVERY STORY IN IT (DELETE /api/v1/epics/:id, loopctl #876). " +
+      "IRREVERSIBLE: the delete cascades to the epic's stories. Answers 204 with no body. " +
+      "Needs a user-or-above key on a human-anchored tenant: LOOPCTL_USER_KEY, sent verbatim " +
+      "when set (a global LOOPCTL_API_KEY never displaces it), else the default key. " +
+      "Refusals: 403 for a lesser key or a tenant that is not " +
+      "human-anchored, 404 for an epic not in your tenant, 422 when an active intake source " +
+      "targets the epic (revoke it first: intake_source_revoke), 422 when a dispatch, " +
+      "capability token or verification run references any story in it (those do not " +
+      "cascade). A story's change-thread ledger is NOT deleted with it: it outlives the story.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
+      },
+      required: ["epic_id"],
+    },
+  },
+  {
+    name: "delete_story",
+    description:
+      "DELETE ONE STORY (DELETE /api/v1/stories/:id, loopctl #876). IRREVERSIBLE. Answers 204 " +
+      "with no body. Needs a user-or-above key on a human-anchored tenant: LOOPCTL_USER_KEY " +
+      "verbatim when set, else the default key. Refusals: 403 for a lesser key, 404 for a story not in your tenant, 422 when " +
+      "a dispatch, capability token or verification run references the story (those do not " +
+      "cascade). Its change-thread ledger outlives it. A malformed `story_id` is refused " +
+      "locally.",
+    inputSchema: {
+      type: "object",
+      properties: { story_id: { type: "string", description: "The story's UUID." } },
+      required: ["story_id"],
+    },
+  },
+  {
+    name: "epic_progress",
+    description:
+      "AN EPIC'S PROGRESS (GET /api/v1/epics/:id/progress, loopctl #876): its stories " +
+      "counted by `agent_status` and by `verified_status`. Any key. Refusals: 404 for an " +
+      "epic not in your tenant; a malformed `epic_id` is refused locally.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
+      },
+      required: ["epic_id"],
     },
   },
   {
@@ -9661,6 +9866,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "update_story":
       return await updateStory(args);
+    case "list_epics":
+      return await listEpics(args);
+    case "create_epic":
+      return await createEpic(args);
+    case "get_epic":
+      return await getEpic(args);
+    case "update_epic":
+      return await updateEpic(args);
+    case "delete_epic":
+      return await deleteEpic(args);
+    case "delete_story":
+      return await deleteStory(args);
+    case "epic_progress":
+      return await epicProgress(args);
 
     case "import_stories":
       return await importStories(args);

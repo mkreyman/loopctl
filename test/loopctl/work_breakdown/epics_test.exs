@@ -5,6 +5,7 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
 
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Epics
+  alias Loopctl.WorkBreakdown.RestrictedDelete
 
   describe "create_epic/3" do
     test "creates an epic with valid attributes" do
@@ -180,6 +181,45 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
 
       assert {:ok, _deleted} = Epics.delete_epic(tenant.id, epic)
       assert {:error, :not_found} = Epics.get_epic(tenant.id, epic.id)
+    end
+
+    test "an epic already deleted is not_found (a 404), not a StaleEntryError" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      assert {:ok, _} = Epics.delete_epic(tenant.id, epic)
+      assert {:error, :not_found} = Epics.delete_epic(tenant.id, epic)
+    end
+
+    test "an epic whose story custody records reference is a 422 changeset, not a raise" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      fixture(:stage_dispatch, %{
+        tenant_id: tenant.id,
+        agent_id: agent.id,
+        story_id: story.id,
+        repo: Loopctl.AdminRepo
+      })
+
+      assert {:error, %Ecto.Changeset{errors: [id: {message, _}]}} =
+               Epics.delete_epic(tenant.id, epic)
+
+      assert message == RestrictedDelete.message(:epic)
+      assert {:ok, _} = Epics.get_epic(tenant.id, epic.id)
+    end
+
+    test "a blank title is a 422 changeset, never a NOT NULL raise" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      assert {:error, %Ecto.Changeset{errors: [title: _]}} =
+               Epics.update_epic(tenant.id, epic, %{title: "  "})
     end
 
     test "creates audit log entry on delete" do

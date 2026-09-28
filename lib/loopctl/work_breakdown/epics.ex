@@ -15,6 +15,7 @@ defmodule Loopctl.WorkBreakdown.Epics do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.RestrictedDelete
   alias Loopctl.WorkBreakdown.Story
 
   @doc """
@@ -210,20 +211,22 @@ defmodule Loopctl.WorkBreakdown.Epics do
   - `{:error, changeset}` on failure
   """
   @spec delete_epic(Ecto.UUID.t(), Epic.t(), keyword()) ::
-          {:ok, Epic.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Epic.t()} | {:error, :not_found | Ecto.Changeset.t()}
   def delete_epic(tenant_id, %Epic{} = epic, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
 
     multi =
       Multi.new()
-      # A CHANGESET, not the bare struct, so the one FK onto `epics` that is RESTRICT rather
-      # than cascade comes back as a 422 naming the field instead of an `Ecto.ConstraintError`
-      # the fallback controller cannot render. `intake_sources.target_epic_id` is that FK
-      # (#803): an intake source pointing at this epic must be repointed or revoked first,
-      # which is the whole reason the reference restricts rather than nilifying — nilify would
-      # silently turn that source's next report into an escalation.
-      |> Multi.delete(:epic, epic_delete_changeset(epic))
+      # The delete as its own step (`RestrictedDelete.delete/3`): an epic already gone is
+      # `:not_found`, and a reference that restricts rather than cascades is a 422 changeset.
+      # `epic_delete_changeset/1` names the one whose remedy is known — an active intake source
+      # targeting this epic, revoked first; it restricts rather than nilifying, since nilify
+      # would silently turn that source's next report into an escalation (#803). Every other
+      # non-cascading reference on the cascade's path is refused by `RestrictedDelete`.
+      |> Multi.run(:epic, fn repo, _changes ->
+        RestrictedDelete.delete(repo, epic_delete_changeset(epic), :epic)
+      end)
       |> Audit.log_in_multi(:audit, fn %{epic: deleted} ->
         %{
           tenant_id: tenant_id,
@@ -242,11 +245,8 @@ defmodule Loopctl.WorkBreakdown.Epics do
       end)
 
     case AdminRepo.transaction(multi) do
-      {:ok, %{epic: deleted}} ->
-        {:ok, deleted}
-
-      {:error, :epic, changeset, _changes} ->
-        {:error, changeset}
+      {:ok, %{epic: deleted}} -> {:ok, deleted}
+      {:error, :epic, refusal, _changes} -> {:error, refusal}
     end
   end
 

@@ -216,11 +216,14 @@ defmodule LoopctlWeb.StoryController do
 
   operation(:delete,
     summary: "Delete story",
-    description: "Deletes a story. Requires user+ role.",
+    description:
+      "Deletes a story. Requires user+ role. Refused 422 when a dispatch, capability token " <>
+        "or verification run references the story: those references do not cascade.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       204 => {"Deleted", "application/json", %OpenApiSpex.Schema{type: :string}},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Not deletable", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -470,8 +473,10 @@ defmodule LoopctlWeb.StoryController do
         {:ok, _deleted} ->
           send_resp(conn, :no_content, "")
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          {:error, changeset}
+        # A 422 changeset, or `:not_found` for a row a racing delete already removed: both
+        # rendered by the fallback controller.
+        {:error, _refusal} = error ->
+          error
       end
     end
   end
