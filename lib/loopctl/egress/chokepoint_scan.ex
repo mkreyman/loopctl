@@ -72,9 +72,9 @@ defmodule Loopctl.Egress.ChokepointScan do
         "pin (pinned_request_opts + redirect: false). It is allowlisted for the same " <>
         "reason Loopctl.Provider is — it is the wrapper, not a call site that bypasses one.",
     "Loopctl.Delivery.GitHubPullRequestSource" =>
-      "Reads a pull request's state, diffstat, changed names, file tree and deployments, " <>
-        "and a commit's Actions workflow runs for story verification (#913), " <>
-        "for the #803 merge precondition and post-deploy verification, AND (#805) WRITES " <>
+      "Reads a pull request's state, diffstat, changed names, file tree and deployments " <>
+        "for the #803 merge precondition and post-deploy verification, a commit's Actions " <>
+        "workflow runs for story verification (#913), AND (#805) WRITES " <>
         "to the issue a story came from: it adds a loopctl:resolution-* label, posts the " <>
         "resolution text and closes the issue. NO LONGER GET ONLY — that justification was " <>
         "true until #805 and is corrected here rather than left to the parity test, which " <>

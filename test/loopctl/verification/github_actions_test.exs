@@ -74,6 +74,20 @@ defmodule Loopctl.Verification.GitHubActionsTest do
                GitHubActions.summarize_workflow_runs([run("completed", "skipped")])
     end
 
+    test "a run waiting on an environment approval is no evidence, not an endless wait" do
+      assert {:error, :ci_waiting} =
+               GitHubActions.summarize_workflow_runs([
+                 run("completed", "success"),
+                 run("waiting", nil)
+               ])
+
+      assert {:ok, %{conclusion: "failure"}} =
+               GitHubActions.summarize_workflow_runs([
+                 run("waiting", nil),
+                 run("completed", "failure")
+               ])
+    end
+
     test "a cancelled run is no evidence, not a failure, unless another run failed" do
       assert {:error, :ci_cancelled} =
                GitHubActions.summarize_workflow_runs([
@@ -90,7 +104,9 @@ defmodule Loopctl.Verification.GitHubActionsTest do
   end
 
   describe "get_status/2 (#913)" do
-    defp api_run(id, path, event, branch, conclusion, sha \\ "abc123") do
+    @sha "abc123"
+
+    defp api_run(id, path, event, branch, conclusion, sha \\ @sha) do
       %{
         "id" => id,
         "path" => path,
@@ -103,20 +119,59 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       }
     end
 
-    defp stub_runs(runs, total \\ nil) do
-      Req.Test.stub(GitHubPullRequestSource, fn conn ->
-        assert conn.request_path == "/repos/mkreyman/infra/actions/runs"
-        assert conn.query_params["head_sha"] == "abc123"
+    # Answers each event's runs page as GitHub would (filtered by `event`, with that event's
+    # own total) and a tag-ref read with 200 for a name in `tags`, 404 otherwise.
+    defp stub_runs(runs, opts \\ []) do
+      tags = Keyword.get(opts, :tags, [])
+      totals = Keyword.get(opts, :totals, %{})
+      test_pid = self()
 
-        Req.Test.json(conn, %{"total_count" => total || length(runs), "workflow_runs" => runs})
+      Req.Test.stub(GitHubPullRequestSource, fn conn ->
+        case conn.request_path do
+          "/repos/mkreyman/infra/actions/runs" ->
+            event = conn.query_params["event"]
+            send(test_pid, {:runs_read, event, conn.query_params["head_sha"]})
+
+            page = runs_page(runs, event, opts[:api_ignores_event])
+
+            Req.Test.json(conn, %{
+              "total_count" => Map.get(totals, event, length(page)),
+              "workflow_runs" => page
+            })
+
+          "/repos/mkreyman/infra/git/ref/tags/" <> name ->
+            tag_ref(conn, name in tags, name)
+        end
       end)
     end
 
-    test "reads the commit's Actions workflow runs, never its check runs" do
-      stub_runs([api_run(1, ".github/workflows/ci.yml", "push", "main", "success")])
+    defp runs_page(runs, _event, true), do: runs
+    defp runs_page(runs, event, _filters), do: Enum.filter(runs, &(&1["event"] == event))
+
+    defp tag_ref(conn, true, name), do: Req.Test.json(conn, %{"ref" => "refs/tags/" <> name})
+    defp tag_ref(conn, false, _name), do: Plug.Conn.send_resp(conn, 404, "{}")
+
+    test "reads the commit's push and pull_request workflow runs, never its check runs" do
+      stub_runs([
+        api_run(1, ".github/workflows/ci.yml", "push", "main", "success"),
+        api_run(2, ".github/workflows/ci.yml", "pull_request", "main", "success")
+      ])
 
       assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("git@github.com:mkreyman/infra.git", "abc123")
+               GitHubActions.get_status("git@github.com:mkreyman/infra.git", @sha)
+
+      assert_received {:runs_read, "push", @sha}
+      assert_received {:runs_read, "pull_request", @sha}
+    end
+
+    test "a pull_request run's failure fails the commit" do
+      stub_runs([
+        api_run(1, ".github/workflows/ci.yml", "push", "main", "success"),
+        api_run(2, ".github/workflows/ci.yml", "pull_request", "main", "failure")
+      ])
+
+      assert {:ok, %{conclusion: "failure"}} =
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
     end
 
     test "a failure on ANY branch the commit was pushed to fails it" do
@@ -126,7 +181,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       ])
 
       assert {:ok, %{conclusion: "failure", url: url}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", "abc123")
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
 
       assert url =~ "/actions/runs/1"
     end
@@ -138,36 +193,88 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       ])
 
       assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", "abc123")
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
     end
 
-    test "runs of other events, or of another commit, are not this commit's CI" do
+    test "a newer CANCELLED run does not hide an older run that finished" do
+      stub_runs([
+        api_run(10, ".github/workflows/ci.yml", "push", "main", "success"),
+        api_run(11, ".github/workflows/ci.yml", "push", "main", "cancelled")
+      ])
+
+      assert {:ok, %{conclusion: "success"}} =
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+    end
+
+    test "a push of a TAG is a release, not the commit's CI" do
+      stub_runs(
+        [
+          api_run(1, ".github/workflows/ci.yml", "push", "main", "success"),
+          api_run(2, ".github/workflows/publish.yml", "push", "mcp-v1.2.3", "failure")
+        ],
+        tags: ["mcp-v1.2.3"]
+      )
+
+      assert {:ok, %{conclusion: "success"}} =
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+    end
+
+    test "runs of another commit are not this commit's CI" do
       stub_runs([
         api_run(1, ".github/workflows/ci.yml", "push", "main", "success"),
-        api_run(2, ".github/workflows/deploy.yml", "workflow_run", "main", "failure"),
         api_run(3, ".github/workflows/ci.yml", "push", "other", "failure", "def456")
       ])
 
       assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", "abc123")
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+    end
+
+    test "a run of another event is not counted even when the API ignores the filter" do
+      stub_runs(
+        [
+          api_run(1, ".github/workflows/ci.yml", "push", "main", "success"),
+          api_run(2, ".github/workflows/nightly.yml", "schedule", "main", "failure")
+        ],
+        api_ignores_event: true
+      )
+
+      assert {:ok, %{conclusion: "success"}} =
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
     end
 
     test "a truncated run list is refused, never judged on the part it has" do
-      stub_runs([api_run(1, ".github/workflows/ci.yml", "push", "main", "success")], 150)
+      stub_runs([api_run(1, ".github/workflows/ci.yml", "push", "main", "success")],
+        totals: %{"push" => 150}
+      )
 
       assert {:error, {:workflow_runs_truncated, 150, 1}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", "abc123")
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
     end
 
-    test "a refused read is an error, not a verdict" do
+    test "a refused read is the forge's permission error, not a verdict" do
       Req.Test.stub(GitHubPullRequestSource, &Plug.Conn.send_resp(&1, 403, "{}"))
 
-      assert {:error, _} = GitHubActions.get_status("https://github.com/mkreyman/infra", "abc123")
+      assert {:error, {:github_api_error, 403}} =
+               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+    end
+
+    test "a repository name with a dot is read whole" do
+      Req.Test.stub(GitHubPullRequestSource, fn conn ->
+        assert conn.request_path == "/repos/mkreyman/loopctl.com/actions/runs"
+        Req.Test.json(conn, %{"total_count" => 0, "workflow_runs" => []})
+      end)
+
+      for url <- [
+            "https://github.com/mkreyman/loopctl.com",
+            "git@github.com:mkreyman/loopctl.com.git"
+          ] do
+        assert {:error, :no_workflow_runs} = GitHubActions.get_status(url, @sha)
+      end
     end
 
     test "a URL that names no GitHub repository is an error, not a lookup" do
       assert {:error, {:unrecognized_repo_url, _}} =
-               GitHubActions.get_status("https://example.com/x", "abc123")
+               GitHubActions.get_status("https://example.com/x", @sha)
     end
   end
 end

@@ -218,7 +218,16 @@ All notable changes to loopctl are documented here.
   re-execution. Three verdicts changed:
   - a commit with no workflow runs is no longer verified as passing;
   - a cancelled run is no evidence rather than a failure;
-  - a timed-out run fails instead of waiting indefinitely.
+  - a timed-out run fails instead of waiting indefinitely;
+  - a run waiting on an environment approval, and a push of a tag (a release workflow), are
+    no longer counted as the commit's CI;
+  - a GitHub rate limit is waited out instead of triggering a local re-run.
+
+  A run with no CI verdict now records why in `ac_results.ci_unavailable_reason`, and a CI
+  verdict records the failing run's `url`. **Before this, every verification run that had a
+  commit crashed before reaching CI**: a schemaless query was passed an uncast UUID. Runs
+  recorded as failed with a Postgrex "expected a binary of 16 bytes" error were never
+  judged.
 
 - **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**
   A triage-accepted story, a release whose re-contract did not land, and an escalation resolved

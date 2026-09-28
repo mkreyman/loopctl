@@ -75,7 +75,11 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   the jobs reads' in batches: with ten workflows, seven reads plus three batches at 7s each,
   70 seconds before an answer, and a
   timeout is a transient `:unevaluated`, never a pass. Plus one repository read after a 404 on
-  the branch. Nothing here runs inside a
+  the branch.
+
+  Story verification (#913, `commit_ci_runs/2`) makes two workflow-run reads, one per event,
+  plus one tag-ref read per distinct pushed name (at most `@max_workflow_runs`): usually
+  three reads, 21 seconds before an answer, and a timeout is no CI evidence, never a pass. Nothing here runs inside a
   database transaction: the caller gathers every fact before it opens one, so a slow forge
   never holds a pooled connection.
 
@@ -264,39 +268,92 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # A commit pushed more than once has a run per push per workflow; only each workflow's
   # NEWEST run is judged (`Loopctl.Delivery.CiEvidence`), so only it is read, and the bound
   # counts workflows rather than pushes (#910 round 3, finding 2).
-  defp newest_per_workflow(runs) do
+  defp newest_per_workflow(runs), do: newest_per(runs, & &1["path"], fn _run -> true end)
+
+  # The newest run of each group, among the runs `preferred` accepts when it accepts any.
+  defp newest_per(runs, key, preferred) do
     runs
-    |> Enum.group_by(& &1["path"])
-    |> Enum.map(fn {_path, same} -> Enum.max_by(same, & &1["id"]) end)
+    |> Enum.group_by(key)
+    |> Enum.map(fn {_key, same} ->
+      case Enum.filter(same, preferred) do
+        [] -> Enum.max_by(same, & &1["id"])
+        kept -> Enum.max_by(kept, & &1["id"])
+      end
+    end)
     |> Enum.sort_by(& &1["id"])
   end
 
   @doc """
   Every CI workflow run of commit `sha`, for story verification (#913).
 
-  The runs a `push` or `pull_request` triggered, on any branch, since verification judges a
-  commit rather than a thread branch; any other event (`schedule`, `workflow_run`,
-  `dynamic`) is not the commit's CI. Only the NEWEST run of each workflow per event per
-  branch is returned. A re-run keeps its run id and reports its latest attempt, so a higher
-  id is a later push of the same commit. Read, shape-checked and truncation-refused by the
-  same code as the merge gate's `check_evidence/3`, so the two cannot disagree about which
-  runs exist. Needs `actions: read`, never Checks, which a fine-grained token cannot hold.
+  The runs a `push` to a BRANCH or a `pull_request` triggered, on any branch, since
+  verification judges a commit rather than a thread branch. Each event is asked for
+  separately, filtered by the API and again here, so a busy `schedule`, `workflow_run` or
+  `dynamic` history on the same commit can neither truncate the read nor count as its CI. A
+  push of a TAG is reported with the tag's name as `head_branch`; those runs are publish or
+  release workflows, not CI, and are dropped (a tag and a branch sharing one name would drop
+  that branch's runs too).
+
+  Per workflow, event and branch, the NEWEST run that was not cancelled is returned, or the
+  newest cancelled one when every run was: a re-run keeps its run id and reports its latest
+  attempt, so a higher id is a later push of the same commit, and a run a newer push
+  cancelled must not hide one that already finished. Read, shape-checked and
+  truncation-refused by the same code as the merge gate's `check_evidence/3`. Needs
+  `actions: read`, never Checks, which a fine-grained token cannot hold.
   """
   @spec commit_ci_runs(String.t(), String.t()) :: {:ok, [map()]} | {:error, term()}
   def commit_ci_runs(repo, sha) do
-    query = URI.encode_query(%{"head_sha" => sha, "per_page" => @workflow_run_page})
-
     with {:ok, repo} <- repo_name(repo),
          {:ok, sha} <- ref(sha),
-         {:ok, body} <- get(repo, "/actions/runs?" <> query),
-         {:ok, runs} <- workflow_runs(body) do
+         {:ok, pushes} <- commit_runs(repo, sha, "push"),
+         {:ok, pushes} <- branch_pushes(repo, pushes),
+         {:ok, pull_requests} <- commit_runs(repo, sha, "pull_request") do
       {:ok,
-       runs
-       |> Enum.filter(&(&1["head_sha"] == sha and &1["event"] in ["push", "pull_request"]))
-       |> Enum.group_by(&{&1["path"], &1["event"], &1["head_branch"]})
-       |> Enum.map(fn {_key, same} -> Enum.max_by(same, & &1["id"]) end)
-       |> Enum.sort_by(& &1["id"])
+       (pushes ++ pull_requests)
+       |> newest_per(
+         &{&1["path"], &1["event"], &1["head_branch"]},
+         &(&1["conclusion"] != "cancelled")
+       )
        |> Enum.map(&Map.put(run_fact(&1), :url, &1["html_url"]))}
+    end
+  end
+
+  defp commit_runs(repo, sha, event) do
+    query =
+      URI.encode_query(%{"head_sha" => sha, "event" => event, "per_page" => @workflow_run_page})
+
+    with {:ok, body} <- get(repo, "/actions/runs?" <> query),
+         {:ok, runs} <- workflow_runs(body) do
+      {:ok, Enum.filter(runs, &(&1["head_sha"] == sha and &1["event"] == event))}
+    end
+  end
+
+  # One ref read per distinct pushed name, bounded like the jobs reads.
+  defp branch_pushes(repo, runs) do
+    names = runs |> Enum.map(& &1["head_branch"]) |> Enum.uniq()
+
+    if length(names) > @max_workflow_runs do
+      {:error, {:too_many_pushed_refs, length(names)}}
+    else
+      Enum.reduce_while(names, {:ok, runs}, &drop_tag_pushes(repo, &1, &2))
+    end
+  end
+
+  defp drop_tag_pushes(repo, name, {:ok, kept}) do
+    case tag?(repo, name) do
+      {:ok, true} -> {:cont, {:ok, Enum.reject(kept, &(&1["head_branch"] == name))}}
+      {:ok, false} -> {:cont, {:ok, kept}}
+      error -> {:halt, error}
+    end
+  end
+
+  defp tag?(repo, name) do
+    with {:ok, name} <- ref(name) do
+      case get(repo, "/git/ref/tags/" <> name) do
+        {:ok, _body} -> {:ok, true}
+        {:error, {:github_api_error, 404}} -> {:ok, false}
+        error -> error
+      end
     end
   end
 

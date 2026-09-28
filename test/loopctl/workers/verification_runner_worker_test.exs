@@ -123,4 +123,85 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       assert reloaded.started_at
     end
   end
+
+  describe "the CI verdict (#913)" do
+    @sha "0123456789abcdef0123456789abcdef01234567"
+
+    defp ci_run(ctx) do
+      %{tenant: tenant, story: story} = ctx
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(p in "projects",
+            join: e in "epics",
+            on: e.project_id == p.id,
+            join: s in "stories",
+            on: s.epic_id == e.id,
+            where: s.id == type(^story.id, :binary_id)
+          ),
+          set: [repo_url: "https://github.com/mkreyman/infra"]
+        )
+
+      {:ok, run} = Verification.create_run(tenant.id, story.id, %{commit_sha: @sha})
+      {run, %Oban.Job{args: %{"run_id" => run.id, "tenant_id" => tenant.id}}}
+    end
+
+    defp stub_ci(fun), do: Req.Test.stub(Loopctl.Delivery.GitHubPullRequestSource, fun)
+
+    test "a failing run is recorded with the URL of the workflow that failed" do
+      stub_ci(fn conn ->
+        runs =
+          if conn.query_params["event"] == "push",
+            do: [
+              %{
+                "id" => 7,
+                "path" => ".github/workflows/ci.yml",
+                "event" => "push",
+                "head_branch" => "main",
+                "head_sha" => @sha,
+                "status" => "completed",
+                "conclusion" => "failure",
+                "html_url" => "https://github.com/mkreyman/infra/actions/runs/7"
+              }
+            ],
+            else: []
+
+        case conn.request_path do
+          "/repos/mkreyman/infra/actions/runs" ->
+            Req.Test.json(conn, %{"total_count" => length(runs), "workflow_runs" => runs})
+
+          _tag_ref ->
+            Plug.Conn.send_resp(conn, 404, "{}")
+        end
+      end)
+
+      {run, job} = ci_run(setup_ctx())
+      assert :ok = VerificationRunnerWorker.perform(job)
+
+      {:ok, done} = Verification.get_run(run.tenant_id, run.id)
+      assert done.status == "fail"
+      assert done.ac_results["url"] == "https://github.com/mkreyman/infra/actions/runs/7"
+    end
+
+    test "a rate limit is waited out, not answered with a clone and a local test run" do
+      stub_ci(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "120")
+        |> Plug.Conn.send_resp(429, "{}")
+      end)
+
+      {_run, job} = ci_run(setup_ctx())
+      assert {:snooze, 120} = VerificationRunnerWorker.perform(job)
+    end
+
+    test "no CI evidence falls back AND records why, so a missing token scope is visible" do
+      stub_ci(&Req.Test.json(&1, %{"total_count" => 0, "workflow_runs" => []}))
+
+      {run, job} = ci_run(setup_ctx())
+      assert :ok = VerificationRunnerWorker.perform(job)
+
+      {:ok, done} = Verification.get_run(run.tenant_id, run.id)
+      assert done.ac_results["ci_unavailable_reason"] == inspect(:no_workflow_runs)
+    end
+  end
 end

@@ -146,7 +146,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       from(s in "stories",
         join: p in "projects",
         on: s.project_id == p.id,
-        where: s.id == ^run.story_id and s.tenant_id == ^tenant_id,
+        # Schemaless: an uncast UUID string is refused by Postgrex, which crashed every run
+        # that had a commit to check before it reached CI (#914).
+        where:
+          s.id == type(^run.story_id, :binary_id) and
+            s.tenant_id == type(^tenant_id, :binary_id),
         select: p.repo_url,
         limit: 1
       )
@@ -157,9 +161,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         {:ok, :ci_checked} ->
           :ok
 
-        {:error, :ci_unavailable} ->
+        {:error, {:ci_unavailable, reason}} ->
           # L3 fallback: independent test re-execution
-          do_local_test_run(run, repo_url)
+          do_local_test_run(run, repo_url, reason)
 
         other ->
           other
@@ -172,28 +176,39 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
 
   defp do_ci_check(run, repo_url) do
     case @ci_adapter.get_status(repo_url, run.commit_sha) do
-      {:ok, %{conclusion: "success"}} ->
-        {:ok, _} = Verification.complete_run(run, "pass", %{"source" => "ci"})
+      {:ok, %{conclusion: "success"} = status} ->
+        {:ok, _} = Verification.complete_run(run, "pass", ci_results(status))
         {:ok, :ci_checked}
 
-      {:ok, %{conclusion: "failure"}} ->
-        {:ok, _} = Verification.complete_run(run, "fail", %{"source" => "ci"})
+      {:ok, %{conclusion: "failure"} = status} ->
+        {:ok, _} = Verification.complete_run(run, "fail", ci_results(status))
         {:ok, :ci_checked}
 
       {:ok, %{status: "in_progress"}} ->
         {:snooze, 60}
 
+      # A rate limit clears on its own: wait it out rather than clone and re-run the suite.
+      {:error, {:github_rate_limited, _status, delay}} when is_integer(delay) and delay > 0 ->
+        {:snooze, delay}
+
       {:ok, %{conclusion: other}} ->
         Logger.warning("VerificationRunner: unexpected CI conclusion: #{inspect(other)}")
-        {:error, :ci_unavailable}
+        {:error, {:ci_unavailable, {:unexpected_conclusion, other}}}
 
-      {:error, _reason} ->
-        {:error, :ci_unavailable}
+      {:error, reason} ->
+        Logger.warning("VerificationRunner: no CI verdict for run #{run.id}: #{inspect(reason)}")
+        {:error, {:ci_unavailable, reason}}
     end
   end
 
+  # The run the verdict came from, so an operator can open the failing workflow.
+  defp ci_results(%{url: url}) when is_binary(url) and url != "",
+    do: %{"source" => "ci", "url" => url}
+
+  defp ci_results(_status), do: %{"source" => "ci"}
+
   # L3: independent test re-execution — clone repo, run tests, check results
-  defp do_local_test_run(run, repo_url) do
+  defp do_local_test_run(run, repo_url, ci_reason) do
     alias Loopctl.Verification.TestRunner
 
     Logger.info("VerificationRunner: falling back to local test execution for #{run.id}")
@@ -203,6 +218,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         {:ok, _} =
           Verification.complete_run(run, results.status, %{
             "source" => "local_test_runner",
+            "ci_unavailable_reason" => inspect(ci_reason),
             "tests_run" => results.tests_run,
             "tests_passed" => results.tests_passed,
             "tests_failed" => results.tests_failed
@@ -212,7 +228,13 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
 
       {:error, reason} ->
         Logger.error("VerificationRunner: local test run failed: #{inspect(reason)}")
-        {:ok, _} = Verification.complete_run(run, "error", %{"local_error" => inspect(reason)})
+
+        {:ok, _} =
+          Verification.complete_run(run, "error", %{
+            "local_error" => inspect(reason),
+            "ci_unavailable_reason" => inspect(ci_reason)
+          })
+
         :ok
     end
   end

@@ -34,7 +34,9 @@ defmodule Loopctl.Verification.GitHubActions do
   end
 
   defp repo_full_name(url) do
-    case Regex.run(~r|github\.com[:/]([^/]+)/([^/.]+)|, url) do
+    # The repository name may contain dots (`loopctl.com`); only a trailing `.git` is not
+    # part of it.
+    case Regex.run(~r|github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$|, url) do
       [_, owner, repo] -> {:ok, owner <> "/" <> repo}
       _ -> {:error, {:unrecognized_repo_url, url}}
     end
@@ -63,33 +65,40 @@ defmodule Loopctl.Verification.GitHubActions do
 
   @doc """
   The CI verdict for a commit's workflow runs, as `GitHubPullRequestSource.commit_ci_runs/2`
-  returns them (newest run per workflow, event and branch).
+  returns them.
 
-    * any run not `completed` - `in_progress`; the caller snoozes until it finishes;
-    * a run that concluded `skipped` or `neutral` did not run the commit's CI and is left
-      out;
-    * any remaining run that did not succeed and was not cancelled - `failure`, with that
-      run's URL;
+    * any run queued or running - `in_progress`; the caller snoozes until it finishes;
+    * a completed run that concluded `skipped` or `neutral` did not run the commit's CI and
+      is left out;
+    * any other completed run that did not succeed and was not cancelled - `failure`, with
+      that run's URL;
+    * otherwise a run `waiting` on an environment approval - `{:error, :ci_waiting}`: it can
+      wait for weeks, so it is no evidence rather than a wait;
     * otherwise a `cancelled` run - `{:error, :ci_cancelled}`. A run cancelled by a newer
-      push (`cancel-in-progress`) says nothing about this commit, so it is no evidence
-      rather than a failure, and the caller falls back to local re-execution;
+      push (`cancel-in-progress`) says nothing about this commit;
     * nothing left at all - `{:error, :no_workflow_runs}`: a repository without Actions CI,
       or a commit a path filter skipped, is no evidence either, never a pass. (An empty
       list once read as SUCCESS, since `Enum.all?/2` of nothing is true.)
     * otherwise - `success`.
+
+  Every error is no CI evidence, and the caller falls back to local re-execution.
   """
   @spec summarize_workflow_runs([map()]) ::
           {:ok, %{status: String.t(), conclusion: String.t() | nil, url: String.t()}}
-          | {:error, :ci_cancelled | :no_workflow_runs}
+          | {:error, :ci_waiting | :ci_cancelled | :no_workflow_runs}
   def summarize_workflow_runs(runs) do
-    counted = Enum.reject(runs, &(&1.status == "completed" and &1.conclusion in @not_run))
+    counted =
+      Enum.filter(runs, &(&1.status == "completed" and &1.conclusion not in @not_run))
 
     cond do
-      Enum.any?(runs, &(&1.status != "completed")) ->
+      Enum.any?(runs, &(&1.status not in ["completed", "waiting"])) ->
         {:ok, %{status: "in_progress", conclusion: nil, url: ""}}
 
       failed = Enum.find(counted, &(&1.conclusion not in ["success", "cancelled"])) ->
         {:ok, %{status: "completed", conclusion: "failure", url: failed.url || ""}}
+
+      Enum.any?(runs, &(&1.status == "waiting")) ->
+        {:error, :ci_waiting}
 
       Enum.any?(counted, &(&1.conclusion == "cancelled")) ->
         {:error, :ci_cancelled}
