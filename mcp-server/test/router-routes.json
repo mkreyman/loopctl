@@ -246,6 +246,7 @@
     ["POST","/api/v1/stories/:id/review-complete","LoopctlWeb.ReviewRecordController",":create"],
     ["GET","/api/v1/stories/:id/stage","LoopctlWeb.StoryEscalationController",":show"],
     ["POST","/api/v1/stories/:id/stage/resolve","LoopctlWeb.StoryEscalationController",":resolve"],
+    ["POST","/api/v1/stories/:id/stage/transitions","LoopctlWeb.StoryStageReportController",":create"],
     ["POST","/api/v1/stories/:id/start","LoopctlWeb.StoryStatusController",":start"],
     ["POST","/api/v1/stories/:id/start-work","LoopctlWeb.StoryStatusController",":start"],
     ["GET","/api/v1/stories/:id/thread","LoopctlWeb.ThreadController",":show"],

@@ -20,6 +20,7 @@ import {
   recordCheckpoint,
   recordEntry,
   recordFix,
+  reportStage,
   requestReview,
 } from "../lib/threads.js";
 
@@ -267,6 +268,46 @@ describe("thread_fix", () => {
   });
 });
 
+describe("reportStage (US-45.9)", () => {
+  test("posts the transition on the claim key, with head_sha as the effect", async () => {
+    const { apiCall, calls } = fakeApi();
+
+    await reportStage(
+      { story_id: STORY_ID, claim_epoch: 4, from: "pr_open", to: "ci", head_sha: SHA },
+      { apiCall, env: ENV },
+    );
+
+    assert.deepEqual(calls, [
+      {
+        method: "POST",
+        path: `/api/v1/stories/${STORY_ID}/stage/transitions`,
+        body: { claim_epoch: 4, from: "pr_open", to: "ci", effects: { head_sha: SHA } },
+        key: "agent-key",
+        keyHint: "LOOPCTL_AGENT_KEY",
+      },
+    ]);
+  });
+
+  test("sends no effects without a head_sha, and refuses a missing epoch before any call", async () => {
+    const { apiCall, calls } = fakeApi();
+
+    await reportStage(
+      { story_id: STORY_ID, claim_epoch: 4, from: "claimed", to: "worktree" },
+      { apiCall, env: ENV },
+    );
+
+    assert.deepEqual(calls[0].body, { claim_epoch: 4, from: "claimed", to: "worktree" });
+
+    const refused = await reportStage(
+      { story_id: STORY_ID, from: "claimed", to: "worktree" },
+      { apiCall, env: ENV },
+    );
+
+    assert.equal(refused.error, true);
+    assert.equal(calls.length, 1);
+  });
+});
+
 describe("wiring", () => {
   for (const [tool, handler] of [
     ["thread_get", "threadGet"],
@@ -275,6 +316,7 @@ describe("wiring", () => {
     ["thread_request_review", "threadRequestReview"],
     ["thread_review_get", "threadReviewGet"],
     ["thread_fix", "threadFix"],
+    ["thread_stage_report", "threadStageReport"],
   ]) {
     test(`${tool} is declared, dispatched and documented`, () => {
       assert.ok(INDEX_SRC.includes(`name: "${tool}"`), `${tool} not declared`);

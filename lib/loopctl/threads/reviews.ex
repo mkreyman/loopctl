@@ -24,10 +24,15 @@ defmodule Loopctl.Threads.Reviews do
   ## Separation
 
   The reviewer is the runner's AGENT. It is refused `reviewer_not_separate` when it is the
-  story's claimant, when it recorded a checkpoint of the thread, or when it is the agent of any
-  dispatch on the implementer's lineage CHAIN, above or below the implementer
+  story's claimant, when it recorded a checkpoint of the thread under any claim, or when it is
+  the agent of any dispatch on the implementer's lineage CHAIN, above or below the implementer
   (`Loopctl.Dispatches.lineage_same_chain?/2`, the comparison the custody gates use). Decided
   at placement and again, under the thread lock, on every judgement.
+
+  A claim a session made ITSELF (US-45.9) may carry no dispatch lineage at all: a key no
+  dispatch minted. It has no chain to compare, so its separation is the first two clauses,
+  agent identity, which is how the custody gates separate a pre-dispatch story. The reviewer is
+  still a runner's agent, reporting over a socket the implementing session cannot write to.
 
   ## Rounds and the ceiling
 
@@ -188,19 +193,6 @@ defmodule Loopctl.Threads.Reviews do
   end
 
   @doc false
-  @spec implementer_dispatched(Story.t()) :: :ok | refusal()
-  def implementer_dispatched(%Story{implementer_dispatch_id: nil}),
-    do:
-      refuse(
-        :conflict,
-        "implementer_dispatch_required",
-        "the story's claim was not made by a dispatch, so there is no implementer lineage " <>
-          "for a review to be separate from"
-      )
-
-  def implementer_dispatched(%Story{}), do: :ok
-
-  @doc false
   # The claim a review reads is still the story's: the same epoch, and still held. A
   # force-unclaim or a release leaves the epoch where it was and clears the claimant, so the
   # epoch alone does not say the claim is over.
@@ -242,11 +234,15 @@ defmodule Loopctl.Threads.Reviews do
   # lineage chain — an ancestor of the implementer, the implementer itself, or anything below.
   @spec reviewer_separate(Ecto.UUID.t(), Story.t(), Ecto.UUID.t()) :: :ok | refusal()
   def reviewer_separate(tenant_id, story, agent_id) do
-    if story.assigned_agent_id == agent_id or
-         recorded_checkpoint?(tenant_id, story, agent_id) or
-         on_implementer_chain?(tenant_id, story, agent_id),
-       do: not_separate(),
-       else: :ok
+    if story.assigned_agent_id == agent_id or recorded_checkpoint?(tenant_id, story, agent_id) do
+      not_separate()
+    else
+      case on_implementer_chain?(tenant_id, story, agent_id) do
+        false -> :ok
+        true -> not_separate()
+        :unresolvable -> unresolvable_lineage()
+      end
+    end
   end
 
   defp recorded_checkpoint?(tenant_id, story, agent_id) do
@@ -263,10 +259,14 @@ defmodule Loopctl.Threads.Reviews do
   defp on_implementer_chain?(_tenant_id, %Story{implementer_dispatch_id: nil}, _agent_id),
     do: false
 
+  # A DECLARED implementer dispatch whose lineage cannot be loaded (deleted, unreadable) is
+  # `:unresolvable` and refuses, never passes: the custody gates fail closed on exactly this
+  # (`unresolvable_dispatch_lineage`), and with the dispatch-required refusal gone this check
+  # is the only thing standing between the implementer's own tree and its review.
   defp on_implementer_chain?(tenant_id, story, agent_id) do
     case implementer_lineage(tenant_id, story.implementer_dispatch_id) do
       [] ->
-        false
+        :unresolvable
 
       [root | _] = implementer ->
         from(d in Dispatch,
@@ -286,6 +286,15 @@ defmodule Loopctl.Threads.Reviews do
         select: d.lineage_path
     ) || []
   end
+
+  defp unresolvable_lineage,
+    do:
+      refuse(
+        :conflict,
+        "unresolvable_dispatch_lineage",
+        "the dispatch that made this claim is recorded but its lineage cannot be read, so " <>
+          "no reviewer can be shown separate from it"
+      )
 
   defp not_separate,
     do:

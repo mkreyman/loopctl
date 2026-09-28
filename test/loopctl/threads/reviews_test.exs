@@ -237,10 +237,32 @@ defmodule Loopctl.Threads.ReviewsTest do
       assert "no_checkpoint" == code(place(ctx))
     end
 
-    test "a claim no dispatch made has no implementer to be separate from", ctx do
+    test "a claim no dispatch made is separated by agent identity alone (US-45.9)", ctx do
       checkpoint(ctx, 1)
       set_story(ctx, implementer_dispatch_id: nil)
-      assert "implementer_dispatch_required" == code(place(ctx))
+
+      assert "reviewer_not_separate" == code(place(ctx, agent_id: ctx.implementer.id))
+
+      checkpoint(ctx, 2, author_principal: "agent:#{ctx.spare.id}")
+      assert "reviewer_not_separate" == code(place(ctx, agent_id: ctx.spare.id))
+
+      assert {:ok, _review, :created} = place(ctx)
+    end
+
+    test "a declared implementer dispatch whose lineage cannot be read refuses, never passes",
+         ctx do
+      checkpoint(ctx, 1)
+
+      # The FK keeps the id pointing at a row; what can still fail is reading its lineage.
+      {:ok, %{num_rows: 1}} =
+        Loopctl.Repo.with_tenant(ctx.tenant_id, fn ->
+          Loopctl.Repo.query!(
+            "UPDATE dispatches SET lineage_path = '{}' WHERE id = $1",
+            [Ecto.UUID.dump!(ctx.session.id)]
+          )
+        end)
+
+      assert "unresolvable_dispatch_lineage" == code(place(ctx))
     end
 
     test "never for the claimant, a checkpoint recorder, or an agent on the implementer's chain",

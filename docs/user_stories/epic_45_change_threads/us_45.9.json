@@ -21,7 +21,7 @@
     },
     {
       "id": "AC-45.9.2",
-      "description": "The claimant of an interactive THREAD claim may report stage transitions for its own claim over HTTP, limited to `StageMachine`'s runner-reportable edges, under the claim's current epoch with a live lease, carrying `head_sha` where a runner's report carries it. An interactive thread claim of a story whose stage row is at `queued` moves it to `implementing` in the claim's transaction, and a story with no row gets one at `implementing`. A `pr` claim does neither. The CI-wait clock therefore starts when the claimant reports `ci` for a checkpoint, never at the claim."
+      "description": "The claimant of an interactive THREAD claim may report stage transitions for its own claim over HTTP, limited to `StageMachine`'s runner-reportable edges minus the merge (never into `merged` and never `merge_refused`: in thread mode loopctl's App makes and records the merge; after it, `merged -> deployed` with its `release_id` and the session escalation, which nothing else writes for a claim with no runner), under the claim's current epoch with a live lease, carrying `head_sha` where a runner's report carries it. An interactive thread claim is recorded only for a story whose stage row is at `queued` (one triage queued: Gate A refuses a story no triage recorded, so nothing else could merge in thread mode). The row moves `queued -> claimed` as control at the claimant's FIRST stage report, not at the claim, so a claim released before any work was reported requeues nothing and spends no retry attempt. Any other claim records a `pr` route. The CI-wait clock therefore starts when the claimant reports `ci` for a checkpoint, never at the claim."
     },
     {
       "id": "AC-45.9.3",
@@ -61,8 +61,8 @@
       "name": "the claimant moves its own stage and nothing more",
       "type": "unit",
       "preconditions": ["an intake-born story at queued; an interactive thread claim"],
-      "steps": ["claim; report implementing to ci with the checkpoint's head; report an edge outside the runner allowlist; report as a non-claimant; report under an old epoch"],
-      "expected_results": ["queued becomes implementing at claim; ci with head_sha recorded and entered_at at the report; the other three refused"]
+      "steps": ["claim; report claimed through ci with the checkpoint's head; report an edge outside the runner allowlist; report as a non-claimant; report under an old epoch"],
+      "expected_results": ["queued becomes claimed at claim; ci with head_sha recorded and entered_at at the report; the other three refused"]
     },
     {
       "id": "TC-45.9.4",
@@ -78,9 +78,9 @@
       "verifies": ["AC-45.9.2", "AC-45.9.4"],
       "name": "end to end, interactive claim to executor merge",
       "type": "integration",
-      "preconditions": ["a hand-made story with no stage row on a thread-mode source; a runner that reviews"],
+      "preconditions": ["a triaged story queued on a thread-mode source; a runner that reviews"],
       "steps": ["claim, checkpoint, report ci, request review, verdict clean, CI green, run the executor"],
-      "expected_results": ["a row at implementing from the claim; the gate allows; the executor squashes the checkpoint onto the base recorded at the claim"]
+      "expected_results": ["the row at claimed from the claim; the gate allows; the executor squashes the checkpoint onto the base recorded at the claim"]
     }
   ],
   "technical_notes": [

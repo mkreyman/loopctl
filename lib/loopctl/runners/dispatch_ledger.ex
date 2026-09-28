@@ -134,6 +134,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
+  alias Loopctl.Delivery.ClaimRoute
   alias Loopctl.LocalGuc
   alias Loopctl.Progress
   alias Loopctl.Repo
@@ -973,13 +974,41 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   @doc """
   The rows a claim's ROUTE is chosen from, before the story, the claim and the newest are
-  picked: implement rows a runner ACCEPTED. `claim_route_query/2` narrows it to one story's
-  current claim; `Loopctl.Workers.ThreadMergeSweepWorker` narrows it per candidate row. One
-  copy of the rule, so the two cannot disagree about which claims are thread claims.
+  picked: implement rows a runner ACCEPTED, and the route an INTERACTIVE claim recorded when a
+  session claimed the story itself (`Loopctl.Delivery.ClaimRoute`, US-45.9). A claim has one
+  or the other, never both: a placement claims with the placement marker, which records no
+  interactive route. `claim_route_query/2` narrows it to one story's current claim;
+  `Loopctl.Workers.ThreadMergeSweepWorker` narrows it per candidate row. One copy of the rule,
+  so no reader can disagree with another about which claims are thread claims.
   """
   @spec route_rows_query() :: Ecto.Query.t()
   def route_rows_query do
-    from(r in DispatchRecord, where: r.status in ^@route_statuses) |> where_implement_kind()
+    placed =
+      from(r in DispatchRecord, where: r.status in ^@route_statuses)
+      |> where_implement_kind()
+      |> select([r], %{
+        tenant_id: r.tenant_id,
+        story_id: r.story_id,
+        claim_epoch: r.claim_epoch,
+        inserted_at: r.inserted_at,
+        mode: r.mode,
+        branch: r.branch,
+        base_branch: r.base_branch
+      })
+
+    claimed =
+      from c in ClaimRoute,
+        select: %{
+          tenant_id: c.tenant_id,
+          story_id: c.story_id,
+          claim_epoch: c.claim_epoch,
+          inserted_at: c.inserted_at,
+          mode: c.mode,
+          branch: c.branch,
+          base_branch: c.base_branch
+        }
+
+    from(r in subquery(union_all(placed, ^claimed)))
   end
 
   defp session_of(%DispatchRecord{} = record) do

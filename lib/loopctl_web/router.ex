@@ -457,6 +457,8 @@ defmodule LoopctlWeb.Router do
     # are any principal's; reads stay open.
     get "/stories/:id/thread", ThreadController, :show
     post "/stories/:id/thread/checkpoints", ThreadController, :checkpoint
+    # US-45.9: the claimant of an interactive thread claim reports its own stages.
+    post "/stories/:id/stage/transitions", StoryStageReportController, :create
     post "/stories/:id/thread/entries", ThreadController, :entry
     # US-45.3: review on the thread. An orchestrator REQUESTS a review, which loopctl places on
     # a runner as a dispatch of kind `review`; its findings and verdict come back over the

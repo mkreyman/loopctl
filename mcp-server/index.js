@@ -53,6 +53,7 @@ import {
   recordCheckpoint as recordCheckpointRequest,
   recordEntry as recordEntryRequest,
   recordFix as recordFixRequest,
+  reportStage as reportStageRequest,
   requestReview as requestReviewRequest,
 } from "./lib/threads.js";
 import {
@@ -1255,6 +1256,10 @@ async function threadReviewGet(args) {
 
 async function threadFix(args) {
   return toContent(await recordFixRequest(args, { apiCall: threadApiCall }));
+}
+
+async function threadStageReport(args) {
+  return toContent(await reportStageRequest(args, { apiCall: threadApiCall }));
 }
 
 async function startStory({ story_id, capability }) {
@@ -4429,7 +4434,13 @@ const TOOLS = [
     name: "claim_story",
     description:
       "Agent claims a contracted story. Uses pessimistic locking to prevent double-claims. " +
-      "Transitions contracted -> assigned. Uses the AGENT key. On a loopctl with claim leases " +
+      "Transitions contracted -> assigned. Uses the AGENT key. On a THREAD-mode repository " +
+      "(its intake source's mode) a claim of a story queued by triage is an interactive " +
+      "change thread (US-45.9): push checkpoints to the loop/ branch and record them with " +
+      "thread_checkpoint, move the story's stage with thread_stage_report, get a runner " +
+      "review with thread_request_review, and loopctl's App merges the checkpoint the gate " +
+      "allows. The mode, base branch and branch are bound when you claim, and the result's " +
+      "`route` names them: push your checkpoints to `route.branch`. On a loopctl with claim leases " +
       "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
       "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
       "is released back to pending under you. Refused 409 story_held when the story's " +
@@ -4454,7 +4465,9 @@ const TOOLS = [
     description:
       "Renew your claim's lease (POST /api/v1/stories/:id/renew-claim): claimed_until becomes " +
       "now plus the lease length (default 24 hours), measured from NOW. Call it well inside the " +
-      "lease on any story you hold longer than it. A DRIVER-PLACED claim (one a placement took " +
+      "lease on any story you hold longer than it. An interactive thread claim (US-45.9) has no " +
+      "runner keeping it alive: when its lease lapses its checkpoints and stage reports are " +
+      "refused and the thread ends with the claim. A DRIVER-PLACED claim (one a placement took " +
       "for a runner dispatch) is CAPPED AT ITS DISPATCH DEADLINE (claim_lease_cap: " +
       "placed_at + wall_clock_seconds + DISPATCH_LEASE_GRACE_SECONDS at the claim, which is " +
       "the dispatch's deadline_at; moved forward to a resume's time or the runner's " +
@@ -8282,6 +8295,50 @@ const TOOLS = [
     },
   },
   {
+    name: "thread_stage_report",
+    description:
+      "REPORT A STAGE TRANSITION of the story you hold, when you claimed it YOURSELF on a " +
+      "thread-mode repository (POST /api/v1/stories/:id/stage/transitions, US-45.9). An " +
+      "interactive claim of a thread-mode story is a change thread with no runner, so you " +
+      "move its delivery stage the way a runner would: `claimed` -> `worktree` " +
+      "-> `implementing` -> `reviewing` -> `pr_open` -> `ci`, passing `head_sha` (the " +
+      "checkpoint you want merged) ONLY when you enter `ci`; `ci_red`, `review_findings` and " +
+      "`base_moved` send it back to `implementing`. Never into `merged` and never " +
+      "`merge_refused`: loopctl's App makes the merge and records it. After it, report " +
+      "`merged` -> `deployed` with the `release_id` once the deploy lands. Your first report " +
+      "(from `claimed`) enters the claim. Travels on the key claim_story claims " +
+      "with. A resend of a report that already landed answers 200 with `replayed: true`. " +
+      "Refusals: 404 (not your tenant's story); 409 `not_claimant`, `stale_claim_epoch`, " +
+      "`claim_not_live` (your lease lapsed, renew it with renew_story_claim while you work, " +
+      "or you requested review), `not_interactive_thread_claim` (a placed claim, whose runner " +
+      "reports for it, or a pr-mode claim), `effect_conflict` (a different `head_sha` is already recorded; the body names it), " +
+      "`stale_stage` (the story is elsewhere; the body " +
+      "names its stage and recorded effects); 422 `invalid_payload` (a transition or effect " +
+      "you may not report); 503 `busy` (retry).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The story UUID." },
+        claim_epoch: { type: "integer", description: "The epoch your claim returned." },
+        from: { type: "string", description: "The stage the story is at." },
+        to: { type: "string", description: "The stage to move it to." },
+        edge: {
+          type: "string",
+          description: "Which transition when from -> to has more than one; default `forward`.",
+        },
+        reason: {
+          type: "string",
+          description: "Required entering `escalated` and on `merge_refused`; stored as untrusted text.",
+        },
+        head_sha: {
+          type: "string",
+          description: "The checkpoint commit, full lowercase hex, when entering `ci`.",
+        },
+      },
+      required: ["story_id", "claim_epoch", "from", "to"],
+    },
+  },
+  {
     name: "thread_checkpoint",
     description:
       "RECORD A CHECKPOINT on the story you hold (POST /api/v1/stories/:id/thread/" +
@@ -8340,7 +8397,9 @@ const TOOLS = [
       "REQUEST A REVIEW of a story's change thread (POST /api/v1/stories/:id/thread/reviews). " +
       "loopctl places it on `runner_id` as a runner dispatch of kind `review` — the runner " +
       "must DECLARE `review` on join — for the next round, on the story's latest checkpoint " +
-      "of the current claim. It claims nothing and returns NO credential: the review's " +
+      "of the current claim. The claim may be a runner's or one a session made itself " +
+      "(US-45.9); either way the reviewer is the runner's agent, which may not be the claimant " +
+      "or an agent that recorded a checkpoint of the thread. It claims nothing and returns NO credential: the review's " +
       "findings and verdict come back over that runner's socket, never through this tool. " +
       "Rounds are counted per claim (a story claimed again starts at round 1). Round 2 " +
       "always follows round 1; round 3 only when a material round-2 finding names a checkpoint " +
@@ -8351,7 +8410,9 @@ const TOOLS = [
       "with the same one. Refusals: 403 for an agent key; 409 `no_checkpoint`, " +
       "`review_claim_ended` (no live claim to review), `review_ceiling_reached`, `reviewer_not_separate` (the runner's agent is the claimant, " +
       "recorded a checkpoint, or is on the implementer's lineage chain), " +
-      "`implementer_dispatch_required`, `dispatch_id_conflict`, `review_dispatch_refused` " +
+      "`unresolvable_dispatch_lineage` (the implementer's lineage cannot be read, so no " +
+      "reviewer can be shown separate: refused closed), " +
+      "`dispatch_id_conflict`, `review_dispatch_refused` " +
       "(the runner refused or superseded that review: place a new one with a new " +
       "`dispatch_id`), and the push's own " +
       "(`runner_not_connected`, `kind_not_supported`, `budget_unset`, ...); 422 " +
@@ -9936,6 +9997,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "thread_fix":
       return await threadFix(args);
+
+    case "thread_stage_report":
+      return await threadStageReport(args);
 
     case "resolve_escalation":
       return await resolveEscalation(args);

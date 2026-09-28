@@ -1647,7 +1647,6 @@ defmodule Loopctl.Threads do
     with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
          nil <- placed_before(tenant_id, story_id, dispatch_id, runner_id),
          :ok <- Reviews.claim_current(story, story.claim_epoch),
-         :ok <- Reviews.implementer_dispatched(story),
          {:ok, checkpoint} <- Reviews.latest_checkpoint(tenant_id, story),
          {:ok, round} <- Reviews.placeable_round(tenant_id, story),
          :ok <- Reviews.reviewer_separate(tenant_id, story, agent_id) do

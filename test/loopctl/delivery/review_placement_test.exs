@@ -734,6 +734,22 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       assert_reply ref, :error, %{reason: "reviewer_not_separate"}, @reply_timeout
     end
 
+    test "an implementer lineage that becomes unreadable is refused reviewer_not_separate", ctx do
+      %{dispatch_id: dispatch_id} = accepted_review!(ctx)
+
+      # Separation fails CLOSED (`unresolvable_dispatch_lineage`), and the runner hears the
+      # contract's permanent refusal rather than the catch-all's `internal_error`.
+      {:ok, %{num_rows: 1}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          Repo.query!("UPDATE dispatches SET lineage_path = '{}' WHERE id = $1", [
+            Ecto.UUID.dump!(ctx.session.id)
+          ])
+        end)
+
+      ref = finding(ctx, dispatch_id)
+      assert_reply ref, :error, %{reason: "reviewer_not_separate"}, @reply_timeout
+    end
+
     test "a round-2 ceiling with a material finding escalates the delivery stage", ctx do
       fixture(:story_stage, %{
         tenant_id: ctx.tenant_id,

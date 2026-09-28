@@ -241,6 +241,12 @@ defmodule Loopctl.Delivery.RunnerReviews do
     "review_claim_ended" => :review_claim_ended,
     "review_round_superseded" => :review_round_superseded,
     "reviewer_not_separate" => :reviewer_not_separate,
+    # US-45.9: the implementer's lineage cannot be read, so this runner cannot be SHOWN
+    # separate from it (`Loopctl.Threads.Reviews.reviewer_separate/3` fails closed). To the
+    # runner that is the same permanent refusal as a proven overlap: this agent may not judge
+    # this story, and resending the judgement cannot change it. Answered under the contract's
+    # existing code rather than the catch-all's retryable-looking `internal_error`.
+    "unresolvable_dispatch_lineage" => :reviewer_not_separate,
     "idempotency_key_reused" => :idempotency_key_reused
   }
 

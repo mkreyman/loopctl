@@ -207,6 +207,27 @@ All notable changes to loopctl are documented here.
   rescues it (`Loopctl.ObanConfig.lifeline_rescue_after_ms/0`). The terminal gate reads the
   tenant's LATEST run, where it used to block on any retained discarded or cancelled job.
 
+- **Interactive change threads (epic 45, US-45.9, #917).** A session that claims a story
+  itself (`claim_story`, no runner placement) on a thread-mode repository now gets a change
+  thread, as a runner placement does:
+  - The claim records its route (the source's mode and base branch, and a `loop/` branch) in
+    the new `claim_routes` table. The merge gate, the merge executor, the thread merge sweep
+    and the thread page's diff all read it, so re-moding or repointing a source affects only
+    later claims.
+  - The new `POST /api/v1/stories/:id/stage/transitions` (agent key, the claimant only) lets
+    the claimant of a thread claim of a story queued by triage report its stages as a runner
+    would, minus the merge, which loopctl's App makes and records; after it, `deployed`. Its
+    first report moves the stage row `queued -> claimed`, so a claim released before any
+    reported work spends no retry attempt. The claim response names the route (`route`) to
+    push checkpoints to.
+  - A runner reviews it. Review placement no longer refuses a claim made without a dispatch
+    (`implementer_dispatch_required` is gone); the reviewer is separated from it by agent
+    identity.
+  - A story that was never triaged still cannot merge in thread mode, because Gate A refuses
+    it.
+  - Migration `20260928100000_create_claim_routes` adds the table and needs no manual step.
+    MCP server 2.109.0 adds `thread_stage_report`.
+
 ### Changed
 
 - **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**

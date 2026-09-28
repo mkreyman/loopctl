@@ -640,6 +640,31 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec runner_reportable?(stage(), stage(), edge()) :: boolean()
   def runner_reportable?(from, to, edge), do: {from, to, edge} in @runner_transitions
 
+  # The claimant of an INTERACTIVE thread claim (US-45.9) reports what a runner reports, minus
+  # the MERGE. In thread mode loopctl's App makes the merge (`Loopctl.Delivery.MergeExecutor`)
+  # and records `ci -> merged` itself; a runner reporting `merged` describes a pull request IT
+  # merged, which a thread never has. Letting the implementing session enter `merged`, or undo
+  # one with `merge_refused`, would let it record (or erase) a merge the gate never allowed and
+  # no executor made.
+  #
+  # AFTER the merge it keeps the runner's two edges out of `merged`, because with no runner for
+  # the claim nothing else writes them: `merged -> deployed` (with its required `release_id`)
+  # and `merged -> escalated` on `:session_escalated`. Without them an interactively merged
+  # story sat at `merged` for good and post-deploy verification never ran. `deployed` is not
+  # the session's word on the outcome: `Loopctl.Delivery.PostDeployVerification` decides
+  # `verified` or `escalated` by comparing the deployed sha against the merge commit, so a
+  # false `deployed` escalates rather than completes.
+  @claimant_transitions for {_from, to, edge} = t <- @runner_transitions,
+                            to != :merged and edge != :merge_refused,
+                            do: t
+
+  @doc """
+  Whether the claimant of an interactive thread claim may report `{from, to, edge}`: a
+  runner-reportable transition that neither enters `merged` nor leaves it on `:merge_refused`.
+  """
+  @spec claimant_reportable?(atom(), atom(), atom()) :: boolean()
+  def claimant_reportable?(from, to, edge), do: {from, to, edge} in @claimant_transitions
+
   @doc "Every stage that appears as the SOURCE of a runner-reportable transition."
   @spec runner_from_stages() :: [stage()]
   def runner_from_stages, do: @runner_from_stages

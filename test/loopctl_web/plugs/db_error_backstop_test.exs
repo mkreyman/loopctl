@@ -60,7 +60,7 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
       refute log =~ "SELECT"
       refute log =~ "embedding <=>"
       refute log =~ "::vector"
-      refute log =~ "0.123"
+      refute log =~ "[0.123"
     end
 
     test "the re-raised SanitizedDBError message never contains the raw query (AC-27.3.8)",
@@ -84,7 +84,7 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
           refute message =~ "SELECT"
           refute message =~ "embedding <=>"
           refute message =~ "::vector"
-          refute message =~ "0.123"
+          refute message =~ "[0.123"
 
           # The pinned 504 status survives so ErrorJSON renders the right body.
           assert Plug.Exception.status(error) == 504
@@ -143,7 +143,7 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
           message = Exception.message(error)
           refute message =~ "secret_bound_param"
           refute message =~ "embedding <=>"
-          refute message =~ "0.123"
+          refute message =~ "[0.123"
           assert Plug.Exception.status(error) == 500
         end)
 

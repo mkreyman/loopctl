@@ -430,8 +430,7 @@ defmodule Loopctl.Delivery.Placement do
   The claim path's runner refusals (`:runner_not_provisioned`, `:runner_declines_work`,
   `:runner_exhausted`, `:not_authorized`), `:tenant_halted`, `:custody_tier_required`,
   `:insufficient_role`, `Loopctl.Threads.record_review/3`'s (`no_checkpoint`,
-  `review_ceiling_reached`, `reviewer_not_separate`, `implementer_dispatch_required`,
-  `dispatch_id_conflict`), and everything `Runners.dispatch/3` refuses.
+  `review_ceiling_reached`, `reviewer_not_separate`, `dispatch_id_conflict`), and everything `Runners.dispatch/3` refuses.
   """
   @spec place_review(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, %{review: Review.t(), dispatch_id: Ecto.UUID.t()}} | {:error, term()}
@@ -1365,6 +1364,8 @@ defmodule Loopctl.Delivery.Placement do
     placed_at = DateTime.utc_now()
 
     Progress.claim_story(tenant_id, story_id,
+      # US-45.9: a placed claim's route is its dispatch ledger row, not an interactive one.
+      placement: true,
       agent_id: agent_id,
       dispatch_id: session.id,
       lineage: session.lineage_path,
