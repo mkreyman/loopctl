@@ -1312,7 +1312,11 @@ defmodule LoopctlRunner.ControlTest do
     test "a run that never gets a worktree escalates from claimed", ctx do
       {pid, topic} = accepting_control(ctx, "stream")
       dispatch = story_dispatch()
-      git!(Path.join(ctx.root, "repo"), ["branch", dispatch["branch"]])
+      # A leftover branch carrying a commit that never shipped: an empty one is retired and
+      # re-cut, so only unshipped work makes the cut refuse.
+      repo = Path.join(ctx.root, "repo")
+      unshipped = git!(repo, ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "unshipped"])
+      git!(repo, ["branch", dispatch["branch"], unshipped])
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
 
       assert %{"from" => "claimed", "to" => "escalated", "reason" => reason} = next_stage()

@@ -236,10 +236,15 @@ defmodule LoopctlRunner.Run do
       {:ok, created} ->
         RunState.take_ownership(config.runs_dir, run_dir, path)
 
-        Trace.emit(trace, "worktree.created", run_seq, %{
-          "path" => path,
-          "reused" => created.reused
-        })
+        Trace.emit(
+          trace,
+          "worktree.created",
+          run_seq,
+          Map.merge(
+            %{"path" => path, "reused" => created.reused, "start" => created.start},
+            fetch_data(created.fetch)
+          )
+        )
 
         stage(opts, {:worktree, %{branch: story.branch, worktree_path: path}})
 
@@ -314,6 +319,12 @@ defmodule LoopctlRunner.Run do
       outcome
     end
   end
+
+  # A branch cut from the local base because origin's could not be fetched starts on stale code;
+  # the trace says so, with git's reason.
+  defp fetch_data(:ok), do: %{"fetch" => "ok"}
+  defp fetch_data(:skipped), do: %{"fetch" => "skipped"}
+  defp fetch_data({:error, error}), do: %{"fetch" => "failed", "fetch_error" => error}
 
   defp session_status(nil), do: "crashed"
   defp session_status(%{reason: :exited, exit_status: 0}), do: "succeeded"

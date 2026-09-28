@@ -182,6 +182,143 @@ defmodule LoopctlRunner.ReaperTest do
     end
   end
 
+  test "one reap fetches each repo's base once, however many of its orphans need it", ctx do
+    # Two crashed runs whose branches origin already carries by content: each removal asks origin,
+    # and asked separately that was one bounded network call per orphan, in series.
+    origin = Path.join(ctx.root, "origin.git")
+    git!(ctx.root, ["clone", "-q", "--bare", ctx.repo, origin])
+    git!(ctx.repo, ["remote", "add", "origin", origin])
+    count = Path.join(ctx.root, "fetches")
+    upload_pack = Path.join(ctx.root, "upload-pack")
+    File.write!(upload_pack, "#!/bin/sh\necho fetch >> #{count}\nexec git upload-pack \"$@\"\n")
+    File.chmod!(upload_pack, 0o755)
+    git!(ctx.repo, ["config", "remote.origin.uploadpack", upload_pack])
+
+    paths =
+      for id <- ~w(s1 s2) do
+        path = Worktree.path_for(ctx.repo, id)
+        {:ok, _} = Worktree.create(ctx.repo, path, "loop/" <> id, "master")
+        File.write!(Path.join(path, id <> ".txt"), id)
+        git!(path, ["add", id <> ".txt"])
+        git!(path, ["commit", "-q", "-m", id])
+        run_dir = Path.join(ctx.runs, id)
+        File.mkdir_p!(run_dir)
+
+        RunState.update(run_dir, %{
+          run_id: id,
+          status: "running",
+          beam_os_pid: dead_pid(),
+          repo_path: ctx.repo,
+          worktree: %{path: path, branch: "loop/" <> id, base: "master", status: "created"}
+        })
+
+        path
+      end
+
+    # What squash-merging both PRs leaves on origin: one commit carrying both branches' content.
+    tree = git!(ctx.repo, ["merge-tree", "--write-tree", "loop/s1", "loop/s2"])
+    squash = git!(ctx.repo, ["commit-tree", tree, "-p", "master", "-m", "squash"])
+    git!(ctx.repo, ["push", "-q", "origin", squash <> ":refs/heads/master"])
+    File.rm(count)
+
+    assert [_, _] = Reaper.reap(ctx.runs, 500)
+
+    for path <- paths, do: refute(File.dir?(path))
+    assert count |> File.read!() |> String.split("\n", trim: true) == ["fetch"]
+  end
+
+  test "the bases of different repos are fetched at the same time, not one after another", ctx do
+    # Each origin's upload-pack waits for the OTHER's to start, and fails when it has not within
+    # ten seconds: fetched in series the first fetch fails, and its shipped branch is kept.
+    rendezvous = Path.join(ctx.root, "rendezvous")
+    File.mkdir_p!(rendezvous)
+
+    paths =
+      for id <- ~w(a b) do
+        repo = git_repo!(Path.join(ctx.root, "repo-" <> id))
+        origin = Path.join(ctx.root, "origin-#{id}.git")
+        git!(ctx.root, ["clone", "-q", "--bare", repo, origin])
+        git!(repo, ["remote", "add", "origin", origin])
+        other = if id == "a", do: "b", else: "a"
+        upload_pack = Path.join(ctx.root, "upload-pack-" <> id)
+
+        File.write!(upload_pack, """
+        #!/bin/sh
+        touch #{rendezvous}/#{id}
+        i=0
+        while [ ! -e #{rendezvous}/#{other} ]; do
+          i=$((i + 1)); [ "$i" -gt 100 ] && exit 1; sleep 0.1
+        done
+        exec git upload-pack "$@"
+        """)
+
+        File.chmod!(upload_pack, 0o755)
+        path = Worktree.path_for(repo, "s1")
+        {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+        git!(repo, ["config", "remote.origin.uploadpack", upload_pack])
+        File.write!(Path.join(path, "work.txt"), id)
+        git!(path, ["add", "work.txt"])
+        git!(path, ["commit", "-q", "-m", "work"])
+        # What a squash merge leaves on origin: one new commit with the branch's content.
+        tree = git!(repo, ["rev-parse", "loop/s1^{tree}"])
+        squash = git!(repo, ["commit-tree", tree, "-p", "master", "-m", "squash"])
+        git!(repo, ["push", "-q", "origin", squash <> ":refs/heads/master"])
+
+        run_dir = Path.join(ctx.runs, id)
+        File.mkdir_p!(run_dir)
+
+        RunState.update(run_dir, %{
+          run_id: id,
+          status: "running",
+          beam_os_pid: dead_pid(),
+          repo_path: repo,
+          worktree: %{path: path, branch: "loop/s1", base: "master", status: "created"}
+        })
+
+        path
+      end
+
+    assert [_, _] = Reaper.reap(ctx.runs, 500)
+    for path <- paths, do: refute(File.dir?(path))
+  end
+
+  test "a reap whose orphans are clean or dirty makes no fetch at all", ctx do
+    # Neither asks origin: a clean tree is removed and a dirty one kept without comparing
+    # content. Fetching anyway cost up to thirty seconds per repo before every run, offline.
+    origin = Path.join(ctx.root, "origin.git")
+    git!(ctx.root, ["clone", "-q", "--bare", ctx.repo, origin])
+    git!(ctx.repo, ["remote", "add", "origin", origin])
+    count = Path.join(ctx.root, "fetches")
+    upload_pack = Path.join(ctx.root, "upload-pack")
+    File.write!(upload_pack, "#!/bin/sh\necho fetch >> #{count}\nexec git upload-pack \"$@\"\n")
+    File.chmod!(upload_pack, 0o755)
+    git!(ctx.repo, ["config", "remote.origin.uploadpack", upload_pack])
+
+    for id <- ~w(clean dirty) do
+      path = Worktree.path_for(ctx.repo, id)
+      {:ok, _} = Worktree.create(ctx.repo, path, "loop/" <> id, "master")
+      if id == "dirty", do: File.write!(Path.join(path, "wip.txt"), "uncommitted")
+      run_dir = Path.join(ctx.runs, id)
+      File.mkdir_p!(run_dir)
+
+      RunState.update(run_dir, %{
+        run_id: id,
+        status: "running",
+        beam_os_pid: dead_pid(),
+        repo_path: ctx.repo,
+        worktree: %{path: path, branch: "loop/" <> id, base: "master", status: "created"}
+      })
+    end
+
+    File.rm(count)
+
+    assert [_, _] = Reaper.reap(ctx.runs, 500)
+
+    refute File.dir?(Worktree.path_for(ctx.repo, "clean"))
+    assert File.dir?(Worktree.path_for(ctx.repo, "dirty"))
+    refute File.exists?(count)
+  end
+
   test "a teardown that failed to remove its worktree is retried", ctx do
     path = Worktree.path_for(ctx.repo, "s1")
     {:ok, _} = Worktree.create(ctx.repo, path, "loop/s1", "master")
@@ -305,6 +442,95 @@ defmodule LoopctlRunner.ReaperTest do
 
     assert [%{worktree: "held by live run adopter; not touched"}] = Reaper.reap(ctx.runs, 500)
     assert File.dir?(path)
+  end
+
+  describe "a tree that changes while origin is fetched" do
+    # The plan reads each tree before the fetch, which can take thirty seconds. Each origin's
+    # upload-pack below does something to the tree while that fetch is running.
+    test "is not removed once a live run has locked it", ctx do
+      path = Worktree.path_for(ctx.repo, "s1")
+      :ok = WorktreeLock.acquire(ctx.runs, path, "adopter")
+      [lock] = Path.wildcard(Path.join([ctx.runs, "locks", "*.lock"]))
+      File.rename!(lock, lock <> ".saved")
+      shipped_orphan!(ctx, path, "cp #{lock}.saved #{lock}")
+
+      assert [%{worktree: "held by live run adopter; not touched"}] = Reaper.reap(ctx.runs, 500)
+      assert File.dir?(path)
+    end
+
+    test "is removed when only the fetch changed what it reads as holding", ctx do
+      # Origin's base reaches the branch by history, which this repository learns only from the
+      # fetch: before it the branch holds a commit, after it nothing. Comparing those two answers
+      # read the fetch as the tree changing, and kept the branch.
+      origin = Path.join(ctx.root, "origin.git")
+      git!(ctx.root, ["clone", "-q", "--bare", ctx.repo, origin])
+      git!(ctx.repo, ["remote", "add", "origin", origin])
+      path = Worktree.path_for(ctx.repo, "s1")
+      {:ok, _} = Worktree.create(ctx.repo, path, "loop/s1", "master")
+      File.write!(Path.join(path, "work.txt"), "work")
+      git!(path, ["add", "work.txt"])
+      git!(path, ["commit", "-q", "-m", "work"])
+      # A fast-forward merge on origin that this repository has not fetched.
+      git!(origin, ["fetch", "-q", ctx.repo, "loop/s1:master"])
+      run_dir = Path.join(ctx.runs, "crashed")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(run_dir, %{
+        run_id: "crashed",
+        status: "running",
+        beam_os_pid: dead_pid(),
+        repo_path: ctx.repo,
+        worktree: %{path: path, branch: "loop/s1", base: "master", status: "created"}
+      })
+
+      assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+      assert worktree =~ ":removed"
+      refute File.dir?(path)
+      assert git!(ctx.repo, ["branch", "--list", "loop/s1"]) == ""
+    end
+
+    test "is kept when it gained uncommitted work", ctx do
+      path = Worktree.path_for(ctx.repo, "s1")
+      run_dir = shipped_orphan!(ctx, path, "echo wip > #{path}/wip.txt")
+
+      assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+      assert worktree =~ "changed while origin was fetched"
+      assert File.read!(Path.join(path, "wip.txt")) == "wip\n"
+      assert {:ok, %{"worktree" => %{"status" => "kept"}}} = RunState.read(run_dir)
+    end
+  end
+
+  # A crashed run whose one commit origin's base carries by a squash merge, so the reap asks origin,
+  # and origin's upload-pack runs `during_fetch` before serving. Returns the run's directory.
+  defp shipped_orphan!(ctx, path, during_fetch) do
+    origin = Path.join(ctx.root, "origin.git")
+    git!(ctx.root, ["clone", "-q", "--bare", ctx.repo, origin])
+    git!(ctx.repo, ["remote", "add", "origin", origin])
+    {:ok, _} = Worktree.create(ctx.repo, path, "loop/s1", "master")
+    File.write!(Path.join(path, "work.txt"), "work")
+    git!(path, ["add", "work.txt"])
+    git!(path, ["commit", "-q", "-m", "work"])
+    tree = git!(ctx.repo, ["rev-parse", "loop/s1^{tree}"])
+    squash = git!(ctx.repo, ["commit-tree", tree, "-p", "master", "-m", "squash"])
+    git!(ctx.repo, ["push", "-q", "origin", squash <> ":refs/heads/master"])
+
+    upload_pack = Path.join(ctx.root, "upload-pack")
+    File.write!(upload_pack, "#!/bin/sh\n#{during_fetch}\nexec git upload-pack \"$@\"\n")
+    File.chmod!(upload_pack, 0o755)
+    git!(ctx.repo, ["config", "remote.origin.uploadpack", upload_pack])
+
+    run_dir = Path.join(ctx.runs, "crashed")
+    File.mkdir_p!(run_dir)
+
+    RunState.update(run_dir, %{
+      run_id: "crashed",
+      status: "running",
+      beam_os_pid: dead_pid(),
+      repo_path: ctx.repo,
+      worktree: %{path: path, branch: "loop/s1", base: "master", status: "created"}
+    })
+
+    run_dir
   end
 
   test "a dead run whose pid a different process now holds is still reaped", ctx do

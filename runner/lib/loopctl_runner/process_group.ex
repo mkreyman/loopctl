@@ -259,10 +259,19 @@ defmodule LoopctlRunner.ProcessGroup do
 
   `System.cmd/3` has no timeout, and a probe that hangs must not wedge the session
   monitor that called it.
+
+  `env` adjusts its environment as `System.cmd/3`'s option does: `{name, nil}` removes a variable.
+  A name it supplies wins over the credential scrub below, because it comes AFTER it and the last
+  entry for a name is the one the child gets, so a caller that needs one of those names (the
+  runner's own git fetch needs the ssh agent) says so by name.
+
+  A Port child is its own session leader with no controlling terminal (measured on OTP 28, Linux
+  and macOS), so nothing it starts can prompt on the operator's tty, and on timeout its whole group
+  is killed — the children it started go with it, not only its own pid.
   """
-  @spec run(String.t(), [String.t()], pos_integer()) ::
+  @spec run(String.t(), [String.t()], pos_integer(), [{String.t(), String.t() | nil}]) ::
           {:ok, binary(), non_neg_integer()} | {:error, :timeout}
-  def run(executable, args, timeout_ms) do
+  def run(executable, args, timeout_ms, env \\ []) do
     port =
       Port.open({:spawn_executable, executable}, [
         :binary,
@@ -273,12 +282,19 @@ defmodule LoopctlRunner.ProcessGroup do
         # runs the CLI (the liveness probe is `claude agents --json`), and a hand-kept one-name
         # list here was a second security list with nothing binding it to the first — it still
         # said ANTHROPIC_API_KEY alone after that list grew to eight names and a shape deny.
-        # `@git_program_env` is deliberately not included: the probe runs no git.
+        # `@git_program_env` is deliberately not included, though this Port does run git: the
+        # runner's own `Worktree.fetch_base/2` goes through here and must reach origin with the
+        # operator's ssh program. It passes GIT_SSH_COMMAND itself, with BatchMode added, and
+        # inherits a GIT_SSH program as it is; scrubbing that would swap in plain ssh.
         env:
           Enum.map(
             Session.credential_env() ++ Session.credential_shaped_env(System.get_env()),
             &{to_charlist(&1), false}
-          )
+          ) ++
+            Enum.map(env, fn
+              {name, nil} -> {to_charlist(name), false}
+              {name, value} -> {to_charlist(name), to_charlist(value)}
+            end)
       ])
 
     {:os_pid, os_pid} = Port.info(port, :os_pid)

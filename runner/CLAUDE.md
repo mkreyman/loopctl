@@ -28,6 +28,27 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   marker and its launcher tree file: on macOS the marker is invisible for Apple binaries.
   `priv/bin/session-launcher.sh` does the same when the Port's pipe closes; `LoopctlRunner.Reaper`
   is the boot-time backstop.
+- **A story's worktree is cut from `origin`'s base and torn down by CONTENT** (`Worktree`). A new
+  branch is cut, `--no-track`, from `origin`'s copy of the base after a bounded fetch, and from the
+  local base when that fetch fails or the local base holds commits `origin`'s lacks, and the
+  `worktree.created` trace event names which, with git's error. A branch holding nothing
+  `origin`'s base lacks is RETIRED: teardown removes its tree and deletes it, and a re-dispatch
+  resets it to a fresh start inside the tree already there, keeping what the tree ignores. It
+  holds nothing when its tip IS the base's commit or a local base reaches it, or when a fetch made
+  for that decision shows `origin`'s base carrying its commits by history, by patch-id (`git
+  cherry` for a rebase merge, the branch's cumulative patch-id for a squash, so a later edit to the
+  same lines does not hide it) or by content (`git merge-tree`, for a squash whose conflicts were
+  resolved). A remote-tracking ref alone never vouches: any other commit keeps the branch, and so
+  does a failed fetch, named in the reason. A worktree is kept, branch and all, while a repository
+  nested in it holds work `git worktree remove --force` would take: uncommitted changes, or commits
+  that neither its remotes nor a submodule's recorded commit reach — for a nested worktree of the
+  same repository, a HEAD no branch reaches, since its branches outlive the tree. `deps`,
+  `_build`, `node_modules` and editor build dirs are not scanned. The fetch is the runner's own and
+  can never prompt (`Worktree.fetch_base/2`: stdin from /dev/null, `GIT_TERMINAL_PROMPT=0`, no
+  askpass, `credential.interactive=false`, ssh in BatchMode, the group killed at thirty seconds)
+  and writes only origin's ref. The reaper fetches each repo's base at most once per reap, all
+  repos at once, only when a removal asks origin, and removes a tree under its lock after checking
+  it still reads as it did before the fetch.
 - **The daemon's credential is a file readable by this user alone** (`control.token_file`,
   mode 600), sent only in the `x-loopctl-runner-token` header. Never put it in the config JSON,
   an environment variable a `claude` session inherits, or a URL.
@@ -81,8 +102,8 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   boundary the runner does not have yet.
 - **Parking is never "no writes under `subagents/`"** (design §8). See `LoopctlRunner.Liveness`.
 - **Fail closed.** A missing or malformed config refuses every dispatch.
-- **The runner commits, pushes and merges nothing** in step 1. Teardown keeps a branch that has
-  commits of its own rather than deleting work.
+- **The runner commits, pushes and merges nothing** in step 1. Teardown keeps a branch unless
+  `origin`'s base already carries its content, rather than deleting work.
 - **Tests never record environment VALUES.** The dev machines carry live credentials in the
   environment, and a failing assertion prints whatever it compared.
 

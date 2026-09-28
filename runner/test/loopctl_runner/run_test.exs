@@ -192,6 +192,15 @@ defmodule LoopctlRunner.RunTest do
     assert [%{"data" => %{"num_turns" => 2}}] = by_type["claude.result.success"]
 
     assert ["worktree.created" | _] = types(events) -- ["run.started"]
+    # The fixture has no origin: the branch is cut from the local base, and the trace says why.
+    assert [
+             %{
+               "data" => %{"start" => "master", "fetch" => "failed", "fetch_error" => fetch_error}
+             }
+           ] =
+             by_type["worktree.created"]
+
+    assert fetch_error =~ "git fetch exited "
     assert List.last(types(events)) == "run.finished"
     assert "worktree.removed" in types(events)
     refute File.dir?(worktree)
@@ -879,7 +888,10 @@ defmodule LoopctlRunner.RunTest do
   end
 
   test "a worktree failure is recorded and nothing is started", %{root: root, state: state} do
-    git!(Path.join(root, "repo"), ["branch", "loop/s1"])
+    # An earlier story's branch with a commit of its own: refused, never adopted or retired.
+    repo = Path.join(root, "repo")
+    earlier = git!(repo, ["commit-tree", "master^{tree}", "-p", "master", "-m", "earlier story"])
+    git!(repo, ["branch", "loop/s1", earlier])
     result = run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}])
 
     assert result.status == "failed"

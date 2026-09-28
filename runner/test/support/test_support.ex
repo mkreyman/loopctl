@@ -21,6 +21,27 @@ defmodule LoopctlRunner.TestSupport do
     dir
   end
 
+  # An ssh stand-in that records what it was given, the fetching git's stdin, and fails.
+  def recording_ssh!(dir) do
+    record = Path.join(dir, "ssh-record")
+    ssh = Path.join(dir, "record-ssh")
+
+    File.write!(ssh, """
+    #!/bin/sh
+    p=$PPID
+    while [ "$p" -gt 1 ]; do
+      case "$(ps -o comm= -p "$p")" in *git) break ;; esac
+      p=$(ps -o ppid= -p "$p" | tr -d ' ')
+    done
+    stdin=$(readlink "/proc/$p/fd/0" 2>/dev/null || lsof -a -p "$p" -d 0 -Fn 2>/dev/null | sed -n 's/^n//p')
+    printf '%s\n' "args=$*" "prompt=${GIT_TERMINAL_PROMPT-unset}" "stdin=$stdin" > #{record}
+    exit 1
+    """)
+
+    File.chmod!(ssh, 0o755)
+    {ssh, record}
+  end
+
   def git_repo!(dir) do
     File.mkdir_p!(dir)
     git!(dir, ["init", "-q", "-b", "master"])

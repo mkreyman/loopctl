@@ -301,6 +301,22 @@ defmodule LoopctlRunner.SessionLauncherTest do
     assert ProcessGroup.marked(ProcessGroup.marker("no-such-session")) == []
   end
 
+  test "ProcessGroup.run's timeout kills what the command started, not only the command" do
+    # The runner's own git fetch runs here, and ssh or a credential helper is its child: killed by
+    # pid alone, git would die and leave them running.
+    child = Path.join(tmp_dir!("run-group"), "child_pid")
+
+    assert {:error, :timeout} =
+             ProcessGroup.run("/bin/sh", ["-c", "sleep 30 & echo $! > #{child}; wait"], 300)
+
+    pid = child |> File.read!() |> String.trim()
+
+    :ok =
+      wait_until(fn ->
+        not match?({_, 0}, System.cmd("kill", ["-0", pid], stderr_to_stdout: true))
+      end)
+  end
+
   test "ProcessGroup.run kills a probe that outlives its timeout" do
     for _ <- 1..10 do
       assert {:error, :timeout} = ProcessGroup.run("/bin/sh", ["-c", "exec sleep 30"], 50)

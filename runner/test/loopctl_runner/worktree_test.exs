@@ -17,16 +17,81 @@ defmodule LoopctlRunner.WorktreeTest do
 
   test "adopts its own worktree on replay instead of creating a second", %{repo: repo, path: path} do
     {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
-    assert {:ok, %{reused: true}} = Worktree.create(repo, path, "loop/s1", "master")
+    File.write!(Path.join(path, "wip.txt"), "a crashed run's work")
+    assert {:ok, %{reused: true, start: nil}} = Worktree.create(repo, path, "loop/s1", "master")
     assert {:error, msg} = Worktree.create(repo, path, "loop/other", "master")
     assert msg =~ "exists on branch loop/s1"
   end
 
-  test "refuses a branch that already exists without a worktree", %{repo: repo, path: path} do
+  test "on replay, a tree holding no work starts afresh and keeps what it ignores", %{
+    repo: repo,
+    path: path
+  } do
+    # Adopting it would start the story from whatever base the crashed run was cut from; removing
+    # it and cutting again threw away the ignored build output, a full rebuild.
+    {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+    File.write!(Path.join([repo, ".git", "info", "exclude"]), "_build/\n")
+    File.mkdir_p!(Path.join(path, "_build"))
+    File.write!(Path.join([path, "_build", "app.beam"]), "compiled")
+    commit!(repo, "later.txt", "the base moved on")
+
+    assert {:ok, %{reused: false, start: "master"}} =
+             Worktree.create(repo, path, "loop/s1", "master")
+
+    assert git!(path, ["rev-parse", "HEAD"]) == git!(repo, ["rev-parse", "master"])
+    assert git!(path, ["rev-parse", "--abbrev-ref", "HEAD"]) == "loop/s1"
+    assert File.read!(Path.join([path, "_build", "app.beam"])) == "compiled"
+  end
+
+  test "on replay, a locked tree holding no work starts afresh instead of failing", %{
+    repo: repo,
+    path: path
+  } do
+    # `worktree remove --force` refuses a locked tree, which failed the whole dispatch.
+    {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+    git!(repo, ["worktree", "lock", path])
+
+    assert {:ok, %{reused: false, start: "master"}} =
+             Worktree.create(repo, path, "loop/s1", "master")
+
+    assert git!(repo, ["worktree", "list", "--porcelain"]) =~ "locked"
+  end
+
+  test "a stray directory at the path is never reset as if it were the story's tree", %{
+    repo: repo,
+    path: path
+  } do
+    # Git reads a plain directory under `.claude/` as part of the main tree: a checkout there
+    # would move the main tree's branch.
     git!(repo, ["branch", "loop/s1"])
+    File.write!(Path.join([repo, ".git", "info", "exclude"]), ".claude/\n")
+    File.mkdir_p!(path)
+
+    assert {:error, message} = Worktree.create(repo, path, "loop/s1", "master")
+    assert message =~ "not the top of a worktree"
+    assert git!(repo, ["rev-parse", "--abbrev-ref", "HEAD"]) == "master"
+  end
+
+  test "refuses a branch with unshipped commits that exists without a worktree", %{
+    repo: repo,
+    path: path
+  } do
+    {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+    commit!(path, "work.txt", "an earlier story's work")
+    git!(repo, ["worktree", "remove", "--force", path])
 
     assert {:error, "branch loop/s1 already exists without a worktree"} =
              Worktree.create(repo, path, "loop/s1", "master")
+  end
+
+  test "retires an empty branch left without a worktree, instead of refusing", %{
+    repo: repo,
+    path: path
+  } do
+    git!(repo, ["branch", "loop/s1"])
+
+    assert {:ok, %{reused: false}} = Worktree.create(repo, path, "loop/s1", "master")
+    assert git!(path, ["rev-parse", "--abbrev-ref", "HEAD"]) == "loop/s1"
   end
 
   test "refuses a base that does not exist locally", %{repo: repo, path: path} do
@@ -34,30 +99,29 @@ defmodule LoopctlRunner.WorktreeTest do
              Worktree.create(repo, path, "loop/s1", "origin/nope")
   end
 
-  test "teardown removes the worktree and its empty branch, even with dirty files", %{
+  test "teardown keeps a tree and branch the session committed to", %{repo: repo, path: path} do
+    {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+    commit!(path, "work.txt", "work")
+
+    assert %{worktree: {:kept, "commits beyond master" <> _}, branch: {:kept, _}} =
+             Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+    assert File.dir?(path)
+    assert git!(repo, ["branch", "--list", "loop/s1"]) =~ "loop/s1"
+  end
+
+  test "teardown keeps an untracked file that status.showUntrackedFiles hides", %{
     repo: repo,
     path: path
   } do
     {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
-    File.write!(Path.join(path, "scratch.txt"), "uncommitted")
+    git!(repo, ["config", "status.showUntrackedFiles", "no"])
+    File.write!(Path.join(path, "new.txt"), "never added")
 
-    assert %{worktree: :removed, branch: :deleted} =
-             Worktree.remove(repo, path, "loop/s1", "master")
+    assert %{worktree: {:kept, "uncommitted changes"}} =
+             Worktree.remove_if_clean(repo, path, "loop/s1", "master")
 
-    refute File.dir?(path)
-    assert git!(repo, ["branch", "--list", "loop/s1"]) == ""
-  end
-
-  test "teardown keeps a branch the session committed to", %{repo: repo, path: path} do
-    {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
-    File.write!(Path.join(path, "work.txt"), "work")
-    git!(path, ["add", "work.txt"])
-    git!(path, ["commit", "-q", "-m", "work"])
-
-    assert %{worktree: :removed, branch: {:kept, 1}} =
-             Worktree.remove(repo, path, "loop/s1", "master")
-
-    assert git!(repo, ["branch", "--list", "loop/s1"]) =~ "loop/s1"
+    assert File.read!(Path.join(path, "new.txt")) == "never added"
   end
 
   describe "remove_if_clean/4" do
@@ -78,7 +142,7 @@ defmodule LoopctlRunner.WorktreeTest do
       git!(path, ["add", "detached.txt"])
       git!(path, ["commit", "-q", "-m", "detached work"])
 
-      assert %{worktree: {:kept, "commits beyond master"}} =
+      assert %{worktree: {:kept, "commits beyond master" <> _}} =
                Worktree.remove_if_clean(repo, path, "loop/s1", "master")
     end
 
@@ -98,8 +162,596 @@ defmodule LoopctlRunner.WorktreeTest do
     end
   end
 
+  describe "a branch whose content origin's base already carries" do
+    # `gh pr merge --squash` lands the branch as ONE new commit on origin's base, so the branch's
+    # own commits are in no history the base has and `rev-list base..branch` stays above zero for
+    # ever. Without a content test teardown keeps it, and the next dispatch adopts work that
+    # shipped.
+    setup %{repo: repo, path: path} do
+      {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+      commit!(path, "work.txt", "work")
+      origin = Path.join(Path.dirname(repo), "origin.git")
+      git!(Path.dirname(repo), ["clone", "-q", "--bare", repo, origin])
+      git!(repo, ["remote", "add", "origin", origin])
+      {:ok, origin: origin}
+    end
+
+    test "teardown removes the worktree and deletes the branch",
+         %{repo: repo, path: path} = ctx do
+      squash_into_origin!(ctx.origin, "loop/s1")
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      refute File.dir?(path)
+      assert git!(repo, ["branch", "--list", "loop/s1"]) == ""
+    end
+
+    test "the branch is still recognised once origin's base has moved on past the squash",
+         %{repo: repo, path: path} = ctx do
+      # The ordinary case: other PRs merge after this one. The branch's tree is no longer origin's
+      # tree, so comparing trees directly would keep it; merging it in changes nothing.
+      squash_into_origin!(ctx.origin, "loop/s1")
+      other = Path.join(Path.dirname(ctx.origin), "other")
+      commit!(other, "later.txt", "a later PR")
+      git!(other, ["push", "-q", "origin", "master"])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a branch origin does NOT carry is kept, origin or not", %{repo: repo, path: path} do
+      # The same repo with an origin that never merged it: the fetch works, the content differs.
+      assert %{worktree: {:kept, "commits beyond master"}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert git!(repo, ["branch", "--list", "loop/s1"]) =~ "loop/s1"
+    end
+
+    test "commits only a stale remote-tracking ref reaches are asked of origin, and kept",
+         %{repo: repo, path: path} do
+      # Origin's ref as an earlier fetch left it, carrying the branch's commit, which origin has
+      # since dropped: counted against that ref alone the branch held nothing and was deleted.
+      tip = git!(repo, ["rev-parse", "loop/s1"])
+      stale = git!(repo, ["commit-tree", tip <> "^{tree}", "-p", tip, "-m", "dropped since"])
+      git!(repo, ["update-ref", "refs/remotes/origin/master", stale])
+
+      assert %{worktree: {:kept, "commits beyond master"}, branch: {:kept, _}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert git!(repo, ["rev-parse", "loop/s1"]) == tip
+    end
+
+    test "a fetch that fails keeps the branch, and the reason names it",
+         %{repo: repo, path: path} = ctx do
+      squash_into_origin!(ctx.origin, "loop/s1")
+      # A remote-tracking ref that already shows the squash, from an earlier fetch: only the
+      # failed fetch stands between it and a removal, so the test sees the failure being honoured.
+      git!(repo, ["fetch", "-q", "origin"])
+      git!(repo, ["remote", "set-url", "origin", Path.join(Path.dirname(repo), "no-such.git")])
+
+      assert %{worktree: {:kept, reason}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert reason =~ ~r/^commits beyond master; origin's master could not be fetched: .*no-such/
+    end
+
+    test "a later commit editing the same lines does not hide the squash",
+         %{repo: repo, path: path} = ctx do
+      # Merging the branch into origin's base as it is NOW conflicts on those lines; the squash
+      # commit's patch-id is still the branch's. Two commits, so neither alone is the squash.
+      commit!(path, "more.txt", "more")
+      git!(repo, ["push", "-q", "origin", "loop/s1"])
+      other = squash_into_origin!(ctx.origin, "loop/s1")
+      commit!(other, "work.txt", "rewritten by a later PR")
+      git!(other, ["push", "-q", "origin", "master"])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a squash whose conflict was resolved in the branch's favour is recognised",
+         %{repo: repo, path: path} = ctx do
+      # A concurrent PR wrote the same file first; the squash commit then changes ITS content to
+      # the branch's, so its patch-id is not the branch's. Its content is.
+      other = clone_origin!(ctx.origin)
+      commit!(other, "work.txt", "a concurrent PR's version")
+      commit!(other, "work.txt", "work")
+      git!(other, ["push", "-q", "origin", "master"])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a rebase merge is recognised, though a later commit edits the same lines",
+         %{repo: repo, path: path} = ctx do
+      commit!(path, "second.txt", "second")
+      git!(repo, ["push", "-q", "origin", "loop/s1"])
+      other = clone_origin!(ctx.origin)
+      commit!(other, "unrelated.txt", "landed first")
+      git!(other, ["cherry-pick", "origin/loop/s1~1", "origin/loop/s1"])
+      commit!(other, "second.txt", "rewritten by a later PR")
+      git!(other, ["push", "-q", "origin", "master"])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a merge carrying content of its own keeps the branch, though its other commits shipped",
+         %{repo: repo, path: path} = ctx do
+      # `git cherry` lists no merge commit: with the branch's ordinary commits on origin by
+      # cherry-pick, it marked every commit shipped and the merge's own content went with the branch.
+      side = Path.join(Path.dirname(repo), "side")
+      git!(repo, ["worktree", "add", "-q", "-b", "side", side, "master"])
+      commit!(side, "side.txt", "side")
+      git!(path, ["merge", "-q", "--no-ff", "--no-commit", "side"])
+      File.write!(Path.join(path, "resolution.txt"), "only the merge has this")
+      git!(path, ["add", "resolution.txt"])
+      git!(path, ["commit", "-q", "-m", "merge side"])
+      git!(repo, ["push", "-q", "origin", "loop/s1", "side"])
+      other = clone_origin!(ctx.origin)
+      git!(other, ["cherry-pick", "origin/loop/s1^1", "origin/side"])
+      git!(other, ["push", "-q", "origin", "master"])
+
+      assert %{worktree: {:kept, "commits beyond master"}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a branch origin's base reaches by history is retired on re-dispatch",
+         %{repo: repo, path: path} do
+      # A fast-forward: origin's base now IS the branch, and a fetched ref shows it, so the branch
+      # holds nothing beyond it. Without a worktree it was refused as an earlier story's.
+      git!(repo, ["push", "-q", "origin", "loop/s1:master"])
+      git!(repo, ["fetch", "-q", "origin"])
+      git!(repo, ["worktree", "remove", "--force", path])
+
+      assert {:ok, %{reused: false}} = Worktree.create(repo, path, "loop/s1", "master")
+    end
+
+    test "uncommitted changes keep the tree even when the commits shipped",
+         %{repo: repo, path: path} = ctx do
+      squash_into_origin!(ctx.origin, "loop/s1")
+      File.write!(Path.join(path, "scratch.txt"), "uncommitted")
+
+      assert %{worktree: {:kept, "uncommitted changes"}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a re-dispatch retires it and cuts a fresh tree instead of adopting",
+         %{repo: repo, path: path} = ctx do
+      squash_into_origin!(ctx.origin, "loop/s1")
+
+      assert {:ok, %{reused: false}} = Worktree.create(repo, path, "loop/s1", "master")
+      # Cut from origin's base, which carries the squash; the local master never saw it.
+      assert git!(path, ["rev-parse", "HEAD"]) == git!(repo, ["rev-parse", "origin/master"])
+      refute git!(path, ["rev-parse", "HEAD"]) == git!(repo, ["rev-parse", "master"])
+    end
+
+    test "a re-dispatch retires it with no worktree, instead of refusing",
+         %{repo: repo, path: path} = ctx do
+      squash_into_origin!(ctx.origin, "loop/s1")
+      git!(repo, ["worktree", "remove", "--force", path])
+
+      assert {:ok, %{reused: false}} = Worktree.create(repo, path, "loop/s1", "master")
+    end
+  end
+
+  test "a squashed rename is recognised, though a later commit edits the same lines", %{
+    repo: repo,
+    path: path
+  } do
+    # The squash search reads only the paths the branch changed. A rename listed by its new name
+    # alone showed the squash as an added file, whose patch-id is not the branch's. Two commits, so
+    # neither alone is the squash, and the later edit makes merging the branch in conflict.
+    commit!(repo, "doc.txt", Enum.map_join(1..10, &"line #{&1}\n"))
+    origin = Path.join(Path.dirname(repo), "origin.git")
+    git!(Path.dirname(repo), ["clone", "-q", "--bare", repo, origin])
+    git!(repo, ["remote", "add", "origin", origin])
+    {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+    git!(path, ["mv", "doc.txt", "guide.txt"])
+    git!(path, ["commit", "-q", "-m", "rename"])
+    commit!(path, "guide.txt", Enum.map_join(1..10, &"line #{&1}\n") <> "added by the branch\n")
+    git!(repo, ["push", "-q", "origin", "loop/s1"])
+    other = squash_into_origin!(origin, "loop/s1")
+    commit!(other, "guide.txt", Enum.map_join(1..10, &"line #{&1}\n") <> "a later PR's line\n")
+    git!(other, ["push", "-q", "origin", "master"])
+
+    assert %{worktree: :removed, branch: :deleted} =
+             Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+  end
+
+  describe "a new branch, when the local base is behind origin's" do
+    # Nothing on a dev machine pulls the local base, so it is usually behind what has shipped: a
+    # branch cut from it starts the story on stale code.
+    setup %{repo: repo} do
+      origin = Path.join(Path.dirname(repo), "origin.git")
+      git!(Path.dirname(repo), ["clone", "-q", "--bare", repo, origin])
+      git!(repo, ["remote", "add", "origin", origin])
+      other = Path.join(Path.dirname(repo), "other")
+      git!(Path.dirname(repo), ["clone", "-q", origin, other])
+      git!(other, ["config", "user.email", "test@example.com"])
+      git!(other, ["config", "user.name", "test"])
+      git!(other, ["config", "core.hooksPath", "/dev/null"])
+      commit!(other, "shipped.txt", "shipped since the local base was last pulled")
+      git!(other, ["push", "-q", "origin", "master"])
+      {:ok, shipped: git!(other, ["rev-parse", "HEAD"])}
+    end
+
+    test "is cut from origin's base, with no upstream", %{repo: repo, path: path} = ctx do
+      assert {:ok,
+              %{reused: false, base: "master", start: "refs/remotes/origin/master", fetch: :ok}} =
+               Worktree.create(repo, path, "loop/s1", "master")
+
+      assert git!(path, ["rev-parse", "HEAD"]) == ctx.shipped
+      # A branch cut from a remote-tracking ref would otherwise track origin's master.
+      env = Enum.map(Worktree.repo_locating_env(), &{&1, nil})
+
+      assert {_, 1} =
+               System.cmd("git", ["-C", path, "config", "branch.loop/s1.merge"], env: env)
+    end
+
+    test "is cut from the local base when it holds a commit origin's lacks", %{
+      repo: repo,
+      path: path
+    } do
+      # Diverged: origin shipped one commit and the local base has one nobody pushed. Cut from
+      # origin's, the story started without the local one.
+      commit!(repo, "local.txt", "committed here, never pushed")
+
+      assert {:ok, %{reused: false, start: "master", fetch: :ok}} =
+               Worktree.create(repo, path, "loop/s1", "master")
+
+      assert git!(path, ["rev-parse", "HEAD"]) == git!(repo, ["rev-parse", "master"])
+    end
+
+    test "is cut from the base as given when the fetch fails", %{repo: repo, path: path} do
+      # Origin's ref resolves, from an earlier fetch: only the failed fetch keeps it out.
+      git!(repo, ["fetch", "-q", "origin"])
+      git!(repo, ["remote", "set-url", "origin", Path.join(Path.dirname(repo), "no-such.git")])
+
+      assert {:ok, %{reused: false, start: "master", fetch: {:error, error}}} =
+               Worktree.create(repo, path, "loop/s1", "master")
+
+      assert error =~ "no-such.git"
+      assert git!(path, ["rev-parse", "HEAD"]) == git!(repo, ["rev-parse", "master"])
+    end
+
+    test "the fetch writes no FETCH_HEAD and runs no automatic maintenance", %{repo: repo} do
+      # FETCH_HEAD is what a session's own `git pull` in this repository reads, and maintenance is
+      # a gc the runner did not ask for. A pack already here and a pack limit of one make the
+      # fetch's second pack due for a gc, which runs the pre-auto-gc hook first.
+      dir = Path.dirname(repo)
+      hooks = Path.join(dir, "hooks")
+      File.mkdir_p!(hooks)
+      File.write!(Path.join(hooks, "pre-auto-gc"), "#!/bin/sh\ntouch #{dir}/gc-ran\nexit 1\n")
+      File.chmod!(Path.join(hooks, "pre-auto-gc"), 0o755)
+      git!(repo, ["repack", "-q", "-d"])
+
+      for {key, value} <- [
+            {"core.hooksPath", hooks},
+            {"maintenance.auto", "true"},
+            {"gc.autoPackLimit", "1"},
+            {"gc.autoDetach", "false"},
+            {"fetch.unpackLimit", "1"}
+          ],
+          do: git!(repo, ["config", key, value])
+
+      assert :ok = Worktree.fetch_base(repo, "master")
+      refute File.exists?(Path.join([repo, ".git", "FETCH_HEAD"]))
+      refute File.exists?(Path.join(dir, "gc-ran"))
+    end
+
+    test "a ref another git holds locked is fetched on a second attempt",
+         %{repo: repo} = ctx do
+      # The first attempt finds origin's ref locked, as a concurrent fetch or gc leaves it; the
+      # second upload-pack is started only by a retry, and releases the lock as it starts.
+      lock = locked_origin_ref!(repo)
+      upload_pack = counting_upload_pack!(repo, ~s(if [ "$n" -ge 2 ]; then rm -f #{lock}; fi))
+
+      assert :ok = Worktree.fetch_base(repo, "master")
+      assert git!(repo, ["rev-parse", "refs/remotes/origin/master"]) == ctx.shipped
+      assert upload_pack |> File.read!() |> String.trim() == "2"
+    end
+
+    test "a ref that stays locked is retried once, then reported", %{repo: repo} do
+      locked_origin_ref!(repo)
+      upload_pack = counting_upload_pack!(repo, "")
+
+      assert {:error, error} = Worktree.fetch_base(repo, "master")
+      assert error =~ "cannot lock ref"
+      assert upload_pack |> File.read!() |> String.trim() == "2"
+    end
+
+    test "a base only origin has is counted against origin's", %{repo: repo, path: path} do
+      # No local `release`: excluding it made every count fail, and the untouched tree was kept as
+      # "could not be counted" for ever.
+      git!(repo, ["push", "-q", "origin", "master:refs/heads/release"])
+      {:ok, _} = Worktree.create(repo, path, "loop/s1", "release")
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "release")
+    end
+
+    test "untouched, it is removed at teardown with no fetch", %{repo: repo, path: path} do
+      {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+      # Offline now: an untouched tree must not need origin to be found clean, though it is ahead
+      # of the local master by what shipped.
+      git!(repo, ["remote", "set-url", "origin", Path.join(Path.dirname(repo), "no-such.git")])
+
+      refute Worktree.asks_origin?(Worktree.work_in(repo, path, "loop/s1", "master"))
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+  end
+
+  describe "a worktree holding worktrees of its own" do
+    # A session following the delivery loop cuts `.claude/worktrees/<name>` inside its own tree,
+    # which is ignored, so the tree reads clean; `worktree remove --force` would take the nested
+    # tree's uncommitted work with it.
+    setup %{repo: repo, path: path} do
+      {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+      File.write!(Path.join(path, ".gitignore"), ".claude/\n")
+      git!(path, ["add", ".gitignore"])
+      git!(path, ["commit", "-q", "-m", "ignore"])
+      git!(repo, ["update-ref", "refs/heads/master", "loop/s1"])
+      nested = Path.join([path, ".claude", "worktrees", "inner"])
+      git!(path, ["worktree", "add", "-q", "-b", "inner", nested])
+      File.write!(Path.join(nested, "wip.txt"), "uncommitted work in the nested tree")
+      {:ok, nested: nested}
+    end
+
+    test "is kept, with its branch, and the nested work survives",
+         %{repo: repo, path: path} = ctx do
+      assert %{worktree: {:kept, reason}, branch: {:kept, reason}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert reason =~ "holds repositories of its own: .claude/worktrees/inner"
+      assert File.read!(Path.join(ctx.nested, "wip.txt")) =~ "uncommitted work"
+      assert git!(repo, ["branch", "--list", "loop/s1"]) =~ "loop/s1"
+    end
+
+    test "a re-dispatch starts its branch afresh in place, and the nested work survives",
+         %{repo: repo, path: path} = ctx do
+      assert {:ok, %{reused: false, start: "master"}} =
+               Worktree.create(repo, path, "loop/s1", "master")
+
+      assert File.read!(Path.join(ctx.nested, "wip.txt")) =~ "uncommitted work"
+    end
+
+    test "a nested worktree of the same repository whose commits are on its branch does not keep it",
+         %{repo: repo, path: path} = ctx do
+      # It shares the story repository's refs, so it always has a branch, and that branch outlives
+      # the tree: counting branches kept every such tree for ever.
+      git!(ctx.nested, ["add", "wip.txt"])
+      git!(ctx.nested, ["commit", "-q", "-m", "nested work"])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert git!(repo, ["show", "inner:wip.txt"]) =~ "uncommitted work"
+    end
+
+    test "a nested worktree of the same repository with a commit no branch reaches keeps it",
+         %{repo: repo, path: path} = ctx do
+      git!(ctx.nested, ["checkout", "-q", "--detach"])
+      git!(ctx.nested, ["add", "wip.txt"])
+      git!(ctx.nested, ["commit", "-q", "-m", "detached nested work"])
+
+      assert %{worktree: {:kept, reason}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert reason =~ "holds repositories of its own: .claude/worktrees/inner"
+    end
+
+    test "a directory the scan may not enter keeps the tree: a forced removal would stop part-way",
+         %{repo: repo, path: path} = ctx do
+      private = Path.join([path, ".claude", "private"])
+      File.mkdir_p!(private)
+      File.chmod!(private, 0o000)
+      on_exit(fn -> File.chmod(private, 0o755) end)
+
+      assert %{worktree: {:kept, reason}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert reason =~ "Permission denied"
+      assert File.dir?(private)
+      assert File.read!(Path.join(ctx.nested, "wip.txt")) =~ "uncommitted work"
+    end
+
+    test "build and dependency directories are not scanned", %{repo: repo, path: path} = ctx do
+      # Rebuilt by the next build or `deps.get`, and node_modules alone can take the scan past its
+      # bound: a repository in one does not keep the tree, whatever it holds.
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+      File.write!(Path.join([repo, ".git", "info", "exclude"]), "node_modules/\n")
+      git_repo!(Path.join([path, "assets", "node_modules", "pkg"]))
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "is removed once the nested tree is gone", %{repo: repo, path: path} = ctx do
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "is removed once the nested tree's directory is deleted, though git still lists it",
+         %{repo: repo, path: path} = ctx do
+      File.rm_rf!(ctx.nested)
+      assert git!(repo, ["worktree", "list", "--porcelain"]) =~ "prunable"
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a repository cloned inside it keeps it while it holds a commit its remotes lack",
+         %{repo: repo, path: path} = ctx do
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+      clone = Path.join([path, ".claude", "worktrees", "clone"])
+      git!(repo, ["clone", "-q", repo, clone])
+      git!(clone, ["config", "user.email", "test@example.com"])
+      git!(clone, ["config", "user.name", "test"])
+      git!(clone, ["config", "core.hooksPath", "/dev/null"])
+      commit!(clone, "clone-work.txt", "only this clone has it")
+
+      assert %{worktree: {:kept, reason}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert reason =~ "holds repositories of its own: .claude/worktrees/clone"
+    end
+
+    test "a repository cloned inside it holding nothing its remotes lack does not keep it",
+         %{repo: repo, path: path} = ctx do
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+      git!(repo, ["clone", "-q", repo, Path.join([path, ".claude", "worktrees", "clone"])])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a pinned dependency checkout does not keep it", %{repo: repo, path: path} = ctx do
+      # Mix's git deps: detached, clean, no branch; the next `deps.get` rebuilds it, and `deps/`
+      # is not scanned at all.
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+      dep = Path.join([path, "deps", "dep"])
+      git!(repo, ["clone", "-q", repo, dep])
+      git!(dep, ["checkout", "-q", "--detach"])
+      git!(dep, ["branch", "-q", "-D", "master"])
+      File.write!(Path.join(path, ".gitignore"), ".claude/\ndeps/\n")
+      git!(path, ["commit", "-q", "-am", "ignore deps"])
+      git!(repo, ["update-ref", "refs/heads/master", "loop/s1"])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "an initialised submodule at its recorded commit does not keep it",
+         %{repo: repo, path: path} = ctx do
+      # Its clone has a branch, as every clone has, so counting branches kept every such tree.
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+      submodule!(repo, path)
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a submodule at a recorded commit no remote-tracking ref of its reaches does not keep it",
+         %{repo: repo, path: path} = ctx do
+      # A recorded commit `submodule update` fetched by id is on no remote-tracking ref of the
+      # clone: only the record says the parent repository has it.
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+      sub = submodule!(repo, path)
+      git!(sub, ["remote", "remove", "origin"])
+
+      assert %{worktree: :removed, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+    end
+
+    test "a submodule with a commit its recorded commit lacks keeps it",
+         %{repo: repo, path: path} = ctx do
+      # HEAD back at the recorded commit, so the tree itself reads clean; the commit is on a branch.
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+      sub = submodule!(repo, path)
+      recorded = git!(sub, ["rev-parse", "HEAD"])
+      git!(sub, ["checkout", "-q", "-b", "session-work"])
+      commit!(sub, "sub-work.txt", "work only this clone has")
+      git!(sub, ["checkout", "-q", "--detach", recorded])
+
+      assert %{worktree: {:kept, reason}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert reason =~ "holds repositories of its own: lib/sub"
+    end
+
+    test "a detached checkout with uncommitted changes keeps it",
+         %{repo: repo, path: path} = ctx do
+      git!(repo, ["worktree", "remove", "--force", ctx.nested])
+      dep = Path.join([path, ".claude", "scratch"])
+      git!(repo, ["clone", "-q", repo, dep])
+      git!(dep, ["checkout", "-q", "--detach"])
+      git!(dep, ["branch", "-q", "-D", "master"])
+      File.write!(Path.join(dep, "README.md"), "edited, never committed")
+
+      assert %{worktree: {:kept, reason}} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      assert reason =~ ".claude/scratch"
+    end
+  end
+
+  # A submodule at lib/sub, committed on loop/s1 and master alike and initialised in the tree, as
+  # `git submodule update --init` leaves it: detached at the recorded commit, its clone on a branch.
+  defp submodule!(repo, path) do
+    source = git_repo!(Path.join(Path.dirname(repo), "sub-source"))
+    file = ["-c", "protocol.file.allow=always"]
+    git!(path, file ++ ["submodule", "add", "-q", source, "lib/sub"])
+    git!(path, ["commit", "-q", "-m", "add submodule"])
+    git!(repo, ["update-ref", "refs/heads/master", "loop/s1"])
+    git!(path, ["submodule", "deinit", "-q", "--force", "lib/sub"])
+    git!(path, file ++ ["submodule", "update", "-q", "--init"])
+    sub = Path.join(path, "lib/sub")
+    git!(sub, ["config", "user.email", "test@example.com"])
+    git!(sub, ["config", "user.name", "test"])
+    git!(sub, ["config", "core.hooksPath", "/dev/null"])
+    sub
+  end
+
+  defp locked_origin_ref!(repo) do
+    lock = Path.join([repo, ".git", "refs", "remotes", "origin", "master.lock"])
+    File.mkdir_p!(Path.dirname(lock))
+    File.write!(lock, "")
+    lock
+  end
+
+  # An upload-pack that counts its runs into the returned file, then runs `then` with $n set.
+  defp counting_upload_pack!(repo, then) do
+    dir = Path.dirname(repo)
+    count = Path.join(dir, "upload-packs")
+    script = Path.join(dir, "upload-pack")
+
+    File.write!(script, """
+    #!/bin/sh
+    n=$(( $(cat #{count} 2>/dev/null || echo 0) + 1 )); echo $n > #{count}
+    #{then}
+    exec git upload-pack "$@"
+    """)
+
+    File.chmod!(script, 0o755)
+    git!(repo, ["config", "remote.origin.uploadpack", script])
+    count
+  end
+
+  defp commit!(dir, file, content) do
+    File.write!(Path.join(dir, file), content)
+    git!(dir, ["add", file])
+    git!(dir, ["commit", "-q", "-m", file])
+  end
+
+  # What `gh pr merge --squash` leaves: origin's master gains ONE new commit with the branch's
+  # content, and the branch's own commits stay out of its history. Returns the clone that made it.
+  defp squash_into_origin!(origin, branch) do
+    other = clone_origin!(origin)
+    git!(other, ["merge", "-q", "--squash", "origin/" <> branch])
+    git!(other, ["commit", "-q", "-m", "squash"])
+    git!(other, ["push", "-q", "origin", "master"])
+    other
+  end
+
+  defp clone_origin!(origin) do
+    other = Path.join(Path.dirname(origin), "other")
+    git!(Path.dirname(origin), ["clone", "-q", origin, other])
+    git!(other, ["config", "user.email", "test@example.com"])
+    git!(other, ["config", "user.name", "test"])
+    git!(other, ["config", "core.hooksPath", "/dev/null"])
+    # An operator's global `merge.ff = false` refuses `--squash`; this clone is the test's own.
+    git!(other, ["config", "merge.ff", "true"])
+    other
+  end
+
   test "teardown of nothing reports absence", %{repo: repo, path: path} do
     assert %{worktree: :absent, branch: :absent} =
-             Worktree.remove(repo, path, "loop/s1", "master")
+             Worktree.remove_if_clean(repo, path, "loop/s1", "master")
   end
 end
