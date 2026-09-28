@@ -45,6 +45,8 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   """
   use ExUnit.Case, async: false
 
+  alias Loopctl.Test.MigrationFile
+
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
@@ -64,10 +66,10 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   side_tables_file =
     Path.wildcard(Path.join(@migrations_dir, "#{@side_tables_version}_*.exs")) |> hd()
 
-  Code.require_file(create_file)
-  Code.require_file(hnsw_file)
-  Code.require_file(partial_file)
-  Code.require_file(side_tables_file)
+  MigrationFile.require!(create_file)
+  MigrationFile.require!(hnsw_file)
+  MigrationFile.require!(partial_file)
+  MigrationFile.require!(side_tables_file)
 
   alias Loopctl.Repo.Migrations.AddMemoriesEmbeddingHnswIndex
   alias Loopctl.Repo.Migrations.AddMemoriesLiveEmbeddingPartialHnswIndex

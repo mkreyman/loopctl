@@ -17,6 +17,8 @@ defmodule Loopctl.Repo.TriageDispatchBackfillMigrationTest do
 
   use ExUnit.Case, async: false
 
+  alias Loopctl.Test.MigrationFile
+
   import Loopctl.Fixtures
 
   alias Ecto.Adapters.SQL.Sandbox
@@ -27,7 +29,7 @@ defmodule Loopctl.Repo.TriageDispatchBackfillMigrationTest do
   @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
 
   migration_file = Path.wildcard(Path.join(@migrations_dir, "#{@version}_*.exs")) |> hd()
-  Code.require_file(migration_file)
+  MigrationFile.require!(migration_file)
 
   alias Loopctl.Repo.Migrations.AddStoryStagesTriageDispatchId
 

@@ -42,6 +42,8 @@ defmodule Loopctl.Repo.DropRedundantChannelPostsRecentIdxMigrationTest do
   # phase is about the committed global-state mutation, not lock conflict.)
   use Loopctl.DataCase, async: false
 
+  alias Loopctl.Test.MigrationFile
+
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
@@ -59,7 +61,7 @@ defmodule Loopctl.Repo.DropRedundantChannelPostsRecentIdxMigrationTest do
                   )
                   |> hd()
 
-  Code.require_file(@migration_file)
+  MigrationFile.require!(@migration_file)
 
   alias Loopctl.Repo.Migrations.DropRedundantChannelPostsRecentIdx
 

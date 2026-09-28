@@ -24,6 +24,8 @@ defmodule Loopctl.Repo.ReshapeChannelPostsRefsMigrationTest do
   """
   use Loopctl.DataCase, async: true
 
+  alias Loopctl.Test.MigrationFile
+
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
   alias Loopctl.Coordination
@@ -41,7 +43,7 @@ defmodule Loopctl.Repo.ReshapeChannelPostsRefsMigrationTest do
                   )
                   |> hd()
 
-  Code.require_file(@migration_file)
+  MigrationFile.require!(@migration_file)
 
   alias Loopctl.Repo.Migrations.ReshapeChannelPostsRefsToList
 

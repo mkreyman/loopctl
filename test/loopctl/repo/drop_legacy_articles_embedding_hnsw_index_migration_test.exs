@@ -55,6 +55,8 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
   # and keeps it off the timeline of the async siblings that read `articles.embedding`.
   use Loopctl.DataCase, async: false
 
+  alias Loopctl.Test.MigrationFile
+
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
@@ -73,7 +75,7 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
                   )
                   |> hd()
 
-  Code.require_file(@migration_file)
+  MigrationFile.require!(@migration_file)
 
   alias Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex
 

@@ -8,6 +8,8 @@ defmodule Loopctl.Threads.IssueLinksTest do
 
   use Loopctl.DataCase, async: true
 
+  alias Loopctl.Test.MigrationFile
+
   import Ecto.Query
 
   alias Loopctl.AdminRepo
@@ -178,7 +180,7 @@ defmodule Loopctl.Threads.IssueLinksTest do
       migration = Module.concat(Loopctl.Repo.Migrations, "AddThreadPage")
 
       unless Code.ensure_loaded?(migration),
-        do: Code.require_file("priv/repo/migrations/20260927120000_add_thread_page.exs")
+        do: MigrationFile.require!("priv/repo/migrations/20260927120000_add_thread_page.exs")
 
       backfill = migration.backfill_sql()
 

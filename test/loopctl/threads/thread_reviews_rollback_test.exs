@@ -11,6 +11,8 @@ defmodule Loopctl.Threads.ThreadReviewsRollbackTest do
   """
   use ExUnit.Case, async: false
 
+  alias Loopctl.Test.MigrationFile
+
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
@@ -19,7 +21,7 @@ defmodule Loopctl.Threads.ThreadReviewsRollbackTest do
 
   @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
   migration_file = Path.wildcard(Path.join(@migrations_dir, "#{@version}_*.exs")) |> hd()
-  Code.require_file(migration_file)
+  MigrationFile.require!(migration_file)
 
   alias Loopctl.Repo.Migrations.CreateThreadReviews
 

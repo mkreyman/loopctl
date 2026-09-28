@@ -20,6 +20,8 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
   # to the SHARED articles table, so they run in ExUnit's sync phase.
   use Loopctl.DataCase, async: false
 
+  alias Loopctl.Test.MigrationFile
+
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Migration.Runner
   alias Loopctl.AdminRepo
@@ -37,7 +39,7 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
                   )
                   |> hd()
 
-  Code.require_file(@migration_file)
+  MigrationFile.require!(@migration_file)
 
   alias Loopctl.Repo.Migrations.AddArticlesPublishedReconciliationIndex
 
