@@ -9,9 +9,9 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   #
   # The only expiry-related index on `dispatches` is the composite
   # (tenant_id, expires_at) from 20260411234856_create_dispatches. Its LEADING column
-  # `tenant_id` is absent from the sweep predicate, so Postgres cannot SEEK on it: at best
-  # it reads the whole index (it does, on a small table), and otherwise seq-scans the
-  # continuously-growing `dispatches` table every minute. The sweep MUST stay
+  # `tenant_id` is absent from the sweep predicate, so Postgres cannot SEEK on it: it can
+  # only read that index whole or seq-scan the continuously-growing `dispatches` table,
+  # every minute. The sweep MUST stay
   # cross-tenant (it finds expired dispatches across all tenants), so a tenant-leading
   # index can never be SEEKED for it.
   #
@@ -27,21 +27,20 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # (other per-tenant lookups still use it).
   # VERIFICATION (AC-32.1.2) — EXPLAIN of the worker's exact predicate
   # (`WHERE revoked_at IS NULL AND expires_at < now()`) uses this partial index,
-  # not a Seq Scan. Two captures:
+  # not a Seq Scan. Two captures, each taken once by hand when this migration was
+  # written; neither is asserted in the suite. The ExUnit guard
+  # `RevokeExpiredDispatchesWorkerTest` asserts the index's shape and predicate from
+  # `pg_index`, because the planner's choice in the shared test table moves with the rows
+  # concurrent tests have in flight.
   #
   #   * Empty table, planner forced to reveal usability (`SET LOCAL
-  #     enable_seqscan = off`), captured once when this migration was written:
+  #     enable_seqscan = off`), which proves eligibility rather than choice:
   #
   #       Index Scan using dispatches_expires_at_active_index on dispatches d0
   #         Index Cond: (expires_at < now())
   #
-  #     Forcing the planner proves eligibility, not choice, so the test guard asserts the
-  #     second form instead.
-  #
   #   * ~20k seeded rows (small selective expired set), DEFAULT planner
-  #     (enable_seqscan on) — the index is chosen UNPROMPTED at scale. The ExUnit guard
-  #     `RevokeExpiredDispatchesPlanTest` asserts this form against the query the worker
-  #     issues:
+  #     (enable_seqscan on) — the index is chosen UNPROMPTED at scale:
   #
   #       Index Scan using dispatches_expires_at_active_index on dispatches d
   #         (cost=0.29..16.72 rows=86 width=32)

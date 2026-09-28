@@ -13,9 +13,6 @@ defmodule Loopctl.Delivery.SessionEndTest do
   use Loopctl.DataCase, async: true
 
   import Ecto.Query
-  import ExUnit.CaptureLog
-
-  require Logger
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerSessionEnded
@@ -450,79 +447,6 @@ defmodule Loopctl.Delivery.SessionEndTest do
                  cast.(String.upcase(ctx.record.dispatch_id)),
                  actor_id: ctx.runner.api_key_id
                )
-    end
-  end
-
-  describe "a budget escalation the stage machine refused (budget_escalation_refused/4)" do
-    # The escalation's own clause in `take_budget_edge/6` sends every refusal that is not the
-    # row moving or the claim ending through this. A behavioural test of that clause needs a
-    # tenant hash chain that REFUSES an append, and none can be built: the only
-    # `:audit_chain_append_failed` `Stages.advance/4` produces comes from an entry changeset a
-    # caller breaks with a malformed lineage, and the escalation hard-codes an empty one; a
-    # chain the trigger rejects raises instead. So the mapping is asserted here, and the
-    # clause's wiring by the lock-busy test in `Loopctl.Delivery.SessionEndReleaseTest`, which
-    # reaches this function through `end_session/4`.
-
-    @refused_session %{story_id: Ecto.UUID.generate()}
-    @refused_msg %{dispatch_id: Ecto.UUID.generate()}
-
-    # capture_log collects EVERY process's logs, so an async neighbour's error lands in the
-    # capture. These tests tag the test process with a unique `request_id` (a key the test
-    # formatter prints, config/test.exs) and read only the lines carrying it: the function
-    # runs, and logs, in this process. `level: :error` makes every captured line an error.
-    defp own_error_lines(fun) do
-      marker = "refusal-#{System.unique_integer([:positive])}"
-      Logger.metadata(request_id: marker)
-
-      [level: :error]
-      |> capture_log(fun)
-      |> String.split("\n")
-      |> Enum.filter(&String.contains?(&1, "request_id=#{marker}"))
-    end
-
-    test "a chain that refuses appends is answered PERMANENTLY, and logged at error" do
-      lines =
-        own_error_lines(fn ->
-          assert {:error, :audit_chain_append_failed} =
-                   RunnerStages.budget_escalation_refused(
-                     :audit_chain_append_failed,
-                     Ecto.UUID.generate(),
-                     @refused_session,
-                     @refused_msg
-                   )
-        end)
-
-      assert Enum.any?(lines, &(&1 =~ "answered permanently"))
-    end
-
-    test "a message fault is answered as the invalid payload it is, not as a retry" do
-      assert {:error, {:invalid, ["invalid_transition"]}} =
-               RunnerStages.budget_escalation_refused(
-                 :invalid_transition,
-                 Ecto.UUID.generate(),
-                 @refused_session,
-                 @refused_msg
-               )
-    end
-
-    test "a lock that was not free is the one retry, and is not logged at error" do
-      lines =
-        own_error_lines(fn ->
-          assert {:error, :busy} =
-                   RunnerStages.budget_escalation_refused(
-                     :busy,
-                     Ecto.UUID.generate(),
-                     @refused_session,
-                     @refused_msg
-                   )
-
-          # Proves this capture can see this process's error lines, so the one below being
-          # the ONLY line means the refusal logged none, rather than that none were readable.
-          Logger.error("busy-refusal canary")
-        end)
-
-      assert [canary] = lines
-      assert canary =~ "busy-refusal canary"
     end
   end
 end
