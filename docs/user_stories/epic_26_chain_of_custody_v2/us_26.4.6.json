@@ -1,0 +1,92 @@
+{
+  "id": "US-26.4.6",
+  "title": "Story verification judges CI with the merge gate's evidence rules",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "medium",
+  "phase": "verification",
+  "background": "Story verification (US-26.4.2, US-26.4.3) has never produced a CI verdict in production: its worker passed an uncast UUID to a schemaless query, so every run that had a commit crashed before reaching CI. Its CI read also used the check-runs endpoint, which a fine-grained token cannot reach (#913). PR #914, then #915, fixed both and kept finding, round after round, that the subsystem's rules were never designed: which runs count as the commit's CI, which repository is read and with whose credential, and when a missing, pending or unreachable answer means wait rather than give up. #915 was held after its third review round; its review threads are the record of every edge found. The thread merge gate (US-45.6) already answers all three questions for a thread checkpoint, with rules hardened over three review rounds of its own.",
+  "story": {
+    "as_a": "tenant operator",
+    "i_want_to": "have story verification record a CI verdict by the same rules the merge gate uses",
+    "so_that": "a verification run means what a merge decision means, instead of a second, weaker reading of the same CI"
+  },
+  "rationale": "Two readings of one commit's CI that can disagree are worse than one. Reusing Loopctl.Delivery.CiEvidence settles which runs count (the intake source's required_checks, by job name) and reusing the merge gate's transient-versus-final handling settles when to wait, so verification designs neither again.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.4.6.1",
+      "description": "The worker resolves the story's repository ONLY from its project's intake source (Loopctl.Intake.source_for_project/2), never from projects.repo_url, for the CI read AND for the local fallback's clone. A project without exactly one live intake source records ci_unavailable_reason no_intake_source and reads nothing."
+    },
+    {
+      "id": "AC-26.4.6.2",
+      "description": "The verdict is Loopctl.Delivery.CiEvidence.judge/2 over the intake source's required_checks: pass only when every required job name concluded success, fail when one failed, wait while one is pending. A source with no required_checks records no_required_checks and reads nothing."
+    },
+    {
+      "id": "AC-26.4.6.3",
+      "description": "The worker's schemaless story/project query casts its UUID parameters, so a run with a commit reaches the CI read (the crash #914 found)."
+    },
+    {
+      "id": "AC-26.4.6.4",
+      "description": "Transient forge failures (timeouts, connection errors, 5xx, rate limits) are waited out the way the merge gate treats unevaluated reads; a run ends as error only after verification_max_run_age_seconds from its creation. The CiBehaviour contract declares the waiting outcome rather than the worker matching one adapter's error terms."
+    },
+    {
+      "id": "AC-26.4.6.5",
+      "description": "An abbreviated commit SHA is resolved to the full object id once, and the full id is persisted on the run."
+    },
+    {
+      "id": "AC-26.4.6.6",
+      "description": "Every GitHub read goes through one credential seam, so the per-tenant credential decision in #915 changes that seam and nothing else. Reads carry the operator GITHUB_TOKEN until that decision is made."
+    },
+    {
+      "id": "AC-26.4.6.7",
+      "description": "ac_results records the CI verdict's evidence URL on pass or fail, and on no verdict a short reason code that never contains a URL or a repository name."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.4.6.1",
+      "verifies": ["AC-26.4.6.1"],
+      "name": "repo_url is never read",
+      "type": "unit",
+      "preconditions": ["a project whose repo_url names another repository than its intake source"],
+      "steps": ["run verification with a stub that fails on any request outside the intake source's repository"],
+      "expected_results": ["only the intake source's repository is read"]
+    },
+    {
+      "id": "TC-26.4.6.2",
+      "verifies": ["AC-26.4.6.2"],
+      "name": "required checks decide",
+      "type": "unit",
+      "preconditions": ["required_checks [\"test\"]"],
+      "steps": ["a commit whose unrelated workflow succeeded and whose test job is pending, then failed, then succeeded"],
+      "expected_results": ["wait, then fail, then pass; the unrelated success never passes it"]
+    },
+    {
+      "id": "TC-26.4.6.3",
+      "verifies": ["AC-26.4.6.3", "AC-26.4.6.4"],
+      "name": "transient failure waits, age ends it",
+      "type": "unit",
+      "preconditions": ["a run with a commit"],
+      "steps": ["answer 502, then a timeout, then a run older than the age window"],
+      "expected_results": ["snooze, snooze, then error ci_wait_exhausted"]
+    },
+    {
+      "id": "TC-26.4.6.4",
+      "verifies": ["AC-26.4.6.5", "AC-26.4.6.7"],
+      "name": "abbreviated SHA and recorded evidence",
+      "type": "unit",
+      "preconditions": ["a run recorded with a 7-character SHA"],
+      "steps": ["verify it twice"],
+      "expected_results": ["one commit read in total; the run carries the full SHA and the failing job's URL"]
+    }
+  ],
+  "technical_notes": [
+    "Reuse GitHubPullRequestSource's workflow-run and jobs readers; the branch-free read #915 added (commit_ci_runs) is the starting point, with jobs read per newest run as check_evidence/3 does.",
+    "Mutation-test the wiring as well as the rule: the repository source, the required_checks lookup, the cast, and the wait arms.",
+    "#915's review threads list every edge found; each must be a test here or be removed by the design."
+  ],
+  "dependencies": ["US-45.6"],
+  "estimated_hours": 6
+}
