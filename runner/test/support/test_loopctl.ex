@@ -45,9 +45,16 @@ defmodule LoopctlRunner.TestLoopctl do
       # unanswered, or {:error, reason_map}; once used up every stage is acknowledged.
       stage_replies: [],
       # Replies to session_ended pushes, oldest first: :ok (ack as recorded), :replayed (ack a
-      # resend), :none for a push left unanswered, or {:error, reason_map}; once used up every
-      # one is acknowledged as recorded.
+      # resend), :review (a review session's ack, `kind` and `replayed` only), :none for a push
+      # left unanswered, or {:error, reason_map}; once used up every one is acknowledged as
+      # recorded.
       session_ended_replies: [],
+      # Replies to review_finding and review_verdict pushes, oldest first: :ok (record and ack),
+      # :replayed (ack a resend), :escalated (a verdict's ack at the round ceiling), :bare_ok for
+      # an ok with no body, :none for a push left unanswered, or {:error, reason_map}; once used up
+      # every one is acknowledged as recorded.
+      review_finding_replies: [],
+      review_verdict_replies: [],
       # Replies to triage_verdict pushes, oldest first: :ok (record and ack), :replayed (ack a
       # resend, applying nothing), :bare_ok for an ok with no body, :none for a push left
       # unanswered, or {:error, reason_map}.
@@ -101,6 +108,15 @@ defmodule LoopctlRunner.TestLoopctl do
 
       state ->
         {:ok, state}
+    end)
+  end
+
+  def next_review_reply(key) do
+    Agent.get_and_update(__MODULE__, fn state ->
+      case Map.fetch!(state, key) do
+        [reply | rest] -> {reply, Map.put(state, key, rest)}
+        [] -> {:ok, state}
+      end
     end)
   end
 
@@ -298,9 +314,30 @@ defmodule LoopctlRunner.TestLoopctl do
           case TestLoopctl.next_session_ended_reply() do
             :ok -> {:reply, {:ok, session_ended_ack(false)}, socket}
             :replayed -> {:reply, {:ok, session_ended_ack(true)}, socket}
+            :review -> {:reply, {:ok, %{kind: "review", replayed: false}}, socket}
             :none -> {:noreply, socket}
             {:error, reply} -> {:reply, {:error, reply}, socket}
           end
+
+        {:error, details} ->
+          {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
+      end
+    end
+
+    # loopctl's idempotency on `<dispatch_id>:<client_seq>` is not modelled: the reply is scripted.
+    # What is modelled is the contract check, since a message failing it is `invalid_payload`.
+    def handle_in(event, payload, socket) when event in ["review_finding", "review_verdict"] do
+      {name, definition, replies} =
+        case event do
+          "review_finding" -> {:review_finding, "RunnerReviewFinding", :review_finding_replies}
+          "review_verdict" -> {:review_verdict, "RunnerReviewVerdict", :review_verdict_replies}
+        end
+
+      TestLoopctl.notify({name, payload})
+
+      case Contract.validate(definition, payload) do
+        :ok ->
+          scripted_review_reply(TestLoopctl.next_review_reply(replies), socket)
 
         {:error, details} ->
           {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
@@ -346,6 +383,29 @@ defmodule LoopctlRunner.TestLoopctl do
         :none -> {:noreply, socket}
         {:error, reply} -> {:reply, {:error, reply}, socket}
       end
+    end
+
+    defp scripted_review_reply(:ok, socket), do: {:reply, {:ok, review_ack(false, false)}, socket}
+
+    defp scripted_review_reply(:replayed, socket),
+      do: {:reply, {:ok, review_ack(true, false)}, socket}
+
+    defp scripted_review_reply(:escalated, socket),
+      do: {:reply, {:ok, review_ack(false, true)}, socket}
+
+    defp scripted_review_reply(:bare_ok, socket), do: {:reply, :ok, socket}
+    defp scripted_review_reply(:none, socket), do: {:noreply, socket}
+    defp scripted_review_reply({:error, reply}, socket), do: {:reply, {:error, reply}, socket}
+
+    # Both acks carry the same three fields; a verdict's adds `escalated`, which a finding's schema
+    # does not forbid, so one shape serves both.
+    defp review_ack(replayed?, escalated?) do
+      %{
+        entry_id: LoopctlRunner.Session.uuid4(),
+        seq: 1,
+        replayed: replayed?,
+        escalated: escalated?
+      }
     end
 
     defp session_ended_ack(replayed?),

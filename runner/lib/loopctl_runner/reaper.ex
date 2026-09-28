@@ -5,8 +5,9 @@ defmodule LoopctlRunner.Reaper do
   runs beside live sessions — a daemon's, or another run's — and touches only what a DEAD owner
   left.
 
-  A run is an orphan when the BEAM that owned it is gone and either its `state.json` says
-  it was still in flight, or its teardown failed to remove the worktree. For an in-flight
+  A run is an orphan when its `state.json` says it was still in flight and the BEAM that owned
+  it is gone, or when it is over and its worktree was not removed (`remove_failed`), whoever owned
+  it. For an in-flight
   orphan the reaper ends the session's processes (see `terminate/3` on the group and the
   session marker) and removes the worktree only if it holds no work — a worktree with
   uncommitted changes or commits is kept, so re-running the story adopts it. A worktree whose
@@ -27,8 +28,8 @@ defmodule LoopctlRunner.Reaper do
     Owner,
     ProcessGroup,
     RunState,
+    ScratchRun,
     Trace,
-    TriageRun,
     Worktree,
     WorktreeLock
   }
@@ -129,21 +130,26 @@ defmodule LoopctlRunner.Reaper do
   end
 
   # Scratch only: an implement run's project directory is its session's record, and a kept
-  # worktree's session may be resumed. `TriageRun.remove_project_dir/2` matches only a directory
+  # worktree's session may be resumed. `ScratchRun.remove_project_dir/2` matches only a directory
   # whose cwd carried the run id, so the reused tree's one directory is never touched.
   defp remove_project_dir(%{"worktree" => %{"scratch" => true}, "run_id" => run_id}, dir)
        when is_binary(dir) and is_binary(run_id),
-       do: TriageRun.remove_project_dir(dir, run_id)
+       do: ScratchRun.remove_project_dir(dir, run_id)
 
   defp remove_project_dir(_state, _projects_dir), do: :ok
 
+  # A run still in flight is an orphan only once its owner is gone. A run that is OVER and whose
+  # tree was not removed is one whoever owned it: nothing of the run is left to use that tree, so a
+  # live owner — this BEAM, when a run's teardown failed or a killed run's tree was handed over
+  # (`LoopctlRunner.Control`) — says nothing about it, and waiting for that owner to die would
+  # keep the tree for the life of the runner.
   defp orphan?(run_dir) do
     case RunState.read(run_dir) do
       {:ok, %{"status" => status} = state} when status in @in_flight ->
         not owner_alive?(state)
 
-      {:ok, %{"worktree" => %{"status" => "remove_failed"}} = state} ->
-        not owner_alive?(state)
+      {:ok, %{"worktree" => %{"status" => "remove_failed"}}} ->
+        true
 
       _ ->
         false
@@ -152,10 +158,19 @@ defmodule LoopctlRunner.Reaper do
 
   defp owner_alive?(state), do: Owner.alive?(state)
 
-  defp end_session(%{"status" => status} = state, grace_ms) when status in @in_flight,
+  @doc """
+  Ends the session a run's `state` records as still in flight — its process group while the
+  leader is still our launcher, and every process carrying its marker or listed in its tree file
+  (`ProcessGroup.terminate/3`) — and says what happened. A run not in flight is left alone.
+
+  Blocks for up to twice `grace_ms` while a session that ignores TERM is given time to go, so a
+  caller that must stay responsive runs it in a task (`LoopctlRunner.Control` does).
+  """
+  @spec end_session(map(), non_neg_integer()) :: String.t()
+  def end_session(%{"status" => status} = state, grace_ms) when status in @in_flight,
     do: reap_group(state, grace_ms)
 
-  defp end_session(_state, _grace_ms), do: "not in flight"
+  def end_session(_state, _grace_ms), do: "not in flight"
 
   defp finish({run_dir, state, group, plan}, fetched, owner) do
     worktree =

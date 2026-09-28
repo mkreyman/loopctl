@@ -142,6 +142,35 @@ if [ -n "${FAKE_VERDICT:-}" ]; then
     printf '%s' "$FAKE_VERDICT" | "$script" "$token" > /dev/null 2>&1 || true
 fi
 
+# A review run's session reports through its two commands, with the token its PROMPT carries —
+# found the way a session would find it, never in the environment. FAKE_REVIEW_FINDINGS findings,
+# then the verdict FAKE_REVIEW_VERDICT names, then (FAKE_REVIEW_AFTER) one more finding, which the
+# command must refuse. Each exit status is recorded, so a test can say which were refused.
+if [ -n "${FAKE_REVIEW_FINDINGS:-}${FAKE_REVIEW_VERDICT:-}" ]; then
+    prompt=${*: -1}
+    finding=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-finding [A-Za-z0-9_-]+' | head -1)
+    verdict=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-review-verdict [A-Za-z0-9_-]+' | head -1)
+    # After round 1 the prompt names the one checkpoint a finding may be introduced by: name it.
+    introduced=$(printf '%s' "$prompt" | grep -oE -- '--introduced-by <[0-9a-f-]+\|none>' | head -1 |
+        sed -E 's/--introduced-by <([0-9a-f-]+)\|none>/--introduced-by \1/')
+    : > "$state/review_exits"
+    i=0
+    while [ "$i" -lt "${FAKE_REVIEW_FINDINGS:-0}" ]; do
+        i=$((i + 1))
+        printf 'defect %s: it fails when called twice\n' "$i" |
+            $finding --severity high --location "lib/app.ex:$i" $introduced > /dev/null 2>&1
+        echo "finding $?" >> "$state/review_exits"
+    done
+    if [ -n "${FAKE_REVIEW_VERDICT:-}" ]; then
+        printf '%s\n' "$FAKE_REVIEW_VERDICT" | $verdict > /dev/null 2>&1
+        echo "verdict $?" >> "$state/review_exits"
+    fi
+    if [ -n "${FAKE_REVIEW_AFTER:-}" ]; then
+        printf 'a late defect\n' | $finding --severity low $introduced > /dev/null 2>&1
+        echo "after $?" >> "$state/review_exits"
+    fi
+fi
+
 # An IO failure at the verdict path that the session cannot cause and the runner cannot parse
 # around: a DIRECTORY where the file goes. The runner must report it, not raise it.
 # Two ways a verdict path refuses to read, and the runner must tell them apart: a DIRECTORY,

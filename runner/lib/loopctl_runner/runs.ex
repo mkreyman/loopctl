@@ -26,6 +26,9 @@ defmodule LoopctlRunner.Runs do
   When a run on this machine last succeeded, ISO 8601 in UTC, or nil — the sample's
   `last_build_at`.
 
+  Only a run that BUILDS counts: an implement run, whose state carries no `kind`. A review that
+  succeeded read a checkpoint and built nothing, and a triage run never records `succeeded`.
+
   Each `finished_at` is parsed, compared as a time and re-rendered. A value that does not parse
   (hand-edited, truncated, written without an offset) is skipped: the contract checks this
   field as a date-time, and one bad file must not fail every join and stop the runner.
@@ -35,7 +38,8 @@ defmodule LoopctlRunner.Runs do
     runs_dir
     |> RunState.all()
     |> Enum.flat_map(fn
-      {_dir, %{"status" => "succeeded", "finished_at" => at}} when is_binary(at) ->
+      {_dir, %{"status" => "succeeded", "finished_at" => at} = state}
+      when is_binary(at) and not is_map_key(state, "kind") ->
         case DateTime.from_iso8601(at) do
           {:ok, datetime, _offset} -> [datetime]
           {:error, _} -> []

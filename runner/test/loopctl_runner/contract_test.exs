@@ -319,14 +319,18 @@ defmodule LoopctlRunner.ContractTest do
     dispatch = Contract.schema_def("RunnerDispatch")["properties"]
     assert dispatch["story"] == Contract.schema_def("RunnerStory")
     assert dispatch["triage"] == Contract.schema_def("RunnerTriage")
+    assert dispatch["review"] == Contract.schema_def("RunnerReview")
   end
 
   test "the declaration is exactly the kinds the accept path can actually run" do
-    # Widening @kinds declares a capability loopctl then sends. The accept path requires a story
-    # object, which the contract allows only on an implement dispatch, so any other declared kind
-    # is refused as `other` — suppressing nothing, recording nothing, and soaking that kind for
-    # as long as it is declared. A new kind needs its payload and its own accept path first.
-    assert LoopctlRunner.Control.kinds() == ["implement"]
+    # Widening @kinds declares a capability loopctl then sends, and a declared kind with no accept
+    # path of its own is refused as `other` — suppressing nothing, recording nothing, and soaking
+    # that kind for as long as it is declared. `implement` and `review` (1.21.0) each have one;
+    # `triage` still builds no lens verdicts, so it stays out.
+    assert LoopctlRunner.Control.kinds() == ["implement", "review"]
+    # Each is one loopctl sends at all: a declared kind it does not know is ignored, not refused.
+    dispatchable = Contract.connection()["dispatchable_kinds"]
+    assert Enum.all?(LoopctlRunner.Control.kinds(), &(&1 in dispatchable))
   end
 
   test "each constraint the contract declares is enforced" do

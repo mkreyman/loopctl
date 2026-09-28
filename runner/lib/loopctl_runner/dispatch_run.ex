@@ -23,9 +23,16 @@ defmodule LoopctlRunner.DispatchRun do
   cap cannot have its tail trimmed into a clean-looking one.
   """
 
-  alias LoopctlRunner.{Config, Contract, DispatchPolicy, DispatchPrompt, Session, Story, Worktree}
-
-  @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
+  alias LoopctlRunner.{
+    Config,
+    Contract,
+    DispatchPolicy,
+    DispatchPrompt,
+    Session,
+    Story,
+    Uuid,
+    Worktree
+  }
 
   # The bounds come from the vendored contract, never re-typed: maxima from the published
   # x-connection.limits.story.fields (derived on loopctl's side from the schema), minima from
@@ -103,7 +110,7 @@ defmodule LoopctlRunner.DispatchRun do
 
   defp check_story_id(id, dispatch_story_id) when is_binary(id) do
     cond do
-      not Regex.match?(@uuid, id) ->
+      not Uuid.valid?(id) ->
         {:error, "the dispatch story id is not a uuid"}
 
       not is_binary(dispatch_story_id) or
@@ -303,8 +310,9 @@ defmodule LoopctlRunner.DispatchRun do
   What a run's end is reported as, in the order it goes out, from the run's summary (or the
   `status`, `reached` and escalations a later Control reads back from `state.json`):
 
-    * `[]` — the run's `deadline_at` passed before its session started (status `deadline_passed`,
-      from `claimed`, `worktree` or `implementing`): it started no session, and escalating the story
+    * `[]` — an implement run's `deadline_at` passed before its session started (status
+      `deadline_passed`, from `claimed`, `worktree` or `implementing`; never a review's, below):
+      it started no session, and escalating the story
       would say a human is needed when none is. After its deadline the claim is loopctl's lease sweep's, which releases it; the run
       records its end as settled (`terminal_reported` `skipped`), so no Control reports it later.
     * `[:escalated]` — no session ever started: the run got no worktree (`reached` `claimed`), or
@@ -315,10 +323,24 @@ defmodule LoopctlRunner.DispatchRun do
       `session_ended/2` for why both go).
     * `[:session_ended]` — every other run: the session's end is a fact to report, and what
       happens to the story next is control's to decide from it.
+    * `[:judgements, :session_ended]` — a REVIEW run (`kind: "review"`), however it ended: its
+      findings and verdict first, then the `session_ended` that frees the slot. A review has no
+      stage to report — it claims nothing — so it never sends `-> escalated`, and its
+      `session_ended` goes even when no session started, because it is the ONLY message that
+      gives the slot back ("send it when the session stops without a verdict ... or after one").
+      That holds for a review whose `deadline_at` passed before its session started
+      (`deadline_passed`) too, which is why this clause is judged FIRST: the `[]` above is about
+      the implementer's CLAIM, which loopctl's lease sweep releases after the deadline, and a
+      review holds no claim — only the slot, which nothing but its `session_ended` frees. So a
+      review never ends owing nothing, and `LoopctlRunner.Control` never forgets its dispatch the
+      way it forgets a sessionless implement run's.
+      It goes last because "once that dispatch's session_ended is recorded the session is over:
+      ... a new one is dispatch_not_accepted".
   """
-  @spec end_reports(map()) :: [:escalated | :session_ended]
+  @spec end_reports(map()) :: [:judgements | :escalated | :session_ended]
   def end_reports(summary) do
     cond do
+      summary[:kind] == "review" -> [:judgements, :session_ended]
       summary[:status] == "deadline_passed" -> []
       summary[:reached] in ["claimed", "worktree"] -> [:escalated]
       summary[:escalations] not in [nil, []] -> [:escalated, :session_ended]
@@ -355,6 +377,17 @@ defmodule LoopctlRunner.DispatchRun do
       which it did not choose either, and `crashed` is what re-queues such a story rather than
       leaving it to a lease reclaim.
 
+  A REVIEW run (`kind: "review"`) is read the same way, off its status alone, because the
+  contract gives a review's `session_ended` no meaning beyond the session's end: it "only frees
+  the runner's slot: no stage effect, no retry-ceiling count, whatever `reason`". What the
+  session stated is not in it — that is the judgements' to carry. A review that prepared nothing
+  and started no session (`failed`) is `crashed`: "any end the runner did not choose and that is
+  not one of the others", and it is none of them — nothing ran to complete, and no budget or
+  usage limit was reached. So is one whose `deadline_at` passed before its session started
+  (`deadline_passed`), and one whose session that deadline stopped (`stopped_at_deadline`), for
+  an implement run's reason above: loopctl's placement ran out, and the review overran no budget
+  of its own.
+
   `usage_exhausted` is never sent: nothing the runner reads today tells a session that hit its
   account's usage limit from any other failing exit, so claiming it would be a guess — and it
   releases the claim WITHOUT counting an attempt, which is exactly the guess that must not be
@@ -365,18 +398,19 @@ defmodule LoopctlRunner.DispatchRun do
     payload = %{
       "dispatch_id" => dispatch["dispatch_id"],
       "claim_epoch" => dispatch["claim_epoch"],
-      "reason" => session_end_reason(summary[:status])
+      "reason" => session_end_reason(summary)
     }
 
     with :ok <- Contract.validate("RunnerSessionEnded", payload), do: {:ok, payload}
   end
 
-  defp session_end_reason(status) when status in ["succeeded", "escalated"], do: "completed"
+  @budgets ["wall_clock_exceeded", "max_turns_exceeded"]
 
-  defp session_end_reason(status) when status in ["wall_clock_exceeded", "max_turns_exceeded"],
-    do: status
+  defp session_end_reason(%{status: status}) when status in ["succeeded", "escalated"],
+    do: "completed"
 
-  defp session_end_reason(_status), do: "crashed"
+  defp session_end_reason(%{status: status}) when status in @budgets, do: status
+  defp session_end_reason(_summary), do: "crashed"
 
   @doc """
   How to answer a refusal of a `session_ended`, by its `reason`: `:rate_limited` waits out the

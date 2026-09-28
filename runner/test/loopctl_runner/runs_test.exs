@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.RunsTest do
   use ExUnit.Case, async: true
 
-  alias LoopctlRunner.{Control, ControlConfig, Owner, Runs, RunState}
+  alias LoopctlRunner.{Control, ControlConfig, Runs, RunState}
   import LoopctlRunner.TestSupport
 
   defp finished(runs_dir, name, finished_at) do
@@ -52,6 +52,17 @@ defmodule LoopctlRunner.RunsTest do
     finished(config.runs_dir, "later", "2026-09-12T10:00:00Z")
     # Earlier in UTC, though its string sorts higher.
     finished(config.runs_dir, "earlier", "2026-09-12T11:00:00+05:00")
+
+    assert Runs.last_success_at(config.runs_dir) == "2026-09-12T10:00:00Z"
+  end
+
+  test "a review that succeeded built nothing, so it is not the machine's last build" do
+    root = tmp_dir!("runs-review")
+    config = config!(root)
+
+    finished(config.runs_dir, "build", "2026-09-12T10:00:00Z")
+    finished(config.runs_dir, "review", "2026-09-13T10:00:00Z")
+    RunState.update(Path.join(config.runs_dir, "review"), %{"kind" => "review"})
 
     assert Runs.last_success_at(config.runs_dir) == "2026-09-12T10:00:00Z"
   end

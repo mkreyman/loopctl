@@ -165,7 +165,7 @@ defmodule LoopctlRunner.Contract do
   end
 
   defp keyword("format", "uuid", value, path, _) when is_binary(value) do
-    if Regex.match?(~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i, value),
+    if LoopctlRunner.Uuid.valid?(value),
       do: [],
       else: ["#{path}: #{shown(value, path)} is not a uuid"]
   end

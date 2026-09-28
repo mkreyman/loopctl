@@ -40,6 +40,14 @@ defmodule LoopctlRunner.ControlConfigTest do
              )
   end
 
+  test "the runner_id is a uuid written in lowercase, as loopctl issues it" do
+    for bad <- ["0B1C7A52-6A4C-4F7E-9D7B-1A2B3C4D5E6F", "runner-1", nil] do
+      assert {:error, "config control.runner_id is missing or malformed"} =
+               ControlConfig.from_map(control(%{"runner_id" => bad})),
+             inspect(bad)
+    end
+  end
+
   describe "the URL" do
     test "must be wss, or ws to loopback" do
       assert {:ok, _} =

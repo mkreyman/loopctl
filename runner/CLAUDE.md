@@ -91,8 +91,8 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   local condition gets its own `DispatchPolicy` reason instead. What the reply costs depends
   entirely on whether the join declared kinds: for a runner that declares none, loopctl records
   it in `DispatchLedger`, keyed by kind, with no expiry and no clearing path short of revoking
-  and re-enrolling — and since `implement` is the only dispatchable kind, refusing it there ends
-  dispatch to that machine while it stays connected and looks healthy.
+  and re-enrolling — so refusing a kind there ends that kind's dispatch to the machine while it
+  stays connected and looks healthy.
 - **This runner declares its kinds on every join** (`RunnerJoin.kinds`, contract 1.6.0), from the
   one `@kinds` list in `Control` that `declared_kind/1` also reads, so the permanence above does
   not apply to it: loopctl reads a present, non-empty declaration INSTEAD of its ledger, and a
@@ -101,14 +101,19 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   honour is a self-contradiction, and a check stricter than the declaration loses that kind's
   work. `@kinds` must never be empty (a compile-time raise refuses it): loopctl reads an empty
   array as no declaration and falls back to the ledger. Draining is how this runner stops taking
-  work. Adding a kind is not enough to run it — the accept path requires a `story`, which only an
-  `implement` dispatch carries, so a new kind needs its payload and its own accept path first.
+  work. Adding a kind to `@kinds` is not enough to run it: each kind needs its own accept path
+  (`Control.work/3` and `start_pending/2`) for the payload that kind carries, as `review` has.
 - **The daemon starts only under `LOOPCTL_RUNNER_DAEMON=1`**, so `mix loopctl.run` never joins
   the pool.
 - **A loop session asks for a human by running `priv/bin/loop-escalate`**, whose path the system
   prompt names — and the prompt is the ONLY path, so if that text stops reaching it a session has
   no way to ask and grinds silently to its turn limit. No hook can observe a question a headless
   session wanted to ask, so escalation must stay a command it calls; the run ends `escalated`.
+  A REVIEW session is the exception: a review claims nothing and has no stage to escalate from,
+  so it is not offered `loop-escalate`, and one that cannot review says why in its verdict. A
+  review run that ends escalated anyway is logged as an error with what it said; its
+  `session_ended` still names how the session ended, since for a review that message "only frees
+  the runner's slot: no stage effect, no retry-ceiling count, whatever `reason`".
 - **Unattended sessions run with the same authority as a locally dispatched agent, and inherit
   the operator's user-scoped Claude setup.** `--permission-mode bypassPermissions`, no
   `--allowedTools` composed at all, and no `--setting-sources ""`. Mark, 2026-09-16: *"All agents

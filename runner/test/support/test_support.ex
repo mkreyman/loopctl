@@ -174,4 +174,28 @@ defmodule LoopctlRunner.TestSupport do
   end
 
   def read_int!(path), do: path |> File.read!() |> String.trim() |> String.to_integer()
+
+  @doc """
+  A session's tree as the launcher records it: a detached process, `"pid start"` in the tree file,
+  which a Port closing does not end. `ignore_term` makes it one that outlives a TERM, so ending it
+  takes the whole grace. Killed when the test exits.
+  """
+  def live_session!(ignore_term) do
+    trap = if ignore_term, do: ~s|$SIG{TERM} = "IGNORE"; |, else: ""
+
+    {out, 0} =
+      System.cmd("/bin/sh", [
+        "-c",
+        ~s|perl -MPOSIX -e '#{trap}POSIX::setsid(); exec "sleep", "30"' >/dev/null 2>&1 & echo $!|
+      ])
+
+    session = String.to_integer(String.trim(out))
+
+    ExUnit.Callbacks.on_exit(fn ->
+      System.cmd("kill", ["-KILL", "#{session}"], stderr_to_stdout: true)
+    end)
+
+    :ok = wait_until(fn -> LoopctlRunner.Owner.start_time(session) != nil end)
+    session
+  end
 end

@@ -26,7 +26,11 @@ defmodule LoopctlRunner.DispatchPolicy do
     5. `insufficient_disk` — free disk under `control.min_free_disk_mb`, or unreadable, on the
        volume of `runs_dir` OR of the repo checkout, where the worktree and its build output land;
     6. `branch_not_allowed` — the branch is outside `branch_prefixes`, or either ref is not a
-       plain ref name;
+       plain ref name. A `review` dispatch is held to the second half only: its `branch` is the
+       IMPLEMENTER's, derived from whatever prefixes that machine declared, and a review never
+       cuts, writes or pushes it — it only fetches it, which a plain ref name is what makes safe.
+       Refusing one for a prefix this machine enforces on the branches it WRITES would turn away
+       every review of a story implemented elsewhere;
     7. `wall_clock_exceeds_limit`, `max_turns_exceeds_limit` — over `max_wall_clock_s` or
        `max_turns`;
     8. `token_budget_exceeds_limit` — when `control.max_token_budget` is set, a dispatch with no
@@ -162,11 +166,14 @@ defmodule LoopctlRunner.DispatchPolicy do
   defp repo(_dispatch, _control, _config),
     do: {:refuse, "repo_not_allowed", "the dispatch names no repo"}
 
-  defp refs(%{"base_branch" => base, "branch" => branch}, config)
+  defp refs(%{"base_branch" => base, "branch" => branch} = dispatch, config)
        when is_binary(base) and is_binary(branch) do
     cond do
       not plain_ref?(base) or not plain_ref?(branch) ->
         {:refuse, "branch_not_allowed", "a ref is not a plain ref name"}
+
+      dispatch["kind"] == "review" ->
+        :ok
 
       not Enum.any?(config.branch_prefixes, &String.starts_with?(branch, &1)) ->
         {:refuse, "branch_not_allowed", "#{branch} is outside #{inspect(config.branch_prefixes)}"}

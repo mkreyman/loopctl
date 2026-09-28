@@ -7,6 +7,8 @@ defmodule LoopctlRunner.RunState do
   worktree and the process group it left behind, and the next boot can clean them up.
   """
 
+  alias LoopctlRunner.AtomicFile
+
   @spec path(String.t()) :: String.t()
   def path(run_dir), do: Path.join(run_dir, "state.json")
 
@@ -62,10 +64,9 @@ defmodule LoopctlRunner.RunState do
       end
 
     next = Map.merge(current, stringify(changes))
-    # A unique temp name: another run's take_ownership may update this file concurrently.
-    tmp = path(run_dir) <> ".#{System.unique_integer([:positive])}.tmp"
-    File.write!(tmp, JSON.encode!(next))
-    File.rename!(tmp, path(run_dir))
+    # Unique temp names (`AtomicFile`): another run's take_ownership may update this file
+    # concurrently.
+    AtomicFile.write!(path(run_dir), JSON.encode!(next))
     next
   end
 

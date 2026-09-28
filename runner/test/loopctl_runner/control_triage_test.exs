@@ -216,7 +216,7 @@ defmodule LoopctlRunner.ControlTriageTest do
                "claim_epoch" => 3,
                "decision" => "refused",
                "reason" => "kind_not_supported",
-               "detail" => "this runner runs only: implement"
+               "detail" => "this runner runs only: implement, review"
              }
 
       # The declaration and the check are one list, and triage is in neither.

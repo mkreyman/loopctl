@@ -413,7 +413,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
       # The final mode is the same whichever order the mint uses, so the ORDER is pinned at the
       # source: the window where the file exists at the umask's mode with the token already in it
       # cannot be observed from here without racing the mint.
-      source = File.read!("lib/loopctl_runner/triage_verdict.ex")
+      source = File.read!("lib/loopctl_runner/capability.ex")
       touch = :binary.match(source, "File.touch(path)") |> elem(0)
       chmod = :binary.match(source, "File.chmod(path, 0o600)") |> elem(0)
       write = :binary.match(source, "File.write(path, token)") |> elem(0)

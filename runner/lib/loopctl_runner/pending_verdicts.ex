@@ -31,6 +31,8 @@ defmodule LoopctlRunner.PendingVerdicts do
 
   require Logger
 
+  alias LoopctlRunner.AtomicFile
+
   # NOT `@file`: that attribute is Elixir's own, set for the next definition and never read back.
   @message_file "verdict_message.json"
 
@@ -40,17 +42,7 @@ defmodule LoopctlRunner.PendingVerdicts do
   @doc "Records `payload` as owed, atomically (write-then-rename)."
   @spec write(String.t(), map()) :: :ok | {:error, term()}
   def write(run_dir, payload) do
-    path = file(run_dir)
-    tmp = path <> ".#{System.unique_integer([:positive])}.tmp"
-
-    with :ok <- File.write(tmp, JSON.encode!(payload)),
-         :ok <- File.rename(tmp, path) do
-      :ok
-    else
-      error ->
-        File.rm(tmp)
-        error
-    end
+    AtomicFile.write(file(run_dir), JSON.encode!(payload))
   end
 
   @doc "Forgets a settled message; one already gone, or a run directory that is not, is fine."

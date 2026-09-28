@@ -27,6 +27,8 @@ defmodule LoopctlRunner.ControlConfig do
     * `machine` must be the name the runner was enrolled under (loopctl refuses any other).
   """
 
+  alias LoopctlRunner.Uuid
+
   @enforce_keys [:url, :runner_id, :machine, :token_file, :repos, :max_sessions]
   defstruct [
     :url,
@@ -54,7 +56,6 @@ defmodule LoopctlRunner.ControlConfig do
           max_token_budget: pos_integer() | nil
         }
 
-  @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
   # The contract's own patterns (RunnerJoin.machine, RunnerJoin.repos.items).
   @machine ~r/\A[a-z0-9][a-z0-9._-]{0,62}\z/
   @repo ~r/\A[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}\z/
@@ -63,8 +64,8 @@ defmodule LoopctlRunner.ControlConfig do
   @spec from_map(map()) :: {:ok, t()} | {:error, String.t()}
   def from_map(map) when is_map(map) do
     with {:ok, url} <- url(map["url"]),
-         {:ok, runner_id} <- matching(map, "runner_id", @uuid),
-         {:ok, machine} <- matching(map, "machine", @machine),
+         {:ok, runner_id} <- matching(map, "runner_id", &Uuid.lowercase?/1),
+         {:ok, machine} <- matching(map, "machine", &(&1 =~ @machine)),
          {:ok, token_file} <- token_file(map["token_file"]),
          {:ok, repos} <- repos(map["repos"]),
          {:ok, max_sessions} <- int(map, "max_sessions", 0, 64),
@@ -153,10 +154,10 @@ defmodule LoopctlRunner.ControlConfig do
 
   defp url(_), do: {:error, "config control.url must be a string"}
 
-  defp matching(map, key, format) do
+  defp matching(map, key, format?) do
     value = map[key]
 
-    if is_binary(value) and value =~ format,
+    if is_binary(value) and format?.(value),
       do: {:ok, value},
       else: {:error, "config control.#{key} is missing or malformed"}
   end

@@ -41,7 +41,7 @@ defmodule LoopctlRunner.TraceShip do
   is left for the next pass.
   """
 
-  alias LoopctlRunner.{ByteRule, Contract, Owner, RunState}
+  alias LoopctlRunner.{AtomicFile, ByteRule, Contract, Owner, RunState, Uuid}
 
   @limits Map.fetch!(Contract.connection(), "limits")
   @max_events Map.fetch!(@limits, "trace_max_events")
@@ -50,7 +50,6 @@ defmodule LoopctlRunner.TraceShip do
   @max_data_bytes Map.fetch!(@limits, "trace_max_event_data_bytes")
   @max_digits get_in(@limits, ["json_byte_rule", "max_number_digits"])
   @in_flight ["starting", "running"]
-  @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
   @chunk 65_536
 
   @type run :: %{
@@ -86,7 +85,7 @@ defmodule LoopctlRunner.TraceShip do
          %{"run_id" => run_id, "dispatch_id" => dispatch_id, "claim_epoch" => epoch} = state
        )
        when is_binary(run_id) and is_binary(dispatch_id) and is_integer(epoch) and epoch >= 0 do
-    if Regex.match?(@uuid, run_id) and Regex.match?(@uuid, dispatch_id) do
+    if Uuid.valid?(run_id) and Uuid.valid?(dispatch_id) do
       %{
         run_dir: run_dir,
         run_id: run_id,
@@ -481,18 +480,8 @@ defmodule LoopctlRunner.TraceShip do
   # Never raises: a full disk or a vanished run directory must not take the control connection
   # down with it. The caller logs the error and keeps the decision in memory.
   defp write_settled(run, fields) do
-    path = settled_path(run.run_dir)
-    tmp = path <> ".#{System.unique_integer([:positive])}.tmp"
     at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
-
-    with :ok <- File.write(tmp, JSON.encode!(Map.put(fields, "at", at))),
-         :ok <- File.rename(tmp, path) do
-      :ok
-    else
-      error ->
-        File.rm(tmp)
-        error
-    end
+    AtomicFile.write(settled_path(run.run_dir), JSON.encode!(Map.put(fields, "at", at)))
   end
 
   defp read_settled(run_dir) do

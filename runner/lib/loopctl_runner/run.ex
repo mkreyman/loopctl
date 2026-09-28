@@ -109,8 +109,13 @@ defmodule LoopctlRunner.Run do
     end
   end
 
-  # The kind is what a reader needs first: an exit or a throw has no exception message.
-  defp crash_error(kind, reason),
+  @doc """
+  A caught crash as a run's `error`: the kind first — an exit or a throw has no exception message
+  — and the banner, cut to 500 characters. `LoopctlRunner.ReviewRun` reports its crashes the same
+  way.
+  """
+  @spec crash_error(atom(), term()) :: String.t()
+  def crash_error(kind, reason),
     do: "#{kind}: " <> String.slice(Exception.format_banner(kind, reason), 0, 500)
 
   @doc """
@@ -265,7 +270,9 @@ defmodule LoopctlRunner.Run do
     stage(opts, event)
   end
 
-  defp stage(opts, event) do
+  @doc "Calls the run's `:on_stage` with `event`, when it has one. `ReviewRun` reports through it too."
+  @spec stage(keyword(), term()) :: term()
+  def stage(opts, event) do
     case Keyword.get(opts, :on_stage) do
       nil -> :ok
       on_stage -> on_stage.(event)
@@ -519,17 +526,25 @@ defmodule LoopctlRunner.Run do
   defp fetch_data(:skipped), do: %{"fetch" => "skipped"}
   defp fetch_data({:error, error}), do: %{"fetch" => "failed", "fetch_error" => error}
 
-  defp session_status(nil), do: "crashed"
-  defp session_status(%{reason: :exited, exit_status: 0}), do: "succeeded"
-  defp session_status(%{reason: :exited}), do: "failed"
+  @doc """
+  A run's status from how its session ended: `succeeded` for an exit 0, `failed` for any other
+  exit, `stopped_at_deadline` for a session the dispatch's `deadline_at` stopped, the session's own
+  stop reason otherwise, and `crashed` for anything that is not a session's end — no session, or
+  one whose monitor crashed. Shared with `LoopctlRunner.ReviewRun`, so the two kinds cannot name
+  one ending differently.
+  """
+  @spec session_status(term()) :: String.t()
+  def session_status(%{reason: :exited, exit_status: 0}), do: "succeeded"
+  def session_status(%{reason: :exited}), do: "failed"
 
   # Stopped by the dispatch's deadline_at, not by its own wall clock: its own status, never
   # `wall_clock_exceeded` — which `DispatchRun.session_ended/2` reports as a budget the story
   # overran and loopctl escalates — and reported `crashed` from it.
-  defp session_status(%{reason: :wall_clock_exceeded, stop_bound: :deadline}),
+  def session_status(%{reason: :wall_clock_exceeded, stop_bound: :deadline}),
     do: "stopped_at_deadline"
 
-  defp session_status(%{reason: reason}), do: Atom.to_string(reason)
+  def session_status(%{reason: reason}) when is_atom(reason), do: Atom.to_string(reason)
+  def session_status(_no_session), do: "crashed"
 
   defp run_dir_name(story, run_id) do
     stamp = DateTime.utc_now() |> Calendar.strftime("%Y%m%dT%H%M%SZ")

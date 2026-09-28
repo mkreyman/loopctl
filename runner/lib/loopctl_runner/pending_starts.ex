@@ -11,7 +11,7 @@ defmodule LoopctlRunner.PendingStarts do
 
   require Logger
 
-  @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
+  alias LoopctlRunner.{AtomicFile, Uuid}
 
   @spec dir(String.t()) :: String.t()
   def dir(runs_dir), do: Path.join(runs_dir, ".pending")
@@ -21,16 +21,7 @@ defmodule LoopctlRunner.PendingStarts do
   def write(runs_dir, %{"dispatch_id" => id} = dispatch) do
     with {:ok, path} <- path(runs_dir, id),
          :ok <- File.mkdir_p(dir(runs_dir)) do
-      tmp = path <> ".#{System.unique_integer([:positive])}.tmp"
-
-      with :ok <- File.write(tmp, JSON.encode!(dispatch)),
-           :ok <- File.rename(tmp, path) do
-        :ok
-      else
-        error ->
-          File.rm(tmp)
-          error
-      end
+      AtomicFile.write(path, JSON.encode!(dispatch))
     end
   end
 
@@ -63,7 +54,7 @@ defmodule LoopctlRunner.PendingStarts do
   # The id is contract-validated as a UUID before it gets here; checked again because it names a
   # file.
   defp path(runs_dir, id) do
-    if is_binary(id) and Regex.match?(@uuid, id),
+    if Uuid.valid?(id),
       do: {:ok, Path.join(dir(runs_dir), String.downcase(id) <> ".json")},
       else: {:error, :invalid_dispatch_id}
   end

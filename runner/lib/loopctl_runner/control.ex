@@ -38,7 +38,8 @@ defmodule LoopctlRunner.Control do
     4. the dispatch must carry the object its kind is run from, meeting what the schema cannot
        say, or it is refused `other`: a `story` whose `id` equals `story_id`
        (`LoopctlRunner.DispatchRun`) for an `implement` dispatch, a `triage` report within the
-       contract's byte cap (`LoopctlRunner.TriageDispatch`) for a `triage` one.
+       contract's byte cap (`LoopctlRunner.TriageDispatch`) for a `triage` one, and for a
+       `review` one both a `story` and a `review` object (`LoopctlRunner.ReviewDispatch`).
 
   Before any of these, the contract's own `RunnerDispatch` validation (1.5.0 types the story)
   refuses a malformed dispatch `other`, naming the field.
@@ -60,7 +61,8 @@ defmodule LoopctlRunner.Control do
 
     * every dispatch bound in a `state.json` or pending in `LoopctlRunner.PendingStarts` is treated
       as started, so a redelivered dispatch is answered `accepted` and starts nothing — except a
-      run that ended owing nothing (`DispatchRun.end_reports/1` is `[]`: it started no session);
+      run that ended owing nothing (`DispatchRun.end_reports/1` is `[]`: an implement or triage
+      run that started no session; never a review, which always owes its `session_ended`);
     * each pending start has its accept resent, and its run starts on `ok` — unless it no longer
       makes runnable work, when it is dropped and its accept not resent. One dropped because its
       `deadline_at` passed is forgotten too, unless a run on disk started for it, so loopctl's
@@ -163,6 +165,61 @@ defmodule LoopctlRunner.Control do
   earlier build accepted is resumed like any other, and runs in a detached worktree of its own
   (`LoopctlRunner.TriageRun`), never in the repository's live checkout.
 
+  ## Reviews (contract 1.21.0)
+
+  An accepted `review` dispatch claims nothing — its `claim_epoch` is the implementer's, echoed
+  back — and runs `LoopctlRunner.ReviewRun.execute/3` on the same supervisor once loopctl records
+  the accept: a READ-ONLY session in a detached scratch tree at the checkpoint's `commit_sha`.
+  It reports the way an implement run does, through `:on_stage`, but has no stage to report: its
+  stream carries the session's JUDGEMENTS — one `review_finding` per defect and then the ONE
+  `review_verdict`, in the order the session stated them and numbered by this runner
+  (`client_seq`, `LoopctlRunner.ReviewJudgements`) — and then the `session_ended` that frees the
+  slot, which the verdict does not ("the slot is freed by the session's `session_ended`, not by
+  the verdict"). Nothing is queued after the verdict: "every later judgement is `review_closed`".
+
+  They are delivered as the stage reports are: one in flight per dispatch, strictly in order, the
+  head kept until it settles, so a push whose reply the channel lost is resent AS THE SAME BYTES
+  after the rejoin — which loopctl answers `ok` with `replayed` true, since both messages are
+  idempotent on `<dispatch_id>:<client_seq>`. NO JUDGEMENT IS SKIPPED ON A REFUSAL THAT CAN CLEAR:
+  the verdict "completes the review's round", so a finding passed over on a transient refusal
+  would be a round completed without it. `rate_limited` waits the `min_interval_ms` the refusal
+  names when it is a positive integer, else the event's burst refill; `internal_error`,
+  `tenant_halted` (which the contract does not call permanent) and a reply this build cannot read
+  send the same bytes again, more slowly each time up to a cap. A composition that cannot be read
+  or written is tried again the same way, with nothing behind it sent. None of that is for ever:
+  once the head has failed for `@judgement_retry_budget_ms` (an hour) from its first failure,
+  EVERYTHING still owed is given up — the verdict with it, never sent past an unsent finding —
+  logged as an error naming the head and why, recorded beside the run
+  (`review_verdict_undelivered`) for the operator, and the `session_ended` goes. The permanent
+  refusals are read from the contract and split by what they are about
+  (`LoopctlRunner.ReviewDispatch.classify/2`): one about the REVIEW or the dispatch —
+  `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate` among
+  them — means the round is over on loopctl's side, so the stream ends; one about the MESSAGE
+  (`secret_blocked`, `idempotency_key_reused`) drops that message, and a verdict dropped so is
+  recorded beside the run (`review_verdict_undelivered`) for the operator. Both are logged as
+  errors, and neither changes anything sent after them. What settled is recorded beside the run
+  (`review_settled`), so a Control that starts over the run sends exactly what is still owed,
+  from the composed bytes on disk.
+
+  The `session_ended` of a review goes last, and its reason is how its SESSION ended
+  (`DispatchRun.session_ended/2`), whatever became of its judgements: the contract gives it no
+  other meaning — "for which it only frees the runner's slot: no stage effect, no retry-ceiling
+  count, whatever `reason`". A run of ANY kind whose task died, or that a restart finds in
+  flight, has its session's process tree ended BEFORE its end is reported — so a review's session
+  can state nothing after a composition that is written once, and an implement session cannot
+  push after its `session_ended` — ended by a task under the run supervisor, never on this
+  process, which owns the channel. A killed review's scratch tree, which its own teardown never
+  removed, is recorded `remove_failed` for the next reap.
+
+  A review honours its dispatch's `deadline_at` (contract 1.19.0) as an implement run does: the
+  policy refuses one already past it `other` (`deadline_passed:`), the run checks it again before
+  it reaps or fetches and immediately before its session, and a session that starts is stopped in
+  time to be gone by it (`LoopctlRunner.ReviewRun`). Absent, nothing bounds the session but its own
+  wall clock. What differs is the end: a review that passed its deadline before its session
+  started still sends its (empty) judgements and its `session_ended`, `crashed`, because that is
+  the only message that frees the slot — so, unlike an implement run's, its dispatch is never
+  forgotten (`sessionless_end?/1`), and a re-send is answered `accepted` with nothing new behind it.
+
   ## Trace shipping
 
   While joined, the client ships run traces as `LoopctlRunner.TraceShip` decides: a
@@ -220,6 +277,10 @@ defmodule LoopctlRunner.Control do
     Owner,
     PendingStarts,
     PendingVerdicts,
+    Reaper,
+    ReviewDispatch,
+    ReviewJudgements,
+    ReviewRun,
     Run,
     Runs,
     RunState,
@@ -249,24 +310,36 @@ defmodule LoopctlRunner.Control do
   @terminal_internal_error_attempts 8
   # The longest wait between stage retries.
   @max_stage_backoff_ms 5_000
+  # The longest wait between resends of a review judgement refused in a way that can clear
+  # (`internal_error`, `tenant_halted`, a reply this build cannot read): a custody halt is lifted
+  # by an operator, in minutes or hours, so the stage backoff's five seconds would only spend the
+  # burst budget, and a judgement is resent until it lands rather than given up.
+  @max_judgement_backoff_ms 60_000
+  # How long the head of a review's judgements is tried again from its FIRST failure — refused in
+  # a way that can clear, or not composed — before everything still owed is given up and the
+  # `session_ended` behind it goes. Never one skipped and the next sent: the verdict completes the
+  # round, so it never goes past an unsent finding. But the slot is loopctl's, and a stream that
+  # waits for ever holds it for ever; an hour outlasts a deploy or a custody halt lifted the same
+  # day, and anything longer is for the operator, who is told.
+  @judgement_retry_budget_ms 3_600_000
   # The kinds this runner runs, declared on every join (`RunnerJoin.kinds`, contract 1.6.0) and
   # checked against every dispatch. ONE list, read by both: a declaration the kind check does not
   # honour is a self-contradiction loopctl suppresses for the rest of the connection, and a kind
   # check stricter than the declaration takes the machine out of that kind's work.
   # Fixed here, never from a story or the config, so nothing on the wire can widen it.
   #
-  # ADDING A KIND HERE IS NOT ENOUGH TO RUN IT. The accept path below is implement-only: it
-  # requires a `story` object, which the contract allows only on an implement dispatch. Declaring
-  # a kind whose dispatch this runner cannot accept makes loopctl send it — the declaration
-  # decides — and every one is refused as `other`, which suppresses nothing and records nothing,
-  # so the machine soaks that kind for as long as it declares it. A new kind needs its payload,
-  # its own contained tool set and its own accept path first; `control_test` holds that canary.
+  # ADDING A KIND HERE IS NOT ENOUGH TO RUN IT. Each kind declared has its own clause of `work/3`
+  # and its own start in `start_pending/2`. Declaring a kind whose dispatch this runner cannot
+  # accept makes loopctl send it — the declaration decides — and every one is refused as `other`,
+  # which suppresses nothing and records nothing, so the machine soaks that kind for as long as it
+  # declares it. `review` has both (contract 1.21.0); `triage` still has no lens verdicts
+  # (`LoopctlRunner.TriagePrompt`), so it stays undeclared. `contract_test` holds that canary.
   #
   # EMPTY IS THE ONE VALUE THAT MUST NEVER SHIP. loopctl reads an empty array as no declaration
   # at all, falls back to its ledger, keeps sending `implement`, and caches the refusal
   # permanently for the life of this runner's row — the exact trap declaring exists to escape.
   # Draining is how this runner says it wants no work.
-  @kinds ["implement"]
+  @kinds ["implement", "review"]
 
   if @kinds == [],
     do:
@@ -405,6 +478,7 @@ defmodule LoopctlRunner.Control do
             run_supervisor: Keyword.get(opts, :run_supervisor, LoopctlRunner.RunSupervisor),
             run: Keyword.get(opts, :run, &Run.execute/3),
             triage_run: Keyword.get(opts, :triage_run, &TriageRun.execute/4),
+            review_run: Keyword.get(opts, :review_run, &ReviewRun.execute/3),
             # What a thread-mode session needs to finish (`DispatchRun.prompt/4` refuses the run
             # without either): the command it pushes with, and the module that reports what it
             # pushed. Replaceable so a test can supply what this branch lacks.
@@ -432,12 +506,17 @@ defmodule LoopctlRunner.Control do
             # is what keeps its task ending from reporting a second time); and ref => dispatch_id.
             runs: %{},
             run_refs: %{},
+            # A dead run's session being ended off this process before its end is reported:
+            # task ref => {dispatch_id, run_dir, what to finish} (`end_session_first/4`).
+            session_enders: %{},
             # dispatch_id => the stage stream (see stage_stream/1); push ref => dispatch_id.
             stage_streams: %{},
             stage_refs: %{},
             stage_retry_ms: Keyword.get(opts, :stage_retry_ms, stage_retry_ms()),
             internal_error_attempts:
               Keyword.get(opts, :internal_error_attempts, @internal_error_attempts),
+            judgement_retry_budget_ms:
+              Keyword.get(opts, :judgement_retry_budget_ms, @judgement_retry_budget_ms),
             terminal_internal_error_attempts:
               Keyword.get(
                 opts,
@@ -566,7 +645,13 @@ defmodule LoopctlRunner.Control do
   # report (`sessionless_end?/1`), which the running process forgot as it ended, and so does this.
   defp started_runs(states) do
     for {_dir, %{"dispatch_id" => id, "claim_epoch" => epoch} = state} <- states,
-        not sessionless_end?(%{status: state["status"], reached: state["reached"]}),
+        # With its KIND: a review that started no session still owes its `session_ended`
+        # (`DispatchRun.end_reports/1`), so it is never sessionless, and is not forgotten here.
+        not sessionless_end?(%{
+          kind: state["kind"],
+          status: state["status"],
+          reached: state["reached"]
+        }),
         do: {id, epoch}
   end
 
@@ -577,6 +662,12 @@ defmodule LoopctlRunner.Control do
   # and at startup (`started_runs/1`). A re-send that arrives while the old run's task is still in
   # `runs` is refused `busy` (`decision/2`) rather than accepted over it — `runs` is keyed by
   # dispatch — and once that task is gone it is decided afresh.
+  #
+  # A REVIEW is never sessionless, whether or not it started a session: its end is always its
+  # judgements and its `session_ended` (`DispatchRun.end_reports/1`), because that message is the
+  # only thing that frees loopctl's slot for it. So a review's dispatch stays in
+  # `started_dispatches` until the process ends, and a re-send of it is answered `accepted`
+  # idempotently, as it was before deadlines existed. Every summary this reads must carry `kind`.
   defp sessionless_end?(summary), do: DispatchRun.end_reports(summary) == []
 
   defp forget_sessionless(socket, id),
@@ -932,6 +1023,16 @@ defmodule LoopctlRunner.Control do
       when is_map_key(socket.assigns.run_refs, ref),
       do: {:noreply, run_ended(socket, ref, reason)}
 
+  def handle_info({ref, ended}, socket)
+      when is_reference(ref) and is_map_key(socket.assigns.session_enders, ref) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, session_ender_done(socket, ref, {:ended, ended})}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, socket)
+      when is_map_key(socket.assigns.session_enders, ref),
+      do: {:noreply, session_ender_done(socket, ref, {:died, reason})}
+
   def handle_info(_message, socket), do: {:noreply, socket}
 
   @impl Slipstream
@@ -982,7 +1083,9 @@ defmodule LoopctlRunner.Control do
         pending_starts: Map.keys(a.pending_starts),
         stage_reports_pending:
           a.stage_streams |> Map.values() |> Enum.map(&length(&1.queue)) |> Enum.sum(),
-        session_ended_pending: Enum.count(Map.values(a.stage_streams), & &1.session_ended)
+        session_ended_pending: Enum.count(Map.values(a.stage_streams), & &1.session_ended),
+        review_judgements_pending:
+          a.stage_streams |> Map.values() |> Enum.map(&length(&1.judgements)) |> Enum.sum()
       })
 
     {:reply, info, socket}
@@ -1460,13 +1563,18 @@ defmodule LoopctlRunner.Control do
   defp later_than?(_later, nil), do: true
   defp later_than?(later, %DateTime{} = current), do: DateTime.compare(later, current) == :gt
 
+  # A triage and a review both hold their stop bound on the work itself: neither runs a `Story`
+  # built at the accept.
   defp work_deadline(%{kind: "implement", story: story}), do: story.deadline_at
-  defp work_deadline(%{kind: "triage", deadline_at: deadline_at}), do: deadline_at
+
+  defp work_deadline(%{kind: kind, deadline_at: deadline_at}) when kind in ["triage", "review"],
+    do: deadline_at
 
   defp put_work_deadline(%{kind: "implement", story: story} = work, deadline),
     do: %{work | story: %{story | deadline_at: deadline}}
 
-  defp put_work_deadline(%{kind: "triage"} = work, deadline), do: %{work | deadline_at: deadline}
+  defp put_work_deadline(%{kind: kind} = work, deadline) when kind in ["triage", "review"],
+    do: %{work | deadline_at: deadline}
 
   defp decide_dispatch(socket, dispatch) do
     case guarded_decision(socket.assigns, dispatch) do
@@ -1573,6 +1681,34 @@ defmodule LoopctlRunner.Control do
     end
   end
 
+  # A review claims nothing and writes nothing: it needs the story it judges the change against,
+  # the review it answers, and what the policy resolved — the checkout, the implementer's branch it
+  # may have to fetch the checkpoint from, and the budgets, already held to this runner's ceilings.
+  #
+  # And its `deadline_at`, as the policy parsed it: the contract puts it on every dispatch "control
+  # PLACED under a claim; absent otherwise", and a review is placed under the IMPLEMENTER's claim
+  # (its `claim_epoch` is that claim's, echoed). Present, it bounds the review session exactly as it
+  # bounds an implement one (`LoopctlRunner.ReviewRun`); absent, nothing but the wall clock does.
+  defp work(%{"kind" => "review"} = dispatch, fields, _a) do
+    with {:ok, story} <- dispatch_story(dispatch),
+         {:ok, review} <- dispatch_review(dispatch) do
+      {:ok,
+       %{
+         kind: "review",
+         story: story,
+         review: review,
+         repo: fields.repo,
+         repo_path: fields.repo_path,
+         dispatch_repo: dispatch["repo"],
+         branch: fields.branch,
+         base: fields.base,
+         wall_clock_s: fields.wall_clock_s,
+         max_turns: fields.max_turns,
+         deadline_at: fields.deadline_at
+       }}
+    end
+  end
+
   # Reached two ways, and the wording has to be true of both: a kind this runner DECLARES and
   # cannot read (the note on `@kinds`), and a kind in a pending file that `rebuild_work/2` does not
   # re-check the declaration for. What is true either way is that there is no accept path.
@@ -1606,6 +1742,14 @@ defmodule LoopctlRunner.Control do
     case DispatchRun.story_object(dispatch) do
       {:ok, story} -> {:ok, story}
       :none -> {:refuse, "other", "the dispatch carries no story"}
+      {:error, detail} -> {:refuse, "other", detail}
+    end
+  end
+
+  defp dispatch_review(dispatch) do
+    case ReviewDispatch.review_object(dispatch) do
+      {:ok, review} -> {:ok, review}
+      :none -> {:refuse, "other", "the dispatch carries no review"}
       {:error, detail} -> {:refuse, "other", detail}
     end
   end
@@ -1669,6 +1813,9 @@ defmodule LoopctlRunner.Control do
 
   defp describe_work(%{kind: "implement", story: story}), do: "run of #{story.id}"
   defp describe_work(%{kind: "triage", triage: triage}), do: "triage of #{triage["record_id"]}"
+
+  defp describe_work(%{kind: "review", review: review}),
+    do: "review #{review["review_id"]} of commit #{review["commit_sha"]}"
 
   # The pending start is kept in memory and on disk (PendingStarts), so a restart resumes it.
   defp register_pending(socket, dispatch, work) do
@@ -1869,24 +2016,32 @@ defmodule LoopctlRunner.Control do
        when is_map_key(socket.assigns.stage_streams, id),
        do: socket
 
+  # The stream is opened at once — `reached` is what `Run.unfinished/2` would read back too — so a
+  # second run bound to the dispatch is left alone while a review's session is still being ended.
   defp recover_terminal_report(socket, run_dir, %{"dispatch_id" => id} = state) do
-    status = state["status"]
     Logger.info("reporting the unacknowledged end of dispatch #{id}'s run", dispatch_id: id)
+    binding = Map.take(state, ["dispatch_id", "claim_epoch", "story_id"])
 
-    # A run whose owner died never recorded how it ended; `Run.unfinished/2` reads what it left on
-    # disk, as it does for a run that raised on a live runner, so both are reported alike.
+    socket
+    |> put_stream(id, stage_stream(binding, state["reached"] || "implementing"))
+    |> end_session_first(id, run_dir, {:recovered, run_dir, state})
+  end
+
+  # A run whose owner died never recorded how it ended; `Run.unfinished/2` reads what it left on
+  # disk, as it does for a run that raised on a live runner, so both are reported alike.
+  defp recovered_end(socket, id, run_dir, state) do
+    status = state["status"]
+
     summary =
       if status in [nil, "starting", "running"],
         do: Run.unfinished(run_dir, "the run did not finish on a live runner"),
         else: %{status: status, reached: state["reached"], escalations: Run.escalations(run_dir)}
 
-    binding = Map.take(state, ["dispatch_id", "claim_epoch", "story_id"])
-
-    # A run with no end to report (`DispatchRun.end_reports/1`: one that passed its deadline
-    # before it began) queues nothing, and its stream goes at once rather than lingering.
+    # A run with no end to report (`DispatchRun.end_reports/1`: an implement run that passed its
+    # deadline before it began) queues nothing, and its stream goes at once rather than lingering.
+    # Its stream was opened by `recover_terminal_report/3`, before its session was ended.
     socket
-    |> put_stream(id, stage_stream(binding, summary.reached || "implementing"))
-    |> queue_end(id, summary)
+    |> queue_end(id, with_kind(summary, state["kind"], run_dir))
     |> drop_stream_if_done(id)
   end
 
@@ -1977,6 +2132,37 @@ defmodule LoopctlRunner.Control do
               run_id: nil,
               run_dir: nil,
               kind: "implement"
+            }),
+          run_refs: Map.put(a.run_refs, task.ref, id),
+          stage_streams: Map.put(a.stage_streams, id, stage_stream(dispatch, "claimed"))
+        )
+
+      # A review opens the same stream an implement run does, and reports through the same
+      # `:on_stage` messages, so a review whose Control died reaches the successor. It carries no
+      # stage reports: its end is its judgements and then its `session_ended`
+      # (`DispatchRun.end_reports/1`).
+      {%{work: %{kind: "review"} = work, dispatch: dispatch, opts: opts}, pending} ->
+        review_run = a.review_run
+        config = a.config
+
+        task =
+          Task.Supervisor.async_nolink(a.run_supervisor, fn -> review_run.(config, work, opts) end)
+
+        Logger.info(
+          "dispatch #{id} recorded as accepted: #{describe_work(work)} started in #{work.repo}",
+          dispatch_id: id
+        )
+
+        PendingStarts.delete(config.runs_dir, id)
+
+        assign(socket,
+          pending_starts: pending,
+          runs:
+            Map.put(a.runs, id, %{
+              ref: task.ref,
+              run_id: nil,
+              run_dir: nil,
+              kind: "review"
             }),
           run_refs: Map.put(a.run_refs, task.ref, id),
           stage_streams: Map.put(a.stage_streams, id, stage_stream(dispatch, "claimed"))
@@ -2075,6 +2261,13 @@ defmodule LoopctlRunner.Control do
   # loopctl's slot back, so they are sent on every stream however its intermediate reports fared.
   # `session_ended` goes only once the queue is EMPTY — after every stage report — because a
   # `crashed` one releases the claim, and a stage report sent after that is refused as stale.
+  #
+  # A REVIEW's stream has no stage reports; its `judgements` — `{event, payload}`, the composed
+  # `review_finding`s and the `review_verdict`, in `client_seq` order, or `[:compose]` until they
+  # are composed — go where the stages would, and its `session_ended` behind them for the same
+  # reason: once it is recorded, "a new one is `dispatch_not_accepted`". `run_dir` is where they
+  # are composed, and where what settled is recorded; `judgement_since` is when the head first
+  # failed, which bounds how long it is tried (`@judgement_retry_budget_ms`).
   defp stage_stream(dispatch, stage),
     do: %{
       dispatch: Map.take(dispatch, ["dispatch_id", "claim_epoch", "story_id"]),
@@ -2088,7 +2281,10 @@ defmodule LoopctlRunner.Control do
       ended: false,
       terminal_tried: [],
       session_ended: nil,
-      escalation_unsettled: false
+      escalation_unsettled: false,
+      judgements: [],
+      judgement_since: nil,
+      run_dir: nil
     }
 
   defp put_stream(socket, id, stream),
@@ -2162,12 +2358,79 @@ defmodule LoopctlRunner.Control do
               reason: DispatchRun.end_reason(summary)
             )
 
+          :judgements, socket ->
+            queue_judgements(socket, id, summary)
+
           :session_ended, socket ->
             queue_session_ended(socket, id, summary)
         end)
 
       _ ->
         socket
+    end
+  end
+
+  # A run with no directory stated nothing anyone can read: its `session_ended` goes alone. Any
+  # other has its judgements composed before anything behind them is sent (`compose_judgements/3`).
+  defp queue_judgements(socket, id, summary) do
+    stream = socket.assigns.stage_streams[id]
+
+    case summary[:run_dir] do
+      nil ->
+        Logger.error(
+          "the review run of dispatch #{id} left no run directory; no judgement is sent",
+          stage_ids(stream)
+        )
+
+        socket
+
+      run_dir ->
+        socket
+        |> put_stream(id, %{stream | judgements: [:compose], run_dir: run_dir})
+        |> send_next_stage(id)
+    end
+  end
+
+  # What the review's session stated, as the messages composed from it ONCE — by the run at its end,
+  # or now, from what a run whose task died left on disk — less what a previous Control already
+  # settled. A composition that cannot be read or written (a full disk, a state that will not read)
+  # is not guessed at and not skipped: it is tried again as a refused judgement is, within the same
+  # budget, with the `session_ended` waiting behind it — so nothing records the run's end, and a
+  # Control that starts over the run composes it too.
+  defp compose_judgements(socket, id, %{judgements: [:compose]} = stream) do
+    case ReviewJudgements.outstanding(stream.run_dir) do
+      {:ok, messages} ->
+        Logger.info(
+          "the review run of dispatch #{id} owes #{length(messages)} judgement message(s)",
+          stage_ids(stream)
+        )
+
+        socket
+        |> put_stream(id, %{
+          stream
+          | judgements: messages,
+            internal_errors: 0,
+            judgement_since: nil
+        })
+        |> send_next_stage(id)
+
+      {:error, why} ->
+        tries = stream.internal_errors + 1
+        delay = judgement_backoff(socket, tries)
+
+        Logger.warning(
+          "the review run of dispatch #{id}'s judgements could not be composed (#{why}); " <>
+            "trying again in #{delay}ms, and nothing behind them goes first",
+          stage_ids(stream)
+        )
+
+        retry_judgement(
+          socket,
+          id,
+          %{stream | internal_errors: tries},
+          delay,
+          {"composition", why}
+        )
     end
   end
 
@@ -2179,6 +2442,8 @@ defmodule LoopctlRunner.Control do
 
     case DispatchRun.session_ended(stream.dispatch, summary) do
       {:ok, payload} ->
+        review_escalated(summary, payload, stream)
+
         socket
         |> put_stream(id, %{stream | session_ended: payload})
         |> send_next_stage(id)
@@ -2192,6 +2457,24 @@ defmodule LoopctlRunner.Control do
         socket
     end
   end
+
+  # A review claims nothing, so it has no stage to escalate through and is never offered
+  # `loop-escalate`: one that escalated anyway is logged here, as an error, with what it said —
+  # nothing else carries it. Its `session_ended` is still the session's own end, named as sent.
+  defp review_escalated(%{kind: "review"} = summary, payload, stream) do
+    escalations = summary[:escalations] || []
+
+    if summary[:status] == "escalated" or escalations != [] do
+      Logger.error(
+        "the review session escalated, which a review cannot do; its session_ended is " <>
+          "#{payload["reason"]}. It said: " <>
+          if(escalations == [], do: "nothing", else: Enum.join(escalations, " | ")),
+        stage_ids(stream)
+      )
+    end
+  end
+
+  defp review_escalated(_summary, _payload, _stream), do: :ok
 
   defp queue_stage(socket, id, to, opts \\ []) do
     case socket.assigns.stage_streams[id] do
@@ -2246,9 +2529,16 @@ defmodule LoopctlRunner.Control do
     end
   end
 
-  # The stage reports first, in order, and the `session_ended` only behind the last of them.
+  # The stage reports first, in order, then a review's judgements, and the `session_ended` only
+  # behind the last of them.
   defp push_next(socket, id, %{queue: [payload | _]} = stream),
     do: push_stage(socket, id, stream, "stage", payload)
+
+  defp push_next(socket, id, %{judgements: [:compose]} = stream),
+    do: compose_judgements(socket, id, stream)
+
+  defp push_next(socket, id, %{judgements: [{event, payload} | _]} = stream),
+    do: push_stage(socket, id, stream, event, payload)
 
   defp push_next(socket, id, %{session_ended: %{} = payload} = stream),
     do: push_stage(socket, id, stream, "session_ended", payload)
@@ -2277,6 +2567,12 @@ defmodule LoopctlRunner.Control do
   defp sent_line("session_ended", payload),
     do: "session_ended sent: #{payload["reason"]}"
 
+  defp sent_line("review_finding", payload),
+    do: "review_finding #{payload["client_seq"]} sent (#{payload["severity"]})"
+
+  defp sent_line("review_verdict", payload),
+    do: "review_verdict sent as #{payload["client_seq"]}"
+
   defp stage_answered(ref, reply, socket) do
     {id, refs} = Map.pop(socket.assigns.stage_refs, ref)
     socket = assign(socket, stage_refs: refs)
@@ -2287,8 +2583,11 @@ defmodule LoopctlRunner.Control do
 
         stage_reply(socket, id, stream, reply)
 
+      %{push: ^ref, queue: [], judgements: [_ | _]} = stream ->
+        judgement_reply(socket, id, %{stream | push: nil}, reply)
+
       # Pushed only with the queue empty, and nothing is queued after the run's end.
-      %{push: ^ref, queue: [], session_ended: %{}} = stream ->
+      %{push: ^ref, queue: [], judgements: [], session_ended: %{}} = stream ->
         session_ended_reply(socket, id, %{stream | push: nil}, reply)
 
       # A reply to a push from before the last rejoin.
@@ -2385,8 +2684,8 @@ defmodule LoopctlRunner.Control do
   end
 
   # `recorded` is what goes beside the run: true or "refused" once settled, nil when only THIS
-  # process gives up, so a restart sends it again. A terminal `escalated` given up unsettled
-  # before it keeps the whole end unrecorded for the same reason.
+  # process gives up, so a restart sends it again. A terminal `escalated` given up unsettled before
+  # it keeps the whole end unrecorded for the same reason.
   defp settle_session_ended(socket, id, stream, recorded) do
     if recorded != nil and not stream.escalation_unsettled,
       do: mark_terminal_reported(socket, stream, recorded)
@@ -2394,6 +2693,229 @@ defmodule LoopctlRunner.Control do
     socket
     |> put_stream(id, %{stream | session_ended: nil, rate_limited: 0, internal_errors: 0})
     |> drop_stream_if_done(id)
+  end
+
+  # --- A review's judgements (contract 1.21.0; "Reviews" in the moduledoc) ---
+
+  @judgement_acks %{
+    "review_finding" => "RunnerReviewFindingAck",
+    "review_verdict" => "RunnerReviewVerdictAck"
+  }
+
+  # Settled on `ok` — a resend's `replayed` true included — and on every refusal no resend can
+  # move; anything else sends the SAME bytes again, which is what makes a resend safe.
+  defp judgement_reply(socket, id, %{judgements: [{event, _payload} | _]} = stream, reply) do
+    case reply do
+      {:error, %{"reason" => reason} = refusal} ->
+        judgement_refused(socket, id, stream, ReviewDispatch.classify(event, reason), refusal)
+
+      _ ->
+        if acked?(reply) do
+          note_judgement(stream, reply)
+          settle_judgement(socket, id, stream)
+        else
+          judgement_refused(socket, id, stream, :unknown, reply)
+        end
+    end
+  end
+
+  # `replayed` is what tells a first delivery from a resend whose first copy had landed, and
+  # `escalated` is loopctl saying this verdict sent the story back for a rewrite.
+  defp note_judgement(%{judgements: [{event, payload} | _]} = stream, {:ok, body})
+       when is_map(body) do
+    case Contract.validate(Map.fetch!(@judgement_acks, event), body) do
+      :ok ->
+        Logger.info(
+          "loopctl recorded #{event} #{payload["client_seq"]} (replayed: #{body["replayed"]})" <>
+            escalated_note(body),
+          stage_ids(stream)
+        )
+
+      {:error, errors} ->
+        Logger.warning(
+          "loopctl acknowledged #{event} #{payload["client_seq"]} with an ack this build cannot " <>
+            "read (#{inspect(errors)}); whether it was recorded now or replayed is unknown",
+          stage_ids(stream)
+        )
+    end
+  end
+
+  defp note_judgement(%{judgements: [{event, payload} | _]} = stream, _reply),
+    do:
+      Logger.warning(
+        "loopctl acknowledged #{event} #{payload["client_seq"]} with no ack body; whether it " <>
+          "was recorded now or replayed is unknown",
+        stage_ids(stream)
+      )
+
+  defp escalated_note(%{"escalated" => true}),
+    do: "; the round ended at its ceiling with a material finding, so the story is escalated"
+
+  defp escalated_note(_body), do: ""
+
+  defp judgement_refused(socket, id, stream, :rate_limited, refusal) do
+    [{event, payload} | _] = stream.judgements
+    delay = refusal_interval(refusal, ReviewDispatch.retry_ms(event))
+    stream = %{stream | rate_limited: stream.rate_limited + 1}
+
+    retry_judgement(
+      socket,
+      id,
+      stream,
+      delay,
+      {"#{event} #{payload["client_seq"]}", "rate_limited"}
+    )
+  end
+
+  # Every refusal that can clear — `internal_error`, the tenant's custody halt (`tenant_halted`,
+  # which the contract does not call permanent and an operator lifts) — and a reply this build
+  # cannot read send the SAME bytes again, more slowly each time up to
+  # `@max_judgement_backoff_ms`, counted apart from rate limiting so a burst refill does not slow
+  # them, and never skipped: that would let the verdict complete the round without it. A resend is
+  # safe because every judgement is idempotent on `<dispatch_id>:<client_seq>`.
+  defp judgement_refused(socket, id, stream, class, refusal)
+       when class in [:internal_error, :halted, :unknown] do
+    [{event, payload} | _] = stream.judgements
+    tries = stream.internal_errors + 1
+    delay = judgement_backoff(socket, tries)
+    why = transient_why(class, refusal)
+
+    Logger.log(
+      if(class == :unknown, do: :error, else: :warning),
+      "loopctl refused #{event} #{payload["client_seq"]} for dispatch #{id} " <>
+        why <> "; resending it in #{delay}ms",
+      stage_ids(stream)
+    )
+
+    stream = %{stream | internal_errors: tries}
+    retry_judgement(socket, id, stream, delay, {"#{event} #{payload["client_seq"]}", why})
+  end
+
+  # A verdict refused so leaves the round without one. Nothing sent can change that — a review's
+  # `session_ended` "only frees the runner's slot" — so it is recorded beside the run for the
+  # operator, and nothing else. Only a PERMANENT refusal records it: one that can clear is resent
+  # until it lands.
+  defp judgement_refused(socket, id, stream, :drop, refusal) do
+    [{event, payload} | _] = stream.judgements
+    reason = refusal["reason"]
+
+    Logger.error(
+      "loopctl refused #{event} #{payload["client_seq"]} for dispatch #{id} (#{reason}), and " <>
+        "no resend can move that: " <> dropped(event),
+      stage_ids(stream)
+    )
+
+    if event == "review_verdict",
+      do: ReviewJudgements.verdict_undelivered(stream.run_dir, "refused #{reason}")
+
+    settle_judgement(socket, id, stream)
+  end
+
+  defp judgement_refused(socket, id, stream, :stop, refusal) do
+    [{event, payload} | _] = stream.judgements
+
+    Logger.error(
+      "loopctl refused #{event} #{payload["client_seq"]} for dispatch #{id} " <>
+        "(#{refusal["reason"]}): this review takes nothing more, so #{length(stream.judgements)} " <>
+        "judgement(s) are not sent; its session_ended still is",
+      stage_ids(stream)
+    )
+
+    stop_judgements(socket, id, stream)
+  end
+
+  defp judgement_backoff(socket, tries),
+    do:
+      min(
+        socket.assigns.stage_retry_ms * Integer.pow(2, min(tries - 1, 16)),
+        @max_judgement_backoff_ms
+      )
+
+  # The head is tried again, and nothing behind it goes first — until `judgement_retry_budget_ms`
+  # has passed since it FIRST failed. Then everything still owed is given up WHOLE, the verdict
+  # included, since a verdict sent past an unsent finding completes the round without it: logged
+  # as an error naming the head and why, recorded beside the run for the operator, and the
+  # `session_ended` behind them goes, so the slot is freed.
+  defp retry_judgement(socket, id, stream, delay, {head, why}) do
+    now = System.monotonic_time(:millisecond)
+    since = stream.judgement_since || now
+    budget = socket.assigns.judgement_retry_budget_ms
+
+    if now - since < budget do
+      retry_stage(socket, id, %{stream | judgement_since: since}, delay)
+    else
+      owed = length(stream.judgements)
+
+      Logger.error(
+        "the review of dispatch #{id} gives up: its #{head} did not go within #{budget}ms of " <>
+          "its first failure (#{why}), so none of the #{owed} judgement(s) still owed is sent " <>
+          "and its session_ended goes now",
+        stage_ids(stream)
+      )
+
+      ReviewJudgements.verdict_undelivered(
+        stream.run_dir,
+        "gave up after #{budget}ms on the #{head}: #{why}"
+      )
+
+      stop_judgements(socket, id, stream)
+    end
+  end
+
+  defp dropped("review_verdict"),
+    do: "the round has no verdict from this review, recorded beside the run for the operator"
+
+  defp dropped(_event), do: "this judgement is not sent, the rest still are"
+
+  defp transient_why(:internal_error, _refusal), do: "as internal_error"
+
+  defp transient_why(:halted, refusal),
+    do: "as #{refusal["reason"]}: the tenant is halted until an operator lifts it"
+
+  defp transient_why(:unknown, refusal),
+    do:
+      "with a reply this build (contract #{Contract.version()}) does not handle: " <>
+        inspect(refusal)
+
+  # The head is settled: recorded beside the run BEFORE the next goes, so a Control that starts
+  # over the run never sends it again.
+  defp settle_judgement(socket, id, %{judgements: [{_event, payload} | _]} = stream) do
+    ReviewJudgements.settle(stream.run_dir, payload["client_seq"] + 1)
+    next_judgement(socket, id, stream)
+  end
+
+  defp next_judgement(socket, id, %{judgements: [_ | rest]} = stream) do
+    socket
+    |> put_stream(id, %{
+      stream
+      | judgements: rest,
+        rate_limited: 0,
+        internal_errors: 0,
+        judgement_since: nil
+    })
+    |> drop_stream_if_done(id)
+    |> send_next_stage(id)
+  end
+
+  # Nothing more of this review is sent — loopctl ended the round, or this runner gave up: every
+  # judgement left is settled as it stands, so a restart does not send it either, and the
+  # `session_ended` behind them goes as it was composed. A composition never made settles nothing.
+  defp stop_judgements(socket, id, %{judgements: judgements} = stream) do
+    case List.last(judgements) do
+      {_event, last} -> ReviewJudgements.settle(stream.run_dir, last["client_seq"] + 1)
+      :compose -> :ok
+    end
+
+    socket
+    |> put_stream(id, %{
+      stream
+      | judgements: [],
+        rate_limited: 0,
+        internal_errors: 0,
+        judgement_since: nil
+    })
+    |> drop_stream_if_done(id)
+    |> send_next_stage(id)
   end
 
   defp stage_reply(socket, id, %{queue: [payload | _]} = stream, reply) do
@@ -2741,7 +3263,7 @@ defmodule LoopctlRunner.Control do
     a = socket.assigns
 
     case a.stage_streams[id] do
-      %{ended: true, push: nil, queue: [], session_ended: nil} ->
+      %{ended: true, push: nil, queue: [], judgements: [], session_ended: nil} ->
         if Map.has_key?(a.runs, id),
           do: socket,
           else: assign(socket, stage_streams: Map.delete(a.stage_streams, id))
@@ -2759,17 +3281,16 @@ defmodule LoopctlRunner.Control do
     ]
 
   # The task is over. A run that ended without reporting it (killed, or an exit rather than a
-  # raise) is reported from what it left on disk, and a state.json it left in flight is closed.
+  # raise) is reported from what it left on disk, and a state.json it left in flight is closed —
+  # once its session is over (`end_session_first/4`), whatever its kind.
   defp run_ended(socket, ref, reason) do
     a = socket.assigns
     {id, run_refs} = Map.pop(a.run_refs, ref)
     {run, runs} = Map.pop(a.runs, id)
-    socket = assign(socket, run_refs: run_refs, runs: runs)
 
-    case run do
-      %{kind: "triage"} -> triage_run_ended(socket, id, run, reason)
-      _ -> implement_run_ended(socket, id, run, reason)
-    end
+    socket
+    |> assign(run_refs: run_refs, runs: runs)
+    |> end_session_first(id, run.run_dir, {:task_ended, run, reason})
   end
 
   # A triage run that reported its outcome is over: the verdict is its whole report, and the task
@@ -2876,23 +3397,113 @@ defmodule LoopctlRunner.Control do
 
   # A run that returned or raised has already queued its own end, and `queue_end/3` sends a run's
   # end once. One that died without doing so is reported from what it left on disk
-  # (`Run.unfinished/2`): the stage it recorded reaching and its session's escalations.
-  defp implement_run_ended(socket, id, run, reason) do
+  # (`Run.unfinished/2`): the stage it recorded reaching and its session's escalations. A review
+  # carries its kind and directory, which are what give it its judgements (`queue_judgements/3`).
+  defp task_ended(socket, id, run, reason) do
     detail =
       if reason == :normal,
         do: "the run ended without reporting its end",
         else: "the run's process died: #{inspect(reason, limit: 5)}"
 
-    summary = Run.unfinished(run.run_dir, detail)
+    summary = run.run_dir |> Run.unfinished(detail) |> with_kind(run.kind, run.run_dir)
 
     if reason != :normal do
       Logger.error("the run of dispatch #{id} died: #{inspect(reason)}", dispatch_id: id)
       close_crashed_state(run.run_dir, summary.status)
+      give_scratch_tree_to_reaper(run.run_dir)
     end
 
     socket
     |> queue_end(id, summary)
     |> drop_stream_if_done(id)
+  end
+
+  # A run whose task died may leave its session running — the launcher ends it when the Port's
+  # pipe closes, but not before this process reads what the run left — and that session can still
+  # act AFTER its end is reported: an implement session push, a triage session write its verdict,
+  # a review session record a judgement after the messages are composed — a finding nobody sends,
+  # or worse, the verdict. So a run whose state is still in flight has its tree ended first, as the
+  # reaper ends an orphan's, whatever its kind, and its end is reported only once that is done.
+  #
+  # The ending runs in a task under the run supervisor, never in this process: a session that
+  # ignores TERM takes up to twice `kill_grace_s` to go, and this process owns the channel — its
+  # heartbeats and every other dispatch's stream. The task's answer (`session_ender_done/3`) is
+  # what finishes the run's end; a task that dies finishes it too, logged, since reporting what is
+  # on disk beats never reporting the run at all. A run that is not in flight finishes at once.
+  defp end_session_first(socket, id, run_dir, next) when is_binary(run_dir) do
+    case RunState.read(run_dir) do
+      {:ok, %{"status" => status} = state} when status in ["starting", "running"] ->
+        grace_ms = socket.assigns.config.kill_grace_s * 1000
+
+        task =
+          Task.Supervisor.async_nolink(socket.assigns.run_supervisor, fn ->
+            Reaper.end_session(state, grace_ms)
+          end)
+
+        enders = Map.put(socket.assigns.session_enders, task.ref, {id, run_dir, next})
+        assign(socket, session_enders: enders)
+
+      _ ->
+        finish_end(socket, id, next)
+    end
+  end
+
+  defp end_session_first(socket, id, _run_dir, next), do: finish_end(socket, id, next)
+
+  defp session_ender_done(socket, ref, outcome) do
+    {{id, run_dir, next}, enders} = Map.pop(socket.assigns.session_enders, ref)
+
+    case outcome do
+      {:ended, ended} ->
+        Logger.info(
+          "the session of #{run_dir}, before its end is reported: #{ended}",
+          dispatch_id: id
+        )
+
+      {:died, reason} ->
+        Logger.error(
+          "the session of #{run_dir} could not be ended before its end is reported " <>
+            "(#{inspect(reason, limit: 5)}); reporting what the run left on disk",
+          dispatch_id: id
+        )
+    end
+
+    socket |> assign(session_enders: enders) |> finish_end(id, next)
+  end
+
+  defp finish_end(socket, id, {:task_ended, %{kind: "triage"} = run, reason}),
+    do: triage_run_ended(socket, id, run, reason)
+
+  defp finish_end(socket, id, {:task_ended, run, reason}), do: task_ended(socket, id, run, reason)
+
+  defp finish_end(socket, id, {:recovered, run_dir, state}),
+    do: recovered_end(socket, id, run_dir, state)
+
+  # A review's summary carries its kind and run directory: `DispatchRun.end_reports/1` gives it its
+  # judgements from the one and `queue_judgements/3` reads them from the other.
+  defp with_kind(summary, "review", run_dir),
+    do: Map.merge(summary, %{kind: "review", run_dir: run_dir})
+
+  defp with_kind(summary, _kind, _run_dir), do: summary
+
+  # A killed run's own scratch tree — a review's — was never released: the teardown that removes it
+  # is in the run's `after`, which a kill skips. Recorded `remove_failed`, which is what the reaper
+  # collects from a run that is over whoever owned it, so the next reap removes the tree and the
+  # Claude project directory its cwd made. Only the RUN's own tree: a triage run's reused tree is
+  # recorded as scratch too, and its end is `triage_run_ended/4`'s, which never comes here.
+  defp give_scratch_tree_to_reaper(nil), do: :ok
+
+  defp give_scratch_tree_to_reaper(run_dir) do
+    case RunState.read(run_dir) do
+      {:ok, %{"worktree" => %{"scratch" => true, "status" => status} = tree}}
+      when status in ["creating", "created"] ->
+        RunState.update(run_dir, %{worktree: Map.put(tree, "status", "remove_failed")})
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
   end
 
   # Closed with the status the run's end is reported with, so a later Control reading it back

@@ -124,6 +124,16 @@ defmodule LoopctlRunner.DispatchRunTest do
     assert DispatchRun.end_reports(%{status: "failed", reached: "claimed"}) == [:escalated]
   end
 
+  test "a review that passed its deadline_at before its session still owes its session_ended" do
+    # A review holds no claim for the lease sweep to release — only the slot, and nothing but its
+    # `session_ended` frees that. So the review clause is judged before the deadline's `[]`.
+    assert DispatchRun.end_reports(%{kind: "review", status: "deadline_passed"}) ==
+             [:judgements, :session_ended]
+
+    assert DispatchRun.end_reports(%{kind: "review", status: "stopped_at_deadline"}) ==
+             [:judgements, :session_ended]
+  end
+
   test "the binding names the dispatch, its epoch and its story" do
     assert DispatchRun.binding(@dispatch) == %{
              "dispatch_id" => @dispatch["dispatch_id"],
@@ -175,6 +185,28 @@ defmodule LoopctlRunner.DispatchRunTest do
                  "reason" => reason
                }
 
+        assert Contract.validate("RunnerSessionEnded", payload) == :ok
+      end
+    end
+
+    test "a review's session_ended is how its session ended, and nothing else" do
+      # The contract gives it no other meaning: it "only frees the runner's slot: no stage effect,
+      # no retry-ceiling count, whatever `reason`".
+      for {status, reason} <- [
+            {"succeeded", "completed"},
+            {"escalated", "completed"},
+            {"wall_clock_exceeded", "wall_clock_exceeded"},
+            {"max_turns_exceeded", "max_turns_exceeded"},
+            # Prepared nothing and started no session: an end the runner did not choose.
+            {"failed", "crashed"},
+            {"crashed", "crashed"},
+            # loopctl's placement ran out, before the session or during it: no budget of its own.
+            {"deadline_passed", "crashed"},
+            {"stopped_at_deadline", "crashed"}
+          ] do
+        summary = %{kind: "review", status: status}
+        assert {:ok, payload} = DispatchRun.session_ended(@dispatch, summary)
+        assert payload["reason"] == reason, status
         assert Contract.validate("RunnerSessionEnded", payload) == :ok
       end
     end

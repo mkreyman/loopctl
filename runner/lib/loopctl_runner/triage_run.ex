@@ -81,9 +81,9 @@ defmodule LoopctlRunner.TriageRun do
     Contract,
     Owner,
     PendingVerdicts,
-    Reaper,
     Run,
     RunState,
+    ScratchRun,
     Session,
     Story,
     Trace,
@@ -91,6 +91,7 @@ defmodule LoopctlRunner.TriageRun do
     TriagePrompt,
     TriageTools,
     TriageVerdict,
+    Uuid,
     Worktree,
     WorktreeLock
   }
@@ -206,10 +207,8 @@ defmodule LoopctlRunner.TriageRun do
   # object — the accept path does — and a record_id carrying `/` or `..` would put the run
   # directory outside runs_dir, where RunState.all/1 and the reaper's glob cannot see it: a run
   # nothing reaps and nothing reports.
-  @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
-
   defp record_id(%{"record_id" => id}) when is_binary(id) do
-    if id =~ @uuid,
+    if Uuid.valid?(id),
       do: {:ok, String.downcase(id)},
       else: {:error, "record_id #{inspect(id)} is not a uuid"}
   end
@@ -290,24 +289,10 @@ defmodule LoopctlRunner.TriageRun do
       }
   end
 
-  # What an implement run does before it starts (`Run`), for the same reason: a triage run is often
-  # the only kind this runner is sent for a while, and an orphaned triage tree — or its lock, which
-  # the next run on the repo would find held — would otherwise wait for an implement dispatch.
-  # Guarded like `announce/2`: a reap that fails costs this run nothing. A run past its deadline
-  # does no work at all, and a reap is work.
+  # What an implement run does before it starts (`ScratchRun.reap/3` says why, and guards it). A
+  # run past its deadline does no work at all, and a reap is work.
   defp reap(_config, _owner, {:passed, _detail}), do: :skipped
-
-  defp reap(config, owner, :ok) do
-    Reaper.reap(config.runs_dir, config.kill_grace_s * 1000, config.grant_dir,
-      projects_dir: config.claude_projects_dir,
-      owner: {:ok, owner}
-    )
-  rescue
-    error -> Logger.error("the reap before a triage run failed: #{inspect(error)}")
-  catch
-    kind, reason ->
-      Logger.error("the reap before a triage run failed: #{inspect({kind, reason})}")
-  end
+  defp reap(config, owner, :ok), do: ScratchRun.reap(config, owner, "triage")
 
   # Guarded, and the guard is the point: this runs OUTSIDE the try below, before the state or the
   # trace exists, so a callback that raises would take the run down before it had written anything
@@ -367,8 +352,16 @@ defmodule LoopctlRunner.TriageRun do
       try do
         prompt =
           prepared(fn ->
-            record_tree(run_dir, path, tree, "created")
-            missing = submodules(path, tree, run_dir, trace, seq)
+            ScratchRun.record_tree(run_dir, tree, "created")
+
+            missing =
+              ScratchRun.submodules(tree, %{
+                run_dir: run_dir,
+                run_id: run_id,
+                trace: trace,
+                seq: seq
+              })
+
             lenses = Keyword.get(opts, :lenses, TriageTools.lenses())
 
             args = [
@@ -385,7 +378,7 @@ defmodule LoopctlRunner.TriageRun do
           judge(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts)
         end
       after
-        release_tree(config, path, tree, run_dir, run_id, trace, seq)
+        release_tree(config, tree, run_dir, run_id, trace, seq)
       end
     end
   end
@@ -550,7 +543,7 @@ defmodule LoopctlRunner.TriageRun do
     with {:ok, tree} <- prepared(fn -> claim_tree(config, path, run_id, owner) end) do
       result =
         prepared(fn ->
-          record_tree(run_dir, path, tree, "creating")
+          ScratchRun.record_tree(run_dir, tree, "creating")
           cut(path, tree)
         end)
 
@@ -559,14 +552,14 @@ defmodule LoopctlRunner.TriageRun do
           {:ok, %{tree | base: sha}}
 
         {:tree_left, reason} ->
-          give_back_left(config, path, tree, run_dir, run_id, trace, seq)
+          give_back_left(config, tree, run_dir, run_id, trace, seq)
           {:unreported, reason}
 
         failed ->
           # Truthful, and terminal: nothing of this run's is at that path, so the reaper — which
           # skips this status — must not go and remove what is. Then the lock, or the next run on
           # this repo would find the reused tree held by a run that has ended.
-          abandon_tree(config, path, run_dir, tree, run_id)
+          abandon_tree(config, run_dir, tree, run_id)
           failed
       end
     end
@@ -577,11 +570,11 @@ defmodule LoopctlRunner.TriageRun do
 
     case WorktreeLock.acquire(config.runs_dir, shared, run_id, owner) do
       :ok ->
-        {:ok, %{path: shared, shared?: true, base: "HEAD"}}
+        {:ok, %{repo_path: path, path: shared, shared?: true, base: "HEAD"}}
 
       {:error, {:held, _}} ->
         own = Worktree.triage_tree_path(config.runs_dir, path, run_id)
-        {:ok, %{path: own, shared?: false, base: "HEAD"}}
+        {:ok, %{repo_path: path, path: own, shared?: false, base: "HEAD"}}
     end
   end
 
@@ -595,31 +588,23 @@ defmodule LoopctlRunner.TriageRun do
   defp tree_result({:error, reason, :tree_left}), do: {:tree_left, reason}
   defp tree_result(other), do: other
 
-  # Paths that could not be initialised go to the trace and the state as well as the prompt, so a
-  # verdict judged without them can be told apart from one that had them.
-  defp submodules(path, tree, run_dir, trace, seq) do
-    case Worktree.sync_submodules(path, tree.path) do
-      :ok ->
-        []
-
-      {:missing, paths, detail} ->
-        Trace.emit(trace, "worktree.submodules_missing", seq, %{
-          "paths" => paths,
-          "detail" => detail
-        })
-
-        RunState.update(run_dir, %{"submodules_missing" => paths})
-        paths
-    end
+  # The reused tree is released, a run's own given back as `ScratchRun.give_back_left/4` gives it.
+  defp give_back_left(config, %{shared?: true} = tree, run_dir, run_id, trace, seq) do
+    prepared(fn -> ScratchRun.record_tree(run_dir, tree, "created") end)
+    release_tree(config, tree, run_dir, run_id, trace, seq)
   end
 
-  defp give_back_left(config, path, tree, run_dir, run_id, trace, seq) do
-    prepared(fn -> record_tree(run_dir, path, tree, "created") end)
-    release_tree(config, path, tree, run_dir, run_id, trace, seq)
-  end
+  defp give_back_left(config, tree, run_dir, run_id, trace, seq),
+    do:
+      ScratchRun.give_back_left(
+        config,
+        tree,
+        %{run_dir: run_dir, run_id: run_id, trace: trace, seq: seq},
+        "triage"
+      )
 
-  defp abandon_tree(config, path, run_dir, tree, run_id) do
-    prepared(fn -> record_tree(run_dir, path, tree, "not_prepared") end)
+  defp abandon_tree(config, run_dir, tree, run_id) do
+    prepared(fn -> ScratchRun.record_tree(run_dir, tree, "not_prepared") end)
     if tree.shared?, do: WorktreeLock.release(config.runs_dir, tree.path, run_id)
   end
 
@@ -631,9 +616,9 @@ defmodule LoopctlRunner.TriageRun do
   # turn a finished run into a raise. EVERY way out, exits included — `Trace.emit/4` is a call, and
   # this runs in the `after` that follows `judge/8`, so an exit escaping here would replace the
   # verdict the run already has with an `{:error, _}`, which has no wire form.
-  defp release_tree(config, path, %{shared?: true} = tree, run_dir, run_id, trace, seq) do
+  defp release_tree(config, %{shared?: true} = tree, run_dir, run_id, trace, seq) do
     Trace.emit(trace, "worktree.released", seq, %{"worktree" => tree.path})
-    record_tree(run_dir, path, tree, "released")
+    ScratchRun.record_tree(run_dir, tree, "released")
   rescue
     error ->
       Logger.error("the triage run's worktree release could not be recorded: #{inspect(error)}")
@@ -646,62 +631,14 @@ defmodule LoopctlRunner.TriageRun do
     WorktreeLock.release(config.runs_dir, tree.path, run_id)
   end
 
-  defp release_tree(config, path, tree, run_dir, run_id, trace, seq) do
-    outcome = Worktree.remove(path, tree.path, "", tree.base)
-    status = Worktree.status_after(outcome)
-    Trace.emit(trace, "worktree.#{status}", seq, %{"worktree" => inspect(outcome.worktree)})
-    record_tree(run_dir, path, tree, status)
-  rescue
-    error ->
-      Logger.error("the triage run's worktree removal could not be recorded: #{inspect(error)}")
-  catch
-    kind, reason ->
-      Logger.error(
-        "the triage run's worktree removal could not be recorded: #{inspect({kind, reason})}"
+  defp release_tree(config, tree, run_dir, run_id, trace, seq),
+    do:
+      ScratchRun.release(
+        config,
+        tree,
+        %{run_dir: run_dir, run_id: run_id, trace: trace, seq: seq},
+        "triage"
       )
-  after
-    remove_project_dir(config.claude_projects_dir, run_id)
-  end
-
-  @doc """
-  Removes the Claude project directory a triage run's OWN tree made, so the reaper can do for an
-  orphan what the run's teardown does for itself.
-
-  Claude Code keeps one project directory per cwd, and a run's own tree is a cwd no other run
-  will have, so each would leave one behind for ever. Found by the run id its path carries rather
-  than by re-deriving the CLI's path-mangling rule, for `Liveness.file_signals/2`'s reason: that
-  rule is not a documented contract. Only for a uuid, which carries no glob metacharacter — an
-  id that did would widen the match to directories that are not this run's. The reused tree's path
-  carries no run id, so its one directory is never matched.
-  """
-  @spec remove_project_dir(String.t(), term()) :: :ok
-  def remove_project_dir(projects_dir, run_id) do
-    if run_id =~ @uuid do
-      projects_dir
-      |> Path.join("*" <> run_id <> "*")
-      |> Path.wildcard()
-      |> Enum.each(&File.rm_rf/1)
-    end
-
-    :ok
-  rescue
-    error ->
-      Logger.error("the triage run's project directory was not removed: #{inspect(error)}")
-      :ok
-  end
-
-  defp record_tree(run_dir, path, tree, status) do
-    RunState.update(run_dir, %{
-      "repo_path" => path,
-      "worktree" => %{
-        "path" => tree.path,
-        "branch" => "",
-        "base" => tree.base,
-        "status" => status,
-        "scratch" => true
-      }
-    })
-  end
 
   defp session(config, prompt, {repo_name, path, tree}, run_dir, run_id, trace, seq, opts) do
     session_id = Session.uuid4()

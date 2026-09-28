@@ -19,7 +19,7 @@ defmodule LoopctlRunner.TriagePrompt do
   bounds it must respect are read from the contract, never re-typed here.
   """
 
-  alias LoopctlRunner.Contract
+  alias LoopctlRunner.{Contract, ScratchRun}
 
   # Fetched, not `get_in`: a contract bump that renames one of these would leave nil here and
   # raise on the first triage dispatch instead of failing the build (see `TriageVerdict`).
@@ -134,20 +134,12 @@ defmodule LoopctlRunner.TriagePrompt do
   defp code_bullets,
     do: Enum.map_join(@codes, "\n", &"- #{&1} — #{Map.fetch!(@code_glosses, &1)}")
 
-  # Said only when the runner's submodule step failed, and naming the paths, so an empty directory
-  # where a submodule should be is read as the runner's failure and not the report's defect. Each
-  # path QUOTED: they come from the repository's own `.gitmodules`, which is text anyone who can
-  # commit there wrote.
-  defp submodule_note([]), do: ""
-
   defp submodule_note(paths) do
-    String.trim_trailing("""
-
-    The runner could NOT initialise this checkout's submodules, so these paths may be empty or at
-    the wrong commit: #{Enum.map_join(paths, ", ", &inspect/1)}. What is missing under them is the
-    runner's failure, not the report's: do not read it as a defect, and say in `evidence` when a
-    judgement needed code that would have been there.
-    """)
+    ScratchRun.missing_note(
+      paths,
+      "not the report's: do not read it as a defect, and say in `evidence` when a judgement " <>
+        "needed code that would have been there."
+    )
   end
 
   @doc """

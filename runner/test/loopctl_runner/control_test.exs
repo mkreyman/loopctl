@@ -60,7 +60,7 @@ defmodule LoopctlRunner.ControlTest do
     assert join["contract_version"] == "1.21.0"
     # Declared on EVERY join, from the same list the kind check reads.
     assert join["kinds"] == LoopctlRunner.Control.kinds()
-    assert join["kinds"] == ["implement"]
+    assert join["kinds"] == ["implement", "review"]
     # Non-empty ON THE WIRE, which is where it decides anything: loopctl reads an empty array as
     # no declaration at all and falls back to its permanent ledger.
     refute join["kinds"] == []
@@ -1581,6 +1581,55 @@ defmodule LoopctlRunner.ControlTest do
                RunState.read(Path.join(runs_dir, "killed-after-escalating"))
     end
 
+    test "a run whose task dies with its session alive has the session ended before session_ended",
+         ctx do
+      # An implement session outliving its run's task can still push. Reported `crashed` while it
+      # runs, loopctl frees the slot and releases the claim under a session that is still working.
+      # One that ignores TERM takes the whole grace (2s here) to end, so what is reported inside
+      # that window says which came first.
+      session = live_session!(true)
+      tree_file = Path.join(ctx.root, "implement.tree")
+      File.write!(tree_file, "#{session} #{LoopctlRunner.Owner.start_time(session)}\n")
+      runs_dir = ctx.config.runs_dir
+      test = self()
+
+      run = fn _config, _story, opts ->
+        run_dir = Path.join(runs_dir, "killed-mid-session")
+        File.mkdir_p!(run_dir)
+
+        RunState.update(
+          run_dir,
+          Map.merge(owner!(), %{
+            "status" => "running",
+            "reached" => "implementing",
+            "session_id" => Session.uuid4(),
+            "tree_file" => tree_file
+          })
+        )
+
+        opts[:on_stage].({:started, %{run_id: Session.uuid4(), run_dir: run_dir}})
+        send(test, :stalled)
+        Process.sleep(:infinity)
+      end
+
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: run)
+
+      capture_log(fn ->
+        TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
+        assert_receive :stalled, 10_000
+        :ok = wait_until(fn -> Control.info(pid).run_dirs != %{} end)
+        [task] = Task.Supervisor.children(ctx.run_supervisor)
+        Process.exit(task, :kill)
+
+        refute_receive {:test_loopctl, {:session_ended, _}}, 1_200
+        assert os_pid_alive?(session)
+
+        assert next_session_ended()["reason"] == "crashed"
+        refute os_pid_alive?(session)
+        runs_done(pid)
+      end)
+    end
+
     test "each budget and ending is the reason its summary names", ctx do
       {pid, _topic} = accepting_control(ctx, "stream")
 
@@ -2704,7 +2753,7 @@ defmodule LoopctlRunner.ControlTest do
                reply
 
       # The refusal names the declaration, from the same list the join sends.
-      assert detail == "this runner runs only: implement"
+      assert detail == "this runner runs only: implement, review"
       assert detail =~ Enum.join(LoopctlRunner.Control.kinds(), ", ")
 
       # The kind is judged before policy, so a draining runner still answers kind_not_supported

@@ -398,6 +398,58 @@ defmodule LoopctlRunner.WorktreeTest do
       {:ok, shipped: git!(other, ["rev-parse", "HEAD"])}
     end
 
+    test "a review names origin's base, fetched, and not the stale local one",
+         %{repo: repo} = ctx do
+      assert Worktree.locate_base(repo, "master", Worktree.fetch_base(repo, "master")) ==
+               {:ok, "origin/master"}
+
+      assert git!(repo, ["rev-parse", "origin/master"]) == ctx.shipped
+
+      # Origin gone: the local base, which is what resolves.
+      git!(repo, ["remote", "set-url", "origin", Path.join(Path.dirname(repo), "nowhere.git")])
+
+      assert Worktree.locate_base(repo, "master", Worktree.fetch_base(repo, "master")) ==
+               {:ok, "master"}
+
+      # Neither: nothing to name.
+      assert Worktree.locate_base(repo, "release", Worktree.fetch_base(repo, "release")) == :none
+    end
+
+    test "a checkpoint the checkout lacks comes with the base in ONE fetch",
+         %{repo: repo} = ctx do
+      fetches = counting_fetches!(repo)
+      checkpoint = pushed_checkpoint!(repo, "loop/story-1")
+
+      assert {:ok, ^checkpoint, :ok} =
+               Worktree.locate_checkpoint(repo, checkpoint, "loop/story-1", "master")
+
+      assert fetches.() == 1
+      assert git!(repo, ["rev-parse", "origin/loop/story-1"]) == checkpoint
+      assert git!(repo, ["rev-parse", "origin/master"]) == ctx.shipped
+
+      # Held now: the base alone is fetched, still once.
+      assert {:ok, ^checkpoint, :ok} =
+               Worktree.locate_checkpoint(repo, checkpoint, "loop/story-1", "master")
+
+      assert fetches.() == 2
+    end
+
+    test "a checkpoint whose branch is gone: the base alone, then the commit by its id",
+         %{repo: repo} = ctx do
+      fetches = counting_fetches!(repo)
+      checkpoint = pushed_checkpoint!(repo, "loop/merged")
+      other = Path.join(Path.dirname(repo), "other")
+      git!(other, ["push", "-q", "origin", "--delete", "loop/merged"])
+
+      # Git fetches nothing when one ref of a fetch is missing, so the base is fetched again,
+      # alone: the review still measures the change against origin's base.
+      assert {:ok, ^checkpoint, :ok} =
+               Worktree.locate_checkpoint(repo, checkpoint, "loop/merged", "master")
+
+      assert fetches.() == 3
+      assert git!(repo, ["rev-parse", "origin/master"]) == ctx.shipped
+    end
+
     test "is cut from origin's base, with no upstream", %{repo: repo, path: path} = ctx do
       assert {:ok,
               %{reused: false, base: "master", start: "refs/remotes/origin/master", fetch: :ok}} =
@@ -756,6 +808,36 @@ defmodule LoopctlRunner.WorktreeTest do
     File.chmod!(script, 0o755)
     git!(repo, ["config", "remote.origin.uploadpack", script])
     count
+  end
+
+  # Every fetch from a local origin runs its upload-pack once, so a wrapper that records each run
+  # counts the fetches. Returns the counter.
+  defp counting_fetches!(repo) do
+    dir = Path.dirname(repo)
+    record = Path.join(dir, "upload-packs")
+    script = Path.join(dir, "upload-pack")
+    File.write!(script, "#!/bin/sh\necho fetch >> '#{record}'\nexec git upload-pack \"$@\"\n")
+    File.chmod!(script, 0o755)
+    git!(repo, ["config", "remote.origin.uploadpack", script])
+
+    fn ->
+      case File.read(record) do
+        {:ok, raw} -> raw |> String.split("\n", trim: true) |> length()
+        {:error, _} -> 0
+      end
+    end
+  end
+
+  # A checkpoint another machine pushed to `branch` on origin, which `repo` has never fetched.
+  defp pushed_checkpoint!(repo, branch) do
+    other = Path.join(Path.dirname(repo), "other")
+    git!(other, ["checkout", "-q", "-b", branch])
+    commit!(other, "app.ex", "the change under review")
+    git!(other, ["push", "-q", "origin", branch])
+    checkpoint = git!(other, ["rev-parse", "HEAD"])
+    git!(other, ["checkout", "-q", "master"])
+    refute match?({:ok, _}, Worktree.commit_tree(repo, checkpoint))
+    checkpoint
   end
 
   defp commit!(dir, file, content) do

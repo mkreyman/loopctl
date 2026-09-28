@@ -39,9 +39,7 @@ defmodule LoopctlRunner.TriageDispatch do
   believed harmless — see `classify/1`.
   """
 
-  alias LoopctlRunner.{ByteRule, Contract}
-
-  @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
+  alias LoopctlRunner.{ByteRule, Contract, Uuid}
 
   @message "RunnerTriageVerdictMessage"
   @triage_keys Contract.schema_def("RunnerTriage") |> Map.fetch!("properties") |> Map.keys()
@@ -133,7 +131,7 @@ defmodule LoopctlRunner.TriageDispatch do
   end
 
   defp record_id(id) when is_binary(id) do
-    if Regex.match?(@uuid, id),
+    if Uuid.valid?(id),
       do: :ok,
       else: {:error, "the dispatch triage record_id is not a uuid"}
   end
