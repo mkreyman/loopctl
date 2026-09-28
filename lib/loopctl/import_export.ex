@@ -6,7 +6,8 @@ defmodule Loopctl.ImportExport do
   - **Fresh import** (`import_project/4`): Creates all epics, stories, and
     dependencies in a single transaction. Rejects if duplicate numbers exist.
   - **Merge import** (`merge_import_project/4`): Creates new entities, updates
-    existing ones (matched by number), preserves status fields, and reports orphans.
+    existing ones (matched by number), preserves status fields, and reports orphans only
+    when asked (`report_orphans`, #880).
   - **Export** (`export_project/2`): Serializes a project to a JSON-compatible
     map in the import format for round-trip fidelity.
 
@@ -83,19 +84,27 @@ defmodule Loopctl.ImportExport do
   @doc """
   Merge-imports a work breakdown into a project.
 
-  Matches epics and stories by number. Creates new entities, updates existing
-  ones (metadata only -- status fields are preserved), and reports orphans.
+  Matches epics and stories by number. Creates new entities and updates existing
+  ones (metadata only -- status fields are preserved).
+
+  ORPHANS ARE REPORTED ONLY ON REQUEST (`report_orphans: true`, #880): a story the payload
+  does not mention is an orphan only when the payload is a FULL round-trip of the project, and
+  on a partial merge every unmentioned story is one by construction, so an unconditional list
+  named every other story in the project and read as a destructive outcome when nothing was
+  touched. With the option the summary carries `stories_orphaned`; without it the key is
+  absent, never an empty list that would read as "nothing fell out".
 
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
   - `project_id` -- the project UUID
   - `data` -- map with `"epics"` and optional dependency arrays
-  - `opts` -- keyword list with `:actor_id`, `:actor_label`
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`, and `:report_orphans` (default
+    false) for a caller round-tripping a full export
 
   ## Returns
 
-  - `{:ok, summary}` on success with detailed merge counts and orphan list
+  - `{:ok, summary}` on success with detailed merge counts, and the orphan list when asked
   - `{:error, :validation, message}` for payload validation errors
   - `{:error, :cycle_detected, message}` for dependency cycles
   """
@@ -512,16 +521,12 @@ defmodule Loopctl.ImportExport do
 
     case AdminRepo.transaction(multi) do
       {:ok, changes} ->
-        # Compute orphaned stories
-        import_story_numbers = extract_all_story_numbers(epics_data)
+        summary = build_merge_summary(changes, existing_story_deps)
 
-        orphaned =
-          existing_stories
-          |> Enum.reject(fn s -> s.number in import_story_numbers end)
-          |> Enum.map(fn s -> %{"number" => s.number, "title" => s.title} end)
-
-        summary = build_merge_summary(changes, orphaned, existing_story_deps)
-        {:ok, summary}
+        # `== true`, not truthiness: a raw "false" or 0 from a caller must not turn it on.
+        if Keyword.get(opts, :report_orphans) == true,
+          do: {:ok, Map.put(summary, :stories_orphaned, orphans(existing_stories, epics_data))},
+          else: {:ok, summary}
 
       {:error, :merge_cycle_check, message, _changes} ->
         {:error, :cycle_detected, message}
@@ -1463,7 +1468,16 @@ defmodule Loopctl.ImportExport do
     }
   end
 
-  defp build_merge_summary(changes, orphaned, existing_story_deps) do
+  # The project's stories a payload does not mention (`report_orphans`, #880).
+  defp orphans(existing_stories, epics_data) do
+    import_story_numbers = epics_data |> extract_all_story_numbers() |> MapSet.new()
+
+    existing_stories
+    |> Enum.reject(fn s -> MapSet.member?(import_story_numbers, s.number) end)
+    |> Enum.map(fn s -> %{"number" => s.number, "title" => s.title} end)
+  end
+
+  defp build_merge_summary(changes, existing_story_deps) do
     {epics_created, epics_updated} = count_merge_epics(changes)
     {stories_created, stories_updated} = count_merge_stories(changes)
 
@@ -1481,7 +1495,6 @@ defmodule Loopctl.ImportExport do
       epics_updated: epics_updated,
       stories_created: stories_created,
       stories_updated: stories_updated,
-      stories_orphaned: orphaned,
       dependencies_created: deps_created,
       dependencies_existing: deps_existing
     }
