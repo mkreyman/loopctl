@@ -175,6 +175,27 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
                Verification.get_run(tenant.id, run.id)
     end
 
+    test "a rate limit inside the window is waited out" do
+      %{tenant: tenant, story: story} = setup_ctx()
+
+      Req.Test.stub(Loopctl.Verification.GitHubActions, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
+        |> Plug.Conn.send_resp(403, "{}")
+      end)
+
+      assert perform(started_run(tenant, story), tenant) == {:snooze, 60}
+    end
+
+    test "a run already judged is not reopened" do
+      %{tenant: tenant, story: story} = setup_ctx()
+      run = started_run(tenant, story)
+      {:ok, run} = Verification.complete_run(run, "pass", %{"source" => "ci"})
+
+      assert perform(run, tenant) == :ok
+      assert {:ok, %{status: "pass"}} = Verification.get_run(tenant.id, run.id)
+    end
+
     test "a lookup with no verdict logs its reason before falling back" do
       %{tenant: tenant, story: story} = setup_ctx()
       Req.Test.stub(Loopctl.Verification.GitHubActions, &Plug.Conn.send_resp(&1, 403, "{}"))

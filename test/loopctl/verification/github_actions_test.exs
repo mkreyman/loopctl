@@ -59,8 +59,8 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       assert {:ok, %{conclusion: "failure"}} = status()
     end
 
-    test "a skipped, neutral or cancelled run is no evidence either way" do
-      for dropped <- ~w(skipped neutral cancelled) do
+    test "a skipped, neutral, cancelled or stale run is no evidence either way" do
+      for dropped <- ~w(skipped neutral cancelled stale) do
         stub_runs([run(1, "completed", "success"), run(2, "completed", dropped)])
         assert {:ok, %{conclusion: "success"}} = status(), dropped
 
@@ -100,6 +100,20 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       assert {:ok, %{conclusion: "failure"}} = status()
     end
 
+    test "a workflow's push run and pull_request run each count" do
+      stub_runs([
+        run(1, "completed", "failure", id: 10, event: "push"),
+        run(1, "completed", "success", id: 11, event: "pull_request")
+      ])
+
+      assert {:ok, %{conclusion: "failure"}} = status()
+    end
+
+    test "a completed run with a conclusion this module does not know gets no verdict" do
+      stub_runs([run(1, "completed", "success"), run(2, "completed", "something_new")])
+      assert {:error, {:unknown_conclusion, "something_new"}} = status()
+    end
+
     test "more runs than one page is refused, not judged from part of them" do
       stub_runs([run(1, "completed", "success")], 150)
       assert {:error, {:workflow_runs_truncated, 150}} = status()
@@ -109,11 +123,23 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       for body <- [
             %{"workflow_runs" => "x", "total_count" => 1},
             %{"workflow_runs" => ["x"], "total_count" => 1},
+            %{"workflow_runs" => [%{"workflow_id" => 1}], "total_count" => 1},
+            %{"workflow_runs" => [%{"id" => "x", "workflow_id" => 1}], "total_count" => 1},
             %{}
           ] do
         Req.Test.stub(GitHubActions, &Req.Test.json(&1, body))
         assert {:error, :unreadable_workflow_runs} = status(), inspect(body)
       end
+    end
+
+    test "an exhausted rate limit is told apart from a refusal" do
+      Req.Test.stub(GitHubActions, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
+        |> Plug.Conn.send_resp(403, "{}")
+      end)
+
+      assert {:error, :github_rate_limited} = status()
     end
 
     test "a refused read is an error carrying the status" do

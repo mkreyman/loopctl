@@ -63,6 +63,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   # this class of run.
   @default_max_run_age_seconds 24 * 60 * 60
 
+  @terminal_statuses ~w(pass fail error skipped)
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"run_id" => run_id, "tenant_id" => tenant_id}}) do
     case Verification.get_run(tenant_id, run_id) do
@@ -78,13 +80,20 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   # Age-gate first (see the "Stale-run age gate" moduledoc section): a run older than
   # the freshness window is retired without ever starting, so no CI call / repo clone.
   defp process_run(run, tenant_id) do
-    if stale_run?(run) do
-      skip_stale_run(run)
-    else
-      case Verification.start_run(run) do
-        {:ok, started} -> execute_verification(started, tenant_id)
-        {:error, reason} -> {:error, reason}
-      end
+    cond do
+      # A run already judged is never reopened: `start_run/1` would put it back to
+      # `running`, and an Oban retry after the rescue below reaches here with a verdict.
+      run.status in @terminal_statuses ->
+        :ok
+
+      stale_run?(run) ->
+        skip_stale_run(run)
+
+      true ->
+        case Verification.start_run(run) do
+          {:ok, started} -> execute_verification(started, tenant_id)
+          {:error, reason} -> {:error, reason}
+        end
     end
   end
 
@@ -203,12 +212,26 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         {:error, :ci_unavailable}
 
       {:error, reason} ->
-        # Logged, because the fallback below hides it: a token without `actions: read`
-        # would otherwise turn every lookup into a silent local test run.
-        Logger.warning("VerificationRunner: no CI verdict for run #{run.id}: #{inspect(reason)}")
-        {:error, :ci_unavailable}
+        if transient?(reason) and not ci_wait_over?(run) do
+          # A rate limit or an outage says nothing about the commit: wait it out inside the
+          # same window, rather than ending a run whose CI may simply still be running.
+          {:snooze, 60}
+        else
+          # Logged, because the fallback below hides it: a token without `actions: read`
+          # would otherwise turn every lookup into a silent local test run.
+          Logger.warning(
+            "VerificationRunner: no CI verdict for run #{run.id}: #{inspect(reason)}"
+          )
+
+          {:error, :ci_unavailable}
+        end
     end
   end
+
+  defp transient?(:github_rate_limited), do: true
+  defp transient?({:github_api_error, status}), do: status == 429 or status >= 500
+  defp transient?(%Req.TransportError{}), do: true
+  defp transient?(_reason), do: false
 
   # From `inserted_at`, not `started_at`: every snooze re-enters `perform/1`, which restarts
   # the run and resets `started_at`, so that clock never ages.

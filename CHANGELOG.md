@@ -247,10 +247,11 @@ All notable changes to loopctl are documented here.
   private repository every verification CI lookup 403'd and fell back to the local runner.
   Verification now reads `GET /repos/:owner/:repo/actions/runs?head_sha=`: only runs the
   commit's own push or pull request triggered count, each workflow's newest run decides, and
-  a commit passes only when every such run succeeded. A skipped, neutral or cancelled run is
-  no evidence either way. A commit with no counting run, more than one page of runs, or an
+  a commit passes only when every such run succeeded. A skipped, neutral, cancelled or stale
+  run is no evidence either way. **CI that is not GitHub Actions** (CircleCI, Buildkite, a
+  third-party check app) is no longer seen: such a commit gets no CI verdict. A commit with no counting run, more than one page of runs, or an
   unreadable response gets no CI verdict: the reason is logged as a warning and the run falls
-  back as before. CI still unfinished once a run is older than
+  back as before. A rate limit or a GitHub outage is waited out inside the window instead. CI still unfinished once a run is older than
   `verification_max_run_age_seconds` now ends it `error` (`ci_unfinished`) instead of
   waiting for ever.
   Before this, no started run reached the CI read at all: the worker's project lookup passed

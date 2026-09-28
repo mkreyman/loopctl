@@ -15,18 +15,24 @@ defmodule Loopctl.Verification.GitHubActions do
   # triggered. A scheduled, dispatched or workflow_run-triggered run on the same commit
   # (a deploy, a nightly) is not the commit's CI and neither passes nor fails it.
   @ci_events ~w(push pull_request)
-  # Of a completed run, only `success` passes and these fail. `skipped`, `neutral` and
-  # `cancelled` are no evidence either way: a skipped run ran no tests, and a run is
-  # cancelled when a newer commit on the same ref supersedes it (cancel-in-progress), so
-  # its tests never finished. They are dropped, and a commit left with no run at all has
-  # no CI verdict.
-  @failed ~w(failure timed_out startup_failure stale)
-  @no_evidence ~w(skipped neutral cancelled)
+  # Of a completed run, only `success` passes and these fail. `skipped`, `neutral`,
+  # `cancelled` and `stale` are no evidence either way: a skipped run ran no tests, a run is
+  # cancelled when a newer commit on the same ref supersedes it (cancel-in-progress), and
+  # GitHub marks a run `stale` when it sat unfinished for 14 days. They are dropped, and a
+  # commit left with no run at all has no CI verdict. `action_required` is a run waiting
+  # for someone to approve it, so it waits like an unfinished one. Any other conclusion is
+  # one this module does not know, and gets no verdict rather than a guess.
+  @failed ~w(failure timed_out startup_failure)
+  @no_evidence ~w(skipped neutral cancelled stale)
+  @awaiting ~w(action_required)
+  @known ["success" | @failed ++ @awaiting]
 
   # #913: CI is read from the commit's Actions workflow runs, not its check runs. The
   # check-runs endpoint needs `checks: read`, which GitHub does not offer to fine-grained
   # personal access tokens, so on a private repository it 403'd on every lookup. Every CI
-  # this fleet reports is an Actions workflow, and `actions: read` is on offer.
+  # this fleet reports is an Actions workflow, and `actions: read` is on offer. The cost is
+  # that CI which is NOT an Actions workflow (CircleCI, Buildkite, a third-party check app)
+  # is no longer seen at all: such a commit has no CI verdict and falls back.
   @impl true
   def get_status(repo_url, commit_sha) do
     {owner, repo} = parse_repo_url(repo_url)
@@ -35,26 +41,30 @@ defmodule Loopctl.Verification.GitHubActions do
       "https://api.github.com/repos/#{owner}/#{repo}/actions/runs" <>
         "?head_sha=#{URI.encode_www_form(commit_sha)}&per_page=#{@per_page}"
 
-    case Req.get(url, req_options()) do
-      {:ok, %{status: 200, body: %{"workflow_runs" => runs, "total_count" => total}}}
-      when is_list(runs) and is_integer(total) ->
-        cond do
-          # More runs than one page holds: judging the page could miss a failure.
-          total > length(runs) -> {:error, {:workflow_runs_truncated, total}}
-          Enum.all?(runs, &is_map/1) -> summarize(runs)
-          true -> {:error, :unreadable_workflow_runs}
-        end
+    url |> Req.get(req_options()) |> from_response()
+  end
 
-      {:ok, %{status: 200}} ->
-        {:error, :unreadable_workflow_runs}
-
-      {:ok, %{status: status}} ->
-        {:error, {:github_api_error, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+  defp from_response(
+         {:ok, %{status: 200, body: %{"workflow_runs" => runs, "total_count" => total}}}
+       )
+       when is_list(runs) and is_integer(total) do
+    cond do
+      # More runs than one page holds: judging the page could miss a failure.
+      total > length(runs) -> {:error, {:workflow_runs_truncated, total}}
+      Enum.all?(runs, &run?/1) -> summarize(runs)
+      true -> {:error, :unreadable_workflow_runs}
     end
   end
+
+  defp from_response({:ok, %{status: 200}}), do: {:error, :unreadable_workflow_runs}
+
+  # GitHub answers an exhausted rate limit 403, not 429; the header tells them apart from a
+  # permission refusal, which is permanent.
+  defp from_response({:ok, %{status: 403, headers: %{"x-ratelimit-remaining" => ["0" | _]}}}),
+    do: {:error, :github_rate_limited}
+
+  defp from_response({:ok, %{status: status}}), do: {:error, {:github_api_error, status}}
+  defp from_response({:error, reason}), do: {:error, reason}
 
   @impl true
   def get_test_results(_repo_url, _run_id) do
@@ -109,30 +119,50 @@ defmodule Loopctl.Verification.GitHubActions do
     end
   end
 
-  # One verdict per workflow, from its newest run (the highest run id): a re-run or a second
-  # trigger of the same workflow on this commit supersedes the older one. A failed newest
-  # run fails the commit; an unfinished one (queued, in progress, waiting for approval)
-  # keeps it in progress, which the worker bounds; otherwise every remaining run passed.
+  defp run?(%{"id" => id, "workflow_id" => workflow})
+       when is_integer(id) and is_integer(workflow),
+       do: true
+
+  defp run?(_), do: false
+
+  # One verdict per workflow and triggering event, from its newest run. A commit's push run
+  # and its pull_request run of the same workflow test different trees (the commit, and its
+  # merge with the base), so neither hides the other. Within one, the highest id is the run
+  # created last: a re-run keeps its id, and this list already reports its latest attempt.
+  # A failed run fails the commit; a completed run with a conclusion this module does not
+  # know gets no verdict; an unfinished one keeps it in progress, which the worker bounds;
+  # otherwise every remaining run passed.
   defp summarize(runs) do
-    latest =
-      runs
-      |> Enum.filter(&(&1["event"] in @ci_events))
-      |> Enum.group_by(& &1["workflow_id"])
-      |> Enum.map(fn {_, per_workflow} -> Enum.max_by(per_workflow, & &1["id"]) end)
-      |> Enum.reject(&(&1["status"] == "completed" and &1["conclusion"] in @no_evidence))
+    runs |> latest_runs() |> verdict()
+  end
 
+  defp latest_runs(runs) do
+    runs
+    |> Enum.filter(&(&1["event"] in @ci_events))
+    |> Enum.group_by(&{&1["workflow_id"], &1["event"]})
+    |> Enum.map(fn {_, runs} -> Enum.max_by(runs, & &1["id"]) end)
+    |> Enum.reject(&concluded?(&1, @no_evidence))
+  end
+
+  defp verdict([]), do: {:error, :no_workflow_runs}
+
+  defp verdict(latest) do
     cond do
-      latest == [] ->
-        {:error, :no_workflow_runs}
-
-      Enum.any?(latest, &(&1["status"] == "completed" and &1["conclusion"] in @failed)) ->
+      Enum.any?(latest, &concluded?(&1, @failed)) ->
         {:ok, %{status: "completed", conclusion: "failure", url: ""}}
 
-      Enum.all?(latest, &(&1["status"] == "completed" and &1["conclusion"] == "success")) ->
+      unknown = Enum.find(latest, &(completed?(&1) and not concluded?(&1, @known))) ->
+        {:error, {:unknown_conclusion, unknown["conclusion"]}}
+
+      Enum.all?(latest, &concluded?(&1, ["success"])) ->
         {:ok, %{status: "completed", conclusion: "success", url: ""}}
 
       true ->
         {:ok, %{status: "in_progress", conclusion: nil, url: ""}}
     end
   end
+
+  defp concluded?(run, conclusions), do: completed?(run) and run["conclusion"] in conclusions
+
+  defp completed?(run), do: run["status"] == "completed"
 end
