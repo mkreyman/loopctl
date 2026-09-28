@@ -22,10 +22,10 @@ defmodule Loopctl.MixProject do
       # hex.audit warns when an entry stops matching, so stale ones surface.
       hex: [
         ignore_advisories: [
-          # cowlib 2.19.0 — no patched release exists for ANY of the three
-          # advisories below: each is introduced at an old version with no
-          # `fixed` event, and 2.19.0 is the newest cowlib on hex, so there is
-          # nothing to bump to. cowlib is compiled into the release as an
+          # cowlib 2.20.0 — no patched release exists for either advisory
+          # below: each is introduced at an old version with no `fixed` event,
+          # and 2.20.0 (which fixed CVE-2026-43971) is the newest cowlib on
+          # hex, so there is nothing to bump to. cowlib is compiled into the release as an
           # optional transitive of phoenix / websock_adapter / open_api_spex /
           # telemetry_metrics_prometheus, but the ONLY component that starts a
           # Cowboy listener is the TelemetryMetricsPrometheus reporter on the
@@ -33,15 +33,12 @@ defmodule Loopctl.MixProject do
           # API serves on Bandit (config/config.exs, Bandit.PhoenixAdapter),
           # never cowboy. That metrics endpoint sets no cookies, reflects no
           # untrusted structured headers, and emits no Link headers — loopctl
-          # never calls cow_link — so none of the three vectors is reachable.
-          # Recheck when cowlib > 2.19.0.
+          # never calls cow_link — so neither vector is reachable.
+          # Recheck when cowlib > 2.20.0.
           # CVE-2026-43966 (GHSA-w4f7-4cxr-rv3c, MEDIUM): HTTP response splitting.
           "CVE-2026-43966",
           # CVE-2026-43969 (GHSA-g2wm-735q-3f56, LOW): cookie header injection.
-          "CVE-2026-43969",
-          # CVE-2026-43971 (MEDIUM): Link header directive smuggling via
-          # unescaped target/rel/attribute keys in cow_link:link/1.
-          "CVE-2026-43971"
+          "CVE-2026-43969"
         ]
       ],
       dialyzer: [
