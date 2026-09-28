@@ -51,13 +51,10 @@ defmodule Loopctl.ContextRetriever.EntityDefinitionsRollbackTest do
 
   @version 20_260_711_120_000
 
-  @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
-  migration_file = Path.wildcard(Path.join(@migrations_dir, "#{@version}_*.exs")) |> hd()
-
   alias Loopctl.Repo.Migrations.CreateEntityDefinitions
   alias Loopctl.Test.MigrationFile
 
-  MigrationFile.require!(CreateEntityDefinitions, migration_file)
+  MigrationFile.require!(CreateEntityDefinitions, @version)
 
   setup do
     pid = Sandbox.start_owner!(AdminRepo)

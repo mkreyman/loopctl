@@ -32,13 +32,11 @@ defmodule Loopctl.Repo.RunnerAgentBackfillMigrationTest do
   alias Loopctl.AdminRepo
 
   @version 20_260_920_100_000
-  @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
 
-  migration_file = Path.wildcard(Path.join(@migrations_dir, "#{@version}_*.exs")) |> hd()
   alias Loopctl.Repo.Migrations.AddAgentIdToRunners
   alias Loopctl.Test.MigrationFile
 
-  MigrationFile.require!(AddAgentIdToRunners, migration_file)
+  MigrationFile.require!(AddAgentIdToRunners, @version)
 
   setup do
     pid = Sandbox.start_owner!(AdminRepo)

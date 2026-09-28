@@ -54,26 +54,16 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   @partial_hnsw_version 20_260_709_000_300
   @side_tables_version 20_260_721_000_100
 
-  @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
-  create_file = Path.wildcard(Path.join(@migrations_dir, "#{@create_version}_*.exs")) |> hd()
-  hnsw_file = Path.wildcard(Path.join(@migrations_dir, "#{@hnsw_version}_*.exs")) |> hd()
-
-  partial_file =
-    Path.wildcard(Path.join(@migrations_dir, "#{@partial_hnsw_version}_*.exs")) |> hd()
-
-  side_tables_file =
-    Path.wildcard(Path.join(@migrations_dir, "#{@side_tables_version}_*.exs")) |> hd()
-
   alias Loopctl.Repo.Migrations.AddMemoriesEmbeddingHnswIndex
   alias Loopctl.Repo.Migrations.AddMemoriesLiveEmbeddingPartialHnswIndex
   alias Loopctl.Repo.Migrations.CreateEmbeddingSideTables
   alias Loopctl.Repo.Migrations.CreateMemoryStores
   alias Loopctl.Test.MigrationFile
 
-  MigrationFile.require!(CreateMemoryStores, create_file)
-  MigrationFile.require!(AddMemoriesEmbeddingHnswIndex, hnsw_file)
-  MigrationFile.require!(AddMemoriesLiveEmbeddingPartialHnswIndex, partial_file)
-  MigrationFile.require!(CreateEmbeddingSideTables, side_tables_file)
+  MigrationFile.require!(CreateMemoryStores, @create_version)
+  MigrationFile.require!(AddMemoriesEmbeddingHnswIndex, @hnsw_version)
+  MigrationFile.require!(AddMemoriesLiveEmbeddingPartialHnswIndex, @partial_hnsw_version)
+  MigrationFile.require!(CreateEmbeddingSideTables, @side_tables_version)
 
   setup do
     pid = Sandbox.start_owner!(AdminRepo)

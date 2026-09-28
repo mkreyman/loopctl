@@ -26,21 +26,11 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
 
   @index "articles_tenant_embeddable_inserted_id_idx"
   @migration_version 20_260_825_130_000
-  @migration_file Path.wildcard(
-                    Path.join([
-                      File.cwd!(),
-                      "priv",
-                      "repo",
-                      "migrations",
-                      "#{@migration_version}_*.exs"
-                    ])
-                  )
-                  |> hd()
 
   alias Loopctl.Repo.Migrations.AddArticlesPublishedReconciliationIndex
   alias Loopctl.Test.MigrationFile
 
-  MigrationFile.require!(AddArticlesPublishedReconciliationIndex, @migration_file)
+  MigrationFile.require!(AddArticlesPublishedReconciliationIndex, @migration_version)
 
   # Restore the canonical index after every test, whatever the test left behind.
   setup do

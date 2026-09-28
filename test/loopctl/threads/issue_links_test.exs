@@ -178,10 +178,7 @@ defmodule Loopctl.Threads.IssueLinksTest do
       # runtime, since the compiler cannot see a module that `priv/` defines.
       migration = Module.concat(Loopctl.Repo.Migrations, "AddThreadPage")
 
-      MigrationFile.require!(
-        migration,
-        "priv/repo/migrations/20260927120000_add_thread_page.exs"
-      )
+      MigrationFile.require!(migration, 20_260_927_120_000)
 
       backfill = migration.backfill_sql()
 

@@ -17,12 +17,10 @@ defmodule Loopctl.Threads.ThreadReviewsRollbackTest do
 
   @version 20_260_926_160_000
 
-  @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
-  migration_file = Path.wildcard(Path.join(@migrations_dir, "#{@version}_*.exs")) |> hd()
   alias Loopctl.Repo.Migrations.CreateThreadReviews
   alias Loopctl.Test.MigrationFile
 
-  MigrationFile.require!(CreateThreadReviews, migration_file)
+  MigrationFile.require!(CreateThreadReviews, @version)
 
   setup do
     pid = Sandbox.start_owner!(AdminRepo)
