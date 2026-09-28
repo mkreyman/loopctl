@@ -212,7 +212,7 @@ defmodule Loopctl.WorkBreakdown.Story do
       :metadata
     ])
     # A blank title casts to nil; required, it is a 422 rather than the NOT NULL violation
-    # (a 500) it used to reach (loopctl #923).
+    # (a 500) it used to reach (PR #924).
     |> validate_required([:title])
     |> validate_length(:title, max: 500)
     |> validate_length(:description, max: 50_000)
@@ -308,49 +308,4 @@ defmodule Loopctl.WorkBreakdown.Story do
       :error -> 0
     end
   end
-
-  # The references onto `stories` that do NOT cascade (`on_delete: :nothing`): the custody
-  # record a story gains once it enters the delivery lifecycle — its dispatches, the capability
-  # tokens a claim mints, its verification runs. Deleting such a story, or the epic holding it,
-  # would destroy that record, so Postgres refuses; named here, the refusal is a 422 rather
-  # than an `Ecto.ConstraintError` no fallback can render (loopctl #923). The list is bound to
-  # the database by `test/loopctl/work_breakdown/story_lifecycle_references_test.exs`, which
-  # reads every non-cascading foreign key onto `stories` from `pg_constraint`.
-  @lifecycle_references ~w(dispatches_story_id_fkey capability_tokens_story_id_fkey
-                           verification_runs_story_id_fkey)a
-
-  @doc "The non-cascading foreign keys onto `stories` that a delete must name."
-  @spec lifecycle_references() :: [atom()]
-  def lifecycle_references, do: @lifecycle_references
-
-  @doc """
-  Names every non-cascading reference onto a story on `changeset`, a DELETE of a story or of
-  an epic (which cascades to its stories), so a violation is a 422 on `field` saying why.
-  `subject` is what the message is about: `:story` or `:epic`.
-  """
-  @spec lifecycle_reference_constraints(Ecto.Changeset.t(), atom(), :story | :epic) ::
-          Ecto.Changeset.t()
-  def lifecycle_reference_constraints(changeset, field, subject) do
-    Enum.reduce(@lifecycle_references, changeset, fn name, acc ->
-      Ecto.Changeset.foreign_key_constraint(acc, field,
-        name: name,
-        message: lifecycle_message(subject)
-      )
-    end)
-  end
-
-  @doc """
-  The refusal a delete of a story, or of an epic holding one, gives when those references
-  exist. It names the records, never a lifecycle state: nothing here reads the story's status,
-  only the rows that reference it. The change-thread ledger is NOT among them — it keys on a
-  bare `story_id` so it OUTLIVES the story (`20260926120000_create_thread_ledger.exs`).
-  """
-  @spec lifecycle_message(:story | :epic) :: String.t()
-  def lifecycle_message(:story),
-    do: "is referenced by custody records (dispatches, capability tokens or verification runs)"
-
-  def lifecycle_message(:epic),
-    do:
-      "has a story referenced by custody records (dispatches, capability tokens or " <>
-        "verification runs)"
 end

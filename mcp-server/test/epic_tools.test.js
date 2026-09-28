@@ -20,6 +20,7 @@ import {
   listEpics,
   updateEpic,
   deleteStory,
+  epicWriteKeyHint,
 } from "../lib/epics.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -113,6 +114,12 @@ describe("epic requests", () => {
     assert.equal(bad.calls.length, 0);
   });
 
+  test("an empty string is sent: it is what clears description or phase", async () => {
+    const api = fakeApi();
+    await updateEpic({ epic_id: EPIC, description: "" }, api);
+    assert.deepEqual(api.calls[0].body, { description: "" });
+  });
+
   test("update_epic sends the named fields and refuses a null or a call naming none", async () => {
     const api = fakeApi();
     await updateEpic({ epic_id: EPIC, title: "Renamed" }, api);
@@ -123,8 +130,6 @@ describe("epic requests", () => {
     for (const args of [
       { epic_id: EPIC },
       { epic_id: EPIC, title: "t", description: null },
-      { epic_id: EPIC, title: "   " },
-      { epic_id: EPIC, phase: "" },
     ]) {
       const refused = fakeApi();
       const result = await updateEpic(args, refused);
@@ -147,6 +152,14 @@ describe("epic requests", () => {
       assert.equal(result.error, true);
       assert.equal(api.calls.length, 0);
     }
+  });
+});
+
+describe("epic writes pick the named key", () => {
+  test("the orchestrator key first, then the user key the hierarchy also admits, else none", () => {
+    assert.equal(epicWriteKeyHint({ LOOPCTL_ORCH_KEY: "o", LOOPCTL_USER_KEY: "u" }), "LOOPCTL_ORCH_KEY");
+    assert.equal(epicWriteKeyHint({ LOOPCTL_USER_KEY: "u" }), "LOOPCTL_USER_KEY");
+    assert.equal(epicWriteKeyHint({ LOOPCTL_API_KEY: "a" }), null);
   });
 });
 
@@ -177,7 +190,8 @@ describe("epic tools are wired", () => {
       assert.match(body(handler), /apiCall: userKeyApiCall/, handler);
     }
 
-    assert.match(body("orchestratorPinnedApiCall"), /orch\.override, orch\.options/);
+    assert.match(body("orchestratorPinnedApiCall"), /epicWriteKeyHint\(\)/);
+    assert.match(body("orchestratorPinnedApiCall"), /exactKey: true, keyHint/);
     assert.match(body("userKeyApiCall"), /process\.env\.LOOPCTL_USER_KEY/);
     assert.match(body("userKeyApiCall"), /exactKey: true/);
   });

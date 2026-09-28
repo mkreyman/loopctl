@@ -76,6 +76,7 @@ import {
   createEpic as createEpicRequest,
   deleteEpic as deleteEpicRequest,
   deleteStory as deleteStoryRequest,
+  epicWriteKeyHint,
   epicProgress as epicProgressRequest,
   getEpic as getEpicRequest,
   listEpics as listEpicsRequest,
@@ -199,7 +200,8 @@ async function apiCall(
   //     `requestAuthenticatorRevokeChallenge`, `revokeAuthenticator`), and the shared
   //     `runnerDeps()` / `deliveryDeps()` factories — the latter covering
   //     `place_dispatch` and `resolve_escalation`, which need an unlineaged human
-  //     principal. `grep -n 'exactKey: true' index.js` is the current list. None of
+  //     principal, and `userKeyApiCall` for `delete_epic` and `delete_story`.
+  //     `grep -n 'exactKey: true' index.js` is the current list. None of
   //     them may silently run under a global key of another role (review #12).
   //   - The `exact_role: :orchestrator` CUSTODY verbs pass it CONDITIONALLY, and
   //     nothing here decides that: `orchestratorKeyArgs` (`lib/custody-key.js`)
@@ -1097,15 +1099,20 @@ async function getStory({ story_id }) {
 
 // --- Epics (loopctl #876) ---
 // Reads travel on the default key (any role passes). Create and update go through
-// `orchestratorPinnedApiCall`: LOOPCTL_ORCH_KEY VERBATIM when it is set, so a global
-// LOOPCTL_API_KEY of a lesser role cannot displace the key the tool names, and the global key
-// when it is not. The deletes go through `userKeyApiCall`, pinned to LOOPCTL_USER_KEY so a
+// `orchestratorPinnedApiCall`: the named orchestrator or user key VERBATIM, so a global
+// LOOPCTL_API_KEY of a lesser role cannot displace it, and the global key when neither is set. The deletes go through `userKeyApiCall`, pinned to LOOPCTL_USER_KEY so a
 // global LOOPCTL_API_KEY cannot displace it: they destroy rows. (`delete_project` is not
 // pinned this way.)
 
+// `role: :orchestrator` WITH the hierarchy (epic_controller.ex), so a user key passes too:
+// the first of LOOPCTL_ORCH_KEY and LOOPCTL_USER_KEY that is set goes VERBATIM, and with
+// neither the global key goes through `resolveKey` as usual.
 function orchestratorPinnedApiCall(method, path, body) {
-  const orch = orchestratorKeyArgs();
-  return apiCall(method, path, body, orch.override, orch.options);
+  const keyHint = epicWriteKeyHint();
+
+  return keyHint
+    ? apiCall(method, path, body, process.env[keyHint], { exactKey: true, keyHint })
+    : apiCall(method, path, body);
 }
 
 function userKeyApiCall(method, path, body) {
@@ -4317,8 +4324,9 @@ const TOOLS = [
     description:
       "CORRECT AN EPIC (PATCH /api/v1/epics/:id, loopctl #876): any of `title`, " +
       "`description`, `phase`, `position`, `metadata`. `number` cannot change. The endpoint " +
-      "DROPS absent and null fields and casts a blank string to null, so a field cannot be " +
-      "erased here: a null, a blank string and a call naming no field are refused locally. `metadata` is REPLACED WHOLE, never merged: read the epic first " +
+      "DROPS absent and null fields, so a null and a call naming no field are refused " +
+      "locally; send an EMPTY STRING to clear `description` or `phase` (a blank `title` is a " +
+      "422). `metadata` is REPLACED WHOLE, never merged: read the epic first " +
       "(get_epic) and send the whole map. Needs LOOPCTL_ORCH_KEY (orchestrator or above) on " +
       "a human-anchored tenant. Refusals: 403, 404, 422 for an invalid field.",
     inputSchema: {
@@ -4356,7 +4364,7 @@ const TOOLS = [
   {
     name: "delete_story",
     description:
-      "DELETE ONE STORY (DELETE /api/v1/stories/:id, loopctl #923). IRREVERSIBLE. Answers 204 " +
+      "DELETE ONE STORY (DELETE /api/v1/stories/:id, loopctl #876). IRREVERSIBLE. Answers 204 " +
       "with no body. Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant, sent " +
       "verbatim. Refusals: 403 for a lesser key, 404 for a story not in your tenant, 422 when " +
       "a dispatch, capability token or verification run references the story (those do not " +

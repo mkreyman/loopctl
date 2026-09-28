@@ -20,6 +20,7 @@ defmodule Loopctl.WorkBreakdown.Stories do
   alias Loopctl.Intake.Record, as: IntakeRecord
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.RestrictedDelete
   alias Loopctl.WorkBreakdown.Story
 
   @doc """
@@ -270,10 +271,9 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
     multi =
       Multi.new()
-      |> Multi.delete(
-        :story,
-        story |> Ecto.Changeset.change() |> Story.lifecycle_reference_constraints(:id, :story)
-      )
+      # `stale_error_field`: a story already gone (a racing delete, or its epic's cascade)
+      # is a changeset error, not an `Ecto.StaleEntryError`.
+      |> Multi.delete(:story, story, stale_error_field: :id)
       |> Audit.log_in_multi(:audit, fn %{story: deleted} ->
         %{
           tenant_id: tenant_id,
@@ -291,13 +291,16 @@ defmodule Loopctl.WorkBreakdown.Stories do
         }
       end)
 
-    case AdminRepo.transaction(multi) do
-      {:ok, %{story: deleted}} ->
-        {:ok, deleted}
+    # A non-cascading reference on the delete's path is a 422, not a raise (`RestrictedDelete`).
+    RestrictedDelete.run(story, fn ->
+      case AdminRepo.transaction(multi) do
+        {:ok, %{story: deleted}} ->
+          {:ok, deleted}
 
-      {:error, :story, changeset, _changes} ->
-        {:error, changeset}
-    end
+        {:error, :story, changeset, _changes} ->
+          {:error, changeset}
+      end
+    end)
   end
 
   @doc """

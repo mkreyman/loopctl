@@ -1,6 +1,6 @@
 /**
  * The epics surface — `list_epics`, `create_epic`, `get_epic`, `update_epic`, `delete_epic`
- * and `epic_progress` — the MCP half of the six `EpicController` routes (loopctl #876).
+ * and `epic_progress` — the MCP half of the `EpicController` routes (loopctl #876).
  *
  * WHY IT EXISTS. The routes were served and no tool reached them, so a session could create
  * an epic through `import_stories` and then not name it: import answers COUNTS
@@ -15,9 +15,10 @@
  *   - create casts `number`, `title`, `description`, `phase`, `position` (default 0) and
  *     `metadata` (default {}); `number` is required and cannot change afterwards.
  *   - update takes `title`, `description`, `phase`, `position`, `metadata` and DROPS every
- *     nil, so a field cannot be nulled through it, and a request naming none of them is a
- *     200 that changes nothing. Both shapes (a null, and no field) are refused here, as
- *     `update_story` refuses them. `metadata` is REPLACED whole, never merged.
+ *     nil, so a null writes nothing, and a request naming none of them is a 200 that changes
+ *     nothing. Both shapes are refused here, as `update_story` refuses them. An empty string
+ *     is what CLEARS `description` or `phase` (a blank `title` is a 422). `metadata` is
+ *     REPLACED whole, never merged.
  *   - index pages (`page`, `page_size`) and filters by `phase`.
  *
  * KEYS, from the controller's plugs: reads are `role: :agent` (any key); create and update
@@ -112,20 +113,13 @@ export async function updateEpic(args = {}, { apiCall } = {}) {
     if (value === undefined) continue;
 
     // Refused, as `update_story` refuses it: a caller writing null means to CLEAR the field,
-    // and the endpoint drops every nil and answers 200 with the field unchanged.
+    // and the endpoint drops every nil and answers 200 with the field unchanged. A BLANK string
+    // is what clears one: it survives the controller's nil filter and the changeset casts it
+    // to nil, so `description: ""` or `phase: ""` erases the field (a blank `title` is a 422).
     if (value === null) {
       return refuse(
         `\`${field}\` cannot be set to null through this endpoint: it drops every null and ` +
-          "answers 200 with the field unchanged. Send the value you want, or leave it out.",
-      );
-    }
-
-    // A BLANK string is refused too: the server casts it to null, which erases the field (or,
-    // for `title`, is a 422), so it is the same no-erase rule in another shape.
-    if (typeof value === "string" && value.trim() === "") {
-      return refuse(
-        `\`${field}\` cannot be blank: the server casts a blank string to null, which this ` +
-          "endpoint cannot write. Send the value you want, or leave it out.",
+          'answers 200 with the field unchanged. To clear it send an empty string ("").',
       );
     }
 
@@ -157,4 +151,14 @@ export function storyPath(storyId) {
 // `delete_story` lives beside `delete_epic`: the same foreign-key refusals, the same key.
 export async function deleteStory({ story_id } = {}, { apiCall } = {}) {
   return badId("story_id", story_id) ?? apiCall("DELETE", storyPath(story_id), null);
+}
+
+// The key an epic WRITE travels on: `role: :orchestrator` WITH the hierarchy
+// (epic_controller.ex), so a user key passes too. The first of LOOPCTL_ORCH_KEY and
+// LOOPCTL_USER_KEY that is set is named, to be sent VERBATIM; `null` when neither is, and the
+// caller's default key selection applies.
+export function epicWriteKeyHint(env = process.env) {
+  if (env.LOOPCTL_ORCH_KEY) return "LOOPCTL_ORCH_KEY";
+  if (env.LOOPCTL_USER_KEY) return "LOOPCTL_USER_KEY";
+  return null;
 }

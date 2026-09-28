@@ -15,6 +15,7 @@ defmodule Loopctl.WorkBreakdown.Epics do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.WorkBreakdown.Epic
+  alias Loopctl.WorkBreakdown.RestrictedDelete
   alias Loopctl.WorkBreakdown.Story
 
   @doc """
@@ -222,9 +223,10 @@ defmodule Loopctl.WorkBreakdown.Epics do
       # the fallback controller cannot render (`epic_delete_changeset/1`): an active intake
       # source targeting this epic, which must be revoked first — restricting rather than
       # nilifying, since nilify would silently turn that source's next report into an
-      # escalation (#803) — and the custody records (dispatches, capability tokens,
-      # verification runs) referencing any story in it.
-      |> Multi.delete(:epic, epic_delete_changeset(epic))
+      # escalation (#803). Every other non-cascading reference on the cascade's path is
+      # `RestrictedDelete`'s, below; `stale_error_field` makes an epic already gone a
+      # changeset error rather than an `Ecto.StaleEntryError`.
+      |> Multi.delete(:epic, epic_delete_changeset(epic), stale_error_field: :id)
       |> Audit.log_in_multi(:audit, fn %{epic: deleted} ->
         %{
           tenant_id: tenant_id,
@@ -242,13 +244,15 @@ defmodule Loopctl.WorkBreakdown.Epics do
         }
       end)
 
-    case AdminRepo.transaction(multi) do
-      {:ok, %{epic: deleted}} ->
-        {:ok, deleted}
+    RestrictedDelete.run(epic, fn ->
+      case AdminRepo.transaction(multi) do
+        {:ok, %{epic: deleted}} ->
+          {:ok, deleted}
 
-      {:error, :epic, changeset, _changes} ->
-        {:error, changeset}
-    end
+        {:error, :epic, changeset, _changes} ->
+          {:error, changeset}
+      end
+    end)
   end
 
   @doc """
@@ -418,7 +422,7 @@ defmodule Loopctl.WorkBreakdown.Epics do
       name: :intake_sources_target_epic_fkey,
       message: "is the target epic of an active intake source; revoke that source first"
     )
+
     # The cascade to the epic's stories meets the references that do not cascade.
-    |> Story.lifecycle_reference_constraints(:id, :epic)
   end
 end
