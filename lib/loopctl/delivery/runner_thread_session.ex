@@ -30,7 +30,7 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
   @doc """
   The ledger row `runner_id` holds for the message's dispatch, whatever its status, provided
   the message's `claim_epoch` is the dispatch's (otherwise `:claim_epoch_mismatch`, or
-  `:stale_claim_epoch` when the story has moved past the dispatch: `DispatchLedger.epoch_refusal/3`).
+  `:stale_claim_epoch` when the story has moved past the dispatch: `DispatchLedger.epoch_refusal/4`).
   A row another runner or tenant holds reads as none (`:unknown_dispatch`); a row of another
   kind than `opts[:kind]` (implement by default; `DispatchLedger.kind_answers?/2`) is
   `:wrong_dispatch_kind`. Contention on the read is `:busy`, counted under
@@ -99,12 +99,17 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
   end
 
   # The MESSAGE's epoch against its own dispatch's. WHICH refusal is the story's call
-  # (`DispatchLedger.epoch_refusal/3`, contract 1.22.0): a claim that moved on is
+  # (`DispatchLedger.epoch_refusal/4`, contract 1.22.0): a claim that moved on is
   # `:stale_claim_epoch`, one still standing makes it this message's `:claim_epoch_mismatch`.
   defp dispatch_epoch_matches(_tenant_id, %{claim_epoch: epoch}, %{claim_epoch: epoch}), do: :ok
 
   defp dispatch_epoch_matches(tenant_id, row, _message),
-    do: DispatchLedger.epoch_refusal(tenant_id, row.story_id, row.claim_epoch)
+    do:
+      DispatchLedger.epoch_refusal(tenant_id, row.story_id, row.claim_epoch, [
+        :loopctl,
+        :threads,
+        :busy
+      ])
 
   @doc """
   A write's structured 422 as the channel publishes it: `:secret_blocked` for a credential,

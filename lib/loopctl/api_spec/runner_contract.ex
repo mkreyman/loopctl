@@ -3243,9 +3243,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     #
     # - `not_claimant` — the story's claim is not this runner's agent (or the story is not
     #   claimed at all). `stale_claim_epoch` names a moved epoch, which this is not.
-    # - `claim_not_live` — the claim is this runner's and at this epoch, but the story has left
-    #   the claimed statuses, so the implementer can no longer add to it. Until 1.22.0 it also
-    #   covered a lapsed lease and a requested review, which now have their own codes.
+    # - `claim_not_live` — the claim is this runner's and at this epoch, but no longer takes
+    #   the implementer's work: its lease lapsed, review was requested, or the story left the
+    #   claimed statuses (`Claimant.live?/2`). Permanent for that checkpoint; not claim-ending
+    #   (`@claim_ending_errors` says why).
     # - `checkpoint_conflict` / `idempotency_key_reused` — a resend that is NOT the same write.
     #   Acknowledging it would say the new content was recorded when it was not.
     # - `secret_blocked` — a text field carries a credential shape. `invalid_payload` would
@@ -3474,13 +3475,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # - `unknown_dispatch` — no such dispatch for this runner (never held, or its story deleted).
   #   This runner's dispatch of the wrong kind is now `wrong_dispatch_kind`.
   # - `not_claimant` on `checkpoint` — the claim is another agent's.
+  # - `@review_ending_codes` on a judgement — that review takes no more judgements.
   #
   # NOT `claim_not_live`: it is also answered once REVIEW IS REQUESTED, which clears only by a
   # release that bumps the epoch, and meanwhile the session still reports its stages. It is
   # permanent for the checkpoint that drew it; a claim that then ends shows as
   # `stale_claim_epoch` on the next message. It is not split, because on the runner channel
   # none of its cases is retryable: a placed claim's lapsed lease is always past its cap.
-  # - `@review_ending_codes` on a judgement — that review takes no more judgements.
   #
   # PER WORK EVENT, no `"*"`: `session_ended` is not work and has no key, so no refusal of it
   # ever asks for another message (`@claim_ending_remedy`). `dispatch_not_accepted` is decided

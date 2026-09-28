@@ -686,7 +686,7 @@ defmodule Loopctl.Runners.DispatchLedger do
           | {:error, :unknown_dispatch}
   def held_dispatch(tenant_id, runner_id, dispatch_id) do
     {:ok, held} =
-      in_tenant(tenant_id, fn -> held(tenant_id, runner_id, dispatch_id) end)
+      in_tenant(tenant_id, fn -> held(tenant_id, runner_id, dispatch_id, []) end)
 
     with {:ok, %DispatchRecord{story_id: story_id, kind: kind}} <- held,
          do: {:ok, %{story_id: story_id, kind: kind}}
@@ -963,14 +963,15 @@ defmodule Loopctl.Runners.DispatchLedger do
   but WITHOUT their lock: the answer only picks a refusal code, so it must not wait behind a
   claim holding the story, and a claim that moves after the read is refused by the fence next
   time. `in_tenant/2` returns what the function did, and this one never rolls back; contention
-  raises and is `:busy` through `Stages.answering_busy/4`.
+  raises and is `:busy` through `Stages.answering_busy/4`, counted under the CALLER's own
+  `busy_event`, so contention on this read lands where that path's is already watched.
   """
-  @spec epoch_refusal(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+  @spec epoch_refusal(Ecto.UUID.t(), Ecto.UUID.t(), integer(), [atom()]) ::
           {:error, :stale_claim_epoch | :claim_epoch_mismatch | :busy}
-  def epoch_refusal(tenant_id, story_id, dispatch_epoch) do
+  def epoch_refusal(tenant_id, story_id, dispatch_epoch, busy_event) do
     # A read in the channel's own process: contention answers `:busy` (sent as
     # `rate_limited`) rather than raising and taking the socket down with it.
-    Stages.answering_busy(tenant_id, [:loopctl, :runners, :busy], "epoch refusal read", fn ->
+    Stages.answering_busy(tenant_id, busy_event, "epoch refusal read", fn ->
       {:ok, current} =
         in_tenant(tenant_id, fn -> current_claim_epoch(tenant_id, story_id, :none) end)
 
@@ -1526,7 +1527,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   # the row it fenced on rather than reading it a second time (`reanchor_lease/3`).
   defp fence_then_lock(tenant_id, runner_id, dispatch_id, story_lock \\ :share) do
     with {:ok, %DispatchRecord{story_id: story_id}} <-
-           held(tenant_id, runner_id, dispatch_id) do
+           held(tenant_id, runner_id, dispatch_id, []) do
       story = locked_story(tenant_id, story_id, story_lock)
 
       with {:ok, record} <- held(tenant_id, runner_id, dispatch_id, lock: true),
@@ -1541,8 +1542,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   # a path all kinds share — a reply, a trace, the `session_ended` routing read, and the two
   # session-end WRITES, which check the kind themselves under the row lock and answer
   # `:wrong_dispatch_kind` (contract 1.22.0). The kind-scoped reads are `accepted_session/4`
-  # and `Loopctl.Delivery.RunnerThreadSession.read/5`. `lock: true` takes the row `FOR UPDATE`.
-  defp held(tenant_id, runner_id, dispatch_id, opts \\ []) do
+  # and `Loopctl.Delivery.RunnerThreadSession.read/5`. A NEW caller that serves one kind must
+  # not use this one unchecked: a review or triage row carries the implementer's story and
+  # `claim_epoch`, so it passes an epoch or story fence, and only a kind check keeps it off an
+  # implement path. `lock: true` takes the row `FOR UPDATE`.
+  defp held(tenant_id, runner_id, dispatch_id, opts) do
     query =
       from(r in DispatchRecord,
         where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
@@ -1589,7 +1593,7 @@ defmodule Loopctl.Runners.DispatchLedger do
     |> Repo.one()
   end
 
-  # No lock: for a read that only picks a refusal code (`epoch_refusal/3`), which must not
+  # No lock: for a read that only picks a refusal code (`epoch_refusal/4`), which must not
   # wait behind a claim or release holding the story `FOR UPDATE` and turn a permanent
   # refusal into `rate_limited`.
   defp locked_story(tenant_id, story_id, :none) do
@@ -1638,11 +1642,8 @@ defmodule Loopctl.Runners.DispatchLedger do
   # own `:claim_epoch_mismatch`. Nothing is written either way.
   defp epoch_matches(%DispatchRecord{} = record, epoch, current) do
     case epoch_matches(record, epoch) do
-      {:error, :claim_epoch_mismatch} when current != record.claim_epoch ->
-        {:error, :stale_claim_epoch}
-
-      result ->
-        result
+      {:error, :claim_epoch_mismatch} -> epoch_refusal_for(current, record.claim_epoch)
+      result -> result
     end
   end
 

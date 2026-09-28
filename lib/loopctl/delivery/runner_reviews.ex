@@ -209,7 +209,7 @@ defmodule Loopctl.Delivery.RunnerReviews do
 
   # The REVIEW row this runner holds for the message's dispatch, asked for by kind
   # (`Loopctl.Delivery.RunnerThreadSession.read/5`): only a review session judges, and a row
-  # of any other kind reads as none.
+  # of any other kind is `:wrong_dispatch_kind`.
   defp session(tenant_id, runner_id, message) do
     with {:ok, row} <-
            RunnerThreadSession.read(tenant_id, runner_id, message, "runner review read",

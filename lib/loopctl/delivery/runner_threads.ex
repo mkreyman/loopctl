@@ -174,7 +174,7 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   # The IMPLEMENT row `runner_id` holds for the message's dispatch
   # (`Loopctl.Delivery.RunnerThreadSession.read/5`, implement by default): only an implement
-  # session writes checkpoints and notes, and a row of any other kind reads as none.
+  # session writes checkpoints and notes, and a row of any other kind is `:wrong_dispatch_kind`.
   defp session(tenant_id, runner_id, message) do
     with {:ok, row} <-
            RunnerThreadSession.read(tenant_id, runner_id, message, "runner thread read") do
