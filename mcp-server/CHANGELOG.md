@@ -5,6 +5,16 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.110.0 — 2026-09-28 (epics)
+
+### Added
+
+- **`list_epics`, `create_epic`, `get_epic`, `update_epic`, `delete_epic`, `epic_progress`**
+  (loopctl #876): the six `EpicController` routes, which no tool reached. An epic created
+  through `import_stories` could not be named, since import answers counts; `list_epics` and
+  `create_epic` return ids. Reads take any key, create and update `LOOPCTL_ORCH_KEY`, delete
+  `LOOPCTL_USER_KEY` (it cascades to the epic's stories).
+
 ## 2.109.0 — 2026-09-28 (interactive change threads)
 
 ### Added

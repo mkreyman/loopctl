@@ -72,6 +72,14 @@ import {
 } from "./lib/intake-sources.js";
 import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-version.js";
 import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
+import {
+  createEpic as createEpicRequest,
+  deleteEpic as deleteEpicRequest,
+  epicProgress as epicProgressRequest,
+  getEpic as getEpicRequest,
+  listEpics as listEpicsRequest,
+  updateEpic as updateEpicRequest,
+} from "./lib/epics.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -1084,6 +1092,50 @@ async function listBlockedStories({ project_id, page, page_size }) {
 async function getStory({ story_id }) {
   const result = await apiCall("GET", `/api/v1/stories/${story_id}`);
   return toContent(result);
+}
+
+// --- Epics (loopctl #876) ---
+// Reads travel on the default key (any role passes). Create and update pass
+// LOOPCTL_ORCH_KEY as an ordinary override: `role: :orchestrator` WITH the hierarchy, as for
+// update_story. Delete passes LOOPCTL_USER_KEY: `role: :user`, and it cascades to stories.
+
+async function listEpics(args) {
+  return toContent(await listEpicsRequest(args, { apiCall }));
+}
+
+async function getEpic(args) {
+  return toContent(await getEpicRequest(args, { apiCall }));
+}
+
+async function epicProgress(args) {
+  return toContent(await epicProgressRequest(args, { apiCall }));
+}
+
+async function createEpic(args) {
+  return toContent(
+    await createEpicRequest(args, {
+      apiCall: (method, path, body) =>
+        apiCall(method, path, body, process.env.LOOPCTL_ORCH_KEY),
+    }),
+  );
+}
+
+async function updateEpic(args) {
+  return toContent(
+    await updateEpicRequest(args, {
+      apiCall: (method, path, body) =>
+        apiCall(method, path, body, process.env.LOOPCTL_ORCH_KEY),
+    }),
+  );
+}
+
+async function deleteEpic(args) {
+  return toContent(
+    await deleteEpicRequest(args, {
+      apiCall: (method, path, body) =>
+        apiCall(method, path, body, process.env.LOOPCTL_USER_KEY),
+    }),
+  );
 }
 
 // --- Workflow Tools (agent key) ---
@@ -4192,6 +4244,113 @@ const TOOLS = [
         },
       },
       required: ["story"],
+    },
+  },
+  {
+    name: "list_epics",
+    description:
+      "LIST A PROJECT'S EPICS (GET /api/v1/projects/:project_id/epics, loopctl #876): each " +
+      "epic's `id`, `number`, `title`, `phase` and status fields, paginated (`page`, " +
+      "`page_size`), optionally filtered by `phase`. The way to learn an epic's id, e.g. the " +
+      "`target_epic_id` an intake source needs. Any key. Refusals: 404 for a project not in " +
+      "your tenant; a malformed `project_id` is refused locally.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "The project's UUID." },
+        page: { type: "integer", description: "Page number (default 1)." },
+        page_size: { type: "integer", description: "Items per page." },
+        phase: { type: "string", description: "Only epics in this phase." },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "create_epic",
+    description:
+      "CREATE AN EPIC in a work project (POST /api/v1/projects/:project_id/epics, loopctl " +
+      "#876) and return it, `id` included. `number` (an integer, fixed for good) and `title` " +
+      "are required; `description`, `phase`, `position` (default 0) and `metadata` are " +
+      "optional. Needs LOOPCTL_ORCH_KEY (orchestrator or above) on a human-anchored tenant. " +
+      "Refusals: 403 for an agent key or a tenant that is not human-anchored, 404 for a " +
+      "project not in your tenant, 422 for a kb scope (epics live in work projects) or a " +
+      "duplicate or invalid field.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "The work project's UUID." },
+        number: { type: "integer", description: "The epic's number; cannot change later." },
+        title: { type: "string", description: "The epic's title." },
+        description: { type: "string", description: "Optional description." },
+        phase: { type: "string", description: "Optional phase." },
+        position: { type: "integer", description: "Optional ordering position (default 0)." },
+        metadata: { type: "object", description: "Optional metadata map." },
+      },
+      required: ["project_id", "number", "title"],
+    },
+  },
+  {
+    name: "get_epic",
+    description:
+      "READ ONE EPIC with its stories (GET /api/v1/epics/:id, loopctl #876). Any key. " +
+      "Refusals: 404 for an epic not in your tenant; a malformed `epic_id` is refused locally.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
+      },
+      required: ["epic_id"],
+    },
+  },
+  {
+    name: "update_epic",
+    description:
+      "CORRECT AN EPIC (PATCH /api/v1/epics/:id, loopctl #876): any of `title`, " +
+      "`description`, `phase`, `position`, `metadata`. `number` cannot change. The endpoint " +
+      "DROPS absent and null fields, so a field cannot be erased here and a call naming none " +
+      "is refused locally. `metadata` is REPLACED WHOLE, never merged: read the epic first " +
+      "(get_epic) and send the whole map. Needs LOOPCTL_ORCH_KEY (orchestrator or above) on " +
+      "a human-anchored tenant. Refusals: 403, 404, 422 for an invalid field.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
+        title: { type: "string" },
+        description: { type: "string" },
+        phase: { type: "string" },
+        position: { type: "integer" },
+        metadata: { type: "object", description: "Replaces the stored map whole." },
+      },
+      required: ["epic_id"],
+    },
+  },
+  {
+    name: "delete_epic",
+    description:
+      "DELETE AN EPIC AND EVERY STORY IN IT (DELETE /api/v1/epics/:id, loopctl #876). " +
+      "IRREVERSIBLE: the delete cascades to the epic's stories. Answers 204 with no body. " +
+      "Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant. Refusals: 403 for a " +
+      "lesser key or a tenant that is not human-anchored, 404 for an epic not in your tenant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
+      },
+      required: ["epic_id"],
+    },
+  },
+  {
+    name: "epic_progress",
+    description:
+      "AN EPIC'S PROGRESS (GET /api/v1/epics/:id/progress, loopctl #876): its stories " +
+      "counted by `agent_status` and by `verified_status`. Any key. Refusals: 404 for an " +
+      "epic not in your tenant; a malformed `epic_id` is refused locally.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        epic_id: { type: "string", description: "The epic's UUID (from list_epics or create_epic)." },
+      },
+      required: ["epic_id"],
     },
   },
   {
@@ -9661,6 +9820,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "update_story":
       return await updateStory(args);
+    case "list_epics":
+      return await listEpics(args);
+    case "create_epic":
+      return await createEpic(args);
+    case "get_epic":
+      return await getEpic(args);
+    case "update_epic":
+      return await updateEpic(args);
+    case "delete_epic":
+      return await deleteEpic(args);
+    case "epic_progress":
+      return await epicProgress(args);
 
     case "import_stories":
       return await importStories(args);

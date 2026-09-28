@@ -241,12 +241,6 @@ const DECLARED = {
   "GET /api/v1/projects/:param/ui-tests/:param": "gap", // UiTestController.show
   "POST /api/v1/projects/:param/ui-tests/:param/findings": "gap", // UiTestController.add_finding
   "POST /api/v1/projects/:param/ui-tests/:param/complete": "gap", // UiTestController.complete
-  "GET /api/v1/projects/:param/epics": "gap", // EpicController.index
-  "POST /api/v1/projects/:param/epics": "gap", // EpicController.create
-  "GET /api/v1/epics/:param": "gap", // EpicController.show
-  "PATCH /api/v1/epics/:param": "gap", // EpicController.update
-  "DELETE /api/v1/epics/:param": "gap", // EpicController.delete
-  "GET /api/v1/epics/:param/progress": "gap", // EpicController.progress
   "GET /api/v1/epics/:param/stories": "gap", // StoryController.index
   "DELETE /api/v1/stories/:param": "gap", // StoryController.delete
   "GET /api/v1/projects/:param/dependency_graph": "gap", // DependencyGraphController.graph
