@@ -783,12 +783,6 @@ config :loopctl, :context_retriever_max_offset, 100_000
 config :loopctl, :context_retriever_retrieve_rate_window_ms, 60_000
 config :loopctl, :context_retriever_retrieve_rate_limit, 120
 
-# L3 local test runner (Loopctl.Verification.TestRunner). DISABLED by default:
-# it clones a tenant-supplied repo and runs `mix deps.get`/`mix test` on it
-# (untrusted-code execution) and is subject to a clone-time DNS-rebinding SSRF
-# residual. Enable ONLY inside an egress-restricted, ephemeral sandbox.
-config :loopctl, :enable_local_test_runner, false
-
 # US-26.4.6: the (tenant, repository) pairs story verification may lend the operator's
 # GITHUB_TOKEN to, as `"<tenant_uuid>:<owner>/<repo>"` strings. EMPTY by default: enrolment
 # does not prove a tenant controls the repository it names, so no repository is read with the

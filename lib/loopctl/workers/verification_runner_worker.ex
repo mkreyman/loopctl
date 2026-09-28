@@ -14,13 +14,32 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
      forge until each is settled: the run's commit (`no_commit_sha`); whether the tenant is
      named for ANY repository (`Loopctl.Verification.Credential.any_for_tenant?/1`;
      `credential_unavailable`), before any read of the story, so an unnamed tenant costs no
-     database read; the story's repository, required checks and branch
+     database read; the story's repository, required checks, branch and stage row
      (`Loopctl.Verification.CiTarget`; `no_intake_source`, `ambiguous_intake_source`,
      `no_required_checks`, `no_story_branch`); and the credential for that tenant AND that
-     repository (`Credential.for_read/2`; `credential_unavailable`).
+     repository (`Credential.for_read/2`; `credential_unavailable`). So a tenant with no
+     allowlist entry records `credential_unavailable` even when its source names no required
+     checks: `no_required_checks` is only ever reached by an allowlisted tenant.
   5. An abbreviated SHA is resolved to its full id ONCE and persisted on the run
      (`resolved_commit_sha`); every later poll reuses it.
-  6. The CI adapter (`Loopctl.Verification.CiBehaviour`) answers one of its declared
+  6. WHICH COMMIT MAY BE JUDGED. When the story's stage row carries `merge_gate_allowed_sha`,
+     the commit the merge gate judged and allowed, verification judges THAT commit and no
+     other: a run whose full id is any other commit records `commit_not_merge_gated`, with no
+     CI read. Being on the base afterwards is then expected — verification of a merged commit
+     is the loop's normal order (merged, deployed, verified) — so the base is not compared
+     again where the gate compared it: a THREAD-mode allow, whose gate refused an empty change
+     and a change to CI definitions itself. A pr-mode gate compares neither, so a pr-mode
+     commit, and any commit the gate never allowed, gets the change check below.
+  7. THE CHANGE CHECK (`CiBehaviour.check_change/1`), ONCE per run: an empty three-dot diff
+     with the base is `empty_change`, a change to CI definitions `ci_definition_changed` (or
+     `ci_definition_unknown`). Passing it stamps `ci_definition_checked_at` on the run, and a
+     stamped run is never compared again, so a merge that lands during the CI wait — which
+     empties that diff — cannot turn a checked commit into a refused one. What it does mean:
+     A STORY OUTSIDE THE THREAD MERGE GATE (a pr-mode story, or one the gate never allowed)
+     MUST BE VERIFIED BEFORE ITS MERGE. Its first poll after a merge that put the commit itself
+     on the base (a merge commit, a fast-forward) finds an empty diff and records
+     `empty_change`; a squash leaves the change visible.
+  8. The CI adapter (`Loopctl.Verification.CiBehaviour`) answers one of its declared
      outcomes, and this worker branches on those alone.
 
   ## Waiting, and what ends a wait
@@ -167,17 +186,51 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
 
   # -- resolving what to read -------------------------------------------------------------
 
-  # Returns the run (with its resolved SHA, when this poll resolved one) and the outcome.
+  # Returns the run (with what this poll recorded on it) and the outcome.
   defp verify(run, tenant_id) do
     with {:ok, sha} <- commit_sha(run),
          :ok <- tenant_named(tenant_id),
          {:ok, target} <- CiTarget.gather(tenant_id, run.story_id),
          {:ok, credential} <- credential(tenant_id, target.repo),
          {:ok, run, full} <- full_sha(run, target.repo, sha, credential) do
-      request = Map.merge(target, %{sha: full, credential: credential})
+      {gate, target} = Map.split(target, [:mode, :merge_gate_allowed_sha])
+      judge(run, Map.merge(target, %{sha: full, credential: credential}), gate)
+    else
+      outcome -> {run, outcome}
+    end
+  end
+
+  defp judge(run, request, gate) do
+    with {:ok, compare?} <- merge_gate(gate, request.sha),
+         {:ok, run} <- change_checked(run, request, compare?) do
       {run, @ci_adapter.verdict(request)}
     else
       outcome -> {run, outcome}
+    end
+  end
+
+  # Which commit may be judged, and whether the base must still be compared (moduledoc, 6).
+  # `sha` is the FULL id, after any resolution, and so is the allow (40 or 64 hex).
+  defp merge_gate(%{merge_gate_allowed_sha: nil}, _sha), do: {:ok, true}
+  defp merge_gate(%{merge_gate_allowed_sha: sha, mode: :thread}, sha), do: {:ok, false}
+  defp merge_gate(%{merge_gate_allowed_sha: sha}, sha), do: {:ok, true}
+  defp merge_gate(_gate, _sha), do: {:refused, "commit_not_merge_gated"}
+
+  # The change check, once per run (moduledoc, 7). Only a pass is stamped: a refusal ends the
+  # run, and a wait asks again next poll.
+  defp change_checked(run, _request, false), do: {:ok, run}
+  defp change_checked(%{ci_definition_checked_at: %DateTime{}} = run, _request, _), do: {:ok, run}
+
+  defp change_checked(run, request, true) do
+    case @ci_adapter.check_change(request) do
+      :ok ->
+        {:ok, run} =
+          Verification.record_poll(run, %{ci_definition_checked_at: DateTime.utc_now()})
+
+        {:ok, run}
+
+      outcome ->
+        outcome
     end
   end
 

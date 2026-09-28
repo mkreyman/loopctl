@@ -35,9 +35,12 @@ defmodule LoopctlWeb.IntakeSourceController do
                          "judges a story's commit by in EITHER mode (US-26.4.6): GitHub Actions " <>
                          "JOB names as they appear on the commit. A `thread` source must name at " <>
                          "least one (422 otherwise, whichever of `mode` and `required_checks` " <>
-                         "the request named). A `pr` source may name none, and then story " <>
-                         "verification records `no_required_checks` and reads nothing — naming " <>
-                         "them is how a pr-mode source opts in. At most " <>
+                         "the request named). Story verification first needs the tenant AND " <>
+                         "this repository named in `VERIFICATION_OPERATOR_TOKEN_TENANTS` " <>
+                         "(`credential_unavailable` otherwise, whatever this list holds); only " <>
+                         "then does a `pr` source that names none record `no_required_checks` " <>
+                         "and read nothing — naming them is how a pr-mode source opts in. " <>
+                         "At most " <>
                          "#{Source.max_required_checks()} distinct, non-blank names of at most " <>
                          "#{Source.max_check_name_bytes()} bytes, no surrounding whitespace. Only a " <>
                          "job of a GitHub Actions workflow run that a push of the story's " <>

@@ -227,6 +227,18 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       refute_read()
     end
 
+    # Round 3, finding 3: the order the docs now state. A tenant with no allowlist entry never
+    # reaches the required-checks opt-in, so its pr source naming none is credential_unavailable.
+    test "an unnamed tenant's pr source naming no checks records credential_unavailable" do
+      ctx = setup_ctx()
+      fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+      run = run!(ctx)
+
+      assert :ok = perform(ctx, run)
+      assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "credential_unavailable"
+      refute_read()
+    end
+
     # Round 2, finding 9: the tenant is checked before CiTarget reads anything. The story here
     # has NO intake source, so a run that reached CiTarget would record no_intake_source; and
     # the pair would be licensed, so only the tenant check stands in the way.

@@ -19,10 +19,10 @@ defmodule Loopctl.Verification.VerificationRun do
   @statuses ~w(pending running pass fail error skipped)
 
   # A git object id: lowercase hex only, 7–64 chars (covers an abbreviated SHA,
-  # a full SHA-1 (40), and a full SHA-256 (64)). A hex-only value cannot contain
-  # `/`, `..`, or a leading `-`, which closes both the path-traversal and the
-  # `git checkout` argument-injection vectors when the SHA flows into
-  # `Loopctl.Verification.TestRunner`. Advisory ie-04 (GHSA-pv74-gwwh-g92x).
+  # a full SHA-1 (40), and a full SHA-256 (64)). The value is caller-supplied and is
+  # interpolated into GitHub API paths by story verification, so a hex-only value is
+  # what keeps `/`, `..`, `?` and a leading `-` out of every URL it reaches. Advisory
+  # ie-04 (GHSA-pv74-gwwh-g92x).
   @commit_sha_format ~r/\A[0-9a-f]{7,64}\z/
   @commit_sha_error "must be a lowercase hexadecimal git object id (7-64 chars)"
 
@@ -43,9 +43,12 @@ defmodule Loopctl.Verification.VerificationRun do
     field :machine_id, :string
     # US-26.4.6: the full id of an abbreviated `commit_sha`, resolved once and reused by every
     # later poll; and transient forge faults in a row, which bound a wait on an unreachable
-    # forge. Both written by `Loopctl.Verification.record_poll/2` only.
+    # forge; and when the commit passed the once-per-run change check (empty diff, CI
+    # definitions), so a merge during the wait cannot turn a checked commit into a refused one.
+    # All written by `Loopctl.Verification.record_poll/2` only.
     field :resolved_commit_sha, :string
     field :ci_forge_faults, :integer, default: 0
+    field :ci_definition_checked_at, :utc_datetime_usec
 
     timestamps()
   end
@@ -70,9 +73,8 @@ defmodule Loopctl.Verification.VerificationRun do
 
   @doc """
   Returns `true` when `sha` is a well-formed git object id (lowercase hex,
-  7-64 chars). Used both here and defensively in
-  `Loopctl.Verification.TestRunner` before the SHA is ever passed to a
-  subprocess or interpolated into a filesystem path.
+  7-64 chars). Used here and by `LoopctlWeb.StoryVerificationController`
+  before a caller-supplied SHA is accepted.
   """
   @spec valid_commit_sha?(term()) :: boolean()
   def valid_commit_sha?(sha) when is_binary(sha), do: Regex.match?(@commit_sha_format, sha)
@@ -81,7 +83,7 @@ defmodule Loopctl.Verification.VerificationRun do
   # A commit SHA is optional (a run may be created before a commit exists), so
   # `nil`/absent is allowed. But any value that IS supplied must be a valid git
   # object id — a blank string or a traversal/flag-shaped value is rejected so
-  # it never reaches the runner. `cast/3` drops `""` from the changes, so we
+  # it never reaches a forge URL. `cast/3` drops `""` from the changes, so we
   # inspect the raw attrs to distinguish "absent" from "explicitly blank".
   defp validate_commit_sha(changeset, attrs) do
     case commit_sha_input(attrs) do

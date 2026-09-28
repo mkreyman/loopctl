@@ -179,7 +179,25 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end)
   end
 
-  defp clean(files), do: %{merge_base_sha: @fork_point, diff: {:ok, %{files: files, renames: []}}}
+  defp clean(files, merge_base \\ @fork_point),
+    do: %{
+      merge_base_sha: merge_base,
+      diffstat: %{files: length(files), changed_lines: 3 * length(files)},
+      diff: {:ok, %{files: files, renames: []}}
+    }
+
+  # A stage row naming the merge gate's allow for `sha`, as `MergePrecondition` records it,
+  # for a story that has since merged.
+  defp stage_allowed!(ctx, sha) do
+    fixture(:story_stage, %{
+      tenant_id: ctx.tenant_id,
+      story_id: ctx.story_id,
+      stage: :merged,
+      branch: @branch,
+      head_sha: sha,
+      merge_gate_allowed_sha: sha
+    })
+  end
 
   defp refute_wrong_reads, do: refute_received({:wrong_read, _, _, _})
 
@@ -390,13 +408,157 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
       stub_forge(ctx, %{
         compare:
-          {:ok, %{merge_base_sha: @fork_point, diff: {:error, {:file_list_truncated, 300}}}},
+          {:ok,
+           %{
+             merge_base_sha: @fork_point,
+             diffstat: %{files: 300, changed_lines: 900},
+             diff: {:error, {:file_list_truncated, 300}}
+           }},
         evidence: green()
       })
 
       run = run!(ctx)
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "ci_definition_unknown"
+    end
+  end
+
+  # -- Round 3: which commit may be judged ---------------------------------------------------
+
+  describe "AC-26.4.6.3 a merge-gated story is judged at the commit the gate allowed" do
+    # The loop's order is merged, deployed, verified: the allowed commit is ON the base by now,
+    # so its diff with the base is empty. The thread gate compared it; verification does not.
+    test "thread mode: the allowed commit already on the base is judged, never compared", ctx do
+      stage_allowed!(ctx, @sha)
+      place_thread!(ctx, @branch, "master")
+      stub_forge(ctx, %{compare: {:ok, clean([], @sha)}, evidence: green()})
+
+      run = run!(ctx)
+      assert :ok = perform(ctx, run)
+
+      assert %{status: "pass", ci_definition_checked_at: nil} = reload(ctx, run)
+      assert_received {:evidence, @sha}
+      refute_received {:compare, _}
+      refute_wrong_reads()
+    end
+
+    # A pr-mode gate compares nothing, so verification still checks the change, once.
+    test "pr mode: the allowed commit is judged after verification's own change check", ctx do
+      stage_allowed!(ctx, @sha)
+      stub_forge(ctx, %{evidence: green()})
+
+      run = run!(ctx)
+      assert :ok = perform(ctx, run)
+
+      assert %{status: "pass", ci_definition_checked_at: %DateTime{}} = reload(ctx, run)
+      assert_received {:compare, @sha}
+    end
+
+    test "another commit records commit_not_merge_gated, and CI is never read", ctx do
+      stage_allowed!(ctx, String.duplicate("c", 40))
+      stub_forge(ctx, %{evidence: green()})
+
+      run = run!(ctx)
+      assert :ok = perform(ctx, run)
+
+      assert reload(ctx, run).ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "commit_not_merge_gated"
+             }
+
+      refute_received {:compare, _}
+      refute_received {:evidence, _}
+    end
+
+    # The comparison is on the FULL id: an abbreviated SHA is resolved first.
+    test "an abbreviated SHA is bound by the commit it resolves to", ctx do
+      stage_allowed!(ctx, @sha)
+      stub_forge(ctx, %{evidence: green()})
+      other = String.duplicate("a", 7) <> String.duplicate("d", 33)
+
+      expect(MockPullRequestSource, :resolve_commit, fn @repo, @short -> {:ok, @sha} end)
+
+      run = run!(ctx, @short)
+      assert :ok = perform(ctx, run)
+      assert reload(ctx, run).status == "pass"
+
+      expect(MockPullRequestSource, :resolve_commit, fn @repo, @short -> {:ok, other} end)
+      run = run!(ctx, @short)
+      assert :ok = perform(ctx, run)
+      assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "commit_not_merge_gated"
+    end
+  end
+
+  describe "AC-26.4.6.3 a story the merge gate has not allowed: the change check" do
+    setup ctx do
+      stage_branch!(ctx, @branch)
+      :ok
+    end
+
+    test "an old green commit of the base (its own merge base) is empty_change", ctx do
+      stub_forge(ctx, %{compare: {:ok, clean([], @sha)}, evidence: green()})
+
+      run = run!(ctx)
+      assert :ok = perform(ctx, run)
+
+      assert reload(ctx, run).ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "empty_change"
+             }
+
+      refute_received {:evidence, _}
+    end
+
+    # The round-2 check (`merge_base == sha`) let this through: an empty commit's merge base
+    # is its parent. Only the diff tells.
+    test "an empty commit on top of an old base commit is empty_change", ctx do
+      stub_forge(ctx, %{compare: {:ok, clean([], @fork_point)}, evidence: green()})
+
+      run = run!(ctx)
+      assert :ok = perform(ctx, run)
+      assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "empty_change"
+      refute_received {:evidence, _}
+    end
+
+    # Checked once, then merged during the CI wait: the next comparison would be empty, and it
+    # is never asked.
+    test "a commit checked once is still judged after a merge empties its diff", ctx do
+      stub_forge(ctx, %{
+        evidence:
+          sequence([
+            evidence([ci_run(5, "in_progress", nil)], [ci_job(5, "in_progress", nil)]),
+            green()
+          ])
+      })
+
+      run = run!(ctx)
+      assert {:snooze, _} = perform(ctx, run)
+      assert_received {:compare, @sha}
+      assert %{ci_definition_checked_at: %DateTime{}} = reload(ctx, run)
+
+      # Merged: the comparison now answers an empty diff.
+      stub(MockPullRequestSource, :compare, fn @repo, "master", sha ->
+        send(ctx.test_pid, {:compare, sha})
+        {:ok, clean([], @sha)}
+      end)
+
+      assert :ok = perform(ctx, run)
+      assert reload(ctx, run).status == "pass"
+      refute_received {:compare, _}
+    end
+
+    test "a stage row loopctl cannot read is a wait, not a verdict", ctx do
+      stub_forge(ctx, %{evidence: green()})
+      run = ctx |> run!() |> set_faults!(2)
+      hold_table_lock!("story_stages")
+
+      assert {:snooze, 60} = perform(ctx, run)
+
+      reloaded = reload(ctx, run)
+      assert reloaded.status == "running"
+      assert reloaded.ci_forge_faults == 2
+      refute_received {:credential_asked, _, _}
+      refute_received {:compare, _}
     end
   end
 
@@ -447,8 +609,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
              }
     end
 
-    # Round 2, finding 1: the comparison answers every poll and the evidence read faults every
-    # poll. That the comparison answered resets nothing, so the streak still reaches the bound.
+    # Round 2, finding 1: the evidence read faults every poll. The comparison that answered on
+    # the first poll resets nothing, so the streak still reaches the bound; and it is asked
+    # only once (round 3: the change check runs once per run).
     test "an evidence read that faults every poll reaches forge_unavailable at the bound", ctx do
       stub_forge(ctx, %{evidence: {:error, {:github_api_error, 503}}})
       run = run!(ctx)
@@ -456,7 +619,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
       for n <- 1..bound do
         assert {:snooze, _} = perform(ctx, run), "fault #{n}"
-        assert_received {:compare, @sha}
+        if n == 1, do: assert_received({:compare, @sha}), else: refute_received({:compare, _})
         assert reload(ctx, run).ci_forge_faults == n
       end
 
@@ -718,7 +881,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   # A lock on the dispatch ledger held by another connection until the test ends: the
   # route read waits out its lock_timeout and answers `:busy` (as in the merge gate's own
   # integration test).
-  defp hold_ledger_lock! do
+  defp hold_ledger_lock!, do: hold_table_lock!("runner_dispatches")
+
+  defp hold_table_lock!(table) do
     test_pid = self()
 
     holder =
@@ -726,7 +891,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         :ok = Sandbox.checkout(Repo, sandbox: false)
 
         Repo.transaction(fn ->
-          Repo.query!("LOCK TABLE runner_dispatches IN ACCESS EXCLUSIVE MODE")
+          Repo.query!("LOCK TABLE #{table} IN ACCESS EXCLUSIVE MODE")
           send(test_pid, :held)
 
           receive do

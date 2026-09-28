@@ -25,11 +25,11 @@
     },
     {
       "id": "AC-26.4.6.3",
-      "description": "A commit that changes CI definitions (`.github/workflows/`, `.github/actions/`, any `action.yml`, compared with the story's base branch) is refused `ci_definition_changed` exactly as the merge gate refuses it, and an unreadable diff `ci_definition_unknown`. A commit already on the base branch is refused `commit_on_base`: its three-dot diff with the base is empty whatever it contains, so nothing shows the story's work is in it (verify before merge, the merge gate's own order). None of the three is a pass or a fail: each records no verdict."
+      "description": "Verification judges only a commit it may vouch for. When the story's stage row carries `merge_gate_allowed_sha` (the commit the merge gate judged and allowed), it judges THAT commit: a run whose commit, after resolving an abbreviated SHA to its full id, is any other records `commit_not_merge_gated` and reads no CI. A THREAD-mode allow is judged merged or not, because the thread gate itself refused an empty change and a change to CI definitions when it allowed that commit, so verification does not compare it with the base again; merged, deployed, verified is the loop's order. Every other run (a pr-mode story, whose gate compares neither, and a story the gate never allowed) gets a change check ONCE per run, against the story's base branch: an empty three-dot diff is refused `empty_change` (the merge gate's own code for the same shape: an old green commit of the base, and an empty commit on top of one, both look like this), a commit that changes CI definitions (`.github/workflows/`, `.github/actions/`, any `action.yml`) is refused `ci_definition_changed` exactly as the merge gate refuses it, and an unreadable diff `ci_definition_unknown`. Passing the check is recorded on the run (`ci_definition_checked_at`), so a merge landing during the CI wait cannot turn a checked commit into a refused one; a story outside the thread merge gate must therefore be verified before its merge. A stage row loopctl cannot read is a wait, never a verdict. None of these refusals is a pass or a fail: each records no verdict."
     },
     {
       "id": "AC-26.4.6.4",
-      "description": "The verdict is `CiEvidence.judge/2` over the intake source's `required_checks`, in either mode: every required name concluded success is `pass`; a failed name, including a jobless run that ended (`run_<conclusion>`), is `fail`; a pending or `:missing` name is a wait. `required_checks` becomes meaningful for pr-mode sources too (its field comment, the enrollment tool's description and FLY_SECRETS/OpenAPI say so); a source with none records `no_required_checks` and reads nothing, which is the opt-in."
+      "description": "The verdict is `CiEvidence.judge/2` over the intake source's `required_checks`, in either mode: every required name concluded success is `pass`; a failed name, including a jobless run that ended (`run_<conclusion>`), is `fail`; a pending or `:missing` name is a wait. `required_checks` becomes meaningful for pr-mode sources too (its field comment, the enrollment tool's description and FLY_SECRETS/OpenAPI say so); the credential check comes first (AC-26.4.6.8), so a tenant and repository not in `VERIFICATION_OPERATOR_TOKEN_TENANTS` record `credential_unavailable` whatever the source names; only then does a pr source with none record `no_required_checks` and read nothing, which is the opt-in."
     },
     {
       "id": "AC-26.4.6.5",
@@ -37,7 +37,7 @@
     },
     {
       "id": "AC-26.4.6.6",
-      "description": "The local fallback (TestRunner) is not wired into verification in this story: a final no-verdict records its code and ends the run. The runner has no environment it can safely run in, because it would execute tenant code with loopctl's environment and filesystem. It returns when an isolated, egress-restricted runner exists."
+      "description": "The local fallback is removed rather than wired in: `Loopctl.Verification.TestRunner` and its `:enable_local_test_runner` flag are deleted, and a final no-verdict records its code and ends the run. The runner had no environment it could safely run in, because it would execute tenant code with loopctl's environment and filesystem. A local re-execution returns only with an isolated, egress-restricted runner."
     },
     {
       "id": "AC-26.4.6.7",
@@ -45,7 +45,7 @@
     },
     {
       "id": "AC-26.4.6.8",
-      "description": "Every GitHub read goes through one credential seam. Until the per-tenant credential decision (#915, 'Needs Mark') is made, that seam carries the operator `GITHUB_TOKEN` ONLY for (tenant, repository) pairs named in an operator allowlist (a new env var of `<tenant_uuid>:<owner>/<repo>` entries, default empty, documented in FLY_SECRETS.md): a run whose tenant and intake-source repository do not match one entry records `credential_unavailable` and nothing is read. Enrollment does not prove a tenant controls the repository it names, so the operator token must not read on an unproven tenant's behalf — and naming the tenant alone would let a trusted tenant enrol a repository that is not its own."
+      "description": "Every GitHub read goes through one credential seam. Until the per-tenant credential decision (#915, 'Needs Mark') is made, that seam carries the operator `GITHUB_TOKEN` ONLY for (tenant, repository) pairs named in an operator allowlist (a new env var of `<tenant_uuid>:<owner>/<repo>` entries, default empty, documented in FLY_SECRETS.md): a run whose tenant and intake-source repository do not match one entry records `credential_unavailable` and nothing is read. The tenant is checked before any other configuration, so this is also what an unnamed tenant records when its source names no `required_checks`. The seam LICENSES the read and carries no token: the forge adapter reads `GITHUB_TOKEN` itself, and carrying a per-tenant token needs the `PullRequestSource` callbacks to take one. Enrollment does not prove a tenant controls the repository it names, so the operator token must not read on an unproven tenant's behalf — and naming the tenant alone would let a trusted tenant enrol a repository that is not its own."
     },
     {
       "id": "AC-26.4.6.9",
@@ -78,11 +78,11 @@
     {
       "id": "TC-26.4.6.3",
       "verifies": ["AC-26.4.6.3"],
-      "name": "a workflow edit is refused",
+      "name": "which commit may be judged",
       "type": "unit",
-      "preconditions": ["the commit changes .github/workflows/ci.yml"],
-      "steps": ["verify it"],
-      "expected_results": ["no verdict, ci_definition_changed"]
+      "preconditions": ["separate runs: an ungated commit changing .github/workflows/ci.yml; an ungated old base commit and an empty commit on one; a thread story whose allowed commit is on the base; a gated story and a run naming another commit; an ungated run checked once whose next comparison is empty"],
+      "steps": ["verify each"],
+      "expected_results": ["ci_definition_changed; empty_change for both; judged with no comparison; commit_not_merge_gated with no CI read; judged with no second comparison"]
     },
     {
       "id": "TC-26.4.6.4",

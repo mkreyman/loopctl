@@ -1101,10 +1101,18 @@ describe("the descriptions carry what a caller needs instead of the controller",
       assert.match(text, /story verification/, name);
       assert.match(text, /no_required_checks/, name);
       assert.match(text, /PUSH run of the story's branch/, name);
+      // Round 3, finding 3: the allowlist is checked first, so the opt-in is only reached by a
+      // tenant and repository the operator named.
+      assert.match(text, /VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*only then[\s\S]*no_required_checks/, name);
       assert.ok(!/mode never reads it/.test(text), `${name} still says pr mode never reads it`);
     }
     for (const name of ["intake_source_enroll", "intake_source_update"]) {
       assert.match(row(name), /no_required_checks/, `${name}'s README row`);
+      assert.match(
+        row(name),
+        /VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks/,
+        `${name}'s README row`,
+      );
     }
   });
 

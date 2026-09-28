@@ -24,10 +24,13 @@ defmodule Loopctl.Verification.Credential do
 
   ## What the credential carries
 
-  `kind: :operator_token` is the only kind today, and it carries no token. The CI reads go
-  through the merge gate's forge adapter (`Loopctl.Delivery.GitHubPullRequestSource`), which
-  authenticates with the same `GITHUB_TOKEN` itself, so the credential is what LICENSES the
-  read, and the token never leaves that adapter.
+  `kind: :operator_token` is the only kind today, and it carries NO TOKEN. This seam LICENSES
+  a read; it does not supply the secret the read authenticates with. The CI reads go through
+  the merge gate's forge adapter (`Loopctl.Delivery.GitHubPullRequestSource`), which reads the
+  operator's `GITHUB_TOKEN` itself, so the token never leaves that adapter. Carrying a
+  per-tenant token (#915) is therefore not a change to this module alone: the
+  `Loopctl.Delivery.PullRequestSource` callbacks verification calls (`compare/3`,
+  `check_evidence/3`, `resolve_commit/2`) have to take one, which they do not today.
   """
 
   @enforce_keys [:kind]

@@ -117,13 +117,16 @@ defmodule Loopctl.Verification do
   @doc """
   Records what one CI poll learned that the next poll of the same run needs (US-26.4.6): the
   full id of an abbreviated commit SHA (`:resolved_commit_sha`, a full git object id or
-  refused) and the count of transient forge faults in a row (`:ci_forge_faults`). Neither is
-  castable from any request.
+  refused), the count of transient forge faults in a row (`:ci_forge_faults`), and when the
+  commit passed the once-per-run change check (`:ci_definition_checked_at`). None is castable
+  from any request.
   """
   @spec record_poll(VerificationRun.t(), map()) :: {:ok, VerificationRun.t()} | {:error, term()}
   def record_poll(run, attrs) do
     run
-    |> Ecto.Changeset.change(Map.take(attrs, [:resolved_commit_sha, :ci_forge_faults]))
+    |> Ecto.Changeset.change(
+      Map.take(attrs, [:resolved_commit_sha, :ci_forge_faults, :ci_definition_checked_at])
+    )
     |> Ecto.Changeset.validate_change(:resolved_commit_sha, fn :resolved_commit_sha, sha ->
       if Loopctl.GitSha.valid?(sha), do: [], else: [resolved_commit_sha: "must be a full id"]
     end)

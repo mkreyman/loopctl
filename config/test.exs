@@ -132,13 +132,6 @@ config :loopctl, :heavy_read_statement_timeout_ms, 250
 # connection); integration tests assert on the buffer contents directly.
 config :loopctl, Loopctl.TouchBuffer, flush_interval_ms: :timer.hours(1)
 
-# Keep the L3 local test runner DISABLED in tests (it clones repos + runs
-# `mix test` on untrusted code). TestRunner's tests exercise the disabled path
-# and the validation-rejection paths WITHOUT ever cloning a real repo; input
-# validation runs before this gate, so validation-rejection is asserted
-# independently of the flag.
-config :loopctl, :enable_local_test_runner, false
-
 # US-26.4.6: story verification's credential seam, as a Mox mock whose DataCase default is
 # fail-closed (no credential). The allowlist below is read only by
 # `Loopctl.Verification.OperatorCredential`'s own test, which names these fixed ids; no fixture

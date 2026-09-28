@@ -5,6 +5,16 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.111.2 — 2026-09-28 (required_checks: the allowlist comes first)
+
+### Changed
+
+- **`intake_source_enroll`** and **`intake_source_update`** say what story verification needs
+  before `required_checks` matters (loopctl #913, US-26.4.6): the tenant and the repository
+  named in the operator's `VERIFICATION_OPERATOR_TOKEN_TENANTS`. Without that every run records
+  `credential_unavailable`, whatever the list holds; only then does a `pr` source that names
+  none record `no_required_checks`. Descriptions only; no argument changed.
+
 ## 2.111.1 — 2026-09-28 (verification reads required_checks)
 
 ### Changed

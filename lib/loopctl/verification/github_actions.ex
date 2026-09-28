@@ -5,14 +5,16 @@ defmodule Loopctl.Verification.GitHubActions do
   It judges a commit by EXACTLY the merge gate's rules, through the merge gate's own code, so a
   verification run means what a merge decision means (issue #913):
 
-  1. the change is compared with the story's base branch (`compare/3`) and a commit that edits
-     its own CI definitions is refused `ci_definition_changed` — or `ci_definition_unknown`
-     when that cannot be told — by `Loopctl.Delivery.CiDefinition.reasons/1`, the rule the
-     merge gate refuses by. A commit already ON the base branch is refused `commit_on_base`:
-     its three-dot diff is empty whatever it contains, so nothing shows the story's work is
-     in it. Verify before merge, the merge gate's own order
-  2. the evidence is `check_evidence/3` for the story's branch and the commit: the jobs of
-     PUSH runs of that branch at that SHA, never another branch's runs, a fork's
+  1. `check_change/1` compares the change with the story's base branch (`compare/3`). An EMPTY
+     three-dot diff is refused `empty_change`, the merge gate's own code for the same shape:
+     nothing shows the story's work is in the commit, which is what an old green commit of the
+     base, or an empty commit on top of one, looks like. A commit that edits its own CI
+     definitions is refused `ci_definition_changed` — or `ci_definition_unknown` when that
+     cannot be told — by `Loopctl.Delivery.CiDefinition.reasons/1`, the rule the merge gate
+     refuses by. The worker asks this once per run, and not at all for a commit the thread
+     merge gate allowed, which it already compared
+  2. `verdict/1` reads the evidence, `check_evidence/3` for the story's branch and the commit:
+     the jobs of PUSH runs of that branch at that SHA, never another branch's runs, a fork's
      `pull_request` run or a `workflow_dispatch`. Anything else is something the implementer
      can produce itself (`Loopctl.Delivery.CiEvidence`)
   3. the verdict is `CiEvidence.judge/2` over the intake source's `required_checks`
@@ -26,7 +28,7 @@ defmodule Loopctl.Verification.GitHubActions do
   ## Reason codes
 
   A fixed set of strings with no numbers in them, so none reads as an HTTP status:
-  `ci_definition_changed`, `ci_definition_unknown`, `commit_on_base`, `no_required_checks`,
+  `empty_change`, `ci_definition_changed`, `ci_definition_unknown`, `no_required_checks`,
   `credential_unavailable`, `unresolved_sha` and `repository_unreadable` (resolving an
   abbreviated SHA: a 422, which GitHub answers for an unknown prefix and an ambiguous one
   alike, and a 404, a repository missing or unreadable), `forge_unauthorized` (401), `forge_forbidden` (a 403 that is not a
@@ -60,16 +62,23 @@ defmodule Loopctl.Verification.GitHubActions do
   def resolve_commit(_repo, _sha, _credential), do: {:refused, "credential_unavailable"}
 
   @impl true
+  def check_change(%{credential: %Credential{kind: :operator_token}} = request) do
+    with {:ok, comparison} <-
+           read(source().compare(request.repo, request.base_branch, request.sha)) do
+      change(comparison)
+    end
+  end
+
+  def check_change(_request), do: {:refused, "credential_unavailable"}
+
+  @impl true
   def verdict(%{credential: %Credential{kind: :operator_token}} = request) do
     if CiEvidence.lookup_names(request.required_checks) == [] do
       # The worker refuses this before asking; refused here too, so the adapter can never
       # judge an empty list — over which every check "passed".
       {:refused, "no_required_checks"}
     else
-      with {:ok, comparison} <-
-             read(source().compare(request.repo, request.base_branch, request.sha)),
-           :ok <- ci_definition(comparison, request.sha),
-           {:ok, evidence} <-
+      with {:ok, evidence} <-
              read(source().check_evidence(request.repo, request.sha, request.branch)) do
         judge(request, evidence)
       end
@@ -78,13 +87,12 @@ defmodule Loopctl.Verification.GitHubActions do
 
   def verdict(_request), do: {:refused, "credential_unavailable"}
 
-  # A commit already ON the base (the merge base IS the commit) is refused, never judged. Its
-  # three-dot diff is empty whatever it contains, so nothing shows the story's work is in it:
-  # an implementer could point the story's branch at an old green commit of the base and be
-  # verified with none of their work. Verify before merge, the merge gate's own order.
-  defp ci_definition(%{merge_base_sha: sha}, sha), do: {:refused, "commit_on_base"}
+  # An empty three-dot diff is refused, never judged: nothing shows the story's work is in the
+  # commit. It is what the base's own old green commit looks like, and an empty commit on top
+  # of one — whose merge base is not itself, so only the diff tells.
+  defp change(%{diffstat: %{files: 0}}), do: {:refused, "empty_change"}
 
-  defp ci_definition(comparison, _sha) do
+  defp change(comparison) do
     case CiDefinition.reasons(Map.get(comparison, :diff)) do
       [] -> :ok
       [{:ci_definition_changed, _names} | _rest] -> {:refused, "ci_definition_changed"}

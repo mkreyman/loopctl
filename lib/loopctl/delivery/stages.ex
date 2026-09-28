@@ -292,6 +292,22 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
+  `get/2` for a caller that must not fail on contention: its lock wait is bounded, and
+  contention is `{:error, :busy}`, counted as `[:loopctl, :delivery, :stage_read_busy]`
+  (US-26.4.6: story verification reads the merge gate's allow here, and a row it cannot read
+  is a wait, never a verdict).
+  """
+  @spec fetch(Ecto.UUID.t(), Ecto.UUID.t()) :: {:ok, StoryStage.t() | nil} | {:error, term()}
+  def fetch(tenant_id, story_id) do
+    answering_busy(tenant_id, [:loopctl, :delivery, :stage_read_busy], "stage row read", fn ->
+      Repo.with_tenant(tenant_id, fn ->
+        Capacity.set_lock_timeout!(Repo)
+        row_query(tenant_id, story_id) |> Repo.one()
+      end)
+    end)
+  end
+
+  @doc """
   A story's TRANSITIONS only, oldest first, as `%{from:, to:, edge:, data:}` — filtered and
   projected in SQL, in the same order `list_events/2` reads. For a caller that walks the
   transition history on a hot path (the merge gate's Gate A input) and has no use for effect

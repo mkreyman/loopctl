@@ -18,9 +18,9 @@ defmodule Loopctl.Verification.CiBehaviour do
     error, 5xx, rate limit), whichever read of the call it was. The worker waits, bounded by a
     count of polls in a row that ended this way; `retry_after` is the forge's own delay in
     seconds, when it gave one
-  - `{:refused, code}` — the commit is not one this CI can vouch for: it changes its own CI
-    definitions, that could not be told, or it is already on the base branch, so nothing
-    shows the story's work is in it. No verdict, ever
+  - `{:refused, code}` — the commit is not one this CI can vouch for: its diff with the base
+    is empty, so nothing shows the story's work is in it (`empty_change`), it changes its own
+    CI definitions, or that could not be told. No verdict, ever
   - `{:no_verdict, code}` — a PERMANENT forge answer that ends the run with no verdict (a 401,
     a non-rate-limit 403, a 404, a 422, a truncated or unreadable list)
 
@@ -69,6 +69,19 @@ defmodule Loopctl.Verification.CiBehaviour do
   @callback resolve_commit(repo :: String.t(), sha :: String.t(), Credential.t()) ::
               {:ok, String.t()} | wait() | {:refused, String.t()} | {:no_verdict, String.t()}
 
-  @doc "The CI outcome for one commit of the story's branch. See the moduledoc."
+  @doc """
+  Whether the commit is a change this CI can vouch for, from its three-dot comparison with the
+  base branch: `:ok`, or a refusal (`empty_change`, `ci_definition_changed`,
+  `ci_definition_unknown`), a wait or a permanent no-verdict. The worker asks it once per run
+  and records that it passed, so a merge landing during the CI wait — which empties that
+  diff — cannot turn a commit already checked into a refused one.
+  """
+  @callback check_change(request()) ::
+              :ok | wait() | {:refused, String.t()} | {:no_verdict, String.t()}
+
+  @doc """
+  The CI outcome for one commit of the story's branch, from its evidence alone: it compares
+  nothing with the base (that is `check_change/1`). See the moduledoc.
+  """
   @callback verdict(request()) :: outcome()
 end
