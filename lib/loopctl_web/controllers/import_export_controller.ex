@@ -36,7 +36,15 @@ defmodule LoopctlWeb.ImportExportController do
     description: "Imports a work breakdown into a project. Use merge=true for merge import.",
     parameters: [
       id: [in: :path, type: :string, description: "Project UUID"],
-      merge: [in: :query, type: :boolean, description: "Merge mode (update existing)"]
+      merge: [in: :query, type: :boolean, description: "Merge mode (update existing)"],
+      report_orphans: [
+        in: :query,
+        type: :boolean,
+        description:
+          "Merge mode only (#880): include `stories_orphaned`, the project's stories the " <>
+            "payload does not mention. Meaningful for a FULL round-trip of an export; on a " <>
+            "partial merge every unmentioned story is listed. Absent, the key is omitted."
+      ]
     ],
     request_body: {"Import data", "application/json", Schemas.ImportRequest},
     responses: %{
@@ -128,6 +136,8 @@ defmodule LoopctlWeb.ImportExportController do
   end
 
   defp do_merge_import(conn, tenant_id, project_id, params, audit_opts) do
+    audit_opts = Keyword.put(audit_opts, :report_orphans, params["report_orphans"] == "true")
+
     case ImportExport.merge_import_project(tenant_id, project_id, params, audit_opts) do
       {:ok, summary} ->
         json(conn, %{import: summary})

@@ -201,7 +201,7 @@ tool parameter.
 | `create_project` | Create a new **work** project (epics/stories/custody). Requires orchestrator+ **and** a `human_anchored` tenant; an agent-rooted tenant gets `403 custody_tier_required` and should use `create_kb_scope`. |
 | `delete_project` | **Requires `LOOPCTL_USER_KEY`.** Delete a project and all of its dependent resources (epics, stories, audit entries). Irreversible — orchestrator role is not sufficient. |
 | `get_progress` | Get progress summary for a project, including story counts by status. Pass `include_cost=true` for cost data. |
-| `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). Pass `merge: true` to add stories to epics that already exist (otherwise duplicates return 409). For large payloads, use `payload_path` to read JSON from disk instead of passing it inline. |
+| `import_stories` | Import stories into a project from a structured payload (Epic 12 import format). Pass `merge: true` to add stories to epics that already exist (otherwise duplicates return 409). For large payloads, use `payload_path` to read JSON from disk instead of passing it inline. With `merge: true`, `report_orphans: true` adds `stories_orphaned` (the project's stories the payload does not mention; nothing is detached) — a signal only on a FULL round-trip of an export; without it the key is absent (#880). |
 
 ### KB Scope Tools (agent key)
 

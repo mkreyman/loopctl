@@ -161,7 +161,7 @@ defmodule LoopctlWeb.MergeImportControllerTest do
       conn =
         conn
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/projects/#{project.id}/import?merge=true", payload)
+        |> post(~p"/api/v1/projects/#{project.id}/import?merge=true&report_orphans=true", payload)
 
       body = json_response(conn, 200)
       orphaned = body["import"]["stories_orphaned"]
@@ -174,6 +174,49 @@ defmodule LoopctlWeb.MergeImportControllerTest do
       assert AdminRepo.exists?(
                from(s in Story, where: s.number == "1.3" and s.tenant_id == ^tenant.id)
              )
+    end
+
+    test "a partial merge reports no orphans unless asked (#880)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      full = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Epic",
+            "stories" => [
+              %{"number" => "1.1", "title" => "One"},
+              %{"number" => "1.2", "title" => "Two"}
+            ]
+          }
+        ]
+      }
+
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/projects/#{project.id}/import", full)
+      |> json_response(201)
+
+      partial = %{
+        "epics" => [
+          %{
+            "number" => 1,
+            "title" => "Epic",
+            "stories" => [%{"number" => "1.3", "title" => "Three"}]
+          }
+        ]
+      }
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/projects/#{project.id}/import?merge=true", partial)
+        |> json_response(200)
+
+      assert body["import"]["stories_created"] == 1
+      refute Map.has_key?(body["import"], "stories_orphaned")
     end
 
     test "merge with new epic creates it with all stories", %{conn: conn} do

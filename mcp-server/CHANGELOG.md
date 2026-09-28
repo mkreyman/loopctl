@@ -5,6 +5,15 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.111.0 — 2026-09-28 (merge import orphans)
+
+### Changed
+
+- **`import_stories`** takes `report_orphans` (loopctl #880). A merge import no longer
+  returns `stories_orphaned` unless asked: on a partial merge it listed every other story in
+  the project and read as a destructive outcome. Pass `report_orphans: true` when the payload
+  is a full round-trip of an export.
+
 ## 2.110.0 — 2026-09-28 (epics)
 
 ### Added
