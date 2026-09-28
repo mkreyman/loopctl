@@ -30,10 +30,11 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # not a Seq Scan. Two captures, both taken by hand when this migration was written and
   # neither re-run by CI. What CI does assert, in `RevokeExpiredDispatchesPlanScaleTest`
   # (scale job), is its own shape: the query the worker issues, with a bound timestamp
-  # parameter, over a committed, ANALYZEd table of 20k revoked rows, 50 live and a 20-row
-  # expired backlog, must be an Index Scan on this index with an Index Cond on expires_at.
-  # That test's moduledoc records where the default planner stops choosing this index (a
-  # live fraction of a few percent). The default suite's `RevokeExpiredDispatchesWorkerTest`
+  # parameter, over a committed, ANALYZEd table of mostly revoked history with a small live
+  # set and expired backlog (sizes in that module), must seek this index with an Index Cond
+  # on expires_at, by an Index Scan, an Index Only Scan, or a bitmap scan driven by it.
+  # That test's moduledoc records the live fractions it was measured across. The default
+  # suite's `RevokeExpiredDispatchesWorkerTest`
   # asserts only the index's shape and predicate from `pg_index`.
   #
   #   * Empty table, planner forced to reveal usability (`SET LOCAL

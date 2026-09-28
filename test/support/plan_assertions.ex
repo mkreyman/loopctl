@@ -670,19 +670,28 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
-  Asserts the plan reaches `relation` through exactly ONE scan node, and that it is an
-  `Index Scan` or `Index Only Scan` on `index` whose `Index Cond` matches `cond` — a range
-  SEEK on that index, not a full read of it with a Filter, and never a Seq Scan or Bitmap
-  Heap Scan. Runs the planner's natural choice. Raises with the plan on any mismatch.
+  Asserts the plan reaches `relation` through exactly ONE scan node, and that it SEEKS
+  `index` with an `Index Cond` matching `cond`: an `Index Scan` or `Index Only Scan` on it,
+  or a `Bitmap Heap Scan` driven by a single `Bitmap Index Scan` on it. A Seq Scan, a scan
+  of another index, or a read of this one with only a Filter fails. Runs the planner's
+  natural choice and raises with the plan on any mismatch.
+
+  Like every assertion here it means something only against a committed, ANALYZEd table;
+  it refuses one `pg_stat_user_tables` shows was never analyzed.
   """
   def assert_index_range_scan(queryable_or_sql, relation, index, %Regex{} = cond)
       when is_binary(relation) and is_binary(index) do
+    assert_analyzed!(relation)
     {root, raw} = explain_json(queryable_or_sql)
 
-    case raw_relation_scans(root, relation) do
-      [%{"Node Type" => type, "Index Name" => ^index} = scan]
-      when type in ["Index Scan", "Index Only Scan"] ->
-        if Regex.match?(cond, scan["Index Cond"] || "") do
+    scans =
+      root
+      |> relation_scan_nodes(relation)
+      |> Enum.filter(&(&1.relation == relation))
+
+    case Enum.map(scans, &seek_cond(&1, index)) do
+      [{:ok, index_cond}] ->
+        if Regex.match?(cond, index_cond || "") do
           :ok
         else
           raise ExUnit.AssertionError,
@@ -690,22 +699,45 @@ defmodule Loopctl.PlanAssertions do
               "Expected an Index Cond matching #{inspect(cond)} on #{index}. Plan:\n#{elide(raw)}"
         end
 
-      scans ->
+      _other ->
         raise ExUnit.AssertionError,
           message:
-            "Expected exactly one Index Scan on #{relation} using #{index}, got " <>
-              "#{inspect(Enum.map(scans, &{&1["Node Type"], &1["Index Name"]}))}. " <>
-              "Plan:\n#{elide(raw)}"
+            "Expected exactly one scan of #{relation}, seeking #{index}; got " <>
+              "#{inspect(Enum.map(scans, &{&1.node_type, &1.index_name}))}. Plan:\n#{elide(raw)}"
+    end
+  end
+
+  defp seek_cond(%{node_type: type, index_name: index, node: node}, index)
+       when type in ["Index Scan", "Index Only Scan"],
+       do: {:ok, node["Index Cond"]}
+
+  defp seek_cond(%{node_type: "Bitmap Heap Scan", node: node}, index) do
+    case Map.get(node, "Plans", []) do
+      [%{"Node Type" => "Bitmap Index Scan", "Index Name" => ^index} = child] ->
+        {:ok, child["Index Cond"]}
+
+      _other ->
+        :no
+    end
+  end
+
+  defp seek_cond(_scan, _index), do: :no
+
+  defp assert_analyzed!(relation) do
+    %{rows: rows} =
+      AdminRepo.query!(
+        "SELECT last_analyze IS NOT NULL OR last_autoanalyze IS NOT NULL " <>
+          "FROM pg_stat_user_tables WHERE relname = $1",
+        [relation]
+      )
+
+    unless rows == [[true]] do
+      raise ExUnit.AssertionError,
+        message: "#{relation} has never been ANALYZEd; a plan assertion on it means nothing"
     end
   end
 
   # --- internals ---
-
-  # Every plan node whose Relation Name is exactly `relation`, as the raw EXPLAIN map.
-  defp raw_relation_scans(node, relation) when is_map(node) do
-    here = if node["Relation Name"] == relation, do: [node], else: []
-    here ++ Enum.flat_map(Map.get(node, "Plans", []), &raw_relation_scans(&1, relation))
-  end
 
   # Runs EXPLAIN (FORMAT JSON) and returns {root_plan_node_map, raw_text_for_messages}.
   defp explain_json({sql, params}) when is_binary(sql) and is_list(params) do
@@ -808,7 +840,8 @@ defmodule Loopctl.PlanAssertions do
             node_type: node["Node Type"],
             index_name: node["Index Name"],
             rows: node["Plan Rows"],
-            relation: name
+            relation: name,
+            node: node
           }
         ]
       else
