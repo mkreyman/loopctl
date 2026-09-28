@@ -391,6 +391,93 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
+  Asserts `name` is the ONLY index anywhere in the plan. Stronger than
+  `assert_index_used/2`: a Bitmap Heap Scan whose BitmapAnd also reads another index whole
+  (a tenant-leading composite, the primary key) fails, and so does a plan naming no index.
+
+  Checks first that `name` is a valid index ON `relation` (both in `public`), so a renamed,
+  dropped, invalid or mismatched index fails here instead of passing vacuously, and that
+  `column`'s planner statistics describe the rows actually in `relation`
+  (`assert_column_stats_current!/2`).
+  """
+  def assert_only_index_used(queryable_or_sql, relation, name, column)
+      when is_binary(relation) and is_binary(name) and is_binary(column) do
+    %{rows: valid} =
+      AdminRepo.query!(
+        """
+        SELECT 1 FROM pg_index i
+        WHERE i.indexrelid = to_regclass('public.' || quote_ident($1))
+          AND i.indrelid = to_regclass('public.' || quote_ident($2))
+          AND i.indisvalid
+        """,
+        [name, relation]
+      )
+
+    if valid == [] do
+      raise ExUnit.AssertionError,
+        message: "#{inspect(name)} is not a valid index on public.#{relation}"
+    end
+
+    assert_column_stats_current!(relation, column)
+    {root, raw} = explain_json(queryable_or_sql)
+
+    case root |> index_names() |> Enum.uniq() do
+      [^name] ->
+        :ok
+
+      names ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected #{inspect(name)} to be the only index in the plan, got #{inspect(names)}. " <>
+              "Plan:\n#{elide(raw)}"
+    end
+  end
+
+  @doc """
+  Raises unless the last ANALYZE of `public.relation` saw the rows there now, judged on
+  `column`: its `pg_stats.null_frac` must be within 0.02 of the column's actual NULL
+  fraction. Column statistics are what the planner's selectivity comes from, and only
+  ANALYZE writes them; `pg_class.reltuples`, which a plain VACUUM or an index build also
+  writes, cannot tell stale column statistics from fresh ones. `assert_fresh_stats!/0` and
+  `assert_fresh_stats_audit!/0` answer a weaker question for their corpora (was the table
+  ever analyzed), and are left as they are.
+  """
+  def assert_column_stats_current!(relation, column)
+      when is_binary(relation) and is_binary(column) do
+    %{rows: rows} =
+      AdminRepo.query!(
+        """
+        SELECT s.null_frac,
+               (SELECT count(*) FILTER (WHERE (to_jsonb(t) -> $2) = 'null'::jsonb)::float8
+                       / nullif(count(*), 0)
+                  FROM #{quoted_relation(relation)} t)
+          FROM pg_stats s
+         WHERE s.schemaname = 'public' AND s.tablename = $1 AND s.attname = $2
+        """,
+        [relation, column]
+      )
+
+    case rows do
+      [[stats_frac, actual_frac]] when is_float(actual_frac) ->
+        unless abs(stats_frac - actual_frac) <= 0.02 do
+          raise ExUnit.AssertionError,
+            message:
+              "public.#{relation}.#{column} statistics are stale (null_frac #{stats_frac}, " <>
+                "actual #{actual_frac}); ANALYZE it before asserting a plan"
+        end
+
+      _none ->
+        raise ExUnit.AssertionError,
+          message:
+            "public.#{relation} is empty or #{column} has never been ANALYZEd; " <>
+              "a plan assertion on it means nothing"
+    end
+  end
+
+  defp quoted_relation(relation),
+    do: "public.\"" <> String.replace(relation, "\"", "\"\"") <> "\""
+
+  @doc """
   Asserts every scan on `articles` is DOMINATED by a `Limit` node whose `Plan Rows`
   is `<= max_rows` (US-27.7b distant_pairs: the SAMPLED candidate subquery
   `... ORDER BY id LIMIT max_pair_candidates()`).

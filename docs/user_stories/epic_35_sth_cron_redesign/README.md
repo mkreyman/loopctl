@@ -13,7 +13,7 @@ Issue #350 predates recent work; **3 of its 6 findings are already done** and ar
 |--------------|--------|----------|
 | Fanout uses N single-row inserts instead of `insert_all` | ✅ done | US-32.5 — `compute_sth_worker.ex:59-68` uses `Oban.insert_all/1`, chunked at 5000 |
 | Zero-jitter thundering herd at the `:00` tick | ✅ done (jitter part) | US-32.5 — `schedule_in: jitter(tenant_id)`, deterministic `phash2` over a 56s window (`compute_sth_worker.ex:45,57,113`) |
-| `RevokeExpiredDispatchesWorker` query can't use its index | ✅ done | US-32.1 — `20260713000000_add_dispatches_expires_at_active_index.exs` adds `CREATE INDEX CONCURRENTLY … ON dispatches (expires_at) WHERE revoked_at IS NULL`; `revoke_expired_dispatches_worker_test.exs` asserts the index's shape and predicate from `pg_index`; the planner's choice is not asserted in the async suite |
+| `RevokeExpiredDispatchesWorker` query can't use its index | ✅ done | US-32.1 — `20260713000000_add_dispatches_expires_at_active_index.exs` adds `CREATE INDEX CONCURRENTLY … ON dispatches (expires_at) WHERE revoked_at IS NULL`; `revoke_expired_dispatches_worker_test.exs` asserts the index's shape and predicate from `pg_index`; `revoke_expired_dispatches_plan_scale_test.exs` (CI scale job) asserts the worker's query is planned through it (Index Scan or Bitmap Index Scan) and not through the tenant-leading composite |
 | `dispatches` missing partial index `(expires_at) WHERE revoked_at IS NULL` | ✅ done | Same migration — exact predicate match, not a different one |
 
 The **genuinely-remaining** work is the three findings the audit rated as the
