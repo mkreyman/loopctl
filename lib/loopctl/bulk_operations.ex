@@ -564,8 +564,8 @@ defmodule Loopctl.BulkOperations do
   # #803: the stage row follows the claim's epoch inside bulk claim's transaction, like the
   # single-story claim (Loopctl.Delivery.Stages.follow_claim/4).
   #
-  # US-45.9: a bulk claim is an INTERACTIVE claim, so it records its route the same way. It
-  # never moves the stage row itself; the claimant's first stage report does
+  # US-45.9: a bulk claim is an INTERACTIVE claim, so it records its route the same way. No
+  # claim moves the stage row; the claimant's first stage report does
   # (`Loopctl.Delivery.InteractiveClaims.enter_claimed/3`).
   #
   # The route is an upsert on its own key (`InteractiveClaims`), so the only way it fails is a

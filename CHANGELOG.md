@@ -214,10 +214,11 @@ All notable changes to loopctl are documented here.
     the new `claim_routes` table. The merge gate, the merge executor, the thread merge sweep
     and the thread page's diff all read it, so re-moding or repointing a source affects only
     later claims.
-  - A thread claim of a story queued by triage moves its stage row `queued -> claimed`.
   - The new `POST /api/v1/stories/:id/stage/transitions` (agent key, the claimant only) lets
-    it report the rest of its stages as a runner would, up to `ci`: never `merged` or after,
-    which loopctl's App makes and records. The claim response names the route (`route`) to
+    the claimant of a thread claim of a story queued by triage report its stages as a runner
+    would, minus the merge, which loopctl's App makes and records; after it, `deployed`. Its
+    first report moves the stage row `queued -> claimed`, so a claim released before any
+    reported work spends no retry attempt. The claim response names the route (`route`) to
     push checkpoints to.
   - A runner reviews it. Review placement no longer refuses a claim made without a dispatch
     (`implementer_dispatch_required` is gone); the reviewer is separated from it by agent

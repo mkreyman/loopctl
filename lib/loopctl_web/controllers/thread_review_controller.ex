@@ -97,6 +97,8 @@ defmodule LoopctlWeb.ThreadReviewController do
            "story has no live claim to review), `review_ceiling_reached`, " <>
            "`reviewer_not_separate` (the runner's agent is the claimant, recorded a " <>
            "checkpoint, or is on the implementer's lineage chain), " <>
+           "`unresolvable_dispatch_lineage` (the implementer's dispatch lineage cannot be " <>
+           "read, so no reviewer can be shown separate from it: refused closed), " <>
            "`dispatch_id_conflict`, " <>
            "`review_dispatch_refused` (a retry of a review the runner refused or superseded: " <>
            "place a new review with a new `dispatch_id`), or a runner refusal " <>

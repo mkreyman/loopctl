@@ -22,7 +22,6 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
-  alias Loopctl.Delivery.ClaimRoute
   alias Loopctl.Delivery.DispatchLease
   alias Loopctl.Delivery.InteractiveClaims
   alias Loopctl.Delivery.RunnerStages
@@ -372,50 +371,8 @@ defmodule Loopctl.Progress do
 
     multi
     |> AdminRepo.transaction()
-    |> enter_claimed(tenant_id, opts)
     |> claim_result()
   end
-
-  # US-45.9: an interactive THREAD claim moves its stage row `queued -> claimed` once the claim
-  # has committed, as a placement does. Best effort: the claim stands either way, and the
-  # claimant's first stage report makes the same idempotent move when this one did not land.
-  defp enter_claimed(
-         {:ok, %{route: %ClaimRoute{mode: "thread"}, story: story}} = result,
-         tenant_id,
-         opts
-       ) do
-    # The claiming key's lineage is required for this chained move and is NEVER defaulted:
-    # a caller that did not resolve one skips the move (logged), and the claimant's first
-    # stage report makes it with the lineage the controller resolves. Raising here would
-    # hand the caller an error for a claim that has already committed.
-    case Keyword.fetch(opts, :lineage) do
-      {:ok, lineage} ->
-        case InteractiveClaims.enter_claimed(tenant_id, story,
-               actor_label: Keyword.get(opts, :actor_label),
-               actor_role: Keyword.get(opts, :actor_role, :agent),
-               actor_lineage: lineage
-             ) do
-          {:ok, _row} ->
-            :ok
-
-          {:error, reason} ->
-            Logger.warning(
-              "interactive claim of #{story.id} did not enter claimed: #{inspect(reason)}; " <>
-                "the claimant's first stage report retries it"
-            )
-        end
-
-      :error ->
-        Logger.warning(
-          "interactive claim of #{story.id} carried no resolved lineage; the claimant's " <>
-            "first stage report enters claimed"
-        )
-    end
-
-    result
-  end
-
-  defp enter_claimed(result, _tenant_id, _opts), do: result
 
   # Contract's and claim's refusal of a story whose delivery stage is held — `escalated`,
   # `done` or `failed` — through the one definition in `Loopctl.Delivery.Stages`. Asked under

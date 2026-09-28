@@ -197,10 +197,13 @@ defmodule Loopctl.Delivery.DispatchPayload do
   end
 
   @doc """
-  The ROUTE `story`'s current claim was dispatched on (US-45.4): the merge `mode` and the
-  `base_branch` its implement dispatch was placed under, and the branch it named. Read from the
-  implement row of the story's CURRENT `claim_epoch` that its runner ACCEPTED, newest first
-  (`Loopctl.Runners.DispatchLedger.claim_route_query/2`, which owns those rules).
+  The ROUTE `story`'s current claim was bound to (US-45.4, US-45.9): the merge `mode` and the
+  `base_branch` it was placed or claimed under, and the branch it named. Read from the route
+  rows of the story's CURRENT `claim_epoch` (`Loopctl.Runners.DispatchLedger.claim_route_query/2`,
+  which owns those rules): the implement row its runner ACCEPTED, newest first, for a placed
+  claim, and the `Loopctl.Delivery.ClaimRoute` an INTERACTIVE claim recorded, both through
+  `DispatchLedger.route_rows_query/0`. An interactive claim therefore HAS a route, and never
+  inherits the source's live mode or base branch.
 
   Every field is a RECORDED fact, never a derivation; a caller that needs a fallback applies
   it, and one that does not need a field never pays for resolving it:
@@ -208,11 +211,12 @@ defmodule Loopctl.Delivery.DispatchPayload do
   - `mode` — the row's recorded mode (`Loopctl.Runners.DispatchLedger.record_sent/4` binds it
     at placement). A row that records none is `:pr`: written before the column existed, when
     `pr` was the only route, or placed where no single source resolved one. `nil` when there is
-    NO accepted row for the claim; the caller then falls back to the intake source's CURRENT
-    mode, as it does for the base branch
+    NO route row for the claim (neither an accepted placement nor an interactive claim's
+    route, e.g. a claim made before either was recorded); only then does the caller fall back
+    to the intake source's CURRENT mode, as it does for the base branch
   - `base_branch` — the base branch the dispatch was placed on, pinned the same way. nil for a
-    row that records none (or no row); the caller then falls back to the intake source's
-    CURRENT base branch
+    row that records none (or no route row); only then does the caller fall back to the intake
+    source's CURRENT base branch
   - `branch` — the name the dispatch put on the wire (#846.2), or nil. `thread_branch/3`
     resolves the branch a thread is judged on from it
 

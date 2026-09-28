@@ -8300,16 +8300,19 @@ const TOOLS = [
       "REPORT A STAGE TRANSITION of the story you hold, when you claimed it YOURSELF on a " +
       "thread-mode repository (POST /api/v1/stories/:id/stage/transitions, US-45.9). An " +
       "interactive claim of a thread-mode story is a change thread with no runner, so you " +
-      "move its delivery stage the way a runner would, UP TO `ci`: `claimed` -> `worktree` " +
+      "move its delivery stage the way a runner would: `claimed` -> `worktree` " +
       "-> `implementing` -> `reviewing` -> `pr_open` -> `ci`, passing `head_sha` (the " +
-      "checkpoint you want merged) when you enter `ci`; `ci_red`, `review_findings` and " +
-      "`base_moved` send it back to `implementing`. Never `merged` or anything after it: " +
-      "loopctl's App makes the merge and records it. Travels on the key claim_story claims " +
+      "checkpoint you want merged) ONLY when you enter `ci`; `ci_red`, `review_findings` and " +
+      "`base_moved` send it back to `implementing`. Never into `merged` and never " +
+      "`merge_refused`: loopctl's App makes the merge and records it. After it, report " +
+      "`merged` -> `deployed` with the `release_id` once the deploy lands. Your first report " +
+      "(from `claimed`) enters the claim. Travels on the key claim_story claims " +
       "with. A resend of a report that already landed answers 200 with `replayed: true`. " +
       "Refusals: 404 (not your tenant's story); 409 `not_claimant`, `stale_claim_epoch`, " +
       "`claim_not_live` (your lease lapsed, renew it with renew_story_claim while you work, " +
       "or you requested review), `not_interactive_thread_claim` (a placed claim, whose runner " +
-      "reports for it, or a pr-mode claim), `stale_stage` (the story is elsewhere; the body " +
+      "reports for it, or a pr-mode claim), `effect_conflict` (a different `head_sha` is already recorded; the body names it), " +
+      "`stale_stage` (the story is elsewhere; the body " +
       "names its stage and recorded effects); 422 `invalid_payload` (a transition or effect " +
       "you may not report); 503 `busy` (retry).",
     inputSchema: {
@@ -8407,6 +8410,8 @@ const TOOLS = [
       "with the same one. Refusals: 403 for an agent key; 409 `no_checkpoint`, " +
       "`review_claim_ended` (no live claim to review), `review_ceiling_reached`, `reviewer_not_separate` (the runner's agent is the claimant, " +
       "recorded a checkpoint, or is on the implementer's lineage chain), " +
+      "`unresolvable_dispatch_lineage` (the implementer's lineage cannot be read, so no " +
+      "reviewer can be shown separate: refused closed), " +
       "`dispatch_id_conflict`, `review_dispatch_refused` " +
       "(the runner refused or superseded that review: place a new one with a new " +
       "`dispatch_id`), and the push's own " +

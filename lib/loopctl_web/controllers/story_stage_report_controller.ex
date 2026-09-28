@@ -3,10 +3,11 @@ defmodule LoopctlWeb.StoryStageReportController do
   US-45.9: the CLAIMANT of an interactive thread claim reports its own story's stage
   transitions, as a runner reports a placed claim's over its socket.
 
-  It is given a runner's vocabulary up to `ci` and nothing more. The body is cast by the runner
-  channel's own validator (`Loopctl.ApiSpec.RunnerContract.cast_stage/1`), then narrowed to
-  `StageMachine.claimant_reportable?/3`: the runner's transitions short of the merge, which
-  loopctl records itself in thread mode. The transition is written by the one writer
+  It is given a runner's vocabulary minus the merge and nothing more. The body is cast by the
+  runner channel's own validator (`Loopctl.ApiSpec.RunnerContract.cast_stage/1`), then
+  narrowed to `StageMachine.claimant_reportable?/3`: never into `merged` and never
+  `merge_refused`, which loopctl records itself in thread mode; after the merge, `deployed`
+  and an escalation, which nothing else would write for a claim with no runner. The transition is written by the one writer
   (`Loopctl.Delivery.Stages.advance/4`) under the claim's epoch. Before that the caller must be
   the story's claimant under the epoch it names (`Loopctl.Delivery.Claimant.check/3`), on a
   live claim (`Claimant.live?/2`), whose recorded route (`Loopctl.Delivery.ClaimRoute`) is an
@@ -32,6 +33,7 @@ defmodule LoopctlWeb.StoryStageReportController do
   alias Loopctl.Delivery.Claimant
   alias Loopctl.Delivery.ClaimRoute
   alias Loopctl.Delivery.InteractiveClaims
+  alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -54,9 +56,10 @@ defmodule LoopctlWeb.StoryStageReportController do
     description:
       "US-45.9. The claimant of an INTERACTIVE claim of a thread-mode story (claimed with " <>
         "`claim_story`, not placed on a runner) reports its story's stage transitions here, " <>
-        "as a runner reports a placed claim's, up to `ci`: the runner's transitions short of " <>
-        "the merge (`StageMachine.claimant_reportable?/3`: loopctl records `merged` itself), " <>
-        "the same reportable effects (a checkpoint's `head_sha` entering `ci`), the same " <>
+        "as a runner reports a placed claim's, minus the merge: never into `merged` and never " <>
+        "`merge_refused` (`StageMachine.claimant_reportable?/3`: loopctl records the merge " <>
+        "itself), but `merged -> deployed` (with `release_id`) after it; the same reportable " <>
+        "effects (a checkpoint's `head_sha` entering `ci`), the same " <>
         "reason rules. The body is the runner `stage` message without `dispatch_id`. " <>
         "Refused 404 for a story not in your tenant, 409 `not_claimant` for any caller but " <>
         "the claimant, 409 `stale_claim_epoch` for another claim's epoch, 409 " <>
@@ -96,8 +99,6 @@ defmodule LoopctlWeb.StoryStageReportController do
   # (`:stale_claim_epoch`, `:stale_stage`, `:not_found`, `:busy`,
   # `:audit_chain_append_failed`) has its clause in `LoopctlWeb.FallbackController`.
   @advance_refusals %{
-    effect_conflict:
-      {:conflict, "effect_conflict", "a different value is already recorded for that effect"},
     wrong_stage:
       {:conflict, "stale_stage", "that effect cannot be recorded at the story's stage"},
     invalid_reason: {:unprocessable_entity, "invalid_payload", "the reason is not acceptable"},
@@ -187,7 +188,7 @@ defmodule LoopctlWeb.StoryStageReportController do
       else:
         {:error,
          {:unprocessable_entity, "invalid_payload",
-          "the claimant of a thread reports up to ci: loopctl records the merge itself"}}
+          "the claimant of a thread never reports the merge: loopctl records it itself"}}
   end
 
   # The one definition of a live claim the thread's own writes use (a checkpoint, a fix), so
@@ -199,53 +200,87 @@ defmodule LoopctlWeb.StoryStageReportController do
   defp report(tenant_id, story, stage, api_key, conn) do
     identity = identity(api_key, conn)
 
-    effects = Map.to_list(Map.get(stage, :effects, %{}))
-
-    with :ok <- ensure_claimed(tenant_id, story, stage, identity) do
-      case Stages.advance(tenant_id, story.id, {stage.from, stage.to, stage.edge},
-             claim_epoch: stage.claim_epoch,
-             effects: effects,
-             reason: Map.get(stage, :reason),
-             actor_label: identity[:actor_label],
-             actor_role: :agent,
-             actor_lineage: identity[:actor_lineage]
-           ) do
-        {:ok, row} ->
-          {:ok, row, false}
-
-        {:error, reason} when reason in [:stale_stage, :effect_conflict] ->
-          replay(tenant_id, story, stage, effects)
-
-        other ->
-          other
+    # A chained transition (the claim's own `queued -> claimed`, an escalation) whose chain
+    # append the tenant's audit chain refuses as a hash violation answers the permanent
+    # `audit_chain_append_failed`, as the runner's path does, instead of escaping as an
+    # unclassified database error (`RunnerStages.answering_broken_chain/3`, the one copy of
+    # that policy).
+    RunnerStages.answering_broken_chain(tenant_id, fn -> "story_id=#{story.id}" end, fn ->
+      with :ok <- ensure_claimed(tenant_id, story, stage, identity) do
+        tenant_id
+        |> Stages.advance(story.id, {stage.from, stage.to, stage.edge},
+          claim_epoch: stage.claim_epoch,
+          effects: Map.to_list(Map.get(stage, :effects, %{})),
+          reason: Map.get(stage, :reason),
+          actor_label: identity[:actor_label],
+          actor_role: :agent,
+          actor_lineage: identity[:actor_lineage]
+        )
+        |> answer(tenant_id, story, stage)
       end
+    end)
+  end
+
+  defp answer({:ok, row}, _tenant_id, _story, _stage), do: {:ok, row, false}
+
+  defp answer({:error, :stale_stage}, tenant_id, story, stage),
+    do: resolve_replay(tenant_id, story, stage)
+
+  defp answer({:error, :effect_conflict}, tenant_id, story, _stage),
+    do: effect_conflict(Stages.get(tenant_id, story.id))
+
+  defp answer(other, _tenant_id, _story, _stage), do: other
+
+  # The runner's replay rule (`RunnerStages`' `resolve_replay/3` and
+  # `replayed_effects_agree/4`), answered over HTTP. A compare-and-set that matched nothing is
+  # a RESEND of a report that already landed when the row is at its destination under its
+  # epoch with the effects it carried; at the destination with OTHER effects it is an
+  # `effect_conflict`; anywhere else the caller's picture is stale, and the refusal carries the
+  # row so it need not read again. Reaching here proves the caller's epoch is the story's:
+  # `Stages.advance/4` refuses `:stale_claim_epoch` before its compare-and-set.
+  defp resolve_replay(tenant_id, story, %{to: to, claim_epoch: epoch} = stage) do
+    case Stages.get(tenant_id, story.id) do
+      nil ->
+        {:error, :not_found}
+
+      %StoryStage{stage: ^to, claim_epoch: ^epoch} = row ->
+        replayed_effects_agree(row, stage)
+
+      %StoryStage{} = row ->
+        {:error,
+         {:conflict, "stale_stage",
+          %{
+            message: "the story is not at this report's from stage",
+            stage: Atom.to_string(row.stage),
+            recorded_effects: RunnerStages.recorded_effects(row)
+          }}}
     end
   end
 
-  # A report that did not apply, read against the row as it stands: the SAME report landed
-  # already (a resend after a lost response) answers the row; anything else is refused with
-  # the row's stage and recorded effects, so the caller need not read again to know which.
-  defp replay(tenant_id, story, stage, effects) do
-    row = Stages.get(tenant_id, story.id)
+  defp replayed_effects_agree(row, stage) do
+    supplied = Map.get(stage, :effects, %{})
 
-    if row && row.stage == stage.to && row.claim_epoch == stage.claim_epoch &&
-         Enum.all?(effects, fn {key, value} -> Map.get(row, key) == value end) do
-      {:ok, row, true}
-    else
-      {:error,
-       {:conflict, "stale_stage",
-        %{
-          message: "the story is not where this report says it is, or records other effects",
-          stage: row && row.stage,
-          recorded_effects: recorded(row, effects)
-        }}}
-    end
+    if Enum.all?(supplied, fn {effect, value} -> Map.get(row, effect) == value end),
+      do: {:ok, row, true},
+      else: effect_conflict(row)
   end
 
-  defp recorded(nil, _effects), do: %{}
-  defp recorded(row, effects), do: Map.new(effects, fn {key, _} -> {key, Map.get(row, key)} end)
+  # An `effect_conflict` carries the identities the row holds, so a caller whose earlier
+  # report recorded one (a `head_sha` at `implementing`, say) can see what it is reconciling
+  # against rather than resend the same refused value.
+  defp effect_conflict(nil), do: {:error, :not_found}
 
-  # The claim's own `queued -> claimed`, made here when it did not land at the claim.
+  defp effect_conflict(%StoryStage{} = row) do
+    {:error,
+     {:conflict, "effect_conflict",
+      %{
+        message: "a different value is already recorded for that effect",
+        stage: Atom.to_string(row.stage),
+        recorded_effects: RunnerStages.recorded_effects(row)
+      }}}
+  end
+
+  # The claim's own `queued -> claimed`, made at the claimant's first report (`InteractiveClaims`).
   defp ensure_claimed(tenant_id, story, %{from: :claimed}, identity) do
     case Stages.get(tenant_id, story.id) do
       %StoryStage{stage: :queued} ->

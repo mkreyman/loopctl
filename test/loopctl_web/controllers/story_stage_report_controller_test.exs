@@ -4,8 +4,10 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
 
   `async: false` and COMMITTED, for the reason `Loopctl.Delivery.PlacementTest` gives: a claim
   is an `AdminRepo` transaction and `queued -> claimed` a chained `Loopctl.Repo` one, and two
-  sandbox connections cannot see each other's work. `sweep_committed_runner_tenants/0` removes
-  everything at the boundary.
+  sandbox connections cannot see each other's work. It cannot be async, which the suite's
+  default asks for: `sweep_committed_runner_tenants/0` deletes EVERY committed runner tenant
+  at the boundary, a concurrent file's included, and the broken-chain test installs committed
+  DDL on the shared `audit_chain` table.
   """
 
   use LoopctlWeb.ConnCase, async: false
@@ -18,6 +20,7 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
   alias Loopctl.Delivery.ClaimRoute
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.InteractiveClaims
+  alias Loopctl.Delivery.RetryCeiling
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Source
@@ -129,19 +132,48 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
     conn |> auth(key) |> post(~p"/api/v1/stories/#{story.id}/stage/transitions", body)
   end
 
+  # A tenant chain that refuses appends as a HASH VIOLATION, installed for this tenant only
+  # and committed, as `Loopctl.Delivery.SessionEndReleaseTest` does it: the chain's own trigger
+  # cannot be driven to that state through the application.
+  defp break_chain(tenant_id) do
+    name = "test_broken_chain_" <> String.replace(tenant_id, "-", "")
+
+    unboxed(fn ->
+      AdminRepo.query!("""
+      CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'audit_chain_hash_violation: injected by test' USING ERRCODE = 'P0001';
+      END
+      $$
+      """)
+
+      AdminRepo.query!("""
+      CREATE TRIGGER #{name} BEFORE INSERT ON audit_chain FOR EACH ROW
+      WHEN (NEW.tenant_id = '#{tenant_id}') EXECUTE FUNCTION #{name}()
+      """)
+    end)
+
+    on_exit(fn ->
+      unboxed(fn ->
+        AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON audit_chain")
+        AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+      end)
+    end)
+  end
+
   defp step(story, from, to, extra \\ %{}),
     do: Map.merge(%{"claim_epoch" => story.claim_epoch, "from" => from, "to" => to}, extra)
 
   describe "the interactive claim's route" do
-    test "a thread claim of a queued story binds thread, the base and a loop/ branch, and enters claimed" do
+    test "a thread claim of a queued story binds thread, the base and a loop/ branch; the row waits" do
       ctx = setup_story()
       story = claim(ctx)
 
       assert %ClaimRoute{mode: "thread", base_branch: "master", branch: "loop/" <> _} =
                route(ctx, story)
 
-      assert %StoryStage{stage: :claimed, claim_epoch: epoch} = row(ctx)
-      assert epoch == story.claim_epoch
+      # The claim does not move the row: the claimant's first report does.
+      assert %StoryStage{stage: :queued} = row(ctx)
     end
 
     test "every reader sees the route bound at the claim, never the source's current setting" do
@@ -227,7 +259,7 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
       assert {:ok, %DateTime{}} = Stages.entered_at(ctx.tenant.id, story.id, :ci)
     end
 
-    test "the claim's own queued -> claimed is made first when it did not land", %{conn: conn} do
+    test "the first report enters the claim, for a bulk claim too", %{conn: conn} do
       ctx = setup_story()
 
       unboxed(fn ->
@@ -240,6 +272,38 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
                conn
                |> report(ctx.raw, story, step(story, "claimed", "worktree"))
                |> json_response(200)
+
+      assert {:ok, %DateTime{}} = Stages.entered_at(ctx.tenant.id, story.id, :claimed)
+    end
+
+    test "a claim released before any report spends no attempt; after one, it spends one" do
+      ctx = setup_story()
+      story = claim(ctx)
+
+      unboxed(fn ->
+        {:ok, _} = Progress.unclaim_story(ctx.tenant.id, story.id, agent_id: ctx.agent.id)
+      end)
+
+      assert %StoryStage{stage: :queued, attempts: attempts} = row(ctx)
+      assert RetryCeiling.counted_releases(attempts) == 0
+
+      {:ok, recontracted} = unboxed(fn -> Stories.get_story(ctx.tenant.id, story.id) end)
+      again = claim(%{ctx | story: recontracted})
+
+      # The move the first report makes, committed here: an HTTP report writes on this test's
+      # sandbox connection, whose uncommitted locks an unboxed unclaim would wait on.
+      unboxed(fn ->
+        {:ok, _} =
+          InteractiveClaims.enter_claimed(ctx.tenant.id, again,
+            actor_label: "agent:test",
+            actor_role: :agent,
+            actor_lineage: []
+          )
+
+        {:ok, _} = Progress.unclaim_story(ctx.tenant.id, again.id, agent_id: ctx.agent.id)
+      end)
+
+      assert RetryCeiling.counted_releases(row(ctx).attempts) == 1
     end
 
     test "refused for another agent, another epoch, and a transition no runner may report", %{
@@ -263,7 +327,7 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
                |> report(ctx.raw, story, step(story, "claimed", "merged"))
                |> json_response(422)
 
-      assert %StoryStage{stage: :claimed} = sandboxed_row(ctx)
+      assert %StoryStage{stage: :queued} = sandboxed_row(ctx)
     end
 
     test "refused on a pr claim and on a placed claim: they have no interactive thread route", %{
@@ -300,7 +364,7 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
                |> report(ctx.raw, story, step(story, "claimed", "worktree"))
                |> json_response(409)
 
-      assert %StoryStage{stage: :claimed} = sandboxed_row(ctx)
+      assert %StoryStage{stage: :queued} = sandboxed_row(ctx)
     end
 
     test "the claimant may not report the merge: loopctl records it", %{conn: conn} do
@@ -318,6 +382,62 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
                conn |> report(ctx.raw, story, body) |> json_response(422)
 
       assert %StoryStage{stage: :ci} = sandboxed_row(ctx)
+    end
+
+    test "after loopctl merges, the claimant reports the deploy, never undoes the merge", %{
+      conn: conn
+    } do
+      ctx = setup_story()
+      story = claim(ctx)
+
+      unboxed(fn ->
+        from(r in StoryStage, where: r.story_id == ^story.id)
+        |> AdminRepo.update_all(
+          set: [stage: :merged, claim_epoch: story.claim_epoch, head_sha: @sha, merge_sha: @sha]
+        )
+      end)
+
+      refused =
+        step(story, "merged", "implementing", %{"edge" => "merge_refused", "reason" => "x"})
+
+      assert %{"error" => %{"code" => "invalid_payload"}} =
+               conn |> report(ctx.raw, story, refused) |> json_response(422)
+
+      deployed = step(story, "merged", "deployed", %{"effects" => %{"release_id" => "v42"}})
+
+      assert %{"stage" => %{"stage" => "deployed"}} =
+               build_conn() |> report(ctx.raw, story, deployed) |> json_response(200)
+
+      assert %StoryStage{stage: :deployed, release_id: "v42"} = sandboxed_row(ctx)
+    end
+
+    test "a head that differs from the one recorded earlier is effect_conflict, naming it", %{
+      conn: conn
+    } do
+      ctx = setup_story()
+      story = claim(ctx)
+
+      for {from, to} <- [{"claimed", "worktree"}, {"worktree", "implementing"}] do
+        build_conn() |> report(ctx.raw, story, step(story, from, to)) |> json_response(200)
+      end
+
+      first = step(story, "implementing", "reviewing", %{"effects" => %{"head_sha" => @sha}})
+      build_conn() |> report(ctx.raw, story, first) |> json_response(200)
+
+      build_conn()
+      |> report(ctx.raw, story, step(story, "reviewing", "pr_open"))
+      |> json_response(200)
+
+      other = String.duplicate("b", 40)
+      body = step(story, "pr_open", "ci", %{"effects" => %{"head_sha" => other}})
+
+      assert %{
+               "error" => %{
+                 "code" => "effect_conflict",
+                 "stage" => "pr_open",
+                 "recorded_effects" => %{"head_sha" => @sha}
+               }
+             } = conn |> report(ctx.raw, story, body) |> json_response(409)
     end
 
     test "a claim that requested review is no longer live, as for its checkpoints", %{conn: conn} do
@@ -423,35 +543,31 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
 
       assert %{
                "error" => %{
-                 "code" => "stale_stage",
+                 "code" => "effect_conflict",
                  "stage" => "ci",
                  "recorded_effects" => %{"head_sha" => @sha}
                }
              } =
                build_conn() |> report(ctx.raw, story, other) |> json_response(409)
+
+      behind = step(story, "reviewing", "pr_open")
+
+      assert %{"error" => %{"code" => "stale_stage", "stage" => "ci"}} =
+               build_conn() |> report(ctx.raw, story, behind) |> json_response(409)
     end
 
-    test "a claim with no resolved lineage never defaults one: the move waits for the claimant",
-         %{conn: conn} do
+    @tag :capture_log
+    test "a broken audit chain answers audit_chain_append_failed, not a 500", %{conn: conn} do
       ctx = setup_story()
+      story = claim(ctx)
+      break_chain(ctx.tenant.id)
 
-      story =
-        unboxed(fn ->
-          {:ok, story} =
-            Progress.claim_story(ctx.tenant.id, ctx.story.id,
-              agent_id: ctx.agent.id,
-              actor_label: "agent:test"
-            )
-
-          story
-        end)
-
-      assert %StoryStage{stage: :queued} = row(ctx)
-
-      assert %{"stage" => %{"stage" => "worktree"}} =
+      assert %{"error" => %{"code" => "audit_chain_append_failed"}} =
                conn
                |> report(ctx.raw, story, step(story, "claimed", "worktree"))
-               |> json_response(200)
+               |> json_response(500)
+
+      assert %StoryStage{stage: :queued} = row(ctx)
     end
   end
 end

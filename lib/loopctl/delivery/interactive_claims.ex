@@ -25,11 +25,18 @@ defmodule Loopctl.Delivery.InteractiveClaims do
 
   `queued -> claimed` is a control transition: it is chained, and a runner may not report it
   (`StageMachine.runner_transitions/0`). `enter_claimed/3` makes it for an interactive thread
-  claim, AFTER the claim commits, because `Stages.advance/4` reads the story under its own
-  lock on another connection. It is idempotent, so the claimant's first stage report makes it
-  again when a claim's own attempt did not land (a bulk claim never attempts it), and from
-  `claimed` on the claimant reports its stages as a runner would
-  (`LoopctlWeb.StoryStageReportController`).
+  claim at the claimant's FIRST stage report (`LoopctlWeb.StoryStageReportController`), and
+  from `claimed` on the claimant reports its stages as a runner would.
+
+  Not at the claim itself, and that is deliberate. A claim the session releases before it
+  reports any work leaves the row at `queued`, so the release requeues nothing and spends no
+  attempt against `Loopctl.Delivery.RetryCeiling` (`Stages.follow_release/5` counts only a
+  release that REQUEUED an in-flight row): claiming a story to read it and letting it go is
+  not a failed delivery. Once the claimant has reported work the row is in flight, and a
+  release of it counts like a runner's. It also keeps a chained write out of the claim's
+  post-commit path, where a refusal could only turn a committed claim into an error.
+  The driver does not place a `queued` story a session holds: it places only `pending` or
+  `contracted` stories (`Loopctl.Delivery.DispatchDriver`).
   """
 
   require Logger
@@ -147,8 +154,8 @@ defmodule Loopctl.Delivery.InteractiveClaims do
   end
 
   @doc """
-  Moves an interactive THREAD claim's stage row `queued -> claimed`, once the claim has
-  committed. Idempotent: a row already at `claimed` under this epoch answers `{:ok, row}`.
+  Moves an interactive THREAD claim's stage row `queued -> claimed`, at the claimant's first
+  stage report. Idempotent: a row already at `claimed` under this epoch answers `{:ok, row}`.
 
   `opts`: `:actor_label`, `:actor_role` and `:actor_lineage`, resolved by the caller from the
   claiming key, as `Stages.advance/4` requires of a chained transition.
