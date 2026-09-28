@@ -1,0 +1,122 @@
+{
+  "id": "US-26.4.6",
+  "title": "Story verification judges CI with the merge gate's evidence rules",
+  "epic": {
+    "id": "epic_26",
+    "name": "Chain of Custody v2"
+  },
+  "priority": "medium",
+  "phase": "verification",
+  "background": "Story verification (US-26.4.2, US-26.4.3) has never produced a CI verdict in production: its worker passed an uncast UUID to a schemaless query, so every run that had a commit crashed before reaching CI. Its CI read also used the check-runs endpoint, which a fine-grained token cannot reach (#913). #914, then #915, fixed both and kept finding, round after round, that the subsystem's rules were never designed: which runs count as the commit's CI, which repository and credential are read, and when a missing, pending or unreachable answer means wait. #915 is held unmerged after its third review round; its branch and review threads are the working material for this story. The thread merge gate (US-45.6) already answers these questions for a checkpoint: `GitHubPullRequestSource.check_evidence/3` reads only the jobs of PUSH runs of one named branch at the exact SHA, `CiEvidence.judge/2` judges them against named required checks, and `MergePrecondition` refuses a change to CI definitions and bounds transient faults. Verification reuses all of it, and so inherits its trust argument whole rather than a weaker reading of the same commit.",
+  "story": {
+    "as_a": "tenant operator",
+    "i_want_to": "have story verification record a CI verdict by the same rules the merge gate uses",
+    "so_that": "a verification run means what a merge decision means, instead of a second, weaker reading of the same CI"
+  },
+  "rationale": "Two readings of one commit's CI that can disagree are worse than one. CiEvidence.judge/2 is sound only for its input (push-run jobs of one branch at one SHA) and only beside the ci_definition_changed refusal, so both come with it. Everything this story does not reuse from the merge gate is a rule designed a second time, which is what #914 and #915 showed goes wrong.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-26.4.6.1",
+      "description": "The repository is resolved ONLY from the story's project's intake source (`Intake.source_for_project/2`), never from `projects.repo_url`, for the CI read and for the local fallback's clone alike. No live source records `ci_unavailable_reason` `no_intake_source`; more than one records `ambiguous_intake_source`; either reads nothing."
+    },
+    {
+      "id": "AC-26.4.6.2",
+      "description": "The branch is the story's own: the branch its placement recorded (`DispatchPayload.thread_branch/3` for a thread, the pull request's head branch for pr mode). The evidence is exactly `GitHubPullRequestSource.check_evidence/3` for that branch and the commit: jobs of push runs of that branch at that SHA, never runs of another branch, a fork's pull_request run or a workflow_dispatch. A story with no recorded branch records `no_story_branch` and reads nothing."
+    },
+    {
+      "id": "AC-26.4.6.3",
+      "description": "A commit that changes CI definitions (`.github/workflows/`, `.github/actions/`, any `action.yml`, compared with the story's base branch) is refused `ci_definition_changed` exactly as the merge gate refuses it, and an unreadable diff `ci_definition_unknown`. Neither is a pass or a fail: both record no verdict and never fall back to the local runner."
+    },
+    {
+      "id": "AC-26.4.6.4",
+      "description": "The verdict is `CiEvidence.judge/2` over the intake source's `required_checks`, in either mode: every required name concluded success is `pass`; a failed name, including a jobless run that ended (`run_<conclusion>`), is `fail`; a pending or `:missing` name is a wait. `required_checks` becomes meaningful for pr-mode sources too (its field comment, the enrollment tool's description and FLY_SECRETS/OpenAPI say so); a source with none records `no_required_checks` and reads nothing, which is the opt-in."
+    },
+    {
+      "id": "AC-26.4.6.5",
+      "description": "Waiting is bounded like the merge gate's. A pending or missing name waits until `verification_max_run_age_seconds` from the run's creation, then records `ci_wait_exhausted`. A TRANSIENT forge fault (timeout, connection error, 5xx, rate limit) waits too, but no more than the merge gate's consecutive-fault bound (`@max_consecutive_unevaluated`) in a row, then records `forge_unavailable`. A PERMANENT one (401, a non-rate-limit 403, 404, 422) records its code at once. Only the adapter classifies: the CiBehaviour contract gains a declared waiting outcome, and the worker never matches one adapter's error terms. The worker's moduledoc stops claiming a started run is never ended by the age window."
+    },
+    {
+      "id": "AC-26.4.6.6",
+      "description": "The local fallback (TestRunner) runs only when CI gives a final no-verdict for a reason that is not a refusal (AC-26.4.6.3) and not a missing configuration (AC-26.4.6.1, .2, .4), never on a wait. It clones the intake source's repository through the same credential seam as the CI read (AC-26.4.6.8)."
+    },
+    {
+      "id": "AC-26.4.6.7",
+      "description": "An abbreviated commit SHA is resolved once, through `GET /repos/:repo/commits/:ref` (the git-data API accepts full ids only), and the full id is persisted on the run, so later polls of the same run read no commit. An ambiguous prefix (422) or no such commit (404) is a permanent no-verdict (`ambiguous_sha`, `unknown_commit`)."
+    },
+    {
+      "id": "AC-26.4.6.8",
+      "description": "Every GitHub read and the clone go through one credential seam. Until the per-tenant credential decision (#915, 'Needs Mark') is made, that seam carries the operator `GITHUB_TOKEN` ONLY for tenants named in an operator allowlist (a new env var, default empty, documented in FLY_SECRETS.md): any other tenant records `credential_unavailable` and nothing is read. Enrollment does not prove a tenant controls the repository it names, so the operator token must not read on an unproven tenant's behalf."
+    },
+    {
+      "id": "AC-26.4.6.9",
+      "description": "ac_results records the evidence URL of the failing job on fail and of the judged run on pass, both inside the tenant's own intake-source repository. On no verdict it records a short reason code carrying no URL and no repository name; the worker's rescue arm and the local fallback's error stop writing `Exception.message/1` and `inspect/1` output."
+    },
+    {
+      "id": "AC-26.4.6.10",
+      "description": "Every edge found in #915's review threads is either a test in this story's suite or named in the PR body as removed by this design."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-26.4.6.1",
+      "verifies": ["AC-26.4.6.1", "AC-26.4.6.2"],
+      "name": "only the story's branch in the intake source's repository is read",
+      "type": "unit",
+      "preconditions": ["repo_url names another repository; the commit also has runs on another branch, a fork pull_request run and a workflow_dispatch run carrying the required job name"],
+      "steps": ["verify the run with a stub that fails on any request outside the intake source's repository"],
+      "expected_results": ["only push runs of the story's branch are judged; the other runs never pass it"]
+    },
+    {
+      "id": "TC-26.4.6.2",
+      "verifies": ["AC-26.4.6.4"],
+      "name": "required checks decide, one run per outcome",
+      "type": "unit",
+      "preconditions": ["required_checks [\"test\"]; an unrelated workflow succeeded"],
+      "steps": ["three runs: test pending; test failed; test succeeded"],
+      "expected_results": ["wait; fail; pass. The unrelated success never passes a run"]
+    },
+    {
+      "id": "TC-26.4.6.3",
+      "verifies": ["AC-26.4.6.3"],
+      "name": "a workflow edit is refused",
+      "type": "unit",
+      "preconditions": ["the commit changes .github/workflows/ci.yml"],
+      "steps": ["verify it"],
+      "expected_results": ["no verdict, ci_definition_changed, no local run"]
+    },
+    {
+      "id": "TC-26.4.6.4",
+      "verifies": ["AC-26.4.6.5", "AC-26.4.6.6"],
+      "name": "transient waits, permanent ends, age ends",
+      "type": "unit",
+      "preconditions": ["separate runs"],
+      "steps": ["a 502 once then success; 502 past the consecutive bound; a 404; a missing name past the age window"],
+      "expected_results": ["pass after a snooze; forge_unavailable; unknown code at once; ci_wait_exhausted. No local run on a wait"]
+    },
+    {
+      "id": "TC-26.4.6.5",
+      "verifies": ["AC-26.4.6.7", "AC-26.4.6.9"],
+      "name": "abbreviated SHA resolved once per run",
+      "type": "unit",
+      "preconditions": ["one run recorded with a 7-character SHA whose CI is pending"],
+      "steps": ["poll the same run twice, then let it fail"],
+      "expected_results": ["one commit read across both polls; the run carries the full SHA and the failing job's URL"]
+    },
+    {
+      "id": "TC-26.4.6.6",
+      "verifies": ["AC-26.4.6.8"],
+      "name": "the operator token reads only for allowlisted tenants",
+      "type": "unit",
+      "preconditions": ["a tenant not in the allowlist"],
+      "steps": ["verify a run"],
+      "expected_results": ["credential_unavailable; no request made"]
+    }
+  ],
+  "technical_notes": [
+    "Start from #915's branch (fix/913-verification-ci-verdict): its endpoint switch, UUID cast and reason codes carry over; its branch-free commit_ci_runs/3 and outcome rule are replaced by check_evidence/3 and CiEvidence.judge/2.",
+    "The ci_definition refusal lives in MergePrecondition (ci_definition_reasons); lift it where both callers can use it rather than copying it.",
+    "Mutation-test the wiring as well as the rules: the repository source, the branch, the required_checks lookup, the refusal, the credential allowlist, the cast and each wait arm."
+  ],
+  "dependencies": ["US-45.6"],
+  "estimated_hours": 10
+}
