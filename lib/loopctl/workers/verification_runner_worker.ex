@@ -50,6 +50,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
 
   require Logger
 
+  alias Loopctl.Intake
   alias Loopctl.Verification
 
   @ci_adapter Application.compile_env(:loopctl, :ci_adapter, Loopctl.Verification.GitHubActions)
@@ -142,7 +143,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   defp check_ci_status(run, tenant_id) do
     import Ecto.Query
 
-    repo_url =
+    project =
       from(s in "stories",
         join: p in "projects",
         on: s.project_id == p.id,
@@ -151,31 +152,38 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         where:
           s.id == type(^run.story_id, :binary_id) and
             s.tenant_id == type(^tenant_id, :binary_id),
-        select: p.repo_url,
+        select: %{id: type(p.id, :binary_id), repo_url: p.repo_url},
         limit: 1
       )
       |> Loopctl.AdminRepo.one()
 
-    if repo_url do
-      case do_ci_check(run, repo_url) do
-        {:ok, :ci_checked} ->
-          :ok
-
-        {:error, {:ci_unavailable, reason}} ->
-          # L3 fallback: independent test re-execution
-          do_local_test_run(run, repo_url, reason)
-
-        other ->
-          other
+    # CI is read from the repository of the project's INTAKE SOURCE, never from its
+    # `repo_url`: a tenant can set `repo_url` to any repository, and the read carries the
+    # operator's GITHUB_TOKEN, so reading it would disclose another repository's CI.
+    ci =
+      with %{id: project_id} <- project,
+           {:ok, source} <- Intake.source_for_project(tenant_id, project_id) do
+        do_ci_check(run, source.repo_full_name)
+      else
+        nil -> {:error, {:ci_unavailable, "no_project"}}
+        {:error, reason} -> {:error, {:ci_unavailable, reason_code(reason)}}
       end
-    else
-      {:ok, _} = Verification.complete_run(run, "error", %{"reason" => "no_repo_url"})
-      :ok
+
+    case ci do
+      {:ok, :ci_checked} ->
+        :ok
+
+      {:error, {:ci_unavailable, reason}} ->
+        # L3 fallback: independent test re-execution
+        do_local_test_run(run, project && project.repo_url, reason)
+
+      other ->
+        other
     end
   end
 
-  defp do_ci_check(run, repo_url) do
-    case @ci_adapter.get_status(repo_url, run.commit_sha) do
+  defp do_ci_check(run, repo) do
+    case @ci_adapter.get_status(repo, run.commit_sha) do
       {:ok, %{conclusion: "success"} = status} ->
         {:ok, _} = Verification.complete_run(run, "pass", ci_results(status))
         {:ok, :ci_checked}
@@ -185,12 +193,12 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         {:ok, :ci_checked}
 
       {:ok, %{status: "in_progress"}} ->
-        {:snooze, 60}
+        wait_or_give_up(run, 60)
 
       # A rate limit clears on its own: wait it out rather than clone and re-run the suite,
       # for the forge's delay when it gave a usable one and a floor when it did not.
       {:error, {:github_rate_limited, _status, delay}} ->
-        {:snooze, rate_limit_snooze(delay)}
+        wait_or_give_up(run, rate_limit_snooze(delay))
 
       {:ok, %{conclusion: other}} ->
         Logger.warning("VerificationRunner: unexpected CI conclusion: #{inspect(other)}")
@@ -204,6 +212,21 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   end
 
   @rate_limit_floor_seconds 60
+
+  # How long a run may wait on CI, measured from when it was created: every snooze runs
+  # `start_run/1` again, so `started_at` cannot bound it. Past this a queued workflow (an
+  # offline self-hosted runner) or a quota that never recovers ends the run as `error`
+  # instead of polling GitHub every minute for ever.
+  @ci_wait_budget_seconds 24 * 60 * 60
+
+  defp wait_or_give_up(run, snooze) do
+    if DateTime.diff(DateTime.utc_now(), run.inserted_at, :second) > @ci_wait_budget_seconds do
+      {:ok, _} = Verification.complete_run(run, "error", %{"reason" => "ci_wait_exhausted"})
+      {:ok, :ci_checked}
+    else
+      {:snooze, snooze}
+    end
+  end
 
   defp rate_limit_snooze(delay) when is_integer(delay) and delay > 0, do: delay
   defp rate_limit_snooze(_unusable), do: @rate_limit_floor_seconds
@@ -229,6 +252,16 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   defp ci_results(_status), do: %{"source" => "ci"}
 
   # L3: independent test re-execution — clone repo, run tests, check results
+  defp do_local_test_run(run, nil, ci_reason) do
+    {:ok, _} =
+      Verification.complete_run(run, "error", %{
+        "reason" => "no_repo_url",
+        "ci_unavailable_reason" => ci_reason
+      })
+
+    :ok
+  end
+
   defp do_local_test_run(run, repo_url, ci_reason) do
     alias Loopctl.Verification.TestRunner
 
@@ -248,11 +281,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
         :ok
 
       {:error, reason} ->
-        Logger.error("VerificationRunner: local test run failed: #{inspect(reason)}")
+        Logger.error("VerificationRunner: local test run failed: #{reason_code(reason)}")
 
         {:ok, _} =
           Verification.complete_run(run, "error", %{
-            "local_error" => inspect(reason),
+            "local_error" => reason_code(reason),
             "ci_unavailable_reason" => ci_reason
           })
 

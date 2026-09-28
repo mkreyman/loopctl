@@ -127,20 +127,24 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   describe "the CI verdict (#913)" do
     @sha "0123456789abcdef0123456789abcdef01234567"
 
-    defp ci_run(ctx) do
+    # A run whose project names a DIFFERENT repository in its tenant-editable repo_url than
+    # its intake source does: CI must be read from the intake source only.
+    defp ci_run(ctx, opts \\ []) do
       %{tenant: tenant, story: story} = ctx
 
       {1, _} =
         AdminRepo.update_all(
-          from(p in "projects",
-            join: e in "epics",
-            on: e.project_id == p.id,
-            join: s in "stories",
-            on: s.epic_id == e.id,
-            where: s.id == type(^story.id, :binary_id)
-          ),
-          set: [repo_url: "https://github.com/mkreyman/infra"]
+          from(p in "projects", where: p.id == type(^story.project_id, :binary_id)),
+          set: [repo_url: "https://github.com/someone-else/private-repo"]
         )
+
+      if Keyword.get(opts, :intake_source, true) do
+        fixture(:intake_source, %{
+          tenant_id: tenant.id,
+          project_id: story.project_id,
+          repo_full_name: "mkreyman/infra"
+        })
+      end
 
       {:ok, run} = Verification.create_run(tenant.id, story.id, %{commit_sha: @sha})
       {run, %Oban.Job{args: %{"run_id" => run.id, "tenant_id" => tenant.id}}}
@@ -150,6 +154,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
 
     test "a failing run is recorded with the URL of the workflow that failed" do
       stub_ci(fn conn ->
+        assert conn.request_path == "/repos/mkreyman/infra/actions/runs"
+
         runs =
           if conn.query_params["event"] == "push",
             do: [
@@ -186,6 +192,73 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
 
       {_run, job} = ci_run(setup_ctx())
       assert {:snooze, 120} = VerificationRunnerWorker.perform(job)
+    end
+
+    test "with no intake source CI is not read at all, never from the project's repo_url" do
+      stub_ci(fn _conn -> flunk("no repository may be read without an intake source") end)
+
+      {run, job} = ci_run(setup_ctx(), intake_source: false)
+      assert :ok = VerificationRunnerWorker.perform(job)
+
+      {:ok, done} = Verification.get_run(run.tenant_id, run.id)
+      assert done.ac_results["ci_unavailable_reason"] == "no_intake_source"
+      # The local fallback's error is a code too, never an inspected term.
+      assert done.ac_results["local_error"] == "runner_disabled"
+    end
+
+    test "with neither an intake source nor a repo_url there is nothing to verify against" do
+      stub_ci(fn _conn -> flunk("nothing may be read") end)
+
+      ctx = setup_ctx()
+      {run, job} = ci_run(ctx, intake_source: false)
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(p in "projects", where: p.id == type(^ctx.story.project_id, :binary_id)),
+          set: [repo_url: nil]
+        )
+
+      assert :ok = VerificationRunnerWorker.perform(job)
+
+      {:ok, done} = Verification.get_run(run.tenant_id, run.id)
+      assert done.ac_results["reason"] == "no_repo_url"
+    end
+
+    test "a run still waiting on CI a day after it was created ends instead of polling" do
+      stub_ci(fn conn ->
+        runs =
+          if conn.query_params["event"] == "push",
+            do: [
+              %{
+                "id" => 1,
+                "path" => ".github/workflows/ci.yml",
+                "event" => "push",
+                "head_branch" => "main",
+                "head_sha" => @sha,
+                "status" => "queued",
+                "conclusion" => nil
+              }
+            ],
+            else: []
+
+        Req.Test.json(conn, %{"total_count" => length(runs), "workflow_runs" => runs})
+      end)
+
+      {run, job} = ci_run(setup_ctx())
+
+      # Started (so the stale gate does not apply) and created just over a day ago.
+      long_ago = DateTime.add(DateTime.utc_now(), -(24 * 60 * 60 + 60), :second)
+
+      {1, _} =
+        AdminRepo.update_all(from(r in VerificationRun, where: r.id == ^run.id),
+          set: [inserted_at: long_ago, started_at: long_ago]
+        )
+
+      assert :ok = VerificationRunnerWorker.perform(job)
+
+      {:ok, done} = Verification.get_run(run.tenant_id, run.id)
+      assert done.status == "error"
+      assert done.ac_results["reason"] == "ci_wait_exhausted"
     end
 
     test "a rate limit with no usable delay still waits, for a floor" do

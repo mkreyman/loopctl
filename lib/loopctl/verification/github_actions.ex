@@ -24,12 +24,24 @@ defmodule Loopctl.Verification.GitHubActions do
   # Still going. `waiting` is not here: an approval can take weeks.
   @running ["queued", "in_progress", "requested", "pending"]
 
+  @doc """
+  The CI verdict for `commit_sha` in `repo`, an `owner/name` the caller resolved from the
+  story's intake source (never the project's tenant-editable `repo_url`: this reads with the
+  operator's token).
+  """
   @impl true
-  def get_status(repo_url, commit_sha) do
-    with {:ok, repo} <- repo_full_name(repo_url),
-         {:ok, runs} <- GitHubPullRequestSource.commit_ci_runs(repo, commit_sha) do
+  def get_status(repo, commit_sha) do
+    with {:ok, runs} <-
+           GitHubPullRequestSource.commit_ci_runs(repo, commit_sha, &reached_result_or_running?/1) do
       summarize_workflow_runs(runs)
     end
+  end
+
+  # A run that reached no result must not hide an older one of the same workflow that did:
+  # a newer run waiting on an approval would otherwise drop a failure.
+  defp reached_result_or_running?(run) do
+    run["status"] in @running or
+      (run["status"] == "completed" and run["conclusion"] in ["success" | @failed])
   end
 
   @impl true
@@ -37,19 +49,12 @@ defmodule Loopctl.Verification.GitHubActions do
     {:ok, []}
   end
 
-  defp repo_full_name(url) do
-    # The repository name may contain dots (`loopctl.com`); only a trailing `.git` is not
-    # part of it.
-    case Regex.run(~r|github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?(?:/.*)?$|, url) do
-      [_, owner, repo] -> {:ok, owner <> "/" <> repo}
-      _ -> {:error, {:unrecognized_repo_url, url}}
-    end
-  end
-
   @doc """
   The CI verdict for a commit's workflow runs, as `GitHubPullRequestSource.commit_ci_runs/2`
   returns them. One rule, in order, and it does not try to tell a CI workflow from a deploy
-  or release workflow, which nothing in a run says:
+  or release workflow, which nothing in a run says. It errs toward `failure`: a verification
+  run is observational and never sets a story's `verified_status`, so a false fail costs a
+  look, while a false pass is the direction that misleads:
 
     1. any run that concluded `failure`, `timed_out` or `startup_failure` - `failure`, with
        that run's URL. A known failure is recorded at once, never held behind a run that is

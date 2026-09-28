@@ -217,6 +217,11 @@ All notable changes to loopctl are documented here.
   reader. **Give `GITHUB_TOKEN` `actions: read` before upgrading**; without it, verification
   finds no CI evidence and falls back to local test re-execution.
 
+  **Verification now reads CI only from the repository of the project's intake source**, and
+  never from the project's `repo_url`. A tenant can set `repo_url` to any repository, and the
+  read carries the operator's token. A project with no intake source gets no CI read; its
+  runs record `no_intake_source` and fall back to local re-execution.
+
   The verdict now follows one rule, applied in order:
   1. A failed, timed-out or unstartable run fails the commit, with that run's `url` recorded.
   2. Otherwise, a run that is still queued or running means wait.
@@ -229,6 +234,8 @@ All notable changes to loopctl are documented here.
   - A deploy that is still waiting, or was cancelled, no longer spoils a green run.
   - A GitHub rate limit is waited out, for the forge's delay or a 60-second floor, instead of
     starting a local re-run.
+  - A run that is still waiting on CI a day after it was created ends as `error` with
+    `ci_wait_exhausted`, instead of polling indefinitely.
   - When there is no CI verdict, the reason is recorded as a short code in
     `ac_results.ci_unavailable_reason`.
 

@@ -137,7 +137,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       ])
 
       assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("git@github.com:mkreyman/infra.git", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
 
       assert_received {:runs_read, "push", @sha}
       assert_received {:runs_read, "pull_request", @sha}
@@ -150,7 +150,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       ])
 
       assert {:ok, %{conclusion: "failure"}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
     end
 
     test "a failure on ANY branch the commit was pushed to fails it" do
@@ -160,7 +160,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       ])
 
       assert {:ok, %{conclusion: "failure", url: url}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
 
       assert url =~ "/actions/runs/1"
     end
@@ -172,7 +172,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       ])
 
       assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
     end
 
     test "a newer CANCELLED run does not hide an older run that finished" do
@@ -182,7 +182,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       ])
 
       assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
     end
 
     test "runs of another commit are not this commit's CI" do
@@ -192,7 +192,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       ])
 
       assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
     end
 
     test "a run of another event is not counted even when the API ignores the filter" do
@@ -205,7 +205,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       )
 
       assert {:ok, %{conclusion: "success"}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
     end
 
     test "a truncated run list is refused, never judged on the part it has" do
@@ -214,33 +214,27 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       )
 
       assert {:error, {:workflow_runs_truncated, 150, 1}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
     end
 
     test "a refused read is the forge's permission error, not a verdict" do
       Req.Test.stub(GitHubPullRequestSource, &Plug.Conn.send_resp(&1, 403, "{}"))
 
       assert {:error, {:github_api_error, 403}} =
-               GitHubActions.get_status("https://github.com/mkreyman/infra", @sha)
+               GitHubActions.get_status("mkreyman/infra", @sha)
     end
 
-    test "a repository name with a dot is read whole" do
-      Req.Test.stub(GitHubPullRequestSource, fn conn ->
-        assert conn.request_path == "/repos/mkreyman/loopctl.com/actions/runs"
-        Req.Test.json(conn, %{"total_count" => 0, "workflow_runs" => []})
-      end)
+    test "a newer run that reached no result does not hide an older failure" do
+      waiting =
+        %{api_run(11, ".github/workflows/ci.yml", "push", "main", nil) | "status" => "waiting"}
 
-      for url <- [
-            "https://github.com/mkreyman/loopctl.com",
-            "git@github.com:mkreyman/loopctl.com.git"
-          ] do
-        assert {:error, :no_ci_evidence} = GitHubActions.get_status(url, @sha)
-      end
-    end
+      stub_runs([
+        api_run(10, ".github/workflows/ci.yml", "push", "main", "failure"),
+        waiting,
+        api_run(12, ".github/workflows/lint.yml", "push", "main", "success")
+      ])
 
-    test "a URL that names no GitHub repository is an error, not a lookup" do
-      assert {:error, {:unrecognized_repo_url, _}} =
-               GitHubActions.get_status("https://example.com/x", @sha)
+      assert {:ok, %{conclusion: "failure"}} = GitHubActions.get_status("mkreyman/infra", @sha)
     end
   end
 end

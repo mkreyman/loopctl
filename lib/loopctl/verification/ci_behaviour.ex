@@ -6,8 +6,8 @@ defmodule Loopctl.Verification.CiBehaviour do
   GitHub Actions, GitLab CI, or any future provider.
   """
 
-  @doc "Fetches the CI status for a commit SHA in a repository."
-  @callback get_status(repo_url :: String.t(), commit_sha :: String.t()) ::
+  @doc "Fetches the CI status for a commit SHA in a repository, named `owner/name`."
+  @callback get_status(repo :: String.t(), commit_sha :: String.t()) ::
               {:ok, %{status: String.t(), conclusion: String.t() | nil, url: String.t()}}
               | {:error, term()}
 
