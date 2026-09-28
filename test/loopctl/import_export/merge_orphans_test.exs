@@ -64,6 +64,19 @@ defmodule Loopctl.ImportExport.MergeOrphansTest do
     assert story.epic_id
   end
 
+  test "only a real true turns orphans on, not a raw string or number" do
+    {tenant, project} = seeded()
+
+    for raw <- ["false", 0, "true"] do
+      assert {:ok, summary} =
+               ImportExport.merge_import_project(tenant.id, project.id, @partial,
+                 report_orphans: raw
+               )
+
+      refute Map.has_key?(summary, :stories_orphaned)
+    end
+  end
+
   test "another tenant's stories are never an orphan here" do
     {tenant, project} = seeded()
     {_other_tenant, _other_project} = seeded()

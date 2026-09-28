@@ -40,8 +40,8 @@ defmodule LoopctlWeb.ImportExportController do
         in: :query,
         type: :boolean,
         description:
-          "Merge mode (update existing). Also accepted as a JSON boolean in the body; any " <>
-            "value but true or false is 422."
+          "Merge mode (update existing). Also accepted as a JSON boolean in the body, which " <>
+            "must then agree with this; any value but true or false is 422."
       ],
       report_orphans: [
         in: :query,
@@ -51,7 +51,8 @@ defmodule LoopctlWeb.ImportExportController do
             "payload does not mention (nothing is detached). Meaningful for a FULL round-trip " <>
             "of an export; on a partial merge every unmentioned story is listed. Absent or " <>
             "false, the key is omitted. 422 without merge=true, and for any value but true or " <>
-            "false. Both flags may instead be JSON booleans in the body (`ImportRequest`)."
+            "false. Either flag may instead be a JSON boolean in the body (`ImportRequest`); " <>
+            "given in both, the two must agree or it is 422."
       ]
     ],
     request_body: {"Import data", "application/json", Schemas.ImportRequest},
@@ -85,20 +86,22 @@ defmodule LoopctlWeb.ImportExportController do
   @doc """
   POST /api/v1/projects/:id/import
 
-  Imports a work breakdown into a project. When `merge=true` query param
-  is present, performs a merge import that updates existing entities.
+  Imports a work breakdown into a project. `merge` performs a merge import that updates
+  existing entities; `report_orphans` (merge only, #880) adds `stories_orphaned`. Each flag is
+  the query string's "true"/"false" or a JSON boolean in the body; given in both it must
+  agree. Anything else is 422, as is `report_orphans` without `merge`.
   """
   def import_project(conn, %{"id" => project_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn) |> Keyword.put(:caller_role, api_key.role)
 
-    with {:ok, merge?} <- flag(params, "merge"),
-         {:ok, report_orphans?} <- flag(params, "report_orphans"),
+    with {:ok, merge?} <- flag(conn, "merge"),
+         {:ok, report_orphans?} <- flag(conn, "report_orphans"),
          :ok <- orphans_need_merge(merge?, report_orphans?),
          {:ok, _project} <- Projects.get_project(tenant_id, project_id) do
       if merge? do
-        merge_import(conn, tenant_id, project_id, params, [
+        do_merge_import(conn, tenant_id, project_id, params, [
           {:report_orphans, report_orphans?} | audit_opts
         ])
       else
@@ -107,17 +110,35 @@ defmodule LoopctlWeb.ImportExportController do
     end
   end
 
-  # ONE reading of both flags (#880): the query string's "true"/"false" or a JSON boolean in the
-  # body — Phoenix merges the body over the query, so the body wins where both are given.
-  # Anything else is refused, never read as false: a flag misread as off silently runs a fresh
-  # import, or drops the orphan list the caller asked for.
-  defp flag(params, name) do
-    case Map.get(params, name) do
-      value when value in [nil, false, "false"] -> {:ok, false}
-      value when value in [true, "true"] -> {:ok, true}
-      _other -> {:error, :unprocessable_entity, "#{name} must be true or false"}
+  # ONE reading of both flags (#880), from each source SEPARATELY: `params` merges the body over
+  # the query, which would let one silently override the other. The query takes "true"/"false",
+  # the body a JSON boolean (`Schemas.ImportRequest`); given in both, they must agree. Anything
+  # else is refused, never read as false: a flag misread as off silently runs a fresh import, or
+  # drops the orphan list the caller asked for.
+  defp flag(conn, name) do
+    with {:ok, query} <- flag_value(Map.get(conn.query_params, name), ["true", "false"], name),
+         {:ok, body} <- flag_value(Map.get(conn.body_params, name), [true, false], name) do
+      agree(query, body, name)
     end
   end
+
+  defp flag_value(nil, _accepted, _name), do: {:ok, nil}
+
+  defp flag_value(value, accepted, name) do
+    if value in accepted,
+      do: {:ok, value in ["true", true]},
+      else: {:error, :unprocessable_entity, "#{name} must be true or false"}
+  end
+
+  defp agree(nil, nil, _name), do: {:ok, false}
+  defp agree(value, nil, _name), do: {:ok, value}
+  defp agree(nil, value, _name), do: {:ok, value}
+  defp agree(value, value, _name), do: {:ok, value}
+
+  defp agree(_query, _body, name),
+    do:
+      {:error, :unprocessable_entity,
+       "#{name} is given in both the query string and the body, with different values"}
 
   # Orphans are a MERGE's report; on a fresh import the flag would be silently meaningless.
   defp orphans_need_merge(false, true),
@@ -170,7 +191,7 @@ defmodule LoopctlWeb.ImportExportController do
     end
   end
 
-  defp merge_import(conn, tenant_id, project_id, params, opts) do
+  defp do_merge_import(conn, tenant_id, project_id, params, opts) do
     case ImportExport.merge_import_project(tenant_id, project_id, params, opts) do
       {:ok, summary} ->
         json(conn, %{import: summary})

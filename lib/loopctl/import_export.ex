@@ -523,7 +523,8 @@ defmodule Loopctl.ImportExport do
       {:ok, changes} ->
         summary = build_merge_summary(changes, existing_story_deps)
 
-        if Keyword.get(opts, :report_orphans, false),
+        # `== true`, not truthiness: a raw "false" or 0 from a caller must not turn it on.
+        if Keyword.get(opts, :report_orphans) == true,
           do: {:ok, Map.put(summary, :stories_orphaned, orphans(existing_stories, epics_data))},
           else: {:ok, summary}
 

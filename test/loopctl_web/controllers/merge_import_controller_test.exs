@@ -270,6 +270,31 @@ defmodule LoopctlWeb.MergeImportControllerTest do
                )
                |> json_response(200)
 
+      # Given in both the query and the body, the two must agree; the body takes booleans only.
+      for {query, body_flags} <- [
+            {"merge=true&report_orphans=true", %{"report_orphans" => false}},
+            {"merge=true", %{"merge" => false}},
+            {"merge=true", %{"report_orphans" => "true"}}
+          ] do
+        assert build_conn()
+               |> auth_conn(raw_key)
+               |> post(
+                 "/api/v1/projects/#{project.id}/import?#{query}",
+                 Map.merge(partial, body_flags)
+               )
+               |> json_response(422)
+      end
+
+      # Agreeing in both is fine.
+      assert %{"import" => %{"stories_orphaned" => [_]}} =
+               build_conn()
+               |> auth_conn(raw_key)
+               |> post(
+                 "/api/v1/projects/#{project.id}/import?merge=true&report_orphans=true",
+                 Map.put(partial, "report_orphans", true)
+               )
+               |> json_response(200)
+
       # Orphans are a merge's report, and a flag misspelled is refused, not read as off.
       for query <- ["report_orphans=true", "merge=1"] do
         assert build_conn()

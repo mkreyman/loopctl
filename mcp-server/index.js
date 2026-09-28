@@ -33,6 +33,7 @@ import {
   buildCorpusIndexBody,
   buildCorpusSearchBody,
   importPath,
+  importPayloadRefusal,
   importRefusal,
 } from "./lib/http-helpers.js";
 import {
@@ -1028,14 +1029,21 @@ async function createStory({ project_id, epic_number, epic_id, story }) {
 }
 
 async function importStories({ project_id, payload, payload_path, merge, report_orphans }) {
+  // The cheap argument check first, before a payload file is read (#880).
+  const refused = importRefusal({ merge, report_orphans });
+  if (refused) return toContent({ error: true, status: 0, body: refused });
+
   const effectivePayload = await resolvePayload(payload, payload_path);
   if (effectivePayload && effectivePayload.error) {
     return toContent(effectivePayload);
   }
-  // `report_orphans` asks a merge for `stories_orphaned` (#880); without it the key is absent.
-  const refused = importRefusal({ merge, report_orphans });
-  if (refused) return toContent({ error: true, status: 0, body: refused });
 
+  // The payload is the request BODY, and the server reads flags there too: a payload carrying
+  // its own would override or contradict the arguments, so it is refused, not sent.
+  const payloadRefused = importPayloadRefusal(effectivePayload);
+  if (payloadRefused) return toContent({ error: true, status: 0, body: payloadRefused });
+
+  // `report_orphans` asks a merge for `stories_orphaned` (#880); without it the key is absent.
   const result = await apiCall(
     "POST",
     importPath(project_id, { merge, report_orphans }),

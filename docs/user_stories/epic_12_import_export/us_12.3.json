@@ -10,9 +10,9 @@
   "story": {
     "as_a": "tenant administrator",
     "i_want_to": "re-import an updated JSON file into an existing project with a merge flag that creates new stories, updates metadata on existing stories (matched by number), and preserves progress on unchanged stories",
-    "so_that": "I can evolve a project's work breakdown over time — adding new stories, refining descriptions, adjusting estimates — without losing existing progress, agent assignments, or verification results"
+    "so_that": "I can evolve a project's work breakdown over time \u2014 adding new stories, refining descriptions, adjusting estimates \u2014 without losing existing progress, agent assignments, or verification results"
   },
-  "rationale": "Projects evolve. New stories are added mid-sprint, acceptance criteria are refined, and estimates are adjusted. A fresh import would wipe all progress — every agent assignment, every verification result, every artifact report. Merge import solves this by matching stories by their number and intelligently merging: new stories are created, existing stories get metadata updates (but not status resets), and stories missing from the import JSON are flagged for attention without auto-deletion.",
+  "rationale": "Projects evolve. New stories are added mid-sprint, acceptance criteria are refined, and estimates are adjusted. A fresh import would wipe all progress \u2014 every agent assignment, every verification result, every artifact report. Merge import solves this by matching stories by their number and intelligently merging: new stories are created, existing stories get metadata updates (but not status resets), and stories missing from the import JSON are flagged for attention without auto-deletion.",
   "acceptance_criteria": [
     {
       "id": "AC-12.3.1",
@@ -71,7 +71,7 @@
     },
     {
       "id": "AC-12.3.12",
-      "description": "During merge import, for stories matched by number: the following fields are UPDATED from the import payload: title, description, acceptance_criteria, estimated_hours, metadata. The following fields are PRESERVED (never overwritten): agent_status, verified_status, assigned_agent_id, assigned_at, reported_done_at, verified_at, rejected_at, rejection_reason. If a field is ABSENT from the import payload (null or missing), it is NOT nulled — the existing value is preserved. This prevents accidental data loss from incomplete exports.",
+      "description": "During merge import, for stories matched by number: the following fields are UPDATED from the import payload: title, description, acceptance_criteria, estimated_hours, metadata. The following fields are PRESERVED (never overwritten): agent_status, verified_status, assigned_agent_id, assigned_at, reported_done_at, verified_at, rejected_at, rejection_reason. If a field is ABSENT from the import payload (null or missing), it is NOT nulled \u2014 the existing value is preserved. This prevents accidental data loss from incomplete exports.",
       "status": "pending"
     }
   ],
@@ -275,7 +275,7 @@
     },
     {
       "id": "TC-12.3.9",
-      "name": "cross-tenant isolation — merge import cannot access other tenant's project",
+      "name": "cross-tenant isolation \u2014 merge import cannot access other tenant's project",
       "type": "integration",
       "preconditions": [
         "fixture(:tenant, %{name: 'Tenant A'})",
@@ -303,7 +303,7 @@
     "Cycle detection must operate on the MERGED graph: existing dependencies UNION new dependencies. Load existing deps from DB, combine with import deps, then run cycle detection.",
     "The merge=true query parameter is checked in the controller. Controller dispatches to import_project/3 or merge_import_project/3 based on the flag.",
     "Transaction includes: epic upserts, story upserts, new dependency creation, cycle validation, audit logging. All in one Ecto.Multi.",
-    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests — all service swapping via config/test.exs.",
+    "Testing infrastructure: (1) All tests use async: true via DataCase/ConnCase, (2) Mox mocks defined in test/support/mocks.ex, (3) Default permissive stubs set in DataCase/ConnCase setup via stub_all_defaults/0 and Mox.set_mox_from_context(tags) for async isolation, (4) setup :verify_on_exit! in every test module, (5) Fixtures in test/support/fixtures.ex with build/2 (no DB) and fixture/2 (DB insert with auto-dependency resolution), (6) NEVER Application.put_env in tests \u2014 all service swapping via config/test.exs.",
     "All context functions MUST return `{:ok, result}` or `{:error, reason}` tuples. Never raise exceptions for expected error cases."
   ],
   "dependencies": [

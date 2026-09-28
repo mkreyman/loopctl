@@ -390,6 +390,23 @@ export function importRefusal({ merge, report_orphans } = {}) {
 }
 
 /**
+ * Why an `import_stories` payload must not be sent as the body, or `null`: it carries its own
+ * `merge` or `report_orphans`, which the server reads from the body as well (loopctl #880) and
+ * which would override or contradict the tool's arguments. Pass the flags as arguments.
+ *
+ * @param {unknown} payload
+ * @returns {string | null}
+ */
+export function importPayloadRefusal(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const carried = ["merge", "report_orphans"].filter((key) => key in payload);
+  return carried.length === 0
+    ? null
+    : `The payload carries ${carried.map((k) => `\`${k}\``).join(" and ")}; pass ` +
+        "import flags as the tool's arguments, not inside the payload.";
+}
+
+/**
  * Path for `import_stories`, for arguments `importRefusal` accepted. ONE template literal, the
  * shape `test/tool-surface.js` resolves to the route; the id is encoded so it cannot rewrite
  * the query.

@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { importPath, importRefusal } from "../lib/http-helpers.js";
+import { importPath, importPayloadRefusal, importRefusal } from "../lib/http-helpers.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
@@ -47,15 +47,24 @@ test("the project id is encoded, so it cannot rewrite the query", () => {
   assert.equal(importPath("a?merge=true", {}), "/api/v1/projects/a%3Fmerge%3Dtrue/import");
 });
 
-test("import_stories refuses on importPath's error and declares the flag", () => {
+test("a payload carrying its own flags is refused: the server would read them too", () => {
+  assert.ok(importPayloadRefusal({ epics: [], merge: false }));
+  assert.ok(importPayloadRefusal({ epics: [], report_orphans: true }));
+  assert.equal(importPayloadRefusal({ epics: [] }), null);
+});
+
+test("import_stories wires both refusals and declares the flag", () => {
   const start = INDEX_SRC.indexOf("async function importStories(");
   assert.ok(start >= 0);
   const end = INDEX_SRC.indexOf("\n}\n", start);
   assert.ok(end > start);
   const body = INDEX_SRC.slice(start, end);
-  assert.match(body, /importPath\(project_id, \{ merge, report_orphans \}\)/);
-  assert.match(body, /const refused = importRefusal\(\{ merge, report_orphans \}\);/);
-  assert.match(body, /if \(refused\) return/);
+
+  // The argument check runs before the payload file is read, and the payload is checked too.
+  assert.ok(body.indexOf("importRefusal(") < body.indexOf("resolvePayload("));
+  assert.ok(body.includes("importPayloadRefusal(effectivePayload)"));
+  assert.ok(body.includes("if (payloadRefused) return toContent({ error: true"));
+  assert.ok(body.includes("importPath(project_id, { merge, report_orphans })"));
 
   const decl = INDEX_SRC.indexOf('name: "import_stories"');
   assert.match(INDEX_SRC.slice(decl, INDEX_SRC.indexOf("required:", decl)), /report_orphans: \{/);
