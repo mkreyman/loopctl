@@ -81,6 +81,24 @@ defmodule LoopctlRunner.TriagePromptTest do
     refute prompt =~ "issue URL: \n"
   end
 
+  test "the session is told its tree is a clean checkout, without the operator's local files" do
+    # It runs in a detached worktree of HEAD, so a missing .env or build output is the tree's
+    # nature, not the report's defect.
+    prompt = build()
+    assert prompt =~ "CLEAN checkout of the commit the operator has out"
+    assert prompt =~ "untracked or ignored files"
+  end
+
+  test "submodules the runner could not initialise are named, quoted, and never a defect" do
+    prompt = build(%{}, missing_submodules: ["vendored", "deps/a b"])
+    assert prompt =~ "could NOT initialise this checkout's submodules"
+    assert prompt =~ ~s|"vendored", "deps/a b"|
+    assert prompt =~ "do not read it as a defect"
+
+    # Said only when it happened: a tree whose submodules are all there is not told otherwise.
+    refute build() =~ "could NOT initialise"
+  end
+
   test "truncated says the report was longer, not that the block is damaged" do
     assert build(%{"truncated" => true}) =~ "wrote MORE than you can see"
     assert build(%{"truncated" => true}) =~ "complete as cut, not damaged"

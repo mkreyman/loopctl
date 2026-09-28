@@ -2,7 +2,7 @@ defmodule LoopctlRunner.TriageRunTest do
   # Mutates PATH and FAKE_* in the OS environment, which every spawned process inherits.
   use ExUnit.Case, async: false
 
-  alias LoopctlRunner.{TriageRun, TriageVerdict}
+  alias LoopctlRunner.{TriageRun, TriageVerdict, Worktree, WorktreeLock}
   import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
 
@@ -87,10 +87,128 @@ defmodule LoopctlRunner.TriageRunTest do
     refute argv =~ "Write(./**)"
     refute argv =~ "Edit(./**)"
     assert argv =~ "--agents\n"
-    # And it ran in the checkout itself: a triage run has no worktree.
-    assert File.read!(Path.join(ctx.state, "cwd")) |> String.trim() =~ "repo"
-    refute File.dir?(Path.join([ctx.root, "repo", ".claude", "worktrees"]))
     assert result.session.exit_status == 0
+  end
+
+  # Compared resolved: on macOS the temp dir lives under /var, a symlink to /private/var, and the
+  # fake records the cwd it resolved.
+  defp real_checkout(ctx), do: real(Path.join(ctx.root, "repo"))
+
+  defp real(path) do
+    {real_parent, 0} = System.cmd("realpath", [Path.dirname(path)])
+    Path.join(String.trim(real_parent), Path.basename(path))
+  end
+
+  # Keyed, as the run keys them, by the checkout path the CONFIG names.
+  defp shared_tree(ctx),
+    do: Worktree.triage_tree_path(ctx.config.runs_dir, Path.join(ctx.root, "repo"))
+
+  defp own_tree(ctx, run_id),
+    do: Worktree.triage_tree_path(ctx.config.runs_dir, Path.join(ctx.root, "repo"), run_id)
+
+  test "a triage run works in the repo's REUSED detached tree, released for the next run", ctx do
+    # Not in the operator's live checkout: the session gets the repo's one triage tree, at the
+    # commit the checkout has out, on no branch — and it stays, so the next run refreshes it rather
+    # than paying for a checkout, and the session's cwd (and so its project directory) is stable.
+    result =
+      execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}])
+
+    checkout = real_checkout(ctx)
+    tree = shared_tree(ctx)
+
+    assert File.read!(Path.join(ctx.state, "cwd")) |> String.trim() == real(tree)
+    assert File.dir?(tree)
+    assert git!(tree, ["rev-parse", "HEAD"]) == git!(checkout, ["rev-parse", "HEAD"])
+    assert git!(tree, ["rev-parse", "--abbrev-ref", "HEAD"]) == "HEAD"
+    # The checkout itself is untouched: still on its own branch, and gaining no tree directory —
+    # the tree is the runner's, under its runs_dir.
+    assert git!(checkout, ["rev-parse", "--abbrev-ref", "HEAD"]) == "master"
+    refute File.exists?(Path.join(checkout, ".claude"))
+    assert String.starts_with?(tree, Path.join(ctx.config.runs_dir, ".triage-trees"))
+
+    # Recorded where the reaper looks, as scratch, and RELEASED: no longer this run's.
+    recorded = tree
+
+    assert {:ok,
+            %{
+              "worktree" => %{"status" => "released", "path" => ^recorded, "scratch" => true}
+            }} = RunStateRead.read(result.run_dir)
+
+    assert WorktreeLock.live_holder(ctx.config.runs_dir, recorded) == nil
+  end
+
+  test "the reused tree is brought to the checkout's commit, and cleaned, for every run", ctx do
+    # What an earlier session left there — untracked, and ignored — is gone before the next one
+    # starts, and a checkout that moved on is judged at its new commit.
+    execute(ctx, [{"FAKE_CLAUDE_MODE", "write_file"}])
+    checkout = real_checkout(ctx)
+    tree = shared_tree(ctx)
+    assert File.exists?(Path.join(tree, "wip.txt"))
+
+    File.write!(Path.join(checkout, ".gitignore"), "*.log\n")
+    git!(checkout, ["add", ".gitignore"])
+    git!(checkout, ["commit", "-q", "-m", "ignore logs"])
+    File.write!(Path.join(tree, "build.log"), "left by a session")
+
+    execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    assert git!(tree, ["rev-parse", "HEAD"]) == git!(checkout, ["rev-parse", "HEAD"])
+    refute File.exists?(Path.join(tree, "wip.txt"))
+    refute File.exists?(Path.join(tree, "build.log"))
+  end
+
+  test "a run that finds the reused tree held cuts its OWN, removed with what it wrote", ctx do
+    # Two triage runs on one repo never share a tree. The second gets one of its own, and its
+    # teardown removes it whatever the session left in it — an untracked file here — and the
+    # Claude project directory its one-off cwd made. Only that one: the reused tree's cwd is the
+    # same for every run on this repo, so its project directory is one, and stays.
+    execute(ctx, [
+      {"FAKE_CLAUDE_MODE", "stream"},
+      {"FAKE_PROJECTS_DIR", ctx.config.claude_projects_dir}
+    ])
+
+    shared_project = File.read!(Path.join(ctx.state, "project_dir")) |> String.trim()
+    shared = shared_tree(ctx)
+    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, "another-live-run")
+
+    result =
+      execute(ctx, [
+        {"FAKE_CLAUDE_MODE", "write_file"},
+        {"FAKE_PROJECTS_DIR", ctx.config.claude_projects_dir}
+      ])
+
+    own = own_tree(ctx, result.run_id)
+    assert File.read!(Path.join(ctx.state, "cwd")) |> String.trim() == real(own)
+    refute File.dir?(own)
+    refute git!(real_checkout(ctx), ["worktree", "list", "--porcelain"]) =~ result.run_id
+    # The other run's lock is not this run's to release.
+    assert WorktreeLock.live_holder(ctx.config.runs_dir, shared) == "another-live-run"
+
+    project = File.read!(Path.join(ctx.state, "project_dir")) |> String.trim()
+    assert project =~ result.run_id
+    refute File.exists?(project)
+    assert File.dir?(shared_project)
+
+    recorded = own
+
+    assert {:ok,
+            %{"worktree" => %{"status" => "removed", "path" => ^recorded, "scratch" => true}}} =
+             RunStateRead.read(result.run_dir)
+  end
+
+  test "a raise after the tree is cut still removes it, and is reported with a wire form", ctx do
+    # Between the cut and the session sit a state write and the prompt. A raise there used to leave
+    # the tree on disk and the run with an {:error, _}, which has no wire form. A lens list that is
+    # not a list is what makes the prompt raise here.
+    shared = shared_tree(ctx)
+    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, "another-live-run")
+
+    result = execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], lenses: :not_a_list)
+
+    assert {:incomplete, "no_verdict_written", detail} = result.outcome
+    assert detail =~ "could not be prepared"
+    refute File.exists?(Path.join(ctx.state, "argv"))
+    refute File.dir?(own_tree(ctx, result.run_id))
   end
 
   test "the prompt carries this run's token, and the token file is not the prompt's neighbour",
@@ -404,6 +522,322 @@ defmodule LoopctlRunner.TriageRunTest do
 
     assert {:incomplete, "verdict_invalid", detail} = unreadable.outcome
     assert detail =~ "could not be read"
+  end
+
+  test "a tree the runner cannot cut is its own failure; a checkout git cannot judge is unreadable",
+       ctx do
+    # The ways cutting the detached worktree fails are different parties' failures. A runs_dir
+    # where no tree can be cut — a FILE where the trees' directory goes — is local to this runner
+    # and says nothing about the checkout, so it is the contract's runner-side report, not
+    # checkout_unreadable. (Something in the way AT the tree's path is not a failure at all: it is
+    # moved aside and the tree cut, `Worktree.refresh_detached/2`.) A checkout with no commit to
+    # judge, or one git will not read as a repository at all, is exactly checkout_unreadable — and
+    # the two say which, in git's own words.
+    restore = fake_env!(ctx.state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    blocked = Path.join(ctx.config.runs_dir, ".triage-trees")
+    File.mkdir_p!(ctx.config.runs_dir)
+    File.write!(blocked, "in the way")
+
+    empty = Path.join(ctx.root, "empty")
+    File.mkdir_p!(empty)
+    git!(empty, ["init", "-q", "-b", "master"])
+    no_commit = config!(ctx.root, %{"repos" => %{"fixture" => empty}})
+
+    plain = Path.join(ctx.root, "plain")
+    File.mkdir_p!(plain)
+    not_a_repo = config!(ctx.root, %{"repos" => %{"fixture" => plain}})
+
+    [cut, unreadable, not_git] =
+      try do
+        [
+          TriageRun.execute(ctx.config, @triage, "mkreyman/fixture"),
+          TriageRun.execute(no_commit, @triage, "mkreyman/fixture"),
+          TriageRun.execute(not_a_repo, @triage, "mkreyman/fixture")
+        ]
+      after
+        restore.()
+      end
+
+    assert {:incomplete, "no_verdict_written", detail} = cut.outcome
+    assert detail =~ "could not be prepared"
+    assert {:incomplete, "checkout_unreadable", reason} = unreadable.outcome
+    assert reason =~ "no commit checked out"
+    assert reason =~ "fatal:"
+    assert {:incomplete, "checkout_unreadable", reason} = not_git.outcome
+    assert reason =~ "will not read"
+    assert reason =~ "not a git repository"
+    refute File.exists?(Path.join(ctx.state, "argv"))
+
+    # Nothing of the run's is at that path, so the entry is terminal and the reaper leaves what is
+    # there alone; and the reused tree's lock is not left held by a run that has ended.
+    assert File.read!(blocked) == "in the way"
+
+    assert {:ok, %{"worktree" => %{"status" => "not_prepared"}}} =
+             RunStateRead.read(cut.run_dir)
+
+    assert WorktreeLock.live_holder(ctx.config.runs_dir, shared_tree(ctx)) == nil
+  end
+
+  test "a tree's submodules are initialised in it", ctx do
+    # A checkout with a submodule: judged without it, a session reads an empty directory where
+    # code is. File transport is refused for submodules by default, so the test allows it for the
+    # runner's git through the environment every git it starts inherits.
+    sub = git_repo!(Path.join(ctx.root, "sub"))
+    checkout = Path.join(ctx.root, "repo")
+
+    git!(checkout, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "vendored"])
+
+    git!(checkout, ["commit", "-q", "-m", "vendor"])
+    System.put_env("GIT_CONFIG_PARAMETERS", "'protocol.file.allow'='always'")
+
+    try do
+      execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+    after
+      System.delete_env("GIT_CONFIG_PARAMETERS")
+    end
+
+    readme = Path.join([shared_tree(ctx), "vendored", "README.md"])
+    assert File.read!(readme) == "fixture\n"
+
+    # And in the REUSED tree on the next run, which refreshes rather than cuts: emptied here, it is
+    # initialised again.
+    git!(shared_tree(ctx), ["submodule", "deinit", "-q", "-f", "vendored"])
+    refute File.exists?(readme)
+    System.put_env("GIT_CONFIG_PARAMETERS", "'protocol.file.allow'='always'")
+
+    try do
+      execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+    after
+      System.delete_env("GIT_CONFIG_PARAMETERS")
+    end
+
+    assert File.read!(readme) == "fixture\n"
+  end
+
+  test "a submodule whose remote the runner cannot reach comes from the checkout's own clone",
+       ctx do
+    # The runner's git runs with the operator's credentials scrubbed, so a PRIVATE submodule's
+    # remote is out of its reach — as this deleted one is. The clone his checkout already has is
+    # not. No GIT_CONFIG_PARAMETERS: allowing the local transport is the runner's own doing.
+    sub = git_repo!(Path.join(ctx.root, "sub"))
+    checkout = Path.join(ctx.root, "repo")
+
+    git!(checkout, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "vendored"])
+
+    git!(checkout, ["commit", "-q", "-m", "vendor"])
+    File.rm_rf!(sub)
+
+    result = execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    assert File.read!(Path.join([shared_tree(ctx), "vendored", "README.md"])) == "fixture\n"
+    refute Map.has_key?(elem(RunStateRead.read(result.run_dir), 1), "submodules_missing")
+  end
+
+  test "an unreadable lock on the reused tree is stale, never a tree lost for good", ctx do
+    # A corrupt lock file names no live run, so nothing it could protect is running. Read as held,
+    # every later run on this repo would cut a tree of its own for ever.
+    shared = shared_tree(ctx)
+    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, "a-run-whose-lock-was-truncated")
+    [lock] = Path.wildcard(Path.join([ctx.config.runs_dir, "locks", "*.lock"]))
+    File.write!(lock, "")
+
+    result = execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    assert File.read!(Path.join(ctx.state, "cwd")) |> String.trim() == real(shared)
+
+    assert {:ok, %{"worktree" => %{"status" => "released", "path" => ^shared}}} =
+             RunStateRead.read(result.run_dir)
+
+    assert WorktreeLock.live_holder(ctx.config.runs_dir, shared) == nil
+  end
+
+  test "an exit while the tree is given back never replaces the verdict the run has", ctx do
+    # `Trace.emit/4` is a GenServer call, and the release runs in the `after` that follows the
+    # judgement. The trace dies exactly as the release reaches it — an exit, not a raise — and the
+    # verdict must still be the outcome, not an {:error, _} with no wire form.
+    Process.flag(:trap_exit, true)
+    test = self()
+
+    killer =
+      spawn_link(fn ->
+        trace = find_trace(test)
+
+        :sys.install(trace, {
+          fn state, event, _name ->
+            # A signal, not `exit/1`: `sys` catches what a debug function raises or exits with.
+            if inspect(event) =~ "worktree.released",
+              do: Process.exit(self(), :kill),
+              else: state
+          end,
+          nil
+        })
+
+        send(test, :installed)
+      end)
+
+    log =
+      capture_log(fn ->
+        result =
+          execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}])
+
+        send(test, {:result, result})
+      end)
+
+    Process.flag(:trap_exit, false)
+    assert_received :installed
+    assert_received {:result, result}
+    assert {:verdict, %{"outcome" => "escalate"}} = result.outcome
+    assert log =~ "worktree release could not be recorded"
+    # The lock is still given back.
+    assert WorktreeLock.live_holder(ctx.config.runs_dir, shared_tree(ctx)) == nil
+    Process.exit(killer, :kill)
+  end
+
+  # The trace this test's own run started: linked to, so an ancestor of, the test process.
+  defp find_trace(test) do
+    Enum.find(Process.list(), fn pid ->
+      case Process.info(pid, :dictionary) do
+        {:dictionary, dict} ->
+          match?({LoopctlRunner.Trace, :init, 1}, dict[:"$initial_call"]) and
+            test in Keyword.get(dict, :"$ancestors", [])
+
+        _ ->
+          false
+      end
+    end) || (Process.sleep(5) && find_trace(test))
+  end
+
+  test "a tree that could not be marked nor removed is recorded as existing, for the reaper",
+       ctx do
+    # A git that will not read the new tree's private directory (so the marker cannot be written)
+    # and will not remove it either. The tree is left, so the entry must say a tree exists —
+    # `not_prepared` is what the reaper skips, and the tree would stay for ever.
+    real_git = System.find_executable("git")
+    bin = Path.join(ctx.root, "git-bin")
+    File.mkdir_p!(bin)
+
+    File.write!(Path.join(bin, "git"), """
+    #!/bin/sh
+    case "$*" in
+      *.triage-trees*--absolute-git-dir*|*"worktree remove"*.triage-trees*) exit 1 ;;
+    esac
+    exec #{real_git} "$@"
+    """)
+
+    File.chmod!(Path.join(bin, "git"), 0o755)
+    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared_tree(ctx), "another-live-run")
+    previous = System.get_env("PATH")
+    System.put_env("PATH", bin <> ":" <> previous)
+
+    result =
+      try do
+        execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+      after
+        System.put_env("PATH", previous)
+      end
+
+    own = own_tree(ctx, result.run_id)
+    assert {:incomplete, "no_verdict_written", detail} = result.outcome
+    assert detail =~ "could not be removed"
+    refute File.exists?(Path.join(ctx.state, "argv"))
+    assert File.dir?(own)
+
+    assert {:ok,
+            %{"worktree" => %{"status" => "remove_failed", "path" => ^own, "scratch" => true}}} =
+             RunStateRead.read(result.run_dir)
+  end
+
+  test "a triage run reaps an orphaned triage tree, and its project directory, before it starts",
+       ctx do
+    # Not only an implement run: a runner sent nothing but triage would otherwise keep a dead run's
+    # tree, and the Claude project directory its one-off cwd made, until an implement dispatch.
+    orphan_id = LoopctlRunner.Session.uuid4()
+    tree = own_tree(ctx, orphan_id)
+    {:ok, sha} = Worktree.create_detached(Path.join(ctx.root, "repo"), tree)
+    project = Path.join(ctx.config.claude_projects_dir, "-private-" <> orphan_id)
+    File.mkdir_p!(project)
+    orphan = Path.join(ctx.config.runs_dir, "triage-orphan")
+    File.mkdir_p!(orphan)
+    {dead, 0} = System.cmd("/bin/sh", ["-c", "echo $$"])
+
+    LoopctlRunner.RunState.update(orphan, %{
+      "run_id" => orphan_id,
+      "kind" => "triage",
+      "status" => "running",
+      "beam_os_pid" => String.to_integer(String.trim(dead)),
+      "repo_path" => Path.join(ctx.root, "repo"),
+      "worktree" => %{
+        "path" => tree,
+        "branch" => "",
+        "base" => sha,
+        "status" => "created",
+        "scratch" => true
+      }
+    })
+
+    execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    refute File.dir?(tree)
+    refute File.exists?(project)
+    assert {:ok, %{"status" => "reaped"}} = RunStateRead.read(orphan)
+  end
+
+  test "the tree is recorded CREATED before its submodules, and a failed one is named to the session",
+       ctx do
+    # A submodule whose "remote" is a script: when git runs it, it copies the run's state.json
+    # aside, which is what the state said at the moment the submodule step was under way — and then
+    # fails, as an unreachable remote does. A raise in that step must find the tree recorded as
+    # existing, so it goes through the release path and never reads as a tree never cut.
+    checkout = Path.join(ctx.root, "repo")
+    snapshot = Path.join(ctx.root, "state-during-submodules.json")
+    remote = Path.join(ctx.root, "remote.sh")
+
+    File.write!(remote, """
+    #!/bin/sh
+    cat #{ctx.config.runs_dir}/triage-*/state.json > #{snapshot}
+    exit 1
+    """)
+
+    File.chmod!(remote, 0o755)
+
+    File.write!(Path.join(checkout, ".gitmodules"), """
+    [submodule "gone"]
+    \tpath = gone
+    \turl = ext::#{remote}
+    """)
+
+    sha = git!(checkout, ["rev-parse", "HEAD"])
+    git!(checkout, ["update-index", "--add", "--cacheinfo", "160000,#{sha},gone"])
+    git!(checkout, ["add", ".gitmodules"])
+    git!(checkout, ["commit", "-q", "-m", "a submodule whose fetch records the state"])
+    System.put_env("GIT_CONFIG_PARAMETERS", "'protocol.ext.allow'='always'")
+
+    log =
+      try do
+        capture_log(fn ->
+          send(self(), {:result, execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])})
+        end)
+      after
+        System.delete_env("GIT_CONFIG_PARAMETERS")
+      end
+
+    assert_received {:result, result}
+    shared = shared_tree(ctx)
+
+    assert %{"worktree" => %{"status" => "created", "path" => ^shared}} =
+             snapshot |> File.read!() |> Jason.decode!()
+
+    # The session is told which paths may be empty, and why that is not the report's defect.
+    argv = File.read!(Path.join(ctx.state, "argv"))
+    assert argv =~ "could NOT initialise this checkout's submodules"
+    assert argv =~ ~s|"gone"|
+
+    # And the run says so where a reader of the run looks: its state and its trace.
+    assert {:ok, %{"submodules_missing" => ["gone"]}} = RunStateRead.read(result.run_dir)
+    {:ok, events} = LoopctlRunner.Trace.read(Path.join(result.run_dir, "trace.ndjson"))
+    assert [missing] = Enum.filter(events, &(&1["type"] == "worktree.submodules_missing"))
+    assert missing["data"]["paths"] == ["gone"]
+    assert log =~ "submodules of"
   end
 
   test "a run the runner cannot prepare is reported, never left without a wire form", ctx do

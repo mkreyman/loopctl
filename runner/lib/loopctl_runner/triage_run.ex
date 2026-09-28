@@ -3,10 +3,15 @@ defmodule LoopctlRunner.TriageRun do
   One triage dispatch, run to a verdict (design §4).
 
   Shaped like `LoopctlRunner.Run` and deliberately not sharing it: an implement run's whole
-  middle is a worktree — created, branched, torn down, kept when it holds work — and a triage run
-  has none. It reads the repository checkout where it is, states one verdict, and writes nothing
-  else. What the two share is the run directory, the state file, the trace and the process-group
-  discipline, which is why those come from the same modules.
+  middle is a worktree — created, branched, torn down, kept when it holds work — and a triage run's
+  is a DETACHED worktree at the commit the checkout has out: the repo's one reused triage tree,
+  refreshed to that commit for each run that holds its lock, or — when a live run holds it — a tree
+  of this run's own, removed after it whatever it holds. Both live under the runner's `runs_dir`
+  (`Worktree.triage_tree_path/2` and `/3`), and the session works there rather than in the
+  operator's live checkout, so nothing it or a lens it dispatches does lands in his working tree,
+  and the checkout's branch is never touched. It states one verdict. What the two share is the run directory, the state file,
+  the trace, the process-group discipline and `LoopctlRunner.Worktree`, which is why those come
+  from the same modules.
 
   The order matters and each step is a precondition of the next:
 
@@ -18,7 +23,13 @@ defmodule LoopctlRunner.TriageRun do
        minted BEFORE the prompt is built because the prompt carries them — they are what make the
        verdict and the escalation the SESSION's rather than something a subagent it dispatches
        could state;
-    3. the prompt, from the fenced report and the lenses this run actually grants;
+    3. the detached worktree the session will run in, recorded in `state.json` before it is cut
+       so the reaper finds it if this BEAM dies; a checkout git will not read is
+       `checkout_unreadable`, a tree that could not be cut is the runner's own
+       `no_verdict_written`. From the moment the cut returns, everything is inside the guard that
+       gives the tree back: the entry recorded `created`, then the tree's submodules, then the
+       prompt, from the fenced report, the lenses this run actually grants and the submodule
+       paths that could not be initialised;
     4. the session, with `LoopctlRunner.TriageTools`' contained set rather than the implement
        one;
     5. the verdict, read and validated against the contract before anything believes it;
@@ -65,6 +76,7 @@ defmodule LoopctlRunner.TriageRun do
     Contract,
     Owner,
     PendingVerdicts,
+    Reaper,
     Run,
     RunState,
     Session,
@@ -73,7 +85,9 @@ defmodule LoopctlRunner.TriageRun do
     TriageDispatch,
     TriagePrompt,
     TriageTools,
-    TriageVerdict
+    TriageVerdict,
+    Worktree,
+    WorktreeLock
   }
 
   # Read from the vendored contract at COMPILE time, not repeated: the last time this repo held
@@ -183,6 +197,7 @@ defmodule LoopctlRunner.TriageRun do
   defp record_id(_triage), do: {:error, "the triage object names no record_id"}
 
   defp start(config, triage, repo, record, run_id, opts) do
+    reap(config)
     run_dir = run_dir(config, record, run_id)
 
     # BEFORE the state, not after: `state.json` at `running` carries this BEAM's live owner, so a
@@ -232,6 +247,21 @@ defmodule LoopctlRunner.TriageRun do
     result
   end
 
+  # What an implement run does before it starts (`Run`), for the same reason: a triage run is often
+  # the only kind this runner is sent for a while, and an orphaned triage tree — or its lock, which
+  # the next run on the repo would find held — would otherwise wait for an implement dispatch.
+  # Guarded like `announce/2`: a reap that fails costs this run nothing.
+  defp reap(config) do
+    Reaper.reap(config.runs_dir, config.kill_grace_s * 1000,
+      projects_dir: config.claude_projects_dir
+    )
+  rescue
+    error -> Logger.error("the reap before a triage run failed: #{inspect(error)}")
+  catch
+    kind, reason ->
+      Logger.error("the reap before a triage run failed: #{inspect({kind, reason})}")
+  end
+
   # Guarded, and the guard is the point: this runs OUTSIDE the try below, before the state or the
   # trace exists, so a callback that raises would take the run down before it had written anything
   # about itself. Whoever is listening loses the early notice; the run goes on, and its outcome
@@ -271,40 +301,51 @@ defmodule LoopctlRunner.TriageRun do
   end
 
   defp run(config, triage, repo, run_dir, run_id, trace, seq, opts) do
+    config
+    |> prepare_and_judge(triage, repo, run_dir, run_id, trace, seq, opts)
+    |> result(run_id, run_dir)
+  end
+
+  defp prepare_and_judge(config, triage, repo, run_dir, run_id, trace, seq, opts) do
     with {:ok, name, path} <- checkout(config, repo),
          :ok <- budgets(config, opts),
          {:ok, token} <- mint(run_dir, &TriageVerdict.mint_token/1),
-         {:ok, escalate} <- mint(run_dir, &TriageVerdict.mint_escalate_token/1) do
-      lenses = Keyword.get(opts, :lenses, TriageTools.lenses())
+         {:ok, escalate} <- mint(run_dir, &TriageVerdict.mint_escalate_token/1),
+         {:ok, tree} <- detached_tree(config, path, run_dir, run_id, trace, seq) do
+      # EVERYTHING after a successful cut is inside this try, so no way out of it — a return, a
+      # raise, an exit — leaves the tree or its lock behind. `created` is recorded FIRST, before
+      # the submodules: a raise in them is a tree that exists, which the release path removes or
+      # releases, and never the `not_prepared` of a tree that was not cut.
+      try do
+        prompt =
+          prepared(fn ->
+            record_tree(run_dir, path, tree, "created")
+            missing = submodules(path, tree, run_dir, trace, seq)
+            lenses = Keyword.get(opts, :lenses, TriageTools.lenses())
 
-      prompt =
-        TriagePrompt.build(triage, repo, token: token, escalate_token: escalate, lenses: lenses)
+            args = [
+              token: token,
+              escalate_token: escalate,
+              lenses: lenses,
+              missing_submodules: missing
+            ]
 
-      # Caught HERE, not only by the outer guard: Session.run/1 exits when its monitor dies, and
-      # the outer catch would return {:error, _} without ever reading the run directory — throwing
-      # away a verdict the session had already written and linked into place. `Run` catches the
-      # same exit locally for the same reason.
-      session =
-        try do
-          session(config, prompt, {name, path}, run_dir, run_id, trace, seq, opts)
-        catch
-          # Only :exit, as `Run.run_session/7` does. A raise in here is the runner's own bug and
-          # belongs to the outer guard, which reports it as an error rather than dressing it up
-          # as something the session did.
-          :exit, reason ->
-            Trace.emit(trace, "session.crashed", seq, %{"reason" => inspect(reason)})
-            {:session_failed, inspect(reason)}
+            {:ok, TriagePrompt.build(triage, repo, args)}
+          end)
+
+        with {:ok, prompt} <- prompt do
+          judge(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts)
         end
+      after
+        release_tree(config, path, tree, run_dir, run_id, trace, seq)
+      end
+    end
+  end
 
-      %{
-        run_id: run_id,
-        run_dir: run_dir,
-        # `:session` is the session's own report or nil; a failure to supervise it is not a
-        # report, and it is already carried in the outcome.
-        session: if(match?({:session_failed, _}, session), do: nil, else: session),
-        outcome: outcome(run_dir, session)
-      }
-    else
+  defp result(%{} = result, _run_id, _run_dir), do: result
+
+  defp result(failure, run_id, run_dir) do
+    case failure do
       {:unreadable, reason} ->
         %{
           run_id: run_id,
@@ -326,6 +367,45 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
+  defp judge(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts) do
+    # Caught HERE, not only by the outer guard: Session.run/1 exits when its monitor dies, and
+    # the outer catch would return {:error, _} without ever reading the run directory — throwing
+    # away a verdict the session had already written and linked into place. `Run` catches the
+    # same exit locally for the same reason.
+    session =
+      try do
+        session(config, prompt, {name, path, tree.path}, run_dir, run_id, trace, seq, opts)
+      catch
+        # Only :exit, as `Run.run_session/7` does. A raise in here is the runner's own bug and
+        # belongs to the outer guard, which reports it as an error rather than dressing it up
+        # as something the session did.
+        :exit, reason ->
+          Trace.emit(trace, "session.crashed", seq, %{"reason" => inspect(reason)})
+          {:session_failed, inspect(reason)}
+      end
+
+    %{
+      run_id: run_id,
+      run_dir: run_dir,
+      # `:session` is the session's own report or nil; a failure to supervise it is not a
+      # report, and it is already carried in the outcome.
+      session: if(match?({:session_failed, _}, session), do: nil, else: session),
+      outcome: outcome(run_dir, session)
+    }
+  end
+
+  # Preparing the run happens after the run directory and state.json exist, so the dispatch is
+  # already this runner's: a raise here (a state write on a full volume, a prompt that will not
+  # build) is the runner failing to prepare the run, which has a wire form — `no_verdict_written`,
+  # as `mint/2` reports it — where the outer guard's `{:error, _}` has none.
+  defp prepared(fun) do
+    fun.()
+  rescue
+    error -> {:unreported, Exception.message(error)}
+  catch
+    kind, reason -> {:unreported, Exception.format_banner(kind, reason)}
+  end
+
   # A token that cannot be written is the SAME operator failure that makes a verdict file
   # unreadable — a full or read-only runs volume — and it happens after the run directory and
   # state.json exist, so the dispatch is already this runner's. As `{:error, _}` it had no wire
@@ -339,7 +419,8 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
-  # The checkout is READ, never branched: a triage session judges what is there.
+  # The checkout is never branched and never the session's cwd: a triage session judges the
+  # commit it has out, from a detached worktree (`detached_tree/4`).
   #
   # Its failures are `{:unreadable, _}` rather than `{:error, _}`, because this function LOOKED:
   # the contract has a reason for exactly this and a verified cause is reportable.
@@ -377,7 +458,180 @@ defmodule LoopctlRunner.TriageRun do
 
   defp max_turns(config, opts), do: Keyword.get(opts, :max_turns, min(60, config.max_turns))
 
-  defp session(config, prompt, {repo_name, path}, run_dir, run_id, trace, seq, opts) do
+  # The session's tree, in two shapes. The repo's REUSED tree (`Worktree.triage_tree_path/2`)
+  # when this run takes its lock: refreshed to the checkout's commit, left in place afterwards,
+  # and cheap, because a full checkout per dispatch is not. Its OWN tree
+  # (`Worktree.triage_tree_path/3`) when a live run holds that lock, so two runs never share one:
+  # cut for this run and removed at its teardown. Both are SCRATCH — detached, so nothing a
+  # session writes there is anywhere else — and the entry says so, which is what the reaper reads.
+  #
+  # Recorded BEFORE it is cut, as an implement run's worktree is, so a BEAM that dies mid-run
+  # leaves it where the reaper looks. A checkout git will not read is `checkout_unreadable`; a
+  # readable one whose tree could not be cut (a full disk, a path in the way) is the runner's own
+  # failure to prepare the run, which the contract reports as `no_verdict_written` (`mint/2`).
+  #
+  # `cut/2` ends with a tree at the path, with none (`Worktree` removes one it could not finish), or
+  # with `{:tree_left, _}` when that removal failed too. `not_prepared` is only ever the entry of a
+  # run that has no tree; one that was left is recorded `created`, as the tree it is, and given back
+  # exactly as a finished run's is — so the reaper retries a removal that fails here.
+  defp detached_tree(config, path, run_dir, run_id, trace, seq) do
+    with {:ok, tree} <- prepared(fn -> claim_tree(config, path, run_id) end) do
+      result =
+        prepared(fn ->
+          record_tree(run_dir, path, tree, "creating")
+          cut(path, tree)
+        end)
+
+      case result do
+        {:ok, sha} ->
+          {:ok, %{tree | base: sha}}
+
+        {:tree_left, reason} ->
+          give_back_left(config, path, tree, run_dir, run_id, trace, seq)
+          {:unreported, reason}
+
+        failed ->
+          # Truthful, and terminal: nothing of this run's is at that path, so the reaper — which
+          # skips this status — must not go and remove what is. Then the lock, or the next run on
+          # this repo would find the reused tree held by a run that has ended.
+          abandon_tree(config, path, run_dir, tree, run_id)
+          failed
+      end
+    end
+  end
+
+  defp claim_tree(config, path, run_id) do
+    shared = Worktree.triage_tree_path(config.runs_dir, path)
+
+    case WorktreeLock.acquire(config.runs_dir, shared, run_id) do
+      :ok ->
+        {:ok, %{path: shared, shared?: true, base: "HEAD"}}
+
+      {:error, {:held, _}} ->
+        own = Worktree.triage_tree_path(config.runs_dir, path, run_id)
+        {:ok, %{path: own, shared?: false, base: "HEAD"}}
+    end
+  end
+
+  defp cut(path, %{shared?: true, path: tree}),
+    do: tree_result(Worktree.refresh_detached(path, tree))
+
+  defp cut(path, %{shared?: false, path: tree}),
+    do: tree_result(Worktree.create_detached(path, tree))
+
+  defp tree_result({:error, reason}), do: {:unreported, reason}
+  defp tree_result({:error, reason, :tree_left}), do: {:tree_left, reason}
+  defp tree_result(other), do: other
+
+  # Paths that could not be initialised go to the trace and the state as well as the prompt, so a
+  # verdict judged without them can be told apart from one that had them.
+  defp submodules(path, tree, run_dir, trace, seq) do
+    case Worktree.sync_submodules(path, tree.path) do
+      :ok ->
+        []
+
+      {:missing, paths, detail} ->
+        Trace.emit(trace, "worktree.submodules_missing", seq, %{
+          "paths" => paths,
+          "detail" => detail
+        })
+
+        RunState.update(run_dir, %{"submodules_missing" => paths})
+        paths
+    end
+  end
+
+  defp give_back_left(config, path, tree, run_dir, run_id, trace, seq) do
+    prepared(fn -> record_tree(run_dir, path, tree, "created") end)
+    release_tree(config, path, tree, run_dir, run_id, trace, seq)
+  end
+
+  defp abandon_tree(config, path, run_dir, tree, run_id) do
+    prepared(fn -> record_tree(run_dir, path, tree, "not_prepared") end)
+    if tree.shared?, do: WorktreeLock.release(config.runs_dir, tree.path, run_id)
+  end
+
+  # The reused tree is RELEASED, not removed: the next run refreshes it, and the reaper skips a
+  # released entry because the tree is no longer this run's. A run's own tree is removed whatever
+  # it holds — nothing a triage session writes is work to keep, and with no branch there is nowhere
+  # for it to have gone — and so is the Claude project directory its unique cwd made.
+  # Guarded as `finish/5` is, and for its reason: a run directory the session removed must not
+  # turn a finished run into a raise. EVERY way out, exits included — `Trace.emit/4` is a call, and
+  # this runs in the `after` that follows `judge/8`, so an exit escaping here would replace the
+  # verdict the run already has with an `{:error, _}`, which has no wire form.
+  defp release_tree(config, path, %{shared?: true} = tree, run_dir, run_id, trace, seq) do
+    Trace.emit(trace, "worktree.released", seq, %{"worktree" => tree.path})
+    record_tree(run_dir, path, tree, "released")
+  rescue
+    error ->
+      Logger.error("the triage run's worktree release could not be recorded: #{inspect(error)}")
+  catch
+    kind, reason ->
+      Logger.error(
+        "the triage run's worktree release could not be recorded: #{inspect({kind, reason})}"
+      )
+  after
+    WorktreeLock.release(config.runs_dir, tree.path, run_id)
+  end
+
+  defp release_tree(config, path, tree, run_dir, run_id, trace, seq) do
+    outcome = Worktree.remove(path, tree.path, "", tree.base)
+    status = Worktree.status_after(outcome)
+    Trace.emit(trace, "worktree.#{status}", seq, %{"worktree" => inspect(outcome.worktree)})
+    record_tree(run_dir, path, tree, status)
+  rescue
+    error ->
+      Logger.error("the triage run's worktree removal could not be recorded: #{inspect(error)}")
+  catch
+    kind, reason ->
+      Logger.error(
+        "the triage run's worktree removal could not be recorded: #{inspect({kind, reason})}"
+      )
+  after
+    remove_project_dir(config.claude_projects_dir, run_id)
+  end
+
+  @doc """
+  Removes the Claude project directory a triage run's OWN tree made, so the reaper can do for an
+  orphan what the run's teardown does for itself.
+
+  Claude Code keeps one project directory per cwd, and a run's own tree is a cwd no other run
+  will have, so each would leave one behind for ever. Found by the run id its path carries rather
+  than by re-deriving the CLI's path-mangling rule, for `Liveness.file_signals/2`'s reason: that
+  rule is not a documented contract. Only for a uuid, which carries no glob metacharacter — an
+  id that did would widen the match to directories that are not this run's. The reused tree's path
+  carries no run id, so its one directory is never matched.
+  """
+  @spec remove_project_dir(String.t(), term()) :: :ok
+  def remove_project_dir(projects_dir, run_id) do
+    if run_id =~ @uuid do
+      projects_dir
+      |> Path.join("*" <> run_id <> "*")
+      |> Path.wildcard()
+      |> Enum.each(&File.rm_rf/1)
+    end
+
+    :ok
+  rescue
+    error ->
+      Logger.error("the triage run's project directory was not removed: #{inspect(error)}")
+      :ok
+  end
+
+  defp record_tree(run_dir, path, tree, status) do
+    RunState.update(run_dir, %{
+      "repo_path" => path,
+      "worktree" => %{
+        "path" => tree.path,
+        "branch" => "",
+        "base" => tree.base,
+        "status" => status,
+        "scratch" => true
+      }
+    })
+  end
+
+  defp session(config, prompt, {repo_name, path, tree}, run_dir, run_id, trace, seq, opts) do
     session_id = Session.uuid4()
     wall_clock_s = wall_clock_s(config, opts)
     max_turns = max_turns(config, opts)
@@ -406,7 +660,7 @@ defmodule LoopctlRunner.TriageRun do
     Session.run(
       config: config,
       story: story,
-      worktree: path,
+      worktree: tree,
       run_dir: run_dir,
       trace: trace,
       parent: seq,

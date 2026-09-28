@@ -260,18 +260,32 @@ defmodule LoopctlRunner.ProcessGroup do
   `System.cmd/3` has no timeout, and a probe that hangs must not wedge the session
   monitor that called it.
 
-  `env` adjusts its environment as `System.cmd/3`'s option does: `{name, nil}` removes a variable.
-  A name it supplies wins over the credential scrub below, because it comes AFTER it and the last
-  entry for a name is the one the child gets, so a caller that needs one of those names (the
-  runner's own git fetch needs the ssh agent) says so by name.
+  `env` is `{name, value}` pairs set ON TOP of the credential scrub below, `nil` unsetting one; it
+  can add to the scrub, never take a name out of it, so a caller can never hand a scrubbed name a
+  value of its own choosing.
+
+  `inherit:` (in `opts`) is the one way a scrubbed name reaches the child, and only with the value
+  the runner itself has: those names are left out of the scrub, and are otherwise untouched. The
+  runner's own `Worktree.fetch_base/2` names the operator's ssh agent and forge token this way,
+  because it authenticates as the operator does. A name that is unset in the runner stays unset.
 
   A Port child is its own session leader with no controlling terminal (measured on OTP 28, Linux
   and macOS), so nothing it starts can prompt on the operator's tty, and on timeout its whole group
   is killed — the children it started go with it, not only its own pid.
   """
-  @spec run(String.t(), [String.t()], pos_integer(), [{String.t(), String.t() | nil}]) ::
+  @spec run(String.t(), [String.t()], pos_integer(), [{String.t(), String.t() | nil}], keyword()) ::
           {:ok, binary(), non_neg_integer()} | {:error, :timeout}
-  def run(executable, args, timeout_ms, env \\ []) do
+  def run(executable, args, timeout_ms, env \\ [], opts \\ []) do
+    inherit = Keyword.get(opts, :inherit, [])
+
+    # Rejected, never `--`: a name can be on both lists (GH_TOKEN is named AND has the shape), and
+    # `--` takes out one occurrence only.
+    scrubbed =
+      Enum.reject(
+        Session.credential_env() ++ Session.credential_shaped_env(System.get_env()),
+        &(&1 in inherit)
+      )
+
     port =
       Port.open({:spawn_executable, executable}, [
         :binary,
@@ -282,24 +296,46 @@ defmodule LoopctlRunner.ProcessGroup do
         # runs the CLI (the liveness probe is `claude agents --json`), and a hand-kept one-name
         # list here was a second security list with nothing binding it to the first — it still
         # said ANTHROPIC_API_KEY alone after that list grew to eight names and a shape deny.
-        # `@git_program_env` is deliberately not included, though this Port does run git: the
+        # `Session.git_program_env/0` is deliberately NOT unset, though this Port does run git. The
         # runner's own `Worktree.fetch_base/2` goes through here and must reach origin with the
-        # operator's ssh program. It passes GIT_SSH_COMMAND itself, with BatchMode added, and
-        # inherits a GIT_SSH program as it is; scrubbing that would swap in plain ssh.
+        # operator's ssh program: it passes GIT_SSH_COMMAND itself, with BatchMode added, and
+        # inherits a GIT_SSH program as it is; scrubbing that would swap in plain ssh. The runner's
+        # own submodule step (`run_group/4`) fetches for the operator from his own checkout, and
+        # `GIT_SSH_COMMAND` is how an operator reaches a submodule over SSH. A session has them
+        # unset because what a session runs is not the operator's to vouch for.
         env:
-          Enum.map(
-            Session.credential_env() ++ Session.credential_shaped_env(System.get_env()),
-            &{to_charlist(&1), false}
-          ) ++
-            Enum.map(env, fn
-              {name, nil} -> {to_charlist(name), false}
-              {name, value} -> {to_charlist(name), to_charlist(value)}
-            end)
+          Enum.map(scrubbed, &{to_charlist(&1), false}) ++
+            for {name, value} <- env, name not in scrubbed do
+              {to_charlist(name), if(value, do: to_charlist(value), else: false)}
+            end
       ])
 
     {:os_pid, os_pid} = Port.info(port, :os_pid)
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     collect(port, os_pid, deadline, [])
+  end
+
+  # Leader of its own session (so of its own group) before the command is exec'd, exactly as
+  # `session-launcher.sh` makes itself: `setsid` only when it is not already one, because a process
+  # that already leads a group cannot call it (EPERM).
+  @setsid_exec ~S|getpgrp() == $$ or POSIX::setsid() != -1 or die "setsid: $!\n"; | <>
+                 ~S|exec { $ARGV[0] } @ARGV or die "exec: $!\n"|
+
+  @doc """
+  `run/5` for a command that starts children of its own, killing ALL of them on expiry.
+
+  git's submodule step runs a helper, a clone and a transport under the process the Port starts.
+  Here that process is made the leader of a new session before the command is exec'd, so the
+  timeout's KILL is sent to its whole group and none of them outlives the call. OTP 27 and 28
+  already start a Port child as a group leader (measured on macOS); this makes it a property of
+  the function rather than of the runtime. A child that makes itself a session of its own (an
+  `ssh` ControlPersist master) leaves the group, and nothing here reaches it.
+  """
+  @spec run_group(String.t(), [String.t()], pos_integer(), [{String.t(), String.t() | nil}]) ::
+          {:ok, binary(), non_neg_integer()} | {:error, :timeout}
+  def run_group(executable, args, timeout_ms, extra_env \\ []) do
+    perl = System.find_executable("perl") || raise "perl is required to run #{executable}"
+    run(perl, ["-MPOSIX", "-e", @setsid_exec, "--", executable | args], timeout_ms, extra_env)
   end
 
   defp collect(port, os_pid, deadline, acc) do

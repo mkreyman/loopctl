@@ -35,6 +35,19 @@ printf '%s' "$sid" > "$state/session_id"
 printf '%s' "$PPID" > "$state/launcher_pid"
 here=$(realpath .)
 printf '%s\n' "$here" > "$state/cwd"
+# What Claude Code does for every cwd it runs in: a project directory under the projects dir,
+# named by mangling the cwd, holding this session's transcript. Only when asked, and recorded, so
+# a test can say which directory a run's cwd made.
+if [ -n "${FAKE_PROJECTS_DIR:-}" ]; then
+    project="$FAKE_PROJECTS_DIR/$(printf '%s' "$here" | sed 's/[^A-Za-z0-9]/-/g')"
+    mkdir -p "$project" && : > "$project/$sid.jsonl"
+    printf '%s\n' "$project" > "$state/project_dir"
+fi
+# A test's own probe of the tree, run in the session's cwd while the session holds it, and what it
+# prints recorded. The command is the TEST's, so what it prints is never an environment value.
+if [ -n "${FAKE_PROBE_CMD:-}" ]; then
+    sh -c "$FAKE_PROBE_CMD" > "$state/probe" 2>&1
+fi
 # Names only for the key, never values: a failing assertion prints this file, and the
 # real environment carries credentials.
 # Matched by CATEGORY and by SHAPE, never by the individual name, so a name added to Session's

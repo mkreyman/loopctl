@@ -3,9 +3,10 @@ defmodule LoopctlRunner.TriageTools do
   What a triage session may use, and the three lenses it judges through (design §8).
 
   Designed with the triage contract rather than taken from the implement set and narrowed: a
-  triage session reads and decides, so it gets strictly less. It has no `Edit` and no `Write` at
-  all — an implement session's file rules allow both inside its worktree, and a triage session has
-  no worktree to write in. Its `Bash` exists for TWO commands and no others: `priv/bin/loop-verdict`,
+  triage session reads and decides, so it gets strictly less. Its cwd is a detached worktree of the
+  checkout (`LoopctlRunner.TriageRun`), and it has no `Edit` and no `Write` there at all — an
+  implement session's file rules allow both inside its worktree, and nothing a triage session
+  decides needs a file written. Its `Bash` exists for TWO commands and no others: `priv/bin/loop-verdict`,
   which is how a verdict leaves, and `priv/bin/loop-escalate`, which the system prompt names for a
   session that cannot work at all — shipping that instruction without the rule would deny the call
   silently. Both take this run's token, so a subagent cannot decide the run's outcome either way.
@@ -88,7 +89,8 @@ defmodule LoopctlRunner.TriageTools do
                   &"  - #{&1} — #{Map.fetch!(@lens_conditions, &1)}."
                 )
 
-  # Scoped to the checkout, like an implement session's, minus everything that writes.
+  # Scoped to the session's cwd, its detached worktree, like an implement session's, minus
+  # everything that writes.
   @file_rules ~w[Read(./**) Glob(./**) Grep(./**)]
 
   # DECLARED, not described. A lens whose definition carries no `tools` inherits broad
@@ -244,8 +246,8 @@ defmodule LoopctlRunner.TriageTools do
   def tools, do: @tools
 
   @doc """
-  Every `--allowedTools` rule a triage session gets: the file tools scoped to the checkout, and
-  Bash for the verdict command alone.
+  Every `--allowedTools` rule a triage session gets: the read-only file tools scoped to its cwd,
+  the detached worktree it runs in, and Bash for the verdict and escalation commands alone.
   """
   @spec rules() :: [String.t()]
   def rules do

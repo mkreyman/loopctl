@@ -134,8 +134,27 @@ defmodule LoopctlRunner.TriagePrompt do
   defp code_bullets,
     do: Enum.map_join(@codes, "\n", &"- #{&1} — #{Map.fetch!(@code_glosses, &1)}")
 
+  # Said only when the runner's submodule step failed, and naming the paths, so an empty directory
+  # where a submodule should be is read as the runner's failure and not the report's defect. Each
+  # path QUOTED: they come from the repository's own `.gitmodules`, which is text anyone who can
+  # commit there wrote.
+  defp submodule_note([]), do: ""
+
+  defp submodule_note(paths) do
+    String.trim_trailing("""
+
+    The runner could NOT initialise this checkout's submodules, so these paths may be empty or at
+    the wrong commit: #{Enum.map_join(paths, ", ", &inspect/1)}. What is missing under them is the
+    runner's failure, not the report's: do not read it as a defect, and say in `evidence` when a
+    judgement needed code that would have been there.
+    """)
+  end
+
   @doc """
   The prompt for `triage`, a `RunnerTriage` object, in the repository checked out at `repo`.
+
+  Options: `:token` and `:escalate_token` (required), `:lenses`, and `:missing_submodules` — the
+  submodule paths the runner could not initialise in the session's tree, which the prompt names.
   """
   @spec build(map(), String.t(), keyword()) :: String.t()
   def build(triage, repo, opts \\ []) when is_map(triage) and is_binary(repo) do
@@ -150,9 +169,13 @@ defmodule LoopctlRunner.TriagePrompt do
     # ARMS the check in `loop-escalate`, so a prompt that showed the verdict's would have the
     # session refused every time it tried to say it could not work at all.
     escalate_token = Keyword.fetch!(opts, :escalate_token)
+    missing_submodules = Keyword.get(opts, :missing_submodules, [])
 
     """
     You are triaging one reported problem for #{repo}, unattended, in a read-only checkout.
+    Your working directory is a CLEAN checkout of the commit the operator has out: none of his
+    untracked or ignored files are in it — no local config, no build output, no uncommitted edits
+    — so judge the committed code, and do not read the absence of such a file as a defect.#{submodule_note(missing_submodules)}
 
     Decide ONE of these, and say which:
     #{outcomes()}

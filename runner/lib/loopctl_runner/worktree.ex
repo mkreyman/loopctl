@@ -14,13 +14,28 @@ defmodule LoopctlRunner.Worktree do
   deleting it; `create/4` resets it to a fresh start inside the tree that is already there, so a
   re-dispatch never starts from work that shipped and never rebuilds what the tree ignores. Work a
   session committed and did not ship is kept and reported, never discarded, and so is a worktree
-  holding a repository whose work its removal would lose. The fetch is the one network call here;
-  when it fails, commits only it could vouch for are kept and the failure is named.
+  holding a repository whose work its removal would lose.
+
+  The network is reached in two places, both bounded and neither fatal. The fetch of `origin`'s base
+  is one; when it fails, commits only it could vouch for are kept and the failure is named. The
+  other is a triage tree's submodules: they are cloned from the checkout's own clones of them, but a
+  submodule the checkout has never cloned is fetched from its URL (`sync_submodules/2`).
   """
+
+  require Logger
 
   alias LoopctlRunner.ProcessGroup
 
   @worktrees_subdir ".claude/worktrees"
+  # A dot-directory, so no `<runs_dir>/*` glob over run directories (the reaper's, `RunState.all/1`)
+  # ever walks into a tree. It is still a sibling of the run directories and their verdict tokens:
+  # Claude Code's file tools are bounded by the session's path RULES (`Read(./**)`, which a `../`
+  # path leaves), not by where a directory sits, and a stronger boundary than that is an OS one this
+  # runner does not have (CLAUDE.md, "The Bash allow-list is not a sandbox").
+  @triage_trees_subdir ".triage-trees"
+  # Written into a triage tree's private git directory when the runner cuts it; `refresh_detached/2`
+  # resets nothing that does not carry it.
+  @marker "loopctl-runner-triage"
   @fetch_timeout_ms 30_000
   # A fetch error is shipped in a trace event, whose data loopctl caps.
   @fetch_error_chars 300
@@ -35,6 +50,13 @@ defmodule LoopctlRunner.Worktree do
   # Directories that scan does not descend: build output and fetched dependencies, which the next
   # build or `deps.get` recreates, and which (node_modules) are large enough to take it past its bound.
   @unscanned ~w(deps _build node_modules .elixir_ls .lexical)
+  # The operator's ssh agent and forge token, as the runner has them. `ProcessGroup.run/5` scrubs
+  # the list a SESSION must not inherit, and that list names all four; `fetch_base/2` is the
+  # runner's own fetch, which authenticates as the operator does, so it INHERITS them — the
+  # runner's own values, never ones a caller chose, and an unset one stays unset. With BatchMode on,
+  # a passphrase-protected key reachable only through the agent would otherwise fail every ssh
+  # fetch, and `gh`'s credential helper reads GH_TOKEN or GITHUB_TOKEN for an https one.
+  @operator_auth_env ~w(SSH_AUTH_SOCK SSH_AGENT_PID GH_TOKEN GITHUB_TOKEN)
 
   # Variables that make git operate on a DIFFERENT repository, index or tree than the
   # directory it runs in. Git exports some of them to hooks, so a runner started from a
@@ -79,6 +101,382 @@ defmodule LoopctlRunner.Worktree do
   @spec path_for(String.t(), String.t()) :: String.t()
   def path_for(repo_path, story_id),
     do: Path.join([repo_path, @worktrees_subdir, "loop-" <> story_id])
+
+  @doc """
+  Where a repo's REUSED triage tree goes: one per repository, refreshed for each run that holds its
+  `WorktreeLock`, so the session's cwd — and so its Claude project directory — is stable.
+
+  Under the runner's own `runs_dir`, never in the operator's checkout: it is still a worktree of his
+  repository, since `git worktree add` takes any path, but his checkout gains nothing and no
+  worktree of his can share its name. Keyed by a digest of the checkout's path, so two repos never
+  share one.
+  """
+  @spec triage_tree_path(String.t(), String.t()) :: String.t()
+  def triage_tree_path(runs_dir, repo_path),
+    do: Path.join([runs_dir, @triage_trees_subdir, repo_key(repo_path)])
+
+  @doc """
+  Where a triage run's OWN detached worktree goes, cut when another live run holds the reused one:
+  one per run, removed at its teardown, never adopted.
+  """
+  @spec triage_tree_path(String.t(), String.t(), String.t()) :: String.t()
+  def triage_tree_path(runs_dir, repo_path, run_id),
+    do: Path.join([runs_dir, @triage_trees_subdir, repo_key(repo_path) <> "-" <> run_id])
+
+  defp repo_key(repo_path) do
+    :crypto.hash(:sha256, Path.expand(repo_path))
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 16)
+  end
+
+  @doc """
+  Cuts a DETACHED worktree at the commit `repo_path` has checked out, and returns that commit.
+  No branch, so nothing a session commits there lands anywhere; `remove/4` with an empty branch
+  removes it. Submodules are not touched here: `sync_submodules/3` does that, once the caller has
+  recorded that the tree exists.
+
+  `{:unreadable, _}` when the checkout cannot be judged — git will not read it as a repository, or
+  it has no commit checked out — with git's own words; `{:error, _}` when it has one and the tree
+  could not be cut, which is a local failure and says nothing about the checkout.
+  """
+  @spec create_detached(String.t(), String.t()) ::
+          {:ok, String.t()} | {:unreadable, String.t()} | {:error, String.t()}
+  def create_detached(repo_path, path) do
+    with {:ok, sha} <- head_commit(repo_path), do: add_detached(repo_path, path, sha)
+  end
+
+  # Ends with the tree MARKED, or with no tree, or — when the tree that could not be marked could
+  # not be removed either — `{:error, _, :tree_left}`, so the caller records a tree that exists
+  # rather than one that was never cut.
+  #
+  # `--force` once, for one thing: a registration of THIS path whose directory is gone (a tree set
+  # aside, or deleted by hand), which `add` otherwise refuses. It drops that one entry. Never a
+  # repository-wide `worktree prune`, which drops the entry of every worktree of the operator's
+  # whose directory is missing at that moment — one on an unmounted volume included.
+  defp add_detached(repo_path, path, sha) do
+    case tree_git(repo_path, ["worktree", "add", "--force", "--detach", path, sha]) do
+      {:ok, _} -> mark(repo_path, path, sha)
+      {:error, out} -> {:error, "cannot cut a detached worktree from #{repo_path}: #{out}"}
+    end
+  end
+
+  # The marker lives in the tree's PRIVATE git directory (`<common>/worktrees/<name>`), which only
+  # `git worktree add` makes and which `worktree remove` and `prune` delete with the tree, so it
+  # cannot outlive the tree it vouches for.
+  defp mark(repo_path, path, sha) do
+    with {:ok, gitdir} <- git(path, ["rev-parse", "--absolute-git-dir"]),
+         :ok <- File.write(Path.join(gitdir, @marker), "loopctl-runner triage tree\n") do
+      {:ok, sha}
+    else
+      failure ->
+        why = "cannot mark #{path} as the runner's triage tree: #{inspect(failure)}"
+
+        case git(repo_path, ["worktree", "remove", "--force", "--force", path]) do
+          {:ok, _} -> {:error, why}
+          {:error, out} -> {:error, "#{why}; and it could not be removed: #{out}", :tree_left}
+        end
+    end
+  end
+
+  @doc """
+  Brings the reused triage tree at `path` to the commit `repo_path` has out, as a clean checkout:
+  tracked changes discarded, untracked AND ignored files removed. Cut fresh when nothing is there.
+
+  Every destructive command runs only after `own_worktree?/2` has seen that `path` is the runner's
+  own triage tree of `repo_path`: a linked worktree in its own right, detached, carrying the
+  runner's marker. Without the first, a directory whose `.git` file is gone would have git walk UP
+  to whatever repository encloses it, and `checkout --force` plus `clean -ffdx` would wipe it.
+
+  Anything else at `path` is never reset, never removed — a worktree of this repository without
+  the marker may hold someone's uncommitted edits — and never a permanent refusal either, since
+  every later run on this repo would find it too: it is moved aside under `.triage-trees/set-aside`,
+  logged, and the tree is cut again. The runner's own tree, when it will not reset, is removed (it
+  is scratch), and moved aside only when git will not remove it.
+  """
+  @spec refresh_detached(String.t(), String.t()) ::
+          {:ok, String.t()}
+          | {:unreadable, String.t()}
+          | {:error, String.t()}
+          | {:error, String.t(), :tree_left}
+  def refresh_detached(repo_path, path) do
+    with {:ok, sha} <- head_commit(repo_path) do
+      cond do
+        not present?(path) ->
+          add_detached(repo_path, path, sha)
+
+        own_worktree?(repo_path, path) ->
+          reset_or_recut(repo_path, path, sha)
+
+        true ->
+          recut_detached(
+            repo_path,
+            path,
+            sha,
+            :foreign,
+            "is not recognisably the runner's triage tree"
+          )
+      end
+    end
+  end
+
+  defp reset_or_recut(repo_path, path, sha) do
+    case reset_detached(path, sha) do
+      :ok ->
+        {:ok, sha}
+
+      {:error, out} ->
+        recut_detached(repo_path, path, sha, :own, "would not reset to #{sha}: #{out}")
+    end
+  end
+
+  # lstat, not exists?: a dangling symlink is something in the way too.
+  defp present?(path), do: match?({:ok, _}, File.lstat(path))
+
+  defp reset_detached(path, sha) do
+    with {:ok, _} <- tree_git(path, ["checkout", "--quiet", "--force", "--detach", sha]),
+         {:ok, _} <- tree_git(path, ["clean", "-ffdxq"]) do
+      :ok
+    end
+  end
+
+  # Four conditions, all needed: `.git` a FILE in `path` itself, so git's discovery stops there
+  # rather than walking up; that file's repository the same one `repo_path` belongs to; HEAD
+  # detached, as only the runner leaves it; and the runner's marker in its private git directory.
+  defp own_worktree?(repo_path, path) do
+    File.regular?(Path.join(path, ".git")) and
+      same_repository?(path, repo_path) and
+      git(path, ["rev-parse", "--abbrev-ref", "HEAD"]) == {:ok, "HEAD"} and
+      marked?(path)
+  end
+
+  defp same_repository?(path, repo_path) do
+    case common_dir(path) do
+      nil -> false
+      common -> common == common_dir(repo_path)
+    end
+  end
+
+  defp marked?(path) do
+    case git(path, ["rev-parse", "--absolute-git-dir"]) do
+      {:ok, gitdir} -> File.regular?(Path.join(gitdir, @marker))
+      {:error, _} -> false
+    end
+  end
+
+  defp recut_detached(repo_path, path, sha, owner, why) do
+    with :ok <- clear(repo_path, path, owner, why), do: add_detached(repo_path, path, sha)
+  end
+
+  # The runner's own tree is scratch, so it is removed: `--force` twice, once for a tree with
+  # changes or submodules, once for a locked one.
+  defp clear(repo_path, path, :own, why) do
+    case git(repo_path, ["worktree", "remove", "--force", "--force", path]) do
+      {:ok, _} ->
+        Logger.warning("the triage tree #{path} #{why}; removed it and cut it again")
+        :ok
+
+      {:error, out} ->
+        set_aside(path, why, "git would not remove it (#{out})")
+    end
+  end
+
+  # Anything else is not the runner's to discard, whatever repository it belongs to.
+  defp clear(_repo_path, path, :foreign, why),
+    do: set_aside(path, why, "it is not the runner's to remove")
+
+  defp set_aside(path, why, because) do
+    aside =
+      Path.join([
+        Path.dirname(path),
+        "set-aside",
+        "#{Path.basename(path)}-#{System.os_time(:second)}-#{System.unique_integer([:positive])}"
+      ])
+
+    with :ok <- File.mkdir_p(Path.dirname(aside)),
+         :ok <- File.rename(path, aside) do
+      relink(aside)
+
+      Logger.warning(
+        "the triage tree #{path} #{why}, and #{because}; moved it to #{aside} and cut it again"
+      )
+
+      :ok
+    else
+      {:error, reason} ->
+        {:error, "#{path} #{why}, and it could not be moved aside: #{:file.format_error(reason)}"}
+    end
+  end
+
+  # A worktree moved aside is re-registered at its new place by its own repository, whichever that
+  # is, so its edits stay usable there and its old registration stops naming `path`. Only where its
+  # `.git` is a file: git run in a directory without one walks UP to whatever repository encloses
+  # it, and `worktree repair` there would act on that one.
+  defp relink(aside) do
+    if File.regular?(Path.join(aside, ".git")), do: git(aside, ["worktree", "repair"])
+  end
+
+  # Two different failures, told apart because they send whoever reads them to different places: a
+  # directory git will not read AS a repository (not one, or refused — dubious ownership), and a
+  # repository with nothing checked out. Both carry git's own words.
+  defp head_commit(repo_path) do
+    case git(repo_path, ["rev-parse", "--git-dir"]) do
+      {:error, out} ->
+        {:unreadable, "git will not read #{repo_path} as a repository: #{out}"}
+
+      {:ok, _} ->
+        case git(repo_path, ["rev-parse", "--verify", "HEAD^{commit}"]) do
+          {:ok, sha} -> {:ok, sha}
+          {:error, out} -> {:unreadable, "#{repo_path} has no commit checked out: #{out}"}
+        end
+    end
+  end
+
+  # One budget for the whole submodule step, not one per command, and every command bounded by
+  # what is left of it (`ProcessGroup.run_group/4` kills the command's whole process group on
+  # expiry), with prompts off: a submodule URL may need credentials no one is there to type, and a
+  # hung clone must not become a hung dispatch.
+  @submodule_timeout_ms 120_000
+
+  # Run by `git submodule foreach` inside every submodule, recursively: the superproject's own
+  # `clean -ffdx` stops at a submodule's boundary.
+  @submodule_clean "git reset --quiet --hard && git clean -ffdxq"
+
+  @doc false
+  def submodule_timeout_ms, do: @submodule_timeout_ms
+
+  @doc """
+  Brings the submodules of the tree at `path` to the commits it records, as clean checkouts:
+  initialised, checked out with `--force`, then reset and cleaned inside each one, recursively —
+  the superproject's `clean -ffdx` never enters a submodule.
+
+  Each submodule the operator's checkout of `repo_path` has already cloned is cloned from THAT
+  clone rather than from its URL: this runner's git runs with the operator's credentials scrubbed
+  (`ProcessGroup.run/5`), so a private submodule's remote is out of its reach, and the checkout's
+  clone is also the one place that holds the commit it records without a fetch. A local clone is
+  copied, not borrowed, so a tree that outlives an operator's `gc` loses nothing. Only a submodule
+  the checkout has never cloned is fetched from its URL, and a nested submodule is always.
+
+  A tree with no `.gitmodules` pays for nothing. A failure is LOGGED and the tree still used — a
+  session judges the superproject without them, which is less than it could have, not a reason to
+  judge nothing — and returned as `{:missing, paths, detail}`, every submodule path the tree
+  declares, so the session can be told which directories may be empty or at the wrong commit.
+  """
+  @spec sync_submodules(String.t(), String.t()) :: :ok | {:missing, [String.t()], String.t()}
+  def sync_submodules(repo_path, path) do
+    if File.exists?(Path.join(path, ".gitmodules")) do
+      deadline = System.monotonic_time(:millisecond) + @submodule_timeout_ms
+      declared = declared_submodules(path)
+
+      update =
+        local_clones(repo_path, declared) ++ ~w(submodule update --init --recursive --force)
+
+      with :ok <- submodule_git(path, update, deadline),
+           :ok <-
+             submodule_git(
+               path,
+               ["submodule", "foreach", "--quiet", "--recursive", @submodule_clean],
+               deadline
+             ) do
+        :ok
+      else
+        {:error, detail} ->
+          Logger.error("submodules of #{path} were not initialised: #{detail}")
+          {:missing, Enum.map(declared, &elem(&1, 1)), detail}
+      end
+    else
+      :ok
+    end
+  end
+
+  # `-c` settings pointing each submodule the checkout has cloned at that clone, found where git
+  # keeps them for THAT checkout (`--git-path modules`: `<common>/modules` for a main checkout,
+  # `<common>/worktrees/<id>/modules` for a linked one). Given on the command line, so the operator's
+  # config is never written, and inherited by the helper processes git starts.
+  #
+  # `protocol.file.allow=always` because git refuses a submodule clone over a local path by default
+  # (CVE-2022-39253, a hostile repository naming a victim's local files as its submodule). These
+  # URLs are the operator's own clones, on his own disk.
+  defp local_clones(repo_path, declared) do
+    with {:ok, modules} <-
+           git(repo_path, ["rev-parse", "--path-format=absolute", "--git-path", "modules"]),
+         [_ | _] = urls <-
+           for(
+             {name, _} <- declared,
+             # `-c` splits at the first `=`, so a name holding one cannot be addressed this way.
+             not String.contains?(name, "="),
+             clone = Path.join(modules, name),
+             File.dir?(clone),
+             do: ["-c", "submodule.#{name}.url=#{clone}"]
+           ) do
+      ["-c", "protocol.file.allow=always" | Enum.concat(urls)]
+    else
+      _ -> []
+    end
+  end
+
+  # `{name, path}` for every submodule `.gitmodules` declares, NUL-separated so a name or path
+  # holding a space or a newline is read whole.
+  defp declared_submodules(path) do
+    file = Path.join(path, ".gitmodules")
+
+    case git(path, ["config", "--file", file, "-z", "--get-regexp", ~S"^submodule\..*\.path$"]) do
+      {:ok, out} ->
+        for record <- String.split(out, <<0>>, trim: true),
+            [key, sub_path] <- [String.split(record, "\n", parts: 2)],
+            do: {submodule_name(key), sub_path}
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  defp submodule_name(key),
+    do: key |> String.replace_prefix("submodule.", "") |> String.replace_suffix(".path", "")
+
+  defp submodule_git(path, args, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, "the time allowed ran out"}
+    else
+      case hookless_git(path, args, remaining) do
+        {:ok, _} -> :ok
+        {:error, detail} -> {:error, detail}
+      end
+    end
+  end
+
+  # How long one command that checks a triage tree's files out, or deletes them, may take.
+  @tree_git_timeout_ms 300_000
+
+  # The commands that write a triage tree's files: `worktree add`, `checkout`, `clean`.
+  defp tree_git(dir, args), do: hookless_git(dir, args, @tree_git_timeout_ms)
+
+  # With the operator's hooks OFF: `worktree add` and `checkout` run his post-checkout hook, which is
+  # his to run in his checkout, not the runner's to run unattended in a scratch tree. And bounded
+  # (`ProcessGroup.run_group/4` kills the command's whole process group on expiry), with prompts
+  # off: a filter or a remote waiting on a terminal no one is at must not become a hung dispatch.
+  defp hookless_git(dir, args, timeout_ms) do
+    env = [{"GIT_TERMINAL_PROMPT", "0"} | Enum.map(@repo_locating_env, &{&1, nil})]
+    argv = ["-C", dir, "-c", "core.hooksPath=/dev/null" | args]
+    command = subcommand(args)
+
+    case ProcessGroup.run_group(git_executable(), argv, timeout_ms, env) do
+      {:ok, out, 0} -> {:ok, String.trim(out)}
+      {:ok, out, status} -> {:error, "git #{command} exited #{status}: #{String.trim(out)}"}
+      {:error, :timeout} -> {:error, "git #{command} did not finish within the time allowed"}
+    end
+  end
+
+  # The words naming the command, past any `-c name=value` pairs in front of it.
+  defp subcommand(["-c", _ | rest]), do: subcommand(rest)
+
+  defp subcommand([command, sub | _]) when command in ~w(submodule worktree),
+    do: "#{command} #{sub}"
+
+  defp subcommand([command | _]), do: command
+
+  defp git_executable, do: System.find_executable("git") || "git"
 
   @doc """
   Creates the worktree, or adopts one already on disk for the same branch.
@@ -418,7 +816,7 @@ defmodule LoopctlRunner.Worktree do
   This is the RUNNER's own fetch, never a session's, so it must never prompt: stdin is /dev/null,
   git's terminal prompt is off, no askpass program runs, a credential helper is told not to
   interact, and ssh runs in BatchMode.
-  `ProcessGroup.run/4` supplies the rest — no controlling terminal, and the whole group killed on
+  `ProcessGroup.run/5` supplies the rest — no controlling terminal, and the whole group killed on
   timeout.
   """
   @spec fetch_base(String.t(), String.t()) :: :ok | {:error, String.t()}
@@ -453,11 +851,9 @@ defmodule LoopctlRunner.Worktree do
 
     remaining = max(deadline - System.monotonic_time(:millisecond), 1)
 
-    env =
-      [{"SSH_ASKPASS_REQUIRE", "never"}, {"GCM_INTERACTIVE", "never"} | batch_ssh(repo_path)] ++
-        operator_auth_env()
+    env = [{"SSH_ASKPASS_REQUIRE", "never"}, {"GCM_INTERACTIVE", "never"} | batch_ssh(repo_path)]
 
-    bounded(~s(exec "$@" </dev/null), args, remaining, env)
+    bounded(~s(exec "$@" </dev/null), args, remaining, env, inherit: @operator_auth_env)
   end
 
   defp retry_if_locked({:ok, out, status} = result, attempt) when status != 0 do
@@ -502,19 +898,6 @@ defmodule LoopctlRunner.Worktree do
     if command, do: [{"GIT_SSH_COMMAND", command <> " -o BatchMode=yes"}], else: []
   end
 
-  # The operator's ssh agent and forge token, as the runner has them. `ProcessGroup.run/4` scrubs
-  # the list a SESSION must not inherit, and that list names all four; this is the runner's own
-  # fetch, which authenticates as the operator does. With BatchMode on, a passphrase-protected key
-  # reachable only through the agent would otherwise fail every ssh fetch, and `gh`'s credential
-  # helper reads GH_TOKEN or GITHUB_TOKEN for an https one. A name supplied here wins over the
-  # scrub; an unset one stays unset.
-  defp operator_auth_env,
-    do:
-      Enum.map(
-        ~w(SSH_AUTH_SOCK SSH_AGENT_PID GH_TOKEN GITHUB_TOKEN),
-        &{&1, System.get_env(&1)}
-      )
-
   # The worktree removed, then the branch deleted, whatever commits it has: the caller has proven
   # none holds anything origin's base lacks.
   defp retire(repo_path, path, branch) do
@@ -523,8 +906,6 @@ defmodule LoopctlRunner.Worktree do
         %{worktree: kept, branch: kept}
 
       worktree ->
-        git(repo_path, ["worktree", "prune"])
-
         branch =
           if branch_exists?(repo_path, branch),
             do: delete_branch(repo_path, branch),
@@ -630,6 +1011,32 @@ defmodule LoopctlRunner.Worktree do
   def status_after(%{worktree: {:kept, _}}), do: "kept"
   def status_after(_), do: "remove_failed"
 
+  @doc """
+  Removes a triage tree and, when it holds no commits of its own, its branch — a detached triage
+  tree has none, and passes `""`.
+
+  A triage tree is the runner's scratch, so it is removed as it is, with no scan for repositories
+  nested in it: its submodules are clones of the operator's own, and nothing a triage session
+  leaves in it is work. A story's worktree is removed by `remove_if_clean/4` instead.
+
+  Returns what happened to each, for the trace.
+  """
+  @spec remove(String.t(), String.t(), String.t(), String.t()) :: removal()
+  def remove(repo_path, path, branch, base) do
+    worktree =
+      if File.dir?(path), do: force_remove(repo_path, path), else: drop_entry(repo_path, path)
+
+    %{worktree: worktree, branch: remove_branch(repo_path, branch, base)}
+  end
+
+  defp remove_branch(repo_path, branch, base) do
+    cond do
+      not branch_exists?(repo_path, branch) -> :absent
+      commits_ahead(repo_path, branch, base) == :none -> delete_branch(repo_path, branch)
+      true -> {:kept, "commits beyond #{base}"}
+    end
+  end
+
   # `--force` removes everything under the tree, and a session following the delivery loop cuts
   # worktrees of its own INSIDE it (`.claude/worktrees/<name>`, ignored, so the tree reads clean),
   # or clones a repository there. Work only they hold would go with it (`holds_work?/3`): such a
@@ -638,17 +1045,29 @@ defmodule LoopctlRunner.Worktree do
   defp remove_worktree(repo_path, path) do
     cond do
       not File.dir?(path) ->
-        :absent
+        drop_entry(repo_path, path)
 
       nested = nested_repositories(path) ->
         {:kept, "holds repositories of its own: " <> Enum.join(nested, ", ")}
 
       true ->
-        case git(repo_path, ["worktree", "remove", "--force", path]) do
-          {:ok, _} -> :removed
-          {:error, out} -> {:error, out}
-        end
+        force_remove(repo_path, path)
     end
+  end
+
+  defp force_remove(repo_path, path) do
+    case git(repo_path, ["worktree", "remove", "--force", path]) do
+      {:ok, _} -> :removed
+      {:error, out} -> {:error, out}
+    end
+  end
+
+  # Its directory gone, the tree may still be registered: that one entry is dropped, and git's
+  # refusal of a path it has no entry for is the same absence. Never a repository-wide
+  # `worktree prune`, which would drop every missing worktree of the operator's with it.
+  defp drop_entry(repo_path, path) do
+    git(repo_path, ["worktree", "remove", "--force", path])
+    :absent
   end
 
   # Nil when nothing under `path` is a repository holding work, else those directories, relative to
@@ -753,10 +1172,10 @@ defmodule LoopctlRunner.Worktree do
   defp clear_repo_env, do: Enum.map(@repo_locating_env, &{&1, nil})
 
   # `sh -c script` under a hard timeout, finding its repository by cwd, with git's terminal prompt
-  # off. `ProcessGroup.run/4` unsets GIT_ASKPASS and SSH_ASKPASS with the other credential names.
-  defp bounded(script, args, timeout_ms, env \\ []) do
+  # off. `ProcessGroup.run/5` unsets GIT_ASKPASS and SSH_ASKPASS with the other credential names.
+  defp bounded(script, args, timeout_ms, env \\ [], opts \\ []) do
     env = clear_repo_env() ++ [{"GIT_TERMINAL_PROMPT", "0"} | env]
-    ProcessGroup.run("/bin/sh", ["-c", script, "sh" | args], timeout_ms, env)
+    ProcessGroup.run("/bin/sh", ["-c", script, "sh" | args], timeout_ms, env, opts)
   end
 
   # Git's stdout alone, untrimmed, under the same bound as the squash search.

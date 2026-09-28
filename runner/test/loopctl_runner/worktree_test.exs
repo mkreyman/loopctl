@@ -132,6 +132,27 @@ defmodule LoopctlRunner.WorktreeTest do
                Worktree.remove_if_clean(repo, path, "loop/s1", "master")
     end
 
+    test "a tree whose directory is gone loses its one registration, and nothing else's", %{
+      repo: repo,
+      path: path
+    } do
+      # Its registration left behind, git refuses to delete the branch it still names. Dropping it
+      # with a repository-wide `worktree prune` also drops every other worktree of the operator's
+      # whose directory is missing at that moment — one on an unmounted volume included.
+      {:ok, _} = Worktree.create(repo, path, "loop/s1", "master")
+      other = Path.join([repo, ".claude/worktrees", "operators-own"])
+      git!(repo, ["worktree", "add", "-q", "-b", "operators-own", other, "master"])
+      File.rm_rf!(path)
+      File.rm_rf!(other)
+
+      assert %{worktree: :absent, branch: :deleted} =
+               Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+
+      listed = git!(repo, ["worktree", "list", "--porcelain"])
+      refute listed =~ "loop-s1"
+      assert listed =~ "operators-own"
+    end
+
     test "keeps one with commits on a detached HEAD that are not on the branch", %{
       repo: repo,
       path: path
@@ -753,5 +774,199 @@ defmodule LoopctlRunner.WorktreeTest do
   test "teardown of nothing reports absence", %{repo: repo, path: path} do
     assert %{worktree: :absent, branch: :absent} =
              Worktree.remove_if_clean(repo, path, "loop/s1", "master")
+  end
+
+  describe "the triage trees" do
+    setup %{repo: repo} do
+      {:ok, runs: Path.join(Path.dirname(repo), "runs")}
+    end
+
+    test "live under the runner's runs_dir, one per repo, never in the operator's checkout", %{
+      repo: repo,
+      runs: runs
+    } do
+      other = git_repo!(Path.join(Path.dirname(repo), "other"))
+      shared = Worktree.triage_tree_path(runs, repo)
+      own = Worktree.triage_tree_path(runs, repo, "run-1")
+
+      assert Path.dirname(shared) == Path.join(runs, ".triage-trees")
+      assert Path.dirname(own) == Path.join(runs, ".triage-trees")
+      assert own == shared <> "-run-1"
+      refute Worktree.triage_tree_path(runs, other) == shared
+
+      {:ok, sha} = Worktree.create_detached(repo, shared)
+      assert git!(shared, ["rev-parse", "HEAD"]) == sha
+      # Still a worktree of HIS repository, and his checkout gains nothing for it.
+      assert git!(repo, ["worktree", "list", "--porcelain"]) =~ Path.basename(shared)
+      refute File.exists?(Path.join(repo, ".claude"))
+    end
+
+    test "is never reset where git would find an ENCLOSING repository; it is cut again", %{
+      repo: repo
+    } do
+      # A tree whose `.git` file is gone is a plain directory, so git run there walks UP — here to
+      # the operator's checkout, as it would to any repository the runs_dir sits inside — and
+      # `checkout --force` plus `clean -ffdx` would discard his edits and his untracked files.
+      runs = Path.join(repo, "runs")
+      tree = Worktree.triage_tree_path(runs, repo)
+      {:ok, _} = Worktree.create_detached(repo, tree)
+      File.rm!(Path.join(tree, ".git"))
+      File.write!(Path.join(repo, "README.md"), "his edit\n")
+      File.write!(Path.join(repo, "his-notes.txt"), "untracked")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, _} = Worktree.refresh_detached(repo, tree)
+        end)
+
+      assert log =~ "is not recognisably the runner's triage tree"
+      assert File.read!(Path.join(repo, "README.md")) == "his edit\n"
+      assert File.read!(Path.join(repo, "his-notes.txt")) == "untracked"
+      assert File.regular?(Path.join(tree, ".git"))
+    end
+
+    test "a plain directory in the way is moved aside, never a refusal every later run repeats",
+         %{
+           repo: repo,
+           runs: runs
+         } do
+      tree = Worktree.triage_tree_path(runs, repo)
+      File.mkdir_p!(tree)
+      File.write!(Path.join(tree, "whose.txt"), "not the runner's")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, sha} = Worktree.refresh_detached(repo, tree)
+          assert git!(tree, ["rev-parse", "HEAD"]) == sha
+        end)
+
+      assert log =~ "moved it to"
+      refute File.exists?(Path.join(tree, "whose.txt"))
+
+      assert [aside] = Path.wildcard(Path.join([runs, ".triage-trees", "set-aside", "*"]))
+      assert File.read!(Path.join(aside, "whose.txt")) == "not the runner's"
+    end
+
+    test "a worktree of a DIFFERENT repository at the path is moved aside, never reset", %{
+      repo: repo,
+      runs: runs
+    } do
+      # Its own `.git` file stops git's discovery, but at someone else's repository: resetting it
+      # would be the runner acting on a repo it was never pointed at.
+      other = git_repo!(Path.join(Path.dirname(repo), "other"))
+      tree = Worktree.triage_tree_path(runs, repo)
+      {:ok, _} = Worktree.create_detached(other, tree)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, _} = Worktree.refresh_detached(repo, tree)
+      end)
+
+      assert git!(tree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]) ==
+               git!(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    end
+
+    test "only a DETACHED tree carrying the runner's marker is reset; any other is cut again", %{
+      repo: repo,
+      runs: runs
+    } do
+      # The runner's own tree, put on a branch: detached is how the runner leaves it, so anything
+      # else is someone's use of that path and is not reset in place.
+      tree = Worktree.triage_tree_path(runs, repo)
+      {:ok, _} = Worktree.create_detached(repo, tree)
+      git!(tree, ["checkout", "-q", "-b", "someone"])
+
+      on_branch =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, _} = Worktree.refresh_detached(repo, tree)
+        end)
+
+      assert on_branch =~ "is not recognisably the runner's triage tree"
+      assert git!(tree, ["rev-parse", "--abbrev-ref", "HEAD"]) == "HEAD"
+
+      # A detached worktree of this repo the runner did not cut: no marker, so not the runner's.
+      git!(repo, ["worktree", "remove", "--force", tree])
+      git!(repo, ["worktree", "add", "-q", "--detach", tree])
+
+      unmarked =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, _} = Worktree.refresh_detached(repo, tree)
+        end)
+
+      assert unmarked =~ "is not recognisably the runner's triage tree"
+
+      # And the runner's own, detached and marked, is reset in place, with nothing said.
+      File.write!(Path.join(tree, "left.txt"), "by a session")
+
+      reset =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, _} = Worktree.refresh_detached(repo, tree)
+        end)
+
+      assert reset == ""
+      refute File.exists?(Path.join(tree, "left.txt"))
+    end
+
+    test "a cut drops no registration but its own path's: the operator's missing worktree survives",
+         %{repo: repo, runs: runs} do
+      # A worktree of his whose directory is not there right now — on a volume that is not mounted —
+      # keeps its registration and whatever git holds for it. A repository-wide `worktree prune`
+      # before a cut deleted it.
+      away = Path.join(Path.dirname(repo), "on-a-usb-disk")
+      git!(repo, ["worktree", "add", "-q", "--detach", away])
+      admin = git!(away, ["rev-parse", "--absolute-git-dir"])
+      File.rm_rf!(away)
+
+      tree = Worktree.triage_tree_path(runs, repo)
+      {:ok, _} = Worktree.create_detached(repo, tree)
+
+      # And a tree of the runner's whose directory went missing is still cut again at its path.
+      File.rm_rf!(tree)
+      assert {:ok, _} = Worktree.refresh_detached(repo, tree)
+      assert %{worktree: :removed} = Worktree.remove(repo, tree, "", "HEAD")
+      assert %{worktree: :absent} = Worktree.remove(repo, tree, "", "HEAD")
+
+      assert File.dir?(admin)
+      assert git!(repo, ["worktree", "list", "--porcelain"]) =~ "on-a-usb-disk"
+    end
+
+    test "a worktree of this repo without the marker is moved aside with its edits, never removed",
+         %{repo: repo, runs: runs} do
+      # Not the runner's, so what is in it may be someone's uncommitted work. Moved, it is still a
+      # working worktree at its new place.
+      tree = Worktree.triage_tree_path(runs, repo)
+      git!(repo, ["worktree", "add", "-q", "--detach", tree])
+      File.write!(Path.join(tree, "README.md"), "someone's edit\n")
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, _} = Worktree.refresh_detached(repo, tree)
+      end)
+
+      assert [aside] = Path.wildcard(Path.join([runs, ".triage-trees", "set-aside", "*"]))
+      assert File.read!(Path.join(aside, "README.md")) == "someone's edit\n"
+      assert git!(aside, ["status", "--porcelain"]) == "M README.md"
+      # Registered where it now is, and the runner's tree at the path is a different worktree.
+      refute git!(aside, ["rev-parse", "--absolute-git-dir"]) ==
+               git!(tree, ["rev-parse", "--absolute-git-dir"])
+    end
+
+    test "the operator's checkout hooks never run in a triage tree", %{repo: repo, runs: runs} do
+      # `worktree add` and `checkout` run post-checkout. His hooks are his to run in his checkout;
+      # in a scratch tree, unattended, they are unbounded code nobody asked for.
+      hooks = Path.join(Path.dirname(repo), "hooks")
+      ran = Path.join(Path.dirname(repo), "hook-ran")
+      File.mkdir_p!(hooks)
+      File.write!(Path.join(hooks, "post-checkout"), "#!/bin/sh\ntouch #{ran}\n")
+      File.chmod!(Path.join(hooks, "post-checkout"), 0o755)
+      git!(repo, ["config", "core.hooksPath", hooks])
+
+      tree = Worktree.triage_tree_path(runs, repo)
+      {:ok, _} = Worktree.refresh_detached(repo, tree)
+      {:ok, _} = Worktree.refresh_detached(repo, tree)
+
+      refute File.exists?(ran)
+      # The hook itself works: it is the runner's git that does not run it.
+      git!(repo, ["checkout", "-q", "--detach"])
+      assert File.exists?(ran)
+    end
   end
 end

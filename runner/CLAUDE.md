@@ -101,6 +101,17 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   this user. The allow-list stops the session's own commands; isolation beyond that needs an OS
   boundary the runner does not have yet.
 - **Parking is never "no writes under `subagents/`"** (design §8). See `LoopctlRunner.Liveness`.
+- **A triage run works in a DETACHED worktree, never in the operator's live checkout.** It is the
+  repo's one reused tree (`Worktree.triage_tree_path/2`, under `runs_dir/.triage-trees`, so his
+  checkout gains nothing), refreshed to the commit the checkout has out by the run holding its
+  `WorktreeLock`; a run that finds it held cuts a tree of its own, removed at teardown whatever it
+  holds. Either is on no branch, recorded in `state.json` as `scratch` before it is cut, and
+  removed by the reaper whatever it holds. Only a tree that is detached AND carries the runner's
+  marker is ever reset; anything else at that path is moved aside, never removed, and the tree
+  cut again, never a refusal every later run repeats. No repository-wide `git worktree prune`:
+  it drops every missing worktree of the operator's, one on an unmounted volume included. A
+  checkout git will not read is `checkout_unreadable`; a tree the runner could not cut is its own
+  `no_verdict_written`.
 - **Fail closed.** A missing or malformed config refuses every dispatch.
 - **The runner commits, pushes and merges nothing** in step 1. Teardown keeps a branch unless
   `origin`'s base already carries its content, rather than deleting work.

@@ -94,7 +94,11 @@ defmodule LoopctlRunner.Run do
   end
 
   defp run(config, story, opts) do
-    reaped = Reaper.reap(config.runs_dir, config.kill_grace_s * 1000)
+    reaped =
+      Reaper.reap(config.runs_dir, config.kill_grace_s * 1000,
+        projects_dir: config.claude_projects_dir
+      )
+
     # The contract identifies a run by UUID; the directory keeps a name a person can find.
     run_id = Session.uuid4()
     run_dir = Path.join(config.runs_dir, run_dir_name(story, run_id))

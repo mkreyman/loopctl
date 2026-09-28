@@ -50,4 +50,24 @@ defmodule LoopctlRunner.ProbeEnvTest do
       refute name in names, "#{name} reached the liveness probe"
     end
   end
+
+  test "extra_env adds to the scrub and sets names, and can never take a name out of it" do
+    # The runner's own submodule git passes GIT_TERMINAL_PROMPT and unsets the repo-locating names
+    # here. A caller able to hand a scrubbed credential back to the Port would make the scrub a
+    # default rather than a rule. Values printed are this test's own, never the environment's.
+    saved = System.get_env("GH_TOKEN")
+    System.put_env("GH_TOKEN", "not-a-real-value")
+
+    try do
+      script = ~s(printf '%s|%s' "${LOOP_PROBE_SET-unset}" "${GH_TOKEN+present}")
+
+      assert {:ok, "1|", 0} =
+               ProcessGroup.run("/bin/sh", ["-c", script], 10_000, [
+                 {"LOOP_PROBE_SET", "1"},
+                 {"GH_TOKEN", "handed-back"}
+               ])
+    after
+      if saved, do: System.put_env("GH_TOKEN", saved), else: System.delete_env("GH_TOKEN")
+    end
+  end
 end

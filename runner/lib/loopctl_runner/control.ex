@@ -1402,7 +1402,7 @@ defmodule LoopctlRunner.Control do
     end
   end
 
-  # A triage run reads the checkout where it is, so it needs no branch and no worktree: the repo
+  # A triage run cuts its own detached worktree (`TriageRun`), so it needs no branch here: the repo
   # the policy allowed, the report, and the budgets the policy already held to this runner's
   # ceilings. `dispatch["repo"]` is the owner/name form `TriageRun` resolves against `repos`.
   defp work(%{"kind" => "triage"} = dispatch, fields, _config) do

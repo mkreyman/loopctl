@@ -182,6 +182,114 @@ defmodule LoopctlRunner.ReaperTest do
     end
   end
 
+  test "an orphaned SCRATCH worktree is removed whatever it holds, under the lock", ctx do
+    # Scratch, as TriageRun's own teardown treats it — decided by the entry, not by the run's
+    # kind, which this state deliberately does not carry. Kept for what it holds, it stays for
+    # ever: the run is left `reaped`, and orphan?/1 never looks at a reaped run again.
+    tree = Worktree.triage_tree_path(ctx.runs, ctx.repo)
+    {:ok, sha} = Worktree.create_detached(ctx.repo, tree)
+    File.write!(Path.join(tree, "notes.txt"), "uncommitted")
+    run_dir = Path.join(ctx.runs, "triage-orphan")
+    File.mkdir_p!(run_dir)
+
+    RunState.update(run_dir, %{
+      run_id: "triage-orphan",
+      status: "running",
+      beam_os_pid: dead_pid(),
+      repo_path: ctx.repo,
+      worktree: %{path: tree, branch: "", base: sha, status: "created", scratch: true}
+    })
+
+    assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+    assert worktree =~ ":removed"
+    refute File.dir?(tree)
+    assert {:ok, %{"worktree" => %{"status" => "removed"}}} = RunState.read(run_dir)
+    # The lock the reaper took for the removal is given back: the next triage run takes the tree.
+    assert :ok = WorktreeLock.acquire(ctx.runs, tree, "next-run")
+  end
+
+  test "an orphan whose lock will not read is reaped: a corrupt lock protects no one", ctx do
+    # Read as held, it named no run and no run could ever release it, so the orphan's tree stayed
+    # for ever and every reap reported it held by "unknown".
+    tree = Worktree.triage_tree_path(ctx.runs, ctx.repo)
+    {:ok, sha} = Worktree.create_detached(ctx.repo, tree)
+    :ok = WorktreeLock.acquire(ctx.runs, tree, "a-run-whose-lock-was-truncated")
+    [lock] = Path.wildcard(Path.join([ctx.runs, "locks", "*.lock"]))
+    File.write!(lock, "{\"run_id\":")
+    run_dir = Path.join(ctx.runs, "triage-orphan")
+    File.mkdir_p!(run_dir)
+
+    RunState.update(run_dir, %{
+      run_id: "triage-orphan",
+      status: "running",
+      beam_os_pid: dead_pid(),
+      repo_path: ctx.repo,
+      worktree: %{path: tree, branch: "", base: sha, status: "created", scratch: true}
+    })
+
+    assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+    assert worktree =~ ":removed"
+    refute File.dir?(tree)
+    assert WorktreeLock.live_holder(ctx.runs, tree) == nil
+  end
+
+  test "a triage tree RELEASED to the next run, or never prepared, is not the run's to remove",
+       ctx do
+    # A released entry names the repo's reused tree, which the next run refreshes; a not_prepared
+    # one names the path a run could not prepare — the reused tree another run owns, or whatever
+    # was in the way. Neither is that run's, so the tree they both name must survive the reap.
+    tree = Worktree.triage_tree_path(ctx.runs, ctx.repo)
+    {:ok, sha} = Worktree.create_detached(ctx.repo, tree)
+
+    for {name, status} <- [{"released", "released"}, {"never", "not_prepared"}] do
+      run_dir = Path.join(ctx.runs, name)
+      File.mkdir_p!(run_dir)
+
+      RunState.update(run_dir, %{
+        run_id: name,
+        status: "running",
+        beam_os_pid: dead_pid(),
+        repo_path: ctx.repo,
+        worktree: %{path: tree, branch: "", base: sha, status: status, scratch: true}
+      })
+    end
+
+    assert [_, _] = Reaper.reap(ctx.runs, 500)
+    assert File.dir?(tree)
+  end
+
+  test "a lock the reaper cannot take is logged and that orphan skipped, never raised", ctx do
+    # The reaper runs at the start of an implement run. A lock directory that will not be made — a
+    # FILE where it goes, standing in for a full or read-only volume — used to raise out of
+    # `WorktreeLock.acquire/3` and take that run down with it.
+    path = Worktree.path_for(ctx.repo, "s1")
+    {:ok, _} = Worktree.create(ctx.repo, path, "loop/s1", "master")
+    run_dir = Path.join(ctx.runs, "orphan")
+    File.mkdir_p!(run_dir)
+    File.write!(Path.join(ctx.runs, "locks"), "not a directory")
+
+    RunState.update(run_dir, %{
+      run_id: "orphan",
+      status: "succeeded",
+      beam_os_pid: dead_pid(),
+      repo_path: ctx.repo,
+      worktree: %{path: path, branch: "loop/s1", base: "master", status: "remove_failed"}
+    })
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+        assert worktree =~ "lock"
+      end)
+
+    assert log =~ "could not take the lock for #{path}"
+    assert File.dir?(path)
+
+    # Counted as a failed attempt, so it is tried again rather than forgotten.
+    assert {:ok, %{"worktree" => %{"status" => "remove_failed", "removal_attempts" => 1}}} =
+             RunState.read(run_dir)
+  end
+
   test "one reap fetches each repo's base once, however many of its orphans need it", ctx do
     # Two crashed runs whose branches origin already carries by content: each removal asks origin,
     # and asked separately that was one bounded network call per orphan, in series.

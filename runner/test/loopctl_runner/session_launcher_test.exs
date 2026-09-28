@@ -301,6 +301,26 @@ defmodule LoopctlRunner.SessionLauncherTest do
     assert ProcessGroup.marked(ProcessGroup.marker("no-such-session")) == []
   end
 
+  test "ProcessGroup.run_group kills the command's CHILDREN on timeout, not only the command" do
+    # git's submodule step runs a helper, a clone and a transport under the process the Port
+    # started. A kill of that process alone leaves them running, unsupervised, holding the tree.
+    pid_file = Path.join(tmp_dir!("run-group"), "child_pid")
+    script = "sleep 30 & echo $! > #{pid_file}; wait"
+
+    assert {:error, :timeout} = ProcessGroup.run_group("/bin/sh", ["-c", script], 500)
+    child = pid_file |> File.read!() |> String.trim()
+    on_exit(fn -> System.cmd("kill", ["-KILL", child], stderr_to_stdout: true) end)
+
+    assert :ok = wait_until(fn -> not os_pid_alive?(child) end, 3_000)
+  end
+
+  test "ProcessGroup.run_group runs the command as the leader of its own group" do
+    assert {:ok, out, 0} =
+             ProcessGroup.run_group("/bin/sh", ["-c", "echo $$ $(ps -o pgid= -p $$)"], 5_000)
+
+    assert [pid, pid] = String.split(out)
+  end
+
   test "ProcessGroup.run's timeout kills what the command started, not only the command" do
     # The runner's own git fetch runs here, and ssh or a credential helper is its child: killed by
     # pid alone, git would die and leave them running.

@@ -7,13 +7,26 @@ defmodule LoopctlRunner.Reaper do
   it was still in flight, or its teardown failed to remove the worktree. For an in-flight
   orphan the reaper ends the session's processes (see `terminate/3` on the group and the
   session marker) and removes the worktree only if it holds no work — a worktree with
-  uncommitted changes or commits is kept, so re-running the story adopts it. A failed
-  removal is retried. Each reap is appended to that run's own trace.
+  uncommitted changes or commits is kept, so re-running the story adopts it. A worktree whose
+  entry says it is `scratch` (a triage run's detached tree) is removed whatever it holds, and with
+  it the Claude project directory a run's own tree made (`:projects_dir`). A
+  worktree is only removed while the reaper holds its `WorktreeLock`, so a live run cannot take
+  it up between the check and the removal; a lock that is held, or that cannot be taken at all, is
+  skipped, never waited on or raised over. A failed removal is retried. Each reap is appended to
+  that run's own trace.
+
+  Run at the start of every implement AND triage run, and by `mix loopctl.reap`.
   """
 
-  alias LoopctlRunner.{Owner, ProcessGroup, RunState, Trace, Worktree, WorktreeLock}
+  require Logger
+
+  alias LoopctlRunner.{Owner, ProcessGroup, RunState, Trace, TriageRun, Worktree, WorktreeLock}
 
   @in_flight ["starting", "running"]
+  # Entries whose path is not, or is no longer, this run's to remove: removed already, handed to a
+  # later run, a triage tree RELEASED for the next run to refresh, or one never prepared — the
+  # path may hold something that was in the way, or the reused tree another run owns.
+  @not_this_runs ["handed_off", "removed", "released", "not_prepared"]
   # A removal git keeps refusing (a locked worktree) is someone's deliberate state, not a
   # transient: stop retrying and leave it to a human.
   @max_removal_attempts 3
@@ -21,8 +34,12 @@ defmodule LoopctlRunner.Reaper do
 
   @type reaped :: %{run_id: String.t(), process_group: String.t(), worktree: String.t()}
 
-  @spec reap(String.t(), non_neg_integer()) :: [reaped()]
-  def reap(runs_dir, grace_ms) do
+  @doc """
+  Reaps every orphan under `runs_dir`. `:projects_dir`, the config's `claude_projects_dir`, is where
+  an orphaned triage run's project directory is removed from; without it none is.
+  """
+  @spec reap(String.t(), non_neg_integer(), keyword()) :: [reaped()]
+  def reap(runs_dir, grace_ms, opts \\ []) do
     orphans =
       runs_dir
       |> Path.join("*/state.json")
@@ -37,7 +54,8 @@ defmodule LoopctlRunner.Reaper do
     # An orphan's session ends before its tree is read: a process still running could still be
     # writing. Each tree is read ONCE (`Worktree.work_in/4`), and the bases those reads say origin must
     # answer for are fetched together — each a network call bounded at thirty seconds, this runs
-    # before every run, and a tree with nothing committed, a dirty one or a held one needs none.
+    # before every run, and a tree with nothing committed, a dirty one, a held one or a scratch one
+    # needs none.
     plans =
       Enum.map(orphans, fn {run_dir, state} ->
         group = end_session(state, grace_ms)
@@ -45,7 +63,12 @@ defmodule LoopctlRunner.Reaper do
       end)
 
     fetched = fetch_origins(plans)
-    Enum.map(plans, &finish(&1, fetched))
+
+    Enum.map(plans, fn {_run_dir, state, _group, _plan} = planned ->
+      reaped = finish(planned, fetched)
+      remove_project_dir(state, opts[:projects_dir])
+      reaped
+    end)
   end
 
   # One fetch per distinct repo and base, all at once: in series a reap of N repos offline waited
@@ -69,6 +92,15 @@ defmodule LoopctlRunner.Reaper do
     end)
     |> Map.new()
   end
+
+  # Scratch only: an implement run's project directory is its session's record, and a kept
+  # worktree's session may be resumed. `TriageRun.remove_project_dir/2` matches only a directory
+  # whose cwd carried the run id, so the reused tree's one directory is never touched.
+  defp remove_project_dir(%{"worktree" => %{"scratch" => true}, "run_id" => run_id}, dir)
+       when is_binary(dir) and is_binary(run_id),
+       do: TriageRun.remove_project_dir(dir, run_id)
+
+  defp remove_project_dir(_state, _projects_dir), do: :ok
 
   defp orphan?(run_dir) do
     case RunState.read(run_dir) do
@@ -95,6 +127,9 @@ defmodule LoopctlRunner.Reaper do
       case plan do
         {:skip, message} ->
           message
+
+        {:scratch, recorded, repo} ->
+          remove_scratch(run_dir, state, recorded, repo)
 
         {:remove, recorded, repo, work, seen} ->
           fetch = Map.get(fetched, {repo, recorded["base"]}, :skipped)
@@ -153,9 +188,24 @@ defmodule LoopctlRunner.Reaper do
            "repo_path" => repo
          }
        )
-       when wt_status not in ["handed_off", "removed"] do
-    # A live run may have adopted this path since the entry was written; its lock says so. What the
-    # read saw is taken first, so a change made while it reads is a change the removal sees.
+       when wt_status not in @not_this_runs do
+    # A scratch worktree — detached, so nothing a session wrote there is anywhere else — is removed
+    # whatever it holds, exactly as `TriageRun`'s own teardown removes one, so it has nothing to read
+    # and nothing to fetch. Kept, it would stay for ever: a kept tree leaves the run `reaped`, which
+    # `orphan?/1` never revisits. Decided by what the ENTRY says rather than by the run's kind,
+    # because it is a property of the tree.
+    if recorded["scratch"] == true do
+      {:scratch, recorded, repo}
+    else
+      plan_removal(run_dir, recorded, repo, path, branch, base)
+    end
+  end
+
+  defp plan(_run_dir, _state), do: {:skip, "none recorded or handed off"}
+
+  # A live run may have adopted this path since the entry was written; its lock says so. What the
+  # read saw is taken first, so a change made while it reads is a change the removal sees.
+  defp plan_removal(run_dir, recorded, repo, path, branch, base) do
     case WorktreeLock.live_holder(Path.dirname(run_dir), path) do
       nil ->
         seen = Worktree.fingerprint(repo, path, branch, base)
@@ -166,8 +216,6 @@ defmodule LoopctlRunner.Reaper do
     end
   end
 
-  defp plan(_run_dir, _state), do: {:skip, "none recorded or handed off"}
-
   # The plan was read before the fetch, which can take thirty seconds, and a run may adopt the tree
   # or anything may write to it in that window. So the removal holds the tree's lock, which no run
   # can then take, and checks under it that the tree is as the plan read it: one that changed is
@@ -176,29 +224,10 @@ defmodule LoopctlRunner.Reaper do
   # branch origin's base now reaches by history reads as holding nothing once it has run — and a
   # changed answer kept every such branch.
   defp remove_locked(run_dir, state, recorded, repo, planned, fetch) do
-    runs_dir = Path.dirname(run_dir)
-    path = recorded["path"]
-    reaper = "reaper-" <> (state["run_id"] || Path.basename(run_dir))
+    with_lock(run_dir, state, recorded, fn ->
+      %{"path" => path, "branch" => branch, "base" => base} = recorded
+      {work, seen} = planned
 
-    case WorktreeLock.acquire(runs_dir, path, reaper) do
-      :ok ->
-        try do
-          remove_recorded(run_dir, recorded, repo, planned, fetch)
-        after
-          WorktreeLock.release(runs_dir, path, reaper)
-        end
-
-      {:error, {:held, holder}} ->
-        "held by live run #{holder}; not touched"
-    end
-  end
-
-  defp remove_recorded(run_dir, recorded, repo, planned, fetch) do
-    %{"path" => path, "branch" => branch, "base" => base} = recorded
-
-    {work, seen} = planned
-
-    outcome =
       case Worktree.fingerprint(repo, path, branch, base) do
         ^seen ->
           Worktree.remove_if_clean(repo, path, branch, base, work, fetch)
@@ -207,7 +236,53 @@ defmodule LoopctlRunner.Reaper do
           reason = "changed while origin was fetched: #{inspect(seen)}, now #{inspect(now)}"
           %{worktree: {:kept, reason}, branch: {:kept, reason}}
       end
+    end)
+  end
 
+  defp remove_scratch(run_dir, state, recorded, repo) do
+    with_lock(run_dir, state, recorded, fn ->
+      Worktree.remove(repo, recorded["path"], recorded["branch"], recorded["base"])
+    end)
+  end
+
+  # The tree's lock held for the removal alone, so a run of the same story is refused for as short a
+  # time as possible. TAKEN, not only read: a triage repo's reused tree is taken up by every run on
+  # that repo, and a run that locked it between a read and the removal would have its tree removed
+  # from under it. TRIED, never waited on, and never raised over: the reaper runs at the start of
+  # every run, so a lock it cannot take — held, or a lock directory that will not be made — skips
+  # this one orphan rather than stalling or crashing the run that called it.
+  defp with_lock(run_dir, state, recorded, remove) do
+    runs_dir = Path.dirname(run_dir)
+    path = recorded["path"]
+    reaper = "reaper-" <> (state["run_id"] || Path.basename(run_dir))
+
+    case WorktreeLock.try_acquire(runs_dir, path, reaper) do
+      :ok ->
+        outcome =
+          try do
+            remove.()
+          after
+            WorktreeLock.release(runs_dir, path, reaper)
+          end
+
+        record_removal(run_dir, recorded, outcome)
+
+      {:error, {:held, holder}} ->
+        "held by live run #{holder}; not touched"
+
+      # Counted as a failed removal, so the entry is revisited (and abandoned after the same three
+      # attempts) rather than left `created` on a run that is about to be marked `reaped`.
+      {:error, {:unavailable, reason}} ->
+        Logger.error("the reaper could not take the lock for #{path}; not touched: #{reason}")
+
+        record_removal(run_dir, recorded, %{
+          worktree: {:error, "lock: #{reason}"},
+          branch: :absent
+        })
+    end
+  end
+
+  defp record_removal(run_dir, recorded, outcome) do
     attempts = Map.get(recorded, "removal_attempts", 0) + 1
 
     status =
