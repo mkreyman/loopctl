@@ -109,6 +109,46 @@ export async function recordCheckpoint(
   );
 }
 
+export function stageTransitionsPath(storyId) {
+  return `/api/v1/stories/${encodeURIComponent(storyId)}/stage/transitions`;
+}
+
+/**
+ * `POST /api/v1/stories/:id/stage/transitions` on the key claim_story claimed with (US-45.9):
+ * the claimant of an INTERACTIVE thread claim reports its own story's stage transitions, as a
+ * runner reports a placed claim's.
+ */
+export async function reportStage(
+  { story_id, claim_epoch, from, to, edge, reason, head_sha } = {},
+  { apiCall, env = process.env } = {},
+) {
+  if (!present(story_id)) return missing("story_id");
+  if (!present(from)) return missing("from");
+  if (!present(to)) return missing("to");
+  if (!Number.isInteger(claim_epoch) || claim_epoch < 0) {
+    return {
+      error: true,
+      status: 0,
+      body: "`claim_epoch` is required: the non-negative integer your claim returned.",
+    };
+  }
+
+  return apiCall(
+    "POST",
+    stageTransitionsPath(story_id),
+    compact({
+      claim_epoch,
+      from,
+      to,
+      edge,
+      reason,
+      effects: present(head_sha) ? { head_sha } : undefined,
+    }),
+    env[claimKeyVar(env)],
+    claimKeyVar(env),
+  );
+}
+
 /** `POST /api/v1/stories/:id/thread/entries` on the key `principal` names. */
 export async function recordEntry(
   {

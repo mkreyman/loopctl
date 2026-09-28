@@ -339,7 +339,10 @@ defmodule LoopctlWeb.StoryEscalationController do
   # puts the reason in front of a model renders it through
   # `Loopctl.Delivery.Stages.escalation_block/1` first. It is a constant because the property
   # is one of the FIELD, not of any particular value: every reason is session-authored.
-  defp render_stage(row) do
+  @doc false
+  # Also the body of `LoopctlWeb.StoryStageReportController`'s answer, so the stage read and
+  # a stage report render one row one way.
+  def render_stage(row) do
     %{
       story_id: row.story_id,
       # WHICH MACHINE HAS IT, which the stage read promised and did not return. An operator

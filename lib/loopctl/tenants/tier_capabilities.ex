@@ -171,6 +171,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
       # US-45.3 — review on a thread: requesting a review places a runner dispatch, and the
       # claimant's fixes are what the round-3 rule reads.
       "LoopctlWeb.ThreadReviewController",
+      # US-45.9 — the claimant of an interactive thread claim moves its story's delivery
+      # stage, which is what the merge gate and the executor fence on.
+      "LoopctlWeb.StoryStageReportController",
       # LCP-1 §9.2 — TenantController mounts RequireHumanAnchor on
       # :register_owner_key (the custody owner key is the root of trust).
       "LoopctlWeb.TenantController"

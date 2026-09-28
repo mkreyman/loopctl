@@ -22,7 +22,9 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
+  alias Loopctl.Delivery.ClaimRoute
   alias Loopctl.Delivery.DispatchLease
+  alias Loopctl.Delivery.InteractiveClaims
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
@@ -319,6 +321,14 @@ defmodule Loopctl.Progress do
       |> Multi.run(:stage, fn _repo, %{story: updated} ->
         Stages.follow_claim(tenant_id, updated.id, updated.claim_epoch, actor_label: actor_label)
       end)
+      # US-45.9: a claim a session makes itself records its route here, in the claim's
+      # transaction, where every reader of a claim's route looks. A placement records its own
+      # on the dispatch ledger and says so with `:placement`.
+      |> Multi.run(:route, fn _repo, %{story: updated, stage: stage_row} ->
+        if Keyword.get(opts, :placement, false),
+          do: {:ok, nil},
+          else: InteractiveClaims.record_route(tenant_id, updated, stage_row)
+      end)
       |> Multi.run(:mint_cap, fn _repo, %{story: updated} ->
         mint_cap(tenant_id, "start_cap", updated.id, Keyword.get(opts, :lineage, []))
       end)
@@ -360,8 +370,39 @@ defmodule Loopctl.Progress do
         }
       end)
 
-    multi |> AdminRepo.transaction() |> claim_result()
+    multi
+    |> AdminRepo.transaction()
+    |> enter_claimed(tenant_id, opts)
+    |> claim_result()
   end
+
+  # US-45.9: an interactive THREAD claim moves its stage row `queued -> claimed` once the claim
+  # has committed, as a placement does. Best effort: the claim stands either way, and the
+  # claimant's first stage report makes the same idempotent move when this one did not land.
+  defp enter_claimed(
+         {:ok, %{route: %ClaimRoute{mode: "thread"}, story: story}} = result,
+         tenant_id,
+         opts
+       ) do
+    case InteractiveClaims.enter_claimed(tenant_id, story,
+           actor_label: Keyword.get(opts, :actor_label),
+           actor_role: Keyword.get(opts, :actor_role, :agent),
+           actor_lineage: Keyword.get(opts, :lineage, [])
+         ) do
+      {:ok, _row} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "interactive claim of #{story.id} did not enter claimed: #{inspect(reason)}; " <>
+            "the claimant's first stage report retries it"
+        )
+    end
+
+    result
+  end
+
+  defp enter_claimed(result, _tenant_id, _opts), do: result
 
   # Contract's and claim's refusal of a story whose delivery stage is held — `escalated`,
   # `done` or `failed` — through the one definition in `Loopctl.Delivery.Stages`. Asked under

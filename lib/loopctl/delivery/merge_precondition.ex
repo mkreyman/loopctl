@@ -1567,14 +1567,14 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  # The mode the claim was PLACED under (`DispatchPayload.dispatch_route/2`). A claim with NO
-  # accepted implement row is `:pr`, NEVER the source's current mode (US-45.4 review round 3,
-  # finding 2). Such a claim was not placed on a runner: a session claimed the story itself and
-  # calls this gate for the pull request it opened. Reading the source's mode there would let
-  # an operator flipping a source to `thread` re-route every such in-flight story onto a path
-  # it cannot satisfy, which is the "a change affects only later placements" promise broken.
-  # Nothing is lost by it: a checkpoint can only be recorded under an accepted implement row
-  # (`Loopctl.Delivery.RunnerThreads`), so a claim with no row has no thread to judge.
+  # The mode the claim's ROUTE records (`DispatchPayload.dispatch_route/2`): the accepted
+  # implement row of a placed claim, or the route an interactive claim recorded when it was made
+  # (`Loopctl.Delivery.InteractiveClaims`, US-45.9). A claim with NEITHER is `:pr`, NEVER the
+  # source's current mode (US-45.4 review round 3, finding 2): reading the source there would
+  # let an operator flipping a source to `thread` re-route an in-flight claim onto a path it
+  # cannot satisfy, which is the "a change affects only later claims" promise broken. Such a
+  # claim is one made before routes were recorded, or of a project with no single intake
+  # source.
   defp placed_mode(%{mode: mode}, _source) when mode in [:pr, :thread], do: mode
   defp placed_mode(_route, _source), do: :pr
 

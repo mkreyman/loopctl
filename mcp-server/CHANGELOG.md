@@ -5,6 +5,20 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.109.0 — 2026-09-28 (interactive change threads)
+
+### Added
+
+- **`thread_stage_report`** (loopctl US-45.9): the claimant of an interactive thread claim
+  reports its own story's stage transitions, as a runner reports a placed claim's.
+
+### Changed
+
+- **`claim_story`**, **`renew_story_claim`**, **`thread_request_review`** describe an
+  interactive claim of a thread-mode story as a change thread, reviewed by a runner, whose
+  lease its claimant must renew. `thread_request_review` no longer lists
+  `implementer_dispatch_required`: a claim made without a dispatch is reviewable.
+
 ## 2.108.0 — 2026-09-27 (CI evidence by exact SHA)
 
 ### Changed

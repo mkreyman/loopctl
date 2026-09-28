@@ -24,10 +24,15 @@ defmodule Loopctl.Threads.Reviews do
   ## Separation
 
   The reviewer is the runner's AGENT. It is refused `reviewer_not_separate` when it is the
-  story's claimant, when it recorded a checkpoint of the thread, or when it is the agent of any
-  dispatch on the implementer's lineage CHAIN, above or below the implementer
+  story's claimant, when it recorded a checkpoint of the thread under any claim, or when it is
+  the agent of any dispatch on the implementer's lineage CHAIN, above or below the implementer
   (`Loopctl.Dispatches.lineage_same_chain?/2`, the comparison the custody gates use). Decided
   at placement and again, under the thread lock, on every judgement.
+
+  A claim a session made ITSELF (US-45.9) may carry no dispatch lineage at all: a key no
+  dispatch minted. It has no chain to compare, so its separation is the first two clauses,
+  agent identity, which is how the custody gates separate a pre-dispatch story. The reviewer is
+  still a runner's agent, reporting over a socket the implementing session cannot write to.
 
   ## Rounds and the ceiling
 
@@ -186,19 +191,6 @@ defmodule Loopctl.Threads.Reviews do
         )
     end
   end
-
-  @doc false
-  @spec implementer_dispatched(Story.t()) :: :ok | refusal()
-  def implementer_dispatched(%Story{implementer_dispatch_id: nil}),
-    do:
-      refuse(
-        :conflict,
-        "implementer_dispatch_required",
-        "the story's claim was not made by a dispatch, so there is no implementer lineage " <>
-          "for a review to be separate from"
-      )
-
-  def implementer_dispatched(%Story{}), do: :ok
 
   @doc false
   # The claim a review reads is still the story's: the same epoch, and still held. A

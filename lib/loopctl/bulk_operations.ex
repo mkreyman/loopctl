@@ -21,6 +21,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Delivery.InteractiveClaims
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Progress
@@ -556,11 +557,17 @@ defmodule Loopctl.BulkOperations do
 
   # #803: the stage row follows the claim's epoch inside bulk claim's transaction, like the
   # single-story claim (Loopctl.Delivery.Stages.follow_claim/4).
+  #
+  # US-45.9: a bulk claim is an INTERACTIVE claim, so it records its route the same way. It
+  # never moves the stage row itself; the claimant's first stage report does
+  # (`Loopctl.Delivery.InteractiveClaims.enter_claimed/3`).
   defp follow_claim({:ok, claimed} = result) do
-    {:ok, _stage} =
+    {:ok, stage} =
       Stages.follow_claim(claimed.tenant_id, claimed.id, claimed.claim_epoch,
         actor_label: "bulk:claim"
       )
+
+    {:ok, _route} = InteractiveClaims.record_route(claimed.tenant_id, claimed, stage)
 
     result
   end

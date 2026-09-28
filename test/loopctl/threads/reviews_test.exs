@@ -237,10 +237,16 @@ defmodule Loopctl.Threads.ReviewsTest do
       assert "no_checkpoint" == code(place(ctx))
     end
 
-    test "a claim no dispatch made has no implementer to be separate from", ctx do
+    test "a claim no dispatch made is separated by agent identity alone (US-45.9)", ctx do
       checkpoint(ctx, 1)
       set_story(ctx, implementer_dispatch_id: nil)
-      assert "implementer_dispatch_required" == code(place(ctx))
+
+      assert "reviewer_not_separate" == code(place(ctx, agent_id: ctx.implementer.id))
+
+      checkpoint(ctx, 2, author_principal: "agent:#{ctx.spare.id}")
+      assert "reviewer_not_separate" == code(place(ctx, agent_id: ctx.spare.id))
+
+      assert {:ok, _review, :created} = place(ctx)
     end
 
     test "never for the claimant, a checkpoint recorder, or an agent on the implementer's chain",
