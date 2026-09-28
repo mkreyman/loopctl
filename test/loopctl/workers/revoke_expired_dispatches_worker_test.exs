@@ -9,15 +9,13 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
     * behavior parity — the worker revokes exactly the expired, non-revoked
       dispatches (and cascades to their api_keys), leaves active and
       already-revoked rows untouched, and does so cross-tenant by design;
-    * index usage (AC-32.1.2) — `EXPLAIN` of the worker's exact predicate reaches
-      the rows through the new partial index, never a Seq Scan. Index choice is a
-      planner concern (cost-based, sensitive to table size), and disabling seq
-      scans makes the INDEX deterministic without making the ACCESS PATH so: this
-      summary used to claim it was "deterministic at any scale", which was false
-      in the direction that costs a build — the assertion pinned one spelling and
-      went red on a Bitmap Index Scan of that same index. What is deterministic is
-      that the index matches the predicate and is usable; see the describe block
-      below for the how/why.
+    * index eligibility (AC-32.1.2) — the partial index is VALID and READY, keyed on
+      `expires_at` with the predicate `revoked_at IS NULL`, read from `pg_index`; and
+      `EXPLAIN` of the worker's exact predicate reaches the rows through an INDEX,
+      never a Seq Scan. Which index the planner picks is not asserted: the composite
+      `(tenant_id, expires_at)` index serves the same `expires_at <` condition (as a
+      full index scan), and the choice moves with the rows other async tests leave in
+      the shared table. Choice at production scale is a scale-test concern.
 
   Dispatches are created through the real `Loopctl.Dispatches.create_dispatch/3`
   API (which mints + links a real api_key) so the cascade parity is exercised,
@@ -115,7 +113,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
   end
 
   describe "partial index dispatches_expires_at_active_index (AC-32.1.2)" do
-    test "the sweep's predicate plans as an index scan on the partial index, never a Seq Scan" do
+    test "the partial index is valid and matches the sweep, and the sweep plans on an index" do
       # Mirror the worker's EXACT sweep predicate (RevokeExpiredDispatchesWorker.perform/1):
       #   from(d in Dispatch, where: is_nil(d.revoked_at) and d.expires_at < ^now, ...)
       # so this EXPLAIN exercises the identical query shape that runs every 60s.
@@ -132,9 +130,9 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
       # chosen Index Scan is only observable at scale. What AC-32.1.2 actually asserts
       # is that the index MATCHES the predicate and is USABLE by the planner; we prove
       # that deterministically at any table size by disabling seq scans for this
-      # transaction and confirming the only remaining plan is an index scan on our
-      # partial index (with the expected `expires_at <` Index Cond). Verified out of
-      # band that at ~20k rows the DEFAULT planner picks this same index unprompted
+      # transaction and confirming the plan is an index scan (with the expected
+      # `expires_at <` Index Cond) on one of the two indexes that can serve it. Verified out of
+      # band that at ~20k rows the DEFAULT planner picks the partial index unprompted
       # (Index Scan, rows~86) — captured in the migration's verification note.
       #
       # `SET LOCAL` + the EXPLAIN must run on the SAME pinned connection, so both
@@ -156,22 +154,28 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
           Enum.map_join(rows, "\n", fn [line] -> line end)
         end)
 
-      # The plan proves the predicate is served by an index, never a Seq Scan. It cannot pin
-      # WHICH index: `dispatches_tenant_id_expires_at_index (tenant_id, expires_at)` serves the
-      # same `expires_at <` condition, and which of the two Postgres picks moves with the
-      # statistics other tests leave behind, so naming one made this fail at random. That the
-      # partial index MATCHES the sweep's predicate is asserted from its definition below.
-      assert plan =~ ~r/Index (Only )?Scan|Bitmap Index Scan/
+      # Either index that can serve `expires_at <` (see the moduledoc), never a Seq Scan and
+      # never any other access path.
+      assert plan =~
+               ~r/Index (Only )?Scan (using|on) (dispatches_expires_at_active_index|dispatches_tenant_id_expires_at_index)/
+
       assert plan =~ "Index Cond: (expires_at <"
       refute plan =~ "Seq Scan"
 
-      %{rows: [[indexdef]]} =
-        AdminRepo.query!(
-          "SELECT indexdef FROM pg_indexes WHERE indexname = 'dispatches_expires_at_active_index'"
-        )
+      # Eligibility, from the catalog: an INVALID leftover of an interrupted CONCURRENTLY
+      # build keeps the same definition text, so validity is asserted, not just the text.
+      %{rows: [[valid?, ready?, keys, predicate]]} =
+        AdminRepo.query!("""
+        SELECT i.indisvalid, i.indisready,
+               pg_get_indexdef(i.indexrelid, 1, true),
+               pg_get_expr(i.indpred, i.indrelid)
+        FROM pg_index i
+        WHERE i.indexrelid = 'dispatches_expires_at_active_index'::regclass
+        """)
 
-      assert indexdef =~
-               "ON public.dispatches USING btree (expires_at) WHERE (revoked_at IS NULL)"
+      assert valid? and ready?
+      assert keys == "expires_at"
+      assert predicate == "(revoked_at IS NULL)"
     end
   end
 end

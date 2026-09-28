@@ -465,18 +465,23 @@ defmodule Loopctl.Delivery.SessionEndTest do
     @refused_msg %{dispatch_id: Ecto.UUID.generate()}
 
     test "a chain that refuses appends is answered PERMANENTLY, and logged at error" do
+      tenant_id = Ecto.UUID.generate()
+
       log =
         capture_log([level: :error], fn ->
           assert {:error, :audit_chain_append_failed} =
                    RunnerStages.budget_escalation_refused(
                      :audit_chain_append_failed,
-                     Ecto.UUID.generate(),
+                     tenant_id,
                      @refused_session,
                      @refused_msg
                    )
         end)
 
-      assert log =~ "answered permanently"
+      # This call's own line, by its tenant, as the `:busy` test below refutes it: that
+      # refutation is only as good as this format, so it is pinned here.
+      assert log =~
+               ~r/\[error\] budget escalation refused .*answered permanently: tenant_id=#{tenant_id} /
     end
 
     test "a message fault is answered as the invalid payload it is, not as a retry" do

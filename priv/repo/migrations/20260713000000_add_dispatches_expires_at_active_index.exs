@@ -12,8 +12,9 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   #
   # The only expiry-related index on `dispatches` is the composite
   # (tenant_id, expires_at) from 20260411234856_create_dispatches. Its LEADING column
-  # `tenant_id` is absent from the sweep predicate, so Postgres cannot use it → a full
-  # seq scan of the continuously-growing `dispatches` table every minute. The sweep MUST
+  # `tenant_id` is absent from the sweep predicate, so Postgres cannot SEEK on it: at best
+  # it reads the whole index (it does, on a small table), and otherwise seq-scans the
+  # continuously-growing `dispatches` table every minute. The sweep MUST
   # stay cross-tenant (it finds expired dispatches across all tenants), so it can never
   # use a tenant-leading index.
   #
@@ -32,8 +33,10 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # not a Seq Scan. Two captures:
   #
   #   * Empty table, planner forced to reveal usability (`SET LOCAL
-  #     enable_seqscan = off`) — the deterministic form asserted by the ExUnit
-  #     guard `RevokeExpiredDispatchesWorkerTest`:
+  #     enable_seqscan = off`). The ExUnit guard `RevokeExpiredDispatchesWorkerTest`
+  #     no longer pins this plan (the shared test table makes the choice between this and
+  #     the composite index move); it asserts this index's validity and predicate from
+  #     `pg_index`, and an index plan:
   #
   #       Index Scan using dispatches_expires_at_active_index on dispatches d0
   #         Index Cond: (expires_at < now())
