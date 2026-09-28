@@ -183,13 +183,13 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
       assert {:error, :not_found} = Epics.get_epic(tenant.id, epic.id)
     end
 
-    test "an epic already deleted is a changeset error, not a StaleEntryError" do
+    test "an epic already deleted is not_found (a 404), not a StaleEntryError" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
 
       assert {:ok, _} = Epics.delete_epic(tenant.id, epic)
-      assert {:error, %Ecto.Changeset{errors: [id: _]}} = Epics.delete_epic(tenant.id, epic)
+      assert {:error, :not_found} = Epics.delete_epic(tenant.id, epic)
     end
 
     test "an epic whose story custody records reference is a 422 changeset, not a raise" do
@@ -209,7 +209,7 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
       assert {:error, %Ecto.Changeset{errors: [id: {message, _}]}} =
                Epics.delete_epic(tenant.id, epic)
 
-      assert message == RestrictedDelete.message("dispatches_story_id_fkey")
+      assert message == RestrictedDelete.message(:epic)
       assert {:ok, _} = Epics.get_epic(tenant.id, epic.id)
     end
 

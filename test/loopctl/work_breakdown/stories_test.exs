@@ -216,6 +216,16 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
   end
 
   describe "update_story/4" do
+    test "a blank title on update is a 422 changeset, never a NOT NULL raise" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
+
+      assert {:error, %Ecto.Changeset{errors: [title: _]}} =
+               Stories.update_story(tenant.id, story, %{title: "  "})
+    end
+
     test "updates story title" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
@@ -268,16 +278,6 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
   end
 
   describe "delete_story/3" do
-    test "a blank title on update is a 422 changeset, never a NOT NULL raise" do
-      tenant = fixture(:tenant)
-      project = fixture(:project, %{tenant_id: tenant.id})
-      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
-      story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
-
-      assert {:error, %Ecto.Changeset{errors: [title: _]}} =
-               Stories.update_story(tenant.id, story, %{title: "  "})
-    end
-
     test "deletes a story" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
@@ -288,14 +288,14 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
       assert {:error, :not_found} = Stories.get_story(tenant.id, story.id)
     end
 
-    test "a story already deleted is a changeset error, not a StaleEntryError" do
+    test "a story already deleted is not_found (a 404), not a StaleEntryError" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
       epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
       story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id})
 
       assert {:ok, _} = Stories.delete_story(tenant.id, story)
-      assert {:error, %Ecto.Changeset{errors: [id: _]}} = Stories.delete_story(tenant.id, story)
+      assert {:error, :not_found} = Stories.delete_story(tenant.id, story)
     end
 
     test "a story custody records reference is a 422 changeset, not a raise" do
@@ -315,7 +315,7 @@ defmodule Loopctl.WorkBreakdown.StoriesTest do
       assert {:error, %Ecto.Changeset{errors: [id: {message, _}]}} =
                Stories.delete_story(tenant.id, story)
 
-      assert message == RestrictedDelete.message("dispatches_story_id_fkey")
+      assert message == RestrictedDelete.message(:story)
       assert {:ok, _} = Stories.get_story(tenant.id, story.id)
     end
 

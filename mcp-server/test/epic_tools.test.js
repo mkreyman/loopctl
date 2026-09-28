@@ -19,9 +19,10 @@ import {
   getEpic,
   listEpics,
   updateEpic,
-  deleteStory,
+  deleteKeyHint,
   epicWriteKeyHint,
 } from "../lib/epics.js";
+import { deleteStory } from "../lib/story-update.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
@@ -161,6 +162,18 @@ describe("epic writes pick the named key", () => {
     assert.equal(epicWriteKeyHint({ LOOPCTL_USER_KEY: "u" }), "LOOPCTL_USER_KEY");
     assert.equal(epicWriteKeyHint({ LOOPCTL_API_KEY: "a" }), null);
   });
+
+  test("a delete pins the user key when it is set, and otherwise takes the default key", () => {
+    assert.equal(deleteKeyHint({ LOOPCTL_USER_KEY: "u", LOOPCTL_API_KEY: "a" }), "LOOPCTL_USER_KEY");
+    assert.equal(deleteKeyHint({ LOOPCTL_API_KEY: "a" }), null);
+  });
+
+  test("list_epics refuses an empty phase: no filter selects unphased epics", async () => {
+    const api = fakeApi();
+    const result = await listEpics({ project_id: PROJECT, phase: "" }, api);
+    assert.equal(result.error, true);
+    assert.equal(api.calls.length, 0);
+  });
 });
 
 describe("epic tools are wired", () => {
@@ -192,7 +205,7 @@ describe("epic tools are wired", () => {
 
     assert.match(body("orchestratorPinnedApiCall"), /epicWriteKeyHint\(\)/);
     assert.match(body("orchestratorPinnedApiCall"), /exactKey: true, keyHint/);
-    assert.match(body("userKeyApiCall"), /process\.env\.LOOPCTL_USER_KEY/);
-    assert.match(body("userKeyApiCall"), /exactKey: true/);
+    assert.match(body("userKeyApiCall"), /deleteKeyHint\(\)/);
+    assert.match(body("userKeyApiCall"), /exactKey: true, keyHint/);
   });
 });

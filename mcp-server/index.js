@@ -63,7 +63,10 @@ import {
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
 } from "./lib/delivery-loop.js";
-import { updateStory as updateStoryRequest } from "./lib/story-update.js";
+import {
+  deleteStory as deleteStoryRequest,
+  updateStory as updateStoryRequest,
+} from "./lib/story-update.js";
 import {
   enrollIntakeSource,
   listIntakeSources,
@@ -75,7 +78,7 @@ import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.j
 import {
   createEpic as createEpicRequest,
   deleteEpic as deleteEpicRequest,
-  deleteStory as deleteStoryRequest,
+  deleteKeyHint,
   epicWriteKeyHint,
   epicProgress as epicProgressRequest,
   getEpic as getEpicRequest,
@@ -1116,10 +1119,11 @@ function orchestratorPinnedApiCall(method, path, body) {
 }
 
 function userKeyApiCall(method, path, body) {
-  return apiCall(method, path, body, process.env.LOOPCTL_USER_KEY, {
-    exactKey: true,
-    keyHint: "LOOPCTL_USER_KEY",
-  });
+  const keyHint = deleteKeyHint();
+
+  return keyHint
+    ? apiCall(method, path, body, process.env[keyHint], { exactKey: true, keyHint })
+    : apiCall(method, path, body);
 }
 
 async function listEpics(args) {
@@ -4347,8 +4351,9 @@ const TOOLS = [
     description:
       "DELETE AN EPIC AND EVERY STORY IN IT (DELETE /api/v1/epics/:id, loopctl #876). " +
       "IRREVERSIBLE: the delete cascades to the epic's stories. Answers 204 with no body. " +
-      "Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant; sent verbatim, never " +
-      "displaced by LOOPCTL_API_KEY. Refusals: 403 for a lesser key or a tenant that is not " +
+      "Needs a user-or-above key on a human-anchored tenant: LOOPCTL_USER_KEY, sent verbatim " +
+      "when set (a global LOOPCTL_API_KEY never displaces it), else the default key. " +
+      "Refusals: 403 for a lesser key or a tenant that is not " +
       "human-anchored, 404 for an epic not in your tenant, 422 when an active intake source " +
       "targets the epic (revoke it first: intake_source_revoke), 422 when a dispatch, " +
       "capability token or verification run references any story in it (those do not " +
@@ -4365,8 +4370,8 @@ const TOOLS = [
     name: "delete_story",
     description:
       "DELETE ONE STORY (DELETE /api/v1/stories/:id, loopctl #876). IRREVERSIBLE. Answers 204 " +
-      "with no body. Needs LOOPCTL_USER_KEY (user or above) on a human-anchored tenant, sent " +
-      "verbatim. Refusals: 403 for a lesser key, 404 for a story not in your tenant, 422 when " +
+      "with no body. Needs a user-or-above key on a human-anchored tenant: LOOPCTL_USER_KEY " +
+      "verbatim when set, else the default key. Refusals: 403 for a lesser key, 404 for a story not in your tenant, 422 when " +
       "a dispatch, capability token or verification run references the story (those do not " +
       "cascade). Its change-thread ledger outlives it. A malformed `story_id` is refused " +
       "locally.",

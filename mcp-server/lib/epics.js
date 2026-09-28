@@ -25,10 +25,11 @@
  * are `role: :orchestrator` with the hierarchy, and human-anchored; delete is `role: :user`,
  * human-anchored, and CASCADES to the epic's stories — refused 422 when a dispatch, capability
  * token or verification run references a story in it (those do not cascade) or an active
- * intake source targets the epic. `delete_story` is here too, for the one story.
+ * intake source targets the epic. `delete_story` is `lib/story-update.js`'s.
  */
 
 import { uuid as uuidRefusal } from "./delivery-loop.js";
+import { namedBody } from "./story-update.js";
 
 const UPDATABLE = ["title", "description", "phase", "position", "metadata"];
 
@@ -68,10 +69,19 @@ function epicsQuery({ page, page_size, phase } = {}) {
 }
 
 export async function listEpics({ project_id, page, page_size, phase } = {}, { apiCall } = {}) {
-  return (
-    badId("project_id", project_id) ??
-    apiCall("GET", projectEpicsPath(project_id, { page, page_size, phase }))
-  );
+  const refused = badId("project_id", project_id);
+  if (refused) return refused;
+
+  // A cleared phase is stored as NULL, so `phase=` would filter on the empty string and match
+  // nothing: an empty list that reads as "no epics". Refused rather than answered wrongly.
+  if (phase === "") {
+    return refuse(
+      "`phase` cannot be empty: no filter selects epics without a phase. Leave it out to list " +
+        "every epic.",
+    );
+  }
+
+  return apiCall("GET", projectEpicsPath(project_id, { page, page_size, phase }));
 }
 
 export async function createEpic(
@@ -107,24 +117,15 @@ export async function updateEpic(args = {}, { apiCall } = {}) {
   const refused = badId("epic_id", args.epic_id);
   if (refused) return refused;
 
-  const body = {};
-  for (const field of UPDATABLE) {
-    const value = args[field];
-    if (value === undefined) continue;
-
-    // Refused, as `update_story` refuses it: a caller writing null means to CLEAR the field,
-    // and the endpoint drops every nil and answers 200 with the field unchanged. A BLANK string
-    // is what clears one: it survives the controller's nil filter and the changeset casts it
-    // to nil, so `description: ""` or `phase: ""` erases the field (a blank `title` is a 422).
-    if (value === null) {
-      return refuse(
-        `\`${field}\` cannot be set to null through this endpoint: it drops every null and ` +
-          'answers 200 with the field unchanged. To clear it send an empty string ("").',
-      );
-    }
-
-    body[field] = value;
-  }
+  // A null is refused, as `update_story` refuses it (`namedBody`). An EMPTY string is what
+  // clears a field: it survives the controller's nil filter and the changeset casts it to nil,
+  // so `description: ""` or `phase: ""` erases it (a blank `title` is a 422).
+  const { body, error } = namedBody(
+    args,
+    UPDATABLE,
+    'To clear `description` or `phase`, send an empty string ("").',
+  );
+  if (error) return refuse(error);
 
   if (Object.keys(body).length === 0) {
     return refuse(
@@ -144,15 +145,6 @@ export async function epicProgress({ epic_id } = {}, { apiCall } = {}) {
   return badId("epic_id", epic_id) ?? apiCall("GET", epicProgressPath(epic_id));
 }
 
-export function storyPath(storyId) {
-  return `/api/v1/stories/${encodeURIComponent(storyId)}`;
-}
-
-// `delete_story` lives beside `delete_epic`: the same foreign-key refusals, the same key.
-export async function deleteStory({ story_id } = {}, { apiCall } = {}) {
-  return badId("story_id", story_id) ?? apiCall("DELETE", storyPath(story_id), null);
-}
-
 // The key an epic WRITE travels on: `role: :orchestrator` WITH the hierarchy
 // (epic_controller.ex), so a user key passes too. The first of LOOPCTL_ORCH_KEY and
 // LOOPCTL_USER_KEY that is set is named, to be sent VERBATIM; `null` when neither is, and the
@@ -161,4 +153,11 @@ export function epicWriteKeyHint(env = process.env) {
   if (env.LOOPCTL_ORCH_KEY) return "LOOPCTL_ORCH_KEY";
   if (env.LOOPCTL_USER_KEY) return "LOOPCTL_USER_KEY";
   return null;
+}
+
+// The key a DELETE travels on: LOOPCTL_USER_KEY, sent VERBATIM when it is set, so a global
+// LOOPCTL_API_KEY of a lesser role cannot displace it; `null` when it is not, and the caller's
+// default selection applies. `role: :user` WITH the hierarchy, so the global key may well pass.
+export function deleteKeyHint(env = process.env) {
+  return env.LOOPCTL_USER_KEY ? "LOOPCTL_USER_KEY" : null;
 }

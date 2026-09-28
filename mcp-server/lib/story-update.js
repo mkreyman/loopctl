@@ -100,22 +100,44 @@ export function storyPath(storyId) {
  * dropped it (`Map.reject`, `story_controller.ex:443`).
  */
 export function updateBody(args = {}) {
+  return namedBody(
+    args,
+    UPDATABLE,
+    "Send the value you want, or leave the field out.",
+  );
+}
+
+/**
+ * The PATCH body of the `fields` a caller named, for an endpoint whose controller DROPS every
+ * nil before the changeset sees it: `undefined` is omitted, `null` refused (it would answer 200
+ * with the field unchanged). Shared by `update_story` and `update_epic` (`lib/epics.js`), so the
+ * two refuse the same shape the same way; `remedy` is the last sentence of the refusal.
+ */
+export function namedBody(args, fields, remedy) {
   const body = {};
 
-  for (const field of UPDATABLE) {
+  for (const field of fields) {
     const value = args[field];
     if (value === undefined) continue;
     if (value === null) {
       return {
         error: `\`${field}\` cannot be set to null through this endpoint. The controller drops ` +
           `every nil before the changeset sees it, so the request would answer 200 with the ` +
-          `field unchanged. Send the value you want, or leave the field out.`,
+          `field unchanged. ${remedy}`,
       };
     }
     body[field] = value;
   }
 
   return { body };
+}
+
+/**
+ * `DELETE /api/v1/stories/:id` — `delete_story`. Refused 404, or 422 when records kept on
+ * purpose (dispatches, capability tokens, verification runs) reference the story.
+ */
+export async function deleteStory({ story_id } = {}, { apiCall } = {}) {
+  return uuidRefusal(story_id, "story_id") ?? apiCall("DELETE", storyPath(story_id), null);
 }
 
 /**
