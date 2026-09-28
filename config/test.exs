@@ -967,6 +967,9 @@ config :loopctl, :delivery_pull_request_source, Loopctl.MockPullRequestSource
 # `Req.Test` bytes, so its response mapping is covered rather than only its interface.
 config :loopctl, :delivery_github_req_plug, {Req.Test, Loopctl.Delivery.GitHubPullRequestSource}
 
+# Story verification's CI adapter, against `Req.Test` bytes for the same reason.
+config :loopctl, :verification_github_req_plug, {Req.Test, Loopctl.Verification.GitHubActions}
+
 # US-45.5: the merge executor's forge writes, as the GitHub App. A Mox mock, fail-closed by
 # default like the source above; the adapter's own tests run against `Req.Test` bytes.
 config :loopctl, :delivery_merge_forge, Loopctl.MockMergeForge

@@ -241,6 +241,15 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Story verification reads CI from Actions workflow runs, not check runs (loopctl#913).
+  `GITHUB_TOKEN` needs `actions: read`; it no longer needs `checks: read`.** GitHub does
+  not offer `checks: read` to a fine-grained personal access token, so on a private
+  repository every verification CI lookup 403'd and fell back to the local runner.
+  Verification now reads `GET /repos/:owner/:repo/actions/runs?head_sha=`, takes each
+  workflow's newest run, and passes a commit only when every workflow passed. A commit
+  with no runs yet is in progress, not a pass. More than 100 runs on one commit is
+  refused (`workflow_runs_truncated`) rather than judged from a partial page.
+
 - **Merge import reports orphans only on request (#880). Breaking for a caller that reads
   `stories_orphaned`.** `POST /api/v1/projects/:id/import?merge=true` omits the key unless
   `report_orphans` is true; on a partial merge it listed every story the payload did not
