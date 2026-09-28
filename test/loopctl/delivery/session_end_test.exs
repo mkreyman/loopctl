@@ -245,9 +245,13 @@ defmodule Loopctl.Delivery.SessionEndTest do
       bump_story_epoch(ctx.story)
 
       # The message carries the epoch the story is at now, but its dispatch served the one
-      # before: that claim is over, which the story fence says first (contract 1.22.0).
+      # before: that claim is over (contract 1.22.0). A MALFORMED report writes nothing, so the
+      # row is not superseded and its slot not released by a message that failed its own check.
       assert {:error, :stale_claim_epoch} =
                end_session(ctx, "wall_clock_exceeded", %{claim_epoch: @epoch + 1})
+
+      assert ledger(ctx.record).status == "accepted"
+      assert ledger(ctx.record).session_ended_reason == nil
     end
 
     test "an epoch that is not even the dispatch's is claim_epoch_mismatch: the claim stands" do

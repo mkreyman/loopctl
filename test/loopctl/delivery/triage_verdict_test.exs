@@ -1486,6 +1486,18 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert stage_of(story) == :detected
     end
 
+    test "a mismatched epoch stays the message's fault after the story moved" do
+      %{story: story, runner: runner, record: record} = session()
+      bump_story_epoch(story)
+
+      # `stale_claim_epoch` is kept for the leave path, whose same-bytes resend repairs a
+      # reclaim; a message that never matched its dispatch could not be repaired that way.
+      message = %{verdict_message(record, verdict("story")) | claim_epoch: @epoch + 1}
+
+      assert {:error, :claim_epoch_mismatch} =
+               TriageVerdict.apply(story.tenant_id, runner.id, message)
+    end
+
     test "a dispatch this runner does not hold is unknown" do
       %{story: story, record: record} = session()
       other = fixture(:stage_runner, %{tenant_id: story.tenant_id})

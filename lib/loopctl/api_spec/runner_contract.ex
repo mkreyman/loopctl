@@ -60,7 +60,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.19.0) A dispatch control PLACES may carry `deadline_at` (`RunnerDispatch.deadline_at`): an instant the runner must END THE SESSION BY — the EARLIER of its own start + `wall_clock_seconds` and `deadline_at`. It is placed_at + `wall_clock_seconds` + `DISPATCH_LEASE_GRACE_SECONDS` (#879) — a RE-SEND moves it to the re-send's time + its `wall_clock_seconds` + the grace — so the time before the session starts comes out of the grace, not the wall clock; only a start-up longer than the grace shortens the session. loopctl's lease sweep never releases the claim on the story before it (an operator's force-unclaim can), so a runner that stops by it — even one cut off from control — never runs on a story the sweep released and loopctl placed again. OPTIONAL on the wire, and a holder of any earlier contract ignores it (undeclared keys are dropped) — but it is NOT PROTECTED by it: the claim is now capped at this instant whether or not the runner reads it, so a runner on an earlier contract whose start-up takes longer than the grace can still be running when the sweep releases the story. RE-VENDOR to read it | | | | |
   | (1.20.0) A SESSION REPORTS ITS WORK AS IT HAPPENS, on the story's change thread (epic 45, US-45.2). Two new messages: `checkpoint` (`RunnerCheckpoint`: `dispatch_id`, `claim_epoch`, `commit_sha`, `tree_sha`, optional `note`) for each commit the session pushed, and `thread_entry` (`RunnerThreadEntry`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, optional `checkpoint_id`) for each note it wants on the thread. Both name an ACCEPTED `implement` dispatch at its `claim_epoch`; a checkpoint is recorded only for the story's current claimant while its claim is live. Both are IDEMPOTENT: a resend of the same checkpoint, or of the same `client_seq` with the same content, is answered `ok` with `replayed: true`, and a DIFFERENT write reusing either is `checkpoint_conflict` or `idempotency_key_reused`. Each has its own bucket (`checkpoint_burst`, `thread_entry_burst`) and its own byte budget (`x-connection.limits.checkpoint`, `x-connection.limits.thread_entry`). OPTIONAL — a runner that sends neither gets exactly today's behaviour. RE-VENDOR to send them: a 1.19.0 copy has neither event, no `RunnerCheckpointAck`, no `RunnerThreadEntryAck` and no bucket for either | | | | |
   | (1.21.0) REVIEW IS DISPATCHABLE (epic 45, US-45.3). `x-connection.dispatchable_kinds` adds `review`: loopctl places a review of a story's change thread as a runner dispatch of kind `review`, carrying the story (`RunnerStory`, as an implement dispatch does) and a `review` object (`RunnerReview`: `review_id`, `round`, and the checkpoint to read — `checkpoint_id`, `checkpoint_seq`, `commit_sha`, `tree_sha`). It CLAIMS NOTHING: `claim_epoch` is the implementer's claim, echoed back like any dispatch's, and the review never writes code. The session answers with two new messages: `review_finding` (`RunnerReviewFinding`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`, `severity`, optional `location` and `introduced_by`) for each defect it found, and ONE `review_verdict` (`RunnerReviewVerdict`: `dispatch_id`, `claim_epoch`, `client_seq`, `body`) that completes the review's round and ends it; the slot is freed by the session's `session_ended`, not by the verdict. Both are bound to the review loopctl recorded for THIS dispatch and THIS runner, and are idempotent on `<dispatch_id>:<client_seq>`. New refusal codes: `tenant_halted`, `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate`. `session_ended` now also ends a REVIEW session: recorded once, the slot freed, no stage effect and no retry-ceiling count, answered with `kind: "review"` and `replayed` only (`RunnerSessionEndedAck` requires only `replayed` from this version; an implement session's ack still carries every row field). Only a runner that DECLARES `review` on join is sent one — `implied_by_silence` stays `implement` alone. RE-VENDOR to run reviews: a 1.20.0 copy has no `review` kind, no `RunnerReview`, no `review_finding` and no `review_verdict` | | | | |
-  | (1.22.0) ONE CODE, ONE MEANING, then WHICH REFUSALS END THE CLAIM (loopctl#920). Four codes were each answered both when the claim was over and when it was not, so their live halves get codes of their own: `claim_epoch_mismatch` (was `stale_claim_epoch`: the message's epoch is not its own dispatch's; `stale_claim_epoch` now means only that the claim moved), `wrong_dispatch_kind` (was `unknown_dispatch`: this runner's dispatch of another kind), and on `checkpoint` `review_requested` and `claim_lease_lapsed` (were `claim_not_live`, which now means only that the story left the claimed statuses; neither new one is permanent: a review reject reopens the claim and `renew_story_claim` accepts a lapsed lease until the reclaim sweep). A runner that JOINS declaring 1.22.0 or later gets the new codes; an older one keeps getting the old. Then `x-connection.claim_ending_errors`, keyed by work event with no `"*"` (`unknown_dispatch` and `stale_claim_epoch` on every work event except `stale_claim_epoch` on `triage_verdict`, whose resend is the reclaim repair; `not_claimant` and `claim_not_live` on `checkpoint`; `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate` on the judgements), and `x-connection.claim_ending_remedy`: send that dispatch no more of its work and stop its session; its one `session_ended` on exit is sent as always and answered finally. RE-VENDOR, and declare 1.22.0 on join, to get the split codes and derive the set | | | | |
+  | (1.22.0) ONE CODE, ONE MEANING, then WHICH REFUSALS END THE CLAIM (loopctl#920). Four codes were each answered both when the claim was over and when it was not, so their live halves get codes of their own: `claim_epoch_mismatch` (was `stale_claim_epoch`: the message's epoch is not its own dispatch's; `stale_claim_epoch` now means only that the claim moved), `wrong_dispatch_kind` (was `unknown_dispatch`: this runner's dispatch of another kind), and on `checkpoint` `review_requested` and `claim_lease_lapsed` (were `claim_not_live`, which now means only that the story left the claimed statuses; neither new one is permanent: a review reject reopens the claim and `renew_story_claim` accepts a lapsed lease until the reclaim sweep). A runner that JOINS declaring 1.22.0 or later gets the new codes; an older one keeps getting the old. Then `x-connection.claim_ending_errors`, keyed by work event with no `"*"` (`unknown_dispatch` and `stale_claim_epoch` on every work event except `stale_claim_epoch` on `triage_verdict`, whose resend is the reclaim repair; `not_claimant` and `claim_not_live` on `checkpoint`; `review_closed`, `review_claim_ended`, `review_round_superseded`, `reviewer_not_separate` on the judgements), and `x-connection.claim_ending_remedy`: send that dispatch no more of its work and stop its session; its `session_ended` on exit is sent as always, resent on `rate_limited`, and final on any permanent refusal. RE-VENDOR, and declare 1.22.0 on join, to get the split codes and derive the set | | | | |
 
   ## Branch prefixes (since 1.14.0)
 
@@ -297,8 +297,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     hex, both 40 or both 64 characters, and an optional `note` saying why. It is recorded only
     for the story's CURRENT claimant (the runner's agent, which a placement claims the story
     as) presenting the current `claim_epoch` while the claim is live — `not_claimant`,
-    `stale_claim_epoch` and `claim_not_live` otherwise, all permanent: the claim this session
-    ran under is over, so stop reporting on it. A checkpoint's parent is loopctl's to derive
+    `stale_claim_epoch` and `claim_not_live` otherwise, all permanent and all ending the claim
+    (`claim_ending_errors`). Since 1.22.0 the cases where the claim STANDS have codes of their
+    own: `claim_epoch_mismatch` (the message's epoch, permanent for that message),
+    `review_requested` and `claim_lease_lapsed` (neither permanent). A checkpoint's parent is loopctl's to derive
     (the previous checkpoint of the same claim); nothing on the wire names one.
   - `thread_entry` — a note on the thread (kind `message`, always). `client_seq` is the
     runner's own counter for the dispatch, and the entry's idempotency key is
@@ -428,8 +430,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   - `claim_ending_errors` (`claim_ending_errors/0`, since 1.22.0) — which of those END THE
     CLAIM the message ran under, keyed by WORK event with no `"*"`; `session_ended` has no
     key. `claim_ending_remedy` (`claim_ending_remedy/0`) says what to do: send that dispatch
-    no more of its work and stop its session, whose one `session_ended` on exit is sent as
-    always and answered finally.
+    no more of its work and stop its session, whose `session_ended` on exit is sent as always
+    and answered by its own rules.
 
   - `triage_gating_reasons` (`Loopctl.DeliveryGates.GateA.gating_reason_codes/0`) — the
     `escalation_reasons` entries the control-side gate matches as WHOLE STRINGS. Published
@@ -3240,8 +3242,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     #
     # - `not_claimant` — the story's claim is not this runner's agent (or the story is not
     #   claimed at all). `stale_claim_epoch` names a moved epoch, which this is not.
-    # - `claim_not_live` — the claim is this runner's and at this epoch, but its lease has
-    #   run out or review has been requested, so the implementer can no longer add to it.
+    # - `claim_not_live` — the claim is this runner's and at this epoch, but the story has left
+    #   the claimed statuses, so the implementer can no longer add to it. Until 1.22.0 it also
+    #   covered a lapsed lease and a requested review, which now have their own codes.
     # - `checkpoint_conflict` / `idempotency_key_reused` — a resend that is NOT the same write.
     #   Acknowledging it would say the new content was recorded when it was not.
     # - `secret_blocked` — a text field carries a credential shape. `invalid_payload` would
@@ -3491,9 +3494,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   @claim_ending_remedy "The claim the refused message ran under is over: send that dispatch " <>
                          "no more messages of its work (the events keyed here) and stop its " <>
-                         "session. An implement or review session still sends its one " <>
-                         "`session_ended` when its process exits, as always, and whatever " <>
-                         "that is answered is final: never resend it. Every OTHER permanent " <>
+                         "session. An implement or review session still sends its " <>
+                         "`session_ended` when its process exits, as always, and treats its " <>
+                         "answer by `session_ended`'s own rules: `rate_limited` is resent, " <>
+                         "and any permanent refusal of it is final. Every OTHER permanent " <>
                          "refusal refuses only the message that drew it, EXCEPT where " <>
                          "`permanent_error_conditions` says the run is over (`stale_stage` " <>
                          "naming a stage no runner can report out of, `dispatch_not_accepted` " <>

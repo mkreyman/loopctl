@@ -8,7 +8,7 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
 
   The read is KIND-SCOPED, implement by default, as `DispatchLedger`'s session accessors are:
   an `implement` session writes checkpoints and notes, a `review` session (`kind: "review"`)
-  writes judgements, and a row of any other kind reads as none (`:unknown_dispatch`).
+  writes judgements, and a row of any other kind is `:wrong_dispatch_kind` (contract 1.22.0).
   """
 
   import Ecto.Query
@@ -29,9 +29,11 @@ defmodule Loopctl.Delivery.RunnerThreadSession do
 
   @doc """
   The ledger row `runner_id` holds for the message's dispatch, whatever its status, provided
-  the message's `claim_epoch` is the dispatch's. A row another runner or tenant holds reads as
-  none (`:unknown_dispatch`), and so is a row of another kind than `opts[:kind]` (implement by
-  default; `DispatchLedger.where_implement_kind/1`). Contention on the read is `:busy`, counted under
+  the message's `claim_epoch` is the dispatch's (otherwise `:claim_epoch_mismatch`, or
+  `:stale_claim_epoch` when the story has moved past the dispatch: `DispatchLedger.epoch_refusal/3`).
+  A row another runner or tenant holds reads as none (`:unknown_dispatch`); a row of another
+  kind than `opts[:kind]` (implement by default; `DispatchLedger.kind_answers?/2`) is
+  `:wrong_dispatch_kind`. Contention on the read is `:busy`, counted under
   `[:loopctl, :threads, :busy]` and logged as `what`.
 
   The epoch check is not the fence: `Loopctl.Threads` reads the story's epoch under its lock,

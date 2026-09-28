@@ -117,8 +117,10 @@ defmodule Loopctl.Delivery.RunnerStages do
 
   @type error ::
           :unknown_dispatch
+          | :wrong_dispatch_kind
           | :dispatch_not_accepted
           | :stale_claim_epoch
+          | :claim_epoch_mismatch
           | {:stale_stage, StoryStage.t()}
           | :unknown_story_stage
           | {:effect_conflict, map()}
@@ -197,8 +199,10 @@ defmodule Loopctl.Delivery.RunnerStages do
 
   @type end_error ::
           :unknown_dispatch
+          | :wrong_dispatch_kind
           | :dispatch_not_accepted
           | :stale_claim_epoch
+          | :claim_epoch_mismatch
           | :already_recorded
           | :unknown_story_stage
           | :audit_chain_append_failed
@@ -215,9 +219,11 @@ defmodule Loopctl.Delivery.RunnerStages do
   returns the story's stage row as it stands afterwards, with whether this message was a
   resend of one already recorded. See "Session end" in the moduledoc for what each reason does.
 
-  Refused before anything is recorded: `:unknown_dispatch` (not this runner's, or not an
-  implement dispatch), `:unknown_story_stage` (the story has no stage row), and — for a FIRST
-  report only — `:stale_claim_epoch` and `:dispatch_not_accepted`. A second report whose bytes
+  Refused before anything is recorded: `:unknown_dispatch` (not this runner's),
+  `:wrong_dispatch_kind` (not an implement dispatch), `:unknown_story_stage` (the story has no
+  stage row), and — for a FIRST report only — `:stale_claim_epoch` (the claim moved),
+  `:claim_epoch_mismatch` (the message's epoch is not its dispatch's, on a claim still
+  standing) and `:dispatch_not_accepted`. A second report whose bytes
   differ from the first is `:already_recorded`, whatever has happened since. `:busy` and
   `:capacity_busy` mean a lock was not free, or a budget escalation's row kept moving: the
   record may or may not have landed, and the resend completes the work either way.

@@ -9,7 +9,7 @@ defmodule Loopctl.Delivery.RunnerThreads do
   channel process should not carry:
 
   1. resolve the runner's dispatch to its story, from the ledger row — the story is NEVER
-     taken off the wire — and refuse any kind but `implement` as `:unknown_dispatch`
+     taken off the wire — and refuse any kind but `implement` as `:wrong_dispatch_kind`
      (`Loopctl.Delivery.RunnerThreadSession.read/5`, implement by default), as
      `session_ended` does: a triage session has no claim to report on;
   2. refuse an epoch that is not even the dispatch's, before the write's transaction opens;
@@ -85,10 +85,14 @@ defmodule Loopctl.Delivery.RunnerThreads do
 
   @type error ::
           :unknown_dispatch
+          | :wrong_dispatch_kind
           | :dispatch_not_accepted
           | :stale_claim_epoch
+          | :claim_epoch_mismatch
           | :not_claimant
           | :claim_not_live
+          | :review_requested
+          | :claim_lease_lapsed
           | :checkpoint_conflict
           | :idempotency_key_reused
           | :secret_blocked

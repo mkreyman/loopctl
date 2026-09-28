@@ -218,8 +218,23 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           "claim_epoch" => @epoch + 1
         })
 
+      handler = "legacy-refusal-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler,
+        [:loopctl, :runners, :message_refused],
+        fn _event, _measurements, metadata, _config -> send(test_pid, {:refused, metadata}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
       ref = push(channel, "stage", message)
       assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+
+      # The operator still sees the code control DECIDED.
+      assert_receive {:refused, %{event: "stage", reason: "claim_epoch_mismatch"}}
     end
 
     test "a transition the machine has no edge for never reaches the database", ctx do

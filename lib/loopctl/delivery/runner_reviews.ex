@@ -9,7 +9,7 @@ defmodule Loopctl.Delivery.RunnerReviews do
 
   1. resolve the runner's dispatch to its story from the LEDGER row the runner holds — the
      story is never taken off the wire — and refuse any kind but `review` as
-     `:unknown_dispatch`;
+     `:wrong_dispatch_kind`;
   2. refuse an epoch that is not even the dispatch's;
   3. hand the judgement to `Loopctl.Threads.record_judgement/5`, which binds it to the review
      loopctl recorded for THIS dispatch and THIS runner, under the thread lock, and decides

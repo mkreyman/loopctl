@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "cc547aca7ef889e89985a00508f1cf30b39e86695c7bb328eb963303fac516ae"
+  @digest "6ce20a39409478dc749d0eb7ea992ab8bffc81a91ccbeba4e9b073c8a052f551"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -3022,6 +3022,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["claim_ending_errors"] == RunnerContract.claim_ending_errors()
       assert connection["claim_ending_remedy"] == RunnerContract.claim_ending_remedy()
       assert connection["claim_ending_remedy"] =~ "session_ended"
+      # `session_ended` keeps its own rules: a transient answer is still resent.
+      assert connection["claim_ending_remedy"] =~ "`rate_limited` is resent"
     end
   end
 end

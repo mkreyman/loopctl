@@ -1881,7 +1881,7 @@
         "unknown_dispatch"
       ]
     },
-    "claim_ending_remedy": "The claim the refused message ran under is over: send that dispatch no more messages of its work (the events keyed here) and stop its session. An implement or review session still sends its one `session_ended` when its process exits, as always, and whatever that is answered is final: never resend it. Every OTHER permanent refusal refuses only the message that drew it, EXCEPT where `permanent_error_conditions` says the run is over (`stale_stage` naming a stage no runner can report out of, `dispatch_not_accepted` with no accept of yours in flight): those end the run too.",
+    "claim_ending_remedy": "The claim the refused message ran under is over: send that dispatch no more messages of its work (the events keyed here) and stop its session. An implement or review session still sends its `session_ended` when its process exits, as always, and treats its answer by `session_ended`'s own rules: `rate_limited` is resent, and any permanent refusal of it is final. Every OTHER permanent refusal refuses only the message that drew it, EXCEPT where `permanent_error_conditions` says the run is over (`stale_stage` naming a stage no runner can report out of, `dispatch_not_accepted` with no accept of yours in flight): those end the run too.",
     "credential_header": "x-loopctl-runner-token",
     "dispatchable_kinds": [
       "triage",
