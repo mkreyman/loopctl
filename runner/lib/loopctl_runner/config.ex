@@ -36,7 +36,12 @@ defmodule LoopctlRunner.Config do
     liveness_interval_s: 30,
     kill_grace_s: 10,
     agents_probe_timeout_s: 20,
-    tree_poll_s: 1
+    tree_poll_s: 1,
+    # The least session worth starting under a dispatch's `deadline_at`, in seconds, capped by the
+    # session's own wall clock: a start with less than that left before it must be stopped
+    # (`LoopctlRunner.Story.check_deadline/4`) would be stopped almost at once, so it counts as past
+    # the deadline.
+    min_session_s: 60
   ]
 
   @type t :: %__MODULE__{
@@ -54,7 +59,8 @@ defmodule LoopctlRunner.Config do
           liveness_interval_s: pos_integer(),
           kill_grace_s: pos_integer(),
           agents_probe_timeout_s: pos_integer(),
-          tree_poll_s: pos_integer()
+          tree_poll_s: pos_integer(),
+          min_session_s: pos_integer()
         }
 
   @positive_ints [
@@ -64,7 +70,8 @@ defmodule LoopctlRunner.Config do
     :liveness_interval_s,
     :kill_grace_s,
     :agents_probe_timeout_s,
-    :tree_poll_s
+    :tree_poll_s,
+    :min_session_s
   ]
 
   @launcher_basename "claude-headless.sh"

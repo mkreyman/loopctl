@@ -94,6 +94,36 @@ defmodule LoopctlRunner.DispatchRunTest do
     assert String.length(DispatchRun.story_id(@story_id)) == 42
   end
 
+  test "the story an accepted dispatch runs carries the instant the policy parsed" do
+    config = LoopctlRunner.TestSupport.config!(LoopctlRunner.TestSupport.tmp_dir!("dr-story"))
+
+    fields = %{
+      repo: "fixture",
+      base: "master",
+      branch: "loop/s1",
+      wall_clock_s: 30,
+      max_turns: 5,
+      deadline_at: ~U[2026-09-28 10:00:40Z]
+    }
+
+    assert {:ok, story} = DispatchRun.story(@dispatch, fields, config)
+    assert story.deadline_at == ~U[2026-09-28 10:00:40Z]
+    # Not a relative budget: the wall clock is the dispatch's, untouched by the deadline.
+    assert story.wall_clock_s == 30
+
+    # A dispatch not placed under a claim carries none.
+    assert {:ok, %{deadline_at: nil}} =
+             DispatchRun.story(@dispatch, %{fields | deadline_at: nil}, config)
+  end
+
+  test "a run that began past its deadline_at has no end to report, whatever it reached" do
+    # Not `-> escalated`: that would say a human is needed when none is, and after the deadline
+    # the claim is loopctl's lease sweep's to release.
+    assert DispatchRun.end_reports(%{status: "deadline_passed", reached: "claimed"}) == []
+    # The shape it would otherwise take: a run that got no worktree escalates.
+    assert DispatchRun.end_reports(%{status: "failed", reached: "claimed"}) == [:escalated]
+  end
+
   test "the binding names the dispatch, its epoch and its story" do
     assert DispatchRun.binding(@dispatch) == %{
              "dispatch_id" => @dispatch["dispatch_id"],
@@ -129,6 +159,8 @@ defmodule LoopctlRunner.DispatchRunTest do
             {"escalated", "completed"},
             {"wall_clock_exceeded", "wall_clock_exceeded"},
             {"max_turns_exceeded", "max_turns_exceeded"},
+            # The deadline stopped it, not its own budget: re-queued, never escalated.
+            {"stopped_at_deadline", "crashed"},
             {"failed", "crashed"},
             {"parked", "crashed"},
             {"not_group_leader", "crashed"},

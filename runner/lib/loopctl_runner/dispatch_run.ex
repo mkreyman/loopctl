@@ -181,9 +181,10 @@ defmodule LoopctlRunner.DispatchRun do
   defp text(_value, _bounds), do: {:error, "is not a string"}
 
   @doc """
-  The `Story` an accepted dispatch runs: the policy's fields and a local id derived from the
-  dispatch. Its prompt is deferred (`Story.from_map/3`): `LoopctlRunner.Run.execute/3` builds it
-  with `prompt/4`'s function once the worktree exists, and nothing builds one before that.
+  The `Story` an accepted dispatch runs: the policy's fields — its `deadline_at` among them, the
+  instant `DispatchPolicy.decide/3` parsed — and a local id derived from the dispatch. Its prompt is
+  deferred (`Story.from_map/3`): `LoopctlRunner.Run.execute/3` builds it with `prompt/4`'s function
+  once the worktree exists, and nothing builds one before that.
   """
   @spec story(map(), map(), Config.t()) :: {:ok, Story.t()} | {:error, String.t()}
   def story(dispatch, fields, %Config{} = config) do
@@ -194,7 +195,11 @@ defmodule LoopctlRunner.DispatchRun do
         "base" => fields.base,
         "branch" => fields.branch,
         "wall_clock_s" => fields.wall_clock_s,
-        "max_turns" => fields.max_turns
+        "max_turns" => fields.max_turns,
+        # Contract 1.19.0's stop bound, nil on a dispatch not placed under a claim. Kept an INSTANT
+        # and turned into a timer only when the session starts (`Story.stop_after/4`), so start-up
+        # time comes out of the grace.
+        "deadline_at" => fields.deadline_at
       },
       config,
       prompt: :deferred
@@ -298,7 +303,11 @@ defmodule LoopctlRunner.DispatchRun do
   What a run's end is reported as, in the order it goes out, from the run's summary (or the
   `status`, `reached` and escalations a later Control reads back from `state.json`):
 
-    * `[:escalated]` — no session ever started: the run got no worktree (`reached` `claimed`) or
+    * `[]` — the run's `deadline_at` passed before its session started (status `deadline_passed`,
+      from `claimed`, `worktree` or `implementing`): it started no session, and escalating the story
+      would say a human is needed when none is. After its deadline the claim is loopctl's lease sweep's, which releases it; the run
+      records its end as settled (`terminal_reported` `skipped`), so no Control reports it later.
+    * `[:escalated]` — no session ever started: the run got no worktree (`reached` `claimed`), or
       its prompt was refused (`worktree`). There is no session to say `session_ended` about, so
       the `-> escalated` stage report is the whole of its end.
     * `[:escalated, :session_ended]` — the session ran `loop-escalate`: the story is escalated,
@@ -310,6 +319,7 @@ defmodule LoopctlRunner.DispatchRun do
   @spec end_reports(map()) :: [:escalated | :session_ended]
   def end_reports(summary) do
     cond do
+      summary[:status] == "deadline_passed" -> []
       summary[:reached] in ["claimed", "worktree"] -> [:escalated]
       summary[:escalations] not in [nil, []] -> [:escalated, :session_ended]
       true -> [:session_ended]
@@ -330,7 +340,14 @@ defmodule LoopctlRunner.DispatchRun do
       nothing". So `completed` cannot move a story the escalation just moved, and it is still the
       truth about the session: it stopped because it handed the story to a human.
     * `wall_clock_exceeded`, `max_turns_exceeded` — the run hit that budget (`Session` reports the
-      turn budget from the CLI's own `error_max_turns` result line).
+      turn budget from the CLI's own `error_max_turns` result line). Its OWN wall clock only: a
+      session the dispatch's `deadline_at` stopped first (`stopped_at_deadline`) is `crashed`,
+      below. The contract: "`wall_clock_exceeded` and `max_turns_exceeded` escalate an in-flight
+      story over the control-only `budget_reported` edge and end its claim", while "`crashed`
+      releases the claim at once over `runner_lost` — re-queued below the retry ceiling". A
+      deadline stop is loopctl's own placement running out, not a budget the story overran, so
+      nothing about it calls for a human, and of the contract's reasons `crashed` is the one that
+      releases the claim and places the story again.
     * `crashed` — anything else: a session that exited non-zero on its own, a run that raised or
       died, and the runner's own stops that are no budget (`parked`, `not_group_leader`). The
       contract's `crashed` is "any end the runner did not choose and that is not one of the

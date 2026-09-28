@@ -15,6 +15,7 @@
   "kill_grace_s": 10,
   "tree_poll_s": 1,
   "agents_probe_timeout_s": 20,
+  "min_session_s": 60,
   "control": {
     "url": "wss://loopctl.com/runner/socket/websocket",
     "runner_id": "<runner.id returned by runner_enroll>",

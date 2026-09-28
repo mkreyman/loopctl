@@ -17,7 +17,8 @@ if [ "${1:-}" = "agents" ]; then
     case "${FAKE_AGENTS:-busy}" in
         fail) echo "agents probe exploded" >&2; exit 3 ;;
         slow_absent) sleep 2; echo '[]'; exit 0 ;;
-        hang) sleep 30; exit 0 ;;
+        # Recorded as it starts, so a test can tell a probe that was in flight from one never sent.
+        hang) : > "$state/agents_probe_started"; sleep 30; exit 0 ;;
     esac
     sid=$(cat "$state/session_id" 2>/dev/null || echo none)
     status=${FAKE_AGENTS:-busy}

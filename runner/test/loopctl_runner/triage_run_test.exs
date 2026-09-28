@@ -454,6 +454,121 @@ defmodule LoopctlRunner.TriageRunTest do
              ~r/^RUNNER_ENV_PROBE=t_#{binary_part(result.run_id, 0, 8)}$/m
   end
 
+  test "deadline_at stops the session in time, and the detail names the deadline", ctx do
+    room = ctx.config.kill_grace_s + LoopctlRunner.Story.deadline_margin_s() + 2
+    deadline = DateTime.utc_now() |> DateTime.add(room, :second)
+    started = System.monotonic_time(:millisecond)
+
+    result =
+      execute(ctx, [{"FAKE_CLAUDE_MODE", "hang"}], wall_clock_s: 30, deadline_at: deadline)
+
+    assert DateTime.compare(DateTime.utc_now(), deadline) == :lt
+    assert {:incomplete, "wall_clock_exceeded", detail} = result.outcome
+    # Which bound it was: loopctl's placement, not this runner's wall clock budget.
+    assert detail =~ "deadline_at"
+    assert result.session.reason == :wall_clock_exceeded
+    assert System.monotonic_time(:millisecond) - started < 15_000
+  end
+
+  test "a wall clock stop says so, and not the deadline", ctx do
+    deadline = DateTime.utc_now() |> DateTime.add(3600, :second)
+    result = execute(ctx, [{"FAKE_CLAUDE_MODE", "hang"}], wall_clock_s: 1, deadline_at: deadline)
+
+    assert {:incomplete, "wall_clock_exceeded", "the session ran out of wall clock"} =
+             result.outcome
+  end
+
+  test "one past its deadline_at when it begins does nothing and owes nothing", ctx do
+    # Past for the guard while still in the future: inside the kill grace and the margin.
+    deadline = DateTime.utc_now() |> DateTime.add(ctx.config.kill_grace_s, :second)
+
+    binding = %{
+      "dispatch_id" => LoopctlRunner.Session.uuid4(),
+      "claim_epoch" => 3,
+      "story_id" => LoopctlRunner.Session.uuid4()
+    }
+
+    log =
+      capture_log(fn ->
+        send(
+          self(),
+          {:result,
+           execute(
+             ctx,
+             [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}],
+             deadline_at: deadline,
+             binding: binding
+           )}
+        )
+      end)
+
+    assert_received {:result, result}
+    # Nothing tried to turn "did not start" into a message and failed at it.
+    refute log =~ "outcome"
+
+    assert {:deadline_passed, detail} = result.outcome
+    assert detail =~ ~r/^deadline_passed: /
+    assert result.session == nil
+    # No session, no tree, and no message recorded for a restart to send.
+    refute File.exists?(Path.join(ctx.state, "argv"))
+    assert LoopctlRunner.PendingVerdicts.all(ctx.config.runs_dir) == []
+
+    assert {:ok, %{"status" => "deadline_passed", "terminal_reported" => "skipped"} = recorded} =
+             RunStateRead.read(result.run_dir)
+
+    refute Map.has_key?(recorded, "worktree")
+  end
+
+  test "one whose deadline passes before its session starts owes nothing either", ctx do
+    config = ctx.config
+    # Room for the run-start check with seconds to spare, then `on_start` — announced after that
+    # check and before the session — waits the guard out: the check immediately before the session
+    # is what refuses it.
+    room =
+      config.kill_grace_s + LoopctlRunner.Story.deadline_margin_s() + config.min_session_s + 3
+
+    deadline = DateTime.utc_now() |> DateTime.add(room, :second)
+
+    wait_out = fn _run ->
+      :ok =
+        wait_until(fn ->
+          LoopctlRunner.Story.check_deadline(deadline, 1800, config, DateTime.utc_now()) != :ok
+        end)
+    end
+
+    binding = %{
+      "dispatch_id" => LoopctlRunner.Session.uuid4(),
+      "claim_epoch" => 3,
+      "story_id" => LoopctlRunner.Session.uuid4()
+    }
+
+    result =
+      execute(
+        ctx,
+        [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}],
+        deadline_at: deadline,
+        binding: binding,
+        on_start: wait_out
+      )
+
+    # The same outcome as a start check that found it passed: no message, nothing owed — never an
+    # `incomplete` `wall_clock_exceeded` for a session that never ran.
+    assert {:deadline_passed, detail} = result.outcome
+    assert detail =~ ~r/^deadline_passed: /
+    assert result.session == nil
+    refute File.exists?(Path.join(ctx.state, "argv"))
+    # Refused inside the tree's `try`: the tree it cut was released as after any session.
+    {:ok, events} = LoopctlRunner.Trace.read(Path.join(result.run_dir, "trace.ndjson"))
+    types = Enum.map(events, & &1["type"])
+    assert "triage.deadline_passed" in types
+    refute "session.started" in types
+    assert Enum.any?(types, &(&1 in ["worktree.released", "worktree.removed"]))
+    assert LoopctlRunner.PendingVerdicts.all(config.runs_dir) == []
+
+    assert {:ok, %{"status" => "deadline_passed", "terminal_reported" => "skipped"}} =
+             RunStateRead.read(result.run_dir)
+  end
+
   test "a budget over this runner's ceiling is refused, not quietly granted", ctx do
     # Story.from_map enforces these for every implement run; a triage dispatch asking for more
     # could otherwise hold a session open past any ceiling the operator set.

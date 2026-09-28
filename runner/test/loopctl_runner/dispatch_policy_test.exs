@@ -69,6 +69,60 @@ defmodule LoopctlRunner.DispatchPolicyTest do
            } = story
   end
 
+  describe "deadline_at (contract 1.19.0)" do
+    @now ~U[2026-09-28 10:00:00Z]
+
+    defp at(seconds), do: @now |> DateTime.add(seconds, :second) |> DateTime.to_iso8601()
+
+    defp decide_at(ctx, deadline),
+      do: decide(ctx, Map.put(@dispatch, "deadline_at", deadline), Map.put(@ready, :now, @now))
+
+    test "is parsed once, into the instant the accepted fields carry", ctx do
+      assert {:accept, %{deadline_at: deadline}} = decide_at(ctx, at(3600))
+      assert deadline == DateTime.add(@now, 3600, :second)
+
+      assert {:accept, %{deadline_at: nil}} = decide(ctx, @dispatch, Map.put(@ready, :now, @now))
+    end
+
+    test "one that leaves no time to stop a session by then is refused other, never a capability",
+         ctx do
+      room =
+        ctx.config.kill_grace_s + LoopctlRunner.Story.deadline_margin_s() +
+          ctx.config.min_session_s
+
+      # Still in the future, but a second short of the grace, the skew margin and the least
+      # session worth starting.
+      assert {:refuse, "other", detail} = decide_at(ctx, at(room - 1))
+      assert detail =~ ~r/^deadline_passed: /
+      assert {:refuse, "other", _} = decide_at(ctx, at(-60))
+
+      # One second more and there is time.
+      assert {:accept, _} = decide_at(ctx, at(room))
+    end
+
+    test "the minimum runtime is the dispatch's own wall clock when that is shorter", ctx do
+      # 60 s minimum, a 20 s dispatch: 20 s before stop_by is enough for it.
+      ctx = %{ctx | config: %{ctx.config | min_session_s: 60}}
+      short = Map.put(@dispatch, "wall_clock_seconds", 20)
+      room = ctx.config.kill_grace_s + LoopctlRunner.Story.deadline_margin_s() + 20
+      state = Map.put(@ready, :now, @now)
+
+      assert {:accept, _} = decide(ctx, Map.put(short, "deadline_at", at(room)), state)
+
+      assert {:refuse, "other", "deadline_passed: " <> _} =
+               decide(ctx, Map.put(short, "deadline_at", at(room - 1)), state)
+    end
+  end
+
+  test "a dispatch whose previous sessionless run is still ending is refused busy, for now",
+       ctx do
+    # A moment, not a capability: `other`, which loopctl places again — never `kind_not_supported`.
+    assert {:refuse, "other", "busy: " <> _} =
+             decide(ctx, @dispatch, Map.put(@ready, :ending, true))
+
+    assert {:accept, _} = decide(ctx, @dispatch, Map.put(@ready, :ending, false))
+  end
+
   test "nothing is accepted unless the runner is configured to accept dispatches", ctx do
     assert reason(decide(ctx, @dispatch, @ready, %{accepts_dispatches: false})) ==
              "dispatches_disabled"

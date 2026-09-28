@@ -15,19 +15,33 @@ defmodule LoopctlRunner.DispatchPolicy do
        wording through `:dispatches_disabled_detail` in `state`; absent, the configured case's own
        sentence is used. Never an empty string: a detail that says nothing is worse than the
        default one, because loopctl would have to special-case it;
-    2. `draining`, then `at_capacity` (in flight at `control.max_sessions`);
-    3. `repo_not_allowed` — the repo is not in `control.repos`, or has no local checkout in
+    2. `other`, its detail starting `busy:` — `state.ending`: a run of this same dispatch started
+       no session and is still ending (`LoopctlRunner.Control` forgets such a dispatch the moment
+       its end is reported, so a re-send reaches this decision while that run's task is still in
+       flight). A moment, like the deadline's refusal below, never a capability; loopctl places the
+       story again;
+    3. `draining`, then `at_capacity` (in flight at `control.max_sessions`);
+    4. `repo_not_allowed` — the repo is not in `control.repos`, or has no local checkout in
        `repos` under its name;
-    4. `insufficient_disk` — free disk under `control.min_free_disk_mb`, or unreadable, on the
+    5. `insufficient_disk` — free disk under `control.min_free_disk_mb`, or unreadable, on the
        volume of `runs_dir` OR of the repo checkout, where the worktree and its build output land;
-    5. `branch_not_allowed` — the branch is outside `branch_prefixes`, or either ref is not a
+    6. `branch_not_allowed` — the branch is outside `branch_prefixes`, or either ref is not a
        plain ref name;
-    6. `wall_clock_exceeds_limit`, `max_turns_exceeds_limit` — over `max_wall_clock_s` or
+    7. `wall_clock_exceeds_limit`, `max_turns_exceeds_limit` — over `max_wall_clock_s` or
        `max_turns`;
-    7. `token_budget_exceeds_limit` — when `control.max_token_budget` is set, a dispatch with no
-       budget or a larger one.
+    8. `token_budget_exceeds_limit` — when `control.max_token_budget` is set, a dispatch with no
+       budget or a larger one;
+    9. `other`, its detail starting `deadline_passed:` — the dispatch's `deadline_at` (contract
+       1.19.0) leaves less than the minimum runtime (`min_session_s`, capped by the dispatch's
+       `wall_clock_seconds`) of session before it must be stopped
+       (`LoopctlRunner.Story.check_deadline/4`). A statement about a moment, never a capability:
+       the contract has no reason of its own for it, and `kind_not_supported` would be a lie that
+       loopctl may keep for ever. loopctl places the story again under a fresh claim.
 
-  An accepted dispatch comes back as the fields a `LoopctlRunner.Story` is built from.
+  An accepted dispatch comes back as the fields a `LoopctlRunner.Story` is built from, its
+  `deadline_at` parsed once, here, into the instant everything after reads.
+
+  `state` may carry `:now`, the instant the deadline is judged at; absent, it is the current time.
 
   The refusals that read what the dispatch does not carry are decided once the run has cut its
   worktree: `delivery_mode/1` (the repository's `.loopctl/mode`, read from the commit the worktree
@@ -36,7 +50,7 @@ defmodule LoopctlRunner.DispatchPolicy do
   fails closed: a run it refuses starts no session.
   """
 
-  alias LoopctlRunner.{Config, ControlConfig}
+  alias LoopctlRunner.{Config, ControlConfig, Story}
 
   @ref_format ~r/\A[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}\z/
 
@@ -47,7 +61,10 @@ defmodule LoopctlRunner.DispatchPolicy do
           :free_disk_mb => (String.t() -> non_neg_integer() | nil),
           # What to say instead of the configured-false sentence, when something other than the
           # config turned dispatches off for this process.
-          optional(:dispatches_disabled_detail) => String.t() | nil
+          optional(:dispatches_disabled_detail) => String.t() | nil,
+          # Whether a run of this dispatch that started no session is still ending.
+          optional(:ending) => boolean(),
+          optional(:now) => DateTime.t()
         }
 
   @type decision ::
@@ -56,6 +73,7 @@ defmodule LoopctlRunner.DispatchPolicy do
   @spec decide(map(), Config.t(), state()) :: decision()
   def decide(dispatch, %Config{control: %ControlConfig{} = control} = config, state) do
     with :ok <- enabled(control, state),
+         :ok <- ending(state),
          :ok <- capacity(control, state),
          {:ok, repo, path} <- repo(dispatch, control, config),
          :ok <- disk(control, state, [config.runs_dir, path]),
@@ -67,7 +85,9 @@ defmodule LoopctlRunner.DispatchPolicy do
              "wall_clock_exceeds_limit"
            ),
          :ok <- limit(dispatch["max_turns"], config.max_turns, "max_turns_exceeds_limit"),
-         :ok <- token_budget(dispatch["token_budget"], control.max_token_budget) do
+         :ok <- token_budget(dispatch["token_budget"], control.max_token_budget),
+         deadline_at = Story.deadline!(dispatch["deadline_at"]),
+         :ok <- deadline(deadline_at, dispatch["wall_clock_seconds"], config, state) do
       {:accept,
        %{
          repo: repo,
@@ -75,8 +95,18 @@ defmodule LoopctlRunner.DispatchPolicy do
          base: dispatch["base_branch"],
          branch: dispatch["branch"],
          wall_clock_s: dispatch["wall_clock_seconds"],
-         max_turns: dispatch["max_turns"]
+         max_turns: dispatch["max_turns"],
+         deadline_at: deadline_at
        }}
+    end
+  end
+
+  defp deadline(deadline_at, wall_clock_s, config, state) do
+    now = Map.get_lazy(state, :now, &DateTime.utc_now/0)
+
+    case Story.check_deadline(deadline_at, wall_clock_s, config, now) do
+      :ok -> :ok
+      {:passed, detail} -> {:refuse, "other", detail}
     end
   end
 
@@ -90,6 +120,11 @@ defmodule LoopctlRunner.DispatchPolicy do
       _absent_or_empty -> {:refuse, "dispatches_disabled", @configured_off}
     end
   end
+
+  defp ending(%{ending: true}),
+    do: {:refuse, "other", "busy: the previous run of this dispatch is ending; send it again"}
+
+  defp ending(_state), do: :ok
 
   defp capacity(_control, %{draining: true}), do: {:refuse, "draining", "this runner is draining"}
 

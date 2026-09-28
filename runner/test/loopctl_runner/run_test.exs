@@ -487,6 +487,245 @@ defmodule LoopctlRunner.RunTest do
     refute "session.parked" in types
   end
 
+  describe "deadline_at (contract 1.19.0)" do
+    defp from_now(seconds), do: DateTime.utc_now() |> DateTime.add(seconds, :second)
+
+    # Room past what the kill grace and the skew margin need, in seconds.
+    defp room(config, seconds), do: config.kill_grace_s + Story.deadline_margin_s() + seconds
+
+    test "stops the session so it is GONE by the deadline, not signalled at it", %{
+      root: root,
+      state: state
+    } do
+      config = config!(root)
+      deadline = from_now(room(config, 2))
+      started = System.monotonic_time(:millisecond)
+
+      result =
+        run!(root, state, [{"FAKE_CLAUDE_MODE", "hang"}, {"FAKE_AGENTS", "busy"}], %{
+          "wall_clock_s" => 30,
+          "deadline_at" => DateTime.to_iso8601(deadline)
+        })
+
+      # The run is over, its tree torn down and its session's whole tree dead, BEFORE the instant
+      # loopctl's lease sweep may release the story. A stop aimed AT the deadline ends after it.
+      assert DateTime.compare(DateTime.utc_now(), deadline) == :lt
+      refute os_pid_alive?(result.session.os_pid)
+
+      # Long before the 30 s wall clock, and named: not `wall_clock_exceeded`, which loopctl reads
+      # as a budget the story overran and escalates. The deadline is loopctl's own placement
+      # running out, reported `crashed`, which re-queues the story.
+      assert result.status == "stopped_at_deadline"
+      assert result.session.stop_bound == :deadline
+      assert System.monotonic_time(:millisecond) - started < 15_000
+
+      assert {:ok, %{"reason" => "crashed"}} =
+               DispatchRun.session_ended(
+                 %{"dispatch_id" => Session.uuid4(), "claim_epoch" => 1},
+                 %{status: result.status}
+               )
+
+      expected = DateTime.to_iso8601(deadline)
+      events = events!(result)
+
+      assert [%{"data" => %{"deadline_at" => ^expected, "stopped_by" => "deadline"}}] =
+               Enum.filter(events, &(&1["type"] == "session.wall_clock_exceeded"))
+
+      assert [%{"data" => %{"stop_bound" => "deadline"}}] =
+               Enum.filter(events, &(&1["type"] == "session.started"))
+    end
+
+    test "a wall clock stop is named as the wall clock's", %{root: root, state: state} do
+      result =
+        run!(root, state, [{"FAKE_CLAUDE_MODE", "hang"}, {"FAKE_AGENTS", "busy"}], %{
+          "wall_clock_s" => 1,
+          "deadline_at" => DateTime.to_iso8601(from_now(3600))
+        })
+
+      # Its OWN wall clock: the budget stop, reported as one.
+      assert result.status == "wall_clock_exceeded"
+      assert result.session.stop_bound == :wall_clock
+
+      assert {:ok, %{"reason" => "wall_clock_exceeded"}} =
+               DispatchRun.session_ended(
+                 %{"dispatch_id" => Session.uuid4(), "claim_epoch" => 1},
+                 %{status: result.status}
+               )
+
+      assert [%{"data" => %{"stopped_by" => "wall_clock"}}] =
+               Enum.filter(events!(result), &(&1["type"] == "session.wall_clock_exceeded"))
+    end
+
+    test "a session shorter than min_session_s needs only its own wall clock before the stop", %{
+      root: root,
+      state: state
+    } do
+      # 60 s minimum, a 20 s story, 30 s of room past the grace and the margin: enough for it.
+      config = config!(root, %{"min_session_s" => 60})
+      deadline = from_now(room(config, 30))
+
+      result =
+        run!(
+          root,
+          state,
+          [{"FAKE_CLAUDE_MODE", "stream"}],
+          %{"wall_clock_s" => 20, "deadline_at" => DateTime.to_iso8601(deadline)},
+          %{"min_session_s" => 60}
+        )
+
+      assert result.status == "succeeded"
+      assert File.exists?(Path.join(state, "argv"))
+    end
+
+    test "one past when the run begins costs no work, escalates nothing, and is settled", %{
+      root: root,
+      state: state
+    } do
+      config = config!(root)
+      # Still in the future, but inside the grace and the margin: past, for the guard.
+      {:ok, story} =
+        Story.from_map(
+          story_map(%{"deadline_at" => DateTime.to_iso8601(from_now(room(config, -1)))}),
+          config
+        )
+
+      test = self()
+      restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+      result =
+        try do
+          Run.execute(config, story, on_stage: &send(test, {:stage, &1}))
+        after
+          restore.()
+        end
+
+      assert result.status == "deadline_passed"
+      assert result.error =~ ~r/^deadline_passed: /
+      assert result.session == nil
+      assert result.teardown == nil
+      # No tree was cut and the fake CLI never ran.
+      refute File.exists?(LoopctlRunner.Worktree.path_for(story.repo_path, story.id))
+      refute File.exists?(Path.join(state, "argv"))
+
+      types = types(events!(result))
+      assert "run.deadline_passed" in types
+      refute "worktree.created" in types
+
+      assert {:ok, recorded} = RunState.read(result.run_dir)
+
+      assert %{
+               "status" => "deadline_passed",
+               "reached" => "claimed",
+               "terminal_reported" => "skipped"
+             } = recorded
+
+      # Its end is announced — so Control closes the dispatch's stream — and reports nothing.
+      assert_received {:stage, {:started, _}}
+      assert_received {:stage, {:finished, summary}}
+      refute_received {:stage, {:worktree, _}}
+      assert DispatchRun.end_reports(summary) == []
+    end
+
+    # Blocks until the deadline guard says `deadline` has passed: a wait on the condition itself,
+    # so a test using it neither races the clock nor sleeps longer than it must.
+    defp wait_out(deadline, config) do
+      :ok =
+        wait_until(fn ->
+          Story.check_deadline(deadline, 30, config, DateTime.utc_now()) != :ok
+        end)
+    end
+
+    # A deadline the run-start check passes with seconds to spare, on a machine as slow as CI.
+    defp slack_deadline(config), do: from_now(room(config, config.min_session_s + 3))
+
+    test "a deadline that passes while the worktree is cut ends the run quietly, not escalated",
+         %{root: root, state: state} do
+      config = config!(root)
+      deadline = slack_deadline(config)
+
+      {:ok, story} =
+        Story.from_map(
+          Map.delete(story_map(%{"deadline_at" => DateTime.to_iso8601(deadline)}), "prompt"),
+          config,
+          prompt: :deferred
+        )
+
+      test = self()
+      restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+      result =
+        try do
+          Run.execute(config, story,
+            on_stage: &send(test, {:stage, &1}),
+            prompt: fn _cut_from ->
+              wait_out(deadline, config)
+              {:ok, "review the story"}
+            end
+          )
+        after
+          restore.()
+        end
+
+      assert result.status == "deadline_passed"
+      assert result.error =~ ~r/^deadline_passed: /
+      refute File.exists?(Path.join(state, "argv"))
+
+      # The path it took: the run-start check passed and the tree was cut, then the check before
+      # the session found it passed — so no `implementing` was announced for a session that never
+      # started, and the tree it cut is gone.
+      types = types(events!(result))
+      assert "worktree.created" in types
+      assert "session.refused" in types
+      refute "session.started" in types
+      assert result.teardown.worktree == :removed
+      assert_received {:stage, {:worktree, _}}
+      refute_received {:stage, {:implementing, _}}
+
+      assert {:ok, %{"terminal_reported" => "skipped", "reached" => "worktree"}} =
+               RunState.read(result.run_dir)
+
+      assert_received {:stage, {:finished, summary}}
+      assert DispatchRun.end_reports(summary) == []
+    end
+
+    test "a deadline that passes after the last check stops the session at once, as crashed",
+         %{root: root, state: state} do
+      # Nothing checks after the run's check before `implementing`: a session started past the
+      # deadline is bounded by its own stop timer, which fires at once, and it ends as any session
+      # the deadline stopped — `crashed` on the wire, re-queued, never a budget stop.
+      config = config!(root)
+      deadline = slack_deadline(config)
+
+      {:ok, story} =
+        Story.from_map(story_map(%{"deadline_at" => DateTime.to_iso8601(deadline)}), config)
+
+      test = self()
+      restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "hang"}, {"FAKE_AGENTS", "busy"}])
+
+      on_stage = fn
+        {:implementing, _} = event ->
+          wait_out(deadline, config)
+          send(test, {:stage, event})
+
+        event ->
+          send(test, {:stage, event})
+      end
+
+      result =
+        try do
+          Run.execute(config, story, on_stage: on_stage)
+        after
+          restore.()
+        end
+
+      assert result.status == "stopped_at_deadline"
+      assert %{reason: :wall_clock_exceeded, stop_bound: :deadline} = result.session
+      assert_received {:stage, {:implementing, _}}
+      assert_received {:stage, {:finished, summary}}
+      assert DispatchRun.end_reports(summary) == [:session_ended]
+    end
+  end
+
   test "the subagent git grant is armed for the session and removed at teardown", %{
     root: root,
     state: state
@@ -829,6 +1068,34 @@ defmodule LoopctlRunner.RunTest do
     assert Enum.any?(events!(result), &(&1["type"] == "session.liveness"))
   end
 
+  test "a hung agents probe does not hold back the wall clock stop", %{root: root, state: state} do
+    # The probe can take agents_probe_timeout_s. Run IN the Session process, it held every message
+    # behind it — the wall clock and deadline stop included — so the session was killed up to that
+    # long after the moment it had to be gone by.
+    started = System.monotonic_time(:millisecond)
+
+    result =
+      run!(
+        root,
+        state,
+        [{"FAKE_CLAUDE_MODE", "hang"}, {"FAKE_AGENTS", "hang"}],
+        %{"wall_clock_s" => 4},
+        %{"agents_probe_timeout_s" => 25}
+      )
+
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    # The probe WAS in flight — the quiet session sent it before the stop was due — and never
+    # answered: its 25 s timeout is still to come.
+    assert File.exists?(Path.join(state, "agents_probe_started"))
+    refute "session.liveness" in types(events!(result))
+
+    assert result.status == "wall_clock_exceeded"
+    assert result.session.stop_bound == :wall_clock
+    # 4 s of wall clock and the kill grace, not the probe's 25 s.
+    assert elapsed < 15_000
+  end
+
   test "a session that cannot start still tears down and closes the run", %{
     root: root,
     state: state
@@ -898,7 +1165,8 @@ defmodule LoopctlRunner.RunTest do
       base: "master",
       branch: "loop/s1",
       wall_clock_s: 30,
-      max_turns: 5
+      max_turns: 5,
+      deadline_at: nil
     }
 
     stories =

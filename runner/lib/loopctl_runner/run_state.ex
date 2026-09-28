@@ -69,6 +69,22 @@ defmodule LoopctlRunner.RunState do
     next
   end
 
+  @doc """
+  Records a run's end — `changes`, which carry its `status` — and, in the SAME write, whether that
+  end is already settled. A run that ended `deadline_passed` started no session and owes loopctl
+  nothing (after its deadline the claim is loopctl's lease sweep's to release), so it is written
+  `terminal_reported` `skipped`, and no later Control goes looking for an end to report. Implement
+  and triage runs both end through here, so the two cannot disagree about it.
+  """
+  @spec finish(String.t(), map()) :: map()
+  def finish(run_dir, changes) do
+    changes = stringify(changes)
+    update(run_dir, Map.merge(changes, settled(changes["status"])))
+  end
+
+  defp settled("deadline_passed"), do: %{"terminal_reported" => "skipped"}
+  defp settled(_status), do: %{}
+
   defp stringify(map) do
     Map.new(map, fn
       {k, v} when is_atom(k) -> {Atom.to_string(k), v}

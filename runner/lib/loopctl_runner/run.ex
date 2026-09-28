@@ -67,6 +67,20 @@ defmodule LoopctlRunner.Run do
   `LoopctlRunner.DispatchRun.prompt/4`). A refusal starts no session: the worktree is torn down
   and the run ends `refused`, its error naming the reason. A builder that raises tears the
   worktree down too, and the run crashes.
+
+  A story whose `deadline_at` has passed when the run begins (`Story.check_deadline/4`) costs no
+  work: no reap, no fetch, no worktree, no session. Its state is written — the binding, and the
+  status `deadline_passed` — with `terminal_reported` `skipped` (`RunState.finish/2`), and
+  `:finished` reports that status from `claimed`, which `LoopctlRunner.DispatchRun.end_reports/1`
+  answers with nothing: escalating the story would call for a human none is needed by, and after
+  its deadline the claim is loopctl's lease sweep's to release. One that passes while the tree is
+  cut ends the same way from `worktree`, its tree torn down, checked again before `implementing`
+  is announced — the last check, immediately before the session.
+
+  A session that STARTED keeps the stop it started with (`Story.stop_after/4`). One its deadline
+  stops ends `stopped_at_deadline`, never `wall_clock_exceeded`: it overran no budget of its own,
+  and `LoopctlRunner.DispatchRun.session_ended/2` reports it `crashed`, which re-queues the story
+  rather than escalating it.
   """
   @summary_key {__MODULE__, :finished_summary}
 
@@ -146,14 +160,23 @@ defmodule LoopctlRunner.Run do
                   "and a run recorded without it would be reaped as an orphan"
       end
 
+    # THE deadline guard, before anything that costs work: the reap below can fetch, and the
+    # worktree step fetches and cuts. Judged again before the session is announced
+    # (`run_session/7`), and the session's own timer is what bounds a run that passes both.
+    deadline =
+      Story.check_deadline(story.deadline_at, story.wall_clock_s, config, DateTime.utc_now())
+
     # From the CONFIG, never from `System.user_home!/0` here: this line runs in every test that
     # runs a Run, so a hardcoded home is a suite that sweeps the operator's grants. The reaper's
     # own worktree locks record the owner already read above.
     reaped =
-      Reaper.reap(config.runs_dir, config.kill_grace_s * 1000, config.grant_dir,
-        projects_dir: config.claude_projects_dir,
-        owner: {:ok, owner}
-      )
+      if deadline == :ok,
+        do:
+          Reaper.reap(config.runs_dir, config.kill_grace_s * 1000, config.grant_dir,
+            projects_dir: config.claude_projects_dir,
+            owner: {:ok, owner}
+          ),
+        else: []
 
     File.mkdir_p!(run_dir)
 
@@ -190,14 +213,28 @@ defmodule LoopctlRunner.Run do
     stage(opts, {:started, %{run_id: run_id, run_dir: run_dir}})
 
     result =
-      try do
-        with_worktree(config, story, run_dir, trace, run_seq, run_id, owner, opts)
-      catch
-        # Any way out must not leave the run recorded in flight. The worktree lock is already
-        # released by the `after` in with_worktree.
-        kind, reason ->
-          record_crash(run_dir, trace, run_seq, Exception.format_banner(kind, reason))
-          :erlang.raise(kind, reason, __STACKTRACE__)
+      case deadline do
+        :ok ->
+          try do
+            with_worktree(config, story, run_dir, trace, run_seq, run_id, owner, opts)
+          catch
+            # Any way out must not leave the run recorded in flight. The worktree lock is already
+            # released by the `after` in with_worktree.
+            kind, reason ->
+              record_crash(run_dir, trace, run_seq, Exception.format_banner(kind, reason))
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        {:passed, detail} ->
+          Trace.emit(trace, "run.deadline_passed", run_seq, %{"error" => detail})
+
+          %{
+            status: "deadline_passed",
+            session: nil,
+            teardown: nil,
+            error: detail,
+            reached: "claimed"
+          }
       end
 
     Trace.emit(trace, "run.finished", run_seq, %{
@@ -209,7 +246,8 @@ defmodule LoopctlRunner.Run do
 
     # `reached` is recorded so a Control that did not see the run end can still report its
     # terminal stage from the right place.
-    RunState.update(run_dir, %{
+    # A run that passed its deadline owes nothing, and `RunState.finish/2` says so in this write.
+    RunState.finish(run_dir, %{
       status: result.status,
       reached: summary.reached,
       finished_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
@@ -335,7 +373,16 @@ defmodule LoopctlRunner.Run do
             run_session(config, story, run_dir, trace, run_seq, path, opts)
 
           {:refuse, reason, detail} ->
-            refuse_session(story, run_dir, trace, run_seq, path, opts, "#{reason}: #{detail}")
+            no_session(
+              story,
+              run_dir,
+              trace,
+              run_seq,
+              path,
+              opts,
+              "refused",
+              "#{reason}: #{detail}"
+            )
         end
 
       {:error, reason} ->
@@ -387,13 +434,14 @@ defmodule LoopctlRunner.Run do
     })
   end
 
-  # No session: the worktree goes the way it would after one, and the run records why.
-  defp refuse_session(story, run_dir, trace, run_seq, path, opts, error) do
+  # No session: the worktree goes the way it would after one, and the run records why — `refused`
+  # by its prompt, or `deadline_passed` while the tree was cut.
+  defp no_session(story, run_dir, trace, run_seq, path, opts, status, error) do
     Trace.emit(trace, "session.refused", run_seq, %{"error" => error})
     teardown = teardown(story, trace, run_seq, path, opts)
     record_worktree(run_dir, story, path, teardown, opts)
 
-    %{status: "refused", session: nil, teardown: teardown, error: error, reached: "worktree"}
+    %{status: status, session: nil, teardown: teardown, error: error, reached: "worktree"}
   end
 
   defp worktree_status(teardown, opts) do
@@ -402,7 +450,21 @@ defmodule LoopctlRunner.Run do
       else: Worktree.status_after(teardown)
   end
 
+  # THE deadline guard before the session, immediately before `implementing` is announced: cutting
+  # the tree and building the prompt take time, and a stage reported for a session that will not
+  # start is a stage loopctl moves the story on for. Nothing checks after it: a session started
+  # here is bounded by its own stop timer (`Story.stop_after/4`).
   defp run_session(config, story, run_dir, trace, run_seq, path, opts) do
+    case Story.check_deadline(story.deadline_at, story.wall_clock_s, config, DateTime.utc_now()) do
+      :ok ->
+        start_session(config, story, run_dir, trace, run_seq, path, opts)
+
+      {:passed, detail} ->
+        no_session(story, run_dir, trace, run_seq, path, opts, "deadline_passed", detail)
+    end
+  end
+
+  defp start_session(config, story, run_dir, trace, run_seq, path, opts) do
     # Teardown runs even when the session monitor crashes. A BEAM that dies outright
     # never gets here: that is the launcher watchdog's job, then the reaper's.
     reach(run_dir, opts, "implementing", {:implementing, %{}})
@@ -460,6 +522,13 @@ defmodule LoopctlRunner.Run do
   defp session_status(nil), do: "crashed"
   defp session_status(%{reason: :exited, exit_status: 0}), do: "succeeded"
   defp session_status(%{reason: :exited}), do: "failed"
+
+  # Stopped by the dispatch's deadline_at, not by its own wall clock: its own status, never
+  # `wall_clock_exceeded` — which `DispatchRun.session_ended/2` reports as a budget the story
+  # overran and loopctl escalates — and reported `crashed` from it.
+  defp session_status(%{reason: :wall_clock_exceeded, stop_bound: :deadline}),
+    do: "stopped_at_deadline"
+
   defp session_status(%{reason: reason}), do: Atom.to_string(reason)
 
   defp run_dir_name(story, run_id) do

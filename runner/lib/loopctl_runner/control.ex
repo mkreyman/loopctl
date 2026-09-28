@@ -58,9 +58,13 @@ defmodule LoopctlRunner.Control do
 
   The runs outlive this process, and what it would otherwise forget is on disk. On init:
 
-    * every dispatch bound in a `state.json` (any status) or pending in `LoopctlRunner.PendingStarts`
-      is treated as started, so a redelivered dispatch is answered `accepted` and starts nothing;
-    * each pending start has its accept resent, and its run starts on `ok`;
+    * every dispatch bound in a `state.json` or pending in `LoopctlRunner.PendingStarts` is treated
+      as started, so a redelivered dispatch is answered `accepted` and starts nothing — except a
+      run that ended owing nothing (`DispatchRun.end_reports/1` is `[]`: it started no session);
+    * each pending start has its accept resent, and its run starts on `ok` — unless it no longer
+      makes runnable work, when it is dropped and its accept not resent. One dropped because its
+      `deadline_at` passed is forgotten too, unless a run on disk started for it, so loopctl's
+      re-send is decided afresh; one dropped for anything else is still answered `accepted`;
     * each bound run that is over without `terminal_reported` in its `state.json` gets its end
       reported again — its `session_ended`, and a terminal `-> escalated` where the run sends one,
       from the stage it recorded reaching and retried from wherever a refusal says the row is.
@@ -92,6 +96,11 @@ defmodule LoopctlRunner.Control do
       `session_escalated`, a reason naming the status, exit reason and any escalation text) is sent
       only for a session that ran `loop-escalate`, before its `session_ended`, and for a run that
       never started a session (no worktree, or a refused prompt), which sends nothing else. A run
+      whose dispatch's `deadline_at` passed before its session started sends nothing at all and
+      records its end settled (`terminal_reported` `skipped`): the claim is loopctl's lease sweep's
+      by then. Its dispatch is forgotten as its end arrives; a re-send that arrives while its task
+      is still ending is refused `other` (`busy:`), and after that it is decided afresh. A session
+      the deadline stopped is reported `crashed`, not `wall_clock_exceeded`. A run
       whose task dies without saying so is reported from what it left on disk
       (`Run.unfinished/2`): the stage it recorded reaching, and `escalated` if its session
       escalated, otherwise `crashed`.
@@ -215,6 +224,7 @@ defmodule LoopctlRunner.Control do
     Runs,
     RunState,
     Session,
+    Story,
     TraceShip,
     TriageDispatch,
     TriageRun
@@ -368,6 +378,10 @@ defmodule LoopctlRunner.Control do
 
     case Health.capacity() do
       {:ok, capacity} ->
+        # ONE reading of the runs on disk, for the dispatches they started and for the pending
+        # starts that restore may forget: two readings are two answers about one directory.
+        started_runs = started_runs(RunState.all(config.runs_dir))
+
         socket =
           new_socket()
           |> assign(
@@ -400,7 +414,7 @@ defmodule LoopctlRunner.Control do
             # dispatch_id => claim_epoch for every dispatch this process started a run for, so
             # a repeat of one is never run twice.
             started_dispatches:
-              started_dispatches(config.runs_dir, restores_pending_starts?(opts)),
+              started_dispatches(config.runs_dir, started_runs, restores_pending_starts?(opts)),
             # In memory, for the life of this PROCESS — `mark_unjoined/2` does not clear it, and
             # that is deliberate rather than an oversight: a superseded ledger row stays
             # superseded, so the fact does not expire with a connection, and forgetting it on a
@@ -509,7 +523,7 @@ defmodule LoopctlRunner.Control do
         # verdicts loopctl never recorded, and finished runs whose end it never took.
         socket =
           socket
-          |> restore_pending_starts()
+          |> restore_pending_starts(MapSet.new(started_runs, fn {id, _epoch} -> id end))
           |> restore_pending_verdicts()
           |> recover_terminal_reports()
 
@@ -532,11 +546,7 @@ defmodule LoopctlRunner.Control do
   # nothing and returns, in silence, until the claim lease expires. Seeded from RunState alone,
   # a redelivery falls through to `decide_dispatch/2` and is refused `dispatches_disabled`,
   # which is the truth.
-  defp started_dispatches(runs_dir, restores_pending_starts?) do
-    bound =
-      for {_dir, %{"dispatch_id" => id, "claim_epoch" => epoch}} <- RunState.all(runs_dir),
-          do: {id, epoch}
-
+  defp started_dispatches(runs_dir, bound, restores_pending_starts?) do
     pending =
       if restores_pending_starts? do
         for %{"dispatch_id" => id, "claim_epoch" => epoch} <- PendingStarts.all(runs_dir),
@@ -551,6 +561,26 @@ defmodule LoopctlRunner.Control do
       acc -> Map.update(acc, id, epoch, &max(&1, epoch))
     end
   end
+
+  # The dispatches a run on disk started for, with their epochs — less a run that ended owing no
+  # report (`sessionless_end?/1`), which the running process forgot as it ended, and so does this.
+  defp started_runs(states) do
+    for {_dir, %{"dispatch_id" => id, "claim_epoch" => epoch} = state} <- states,
+        not sessionless_end?(%{status: state["status"], reached: state["reached"]}),
+        do: {id, epoch}
+  end
+
+  # THE rule for a run that started no session and owes nothing (`DispatchRun.end_reports/1` is
+  # `[]`: its deadline passed first). loopctl re-sends such a dispatch with a later `deadline_at`
+  # (contract 1.19.0), and one still in `started_dispatches` is answered `accepted` with nothing
+  # behind it, so its id is forgotten the moment its end is known: live (`forget_sessionless/2`),
+  # and at startup (`started_runs/1`). A re-send that arrives while the old run's task is still in
+  # `runs` is refused `busy` (`decision/2`) rather than accepted over it — `runs` is keyed by
+  # dispatch — and once that task is gone it is decided afresh.
+  defp sessionless_end?(summary), do: DispatchRun.end_reports(summary) == []
+
+  defp forget_sessionless(socket, id),
+    do: assign(socket, started_dispatches: Map.delete(socket.assigns.started_dispatches, id))
 
   defp halt(reason) do
     status = fatal_exit_status()
@@ -1342,7 +1372,9 @@ defmodule LoopctlRunner.Control do
             "starting nothing"
         )
 
-        push_dispatch_reply(socket, accepted_reply(dispatch), dispatch["story_id"])
+        socket
+        |> extend_pending_deadline(dispatch)
+        |> push_dispatch_reply(accepted_reply(dispatch), dispatch["story_id"])
 
       {:ok, started_epoch} ->
         Logger.warning(
@@ -1379,6 +1411,62 @@ defmodule LoopctlRunner.Control do
         decide_dispatch(socket, dispatch)
     end
   end
+
+  # A RE-SEND carries the re-send's own `deadline_at` (contract 1.19.0: "a RE-SEND of the dispatch
+  # carries the re-send's time + its `wall_clock_seconds` + the grace"), and loopctl's lease sweep
+  # holds the claim until that one. A start still PENDING takes it when it is later — in memory,
+  # where `start_pending/2` reads the work, and in the pending file, where a restart reads it — so
+  # the run is bounded by the deadline loopctl now holds rather than the one it replaced. Never an
+  # earlier one: "your acceptance and a re-send may move the claim later, never earlier". A start
+  # held with NO deadline takes the re-send's: it is the only bound loopctl's sweep now keeps to.
+  #
+  # A run that has ALREADY STARTED keeps the stop it started with: its session's timer was set as
+  # the session started (`Story.stop_after/4`), and nothing re-arms it. A session that stop ends is
+  # reported `crashed`, not `wall_clock_exceeded` (`Run`, `DispatchRun.session_ended/2`): the
+  # contract's `wall_clock_exceeded` "escalate[s] an in-flight story over the control-only
+  # `budget_reported` edge", while `crashed` "releases the claim at once over `runner_lost` —
+  # re-queued" — and a stop that came early only because the re-send moved the deadline later is no
+  # budget the story overran and nothing a human is needed for.
+  defp extend_pending_deadline(socket, dispatch) do
+    a = socket.assigns
+    id = dispatch["dispatch_id"]
+
+    with %{dispatch: held, work: work} = pending <- a.pending_starts[id],
+         %DateTime{} = later <- Story.deadline!(dispatch["deadline_at"]),
+         true <- later_than?(later, work_deadline(work)) do
+      held = Map.put(held, "deadline_at", dispatch["deadline_at"])
+      pending = %{pending | dispatch: held, work: put_work_deadline(work, later)}
+
+      with {:error, reason} <- PendingStarts.write(a.config.runs_dir, held) do
+        Logger.error(
+          "could not record dispatch #{id}'s later deadline_at on disk (#{inspect(reason)}); " <>
+            "a restart before it starts would bound it by the earlier one",
+          dispatch_id: id
+        )
+      end
+
+      Logger.info(
+        "dispatch #{id} re-sent with deadline_at #{DateTime.to_iso8601(later)}, later than its " <>
+          "pending start held; that start is bounded by it now",
+        dispatch_id: id
+      )
+
+      assign(socket, pending_starts: Map.put(a.pending_starts, id, pending))
+    else
+      _ -> socket
+    end
+  end
+
+  defp later_than?(_later, nil), do: true
+  defp later_than?(later, %DateTime{} = current), do: DateTime.compare(later, current) == :gt
+
+  defp work_deadline(%{kind: "implement", story: story}), do: story.deadline_at
+  defp work_deadline(%{kind: "triage", deadline_at: deadline_at}), do: deadline_at
+
+  defp put_work_deadline(%{kind: "implement", story: story} = work, deadline),
+    do: %{work | story: %{story | deadline_at: deadline}}
+
+  defp put_work_deadline(%{kind: "triage"} = work, deadline), do: %{work | deadline_at: deadline}
 
   defp decide_dispatch(socket, dispatch) do
     case guarded_decision(socket.assigns, dispatch) do
@@ -1426,7 +1514,13 @@ defmodule LoopctlRunner.Control do
       draining: a.draining,
       in_flight: in_flight(a),
       free_disk_mb: &free_disk_mb(a, &1),
-      dispatches_disabled_detail: a.dispatch_refusal_detail
+      dispatches_disabled_detail: a.dispatch_refusal_detail,
+      # A dispatch in `runs` that reached the policy is one forgotten as its sessionless run ended
+      # (`sessionless_end?/1`) while that run's task is still going: refused `busy` until it is gone.
+      ending: Map.has_key?(a.runs, dispatch["dispatch_id"]),
+      # The instant a `deadline_at` is judged at: one past it is refused `other`, never
+      # `kind_not_supported`, and loopctl places the story again.
+      now: DateTime.utc_now()
     }
 
     with :ok <- declared_kind(dispatch),
@@ -1462,6 +1556,9 @@ defmodule LoopctlRunner.Control do
   # A triage run cuts its own detached worktree (`TriageRun`), so it needs no branch here: the repo
   # the policy allowed, the report, and the budgets the policy already held to this runner's
   # ceilings. `dispatch["repo"]` is the owner/name form `TriageRun` resolves against `repos`.
+  #
+  # Its `deadline_at` (contract 1.19.0) binds the triage session as it binds an implement one: the
+  # instant the policy parsed, so a pending start rebuilt from its file keeps it.
   defp work(%{"kind" => "triage"} = dispatch, fields, _a) do
     with {:ok, triage} <- dispatch_triage(dispatch) do
       {:ok,
@@ -1470,7 +1567,8 @@ defmodule LoopctlRunner.Control do
          triage: triage,
          repo: dispatch["repo"],
          wall_clock_s: fields.wall_clock_s,
-         max_turns: fields.max_turns
+         max_turns: fields.max_turns,
+         deadline_at: fields.deadline_at
        }}
     end
   end
@@ -1598,7 +1696,7 @@ defmodule LoopctlRunner.Control do
   # A Control starting over pending files resends each accept and starts the run on ok, as for a
   # fresh accept. The work is rebuilt against the current config; work that no longer builds is
   # logged and forgotten rather than started.
-  defp restore_pending_starts(%{assigns: %{restores_pending_starts: false}} = socket) do
+  defp restore_pending_starts(%{assigns: %{restores_pending_starts: false}} = socket, _bound) do
     # The scenario this refuses is ordinary and ends in a real production session: the service
     # daemon accepts a dispatch and writes a pending entry, it dies, and someone runs
     # `mix loopctl.serve` over the SAME runs_dir to see why. Recovery does not go through
@@ -1621,7 +1719,9 @@ defmodule LoopctlRunner.Control do
     end
   end
 
-  defp restore_pending_starts(socket) do
+  # `bound` is the ids of the dispatches a run on disk started for (`started_runs/1`, from init's one
+  # reading of them).
+  defp restore_pending_starts(socket, bound) do
     a = socket.assigns
 
     Enum.reduce(PendingStarts.all(a.config.runs_dir), socket, fn dispatch, socket ->
@@ -1636,17 +1736,31 @@ defmodule LoopctlRunner.Control do
           |> register_pending(dispatch, work)
           |> assign(reply_backlog: socket.assigns.reply_backlog ++ [entry])
 
-        {:error, why} ->
+        {:error, kind, why} ->
           Logger.error(
-            "pending dispatch #{id} no longer makes runnable work (#{why}); not started",
+            "pending dispatch #{id} no longer makes runnable work (#{why}); not started, and its " <>
+              "accept is not resent",
             dispatch_id: id
           )
 
           PendingStarts.delete(a.config.runs_dir, id)
-          socket
+          forget_dropped(socket, id, kind, bound)
       end
     end)
   end
+
+  # `started_dispatches/3` counted the pending file this process just dropped, and a dispatch left
+  # in that map is answered `accepted` on redelivery. A start dropped for its DEADLINE started no
+  # session — the fact `sessionless_end?/1` reads off a run that ended `deadline_passed` — and
+  # loopctl re-sends it with a later `deadline_at` (contract 1.19.0): forgotten, that re-send is
+  # decided afresh, unless a run on disk started for the dispatch (`bound`). A start dropped for anything
+  # else stays counted, answered idempotently, as it always was: that re-send would be refused for
+  # the same reason, and nothing about it will change by being asked again.
+  defp forget_dropped(socket, id, :deadline_passed, bound) do
+    if MapSet.member?(bound, id), do: socket, else: forget_sessionless(socket, id)
+  end
+
+  defp forget_dropped(socket, _id, _kind, _bound), do: socket
 
   # A triage verdict its predecessor pushed and loopctl never recorded is sent again, as the bytes
   # that were pushed: the run is long over, its answer exists, and nothing else will ever state it.
@@ -1701,7 +1815,10 @@ defmodule LoopctlRunner.Control do
     state = %{
       draining: false,
       in_flight: 0,
-      free_disk_mb: fn _path -> min end
+      free_disk_mb: fn _path -> min end,
+      # The deadline IS re-checked, unlike capacity: it was true of the moment the accept was
+      # given, and a restart can come long after. A pending start past it is dropped below.
+      now: DateTime.utc_now()
     }
 
     with {:accept, fields} <-
@@ -1711,11 +1828,17 @@ defmodule LoopctlRunner.Control do
       {:ok, work}
     else
       # Every refusal on this path is a policy or a payload one; `work/3` turns what the object
-      # validators report into the same shape, so there is nothing else to come back.
-      {:refuse, reason, detail} -> {:error, "#{reason}: #{detail}"}
+      # validators report into the same shape, so there is nothing else to come back. The
+      # deadline's is told apart (`DispatchPolicy`: `other`, its detail `deadline_passed:`), because
+      # only a start dropped for its deadline is forgotten (`forget_dropped/4`).
+      {:refuse, "other", "deadline_passed:" <> _ = detail} ->
+        {:error, :deadline_passed, "other: #{detail}"}
+
+      {:refuse, reason, detail} ->
+        {:error, :refused, "#{reason}: #{detail}"}
     end
   rescue
-    exception -> {:error, inspect(exception.__struct__)}
+    exception -> {:error, :raised, inspect(exception.__struct__)}
   end
 
   # A bound run that is over (finished, or its owner gone) and whose end loopctl never acknowledged
@@ -1759,9 +1882,12 @@ defmodule LoopctlRunner.Control do
 
     binding = Map.take(state, ["dispatch_id", "claim_epoch", "story_id"])
 
+    # A run with no end to report (`DispatchRun.end_reports/1`: one that passed its deadline
+    # before it began) queues nothing, and its stream goes at once rather than lingering.
     socket
     |> put_stream(id, stage_stream(binding, summary.reached || "implementing"))
     |> queue_end(id, summary)
+    |> drop_stream_if_done(id)
   end
 
   defp live?(state), do: state["status"] in ["starting", "running"] and Owner.alive?(state)
@@ -1878,7 +2004,8 @@ defmodule LoopctlRunner.Control do
                 # process is about to build is kept until loopctl records it, and a Control that
                 # did not start this run has no other way to learn it.
                 wall_clock_s: work.wall_clock_s,
-                max_turns: work.max_turns
+                max_turns: work.max_turns,
+                deadline_at: work.deadline_at
               )
 
             notify_control(
@@ -2013,7 +2140,10 @@ defmodule LoopctlRunner.Control do
 
   defp run_stage(socket, id, {:implementing, _}), do: queue_stage(socket, id, "implementing")
 
-  defp run_stage(socket, id, {:finished, summary}), do: queue_end(socket, id, summary)
+  defp run_stage(socket, id, {:finished, summary}) do
+    socket = if sessionless_end?(summary), do: forget_sessionless(socket, id), else: socket
+    queue_end(socket, id, summary)
+  end
 
   defp run_stage(socket, _id, _event), do: socket
 
@@ -2837,6 +2967,23 @@ defmodule LoopctlRunner.Control do
 
   # --- Triage verdicts (a triage run's one report) ---
 
+  # A run whose deadline passed before its session started owes nothing: after the deadline the claim
+  # is loopctl's lease sweep's to release, and there is no verdict to state. It is still remembered
+  # as having reported, so its task ending does not report an account of its death instead, and
+  # its dispatch is forgotten, as any run's that started no session is (`sessionless_end?/1`).
+  defp triage_outcome(socket, binding, _run_dir, {:deadline_passed, detail}) do
+    id = binding["dispatch_id"]
+
+    Logger.warning(
+      "the triage run of dispatch #{id} did not start: #{detail}; nothing is reported for it",
+      dispatch_id: id
+    )
+
+    socket
+    |> mark_verdict_reported(id)
+    |> forget_sessionless(id)
+  end
+
   # The run's outcome, however it ended, becomes the one message loopctl is owed for this
   # dispatch. A payload that would fail the contract is NOT sent: loopctl refuses it
   # `invalid_payload`, which is permanent, so pushing it would discard the run's only output and
@@ -2915,6 +3062,9 @@ defmodule LoopctlRunner.Control do
 
   defp describe_outcome({:incomplete, reason, _detail}), do: "incomplete: #{reason}"
   defp describe_outcome({:error, _reason}), do: "a runner failure, reported as incomplete"
+
+  defp describe_outcome({:deadline_passed, _detail}),
+    do: "its deadline_at had passed; not started"
 
   # A run this process did not start (its Control was replaced while it ran) has nothing here to
   # record against, and needs nothing: whatever ends it will report its own outcome.

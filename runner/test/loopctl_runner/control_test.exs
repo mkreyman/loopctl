@@ -1251,6 +1251,21 @@ defmodule LoopctlRunner.ControlTest do
       end
     end
 
+    # A run of `dispatch` on disk that ended `deadline_passed`, as `Run` leaves one.
+    defp deadline_passed_run!(ctx, dispatch) do
+      run_dir = Path.join(ctx.config.runs_dir, "deadline-#{dispatch["dispatch_id"]}")
+      File.mkdir_p!(run_dir)
+
+      RunState.finish(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "deadline_passed",
+          "reached" => "claimed"
+        })
+      )
+    end
+
     defp runs_done(pid) do
       :ok = wait_until(fn -> Control.info(pid).runs_in_flight == [] end, 30_000)
     end
@@ -2264,6 +2279,343 @@ defmodule LoopctlRunner.ControlTest do
       assert story_id == DispatchRun.story_id(dispatch["story_id"])
       assert LoopctlRunner.PendingStarts.all(ctx.config.runs_dir) == []
       runs_done(pid)
+    end
+
+    test "a pending start resumed by a fresh Control keeps its deadline_at", ctx do
+      # Contract 1.19.0's stop bound survives the restart: the pending file is the dispatch as it
+      # arrived, and the story rebuilt from it carries the same instant. A start that dropped it
+      # would give the resumed session its whole wall clock past the moment loopctl's lease sweep
+      # may release the story.
+      test = self()
+      deadline = DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:second)
+      dispatch = story_dispatch(%{"deadline_at" => DateTime.to_iso8601(deadline)})
+      :ok = LoopctlRunner.PendingStarts.write(ctx.config.runs_dir, dispatch)
+
+      run = fn config, story, opts ->
+        send(test, {:run_deadline, story.deadline_at})
+        Run.execute(config, story, opts)
+      end
+
+      {pid, _topic} = accepting_control(ctx, "stream", %{}, run: run)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:run_deadline, ^deadline}, 5_000
+      runs_done(pid)
+    end
+
+    test "a dispatch whose deadline_at leaves no time to stop a session is refused other", ctx do
+      # A statement about a moment: loopctl places the story again. `kind_not_supported` would say
+      # this runner never runs implement, which loopctl may keep for ever.
+      {pid, topic} = accepting_control(ctx, "stream")
+      # Still in the future, but inside the kill grace and the skew margin.
+      deadline = DateTime.utc_now() |> DateTime.add(ctx.config.kill_grace_s, :second)
+      dispatch = story_dispatch(%{"deadline_at" => DateTime.to_iso8601(deadline)})
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+      assert %{"decision" => "refused", "reason" => "other", "detail" => detail} = reply
+      assert detail =~ ~r/^deadline_passed: /
+      assert Control.info(pid).pending_starts == []
+      assert Control.info(pid).runs_in_flight == []
+    end
+
+    test "a pending start past its deadline_at is dropped unresent, and a re-send runs", ctx do
+      test = self()
+      passed = DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.to_iso8601()
+      dispatch = story_dispatch(%{"deadline_at" => passed})
+      id = dispatch["dispatch_id"]
+      :ok = LoopctlRunner.PendingStarts.write(ctx.config.runs_dir, dispatch)
+
+      run = fn config, story, opts ->
+        send(test, {:run_deadline, story.deadline_at})
+        Run.execute(config, story, opts)
+      end
+
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: run)
+
+      # Dropped: its accept is not resent, its file is gone and nothing runs.
+      refute_receive {:test_loopctl, {:dispatch_reply, %{"dispatch_id" => ^id}}}, 1_000
+      assert LoopctlRunner.PendingStarts.all(ctx.config.runs_dir) == []
+      refute_received {:run_deadline, _}
+
+      # loopctl re-sends it with a later deadline (contract 1.19.0). The dropped start is
+      # forgotten, so the re-send is decided afresh and RUNS, rather than being answered accepted
+      # with nothing behind it.
+      fresh = DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:second)
+
+      TestLoopctl.Endpoint.broadcast(
+        topic,
+        "dispatch",
+        %{dispatch | "deadline_at" => DateTime.to_iso8601(fresh)}
+      )
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:run_deadline, ^fresh}, 5_000
+      runs_done(pid)
+    end
+
+    test "a re-send of a pending start with a later deadline_at moves it later, never earlier",
+         ctx do
+      # Neither accept is recorded, so the start stays pending across both re-sends.
+      TestLoopctl.put(:dispatch_reply_replies, [:none, :none])
+      test = self()
+
+      run = fn config, story, opts ->
+        send(test, {:run_deadline, story.deadline_at})
+        Run.execute(config, story, opts)
+      end
+
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: run)
+      first = DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:second)
+      later = DateTime.add(first, 600, :second)
+      dispatch = story_dispatch(%{"deadline_at" => DateTime.to_iso8601(first)})
+      id = dispatch["dispatch_id"]
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", %{
+        dispatch
+        | "deadline_at" => DateTime.to_iso8601(later)
+      })
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+
+      # On disk, where a restart reads it.
+      assert [%{"dispatch_id" => ^id, "deadline_at" => on_disk}] =
+               LoopctlRunner.PendingStarts.all(ctx.config.runs_dir)
+
+      assert on_disk == DateTime.to_iso8601(later)
+
+      # An EARLIER one does not move it back; this reply is recorded, and the run starts with the
+      # later deadline held in memory.
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:run_deadline, ^later}, 5_000
+      runs_done(pid)
+    end
+
+    test "a run that began past its deadline_at reports nothing, and records that", ctx do
+      # Past by the time the run begins, though not when the dispatch was accepted: the run-start
+      # guard. No `-> escalated` (a human is not needed) and no `session_ended` (there was none).
+      past = DateTime.utc_now() |> DateTime.add(-60, :second)
+      run = fn config, story, opts -> Run.execute(config, %{story | deadline_at: past}, opts) end
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: run)
+      dispatch = story_dispatch()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      runs_done(pid)
+
+      refute_receive {:test_loopctl, {:stage, _}}, 1_000
+      refute_receive {:test_loopctl, {:session_ended, _}}, 300
+
+      assert [{_dir, %{"status" => "deadline_passed", "terminal_reported" => "skipped"}}] =
+               RunState.all(ctx.config.runs_dir)
+    end
+
+    test "a run that ended deadline_passed is forgotten, so loopctl's re-send runs", ctx do
+      # Left in started_dispatches, the re-send (contract 1.19.0: same dispatch, a later deadline)
+      # is answered `accepted` while nothing runs, until the lease sweep takes the claim back.
+      test = self()
+      past = DateTime.utc_now() |> DateTime.add(-60, :second)
+
+      run = fn config, story, opts ->
+        send(test, :run_called)
+        Run.execute(config, %{story | deadline_at: past}, opts)
+      end
+
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: run)
+      dispatch = story_dispatch()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive :run_called, 5_000
+      runs_done(pid)
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      # Decided afresh: a run of its own, not an `accepted` with nothing behind it.
+      assert_receive :run_called, 5_000
+      runs_done(pid)
+    end
+
+    test "a re-send while the sessionless run is still ending is refused busy, then runs", ctx do
+      # Forgotten the moment its end is reported, but its task is still in `runs`, keyed by the
+      # dispatch: accepting over it would take that task's end for the new run's. Refused for the
+      # moment instead — `other`, never `kind_not_supported` — and decided afresh once it is gone.
+      test = self()
+      past = DateTime.utc_now() |> DateTime.add(-60, :second)
+
+      run = fn config, story, opts ->
+        send(test, :run_called)
+        result = Run.execute(config, %{story | deadline_at: past}, opts)
+        # Its end is reported: `:finished` is in Control's mailbox before this is sent, and so
+        # before any re-send the test makes after receiving it. The task lingers until released.
+        send(test, {:run_ended, self()})
+
+        receive do
+          :release -> result
+        end
+      end
+
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: run)
+      dispatch = story_dispatch()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:run_ended, task}, 10_000
+      assert_received :run_called
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+      assert %{"decision" => "refused", "reason" => "other", "detail" => "busy: " <> _} = reply
+      refute_received :run_called
+
+      send(task, :release)
+      runs_done(pid)
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:run_ended, second}, 10_000
+      send(second, :release)
+      runs_done(pid)
+    end
+
+    test "a pending start dropped for anything but its deadline is still answered accepted",
+         ctx do
+      # Only a start dropped for its deadline is forgotten. One this config no longer takes would be
+      # refused again on every re-send, so its re-send is answered idempotently and starts nothing.
+      test = self()
+      dispatch = story_dispatch(%{"branch" => "not-a-loop-branch"})
+      id = dispatch["dispatch_id"]
+      :ok = LoopctlRunner.PendingStarts.write(ctx.config.runs_dir, dispatch)
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: counting_run(test))
+
+      refute_receive {:test_loopctl, {:dispatch_reply, %{"dispatch_id" => ^id}}}, 1_000
+      assert LoopctlRunner.PendingStarts.all(ctx.config.runs_dir) == []
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      refute_receive {:run_started, _}, 500
+      assert Control.info(pid).runs_in_flight == []
+    end
+
+    test "a pending start with no deadline_at takes the one its re-send carries", ctx do
+      # Neither of the first two accepts is recorded, so the start stays pending across the re-send.
+      TestLoopctl.put(:dispatch_reply_replies, [:none, :none])
+      test = self()
+
+      run = fn config, story, opts ->
+        send(test, {:run_deadline, story.deadline_at})
+        Run.execute(config, story, opts)
+      end
+
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: run)
+      dispatch = story_dispatch()
+      id = dispatch["dispatch_id"]
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+
+      deadline = DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:second)
+      resent = Map.put(dispatch, "deadline_at", DateTime.to_iso8601(deadline))
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", resent)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+
+      # On disk, where a restart reads it.
+      expected = DateTime.to_iso8601(deadline)
+
+      assert [%{"dispatch_id" => ^id, "deadline_at" => ^expected}] =
+               LoopctlRunner.PendingStarts.all(ctx.config.runs_dir)
+
+      # And in memory, where the start reads it: this reply is recorded, and the run starts.
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", resent)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:run_deadline, ^deadline}, 5_000
+      runs_done(pid)
+    end
+
+    test "a pending start dropped for its deadline stays answered while a run on disk holds it",
+         ctx do
+      # The one reading of the runs at init: a run that STARTED for the dispatch keeps it counted,
+      # so a re-send is answered `accepted` and starts nothing, however the pending start fared.
+      test = self()
+      passed = DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.to_iso8601()
+      dispatch = story_dispatch(%{"deadline_at" => passed})
+      run_dir = Path.join(ctx.config.runs_dir, "started-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "succeeded",
+          "reached" => "implementing",
+          "terminal_reported" => "ok"
+        })
+      )
+
+      :ok = LoopctlRunner.PendingStarts.write(ctx.config.runs_dir, dispatch)
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: counting_run(test))
+
+      fresh = DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.to_iso8601()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", %{dispatch | "deadline_at" => fresh})
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      refute_receive {:run_started, _}, 1_000
+      assert %{pending_starts: [], runs_in_flight: []} = Control.info(pid)
+    end
+
+    test "a restart does not count a deadline_passed run as started", ctx do
+      test = self()
+      dispatch = story_dispatch()
+      deadline_passed_run!(ctx, dispatch)
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: counting_run(test))
+
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:run_started, _story_id}, 5_000
+      runs_done(pid)
+    end
+
+    test "nor as the start that keeps a dropped pending start's dispatch", ctx do
+      # A pending start past its deadline is dropped and its dispatch forgotten unless a run on
+      # disk STARTED for it; one that ended deadline_passed did not.
+      test = self()
+      passed = DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.to_iso8601()
+      dispatch = story_dispatch(%{"deadline_at" => passed})
+      deadline_passed_run!(ctx, dispatch)
+      :ok = LoopctlRunner.PendingStarts.write(ctx.config.runs_dir, dispatch)
+      {pid, topic} = accepting_control(ctx, "stream", %{}, run: counting_run(test))
+
+      fresh = DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.to_iso8601()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", %{dispatch | "deadline_at" => fresh})
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      assert_receive {:run_started, _story_id}, 5_000
+      runs_done(pid)
+    end
+
+    test "a restart finds nothing to report for a run that began past its deadline_at", ctx do
+      # `DispatchRun.end_reports/1` is what recovery asks too: a state without its settled marker
+      # (as an older build would leave it) is still reported with nothing.
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "deadline-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "deadline_passed",
+          "reached" => "claimed"
+        })
+      )
+
+      {pid, _topic} = accepting_control(ctx, "stream")
+
+      refute_receive {:test_loopctl, {:stage, _}}, 1_000
+      refute_receive {:test_loopctl, {:session_ended, _}}, 300
+      assert Control.info(pid).stage_reports_pending == 0
     end
 
     test "a foreground run resumes NO pending start, and leaves it for the service daemon", ctx do

@@ -280,6 +280,69 @@ defmodule LoopctlRunner.ControlTriageTest do
       assert Enum.any?(events, &(&1["type"] == "triage.started"))
     end
 
+    test "whose deadline_at passed is dropped: no accept resent, no run, nothing reported", ctx do
+      passed = DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.to_iso8601()
+      dispatch = triage_dispatch(%{"deadline_at" => passed})
+      id = dispatch["dispatch_id"]
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+
+      {pid, _topic} =
+        running_control(ctx, [
+          {"FAKE_CLAUDE_MODE", "stream"},
+          {"FAKE_VERDICT", Jason.encode!(@verdict)}
+        ])
+
+      refute_receive {:test_loopctl, {:dispatch_reply, %{"dispatch_id" => ^id}}}, 1_000
+      refute_receive {:test_loopctl, {:triage_verdict, _}}, 300
+      assert PendingStarts.all(ctx.config.runs_dir) == []
+      assert Control.info(pid).runs_in_flight == []
+      assert RunState.all(ctx.config.runs_dir) == []
+      # The fake CLI never ran.
+      refute File.exists?(Path.join(ctx.fake, "argv"))
+    end
+
+    test "that began past its deadline_at sends no verdict, not even an account of it", ctx do
+      # Past by the time the run begins, though not at the accept: the run-start guard. The run
+      # owes nothing, and its task ending must not report the missing verdict in its place.
+      past = DateTime.utc_now() |> DateTime.add(-60, :second)
+
+      triage_run = fn config, triage, repo, opts ->
+        LoopctlRunner.TriageRun.execute(
+          config,
+          triage,
+          repo,
+          Keyword.put(opts, :deadline_at, past)
+        )
+      end
+
+      # Through a pending start: this runner declares no triage kind, so one reaches it only as an
+      # accept it already gave.
+      dispatch = triage_dispatch()
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+
+      {pid, topic} =
+        running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], triage_run: triage_run)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "accepted"}}}, 5_000
+      :ok = wait_until(fn -> Control.info(pid).runs_in_flight == [] end, 10_000)
+
+      refute_receive {:test_loopctl, {:triage_verdict, _}}, 1_000
+      assert PendingVerdicts.all(ctx.config.runs_dir) == []
+
+      assert [{_dir, %{"status" => "deadline_passed", "terminal_reported" => "skipped"}}] =
+               RunState.all(ctx.config.runs_dir)
+
+      # Handled, not merely unsent: an outcome with no message is no reason for Control to die.
+      assert Process.alive?(pid)
+      assert Control.info(pid).joined
+
+      # And forgotten: loopctl's re-send is decided afresh — here refused, since this runner
+      # declares no triage kind — never answered `accepted` with nothing running.
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => "refused"}}}, 5_000
+    end
+
     test "whose verdict its Control died before delivering is sent by the next one", ctx do
       dispatch = triage_dispatch()
       :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)

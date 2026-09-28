@@ -39,8 +39,13 @@ defmodule LoopctlRunner.TriageRun do
        Control would otherwise have done the work and left loopctl waiting on the dispatch for the
        life of the claim.
 
-  The outcome is one of `{:verdict, verdict}`, `{:incomplete, reason, detail}` or
-  `{:error, reason}`. The incomplete reasons come from the vendored contract's
+  The outcome is one of `{:verdict, verdict}`, `{:incomplete, reason, detail}`, `{:error, reason}`
+  or `{:deadline_passed, detail}`. The last is a run whose dispatch's `deadline_at` had passed when
+  it began (`Story.check_deadline/4`), when it reaps, mints, cuts and launches nothing, or by the
+  time its session would start, checked immediately before it (its tree is released as after any
+  session): it records its state `deadline_passed` with `terminal_reported` `skipped`
+  (`RunState.finish/2`) and no message — after its deadline the claim is loopctl's lease sweep's
+  to release, and there is no verdict to state. The incomplete reasons come from the vendored contract's
   `RunnerTriageVerdictMessage.incomplete` enum (its non-null members; 1.9.2) and are read from it rather than repeated
   here — `incomplete_reasons/0` is the list, and a value outside it raises at compile time.
   Four of the five describe what the SESSION did: `session_crashed`, `wall_clock_exceeded`,
@@ -150,6 +155,7 @@ defmodule LoopctlRunner.TriageRun do
           {:verdict, map()}
           | {:incomplete, String.t(), String.t()}
           | {:error, String.t()}
+          | {:deadline_passed, String.t()}
 
   @type result :: %{
           run_id: String.t(),
@@ -163,7 +169,10 @@ defmodule LoopctlRunner.TriageRun do
 
   Options: `:binding` (written into `state.json`, the dispatch this run answers), `:on_start`
   (called with `%{run_id:, run_dir:}` the moment the run directory and its state exist), `:lenses`
-  (default `TriageTools.lenses/0`), `:wall_clock_s`, `:max_turns`, `:model`, `:run_id`.
+  (default `TriageTools.lenses/0`), `:wall_clock_s`, `:max_turns`, `:model`, `:run_id`, and
+  `:deadline_at` (the dispatch's stop bound, a `DateTime`: the session is stopped in time to be gone
+  by it, `Story.stop_after/4`, and a run past `Story.check_deadline/4` when it begins, or when its
+  session would start, ends `{:deadline_passed, _}` having started no session).
 
   `:on_start` is what makes this run's directory reachable by whoever is supervising it BEFORE the
   run ends, which is the only moment that matters when it does not end normally: a task killed
@@ -208,7 +217,10 @@ defmodule LoopctlRunner.TriageRun do
   defp record_id(_triage), do: {:error, "the triage object names no record_id"}
 
   defp start(config, triage, repo, record, run_id, owner, opts) do
-    reap(config, owner)
+    # THE deadline guard before anything that costs work: the reap can fetch, and the run mints,
+    # fetches and cuts. Judged again immediately before the session (`judge/8`).
+    deadline = check_deadline(config, opts)
+    _reaped = reap(config, owner, deadline)
     run_dir = run_dir(config, record, run_id)
 
     # BEFORE the state, not after: `state.json` at `running` carries this BEAM's live owner, so a
@@ -238,32 +250,54 @@ defmodule LoopctlRunner.TriageRun do
     seq = Trace.emit(trace, "triage.started", nil, %{"record_id" => record, "repo" => repo})
 
     result =
-      try do
-        # The owner rides in the options to the reused tree's lock (`claim_tree/4`), which records it.
-        run(config, triage, repo, run_dir, run_id, trace, seq, Keyword.put(opts, :owner, owner))
-      catch
-        # EVERY way out, as `Run.execute/3` does: Session.run/1 exits on a launch or monitor
-        # failure by design, and a raise anywhere in here would otherwise leave the run recorded
-        # "running" with no outcome and no triage.finished — indistinguishable from one still
-        # going, and now un-reaped too, because the owner this run records is alive.
-        kind, reason ->
-          %{
-            run_id: run_id,
-            run_dir: run_dir,
-            session: nil,
-            outcome: {:error, "the run failed: #{Exception.format(kind, reason, [])}"}
-          }
+      case deadline do
+        :ok ->
+          # The owner rides in the options to the reused tree's lock (`claim_tree/4`), which
+          # records it.
+          guarded_run(
+            config,
+            triage,
+            repo,
+            run_dir,
+            run_id,
+            trace,
+            seq,
+            Keyword.put(opts, :owner, owner)
+          )
+
+        {:passed, detail} ->
+          Trace.emit(trace, "triage.deadline_passed", seq, %{"error" => detail})
+          %{run_id: run_id, run_dir: run_dir, session: nil, outcome: {:deadline_passed, detail}}
       end
 
     finish(trace, seq, run_dir, result, Keyword.get(opts, :binding, %{}))
     result
   end
 
+  defp guarded_run(config, triage, repo, run_dir, run_id, trace, seq, opts) do
+    run(config, triage, repo, run_dir, run_id, trace, seq, opts)
+  catch
+    # EVERY way out, as `Run.execute/3` does: Session.run/1 exits on a launch or monitor failure by
+    # design, and a raise anywhere in here would otherwise leave the run recorded "running" with no
+    # outcome and no triage.finished — indistinguishable from one still going, and now un-reaped
+    # too, because the owner this run records is alive.
+    kind, reason ->
+      %{
+        run_id: run_id,
+        run_dir: run_dir,
+        session: nil,
+        outcome: {:error, "the run failed: #{Exception.format(kind, reason, [])}"}
+      }
+  end
+
   # What an implement run does before it starts (`Run`), for the same reason: a triage run is often
   # the only kind this runner is sent for a while, and an orphaned triage tree — or its lock, which
   # the next run on the repo would find held — would otherwise wait for an implement dispatch.
-  # Guarded like `announce/2`: a reap that fails costs this run nothing.
-  defp reap(config, owner) do
+  # Guarded like `announce/2`: a reap that fails costs this run nothing. A run past its deadline
+  # does no work at all, and a reap is work.
+  defp reap(_config, _owner, {:passed, _detail}), do: :skipped
+
+  defp reap(config, owner, :ok) do
     Reaper.reap(config.runs_dir, config.kill_grace_s * 1000, config.grant_dir,
       projects_dir: config.claude_projects_dir,
       owner: {:ok, owner}
@@ -300,7 +334,8 @@ defmodule LoopctlRunner.TriageRun do
     Trace.emit(trace, "triage.finished", seq, %{"outcome" => name})
     Trace.close(trace)
 
-    RunState.update(run_dir, %{
+    # A run that passed its deadline owes nothing, and `RunState.finish/2` says so in this write.
+    RunState.finish(run_dir, %{
       "status" => name,
       "finished_at" => DateTime.utc_now() |> DateTime.to_iso8601()
     })
@@ -380,11 +415,35 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
-  defp judge(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts) do
-    # Caught HERE, not only by the outer guard: Session.run/1 exits when its monitor dies, and
-    # the outer catch would return {:error, _} without ever reading the run directory — throwing
-    # away a verdict the session had already written and linked into place. `Run` catches the
-    # same exit locally for the same reason.
+  # THE deadline guard before the session: minting, fetching and cutting take time, and a session
+  # started past it would be stopped at once. Nothing checks after it: a session started here is
+  # bounded by its own stop timer (`Story.stop_after/4`). Inside the tree's `try`, so the tree is
+  # released as after any session.
+  defp judge(config, prompt, tree, run_dir, run_id, trace, seq, opts) do
+    case check_deadline(config, opts) do
+      :ok ->
+        judge_session(config, prompt, tree, run_dir, run_id, trace, seq, opts)
+
+      {:passed, detail} ->
+        Trace.emit(trace, "triage.deadline_passed", seq, %{"error" => detail})
+        %{run_id: run_id, run_dir: run_dir, session: nil, outcome: {:deadline_passed, detail}}
+    end
+  end
+
+  defp check_deadline(config, opts) do
+    Story.check_deadline(
+      Keyword.get(opts, :deadline_at),
+      wall_clock_s(config, opts),
+      config,
+      DateTime.utc_now()
+    )
+  end
+
+  defp judge_session(config, prompt, {name, path, tree}, run_dir, run_id, trace, seq, opts) do
+    # Caught HERE, not only by the outer guard: Session.run/1 exits when its monitor dies, and the
+    # outer catch would return {:error, _} without ever reading the run directory — throwing away a
+    # verdict the session had already written and linked into place. `Run` catches the same exit
+    # locally for the same reason.
     session =
       try do
         session(config, prompt, {name, path, tree.path}, run_dir, run_id, trace, seq, opts)
@@ -667,7 +726,9 @@ defmodule LoopctlRunner.TriageRun do
       wall_clock_s: wall_clock_s,
       max_turns: max_turns,
       # Recorded so the trace says which model judged this report, not only that one ran.
-      model: Keyword.get(opts, :model)
+      model: Keyword.get(opts, :model),
+      # The same stop bound an implement session has (`Story.stop_after/4`).
+      deadline_at: Keyword.get(opts, :deadline_at)
     }
 
     Session.run(
@@ -741,6 +802,12 @@ defmodule LoopctlRunner.TriageRun do
   defp incomplete(_run_dir, {:session_failed, detail}),
     do: reported("session_crashed", "the session could not be supervised: #{detail}")
 
+  # WHICH bound ended it, because the two send a reader to different places: its own wall clock is
+  # this runner's budget, the deadline is loopctl's placement, reached while the session ran.
+  defp incomplete(_run_dir, %{reason: :wall_clock_exceeded, stop_bound: :deadline}),
+    do:
+      reported("wall_clock_exceeded", "the session's time ran out at the dispatch's deadline_at")
+
   defp incomplete(_run_dir, %{reason: :wall_clock_exceeded}),
     do: reported("wall_clock_exceeded", "the session ran out of wall clock")
 
@@ -798,6 +865,9 @@ defmodule LoopctlRunner.TriageRun do
   #
   # Guarded like everything else on this path, and skipped for a run with no dispatch to answer
   # (`execute/4` called without a binding): there is nobody to report to.
+  # A run past its deadline owes no message: nothing is recorded for a restart to resend.
+  defp record(_run_dir, _binding, {:deadline_passed, _detail}), do: :ok
+
   defp record(run_dir, %{"dispatch_id" => _, "claim_epoch" => _} = binding, outcome) do
     case TriageDispatch.verdict_message(binding, outcome) do
       {:ok, payload} ->
@@ -819,6 +889,7 @@ defmodule LoopctlRunner.TriageRun do
 
   defp record(_run_dir, _binding, _outcome), do: :ok
 
+  defp outcome_name({:deadline_passed, _}), do: "deadline_passed"
   defp outcome_name({:verdict, _}), do: "verdict"
   defp outcome_name({:incomplete, reason, _}), do: "incomplete:#{reason}"
   defp outcome_name({:error, _}), do: "failed"

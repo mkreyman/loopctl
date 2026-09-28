@@ -95,6 +95,9 @@ defmodule LoopctlRunner.Session do
             | :parked
             | :not_group_leader
             | :escalated,
+          # Which bound stopped a `:wall_clock_exceeded` session: its own start + `wall_clock_s`,
+          # or the dispatch's `deadline_at`. nil for every other end.
+          stop_bound: :wall_clock | :deadline | nil,
           duration_ms: non_neg_integer()
         }
 
@@ -113,6 +116,10 @@ defmodule LoopctlRunner.Session do
   armed once it has (`LoopctlRunner.GitGrant.prepare/2`, then `LoopctlRunner.GitGrant.arm/2`). It is
   false for a triage run, which has no branch of its own, and false by default so a launcher added
   later gets no grant unless it asks.
+
+  Whether a session may still start under the story's `deadline_at` is the caller's to decide,
+  immediately before it calls this (`Story.check_deadline/4`, in `LoopctlRunner.Run` and
+  `LoopctlRunner.TriageRun`); here the deadline only fixes when the session is stopped.
   """
   @spec run(keyword()) :: result()
   def run(opts) do
@@ -343,6 +350,18 @@ defmodule LoopctlRunner.Session do
 
       {:os_pid, os_pid} = Port.info(port, :os_pid)
 
+      # The stop bound is fixed HERE, where the session has started: the earlier of this start +
+      # wall_clock_s and the moment it must be signalled to be gone by the dispatch's deadline_at —
+      # deadline_at less the kill grace (TERM, then up to kill_grace_s before KILL) and the
+      # clock-skew margin (`Story.stop_after/4`, `Story.deadline_margin_s/0`).
+      {stop_after_ms, stop_bound} =
+        Story.stop_after(
+          story,
+          DateTime.utc_now(),
+          config.kill_grace_s,
+          Story.deadline_margin_s()
+        )
+
       # ONE reading of the launcher, for the grant's session line and for `leader_start` alike: two
       # would be two answers about one process, taken at two moments.
       launcher = Owner.of(os_pid)
@@ -361,10 +380,13 @@ defmodule LoopctlRunner.Session do
           "launcher" => config.claude_launcher,
           "max_turns" => story.max_turns,
           "wall_clock_s" => story.wall_clock_s,
+          "deadline_at" => deadline_iso(story),
+          "stop_after_ms" => stop_after_ms,
+          "stop_bound" => Atom.to_string(stop_bound),
           "model" => story.model
         })
 
-      Process.send_after(self(), :wall_clock, story.wall_clock_s * 1000)
+      Process.send_after(self(), :wall_clock, stop_after_ms)
       Process.send_after(self(), :verify_group, @verify_group_after_ms)
       Process.send_after(self(), :check_escalation, @escalation_check_ms)
       schedule_tick(config)
@@ -391,6 +413,9 @@ defmodule LoopctlRunner.Session do
          escalations_seen: 0,
          started_ms: now,
          last_stdout_ms: now,
+         stop_bound: stop_bound,
+         # The ref of the agents probe in flight (`start_probe/1`), or nil: one at a time.
+         probe: nil,
          reason: nil
        }}
     catch
@@ -562,6 +587,7 @@ defmodule LoopctlRunner.Session do
       os_pid: state.os_pid,
       exit_status: status,
       reason: reason,
+      stop_bound: if(reason == :wall_clock_exceeded, do: state.stop_bound),
       duration_ms: now_ms() - state.started_ms
     }
 
@@ -594,8 +620,19 @@ defmodule LoopctlRunner.Session do
   def handle_info(:wall_clock, %{reason: reason} = state) when reason != nil,
     do: {:noreply, state}
 
+  # A stop at deadline_at is this one timer too — the contract calls deadline_at "A STOP BOUND: end
+  # the session by the EARLIER of your own start + `wall_clock_seconds` and this instant" — and the
+  # result's `stop_bound` says which end fired. They are REPORTED differently, which is the runs'
+  # business, not this process's: a deadline stop is no budget the story overran
+  # (`LoopctlRunner.Run`, `LoopctlRunner.DispatchRun.session_ended/2`).
   def handle_info(:wall_clock, state) do
-    data = %{"wall_clock_s" => state.story.wall_clock_s}
+    data = %{
+      "wall_clock_s" => state.story.wall_clock_s,
+      "deadline_at" => deadline_iso(state.story),
+      # Which of the two ends this was, so a reader of the trace need not do the arithmetic.
+      "stopped_by" => Atom.to_string(state.stop_bound)
+    }
+
     {:noreply, stop_session(state, :wall_clock_exceeded, data)}
   end
 
@@ -623,15 +660,24 @@ defmodule LoopctlRunner.Session do
     do: {:noreply, state}
 
   def handle_info(:liveness_tick, state) do
-    state =
-      case observe(state) do
-        {:parked, evidence} -> stop_session(state, :parked, evidence)
-        _ -> state
-      end
-
     schedule_tick(state.config)
-    {:noreply, state}
+    {:noreply, observe(state)}
   end
+
+  # The agents probe's answer. Judged only while the session is still running unstopped: one that
+  # lands after a stop is stale, and the stop already decided the session's end.
+  def handle_info({ref, status}, %{probe: ref} = state) when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    state = %{state | probe: nil}
+
+    if state.port != nil and state.reason == nil,
+      do: {:noreply, judge_probe(state, status)},
+      else: {:noreply, state}
+  end
+
+  # A probe that died answered nothing, which is not evidence either way: the next tick asks again.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{probe: ref} = state),
+    do: {:noreply, %{state | probe: nil}}
 
   def handle_info({:EXIT, _from, _reason}, state), do: {:noreply, state}
 
@@ -656,46 +702,70 @@ defmodule LoopctlRunner.Session do
     GitGrant.disarm(grant)
   end
 
+  # The agents probe spawns a CLI, so it runs only once the cheap signals are quiet, and only one
+  # at a time: a tick that finds one in flight leaves it to answer.
   defp observe(state) do
-    config = state.config
-    window_ms = config.park_after_s * 1000
-    now = now_ms()
-    files = Liveness.file_signals(config.claude_projects_dir, state.session_id)
-
-    obs = %{
-      now_ms: now,
-      last_stdout_ms: state.last_stdout_ms,
-      transcript_mtime_ms: files.transcript_mtime_ms,
-      subagents_mtime_ms: files.subagents_mtime_ms,
-      agent_status: :unknown
-    }
-
-    # The agents probe spawns a CLI, so it runs only once the cheap signals are quiet.
-    case Liveness.evaluate(obs, window_ms) do
-      {:active, _} = verdict ->
-        verdict
-
-      _ ->
-        status =
-          Liveness.agent_status(
-            config.claude_launcher,
-            state.session_id,
-            config.agents_probe_timeout_s * 1000
-          )
-
-        verdict =
-          %{obs | agent_status: status}
-          |> Liveness.evaluate(window_ms)
-          |> unless_port_spoke(state.port)
-
-        Trace.emit(state.trace, "session.liveness", state.session_seq, verdict_data(verdict))
-        verdict
+    case Liveness.evaluate(observation(state, :unknown), window_ms(state)) do
+      {:active, _} -> state
+      _ when state.probe != nil -> state
+      _ -> %{state | probe: start_probe(state)}
     end
   end
 
-  # The probe blocks this process for up to its timeout, so `obs` is stale by the time
-  # it returns: the CLI may have printed its result and exited meanwhile, which also
-  # makes `claude agents` report it absent. Output queued in the mailbox is activity.
+  # OFF this process: the probe can take up to `agents_probe_timeout_s`, and a Session blocked on
+  # it would hold every message behind it — the wall clock and deadline stop above all, which would
+  # then kill the session that much after the deadline loopctl's lease sweep acts on. Linked, so it
+  # dies with a Session that is killed; a Session that ends normally leaves it to its own timeout,
+  # which kills the CLI it started, and its answer goes nowhere. This process traps exits, so a
+  # probe that crashes is an `{:EXIT, _, _}` ignored below and a `:DOWN` handled above.
+  defp start_probe(%{config: config, session_id: session_id}) do
+    %Task{ref: ref} =
+      Task.async(fn ->
+        Liveness.agent_status(
+          config.claude_launcher,
+          session_id,
+          config.agents_probe_timeout_s * 1000
+        )
+      end)
+
+    ref
+  end
+
+  # Judged on a FRESH reading of the cheap signals, not the one that sent the probe: this process
+  # kept handling the Port while the probe ran, so output that arrived meanwhile is in
+  # `last_stdout_ms` already.
+  defp judge_probe(state, status) do
+    verdict =
+      state
+      |> observation(status)
+      |> Liveness.evaluate(window_ms(state))
+      |> unless_port_spoke(state.port)
+
+    Trace.emit(state.trace, "session.liveness", state.session_seq, verdict_data(verdict))
+
+    case verdict do
+      {:parked, evidence} -> stop_session(state, :parked, evidence)
+      _ -> state
+    end
+  end
+
+  defp observation(state, agent_status) do
+    files = Liveness.file_signals(state.config.claude_projects_dir, state.session_id)
+
+    %{
+      now_ms: now_ms(),
+      last_stdout_ms: state.last_stdout_ms,
+      transcript_mtime_ms: files.transcript_mtime_ms,
+      subagents_mtime_ms: files.subagents_mtime_ms,
+      agent_status: agent_status
+    }
+  end
+
+  defp window_ms(state), do: state.config.park_after_s * 1000
+
+  # Output queued in the mailbox BEHIND the probe's answer has not reached `last_stdout_ms` yet: the
+  # CLI may have printed its result and be exiting, which also makes `claude agents` report it
+  # absent. It is activity.
   defp unless_port_spoke({:parked, _} = verdict, port) do
     {:messages, messages} = Process.info(self(), :messages)
 
@@ -832,4 +902,7 @@ defmodule LoopctlRunner.Session do
       Enum.join([p1, p2, p3, p4, p5], "-")
     end)
   end
+
+  defp deadline_iso(%Story{deadline_at: nil}), do: nil
+  defp deadline_iso(%Story{deadline_at: deadline}), do: DateTime.to_iso8601(deadline)
 end

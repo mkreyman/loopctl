@@ -101,7 +101,10 @@ defmodule LoopctlRunner.TestSupport do
         "liveness_interval_s" => 1,
         "kill_grace_s" => 2,
         "agents_probe_timeout_s" => 5,
-        "tree_poll_s" => 1
+        "tree_poll_s" => 1,
+        # Production's is 60: a suite whose deadline tests each waited out a minute of session
+        # would be a suite nobody runs. The guard's own test sets the real one.
+        "min_session_s" => 1
       },
       overrides
     )
