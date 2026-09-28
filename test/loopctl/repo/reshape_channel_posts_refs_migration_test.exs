@@ -41,9 +41,10 @@ defmodule Loopctl.Repo.ReshapeChannelPostsRefsMigrationTest do
                   )
                   |> hd()
 
-  Code.require_file(@migration_file)
-
   alias Loopctl.Repo.Migrations.ReshapeChannelPostsRefsToList
+  alias Loopctl.Test.MigrationFile
+
+  MigrationFile.require!(ReshapeChannelPostsRefsToList, @migration_file)
 
   # Drive the real migration's up/0 in THIS process (mirrors Ecto.Migrator.attempt/7
   # for an explicit up/0 running :forward), so the UPDATE runs inside the sandbox

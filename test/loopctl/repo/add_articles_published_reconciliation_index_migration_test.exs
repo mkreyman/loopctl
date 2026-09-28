@@ -37,9 +37,10 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
                   )
                   |> hd()
 
-  Code.require_file(@migration_file)
-
   alias Loopctl.Repo.Migrations.AddArticlesPublishedReconciliationIndex
+  alias Loopctl.Test.MigrationFile
+
+  MigrationFile.require!(AddArticlesPublishedReconciliationIndex, @migration_file)
 
   # Restore the canonical index after every test, whatever the test left behind.
   setup do

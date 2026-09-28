@@ -64,15 +64,16 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   side_tables_file =
     Path.wildcard(Path.join(@migrations_dir, "#{@side_tables_version}_*.exs")) |> hd()
 
-  Code.require_file(create_file)
-  Code.require_file(hnsw_file)
-  Code.require_file(partial_file)
-  Code.require_file(side_tables_file)
-
   alias Loopctl.Repo.Migrations.AddMemoriesEmbeddingHnswIndex
   alias Loopctl.Repo.Migrations.AddMemoriesLiveEmbeddingPartialHnswIndex
   alias Loopctl.Repo.Migrations.CreateEmbeddingSideTables
   alias Loopctl.Repo.Migrations.CreateMemoryStores
+  alias Loopctl.Test.MigrationFile
+
+  MigrationFile.require!(CreateMemoryStores, create_file)
+  MigrationFile.require!(AddMemoriesEmbeddingHnswIndex, hnsw_file)
+  MigrationFile.require!(AddMemoriesLiveEmbeddingPartialHnswIndex, partial_file)
+  MigrationFile.require!(CreateEmbeddingSideTables, side_tables_file)
 
   setup do
     pid = Sandbox.start_owner!(AdminRepo)

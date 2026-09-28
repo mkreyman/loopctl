@@ -15,6 +15,7 @@ defmodule Loopctl.Threads.IssueLinksTest do
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.Repo
+  alias Loopctl.Test.MigrationFile
   alias Loopctl.Threads
   alias Loopctl.Threads.IssueLink
   alias Loopctl.Threads.IssueLinks
@@ -177,8 +178,10 @@ defmodule Loopctl.Threads.IssueLinksTest do
       # runtime, since the compiler cannot see a module that `priv/` defines.
       migration = Module.concat(Loopctl.Repo.Migrations, "AddThreadPage")
 
-      unless Code.ensure_loaded?(migration),
-        do: Code.require_file("priv/repo/migrations/20260927120000_add_thread_page.exs")
+      MigrationFile.require!(
+        migration,
+        "priv/repo/migrations/20260927120000_add_thread_page.exs"
+      )
 
       backfill = migration.backfill_sql()
 

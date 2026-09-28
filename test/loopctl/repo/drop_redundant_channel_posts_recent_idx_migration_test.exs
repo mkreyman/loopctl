@@ -59,9 +59,10 @@ defmodule Loopctl.Repo.DropRedundantChannelPostsRecentIdxMigrationTest do
                   )
                   |> hd()
 
-  Code.require_file(@migration_file)
-
   alias Loopctl.Repo.Migrations.DropRedundantChannelPostsRecentIdx
+  alias Loopctl.Test.MigrationFile
+
+  MigrationFile.require!(DropRedundantChannelPostsRecentIdx, @migration_file)
 
   # Restore the canonical post-migration state after every test: the applied
   # migration leaves channel_posts_recent_idx ABSENT, and any DDL test that

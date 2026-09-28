@@ -73,9 +73,10 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
                   )
                   |> hd()
 
-  Code.require_file(@migration_file)
-
   alias Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex
+  alias Loopctl.Test.MigrationFile
+
+  MigrationFile.require!(DropLegacyArticlesEmbeddingHnswIndex, @migration_file)
 
   @index "articles_embedding_hnsw_idx"
 
