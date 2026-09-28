@@ -9,10 +9,11 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
     * behavior parity — the worker revokes exactly the expired, non-revoked
       dispatches (and cascades to their api_keys), leaves active and
       already-revoked rows untouched, and does so cross-tenant by design;
-    * index eligibility (AC-32.1.2) — the partial index is a valid single-column btree
-      on `expires_at` whose predicate `revoked_at IS NULL` the worker's own query carries
-      (`RevokeExpiredDispatchesWorker.expired_query/1`), read from `pg_index`. Which
-      index the planner CHOOSES is not asserted: see the describe block below.
+    * index shape — the partial index is a valid single-column btree on `expires_at`
+      with the predicate `revoked_at IS NULL`, read from `pg_index`. That the planner
+      CHOOSES it for the worker's query (AC-32.1.2) is asserted in
+      `Loopctl.Workers.RevokeExpiredDispatchesPlanTest`, which is `async: false` because
+      the choice moves with whatever rows concurrent tests have in flight.
 
   Dispatches are created through the real `Loopctl.Dispatches.create_dispatch/3`
   API (which mints + links a real api_key) so the cascade parity is exercised,
@@ -26,7 +27,6 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
   import Ecto.Query
   import Loopctl.Fixtures
 
-  alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Dispatches
@@ -109,15 +109,11 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
     end
   end
 
-  describe "partial index dispatches_expires_at_active_index (AC-32.1.2)" do
-    # Eligibility, deterministically. Which index the planner CHOOSES is not asserted here:
-    # the composite `(tenant_id, expires_at)` index can serve `expires_at <` too, as a full
-    # index scan, and the choice moves with the rows other async tests leave in the shared
-    # table (a plan pinned to one index failed at random for that reason). What makes the
-    # partial index usable is that it is a valid single-column btree on `expires_at` whose
-    # predicate the sweep's own WHERE clause carries; each half is asserted below, the
-    # predicate against the query `RevokeExpiredDispatchesWorker` really runs.
-    test "is a valid btree on expires_at whose predicate the sweep's own query carries" do
+  describe "partial index dispatches_expires_at_active_index" do
+    # The index's own definition, read from the catalog. Which index the planner chooses is
+    # asserted in RevokeExpiredDispatchesPlanTest, not here: in this async module the choice
+    # moves with the rows other tests have in flight.
+    test "is a valid single-column btree on expires_at with the predicate revoked_at IS NULL" do
       %{rows: [[valid?, keys, key_count, method, table, predicate]]} =
         AdminRepo.query!("""
         SELECT i.indisvalid, pg_get_indexdef(i.indexrelid, 1, true), i.indnkeyatts,
@@ -132,16 +128,6 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
       assert valid?
       assert {keys, key_count, method, table} == {"expires_at", 1, "btree", "dispatches"}
       assert predicate == "(revoked_at IS NULL)"
-
-      {sql, _params} =
-        SQL.to_sql(
-          :all,
-          AdminRepo,
-          RevokeExpiredDispatchesWorker.expired_query(DateTime.utc_now())
-        )
-
-      assert sql =~ ~s|"revoked_at" IS NULL|
-      assert sql =~ ~r/"expires_at" < \$\d/
     end
   end
 end

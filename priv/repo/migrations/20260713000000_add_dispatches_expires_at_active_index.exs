@@ -4,11 +4,8 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # Epic 32 (scalability), US-32.1.
   #
   # `Loopctl.Workers.RevokeExpiredDispatchesWorker` runs every 60s via Oban Cron and
-  # issues a TENANT-AGNOSTIC (cross-tenant, BYPASSRLS via AdminRepo) sweep:
-  #
-  #     from(d in Dispatch,
-  #       where: is_nil(d.revoked_at) and d.expires_at < ^now,
-  #       select: %{id: d.id, api_key_id: d.api_key_id})
+  # issues a TENANT-AGNOSTIC (cross-tenant, BYPASSRLS via AdminRepo) sweep whose WHERE
+  # clause is `revoked_at IS NULL AND expires_at < now` (see its `perform/1`).
   #
   # The only expiry-related index on `dispatches` is the composite
   # (tenant_id, expires_at) from 20260411234856_create_dispatches. Its LEADING column
@@ -38,13 +35,13 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   #       Index Scan using dispatches_expires_at_active_index on dispatches d0
   #         Index Cond: (expires_at < now())
   #
-  #     The ExUnit guard `RevokeExpiredDispatchesWorkerTest` does not assert a plan: the
-  #     shared test table makes the choice between this and the composite index move. It
-  #     asserts this index's shape and predicate from `pg_index`, against the worker's
-  #     own query.
+  #     Forcing the planner proves eligibility, not choice, so the test guard asserts the
+  #     second form instead.
   #
   #   * ~20k seeded rows (small selective expired set), DEFAULT planner
-  #     (enable_seqscan on) — the index is chosen UNPROMPTED at scale:
+  #     (enable_seqscan on) — the index is chosen UNPROMPTED at scale. The ExUnit guard
+  #     `RevokeExpiredDispatchesPlanTest` asserts this form against the query the worker
+  #     issues:
   #
   #       Index Scan using dispatches_expires_at_active_index on dispatches d
   #         (cost=0.29..16.72 rows=86 width=32)
