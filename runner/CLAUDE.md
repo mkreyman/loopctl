@@ -52,6 +52,24 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
 - **The daemon's credential is a file readable by this user alone** (`control.token_file`,
   mode 600), sent only in the `x-loopctl-runner-token` header. Never put it in the config JSON,
   an environment variable a `claude` session inherits, or a URL.
+- **The runner arms the subagent git grant for an implement session — the one run on a branch of
+  its own (`own_worktree: true`) — and removes it at teardown** (`LoopctlRunner.GitGrant`).
+  `block-subagent-git.sh` is a user-settings hook, so in any session that loads the operator's
+  settings an engineer agent the session dispatches has its commit refused without it — while its
+  report reads as having chosen not to commit. Session-scoped by uuid, so an orphan authorises an
+  id nothing will hold again. The argv is checked BEFORE the grant is armed, and anything that
+  raises after arming disarms it. Each grant records its OWNER, the pid and start time of the BEAM
+  that armed it (`LoopctlRunner.Owner`, which never raises and reads "cannot tell" as alive), and
+  the sweep (`GitGrant.sweep/1`, which `Reaper.reap/4` runs first on its third argument, the
+  grant directory, passed positionally and never defaulted) — which runs before every run and
+  from `mix loopctl.reap`, beside live sessions — removes only a grant whose owner is no longer
+  running, or whose recorded session launcher (written once the Port opens) is not. One without a
+  parseable owner is left alone. A pending file (owner line only, before the launcher's is added)
+  is removed on the same rule, or once it is ten minutes old. The directory is CONFIG DATA (`Config.grant_dir`, `Config.default_grant_dir/0`, the real `~/.claude`
+  when absent, a refused load when there is no HOME), never a default a test can reach: the suite
+  drives the production path, and an after-suite check (`test/support/grant_canary.ex`) fails the
+  run on any grant or pending file in the real directory owned by the test BEAM, and on any grant
+  present at the start that is gone at the end while its owner and launcher still live.
 - **Every payload sent to loopctl is validated against the vendored contract**
   (`priv/runner_contract/v1.json`, copied from mkreyman/loopctl, never re-typed). When loopctl
   bumps the contract, copy the file again from loopctl MASTER, once it is merged AND deployed;

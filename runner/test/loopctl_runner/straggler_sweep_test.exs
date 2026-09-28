@@ -295,7 +295,7 @@ defmodule LoopctlRunner.StragglerSweepTest do
         Process.put(:pins, TestStragglers.pinned([gone, live], %{}))
       end)
 
-    assert Process.get(:pins) == [{live, ProcessGroup.start_time(live)}]
+    assert Process.get(:pins) == [{live, LoopctlRunner.Owner.start_time(live)}]
     assert report =~ "no start time for #{gone}"
   end
 
@@ -326,12 +326,14 @@ defmodule LoopctlRunner.StragglerSweepTest do
     TestStragglers.note!(live, ctx.ledger)
     ledger_start = "Thu Jan 1 00:00:00 1970"
 
-    refute ProcessGroup.start_time(live) == ledger_start
+    refute LoopctlRunner.Owner.start_time(live) == ledger_start
     assert TestStragglers.pinned([live], %{live => ledger_start}) == [{live, ledger_start}]
 
     # And that is the value the sweep threads through: the entry carries the file's own
     # start time, not one read after the scan.
-    assert ProcessGroup.recorded_entries(ctx.ledger) == [{live, ProcessGroup.start_time(live)}]
+    assert ProcessGroup.recorded_entries(ctx.ledger) == [
+             {live, LoopctlRunner.Owner.start_time(live)}
+           ]
   end
 
   test "the sweep's tree file is named by a uuid, not a counter another BEAM repeats", ctx do
@@ -372,9 +374,9 @@ defmodule LoopctlRunner.StragglerSweepTest do
   test "a start time ps prints as empty is refused, not recorded as an unmatchable line" do
     # The "" half of the guard, which nothing on this machine produces by itself: `ps` here
     # always prints an lstart for a live pid. So `ps` is replaced for the length of one call
-    # by one that exits 0 with nothing to say, which is what `start_time/1` squeezes to "" —
-    # the truthy value that used to pass a nil-only guard and become the ledger line
-    # `recorded/1` compares against a real start time and drops for ever. Safe because this
+    # by one that exits 0 with nothing to say, which `Owner.start_time/1` reads as nil. Read as
+    # "", it is truthy: it would pass a nil-only guard and become the ledger line `recorded/1`
+    # compares against a real start time and drops for ever. Safe because this
     # file is async: false and the swap spans a single call; every `ps` the fixtures need
     # has already run.
     live = straggler!([])
@@ -387,13 +389,13 @@ defmodule LoopctlRunner.StragglerSweepTest do
 
     # Armed BEFORE the swap, never after. An exit landing between the two — an ExUnit
     # timeout, a linked exit — would leave the fake `ps` on PATH for every remaining sync
-    # module, where `start_time/1` answers "" for every live pid, `pinnable?/1` drops every
+    # module, where `start_time/1` answers nil for every live pid, `pinnable?/1` drops every
     # candidate, and the ledger half of the sweep disarms itself for the rest of the run
     # with every test still reporting green.
     on_exit(fn -> System.put_env("PATH", previous) end)
     System.put_env("PATH", Path.dirname(fake) <> ":" <> previous)
 
-    assert ProcessGroup.start_time(live) == ""
+    assert LoopctlRunner.Owner.start_time(live) == nil
     assert_raise RuntimeError, ~r/no start time/, fn -> TestStragglers.note!(live, ledger) end
 
     System.put_env("PATH", previous)

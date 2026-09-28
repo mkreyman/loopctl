@@ -291,7 +291,7 @@ defmodule LoopctlRunner.SessionLauncherTest do
 
     # With its real start time it is ours, and it is ended.
     assert ProcessGroup.terminate(stranger, 2_000,
-             leader_start: ProcessGroup.start_time(stranger)
+             leader_start: LoopctlRunner.Owner.start_time(stranger)
            ) ==
              :terminated
   end

@@ -1,7 +1,9 @@
 defmodule LoopctlRunner.Reaper do
   @moduledoc """
-  Boot-time cleanup of runs whose runner died (design §8: "reap orphans at runner boot,
-  since teardown only runs on the happy path").
+  Cleanup of runs whose runner died (design §8: "reap orphans at runner boot, since teardown
+  only runs on the happy path"). It runs before every run and from `mix loopctl.reap`, so it
+  runs beside live sessions — a daemon's, or another run's — and touches only what a DEAD owner
+  left.
 
   A run is an orphan when the BEAM that owned it is gone and either its `state.json` says
   it was still in flight, or its teardown failed to remove the worktree. For an in-flight
@@ -20,7 +22,16 @@ defmodule LoopctlRunner.Reaper do
 
   require Logger
 
-  alias LoopctlRunner.{Owner, ProcessGroup, RunState, Trace, TriageRun, Worktree, WorktreeLock}
+  alias LoopctlRunner.{
+    GitGrant,
+    Owner,
+    ProcessGroup,
+    RunState,
+    Trace,
+    TriageRun,
+    Worktree,
+    WorktreeLock
+  }
 
   @in_flight ["starting", "running"]
   # Entries whose path is not, or is no longer, this run's to remove: removed already, handed to a
@@ -35,11 +46,34 @@ defmodule LoopctlRunner.Reaper do
   @type reaped :: %{run_id: String.t(), process_group: String.t(), worktree: String.t()}
 
   @doc """
-  Reaps every orphan under `runs_dir`. `:projects_dir`, the config's `claude_projects_dir`, is where
-  an orphaned triage run's project directory is removed from; without it none is.
+  Reaps every orphan under `runs_dir`, and sweeps leaked subagent git grants out of `grant_dir`.
+
+  THE GRANT DIRECTORY IS REQUIRED, with no default: a default right in production is destructive
+  in a test, which drives this same path and must never sweep the operator's real `~/.claude`.
+  Callers pass their config's `grant_dir`, where it is visible.
+
+  The sweep removes only a grant whose owner BEAM or recorded session is no longer running
+  (`LoopctlRunner.GitGrant.sweep/1`), so a live session's grant survives it whichever process reaps.
+
+  Options:
+
+    * `:projects_dir` — the config's `claude_projects_dir`, where an orphaned triage run's project
+      directory is removed from; without it none is.
+    * `:owner` — this BEAM's `LoopctlRunner.Owner.current/0` reading, when the caller has already
+      taken one; read here otherwise. It is what the reaper records in the `WorktreeLock` it holds
+      for a removal, and a reading with no start takes no lock: that orphan's tree is not touched
+      this reap and is revisited by the next, its removal attempts unspent.
   """
-  @spec reap(String.t(), non_neg_integer(), keyword()) :: [reaped()]
-  def reap(runs_dir, grace_ms, opts \\ []) do
+  @spec reap(String.t(), non_neg_integer(), String.t() | nil, keyword()) :: [reaped()]
+  def reap(runs_dir, grace_ms, grant_dir, opts \\ []) do
+    # A leaked subagent git grant is an orphan of the same kind, for the same reason: it is removed
+    # by the session's own teardown, which a halt or a hard kill never reaches. Swept first because
+    # it costs one directory listing and cannot fail the reap.
+    case GitGrant.sweep(grant_dir) do
+      [] -> :ok
+      swept -> Logger.info("reaper: removed #{length(swept)} leaked subagent git grant(s)")
+    end
+
     orphans =
       runs_dir
       |> Path.join("*/state.json")
@@ -63,9 +97,10 @@ defmodule LoopctlRunner.Reaper do
       end)
 
     fetched = fetch_origins(plans)
+    owner = Keyword.get_lazy(opts, :owner, &Owner.current/0)
 
     Enum.map(plans, fn {_run_dir, state, _group, _plan} = planned ->
-      reaped = finish(planned, fetched)
+      reaped = finish(planned, fetched, owner)
       remove_project_dir(state, opts[:projects_dir])
       reaped
     end)
@@ -122,18 +157,18 @@ defmodule LoopctlRunner.Reaper do
 
   defp end_session(_state, _grace_ms), do: "not in flight"
 
-  defp finish({run_dir, state, group, plan}, fetched) do
+  defp finish({run_dir, state, group, plan}, fetched, owner) do
     worktree =
       case plan do
         {:skip, message} ->
           message
 
         {:scratch, recorded, repo} ->
-          remove_scratch(run_dir, state, recorded, repo)
+          remove_scratch(run_dir, state, recorded, repo, owner)
 
         {:remove, recorded, repo, work, seen} ->
           fetch = Map.get(fetched, {repo, recorded["base"]}, :skipped)
-          remove_locked(run_dir, state, recorded, repo, {work, seen}, fetch)
+          remove_locked(run_dir, state, recorded, repo, {work, seen}, fetch, owner)
       end
 
     record(run_dir, state, group, worktree)
@@ -223,8 +258,8 @@ defmodule LoopctlRunner.Reaper do
   # (`Worktree.fingerprint/4`), never the plan's answer: the fetch itself changes the answer — a
   # branch origin's base now reaches by history reads as holding nothing once it has run — and a
   # changed answer kept every such branch.
-  defp remove_locked(run_dir, state, recorded, repo, planned, fetch) do
-    with_lock(run_dir, state, recorded, fn ->
+  defp remove_locked(run_dir, state, recorded, repo, planned, fetch, owner) do
+    with_lock(run_dir, state, recorded, owner, fn ->
       %{"path" => path, "branch" => branch, "base" => base} = recorded
       {work, seen} = planned
 
@@ -239,8 +274,8 @@ defmodule LoopctlRunner.Reaper do
     end)
   end
 
-  defp remove_scratch(run_dir, state, recorded, repo) do
-    with_lock(run_dir, state, recorded, fn ->
+  defp remove_scratch(run_dir, state, recorded, repo, owner) do
+    with_lock(run_dir, state, recorded, owner, fn ->
       Worktree.remove(repo, recorded["path"], recorded["branch"], recorded["base"])
     end)
   end
@@ -250,13 +285,27 @@ defmodule LoopctlRunner.Reaper do
   # that repo, and a run that locked it between a read and the removal would have its tree removed
   # from under it. TRIED, never waited on, and never raised over: the reaper runs at the start of
   # every run, so a lock it cannot take — held, or a lock directory that will not be made — skips
-  # this one orphan rather than stalling or crashing the run that called it.
-  defp with_lock(run_dir, state, recorded, remove) do
+  # this one orphan rather than stalling or crashing the run that called it. The lock records this
+  # BEAM as its owner, so a BEAM whose own start cannot be read takes none: a lock written without
+  # it reads dead to every check, and a live run could take the tree over mid-removal.
+  #
+  # A reaper that cannot read its own start is not a failed removal of THIS orphan — nothing about
+  # the orphan was tried — so it spends none of the orphan's attempts: the entry is left for the
+  # next reap, as `remove_failed` so it is revisited once this run is marked `reaped`, with its
+  # count as it was.
+  defp with_lock(run_dir, _state, recorded, {:error, :no_start}, _remove) do
+    reason = "this BEAM's own start time could not be read"
+    Logger.warning("the reaper takes no lock for #{recorded["path"]}; not touched: #{reason}")
+    RunState.update(run_dir, %{worktree: Map.put(recorded, "status", "remove_failed")})
+    "not touched: #{reason}"
+  end
+
+  defp with_lock(run_dir, state, recorded, {:ok, owner}, remove) do
     runs_dir = Path.dirname(run_dir)
     path = recorded["path"]
     reaper = "reaper-" <> (state["run_id"] || Path.basename(run_dir))
 
-    case WorktreeLock.try_acquire(runs_dir, path, reaper) do
+    case WorktreeLock.try_acquire(runs_dir, path, reaper, owner) do
       :ok ->
         outcome =
           try do

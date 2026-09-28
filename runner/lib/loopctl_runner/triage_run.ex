@@ -176,9 +176,20 @@ defmodule LoopctlRunner.TriageRun do
   def execute(%Config{} = config, triage, repo, opts \\ []) do
     run_id = Keyword.get_lazy(opts, :run_id, &Session.uuid4/0)
 
-    case record_id(triage) do
-      {:ok, record} -> start(config, triage, repo, record, run_id, opts)
+    # The owner before anything is written: a state recorded without its start reads as an
+    # orphan, and the next implement dispatch's reap would kill this run's session.
+    with {:ok, record} <- record_id(triage),
+         {:ok, owner} <- owner() do
+      start(config, triage, repo, record, run_id, owner, opts)
+    else
       {:error, reason} -> %{run_id: run_id, run_dir: nil, session: nil, outcome: {:error, reason}}
+    end
+  end
+
+  defp owner do
+    case Owner.current() do
+      {:ok, owner} -> {:ok, owner}
+      {:error, :no_start} -> {:error, "this BEAM's own start time could not be read"}
     end
   end
 
@@ -196,8 +207,8 @@ defmodule LoopctlRunner.TriageRun do
 
   defp record_id(_triage), do: {:error, "the triage object names no record_id"}
 
-  defp start(config, triage, repo, record, run_id, opts) do
-    reap(config)
+  defp start(config, triage, repo, record, run_id, owner, opts) do
+    reap(config, owner)
     run_dir = run_dir(config, record, run_id)
 
     # BEFORE the state, not after: `state.json` at `running` carries this BEAM's live owner, so a
@@ -220,7 +231,7 @@ defmodule LoopctlRunner.TriageRun do
       # Without the owner, Reaper.orphan? reads a LIVE triage run as an orphan — every state
       # lacking beam_os_pid is — so the next implement dispatch reaps first and kills its session.
       # The verdict is then never stated, by the runner's own hand.
-      |> Map.merge(Owner.current())
+      |> Map.merge(owner)
     )
 
     {:ok, trace} = Trace.start_link(Path.join(run_dir, "trace.ndjson"), run_id)
@@ -228,7 +239,8 @@ defmodule LoopctlRunner.TriageRun do
 
     result =
       try do
-        run(config, triage, repo, run_dir, run_id, trace, seq, opts)
+        # The owner rides in the options to the reused tree's lock (`claim_tree/4`), which records it.
+        run(config, triage, repo, run_dir, run_id, trace, seq, Keyword.put(opts, :owner, owner))
       catch
         # EVERY way out, as `Run.execute/3` does: Session.run/1 exits on a launch or monitor
         # failure by design, and a raise anywhere in here would otherwise leave the run recorded
@@ -251,9 +263,10 @@ defmodule LoopctlRunner.TriageRun do
   # the only kind this runner is sent for a while, and an orphaned triage tree — or its lock, which
   # the next run on the repo would find held — would otherwise wait for an implement dispatch.
   # Guarded like `announce/2`: a reap that fails costs this run nothing.
-  defp reap(config) do
-    Reaper.reap(config.runs_dir, config.kill_grace_s * 1000,
-      projects_dir: config.claude_projects_dir
+  defp reap(config, owner) do
+    Reaper.reap(config.runs_dir, config.kill_grace_s * 1000, config.grant_dir,
+      projects_dir: config.claude_projects_dir,
+      owner: {:ok, owner}
     )
   rescue
     error -> Logger.error("the reap before a triage run failed: #{inspect(error)}")
@@ -311,7 +324,7 @@ defmodule LoopctlRunner.TriageRun do
          :ok <- budgets(config, opts),
          {:ok, token} <- mint(run_dir, &TriageVerdict.mint_token/1),
          {:ok, escalate} <- mint(run_dir, &TriageVerdict.mint_escalate_token/1),
-         {:ok, tree} <- detached_tree(config, path, run_dir, run_id, trace, seq) do
+         {:ok, tree} <- detached_tree(config, path, run_dir, run_id, trace, seq, opts[:owner]) do
       # EVERYTHING after a successful cut is inside this try, so no way out of it — a return, a
       # raise, an exit — leaves the tree or its lock behind. `created` is recorded FIRST, before
       # the submodules: a raise in them is a tree that exists, which the release path removes or
@@ -420,7 +433,7 @@ defmodule LoopctlRunner.TriageRun do
   end
 
   # The checkout is never branched and never the session's cwd: a triage session judges the
-  # commit it has out, from a detached worktree (`detached_tree/4`).
+  # commit it has out, from a detached worktree (`detached_tree/7`).
   #
   # Its failures are `{:unreadable, _}` rather than `{:error, _}`, because this function LOOKED:
   # the contract has a reason for exactly this and a verified cause is reportable.
@@ -474,8 +487,8 @@ defmodule LoopctlRunner.TriageRun do
   # with `{:tree_left, _}` when that removal failed too. `not_prepared` is only ever the entry of a
   # run that has no tree; one that was left is recorded `created`, as the tree it is, and given back
   # exactly as a finished run's is — so the reaper retries a removal that fails here.
-  defp detached_tree(config, path, run_dir, run_id, trace, seq) do
-    with {:ok, tree} <- prepared(fn -> claim_tree(config, path, run_id) end) do
+  defp detached_tree(config, path, run_dir, run_id, trace, seq, owner) do
+    with {:ok, tree} <- prepared(fn -> claim_tree(config, path, run_id, owner) end) do
       result =
         prepared(fn ->
           record_tree(run_dir, path, tree, "creating")
@@ -500,10 +513,10 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
-  defp claim_tree(config, path, run_id) do
+  defp claim_tree(config, path, run_id, owner) do
     shared = Worktree.triage_tree_path(config.runs_dir, path)
 
-    case WorktreeLock.acquire(config.runs_dir, shared, run_id) do
+    case WorktreeLock.acquire(config.runs_dir, shared, run_id, owner) do
       :ok ->
         {:ok, %{path: shared, shared?: true, base: "HEAD"}}
 

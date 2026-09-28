@@ -2,10 +2,43 @@ defmodule LoopctlRunner.ConfigTest do
   use ExUnit.Case, async: true
 
   alias LoopctlRunner.Config
+  import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
 
   setup do
     {:ok, root: tmp_dir!("config")}
+  end
+
+  test "a grant_dir the hook cannot see is warned about; the same directory by any path is not",
+       %{root: root} do
+    # block-subagent-git.sh reads $HOME/.claude alone: grants armed anywhere else leave every
+    # dispatched agent's commit refused while the runner looks healthy.
+    home_claude = Path.join(root, "home/.claude")
+    File.mkdir_p!(home_claude)
+    config = config!(root)
+
+    assert capture_log(fn -> Config.warn_if_hook_cannot_see_grants(config, home_claude) end) =~
+             "invisible to it"
+
+    # A HOME reached through a symlink names the directory the hook reads, by another path.
+    File.ln_s!(Path.join(root, "home"), Path.join(root, "linked-home"))
+    linked = %{config | grant_dir: Path.join(root, "linked-home/.claude")}
+
+    refute capture_log(fn -> Config.warn_if_hook_cannot_see_grants(linked, home_claude) end) =~
+             "grant_dir"
+
+    same = %{config | grant_dir: home_claude}
+
+    refute capture_log(fn -> Config.warn_if_hook_cannot_see_grants(same, home_claude) end) =~
+             "grant_dir"
+  end
+
+  test "loading a config warns nothing about its grant_dir", %{root: root} do
+    # Every test config points grant_dir at a directory of its own and goes through load/1: the
+    # warning belongs to the entry points that arm grants for real (control_config_test).
+    moved = Path.join(root, "moved.json")
+    File.write!(moved, JSON.encode!(config_map(root)))
+    refute capture_log(fn -> {:ok, _} = Config.load(moved) end) =~ "grant_dir"
   end
 
   test "a complete config loads, expanding paths and keeping explicit integers", %{root: root} do
@@ -54,6 +87,29 @@ defmodule LoopctlRunner.ConfigTest do
     test "on a non-positive budget", %{root: root} do
       assert {:error, "config max_turns must be a positive integer"} =
                Config.from_map(config_map(root, %{"max_turns" => 0}))
+    end
+
+    test "when no grant_dir is configured and HOME is not set", %{root: root} do
+      # The BEAM reads its home once, at boot, so only a VM started without HOME can show this:
+      # one is started here on the suite's own compiled code, with the same Erlang and Elixir.
+      path = Path.join(root, "runner.json")
+      File.write!(path, JSON.encode!(Map.delete(config_map(root), "grant_dir")))
+      elixir = Path.expand("../../bin/elixir", :code.lib_dir(:elixir))
+      ebins = Path.wildcard(Path.join(Mix.Project.build_path(), "lib/*/ebin"))
+
+      {out, _status} =
+        System.cmd(
+          elixir,
+          Enum.flat_map(ebins, &["-pa", &1]) ++
+            ["-e", "IO.inspect(LoopctlRunner.Config.load(#{inspect(path)}))"],
+          env: [
+            {"HOME", nil},
+            {"PATH", Path.join(:code.root_dir(), "bin") <> ":" <> System.get_env("PATH")}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert out =~ ~s({:error, "cannot resolve grant_dir: HOME is not set"})
     end
   end
 

@@ -220,7 +220,7 @@ defmodule LoopctlRunner.ControlTest do
 
     LoopctlRunner.RunState.update(
       run_dir,
-      Map.merge(LoopctlRunner.Owner.current(), %{"run_id" => "live-run", "status" => "running"})
+      Map.merge(owner!(), %{"run_id" => "live-run", "status" => "running"})
     )
 
     assert_receive {:test_loopctl, {:join, _, %{"in_flight" => 1}}}, 10_000
@@ -634,7 +634,7 @@ defmodule LoopctlRunner.ControlTest do
         dispatched_run(
           ctx,
           0..2,
-          Map.merge(LoopctlRunner.Owner.current(), %{"status" => "running"})
+          Map.merge(owner!(), %{"status" => "running"})
         )
 
       shipping_control(ctx)
@@ -749,7 +749,7 @@ defmodule LoopctlRunner.ControlTest do
         dispatched_run(
           ctx,
           0..2,
-          Map.merge(LoopctlRunner.Owner.current(), %{"status" => "running"})
+          Map.merge(owner!(), %{"status" => "running"})
         )
 
       shipping_control(ctx)
@@ -1137,7 +1137,7 @@ defmodule LoopctlRunner.ControlTest do
         dispatched_run(
           ctx,
           0..2,
-          Map.merge(LoopctlRunner.Owner.current(), %{"status" => "running"})
+          Map.merge(owner!(), %{"status" => "running"})
         )
 
       pid = shipping_control(ctx)

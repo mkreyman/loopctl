@@ -10,6 +10,8 @@ defmodule LoopctlRunner.Config do
   refuses every dispatch.
   """
 
+  require Logger
+
   @default_path "~/.config/loopctl-runner/runner.json"
 
   @enforce_keys [:runs_dir, :claude_launcher, :claude_projects_dir, :repos, :branch_prefixes]
@@ -21,6 +23,13 @@ defmodule LoopctlRunner.Config do
     :branch_prefixes,
     allowed_tools: [],
     session_env: %{},
+    # WHERE THE SUBAGENT GIT GRANTS LIVE, as data rather than as a call to `System.user_home!/0`
+    # buried in `Run.execute/3`. It is here because the SUITE exercises the production path: with
+    # the directory hardcoded there, every test that ran a Run swept the operator's real
+    # ~/.claude, and a stamped grant planted there from outside the suite was deleted by a full
+    # run (measured 2026-09-16). A test's config points at a directory the test owns; nothing a
+    # test can call reaches the real one by default.
+    grant_dir: nil,
     control: nil,
     max_wall_clock_s: 3600,
     max_turns: 200,
@@ -39,6 +48,7 @@ defmodule LoopctlRunner.Config do
           branch_prefixes: [String.t()],
           allowed_tools: [String.t()],
           session_env: %{optional(String.t()) => %{optional(String.t()) => String.t()}},
+          grant_dir: String.t() | nil,
           control: LoopctlRunner.ControlConfig.t() | nil,
           max_wall_clock_s: pos_integer(),
           max_turns: pos_integer(),
@@ -65,6 +75,15 @@ defmodule LoopctlRunner.Config do
   @spec default_path() :: String.t()
   def default_path, do: Path.expand(@default_path)
 
+  @doc """
+  The directory the operator's subagent git grants live in — where `block-subagent-git.sh` looks,
+  and what a config without `grant_dir` gets — or nil when the runner has no home directory.
+  """
+  @spec default_grant_dir() :: String.t() | nil
+  def default_grant_dir do
+    with home when is_binary(home) <- System.user_home(), do: Path.join(home, ".claude")
+  end
+
   @doc "Reads and validates the config file at `path`."
   @spec load(String.t()) :: {:ok, t()} | {:error, String.t()}
   def load(path) do
@@ -75,6 +94,45 @@ defmodule LoopctlRunner.Config do
       {:ok, config}
     end
   end
+
+  @doc """
+  Warns when `config`'s grant_dir is not the directory `block-subagent-git.sh` reads (`default`,
+  `default_grant_dir/0`). A grant_dir is config data so a TEST can point it elsewhere; an operator
+  config that does the same arms grants the hook never sees, so every dispatched agent's commit is
+  refused while the runner looks healthy.
+
+  Called by every entry point that arms grants for real — the daemon
+  (`LoopctlRunner.Application.daemon_children!/0`) and `mix loopctl.run` — and NOT by `load/1`,
+  which every test config passes through with a directory of its own, and `mix loopctl.reap`,
+  which arms nothing. The same directory reached another way — a symlinked HOME — is the same
+  directory: compared by device and inode once the paths differ.
+  """
+  @spec warn_if_hook_cannot_see_grants(t(), String.t() | nil) :: :ok
+  def warn_if_hook_cannot_see_grants(%__MODULE__{grant_dir: dir}, default \\ default_grant_dir()) do
+    unless same_dir?(dir, default) do
+      Logger.warning(
+        "config grant_dir #{dir} is not #{default || "$HOME/.claude"}: block-subagent-git.sh " <>
+          "reads grants only from $HOME/.claude, so the grants this runner arms there are " <>
+          "invisible to it and a dispatched agent's commit will be refused"
+      )
+    end
+
+    :ok
+  end
+
+  defp same_dir?(a, b) when is_binary(a) and is_binary(b) do
+    Path.expand(a) == Path.expand(b) or same_file?(File.stat(a), File.stat(b))
+  end
+
+  defp same_dir?(_a, _b), do: false
+
+  defp same_file?(
+         {:ok, %File.Stat{major_device: device, inode: inode}},
+         {:ok, %File.Stat{major_device: device, inode: inode}}
+       ),
+       do: true
+
+  defp same_file?(_a, _b), do: false
 
   # `session_env` is the sanctioned place to keep a credential a session needs — it is the whole
   # escape hatch for the shape deny (`Session.unset_names/2`) — and both that doc and the comment
@@ -113,6 +171,7 @@ defmodule LoopctlRunner.Config do
          {:ok, tools} <- allowed_tools(map),
          {:ok, session_env} <- session_env(map, repos),
          {:ok, control} <- control(map),
+         {:ok, grant_dir} <- grant_dir(map),
          {:ok, ints} <- positive_ints(map) do
       {:ok,
        struct!(
@@ -125,7 +184,8 @@ defmodule LoopctlRunner.Config do
            branch_prefixes: prefixes,
            allowed_tools: tools,
            session_env: session_env,
-           control: control
+           control: control,
+           grant_dir: grant_dir
          ] ++ ints
        )}
     end
@@ -152,6 +212,19 @@ defmodule LoopctlRunner.Config do
       {:error, reason} -> {:error, "config is not valid JSON: #{inspect(reason)}"}
     end
   end
+
+  # Absent means the real one: an operator's config says nothing about this and should not have to.
+  # With no home to find it in, the load fails closed rather than raising.
+  defp grant_dir(map) do
+    case Map.get(map, "grant_dir") do
+      nil -> resolved_grant_dir(default_grant_dir())
+      value when is_binary(value) and value != "" -> {:ok, Path.expand(value)}
+      _ -> {:error, "config grant_dir must be a non-empty path"}
+    end
+  end
+
+  defp resolved_grant_dir(nil), do: {:error, "cannot resolve grant_dir: HOME is not set"}
+  defp resolved_grant_dir(dir), do: {:ok, dir}
 
   defp required_path(map, key) do
     case Map.get(map, key) do

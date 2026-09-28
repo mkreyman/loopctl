@@ -9,6 +9,29 @@ defmodule LoopctlRunner.TestSupport do
 
   def fake_bin_dir, do: Path.expand("bin", __DIR__)
 
+  @doc "This BEAM's `LoopctlRunner.Owner` identity, which a test BEAM can always read."
+  def owner! do
+    {:ok, owner} = LoopctlRunner.Owner.current()
+    owner
+  end
+
+  @doc """
+  `owner` as a grant line records it, and `LoopctlRunner.GitGrant.holders/1` reads it back: its
+  pid and start, without the `ps lstart` string only a run or lock record carries.
+  """
+  def granted(owner), do: %{owner | "beam_started" => nil}
+
+  @doc """
+  A start of the same form as `started` that its process never had: a reused pid's, in whichever
+  form this kernel records (`LoopctlRunner.Owner.clock/0`).
+  """
+  def other_start("utc:" <> _), do: "utc:Thu Jan 1 00:00:00 1970"
+
+  def other_start("boot:" <> _ = started) do
+    [boot, id, ticks] = String.split(started, ":")
+    Enum.join([boot, id, String.to_integer(ticks) + 360_000], ":")
+  end
+
   def tmp_dir!(label) do
     dir =
       Path.join(
@@ -65,6 +88,10 @@ defmodule LoopctlRunner.TestSupport do
       %{
         "runs_dir" => Path.join(root, "runs"),
         "claude_projects_dir" => Path.join(root, "projects"),
+        # NEVER the operator's ~/.claude: the reaper sweeps this directory, and the suite drives
+        # the production path. The after-suite canary in test_helper.exs is what notices if this
+        # stops being true.
+        "grant_dir" => Path.join(root, "grants"),
         "claude_launcher" => @headless,
         "repos" => %{"fixture" => Path.join(root, "repo")},
         "branch_prefixes" => ["loop/"],

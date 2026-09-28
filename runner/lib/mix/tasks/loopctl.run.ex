@@ -36,6 +36,7 @@ defmodule Mix.Tasks.Loopctl.Run do
     config_path = Keyword.get(opts, :config, Config.default_path())
 
     with {:ok, config} <- Config.load(config_path),
+         :ok <- Config.warn_if_hook_cannot_see_grants(config),
          {:ok, story} <- load_story(story_arg, config) do
       result = Run.execute(config, story, keep_worktree: Keyword.get(opts, :keep_worktree, false))
       Mix.shell().info(JSON.encode!(summary(result)))

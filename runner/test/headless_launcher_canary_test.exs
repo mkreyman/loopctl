@@ -67,8 +67,11 @@ defmodule LoopctlRunner.HeadlessLauncherCanaryTest do
     session = File.read!(Path.join(@root, "lib/loopctl_runner/session.ex"))
     assert session =~ "Port.open({:spawn_executable, launcher_script()}"
 
-    # The launcher and the wrapper are what this canary pins; the argv is an argument.
-    assert session =~ "args: [stderr_log, config.claude_launcher | argv(story, session_id, opts)]"
+    # The launcher and the wrapper are what this canary pins; the argv is an argument, and it is
+    # the one the CHECKED builder returned: bound once, from `argv/3`, and launched as is.
+    assert session =~ "checked_argv = argv(story, session_id, opts)"
+    assert length(Regex.scan(~r/\bchecked_argv\s*=[^=]/, session)) == 1
+    assert session =~ "args: [stderr_log, config.claude_launcher | checked_argv]"
 
     launcher = File.read!(Path.join(@root, "priv/bin/session-launcher.sh"))
     assert launcher =~ ~s|"$headless" "$@" </dev/null|

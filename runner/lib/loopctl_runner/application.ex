@@ -13,6 +13,8 @@ defmodule LoopctlRunner.Application do
 
   @impl true
   def start(_type, _args) do
+    # Before anything can judge an owner: every mix task, the daemon and the suite start here.
+    LoopctlRunner.Owner.init_outage_counter()
     children = if daemon?(), do: daemon_children!(), else: []
     Supervisor.start_link(children, strategy: :one_for_one, name: LoopctlRunner.Supervisor)
   end
@@ -121,6 +123,7 @@ defmodule LoopctlRunner.Application do
         # Primary metadata, so every process's lines carry the runner id, supervisor reports
         # about Control included. Lines logged before the config loads cannot.
         :logger.update_primary_config(%{metadata: %{runner_id: config.control.runner_id}})
+        Config.warn_if_hook_cannot_see_grants(config)
         # Accepted runs live under their own supervisor, started before Control so it exists
         # whenever a dispatch is accepted. A run is a synchronous Run.execute in a task: Control
         # is never blocked by one, and a Control restart does not take running sessions down.

@@ -90,6 +90,27 @@ defmodule LoopctlRunner.TriageRunTest do
     assert result.session.exit_status == 0
   end
 
+  test "a triage session gets NO subagent git grant: it has no branch of its own", ctx do
+    # The grant exists so an engineer agent can commit to the branch the runner cut for a story.
+    # A triage run has no branch of its own to commit to. The RUNNER's environment carries a
+    # LOOP_GIT_GRANT naming a file that exists — a daemon started from inside a loop session
+    # would — and the session must still see none: inherited, it would read as this session's.
+    decoy = Path.join(ctx.root, "inherited-grant")
+    File.write!(decoy, "not this session's\n")
+
+    result =
+      execute(ctx, [
+        {"FAKE_CLAUDE_MODE", "stream"},
+        {"FAKE_VERDICT", Jason.encode!(@verdict)},
+        {"LOOP_GIT_GRANT", decoy}
+      ])
+
+    assert File.read!(Path.join(ctx.state, "git_grant")) == "GIT_GRANT ABSENT\n"
+    assert File.read!(Path.join(ctx.state, "git_grant_env")) == "LOOP_GIT_GRANT UNSET\n"
+
+    refute File.exists?(LoopctlRunner.GitGrant.path(config!(ctx.root), result.session.session_id))
+  end
+
   # Compared resolved: on macOS the temp dir lives under /var, a symlink to /private/var, and the
   # fake records the cwd it resolved.
   defp real_checkout(ctx), do: real(Path.join(ctx.root, "repo"))
@@ -169,7 +190,7 @@ defmodule LoopctlRunner.TriageRunTest do
 
     shared_project = File.read!(Path.join(ctx.state, "project_dir")) |> String.trim()
     shared = shared_tree(ctx)
-    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, "another-live-run")
+    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, "another-live-run", owner!())
 
     result =
       execute(ctx, [
@@ -201,7 +222,7 @@ defmodule LoopctlRunner.TriageRunTest do
     # the tree on disk and the run with an {:error, _}, which has no wire form. A lens list that is
     # not a list is what makes the prompt raise here.
     shared = shared_tree(ctx)
-    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, "another-live-run")
+    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, "another-live-run", owner!())
 
     result = execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], lenses: :not_a_list)
 
@@ -637,7 +658,15 @@ defmodule LoopctlRunner.TriageRunTest do
     # A corrupt lock file names no live run, so nothing it could protect is running. Read as held,
     # every later run on this repo would cut a tree of its own for ever.
     shared = shared_tree(ctx)
-    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, "a-run-whose-lock-was-truncated")
+
+    :ok =
+      WorktreeLock.acquire(
+        ctx.config.runs_dir,
+        shared,
+        "a-run-whose-lock-was-truncated",
+        owner!()
+      )
+
     [lock] = Path.wildcard(Path.join([ctx.config.runs_dir, "locks", "*.lock"]))
     File.write!(lock, "")
 
@@ -725,7 +754,10 @@ defmodule LoopctlRunner.TriageRunTest do
     """)
 
     File.chmod!(Path.join(bin, "git"), 0o755)
-    :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared_tree(ctx), "another-live-run")
+
+    :ok =
+      WorktreeLock.acquire(ctx.config.runs_dir, shared_tree(ctx), "another-live-run", owner!())
+
     previous = System.get_env("PATH")
     System.put_env("PATH", bin <> ":" <> previous)
 

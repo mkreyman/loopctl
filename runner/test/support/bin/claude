@@ -33,6 +33,35 @@ for arg in "$@"; do
 done
 printf '%s' "$sid" > "$state/session_id"
 printf '%s' "$PPID" > "$state/launcher_pid"
+# Whether the runner armed the grant that lets a DISPATCHED agent commit. Recorded from inside a
+# live session because that is the only moment the answer means anything: the file is removed at
+# teardown, so a test looking afterwards can only ever see it gone. The path is read, never
+# written, and the name is a fixed literal.
+# Read from the environment rather than reconstructed from $HOME: the runner tells a session
+# where its grant is, and a test's grant directory is not the operator's.
+# The runner arms it just AFTER the fork, with the launcher's pid in it. A real session's first
+# tool call is seconds away; this stub looks at once, so it waits up to five seconds for the write.
+if [ -n "${LOOP_GIT_GRANT:-}" ]; then
+    tries=0
+    while [ ! -f "$LOOP_GIT_GRANT" ] && [ "$tries" -lt 50 ]; do
+        sleep 0.1
+        tries=$((tries + 1))
+    done
+fi
+if [ -n "${LOOP_GIT_GRANT:-}" ] && [ -f "$LOOP_GIT_GRANT" ]; then
+    echo "GIT_GRANT PRESENT" > "$state/git_grant"
+    # Its first line, which is the runner's stamp and the owner the sweep keys on: no credential.
+    head -n 1 "$LOOP_GIT_GRANT" > "$state/git_grant_stamp"
+else
+    echo "GIT_GRANT ABSENT" > "$state/git_grant"
+fi
+# Whether the variable is in the environment AT ALL, never its value: a session with no grant must
+# not inherit the runner's, and one set to an unusable value would pass the file test above.
+if [ -n "${LOOP_GIT_GRANT+set}" ]; then
+    echo "LOOP_GIT_GRANT SET" > "$state/git_grant_env"
+else
+    echo "LOOP_GIT_GRANT UNSET" > "$state/git_grant_env"
+fi
 here=$(realpath .)
 printf '%s\n' "$here" > "$state/cwd"
 # What Claude Code does for every cwd it runs in: a project directory under the projects dir,

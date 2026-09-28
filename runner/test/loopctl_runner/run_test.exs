@@ -2,7 +2,7 @@ defmodule LoopctlRunner.RunTest do
   # Mutates PATH and FAKE_* in the OS environment, which every spawned process inherits.
   use ExUnit.Case, async: false
 
-  alias LoopctlRunner.{Run, RunState, Story, Trace, WorktreeLock}
+  alias LoopctlRunner.{GitGrant, Owner, Run, RunState, Session, Story, Trace, WorktreeLock}
   import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
 
@@ -503,6 +503,275 @@ defmodule LoopctlRunner.RunTest do
     refute "session.parked" in types
   end
 
+  test "the subagent git grant is armed for the session and removed at teardown", %{
+    root: root,
+    state: state
+  } do
+    # A loop session dispatches an engineer agent to do the implementing (this repo's CLAUDE.md
+    # says so), and block-subagent-git.sh — a PreToolUse hook in the operator's user settings,
+    # live in any session that loads them — refuses that agent's `git commit` unless the
+    # dispatching session armed this file first. The agent's report then
+    # reads as having chosen not to commit, so the failure looks like a judgement call: the whole
+    # reason this is tested from INSIDE the session rather than inferred.
+    result = run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    assert result.status == "succeeded"
+    assert File.read!(Path.join(state, "git_grant")) == "GIT_GRANT PRESENT\n"
+    # Stamped with THIS BEAM as its owner, which is what keeps a reap beside a live session from
+    # sweeping it: an owner that is running is a dispatch in flight.
+    assert LoopctlRunner.GitGrant.holders(Path.join(state, "git_grant_stamp")) ==
+             {granted(owner!()), nil}
+
+    # ...and it does not outlive the session. An orphan authorises a uuid nothing will hold
+    # again, so it is inert rather than dangerous — but an unscoped, un-removed sentinel is the
+    # failure KB 7a9afe2e measures, and this is the half that keeps it from becoming one.
+    refute File.exists?(LoopctlRunner.GitGrant.path(config!(root), result.session.session_id))
+  end
+
+  @tag :capture_log
+  test "a grant that cannot be written is never announced to the session", %{
+    root: root,
+    state: state
+  } do
+    # LOOP_GIT_GRANT is fixed at the fork. Set before the write that could fail, it told the
+    # session of a grant that did not exist; a grant directory under a regular file cannot be.
+    blocker = Path.join(root, "not-a-directory")
+    File.write!(blocker, "")
+
+    result =
+      run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
+        "grant_dir" => Path.join(blocker, "grants")
+      })
+
+    assert result.status == "succeeded"
+    assert File.read!(Path.join(state, "git_grant_env")) == "LOOP_GIT_GRANT UNSET\n"
+    assert File.read!(Path.join(state, "git_grant")) == "GIT_GRANT ABSENT\n"
+  end
+
+  test "a grant whose arm fails after the fork is no grant: the session finds no file", %{
+    root: root,
+    state: state
+  } do
+    # LOOP_GIT_GRANT is fixed at the fork, which comes before arming can fail, so it says WHERE the
+    # grant is and never that there is one: the hook tests the FILE. A directory where the grant
+    # goes fails the rename that would arm it — and leaves no pending file behind either.
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    on_exit(restore)
+    session_id = Session.uuid4()
+    grant = GitGrant.path(config!(root), session_id)
+    File.mkdir_p!(Path.join(grant, "occupied"))
+
+    log =
+      capture_log(fn ->
+        %{pid: pid} = start_session!(root, session_id)
+        assert_receive {:session_result, ^pid, _}, 20_000
+      end)
+
+    assert log =~ "could not arm the subagent git grant for session #{session_id}"
+    assert File.read!(Path.join(state, "git_grant_env")) == "LOOP_GIT_GRANT SET\n"
+    assert File.read!(Path.join(state, "git_grant")) == "GIT_GRANT ABSENT\n"
+    assert File.ls!(Path.dirname(grant)) == [Path.basename(grant)]
+  end
+
+  test "the run records this BEAM as its owner, start and all", %{root: root, state: state} do
+    # A state without its owner's start reads as an orphan, so the next run's reap would kill a
+    # live session. The owner is read before anything is written and recorded as read.
+    result = run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}])
+
+    {:ok, recorded} = RunState.read(result.run_dir)
+    # Both starts: the one this runner judges by, and the `ps lstart` string a runner built before
+    # it judges by — without which that runner's reap kills this run's session.
+    assert Map.take(recorded, ["beam_os_pid", "beam_start_id", "beam_started"]) == owner!()
+    assert is_binary(recorded["beam_started"])
+  end
+
+  test "stopping the Session while its port is LIVE still ends the whole tree", %{
+    root: root,
+    state: state
+  } do
+    # The runner-shutdown path, and the one kill path nothing covered: every other test reaches
+    # teardown after the CLI has exited, when `port` is already nil, so `terminate/2`'s live-port
+    # branch ran in no test at all — mutating `ProcessGroup.terminate/3` out of it left the FULL
+    # suite green. It is also the clause that must disarm the subagent git grant on a runner
+    # shutdown, and a missed kill is a straggler holding a port.
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "hang"}, {"FAKE_AGENTS", "busy"}])
+
+    on_exit(restore)
+    %{pid: pid, grant: grant} = start_session!(root)
+
+    # Wait until the fixture has detached its children, so there is a tree to miss.
+    grandchild = Path.join(state, "grandchild_pid")
+    detached = Path.join(state, "detached_pid")
+    :ok = wait_until(fn -> File.exists?(grandchild) and File.exists?(detached) end, 10_000)
+    grandchild = read_int!(grandchild)
+    detached = read_int!(detached)
+    assert os_pid_alive?(grandchild)
+    assert os_pid_alive?(detached)
+    assert File.exists?(grant)
+
+    # The port is still open here: this is the clause under test.
+    GenServer.stop(pid)
+
+    # Disarmed on this path too: a runner shutdown must not leave the grant behind.
+    refute File.exists?(grant)
+
+    refute os_pid_alive?(grandchild)
+    # The detached one is in its own session and carries only the marker, which is what
+    # ProcessGroup.terminate/3 uses to find it.
+    refute os_pid_alive?(detached)
+  end
+
+  test "a session's grant is gone BEFORE its waiter hears the result", %{
+    root: root,
+    state: state
+  } do
+    # A result in hand has to mean the grant is disarmed: whatever acts on it — the next run's
+    # sweep, a shutdown — must not find it still armed. Ordered by trace, because looking at the
+    # file once the result arrives races the session's own teardown and passes either way.
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    on_exit(restore)
+
+    %{pid: pid, grant: grant} = start_session!(root)
+    ref = Process.monitor(pid)
+    trace_session(pid, [{File, :rm, 1}])
+
+    assert_receive {:session_result, ^pid, _}, 20_000
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
+
+    assert traced_events(pid, fn
+             {:trace, _, :call, {File, :rm, [^grant]}} -> :disarmed
+             {:trace, _, :send, {:session_result, _, _}, _} -> :result_sent
+             _ -> nil
+           end) == [:disarmed, :result_sent]
+
+    refute File.exists?(grant)
+  end
+
+  test "stopping a live session kills its tree BEFORE disarming its grant", %{
+    root: root,
+    state: state
+  } do
+    # Disarmed first, a subagent committing during the kill's grace period has that commit
+    # refused by the hook while its session is still running.
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "hang"}, {"FAKE_AGENTS", "busy"}])
+    on_exit(restore)
+
+    %{pid: pid, grant: grant} = start_session!(root)
+    :ok = wait_until(fn -> File.exists?(Path.join(state, "grandchild_pid")) end, 10_000)
+    trace_session(pid, [{File, :rm, 1}, {LoopctlRunner.ProcessGroup, :terminate, 3}])
+
+    GenServer.stop(pid)
+
+    assert pid
+           |> traced_events(fn
+             {:trace, _, :call, {LoopctlRunner.ProcessGroup, :terminate, _}} -> :killed
+             {:trace, _, :call, {File, :rm, [^grant]}} -> :disarmed
+             _ -> nil
+           end)
+           |> Enum.dedup() == [:killed, :disarmed]
+
+    refute File.exists?(grant)
+  end
+
+  test "terminate/2 disarms the grant even when ending the tree raises", %{root: root} do
+    # This BEAM owns the grant and lives on, so no sweep would remove one a raising kill skipped.
+    grant = Path.join(root, "grant")
+    File.write!(grant, "armed\n")
+    # A live port with no config: reading the kill's grace period raises before any signal.
+    state = %{grant: grant, port: :live, os_pid: 1, config: nil}
+
+    assert catch_error(Session.terminate(:shutdown, state))
+    refute File.exists?(grant)
+  end
+
+  test "a session killed outright leaves a grant the sweep removes once its launcher is gone", %{
+    root: root,
+    state: state
+  } do
+    # A Session killed with :kill runs no terminate/2, and the BEAM that owns its grant — the
+    # daemon's — lives on, so judged by that owner alone the grant would never be swept. The
+    # session line the runner writes once the Port opens names the launcher, which does end.
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "hang"}, {"FAKE_AGENTS", "busy"}])
+    on_exit(restore)
+
+    %{pid: pid, config: config, grant: grant} = start_session!(root)
+    :ok = wait_until(fn -> File.exists?(Path.join(state, "grandchild_pid")) end, 10_000)
+    %{os_pid: launcher} = :sys.get_state(pid)
+
+    # Armed with its session line in the one write: the launcher, by pid and start.
+    assert {owner, %{"beam_os_pid" => ^launcher, "beam_start_id" => started}} =
+             GitGrant.holders(grant)
+
+    assert owner == granted(owner!())
+    assert started == Owner.of(launcher)["beam_start_id"]
+    # From the same reading: the launcher's start in the `ps lstart` form ProcessGroup compares.
+    assert {:ok, %{"leader_start" => leader_start}} = RunState.read(Path.join(root, "direct-run"))
+    assert leader_start == Owner.start_time(launcher)
+    # Its BEAM and its session both running: a dispatch in flight, never swept.
+    assert GitGrant.sweep(config.grant_dir) == []
+
+    Process.exit(pid, :kill)
+    # The launcher's watchdog sees the Port's pipe close and ends the session, itself included.
+    :ok = wait_until(fn -> not os_pid_alive?(launcher) end, 15_000)
+
+    assert GitGrant.sweep(config.grant_dir) == [grant]
+    refute File.exists?(grant)
+  end
+
+  # A Session started directly, as `Run` starts one for an implement run: on a branch of its own,
+  # so it arms the grant.
+  defp start_session!(root, session_id \\ Session.uuid4()) do
+    config = config!(root)
+    {:ok, story} = Story.from_map(story_map(), config)
+    run_dir = Path.join(root, "direct-run")
+    File.mkdir_p!(run_dir)
+    {:ok, trace} = Trace.start_link(Path.join(run_dir, "trace.ndjson"), Session.uuid4())
+
+    {:ok, pid} =
+      GenServer.start(Session,
+        config: config,
+        story: story,
+        worktree: Path.join(root, "repo"),
+        run_dir: run_dir,
+        trace: trace,
+        parent: nil,
+        waiter: self(),
+        session_id: session_id,
+        own_worktree: true
+      )
+
+    %{pid: pid, config: config, grant: GitGrant.path(config, session_id)}
+  end
+
+  # Traces `pid`'s calls to `mfas` and its sends, to this process. Trace messages from one traced
+  # process reach the tracer in the order its events happened, which is what makes an ORDER
+  # assertion deterministic rather than a race against that process's next few microseconds.
+  defp trace_session(pid, mfas) do
+    for mfa <- mfas, do: :erlang.trace_pattern(mfa, true, [:global])
+    on_exit(fn -> for mfa <- mfas, do: :erlang.trace_pattern(mfa, false, [:global]) end)
+    :erlang.trace(pid, true, [:call, :send])
+  end
+
+  # Once `pid` is gone: every event traced from it, in order, mapped by `tag` (nil drops one).
+  defp traced_events(pid, tag) do
+    ref = :erlang.trace_delivered(:all)
+
+    receive do
+      {:trace_delivered, :all, ^ref} -> :ok
+    end
+
+    collect_traced(pid, tag, [])
+  end
+
+  defp collect_traced(pid, tag, acc) do
+    receive do
+      {:trace, ^pid, _, _} = event -> collect_traced(pid, tag, [tag.(event) | acc])
+      {:trace, ^pid, _, _, _} = event -> collect_traced(pid, tag, [tag.(event) | acc])
+    after
+      0 -> acc |> Enum.reverse() |> Enum.reject(&is_nil/1)
+    end
+  end
+
   test "a quiet session the agents probe reports idle is parked and killed", %{
     root: root,
     state: state
@@ -702,7 +971,7 @@ defmodule LoopctlRunner.RunTest do
   } do
     config = config!(root)
     worktree = Path.join([root, "repo", ".claude/worktrees/loop-s1"])
-    :ok = WorktreeLock.acquire(config.runs_dir, worktree, "holder")
+    :ok = WorktreeLock.acquire(config.runs_dir, worktree, "holder", owner!())
 
     result = run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}])
     assert result.status == "failed"
@@ -791,7 +1060,7 @@ defmodule LoopctlRunner.RunTest do
     end
 
     assert WorktreeLock.live_holder(config.runs_dir, worktree) == nil
-    assert :ok = WorktreeLock.acquire(config.runs_dir, worktree, "next")
+    assert :ok = WorktreeLock.acquire(config.runs_dir, worktree, "next", owner!())
   end
 
   test "a detached child that ignores TERM is killed by the runner's escalation", %{

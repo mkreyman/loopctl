@@ -26,7 +26,9 @@ defmodule LoopctlRunner.Session do
 
   alias LoopctlRunner.{
     Config,
+    GitGrant,
     Liveness,
+    Owner,
     ProcessGroup,
     RunState,
     Story,
@@ -54,7 +56,14 @@ defmodule LoopctlRunner.Session do
   run with its own contained set), `:system_prompt` (what `--append-system-prompt` carries on the
   default argv; the implement session's escalation prompt),
   `:parent` (the run's
-  trace seq), and optionally `:session_id` and `:env` (extra `{name, value}` pairs).
+  trace seq), and optionally `:session_id`, `:env` (extra `{name, value}` pairs) and
+  `:own_worktree` (default false).
+
+  `:own_worktree` says the runner cut this session's worktree on a BRANCH of its own — an implement
+  run — and it decides one thing: the subagent git grant, prepared before the launcher starts and
+  armed once it has (`LoopctlRunner.GitGrant.prepare/2`, then `LoopctlRunner.GitGrant.arm/2`). It is
+  false for a triage run, which has no branch of its own, and false by default so a launcher added
+  later gets no grant unless it asks.
   """
   @spec run(keyword()) :: result()
   def run(opts) do
@@ -269,63 +278,138 @@ defmodule LoopctlRunner.Session do
     run_dir = Keyword.fetch!(opts, :run_dir)
     worktree = Keyword.fetch!(opts, :worktree)
     session_id = Keyword.get_lazy(opts, :session_id, &uuid4/0)
+    # Built, and checked, BEFORE anything is written outside the run directory: `checked/2`
+    # raises here, and a grant armed ahead of it would leak on every refused argv.
+    checked_argv = argv(story, session_id, opts)
 
     stderr_log = Path.join(run_dir, "stderr.log")
     {:ok, stdout_io} = File.open(Path.join(run_dir, "stdout.ndjson"), [:append, :binary])
     tree_file = Path.join(run_dir, "stderr.log.tree")
     RunState.update(run_dir, %{session_id: session_id, tree_file: tree_file, status: "running"})
 
-    port =
-      Port.open({:spawn_executable, launcher_script()}, [
-        :binary,
-        :exit_status,
-        cd: worktree,
-        args: [stderr_log, config.claude_launcher | argv(story, session_id, opts)],
-        env: port_env(run_dir, session_id, config, Keyword.get(opts, :env, []))
-      ])
+    # INERT UNTIL #64 LANDS, on purpose: until a loop session loads the operator's setup nothing in
+    # it reads this grant. It ships first so the two changes land and revert independently.
+    #
+    # ARMED ONLY FOR A RUN ON A BRANCH OF ITS OWN (`:own_worktree`), which is the only place the
+    # grant's reason holds (`LoopctlRunner.GitGrant`): an engineer agent committing to the branch
+    # the runner cut for this story. A triage run has no branch of its own to commit to. PREPARED
+    # here, with this BEAM as its owner, and armed once the Port is open, below: nil when it could
+    # not be prepared, so the session is told of no grant that cannot exist.
+    grant_path =
+      if Keyword.get(opts, :own_worktree, false), do: prepare_grant(config, session_id)
 
-    {:os_pid, os_pid} = Port.info(port, :os_pid)
-    leader_start = ProcessGroup.start_time(os_pid)
-    RunState.update(run_dir, %{pgid: os_pid, leader_start: leader_start})
-    now = now_ms()
+    # terminate/2 does not run for an init that raises, and the grant's owner is the BEAM this
+    # runs in — the daemon's, which outlives the session. Whatever raises once the grant is
+    # prepared disarms it first, pending file and grant alike (either not written is simply not
+    # there to remove).
+    try do
+      port =
+        Port.open({:spawn_executable, launcher_script()}, [
+          :binary,
+          :exit_status,
+          cd: worktree,
+          args: [stderr_log, config.claude_launcher | checked_argv],
+          env:
+            port_env(
+              run_dir,
+              session_id,
+              config,
+              # WHERE the grant is, when one was prepared — not that there is one: the file is the
+              # grant, and arming it comes after this fork (`LoopctlRunner.GitGrant`). The session
+              # can compute the path anyway from its own id and HOME, so this hands over nothing
+              # new; what it buys is that the path a session sees is the one the runner ARMS, which
+              # a test's directory makes differ. UNSET when this session has none — none asked for,
+              # or none that could be prepared — so a value in the runner's own environment is
+              # never passed off as this session's.
+              Keyword.get(opts, :env, []) ++ [{"LOOP_GIT_GRANT", grant_path || false}]
+            )
+        ])
 
-    session_seq =
-      Trace.emit(trace, "session.started", Keyword.fetch!(opts, :parent), %{
-        "session_id" => session_id,
-        "os_pid" => os_pid,
-        "cwd" => worktree,
-        "launcher" => config.claude_launcher,
-        "max_turns" => story.max_turns,
-        "wall_clock_s" => story.wall_clock_s,
-        "model" => story.model
-      })
+      {:os_pid, os_pid} = Port.info(port, :os_pid)
 
-    Process.send_after(self(), :wall_clock, story.wall_clock_s * 1000)
-    Process.send_after(self(), :verify_group, @verify_group_after_ms)
-    Process.send_after(self(), :check_escalation, @escalation_check_ms)
-    schedule_tick(config)
+      # ONE reading of the launcher, for the grant's session line and for `leader_start` alike: two
+      # would be two answers about one process, taken at two moments.
+      launcher = Owner.of(os_pid)
+      grant = arm_grant(grant_path, launcher)
+      # Still a `ps lstart` string, unlike an Owner's start: ProcessGroup and session-launcher.sh
+      # compare it in that form, and moving them is issue #66.
+      leader_start = Owner.lstart(launcher)
+      RunState.update(run_dir, %{pgid: os_pid, leader_start: leader_start})
+      now = now_ms()
 
-    {:ok,
-     %{
-       config: config,
-       story: story,
-       trace: trace,
-       waiter: Keyword.fetch!(opts, :waiter),
-       port: port,
-       os_pid: os_pid,
-       session_id: session_id,
-       tree_file: tree_file,
-       leader_start: leader_start,
-       session_seq: session_seq,
-       stream: StreamEvents.new(session_seq),
-       stdout_io: stdout_io,
-       partial: "",
-       escalation_file: Path.join(run_dir, "escalations.ndjson"),
-       escalations_seen: 0,
-       started_ms: now,
-       last_stdout_ms: now,
-       reason: nil
-     }}
+      session_seq =
+        Trace.emit(trace, "session.started", Keyword.fetch!(opts, :parent), %{
+          "session_id" => session_id,
+          "os_pid" => os_pid,
+          "cwd" => worktree,
+          "launcher" => config.claude_launcher,
+          "max_turns" => story.max_turns,
+          "wall_clock_s" => story.wall_clock_s,
+          "model" => story.model
+        })
+
+      Process.send_after(self(), :wall_clock, story.wall_clock_s * 1000)
+      Process.send_after(self(), :verify_group, @verify_group_after_ms)
+      Process.send_after(self(), :check_escalation, @escalation_check_ms)
+      schedule_tick(config)
+
+      {:ok,
+       %{
+         config: config,
+         story: story,
+         trace: trace,
+         waiter: Keyword.fetch!(opts, :waiter),
+         port: port,
+         os_pid: os_pid,
+         session_id: session_id,
+         # The grant this session armed, or nil: teardown removes the path that was WRITTEN rather
+         # than recomputing one, so a config whose directory moved cannot leave the file behind.
+         grant: grant,
+         tree_file: tree_file,
+         leader_start: leader_start,
+         session_seq: session_seq,
+         stream: StreamEvents.new(session_seq),
+         stdout_io: stdout_io,
+         partial: "",
+         escalation_file: Path.join(run_dir, "escalations.ndjson"),
+         escalations_seen: 0,
+         started_ms: now,
+         last_stdout_ms: now,
+         reason: nil
+       }}
+    catch
+      kind, reason ->
+        GitGrant.disarm(grant_path)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  # PREPARED BEFORE THE PORT OPENS, SO THE SESSION IS TOLD THE TRUTH. `LOOP_GIT_GRANT` is fixed at
+  # the fork, so whether to set it has to be decided before the launcher's pid exists: the owner
+  # line is written to a pending name first, and only a grant whose write succeeded is announced.
+  # A failure is logged by `GitGrant.prepare/2` and the session runs with the variable unset.
+  defp prepare_grant(config, session_id) do
+    case GitGrant.prepare(config, session_id) do
+      {:ok, path} -> path
+      {:error, _} -> nil
+    end
+  end
+
+  # ARMED AFTER THE PORT OPENS, THE LAUNCHER JOINING THE OWNER IN THE ONE RENAME. A grant visible
+  # before the launcher's line was in it would name only this BEAM, which outlives the session, so
+  # a Session killed outright would leave a grant no sweep removed while the daemon lived. The gap
+  # this opens is harmless: nothing in the session can use the grant before its first tool call,
+  # seconds after launch, while this lands milliseconds after the fork; a Session killed before it
+  # leaves a pending file the sweep removes once its owner is gone. An arm that fails here leaves
+  # `LOOP_GIT_GRANT` naming a path that holds no grant, which is what that variable means: the
+  # FILE is the grant, and a session that finds none has none. `GitGrant.arm/2` logs it.
+  defp arm_grant(nil, _launcher), do: nil
+
+  defp arm_grant(path, launcher) do
+    case GitGrant.arm(path, launcher) do
+      {:ok, path} -> path
+      {:error, _} -> nil
+    end
   end
 
   # Credentials the runner's own environment may carry, which a session must not inherit. The
@@ -452,7 +536,8 @@ defmodule LoopctlRunner.Session do
   safe spellings fails the same way enumerating dangerous ones does (KB 909ba2b2). `session_env`
   is per repo, in a mode-600 file only the operator writes, and revocable in one place.
   """
-  @spec unset_names(%{String.t() => String.t()}, [{String.t(), String.t()}]) :: [String.t()]
+  @spec unset_names(%{String.t() => String.t()}, [{String.t(), String.t() | false}]) ::
+          [String.t()]
   def unset_names(env, extra) do
     supplied = MapSet.new(extra, fn {name, _value} -> name end)
     shaped = Enum.reject(credential_shaped_env(env), &MapSet.member?(supplied, &1))
@@ -501,8 +586,10 @@ defmodule LoopctlRunner.Session do
     # because the value is also arbitrary code git executes, and because nothing legitimately
     # sets it today; the moment something does, it needs the explicit path above.
     # `LoopctlRunner.RunTest` has a characterisation test naming today's `extra` behaviour.
-    Enum.map(base ++ release_path(env) ++ extra, fn {k, v} ->
-      {to_charlist(k), to_charlist(v)}
+    # A `false` value in `extra` unsets that name, as it does for an Erlang Port.
+    Enum.map(base ++ release_path(env) ++ extra, fn
+      {k, false} -> {to_charlist(k), false}
+      {k, v} -> {to_charlist(k), to_charlist(v)}
     end) ++
       Enum.map(unset ++ release_env(env), &{to_charlist(&1), false})
   end
@@ -624,8 +711,11 @@ defmodule LoopctlRunner.Session do
       duration_ms: now_ms() - state.started_ms
     }
 
+    # Disarmed BEFORE the waiter hears: a result in hand means the grant is gone, so nothing
+    # acting on the result — the next run's sweep, a shutdown, a test — can see it still armed.
+    GitGrant.disarm(state.grant)
     send(state.waiter, {:session_result, self(), result})
-    {:stop, :normal, %{state | port: nil}}
+    {:stop, :normal, %{state | port: nil, grant: nil}}
   end
 
   def handle_info(:verify_group, %{port: nil} = state), do: {:noreply, state}
@@ -701,12 +791,16 @@ defmodule LoopctlRunner.Session do
     {:noreply, state}
   end
 
+  # Every end but a normal exit, whose handler has already disarmed (and cleared `grant`). The tree
+  # is killed FIRST: removed while the session still runs, the grant would have the hook refuse a
+  # commit its subagent is making during the kill's grace period. Disarmed in `after`, because the
+  # kill can raise, and this BEAM — the grant's owner — lives on, so no sweep would remove it.
   @impl true
-  def terminate(_reason, %{port: port} = state) when port != nil do
-    ProcessGroup.terminate(state.os_pid, grace_ms(state), kill_opts(state))
+  def terminate(_reason, %{grant: grant, port: port} = state) do
+    if port != nil, do: ProcessGroup.terminate(state.os_pid, grace_ms(state), kill_opts(state))
+  after
+    GitGrant.disarm(grant)
   end
-
-  def terminate(_reason, _state), do: :ok
 
   defp observe(state) do
     config = state.config

@@ -19,7 +19,9 @@ defmodule Mix.Tasks.Loopctl.Reap do
     case Config.load(Keyword.get(opts, :config, Config.default_path())) do
       {:ok, config} ->
         config.runs_dir
-        |> Reaper.reap(config.kill_grace_s * 1000, projects_dir: config.claude_projects_dir)
+        |> Reaper.reap(config.kill_grace_s * 1000, config.grant_dir,
+          projects_dir: config.claude_projects_dir
+        )
         |> Enum.each(&Mix.shell().info(JSON.encode!(&1)))
 
       {:error, reason} ->

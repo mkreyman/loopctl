@@ -179,7 +179,7 @@ defmodule LoopctlRunner.ControlTriageTest do
       |> Map.merge(state)
       # A state with no owner reads as an orphan; one with this BEAM's is what `Runs.in_flight/2`
       # counts and what nothing will reap.
-      |> Map.merge(Owner.current())
+      |> Map.merge(owner!())
     )
 
     dir

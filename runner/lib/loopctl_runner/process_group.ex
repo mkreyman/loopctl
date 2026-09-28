@@ -20,7 +20,7 @@ defmodule LoopctlRunner.ProcessGroup do
   machines.
   """
 
-  alias LoopctlRunner.Session
+  alias LoopctlRunner.{Owner, Session}
 
   @poll_ms 200
 
@@ -114,7 +114,7 @@ defmodule LoopctlRunner.ProcessGroup do
         for line <- String.split(raw, "\n", trim: true),
             [pid_s, raw_start] <- [String.split(line, " ", parts: 2)],
             {pid, ""} <- [Integer.parse(pid_s)],
-            start <- [squeeze(raw_start)],
+            start <- [Owner.normalize_start(raw_start)],
             Map.get(starts, pid) == start,
             do: {pid, start}
 
@@ -122,10 +122,6 @@ defmodule LoopctlRunner.ProcessGroup do
         []
     end
   end
-
-  # `ps lstart` pads a one-digit day with a second space ("Tue Sep  8"); the launcher's awk
-  # collapses it. Compared raw, every recorded pid mismatched on days 1-9.
-  defp squeeze(start), do: start |> String.split() |> Enum.join(" ")
 
   @doc "Current descendants of `root`, walked by parent pid."
   @spec descendants(pos_integer() | nil) :: [pos_integer()]
@@ -153,7 +149,7 @@ defmodule LoopctlRunner.ProcessGroup do
     for line <- ps_rows(["-A", "-o", "pid=,lstart="]),
         [pid_s, start] <- [String.split(String.trim_leading(line), " ", parts: 2)],
         into: %{},
-        do: {String.to_integer(pid_s), squeeze(start)}
+        do: {String.to_integer(pid_s), Owner.normalize_start(start)}
   end
 
   defp ps_rows(args) do
@@ -167,15 +163,6 @@ defmodule LoopctlRunner.ProcessGroup do
           leader_start: String.t() | nil
         ]
 
-  @doc "The start time of `pid` as `ps lstart` prints it, whitespace-normalised, or nil."
-  @spec start_time(pos_integer()) :: String.t() | nil
-  def start_time(pid) when is_integer(pid) and pid > 1 do
-    case System.cmd("ps", ["-o", "lstart=", "-p", "#{pid}"], stderr_to_stdout: true) do
-      {out, 0} -> squeeze(out)
-      _ -> nil
-    end
-  end
-
   # Whether `pgid` still names OUR group. A live group whose id is our launcher's pid is
   # ours unless a process with that pid is alive and started at a different time: then the
   # launcher died, its group emptied, and the pid was recycled into a stranger's group
@@ -186,7 +173,7 @@ defmodule LoopctlRunner.ProcessGroup do
   defp ours?(_pgid, nil), do: true
 
   defp ours?(pgid, leader_start) do
-    case start_time(pgid) do
+    case Owner.start_time(pgid) do
       nil -> true
       ^leader_start -> true
       _other -> false

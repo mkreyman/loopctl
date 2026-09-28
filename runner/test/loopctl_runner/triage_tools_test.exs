@@ -50,7 +50,10 @@ defmodule LoopctlRunner.TriageToolsTest do
     List.delete_at(List.delete_at(argv, index), index)
   end
 
-  defp launch(argv, session_id) do
+  defp launch(argv, session_id, opts \\ []) do
+    {root, opts} =
+      Keyword.pop_lazy(opts, :root, fn -> LoopctlRunner.TestSupport.tmp_dir!("argv") end)
+
     story = %LoopctlRunner.Story{
       id: "t",
       repo: "r",
@@ -62,18 +65,59 @@ defmodule LoopctlRunner.TriageToolsTest do
       max_turns: 5
     }
 
-    root = LoopctlRunner.TestSupport.tmp_dir!("argv")
-
     LoopctlRunner.Session.run(
-      config: LoopctlRunner.TestSupport.config!(root),
-      story: story,
-      worktree: root,
-      run_dir: LoopctlRunner.TestSupport.tmp_dir!("argv-run"),
-      trace: self(),
-      parent: nil,
-      session_id: session_id,
-      argv: argv
+      Keyword.merge(
+        [
+          config: LoopctlRunner.TestSupport.config!(root),
+          story: story,
+          worktree: root,
+          run_dir: LoopctlRunner.TestSupport.tmp_dir!("argv-run"),
+          trace: self(),
+          parent: nil,
+          session_id: session_id,
+          argv: argv
+        ],
+        opts
+      )
     )
+  end
+
+  test "a refused argv arms no git grant, so a refusal leaks none" do
+    # The argv is checked inside `init/1`, and a raise there never reaches `terminate/2`, which is
+    # where a grant is removed. Checked FIRST, a refusal leaves the grant directory as it was.
+    root = LoopctlRunner.TestSupport.tmp_dir!("argv-grant")
+
+    argv =
+      TriageTools.claude_args("p", "the-id", TriagePrompt.system_prompt(), max_turns: 5)
+      |> drop_flag("--permission-prompts")
+
+    assert {:session_start_failed, {%ArgumentError{}, _}} =
+             catch_exit(launch(argv, "the-id", own_worktree: true, root: root))
+
+    assert File.ls(LoopctlRunner.TestSupport.config!(root).grant_dir) in [
+             {:ok, []},
+             {:error, :enoent}
+           ]
+  end
+
+  test "a launch that fails leaves no grant behind" do
+    # terminate/2 never runs for an init that raises, and the grant's owner is the daemon BEAM,
+    # which outlives the session — so no sweep would ever remove it. A cwd that does not exist
+    # fails the launch past the arming (the child cannot change into it, so the Port has no OS
+    # process to report) and launches nothing.
+    root = LoopctlRunner.TestSupport.tmp_dir!("launch-grant")
+    argv = TriageTools.claude_args("p", "the-id", TriagePrompt.system_prompt(), max_turns: 5)
+    gone = Path.join(root, "no-such-worktree")
+
+    assert {:session_start_failed, _} =
+             catch_exit(launch(argv, "the-id", own_worktree: true, root: root, worktree: gone))
+
+    # The grant is armed only once the Port is open, so a launch refused there may never have
+    # created the directory at all. Either way, no grant is left behind.
+    assert File.ls(LoopctlRunner.TestSupport.config!(root).grant_dir) in [
+             {:ok, []},
+             {:error, :enoent}
+           ]
   end
 
   test "an argv whose session id is not the session's is refused at launch" do

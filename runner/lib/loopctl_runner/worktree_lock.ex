@@ -16,11 +16,17 @@ defmodule LoopctlRunner.WorktreeLock do
 
   alias LoopctlRunner.Owner
 
-  @spec acquire(String.t(), String.t(), String.t()) :: :ok | {:error, {:held, String.t()}}
-  def acquire(runs_dir, path, run_id) do
+  @doc """
+  Takes the lock on `path` for `run_id`, recording `owner` — this BEAM's `LoopctlRunner.Owner`,
+  which the caller has already read: a lock written without its start is dead on arrival, and the
+  next run would take it over, so there is no lock to take without one.
+  """
+  @spec acquire(String.t(), String.t(), String.t(), Owner.t()) ::
+          :ok | {:error, {:held, String.t()}}
+  def acquire(runs_dir, path, run_id, owner) do
     lock = lock_path(runs_dir, path)
     File.mkdir_p!(Path.dirname(lock))
-    body = JSON.encode!(Map.merge(Owner.current(), %{"run_id" => run_id, "path" => path}))
+    body = JSON.encode!(Map.merge(owner, %{"run_id" => run_id, "path" => path}))
 
     case create(lock, body) do
       :ok -> :ok
@@ -51,14 +57,14 @@ defmodule LoopctlRunner.WorktreeLock do
   end
 
   @doc """
-  `acquire/3` for a caller that must never raise over a lock: the lock directory that cannot be
+  `acquire/4` for a caller that must never raise over a lock: the lock directory that cannot be
   created, a lock file that cannot be written. `{:error, {:unavailable, reason}}` for those, so the
   boot-time reaper skips one orphan rather than taking down the run that called it.
   """
-  @spec try_acquire(String.t(), String.t(), String.t()) ::
+  @spec try_acquire(String.t(), String.t(), String.t(), Owner.t()) ::
           :ok | {:error, {:held, String.t()}} | {:error, {:unavailable, String.t()}}
-  def try_acquire(runs_dir, path, run_id) do
-    acquire(runs_dir, path, run_id)
+  def try_acquire(runs_dir, path, run_id, owner) do
+    acquire(runs_dir, path, run_id, owner)
   rescue
     error -> {:error, {:unavailable, Exception.message(error)}}
   end

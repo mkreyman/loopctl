@@ -2,7 +2,12 @@ defmodule LoopctlRunner.ControlConfigTest do
   use ExUnit.Case, async: false
 
   alias LoopctlRunner.{Config, ControlConfig}
+  alias Mix.Tasks.Loopctl.Run, as: LoopctlRun
+  import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
+
+  # daemon_children!/0 warns about every test config's grant_dir, which is a directory of its own.
+  @moduletag :capture_log
 
   defp control(overrides \\ %{}) do
     Map.merge(
@@ -406,6 +411,50 @@ defmodule LoopctlRunner.ControlConfigTest do
              LoopctlRunner.Application.daemon_children!()
 
     refute Keyword.has_key?(service, :accepts_dispatches)
+  end
+
+  test "the daemon and mix loopctl.run warn about a grant_dir the hook cannot see" do
+    # Config.load/1 does not: every test config passes through it with a directory of its own.
+    # These two are the entry points that arm grants for real.
+    root = tmp_dir!("daemon-grant-dir")
+    token = Path.join(root, "token")
+    File.write!(token, "lc_x")
+    File.chmod!(token, 0o600)
+
+    control = %{
+      "url" => "wss://loopctl.example/runner/socket/websocket",
+      "runner_id" => "3781bee6-2b97-4df0-9664-7f01a492630f",
+      "machine" => "minis",
+      "token_file" => token,
+      "repos" => ["mkreyman/home_care_billing"],
+      "max_sessions" => 1
+    }
+
+    path = Path.join(root, "runner.json")
+    File.write!(path, JSON.encode!(Map.put(config_map(root), "control", control)))
+    File.chmod!(path, 0o600)
+    System.put_env("LOOPCTL_RUNNER_CONFIG", path)
+    %{metadata: before} = :logger.get_primary_config()
+
+    on_exit(fn ->
+      System.delete_env("LOOPCTL_RUNNER_CONFIG")
+      :logger.update_primary_config(%{metadata: before})
+    end)
+
+    assert capture_log(fn -> LoopctlRunner.Application.daemon_children!() end) =~
+             "invisible to it"
+
+    # A story that does not exist: the task refuses after loading the config, running nothing.
+    Mix.shell(Mix.Shell.Process)
+    on_exit(fn -> Mix.shell(Mix.Shell.IO) end)
+
+    log =
+      capture_log(fn ->
+        assert catch_exit(LoopctlRun.run([Path.join(root, "no-story.json"), "--config", path])) ==
+                 {:shutdown, 2}
+      end)
+
+    assert log =~ "invisible to it"
   end
 
   test "the daemon refuses to start without a control section" do

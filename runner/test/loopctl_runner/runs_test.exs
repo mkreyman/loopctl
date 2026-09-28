@@ -10,7 +10,7 @@ defmodule LoopctlRunner.RunsTest do
 
     RunState.update(
       run_dir,
-      Map.merge(Owner.current(), %{
+      Map.merge(owner!(), %{
         "run_id" => name,
         "status" => "succeeded",
         "finished_at" => finished_at

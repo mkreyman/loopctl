@@ -94,9 +94,26 @@ defmodule LoopctlRunner.Run do
   end
 
   defp run(config, story, opts) do
+    # THIS BEAM'S IDENTITY FIRST, before anything is written. A run recorded without its owner's
+    # start reads dead to every check, so the next run's reap would kill this one's session; with
+    # no start to record, nothing is started.
+    owner =
+      case Owner.current() do
+        {:ok, owner} ->
+          owner
+
+        {:error, :no_start} ->
+          raise "refusing to start a run: this BEAM's own start time could not be read, " <>
+                  "and a run recorded without it would be reaped as an orphan"
+      end
+
+    # From the CONFIG, never from `System.user_home!/0` here: this line runs in every test that
+    # runs a Run, so a hardcoded home is a suite that sweeps the operator's grants. The reaper's
+    # own worktree locks record the owner already read above.
     reaped =
-      Reaper.reap(config.runs_dir, config.kill_grace_s * 1000,
-        projects_dir: config.claude_projects_dir
+      Reaper.reap(config.runs_dir, config.kill_grace_s * 1000, config.grant_dir,
+        projects_dir: config.claude_projects_dir,
+        owner: {:ok, owner}
       )
 
     # The contract identifies a run by UUID; the directory keeps a name a person can find.
@@ -127,14 +144,14 @@ defmodule LoopctlRunner.Run do
         "status" => "starting",
         "repo_path" => story.repo_path
       })
-      |> Map.merge(Owner.current())
+      |> Map.merge(owner)
     )
 
     stage(opts, {:started, %{run_id: run_id, run_dir: run_dir}})
 
     result =
       try do
-        with_worktree(config, story, run_dir, trace, run_seq, run_id, opts)
+        with_worktree(config, story, run_dir, trace, run_seq, run_id, owner, opts)
       catch
         # Any way out must not leave the run recorded in flight. The worktree lock is already
         # released by the `after` in with_worktree.
@@ -210,13 +227,13 @@ defmodule LoopctlRunner.Run do
     :exit, _ -> :ok
   end
 
-  defp with_worktree(config, story, run_dir, trace, run_seq, run_id, opts) do
+  defp with_worktree(config, story, run_dir, trace, run_seq, run_id, owner, opts) do
     # The session environment is rendered per run (Config.session_env_for/3).
     opts = Keyword.put(opts, :run_id, run_id)
 
     path = Worktree.path_for(story.repo_path, story.id)
 
-    case WorktreeLock.acquire(config.runs_dir, path, run_id) do
+    case WorktreeLock.acquire(config.runs_dir, path, run_id, owner) do
       :ok ->
         try do
           claim_worktree(config, story, run_dir, trace, run_seq, opts, path)
@@ -279,6 +296,9 @@ defmodule LoopctlRunner.Run do
            config: config,
            story: story,
            worktree: path,
+           # The runner cut this worktree on a branch of its own, so this run's session may hold
+           # the subagent git grant. A triage run has no branch of its own and gets none.
+           own_worktree: true,
            run_dir: run_dir,
            trace: trace,
            parent: run_seq,

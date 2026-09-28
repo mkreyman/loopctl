@@ -2,6 +2,7 @@ defmodule LoopctlRunner.ReaperTest do
   use ExUnit.Case, async: false
 
   alias LoopctlRunner.{
+    GitGrant,
     Owner,
     ProcessGroup,
     Reaper,
@@ -12,6 +13,9 @@ defmodule LoopctlRunner.ReaperTest do
     WorktreeLock
   }
 
+  alias Mix.Tasks.Loopctl.Reap
+
+  import ExUnit.CaptureIO
   import LoopctlRunner.TestSupport
 
   @moduletag timeout: 30_000
@@ -23,7 +27,14 @@ defmodule LoopctlRunner.ReaperTest do
     File.mkdir_p!(state)
     restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "hang"}])
     on_exit(restore)
-    {:ok, root: root, repo: repo, state: state, runs: Path.join(root, "runs")}
+    # Every reap in this file sweeps a grant directory THIS TEST OWNS: `Reaper.reap/3` has no
+    # default, so none can reach the operator's ~/.claude.
+    {:ok,
+     root: root,
+     repo: repo,
+     state: state,
+     runs: Path.join(root, "runs"),
+     grants: tmp_dir!("reaper-grants")}
   end
 
   # A launcher whose watchdog never fires: its stdin is a pipe held open by a process
@@ -78,7 +89,9 @@ defmodule LoopctlRunner.ReaperTest do
       worktree: %{path: path, branch: "loop/s1", base: "master", status: "creating"}
     })
 
-    assert [%{run_id: "s1-run", process_group: ":terminated"}] = Reaper.reap(ctx.runs, 2_000)
+    assert [%{run_id: "s1-run", process_group: ":terminated"}] =
+             Reaper.reap(ctx.runs, 2_000, ctx.grants)
+
     refute ProcessGroup.alive?(pgid)
     refute os_pid_alive?(read_int!(Path.join(ctx.state, "grandchild_pid")))
     refute os_pid_alive?(read_int!(Path.join(ctx.state, "detached_pid")))
@@ -92,7 +105,7 @@ defmodule LoopctlRunner.ReaperTest do
     assert {:ok, _} = Trace.tree(events)
 
     # Reaping is idempotent: a reaped run is not revisited.
-    assert Reaper.reap(ctx.runs, 2_000) == []
+    assert Reaper.reap(ctx.runs, 2_000, ctx.grants) == []
   end
 
   test "a group whose leader is no longer our launcher is never signalled", ctx do
@@ -112,7 +125,7 @@ defmodule LoopctlRunner.ReaperTest do
       pgid: stranger
     })
 
-    assert [%{process_group: group}] = Reaper.reap(ctx.runs, 500)
+    assert [%{process_group: group}] = Reaper.reap(ctx.runs, 500, ctx.grants)
     assert group =~ "not signalled"
     assert os_pid_alive?(stranger)
     System.cmd("kill", ["#{stranger}"])
@@ -140,7 +153,7 @@ defmodule LoopctlRunner.ReaperTest do
       tree_file: Path.join(ctx.state, "stderr.log.tree")
     })
 
-    assert [%{process_group: ":terminated"}] = Reaper.reap(ctx.runs, 2_000)
+    assert [%{process_group: ":terminated"}] = Reaper.reap(ctx.runs, 2_000, ctx.grants)
     refute os_pid_alive?(detached)
   end
 
@@ -172,7 +185,7 @@ defmodule LoopctlRunner.ReaperTest do
           worktree: %{path: path, branch: "loop/s1", base: "master", status: "creating"}
         })
 
-        assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+        assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500, ctx.grants)
         assert worktree =~ "kept"
         assert File.dir?(path)
         assert {:ok, %{"worktree" => %{"status" => "kept"}}} = RunState.read(run_dir)
@@ -200,12 +213,12 @@ defmodule LoopctlRunner.ReaperTest do
       worktree: %{path: tree, branch: "", base: sha, status: "created", scratch: true}
     })
 
-    assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+    assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500, ctx.grants)
     assert worktree =~ ":removed"
     refute File.dir?(tree)
     assert {:ok, %{"worktree" => %{"status" => "removed"}}} = RunState.read(run_dir)
     # The lock the reaper took for the removal is given back: the next triage run takes the tree.
-    assert :ok = WorktreeLock.acquire(ctx.runs, tree, "next-run")
+    assert :ok = WorktreeLock.acquire(ctx.runs, tree, "next-run", owner!())
   end
 
   test "an orphan whose lock will not read is reaped: a corrupt lock protects no one", ctx do
@@ -213,7 +226,7 @@ defmodule LoopctlRunner.ReaperTest do
     # for ever and every reap reported it held by "unknown".
     tree = Worktree.triage_tree_path(ctx.runs, ctx.repo)
     {:ok, sha} = Worktree.create_detached(ctx.repo, tree)
-    :ok = WorktreeLock.acquire(ctx.runs, tree, "a-run-whose-lock-was-truncated")
+    :ok = WorktreeLock.acquire(ctx.runs, tree, "a-run-whose-lock-was-truncated", owner!())
     [lock] = Path.wildcard(Path.join([ctx.runs, "locks", "*.lock"]))
     File.write!(lock, "{\"run_id\":")
     run_dir = Path.join(ctx.runs, "triage-orphan")
@@ -227,7 +240,7 @@ defmodule LoopctlRunner.ReaperTest do
       worktree: %{path: tree, branch: "", base: sha, status: "created", scratch: true}
     })
 
-    assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+    assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500, ctx.grants)
     assert worktree =~ ":removed"
     refute File.dir?(tree)
     assert WorktreeLock.live_holder(ctx.runs, tree) == nil
@@ -254,14 +267,14 @@ defmodule LoopctlRunner.ReaperTest do
       })
     end
 
-    assert [_, _] = Reaper.reap(ctx.runs, 500)
+    assert [_, _] = Reaper.reap(ctx.runs, 500, ctx.grants)
     assert File.dir?(tree)
   end
 
   test "a lock the reaper cannot take is logged and that orphan skipped, never raised", ctx do
     # The reaper runs at the start of an implement run. A lock directory that will not be made — a
     # FILE where it goes, standing in for a full or read-only volume — used to raise out of
-    # `WorktreeLock.acquire/3` and take that run down with it.
+    # `WorktreeLock.acquire/4` and take that run down with it.
     path = Worktree.path_for(ctx.repo, "s1")
     {:ok, _} = Worktree.create(ctx.repo, path, "loop/s1", "master")
     run_dir = Path.join(ctx.runs, "orphan")
@@ -278,7 +291,7 @@ defmodule LoopctlRunner.ReaperTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+        assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500, ctx.grants)
         assert worktree =~ "lock"
       end)
 
@@ -288,6 +301,52 @@ defmodule LoopctlRunner.ReaperTest do
     # Counted as a failed attempt, so it is tried again rather than forgotten.
     assert {:ok, %{"worktree" => %{"status" => "remove_failed", "removal_attempts" => 1}}} =
              RunState.read(run_dir)
+  end
+
+  test "a reaper whose own start cannot be read takes no lock, removes nothing, spends nothing",
+       ctx do
+    # The lock the reaper holds for a removal records THIS BEAM as its owner. Written without a
+    # start it reads dead to every check, so a live run could take the tree over mid-removal: the
+    # removal is not attempted. Nothing about the ORPHAN failed, so none of its three attempts is
+    # spent — counted, three such reaps abandoned a tree no removal was ever tried on.
+    tree = Worktree.triage_tree_path(ctx.runs, ctx.repo)
+    {:ok, sha} = Worktree.create_detached(ctx.repo, tree)
+    run_dir = Path.join(ctx.runs, "triage-orphan")
+    File.mkdir_p!(run_dir)
+
+    RunState.update(run_dir, %{
+      run_id: "triage-orphan",
+      status: "running",
+      beam_os_pid: dead_pid(),
+      repo_path: ctx.repo,
+      worktree: %{path: tree, branch: "", base: sha, status: "created", scratch: true}
+    })
+
+    for _reap <- 1..3 do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert [%{worktree: worktree}] =
+                   Reaper.reap(ctx.runs, 500, ctx.grants, owner: {:error, :no_start})
+
+          assert worktree =~ "own start time could not be read"
+        end)
+
+      assert log =~ "the reaper takes no lock for #{tree}; not touched"
+      assert File.dir?(tree)
+      assert Path.wildcard(Path.join([ctx.runs, "locks", "*.lock"])) == []
+
+      # Left to be revisited, its attempts as they were.
+      assert {:ok, %{"worktree" => %{"status" => "remove_failed"} = entry}} =
+               RunState.read(run_dir)
+
+      assert Map.get(entry, "removal_attempts", 0) == 0
+    end
+
+    # The same orphan, with the start readable: removed under the lock, which is given back.
+    assert [%{worktree: removed}] = Reaper.reap(ctx.runs, 500, ctx.grants, owner: {:ok, owner!()})
+    assert removed =~ ":removed"
+    refute File.dir?(tree)
+    assert WorktreeLock.live_holder(ctx.runs, tree) == nil
   end
 
   test "one reap fetches each repo's base once, however many of its orphans need it", ctx do
@@ -329,7 +388,7 @@ defmodule LoopctlRunner.ReaperTest do
     git!(ctx.repo, ["push", "-q", "origin", squash <> ":refs/heads/master"])
     File.rm(count)
 
-    assert [_, _] = Reaper.reap(ctx.runs, 500)
+    assert [_, _] = Reaper.reap(ctx.runs, 500, ctx.grants)
 
     for path <- paths, do: refute(File.dir?(path))
     assert count |> File.read!() |> String.split("\n", trim: true) == ["fetch"]
@@ -386,7 +445,7 @@ defmodule LoopctlRunner.ReaperTest do
         path
       end
 
-    assert [_, _] = Reaper.reap(ctx.runs, 500)
+    assert [_, _] = Reaper.reap(ctx.runs, 500, ctx.grants)
     for path <- paths, do: refute(File.dir?(path))
   end
 
@@ -420,7 +479,7 @@ defmodule LoopctlRunner.ReaperTest do
 
     File.rm(count)
 
-    assert [_, _] = Reaper.reap(ctx.runs, 500)
+    assert [_, _] = Reaper.reap(ctx.runs, 500, ctx.grants)
 
     refute File.dir?(Worktree.path_for(ctx.repo, "clean"))
     assert File.dir?(Worktree.path_for(ctx.repo, "dirty"))
@@ -442,14 +501,14 @@ defmodule LoopctlRunner.ReaperTest do
       worktree: %{path: path, branch: "loop/s1", base: "master", status: "remove_failed"}
     })
 
-    assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+    assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500, ctx.grants)
     assert worktree =~ ":removed"
     refute File.dir?(path)
 
     assert {:ok, %{"status" => "succeeded", "worktree" => %{"status" => "removed"}}} =
              RunState.read(run_dir)
 
-    assert Reaper.reap(ctx.runs, 500) == []
+    assert Reaper.reap(ctx.runs, 500, ctx.grants) == []
   end
 
   test "an entry handed off to a later run is never acted on", ctx do
@@ -460,7 +519,7 @@ defmodule LoopctlRunner.ReaperTest do
       dir = Path.join(ctx.runs, id)
       File.mkdir_p!(dir)
 
-      owner = if id == "old", do: %{"beam_os_pid" => dead_pid()}, else: Owner.current()
+      owner = if id == "old", do: %{"beam_os_pid" => dead_pid()}, else: owner!()
 
       RunState.update(
         dir,
@@ -484,7 +543,7 @@ defmodule LoopctlRunner.ReaperTest do
     assert {:ok, %{"worktree" => %{"status" => "handed_off"}}} =
              RunState.read(Path.join(ctx.runs, "old"))
 
-    assert Reaper.reap(ctx.runs, 500) == []
+    assert Reaper.reap(ctx.runs, 500, ctx.grants) == []
     assert File.dir?(path)
   end
 
@@ -503,7 +562,7 @@ defmodule LoopctlRunner.ReaperTest do
       worktree: %{path: path, branch: "loop/s1", base: "master", status: "handed_off"}
     })
 
-    assert [%{worktree: "none recorded or handed off"}] = Reaper.reap(ctx.runs, 500)
+    assert [%{worktree: "none recorded or handed off"}] = Reaper.reap(ctx.runs, 500, ctx.grants)
     assert File.dir?(path)
   end
 
@@ -524,18 +583,18 @@ defmodule LoopctlRunner.ReaperTest do
       worktree: %{path: path, branch: "loop/s1", base: "master", status: "remove_failed"}
     })
 
-    for _ <- 1..3, do: assert([_] = Reaper.reap(ctx.runs, 500))
+    for _ <- 1..3, do: assert([_] = Reaper.reap(ctx.runs, 500, ctx.grants))
 
     assert {:ok, %{"worktree" => %{"status" => "remove_abandoned", "removal_attempts" => 3}}} =
              RunState.read(run_dir)
 
-    assert Reaper.reap(ctx.runs, 500) == []
+    assert Reaper.reap(ctx.runs, 500, ctx.grants) == []
   end
 
   test "a clean worktree a live run holds the lock for is not removed by another reap", ctx do
     path = Worktree.path_for(ctx.repo, "s1")
     {:ok, _} = Worktree.create(ctx.repo, path, "loop/s1", "master")
-    :ok = WorktreeLock.acquire(ctx.runs, path, "adopter")
+    :ok = WorktreeLock.acquire(ctx.runs, path, "adopter", owner!())
     run_dir = Path.join(ctx.runs, "stale-entry")
     File.mkdir_p!(run_dir)
 
@@ -548,7 +607,9 @@ defmodule LoopctlRunner.ReaperTest do
       worktree: %{path: path, branch: "loop/s1", base: "master", status: "creating"}
     })
 
-    assert [%{worktree: "held by live run adopter; not touched"}] = Reaper.reap(ctx.runs, 500)
+    assert [%{worktree: "held by live run adopter; not touched"}] =
+             Reaper.reap(ctx.runs, 500, ctx.grants)
+
     assert File.dir?(path)
   end
 
@@ -557,12 +618,14 @@ defmodule LoopctlRunner.ReaperTest do
     # upload-pack below does something to the tree while that fetch is running.
     test "is not removed once a live run has locked it", ctx do
       path = Worktree.path_for(ctx.repo, "s1")
-      :ok = WorktreeLock.acquire(ctx.runs, path, "adopter")
+      :ok = WorktreeLock.acquire(ctx.runs, path, "adopter", owner!())
       [lock] = Path.wildcard(Path.join([ctx.runs, "locks", "*.lock"]))
       File.rename!(lock, lock <> ".saved")
       shipped_orphan!(ctx, path, "cp #{lock}.saved #{lock}")
 
-      assert [%{worktree: "held by live run adopter; not touched"}] = Reaper.reap(ctx.runs, 500)
+      assert [%{worktree: "held by live run adopter; not touched"}] =
+               Reaper.reap(ctx.runs, 500, ctx.grants)
+
       assert File.dir?(path)
     end
 
@@ -591,7 +654,7 @@ defmodule LoopctlRunner.ReaperTest do
         worktree: %{path: path, branch: "loop/s1", base: "master", status: "created"}
       })
 
-      assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+      assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500, ctx.grants)
       assert worktree =~ ":removed"
       refute File.dir?(path)
       assert git!(ctx.repo, ["branch", "--list", "loop/s1"]) == ""
@@ -601,7 +664,7 @@ defmodule LoopctlRunner.ReaperTest do
       path = Worktree.path_for(ctx.repo, "s1")
       run_dir = shipped_orphan!(ctx, path, "echo wip > #{path}/wip.txt")
 
-      assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500)
+      assert [%{worktree: worktree}] = Reaper.reap(ctx.runs, 500, ctx.grants)
       assert worktree =~ "changed while origin was fetched"
       assert File.read!(Path.join(path, "wip.txt")) == "wip\n"
       assert {:ok, %{"worktree" => %{"status" => "kept"}}} = RunState.read(run_dir)
@@ -645,15 +708,15 @@ defmodule LoopctlRunner.ReaperTest do
     run_dir = Path.join(ctx.runs, "reused-pid")
     File.mkdir_p!(run_dir)
     # This BEAM's pid, but a start time that is not this BEAM's: a recycled pid.
-    owner = Map.put(Owner.current(), "beam_started", "Thu Jan  1 00:00:00 1970")
+    owner = Map.update!(owner!(), "beam_start_id", &other_start/1)
     RunState.update(run_dir, Map.merge(owner, %{"run_id" => "reused-pid", "status" => "running"}))
 
-    assert [%{run_id: "reused-pid"}] = Reaper.reap(ctx.runs, 500)
+    assert [%{run_id: "reused-pid"}] = Reaper.reap(ctx.runs, 500, ctx.grants)
   end
 
   test "runs owned by a live BEAM, or already finished, are left alone", ctx do
     for {id, status, owner} <- [
-          {"live", "running", Owner.current()},
+          {"live", "running", owner!()},
           {"done", "succeeded", %{"beam_os_pid" => dead_pid()}}
         ] do
       dir = Path.join(ctx.runs, id)
@@ -661,6 +724,78 @@ defmodule LoopctlRunner.ReaperTest do
       RunState.update(dir, Map.merge(owner, %{"run_id" => id, "status" => status}))
     end
 
-    assert Reaper.reap(ctx.runs, 500) == []
+    assert Reaper.reap(ctx.runs, 500, ctx.grants) == []
+  end
+
+  test "the grant sweep removes only a grant whose owner BEAM is gone", ctx do
+    # Teardown only runs on the happy path — the reason this module exists — so a halt or a hard
+    # kill leaks a grant. But every Run reaps, and so
+    # does `mix loopctl.reap`, beside a daemon whose sessions are live: a grant whose owner is still
+    # running is a dispatch in flight, and removing it makes the hook refuse its subagent's
+    # commits mid-run.
+    %{"beam_os_pid" => me, "beam_start_id" => started} = owner!()
+
+    # A pid that has exited, read off a Port that ran to completion.
+    port = Port.open({:spawn_executable, System.find_executable("true")}, [:exit_status])
+    {:os_pid, gone} = Port.info(port, :os_pid)
+    assert_receive {^port, {:exit_status, 0}}, 5_000
+
+    grant = &Path.join(ctx.grants, ".subagent-git-grant-" <> &1)
+    stamp = &"loopctl-runner session #{&1} owner #{&2} #{&3}\n"
+
+    File.write!(grant.("dead"), stamp.("dead", gone, started))
+    # This BEAM's pid under a start time it never had: a reused pid, which is not its owner.
+    File.write!(grant.("reused"), stamp.("reused", me, other_start(started)))
+    File.write!(grant.("live"), stamp.("live", me, started))
+    # A grant a human typed, one stamped but naming no owner, and one another hook overwrote:
+    # none names an owner, so none is this sweep's to judge.
+    File.write!(grant.("human"), "armed by hand\n")
+    File.write!(grant.("legacy"), "loopctl-runner session legacy\n")
+    File.write!(grant.("overwritten"), "auto-armed\n")
+
+    # An owner recorded by pid alone is dead even while the pid is held: the pid cannot tell the
+    # owner from whatever reused it, and a stale "alive" keeps the grant for ever.
+    pid_only = &GitGrant.line(&1, Owner.of(&2, nil))
+    File.write!(grant.("pid-only-dead"), pid_only.("pid-only-dead", gone))
+    File.write!(grant.("pid-only-live"), pid_only.("pid-only-live", me))
+
+    assert GitGrant.holders(grant.("pid-only-dead")) ==
+             {Owner.of(gone, nil), nil}
+
+    # Given its session line once the Port opened: a live owner BEAM no longer keeps it on its
+    # own — a session whose GenServer was killed outright runs no teardown while the daemon lives.
+    live_owner = Owner.of(me, started)
+    ended = Owner.of(gone, started)
+    File.write!(grant.("session-gone"), GitGrant.line("session-gone", live_owner, ended))
+
+    File.write!(
+      grant.("session-live"),
+      GitGrant.line("session-live", live_owner, live_owner)
+    )
+
+    Reaper.reap(ctx.runs, 2_000, ctx.grants)
+
+    refute File.exists?(grant.("dead"))
+    refute File.exists?(grant.("reused"))
+    refute File.exists?(grant.("pid-only-dead"))
+    refute File.exists?(grant.("pid-only-live"))
+    refute File.exists?(grant.("session-gone"))
+
+    for kept <- ~w(live human legacy overwritten session-live) do
+      assert File.exists?(grant.(kept)), "the sweep removed the #{kept} grant"
+    end
+  end
+
+  test "mix loopctl.reap sweeps the CONFIG's grant directory", ctx do
+    # The task is the operator asking; the directory is still the config's, which is what the
+    # rest of the runner arms into.
+    config = Path.join(ctx.root, "runner.json")
+    File.write!(config, JSON.encode!(config_map(ctx.root, %{"grant_dir" => ctx.grants})))
+    dead = Path.join(ctx.grants, ".subagent-git-grant-dead")
+    File.write!(dead, GitGrant.line("dead", Owner.of(dead_pid(), owner!()["beam_start_id"])))
+
+    capture_io(fn -> Reap.run(["--config", config]) end)
+
+    refute File.exists?(dead)
   end
 end
