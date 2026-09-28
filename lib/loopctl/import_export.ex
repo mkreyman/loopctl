@@ -1469,10 +1469,10 @@ defmodule Loopctl.ImportExport do
 
   # The project's stories a payload does not mention (`report_orphans`, #880).
   defp orphans(existing_stories, epics_data) do
-    import_story_numbers = extract_all_story_numbers(epics_data)
+    import_story_numbers = epics_data |> extract_all_story_numbers() |> MapSet.new()
 
     existing_stories
-    |> Enum.reject(fn s -> s.number in import_story_numbers end)
+    |> Enum.reject(fn s -> MapSet.member?(import_story_numbers, s.number) end)
     |> Enum.map(fn s -> %{"number" => s.number, "title" => s.title} end)
   end
 

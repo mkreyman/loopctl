@@ -243,10 +243,12 @@ All notable changes to loopctl are documented here.
 
 - **Merge import reports orphans only on request (#880). Breaking for a caller that reads
   `stories_orphaned`.** `POST /api/v1/projects/:id/import?merge=true` omits the key unless
-  `report_orphans` is true (the `?report_orphans=true` query parameter or a JSON boolean in
-  the body; anything but true or false is 422); on a partial merge it listed every story the
-  payload did not mention, which is every other story in the project. Pass the flag when
-  round-tripping a full export.
+  `report_orphans` is true; on a partial merge it listed every story the payload did not
+  mention, which is every other story in the project. Pass the flag when round-tripping a
+  full export. `merge` and `report_orphans` are now read the same way: the query string's
+  "true"/"false" or a JSON boolean in the body (the body wins). Any other value, such as
+  `merge=1`, is 422 instead of being read as false, and `report_orphans` without a merge is
+  422.
 
 - **A queued delivery story is placed whether it is `pending` or `contracted` (epic 44, #884).**
   A triage-accepted story, a release whose re-contract did not land, and an escalation resolved

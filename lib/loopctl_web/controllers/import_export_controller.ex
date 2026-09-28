@@ -36,16 +36,22 @@ defmodule LoopctlWeb.ImportExportController do
     description: "Imports a work breakdown into a project. Use merge=true for merge import.",
     parameters: [
       id: [in: :path, type: :string, description: "Project UUID"],
-      merge: [in: :query, type: :boolean, description: "Merge mode (update existing)"],
+      merge: [
+        in: :query,
+        type: :boolean,
+        description:
+          "Merge mode (update existing). Also accepted as a JSON boolean in the body; any " <>
+            "value but true or false is 422."
+      ],
       report_orphans: [
         in: :query,
         type: :boolean,
         description:
           "Merge mode only (#880): include `stories_orphaned`, the project's stories the " <>
             "payload does not mention (nothing is detached). Meaningful for a FULL round-trip " <>
-            "of an export; on a partial merge every unmentioned story is listed. Also read " <>
-            "from the JSON body as a boolean. Absent or false, the key is omitted; any value " <>
-            "but true or false is 422."
+            "of an export; on a partial merge every unmentioned story is listed. Absent or " <>
+            "false, the key is omitted. 422 without merge=true, and for any value but true or " <>
+            "false. Both flags may instead be JSON booleans in the body (`ImportRequest`)."
       ]
     ],
     request_body: {"Import data", "application/json", Schemas.ImportRequest},
@@ -86,16 +92,38 @@ defmodule LoopctlWeb.ImportExportController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn) |> Keyword.put(:caller_role, api_key.role)
-    merge? = params["merge"] == "true"
 
-    with {:ok, _project} <- Projects.get_project(tenant_id, project_id) do
+    with {:ok, merge?} <- flag(params, "merge"),
+         {:ok, report_orphans?} <- flag(params, "report_orphans"),
+         :ok <- orphans_need_merge(merge?, report_orphans?),
+         {:ok, _project} <- Projects.get_project(tenant_id, project_id) do
       if merge? do
-        do_merge_import(conn, tenant_id, project_id, params, audit_opts)
+        merge_import(conn, tenant_id, project_id, params, [
+          {:report_orphans, report_orphans?} | audit_opts
+        ])
       else
         do_fresh_import(conn, tenant_id, project_id, params, audit_opts)
       end
     end
   end
+
+  # ONE reading of both flags (#880): the query string's "true"/"false" or a JSON boolean in the
+  # body — Phoenix merges the body over the query, so the body wins where both are given.
+  # Anything else is refused, never read as false: a flag misread as off silently runs a fresh
+  # import, or drops the orphan list the caller asked for.
+  defp flag(params, name) do
+    case Map.get(params, name) do
+      value when value in [nil, false, "false"] -> {:ok, false}
+      value when value in [true, "true"] -> {:ok, true}
+      _other -> {:error, :unprocessable_entity, "#{name} must be true or false"}
+    end
+  end
+
+  # Orphans are a MERGE's report; on a fresh import the flag would be silently meaningless.
+  defp orphans_need_merge(false, true),
+    do: {:error, :unprocessable_entity, "report_orphans needs merge=true"}
+
+  defp orphans_need_merge(_merge?, _report_orphans?), do: :ok
 
   @doc """
   GET /api/v1/projects/:id/export
@@ -139,25 +167,6 @@ defmodule LoopctlWeb.ImportExportController do
 
       {:error, :cycle_detected, message} ->
         {:error, :unprocessable_entity, message}
-    end
-  end
-
-  defp do_merge_import(conn, tenant_id, project_id, params, audit_opts) do
-    with {:ok, report_orphans} <- report_orphans(params) do
-      merge_import(conn, tenant_id, project_id, params, [
-        {:report_orphans, report_orphans} | audit_opts
-      ])
-    end
-  end
-
-  # `report_orphans` from the query string ("true"/"false") or the JSON body (a boolean); the
-  # body wins where both are given, as Phoenix merges it over the query. Anything else is
-  # refused rather than read as false, which would silently drop the list a caller asked for.
-  defp report_orphans(params) do
-    case Map.get(params, "report_orphans") do
-      value when value in [nil, false, "false"] -> {:ok, false}
-      value when value in [true, "true"] -> {:ok, true}
-      _other -> {:error, :unprocessable_entity, "report_orphans must be true or false"}
     end
   end
 

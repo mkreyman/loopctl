@@ -33,6 +33,7 @@ import {
   buildCorpusIndexBody,
   buildCorpusSearchBody,
   importPath,
+  importRefusal,
 } from "./lib/http-helpers.js";
 import {
   createWitnessClient,
@@ -1032,6 +1033,9 @@ async function importStories({ project_id, payload, payload_path, merge, report_
     return toContent(effectivePayload);
   }
   // `report_orphans` asks a merge for `stories_orphaned` (#880); without it the key is absent.
+  const refused = importRefusal({ merge, report_orphans });
+  if (refused) return toContent({ error: true, status: 0, body: refused });
+
   const result = await apiCall(
     "POST",
     importPath(project_id, { merge, report_orphans }),

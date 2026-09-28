@@ -7,6 +7,8 @@ defmodule Loopctl.ImportExport.MergeOrphansTest do
 
   use Loopctl.DataCase, async: true
 
+  import Ecto.Query
+
   alias Loopctl.ImportExport
 
   defp seeded do
@@ -50,5 +52,27 @@ defmodule Loopctl.ImportExport.MergeOrphansTest do
              ImportExport.merge_import_project(tenant.id, project.id, @partial,
                report_orphans: true
              )
+
+    # Reported, not detached: 1.2 is still there, under its epic.
+    assert [story] =
+             Loopctl.AdminRepo.all(
+               from(s in Loopctl.WorkBreakdown.Story,
+                 where: s.tenant_id == ^tenant.id and s.number == "1.2"
+               )
+             )
+
+    assert story.epic_id
+  end
+
+  test "another tenant's stories are never an orphan here" do
+    {tenant, project} = seeded()
+    {_other_tenant, _other_project} = seeded()
+
+    assert {:ok, %{stories_orphaned: orphans}} =
+             ImportExport.merge_import_project(tenant.id, project.id, @partial,
+               report_orphans: true
+             )
+
+    assert Enum.map(orphans, & &1["number"]) == ["1.2"]
   end
 end

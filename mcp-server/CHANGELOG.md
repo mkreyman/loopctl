@@ -12,7 +12,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - **`import_stories`** takes `report_orphans` (loopctl #880). A merge import no longer
   returns `stories_orphaned` unless asked: on a partial merge it listed every other story in
   the project and read as a destructive outcome. Pass `report_orphans: true` when the payload
-  is a full round-trip of an export.
+  is a full round-trip of an export. `merge` and `report_orphans` accept `true`/`false` (or
+  their strings) only; any other value, which used to count as truthy for `merge`, is refused
+  locally, and so is `report_orphans` without `merge`.
 
 ## 2.110.0 — 2026-09-28 (epics)
 

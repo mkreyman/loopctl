@@ -2388,6 +2388,17 @@ defmodule Loopctl.ApiSpec.Schemas do
           items: ImportEpic,
           description: "Array of epic objects with nested stories"
         },
+        merge: %Schema{
+          type: :boolean,
+          description:
+            "Merge mode, as the `merge` query parameter; the body wins where both are given."
+        },
+        report_orphans: %Schema{
+          type: :boolean,
+          description:
+            "Merge only (#880): include `stories_orphaned` in the summary. As the query " <>
+              "parameter; the body wins where both are given. 422 without merge."
+        },
         story_dependencies: %Schema{
           type: :array,
           items: ImportStoryDependency,

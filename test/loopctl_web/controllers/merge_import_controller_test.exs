@@ -259,6 +259,24 @@ defmodule LoopctlWeb.MergeImportControllerTest do
                partial
              )
              |> json_response(422)
+
+      # One reading for both flags: merge as a body boolean is a merge, not a fresh import.
+      assert %{"import" => %{"stories_orphaned" => [_]}} =
+               build_conn()
+               |> auth_conn(raw_key)
+               |> post(
+                 ~p"/api/v1/projects/#{project.id}/import",
+                 Map.merge(partial, %{"merge" => true, "report_orphans" => true})
+               )
+               |> json_response(200)
+
+      # Orphans are a merge's report, and a flag misspelled is refused, not read as off.
+      for query <- ["report_orphans=true", "merge=1"] do
+        assert build_conn()
+               |> auth_conn(raw_key)
+               |> post("/api/v1/projects/#{project.id}/import?#{query}", partial)
+               |> json_response(422)
+      end
     end
 
     test "merge with new epic creates it with all stories", %{conn: conn} do

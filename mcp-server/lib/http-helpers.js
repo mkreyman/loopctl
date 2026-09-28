@@ -362,19 +362,45 @@ export function buildCorpusSearchBody({ query, query_vector, lanes, limit } = {}
   return body;
 }
 
+// `true`/`false` or their strings, and nothing else (loopctl #880); `undefined` for anything
+// else, which `importRefusal` turns into a refusal before a path is ever built.
+function importFlag(value) {
+  if (value === undefined || value === null || value === false || value === "false") return false;
+  if (value === true || value === "true") return true;
+  return undefined;
+}
+
 /**
- * Path for `import_stories`. `report_orphans` asks a MERGE for `stories_orphaned` (loopctl
- * #880) and is sent only for `true` or the string "true": a non-boolean the tool received
- * (the server does not type-check arguments against the schema) must not turn the list on.
+ * Why an `import_stories` call must not be sent, or `null`. `merge` and `report_orphans` take
+ * `true`/`false` (or their strings) and nothing else, as the server does (loopctl #880): a value
+ * that is neither is REFUSED rather than read as off, which would silently run a fresh import
+ * or drop the orphan list a caller asked for; and `report_orphans` without `merge` is refused,
+ * since orphans are a merge's report.
+ *
+ * @param {{ merge?: unknown, report_orphans?: unknown }} [args]
+ * @returns {string | null}
+ */
+export function importRefusal({ merge, report_orphans } = {}) {
+  if (importFlag(merge) === undefined) return "`merge` must be true or false.";
+  if (importFlag(report_orphans) === undefined) return "`report_orphans` must be true or false.";
+  if (importFlag(report_orphans) && !importFlag(merge)) {
+    return "`report_orphans` needs `merge: true`: orphans are a merge's report.";
+  }
+  return null;
+}
+
+/**
+ * Path for `import_stories`, for arguments `importRefusal` accepted. ONE template literal, the
+ * shape `test/tool-surface.js` resolves to the route; the id is encoded so it cannot rewrite
+ * the query.
  *
  * @param {string} projectId
  * @param {{ merge?: unknown, report_orphans?: unknown }} [args]
  * @returns {string}
  */
 export function importPath(projectId, { merge, report_orphans } = {}) {
-  const on = (value) => value === true || value === "true";
-  return `/api/v1/projects/${projectId}/import${buildQuery([
-    ["merge", on(merge) ? "true" : null],
-    ["report_orphans", on(merge) && on(report_orphans) ? "true" : null],
+  return `/api/v1/projects/${encodeURIComponent(projectId)}/import${buildQuery([
+    ["merge", importFlag(merge) ? "true" : null],
+    ["report_orphans", importFlag(report_orphans) ? "true" : null],
   ])}`;
 }
