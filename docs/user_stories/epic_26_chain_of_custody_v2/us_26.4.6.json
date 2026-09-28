@@ -41,11 +41,11 @@
     },
     {
       "id": "AC-26.4.6.7",
-      "description": "An abbreviated commit SHA is resolved once, through `GET /repos/:repo/commits/:ref` (the git-data API accepts full ids only), and the full id is persisted on the run, so later polls of the same run read no commit. An ambiguous prefix (422) or no such commit (404) is a permanent no-verdict (`ambiguous_sha`, `unknown_commit`)."
+      "description": "An abbreviated commit SHA is resolved once, through `GET /repos/:repo/commits/:ref` (the git-data API accepts full ids only), and the full id is persisted on the run, so later polls of the same run read no commit. Measured against GitHub on 2026-09-28: that endpoint answers 422 'No commit found for SHA' for an unknown prefix and an unknown full id alike (it does not distinguish an ambiguous prefix from an unknown one), and 404 for a repository that is missing or unreadable. So a 422 is `unresolved_sha` and a 404 `repository_unreadable`, both permanent no-verdicts."
     },
     {
       "id": "AC-26.4.6.8",
-      "description": "Every GitHub read and the clone go through one credential seam. Until the per-tenant credential decision (#915, 'Needs Mark') is made, that seam carries the operator `GITHUB_TOKEN` ONLY for tenants named in an operator allowlist (a new env var, default empty, documented in FLY_SECRETS.md): any other tenant records `credential_unavailable` and nothing is read. Enrollment does not prove a tenant controls the repository it names, so the operator token must not read on an unproven tenant's behalf."
+      "description": "Every GitHub read and the clone go through one credential seam. Until the per-tenant credential decision (#915, 'Needs Mark') is made, that seam carries the operator `GITHUB_TOKEN` ONLY for (tenant, repository) pairs named in an operator allowlist (a new env var of `<tenant_uuid>:<owner>/<repo>` entries, default empty, documented in FLY_SECRETS.md): a run whose tenant and intake-source repository do not match one entry records `credential_unavailable` and nothing is read. Enrollment does not prove a tenant controls the repository it names, so the operator token must not read on an unproven tenant's behalf — and naming the tenant alone would let a trusted tenant enrol a repository that is not its own."
     },
     {
       "id": "AC-26.4.6.9",

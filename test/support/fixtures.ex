@@ -3415,6 +3415,30 @@ defmodule Loopctl.Fixtures do
     :ok
   end
 
+  @doc """
+  `sweep_committed_runner_tenants/0` for the given tenant ids ONLY, and only those that are
+  committed-runner tenants. For a module that must not delete ANOTHER tree's committed tenants:
+  every worktree on a box shares one test database, and the marker sweep deletes every tenant
+  carrying the slug prefix, including the rows a concurrently running suite is still using.
+  """
+  def sweep_committed_tenants(ids) when is_list(ids) do
+    import Ecto.Query, only: [from: 2]
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      ours =
+        AdminRepo.all(
+          from(t in Tenant,
+            where: t.id in ^ids and like(t.slug, ^"#{@committed_runner_marker}%"),
+            select: t.id
+          )
+        )
+
+      if ours != [], do: sweep_tenant_ids(ours)
+    end)
+
+    :ok
+  end
+
   defp sweep_tenant_ids(ids) do
     import Ecto.Query, only: [from: 2]
 

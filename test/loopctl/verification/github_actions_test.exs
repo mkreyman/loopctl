@@ -150,6 +150,38 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       assert url == "https://github.com/acme/widgets/actions/runs/5"
     end
 
+    # Review round 1, finding 6: a workflow that concluded success (or skipped, or neutral)
+    # with no jobs ran nothing and failed nothing, so it is no evidence; and the failing URL
+    # points at the run that DID fail the name, never at an unrelated jobless success.
+    test "a jobless run that concluded success, skipped or neutral is no evidence" do
+      for conclusion <- ["success", "skipped", "neutral"] do
+        clean_compare()
+        stub_evidence(evidence([run(5, "completed", conclusion)], []))
+        assert GitHubActions.verdict(request()) == {:wait, :ci_pending}, conclusion
+      end
+    end
+
+    test "the failing URL is the run that died, not a jobless success of another workflow" do
+      clean_compare()
+
+      stub_evidence(
+        evidence(
+          [
+            # `build.yml` sorts before `ci.yml`, so a URL taken from the first completed
+            # jobless run would point here.
+            run(4, "completed", "success", ".github/workflows/build.yml"),
+            run(5, "completed", "startup_failure")
+          ],
+          []
+        )
+      )
+
+      assert {:fail, %{conclusion: "run_startup_failure", url: url}} =
+               GitHubActions.verdict(request())
+
+      assert url == "https://github.com/acme/widgets/actions/runs/5"
+    end
+
     # #931 finding c: a NEWER run of a workflow that was cancelled or skipped must not hide
     # an OLDER failed run of it by reading as anything but a failure itself.
     test "a newer cancelled run of the workflow is a fail, never a pass over the older failure" do
@@ -222,13 +254,19 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       assert GitHubActions.verdict(request()) == {:refused, "ci_definition_unknown"}
     end
 
-    # A commit already ON the base has an empty three-dot diff whatever it changed.
-    test "a commit the base already contains is ci_definition_unknown, not vacuously clean" do
+    # Review round 1, finding 7: a commit already ON the base is JUDGED. The definition it
+    # ran is the base's own; what lands on the base is the merge gate's to guard.
+    test "a commit the base already contains is judged on its CI" do
       expect(MockPullRequestSource, :compare, fn @repo, "master", @sha ->
         {:ok, %{merge_base_sha: @sha, diff: {:ok, %{files: [], renames: []}}}}
       end)
 
-      assert GitHubActions.verdict(request()) == {:refused, "ci_definition_unknown"}
+      stub_evidence(
+        evidence([run(5, "completed", "success")], [job(50, 5, "test", "completed", "success")])
+      )
+
+      assert {:pass, %{url: "https://github.com/acme/widgets/actions/runs/5"}} =
+               GitHubActions.verdict(request())
     end
   end
 
@@ -242,8 +280,18 @@ defmodule Loopctl.Verification.GitHubActionsTest do
             {{:github_rate_limited, 429, nil}, nil}
           ] do
         expect(MockPullRequestSource, :compare, fn _repo, _base, _sha -> {:error, reason} end)
-        assert GitHubActions.verdict(request()) == {:wait, {:transient, delay}}, inspect(reason)
+
+        assert GitHubActions.verdict(request()) == {:wait, {:transient, delay, false}},
+               inspect(reason)
       end
+    end
+
+    # Review round 1, finding 8: the comparison WAS answered, so the evidence read's fault is
+    # the first of a new streak, and the adapter says so.
+    test "a transient fault after an answered comparison says the call was answered" do
+      clean_compare()
+      stub_evidence({:error, {:github_api_error, 503}})
+      assert GitHubActions.verdict(request()) == {:wait, {:transient, nil, true}}
     end
 
     test "a permanent answer is a no-verdict code with no number in it" do
@@ -265,20 +313,30 @@ defmodule Loopctl.Verification.GitHubActionsTest do
       end
     end
 
-    test "resolving an abbreviated SHA names the commit: 422 ambiguous, 404 unknown" do
+    # Measured against GitHub on 2026-09-28: `GET /repos/:r/commits/<ref>` answers 422 "No
+    # commit found for SHA" for an unknown prefix and an unknown full id alike, and 404 for a
+    # repository that is missing or unreadable.
+    test "resolving an abbreviated SHA: 422 unresolved_sha, 404 repository_unreadable" do
       expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" ->
         {:error, {:github_api_error, 422}}
       end)
 
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
-               {:no_verdict, "ambiguous_sha"}
+               {:no_verdict, "unresolved_sha"}
 
       expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" ->
         {:error, {:github_api_error, 404}}
       end)
 
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
-               {:no_verdict, "unknown_commit"}
+               {:no_verdict, "repository_unreadable"}
+
+      expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" ->
+        {:error, {:github_api_error, 502}}
+      end)
+
+      assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
+               {:wait, {:transient, nil, false}}
 
       expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" -> {:ok, @sha} end)
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) == {:ok, @sha}

@@ -8,8 +8,8 @@ defmodule Loopctl.Verification.GitHubActions do
   1. the change is compared with the story's base branch (`compare/3`) and a commit that edits
      its own CI definitions is refused `ci_definition_changed` — or `ci_definition_unknown`
      when that cannot be told — by `Loopctl.Delivery.CiDefinition.reasons/1`, the rule the
-     merge gate refuses by. A commit already ON the base branch has an empty three-dot diff
-     whatever it changed, so it is `ci_definition_unknown` too rather than vacuously clean
+     merge gate refuses by. A commit already ON the base branch is judged: the definition it
+     ran is the base's own, and what lands on the base is the merge gate's to guard
   2. the evidence is `check_evidence/3` for the story's branch and the commit: the jobs of
      PUSH runs of that branch at that SHA, never another branch's runs, a fork's
      `pull_request` run or a `workflow_dispatch`. Anything else is something the implementer
@@ -26,8 +26,9 @@ defmodule Loopctl.Verification.GitHubActions do
 
   A fixed set of strings with no numbers in them, so none reads as an HTTP status:
   `ci_definition_changed`, `ci_definition_unknown`, `no_required_checks`,
-  `credential_unavailable`, `ambiguous_sha` and `unknown_commit` (resolving an abbreviated
-  SHA: a 422 and a 404), `forge_unauthorized` (401), `forge_forbidden` (a 403 that is not a
+  `credential_unavailable`, `unresolved_sha` and `repository_unreadable` (resolving an
+  abbreviated SHA: a 422, which GitHub answers for an unknown prefix and an ambiguous one
+  alike, and a 404, a repository missing or unreadable), `forge_unauthorized` (401), `forge_forbidden` (a 403 that is not a
   rate limit), `forge_not_found` (404), `forge_unprocessable` (422), `forge_rejected` (any
   other status that is not transient), `too_many_workflow_runs`, `workflow_runs_truncated`,
   `jobs_truncated`, `invalid_repository`, `invalid_ref` and `forge_unreadable`.
@@ -51,7 +52,7 @@ defmodule Loopctl.Verification.GitHubActions do
   def resolve_commit(repo, sha, %Credential{kind: :operator_token}) do
     case source().resolve_commit(repo, sha) do
       {:ok, full} -> {:ok, full}
-      {:error, reason} -> classify(reason, :resolve)
+      {:error, reason} -> classify(reason, :resolve, false)
     end
   end
 
@@ -64,11 +65,13 @@ defmodule Loopctl.Verification.GitHubActions do
       # judge an empty list — over which every check "passed".
       {:refused, "no_required_checks"}
     else
+      # The evidence read's fault comes AFTER the comparison was answered, so it says so: the
+      # worker's fault streak counts forge reads in a row that went unanswered.
       with {:ok, comparison} <-
-             read(source().compare(request.repo, request.base_branch, request.sha)),
-           :ok <- ci_definition(comparison, request.sha),
+             read(source().compare(request.repo, request.base_branch, request.sha), false),
+           :ok <- ci_definition(comparison),
            {:ok, evidence} <-
-             read(source().check_evidence(request.repo, request.sha, request.branch)) do
+             read(source().check_evidence(request.repo, request.sha, request.branch), true) do
         judge(request, evidence)
       end
     end
@@ -76,9 +79,11 @@ defmodule Loopctl.Verification.GitHubActions do
 
   def verdict(_request), do: {:refused, "credential_unavailable"}
 
-  defp ci_definition(%{merge_base_sha: sha}, sha), do: {:refused, "ci_definition_unknown"}
-
-  defp ci_definition(comparison, _sha) do
+  # A commit already ON the base (the merge base IS the commit) has an empty three-dot diff,
+  # and is JUDGED, not refused. The refusal exists because a branch could run a CI definition
+  # the base does not; once the commit is on the base, the definition it ran is the base's
+  # own, and what lands on the base is the merge gate's to guard.
+  defp ci_definition(comparison) do
     case CiDefinition.reasons(Map.get(comparison, :diff)) do
       [] -> :ok
       [{:ci_definition_changed, _names} | _rest] -> {:refused, "ci_definition_changed"}
@@ -94,7 +99,8 @@ defmodule Loopctl.Verification.GitHubActions do
       result.failed != [] ->
         [{name, why} | _rest] = result.failed
 
-        {:fail, %{url: failing_url(request.repo, name, counted), check: name, conclusion: why}}
+        {:fail,
+         %{url: failing_url(request.repo, name, why, counted), check: name, conclusion: why}}
 
       result.pending != [] or result.missing != [] ->
         {:wait, :ci_pending}
@@ -104,17 +110,21 @@ defmodule Loopctl.Verification.GitHubActions do
     end
   end
 
-  # The failing JOB, among the jobs the judgement counted. A name that failed because its run
-  # ended with no jobs at all (`run_<conclusion>`) points at that run.
-  defp failing_url(repo, name, %{jobs: jobs, jobless_runs: jobless}) do
+  # The failing JOB, among the jobs the judgement counted. A name that failed because a run
+  # DIED with no jobs at all (`run_<conclusion>`) points at a run that failed it that way —
+  # never at a jobless run that concluded `success`, which the judgement did not count.
+  defp failing_url(repo, name, why, %{jobs: jobs, jobless_runs: jobless}) do
     failed_job =
       Enum.find(jobs, fn job ->
         job.name == name and job.status == "completed" and job.conclusion != "success"
       end)
 
+    dead_run =
+      Enum.find(jobless, &(CiEvidence.dead_run?(&1) and CiEvidence.run_conclusion(&1) == why))
+
     cond do
       failed_job -> job_url(repo, failed_job)
-      run = Enum.find(jobless, &(&1.status == "completed")) -> run_url(repo, Map.get(run, :id))
+      dead_run -> run_url(repo, Map.get(dead_run, :id))
       true -> actions_url(repo)
     end
   end
@@ -144,19 +154,22 @@ defmodule Loopctl.Verification.GitHubActions do
 
   defp actions_url(repo), do: "https://github.com/#{repo}/actions"
 
-  defp read({:ok, value}), do: {:ok, value}
-  defp read({:error, reason}), do: classify(reason, :read)
+  defp read({:ok, value}, _answered), do: {:ok, value}
+  defp read({:error, reason}, answered), do: classify(reason, :read, answered)
 
-  defp classify(reason, stage) do
+  # `answered`: whether an earlier read of the same call was answered (see `CiBehaviour`).
+  defp classify(reason, stage, answered) do
     if MergePrecondition.transient?(reason),
-      do: {:wait, {:transient, MergePrecondition.retry_after(reason)}},
+      do: {:wait, {:transient, MergePrecondition.retry_after(reason), answered}},
       else: {:no_verdict, code(reason, stage)}
   end
 
-  # Resolving an abbreviated SHA is the one read where a 404 and a 422 are about the COMMIT
-  # (AC-26.4.6.7); anywhere else they are about the repository, a ref or the token.
-  defp code({:github_api_error, 404}, :resolve), do: "unknown_commit"
-  defp code({:github_api_error, 422}, :resolve), do: "ambiguous_sha"
+  # Resolving an abbreviated SHA (AC-26.4.6.7), measured against GitHub on 2026-09-28:
+  # `GET /repos/:repo/commits/:ref` answers 422 "No commit found for SHA" for an unknown
+  # prefix AND for an unknown full id (it does not tell an ambiguous prefix from an unknown
+  # one), and 404 for a repository that is missing or that the token cannot read.
+  defp code({:github_api_error, 422}, :resolve), do: "unresolved_sha"
+  defp code({:github_api_error, 404}, :resolve), do: "repository_unreadable"
   defp code({:github_api_error, 401}, _stage), do: "forge_unauthorized"
   defp code({:github_api_error, 403}, _stage), do: "forge_forbidden"
   defp code({:github_api_error, 404}, _stage), do: "forge_not_found"

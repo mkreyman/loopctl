@@ -15,9 +15,12 @@ All notable changes to loopctl are documented here.
   branch at the exact commit, a commit that edits `.github/workflows/`, `.github/actions/` or
   any `action.yml` is refused `ci_definition_changed`, and the verdict is the source's
   `required_checks`. **Operator action:**
-  - **New env var `VERIFICATION_OPERATOR_TOKEN_TENANTS`, default EMPTY.** Only the tenants it
-    names are read with the operator's `GITHUB_TOKEN`; every other run records
-    `credential_unavailable` and reads nothing. Name your own tenant(s) to turn verification on.
+  - **New env var `VERIFICATION_OPERATOR_TOKEN_TENANTS`, default EMPTY: comma-separated
+    `<tenant_uuid>:<owner>/<repo>` PAIRS.** A run is read with the operator's `GITHUB_TOKEN`
+    only when its tenant AND its intake-source repository match one entry; every other run
+    records `credential_unavailable` and reads nothing. A malformed entry (a bare UUID
+    included) is dropped. Name your own tenant with each of its repositories to turn
+    verification on.
   - **`GITHUB_TOKEN` permissions:** verification needs `actions: read` and `contents: read`;
     `checks: read` is no longer used.
   - **`required_checks` now matters for `pr`-mode sources:** a source naming none records
@@ -31,6 +34,12 @@ All notable changes to loopctl are documented here.
     consecutive-fault bound.
   - Migration `20260928120000_add_verification_run_ci_poll_state` adds
     `verification_runs.resolved_commit_sha` and `ci_forge_faults` (no manual step).
+  - **If you enable the local fallback** (`:enable_local_test_runner`, off by default): every
+    command it runs now needs coreutils `timeout` on `PATH` and is bounded by it (a run that
+    outlives a budget records `local_error: local_timeout`), and runs with loopctl's
+    environment scrubbed to `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `MIX_HOME`,
+    `HEX_HOME`, `ASDF_DIR` and `ASDF_DATA_DIR` — proxy variables included in what is dropped,
+    so a sandbox must restrict egress at its network.
 
 - **Runner contract 1.22.0: one refusal code, one meaning, and which refusals end the claim
   (loopctl#920). RE-VENDOR, and declare 1.22.0 on join, to receive the new codes.** Two

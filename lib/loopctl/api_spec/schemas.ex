@@ -3659,8 +3659,10 @@ defmodule Loopctl.ApiSpec.Schemas do
               "`conclusion`. With no verdict, `ci_unavailable_reason` is a short code with no " <>
               "URL and no repository name (e.g. `credential_unavailable`, `no_intake_source`, " <>
               "`no_required_checks`, `no_story_branch`, `ci_definition_changed`, " <>
-              "`ci_wait_exhausted`, `forge_unavailable`), plus `local_error` or the local " <>
-              "runner's counts when it was asked. A stale backlog run is `skipped` with " <>
+              "`ci_wait_exhausted`, `forge_unavailable`, `database_busy`, and for an " <>
+              "abbreviated `commit_sha` `unresolved_sha` or `repository_unreadable`), plus " <>
+              "`local_error` (e.g. `runner_disabled`, `clone_failed`, `local_timeout`) or the " <>
+              "local runner's counts when it was asked. A stale backlog run is `skipped` with " <>
               "`reason: stale_run_skipped`."
         },
         started_at: %Schema{type: :string, format: :"date-time", nullable: true},

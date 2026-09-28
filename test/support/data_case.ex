@@ -237,7 +237,7 @@ defmodule Loopctl.DataCase do
 
     # US-26.4.6: story verification reads nothing without a credential, and its local
     # fallback runs nothing. A test that wants either says so.
-    Mox.stub(Loopctl.MockVerificationCredential, :for_tenant, fn _tenant_id ->
+    Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
       {:error, :credential_unavailable}
     end)
 

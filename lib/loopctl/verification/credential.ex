@@ -1,19 +1,21 @@
 defmodule Loopctl.Verification.Credential do
   @moduledoc """
   The ONE credential seam story verification reads GitHub through (US-26.4.6, AC-26.4.6.8):
-  every CI read and the local fallback's clone ask it first, per tenant, and read nothing
-  when it answers `{:error, :credential_unavailable}`.
+  every CI read and the local fallback's clone ask it first, per tenant AND repository, and
+  read nothing when it answers `{:error, :credential_unavailable}`.
 
-  ## Why a tenant has to be named before anything is read
+  ## Why a (tenant, repository) pair has to be named before anything is read
 
   An intake source names a repository, and enrolment does not prove the tenant controls it.
   The only credential loopctl holds is the operator's `GITHUB_TOKEN`, which can read every
   private repository the operator can. Reading with it on behalf of any tenant that enrolled
   a repository would make verification a cross-tenant oracle: enrol somebody else's private
   repository, request a verification, and read back whether a commit exists there and what
-  its CI said. So, until a per-tenant credential exists (#915, "Needs Mark"), the operator
-  token is lent only to the tenants the operator named (`Loopctl.Verification.OperatorCredential`,
-  `VERIFICATION_OPERATOR_TOKEN_TENANTS`), and every other tenant records
+  its CI said. Naming the tenant alone is not enough for the same reason: a trusted tenant
+  could enrol a repository that is not its own. So, until a per-tenant credential exists
+  (#915, "Needs Mark"), the operator token is lent only for the (tenant, repository) pairs the
+  operator named (`Loopctl.Verification.OperatorCredential`,
+  `VERIFICATION_OPERATOR_TOKEN_TENANTS`), and every other read records
   `credential_unavailable`.
 
   ## What the credential carries
@@ -21,8 +23,13 @@ defmodule Loopctl.Verification.Credential do
   `kind: :operator_token` is the only kind today. The CI reads go through the merge gate's
   forge adapter (`Loopctl.Delivery.GitHubPullRequestSource`), which authenticates with the
   same `GITHUB_TOKEN` itself, so for those the credential is what LICENSES the read. The
-  clone has no adapter of its own and takes the token from `token` (`git_env/1`). The token
-  is never inspected into a log: `Inspect` omits it.
+  clone has no adapter of its own and takes the token from `token` (`git_env/1`), which the
+  local runner hands to its `git` clone and fetch ONLY: `mix deps.get` and `mix test` run the
+  tenant's code with loopctl's environment scrubbed and no token
+  (`Loopctl.Verification.TestRunner.command_env/2`). The header is scoped to github.com, not
+  to the one repository, so the clone's licence is the pair the worker asked for only because
+  the worker clones exactly that repository. The token is never inspected into a log:
+  `Inspect` omits it.
   """
 
   @derive {Inspect, except: [:token]}
@@ -31,13 +38,16 @@ defmodule Loopctl.Verification.Credential do
 
   @type t :: %__MODULE__{kind: :operator_token, token: String.t() | nil}
 
-  @doc "The credential verification may read `tenant_id`'s repository with, or none."
-  @callback for_tenant(tenant_id :: Ecto.UUID.t()) ::
+  @doc """
+  The credential verification may read `repo_full_name` (`owner/name`, the intake source's)
+  with on behalf of `tenant_id`, or none.
+  """
+  @callback for_read(tenant_id :: Ecto.UUID.t(), repo_full_name :: String.t()) ::
               {:ok, t()} | {:error, :credential_unavailable}
 
   @doc "Resolves through the configured implementation (`:verification_credential`)."
-  @spec for_tenant(Ecto.UUID.t()) :: {:ok, t()} | {:error, :credential_unavailable}
-  def for_tenant(tenant_id), do: impl().for_tenant(tenant_id)
+  @spec for_read(Ecto.UUID.t(), String.t()) :: {:ok, t()} | {:error, :credential_unavailable}
+  def for_read(tenant_id, repo_full_name), do: impl().for_read(tenant_id, repo_full_name)
 
   defp impl do
     Application.get_env(

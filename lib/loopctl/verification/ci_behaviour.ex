@@ -14,14 +14,16 @@ defmodule Loopctl.Verification.CiBehaviour do
     run (pass) or the failing job (fail), inside the tenant's own repository
   - `{:wait, :ci_pending}` — the forge answered and a required check is still running or not
     reported yet. The worker waits, bounded by the run's age
-  - `{:wait, {:transient, retry_after}}` — the forge could not be asked (timeout, connection
-    error, 5xx, rate limit). The worker waits, bounded by a count of these in a row;
-    `retry_after` is the forge's own delay in seconds, when it gave one
+  - `{:wait, {:transient, retry_after, answered}}` — the forge could not be asked (timeout,
+    connection error, 5xx, rate limit). The worker waits, bounded by a count of unanswered
+    reads in a row; `retry_after` is the forge's own delay in seconds, when it gave one, and
+    `answered` is `true` when an EARLIER read of the same call was answered (the comparison,
+    before the evidence read faulted), which ends the previous streak
   - `{:refused, code}` — the commit is not one this CI can vouch for (it changes its own CI
     definitions, or that could not be told). No verdict, and never a local fallback
   - `{:no_verdict, code}` — a PERMANENT forge answer that ends the run with no verdict (a 401,
     a non-rate-limit 403, a 404, a 422, a truncated or unreadable list). The worker may fall
-    back to local re-execution
+    back to local re-execution, when the commit's full id is known
 
   Every `code` is a short fixed string naming the reason. It carries no URL and no repository
   name, because it is recorded on the run as it is.
@@ -35,7 +37,7 @@ defmodule Loopctl.Verification.CiBehaviour do
           optional(:conclusion) => String.t()
         }
 
-  @type wait :: {:wait, :ci_pending | {:transient, pos_integer() | nil}}
+  @type wait :: {:wait, :ci_pending | {:transient, pos_integer() | nil, boolean()}}
 
   @type outcome ::
           {:pass, evidence()}
@@ -61,8 +63,10 @@ defmodule Loopctl.Verification.CiBehaviour do
 
   @doc """
   The full id of an abbreviated commit SHA. Asked once per run; the worker persists the
-  answer. A prefix naming more than one commit is `{:no_verdict, "ambiguous_sha"}`, one naming
-  none `{:no_verdict, "unknown_commit"}`.
+  answer. A prefix the forge cannot resolve to one commit is `{:no_verdict, "unresolved_sha"}`
+  (GitHub answers an unknown prefix and an ambiguous one with the same 422), and a repository
+  it cannot read `{:no_verdict, "repository_unreadable"}`. A transient fault here is never
+  `answered`: it is the call's only read.
   """
   @callback resolve_commit(repo :: String.t(), sha :: String.t(), Credential.t()) ::
               {:ok, String.t()} | wait() | {:refused, String.t()} | {:no_verdict, String.t()}

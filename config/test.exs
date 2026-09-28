@@ -141,15 +141,24 @@ config :loopctl, :enable_local_test_runner, false
 
 # US-26.4.6: story verification's credential seam and local fallback, as Mox mocks whose
 # DataCase defaults are fail-closed (no credential, a disabled runner). The allowlist below is
-# read only by `Loopctl.Verification.OperatorCredential`'s own test, which names this fixed id;
-# no fixture ever creates a tenant with it.
+# read only by `Loopctl.Verification.OperatorCredential`'s own test, which names these fixed
+# ids; no fixture ever creates a tenant with either. The last three entries are malformed and
+# must be dropped: no repository half, a repository half that is not owner/name, and a tenant
+# half that is not a UUID.
 config :loopctl, :verification_credential, Loopctl.MockVerificationCredential
 config :loopctl, :verification_local_runner, Loopctl.MockVerificationLocalRunner
 
+# How long the verification worker waits for a local run before recording `local_timeout`
+# (production: the runner's command budgets plus a margin, about an hour). One second here, so
+# `VerificationRunnerWorkerIntegrationTest` can prove a hung fallback still ends the run.
+config :loopctl, :verification_local_run_timeout_ms, 1_000
+
 config :loopctl, :verification_operator_token_tenants, [
-  "0000a110-0000-4000-8000-00000000a110",
-  "  0000A110-0000-4000-8000-00000000B220  ",
-  "not-a-uuid"
+  "0000a110-0000-4000-8000-00000000a110:acme/widgets",
+  "  0000A110-0000-4000-8000-00000000B220 : Acme/Gadgets  ",
+  "0000a110-0000-4000-8000-00000000c330",
+  "0000a110-0000-4000-8000-00000000d440:not a repo",
+  "not-a-uuid:acme/widgets"
 ]
 
 # LCP-1 §9.3 signed-profile enforcement: resolve the deployment profile from a

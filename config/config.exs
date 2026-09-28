@@ -789,10 +789,11 @@ config :loopctl, :context_retriever_retrieve_rate_limit, 120
 # residual. Enable ONLY inside an egress-restricted, ephemeral sandbox.
 config :loopctl, :enable_local_test_runner, false
 
-# US-26.4.6: the tenants story verification may lend the operator's GITHUB_TOKEN to. EMPTY by
-# default: enrolment does not prove a tenant controls the repository it names, so no tenant's
-# repository is read with the operator's token until the operator names it
-# (`VERIFICATION_OPERATOR_TOKEN_TENANTS` in production; see `Loopctl.Verification.Credential`).
+# US-26.4.6: the (tenant, repository) pairs story verification may lend the operator's
+# GITHUB_TOKEN to, as `"<tenant_uuid>:<owner>/<repo>"` strings. EMPTY by default: enrolment
+# does not prove a tenant controls the repository it names, so no repository is read with the
+# operator's token until the operator names that pair (`VERIFICATION_OPERATOR_TOKEN_TENANTS`
+# in production; see `Loopctl.Verification.Credential`).
 config :loopctl, :verification_operator_token_tenants, []
 
 # US-33.7 — Flag-guarded RLS-Repo reroute pilot (Epic 33, DB Connection Topology).

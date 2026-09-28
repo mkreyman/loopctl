@@ -1,8 +1,9 @@
 defmodule Loopctl.Verification.CredentialTest do
   @moduledoc """
-  US-26.4.6, AC-26.4.6.8: the operator's `GITHUB_TOKEN` is lent only to tenants the operator
-  named. `config/test.exs` names two fixed ids (one padded and upper-cased) and one entry that
-  is not a UUID; no fixture ever creates a tenant with either id.
+  US-26.4.6, AC-26.4.6.8: the operator's `GITHUB_TOKEN` is lent only for the (tenant,
+  repository) PAIRS the operator named. `config/test.exs` names two well-formed pairs (one
+  padded and in mixed case) and three malformed entries; no fixture ever creates a tenant with
+  any of those ids.
   """
 
   use ExUnit.Case, async: true
@@ -13,26 +14,52 @@ defmodule Loopctl.Verification.CredentialTest do
   @named "0000a110-0000-4000-8000-00000000a110"
   @named_padded "0000a110-0000-4000-8000-00000000b220"
 
-  describe "OperatorCredential.for_tenant/1" do
-    test "a named tenant gets the operator credential" do
-      assert {:ok, %Credential{kind: :operator_token}} = OperatorCredential.for_tenant(@named)
+  describe "OperatorCredential.for_read/2" do
+    test "a named pair gets the operator credential" do
+      assert {:ok, %Credential{kind: :operator_token}} =
+               OperatorCredential.for_read(@named, "acme/widgets")
     end
 
-    test "an entry is matched trimmed and case-insensitively" do
-      assert {:ok, %Credential{}} = OperatorCredential.for_tenant(@named_padded)
-      assert {:ok, %Credential{}} = OperatorCredential.for_tenant(String.upcase(@named))
+    test "both halves match trimmed and case-insensitively" do
+      assert {:ok, %Credential{}} = OperatorCredential.for_read(@named_padded, "acme/gadgets")
+      assert {:ok, %Credential{}} = OperatorCredential.for_read(@named_padded, "ACME/Gadgets")
+
+      assert {:ok, %Credential{}} =
+               OperatorCredential.for_read(String.upcase(@named), "Acme/Widgets")
+    end
+
+    test "a named tenant has no credential for a repository it was not named with" do
+      # Allowlisted for acme/widgets, enrolling acme/gadgets (another tenant's pair) or any
+      # other repository: nothing is read.
+      assert OperatorCredential.for_read(@named, "acme/gadgets") ==
+               {:error, :credential_unavailable}
+
+      assert OperatorCredential.for_read(@named, "evil/private") ==
+               {:error, :credential_unavailable}
     end
 
     test "TC-26.4.6.6 any other tenant has no credential" do
-      assert OperatorCredential.for_tenant(Ecto.UUID.generate()) ==
+      assert OperatorCredential.for_read(Ecto.UUID.generate(), "acme/widgets") ==
                {:error, :credential_unavailable}
 
-      assert OperatorCredential.for_tenant("not-a-uuid") == {:error, :credential_unavailable}
-      assert OperatorCredential.for_tenant(nil) == {:error, :credential_unavailable}
+      assert OperatorCredential.for_read("not-a-uuid", "acme/widgets") ==
+               {:error, :credential_unavailable}
+
+      assert OperatorCredential.for_read(nil, "acme/widgets") ==
+               {:error, :credential_unavailable}
+
+      assert OperatorCredential.for_read(@named, nil) == {:error, :credential_unavailable}
     end
 
-    test "an entry that is not a UUID is dropped from the allowlist" do
-      assert Enum.sort(OperatorCredential.allowlist()) == Enum.sort([@named, @named_padded])
+    test "a malformed entry is dropped: no repository, a bad repository, a bad tenant" do
+      assert Enum.sort(OperatorCredential.allowlist()) ==
+               Enum.sort([{@named, "acme/widgets"}, {@named_padded, "acme/gadgets"}])
+
+      # The bare-UUID entry (the old format) licenses no repository at all.
+      bare = "0000a110-0000-4000-8000-00000000c330"
+
+      for repo <- ["acme/widgets", ""],
+          do: assert(OperatorCredential.for_read(bare, repo) == {:error, :credential_unavailable})
     end
   end
 

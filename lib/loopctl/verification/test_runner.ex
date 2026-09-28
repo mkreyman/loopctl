@@ -20,7 +20,7 @@ defmodule Loopctl.Verification.TestRunner do
       config :loopctl, :enable_local_test_runner, true
 
   When the flag is off (the default in every environment, including prod),
-  `run_tests/2` returns `{:error, :runner_disabled}` before any clone or
+  `run_tests/3` returns `{:error, :runner_disabled}` before any clone or
   subprocess runs. Turn it on ONLY inside an egress-restricted, ephemeral
   sandbox — enabling it on a host with outbound network + `git`/`mix` exposes
   the untrusted-code-exec and clone-time SSRF surface described below.
@@ -33,11 +33,25 @@ defmodule Loopctl.Verification.TestRunner do
        a hex git object id and a `repo_url` to a well-formed `http(s)` URL — so
        neither can inject a subprocess argument or escape the temp directory.
     3. In production the release image also ships no `git`/`mix`, so even if the
-       flag were flipped there the `System.cmd/3` calls would raise `:enoent`.
+       flag were flipped there the clone would fail: `timeout` (coreutils, which the
+       Debian runtime image carries as an essential package) finds no `git` and
+       exits 127, recorded `clone_failed`.
 
   True isolation (running each verification in an ephemeral, network-restricted
-  container with a CPU/memory/time budget) is the intended future hardening and
-  is deliberately out of scope for this change.
+  container with a CPU/memory budget) is the intended future hardening and is
+  deliberately out of scope for this change. Two narrower bounds are in place
+  (US-26.4.6):
+
+    * **Environment.** Every command runs with loopctl's own environment
+      SCRUBBED (`command_env/2`): every variable but a short allowlist is unset,
+      so `GITHUB_TOKEN`, `DATABASE_URL`, `SECRET_KEY_BASE` and the Cloak keys never
+      reach `mix deps.get` or `mix test`, which run the tenant's code. The
+      verification credential reaches `git clone` and `git fetch` ONLY, through
+      `Loopctl.Verification.Credential.git_env/1`. The filesystem is NOT scrubbed:
+      anything readable under `HOME` stays readable, which is one more reason
+      this belongs in a sandbox.
+    * **Time.** Every command runs under coreutils `timeout` with its own budget
+      (`steps/5`); one that runs out ends the run `{:error, :local_timeout}`.
 
   ## Input hardening (advisory ie-04, GHSA-pv74-gwwh-g92x)
 
@@ -83,8 +97,57 @@ defmodule Loopctl.Verification.TestRunner do
 
   @allowed_repo_schemes ~w(https http)
 
+  # What a toolchain needs to find itself and run, and nothing else (`command_env/2`):
+  #   PATH                  finds git, mix, erl
+  #   HOME                  git's global config; hex's and mix's caches default under it
+  #   LANG, LC_ALL          Elixir warns, and some deps misbehave, outside a UTF-8 locale
+  #   TMPDIR                compilers' and test suites' scratch space
+  #   MIX_HOME, HEX_HOME    where the hex archive and caches live when not under HOME
+  #   ASDF_DIR, ASDF_DATA_DIR  asdf shims on PATH resolve the toolchain through them when it
+  #                         is installed outside the default ~/.asdf
+  # The Erlang runtime needs nothing more: `erl` derives ROOTDIR/BINDIR from its own location,
+  # and inheriting a release's ROOTDIR/RELEASE_* would point the child at loopctl's runtime.
+  # Proxy variables are deliberately NOT kept: a proxy URL can carry credentials, and a
+  # sandbox should restrict egress at its network rather than in an environment the tenant's
+  # code can read.
+  @env_allowlist ~w(PATH HOME LANG LC_ALL TMPDIR MIX_HOME HEX_HOME ASDF_DIR ASDF_DATA_DIR)
+
+  # Wall-clock budgets, in seconds, one per command, each enforced by coreutils `timeout`,
+  # which sends TERM at the budget and KILL `@kill_after_seconds` later:
+  #   clone     a --depth 1 --no-checkout clone moves the refs and one tip's objects;
+  #             five minutes covers a large repository on a slow link
+  #   fetch     one commit at depth 1: the same order of transfer as the clone
+  #   checkout  local only (the objects are fetched); two minutes is a very large tree on a
+  #             slow disk
+  #   deps.get  resolves and downloads the whole dependency tree from hex and git
+  #   test      compiles the project and every dependency in :test, then runs the suite;
+  #             half an hour is well past a healthy suite and short of a hung one
+  @clone_seconds 300
+  @fetch_seconds 300
+  @checkout_seconds 120
+  @deps_get_seconds 600
+  @test_seconds 1_800
+  @kill_after_seconds 30
+
+  # `timeout`'s own exit statuses: 124 the budget ran out and TERM ended the command, 137
+  # (128 + 9) it ignored TERM and KILL did.
+  @timeout_statuses [124, 137]
+
   @doc """
-  Executes tests for a commit SHA in the given repo.
+  The longest a run's commands can take in total: every budget plus its KILL grace. The
+  verification worker waits a little longer than this before it gives up on a run.
+  """
+  @spec max_run_seconds() :: pos_integer()
+  def max_run_seconds do
+    @clone_seconds + @fetch_seconds + @checkout_seconds + @deps_get_seconds + @test_seconds +
+      5 * @kill_after_seconds
+  end
+
+  @doc """
+  Clones `repo_url` at `commit_sha` through the verification credential (US-26.4.6) and runs
+  its suite. The clone and the fetch authenticate through `Credential.git_env/1`, the same
+  seam the CI read went through, so a private repository the tenant was licensed to read is
+  cloned with that licence and nothing else; no other command sees the credential.
 
   Returns `{:ok, results}` or `{:error, reason}` where results is a map:
   ```
@@ -96,16 +159,7 @@ defmodule Loopctl.Verification.TestRunner do
     output: string (truncated)
   }
   ```
-  """
-  @spec run_tests(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
-  def run_tests(repo_url, commit_sha),
-    do: run_tests(repo_url, commit_sha, %Credential{kind: :operator_token, token: nil})
-
-  @doc """
-  `run_tests/2` with the verification credential (US-26.4.6): the clone and the fetch
-  authenticate through `Credential.git_env/1`, the same seam the CI read went through, so a
-  private repository the tenant was licensed to read is cloned with that licence and nothing
-  else.
+  A command that outlives its budget is `{:error, :local_timeout}`.
   """
   @impl true
   @spec run_tests(String.t(), String.t(), Credential.t()) :: {:ok, map()} | {:error, term()}
@@ -122,16 +176,129 @@ defmodule Loopctl.Verification.TestRunner do
       work_dir = build_work_dir()
 
       try do
-        with :ok <- clone_repo(repo_url, commit_sha, work_dir, Credential.git_env(credential)),
-             {:ok, output} <- execute_mix_test(work_dir) do
-          results = parse_test_output(output)
-          {:ok, results}
+        with {:ok, output} <- run_steps(steps(repo_url, commit_sha, work_dir, credential)) do
+          {:ok, parse_test_output(output)}
         end
       after
         # Always clean up the clone — but only ever inside the temp dir.
         safe_rm_rf(work_dir)
       end
     end
+  end
+
+  @doc """
+  The commands a run executes, in order, as data: `command` and `args` (run under `exec/1`'s
+  `timeout`), `opts` for `System.cmd/3`, the `budget` in seconds, and what a non-zero exit
+  means (`on_failure`: an error tag, or `:continue` for `mix deps.get`, whose failure `mix
+  test` reports, and for `mix test`, whose failure IS the result).
+
+  `parent_env` is the environment the commands would otherwise inherit (loopctl's own); it is
+  a parameter so the scrub is testable without touching the VM's environment.
+  """
+  @spec steps(String.t(), String.t(), String.t(), Credential.t(), %{String.t() => String.t()}) ::
+          [map()]
+  def steps(
+        repo_url,
+        commit_sha,
+        work_dir,
+        %Credential{} = credential,
+        parent_env \\ System.get_env()
+      ) do
+    git = command_env({:git, credential}, parent_env)
+    plain = command_env(:plain, parent_env)
+
+    [
+      # `--` before positional args: a `-`-leading repo_url can't become a flag.
+      %{
+        command: "git",
+        args: ["clone", "--depth", "1", "--no-checkout", "--", repo_url, work_dir],
+        opts: [env: git],
+        budget: @clone_seconds,
+        on_failure: :clone_failed
+      },
+      # A shallow clone holds only the default branch's tip, so checking out any other commit
+      # failed `checkout_failed` for every commit that was not the tip. The commit is FETCHED
+      # by id instead (GitHub serves any reachable commit that way), which needs the full id
+      # the verification worker resolved (AC-26.4.6.7).
+      %{
+        command: "git",
+        args: ["fetch", "--depth", "1", "origin", commit_sha],
+        opts: [cd: work_dir, env: git],
+        budget: @fetch_seconds,
+        on_failure: :fetch_failed
+      },
+      # Local: the objects are already fetched, so it needs no credential.
+      %{
+        command: "git",
+        args: ["checkout", commit_sha],
+        opts: [cd: work_dir, env: plain],
+        budget: @checkout_seconds,
+        on_failure: :checkout_failed
+      },
+      %{
+        command: "mix",
+        args: ["deps.get"],
+        opts: [cd: work_dir, env: plain],
+        budget: @deps_get_seconds,
+        on_failure: :continue
+      },
+      %{
+        command: "mix",
+        args: ["test", "--no-color"],
+        opts: [cd: work_dir, env: plain],
+        budget: @test_seconds,
+        on_failure: :continue
+      }
+    ]
+  end
+
+  @doc """
+  The `env:` of one command: every variable of `parent_env` outside the allowlist UNSET (a
+  `nil` value), then `MIX_ENV=test`, then — for `{:git, credential}` only —
+  `Credential.git_env/1`. So the credential reaches git's own process and nothing else, and no
+  command inherits loopctl's secrets.
+  """
+  @spec command_env(:plain | {:git, Credential.t()}, %{String.t() => String.t()}) ::
+          [{String.t(), String.t() | nil}]
+  def command_env(kind, parent_env \\ System.get_env()) do
+    set = [{"MIX_ENV", "test"} | credential_env(kind)]
+    set_names = Enum.map(set, &elem(&1, 0))
+
+    unset =
+      for {name, _value} <- parent_env,
+          name not in @env_allowlist and name not in set_names,
+          do: {name, nil}
+
+    unset ++ set
+  end
+
+  defp credential_env({:git, %Credential{} = credential}), do: Credential.git_env(credential)
+  defp credential_env(:plain), do: []
+
+  @doc """
+  Runs one step under `timeout --kill-after=#{@kill_after_seconds}s <budget>s`. Returns
+  `{:ok, output, exit_status}`, or `{:error, :local_timeout}` when the budget ran out.
+  """
+  @spec exec(map()) :: {:ok, String.t(), non_neg_integer()} | {:error, :local_timeout}
+  def exec(%{command: command, args: args, opts: opts, budget: budget}) do
+    argv = ["--kill-after=#{@kill_after_seconds}s", "#{budget}s", command | args]
+
+    case System.cmd("timeout", argv, [stderr_to_stdout: true] ++ opts) do
+      {_output, status} when status in @timeout_statuses -> {:error, :local_timeout}
+      {output, status} -> {:ok, output, status}
+    end
+  end
+
+  # Runs the steps in order and answers the LAST one's output (`mix test`'s).
+  defp run_steps(steps) do
+    Enum.reduce_while(steps, {:ok, ""}, fn step, _acc ->
+      case exec(step) do
+        {:error, :local_timeout} = timeout -> {:halt, timeout}
+        {:ok, output, 0} -> {:cont, {:ok, output}}
+        {:ok, output, _status} when step.on_failure == :continue -> {:cont, {:ok, output}}
+        {:ok, output, _status} -> {:halt, {:error, {step.on_failure, output}}}
+      end
+    end)
   end
 
   @doc """
@@ -240,46 +407,6 @@ defmodule Loopctl.Verification.TestRunner do
     else
       Logger.error("TestRunner: refusing to rm_rf path outside tmp: #{inspect(work_dir)}")
       {:ok, []}
-    end
-  end
-
-  # A shallow clone holds only the default branch's tip, so checking out any other commit
-  # failed `checkout_failed` for every commit that was not the tip. The commit is FETCHED by
-  # id instead (GitHub serves any reachable commit that way), which needs the full id the
-  # verification worker resolved (AC-26.4.6.7).
-  defp clone_repo(repo_url, commit_sha, work_dir, env) do
-    # `--` before positional args: a `-`-leading repo_url can't become a flag.
-    clone = ["clone", "--depth", "1", "--no-checkout", "--", repo_url, work_dir]
-
-    with :ok <- git(clone, [env: env], :clone_failed),
-         :ok <-
-           git(
-             ["fetch", "--depth", "1", "origin", commit_sha],
-             [cd: work_dir, env: env],
-             :fetch_failed
-           ) do
-      git(["checkout", commit_sha], [cd: work_dir], :checkout_failed)
-    end
-  end
-
-  defp git(args, opts, failure) do
-    case System.cmd("git", args, [stderr_to_stdout: true] ++ opts) do
-      {_output, 0} -> :ok
-      {output, _status} -> {:error, {failure, output}}
-    end
-  end
-
-  defp execute_mix_test(work_dir) do
-    # Install deps and run tests with a timeout
-    System.cmd("mix", ["deps.get"], cd: work_dir, stderr_to_stdout: true)
-
-    case System.cmd("mix", ["test", "--no-color"],
-           cd: work_dir,
-           stderr_to_stdout: true,
-           env: [{"MIX_ENV", "test"}]
-         ) do
-      {output, 0} -> {:ok, output}
-      {output, _exit_code} -> {:ok, output}
     end
   end
 

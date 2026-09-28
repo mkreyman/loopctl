@@ -2,7 +2,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   @moduledoc """
   `Loopctl.Workers.VerificationRunnerWorker.perform/1`, for every path that settles WITHOUT a
   story branch: the stale-run age gate (US-36.1), terminal-run re-entry, and the configuration
-  refusals of US-26.4.6 that read nothing from the forge.
+  refusals of US-26.4.6 that read nothing from the forge. The credential is asked for the
+  (tenant, repository) pair only once the branch is known, so `credential_unavailable` and the
+  rescue arm (reached through the credential seam) are integration tests too.
 
   The paths that DO read the forge need a branch, which lives on the RLS `Loopctl.Repo`
   (the dispatch ledger and the stage row) while the run and its story live on `AdminRepo` —
@@ -14,7 +16,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   """
   use Loopctl.DataCase, async: true
 
-  import ExUnit.CaptureLog, only: [with_log: 1]
   import Loopctl.Fixtures
   import Mox
 
@@ -53,7 +54,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
     do: fn _, _, _ -> send(pid, message) && {:error, :not_stubbed} end
 
   defp with_credential do
-    stub(MockVerificationCredential, :for_tenant, fn _tenant_id ->
+    stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
       {:ok, %Credential{kind: :operator_token, token: nil}}
     end)
   end
@@ -182,31 +183,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       refute_read()
     end
 
-    test "TC-26.4.6.6 a tenant with no credential records credential_unavailable, no request made" do
-      ctx = setup_ctx()
-
-      fixture(:intake_source, %{
-        tenant_id: ctx.tenant.id,
-        project_id: ctx.project.id,
-        required_checks: ["test"]
-      })
-
-      run = run!(ctx)
-
-      # The DataCase default for the credential seam is `credential_unavailable`.
-      assert :ok = perform(ctx, run)
-
-      reloaded = reload(ctx, run)
-      assert reloaded.status == "error"
-
-      assert reloaded.ac_results == %{
-               "source" => "ci",
-               "ci_unavailable_reason" => "credential_unavailable"
-             }
-
-      refute_read()
-    end
-
     # The pre-existing master bug: the worker's schemaless story/project query passed string
     # UUIDs uncast and crashed every started run before any CI read. This is the same run,
     # through perform/1, reaching the intake-source lookup.
@@ -273,30 +249,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "no_story_branch"
       refute_read()
-    end
-  end
-
-  describe "the rescue arm (#931 finding g)" do
-    test "a crash records internal_error with no exception text, and cancels" do
-      ctx = setup_ctx()
-
-      stub(MockVerificationCredential, :for_tenant, fn _tenant_id ->
-        raise "leaky detail acme/private-repo"
-      end)
-
-      run = run!(ctx)
-
-      {result, log} = with_log(fn -> perform(ctx, run) end)
-      assert result == {:cancel, :internal_error}
-      assert log =~ "leaky detail"
-
-      reloaded = reload(ctx, run)
-      assert reloaded.status == "error"
-
-      assert reloaded.ac_results == %{
-               "source" => "ci",
-               "ci_unavailable_reason" => "internal_error"
-             }
     end
   end
 

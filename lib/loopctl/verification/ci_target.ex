@@ -20,7 +20,8 @@ defmodule Loopctl.Verification.CiTarget do
 
   Each refusal is `{:unconfigured, code}`: a missing configuration, which reads nothing and
   never falls back to the local runner. A dispatch-route read that met database contention is
-  `{:wait, {:transient, nil}}`, the same wait a forge fault is.
+  `{:wait, :database_busy}`: a wait of its own, because it is loopctl's database and not the
+  forge, so it neither counts toward nor ends the worker's forge-fault streak.
   """
 
   alias Loopctl.Delivery.CiEvidence
@@ -38,7 +39,7 @@ defmodule Loopctl.Verification.CiTarget do
 
   @doc "Reads the facts for `story_id` and resolves them. See the moduledoc."
   @spec gather(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, t()} | {:unconfigured, String.t()} | {:wait, {:transient, nil}}
+          {:ok, t()} | {:unconfigured, String.t()} | {:wait, :database_busy}
   def gather(tenant_id, story_id) do
     with {:story, {:ok, story}} <- {:story, Stories.get_story(tenant_id, story_id)},
          {:ok, source} <- source(tenant_id, story),
@@ -48,7 +49,7 @@ defmodule Loopctl.Verification.CiTarget do
       resolve(story, source, required, route, stage && stage.branch)
     else
       {:story, {:error, :not_found}} -> {:unconfigured, "story_not_found"}
-      {:route, {:error, _busy}} -> {:wait, {:transient, nil}}
+      {:route, {:error, _busy}} -> {:wait, :database_busy}
       {:unconfigured, _code} = refusal -> refusal
     end
   end

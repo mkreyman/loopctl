@@ -10,8 +10,15 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   references `stories`. Under `Ecto.Adapters.SQL.Sandbox` those are two owners with two
   transactions that cannot see each other's rows, so — exactly as
   `Loopctl.Delivery.MergePreconditionIntegrationTest` does for the merge gate — the rows are
-  COMMITTED under a `fixture(:committed_tenant)` and swept at the module boundaries. Every
-  path that needs no branch is in the `async: true` `VerificationRunnerWorkerTest`.
+  COMMITTED under a `fixture(:committed_tenant)`. Every path that needs no branch is in the
+  `async: true` `VerificationRunnerWorkerTest`. It is `async: false` because the rows are
+  committed and the forge mock is GLOBAL (`Mox.set_mox_global/0`), so two tests at once would
+  answer each other's reads.
+
+  Cleanup deletes ONLY what this module created: each test's own tenant, by id, on exit
+  (`purge/1`, then `sweep_committed_tenants/1`). Never the `committed-runner-%` slug sweep: every
+  worktree on a box shares one test database, and that sweep deletes the committed rows of a
+  suite running concurrently in another tree.
 
   The forge is `Loopctl.MockPullRequestSource` (global mode). Each stub answers ONLY for the
   intake source's repository and the story's own branch; anything else is recorded as
@@ -34,6 +41,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   alias Loopctl.Repo
   alias Loopctl.Verification
   alias Loopctl.Verification.Credential
+  alias Loopctl.Verification.TestRunner
   alias Loopctl.Verification.VerificationRun
   alias Loopctl.Workers.VerificationRunnerWorker
 
@@ -43,12 +51,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   @short "aaaaaaa"
   @fork_point String.duplicate("b", 40)
 
-  setup_all do
-    sweep()
-    on_exit(&sweep/0)
-    :ok
-  end
-
   setup do
     Mox.set_mox_global()
     Loopctl.DataCase.stub_all_defaults()
@@ -56,7 +58,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     tenant = fixture(:committed_tenant, %{})
     :ok = Sandbox.checkout(Repo, sandbox: false)
     :ok = Sandbox.checkout(AdminRepo, sandbox: false)
-    on_exit(fn -> purge(tenant.id) end)
+
+    on_exit(fn ->
+      purge(tenant.id)
+      sweep_committed_tenants([tenant.id])
+    end)
 
     # `repo_url` names ANOTHER repository: nothing may read it (#931 finding a).
     project =
@@ -72,11 +78,12 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       required_checks: ["test"]
     })
 
-    stub(MockVerificationCredential, :for_tenant, fn _tenant_id ->
+    test_pid = self()
+
+    stub(MockVerificationCredential, :for_read, fn tenant_id, repo ->
+      send(test_pid, {:credential_asked, tenant_id, repo})
       {:ok, %Credential{kind: :operator_token, token: nil}}
     end)
-
-    test_pid = self()
 
     stub(MockVerificationLocalRunner, :run_tests, fn url, sha, _credential ->
       send(test_pid, {:local_run, url, sha})
@@ -265,6 +272,108 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
   end
 
+  # -- TC-26.4.6.6 / AC-26.4.6.8 -------------------------------------------------------------
+
+  describe "TC-26.4.6.6 the credential is asked for the (tenant, repository) pair" do
+    setup ctx do
+      stage_branch!(ctx, @branch)
+      :ok
+    end
+
+    test "it is asked for the intake source's repository, never projects.repo_url", ctx do
+      stub_forge(ctx, %{evidence: green()})
+
+      run = run!(ctx)
+      assert :ok = perform(ctx, run)
+
+      tenant_id = ctx.tenant_id
+      assert_received {:credential_asked, ^tenant_id, @repo}
+      refute_received {:credential_asked, _, _}
+      assert reload(ctx, run).status == "pass"
+    end
+
+    test "a pair with no credential records credential_unavailable, no request made", ctx do
+      stub_forge(ctx, %{evidence: green()})
+
+      # Allowlisted for ANOTHER repository only: this story's is not licensed.
+      stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
+        if repo == "acme/other",
+          do: {:ok, %Credential{kind: :operator_token, token: nil}},
+          else: {:error, :credential_unavailable}
+      end)
+
+      run = run!(ctx)
+      assert :ok = perform(ctx, run)
+
+      reloaded = reload(ctx, run)
+      assert reloaded.status == "error"
+
+      assert reloaded.ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "credential_unavailable"
+             }
+
+      refute_received {:compare, _}
+      refute_received {:evidence, _}
+      refute_received {:local_run, _, _}
+    end
+
+    # #931 finding g: the rescue arm records a code, never the exception.
+    test "a crash records internal_error with no exception text, and cancels", ctx do
+      stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        raise "leaky detail acme/private-repo"
+      end)
+
+      run = run!(ctx)
+
+      {result, log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run) end)
+      assert result == {:cancel, :internal_error}
+      assert log =~ "leaky detail"
+
+      reloaded = reload(ctx, run)
+      assert reloaded.status == "error"
+
+      assert reloaded.ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "internal_error"
+             }
+    end
+  end
+
+  # Review round 1, finding 4: a local run that hangs past the worker's bound (one second in
+  # config/test.exs) is killed, and the run still gets a disposition.
+  describe "a hung local fallback" do
+    test "is killed at the worker's bound and recorded local_timeout", ctx do
+      stage_branch!(ctx, @branch)
+      stub_forge(ctx, %{compare: {:error, {:github_api_error, 404}}, evidence: green()})
+
+      stub(MockVerificationLocalRunner, :run_tests, fn _url, _sha, %Credential{} ->
+        Process.sleep(30_000)
+        {:ok, %{status: "pass", tests_run: 1, tests_passed: 1, tests_failed: 0, output: ""}}
+      end)
+
+      run = run!(ctx)
+      started = System.monotonic_time(:millisecond)
+      assert :ok = perform(ctx, run)
+      assert System.monotonic_time(:millisecond) - started < 10_000
+
+      reloaded = reload(ctx, run)
+      assert reloaded.status == "error"
+
+      assert reloaded.ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "forge_not_found",
+               "local_error" => "local_timeout"
+             }
+    end
+
+    test "the job's own timeout is above the local bound and every command budget" do
+      timeout = VerificationRunnerWorker.timeout(%Oban.Job{})
+      assert timeout > VerificationRunnerWorker.local_run_timeout_ms()
+      assert timeout > :timer.seconds(TestRunner.max_run_seconds())
+    end
+  end
+
   # -- TC-26.4.6.2 --------------------------------------------------------------------------
 
   describe "TC-26.4.6.2 required checks decide, one run per outcome" do
@@ -384,13 +493,18 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       assert reload(ctx, run).status == "pass"
     end
 
+    # Review round 1, finding 3: the snooze backs off with the STREAK, so the bound spans
+    # tens of minutes of an unreachable forge rather than a few.
     test "a 502 past the merge gate's consecutive bound records forge_unavailable", ctx do
-      stub_forge(ctx, %{evidence: {:error, {:github_api_error, 502}}})
+      stub_forge(ctx, %{compare: {:error, {:github_api_error, 502}}, evidence: green()})
       run = run!(ctx)
       bound = MergePrecondition.max_consecutive_unevaluated()
+      backoff = [60, 120, 240, 480, 900, 900, 900]
 
       for n <- 1..bound do
-        assert {:snooze, _} = perform(ctx, run), "fault #{n} ended the run"
+        expected = Enum.at(backoff, n - 1)
+        assert {:snooze, ^expected} = perform(ctx, run), "fault #{n}"
+        assert reload(ctx, run).ci_forge_faults == n
       end
 
       refute_received {:local_run, _, _}
@@ -402,6 +516,54 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       assert reloaded.ac_results["ci_unavailable_reason"] == "forge_unavailable"
       # A final no-verdict that is not a refusal asks the (disabled) local runner.
       assert reloaded.ac_results["local_error"] == "runner_disabled"
+    end
+
+    test "a comparison answered before the evidence read faulted ends the streak", ctx do
+      stub_forge(ctx, %{evidence: {:error, {:github_api_error, 503}}})
+
+      run = ctx |> run!() |> set_faults!(4)
+      # The compare answered, so this fault is the FIRST of a new streak: 1, and 60 seconds.
+      assert {:snooze, 60} = perform(ctx, run)
+      assert_received {:compare, @sha}
+      assert reload(ctx, run).ci_forge_faults == 1
+    end
+
+    test "a forge-supplied retry-after is honoured up to an hour", ctx do
+      stub_forge(ctx, %{compare: {:error, {:github_rate_limited, 429, 7_200}}, evidence: green()})
+
+      run = run!(ctx)
+      assert {:snooze, 3_600} = perform(ctx, run)
+    end
+
+    # Review round 1, finding 3(b): the dispatch ledger is loopctl's own database, not the
+    # forge. Contention there snoozes without touching the fault streak, and reads nothing.
+    test "database contention resolving the branch is not a forge fault", ctx do
+      stub_forge(ctx, %{evidence: green()})
+      run = ctx |> run!() |> set_faults!(2)
+      hold_ledger_lock!()
+
+      assert {:snooze, 60} = perform(ctx, run)
+
+      reloaded = reload(ctx, run)
+      assert reloaded.status == "running"
+      assert reloaded.ci_forge_faults == 2
+      refute_received {:compare, _}
+      refute_received {:credential_asked, _, _}
+    end
+
+    test "database contention past the age window records database_busy", ctx do
+      stub_forge(ctx, %{evidence: green()})
+      run = ctx |> run!() |> age!(25 * 60 * 60)
+      hold_ledger_lock!()
+
+      assert :ok = perform(ctx, run)
+
+      assert reload(ctx, run).ac_results == %{
+               "source" => "ci",
+               "ci_unavailable_reason" => "database_busy"
+             }
+
+      refute_received {:local_run, _, _}
     end
 
     test "an answered wait resets the fault streak", ctx do
@@ -513,11 +675,26 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       refute_received {:evidence, @short}
     end
 
-    test "an ambiguous prefix and an unknown commit are permanent, with no local run", ctx do
+    test "resolving a resolved commit ends the fault streak", ctx do
+      stage_branch!(ctx, @branch)
+      stub_forge(ctx, %{compare: {:error, {:github_api_error, 502}}, evidence: green()})
+      expect(MockPullRequestSource, :resolve_commit, 1, fn @repo, @short -> {:ok, @sha} end)
+
+      run = ctx |> run!(@short) |> set_faults!(4)
+      # The resolution answered; the comparison after it faulted: the first of a new streak.
+      assert {:snooze, 60} = perform(ctx, run)
+
+      reloaded = reload(ctx, run)
+      assert reloaded.resolved_commit_sha == @sha
+      assert reloaded.ci_forge_faults == 1
+    end
+
+    test "an unresolvable prefix and an unreadable repository are permanent, no local run",
+         ctx do
       stage_branch!(ctx, @branch)
       stub_forge(ctx, %{evidence: green()})
 
-      for {status, code} <- [{422, "ambiguous_sha"}, {404, "unknown_commit"}] do
+      for {status, code} <- [{422, "unresolved_sha"}, {404, "repository_unreadable"}] do
         expect(MockPullRequestSource, :resolve_commit, fn @repo, @short ->
           {:error, {:github_api_error, status}}
         end)
@@ -530,6 +707,24 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       refute_received {:local_run, _, _}
       refute_received {:evidence, _}
     end
+  end
+
+  # Review round 1, finding 10: this module's cleanup deletes its own tenant and nothing of
+  # another suite's, which shares the test database from another worktree.
+  test "cleanup deletes only the tenants it names", ctx do
+    other = fixture(:committed_tenant, %{})
+    on_exit(fn -> sweep_committed_tenants([other.id]) end)
+
+    # Both calls run unboxed, which gives up this process's AdminRepo checkout.
+    :ok = sweep_committed_tenants([Ecto.UUID.generate()])
+    checkout_admin()
+
+    assert AdminRepo.get(Loopctl.Tenants.Tenant, other.id)
+    assert AdminRepo.get(Loopctl.Tenants.Tenant, ctx.tenant_id)
+
+    :ok = sweep_committed_tenants([other.id])
+    checkout_admin()
+    refute AdminRepo.get(Loopctl.Tenants.Tenant, other.id)
   end
 
   # -- plumbing ------------------------------------------------------------------------------
@@ -566,7 +761,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   end
 
   # `verification_runs` and `api_keys` reference the tenant without a cascade, so they go
-  # before the tenant sweep can delete it.
+  # before `sweep_committed_tenants/1` can delete it. By this test's tenant id only.
   defp purge(tenant_id) do
     checkout_admin()
     raw = Ecto.UUID.dump!(tenant_id)
@@ -574,19 +769,39 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     AdminRepo.query!("DELETE FROM api_keys WHERE tenant_id = $1", [raw])
   end
 
-  defp sweep do
-    Sandbox.unboxed_run(AdminRepo, fn ->
-      AdminRepo.query!(
-        "DELETE FROM verification_runs WHERE tenant_id IN " <>
-          "(SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')"
+  defp set_faults!(run, faults) do
+    {1, _} =
+      AdminRepo.update_all(from(r in VerificationRun, where: r.id == ^run.id),
+        set: [ci_forge_faults: faults]
       )
 
-      AdminRepo.query!(
-        "DELETE FROM api_keys WHERE tenant_id IN " <>
-          "(SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')"
-      )
-    end)
+    run
+  end
 
-    sweep_committed_runner_tenants()
+  # A lock on the dispatch ledger held by another connection until the test ends: the
+  # route read waits out its lock_timeout and answers `:busy` (as in the merge gate's own
+  # integration test).
+  defp hold_ledger_lock! do
+    test_pid = self()
+
+    holder =
+      spawn(fn ->
+        :ok = Sandbox.checkout(Repo, sandbox: false)
+
+        Repo.transaction(fn ->
+          Repo.query!("LOCK TABLE runner_dispatches IN ACCESS EXCLUSIVE MODE")
+          send(test_pid, :held)
+
+          receive do
+            :release -> :ok
+          end
+        end)
+
+        Sandbox.checkin(Repo)
+      end)
+
+    assert_receive :held, 5_000
+    on_exit(fn -> send(holder, :release) end)
+    holder
   end
 end
