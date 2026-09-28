@@ -24,12 +24,11 @@ defmodule Loopctl.Repo.TriageDispatchBackfillMigrationTest do
   alias Loopctl.AdminRepo
 
   @version 20_260_923_130_000
-  @migrations_dir Path.join([File.cwd!(), "priv", "repo", "migrations"])
-
-  migration_file = Path.wildcard(Path.join(@migrations_dir, "#{@version}_*.exs")) |> hd()
-  Code.require_file(migration_file)
 
   alias Loopctl.Repo.Migrations.AddStoryStagesTriageDispatchId
+  alias Loopctl.Test.MigrationFile
+
+  MigrationFile.require!(AddStoryStagesTriageDispatchId, @version)
 
   setup do
     pid = Sandbox.start_owner!(AdminRepo)

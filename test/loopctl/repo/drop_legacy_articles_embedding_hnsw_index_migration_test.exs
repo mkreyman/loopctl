@@ -62,20 +62,11 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
   alias Loopctl.Repo.HnswIndex
 
   @migration_version 20_260_805_120_000
-  @migration_file Path.wildcard(
-                    Path.join([
-                      File.cwd!(),
-                      "priv",
-                      "repo",
-                      "migrations",
-                      "#{@migration_version}_*.exs"
-                    ])
-                  )
-                  |> hd()
-
-  Code.require_file(@migration_file)
 
   alias Loopctl.Repo.Migrations.DropLegacyArticlesEmbeddingHnswIndex
+  alias Loopctl.Test.MigrationFile
+
+  MigrationFile.require!(DropLegacyArticlesEmbeddingHnswIndex, @migration_version)
 
   @index "articles_embedding_hnsw_idx"
 
