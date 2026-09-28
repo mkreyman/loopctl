@@ -1033,6 +1033,8 @@ jobs:
       # production-shaped dispatches table. Here and not in the default suite because an
       # ANALYZE writes reltuples in place and would skew every other test's plans there.
       - name: Run revoke-sweep plan guard (AC-32.1.2)
+        # Independent of the steps around it, so a failure in one does not hide another's.
+        if: ${{ !cancelled() }}
         run: SCALE_TESTS=true mix test --only scale test/loopctl/workers/revoke_expired_dispatches_plan_scale_test.exs
 
       # US-41.1 AC-41.1.12(i) — the per-dimension ANN plan GATE. It EXPLAINs the real
@@ -1050,6 +1052,7 @@ jobs:
       # This step is the gate; AC-41.1.12(ii)'s production EXPLAIN is an artifact report,
       # not CI.
       - name: Run per-dimension ANN plan gate (TC-41.1.2, AC-41.1.12(i))
+        if: ${{ !cancelled() }}
         run: |
           SCALE_TESTS=true mix test --only scale \
             test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs

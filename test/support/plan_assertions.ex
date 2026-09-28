@@ -391,6 +391,24 @@ defmodule Loopctl.PlanAssertions do
   end
 
   @doc """
+  The inverse of `assert_index_used/2`: raises, with the plan, if `name` appears anywhere in
+  it. Pair the two to require one index and rule out another, for example a Bitmap Heap Scan
+  whose BitmapAnd reads a second, whole index alongside the one asserted.
+  """
+  def refute_index_used(queryable_or_sql, name) when is_binary(name) do
+    {root, raw} = explain_json(queryable_or_sql)
+
+    if name in index_names(root) do
+      raise ExUnit.AssertionError,
+        message:
+          "Expected the plan NOT to use index #{inspect(name)}, but it does. " <>
+            "Plan:\n#{elide(raw)}"
+    else
+      :ok
+    end
+  end
+
+  @doc """
   Asserts every scan on `articles` is DOMINATED by a `Limit` node whose `Plan Rows`
   is `<= max_rows` (US-27.7b distant_pairs: the SAMPLED candidate subquery
   `... ORDER BY id LIMIT max_pair_candidates()`).
