@@ -181,6 +181,7 @@ defmodule LoopctlRunner.Control do
   require Logger
 
   alias LoopctlRunner.{
+    CheckpointStream,
     Config,
     Contract,
     ControlConfig,
@@ -190,6 +191,7 @@ defmodule LoopctlRunner.Control do
     Owner,
     PendingStarts,
     PendingVerdicts,
+    PushedCommits,
     Run,
     Runs,
     RunState,
@@ -384,6 +386,14 @@ defmodule LoopctlRunner.Control do
             stage_streams: %{},
             stage_refs: %{},
             stage_retry_ms: Keyword.get(opts, :stage_retry_ms, stage_retry_ms()),
+            # dispatch_id => its CheckpointStream (contract 1.20.0); push ref => dispatch_id. The
+            # poll reads each stream's pushed commits; `pushed_commits` is PushedCommits.since/3,
+            # replaceable so a test can hand a stream commits without a remote.
+            checkpoint_streams: %{},
+            checkpoint_refs: %{},
+            checkpoint_timer: nil,
+            checkpoint_poll_ms: Keyword.get(opts, :checkpoint_poll_ms, 5_000),
+            pushed_commits: Keyword.get(opts, :pushed_commits, &PushedCommits.since/3),
             internal_error_attempts:
               Keyword.get(opts, :internal_error_attempts, @internal_error_attempts),
             terminal_internal_error_attempts:
@@ -580,7 +590,8 @@ defmodule LoopctlRunner.Control do
      |> schedule_reply_backlog()
      |> schedule_verdict_backlog()
      |> schedule_trace(0, true)
-     |> resume_stages()}
+     |> resume_stages()
+     |> schedule_checkpoints(0)}
   end
 
   # How long the runner was out of the pool, so a rejoin line says what the outage cost.
@@ -696,6 +707,13 @@ defmodule LoopctlRunner.Control do
       stage_refs: %{},
       stage_streams:
         Map.new(socket.assigns.stage_streams, fn {id, stream} ->
+          {id, %{stream | push: nil, timer: cancel_reply_timer(stream.timer)}}
+        end),
+      # The same for a checkpoint: an identical resend is answered `replayed: true`, so the head
+      # in flight is sent again after the rejoin and nothing is lost with the channel.
+      checkpoint_refs: %{},
+      checkpoint_streams:
+        Map.new(socket.assigns.checkpoint_streams, fn {id, stream} ->
           {id, %{stream | push: nil, timer: cancel_reply_timer(stream.timer)}}
         end)
     )
@@ -837,7 +855,30 @@ defmodule LoopctlRunner.Control do
 
   # What a run reports through Run.execute/3's :on_stage callback.
   def handle_info({:run_stage, binding, event}, socket) when is_map(binding),
-    do: {:noreply, run_message(socket, binding, event)}
+    do: {:noreply, socket |> checkpoints_on(binding, event) |> run_message(binding, event)}
+
+  # Every stream's pushed commits are read on one timer, whether or not the channel is joined:
+  # reading is local, and what it queues goes out on the rejoin.
+  def handle_info(
+        {:checkpoint_tick, token},
+        %{assigns: %{checkpoint_timer: {_, token}}} = socket
+      ),
+      do: {:noreply, socket |> assign(checkpoint_timer: nil) |> poll_checkpoints()}
+
+  def handle_info({:checkpoint_tick, _stale_token}, socket), do: {:noreply, socket}
+
+  def handle_info({:checkpoint_retry, id, token}, socket) do
+    case socket.assigns.checkpoint_streams[id] do
+      %{timer: {_timer, ^token}} = stream ->
+        socket
+        |> put_checkpoints(id, %{stream | timer: nil})
+        |> send_next_checkpoint(id)
+        |> then(&{:noreply, &1})
+
+      _ ->
+        {:noreply, socket}
+    end
+  end
 
   def handle_info({:stage_retry, dispatch_id, token}, socket) do
     case socket.assigns.stage_streams[dispatch_id] do
@@ -935,6 +976,9 @@ defmodule LoopctlRunner.Control do
 
       Map.has_key?(socket.assigns.stage_refs, ref) ->
         {:ok, stage_answered(ref, reply, socket)}
+
+      Map.has_key?(socket.assigns.checkpoint_refs, ref) ->
+        {:ok, checkpoint_answered(ref, reply, socket)}
 
       List.keymember?(socket.assigns.status_pushes, ref, 0) ->
         handle_status_reply(reply, settle_status(socket, ref, reply))
@@ -2401,6 +2445,228 @@ defmodule LoopctlRunner.Control do
       story_id: dispatch["story_id"],
       claim_epoch: dispatch["claim_epoch"]
     ]
+
+  # --- Checkpoints (contract 1.20.0: each commit an implement session pushed) ---
+
+  # A stream opens when the run's worktree exists, which is when it has a branch to push. A run
+  # this Control did not start (its predecessor crashed) gets one on its end instead, so its pushed
+  # commits are still reported, all at once, before the stream closes. The run's end also takes
+  # one last read: a session's final push lands moments before it exits.
+  defp checkpoints_on(socket, %{"dispatch_id" => id} = binding, {:worktree, _})
+       when is_binary(id),
+       do: open_checkpoints(socket, id, binding)
+
+  defp checkpoints_on(socket, %{"dispatch_id" => id} = binding, {:finished, _})
+       when is_binary(id) do
+    socket = open_checkpoints(socket, id, binding)
+
+    case socket.assigns.checkpoint_streams[id] do
+      nil ->
+        socket
+
+      stream ->
+        socket
+        |> put_checkpoints(id, %{read_pushed(stream) | ended: true})
+        |> send_next_checkpoint(id)
+        |> drop_checkpoints_if_done(id)
+    end
+  end
+
+  defp checkpoints_on(socket, _binding, _event), do: socket
+
+  defp open_checkpoints(socket, id, binding) do
+    if Map.has_key?(socket.assigns.checkpoint_streams, id) do
+      socket
+    else
+      stream = CheckpointStream.new(binding, run_story(socket, id), socket.assigns.pushed_commits)
+
+      if CheckpointStream.readable?(stream) do
+        socket |> put_checkpoints(id, stream) |> schedule_checkpoints(0)
+      else
+        Logger.warning(
+          "dispatch #{id}'s pushed commits cannot be reported: its story.json was not found",
+          dispatch_id: id
+        )
+
+        socket
+      end
+    end
+  end
+
+  # The story the run is working, from its run directory: known from the run's own `started`
+  # message when this Control started it, and found by dispatch in the run state otherwise.
+  defp run_story(socket, id) do
+    run_dir =
+      get_in(socket.assigns.runs, [id, :run_dir]) ||
+        Enum.find_value(RunState.all(socket.assigns.config.runs_dir), fn
+          {dir, %{"dispatch_id" => ^id}} -> dir
+          _ -> nil
+        end)
+
+    with dir when is_binary(dir) <- run_dir,
+         {:ok, body} <- File.read(Path.join(dir, "story.json")),
+         {:ok, story} when is_map(story) <- JSON.decode(body) do
+      story
+    else
+      _ -> %{}
+    end
+  end
+
+  defp put_checkpoints(socket, id, stream),
+    do: assign(socket, checkpoint_streams: Map.put(socket.assigns.checkpoint_streams, id, stream))
+
+  defp schedule_checkpoints(%{assigns: %{checkpoint_timer: {_, _}}} = socket, _ms), do: socket
+
+  defp schedule_checkpoints(socket, ms) do
+    if socket.assigns.checkpoint_streams == %{} do
+      socket
+    else
+      token = make_ref()
+      timer = Process.send_after(self(), {:checkpoint_tick, token}, ms)
+      assign(socket, checkpoint_timer: {timer, token})
+    end
+  end
+
+  defp poll_checkpoints(socket) do
+    socket.assigns.checkpoint_streams
+    |> Map.keys()
+    |> Enum.reduce(socket, fn id, socket ->
+      stream = socket.assigns.checkpoint_streams[id]
+
+      socket
+      |> put_checkpoints(id, read_pushed(stream))
+      |> send_next_checkpoint(id)
+    end)
+    |> schedule_checkpoints(socket.assigns.checkpoint_poll_ms)
+  end
+
+  # A read that fails is said once per distinct failure, not every poll, and queues nothing.
+  defp read_pushed(%{stopped: true} = stream), do: stream
+
+  defp read_pushed(stream) do
+    case stream.reader.(stream.repo_path, stream.base, stream.branch) do
+      {:ok, commits} ->
+        %{CheckpointStream.enqueue(stream, commits) | read_error: nil}
+
+      {:error, why} ->
+        if why != stream.read_error,
+          do:
+            Logger.warning(
+              "could not read the commits dispatch #{stream.dispatch["dispatch_id"]} pushed: #{why}",
+              dispatch_id: stream.dispatch["dispatch_id"]
+            )
+
+        %{stream | read_error: why}
+    end
+  end
+
+  defp send_next_checkpoint(socket, id) do
+    a = socket.assigns
+
+    case a.checkpoint_streams[id] do
+      %{queue: [_ | _], push: nil, timer: nil} = stream when a.joined ->
+        push_checkpoint(socket, id, stream)
+
+      _ ->
+        socket
+    end
+  end
+
+  defp push_checkpoint(socket, id, stream) do
+    case CheckpointStream.payload(stream) do
+      {:ok, payload} ->
+        case push_event(socket, socket.assigns.topic, "checkpoint", payload) do
+          {:ok, ref} ->
+            socket
+            |> put_checkpoints(id, %{stream | push: ref})
+            |> assign(checkpoint_refs: Map.put(socket.assigns.checkpoint_refs, ref, id))
+
+          # Not joined at this instant: the rejoin sends it.
+          {:error, reason} ->
+            Logger.info("checkpoint held until the channel rejoins: #{inspect(reason)}")
+            socket
+        end
+
+      {:error, errors} ->
+        Logger.error(
+          "checkpoint #{hd(stream.queue).commit_sha} not sent: it would fail the contract: " <>
+            inspect(errors),
+          dispatch_id: id
+        )
+
+        socket
+        |> put_checkpoints(id, %{stream | queue: tl(stream.queue)})
+        |> send_next_checkpoint(id)
+    end
+  end
+
+  defp checkpoint_answered(ref, reply, socket) do
+    {id, refs} = Map.pop(socket.assigns.checkpoint_refs, ref)
+    socket = assign(socket, checkpoint_refs: refs)
+
+    case socket.assigns.checkpoint_streams[id] do
+      %{push: ^ref, queue: [head | _]} = stream ->
+        {outcome, stream} = CheckpointStream.settle(stream, reply)
+        ids = [dispatch_id: id, commit_sha: head.commit_sha]
+
+        case outcome do
+          :recorded ->
+            Logger.info("loopctl recorded the checkpoint #{head.commit_sha}", ids)
+            socket |> put_checkpoints(id, stream) |> send_next_checkpoint(id)
+
+          :stopped ->
+            Logger.warning(
+              "loopctl refused checkpoint #{head.commit_sha} for good (#{inspect(reply)}); " <>
+                "no further checkpoints are sent for this claim",
+              ids
+            )
+
+            put_checkpoints(socket, id, stream)
+
+          {:dropped, reason} ->
+            Logger.error(
+              "loopctl refused checkpoint #{head.commit_sha} (#{reason}); resending the same " <>
+                "commit cannot change that, so the next one goes",
+              ids
+            )
+
+            socket |> put_checkpoints(id, stream) |> send_next_checkpoint(id)
+
+          {:retry, ms} ->
+            retry_checkpoint(socket, id, stream, ms)
+        end
+        |> drop_checkpoints_if_done(id)
+
+      # A reply to a push from before the last rejoin.
+      _ ->
+        socket
+    end
+  end
+
+  # loopctl's own interval when it named one; otherwise doubling from the stage retry, capped.
+  defp retry_checkpoint(socket, id, stream, ms) do
+    delay =
+      ms ||
+        min(
+          socket.assigns.stage_retry_ms * Integer.pow(2, min(stream.retries - 1, 10)),
+          @max_stage_backoff_ms
+        )
+
+    token = make_ref()
+    timer = Process.send_after(self(), {:checkpoint_retry, id, token}, delay)
+    put_checkpoints(socket, id, %{stream | timer: {timer, token}})
+  end
+
+  # A stream is forgotten once its run has ended and nothing is left to send or stopped it.
+  defp drop_checkpoints_if_done(socket, id) do
+    case socket.assigns.checkpoint_streams[id] do
+      %{ended: true, push: nil} = stream when stream.queue == [] or stream.stopped ->
+        assign(socket, checkpoint_streams: Map.delete(socket.assigns.checkpoint_streams, id))
+
+      _ ->
+        socket
+    end
+  end
 
   # The task is over. A run that ended without reporting it (killed, or an exit rather than a
   # raise) is reported as crashed, and a state.json it left in flight is closed.
