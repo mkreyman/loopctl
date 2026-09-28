@@ -669,7 +669,43 @@ defmodule Loopctl.PlanAssertions do
     end
   end
 
+  @doc """
+  Asserts the plan reaches `relation` through exactly ONE scan node, and that it is an
+  `Index Scan` or `Index Only Scan` on `index` whose `Index Cond` matches `cond` — a range
+  SEEK on that index, not a full read of it with a Filter, and never a Seq Scan or Bitmap
+  Heap Scan. Runs the planner's natural choice. Raises with the plan on any mismatch.
+  """
+  def assert_index_range_scan(queryable_or_sql, relation, index, %Regex{} = cond)
+      when is_binary(relation) and is_binary(index) do
+    {root, raw} = explain_json(queryable_or_sql)
+
+    case raw_relation_scans(root, relation) do
+      [%{"Node Type" => type, "Index Name" => ^index} = scan]
+      when type in ["Index Scan", "Index Only Scan"] ->
+        if Regex.match?(cond, scan["Index Cond"] || "") do
+          :ok
+        else
+          raise ExUnit.AssertionError,
+            message:
+              "Expected an Index Cond matching #{inspect(cond)} on #{index}. Plan:\n#{elide(raw)}"
+        end
+
+      scans ->
+        raise ExUnit.AssertionError,
+          message:
+            "Expected exactly one Index Scan on #{relation} using #{index}, got " <>
+              "#{inspect(Enum.map(scans, &{&1["Node Type"], &1["Index Name"]}))}. " <>
+              "Plan:\n#{elide(raw)}"
+    end
+  end
+
   # --- internals ---
+
+  # Every plan node whose Relation Name is exactly `relation`, as the raw EXPLAIN map.
+  defp raw_relation_scans(node, relation) when is_map(node) do
+    here = if node["Relation Name"] == relation, do: [node], else: []
+    here ++ Enum.flat_map(Map.get(node, "Plans", []), &raw_relation_scans(&1, relation))
+  end
 
   # Runs EXPLAIN (FORMAT JSON) and returns {root_plan_node_map, raw_text_for_messages}.
   defp explain_json({sql, params}) when is_binary(sql) and is_list(params) do

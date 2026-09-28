@@ -1,33 +1,48 @@
 defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
   @moduledoc """
-  Epic 32, US-32.1, AC-32.1.2: the query `RevokeExpiredDispatchesWorker` actually issues is
-  served by an index range scan on the partial index `dispatches_expires_at_active_index`,
-  chosen by the DEFAULT planner (no `enable_seqscan = off`), with no Seq Scan.
+  Epic 32, US-32.1, AC-32.1.2: in the table shape production settles into, the query
+  `RevokeExpiredDispatchesWorker` actually issues is an index range scan on the partial
+  index `dispatches_expires_at_active_index`, chosen by the DEFAULT planner (no
+  `enable_seqscan = off`), with no Seq Scan.
 
-  It lives in the `:scale` job, on that job's own database, because the planner's choice
-  depends on table statistics, and there are only two ways to control them:
+  ## Which shape, and where the guarantee ends
 
-    * commit the seed and ANALYZE it here. Inside a sandbox transaction an ANALYZE still
-      writes `pg_class.reltuples`/`relpages` in place, so its statistics outlive the rollback
-      and skew every later test that plans a `dispatches` query. In the shared default-suite
-      database that is a flake source; here the rows are committed on purpose, deleted on
-      exit, and the table re-ANALYZEd so the next module plans against what is really there.
-    * seed the production SHAPE. Every swept dispatch stays in the table past its expiry, so
-      the table is a large revoked history plus a small live set. The ratio is what makes
-      the choice decisive: the planner multiplies the two predicates' selectivities as if
-      independent, so at a live fraction of 10% it estimated ~1,800 matching rows and
-      seq-scanned, while at the fraction here the estimate is a few dozen rows.
+  Every swept dispatch stays in the table past its expiry, so a table that has run for a
+  while is a large revoked history, a small live set, and a small expired-but-unswept
+  backlog the next sweep will take. That is the seed: 20,000 revoked, 50 live, 20 in the
+  backlog.
 
-  The query is captured from the worker's own `perform/1` through repo telemetry, not rebuilt
-  here, so a WHERE clause that stops implying the index predicate `revoked_at IS NULL`, or
-  stops being a range on `expires_at`, turns this red.
+  The guarantee does not extend to a table with a large live fraction. The planner
+  multiplies the selectivities of `revoked_at IS NULL` and `expires_at < $1` as if they were
+  independent, and they are not (a revoked row is almost always an expired one), so as the
+  live fraction grows it overestimates the matches and switches to a Seq Scan. Measured
+  with this seed on 2026-09-28 (Postgres 16): the index is chosen at 500 live rows of
+  20,500 (2.4%) and a Seq Scan at 1,000 of 21,000 (4.8%). A table in that regime is either
+  young, and small enough that a Seq Scan is cheap, or carrying an unusual burst of live
+  dispatches; neither is what this index was added for.
 
-      SCALE_TESTS=true mix test --only scale test/loopctl/workers/revoke_expired_dispatches_plan_scale_test.exs
+  ## Why the scale job, and why not the shared test database
+
+  An ANALYZE inside a sandbox transaction still writes `pg_class.reltuples`/`relpages` in
+  place, so its statistics outlive the rollback and skew every other test that plans a
+  `dispatches` query. So this test commits its seed, and runs only where that is harmless:
+  CI's scale job, which has a database of its own, or a local database other than the
+  default suite's (a worktree's derived partition, or an explicit `MIX_TEST_PARTITION`).
+  It refuses to run against the shared `loopctl_test` outside CI.
+
+      MIX_TEST_PARTITION=_plan MIX_ENV=test mix ecto.create
+      MIX_TEST_PARTITION=_plan MIX_ENV=test mix ecto.migrate
+      MIX_TEST_PARTITION=_plan SCALE_TESTS=true mix test --only scale test/loopctl/workers/revoke_expired_dispatches_plan_scale_test.exs
+
+  The query is captured from the worker's own `perform/1` through repo telemetry, not
+  rebuilt here, so a WHERE clause that stops implying the index predicate `revoked_at IS
+  NULL`, or stops being a range on `expires_at`, turns this red.
   """
 
   use ExUnit.Case, async: false
 
   import Ecto.Query
+  import Mox
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
@@ -41,10 +56,18 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
   @index "dispatches_expires_at_active_index"
   @revoked_history 20_000
   @live 50
+  @backlog 20
+
+  setup :verify_on_exit!
 
   defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
 
   setup do
+    if AdminRepo.config()[:database] == "loopctl_test" and is_nil(System.get_env("CI")) do
+      raise "RevokeExpiredDispatchesPlanScaleTest commits 20k rows and ANALYZEs dispatches; " <>
+              "run it against its own database (see the moduledoc), not the shared loopctl_test"
+    end
+
     Loopctl.DataCase.stub_all_defaults()
 
     tenant =
@@ -62,32 +85,10 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
           })
           |> AdminRepo.insert()
 
-        tenant_id = Ecto.UUID.dump!(tenant.id)
-
-        AdminRepo.query!(
-          """
-          INSERT INTO dispatches (tenant_id, role, expires_at, revoked_at)
-          SELECT $1::uuid, 'agent',
-                 now() - make_interval(hours => g),
-                 now() - make_interval(hours => g) - interval '1 minute'
-          FROM generate_series(1, $2::int) g
-          """,
-          [tenant_id, @revoked_history]
-        )
-
-        AdminRepo.query!(
-          """
-          INSERT INTO dispatches (tenant_id, role, expires_at)
-          SELECT $1::uuid, 'agent', now() + make_interval(mins => g)
-          FROM generate_series(1, $2::int) g
-          """,
-          [tenant_id, @live]
-        )
-
-        AdminRepo.query!("ANALYZE dispatches")
         tenant
       end)
 
+    # Registered before anything is seeded, so a seed that fails part-way is still removed.
     on_exit(fn ->
       unboxed(fn ->
         AdminRepo.delete_all(from(d in Dispatch, where: d.tenant_id == ^tenant.id))
@@ -96,30 +97,51 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
       end)
     end)
 
+    unboxed(fn -> seed!(Ecto.UUID.dump!(tenant.id)) end)
     :ok
+  end
+
+  defp seed!(tenant_id) do
+    AdminRepo.query!(
+      """
+      INSERT INTO dispatches (tenant_id, role, expires_at, revoked_at)
+      SELECT $1::uuid, 'agent',
+             now() - make_interval(hours => g),
+             now() - make_interval(hours => g) - interval '1 minute'
+      FROM generate_series(1, $2::int) g
+      """,
+      [tenant_id, @revoked_history]
+    )
+
+    AdminRepo.query!(
+      """
+      INSERT INTO dispatches (tenant_id, role, expires_at)
+      SELECT $1::uuid, 'agent', now() + make_interval(mins => g)
+      FROM generate_series(1, $2::int) g
+      """,
+      [tenant_id, @live]
+    )
+
+    AdminRepo.query!(
+      """
+      INSERT INTO dispatches (tenant_id, role, expires_at)
+      SELECT $1::uuid, 'agent', now() - make_interval(secs => g)
+      FROM generate_series(1, $2::int) g
+      """,
+      [tenant_id, @backlog]
+    )
+
+    AdminRepo.query!("ANALYZE dispatches")
   end
 
   test "the worker's sweep is an index range scan on the partial index, never a Seq Scan" do
     unboxed(fn ->
-      {sql, params} =
+      sweep =
         fn -> assert :ok = RevokeExpiredDispatchesWorker.perform(%Oban.Job{args: %{}}) end
         |> PlanAssertions.capture_repo_queries()
         |> PlanAssertions.only_query_matching(~r/FROM "dispatches".*"expires_at" </s)
 
-      %{rows: [[plan]]} = AdminRepo.query!("EXPLAIN (FORMAT JSON) " <> sql, params)
-      plan = if is_binary(plan), do: Jason.decode!(plan), else: plan
-      root = plan |> List.first() |> Map.fetch!("Plan")
-
-      # Every node that reads `dispatches`: exactly one, and it is the range scan.
-      assert [scan] = dispatch_scans(root), "plan: #{Jason.encode!(plan)}"
-      assert scan["Node Type"] in ["Index Scan", "Index Only Scan"], Jason.encode!(plan)
-      assert scan["Index Name"] == @index
-      assert scan["Index Cond"] =~ ~r/expires_at < /
+      PlanAssertions.assert_index_range_scan(sweep, "dispatches", @index, ~r/expires_at < /)
     end)
-  end
-
-  defp dispatch_scans(node) do
-    here = if node["Relation Name"] == "dispatches", do: [node], else: []
-    here ++ Enum.flat_map(Map.get(node, "Plans", []), &dispatch_scans/1)
   end
 end

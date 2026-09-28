@@ -27,12 +27,14 @@ defmodule Loopctl.Repo.Migrations.AddDispatchesExpiresAtActiveIndex do
   # (other per-tenant lookups still use it).
   # VERIFICATION (AC-32.1.2) — EXPLAIN of the worker's exact predicate
   # (`WHERE revoked_at IS NULL AND expires_at < now()`) uses this partial index,
-  # not a Seq Scan. Two captures, taken by hand when this migration was written. The
-  # second is asserted by `RevokeExpiredDispatchesPlanScaleTest` in CI's scale job, against
-  # the query the worker issues on a committed, ANALYZEd, production-shaped table; the
-  # default suite's `RevokeExpiredDispatchesWorkerTest` asserts only the index's shape and
-  # predicate from `pg_index`, because there the planner's choice moves with the rows
-  # concurrent tests have in flight.
+  # not a Seq Scan. Two captures, both taken by hand when this migration was written and
+  # neither re-run by CI. What CI does assert, in `RevokeExpiredDispatchesPlanScaleTest`
+  # (scale job), is its own shape: the query the worker issues, with a bound timestamp
+  # parameter, over a committed, ANALYZEd table of 20k revoked rows, 50 live and a 20-row
+  # expired backlog, must be an Index Scan on this index with an Index Cond on expires_at.
+  # That test's moduledoc records where the default planner stops choosing this index (a
+  # live fraction of a few percent). The default suite's `RevokeExpiredDispatchesWorkerTest`
+  # asserts only the index's shape and predicate from `pg_index`.
   #
   #   * Empty table, planner forced to reveal usability (`SET LOCAL
   #     enable_seqscan = off`), which proves eligibility rather than choice:
