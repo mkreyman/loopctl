@@ -1,3 +1,17 @@
+# Migration modules already loaded before any test file compiles. The `test` aliases migrate
+# in a VM of their own (Loopctl.MixProject.migrate_out_of_vm/1), so this is [] unless
+# something migrated in THIS VM, and then the migration tests' Code.require_file would fail
+# --warnings-as-errors with "redefining module" after a green suite.
+# Loopctl.TestAliasMigrateTest turns that into a failure that names the cause.
+:persistent_term.put(
+  {Loopctl.TestAliasMigrateTest, :preloaded_migrations},
+  for(
+    {module, _} <- :code.all_loaded(),
+    String.starts_with?(Atom.to_string(module), "Elixir.Loopctl.Repo.Migrations."),
+    do: module
+  )
+)
+
 ExUnit.start()
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)

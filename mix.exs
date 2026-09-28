@@ -248,21 +248,11 @@ defmodule Loopctl.MixProject do
     Mix.Task.run("app.config")
 
     if Enum.any?(Application.get_env(:loopctl, :ecto_repos, []), &pending_migrations?/1) do
-      elixir_bin = :elixir |> :code.lib_dir() |> Path.join("../../bin") |> Path.expand()
+      {elixir, mix, path} = child_toolchain()
 
       {_, status} =
-        System.cmd(
-          Path.join(elixir_bin, "elixir"),
-          [Path.join(elixir_bin, "mix"), "ecto.migrate", "--quiet"],
-          env: [
-            {"MIX_ENV", to_string(Mix.env())},
-            # The elixir script execs `erl` by PATH, so this ERTS goes first on it.
-            {"PATH",
-             Enum.join(
-               [Path.join(:code.root_dir(), "bin"), elixir_bin, System.get_env("PATH", "")],
-               ":"
-             )}
-          ],
+        System.cmd(elixir, [mix, "ecto.migrate", "--quiet"],
+          env: [{"MIX_ENV", to_string(Mix.env())}, {"PATH", path}],
           into: IO.stream(),
           stderr_to_stdout: true
         )
@@ -271,13 +261,47 @@ defmodule Loopctl.MixProject do
     end
   end
 
-  defp pending_migrations?(repo) do
-    {:ok, pending?, _} =
-      Ecto.Migrator.with_repo(repo, fn repo ->
-        Enum.any?(Ecto.Migrator.migrations(repo), &match?({:down, _, _}, &1))
-      end)
+  # This install's own launchers, and a PATH with this install's ERTS first: the elixir
+  # launcher execs `erl` by PATH.
+  defp child_toolchain do
+    {separator, ext} = if match?({:win32, _}, :os.type()), do: {";", ".bat"}, else: {":", ""}
+    elixir_bin = :elixir |> :code.lib_dir() |> Path.join("../../bin") |> Path.expand()
+    elixir = Path.join(elixir_bin, "elixir" <> ext)
+    mix = Path.join(elixir_bin, "mix")
 
-    pending?
+    for file <- [elixir, mix], not File.exists?(file) do
+      Mix.raise("Cannot migrate out of the test VM: #{file} does not exist")
+    end
+
+    erts_bin = Path.join(:code.root_dir(), "bin")
+    {elixir, mix, Enum.join([erts_bin, elixir_bin, System.get_env("PATH", "")], separator)}
+  end
+
+  # Mirrors `mix ecto.migrate`: the SOURCE migrations directory (not the copy under
+  # `_build`), the apps started `:temporary`, and the sandbox pool run unboxed.
+  defp pending_migrations?(repo) do
+    dir = Path.join([File.cwd!(), repo.config()[:priv] || "priv/repo", "migrations"])
+    pool = repo.config()[:pool]
+
+    pending? = fn repo ->
+      Enum.any?(Ecto.Migrator.migrations(repo, [dir]), &match?({:down, _, _}, &1))
+    end
+
+    run =
+      if Code.ensure_loaded?(pool) and function_exported?(pool, :unboxed_run, 2),
+        do: &pool.unboxed_run(&1, fn -> pending?.(&1) end),
+        else: pending?
+
+    case Ecto.Migrator.with_repo(repo, run, mode: :temporary) do
+      {:ok, pending?, _apps} ->
+        pending?
+
+      {:error, reason} ->
+        Mix.raise(
+          "Could not start #{inspect(repo)} to check for pending migrations: " <>
+            inspect(reason)
+        )
+    end
   end
 
   defp aliases do
