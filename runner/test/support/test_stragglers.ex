@@ -99,7 +99,7 @@ defmodule LoopctlRunner.TestStragglers do
       pid in ProcessGroup.marked(marker) ->
         true
 
-      LoopctlRunner.Owner.start_time(pid) == nil ->
+      LoopctlRunner.TestSupport.utc_start_time(pid) == nil ->
         raise "env-ps probe target #{pid} died before any scan could see it"
 
       System.monotonic_time(:millisecond) >= deadline ->
@@ -122,7 +122,7 @@ defmodule LoopctlRunner.TestStragglers do
   def note!(_pid, nil), do: :ok
 
   def note!(pid, ledger) do
-    start = LoopctlRunner.Owner.start_time(pid)
+    start = LoopctlRunner.TestSupport.utc_start_time(pid)
 
     # A line with no start time is worse than no line: `recorded/1` compares the real start
     # against "" and drops it, so the process is invisible to the sweep for ever — and on
@@ -345,7 +345,7 @@ defmodule LoopctlRunner.TestStragglers do
   defp pin_start(pid, recorded) do
     case Map.fetch(recorded, pid) do
       {:ok, start} -> start
-      :error -> LoopctlRunner.Owner.start_time(pid)
+      :error -> LoopctlRunner.TestSupport.utc_start_time(pid)
     end
   end
 

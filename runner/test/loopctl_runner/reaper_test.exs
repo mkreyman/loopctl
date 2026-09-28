@@ -131,6 +131,32 @@ defmodule LoopctlRunner.ReaperTest do
     System.cmd("kill", ["#{stranger}"])
   end
 
+  test "a launcher's group is judged by its recorded kernel start before the legacy one (#66)",
+       ctx do
+    pgid = orphan_launcher!(ctx.state, Session.uuid4())
+    run_dir = Path.join(ctx.runs, "id-leader")
+    File.mkdir_p!(run_dir)
+
+    # No marker and no tree file: only the group itself could be signalled. The legacy start
+    # says the leader is ours; the kernel-form one, which this runner records and decides by,
+    # says not.
+    RunState.update(run_dir, %{
+      run_id: "id-leader",
+      run_seq: 0,
+      status: "running",
+      beam_os_pid: dead_pid(),
+      pgid: pgid,
+      leader_start: LoopctlRunner.Owner.local_start_time(pgid),
+      leader_start_id: LoopctlRunner.Owner.start_id(pgid) <> "0"
+    })
+
+    assert [%{process_group: group}] = Reaper.reap(ctx.runs, 500, ctx.grants)
+    assert group =~ "not signalled"
+    assert ProcessGroup.alive?(pgid)
+    System.cmd("kill", ["-KILL", "--", "-#{pgid}"])
+    System.cmd("kill", ["-KILL", "#{read_int!(Path.join(ctx.state, "detached_pid"))}"])
+  end
+
   test "marked processes are ended even when the group is gone", ctx do
     session_id = Session.uuid4()
     pgid = orphan_launcher!(ctx.state, session_id)

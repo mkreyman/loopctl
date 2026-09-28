@@ -14,7 +14,7 @@ defmodule LoopctlRunner.SessionLauncherTest do
     {:ok, state: state, session_id: session_id, marker: ProcessGroup.marker(session_id)}
   end
 
-  defp spawn_owner(%{state: state, session_id: session_id}) do
+  defp spawn_owner(%{state: state, session_id: session_id}, extra_env \\ []) do
     test = self()
 
     owner =
@@ -28,6 +28,7 @@ defmodule LoopctlRunner.SessionLauncherTest do
               {~c"LOOP_SESSION_ID", to_charlist(session_id)},
               {~c"LOOP_KILL_GRACE_S", ~c"1"},
               {~c"LOOP_TREE_POLL_S", ~c"1"}
+              | extra_env
             ]
           ])
 
@@ -69,6 +70,22 @@ defmodule LoopctlRunner.SessionLauncherTest do
     assert ProcessGroup.terminate(nil, 2_000, tree_file: tree_file(ctx.state)) == :terminated
     refute os_pid_alive?(detached)
     assert ProcessGroup.recorded(tree_file(ctx.state)) == []
+    Process.exit(owner, :kill)
+  end
+
+  @far_tz LoopctlRunner.TestSupport.far_timezone()
+  if @far_tz == nil, do: @tag(skip: "this host's tz database lacks Pacific/Kiritimati")
+
+  test "a launcher running in another timezone records starts the runner still matches (#66)",
+       ctx do
+    # Recorded in the launcher's own zone, the detached child would never read as recorded here.
+    {owner, _os_pid} = spawn_owner(ctx, [{~c"TZ", to_charlist(@far_tz)}])
+    [_grandchild, detached] = pids(ctx.state)
+    assert detached in ProcessGroup.recorded(tree_file(ctx.state))
+
+    lines = ctx.state |> tree_file() |> File.read!() |> String.split("\n")
+    assert "#{detached} #{tree_start(detached)}" in lines
+
     Process.exit(owner, :kill)
   end
 
@@ -298,11 +315,17 @@ defmodule LoopctlRunner.SessionLauncherTest do
     assert ProcessGroup.terminate(stranger, 300, leader_start: "Thu Jan 1 00:00:00 1970") ==
              :already_gone
 
+    # The kernel-form start decides when a run carries one, whatever the legacy one says.
+    assert ProcessGroup.terminate(stranger, 300,
+             leader_start_id: LoopctlRunner.Owner.start_id(stranger) <> "0",
+             leader_start: LoopctlRunner.Owner.local_start_time(stranger)
+           ) == :already_gone
+
     assert os_pid_alive?(stranger)
 
-    # With its real start time it is ours, and it is ended.
+    # With its real start it is ours, and it is ended.
     assert ProcessGroup.terminate(stranger, 2_000,
-             leader_start: LoopctlRunner.Owner.start_time(stranger)
+             leader_start_id: LoopctlRunner.Owner.start_id(stranger)
            ) ==
              :terminated
   end

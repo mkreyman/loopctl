@@ -17,9 +17,9 @@
 #        process on Linux, but on macOS only for non-Apple binaries (node, beam), since
 #        `ps -E` cannot read a platform binary's environment (measured, macOS on arm64);
 #      - the TREE FILE: while the CLI runs, a recorder snapshots this launcher's
-#        descendants every LOOP_TREE_POLL_S seconds as "pid start-time", so a process
-#        orphaned later is still known. A recorded pid is signalled only if its start
-#        time still matches, so a recycled pid is never hit.
+#        descendants every LOOP_TREE_POLL_S seconds as "pid start" lines (a tagged start,
+#        see sid() below), so a process orphaned later is still known. A recorded pid is
+#        signalled only if its start still matches, so a recycled pid is never hit.
 #    KNOWN BOUND, macOS only: a process orphaned before any snapshot sees it — a
 #    `nohup ... &` from a wrapper shell that exits within the poll interval — is an Apple
 #    binary the marker cannot see and a pid no snapshot recorded. Nothing here reaches it.
@@ -70,14 +70,43 @@ case "$(uname -s)" in
     *) ps_args="axeww -o pid=,ppid=,pgid=,lstart=,command=" ;;
 esac
 
+# Each process is recorded by a start no timezone moves, tagged with its form, as
+# LoopctlRunner.ProcessGroup compares it: a start printed in the reader's own zone mismatched
+# whenever the daemon and a reaper differ in theirs, or the zone changed while a session ran, and
+# a live session's processes read as strangers (#66). On Linux that is the kernel's start,
+# "boot:<boot id>:<ticks>" (LoopctlRunner.Owner.start_id/1), since procps derives lstart from the
+# wall clock and a clock step moves it. Elsewhere, or with no boot id, it is "utc:<lstart>" from
+# the snapshot, read under UTC and the C locale (LoopctlRunner.Owner.start_time/1).
+boot_id=
+[ -r /proc/sys/kernel/random/boot_id ] && boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+
 snapshot() {
     # shellcheck disable=SC2086
-    ps $ps_args > "$1" 2>/dev/null
+    TZ=UTC LC_ALL=C ps $ps_args > "$1" 2>/dev/null
 }
 
-# Descendants of the launcher, and marked processes, as "pid start-time" lines.
-AWK_RECORD='
+# sid(pid, lstart): the start to record or compare, or "" when it cannot be read. On Linux, field
+# 22 of /proc/<pid>/stat, the 20th after the LAST ")" (a command name can hold one), parsed as
+# LoopctlRunner.Owner.start_ticks/1 parses it: change one and change the other, or every boot:
+# line stops matching (session_launcher_test compares the two). It is read a
+# moment after the snapshot; a pid reused in that moment would need the whole pid space to wrap,
+# while a parent or group changing in it (a setsid, a reparent) is normal, so neither is checked.
+AWK_SID='
+function sid(p, lstart,   f, line, a) {
+    if (bootid == "") return "utc:" lstart
+    f = "/proc/" p "/stat"
+    if ((getline line < f) <= 0) { close(f); return "" }
+    close(f)
+    sub(/^.*\)/, "", line)
+    split(line, a, " ")
+    if (a[20] !~ /^[0-9]+$/) return ""
+    return "boot:" bootid ":" a[20]
+}'
+
+# Descendants of the launcher, and marked processes, as "pid start" lines.
+AWK_RECORD="$AWK_SID"'
 { pid = $1; parent[pid] = $2; start[pid] = $4 " " $5 " " $6 " " $7 " " $8; row[pid] = " " $0 " " }
+function emit(p,   s) { s = sid(p, start[p]); if (s != "") print p, s }
 END {
     inset[root] = 1
     changed = 1
@@ -85,20 +114,18 @@ END {
         changed = 0
         for (p in parent) if (!(p in inset) && (parent[p] in inset)) { inset[p] = 1; changed = 1 }
     }
-    for (p in inset) if (p != root) print p, start[p]
-    for (p in row) if (!(p in inset) && index(row[p], " " marker " ")) print p, start[p]
+    for (p in inset) if (p != root) emit(p)
+    for (p in row) if (!(p in inset) && index(row[p], " " marker " ")) emit(p)
 }'
 
-# Recorded pids whose start time still matches, minus everything still in this launcher's
-# own group: the group signal, sent last, ends those, and signalling the watchdog's own
-# `sleep` by pid would cut its grace period short. Excluded by group, never by name — a
-# detached command that merely mentions this script must still be ended.
-AWK_LIVE='
-FNR == NR { recorded[$1] = $2 " " $3 " " $4 " " $5 " " $6; next }
-{
-    start = $4 " " $5 " " $6 " " $7 " " $8
-    if (($1 in recorded) && recorded[$1] == start && $3 != group) print $1
-}'
+# Recorded pids whose start still matches ANY line recorded for that pid (a pid reused during the
+# session has one per process it named), minus everything still in this launcher's own group:
+# the group signal, sent last, ends those, and signalling the watchdog's own `sleep` by pid would
+# cut its grace period short. Excluded by group, never by name — a detached command that merely
+# mentions this script must still be ended.
+AWK_LIVE="$AWK_SID"'
+FNR == NR { rec[$1, substr($0, index($0, " ") + 1)] = 1; seen[$1] = 1; next }
+($1 in seen) && $3 != group && (($1, sid($1, $4 " " $5 " " $6 " " $7 " " $8)) in rec) { print $1 }'
 
 # Silent on failure: the run directory can disappear under a dying run, and a recorder
 # that cannot write simply records nothing more.
@@ -106,7 +133,7 @@ record_tree() {
     local snap="$tree_file.snap.$1"
     {
         snapshot "$snap" &&
-            { [ -f "$tree_file" ] && cat "$tree_file"; awk -v root="$launcher" -v marker="$marker" "$AWK_RECORD" "$snap"; } \
+            { [ -f "$tree_file" ] && cat "$tree_file"; awk -v root="$launcher" -v marker="$marker" -v bootid="$boot_id" "$AWK_RECORD" "$snap"; } \
                 | sort -u > "$tree_file.tmp.$1" && mv "$tree_file.tmp.$1" "$tree_file"
         rm -f "$snap"
     } 2>/dev/null
@@ -118,7 +145,7 @@ kill_session() {
     local sig=$1 tag=$2 targets snap
     record_tree "$tag"
     snap="$tree_file.live.$tag"
-    targets=$({ snapshot "$snap" && awk -v group="$launcher" "$AWK_LIVE" "$tree_file" "$snap"; } 2>/dev/null)
+    targets=$({ snapshot "$snap" && awk -v group="$launcher" -v bootid="$boot_id" "$AWK_LIVE" "$tree_file" "$snap"; } 2>/dev/null)
     rm -f "$snap" 2>/dev/null
     # shellcheck disable=SC2086
     [ -n "$targets" ] && kill "-$sig" $targets 2>/dev/null

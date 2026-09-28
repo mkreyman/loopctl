@@ -222,52 +222,43 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   its `completed` "changes nothing", per the contract) or no session ever started (no worktree, a
   refused prompt). `terminal_reported` in `state.json` records that the run's LAST end report
   settled, which is what a restarted daemon reads before reporting it again.
+- **Nothing modifies global state to be tested; what varies is passed in.** Mark, 2026-09-28,
+  reading a suite whose tests flaked under load: *"flaky tests under load indicate poorly done
+  architecture and not using dependency injection. No fucking modifying global state, ever!"*
+  A test that needs another timezone, `PATH`, clock or environment passes it to the code under
+  test (an `env` argument, an option, a config field), never `System.put_env`,
+  `Application.put_env` or a persistent term, which leak into every concurrent test and force
+  modules `async: false`. The suite still does this in places (`fake_env!` and its callers);
+  each is a defect to remove, not a pattern to copy.
 - **Tests never record environment VALUES.** The dev machines carry live credentials in the
   environment, and a failing assertion prints whatever it compared.
 
 ## How changes get made here
 
-**The rule to DISPATCH binds the SESSION Mark is talking to, not the agent it dispatches.** If you
-are that agent: do the work you were sent for and do not re-delegate it — but the rest of this
-section still applies to you, and one bullet of it especially. THE BRANCH, THE COMMIT, THE PUSH,
-THE PR AND THE MERGE ARE NEVER THE DISPATCHED AGENT'S; leave your changes uncommitted and
-describe them, which is your correct end state (SOUL's Subordination Rule). They belong to the
-session, which is what the bullet below says from the other side. This file is the one
-tier a subagent is guaranteed to read, which is why the scoping is written here rather than
-assumed — and why it scopes one rule rather than waving the section away.
+**If you are a dispatched agent:** do the work you were sent for and do not re-delegate it. THE
+BRANCH, THE COMMIT, THE PUSH, THE PR AND THE MERGE ARE NEVER THE DISPATCHED AGENT'S; leave your
+changes uncommitted and describe them, which is your correct end state (SOUL's Subordination
+Rule). This file is the one tier a subagent is guaranteed to read, which is why that is written
+here rather than assumed.
 
-- **Implementation is DISPATCHED, not typed by the session.** Any change to ELIXIR code — a
-  feature, a fix, a refactor, and the fixes a review round asks for — goes to `elixir-engineer`.
-  Mark, 2026-09-15: *"make it a standing rule that you dispatch an engineer agent on high effort
-  for any implementation and fixes. I see it over and over again that sessions doing direct
-  editing are doing sloppy job."*
-- **Dispatch it with NO `model` override.** "High effort" is a property of the agent's own
-  definition, which lives in `claude-config` and is not this repo's to re-state — pinning its
-  values here would be the re-typing the contract rule forbids, drifting silently the first time
-  that repo changes or a machine has not pulled. The Agent tool's `model` argument OVERRIDES that
-  definition, so passing one is how a dispatch quietly buys something weaker than the rule
-  promises. Name the agent; pass nothing else about how it runs.
-- **What this rule does NOT route, because no agent here fits it**: the shell and unit files —
-  `priv/bin/session-launcher.sh`, `priv/bin/loop-escalate`, `priv/bin/loop-verdict`,
-  `rel/install.sh`, and the systemd and launchd templates. The engineer agents are Elixir and
-  TypeScript; there is no shell-capable one in the roster. Those stay with the session, and the
-  session says so in the PR — the same disclosure an inline fix carries. `session-launcher.sh` is
-  the one to be most careful with by hand: its teardown is load-bearing and macOS and Linux
-  diverge inside it.
-- **The review fixers are a carve-out, not a violation.** `/code-review --fix` applies findings to
-  the working tree itself, and `enhanced-review-workflow`'s FIXER commits by design. Both are
-  sanctioned by the delivery loop, so using them is compliance; what is not allowed is the session
-  typing the fix itself while a dispatch was available.
+- **The session writes the code itself, inline, or dispatches where that buys parallelism.**
+  Mark, 2026-09-22 (user CLAUDE.md, delivery loop step 2): *"for the time being, let's remove the
+  requirement for sessions to dispatch agents for implementation and fixes, and let them do
+  everything inline instead."* Whoever writes it, the rigor is the same.
+- **A dispatch names the agent and passes NO `model` override.** "High effort" is a property of
+  the agent's own definition, which lives in `claude-config` and is not this repo's to re-state.
+  The Agent tool's `model` argument OVERRIDES that definition, so passing one is how a dispatch
+  quietly buys something weaker.
+- **The shell and unit files stay with the session**: `priv/bin/session-launcher.sh`,
+  `priv/bin/loop-escalate`, `priv/bin/loop-verdict`, `rel/install.sh`, and the systemd and launchd
+  templates. The engineer agents are Elixir and TypeScript; none is shell-capable.
+  `session-launcher.sh` is the one to be most careful with: its teardown is load-bearing and
+  macOS and Linux diverge inside it.
 - **The session keeps what the Subordination Rule gives no agent**: the branch, the commit, the
-  PR, the review gate, the merge, the deploy — and VERIFYING the agent's report. "All green" is a
-  claim: re-run the suite, read the diff, and re-run at least one mutation proof for any
-  ASSERTION THE CHANGE ADDED. A refactor that adds no assertion has nothing to falsify, and
+  PR, the review gate, the merge, the deploy — and VERIFYING a dispatched agent's report. "All
+  green" is a claim: re-run the tests, read the diff, and re-run at least one mutation proof for
+  any ASSERTION THE CHANGE ADDED. A refactor that adds no assertion has nothing to falsify, and
   claiming that step anyway is the false green this bar exists to prevent.
-- **Two bounds, so it is a rule and not a ritual.** Prose is not implementation — this file, a
-  doc, a PR body — and is written where it is read. A change statable completely in one command
-  needs no agent; one that needs a DECISION is implementation however few lines it is. And if
-  dispatch genuinely fails, do it inline and say so in the PR, never calling a restriction an
-  incapacity.
 - **No tidewave preflight here.** The global rule says to start the dev server before dispatching
   an Elixir subagent. This repo has no `.mcp.json`, no endpoint and no `config/dev.exs` server —
   step 1a has no server at all, and port 4040 is reserved for a step-1b app that does not exist

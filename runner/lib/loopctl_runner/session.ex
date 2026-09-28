@@ -366,10 +366,19 @@ defmodule LoopctlRunner.Session do
       # would be two answers about one process, taken at two moments.
       launcher = Owner.of(os_pid)
       grant = arm_grant(grant_path, launcher)
-      # Still a `ps lstart` string, unlike an Owner's start: ProcessGroup and session-launcher.sh
-      # compare it in that form, and moving them is issue #66.
+
+      # From that one reading: the launcher's start in the kernel's form, which ProcessGroup compares
+      # a leader by (`Owner.start_id/1`), and the local `ps lstart` a runner before #66 compares
+      # instead.
+      leader_start_id = launcher["beam_start_id"]
       leader_start = Owner.lstart(launcher)
-      RunState.update(run_dir, %{pgid: os_pid, leader_start: leader_start})
+
+      RunState.update(run_dir, %{
+        pgid: os_pid,
+        leader_start: leader_start,
+        leader_start_id: leader_start_id
+      })
+
       now = now_ms()
 
       session_seq =
@@ -405,6 +414,7 @@ defmodule LoopctlRunner.Session do
          grant: grant,
          tree_file: tree_file,
          leader_start: leader_start,
+         leader_start_id: leader_start_id,
          session_seq: session_seq,
          stream: StreamEvents.new(session_seq),
          stdout_io: stdout_io,
@@ -867,7 +877,8 @@ defmodule LoopctlRunner.Session do
     do: [
       marker: ProcessGroup.marker(state.session_id),
       tree_file: state.tree_file,
-      leader_start: state.leader_start
+      leader_start: state.leader_start,
+      leader_start_id: state.leader_start_id
     ]
 
   # Returns [remainder | complete lines, newest first].

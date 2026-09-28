@@ -895,7 +895,11 @@ defmodule LoopctlRunner.ControlReviewTest do
 
       stalling = fn _config, _work, opts ->
         tree_file = Path.join(ctx.root, "stderr.log.tree")
-        File.write!(tree_file, "#{session} #{Owner.start_time(session)}\n")
+
+        File.write!(
+          tree_file,
+          "#{session} #{LoopctlRunner.TestSupport.utc_start_time(session)}\n"
+        )
 
         state =
           %{"status" => "running", "session_id" => Session.uuid4(), "tree_file" => tree_file}
@@ -953,7 +957,7 @@ defmodule LoopctlRunner.ControlReviewTest do
       dispatch = review_dispatch(ctx)
       session = live_session!(false)
       tree_file = Path.join(ctx.root, "stderr.log.tree")
-      File.write!(tree_file, "#{session} #{Owner.start_time(session)}\n")
+      File.write!(tree_file, "#{session} #{LoopctlRunner.TestSupport.utc_start_time(session)}\n")
 
       # In flight, and no owner recorded: a run whose BEAM is gone, its session still up.
       review_run_dir!(ctx, dispatch, [finding("one")], %{

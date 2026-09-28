@@ -88,11 +88,13 @@ defmodule LoopctlRunner.ProcessGroup do
   end
 
   @doc """
-  Pids from the launcher's tree file ("pid start-time" lines) that are still the same
-  process: a recorded pid whose start time no longer matches has been reused.
+  Pids from the launcher's tree file ("pid boot:<id>:<ticks>" on Linux, "pid utc:<lstart>"
+  elsewhere, untagged from a runner before #66) that are still the same process: a recorded pid
+  whose start no longer matches has been reused.
   """
-  @spec recorded(String.t() | nil) :: [pos_integer()]
-  def recorded(tree_file), do: for({pid, _start} <- recorded_entries(tree_file), do: pid)
+  @spec recorded(String.t() | nil, [{String.t(), String.t()}]) :: [pos_integer()]
+  def recorded(tree_file, env \\ []),
+    do: for({pid, _start} <- recorded_entries(tree_file, env), do: pid)
 
   @doc """
   `recorded/1`, keeping each pid's start time as the tree file recorded it.
@@ -103,20 +105,24 @@ defmodule LoopctlRunner.ProcessGroup do
   tree file of its own has to write that value, since re-reading it after this scan would
   hand a stranger the line meant for a process that has since exited.
   """
-  @spec recorded_entries(String.t() | nil) :: [{pos_integer(), String.t()}]
-  def recorded_entries(nil), do: []
+  #
+  # `env` is the reader's environment for its `ps` snapshots (see `Owner.start_time/2`).
+  @spec recorded_entries(String.t() | nil, [{String.t(), String.t()}]) ::
+          [{pos_integer(), String.t()}]
+  def recorded_entries(tree_file, env \\ [])
+  def recorded_entries(nil, _env), do: []
 
-  def recorded_entries(tree_file) do
+  def recorded_entries(tree_file, env) do
     case File.read(tree_file) do
       {:ok, raw} ->
-        starts = start_times()
+        entries =
+          for line <- String.split(raw, "\n", trim: true),
+              [pid_s, raw_start] <- [String.split(line, " ", parts: 2)],
+              {pid, ""} <- [Integer.parse(pid_s)],
+              do: {pid, Owner.normalize_start(raw_start)}
 
-        for line <- String.split(raw, "\n", trim: true),
-            [pid_s, raw_start] <- [String.split(line, " ", parts: 2)],
-            {pid, ""} <- [Integer.parse(pid_s)],
-            start <- [Owner.normalize_start(raw_start)],
-            Map.get(starts, pid) == start,
-            do: {pid, start}
+        snapshots = snapshots(entries, env)
+        for entry <- entries, live?(entry, snapshots), do: entry
 
       {:error, _} ->
         []
@@ -145,11 +151,47 @@ defmodule LoopctlRunner.ProcessGroup do
     if MapSet.size(grown) == MapSet.size(set), do: set, else: walk(parents, grown)
   end
 
-  defp start_times do
-    for line <- ps_rows(["-A", "-o", "pid=,lstart="]),
-        [pid_s, start] <- [String.split(String.trim_leading(line), " ", parts: 2)],
-        into: %{},
-        do: {String.to_integer(pid_s), Owner.normalize_start(start)}
+  # A line is compared only in its own form. `"boot:..."` — the launcher's on Linux — is the
+  # kernel's start (`Owner.start_id/1`, a /proc read, no process spawned). `"utc:..."` is compared
+  # against one UTC `ps -A` snapshot, and an untagged line, written by a runner before #66, against
+  # one in this process's own zone; each snapshot is taken only when a line of its form exists.
+  # A snapshot that could not be taken verifies nothing, and an unverified pid is never signalled:
+  # a stranger that reused it would be killed.
+  defp snapshots(entries, env) do
+    forms = entries |> Enum.map(fn {_pid, start} -> form(start) end) |> MapSet.new()
+
+    %{
+      # The pids alive now, listed once: a tree file is never pruned, so most of a long
+      # session's boot: lines name processes long gone, and each needs no /proc read of its own.
+      boot: if(:boot in forms, do: live_pids(), else: :cannot_tell),
+      utc: if(:utc in forms, do: Owner.utc_starts(env), else: :cannot_tell),
+      local: if(:local in forms, do: Owner.local_starts(env), else: :cannot_tell)
+    }
+  end
+
+  # Unlistable reads as "maybe alive", so each boot: line is still read on its own.
+  defp alive_in?({:ok, pids}, pid), do: MapSet.member?(pids, pid)
+  defp alive_in?(:cannot_tell, _pid), do: true
+
+  defp live_pids do
+    case File.ls("/proc") do
+      {:ok, names} ->
+        {:ok, for(name <- names, {pid, ""} <- [Integer.parse(name)], into: MapSet.new(), do: pid)}
+
+      {:error, _} ->
+        :cannot_tell
+    end
+  end
+
+  defp form("boot:" <> _), do: :boot
+  defp form("utc:" <> _), do: :utc
+  defp form(_legacy), do: :local
+
+  defp live?({pid, start}, snapshots) do
+    case form(start) do
+      :boot -> alive_in?(snapshots.boot, pid) and Owner.start_id(pid) == start
+      snapshot -> match?({:ok, %{^pid => ^start}}, Map.fetch!(snapshots, snapshot))
+    end
   end
 
   defp ps_rows(args) do
@@ -160,7 +202,9 @@ defmodule LoopctlRunner.ProcessGroup do
   @type opts :: [
           marker: String.t() | nil,
           tree_file: String.t() | nil,
-          leader_start: String.t() | nil
+          leader_start: String.t() | nil,
+          leader_start_id: String.t() | nil,
+          ps_env: [{String.t(), String.t()}]
         ]
 
   # Whether `pgid` still names OUR group. A live group whose id is our launcher's pid is
@@ -169,16 +213,35 @@ defmodule LoopctlRunner.ProcessGroup do
   # leader. With the leader dead, the group id is held by our own stragglers — the kernel
   # does not reuse a pid while it is a live process group id. Without a recorded start
   # time only the group's liveness can be checked.
-  defp ours?(nil, _leader_start), do: false
-  defp ours?(_pgid, nil), do: true
+  #
+  # The launcher's start is `leader_start_id` (`Owner.start_id/1`), which neither a timezone nor a
+  # clock step moves; a run a runner before #66 recorded carries only `leader_start`, in that
+  # runner's zone. ONE reading either way, so a leader cannot exit between two and pass as a
+  # stranger.
+  defp ours?(nil, _opts), do: false
 
-  defp ours?(pgid, leader_start) do
-    case Owner.start_time(pgid) do
-      nil -> true
-      ^leader_start -> true
-      _other -> false
+  defp ours?(pgid, opts) do
+    case {opts[:leader_start_id], opts[:leader_start]} do
+      {nil, nil} ->
+        true
+
+      {nil, legacy} when is_binary(legacy) ->
+        same_leader?(
+          Owner.local_start_time(pgid, opts[:ps_env] || []),
+          Owner.normalize_start(legacy)
+        )
+
+      # A start in no form this reads names no leader it could vouch for, as before #66.
+      {nil, _unreadable} ->
+        false
+
+      {started, _legacy} ->
+        same_leader?(Owner.start_id(pgid, opts[:ps_env] || []), started)
     end
   end
+
+  defp same_leader?(nil, _recorded), do: true
+  defp same_leader?(now, recorded), do: now == recorded
 
   @doc """
   TERM the group and every process belonging to the session, wait up to `grace_ms`, then
@@ -186,12 +249,13 @@ defmodule LoopctlRunner.ProcessGroup do
 
   A session's processes are its group, its current descendants, the processes carrying
   `:marker`, and the still-live pids in `:tree_file`. `pgid` may be nil to end only the
-  latter, for a group that is no longer ours; with `:leader_start` (the launcher's start
-  time) a `pgid` recycled into someone else's group is treated as nil.
+  latter, for a group that is no longer ours; with `:leader_start_id` or `:leader_start` (the
+  launcher's start, as `Owner.start_id/1` or a runner before #66 recorded it) a `pgid` recycled
+  into someone else's group is treated as nil.
   """
   @spec terminate(pos_integer() | nil, non_neg_integer(), opts()) :: outcome()
   def terminate(pgid, grace_ms, opts \\ []) do
-    pgid = if ours?(pgid, opts[:leader_start]), do: pgid
+    pgid = if ours?(pgid, opts), do: pgid
 
     if gone?(pgid, opts) do
       :already_gone
@@ -211,7 +275,8 @@ defmodule LoopctlRunner.ProcessGroup do
   defp members(pgid, opts) do
     walk_from = if pgid != nil and alive?(pgid), do: pgid
 
-    (marked(opts[:marker]) ++ recorded(opts[:tree_file]) ++ descendants(walk_from))
+    (marked(opts[:marker]) ++
+       recorded(opts[:tree_file], opts[:ps_env] || []) ++ descendants(walk_from))
     |> Enum.uniq()
     |> Enum.reject(&(&1 == pgid))
   end

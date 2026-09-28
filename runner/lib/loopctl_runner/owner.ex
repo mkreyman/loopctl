@@ -32,8 +32,9 @@ defmodule LoopctlRunner.Owner do
   it is one an older runner's reap judges dead, and it kills that run's session. A record is
   judged by `"beam_start_id"` when it carries one in a form above and by `"beam_started"` when it
   does not — a record written by master, compared by the rule it was written under.
-  `start_time/1`, the normalised string, remains for `LoopctlRunner.ProcessGroup`, whose tree
-  files the session launcher's shell writes in that form.
+  A session's tree files record each process by `start_id/1`'s form on Linux and by
+  `start_time/1`'s `"utc:"` form on macOS, which the session launcher's shell reads from a `ps`
+  snapshot (`utc_starts/0`).
   """
 
   require Logger
@@ -258,12 +259,13 @@ defmodule LoopctlRunner.Owner do
   # {:ok, start} in this kernel's form, :gone when `pid` names no process, {:cannot_tell, why}
   # when the reading could not be taken. What judging a record needs, and no more: one `ps` on
   # macOS, none on Linux.
-  defp reading(pid) when pid < 1, do: :gone
+  defp reading(pid, env \\ [])
+  defp reading(pid, _env) when pid < 1, do: :gone
 
-  defp reading(pid) do
+  defp reading(pid, env) do
     case clock() do
       :boot -> boot_reading(pid)
-      :utc -> utc_reading(pid)
+      :utc -> utc_reading(pid, env)
     end
   end
 
@@ -283,8 +285,8 @@ defmodule LoopctlRunner.Owner do
     end
   end
 
-  defp utc_reading(pid) do
-    with {:ok, out} <- ps(pid, ["lstart="], @utc_env) do
+  defp utc_reading(pid, env) do
+    with {:ok, out} <- ps(pid, ["lstart="], utc(env)) do
       lstart = normalize_start(out)
 
       if lstart =~ @lstart_shape,
@@ -408,18 +410,78 @@ defmodule LoopctlRunner.Owner do
     end
   end
 
+  # The reader's environment for a UTC reading (`System.cmd/3`'s `:env`, added to this process's
+  # own): TZ and the locale are overridden, which is the point, and a caller shows that by passing
+  # one rather than changing this BEAM's. A start read in the reader's own zone mismatched between
+  # the daemon (launchd) and `mix loopctl.reap` (a shell), or across a timezone change, and a live
+  # session's processes read as strangers (#66).
+  defp utc(env), do: Enum.reject(env, fn {name, _} -> name in ["TZ", "LC_ALL"] end) ++ @utc_env
+
   @doc """
-  The start time of os process `pid` as `ps -o lstart=` prints it in this process's timezone and
-  locale, whitespace-normalised, or nil when it cannot be read. For `LoopctlRunner.ProcessGroup`'s
-  tree files, which the launcher's shell writes in this form; an OWNER's start is read as
-  `current/0` describes. Never raises.
+  `ps -o lstart=` for `pid` in this process's own timezone and locale, whitespace-normalised, or
+  nil: the untagged form a runner before #66 wrote in tree files and `leader_start`, which
+  matches only when reader and writer share a zone. Never raises.
   """
-  @spec start_time(integer()) :: String.t() | nil
-  def start_time(pid) when is_integer(pid) do
-    case ps(pid, ["lstart="]) do
+  @spec local_start_time(integer(), [{String.t(), String.t()}]) :: String.t() | nil
+  def local_start_time(pid, env \\ []) when is_integer(pid) do
+    case ps(pid, ["lstart="], env) do
       {:ok, out} -> normalize_start(out)
       _ -> nil
     end
+  end
+
+  @doc """
+  The start of `pid` in this kernel's owner form — the `"beam_start_id"` `of/1` records — or nil
+  when it cannot be read, in ONE reading. A session records its launcher's by this form
+  (`leader_start_id`), and on Linux the launcher records each tree-file process by it
+  (`"boot:<boot id>:<ticks>"`): a value the kernel fixed at fork, so neither a timezone nor a clock
+  step moves it. `env` is the reader's environment, which it does not depend on. Never raises.
+  """
+  @spec start_id(integer(), [{String.t(), String.t()}]) :: String.t() | nil
+  def start_id(pid, env \\ []) when is_integer(pid) do
+    case reading(pid, env) do
+      {:ok, started} -> started
+      _ -> nil
+    end
+  end
+
+  @doc """
+  Every live process's start as the session launcher records it on macOS (and on Linux with no
+  readable boot id), from ONE `ps -A` snapshot under UTC and the C locale:
+  `{:ok, %{pid => "utc:<lstart>"}}`, or `:cannot_tell` when `ps` fails, cannot run or lists
+  nothing. For `LoopctlRunner.ProcessGroup`, which judges a whole tree file per poll. Never raises.
+  """
+  @spec utc_starts([{String.t(), String.t()}]) ::
+          {:ok, %{pos_integer() => String.t()}} | :cannot_tell
+  def utc_starts(env \\ []), do: snapshot_starts(utc(env), "utc:")
+
+  @doc """
+  `utc_starts/0` in the untagged local form `local_start_time/1` gives, for tree-file lines a
+  runner before #66 wrote. Never raises.
+  """
+  @spec local_starts([{String.t(), String.t()}]) ::
+          {:ok, %{pos_integer() => String.t()}} | :cannot_tell
+  def local_starts(env \\ []), do: snapshot_starts(env, "")
+
+  defp snapshot_starts(env, prefix) do
+    case System.cmd("ps", ["-A", "-o", "pid=,lstart="], stderr_to_stdout: true, env: env) do
+      {out, 0} ->
+        starts =
+          for line <- String.split(out, "\n", trim: true),
+              [pid_s, raw] <- [String.split(String.trim_leading(line), " ", parts: 2)],
+              {pid, ""} <- [Integer.parse(pid_s)],
+              start = normalize_start(raw),
+              prefix == "" or start =~ @lstart_shape,
+              into: %{},
+              do: {pid, prefix <> start}
+
+        if starts == %{}, do: :cannot_tell, else: {:ok, starts}
+
+      _failed ->
+        :cannot_tell
+    end
+  rescue
+    _ -> :cannot_tell
   end
 
   @doc """

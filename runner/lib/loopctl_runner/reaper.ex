@@ -211,7 +211,13 @@ defmodule LoopctlRunner.Reaper do
     session_id = state["session_id"]
     marker = if is_binary(session_id), do: ProcessGroup.marker(session_id)
     group_ours? = is_integer(pgid) and ProcessGroup.alive?(pgid) and launcher?(pgid)
-    opts = [marker: marker, tree_file: state["tree_file"], leader_start: state["leader_start"]]
+
+    opts = [
+      marker: marker,
+      tree_file: state["tree_file"],
+      leader_start: state["leader_start"],
+      leader_start_id: state["leader_start_id"]
+    ]
 
     outcome = ProcessGroup.terminate(if(group_ours?, do: pgid), grace_ms, opts)
 

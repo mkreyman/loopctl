@@ -122,7 +122,7 @@ defmodule LoopctlRunner.OwnerTest do
 
   test "a run recorded with a ps lstart start is judged by that string's rule" do
     pid = String.to_integer(System.pid())
-    lstart = Owner.start_time(pid)
+    lstart = Owner.local_start_time(pid)
     assert is_binary(lstart)
     # As master wrote it: `"beam_started"` and no `"beam_start_id"`.
     assert Owner.alive?(%{
@@ -139,7 +139,7 @@ defmodule LoopctlRunner.OwnerTest do
       refute Owner.alive?(Owner.of(pid, other_form(nil)))
       refute Owner.alive?(Owner.of(pid, owner!()["beam_start_id"]))
       refute Owner.process_alive?(Owner.of(pid, nil))
-      assert Owner.start_time(pid) == nil
+      assert LoopctlRunner.TestSupport.utc_start_time(pid) == nil
       assert Owner.of(pid) == Owner.of(pid, nil)
     end
   end
@@ -149,7 +149,7 @@ defmodule LoopctlRunner.OwnerTest do
     %{"beam_start_id" => read} = launcher = Owner.of(pid)
     assert read == started
     # The same one reading carries the `ps lstart` form ProcessGroup compares a leader by.
-    assert Owner.lstart(launcher) == Owner.start_time(pid)
+    assert Owner.lstart(launcher) == Owner.local_start_time(pid)
     assert Owner.of(dead_pid())["beam_start_id"] == nil
   end
 

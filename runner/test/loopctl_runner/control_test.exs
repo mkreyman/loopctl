@@ -1589,7 +1589,7 @@ defmodule LoopctlRunner.ControlTest do
       # that window says which came first.
       session = live_session!(true)
       tree_file = Path.join(ctx.root, "implement.tree")
-      File.write!(tree_file, "#{session} #{LoopctlRunner.Owner.start_time(session)}\n")
+      File.write!(tree_file, "#{session} #{LoopctlRunner.TestSupport.utc_start_time(session)}\n")
       runs_dir = ctx.config.runs_dir
       test = self()
 

@@ -269,7 +269,7 @@ defmodule LoopctlRunner.StragglerSweepTest do
         out |> String.split("\n", trim: true) |> List.first()
       end)
 
-    start = LoopctlRunner.Owner.start_time(os_pid)
+    start = LoopctlRunner.TestSupport.utc_start_time(os_pid)
     File.write!(ctx.ledger, "#{os_pid} #{start}\n")
 
     assert {_outcome, [^os_pid], [command]} = TestStragglers.sweep(nil, ctx.ledger, 2_000)
@@ -315,7 +315,7 @@ defmodule LoopctlRunner.StragglerSweepTest do
         out |> String.split("\n", trim: true) |> List.first()
       end)
 
-    File.write!(ctx.ledger, "#{os_pid} #{LoopctlRunner.Owner.start_time(os_pid)}\n")
+    File.write!(ctx.ledger, "#{os_pid} #{LoopctlRunner.TestSupport.utc_start_time(os_pid)}\n")
 
     assert {_outcome, [^os_pid], [command]} = TestStragglers.sweep(nil, ctx.ledger, 2_000)
     # Whole on macOS (`comm` is the path), the basename on Linux (`comm` is the name): either way
@@ -388,7 +388,7 @@ defmodule LoopctlRunner.StragglerSweepTest do
         Process.put(:pins, TestStragglers.pinned([gone, live], %{}))
       end)
 
-    assert Process.get(:pins) == [{live, LoopctlRunner.Owner.start_time(live)}]
+    assert Process.get(:pins) == [{live, LoopctlRunner.TestSupport.utc_start_time(live)}]
     assert report =~ "no start time for #{gone}"
   end
 
@@ -419,13 +419,13 @@ defmodule LoopctlRunner.StragglerSweepTest do
     TestStragglers.note!(live, ctx.ledger)
     ledger_start = "Thu Jan 1 00:00:00 1970"
 
-    refute LoopctlRunner.Owner.start_time(live) == ledger_start
+    refute LoopctlRunner.TestSupport.utc_start_time(live) == ledger_start
     assert TestStragglers.pinned([live], %{live => ledger_start}) == [{live, ledger_start}]
 
     # And that is the value the sweep threads through: the entry carries the file's own
     # start time, not one read after the scan.
     assert ProcessGroup.recorded_entries(ctx.ledger) == [
-             {live, LoopctlRunner.Owner.start_time(live)}
+             {live, LoopctlRunner.TestSupport.utc_start_time(live)}
            ]
   end
 
@@ -467,7 +467,7 @@ defmodule LoopctlRunner.StragglerSweepTest do
   test "a start time ps prints as empty is refused, not recorded as an unmatchable line" do
     # The "" half of the guard, which nothing on this machine produces by itself: `ps` here
     # always prints an lstart for a live pid. So `ps` is replaced for the length of one call
-    # by one that exits 0 with nothing to say, which `Owner.start_time/1` reads as nil. Read as
+    # by one that exits 0 with nothing to say, which `TestSupport.utc_start_time/2` reads as nil. Read as
     # "", it is truthy: it would pass a nil-only guard and become the ledger line `recorded/1`
     # compares against a real start time and drops for ever. Safe because this
     # file is async: false and the swap spans a single call; every `ps` the fixtures need
@@ -488,7 +488,7 @@ defmodule LoopctlRunner.StragglerSweepTest do
     on_exit(fn -> System.put_env("PATH", previous) end)
     System.put_env("PATH", Path.dirname(fake) <> ":" <> previous)
 
-    assert LoopctlRunner.Owner.start_time(live) == nil
+    assert LoopctlRunner.TestSupport.utc_start_time(live) == nil
     assert_raise RuntimeError, ~r/no start time/, fn -> TestStragglers.note!(live, ledger) end
 
     System.put_env("PATH", previous)

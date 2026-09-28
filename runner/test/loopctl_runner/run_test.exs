@@ -927,9 +927,14 @@ defmodule LoopctlRunner.RunTest do
 
     assert owner == granted(owner!())
     assert started == Owner.of(launcher)["beam_start_id"]
-    # From the same reading: the launcher's start in the `ps lstart` form ProcessGroup compares.
-    assert {:ok, %{"leader_start" => leader_start}} = RunState.read(Path.join(root, "direct-run"))
-    assert leader_start == Owner.start_time(launcher)
+
+    # From the same reading: the kernel-form start ProcessGroup compares a leader by, and the local
+    # form a runner before #66 compares.
+    assert {:ok, %{"leader_start_id" => leader_start_id, "leader_start" => leader_start}} =
+             RunState.read(Path.join(root, "direct-run"))
+
+    assert leader_start_id == started
+    assert leader_start == Owner.local_start_time(launcher)
     # Its BEAM and its session both running: a dispatch in flight, never swept.
     assert GitGrant.sweep(config.grant_dir) == []
 

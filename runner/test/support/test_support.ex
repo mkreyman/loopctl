@@ -195,7 +195,40 @@ defmodule LoopctlRunner.TestSupport do
       System.cmd("kill", ["-KILL", "#{session}"], stderr_to_stdout: true)
     end)
 
-    :ok = wait_until(fn -> LoopctlRunner.Owner.start_time(session) != nil end)
+    :ok = wait_until(fn -> utc_start_time(session) != nil end)
     session
+  end
+
+  @doc """
+  A zone fourteen hours from UTC, so no machine running the suite reads it as its own, or nil when
+  this host's tz database lacks it: glibc then reads the name as UTC, and a test of timezone
+  independence would pass without testing anything, so such a test is skipped, visibly.
+  """
+  def far_timezone do
+    tz = "Pacific/Kiritimati"
+
+    case System.cmd("date", ["+%z"], env: [{"TZ", tz}]) do
+      {"+1400\n", 0} -> tz
+      _ -> nil
+    end
+  end
+
+  @doc """
+  `pid`'s start in the "utc:" form the session launcher records on macOS, read from one
+  `Owner.utc_starts/1` snapshot under the reader's `env`, or nil.
+  """
+  def utc_start_time(pid, env \\ []) do
+    case LoopctlRunner.Owner.utc_starts(env) do
+      {:ok, starts} -> Map.get(starts, pid)
+      :cannot_tell -> nil
+    end
+  end
+
+  @doc "A process's start in the form the session launcher records it on this kernel."
+  def tree_start(pid) do
+    case LoopctlRunner.Owner.clock() do
+      :boot -> LoopctlRunner.Owner.start_id(pid)
+      :utc -> utc_start_time(pid)
+    end
   end
 end
