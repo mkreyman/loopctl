@@ -29,6 +29,7 @@ defmodule Loopctl.DataCase do
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
+  alias Loopctl.Test.LockGuard
   alias Loopctl.Webhooks.ReqDelivery
 
   using do
@@ -136,10 +137,18 @@ defmodule Loopctl.DataCase do
     admin_pid = Sandbox.start_owner!(Loopctl.AdminRepo, shared: not tags[:async])
     heavy_pid = Sandbox.start_owner!(Loopctl.HeavyReadRepo, shared: not tags[:async])
 
+    # An async test must not END holding a DDL lock on a shared table (LockGuard); read
+    # before the owners stop, because stopping rolls the sandbox back and frees the locks.
+    backend_pids = if tags[:async], do: LockGuard.backend_pids([Loopctl.Repo, Loopctl.AdminRepo])
+
     on_exit(fn ->
-      Sandbox.stop_owner(pid)
-      Sandbox.stop_owner(admin_pid)
-      Sandbox.stop_owner(heavy_pid)
+      try do
+        if backend_pids, do: LockGuard.check!(backend_pids)
+      after
+        Sandbox.stop_owner(pid)
+        Sandbox.stop_owner(admin_pid)
+        Sandbox.stop_owner(heavy_pid)
+      end
     end)
   end
 
