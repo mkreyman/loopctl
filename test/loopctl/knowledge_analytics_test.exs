@@ -1101,39 +1101,11 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
   describe "the project_id composite index (US-25.2 AC-25.2.8 TC-25.2.9)" do
     @tag :slow
     test "exists, and the top-articles query shape with a project_id filter EXPLAINs" do
-      tenant = fixture(:tenant)
-      {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
-      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
-
-      # Smaller dataset than the story's 10,000 for test speed. No ANALYZE: the assertions
-      # below do not depend on the chosen plan, and ANALYZE in an async test held SHARE
-      # UPDATE EXCLUSIVE on this shared table to test end and rewrote its planner stats
-      # for every other test (Loopctl.Test.LockGuard).
-      projects =
-        for _ <- 1..5 do
-          fixture(:project, %{tenant_id: tenant.id})
-        end
-
-      rows =
-        for p <- projects, _ <- 1..50 do
-          %{
-            id: Ecto.UUID.generate(),
-            tenant_id: tenant.id,
-            article_id: article.id,
-            api_key_id: agent.id,
-            project_id: p.id,
-            story_id: nil,
-            access_type: "get",
-            metadata: %{},
-            accessed_at: DateTime.utc_now()
-          }
-        end
-
-      AdminRepo.insert_all(ArticleAccessEvent, rows)
-
-      target = List.first(projects)
-      tenant_uuid = Ecto.UUID.dump!(tenant.id)
-      project_uuid = Ecto.UUID.dump!(target.id)
+      # No rows and no ANALYZE: neither assertion depends on data or on the chosen plan, and
+      # ANALYZE in an async test held SHARE UPDATE EXCLUSIVE on this shared table to test end
+      # and rewrote its planner stats for every other test (Loopctl.Test.LockGuard).
+      tenant_uuid = Ecto.UUID.dump!(Ecto.UUID.generate())
+      project_uuid = Ecto.UUID.dump!(Ecto.UUID.generate())
 
       # EXPLAIN the exact shape of the aggregate query the context runs.
       %{rows: [[plan_json]]} =

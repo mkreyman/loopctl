@@ -22,10 +22,10 @@ defmodule LoopctlWeb.ChannelCase do
   end
 
   setup tags do
-    Loopctl.DataCase.setup_sandbox(tags)
+    sandbox = Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     Loopctl.DataCase.stub_all_defaults()
-    :ok
+    {:ok, sandbox}
   end
 
   @doc """

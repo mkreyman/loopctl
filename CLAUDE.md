@@ -341,7 +341,7 @@ Opts are for query parameters (limit, offset, filters) only.
 
 ### ABSOLUTE RULES
 
-1. **`async: true` on EVERY test file** via DataCase/ConnCase — except where the test's subject is shared state the sandbox cannot isolate (DDL on a shared table, planner statistics, VM-global processes): then `async: false`, with the reason in the module's moduledoc. An async test that ends holding a DDL lock on a shared table fails at teardown (`Loopctl.Test.LockGuard`)
+1. **`async: true` on EVERY test file** via DataCase/ConnCase — except where the test's subject is shared state the sandbox cannot isolate (DDL on a shared table, planner statistics, VM-global processes): then `async: false`, with the reason in the module's moduledoc. An async test that ends holding a DDL lock on a shared table through one of its sandbox OWNER connections fails at teardown (`Loopctl.Test.LockGuard`); a connection it checks out itself is not checked
 2. **NEVER `Application.put_env` in tests** — all service swapping via config/test.exs
 3. **`Mox.set_mox_from_context(tags)`** in DataCase/ConnCase setup for async isolation
 4. **`setup :verify_on_exit!`** on EVERY test file using Mox

@@ -20,13 +20,15 @@ defmodule Loopctl.Test.LockGuard do
   WHY A SEPARATE CONNECTION: it still answers when the test's own transaction is aborted (a
   test that provoked a DB error on purpose), and it cannot see a relation the test CREATED —
   that `pg_class` row is uncommitted — so DDL on a table the test made for itself drops out
-  with no exemption list.
+  with no exemption list. Not when that DDL also locks a SHARED table: a foreign key to it
+  (SHARE ROW EXCLUSIVE) or `PARTITION OF` it (ACCESS EXCLUSIVE) is reported, correctly.
 
   WHAT IT CANNOT SEE, stated so nobody relies on it for these:
   - a lock taken and released BEFORE the test ends (DDL inside a `Repo.transaction` that
     rolls back is a sandbox savepoint, and rolling back frees its locks);
-  - a connection the test checks out itself (`Sandbox.checkout/1` in a Task) or one that
-    reconnected mid-test under a new backend PID.
+  - a connection the test checks out itself (`Sandbox.checkout/1` in a spawned process, which
+    some async DataCase tests do) or one that reconnected mid-test under a new backend PID.
+    Only the sandbox OWNER connections are recorded.
 
   It fails CLOSED: `start/0` refuses to start a guard that cannot read `pg_locks`, and a
   teardown whose own query fails raises rather than passing a test it never checked.
@@ -49,8 +51,9 @@ defmodule Loopctl.Test.LockGuard do
   """
 
   # AdminRepo's own options for WHERE and HOW to connect, so the guard's pool never drifts.
-  @connect_keys ~w(hostname port username password database socket socket_dir ssl ssl_opts
-                   parameters connect_timeout timeout types)a
+  @connect_keys ~w(hostname endpoints port username password database socket socket_dir
+                   socket_options ssl ssl_opts parameters connect_timeout handshake_timeout
+                   timeout types)a
 
   @doc """
   Starts the non-sandbox pool the check reads through, from test_helper.exs: one connection
@@ -65,7 +68,7 @@ defmodule Loopctl.Test.LockGuard do
       |> Keyword.take(@connect_keys)
       |> Keyword.merge(
         name: name,
-        pool_size: ExUnit.configuration()[:max_cases] || System.schedulers_online()
+        pool_size: ExUnit.configuration()[:max_cases]
       )
       |> Keyword.merge(overrides)
 
@@ -110,7 +113,14 @@ defmodule Loopctl.Test.LockGuard do
     if backend_pids, do: check!(backend_pids)
     :ok
   after
-    Enum.each(owners, &Sandbox.stop_owner/1)
+    Enum.each(owners, &stop_quietly/1)
+  end
+
+  # An owner that already stopped must not replace the lock check's error with its exit.
+  defp stop_quietly(owner) do
+    Sandbox.stop_owner(owner)
+  catch
+    :exit, _ -> :ok
   end
 
   @doc """
@@ -143,7 +153,7 @@ defmodule Loopctl.Test.LockGuard do
     fun.()
   catch
     kind, reason ->
-      Enum.each(owners, &Sandbox.stop_owner/1)
+      Enum.each(owners, &stop_quietly/1)
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
@@ -174,7 +184,8 @@ defmodule Loopctl.Test.LockGuard do
       ". Remedies, by what the DDL was for: skipping a trigger — SET LOCAL " <>
       "session_replication_role = replica (needs the superuser test role); provoking a DB " <>
       "error — a transaction-local setting such as SET LOCAL search_path; exercising a " <>
-      "table of the test's own — create it inside the test (it is then invisible here); " <>
+      "table of the test's own — create it inside the test, with no foreign key to or " <>
+      "partition of a shared table (it is then invisible here); " <>
       "anything else, where the DDL itself is the point — async: false, with the reason."
   end
 end

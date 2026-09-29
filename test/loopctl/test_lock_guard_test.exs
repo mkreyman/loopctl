@@ -13,6 +13,7 @@ defmodule Loopctl.Test.LockGuardTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.SourceScan
   alias Loopctl.Test.LockGuard
 
   @probe "lock_guard_probe"
@@ -125,9 +126,7 @@ defmodule Loopctl.Test.LockGuardTest do
   test "start_owners!/2 stops what it started when a later start fails" do
     before = MapSet.new(Process.list())
 
-    assert_raise MatchError, fn ->
-      LockGuard.start_owners!([AdminRepo, NoSuchRepoForTheGuard], true)
-    end
+    assert catch_error(LockGuard.start_owners!([AdminRepo, NoSuchRepoForTheGuard], true))
 
     leaked =
       Process.list()
@@ -135,6 +134,26 @@ defmodule Loopctl.Test.LockGuardTest do
       |> Enum.filter(&sandbox_owner?/1)
 
     assert leaked == []
+  end
+
+  test "sandbox_owner?/1 recognises an owner, so the leak check above is not vacuous" do
+    owner = Sandbox.start_owner!(AdminRepo)
+    on_exit(fn -> quietly(fn -> Sandbox.stop_owner(owner) end) end)
+
+    assert sandbox_owner?(owner)
+    refute sandbox_owner?(self())
+  end
+
+  test "release/2 keeps the lock check's error when an owner is already gone" do
+    {[owner], pids} = LockGuard.start_owners!([AdminRepo], true)
+    AdminRepo.query!("LOCK TABLE #{@probe} IN EXCLUSIVE MODE")
+    dead = spawn(fn -> :ok end)
+
+    assert_raise ExUnit.AssertionError, ~r/ExclusiveLock/, fn ->
+      LockGuard.release([dead, owner], pids)
+    end
+
+    refute Process.alive?(owner)
   end
 
   test "a failure of the guard's own connection fails the check" do
@@ -166,16 +185,18 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "no async bare ExUnit.Case module opens its own sandbox outside LockGuard" do
-    async_bare =
-      for path <- Path.wildcard("test/**/*_test.exs"),
-          source = File.read!(path),
-          source =~ ~r/^\s*use ExUnit\.Case,\s*async:\s*true/m,
-          into: %{},
-          do: {path, source}
+    # Parsed, not matched as text (Loopctl.SourceScan): a comment neither trips nor satisfies
+    # it, and a `use` split across lines still classifies. A call through an alias of another
+    # name (`alias ...Sandbox, as: S`) is not seen; SourceScan says so.
+    bare =
+      for path <- Path.wildcard("test/**/*_test.exs"), bare = bare_case(path), do: {path, bare}
+
+    async_bare = for {path, :async} <- bare, do: path
 
     offenders =
-      for {path, source} <- async_bare,
-          source =~ ~r/\bSandbox\.(start_owner!|checkout)\(/,
+      for path <- async_bare,
+          SourceScan.calls?(path, :Sandbox, :start_owner!) or
+            SourceScan.calls?(path, :Sandbox, :checkout),
           do: path
 
     assert offenders == [],
@@ -184,15 +205,28 @@ defmodule Loopctl.Test.LockGuardTest do
 
     # The classifier sees every bare-case module that adopted the guard, so the scan is not
     # vacuous.
-    adopters =
-      for path <- Path.wildcard("test/**/*_test.exs"),
-          source = File.read!(path),
-          source =~ ~r/^\s*use ExUnit\.Case\b/m,
-          source =~ ~r/\bLockGuard\.start_owner!\(/,
-          do: path
+    adopters = for {path, _} <- bare, SourceScan.calls?(path, :LockGuard, :start_owner!), do: path
 
     assert adopters != []
-    assert Enum.reject(adopters, &Map.has_key?(async_bare, &1)) == []
+    assert adopters -- async_bare == []
+  end
+
+  test "bare_case/1 classifies by the parsed use, not by text" do
+    dir = Path.join(System.tmp_dir!(), "lock_guard_scan_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    split = Path.join(dir, "split_test.exs")
+    File.write!(split, "defmodule Split do\n  use ExUnit.Case,\n    async: true\nend\n")
+    commented = Path.join(dir, "commented_test.exs")
+
+    File.write!(
+      commented,
+      "defmodule C do\n  # use ExUnit.Case, async: true\n  use ExUnit.Case\nend\n"
+    )
+
+    assert bare_case(split) == :async
+    assert bare_case(commented) == :sync
   end
 
   # A register function that hands the teardown to the test, from whichever process runs the
@@ -207,6 +241,21 @@ defmodule Loopctl.Test.LockGuardTest do
     assert_received {:teardown, teardown}
     on_exit(fn -> quietly(teardown) end)
     teardown
+  end
+
+  # :async / :sync for a module on bare ExUnit.Case, nil for anything else.
+  defp bare_case(path) do
+    path
+    |> File.read!()
+    |> Code.string_to_quoted!()
+    |> Macro.prewalk(nil, fn
+      {:use, _, [{:__aliases__, _, [:ExUnit, :Case]} | opts]} = node, _acc ->
+        {node, if(Keyword.get(List.flatten(opts), :async) == true, do: :async, else: :sync)}
+
+      node, acc ->
+        {node, acc}
+    end)
+    |> elem(1)
   end
 
   defp quietly(fun) do
