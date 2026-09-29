@@ -101,6 +101,18 @@ defmodule LoopctlRunner.TestLoopctl do
     end)
   end
 
+  # Replies to checkpoint pushes, oldest first: :ok, {:error, reason_map}, or :none for a push
+  # left unanswered; :ok once the list is spent.
+  def next_checkpoint_reply do
+    Agent.get_and_update(__MODULE__, fn
+      %{checkpoint_replies: [reply | rest]} = state ->
+        {reply, %{state | checkpoint_replies: rest}}
+
+      state ->
+        {:ok, state}
+    end)
+  end
+
   def next_session_ended_reply do
     Agent.get_and_update(__MODULE__, fn
       %{session_ended_replies: [reply | rest]} = state ->
@@ -308,6 +320,29 @@ defmodule LoopctlRunner.TestLoopctl do
             :ok -> {:reply, {:ok, %{stage: payload["to"]}}, socket}
             :none -> {:noreply, socket}
             {:error, reply} -> {:reply, {:error, reply}, socket}
+          end
+
+        {:error, details} ->
+          {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
+      end
+    end
+
+    # loopctl's idempotent recording is not modelled: the reply is scripted.
+    def handle_in("checkpoint", payload, socket) do
+      TestLoopctl.notify({:checkpoint, payload})
+
+      case Contract.validate("RunnerCheckpoint", payload) do
+        :ok ->
+          case TestLoopctl.next_checkpoint_reply() do
+            :ok ->
+              ack = %{checkpoint_id: LoopctlRunner.Session.uuid4(), seq: 1, replayed: false}
+              {:reply, {:ok, ack}, socket}
+
+            :none ->
+              {:noreply, socket}
+
+            {:error, reply} ->
+              {:reply, {:error, reply}, socket}
           end
 
         {:error, details} ->

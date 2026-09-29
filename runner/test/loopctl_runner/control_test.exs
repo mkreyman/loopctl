@@ -515,6 +515,223 @@ defmodule LoopctlRunner.ControlTest do
     end
   end
 
+  describe "checkpoints" do
+    @cp_dispatch "5b1f0a3e-2c4d-4e6f-8a9b-0c1d2e3f4a5b"
+    @cp_commit String.duplicate("a", 40)
+    @cp_tree String.duplicate("b", 40)
+
+    # A run loop-push has recorded pushes in, bound to its dispatch at claim epoch 2.
+    defp pushed_run(ctx, lines) do
+      run_dir = Path.join(ctx.config.runs_dir, "pushed-run")
+      File.mkdir_p!(run_dir)
+
+      LoopctlRunner.RunState.update(run_dir, %{
+        "dispatch_id" => @cp_dispatch,
+        "claim_epoch" => 2,
+        # Finished: its last pushes are still reported after the session is gone.
+        "status" => "succeeded"
+      })
+
+      File.write!(
+        Path.join(run_dir, "checkpoints.log"),
+        Enum.map_join(lines, &"#{&1} #{@cp_tree}\n")
+      )
+
+      run_dir
+    end
+
+    defp cp_sent(run_dir) do
+      case File.read(Path.join(run_dir, "checkpoints.sent")) do
+        {:ok, raw} -> JSON.decode!(raw)
+        _ -> nil
+      end
+    end
+
+    defp checkpoint_control(ctx, poll_ms \\ 100, opts \\ []) do
+      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+      {pid, _ref} = start_control(slow, Keyword.merge([checkpoint_poll_ms: poll_ms], opts))
+      pid
+    end
+
+    defp count_checkpoints(n \\ 0) do
+      receive do
+        {:test_loopctl, {:checkpoint, _}} -> count_checkpoints(n + 1)
+      after
+        0 -> n
+      end
+    end
+
+    test "a run whose log ends mid-line does not hold the runs after it", ctx do
+      stuck = Path.join(ctx.config.runs_dir, "a-stuck-run")
+      File.mkdir_p!(stuck)
+
+      LoopctlRunner.RunState.update(stuck, %{
+        "dispatch_id" => LoopctlRunner.Session.uuid4(),
+        "claim_epoch" => 2,
+        "status" => "succeeded"
+      })
+
+      File.write!(Path.join(stuck, "checkpoints.log"), "#{@cp_commit} #{@cp_tree}")
+      pushed_run(ctx, [@cp_commit])
+      checkpoint_control(ctx)
+
+      assert_receive {:test_loopctl, {:checkpoint, %{"dispatch_id" => @cp_dispatch}}}, 5_000
+    end
+
+    test "a checkpoint loopctl never answers is sent again", ctx do
+      TestLoopctl.put(:checkpoint_replies, [:none])
+      run_dir = pushed_run(ctx, [@cp_commit])
+      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+      start_control(slow, checkpoint_poll_ms: 50, checkpoint_reply_ms: 200)
+
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 3_000
+      :ok = wait_until(fn -> match?(%{"sent" => 1}, cp_sent(run_dir)) end, 3_000)
+    end
+
+    test "a last line loopctl keeps refusing unrecognised is given up in the end", ctx do
+      TestLoopctl.put(
+        :checkpoint_replies,
+        # More refusals than any line is tried: settled only by giving up, after thirty tries.
+        List.duplicate({:error, %{reason: "something_new"}}, 200)
+      )
+
+      run_dir = pushed_run(ctx, [@cp_commit])
+      checkpoint_control(ctx, 1, checkpoint_max_backoff_ms: 5)
+
+      :ok = wait_until(fn -> match?(%{"sent" => 1}, cp_sent(run_dir)) end, 15_000)
+      assert count_checkpoints() in 29..31
+    end
+
+    test "one run's rate limit holds back only that run", ctx do
+      TestLoopctl.put(:checkpoint_replies, [
+        {:error, %{reason: "rate_limited", min_interval_ms: 3_600_000}}
+      ])
+
+      pushed_run(ctx, [@cp_commit])
+      other = Path.join(ctx.config.runs_dir, "other-run")
+      File.mkdir_p!(other)
+
+      LoopctlRunner.RunState.update(other, %{
+        "dispatch_id" => "6c2f0a3e-2c4d-4e6f-8a9b-0c1d2e3f4a5b",
+        "claim_epoch" => 1,
+        "status" => "succeeded"
+      })
+
+      second = String.duplicate("d", 40)
+      File.write!(Path.join(other, "checkpoints.log"), "#{second} #{@cp_tree}\n")
+      checkpoint_control(ctx)
+
+      # Whichever run is refused first waits; the other's commit still goes.
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => refused}}}, 5_000
+      other_commit = if refused == second, do: @cp_commit, else: second
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^other_commit}}}, 3_000
+    end
+
+    test "a settle that cannot be written backs the run off instead of resending at once", ctx do
+      run_dir = pushed_run(ctx, [@cp_commit])
+      # A directory where the progress file goes: every settle write fails.
+      File.mkdir_p!(Path.join([run_dir, "checkpoints.sent", "x"]))
+      checkpoint_control(ctx, 50)
+
+      assert_receive {:test_loopctl, {:checkpoint, _}}, 5_000
+      Process.sleep(1_000)
+      # Backing off from 50 ms and doubling: a handful in a second, never a loop.
+      assert count_checkpoints() <= 6
+    end
+
+    test "a rate_limited interval past what a timer takes is bounded, and the line resent", ctx do
+      TestLoopctl.put(:checkpoint_replies, [
+        {:error, %{reason: "rate_limited", min_interval_ms: 5_000_000_000}}
+      ])
+
+      run_dir = pushed_run(ctx, [@cp_commit])
+      pid = checkpoint_control(ctx)
+
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 3_000
+      :ok = wait_until(fn -> match?(%{"sent" => 1}, cp_sent(run_dir)) end, 3_000)
+      assert Process.alive?(pid)
+    end
+
+    test "a failing line a later one follows is given up; the last line never is", ctx do
+      second = String.duplicate("c", 40)
+      failures = List.duplicate({:error, %{reason: "internal_error"}}, 8)
+      # Eight failures of the first line give it up; eight more of the last do not.
+      TestLoopctl.put(:checkpoint_replies, failures ++ failures)
+      run_dir = pushed_run(ctx, [@cp_commit, second])
+      checkpoint_control(ctx, 2)
+
+      for _ <- 1..8,
+          do: assert_receive({:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000)
+
+      for _ <- 1..9,
+          do: assert_receive({:test_loopctl, {:checkpoint, %{"commit_sha" => ^second}}}, 5_000)
+
+      :ok = wait_until(fn -> match?(%{"sent" => 2}, cp_sent(run_dir)) end, 3_000)
+    end
+
+    test "each recorded push is reported once, oldest first, and settled", ctx do
+      second = String.duplicate("c", 40)
+      run_dir = pushed_run(ctx, [@cp_commit, second])
+      checkpoint_control(ctx)
+
+      assert_receive {:test_loopctl, {:checkpoint, first}}, 5_000
+
+      assert first == %{
+               "dispatch_id" => @cp_dispatch,
+               "claim_epoch" => 2,
+               "commit_sha" => @cp_commit,
+               "tree_sha" => @cp_tree
+             }
+
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^second}}}, 3_000
+      :ok = wait_until(fn -> match?(%{"sent" => 2}, cp_sent(run_dir)) end, 3_000)
+      refute_receive {:test_loopctl, {:checkpoint, _}}, 500
+
+      # A push recorded later is found by the next poll.
+      File.write!(Path.join(run_dir, "checkpoints.log"), "#{@cp_commit} #{@cp_tree}\n", [:append])
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 3_000
+    end
+
+    test "a claim-ending refusal stops the run's checkpoints and ends its claim", ctx do
+      TestLoopctl.put(:checkpoint_replies, [{:error, %{reason: "not_claimant"}}])
+      run_dir = pushed_run(ctx, [@cp_commit, String.duplicate("c", 40)])
+      checkpoint_control(ctx)
+
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000
+      :ok = wait_until(fn -> cp_sent(run_dir) == %{"stopped" => "not_claimant"} end, 3_000)
+      assert LoopctlRunner.ClaimEnded.ended?(ctx.config.runs_dir, @cp_dispatch, 2)
+      refute_receive {:test_loopctl, {:checkpoint, _}}, 500
+    end
+
+    test "a refusal of those bytes settles that line and the next goes", ctx do
+      second = String.duplicate("c", 40)
+      TestLoopctl.put(:checkpoint_replies, [{:error, %{reason: "checkpoint_conflict"}}])
+      run_dir = pushed_run(ctx, [@cp_commit, second])
+      checkpoint_control(ctx)
+
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^second}}}, 3_000
+      :ok = wait_until(fn -> match?(%{"sent" => 2}, cp_sent(run_dir)) end, 3_000)
+    end
+
+    test "rate_limited and a transient failure send the same line again", ctx do
+      TestLoopctl.put(:checkpoint_replies, [
+        {:error, %{reason: "rate_limited", min_interval_ms: 50}},
+        {:error, %{reason: "internal_error"}}
+      ])
+
+      run_dir = pushed_run(ctx, [@cp_commit])
+      checkpoint_control(ctx)
+
+      for _ <- 1..3,
+          do: assert_receive({:test_loopctl, {:checkpoint, %{"commit_sha" => @cp_commit}}}, 5_000)
+
+      :ok = wait_until(fn -> match?(%{"sent" => 1}, cp_sent(run_dir)) end, 3_000)
+    end
+  end
+
   describe "trace shipping" do
     @dispatch_id "2e2d3c4b-5a69-4788-9a0b-1c2d3e4f5a6b"
 
@@ -1392,7 +1609,7 @@ defmodule LoopctlRunner.ControlTest do
       helper
     end
 
-    # Any module this build has stands in for the checkpoint reporter PR #59 adds.
+    # Any module this build has stands in for the checkpoint reporter.
     @reporter __MODULE__
 
     test "a repository in thread mode gets the thread prompt and LOOP_BRANCH", ctx do
@@ -1467,8 +1684,13 @@ defmodule LoopctlRunner.ControlTest do
     test "a thread repository on a build without checkpoint reporting is refused", ctx do
       commit_mode!(ctx, "thread\n")
 
-      # The default reporter: LoopctlRunner.CheckpointStream, which this branch does not have.
-      {pid, topic} = accepting_control(ctx, "stream", %{}, push_script: push_helper!(ctx))
+      # A build whose reporter module is missing.
+      {pid, topic} =
+        accepting_control(ctx, "stream", %{},
+          push_script: push_helper!(ctx),
+          checkpoint_reporter: LoopctlRunner.NoCheckpointReporter
+        )
+
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch())
       assert %{"to" => "worktree"} = next_stage()
 
@@ -1786,6 +2008,74 @@ defmodule LoopctlRunner.ControlTest do
       assert %{"reason" => "completed"} = next_session_ended(5_000)
       refute_receive {:test_loopctl, {:stage, _}}, 300
       :ok = wait_until(fn -> Control.info(pid).session_ended_pending == 0 end, 3_000)
+    end
+
+    test "a thread run's session_ended waits until its recorded pushes are checkpoints", ctx do
+      TestLoopctl.put(:checkpoint_replies, [{:error, %{reason: "internal_error"}}])
+      {pid, _ref} = start_accepting(ctx, %{}, checkpoint_poll_ms: 300)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+      dispatch = story_dispatch()
+      binding = DispatchRun.binding(dispatch)
+      run_dir = Path.join(ctx.config.runs_dir, "thread-run")
+      File.mkdir_p!(run_dir)
+      LoopctlRunner.RunState.update(run_dir, Map.put(binding, "status", "failed"))
+      commit = String.duplicate("a", 40)
+
+      File.write!(
+        Path.join(run_dir, "checkpoints.log"),
+        "#{commit} #{String.duplicate("b", 40)}\n"
+      )
+
+      send(
+        pid,
+        {:run_stage, binding,
+         {:finished, %{status: "failed", reached: "implementing", run_dir: run_dir}}}
+      )
+
+      # The first checkpoint fails, so the crashed session's end is held behind it...
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^commit}}}, 5_000
+      refute_receive {:test_loopctl, {:session_ended, _}}, 250
+
+      # ...until the resend is recorded, and only then does it go.
+      assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^commit}}}, 5_000
+      assert %{"reason" => "crashed"} = next_session_ended(5_000)
+    end
+
+    test "a stage report still queued when the run ends is not held behind its checkpoints",
+         ctx do
+      TestLoopctl.put(
+        :checkpoint_replies,
+        List.duplicate({:error, %{reason: "internal_error"}}, 50)
+      )
+
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "rate_limited", min_interval_ms: 400}}])
+      {pid, _ref} = start_accepting(ctx, %{}, checkpoint_poll_ms: 100)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+      dispatch = story_dispatch()
+      binding = DispatchRun.binding(dispatch)
+      run_dir = Path.join(ctx.config.runs_dir, "thread-run")
+      File.mkdir_p!(run_dir)
+      LoopctlRunner.RunState.update(run_dir, Map.put(binding, "status", "failed"))
+
+      File.write!(
+        Path.join(run_dir, "checkpoints.log"),
+        "#{String.duplicate("a", 40)} #{String.duplicate("b", 40)}\n"
+      )
+
+      send(pid, {:run_stage, binding, {:implementing, %{}}})
+      assert %{"to" => "implementing"} = next_stage(5_000)
+
+      # Ended while that report waits out its rate limit: it still goes, the end does not.
+      send(
+        pid,
+        {:run_stage, binding,
+         {:finished, %{status: "failed", reached: "implementing", run_dir: run_dir}}}
+      )
+
+      assert %{"to" => "implementing"} = next_stage(3_000)
+      refute_receive {:test_loopctl, {:session_ended, _}}, 300
     end
 
     test "a run outliving its Control reports its stages to the one that replaces it", ctx do
@@ -2363,6 +2653,39 @@ defmodule LoopctlRunner.ControlTest do
           )
 
         :ok = wait_until(fn -> Control.info(pid).session_stops_pending == 0 end, 3_000)
+      end)
+    end
+
+    test "a restarted Control holds a finished thread run's end for its checkpoints", ctx do
+      TestLoopctl.put(:checkpoint_replies, [{:error, %{reason: "internal_error"}}])
+      dispatch = story_dispatch()
+      run_dir = Path.join(ctx.config.runs_dir, "recovered-thread-run")
+      File.mkdir_p!(run_dir)
+
+      RunState.update(
+        run_dir,
+        Map.merge(DispatchRun.binding(dispatch), %{
+          "run_id" => Session.uuid4(),
+          "status" => "failed",
+          "reached" => "implementing"
+        })
+      )
+
+      commit = String.duplicate("a", 40)
+
+      File.write!(
+        Path.join(run_dir, "checkpoints.log"),
+        "#{commit} #{String.duplicate("b", 40)}\n"
+      )
+
+      capture_log(fn ->
+        {pid, _ref} = start_accepting(ctx, %{}, checkpoint_poll_ms: 300)
+        :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+        assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^commit}}}, 5_000
+        refute_receive {:test_loopctl, {:session_ended, _}}, 250
+        assert_receive {:test_loopctl, {:checkpoint, %{"commit_sha" => ^commit}}}, 5_000
+        assert %{"reason" => "crashed"} = next_session_ended(5_000)
       end)
     end
 

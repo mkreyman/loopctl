@@ -109,8 +109,10 @@ defmodule LoopctlRunner.DispatchPrompt do
        conflict, commit, and run it again. If it says git would not merge at all (exit 5), commit
        or discard the changes it names that are in the way and run it again. If the push failed
        (exit 4), read what it printed; if it names a network or permission failure you cannot
-       fix, escalate with that text. Do not run git push yourself, do not open a pull request, do
-       not merge anything else, and never force-push: loopctl's merge executor merges the
+       fix, escalate with that text. If it pushed but could not record the push (exit 6), run it
+       again once, since a push it has not recorded is one nothing will ever merge; if it exits 6
+       again, escalate with what it printed. Do not run git push yourself, do not open a pull
+       request, do not merge anything else, and never force-push: loopctl's merge executor merges the
        checkpoints it records from your pushes.
     """
   end

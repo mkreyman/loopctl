@@ -23,6 +23,11 @@ defmodule LoopctlRunner.LoopPushTest do
   end
 
   defp loop_push(dir, env \\ []) do
+    # A run directory of the test's own: a test run inside a loop session must never record in
+    # ITS run directory, and loop-push refuses to push with none.
+    default_run = Path.join(Path.dirname(dir), "default-run")
+    File.mkdir_p!(default_run)
+
     System.cmd(@script, [],
       cd: dir,
       stderr_to_stdout: true,
@@ -30,7 +35,12 @@ defmodule LoopctlRunner.LoopPushTest do
         @no_repo_env ++
           [{"GIT_AUTHOR_NAME", "t"}, {"GIT_AUTHOR_EMAIL", "t@t"}] ++
           [{"GIT_COMMITTER_NAME", "t"}, {"GIT_COMMITTER_EMAIL", "t@t"}] ++
-          Enum.to_list(Map.merge(%{"LOOP_BRANCH" => "loop/story"}, Map.new(env)))
+          Enum.to_list(
+            Map.merge(
+              %{"LOOP_BRANCH" => "loop/story", "LOOP_RUN_DIR" => default_run},
+              Map.new(env)
+            )
+          )
     )
   end
 
@@ -268,5 +278,70 @@ defmodule LoopctlRunner.LoopPushTest do
     assert {_, 0} = loop_push(ctx.session, [{"PATH", bin <> ":" <> System.get_env("PATH")}])
     assert File.exists?(once)
     assert remote_head(ctx) == mine
+  end
+
+  describe "recording each push for the runner" do
+    test "each push appends its commit and tree to the run's checkpoints.log", ctx do
+      run_dir = Path.join(ctx.tmp, "run")
+      File.mkdir_p!(run_dir)
+      log = Path.join(run_dir, "checkpoints.log")
+
+      one = commit!(ctx.session, "one")
+      assert {_, 0} = loop_push(ctx.session, %{"LOOP_RUN_DIR" => run_dir})
+      tree_one = git!(ctx.session, ["rev-parse", "#{one}^{tree}"])
+      assert File.read!(log) == "#{one} #{tree_one}\n"
+
+      # After origin moved, what is recorded is the head that was PUSHED: the merge.
+      move_remote(ctx, "base-update")
+      commit!(ctx.session, "two")
+      assert {_, 0} = loop_push(ctx.session, %{"LOOP_RUN_DIR" => run_dir})
+      pushed = remote_head(ctx)
+      tree = git!(ctx.session, ["rev-parse", "#{pushed}^{tree}"])
+      assert File.read!(log) == "#{one} #{tree_one}\n#{pushed} #{tree}\n"
+    end
+
+    test "a push it cannot record exits 6, says so, and running it again records it", ctx do
+      run_dir = Path.join(ctx.tmp, "run")
+      mine = commit!(ctx.session, "one")
+
+      assert {out, 6} = loop_push(ctx.session, %{"LOOP_RUN_DIR" => run_dir})
+      assert out =~ "pushed #{mine}"
+      assert out =~ "could not record it"
+      assert remote_head(ctx) == mine
+
+      File.mkdir_p!(run_dir)
+      assert {_, 0} = loop_push(ctx.session, %{"LOOP_RUN_DIR" => run_dir})
+      assert File.read!(Path.join(run_dir, "checkpoints.log")) =~ ~r/\A#{mine} [0-9a-f]{40}\n\z/
+    end
+
+    test "a line an earlier append left unfinished is ended before the next is written", ctx do
+      run_dir = Path.join(ctx.tmp, "run")
+      File.mkdir_p!(run_dir)
+      log = Path.join(run_dir, "checkpoints.log")
+      File.write!(log, "abc123")
+      mine = commit!(ctx.session, "one")
+
+      assert {_, 0} = loop_push(ctx.session, %{"LOOP_RUN_DIR" => run_dir})
+      assert File.read!(log) =~ ~r/\Aabc123\n#{mine} [0-9a-f]{40}\n\z/
+    end
+
+    test "with no run directory to record in, nothing is pushed", ctx do
+      commit!(ctx.session, "one")
+
+      assert {out, 2} = loop_push(ctx.session, %{"LOOP_RUN_DIR" => nil})
+      assert out =~ "LOOP_RUN_DIR is not set"
+
+      assert {_, status} =
+               System.cmd("git", [
+                 "-C",
+                 ctx.origin,
+                 "rev-parse",
+                 "--verify",
+                 "-q",
+                 "refs/heads/loop/story"
+               ])
+
+      assert status != 0
+    end
   end
 end

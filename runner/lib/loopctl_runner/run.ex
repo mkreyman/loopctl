@@ -139,7 +139,9 @@ defmodule LoopctlRunner.Run do
       status: if(escalations == [], do: "crashed", else: "escalated"),
       error: error,
       escalations: escalations,
-      reached: recorded_reached(run_dir)
+      reached: recorded_reached(run_dir),
+      # Where its thread session's pushes are recorded, which its end reports wait on.
+      run_dir: run_dir
     }
   end
 
@@ -289,7 +291,9 @@ defmodule LoopctlRunner.Run do
       exit_reason: result.session && Atom.to_string(result.session.reason),
       exit_status: result.session && result.session.exit_status,
       escalations: escalations(run_dir),
-      reached: reached(result)
+      reached: reached(result),
+      # Where its thread session's pushes are recorded, which its end reports wait on.
+      run_dir: run_dir
     }
   end
 

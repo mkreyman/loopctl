@@ -256,7 +256,7 @@ defmodule LoopctlRunner.DispatchPolicy do
   @doc """
   Whether a `thread` session's pushes can reach loopctl: its merge executor merges only the
   checkpoints the runner reports, so a thread session on a build with no checkpoint reporter
-  (`reporter`, `LoopctlRunner.CheckpointStream` in production, from PR #59) would push work
+  (`reporter`, `LoopctlRunner.CheckpointStream` in production) would push work
   nothing ever merges. Such a run is refused `other`; a `pr` session reports nothing and needs
   none.
   """

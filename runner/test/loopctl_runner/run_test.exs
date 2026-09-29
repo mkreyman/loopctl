@@ -653,6 +653,9 @@ defmodule LoopctlRunner.RunTest do
       assert_received {:stage, {:finished, summary}}
       refute_received {:stage, {:worktree, _}}
       assert DispatchRun.end_reports(summary) == []
+      # The run's directory, where a thread session's pushes are recorded: Control holds the
+      # run's end reports until they are checkpoints.
+      assert summary.run_dir == result.run_dir
     end
 
     # Blocks until the deadline guard says `deadline` has passed: a wait on the condition itself,
@@ -1363,6 +1366,12 @@ defmodule LoopctlRunner.RunTest do
 
     assert_received {:stage, {:finished, %{status: "crashed", reached: "claimed"} = summary}}
     assert DispatchRun.end_reports(summary) == [:escalated]
+  end
+
+  test "an unfinished run's summary names its directory", %{root: root} do
+    run_dir = Path.join(root, "unfinished-run")
+    File.mkdir_p!(run_dir)
+    assert %{run_dir: ^run_dir} = Run.unfinished(run_dir, "the run did not finish")
   end
 
   test "a run that crashes after its session escalated ends escalated, not crashed", %{

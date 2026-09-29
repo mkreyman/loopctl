@@ -16,10 +16,15 @@
 # Only the session's own branch, named by LOOP_BRANCH, which the runner sets. Unset is a refusal,
 # not permission to push whatever is checked out: fail closed.
 #
-# Exit 0 pushed (the sha is printed); 2 refused to run (LOOP_BRANCH unset, a detached HEAD, or
+# Each push is recorded for the runner, which reports it to loopctl as a checkpoint: one line,
+# "<commit_sha> <tree_sha>", appended to checkpoints.log in LOOP_RUN_DIR, which the runner sets.
+# Unset is a refusal too: a push nothing records is work nothing merges.
+#
+# Exit 0 pushed and recorded (the sha is printed); 2 refused to run (LOOP_BRANCH or LOOP_RUN_DIR unset, a detached HEAD, or
 # another branch); 3 origin's commits CONFLICT with yours (the merge was aborted, nothing pushed);
 # 4 the push failed, or origin kept moving; 5 git refused to merge at all (uncommitted changes
-# in the way, or a repository error), or a conflicted merge could not be aborted, with git's words.
+# in the way, or a repository error), or a conflicted merge could not be aborted, with git's words;
+# 6 pushed, but the push could not be recorded.
 #
 # Nothing it runs can wait on a person or on a dead connection: no credential prompt, ssh in
 # BatchMode with keepalives, and https given up when it stalls. An operator's own GIT_SSH_COMMAND
@@ -32,6 +37,11 @@ net=(-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60)
 
 if [ -z "${LOOP_BRANCH:-}" ]; then
     echo "loop-push: LOOP_BRANCH is not set, so there is no branch this session may push" >&2
+    exit 2
+fi
+
+if [ -z "${LOOP_RUN_DIR:-}" ]; then
+    echo "loop-push: LOOP_RUN_DIR is not set, so a push could not be recorded for loopctl to merge" >&2
     exit 2
 fi
 
@@ -94,7 +104,23 @@ for attempt in 1 2 3; do
     fi
 
     if out=$(git "${net[@]}" push --porcelain origin "HEAD:refs/heads/$branch" 2>&1); then
-        echo "pushed $(git rev-parse HEAD) to origin/$branch"
+        sha=$(git rev-parse HEAD)
+        # What loopctl merges is what the runner reports, and it reports what is recorded here:
+        # a push left unrecorded is work nothing ever merges, so it is a failure, and running
+        # loop-push again (nothing new to push) records it.
+        # An append a full disk cut short left a line with no newline: end it first, so this
+        # line is whole and the fragment is a line of its own the runner skips.
+        log="$LOOP_RUN_DIR/checkpoints.log"
+        lead=""
+        if [ -s "$log" ] && [ -n "$(tail -c 1 "$log")" ]; then
+            lead='\n'
+        fi
+        if ! tree=$(git rev-parse "HEAD^{tree}") ||
+            ! printf "$lead%s %s\\n" "$sha" "$tree" >> "$log"; then
+            echo "loop-push: pushed $sha to origin/$branch, but could not record it for loopctl, so nothing will merge it; run loop-push again" >&2
+            exit 6
+        fi
+        echo "pushed $sha to origin/$branch"
         exit 0
     fi
 

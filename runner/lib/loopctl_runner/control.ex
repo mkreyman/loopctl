@@ -258,6 +258,17 @@ defmodule LoopctlRunner.Control do
   the only message that frees the slot — so, unlike an implement run's, its dispatch is never
   forgotten (`sessionless_end?/1`), and a re-send is answered `accepted` with nothing new behind it.
 
+  ## Checkpoints
+
+  While joined, the client reports each commit a thread session pushed as a `checkpoint`
+  (`LoopctlRunner.CheckpointStream`), from the log `loop-push` appends to in the run's directory,
+  one push in flight at a time, oldest first. A line is settled once answered: `ok` (a resend is
+  `replayed`), or a permanent refusal of those bytes, logged. A claim-ending refusal stops the
+  run's checkpoints and ends the claim as above; `dispatch_not_accepted` waits while this
+  runner's accept is outstanding and otherwise ends the run; `rate_limited` waits loopctl's
+  interval; anything else backs the run off a poll and, after `@checkpoint_attempts` tries, gives
+  that one line up. With nothing to send it looks again every `:checkpoint_poll_ms`.
+
   ## Trace shipping
 
   While joined, the client ships run traces as `LoopctlRunner.TraceShip` decides: a
@@ -307,6 +318,7 @@ defmodule LoopctlRunner.Control do
   require Logger
 
   alias LoopctlRunner.{
+    CheckpointStream,
     ClaimEnded,
     Config,
     Contract,
@@ -655,7 +667,21 @@ defmodule LoopctlRunner.Control do
             trace_settled: %{},
             trace_poll_ms: Keyword.get(opts, :trace_poll_ms, 2_000),
             # TraceShip.runs/1, replaceable so a test can count how often run state is scanned.
-            trace_find_runs: Keyword.get(opts, :trace_find_runs, &TraceShip.runs/1)
+            trace_find_runs: Keyword.get(opts, :trace_find_runs, &TraceShip.runs/1),
+            # Checkpoints: the one push awaiting its reply, its timer, per-run backoff and
+            # transient-failure counts, and the poll interval.
+            checkpoint_push: nil,
+            checkpoint_timer: nil,
+            checkpoint_backoff: %{},
+            checkpoint_failures: %{},
+            checkpoint_poll_ms: Keyword.get(opts, :checkpoint_poll_ms, 2_000),
+            # nil: `@max_checkpoint_backoff_ms` (`checkpoint_max_backoff/1`).
+            checkpoint_max_backoff_ms: Keyword.get(opts, :checkpoint_max_backoff_ms),
+            # How long a checkpoint waits for its reply before it is tried again.
+            checkpoint_reply_ms: Keyword.get(opts, :checkpoint_reply_ms, 30_000),
+            # `CheckpointStream.candidates/1`, re-scanned on a poll, reused between them.
+            checkpoint_candidates: nil,
+            checkpoint_refresh: true
           )
 
         # What a crashed predecessor left unfinished: accepts whose run never started, triage
@@ -800,6 +826,7 @@ defmodule LoopctlRunner.Control do
      |> schedule_reply_backlog()
      |> schedule_verdict_backlog()
      |> schedule_trace(0, true)
+     |> schedule_checkpoint(0)
      |> resume_stages()}
   end
 
@@ -911,12 +938,21 @@ defmodule LoopctlRunner.Control do
       trace_runs: nil,
       trace_push: nil,
       trace_timer: cancel_reply_timer(socket.assigns.trace_timer),
+      # A checkpoint in flight is sent again after the rejoin: its line is not settled until an
+      # answer is, and loopctl answers an identical resend `ok, replayed: true`.
+      checkpoint_push: nil,
+      checkpoint_timer: cancel_reply_timer(socket.assigns.checkpoint_timer),
+      checkpoint_refresh: true,
       # A stage report stays at the head of its queue until acknowledged, so one in flight is
       # simply sent again, in order, after the rejoin.
       stage_refs: %{},
       stage_streams:
         Map.new(socket.assigns.stage_streams, fn {id, stream} ->
-          {id, %{stream | push: nil, timer: cancel_reply_timer(stream.timer)}}
+          # No checkpoint goes while unjoined, so the end-report hold starts again on the rejoin.
+          held = if stream.end_held_since == :expired, do: :expired, else: nil
+
+          {id,
+           %{stream | push: nil, timer: cancel_reply_timer(stream.timer), end_held_since: held}}
         end)
     )
   end
@@ -1055,6 +1091,27 @@ defmodule LoopctlRunner.Control do
 
   def handle_info({:trace_tick, _stale_token, _refresh?}, socket), do: {:noreply, socket}
 
+  # One checkpoint step per tick, and only the current timer's tick on a joined channel.
+  def handle_info(
+        {:checkpoint_tick, token},
+        %{assigns: %{joined: true, checkpoint_timer: {_timer, token}}} = socket
+      ),
+      do: {:noreply, socket |> assign(checkpoint_timer: nil) |> checkpoint_step()}
+
+  def handle_info({:checkpoint_tick, _stale_token}, socket), do: {:noreply, socket}
+
+  # A checkpoint loopctl has not answered in `checkpoint_reply_ms` is tried again, as a failure
+  # this runner cannot read, so one lost reply never holds every run's checkpoints until a rejoin.
+  # Its reply arriving later names a ref nothing waits on, and is dropped; the resend is answered
+  # `replayed`.
+  def handle_info(
+        {:checkpoint_unanswered, ref},
+        %{assigns: %{checkpoint_push: %{ref: ref}}} = socket
+      ),
+      do: {:noreply, checkpoint_answered({:error, %{"reason" => "unanswered"}}, socket)}
+
+  def handle_info({:checkpoint_unanswered, _stale_ref}, socket), do: {:noreply, socket}
+
   # What a run reports through Run.execute/3's :on_stage callback.
   def handle_info({:run_stage, binding, event}, socket) when is_map(binding),
     do: {:noreply, run_message(socket, binding, event)}
@@ -1144,6 +1201,7 @@ defmodule LoopctlRunner.Control do
         trace_acked:
           Map.new(a.trace_positions, fn {run_id, %{acked: acked}} -> {run_id, acked} end),
         trace_push_pending: a.trace_push != nil,
+        checkpoint_push_pending: a.checkpoint_push != nil,
         # The value this runner reports, which is not the set_draining/2 flag while no dispatch
         # can be accepted. It is what the next status carries, not proof loopctl received it:
         # runner_pool can lag it while a push is pending, rate-limited or lost with the socket.
@@ -1180,6 +1238,9 @@ defmodule LoopctlRunner.Control do
 
       match?(%{ref: ^ref}, socket.assigns.trace_push) ->
         {:ok, trace_answered(reply, socket)}
+
+      match?(%{ref: ^ref}, socket.assigns.checkpoint_push) ->
+        {:ok, checkpoint_answered(reply, socket)}
 
       Map.has_key?(socket.assigns.stage_refs, ref) ->
         {:ok, stage_answered(ref, reply, socket)}
@@ -1368,6 +1429,23 @@ defmodule LoopctlRunner.Control do
   # these two carried `|| 250` while 250 is exactly what the contract publishes, so a renamed key
   # would have changed nothing observable on the implement path either.
   @burst_refill_ms Map.fetch!(Contract.connection(), "limits")
+
+  # How many times a checkpoint loopctl answers with neither an ack nor a refusal this runner
+  # understands is tried before that one line is given up, when a later line carries its work.
+  @checkpoint_attempts 8
+
+  # The longest a failing checkpoint waits between tries.
+  @max_checkpoint_backoff_ms 60_000
+
+  # How many times the LAST line is tried before it too is given up: a refusal this runner does
+  # not recognise must not be resent for as long as the run directory lasts. At the one-minute
+  # backoff cap, about half an hour.
+  @last_checkpoint_attempts 30
+
+  # How long a run's end reports wait for its recorded pushes to be settled
+  # (`hold_end_for_checkpoints/3`). Past it the end goes anyway: a slot loopctl never gets back is
+  # worse than a checkpoint it never got, and whatever held it is logged.
+  @checkpoint_hold_ms 10 * 60_000
 
   @stage_retry_ms Map.fetch!(Map.fetch!(@burst_refill_ms, "stage_burst"), "refill_interval_ms")
 
@@ -2123,7 +2201,13 @@ defmodule LoopctlRunner.Control do
     summary =
       if status in [nil, "starting", "running"],
         do: Run.unfinished(run_dir, "the run did not finish on a live runner"),
-        else: %{status: status, reached: state["reached"], escalations: Run.escalations(run_dir)}
+        else: %{
+          status: status,
+          reached: state["reached"],
+          escalations: Run.escalations(run_dir),
+          # Where a thread session's pushes are recorded, which its end reports wait on.
+          run_dir: run_dir
+        }
 
     # A run with no end to report (`DispatchRun.end_reports/1`: an implement run that passed its
     # deadline before it began) queues nothing, and its stream goes at once rather than lingering.
@@ -2378,7 +2462,11 @@ defmodule LoopctlRunner.Control do
       judgement_since: nil,
       run_dir: nil,
       claim_ended: false,
-      stop_session: false
+      stop_session: false,
+      # A thread run's directory, where loop-push records its pushes, and since when its end
+      # reports have waited for them to be settled (`hold_end_for_checkpoints/3`).
+      checkpoint_dir: nil,
+      end_held_since: nil
     }
 
   # Every stream is opened through here, so each honours a claim recorded over
@@ -2455,7 +2543,8 @@ defmodule LoopctlRunner.Control do
   defp queue_end(socket, id, summary) do
     case socket.assigns.stage_streams[id] do
       %{ended: false} = stream ->
-        socket = put_stream(socket, id, %{stream | ended: true})
+        socket =
+          put_stream(socket, id, %{stream | ended: true, checkpoint_dir: summary[:run_dir]})
 
         # A claim loopctl already ended takes no escalation; one that was the run's LAST end report
         # is recorded refused, as its refusal would have been, so a later Control does not send it.
@@ -2653,13 +2742,64 @@ defmodule LoopctlRunner.Control do
     case a.stage_streams[id] do
       %{push: nil, timer: nil} = stream ->
         if a.joined,
-          do: push_next(socket, id, stream),
+          do: hold_end_for_checkpoints(socket, id, stream),
           else: socket
 
       _ ->
         socket
     end
   end
+
+  # A thread run's end reports wait until every push its session recorded is settled as a
+  # checkpoint: a `session_ended` (`crashed`, `max_turns_exceeded`) or a terminal `escalated` can end
+  # or release the claim, and a checkpoint sent after that is refused, so the session's last pushed
+  # work would never be merged. Bounded by `@checkpoint_hold_ms`, past which the end goes and what
+  # held it is logged; a claim already recorded over sends no checkpoint and holds nothing.
+  defp hold_end_for_checkpoints(socket, id, %{ended: true, claim_ended: false} = stream)
+       when is_binary(stream.checkpoint_dir) and stream.end_held_since != :expired do
+    if end_payload_next?(stream) and checkpoints_pending?(socket, stream.checkpoint_dir) do
+      now = now_ms()
+      since = stream.end_held_since || now
+
+      if stream.end_held_since == nil,
+        do: Logger.info("the run's end reports wait for its checkpoints", stage_ids(stream))
+
+      if now - since >= @checkpoint_hold_ms do
+        Logger.error(
+          "the run's end reports waited #{div(now - since, 1000)} s for its checkpoints; " <>
+            "sending them with checkpoints still unsettled in #{stream.checkpoint_dir}",
+          stage_ids(stream)
+        )
+
+        stream = %{stream | end_held_since: :expired}
+        socket |> put_stream(id, stream) |> push_next(id, stream)
+      else
+        token = make_ref()
+
+        timer =
+          Process.send_after(self(), {:stage_retry, id, token}, socket.assigns.checkpoint_poll_ms)
+
+        put_stream(socket, id, %{stream | end_held_since: since, timer: {timer, token}})
+      end
+    else
+      push_next(socket, id, stream)
+    end
+  end
+
+  defp hold_end_for_checkpoints(socket, id, stream), do: push_next(socket, id, stream)
+
+  # Checkpoints still to go that this process will send: not a run parked for good because its
+  # stop could not be written.
+  defp checkpoints_pending?(socket, run_dir),
+    do:
+      Map.get(socket.assigns.checkpoint_backoff, run_dir) != :infinity and
+        CheckpointStream.unsettled?(run_dir)
+
+  # Only an END report waits: the terminal `-> escalated` or what goes behind the stage reports.
+  # A stage report still queued ahead of them goes as it would have.
+  defp end_payload_next?(%{queue: [%{"to" => "escalated"} | _]}), do: true
+  defp end_payload_next?(%{queue: [_ | _]}), do: false
+  defp end_payload_next?(_stream), do: true
 
   # The stage reports first, in order, then a review's judgements, and the `session_ended` only
   # behind the last of them.
@@ -2965,11 +3105,7 @@ defmodule LoopctlRunner.Control do
   end
 
   defp judgement_backoff(socket, tries),
-    do:
-      min(
-        socket.assigns.stage_retry_ms * Integer.pow(2, min(tries - 1, 16)),
-        @max_judgement_backoff_ms
-      )
+    do: capped_backoff(socket.assigns.stage_retry_ms, tries, 16, @max_judgement_backoff_ms)
 
   # The head is tried again, and nothing behind it goes first — until `judgement_retry_budget_ms`
   # has passed since it FIRST failed. Then everything still owed is given up WHOLE, the verdict
@@ -3474,10 +3610,7 @@ defmodule LoopctlRunner.Control do
 
     delay =
       delay ||
-        min(
-          socket.assigns.stage_retry_ms * Integer.pow(2, min(tries - 1, 10)),
-          @max_stage_backoff_ms
-        )
+        capped_backoff(socket.assigns.stage_retry_ms, tries, 10, @max_stage_backoff_ms)
 
     token = make_ref()
     timer = Process.send_after(self(), {:stage_retry, id, token}, delay)
@@ -4597,6 +4730,274 @@ defmodule LoopctlRunner.Control do
 
   defp verdict_ids(payload),
     do: [dispatch_id: payload["dispatch_id"], claim_epoch: payload["claim_epoch"]]
+
+  # --- Checkpoints (CheckpointStream reads and decides, this process pushes) ---
+
+  defp schedule_checkpoint(%{assigns: %{checkpoint_timer: timer}} = socket, _ms)
+       when timer != nil,
+       do: socket
+
+  defp schedule_checkpoint(socket, ms) do
+    token = make_ref()
+    timer = Process.send_after(self(), {:checkpoint_tick, token}, ms)
+    assign(socket, checkpoint_timer: {timer, token})
+  end
+
+  # A poll re-scans the run directories; a step straight after a reply works from the last scan.
+  defp poll_checkpoints(socket) do
+    socket
+    |> assign(checkpoint_refresh: true)
+    |> schedule_checkpoint(socket.assigns.checkpoint_poll_ms)
+  end
+
+  defp checkpoint_step(%{assigns: %{checkpoint_push: push}} = socket) when push != nil,
+    do: socket
+
+  defp checkpoint_step(socket) do
+    {socket, runs} = checkpoint_runs(socket)
+    socket = prune_checkpoint_state(socket, runs)
+
+    case next_checkpoint(socket, runs) do
+      nil ->
+        poll_checkpoints(socket)
+
+      {_run, {:ok, payload, run}} ->
+        push_checkpoint(socket, run, payload)
+
+      {_run, {:skip, why, run}} ->
+        Logger.error("checkpoint not sent, and skipped: #{why}", checkpoint_ids(run))
+        socket |> checkpoint_settled(run) |> schedule_checkpoint(0)
+
+      {run, {:error, why}} ->
+        Logger.warning("checkpoints wait: #{why}", checkpoint_ids(run))
+
+        socket
+        |> checkpoint_back_off(run, checkpoint_tries(socket, run))
+        |> schedule_checkpoint(0)
+
+      {run, {:stop, why}} ->
+        Logger.error("no more checkpoints are reported for this run: #{why}", checkpoint_ids(run))
+        socket |> checkpoint_stopped(run, "unreadable_log") |> schedule_checkpoint(0)
+    end
+  end
+
+  # The runs with something to report: from the last scan of every run directory, re-scanned
+  # only on a poll (or before the first).
+  defp checkpoint_runs(socket) do
+    runs_dir = socket.assigns.config.runs_dir
+
+    candidates =
+      if socket.assigns.checkpoint_refresh or socket.assigns.checkpoint_candidates == nil,
+        do: CheckpointStream.candidates(runs_dir),
+        else: socket.assigns.checkpoint_candidates
+
+    socket = assign(socket, checkpoint_candidates: candidates, checkpoint_refresh: false)
+    {socket, CheckpointStream.runs(runs_dir, candidates)}
+  end
+
+  # The first run not backing off with something to act on: one whose log ends in a line still
+  # being written has nothing yet, and must not hold the runs after it.
+  defp next_checkpoint(socket, runs) do
+    now = now_ms()
+
+    runs
+    |> Enum.filter(&(Map.get(socket.assigns.checkpoint_backoff, &1.run_dir, now) <= now))
+    |> Enum.find_value(fn run ->
+      case CheckpointStream.next(run) do
+        :none -> nil
+        step -> {run, step}
+      end
+    end)
+  end
+
+  # What is kept per run is kept only while the run still has something to report: a run settled,
+  # stopped on disk, or removed by the reaper leaves nothing behind in this process.
+  defp prune_checkpoint_state(socket, runs) do
+    dirs = MapSet.new(runs, & &1.run_dir)
+
+    assign(socket,
+      checkpoint_backoff:
+        Map.filter(socket.assigns.checkpoint_backoff, fn {dir, _} -> dir in dirs end),
+      checkpoint_failures:
+        Map.filter(socket.assigns.checkpoint_failures, fn {{dir, _}, _} -> dir in dirs end)
+    )
+  end
+
+  defp push_checkpoint(socket, run, payload) do
+    case push_event(socket, socket.assigns.topic, "checkpoint", payload) do
+      {:ok, ref} ->
+        Process.send_after(
+          self(),
+          {:checkpoint_unanswered, ref},
+          socket.assigns.checkpoint_reply_ms
+        )
+
+        assign(socket, checkpoint_push: %{ref: ref, run: run, sha: payload["commit_sha"]})
+
+      {:error, reason} ->
+        Logger.warning("checkpoint not sent: #{inspect(reason)}", checkpoint_ids(run))
+        poll_checkpoints(socket)
+    end
+  end
+
+  defp checkpoint_answered(reply, socket) do
+    %{run: run, sha: sha} = socket.assigns.checkpoint_push
+    socket = assign(socket, checkpoint_push: nil)
+    ids = checkpoint_ids(run) ++ [commit_sha: sha]
+
+    case CheckpointStream.classify(reply) do
+      :recorded ->
+        Logger.info("checkpoint #{sha} recorded", ids)
+        socket |> checkpoint_settled(run) |> schedule_checkpoint(0)
+
+      {:refused, reason} ->
+        Logger.error("loopctl refused checkpoint #{sha} (#{reason}); it is not sent again", ids)
+        socket |> checkpoint_settled(run) |> schedule_checkpoint(0)
+
+      {:claim_over, reason} ->
+        socket
+        |> checkpoint_stopped(run, reason)
+        |> end_claim(run.dispatch_id, run.claim_epoch, "checkpoint", reason)
+        |> schedule_checkpoint(0)
+
+      {:not_accepted, reason} ->
+        if accept_outstanding?(socket, run.dispatch_id, run.claim_epoch) do
+          Logger.info("checkpoint waits for this runner's accept to be recorded", ids)
+
+          socket
+          |> checkpoint_back_off(run, checkpoint_tries(socket, run))
+          |> schedule_checkpoint(0)
+        else
+          socket
+          |> checkpoint_stopped(run, reason)
+          |> end_run(
+            run.dispatch_id,
+            run.claim_epoch,
+            "checkpoint",
+            "dispatch_not_accepted, with no accept of this runner's outstanding"
+          )
+          |> schedule_checkpoint(0)
+        end
+
+      # This run waits loopctl's interval, bounded like any backoff; the others go on.
+      {:rate_limited, refusal} ->
+        wait =
+          min(
+            refusal_interval(refusal, socket.assigns.checkpoint_poll_ms),
+            checkpoint_max_backoff(socket)
+          )
+
+        socket |> checkpoint_wait(run, wait) |> schedule_checkpoint(0)
+
+      {:transient, reason} ->
+        checkpoint_transient(socket, run, sha, reason, ids)
+    end
+  end
+
+  # A reply this runner cannot act on is tried again, backing off, a few times; then a line that a
+  # later recorded line follows is given up, since that later commit contains it and it must not
+  # hold every one behind it. The LAST line is never given up: nothing after it would carry its
+  # work, and the run's end reports wait for it (`hold_end_for_checkpoints/3`) until loopctl
+  # answers it one way or the other, or ends the claim.
+  defp checkpoint_transient(socket, run, sha, reason, ids) do
+    tries = checkpoint_tries(socket, run)
+
+    if (tries >= @checkpoint_attempts and run.later?) or tries >= @last_checkpoint_attempts do
+      Logger.error(
+        "checkpoint #{sha} failed #{tries} times (#{reason}); giving it up, a later one carries it",
+        ids
+      )
+
+      socket |> checkpoint_settled(run) |> schedule_checkpoint(0)
+    else
+      Logger.warning("checkpoint #{sha} failed (#{reason}); trying again", ids)
+      socket |> checkpoint_back_off(run, tries) |> schedule_checkpoint(0)
+    end
+  end
+
+  defp checkpoint_tries(socket, run),
+    do: Map.get(socket.assigns.checkpoint_failures, {run.run_dir, run.sent}, 0) + 1
+
+  # A settle that cannot be written leaves the line unsettled: it is sent again, and a resend is
+  # answered `replayed`. The run backs off first, so a disk that refuses the write costs one
+  # message per backoff, never a loop.
+  defp checkpoint_settled(socket, run) do
+    case CheckpointStream.settle(run) do
+      :ok ->
+        failures =
+          Map.reject(socket.assigns.checkpoint_failures, fn {{dir, _}, _} ->
+            dir == run.run_dir
+          end)
+
+        assign(socket,
+          checkpoint_failures: failures,
+          checkpoint_backoff: Map.delete(socket.assigns.checkpoint_backoff, run.run_dir)
+        )
+
+      {:error, why} ->
+        Logger.warning(
+          "could not record a settled checkpoint (#{inspect(why)})",
+          checkpoint_ids(run)
+        )
+
+        checkpoint_back_off(socket, run, checkpoint_tries(socket, run))
+    end
+  end
+
+  # Recorded on disk, so `CheckpointStream.runs/1` does not find this run again; only when that
+  # write fails is it kept in memory, as a backoff that never ends.
+  defp checkpoint_stopped(socket, run, reason) do
+    case CheckpointStream.stop(run, reason) do
+      :ok ->
+        socket
+
+      {:error, why} ->
+        Logger.warning(
+          "could not record that checkpoints stopped (#{inspect(why)})",
+          checkpoint_ids(run)
+        )
+
+        backoff = Map.put(socket.assigns.checkpoint_backoff, run.run_dir, :infinity)
+        assign(socket, checkpoint_backoff: backoff)
+    end
+  end
+
+  # The `tries`th consecutive failure of the run's current line waits a poll, doubling each time,
+  # up to `@max_checkpoint_backoff_ms`.
+  defp checkpoint_back_off(socket, run, tries) do
+    delay =
+      capped_backoff(
+        socket.assigns.checkpoint_poll_ms,
+        tries,
+        10,
+        checkpoint_max_backoff(socket)
+      )
+
+    socket
+    |> checkpoint_wait(run, delay)
+    |> assign(
+      checkpoint_failures:
+        Map.put(socket.assigns.checkpoint_failures, {run.run_dir, run.sent}, tries)
+    )
+  end
+
+  defp checkpoint_max_backoff(socket),
+    do: socket.assigns.checkpoint_max_backoff_ms || @max_checkpoint_backoff_ms
+
+  defp checkpoint_wait(socket, run, delay),
+    do:
+      assign(socket,
+        checkpoint_backoff:
+          Map.put(socket.assigns.checkpoint_backoff, run.run_dir, now_ms() + delay)
+      )
+
+  # `base` doubled for each try after the first, the doubling capped at 2^`exp_cap`, the result at
+  # `max`.
+  defp capped_backoff(base, tries, exp_cap, max),
+    do: min(base * Integer.pow(2, min(tries - 1, exp_cap)), max)
+
+  defp checkpoint_ids(run),
+    do: [dispatch_id: run.dispatch_id, claim_epoch: run.claim_epoch, run_dir: run.run_dir]
 
   # --- Trace shipping (TraceShip decides, this process pushes) ---
 
