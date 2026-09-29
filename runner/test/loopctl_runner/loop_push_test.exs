@@ -223,7 +223,8 @@ defmodule LoopctlRunner.LoopPushTest do
     commit!(ctx.session, "two")
 
     assert {out, 4} = loop_push(ctx.session)
-    assert out =~ "loop-push: the push failed"
+    assert out =~ "loop-push: could not ask origin where loop/story is"
+    assert out =~ "does not appear to be a git repository"
   end
 
   test "a tag sharing the branch's name does not stop it pushing its own branch", ctx do
@@ -252,32 +253,185 @@ defmodule LoopctlRunner.LoopPushTest do
     assert git!(ctx.session, ["rev-parse", "HEAD"]) == mine
   end
 
-  test "a push origin refuses mid-update, its ref lock moved, goes round again", ctx do
-    commit!(ctx.session, "one")
-    {_, 0} = loop_push(ctx.session)
-    bin = Path.join(ctx.tmp, "locking-bin")
+  # A git whose pushes run `on_push` and fail, printing `said` on stdout, as git's porcelain status
+  # and a pre-push hook's own output both come. Returns the environment that puts it first on
+  # PATH, and a file counting its pushes.
+  defp failing_push_git!(ctx, said, on_push \\ ":") do
+    bin = Path.join(ctx.tmp, "failing-bin")
     File.mkdir_p!(bin)
     real = System.find_executable("git")
-    once = Path.join(ctx.tmp, "refused")
+    count = Path.join(ctx.tmp, "pushes")
 
-    # What origin says when the branch moved between advertising it and updating it.
     File.write!(Path.join(bin, "git"), """
     #!/bin/sh
-    case " $* " in *" push "*) is_push=1 ;; *) is_push= ;; esac
-    if [ -n "$is_push" ] && [ ! -e "#{once}" ]; then
-        touch "#{once}"
-        echo " ! refs/heads/loop/story [remote rejected] (cannot lock ref 'refs/heads/loop/story')"
-        exit 1
-    fi
+    case " $* " in *" push "*)
+        echo x >> "#{count}"
+        #{on_push}
+        printf '%b\\n' "#{said}"
+        exit 1 ;;
+    esac
     exec "#{real}" "$@"
     """)
 
     File.chmod!(Path.join(bin, "git"), 0o755)
+    {[{"PATH", bin <> ":" <> System.get_env("PATH")}], count}
+  end
+
+  # An update hook on origin that moves the branch after origin advertised it and before it
+  # updates it, so receive-pack itself refuses the push: once, or every time.
+  defp moving_origin!(ctx, times) do
+    hooks = Path.join(ctx.tmp, "origin-hooks")
+    File.mkdir_p!(hooks)
+    moves = Path.join(ctx.tmp, "origin-moves")
+
+    File.write!(Path.join(hooks, "update"), """
+    #!/bin/sh
+    n=$(cat "#{moves}" 2>/dev/null || echo 0)
+    if [ "$n" -lt #{times} ]; then
+        echo $((n + 1)) > "#{moves}"
+        head=$(git rev-parse refs/heads/loop/story)
+        moved=$(git commit-tree "$head^{tree}" -p "$head" -m "moved by origin $n")
+        git update-ref refs/heads/loop/story "$moved"
+    fi
+    exit 0
+    """)
+
+    File.chmod!(Path.join(hooks, "update"), 0o755)
+    git!(ctx.origin, ["config", "core.hooksPath", hooks])
+    moves
+  end
+
+  test "origin's own refusal of a branch moved under it is fetched, merged and pushed past",
+       ctx do
+    commit!(ctx.session, "one")
+    {_, 0} = loop_push(ctx.session)
+    moves = moving_origin!(ctx, 1)
     mine = commit!(ctx.session, "two")
 
-    assert {_, 0} = loop_push(ctx.session, [{"PATH", bin <> ":" <> System.get_env("PATH")}])
-    assert File.exists?(once)
-    assert remote_head(ctx) == mine
+    assert {_, 0} = loop_push(ctx.session)
+    assert File.read!(moves) == "1\n"
+    assert git!(ctx.origin, ["merge-base", "--is-ancestor", mine, remote_head(ctx)]) == ""
+  end
+
+  test "a branch origin keeps moving gives up after three pushes, saying what origin answered",
+       ctx do
+    commit!(ctx.session, "one")
+    {_, 0} = loop_push(ctx.session)
+    moving_origin!(ctx, 9)
+    commit!(ctx.session, "two")
+
+    assert {out, 4} = loop_push(ctx.session)
+    assert out =~ "kept moving across 3 attempts"
+    assert out =~ "remote rejected"
+  end
+
+  test "a refusal with origin unmoved exits at once with git's words", ctx do
+    commit!(ctx.session, "one")
+    {_, 0} = loop_push(ctx.session)
+
+    {env, count} =
+      failing_push_git!(ctx, "!\\tHEAD:refs/heads/loop/story\\t[rejected] (needs force)")
+
+    commit!(ctx.session, "two")
+
+    assert {out, 4} = loop_push(ctx.session, env)
+    assert out =~ "origin's loop/story did not move"
+    assert out =~ "[rejected] (needs force)"
+    assert File.read!(count) == "x\n"
+  end
+
+  test "a failing hook's output decides nothing, whatever it prints, and is shown", ctx do
+    commit!(ctx.session, "one")
+    {_, 0} = loop_push(ctx.session)
+
+    # A pre-push hook fails having printed, on stdout, its reason and a line shaped like git's.
+    {env, count} =
+      failing_push_git!(
+        ctx,
+        "e2e checks FAILED\\n!\\tHEAD:refs/heads/loop/story\\t[rejected] (non-fast-forward)"
+      )
+
+    commit!(ctx.session, "two")
+
+    assert {out, 4} = loop_push(ctx.session, env)
+    assert out =~ "e2e checks FAILED"
+    assert File.read!(count) == "x\n"
+  end
+
+  test "a branch deleted after origin moved it is not pushed back on the next round", ctx do
+    commit!(ctx.session, "one")
+    {_, 0} = loop_push(ctx.session)
+
+    # The first push is refused as origin moves the branch; the second, after the merge, as loopctl
+    # merges the thread and deletes it.
+    {env, count} =
+      failing_push_git!(ctx, "!\\tHEAD:refs/heads/loop/story\\t[remote rejected] (refused)", """
+      n=$(wc -l < "#{Path.join(ctx.tmp, "pushes")}")
+      if [ "$n" -eq 1 ]; then
+          head=$(git -C "#{ctx.origin}" rev-parse refs/heads/loop/story)
+          moved=$(git -C "#{ctx.origin}" commit-tree "$head^{tree}" -p "$head" -m moved)
+          git -C "#{ctx.origin}" update-ref refs/heads/loop/story "$moved"
+      else
+          git -C "#{ctx.origin}" update-ref -d refs/heads/loop/story
+      fi
+      """)
+
+    commit!(ctx.session, "two")
+
+    assert {out, 4} = loop_push(ctx.session, env)
+    assert out =~ "origin deleted loop/story after a push was refused"
+    assert File.read!(count) == "x\nx\n"
+
+    assert {_, 128} =
+             System.cmd(
+               "git",
+               ["-C", ctx.origin, "rev-parse", "--verify", "refs/heads/loop/story"],
+               stderr_to_stdout: true
+             )
+  end
+
+  test "a long refusal keeps the reason at its top and git's words at its bottom", ctx do
+    commit!(ctx.session, "one")
+    {_, 0} = loop_push(ctx.session)
+    filler = Enum.map_join(1..40, "\\n", &"trace line #{&1}")
+
+    {env, _count} =
+      failing_push_git!(
+        ctx,
+        "e2e checks FAILED: invoice_test\\n#{filler}\\nerror: failed to push"
+      )
+
+    commit!(ctx.session, "two")
+
+    assert {out, 4} = loop_push(ctx.session, env)
+    assert out =~ "e2e checks FAILED: invoice_test"
+    assert out =~ "error: failed to push"
+    refute out =~ "trace line 20\n"
+  end
+
+  test "a branch origin deleted during the push is not pushed back", ctx do
+    commit!(ctx.session, "one")
+    {_, 0} = loop_push(ctx.session)
+
+    {env, count} =
+      failing_push_git!(
+        ctx,
+        "!\\tHEAD:refs/heads/loop/story\\t[remote rejected] (reference does not exist)",
+        ~s(git -C "#{ctx.origin}" update-ref -d refs/heads/loop/story)
+      )
+
+    commit!(ctx.session, "two")
+
+    assert {out, 4} = loop_push(ctx.session, env)
+    assert out =~ "origin deleted loop/story after a push was refused"
+    assert File.read!(count) == "x\n"
+
+    assert {_, 128} =
+             System.cmd(
+               "git",
+               ["-C", ctx.origin, "rev-parse", "--verify", "refs/heads/loop/story"],
+               stderr_to_stdout: true
+             )
   end
 
   describe "recording each push for the runner" do

@@ -8,10 +8,14 @@
 # session. A push from the stale local head is then refused as non-fast-forward, and a FORCED
 # push would erase the base update and create a head nobody reported (loopctl-runner#56). So:
 #
-#   1. fetch origin's copy of the session's branch;
+#   1. ask origin where the session's branch is, and fetch it when that is not what the
+#      repository already holds;
 #   2. if origin has commits this branch lacks, MERGE them (merge, not rebase: a rebase rewrites
 #      commits that may already be reported as checkpoints);
-#   3. push without force; a non-fast-forward means origin moved again, so go back to 1.
+#   3. push without force. Refused: back to 1, which asks origin again. The branch moved since
+#      (another push, loopctl's merge executor): go round. It did not move: the refusal is
+#      something else, and git's words are shown. It was deleted: loopctl merged the thread, and
+#      pushing would bring it back, so stop. Git's own words never decide.
 #
 # Only the session's own branch, named by LOOP_BRANCH, which the runner sets. Unset is a refusal,
 # not permission to push whatever is checked out: fail closed.
@@ -59,24 +63,54 @@ fi
 branch=$LOOP_BRANCH
 
 remote="refs/remotes/origin/$branch"
-fetch_error=""
+# Where origin's branch was when the last refused push was made, and what that push said.
+prev=""
+said=""
 
-for attempt in 1 2 3; do
-    # A branch origin does not have yet fetches nothing, and a failed fetch is not fatal: a push
-    # from a stale view is refused by origin, which sends this loop round again. Its words are
-    # kept, because a fetch that fails every time is the real reason a push keeps being refused.
-    # Only a ref THIS fetch refreshed is merged: a failed fetch leaves whatever the repository held
-    # before, and for a branch origin deleted (a squash-merged story re-dispatched) that is old,
-    # already-shipped history.
-    fetched=""
-    if out=$(git "${net[@]}" fetch --quiet origin "+refs/heads/$branch:$remote" 2>&1); then
-        fetch_error=""
-        fetched=1
+# The first and last lines of `$1` when it is long: a hook's reason is often at the top, git's own
+# at the bottom.
+brief() {
+    printf '%s\n' "$1" | awk '{ line[NR] = $0 } END {
+        if (NR <= 30) { for (i = 1; i <= NR; i++) print line[i] }
+        else { for (i = 1; i <= 15; i++) print line[i]; print "..."; for (i = NR - 14; i <= NR; i++) print line[i] }
+    }'
+}
+
+# Three pushes; a fourth round only asks origin what became of the third.
+for attempt in 1 2 3 4; do
+    # Where origin's branch is now: a commit, or "none" when origin has no such branch.
+    if ls_out=$(git "${net[@]}" ls-remote --exit-code origin "refs/heads/$branch" 2>&1); then
+        now=${ls_out%%[[:space:]]*}
+    elif [ $? -eq 2 ]; then
+        now=none
     else
-        fetch_error=$out
+        echo "loop-push: could not ask origin where $branch is: $(brief "$ls_out")${said:+. The last push said: $said}" >&2
+        exit 4
     fi
 
-    if [ -n "$fetched" ] && git rev-parse --verify --quiet "$remote" > /dev/null; then
+    if [ -n "$prev" ]; then
+        if [ "$now" = none ] && [ "$prev" != none ]; then
+            # loopctl merges a finished thread and deletes its branch; pushing would bring it back.
+            echo "loop-push: origin deleted $branch after a push was refused; nothing more was pushed, and its work may already be merged. The push said: $said" >&2
+            exit 4
+        fi
+        if [ "$now" = "$prev" ]; then
+            echo "loop-push: the push failed, and origin's $branch did not move, so pushing again would fail the same way. If git says a lock was held on origin, running loop-push again is safe. The push said: $said" >&2
+            exit 4
+        fi
+    fi
+
+    [ "$attempt" -gt 3 ] && break
+
+    # Only a ref origin has is fetched, and only when the repository does not already hold it.
+    if [ "$now" != none ] && [ "$(git rev-parse --verify --quiet "$remote")" != "$now" ]; then
+        if ! out=$(git "${net[@]}" fetch --quiet origin "+refs/heads/$branch:$remote" 2>&1); then
+            echo "loop-push: origin's $branch is at $now, and fetching it failed: $(brief "$out")" >&2
+            exit 4
+        fi
+    fi
+
+    if [ "$now" != none ]; then
         git merge-base --is-ancestor "$remote" HEAD
         case $? in
             0) ;; # origin has nothing this branch lacks
@@ -124,21 +158,10 @@ for attempt in 1 2 3; do
         exit 0
     fi
 
-    case "$out" in
-        # Refused because origin moved: before the push (the first three), or between origin
-        # advertising its refs and updating one (the remote's lock or old-value check), which a
-        # long pre-push hook widens.
-        *"[rejected]"* | *"non-fast-forward"* | *"fetch first"* | *"cannot lock ref"* | *"incorrect old value"*) continue ;;
-        *)
-            echo "loop-push: the push failed: $out" >&2
-            exit 4
-            ;;
-    esac
+    # Refused: the next round asks origin whether the branch moved.
+    prev=$now
+    said=$(brief "$out")
 done
 
-if [ -n "$fetch_error" ]; then
-    echo "loop-push: origin refused every push, and the fetch that should have caught up failed: $fetch_error" >&2
-else
-    echo "loop-push: origin/$branch kept moving across $attempt attempts; nothing more was pushed" >&2
-fi
+echo "loop-push: origin/$branch kept moving across 3 attempts; nothing more was pushed. The last push said: $said" >&2
 exit 4
