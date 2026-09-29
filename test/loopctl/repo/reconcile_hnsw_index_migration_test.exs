@@ -41,13 +41,13 @@ defmodule Loopctl.Repo.ReconcileHnswIndexMigrationTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Repo.HnswIndex
+  alias Loopctl.Test.LockGuard
 
   setup do
-    pid = Sandbox.start_owner!(AdminRepo, shared: false)
-    on_exit(fn -> Sandbox.stop_owner(pid) end)
+    # Owns its sandbox, so the teardown lock check comes with it (Loopctl.Test.LockGuard).
+    _backend_pids = LockGuard.start_owner!(AdminRepo)
 
     # A per-test, uniquely-named throwaway table with a pgvector embedding
     # column. Created inside this test's sandbox transaction, so it is invisible

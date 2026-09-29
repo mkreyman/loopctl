@@ -29,6 +29,7 @@ defmodule Loopctl.DataCase do
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
+  alias Loopctl.Test.LockGuard
   alias Loopctl.Webhooks.ReqDelivery
 
   using do
@@ -46,14 +47,14 @@ defmodule Loopctl.DataCase do
 
   setup tags do
     if tags[:vacuum_vector_indexes], do: Loopctl.DataCase.vacuum_vector_indexes()
-    Loopctl.DataCase.setup_sandbox(tags)
+    sandbox = Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     stub_all_defaults()
     # Per-test embedding axis: every test gets a UNIQUE integer, so `test_vec/2` hashes
     # this test's vectors onto its own sparse dimensions of the shared pgvector HNSW index.
     # Setup runs in the test process, so `Process.get(:test_vec_axis)` at insert time sees it.
     Process.put(:test_vec_axis, System.unique_integer([:positive]))
-    :ok
+    {:ok, sandbox}
   end
 
   # Tables carrying a pgvector HNSW index. Vacuuming these is what removes dead index
@@ -130,18 +131,19 @@ defmodule Loopctl.DataCase do
   @doc """
   Sets up the sandbox based on the test tags.
   Configures Repo, AdminRepo, and HeavyReadRepo (US-27.11) for test isolation.
-  """
-  def setup_sandbox(tags) do
-    pid = Sandbox.start_owner!(Loopctl.Repo, shared: not tags[:async])
-    admin_pid = Sandbox.start_owner!(Loopctl.AdminRepo, shared: not tags[:async])
-    heavy_pid = Sandbox.start_owner!(Loopctl.HeavyReadRepo, shared: not tags[:async])
 
-    on_exit(fn ->
-      Sandbox.stop_owner(pid)
-      Sandbox.stop_owner(admin_pid)
-      Sandbox.stop_owner(heavy_pid)
-    end)
+  An async test has the backend PID of every one of those sandbox connections recorded, and
+  its teardown, registered through `register`, checks them for held DDL locks before the
+  owners stop (`Loopctl.Test.LockGuard`). The PIDs go into the test context too, so a test can
+  see what was recorded (`Loopctl.Test.LockGuardWiringTest`).
+  """
+  def setup_sandbox(tags, register \\ &ExUnit.Callbacks.on_exit/1) do
+    backend_pids = LockGuard.guard_sandbox!(sandbox_repos(), tags[:async] == true, register)
+    %{lock_guard_backend_pids: backend_pids}
   end
+
+  @doc "The repos every DataCase/ConnCase test gets a sandbox owner for."
+  def sandbox_repos, do: [Loopctl.Repo, Loopctl.AdminRepo, Loopctl.HeavyReadRepo]
 
   @doc """
   US-41.1: default the injected read-path decision to the REAL SystemConfig-backed

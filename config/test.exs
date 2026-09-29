@@ -8,8 +8,10 @@ import Config
 # `max_connections` (100) on a high-core dev box: 24 cores * 2 * 3 repos = 144,
 # which fails as `DBConnection.ConnectionError ... queue_timeout` on sandbox
 # checkout — a full DB that reads like a missing one. Capping keeps the floor at
-# 3 * 16 = 48 on every machine (mac-mini, blockit, beelink) and in CI, leaving
-# room for a second Elixir app sharing the same local Postgres.
+# 3 * 16 = 48 on every machine (mac-mini, blockit, beelink) and in CI, plus
+# `Loopctl.Test.LockGuard`'s own non-sandbox pool of `max_cases` connections (at most 8
+# unless `mix test --max-cases` raises it, so at most 56 in all by default), leaving room for
+# a second Elixir app on the same local Postgres.
 #
 # `max_cases` is derived from the SAME number on purpose: the pool must never be
 # smaller than the count of concurrently running async tests, or the suite

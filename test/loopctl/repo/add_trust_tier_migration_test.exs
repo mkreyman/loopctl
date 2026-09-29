@@ -14,10 +14,10 @@ defmodule Loopctl.Repo.AddTrustTierMigrationTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Tenants.RootAuthenticator
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.Test.LockGuard
 
   @backfill_sql """
   UPDATE tenants
@@ -26,8 +26,8 @@ defmodule Loopctl.Repo.AddTrustTierMigrationTest do
   """
 
   setup do
-    pid = Sandbox.start_owner!(AdminRepo, shared: false)
-    on_exit(fn -> Sandbox.stop_owner(pid) end)
+    # Owns its sandbox, so the teardown lock check comes with it (Loopctl.Test.LockGuard).
+    _backend_pids = LockGuard.start_owner!(AdminRepo)
     :ok
   end
 
