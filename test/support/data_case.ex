@@ -29,6 +29,7 @@ defmodule Loopctl.DataCase do
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
+  alias Loopctl.Test.LockGuard
   alias Loopctl.Webhooks.ReqDelivery
 
   using do
@@ -46,14 +47,14 @@ defmodule Loopctl.DataCase do
 
   setup tags do
     if tags[:vacuum_vector_indexes], do: Loopctl.DataCase.vacuum_vector_indexes()
-    Loopctl.DataCase.setup_sandbox(tags)
+    sandbox = Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     stub_all_defaults()
     # Per-test embedding axis: every test gets a UNIQUE integer, so `test_vec/2` hashes
     # this test's vectors onto its own sparse dimensions of the shared pgvector HNSW index.
     # Setup runs in the test process, so `Process.get(:test_vec_axis)` at insert time sees it.
     Process.put(:test_vec_axis, System.unique_integer([:positive]))
-    :ok
+    {:ok, sandbox}
   end
 
   # Tables carrying a pgvector HNSW index. Vacuuming these is what removes dead index
@@ -132,15 +133,16 @@ defmodule Loopctl.DataCase do
   Configures Repo, AdminRepo, and HeavyReadRepo (US-27.11) for test isolation.
   """
   def setup_sandbox(tags) do
-    pid = Sandbox.start_owner!(Loopctl.Repo, shared: not tags[:async])
-    admin_pid = Sandbox.start_owner!(Loopctl.AdminRepo, shared: not tags[:async])
-    heavy_pid = Sandbox.start_owner!(Loopctl.HeavyReadRepo, shared: not tags[:async])
+    # Async tests have their backend PIDs recorded, and the teardown checks them for held DDL
+    # locks before the owners stop (Loopctl.Test.LockGuard).
+    backend_pids =
+      LockGuard.guard_sandbox!(
+        [Loopctl.Repo, Loopctl.AdminRepo, Loopctl.HeavyReadRepo],
+        if(tags[:async], do: LockGuard.guarded_repos())
+      )
 
-    on_exit(fn ->
-      Sandbox.stop_owner(pid)
-      Sandbox.stop_owner(admin_pid)
-      Sandbox.stop_owner(heavy_pid)
-    end)
+    # In the test context too, so an async test can see it was recorded (LockGuardWiringTest).
+    %{lock_guard_backend_pids: backend_pids}
   end
 
   @doc """
