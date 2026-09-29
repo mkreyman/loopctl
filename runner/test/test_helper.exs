@@ -13,10 +13,18 @@ Application.put_env(:loopctl_runner, LoopctlRunner.TestLoopctl.Endpoint,
 {:ok, _} = Phoenix.PubSub.Supervisor.start_link(name: LoopctlRunner.TestPubSub)
 {:ok, _} = LoopctlRunner.TestLoopctl.Endpoint.start_link()
 
+# Every temporary file the suite makes goes under one root of this BEAM's, swept by the next
+# suite if this one is killed.
+LoopctlRunner.TestTmp.arm()
+
 # Armed before ExUnit.start/1 so every process the suite spawns inherits the marker, and
 # swept afterwards: the fixtures detach processes on purpose and a failing test never
 # reaches the assertion that would have ended them.
 LoopctlRunner.TestStragglers.arm()
+
+# ExUnit runs the LAST-registered after_suite callback first, so the root is removed after the
+# straggler sweep, which still writes there.
+ExUnit.after_suite(&LoopctlRunner.TestTmp.sweep_suite/1)
 ExUnit.after_suite(&LoopctlRunner.TestStragglers.sweep_suite/1)
 
 # NO TEST WRITES TO OR DELETES FROM THE OPERATOR'S REAL ~/.claude: every test takes a grant

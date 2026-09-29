@@ -11,12 +11,6 @@ defmodule LoopctlRunner.StragglerSweepTest do
 
   @probe_var "LOOPCTL_TEST_SWEEP_PROBE"
 
-  # The uuid a foreign suite's tree file is planted under in the uuid-naming test below. A
-  # fixed name on purpose, because it is the reviewer's own reproduction kept as a fixture:
-  # two worktrees both planting it is harmless, since nothing asserts it exists and either
-  # one removing it only removes a decoy.
-  @foreign_uuid "11111111-2222-3333-4444-555555555555"
-
   setup do
     probe = "sweep-#{System.unique_integer([:positive])}-#{System.system_time(:nanosecond)}"
 
@@ -62,17 +56,11 @@ defmodule LoopctlRunner.StragglerSweepTest do
     pid
   end
 
-  # The tree files THIS sweep wrote, told apart from every other one's by the pid their lines
-  # name. The glob is process-global — the tmpdir is shared by every suite on the machine —
-  # so a suite in another worktree holds its own loopctl-runner-sweep-<uuid> for the length
-  # of its own grace, about four seconds for a stubborn straggler. Set subtraction against a
-  # listing taken earlier does not tell the two apart: a foreign file created after that
-  # listing is in neither the subtrahend nor this sweep, and every assertion built on the
-  # difference then judges somebody else's file. Reading the file does tell them apart, and
-  # a tree file is exactly "pid start-time" lines, so the pid is the attribution.
+  # The tree files this sweep wrote in the suite's own directory, told by the pid their lines
+  # name: a tree file is exactly "pid start-time" lines.
   defp sweep_tree_files_naming(pid) do
-    System.tmp_dir!()
-    |> Path.join("loopctl-runner-sweep-*")
+    LoopctlRunner.TestTmp.suite_dir()
+    |> Path.join("sweep-*")
     |> Path.wildcard()
     |> Enum.filter(&names?(&1, pid))
   end
@@ -429,13 +417,7 @@ defmodule LoopctlRunner.StragglerSweepTest do
            ]
   end
 
-  test "the sweep's tree file is named by a uuid, not a counter another BEAM repeats", ctx do
-    # `System.unique_integer/1` is unique per NODE, and the sequences overlap heavily across
-    # BEAMs, while two suites in two worktrees is this fleet's default. On a collision the
-    # second write truncates the first one's list, so the first signals the second's
-    # stragglers; then its `File.rm` empties the file while the second is still polling,
-    # which reads the empty set as :terminated for a process that never got the KILL.
-    #
+  test "the sweep's tree file is written in the suite's own directory and removed after", ctx do
     # Observed WHILE a sweep runs, since the file exists only between the write and the
     # `after` that removes it. The straggler ignores TERM, so that window is the whole
     # grace and then some, never a race with the poller.
@@ -444,22 +426,11 @@ defmodule LoopctlRunner.StragglerSweepTest do
 
     task = Task.async(fn -> TestStragglers.sweep(nil, ctx.ledger, 2_000) end)
 
-    # The very collision this test is about, standing in the way of the instrument that
-    # judges it: another worktree's suite sweeping its own stubborn straggler, holding its
-    # own tree file in the shared tmpdir for the length of its grace. It is planted AFTER
-    # this sweep starts, which is what a listing taken beforehand cannot subtract away — the
-    # shape the reviewer reproduced, where the foreign file failed the removal assertion and
-    # could satisfy the wait and the uuid check in place of ours. Every assertion below is
-    # about our file because it names our pid.
-    foreign = Path.join(System.tmp_dir!(), "loopctl-runner-sweep-#{@foreign_uuid}")
-    File.write!(foreign, "#{stubborn + 1_000_000} Thu Jan  1 00:00:00 1970\n")
-    on_exit(fn -> File.rm(foreign) end)
-
     :ok = wait_until(fn -> sweep_tree_files_naming(stubborn) != [] end)
     ours = sweep_tree_files_naming(stubborn)
 
     assert ours != []
-    assert Enum.all?(ours, &(Path.basename(&1) =~ ~r/^loopctl-runner-sweep-[0-9a-f-]{36}$/))
+    assert Enum.all?(ours, &(Path.basename(&1) =~ ~r/^sweep-[0-9a-f-]{36}$/))
     assert {:killed, [^stubborn], _} = Task.await(task, 30_000)
     assert sweep_tree_files_naming(stubborn) == []
   end

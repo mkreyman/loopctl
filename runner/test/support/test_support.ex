@@ -32,17 +32,8 @@ defmodule LoopctlRunner.TestSupport do
     Enum.join([boot, id, String.to_integer(ticks) + 360_000], ":")
   end
 
-  def tmp_dir!(label) do
-    dir =
-      Path.join(
-        System.tmp_dir!(),
-        "loopctl-runner-test-#{label}-#{System.unique_integer([:positive])}"
-      )
-
-    File.rm_rf!(dir)
-    File.mkdir_p!(dir)
-    dir
-  end
+  # Inside this suite's own root (`LoopctlRunner.TestTmp`), removed when the suite ends.
+  def tmp_dir!(label), do: LoopctlRunner.TestTmp.dir!(label)
 
   # An ssh stand-in that records what it was given, the fetching git's stdin, and fails.
   def recording_ssh!(dir) do

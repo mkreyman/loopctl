@@ -43,7 +43,7 @@ defmodule LoopctlRunner.TestStragglers do
   def arm do
     id = Session.uuid4()
     System.put_env(@marker_var, id)
-    System.put_env(@ledger_var, Path.join(System.tmp_dir!(), "loopctl-runner-stragglers-#{id}"))
+    System.put_env(@ledger_var, Path.join(LoopctlRunner.TestTmp.suite_dir(), "stragglers-#{id}"))
     :ok
   end
 
@@ -372,10 +372,9 @@ defmodule LoopctlRunner.TestStragglers do
   # second write truncates the first one's list, so the first signals the second's
   # stragglers, and its `File.rm` then empties the file under a sweep still polling, which
   # reads the empty set as :terminated for a process that never got the KILL. (A SIGKILLed
-  # BEAM skips the `after` and leaves the file in /tmp. That is litter, not a wrong answer,
-  # and needs no sweeper of its own.)
+  # BEAM skips the `after` and leaves the file in the suite's root, which the next suite sweeps.)
   defp terminate_only(pins, grace_ms) do
-    file = Path.join(System.tmp_dir!(), "loopctl-runner-sweep-#{Session.uuid4()}")
+    file = Path.join(LoopctlRunner.TestTmp.suite_dir(), "sweep-#{Session.uuid4()}")
     File.write!(file, Enum.map(pins, fn {pid, start} -> "#{pid} #{start}\n" end))
 
     try do
