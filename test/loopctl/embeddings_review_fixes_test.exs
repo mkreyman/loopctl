@@ -1072,7 +1072,9 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   # `replica` skips EVERY ordinary trigger on the table — the live_denorm BEFORE UPDATE trigger
   # among them — and FK checks, for this transaction only, and takes no lock. The UPDATE sets
   # one column on an existing row, so nothing else those would do applies. Put back to
-  # `origin` at once, because the sandbox transaction is the whole test.
+  # `origin` at once, because the sandbox transaction is the whole test. Setting it needs a
+  # superuser, which the test database's AdminRepo role is — the same dependency
+  # `Loopctl.Fixtures.delete_audit_chain_rows!/1` already has.
   defp force_live_denorm(table, id, value) do
     AdminRepo.query!("SET LOCAL session_replication_role = replica")
 

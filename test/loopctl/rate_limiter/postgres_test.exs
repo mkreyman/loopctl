@@ -119,8 +119,9 @@ defmodule Loopctl.RateLimiter.PostgresTest do
     test "a genuine DB error allows the request and logs a warning" do
       b = bucket("failopen")
 
-      # Point THIS test's sandbox transaction at an empty search_path so the upsert's
-      # unqualified table name does not resolve: a real Postgres error (42P01
+      # Point THIS test's sandbox transaction's search_path at pg_catalog alone (it is
+      # searched implicitly anyway, so gen_random_uuid() and now() still resolve) so the
+      # upsert's unqualified table name does not resolve: a real Postgres error (42P01
       # undefined_table) the impl must catch and fail OPEN on. Not DDL: a DROP INDEX here
       # took ACCESS EXCLUSIVE on rate_limit_counters until the test ended, and every
       # concurrent async test touching that table waited out the statement timeout (57014).
