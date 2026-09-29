@@ -61,7 +61,11 @@ defmodule LoopctlRunner.ScratchRun do
         "branch" => "",
         "base" => tree.base,
         "status" => status,
-        "scratch" => true
+        "scratch" => true,
+        # A triage repo's one reused tree outlives every run: Control never gives it to the reaper
+        # when its run is killed (`give_scratch_tree_to_reaper`); the reaper still removes it for a
+        # run whose BEAM died, which cannot free it any other way.
+        "reused" => Map.get(tree, :shared?, false)
       }
     })
   end

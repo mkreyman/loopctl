@@ -233,8 +233,19 @@ ESCALATION
         exit 0
         ;;
     delete_run_dir)
-        # Pulls the run directory out from under the runner: its next state write raises.
+        # Pulls the run directory out from under the runner: its next state write raises. Only once
+        # the runner has recorded this session (its pgid), so the run is past its start and the
+        # outcome under test is the session's end, whatever the machine's load.
         echo "$init"
+        recorded=
+        for _ in $(seq 1 400); do
+            grep -q '"pgid"' "$LOOP_RUN_DIR/state.json" 2>/dev/null && { recorded=1; break; }
+            sleep 0.05
+        done
+        if [ -z "$recorded" ]; then
+            echo "fake claude: the runner never recorded this session's pgid" >&2
+            exit 3
+        fi
         rm -rf "$LOOP_RUN_DIR"
         exit 0
         ;;

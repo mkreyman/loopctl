@@ -824,4 +824,11 @@ defmodule LoopctlRunner.ReaperTest do
 
     refute File.exists?(dead)
   end
+
+  test "a session is gone unless processes of it outlived TERM and KILL" do
+    assert Reaper.verdict({:error, :survived}) == :survived
+
+    for outcome <- [:terminated, :killed, :already_gone],
+        do: assert(Reaper.verdict(outcome) == :gone)
+  end
 end

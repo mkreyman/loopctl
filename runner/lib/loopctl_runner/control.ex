@@ -329,7 +329,8 @@ defmodule LoopctlRunner.Control do
     Story,
     TraceShip,
     TriageDispatch,
-    TriageRun
+    TriageRun,
+    WorktreeLock
   }
 
   @reconnect_backoff_ms [1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000]
@@ -562,6 +563,9 @@ defmodule LoopctlRunner.Control do
             session_stopping: MapSet.new(),
             session_stop_retry_ms:
               Keyword.get(opts, :session_stop_retry_ms, @session_stop_retry_ms),
+            # How a dead run's session is ended before its end is reported: passed in so a test
+            # can be a session that survives, which no real signal can stage.
+            end_session: Keyword.get(opts, :end_session, &Reaper.end_session_outcome/2),
             # dispatch_id => the stage stream (see stage_stream/1); push ref => dispatch_id.
             stage_streams: %{},
             stage_refs: %{},
@@ -3566,6 +3570,8 @@ defmodule LoopctlRunner.Control do
     # before its announcement reached this process, and `TriageRun` announces before it writes
     # any state, so that really is a run with nothing to close: a directory and nothing in it.
     close_crashed_state(run_dir)
+    # A kill skips the run's `after`, which gives its own tree back (#69).
+    if reason != :normal, do: give_scratch_tree_to_reaper(run_dir)
 
     case recorded_message(run_dir) do
       {:ok, payload} ->
@@ -3671,12 +3677,16 @@ defmodule LoopctlRunner.Control do
       {:ok, %{"status" => status} = state} when status in ["starting", "running"] ->
         grace_ms = socket.assigns.config.kill_grace_s * 1000
 
+        end_session = socket.assigns.end_session
+
         task =
           Task.Supervisor.async_nolink(socket.assigns.run_supervisor, fn ->
-            Reaper.end_session(state, grace_ms)
+            end_session.(state, grace_ms)
           end)
 
-        enders = Map.put(socket.assigns.session_enders, task.ref, {id, run_dir, next})
+        enders =
+          Map.put(socket.assigns.session_enders, task.ref, {id, run_dir, next, state["run_id"]})
+
         assign(socket, session_enders: enders)
 
       _ ->
@@ -3686,15 +3696,37 @@ defmodule LoopctlRunner.Control do
 
   defp end_session_first(socket, id, _run_dir, next), do: finish_end(socket, id, next)
 
+  # The dead run's hold on its trees: a kill skipped the release in its `after` (#69), and only
+  # once its session is gone may another run take them. Found by the run's id (`WorktreeLock`),
+  # so a kill before its state recorded a path frees them too. Called only for a session that is
+  # gone: one that survived, or whose ender died, keeps them (`session_ender_done/3` says so).
+  defp release_dead_hold(runs_dir, id, run_id, {:gone, _text}) do
+    released = if is_binary(run_id), do: WorktreeLock.release_held_by(runs_dir, run_id), else: []
+
+    for path <- released,
+        do: Logger.info("released dead run #{run_id}'s hold on #{path}", dispatch_id: id)
+
+    :ok
+  end
+
   defp session_ender_done(socket, ref, outcome) do
-    {{id, run_dir, next}, enders} = Map.pop(socket.assigns.session_enders, ref)
+    {{id, run_dir, next, run_id}, enders} = Map.pop(socket.assigns.session_enders, ref)
 
     case outcome do
-      {:ended, ended} ->
-        Logger.info(
-          "the session of #{run_dir}, before its end is reported: #{ended}",
+      {:ended, {:survived, text}} ->
+        Logger.error(
+          "the session of #{run_dir} survived its end (#{text}): run #{run_id} keeps its hold " <>
+            "on its trees until this runner restarts, so no run works where it still writes",
           dispatch_id: id
         )
+
+      {:ended, {:gone, text} = ended} ->
+        Logger.info(
+          "the session of #{run_dir}, before its end is reported: #{text}",
+          dispatch_id: id
+        )
+
+        release_dead_hold(socket.assigns.config.runs_dir, id, run_id, ended)
 
       {:died, reason} ->
         Logger.error(
@@ -4044,15 +4076,19 @@ defmodule LoopctlRunner.Control do
 
   defp with_kind(summary, _kind, _run_dir), do: summary
 
-  # A killed run's own scratch tree — a review's — was never released: the teardown that removes it
-  # is in the run's `after`, which a kill skips. Recorded `remove_failed`, which is what the reaper
-  # collects from a run that is over whoever owned it, so the next reap removes the tree and the
-  # Claude project directory its cwd made. Only the RUN's own tree: a triage run's reused tree is
-  # recorded as scratch too, and its end is `triage_run_ended/4`'s, which never comes here.
+  # A killed run's own scratch tree — a review's, or a triage run's cut beside a held reused one —
+  # was never released: the teardown that removes it is in the run's `after`, which a kill skips.
+  # Recorded `remove_failed`, which is what the reaper collects from a run that is over whoever
+  # owned it, so the next reap removes the tree and the Claude project directory its cwd made.
+  # Never a triage repo's REUSED tree, which the entry says (`"reused"`): it outlives the run. Its
+  # lock, the dead run's hold, is released once the run's session is gone (`session_ender_done/3`).
   defp give_scratch_tree_to_reaper(nil), do: :ok
 
   defp give_scratch_tree_to_reaper(run_dir) do
     case RunState.read(run_dir) do
+      {:ok, %{"worktree" => %{"reused" => true}}} ->
+        :ok
+
       {:ok, %{"worktree" => %{"scratch" => true, "status" => status} = tree}}
       when status in ["creating", "created"] ->
         RunState.update(run_dir, %{worktree: Map.put(tree, "status", "remove_failed")})

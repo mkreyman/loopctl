@@ -167,10 +167,18 @@ defmodule LoopctlRunner.Reaper do
   caller that must stay responsive runs it in a task (`LoopctlRunner.Control` does).
   """
   @spec end_session(map(), non_neg_integer()) :: String.t()
-  def end_session(%{"status" => status} = state, grace_ms) when status in @in_flight,
-    do: reap_group(state, grace_ms)
+  def end_session(state, grace_ms), do: state |> end_session_outcome(grace_ms) |> elem(1)
 
-  def end_session(_state, _grace_ms), do: "not in flight"
+  @doc """
+  `end_session/2`, with whether the session is gone as data: `{:gone, text}`, or
+  `{:survived, text}` when processes of it outlived TERM and KILL. What a caller acts on is the
+  atom, never the text, which is for the log.
+  """
+  @spec end_session_outcome(map(), non_neg_integer()) :: {:gone | :survived, String.t()}
+  def end_session_outcome(%{"status" => status} = state, grace_ms) when status in @in_flight,
+    do: end_group(state, grace_ms)
+
+  def end_session_outcome(_state, _grace_ms), do: {:gone, "not in flight"}
 
   defp finish({run_dir, state, group, plan}, fetched, owner) do
     worktree =
@@ -206,7 +214,7 @@ defmodule LoopctlRunner.Reaper do
   # The session marker is an identity pids cannot counterfeit by being reused, so marked
   # processes are always ended. The group is signalled only while its leader is still
   # our launcher.
-  defp reap_group(state, grace_ms) do
+  defp end_group(state, grace_ms) do
     pgid = state["pgid"]
     session_id = state["session_id"]
     marker = if is_binary(session_id), do: ProcessGroup.marker(session_id)
@@ -223,15 +231,23 @@ defmodule LoopctlRunner.Reaper do
 
     cond do
       outcome != :already_gone ->
-        inspect(outcome)
+        {verdict(outcome), inspect(outcome)}
 
       is_integer(pgid) and ProcessGroup.alive?(pgid) ->
-        "pid reused by #{ProcessGroup.command(pgid)}; not signalled"
+        {:gone, "pid reused by #{ProcessGroup.command(pgid)}; not signalled"}
 
       true ->
-        "gone"
+        {:gone, "gone"}
     end
   end
+
+  @doc """
+  Whether `ProcessGroup.terminate/3`'s outcome left the session gone: `:survived` only when
+  processes of it outlived TERM and KILL.
+  """
+  @spec verdict(ProcessGroup.outcome()) :: :gone | :survived
+  def verdict({:error, :survived}), do: :survived
+  def verdict(_outcome), do: :gone
 
   defp launcher?(pgid), do: (ProcessGroup.command(pgid) || "") =~ @launcher_name
 

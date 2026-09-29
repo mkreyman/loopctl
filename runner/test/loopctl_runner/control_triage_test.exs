@@ -20,13 +20,17 @@ defmodule LoopctlRunner.ControlTriageTest do
     Owner,
     PendingStarts,
     PendingVerdicts,
+    Reaper,
     Runs,
     RunState,
+    ScratchRun,
     Session,
     TestLoopctl,
     TriageDispatch,
     TriageRun,
-    TriageVerdict
+    TriageVerdict,
+    Worktree,
+    WorktreeLock
   }
 
   import ExUnit.CaptureLog
@@ -193,6 +197,9 @@ defmodule LoopctlRunner.ControlTriageTest do
       run_dir = run_dir!(ctx, dispatch, %{"status" => "running"})
       Keyword.fetch!(opts, :on_start).(%{run_id: Session.uuid4(), run_dir: run_dir})
       fun.(run_dir)
+      # What `kill_the_run/3` waits for: killed before `fun` finished, a test would judge a run
+      # that never recorded what it set out to.
+      File.write!(Path.join(run_dir, ".stalled"), "")
       Process.sleep(:infinity)
     end
   end
@@ -200,6 +207,8 @@ defmodule LoopctlRunner.ControlTriageTest do
   defp kill_the_run(ctx, pid, dispatch) do
     id = dispatch["dispatch_id"]
     assert :ok = wait_until(fn -> Control.info(pid).run_dirs[id] != nil end, 10_000)
+    stalled = Path.join(Control.info(pid).run_dirs[id], ".stalled")
+    assert :ok = wait_until(fn -> File.exists?(stalled) end, 10_000)
     [task] = Task.Supervisor.children(ctx.run_supervisor)
     Process.exit(task, :kill)
   end
@@ -1205,6 +1214,129 @@ defmodule LoopctlRunner.ControlTriageTest do
 
       refute_receive {:test_loopctl, {:stage, _}}, 1_000
       assert Control.info(pid).stage_reports_pending == 0
+    end
+  end
+
+  describe "a triage run whose task is killed holding a tree" do
+    # A run that cuts `tree` and records it as `TriageRun` does, taking the reused tree's lock when
+    # `tree` is that one, then stalls mid-session: its teardown, in the run's `after`, never runs.
+    defp stalling_tree_run(ctx, dispatch, run_id, tree) do
+      test = self()
+      repo = Path.join(ctx.root, "repo")
+
+      fn _config, _triage, _repo, opts ->
+        run_dir = run_dir!(ctx, dispatch, %{"status" => "running", "run_id" => run_id})
+        Keyword.fetch!(opts, :on_start).(%{run_id: run_id, run_dir: run_dir})
+
+        shared? = tree == Worktree.triage_tree_path(ctx.config.runs_dir, repo)
+        if shared?, do: :ok = WorktreeLock.acquire(ctx.config.runs_dir, tree, run_id, owner!())
+
+        {:ok, sha} = Worktree.create_detached(repo, tree)
+
+        ScratchRun.record_tree(
+          run_dir,
+          %{repo_path: repo, path: tree, base: sha, shared?: shared?},
+          "created"
+        )
+
+        File.write!(Path.join(run_dir, ".stalled"), "")
+        send(test, {:stalled, run_dir})
+        Process.sleep(:infinity)
+      end
+    end
+
+    defp kill_mid_session(ctx, dispatch, run, opts \\ []) do
+      {pid, _topic} =
+        running_control(ctx, [{"FAKE_CLAUDE_MODE", "stream"}], [triage_run: run] ++ opts)
+
+      {run_dir, _log} =
+        with_log(fn ->
+          assert_receive {:stalled, run_dir}, 10_000
+          kill_the_run(ctx, pid, dispatch)
+
+          # Stated after the tree is given back, in the same pass: the tree's fate is settled here.
+          assert next_verdict()["incomplete"] == "no_verdict_written"
+          run_dir
+        end)
+
+      run_dir
+    end
+
+    defp reap!(ctx) do
+      Reaper.reap(ctx.config.runs_dir, 500, ctx.config.grant_dir,
+        projects_dir: ctx.config.claude_projects_dir
+      )
+    end
+
+    test "leaves its OWN tree to the next reap, which removes it", ctx do
+      dispatch = triage_dispatch()
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+      run_id = Session.uuid4()
+      own = Worktree.triage_tree_path(ctx.config.runs_dir, Path.join(ctx.root, "repo"), run_id)
+
+      run_dir = kill_mid_session(ctx, dispatch, stalling_tree_run(ctx, dispatch, run_id, own))
+
+      assert {:ok, %{"status" => "crashed", "worktree" => %{"status" => "remove_failed"}}} =
+               RunState.read(run_dir)
+
+      assert File.dir?(own)
+      reap!(ctx)
+      refute File.dir?(own)
+    end
+
+    test "frees the REUSED tree once the dead run's session is gone, and never gives it to the reaper",
+         ctx do
+      dispatch = triage_dispatch()
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+      run_id = Session.uuid4()
+      shared = Worktree.triage_tree_path(ctx.config.runs_dir, Path.join(ctx.root, "repo"))
+
+      run_dir = kill_mid_session(ctx, dispatch, stalling_tree_run(ctx, dispatch, run_id, shared))
+
+      # Free: the dead run's session is gone, so the next triage takes the reused tree.
+      assert WorktreeLock.live_holder(ctx.config.runs_dir, shared) == nil
+
+      # Not marked: the reaper would remove a tree meant for reuse.
+      assert {:ok, %{"status" => "crashed", "worktree" => %{"status" => "created"}}} =
+               RunState.read(run_dir)
+
+      reap!(ctx)
+      assert File.dir?(shared)
+    end
+
+    test "keeps the dead run's hold while its session survived its end", ctx do
+      dispatch = triage_dispatch()
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+      run_id = Session.uuid4()
+      shared = Worktree.triage_tree_path(ctx.config.runs_dir, Path.join(ctx.root, "repo"))
+      survived = fn _state, _grace_ms -> {:survived, "{:error, :survived}"} end
+
+      kill_mid_session(ctx, dispatch, stalling_tree_run(ctx, dispatch, run_id, shared),
+        end_session: survived
+      )
+
+      assert WorktreeLock.live_holder(ctx.config.runs_dir, shared) == run_id
+    end
+
+    test "frees a hold the dead run took before its state recorded any tree", ctx do
+      dispatch = triage_dispatch()
+      :ok = PendingStarts.write(ctx.config.runs_dir, dispatch)
+      repo = Path.join(ctx.root, "repo")
+      shared = Worktree.triage_tree_path(ctx.config.runs_dir, repo)
+      run_id = Session.uuid4()
+      test = self()
+
+      run = fn _config, _triage, _repo, opts ->
+        run_dir = run_dir!(ctx, dispatch, %{"status" => "running", "run_id" => run_id})
+        Keyword.fetch!(opts, :on_start).(%{run_id: run_id, run_dir: run_dir})
+        :ok = WorktreeLock.acquire(ctx.config.runs_dir, shared, run_id, owner!())
+        File.write!(Path.join(run_dir, ".stalled"), "")
+        send(test, {:stalled, run_dir})
+        Process.sleep(:infinity)
+      end
+
+      kill_mid_session(ctx, dispatch, run)
+      assert WorktreeLock.live_holder(ctx.config.runs_dir, shared) == nil
     end
   end
 end

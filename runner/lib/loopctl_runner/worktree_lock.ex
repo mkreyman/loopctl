@@ -82,6 +82,29 @@ defmodule LoopctlRunner.WorktreeLock do
     :ok
   end
 
+  @doc """
+  Releases every lock `run_id` holds, whatever its path, and returns the paths released. For a
+  run that died without its `after` (#69): its locks are found by the run, not by what its state
+  recorded, which a kill can precede.
+  """
+  @spec release_held_by(String.t(), String.t()) :: [String.t()]
+  def release_held_by(runs_dir, run_id) when is_binary(run_id) do
+    dir = Path.join(runs_dir, "locks")
+
+    case File.ls(dir) do
+      {:ok, names} ->
+        for name <- names,
+            String.ends_with?(name, ".lock"),
+            file = Path.join(dir, name),
+            {:ok, %{"run_id" => ^run_id} = lock} <- [read(file)],
+            File.rm(file) == :ok,
+            do: lock["path"]
+
+      {:error, _} ->
+        []
+    end
+  end
+
   @doc "The run id holding `path` on a live BEAM, or nil."
   @spec live_holder(String.t(), String.t()) :: String.t() | nil
   def live_holder(runs_dir, path) do
