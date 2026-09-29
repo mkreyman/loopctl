@@ -46,18 +46,25 @@ defmodule Mix.Tasks.Loopctl.Run do
     end
   end
 
-  defp load_story("-", config) do
-    tmp = Path.join(System.tmp_dir!(), "loopctl-story-#{System.unique_integer([:positive])}.json")
-    File.write!(tmp, IO.read(:stdio, :eof))
+  @doc false
+  # The story `arg` names, `-` meaning the JSON on standard input, read by `read` so a test can
+  # pass its own. Read as bytes, so a story decodes the same from stdin as from a file.
+  def load_story(arg, config, read \\ fn -> IO.binread(:stdio, :eof) end)
 
-    try do
-      Story.load(tmp, config)
-    after
-      File.rm(tmp)
+  def load_story("-", config, read) do
+    case read.() do
+      raw when is_binary(raw) ->
+        Story.from_json(raw, config)
+
+      :eof ->
+        {:error, "no story on standard input"}
+
+      {:error, reason} ->
+        {:error, "cannot read the story from standard input: #{inspect(reason)}"}
     end
   end
 
-  defp load_story(path, config), do: Story.load(path, config)
+  def load_story(path, config, _read), do: Story.load(path, config)
 
   defp summary(result) do
     %{

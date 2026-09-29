@@ -2,6 +2,7 @@ defmodule LoopctlRunner.StoryTest do
   use ExUnit.Case, async: true
 
   alias LoopctlRunner.Story
+  alias Mix.Tasks.Loopctl.Run, as: LoopctlRun
   import LoopctlRunner.TestSupport
 
   setup do
@@ -19,6 +20,23 @@ defmodule LoopctlRunner.StoryTest do
     path = Path.join(root, "story.json")
     File.write!(path, JSON.encode!(story_map()))
     assert {:ok, %Story{id: "s1"}} = Story.load(path, config)
+  end
+
+  test "decodes from JSON text, and refuses what is not a JSON object", %{config: config} do
+    assert {:ok, %Story{id: "s1"}} = Story.from_json(JSON.encode!(story_map()), config)
+    assert {:error, "story is not valid JSON" <> _} = Story.from_json("{", config)
+    assert {:error, "story must be a JSON object"} = Story.from_json("[]", config)
+  end
+
+  test "mix loopctl.run - reads the story from what it is handed, as bytes", %{config: config} do
+    json = JSON.encode!(story_map())
+    assert {:ok, %Story{id: "s1"}} = LoopctlRun.load_story("-", config, fn -> json end)
+
+    assert {:error, "no story on standard input"} =
+             LoopctlRun.load_story("-", config, fn -> :eof end)
+
+    assert {:error, "cannot read the story from standard input: :terminated"} =
+             LoopctlRun.load_story("-", config, fn -> {:error, :terminated} end)
   end
 
   describe "refuses by default" do

@@ -1393,54 +1393,55 @@ defmodule LoopctlRunner.Worktree do
 
   # git with stdout as the ANSWER, untrimmed, and stderr kept apart: a warning git prints (an
   # ambiguous ref, say) must never be read as part of a commit id or a file's bytes. System.cmd
-  # can only merge stderr into stdout, so a shell sends it to a file of its own — inside a
-  # directory only this user can enter, under an unguessable name, because a predictable path in
-  # a shared temp directory is one another user can plant a symlink at first.
-  defp git_stdout(dir, args) do
+  # can only merge stderr into stdout, so the shell splits them itself and writes no file: git's
+  # stdout goes straight out, its stderr is held in a variable and printed after it, followed by
+  # a line giving its length in bytes, so the two are cut apart exactly.
+  @split_stderr ~S"""
+  exec 3>&1
+  err=$("$0" "$@" 2>&1 >&3 3>&-)
+  rc=$?
+  exec 3>&-
+  LC_ALL=C
+  printf '%s\n%d' "$err" "${#err}"
+  exit "$rc"
+  """
+
+  defp git_stdout(dir, args), do: split_git("git", dir, args)
+
+  @doc false
+  # git_stdout's mechanism, with the git to run passed in, so a test can run one that writes part
+  # of its stdout and then fails.
+  @spec split_git(String.t(), String.t(), [String.t()]) :: {:ok, binary()} | {:error, String.t()}
+  def split_git(git, dir, args) do
     env = Enum.map(@repo_locating_env, &{&1, nil})
+    {out, status} = System.cmd("sh", ["-c", @split_stderr, git, "-C", dir | args], env: env)
 
-    with {:ok, private} <- private_dir() do
-      err = Path.join(private, "stderr")
+    case {split_stderr(out), status} do
+      {{stdout, ""}, 0} ->
+        {:ok, stdout}
 
-      try do
-        case System.cmd("sh", ["-c", ~s(exec git "$@" 2>"$0"), err, "-C", dir | args], env: env) do
-          {out, 0} -> {:ok, out}
-          {_out, status} -> {:error, stderr(err, status)}
-        end
-      after
-        File.rm_rf(private)
-      end
+      {{stdout, err}, 0} ->
+        Logger.warning("git #{Enum.join(args, " ")} in #{dir} warned: #{String.trim(err)}")
+        {:ok, stdout}
+
+      {{_stdout, err}, _} when err != "" ->
+        {:error, String.trim(err)}
+
+      {_, 0} ->
+        {:error, "git's output carried no length line"}
+
+      _ ->
+        {:error, "git exited #{status}"}
     end
   end
 
-  # mkdtemp's contract: `mkdir` fails on a name that exists, so a directory it made is this call's
-  # own — and one it did not make is never touched — and it is closed to everyone else before
-  # anything is written in it.
-  defp private_dir do
-    name = "loopctl-git-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
-    private = Path.join(System.tmp_dir!(), name)
-
-    case File.mkdir(private) do
-      :ok -> close_to_others(private)
-      {:error, reason} -> {:error, "cannot make a directory for git's stderr: #{reason}"}
-    end
-  end
-
-  defp close_to_others(private) do
-    case File.chmod(private, 0o700) do
-      :ok ->
-        {:ok, private}
-
-      {:error, reason} ->
-        File.rm_rf(private)
-        {:error, "cannot make #{private} private for git's stderr: #{reason}"}
-    end
-  end
-
-  defp stderr(err, status) do
-    case File.read(err) do
-      {:ok, text} when text != "" -> String.trim(text)
-      _ -> "git exited #{status}"
+  defp split_stderr(out) do
+    with [trailer, digits] <- Regex.run(~r/\n(\d+)\z/, out),
+         n = String.to_integer(digits),
+         at when at >= 0 <- byte_size(out) - byte_size(trailer) - n do
+      {binary_part(out, 0, at), binary_part(out, at, n)}
+    else
+      _ -> :error
     end
   end
 end

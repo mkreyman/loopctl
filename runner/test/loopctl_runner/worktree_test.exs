@@ -1066,23 +1066,6 @@ defmodule LoopctlRunner.WorktreeTest do
     end
   end
 
-  # Every directory a git_stdout call is running in, this test's and any other's.
-  defp stderr_dirs do
-    tmp = System.tmp_dir!()
-
-    for name <- File.ls!(tmp),
-        String.starts_with?(name, "loopctl-git-"),
-        path = Path.join(tmp, name),
-        File.dir?(path),
-        do: path
-  end
-
-  defp held_dirs(before) do
-    new = stderr_dirs() -- before
-    Process.sleep(200)
-    Enum.filter(new, &File.dir?/1)
-  end
-
   describe "cut_from" do
     test "a new tree's is its HEAD, the base's commit, read before any session", %{
       repo: repo,
@@ -1177,7 +1160,13 @@ defmodule LoopctlRunner.WorktreeTest do
       # A tag and a branch of one name: git warns that the name is ambiguous, on stderr, and
       # still answers. Merged into stdout, the warning would be parsed as the tree entry.
       git!(repo, ["tag", "master"])
-      assert Worktree.commit_file(repo, "master", ".loopctl/mode", 64) == {:ok, "pr\n"}
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Worktree.commit_file(repo, "master", ".loopctl/mode", 64) == {:ok, "pr\n"}
+        end)
+
+      assert log =~ "ambiguous"
     end
 
     test "a file over the bound is refused unread", %{repo: repo} do
@@ -1204,38 +1193,6 @@ defmodule LoopctlRunner.WorktreeTest do
       assert why =~ "is not a regular file"
     end
 
-    test "git's stderr goes to a directory only this user can enter, and nothing is left", %{
-      repo: repo
-    } do
-      commit_mode!(repo, &File.write!(&1, "pr\n"))
-      # git opens the alternates file on its first object lookup; a FIFO there holds it open, so
-      # what it was given for its stderr can be looked at while it runs.
-      fifo = Path.join([repo, ".git", "objects", "info", "alternates"])
-      File.mkdir_p!(Path.dirname(fifo))
-      {_, 0} = System.cmd("mkfifo", [fifo])
-      before = stderr_dirs()
-
-      read = Task.async(fn -> Worktree.commit_file(repo, "master", ".loopctl/mode", 64) end)
-
-      # Other tests' reads come and go in milliseconds; the held one is the one that stays.
-      :ok = wait_until(fn -> match?([_], held_dirs(before)) end, 5_000)
-      [private] = held_dirs(before)
-
-      assert %File.Stat{type: :directory, mode: mode} = File.lstat!(private)
-      assert Bitwise.band(mode, 0o777) == 0o700
-      # The shell opened git's stderr before exec'ing git, so it is there while git is held.
-      assert File.regular?(Path.join(private, "stderr"))
-
-      # The read makes more than one git call: later ones find an empty file, and the held one is
-      # released through the FIFO's new name.
-      held = fifo <> ".held"
-      File.rename!(fifo, held)
-      File.write!(fifo, "")
-      File.write!(held, "")
-      assert Task.await(read) == {:ok, "pr\n"}
-      refute File.exists?(private)
-    end
-
     test "a commit that does not exist is an error carrying git's stderr, never absent", %{
       repo: repo
     } do
@@ -1243,6 +1200,47 @@ defmodule LoopctlRunner.WorktreeTest do
       assert why =~ "cannot list .loopctl/mode at nope"
       assert why =~ "nope"
       refute why =~ "git exited"
+      # The length line the shell appends after stderr is cut off, never shown.
+      refute why =~ ~r/\d\z/
+    end
+  end
+
+  describe "split_git/3" do
+    setup %{repo: repo} do
+      dir = tmp_dir!("fake-git")
+
+      fake = fn name, body ->
+        path = Path.join(dir, name)
+        File.write!(path, "#!/bin/sh\n" <> body)
+        File.chmod!(path, 0o755)
+        path
+      end
+
+      {:ok, fake: fake, repo: repo}
+    end
+
+    test "a failure's stderr is cut exactly off the stdout written before it", %{
+      fake: fake,
+      repo: repo
+    } do
+      git = fake.("fails", "printf 'partial 42'\nprintf 'boom \\303\\251 7\\n' >&2\nexit 3\n")
+      assert Worktree.split_git(git, repo, []) == {:error, "boom é 7"}
+    end
+
+    test "a success's stderr is logged, never read as the answer", %{fake: fake, repo: repo} do
+      git = fake.("warns", "printf 'answer\\n'\necho 'careful' >&2\n")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Worktree.split_git(git, repo, ["rev-parse"]) == {:ok, "answer\n"}
+        end)
+
+      assert log =~ "careful"
+    end
+
+    test "a failure with no stderr names its exit status", %{fake: fake, repo: repo} do
+      git = fake.("silent", "printf 'partial'\nexit 5\n")
+      assert Worktree.split_git(git, repo, []) == {:error, "git exited 5"}
     end
   end
 end

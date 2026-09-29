@@ -41,10 +41,13 @@ defmodule LoopctlRunner.Story do
 
   @spec load(String.t(), Config.t()) :: {:ok, t()} | {:error, String.t()}
   def load(path, %Config{} = config) do
-    with {:ok, raw} <- File.read(path) |> file_error(path),
-         {:ok, map} <- decode(raw) do
-      from_map(map, config)
-    end
+    with {:ok, raw} <- File.read(path) |> file_error(path), do: from_json(raw, config)
+  end
+
+  @doc "The story the JSON text `raw` describes, validated against `config`."
+  @spec from_json(String.t(), Config.t()) :: {:ok, t()} | {:error, String.t()}
+  def from_json(raw, %Config{} = config) do
+    with {:ok, map} <- decode(raw), do: from_map(map, config)
   end
 
   @doc """
