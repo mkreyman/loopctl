@@ -111,8 +111,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
        "enrolled runners stays open."},
     {:issue_intake, :human_anchored,
      "Creating and revoking GitHub intake sources for the agent delivery loop (#803): a " <>
-       "source admits outside issue text into a work project's queue. Listing sources " <>
-       "stays open."},
+       "source admits outside issue text into a work project's queue. Setting and clearing " <>
+       "the tenant's own GitHub token (#936), which every forge call for those sources " <>
+       "authenticates with. Listing sources stays open, and so does reading the credential's state."},
     {:token_budgets, :human_anchored,
      "RECORDING token usage (POST /api/v1/token-usage — the per-dispatch usage report " <>
        "agents emit at end of work), correcting/deleting usage records, token budgets, " <>
@@ -187,7 +188,7 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.DispatchPlacementController"
     ],
     runner_pool: ["LoopctlWeb.RunnerController"],
-    issue_intake: ["LoopctlWeb.IntakeSourceController"],
+    issue_intake: ["LoopctlWeb.IntakeSourceController", "LoopctlWeb.GitHubCredentialController"],
     token_budgets: [
       "LoopctlWeb.TokenBudgetController",
       "LoopctlWeb.TokenUsageController",

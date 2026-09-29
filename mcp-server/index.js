@@ -79,6 +79,11 @@ import {
 import { mcpVersion as mcpVersionRequest, packageVersion } from "./lib/mcp-version.js";
 import { revokeDispatch as revokeDispatchRequest } from "./lib/dispatch-revoke.js";
 import {
+  clearGithubCredential as clearGithubCredentialRequest,
+  githubCredential as githubCredentialRequest,
+  setGithubCredential as setGithubCredentialRequest,
+} from "./lib/github-credential.js";
+import {
   createEpic as createEpicRequest,
   deleteEpic as deleteEpicRequest,
   deleteKeyHint,
@@ -2608,6 +2613,27 @@ async function setLlmConfig({
     { exactKey: true },
   );
   return toContent(result);
+}
+
+// --- #936: the tenant's own GitHub token ------------------------------------
+// A stored credential, so EXACT user key only, like set_llm_config.
+function userKeyApi() {
+  return {
+    apiCall: (method, path, body) =>
+      apiCall(method, path, body, process.env.LOOPCTL_USER_KEY, { exactKey: true }),
+  };
+}
+
+async function githubCredential(args) {
+  return toContent(await githubCredentialRequest(args, userKeyApi()));
+}
+
+async function setGithubCredential(args) {
+  return toContent(await setGithubCredentialRequest(args, userKeyApi()));
+}
+
+async function clearGithubCredential(args) {
+  return toContent(await clearGithubCredentialRequest(args, userKeyApi()));
 }
 
 // --- US-41.4: fail-closed no-egress guard -----------------------------------
@@ -7597,6 +7623,56 @@ const TOOLS = [
     },
   },
   {
+    name: "github_credential",
+    description:
+      "CHECK this tenant's GitHub credential (#936): `has_token`, a masked last-4 " +
+      "`token_hint`, `updated_at`, and `operator_repositories` — the repositories the " +
+      "operator's token is lent for while you have no token of your own. NEVER returns the " +
+      "token. Reach for it when a merge gate refusal says " +
+      "`{pull_request_unavailable, credential_unavailable}`, a verification run records " +
+      "`credential_unavailable`, or an issue closure was abandoned with that reason: it " +
+      "tells you whether the repository has any credential at all. Requires " +
+      "LOOPCTL_USER_KEY (403 for any other role).",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "set_github_credential",
+    description:
+      "SET OR REPLACE this tenant's own GitHub token (#936, PUT " +
+      "/api/v1/tenants/me/github-credential). From then on EVERY GitHub call loopctl makes for " +
+      "this tenant uses it — the merge gate, story and post-deploy verification, thread " +
+      "checkpoint reads and issue closing — for EVERY repository, replacing the operator's " +
+      "token even for repositories the operator lent it for. Use a fine-grained token limited " +
+      "to your own intake-source repositories with read access to Contents, Pull requests, " +
+      "Actions and Commit statuses, plus Issues: write if loopctl should close the issues " +
+      "stories came from. Stored encrypted, never returned. NOT checked against GitHub here: " +
+      "a token that cannot read a repository shows up as that repository's forge refusal " +
+      "(a 403/404 in the merge gate or verification), so check a story after setting it. " +
+      "422 when blank, over 500 characters or containing whitespace; 403 " +
+      "custody_tier_required on an agent-rooted tenant. Requires LOOPCTL_USER_KEY (403 for " +
+      "any other role).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        token: {
+          type: "string",
+          description: "The GitHub token. Write-only; stored encrypted, never returned.",
+        },
+      },
+      required: ["token"],
+    },
+  },
+  {
+    name: "clear_github_credential",
+    description:
+      "REMOVE this tenant's GitHub token (#936, DELETE /api/v1/tenants/me/github-credential). " +
+      "Every GitHub call for the tenant then uses the operator's token ONLY for the " +
+      "repositories `github_credential` lists as `operator_repositories`, and is refused " +
+      "`credential_unavailable` for every other one — a pr-mode repository outside that list " +
+      "stops merging. Idempotent. Requires LOOPCTL_USER_KEY (403 for any other role).",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
     name: "llm_config",
     description:
       "CHECK your BYO LLM onboarding status. Returns this tenant's per-operation model " +
@@ -9023,13 +9099,13 @@ const TOOLS = [
             "merge gate allows it, and the checks story verification judges a story's commit " +
             "by in EITHER mode: GitHub Actions job names as they appear on the commit, satisfied " +
             "only by a job of a PUSH run of the story's branch. A `thread` source must name at " +
-            "least one (422 otherwise). Verification first needs an entry for this tenant in " +
-            "the operator's VERIFICATION_OPERATOR_TOKEN_TENANTS (`credential_unavailable` " +
-            "otherwise, whatever this list holds); then a `pr` source that names none records " +
-            "`no_required_checks` and reads nothing (naming them is how a pr source opts in), " +
-            "and a source that names some has its (tenant, repository) pair checked against " +
-            "that list before any GitHub read (`credential_unavailable` if the pair is not an " +
-            "entry). Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
+            "least one (422 otherwise). Verification first needs a GitHub credential for this " +
+            "tenant: its own token (set_github_credential) or an entry in the operator's " +
+            "VERIFICATION_OPERATOR_TOKEN_TENANTS (`credential_unavailable` otherwise, whatever " +
+            "this list holds); then a `pr` source that names none records `no_required_checks` " +
+            "and reads nothing (naming them is how a pr source opts in), and a source that " +
+            "names some has its (tenant, repository) credential resolved before any GitHub " +
+            "read (`credential_unavailable` if there is none). Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused: whoever pushed posts it, so it is only recorded.",
         },
         secret_file: {
@@ -9140,13 +9216,13 @@ const TOOLS = [
             "merge gate allows it, and the checks story verification judges a story's commit " +
             "by in EITHER mode: GitHub Actions job names as they appear on the commit, satisfied " +
             "only by a job of a PUSH run of the story's branch. A `thread` source must name at " +
-            "least one (422 otherwise). Verification first needs an entry for this tenant in " +
-            "the operator's VERIFICATION_OPERATOR_TOKEN_TENANTS (`credential_unavailable` " +
-            "otherwise, whatever this list holds); then a `pr` source that names none records " +
-            "`no_required_checks` and reads nothing (naming them is how a pr source opts in), " +
-            "and a source that names some has its (tenant, repository) pair checked against " +
-            "that list before any GitHub read (`credential_unavailable` if the pair is not an " +
-            "entry). Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
+            "least one (422 otherwise). Verification first needs a GitHub credential for this " +
+            "tenant: its own token (set_github_credential) or an entry in the operator's " +
+            "VERIFICATION_OPERATOR_TOKEN_TENANTS (`credential_unavailable` otherwise, whatever " +
+            "this list holds); then a `pr` source that names none records `no_required_checks` " +
+            "and reads nothing (naming them is how a pr source opts in), and a source that " +
+            "names some has its (tenant, repository) credential resolved before any GitHub " +
+            "read (`credential_unavailable` if there is none). Distinct, non-blank names, bounded in number and length by the server (422 past them). " +
             "`local-gate` is refused. Omit to leave the current list alone.",
         },
       },
@@ -10181,6 +10257,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "set_llm_config":
       return await setLlmConfig(args);
+
+    // #936: the tenant's own GitHub token
+    case "github_credential":
+      return await githubCredential(args);
+
+    case "set_github_credential":
+      return await setGithubCredential(args);
+
+    case "clear_github_credential":
+      return await clearGithubCredential(args);
 
     case "knowledge_llm_usage":
       return await knowledgeLlmUsage(args);

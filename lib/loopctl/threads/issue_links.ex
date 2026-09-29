@@ -47,6 +47,7 @@ defmodule Loopctl.Threads.IssueLinks do
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.Threads.IssueLink
+  alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Story
 
   @doc "How many transient attempts a link gets before it is abandoned (`Loopctl.ForgeOutbox`)."
@@ -139,9 +140,18 @@ defmodule Loopctl.Threads.IssueLinks do
 
   defp post(link, url) do
     if source_live?(link) do
-      link.repo_full_name
-      |> PullRequestSource.impl().comment_issue(link.issue_number, body(url))
-      |> recorded(link)
+      # As the credential chosen for this (tenant, repository) (#936); none is a permanent
+      # failure like a 403, so nothing is sent.
+      sent =
+        case Credential.repo(link.tenant_id, link.repo_full_name) do
+          {:ok, repo} ->
+            PullRequestSource.impl().comment_issue(repo, link.issue_number, body(url))
+
+          {:error, :credential_unavailable} = error ->
+            error
+        end
+
+      recorded(sent, link)
     else
       abandon(link, :source_revoked)
       {:abandoned, nil}

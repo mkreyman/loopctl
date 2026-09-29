@@ -101,7 +101,8 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   alias Loopctl.DeliveryGates.DiffNames
 
-  @type repo :: String.t()
+  @typedoc "A repository and the credential its calls authenticate with (#936). Never a bare `owner/name`."
+  @type repo :: Loopctl.Delivery.ForgeRepo.t()
 
   @doc """
   The configured implementation (`config :loopctl, :delivery_pull_request_source`), resolved

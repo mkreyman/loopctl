@@ -29,6 +29,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.Escalations
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.GateAInput
   alias Loopctl.Delivery.MergeExecutor
   alias Loopctl.Delivery.MergePrecondition
@@ -115,6 +116,60 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
       assert {:pull_request_unavailable, {:github_api_error, 404}} in reasons
+    end
+
+    test "#936: every forge read authenticates as the credential chosen for (tenant, repo)",
+         ctx do
+      test_pid = self()
+      tenant_repo = ForgeRepo.tenant(@repo, "github_pat_tenant_0001")
+
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, repo ->
+        send(test_pid, {:asked, tenant_id, repo})
+        {:ok, %Loopctl.Verification.Credential{kind: :tenant_token, repo: tenant_repo}}
+      end)
+
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10})
+
+      # Only the exact credential answers: an operator-token read of the same name would be a
+      # FunctionClauseError here.
+      Mox.stub(MockPullRequestSource, :pull_request, fn ^tenant_repo, 4242 ->
+        send(test_pid, :pull_request_read_as_tenant)
+
+        {:ok,
+         %{
+           state: "open",
+           merged?: false,
+           merge_sha: nil,
+           head_sha: @head,
+           merge_base_sha: @base,
+           diffstat: %{files: 1, changed_lines: 10},
+           diff: {:ok, %{files: ["lib/widgets/thing.ex"], renames: []}}
+         }}
+      end)
+
+      Mox.stub(MockPullRequestSource, :repo_files, fn ^tenant_repo, _ref -> {:ok, @repo_files} end)
+
+      assert {:ok, %Verdict{decision: :allow}} = evaluate(ctx)
+      assert_received :pull_request_read_as_tenant
+      assert_received {:asked, tenant_id, @repo}
+      assert tenant_id == ctx.tenant_id
+    end
+
+    test "#936: no credential for the pair refuses naming it, and reads nothing", ctx do
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _n ->
+        flunk("the forge was called with no credential")
+      end)
+
+      Mox.stub(MockPullRequestSource, :repo_files, fn _repo, _ref ->
+        flunk("the forge was called with no credential")
+      end)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
+      assert {:pull_request_unavailable, :credential_unavailable} in reasons
     end
 
     test "a story that is not in the tenant is :not_found", ctx do
@@ -360,7 +415,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       # ordinary push into an escalation once the unevaluated bound is reached.
       moved = String.duplicate("e", 40)
 
-      Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
+      Mox.stub(MockPullRequestSource, :pull_request, fn %ForgeRepo{full_name: @repo}, _number ->
         {:ok,
          %{
            state: "open",
@@ -373,7 +428,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
          }}
       end)
 
-      Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref ->
+      Mox.stub(MockPullRequestSource, :repo_files, fn %ForgeRepo{full_name: @repo}, _ref ->
         flunk("the head-moved branch must not fetch a file list")
       end)
 
@@ -448,6 +503,20 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     setup :thread_setup
 
+    test "#936: a thread with no credential for its repository refuses naming it, unread", ctx do
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      for call <- [:branch_head, :commit, :compare, :contains?, :check_evidence] do
+        arity = if call in [:branch_head, :commit], do: 2, else: 3
+        stub_flunk(call, arity)
+      end
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
+      assert {:pull_request_unavailable, :credential_unavailable} in reasons
+    end
+
     test "TC-45.4.1 a claim placed in pr mode is untouched: it never reads a checkpoint", ctx do
       set_mode(ctx, "pr")
       stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
@@ -493,7 +562,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx)
       parent = String.duplicate("b", 40)
 
-      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, sha, _branch ->
+      Mox.stub(MockPullRequestSource, :check_evidence, fn %ForgeRepo{full_name: @repo},
+                                                          sha,
+                                                          _branch ->
         cond do
           sha == @head -> {:ok, %{jobs: [ci_run("test", nil, "in_progress")], statuses: []}}
           sha == parent -> {:ok, %{jobs: [ci_run("test", "success")], statuses: []}}
@@ -510,7 +581,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx)
       test_pid = self()
 
-      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha, _branch ->
+      Mox.stub(MockPullRequestSource, :check_evidence, fn %ForgeRepo{full_name: @repo},
+                                                          _sha,
+                                                          _branch ->
         send(test_pid, {:reading_at, DateTime.utc_now()})
         Process.sleep(20)
         {:ok, %{jobs: [ci_run("test", "success")], statuses: []}}
@@ -597,7 +670,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       blips = MergePrecondition.max_consecutive_unevaluated() - 1
 
       fault = fn ->
-        Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha, _branch ->
+        Mox.stub(MockPullRequestSource, :check_evidence, fn %ForgeRepo{full_name: @repo},
+                                                            _sha,
+                                                            _branch ->
           {:error, {:github_unreachable, :timeout}}
         end)
 
@@ -606,7 +681,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       fault.()
 
-      Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, _sha, _branch ->
+      Mox.stub(MockPullRequestSource, :check_evidence, fn %ForgeRepo{full_name: @repo},
+                                                          _sha,
+                                                          _branch ->
         {:ok, %{jobs: [ci_run("test", nil, "queued")], statuses: []}}
       end)
 
@@ -655,12 +732,17 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx, branch_head: in_flight)
 
       Mox.stub(MockPullRequestSource, :commit, fn
-        @repo, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
-        @repo, ^in_flight -> {:ok, %{tree_sha: @tree, parents: [@head, @base_head]}}
+        %ForgeRepo{full_name: @repo}, @head ->
+          {:ok, %{tree_sha: @tree, parents: [@base_head]}}
+
+        %ForgeRepo{full_name: @repo}, ^in_flight ->
+          {:ok, %{tree_sha: @tree, parents: [@head, @base_head]}}
       end)
 
       # Its second parent is on the base branch: the executor's own merge.
-      Mox.stub(MockPullRequestSource, :contains?, fn @repo, sha, "master" ->
+      Mox.stub(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                     sha,
+                                                     "master" ->
         {:ok, sha == @base_head}
       end)
 
@@ -670,8 +752,11 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       # Two parents, the second NOT on the base: somebody's merge, a moved head.
       Mox.stub(MockPullRequestSource, :commit, fn
-        @repo, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
-        @repo, ^in_flight -> {:ok, %{tree_sha: @tree, parents: [@head, @base]}}
+        %ForgeRepo{full_name: @repo}, @head ->
+          {:ok, %{tree_sha: @tree, parents: [@base_head]}}
+
+        %ForgeRepo{full_name: @repo}, ^in_flight ->
+          {:ok, %{tree_sha: @tree, parents: [@head, @base]}}
       end)
 
       assert {:ok, %Verdict{decision: decision}} = evaluate(ctx)
@@ -688,8 +773,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx, branch_head: pushed)
 
       Mox.stub(MockPullRequestSource, :commit, fn
-        @repo, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
-        @repo, ^pushed -> {:error, {:github_api_error, 404}}
+        %ForgeRepo{full_name: @repo}, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
+        %ForgeRepo{full_name: @repo}, ^pushed -> {:error, {:github_api_error, 404}}
       end)
 
       assert {:ok, %Verdict{decision: :head_moved}} = enforce(ctx)
@@ -706,11 +791,15 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx, branch_head: pushed)
 
       Mox.stub(MockPullRequestSource, :commit, fn
-        @repo, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
-        @repo, ^pushed -> {:ok, %{tree_sha: @tree, parents: [@head]}}
+        %ForgeRepo{full_name: @repo}, @head -> {:ok, %{tree_sha: @tree, parents: [@base_head]}}
+        %ForgeRepo{full_name: @repo}, ^pushed -> {:ok, %{tree_sha: @tree, parents: [@head]}}
       end)
 
-      Mox.stub(MockPullRequestSource, :contains?, fn @repo, _sha, "master" -> {:ok, true} end)
+      Mox.stub(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                     _sha,
+                                                     "master" ->
+        {:ok, true}
+      end)
 
       assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
       assert {:branch_head_unrecorded, pushed, @head} in reasons
@@ -767,12 +856,14 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       make_claim_live(ctx)
       stub_thread(ctx)
 
-      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, _branch ->
+      Mox.stub(MockPullRequestSource, :branch_head, fn %ForgeRepo{full_name: @repo}, _branch ->
         {:error, {:github_api_error, 404}}
       end)
 
       # The repository reads, so the 404 is about the branch.
-      Mox.stub(MockPullRequestSource, :repository_readable, fn @repo -> :ok end)
+      Mox.stub(MockPullRequestSource, :repository_readable, fn %ForgeRepo{full_name: @repo} ->
+        :ok
+      end)
 
       assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
       assert {:branch_missing, @head} in reasons
@@ -787,7 +878,10 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       set_dispatch(ctx, branch: dispatched)
       stub_thread(ctx)
 
-      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^dispatched -> {:ok, @head} end)
+      Mox.stub(MockPullRequestSource, :branch_head, fn %ForgeRepo{full_name: @repo},
+                                                       ^dispatched ->
+        {:ok, @head}
+      end)
 
       assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
     end
@@ -806,7 +900,11 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         end)
 
       stub_thread(ctx)
-      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^dispatched -> {:ok, @head} end)
+
+      Mox.stub(MockPullRequestSource, :branch_head, fn %ForgeRepo{full_name: @repo},
+                                                       ^dispatched ->
+        {:ok, @head}
+      end)
 
       assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
     end
@@ -879,7 +977,12 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       merged = String.duplicate("6", 40)
       set_merge_commit(ctx, merged)
       stub_thread(ctx, merge_base: @head)
-      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^merged, "master" -> {:ok, false} end)
+
+      Mox.stub(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                     ^merged,
+                                                     "master" ->
+        {:ok, false}
+      end)
 
       assert {:ok, %Verdict{decision: :already_merged, merge_sha: @head}} = evaluate(ctx)
     end
@@ -930,7 +1033,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       stub_thread(ctx)
       stub_branch_deleted()
 
-      Mox.stub(MockPullRequestSource, :compare, fn @repo, "master", @head ->
+      Mox.stub(MockPullRequestSource, :compare, fn %ForgeRepo{full_name: @repo},
+                                                   "master",
+                                                   @head ->
         {:error, {:github_unreachable, :timeout}}
       end)
 
@@ -999,7 +1104,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       set_merge_commit(ctx, merged)
       stub_thread(ctx)
 
-      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^merged, "master" ->
+      Mox.stub(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                     ^merged,
+                                                     "master" ->
         {:error, {:github_api_error, 404}}
       end)
 
@@ -1011,7 +1118,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       set_merge_commit(ctx, merged)
       stub_thread(ctx)
 
-      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^merged, "master" ->
+      Mox.stub(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                     ^merged,
+                                                     "master" ->
         {:error, {:github_unreachable, :timeout}}
       end)
 
@@ -1022,11 +1131,11 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
          ctx do
       stub_thread(ctx)
 
-      Mox.stub(MockPullRequestSource, :branch_head, fn @repo, _branch ->
+      Mox.stub(MockPullRequestSource, :branch_head, fn %ForgeRepo{full_name: @repo}, _branch ->
         {:error, {:github_api_error, 404}}
       end)
 
-      Mox.stub(MockPullRequestSource, :repository_readable, fn @repo ->
+      Mox.stub(MockPullRequestSource, :repository_readable, fn %ForgeRepo{full_name: @repo} ->
         {:error, {:github_api_error, 404}}
       end)
 
@@ -1040,7 +1149,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
          ctx do
       stub_thread(ctx)
 
-      Mox.stub(MockPullRequestSource, :commit, fn @repo, @head ->
+      Mox.stub(MockPullRequestSource, :commit, fn %ForgeRepo{full_name: @repo}, @head ->
         {:error, {:github_api_error, 404}}
       end)
 
@@ -1087,7 +1196,11 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       set_merge_commit(ctx, merged)
       stub_thread(ctx)
 
-      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^merged, "master" -> {:ok, false} end)
+      Mox.stub(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                     ^merged,
+                                                     "master" ->
+        {:ok, false}
+      end)
 
       assert {:ok, %Verdict{decision: :allow, merge_sha: nil}} = enforce(ctx)
     end
@@ -1099,7 +1212,12 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       merged = String.duplicate("6", 40)
       set_merge_commit(ctx, merged)
-      Mox.stub(MockPullRequestSource, :contains?, fn @repo, ^merged, "master" -> {:ok, true} end)
+
+      Mox.stub(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                     ^merged,
+                                                     "master" ->
+        {:ok, true}
+      end)
 
       assert {:ok, %Verdict{decision: :already_merged, merge_sha: ^merged}} = evaluate(ctx)
     end
@@ -1927,7 +2045,13 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
          ctx do
       stub_thread(ctx)
       set_merge_commit(ctx, @merge)
-      Mox.stub(MockPullRequestSource, :contains?, fn @repo, @merge, "master" -> {:ok, true} end)
+
+      Mox.stub(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                     @merge,
+                                                     "master" ->
+        {:ok, true}
+      end)
+
       stub_ancestors(%{{@merge, @base_head} => true})
 
       assert {:ok, %Verdict{decision: :already_merged, merge_sha: @merge}} = enforce(ctx)
@@ -2096,6 +2220,18 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   # The forge as the executor sees it on the happy path: the base head is the allow's
   # `base_sha`, the thread branch names the checkpoint, the checkpoint contains the base, and
   # every write succeeds. A test overrides what it is about.
+  defp stub_flunk(call, 2),
+    do:
+      Mox.stub(MockPullRequestSource, call, fn _a, _b ->
+        flunk("#{call} read with no credential")
+      end)
+
+  defp stub_flunk(call, 3),
+    do:
+      Mox.stub(MockPullRequestSource, call, fn _a, _b, _c ->
+        flunk("#{call} read with no credential")
+      end)
+
   defp stub_forge(branch) do
     Mox.stub(MockMergeForge, :session, fn @repo -> {:ok, @session} end)
     stub_base_head(@base_head, branch)
@@ -2195,11 +2331,11 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     {:ok, route} = DispatchPayload.dispatch_route(ctx.tenant_id, story)
     {:ok, branch} = DispatchPayload.thread_branch(route, story, stage.branch)
 
-    Mox.stub(MockPullRequestSource, :branch_head, fn @repo, ^branch ->
+    Mox.stub(MockPullRequestSource, :branch_head, fn %ForgeRepo{full_name: @repo}, ^branch ->
       {:ok, Keyword.get(opts, :branch_head, head)}
     end)
 
-    Mox.stub(MockPullRequestSource, :commit, fn @repo, ^head ->
+    Mox.stub(MockPullRequestSource, :commit, fn %ForgeRepo{full_name: @repo}, ^head ->
       {:ok,
        %{
          tree_sha: Keyword.get(opts, :tree, @tree)
@@ -2208,16 +2344,24 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     base_branch = Keyword.get(opts, :base_branch, "master")
 
-    Mox.stub(MockPullRequestSource, :compare, fn @repo, ^base_branch, ^head ->
+    Mox.stub(MockPullRequestSource, :compare, fn %ForgeRepo{full_name: @repo},
+                                                 ^base_branch,
+                                                 ^head ->
       {:ok, comparison(Keyword.get(opts, :base_tree, @base_tree), opts)}
     end)
 
-    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+    Mox.stub(MockPullRequestSource, :repo_files, fn %ForgeRepo{full_name: @repo}, _ref ->
+      {:ok, @repo_files}
+    end)
 
     # US-45.6: CI on the CHECKPOINT's commit, green unless the test says otherwise.
     ci = Keyword.get(opts, :ci, %{jobs: [ci_run("test", "success")], statuses: []})
     # The read names the thread branch: only its push runs are trusted.
-    Mox.stub(MockPullRequestSource, :check_evidence, fn @repo, ^head, ^branch -> {:ok, ci} end)
+    Mox.stub(MockPullRequestSource, :check_evidence, fn %ForgeRepo{full_name: @repo},
+                                                        ^head,
+                                                        ^branch ->
+      {:ok, ci}
+    end)
   end
 
   # Records the story's transition into `ci` at `at` (the CI wait's origin).
@@ -2278,11 +2422,13 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
   # The thread branch 404s in a repository the token can read: deleted.
   defp stub_branch_deleted do
-    Mox.stub(MockPullRequestSource, :branch_head, fn @repo, _branch ->
+    Mox.stub(MockPullRequestSource, :branch_head, fn %ForgeRepo{full_name: @repo}, _branch ->
       {:error, {:github_api_error, 404}}
     end)
 
-    Mox.stub(MockPullRequestSource, :repository_readable, fn @repo -> :ok end)
+    Mox.stub(MockPullRequestSource, :repository_readable, fn %ForgeRepo{full_name: @repo} ->
+      :ok
+    end)
   end
 
   defp set_merge_commit(ctx, sha) do
@@ -2351,7 +2497,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   defp stub_source(opts) do
     head = Keyword.get(opts, :head, @head)
 
-    Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
+    Mox.stub(MockPullRequestSource, :pull_request, fn %ForgeRepo{full_name: @repo}, _number ->
       {:ok,
        %{
          state: Keyword.get(opts, :state, "open"),
@@ -2364,21 +2510,23 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
        }}
     end)
 
-    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+    Mox.stub(MockPullRequestSource, :repo_files, fn %ForgeRepo{full_name: @repo}, _ref ->
+      {:ok, @repo_files}
+    end)
   end
 
   defp stub_unreachable do
-    Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
+    Mox.stub(MockPullRequestSource, :pull_request, fn %ForgeRepo{full_name: @repo}, _number ->
       {:error, {:github_unreachable, :timeout}}
     end)
 
-    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref ->
+    Mox.stub(MockPullRequestSource, :repo_files, fn %ForgeRepo{full_name: @repo}, _ref ->
       {:error, {:github_unreachable, :timeout}}
     end)
   end
 
   defp stub_merged(merge_sha) do
-    Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
+    Mox.stub(MockPullRequestSource, :pull_request, fn %ForgeRepo{full_name: @repo}, _number ->
       {:ok,
        %{
          state: "closed",
@@ -2391,7 +2539,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
        }}
     end)
 
-    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+    Mox.stub(MockPullRequestSource, :repo_files, fn %ForgeRepo{full_name: @repo}, _ref ->
+      {:ok, @repo_files}
+    end)
   end
 
   defp build_story(tenant) do

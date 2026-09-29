@@ -12,6 +12,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
 
   import Mox
 
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.MockPullRequestSource
   alias Loopctl.Verification.Credential
   alias Loopctl.Verification.GitHubActions
@@ -25,7 +26,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
   @head_tree String.duplicate("e", 40)
   @base_tree String.duplicate("f", 40)
   @branch "loop/story-7-abcd1234"
-  @credential %Credential{kind: :operator_token}
+  @credential %Credential{kind: :operator_token, repo: ForgeRepo.operator("acme/widgets")}
 
   defp request(extra \\ %{}) do
     Map.merge(
@@ -54,11 +55,14 @@ defmodule Loopctl.Verification.GitHubActionsTest do
   # The change check reads the commit's tree, then compares it with the base.
   defp expect_compare(answer, tree \\ @head_tree) do
     expect_commit({:ok, %{tree_sha: tree, parents: [@fork_point]}})
-    expect(MockPullRequestSource, :compare, fn @repo, "master", @sha -> answer end)
+
+    expect(MockPullRequestSource, :compare, fn %ForgeRepo{full_name: @repo}, "master", @sha ->
+      answer
+    end)
   end
 
   defp expect_commit(answer) do
-    expect(MockPullRequestSource, :commit, fn @repo, @sha -> answer end)
+    expect(MockPullRequestSource, :commit, fn %ForgeRepo{full_name: @repo}, @sha -> answer end)
   end
 
   defp job(id, run_id, name, status, conclusion, workflow \\ ".github/workflows/ci.yml") do
@@ -79,7 +83,11 @@ defmodule Loopctl.Verification.GitHubActionsTest do
   defp evidence(runs, jobs), do: {:ok, %{runs: runs, jobs: jobs, statuses: []}}
 
   defp stub_evidence(result) do
-    expect(MockPullRequestSource, :check_evidence, fn @repo, @sha, @branch -> result end)
+    expect(MockPullRequestSource, :check_evidence, fn %ForgeRepo{full_name: @repo},
+                                                      @sha,
+                                                      @branch ->
+      result
+    end)
   end
 
   describe "auth_headers/1" do
@@ -365,30 +373,57 @@ defmodule Loopctl.Verification.GitHubActionsTest do
     # commit found for SHA" for an unknown prefix and an unknown full id alike, and 404 for a
     # repository that is missing or unreadable.
     test "resolving an abbreviated SHA: 422 unresolved_sha, 404 repository_unreadable" do
-      expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" ->
+      expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, "aaaaaaa" ->
         {:error, {:github_api_error, 422}}
       end)
 
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
                {:no_verdict, "unresolved_sha"}
 
-      expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" ->
+      expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, "aaaaaaa" ->
         {:error, {:github_api_error, 404}}
       end)
 
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
                {:no_verdict, "repository_unreadable"}
 
-      expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" ->
+      expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, "aaaaaaa" ->
         {:error, {:github_api_error, 502}}
       end)
 
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
                {:wait, {:transient, nil}}
 
-      expect(MockPullRequestSource, :resolve_commit, fn @repo, "aaaaaaa" -> {:ok, @sha} end)
+      expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, "aaaaaaa" ->
+        {:ok, @sha}
+      end)
+
       assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) == {:ok, @sha}
     end
+  end
+
+  test "#936: every read goes to the forge as the credential's own repository" do
+    tenant_repo = ForgeRepo.tenant(@repo, "github_pat_verify_001")
+    credential = %Credential{kind: :tenant_token, repo: tenant_repo}
+
+    expect(MockPullRequestSource, :resolve_commit, fn ^tenant_repo, "aaaaaaa" -> {:ok, @sha} end)
+    assert GitHubActions.resolve_commit(@repo, "aaaaaaa", credential) == {:ok, @sha}
+
+    expect(MockPullRequestSource, :commit, fn ^tenant_repo, @sha ->
+      {:ok, %{tree_sha: @head_tree, parents: [@fork_point]}}
+    end)
+
+    expect(MockPullRequestSource, :compare, fn ^tenant_repo, "master", @sha ->
+      compare(["lib/widgets/thing.ex"])
+    end)
+
+    assert GitHubActions.check_change(request(%{credential: credential})) == :ok
+
+    expect(MockPullRequestSource, :check_evidence, fn ^tenant_repo, @sha, @branch ->
+      evidence([run(1, "completed", "success")], [job(10, 1, "test", "completed", "success")])
+    end)
+
+    assert {:pass, _evidence} = GitHubActions.verdict(request(%{credential: credential}))
   end
 
   test "without an operator credential nothing is read" do

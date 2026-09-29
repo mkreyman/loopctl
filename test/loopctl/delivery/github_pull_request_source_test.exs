@@ -10,10 +10,11 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
   use ExUnit.Case, async: true
 
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.GitHubPullRequestSource, as: Source
   alias Loopctl.Delivery.MergePrecondition
 
-  @repo "acme/widgets"
+  @repo ForgeRepo.operator("acme/widgets")
   @head String.duplicate("a", 40)
   @merge_base String.duplicate("b", 40)
   @since ~U[2026-09-13 12:00:00Z]
@@ -229,7 +230,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
 
     test "a repository name that is not owner/name never reaches the network" do
-      assert {:error, {:invalid_repo, "../../etc"}} = Source.pull_request("../../etc", 7)
+      assert {:error, {:invalid_repo, "../../etc"}} =
+               Source.pull_request(ForgeRepo.operator("../../etc"), 7)
     end
 
     test "a non-positive pull request number never reaches the network" do
@@ -752,6 +754,46 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
   end
 
   # -- helpers ---------------------------------------------------------------------------
+
+  describe "the credential a call authenticates with (#936)" do
+    @tenant_repo ForgeRepo.tenant("acme/widgets", "github_pat_tenant_only")
+
+    defp capture_auth(response) do
+      stub(fn conn ->
+        send(self(), {:auth, conn.method, Plug.Conn.get_req_header(conn, "authorization")})
+        response.(conn)
+      end)
+    end
+
+    test "a read, the diff stream, the sha read and a write all carry the tenant's token" do
+      capture_auth(fn conn ->
+        case conn.method do
+          "POST" -> Plug.Conn.resp(conn, 201, "{}")
+          _get -> json(conn, %{"object" => %{"sha" => @head, "type" => "commit"}})
+        end
+      end)
+
+      assert {:ok, @head} = Source.branch_head(@tenant_repo, "main")
+      assert_received {:auth, "GET", ["Bearer github_pat_tenant_only"]}
+
+      assert :ok = Source.comment_issue(@tenant_repo, 3, "done")
+      assert_received {:auth, "POST", ["Bearer github_pat_tenant_only"]}
+
+      capture_auth(fn conn -> sha_response(conn, 200, @head) end)
+      assert {:ok, @head} = Source.resolve_commit(@tenant_repo, "aaaaaaa")
+      assert_received {:auth, "GET", ["Bearer github_pat_tenant_only"]}
+
+      capture_auth(fn conn -> Plug.Conn.resp(conn, 200, "") end)
+      assert {:ok, _diff} = Source.checkpoint_diff(@tenant_repo, "main", @head)
+      assert_received {:auth, "GET", ["Bearer github_pat_tenant_only"]}
+    end
+
+    test "a bare repository name is refused before any request, whatever it names" do
+      assert {:error, {:invalid_repo, :unreadable}} = Source.branch_head("acme/widgets", "main")
+      assert {:error, {:invalid_repo, :unreadable}} = Source.pull_request("acme/widgets", 7)
+      assert {:error, {:invalid_repo, :unreadable}} = Source.comment_issue("acme/widgets", 3, "x")
+    end
+  end
 
   describe "resolve_commit/2 (US-26.4.6)" do
     defp sha_response(conn, status, body) do

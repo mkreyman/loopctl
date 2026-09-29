@@ -55,7 +55,10 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
       assert {:closed, nil} = IssueCloser.close(closure)
 
-      assert_received {:labelled, "mkreyman/home_care_billing", 77, @shipped_label}
+      assert_received {:labelled,
+                       %Loopctl.Delivery.ForgeRepo{full_name: "mkreyman/home_care_billing"}, 77,
+                       @shipped_label}
+
       assert_received {:commented, body}
       assert body == Resolution.for_verdict(:shipped).resolution_notes
       assert_received {:closed, :completed}
@@ -267,6 +270,26 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
       # And nothing of the label TEXT reached the row.
       refute row.last_error =~ "🇺🇸"
+    end
+
+    test "#936: no credential for the pair is abandoned with nothing sent to the forge", ctx do
+      closure = closure(ctx, :shipped)
+
+      stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, repo ->
+        assert tenant_id == ctx.tenant.id
+        assert repo == "mkreyman/home_care_billing"
+        {:error, :credential_unavailable}
+      end)
+
+      expect(MockPullRequestSource, :issue, 0, fn _repo, _number -> flunk("read") end)
+      expect(MockPullRequestSource, :close_issue, 0, fn _repo, _number, _r -> flunk("closed") end)
+
+      assert {:abandoned, nil} = IssueCloser.close(closure)
+
+      row = reload(ctx)
+      assert row.status == :abandoned
+      assert row.abandoned_reason =~ "permanent_forge_failure"
+      assert row.last_error =~ "credential_unavailable"
     end
 
     test "a 404 is abandoned on the first attempt and never retried", ctx do

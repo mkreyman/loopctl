@@ -350,6 +350,10 @@ defmodule LoopctlWeb.Router do
 
     get "/tenants/me/llm-config", LlmConfigController, :show
     patch "/tenants/me/llm-config", LlmConfigController, :update
+    # #936: the tenant's own GitHub token. Role :user, enforced by the controller.
+    get "/tenants/me/github-credential", GitHubCredentialController, :show
+    put "/tenants/me/github-credential", GitHubCredentialController, :update
+    delete "/tenants/me/github-credential", GitHubCredentialController, :delete
     post "/tenants/:id/rotate-audit-key/challenge", TenantAuditKeyController, :challenge
     post "/tenants/:id/rotate-audit-key", TenantAuditKeyController, :rotate
     post "/tenants/:id/bootstrap-audit-key", TenantAuditKeyController, :bootstrap

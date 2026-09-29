@@ -106,6 +106,7 @@ defmodule Loopctl.Delivery.IssueCloser do
   alias Loopctl.Delivery.Resolution
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.IssueClosures
+  alias Loopctl.Verification.Credential
 
   @typedoc """
   What one attempt did.
@@ -150,7 +151,7 @@ defmodule Loopctl.Delivery.IssueCloser do
   end
 
   defp read_issue(%IssueClosure{} = closure) do
-    case source().issue(closure.repo_full_name, closure.issue_number) do
+    case forge(closure, &source().issue(&1, closure.issue_number)) do
       {:ok, issue} -> proceed(closure, issue)
       {:error, reason} -> fault(closure, reason)
     end
@@ -233,7 +234,7 @@ defmodule Loopctl.Delivery.IssueCloser do
   defp recheck_state(%IssueClosure{} = closure) do
     %Resolution{label: own_label} = IssueClosure.resolution(closure)
 
-    case source().issue(closure.repo_full_name, closure.issue_number) do
+    case forge(closure, &source().issue(&1, closure.issue_number)) do
       {:ok, %{state: "closed", labels: labels}} ->
         {:closed, abandon(closure, :closed_by_other, {:closed_mid_attempt, own_label in labels})}
 
@@ -265,7 +266,7 @@ defmodule Loopctl.Delivery.IssueCloser do
     if label in live_labels do
       {:ok, closure}
     else
-      case source().label_issue(closure.repo_full_name, closure.issue_number, label) do
+      case forge(closure, &source().label_issue(&1, closure.issue_number, label)) do
         :ok -> IssueClosures.mark_labelled(closure.tenant_id, closure.id)
         {:error, reason} -> {:fault, reason}
       end
@@ -280,7 +281,7 @@ defmodule Loopctl.Delivery.IssueCloser do
 
   defp apply_comment(%IssueClosure{} = closure, %Resolution{resolution_notes: notes})
        when is_binary(notes) do
-    case source().comment_issue(closure.repo_full_name, closure.issue_number, notes) do
+    case forge(closure, &source().comment_issue(&1, closure.issue_number, notes)) do
       :ok -> IssueClosures.mark_commented(closure.tenant_id, closure.id)
       {:error, reason} -> {:fault, reason}
     end
@@ -296,7 +297,7 @@ defmodule Loopctl.Delivery.IssueCloser do
   defp apply_close(%IssueClosure{} = closure, %Resolution{} = resolution) do
     reason = state_reason(resolution)
 
-    case source().close_issue(closure.repo_full_name, closure.issue_number, reason) do
+    case forge(closure, &source().close_issue(&1, closure.issue_number, reason)) do
       :ok -> record_closed(closure, :closed)
       {:error, forge_reason} -> fault(closure, forge_reason)
     end
@@ -385,6 +386,15 @@ defmodule Loopctl.Delivery.IssueCloser do
       tenant_id: closure.tenant_id,
       story_id: closure.story_id
     )
+  end
+
+  # Every forge call authenticates as the credential chosen for this closure's (tenant,
+  # repository) (#936). None is a fault like any permanent forge refusal: nothing is sent.
+  defp forge(%IssueClosure{} = closure, call) do
+    case Credential.repo(closure.tenant_id, closure.repo_full_name) do
+      {:ok, repo} -> call.(repo)
+      {:error, :credential_unavailable} = error -> error
+    end
   end
 
   defp source, do: PullRequestSource.impl()

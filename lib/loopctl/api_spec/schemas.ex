@@ -3785,6 +3785,58 @@ defmodule Loopctl.ApiSpec.Schemas do
     })
   end
 
+  defmodule GitHubCredentialResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "GitHubCredentialResponse",
+      description:
+        "The tenant's GitHub credential (#936). NEVER includes the token — only whether one " <>
+          "is set, a masked last-4 hint, and the repositories the operator's token is lent " <>
+          "for when the tenant has none.",
+      type: :object,
+      properties: %{
+        has_token: %Schema{type: :boolean, description: "Whether the tenant has set a token"},
+        token_hint: %Schema{
+          type: :string,
+          nullable: true,
+          description: "Masked last-4 hint; never the token"
+        },
+        updated_at: %Schema{type: :string, format: :"date-time", nullable: true},
+        operator_repositories: %Schema{
+          type: :array,
+          items: %Schema{type: :string},
+          description:
+            "The `owner/name` repositories `VERIFICATION_OPERATOR_TOKEN_TENANTS` lends the " <>
+              "operator's token for, used only while `has_token` is false"
+        }
+      },
+      required: [:has_token, :token_hint, :updated_at, :operator_repositories]
+    })
+  end
+
+  defmodule GitHubCredentialRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "GitHubCredentialRequest",
+      description:
+        "A GitHub token for every forge call made for this tenant (#936). A fine-grained " <>
+          "token limited to the tenant's own repositories is the intended shape.",
+      type: :object,
+      properties: %{
+        token: %Schema{
+          type: :string,
+          description:
+            "The token. Trimmed; blank, over 500 characters or containing whitespace is 422."
+        }
+      },
+      required: [:token]
+    })
+  end
+
   defmodule LlmConfigResponse do
     @moduledoc false
     require OpenApiSpex

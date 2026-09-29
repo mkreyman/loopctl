@@ -6,6 +6,22 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Each tenant can give loopctl its own GitHub token, and every forge call for that tenant
+  uses it (#936).** The merge gate, story verification, post-deploy verification, thread
+  checkpoint reads, the issue closer and thread issue links all authenticate per (tenant,
+  repository): the tenant's own token when it has set one, else the operator's `GITHUB_TOKEN`
+  for the pairs named in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, else nothing. Set it with
+  `PUT /api/v1/tenants/me/github-credential` (MCP `set_github_credential`, `:user` key); it is
+  stored encrypted and never returned. A tenant reading with its own token can learn nothing
+  that token could not already read, which closes the cross-tenant disclosure where a tenant
+  enrolled another party's private repository and read it through the operator's token.
+  **Behaviour change, operator action:** before this the MERGE GATE (and post-deploy
+  verification and the issue closer) used `GITHUB_TOKEN` for every tenant with no allowlist.
+  Now a repository with no credential is refused `{:pull_request_unavailable,
+  :credential_unavailable}` at the merge gate and its issue closures are abandoned. Before
+  deploying, confirm every active intake source (`intake_source_list`) is either named in
+  `VERIFICATION_OPERATOR_TOKEN_TENANTS` or belongs to a tenant that will set its own token.
+  Migration `create_tenant_github_credentials` adds one table; no manual step.
 - **Story verification records a CI verdict, by the merge gate's rules (US-26.4.6, #913).
   Before this, verification NEVER produced a CI verdict:** the worker passed an uncast UUID to
   a schemaless query, so every run with a commit crashed before any CI read, and its lookup

@@ -50,13 +50,14 @@ defmodule Loopctl.Verification.GitHubActions do
   alias Loopctl.Delivery.CiDefinition
   alias Loopctl.Delivery.CiEvidence
   alias Loopctl.Delivery.EmptyChange
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Verification.Credential
 
   @impl true
-  def resolve_commit(repo, sha, %Credential{kind: :operator_token}) do
-    case source().resolve_commit(repo, sha) do
+  def resolve_commit(_repo, sha, %Credential{repo: %ForgeRepo{} = forge_repo}) do
+    case source().resolve_commit(forge_repo, sha) do
       {:ok, full} -> {:ok, full}
       {:error, reason} -> classify(reason, :resolve)
     end
@@ -65,10 +66,10 @@ defmodule Loopctl.Verification.GitHubActions do
   def resolve_commit(_repo, _sha, _credential), do: {:refused, "credential_unavailable"}
 
   @impl true
-  def check_change(%{credential: %Credential{kind: :operator_token}} = request) do
-    with {:ok, commit} <- read(source().commit(request.repo, request.sha)),
+  def check_change(%{credential: %Credential{repo: %ForgeRepo{} = forge_repo}} = request) do
+    with {:ok, commit} <- read(source().commit(forge_repo, request.sha)),
          {:ok, comparison} <-
-           read(source().compare(request.repo, request.base_branch, request.sha)) do
+           read(source().compare(forge_repo, request.base_branch, request.sha)) do
       change(commit, comparison)
     end
   end
@@ -76,14 +77,14 @@ defmodule Loopctl.Verification.GitHubActions do
   def check_change(_request), do: {:refused, "credential_unavailable"}
 
   @impl true
-  def verdict(%{credential: %Credential{kind: :operator_token}} = request) do
+  def verdict(%{credential: %Credential{repo: %ForgeRepo{} = forge_repo}} = request) do
     if CiEvidence.lookup_names(request.required_checks) == [] do
       # The worker refuses this before asking; refused here too, so the adapter can never
       # judge an empty list — over which every check "passed".
       {:refused, "no_required_checks"}
     else
       with {:ok, evidence} <-
-             read(source().check_evidence(request.repo, request.sha, request.branch)) do
+             read(source().check_evidence(forge_repo, request.sha, request.branch)) do
         judge(request, evidence)
       end
     end

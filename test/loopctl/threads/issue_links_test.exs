@@ -220,7 +220,11 @@ defmodule Loopctl.Threads.IssueLinksTest do
     end
 
     test "posts one comment carrying the URL, then is terminal", ctx do
-      expect(Loopctl.MockPullRequestSource, :comment_issue, fn "acme/widgets", 9, body ->
+      expect(Loopctl.MockPullRequestSource, :comment_issue, fn %Loopctl.Delivery.ForgeRepo{
+                                                                 full_name: "acme/widgets"
+                                                               },
+                                                               9,
+                                                               body ->
         assert body =~ @url
         :ok
       end)
@@ -233,6 +237,18 @@ defmodule Loopctl.Threads.IssueLinksTest do
       # A second drainer holding the same stale candidate posts nothing.
       assert {:skipped, nil} = IssueLinks.attempt(ctx.link, @url)
       assert [] == IssueLinks.due(50) |> Enum.filter(&(&1.id == ctx.link.id))
+    end
+
+    test "#936: no credential for the pair abandons with nothing posted", ctx do
+      stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, "acme/widgets" ->
+        assert tenant_id == ctx.tenant.id
+        {:error, :credential_unavailable}
+      end)
+
+      expect(Loopctl.MockPullRequestSource, :comment_issue, 0, fn _, _, _ -> :ok end)
+
+      assert {:abandoned, nil} = IssueLinks.attempt(ctx.link, @url)
+      assert %IssueLink{status: :abandoned} = IssueLinks.get(ctx.tenant.id, ctx.story.id)
     end
 
     test "a transient failure backs off and stays pending; a permanent one abandons", ctx do

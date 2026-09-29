@@ -115,14 +115,20 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   ## Authentication
 
-  `GITHUB_TOKEN`, through `Loopctl.Verification.GitHubActions.auth_headers/1` — one rule
-  for the whole application, including its blank-value handling. Unset means anonymous
-  calls, which work for a public repository until GitHub's per-IP hourly limit bites and
-  then escalate rather than pass.
+  Every callback takes a `Loopctl.Delivery.ForgeRepo`, never a bare `owner/name`, and
+  authenticates with the credential it carries (#936): the tenant's own token, or the
+  operator's `GITHUB_TOKEN` where the operator lent it for that (tenant, repository). A bare
+  string is refused as `{:invalid_repo, _}` with no request made, so a caller cannot reach
+  GitHub without `Loopctl.Verification.Credential.for_read/2` having chosen a credential.
+  The header is built by `Loopctl.Verification.GitHubActions.auth_headers/1`, one rule for
+  the whole application including its blank-value handling: an operator `GITHUB_TOKEN` that
+  is unset means anonymous calls, which work for a public repository until GitHub's per-IP
+  hourly limit bites and then escalate rather than pass.
   """
 
   @behaviour Loopctl.Delivery.PullRequestSource
 
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.GitSha
   alias Loopctl.Verification.GitHubActions
 
@@ -239,7 +245,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   def resolve_commit(repo, ref) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, ref} <- hex_prefix(ref),
-         {:ok, body} <- get(repo, "/commits/#{ref}", sha_headers()) do
+         {:ok, body} <- get(repo, "/commits/#{ref}", sha_headers(repo)) do
       full = if is_binary(body), do: String.trim(body), else: body
 
       if GitSha.valid?(full) and String.starts_with?(full, ref),
@@ -256,8 +262,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   defp hex_prefix(ref), do: {:error, {:invalid_ref, shape(ref)}}
 
-  defp sha_headers do
-    Enum.map(headers(), fn
+  defp sha_headers(repo) do
+    Enum.map(headers(repo), fn
       {"accept", _} -> {"accept", "application/vnd.github.sha"}
       header -> header
     end)
@@ -449,12 +455,13 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   defp hex_sha(sha), do: {:error, {:invalid_sha, shape(sha)}}
 
   defp read_diff(repo, path) do
-    url = @api_base <> "/repos/" <> repo <> path
+    url = url(repo, path)
     deadline = System.monotonic_time(:millisecond) + @diff_deadline_ms
 
     opts =
-      req_options()
-      |> Keyword.put(:headers, diff_headers())
+      repo
+      |> req_options()
+      |> Keyword.put(:headers, diff_headers(repo))
       |> Keyword.put(:into, &collect_diff(&1, &2, deadline))
 
     case Req.get(url, opts) do
@@ -505,8 +512,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     |> Req.Response.put_private(:truncated, true)
   end
 
-  defp diff_headers do
-    Enum.map(headers(), fn
+  defp diff_headers(repo) do
+    Enum.map(headers(repo), fn
       {"accept", _} -> {"accept", "application/vnd.github.diff"}
       header -> header
     end)
@@ -992,8 +999,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   defp tree(body, _ref), do: {:error, {:unreadable_tree, shape(body)}}
 
   defp get(repo, path, headers \\ nil) do
-    url = @api_base <> "/repos/" <> repo <> path
-    opts = if headers, do: Keyword.put(req_options(), :headers, headers), else: req_options()
+    url = url(repo, path)
+
+    opts =
+      if headers, do: Keyword.put(req_options(repo), :headers, headers), else: req_options(repo)
 
     case Req.get(url, opts) do
       {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
@@ -1017,9 +1026,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # call a limit stays a permanent permission problem — one classification for the whole
   # client, which is why these live on this module rather than a second one.
   defp write(verb, repo, path, body) do
-    url = @api_base <> "/repos/" <> repo <> path
+    url = url(repo, path)
 
-    case verb.(url, Keyword.put(req_options(), :json, body)) do
+    case verb.(url, Keyword.put(req_options(repo), :json, body)) do
       {:ok, %Req.Response{status: status, body: body}} when status in [200, 201] -> {:ok, body}
       {:ok, %Req.Response{} = response} -> {:error, failure(response)}
       {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
@@ -1107,9 +1116,12 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  defp req_options do
+  defp url(%ForgeRepo{full_name: full_name}, path),
+    do: @api_base <> "/repos/" <> full_name <> path
+
+  defp req_options(repo) do
     maybe_add_plug(
-      headers: headers(),
+      headers: headers(repo),
       retry: false,
       # A renamed or transferred repository REDIRECTS, and Req follows by default — so the
       # gate would read a repository the trigger list is not keyed to and judge the change
@@ -1130,8 +1142,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  defp headers do
-    GitHubActions.auth_headers(System.get_env("GITHUB_TOKEN")) ++
+  defp headers(repo) do
+    GitHubActions.auth_headers(ForgeRepo.token(repo)) ++
       [
         {"accept", "application/vnd.github+json"},
         {"x-github-api-version", "2022-11-28"},
@@ -1139,8 +1151,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
       ]
   end
 
-  defp repo_name(repo) when is_binary(repo) do
-    if Regex.match?(@repo_name, repo), do: {:ok, repo}, else: {:error, {:invalid_repo, repo}}
+  defp repo_name(%ForgeRepo{full_name: full_name} = repo) when is_binary(full_name) do
+    if Regex.match?(@repo_name, full_name),
+      do: {:ok, repo},
+      else: {:error, {:invalid_repo, full_name}}
   end
 
   defp repo_name(repo), do: {:error, {:invalid_repo, shape(repo)}}

@@ -24,6 +24,7 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.MockPullRequestSource
@@ -407,7 +408,7 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
   end
 
   defp stub_source(opts) do
-    Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
+    Mox.stub(MockPullRequestSource, :pull_request, fn %ForgeRepo{full_name: @repo}, _number ->
       {:ok,
        %{
          state: "open",
@@ -420,7 +421,9 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
        }}
     end)
 
-    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+    Mox.stub(MockPullRequestSource, :repo_files, fn %ForgeRepo{full_name: @repo}, _ref ->
+      {:ok, @repo_files}
+    end)
   end
 
   defp build_story(tenant) do

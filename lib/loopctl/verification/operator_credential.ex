@@ -10,12 +10,16 @@ defmodule Loopctl.Verification.OperatorCredential do
   operator's token can read and have verification read it. A tenant named for `acme/one` that
   enrols `acme/two` gets no credential for `acme/two`.
 
+  `Loopctl.Verification.ForgeCredential`, the configured implementation, asks here only for a
+  tenant that has set no token of its own.
+
   Both halves match case-insensitively (GitHub names are). An entry whose tenant half is not a
   UUID, or whose repository half is not `owner/name`, can never match and is dropped.
   """
 
   @behaviour Loopctl.Verification.Credential
 
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Intake.Source
   alias Loopctl.Verification.Credential
 
@@ -23,7 +27,7 @@ defmodule Loopctl.Verification.OperatorCredential do
   def for_read(tenant_id, repo_full_name)
       when is_binary(tenant_id) and is_binary(repo_full_name) do
     if {String.downcase(tenant_id), String.downcase(repo_full_name)} in allowlist() do
-      {:ok, %Credential{kind: :operator_token}}
+      {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo_full_name)}}
     else
       {:error, :credential_unavailable}
     end

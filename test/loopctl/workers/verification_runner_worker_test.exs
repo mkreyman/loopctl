@@ -20,6 +20,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   import Mox
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
   alias Loopctl.Verification
@@ -50,8 +51,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   defp with_credential do
     stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
 
-    stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
-      {:ok, %Credential{kind: :operator_token}}
+    stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
+      {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
     end)
   end
 
@@ -267,9 +268,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       ctx = setup_ctx()
       test_pid = self()
 
-      stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+      stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
         send(test_pid, :pair_asked)
-        {:ok, %Credential{kind: :operator_token}}
+        {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
       end)
 
       run = run!(ctx)

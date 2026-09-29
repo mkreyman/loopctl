@@ -867,6 +867,9 @@ defmodule LoopctlWeb.ThreadLive do
   defp diff_error({:ambiguous_intake_source, _project, _count}),
     do: "the project has more than one intake repository"
 
+  defp diff_error(:credential_unavailable),
+    do: "no GitHub credential for this repository (set_github_credential)"
+
   defp diff_error({:github_unreachable, _}), do: "the forge did not answer in time"
   defp diff_error({:github_rate_limited, _, _}), do: "the forge is rate limiting; try later"
   defp diff_error({:github_api_error, status}), do: "the forge answered #{status}"

@@ -286,13 +286,19 @@ defmodule LoopctlWeb.ThreadLiveTest do
       placed(ctx, runner, @epoch + 1, "main")
       cp2 = checkpoint(ctx, @sha2, @epoch + 1)
 
-      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn "acme/widgets",
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn %Loopctl.Delivery.ForgeRepo{
+                                                                   full_name: "acme/widgets"
+                                                                 },
                                                                  "release-1",
                                                                  @sha1 ->
         {:ok, %{text: "+first", truncated: false}}
       end)
 
-      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn "acme/widgets", "main", @sha2 ->
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn %Loopctl.Delivery.ForgeRepo{
+                                                                   full_name: "acme/widgets"
+                                                                 },
+                                                                 "main",
+                                                                 @sha2 ->
         {:ok, %{text: "+second", truncated: false}}
       end)
 
@@ -312,7 +318,11 @@ defmodule LoopctlWeb.ThreadLiveTest do
          ctx do
       cp = checkpoint(ctx, @sha1)
 
-      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn "acme/widgets", "trunk", @sha1 ->
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn %Loopctl.Delivery.ForgeRepo{
+                                                                   full_name: "acme/widgets"
+                                                                 },
+                                                                 "trunk",
+                                                                 @sha1 ->
         {:ok, %{text: "+fallback", truncated: false}}
       end)
 
@@ -322,6 +332,25 @@ defmodule LoopctlWeb.ThreadLiveTest do
 
       assert has_element?(view, "#diff-#{cp.id}", "+fallback")
       assert has_element?(view, "#diff-#{cp.id}-base", "CURRENT base")
+    end
+
+    test "#936: with no credential for the repository the diff says so, and nothing is read",
+         ctx do
+      cp = checkpoint(ctx, @sha1)
+
+      stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, "acme/widgets" ->
+        {:error, :credential_unavailable}
+      end)
+
+      expect(Loopctl.MockPullRequestSource, :checkpoint_diff, 0, fn _repo, _base, _head ->
+        {:ok, %{text: "+read anyway", truncated: false}}
+      end)
+
+      {:ok, view, _html} = open(ctx)
+      view |> element("#diff-button-#{cp.id}") |> render_click()
+      render_async(view)
+
+      assert has_element?(view, "#diff-#{cp.id}", "no GitHub credential for this repository")
     end
 
     test "one diff is open at a time; opening another closes it", ctx do

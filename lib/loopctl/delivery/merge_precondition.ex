@@ -282,6 +282,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.Progress
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
+  alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
   alias Loopctl.Workers.ThreadMergeWorker
 
@@ -1342,6 +1343,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp gather(story, stage, opts) do
     source = source_for_story(story)
     repo = repo_of(source)
+    # The repository with the credential every forge read below authenticates with (#936),
+    # chosen per (tenant, repository). `repo` itself stays the bare name: the exclusion list
+    # and Gate B's trigger list are keyed by it.
+    forge = forge_repo(story.tenant_id, repo)
 
     # The MODE and the BASE BRANCH are the ones this claim's implement dispatch was PLACED
     # under (US-45.4), never the source's now: a source changed after placement decides only
@@ -1354,8 +1359,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
       case DispatchPayload.dispatch_route(story.tenant_id, story) do
         {:ok, route} ->
           case placed_mode(route, source) do
-            :thread -> {:thread, thread_facts(story, stage, source, repo, route)}
-            :pr -> {:pr, pr_facts(stage, repo)}
+            :thread -> {:thread, thread_facts(story, stage, source, forge, route)}
+            :pr -> {:pr, pr_facts(stage, forge)}
           end
 
         # The route could not be read (contention): nothing is judged on a guessed route, and
@@ -1411,9 +1416,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # timeouts; the order of the results is fixed.
     [head_files, base_files, ci_evidence] =
       [
-        fn -> repo_files(repo, pull_request, :head_sha, skip?) end,
-        fn -> repo_files(repo, pull_request, :merge_base_sha, skip?) end,
-        fn -> ci_evidence(facts, pull_request, skip?) end
+        fn -> repo_files(forge, pull_request, :head_sha, skip?) end,
+        fn -> repo_files(forge, pull_request, :merge_base_sha, skip?) end,
+        fn -> ci_evidence(facts, forge, pull_request, skip?) end
       ]
       |> Task.async_stream(& &1.(), timeout: :infinity)
       |> Enum.map(fn {:ok, fact} -> fact end)
@@ -1454,6 +1459,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # checkpoint decides without it, and a source requiring nothing is refused without a read.
   defp ci_evidence(
          %{mode: :thread} = facts,
+         forge,
          {:ok, %{merged?: false, thread_branch: branch}},
          false = _skip?
        ) do
@@ -1462,7 +1468,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # A repository or checkpoint that could not be read is already refused as itself; only
     # the evidence read's OWN failure is this fact's. The BRANCH is the one the thread is
     # judged on: only the runs a push of it triggered are trusted (`CiEvidence`).
-    with {:ok, repo} <- facts.repo,
+    with {:ok, repo} <- forge,
          {:ok, %{commit_sha: sha}} <- facts.checkpoint,
          [_ | _] <- names do
       # Stamped BEFORE the read: evidence is ordered by when it was read FROM, so a slow read
@@ -1478,7 +1484,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  defp ci_evidence(_facts, _pull_request, _skip?), do: {:ok, nil}
+  defp ci_evidence(_facts, _forge, _pull_request, _skip?), do: {:ok, nil}
 
   # The branch travels with the thread's facts so the CI read can name it.
   defp with_thread_branch({:ok, %{} = facts}, branch),
@@ -1510,6 +1516,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # The branch is the one the story was DISPATCHED on, never re-derived here.
   # A thread-mode story whose project has no single source still has no repository: the input
   # reasons refuse it `:repository_unresolved`, and nothing is read.
+  # A repository with no credential for this tenant (#936) is refused as ITSELF, through the
+  # pull request fact (`{:pull_request_unavailable, :credential_unavailable}`), because that
+  # is the thing a human has to fix; the checkpoint was not read and is not a finding.
+  defp thread_facts(_story, _stage, _source, {:error, :credential_unavailable} = error, _route),
+    do: {{:ok, nil}, {:error, :not_attempted}, error}
+
   defp thread_facts(_story, _stage, _source, {:error, _reason}, _route),
     do: {{:ok, nil}, {:error, :not_attempted}, {:error, :not_attempted}}
 
@@ -1568,6 +1580,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp pr_number(%{pr_number: number}), do: {:error, {:not_recorded, number}}
 
   defp pull_request({:ok, repo}, {:ok, number}), do: source().pull_request(repo, number)
+  defp pull_request({:error, :credential_unavailable} = error, {:ok, _number}), do: error
   defp pull_request(_repo, _number), do: {:error, :not_attempted}
 
   defp repo_files(_repo, {:ok, %{merged?: true}}, _key, _skip?), do: {:error, :not_consumed}
@@ -1607,6 +1620,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp repo_of({:ok, source}), do: {:ok, source.repo_full_name}
   defp repo_of(error), do: error
+
+  # No credential for the pair is a refusal that names it (`credential_unavailable`, not
+  # transient): retrying cannot produce one, and setting a token or naming the pair can.
+  defp forge_repo(tenant_id, {:ok, repo}), do: Credential.repo(tenant_id, repo)
+  defp forge_repo(_tenant_id, error), do: error
 
   defp source, do: PullRequestSource.impl()
 
