@@ -452,7 +452,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
       # Force the exact state the INSERT write skew produced: a superseded parent with
       # a row still marked live, IN the partial HNSW index.
-      force_live_denorm("article_embeddings", "article_embeddings_live_denorm_trg", row.id, true)
+      force_live_denorm("article_embeddings", row.id, true)
 
       assert row.id in Embeddings.article_live_denorm_drift()
       assert {:ok, %{live_denorm_repaired: n}} = Embeddings.reconcile_articles()
@@ -466,7 +466,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       memory = fixture(:memory, %{tenant_id: tenant.id, tier: :long_term})
       {:ok, row} = Embeddings.upsert_memory_embedding(tenant.id, memory, vec(1536), nil, 1536)
 
-      force_live_denorm("memory_embeddings", "memory_embeddings_live_denorm_trg", row.id, false)
+      force_live_denorm("memory_embeddings", row.id, false)
 
       assert row.id in Embeddings.memory_live_denorm_drift()
       assert {:ok, %{live_denorm_repaired: n}} = Embeddings.reconcile_memories()
@@ -1069,9 +1069,11 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   # cannot be produced by an ordinary UPDATE. Disabling the trigger for one statement
   # reproduces the state the INSERT-time write skew used to leave behind (and that a
   # COPY/restore could still leave), which is what the sweep exists to repair.
-  # `replica` skips ordinary triggers for this transaction only and takes no lock; it is put
-  # back to `origin` at once, because the sandbox transaction is the whole test.
-  defp force_live_denorm(table, _trigger, id, value) do
+  # `replica` skips EVERY ordinary trigger on the table — the live_denorm BEFORE UPDATE trigger
+  # among them — and FK checks, for this transaction only, and takes no lock. The UPDATE sets
+  # one column on an existing row, so nothing else those would do applies. Put back to
+  # `origin` at once, because the sandbox transaction is the whole test.
+  defp force_live_denorm(table, id, value) do
     AdminRepo.query!("SET LOCAL session_replication_role = replica")
 
     AdminRepo.query!("UPDATE #{table} SET live_denorm = $1 WHERE id = $2", [

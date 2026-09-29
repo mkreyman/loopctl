@@ -124,7 +124,9 @@ defmodule Loopctl.RateLimiter.PostgresTest do
       # undefined_table) the impl must catch and fail OPEN on. Not DDL: a DROP INDEX here
       # took ACCESS EXCLUSIVE on rate_limit_counters until the test ended, and every
       # concurrent async test touching that table waited out the statement timeout (57014).
-      # A transaction-local setting locks nothing.
+      # A transaction-local setting locks nothing. It relies on the upsert naming the table
+      # unqualified (as `Loopctl.RateLimiter.Postgres` does); the contract under test is "any
+      # DB error fails OPEN", which this is.
       Loopctl.AdminRepo.query!("SET LOCAL search_path = pg_catalog")
 
       log =
