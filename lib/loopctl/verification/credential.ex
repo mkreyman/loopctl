@@ -5,8 +5,8 @@ defmodule Loopctl.Verification.Credential do
   closer and the thread issue links. Each asks here per tenant AND repository, and makes no
   request when it answers `{:error, :credential_unavailable}`. The thread-mode merge, which
   loopctl's GitHub App writes, asks here too before it opens an App session
-  (`Loopctl.Delivery.MergeExecutor`): an operator credential licenses it, and a tenant token
-  licenses it only when that token's owner can push to the repository.
+  (`Loopctl.Delivery.MergeExecutor`): only an operator credential licenses it, never a
+  tenant token.
 
   ## Why a (tenant, repository) pair has to be named before anything is read
 
@@ -70,6 +70,30 @@ defmodule Loopctl.Verification.Credential do
       {:error, :credential_unavailable} = error -> error
     end
   end
+
+  # How long a caller that can wait waits before asking again when there is no credential.
+  @configuration_retry_seconds 3_600
+
+  @doc """
+  Whether `reason` is the missing-credential CONFIGURATION state (#936): not a forge fault and
+  not a verdict, but something a human fixes by setting a token or naming the pair, after which
+  the same call succeeds. The ONE classification every caller applies:
+
+  - the merge gate REFUSES on it (the refusal names it, and a human re-queues after fixing it);
+  - story verification ends the run with no verdict (`credential_unavailable`);
+  - post-deploy verification and the forge outboxes (issue closer, thread issue links) WAIT on
+    it like a transient fault, under their own existing bounds, asking again after
+    `configuration_retry_seconds/0` — a story that shipped is never judged failed, and a
+    closure is only abandoned once its attempts are spent, in the shape
+    `IssueClosures.requeue_abandoned/1` recovers.
+  """
+  @spec configuration?(term()) :: boolean()
+  def configuration?(:credential_unavailable), do: true
+  def configuration?(_reason), do: false
+
+  @doc "Seconds a waiting caller leaves between asks while `configuration?/1` holds."
+  @spec configuration_retry_seconds() :: pos_integer()
+  def configuration_retry_seconds, do: @configuration_retry_seconds
 
   @doc "Resolves through the configured implementation (`:verification_credential`)."
   @spec any_for_tenant?(Ecto.UUID.t()) :: boolean()

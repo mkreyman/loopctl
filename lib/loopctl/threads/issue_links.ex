@@ -141,17 +141,11 @@ defmodule Loopctl.Threads.IssueLinks do
   defp post(link, url) do
     if source_live?(link) do
       # As the credential chosen for this (tenant, repository) (#936).
-      case Credential.repo(link.tenant_id, link.repo_full_name) do
-        {:ok, repo} ->
-          repo
-          |> PullRequestSource.comment_issue(link.issue_number, body(url))
-          |> recorded(link)
+      sent =
+        with {:ok, repo} <- Credential.repo(link.tenant_id, link.repo_full_name),
+             do: PullRequestSource.comment_issue(repo, link.issue_number, body(url))
 
-        # A configuration state, not a forge fault: parked without spending an attempt.
-        {:error, :credential_unavailable} = error ->
-          ForgeOutbox.park_unlicensed(IssueLink, link.tenant_id, link.id, error)
-          {:deferred, nil}
-      end
+      recorded(sent, link)
     else
       abandon(link, :source_revoked)
       {:abandoned, nil}
@@ -171,7 +165,7 @@ defmodule Loopctl.Threads.IssueLinks do
 
   defp recorded({:error, reason}, link) do
     cond do
-      not MergePrecondition.transient?(reason) ->
+      not MergePrecondition.transient?(reason) and not Credential.configuration?(reason) ->
         abandon(link, reason)
         {:abandoned, nil}
 
@@ -180,7 +174,15 @@ defmodule Loopctl.Threads.IssueLinks do
         {:abandoned, nil}
 
       true ->
-        retry_after = MergePrecondition.retry_after(reason)
+        # No credential (#936) waits an hour per attempt, within the same attempt budget. That
+        # wait is this ROW's and is not returned: a non-nil value halts the drainer's batch.
+        configuration? = Credential.configuration?(reason)
+
+        retry_after =
+          if configuration?,
+            do: Credential.configuration_retry_seconds(),
+            else: MergePrecondition.retry_after(reason)
+
         wait = ForgeOutbox.wait_seconds(link.attempts, retry_after)
 
         stamp(link,
@@ -188,7 +190,7 @@ defmodule Loopctl.Threads.IssueLinks do
           last_error: ForgeOutbox.error_text(reason)
         )
 
-        {:deferred, retry_after}
+        {:deferred, if(configuration?, do: nil, else: retry_after)}
     end
   end
 

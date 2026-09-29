@@ -347,16 +347,21 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   defp transient_reasons(facts) do
     for {key, kind} <- @judged_facts,
         reason = error_reason(facts, key),
-        MergePrecondition.transient?(reason),
+        waits?(reason),
         do: {kind, reason}
   end
 
   defp broken_reasons(facts) do
     for {key, kind} <- @judged_facts,
         reason = error_reason(facts, key),
-        not MergePrecondition.transient?(reason),
+        not waits?(reason),
         do: {kind, reason}
   end
+
+  # A missing credential (#936) waits like a transient forge fault, under the same bound: a
+  # story that shipped must not be judged failed because a tenant was between tokens.
+  defp waits?(reason),
+    do: MergePrecondition.transient?(reason) or Credential.configuration?(reason)
 
   defp error_reason(facts, key) do
     case Map.get(facts, key) do

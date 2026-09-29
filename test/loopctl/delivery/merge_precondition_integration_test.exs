@@ -172,6 +172,22 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:pull_request_unavailable, :credential_unavailable} in reasons
     end
 
+    test "#936: no PR number AND no credential refuses naming both", ctx do
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(r in StoryStage, where: r.story_id == ^ctx.story_id)
+          |> Repo.update_all(set: [pr_number: nil])
+        end)
+
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
+      assert {:pull_request_unavailable, :credential_unavailable} in reasons
+      assert Enum.any?(reasons, &match?({:no_pull_request_recorded, _}, &1))
+    end
+
     test "a story that is not in the tenant is :not_found", ctx do
       assert {:error, :not_found} =
                MergePrecondition.evaluate(ctx.tenant_id, Ecto.UUID.generate(), opts())
@@ -1801,23 +1817,13 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       repo
     end
 
-    test "#936: a tenant token whose owner cannot push escalates, and the App is never asked",
+    test "#936: a tenant's own token never licenses the App, and the App is never asked",
          ctx do
-      repo = tenant_token_credential(ctx)
-      Mox.stub(MockPullRequestSource, :push_permission, fn ^repo -> {:ok, false} end)
+      tenant_token_credential(ctx)
       Mox.stub(MockMergeForge, :session, fn _repo -> flunk("the App opened a session") end)
 
-      assert {:escalated, :tenant_cannot_push} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+      assert {:escalated, :app_not_licensed} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
-    end
-
-    test "#936: a tenant token whose owner can push merges as before", ctx do
-      repo = tenant_token_credential(ctx)
-      Mox.stub(MockPullRequestSource, :push_permission, fn ^repo -> {:ok, true} end)
-      Mox.stub(MockMergeForge, :create_commit, fn @session, _commit -> {:ok, @merge} end)
-      Mox.stub(MockMergeForge, :update_ref, fn @session, "master", @merge -> :ok end)
-
-      assert {:merged, @merge} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
     end
 
     test "#936: no credential for the pair escalates, and the App is never asked", ctx do

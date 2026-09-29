@@ -27,8 +27,10 @@ defmodule Loopctl.Forge.TenantCredential do
 
   @doc """
   Sets the token via `put_change/3`, trimmed. Blank, over #{@max_token_length} characters, or
-  carrying whitespace inside is refused: a GitHub token is one opaque word, and one with a
-  space in it is a paste accident that would otherwise fail on the first read, far from here.
+  carrying any character outside GitHub's token alphabet (`A-Z a-z 0-9 _`, the shape of
+  `ghp_…`, `github_pat_…`, `ghs_…`) is refused: a non-breaking or zero-width space, a control
+  byte or any other paste accident would otherwise be stored and fail on the first forge
+  call, far from here — as a 401, or as a header-encoding error that reads as transient.
   """
   @spec token_changeset(t(), term()) :: Ecto.Changeset.t()
   def token_changeset(credential, token) when is_binary(token) do
@@ -42,8 +44,8 @@ defmodule Loopctl.Forge.TenantCredential do
       String.length(trimmed) > @max_token_length ->
         add_error(changeset, :token, "is too long (max #{@max_token_length} characters)")
 
-      String.match?(trimmed, ~r/\s/) ->
-        add_error(changeset, :token, "must not contain whitespace")
+      not String.match?(trimmed, ~r/\A[A-Za-z0-9_]+\z/) ->
+        add_error(changeset, :token, "must contain only letters, digits and underscores")
 
       true ->
         changeset

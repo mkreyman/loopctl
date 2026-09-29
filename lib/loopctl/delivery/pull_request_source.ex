@@ -200,16 +200,6 @@ defmodule Loopctl.Delivery.PullRequestSource do
   """
   @callback repository_readable(repo()) :: :ok | {:error, term()}
 
-  @doc """
-  Whether the principal behind `repo`'s credential may PUSH to the repository (#936): GitHub's
-  `permissions.push` on `GET /repos/:repo`, which is the token owner's role on it. The thread
-  merge executor writes as loopctl's GitHub App, which can reach any repository it is installed
-  on; asking this first, with the TENANT's token, is what stops a tenant from having the App
-  merge into a repository the tenant itself cannot push to. `{:ok, false}` for an answer that
-  names no push permission at all.
-  """
-  @callback push_permission(repo()) :: {:ok, boolean()} | {:error, term()}
-
   @typedoc """
   A checkpoint's unified diff as the thread page shows it (US-45.7): the text, cut at the
   adapter's byte bound, and whether it was cut.
@@ -349,9 +339,6 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   @doc false
   def repository_readable(%ForgeRepo{} = repo), do: impl().repository_readable(repo)
-
-  @doc false
-  def push_permission(%ForgeRepo{} = repo), do: impl().push_permission(repo)
 
   @doc false
   def checkpoint_diff(%ForgeRepo{} = repo, a, b), do: impl().checkpoint_diff(repo, a, b)

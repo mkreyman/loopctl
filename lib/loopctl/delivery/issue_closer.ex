@@ -145,15 +145,10 @@ defmodule Loopctl.Delivery.IssueCloser do
   defp attempt(%IssueClosure{} = closure) do
     if IssueClosures.source_live?(closure) do
       # The credential is resolved ONCE per attempt (#936) and every call below uses it. None
-      # is a configuration state, not a forge fault: nothing is sent, the row is PARKED without
-      # spending an attempt, and it is tried again once a credential can exist.
+      # sends nothing and waits (`fault/2`, `Credential.configuration?/1`).
       case Credential.repo(closure.tenant_id, closure.repo_full_name) do
-        {:ok, repo} ->
-          read_issue(closure, repo)
-
-        {:error, :credential_unavailable} = error ->
-          IssueClosures.park_unlicensed(closure, error)
-          {:deferred, nil}
+        {:ok, repo} -> read_issue(closure, repo)
+        {:error, reason} -> fault(closure, reason)
       end
     else
       abandon(closure, :source_revoked, nil)
@@ -347,10 +342,19 @@ defmodule Loopctl.Delivery.IssueCloser do
   defp fault(%IssueClosure{} = closure, reason) do
     retry_after = MergePrecondition.retry_after(reason)
 
-    if MergePrecondition.transient?(reason) do
-      defer(closure, reason, retry_after)
-    else
-      abandon(closure, {:permanent_forge_failure, reason}, reason)
+    cond do
+      MergePrecondition.transient?(reason) ->
+        defer(closure, reason, retry_after)
+
+      # No credential (#936): wait an hour per attempt, within the same attempt budget. The
+      # wait is this ROW's, so it is not returned: a non-nil value halts the whole batch, and one
+      # tenant missing a credential says nothing about the forge the other rows will ask.
+      Credential.configuration?(reason) ->
+        {outcome, _wait} = defer(closure, reason, Credential.configuration_retry_seconds())
+        {outcome, nil}
+
+      true ->
+        abandon(closure, {:permanent_forge_failure, reason}, reason)
     end
   end
 

@@ -274,7 +274,7 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       refute row.last_error =~ "🇺🇸"
     end
 
-    test "#936: no credential is PARKED, attempt given back, and closes once one exists", ctx do
+    test "#936: no credential waits an hour within its budget, and closes once one exists", ctx do
       closure = closure(ctx, :shipped)
 
       stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, repo ->
@@ -285,11 +285,12 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
       expect(MockPullRequestSource, :issue, 0, fn _repo, _number -> flunk("read") end)
 
+      # nil: the wait is this row's, and must not halt the rest of the batch.
       assert {:deferred, nil} = IssueCloser.close(closure)
 
       row = reload(ctx)
       assert row.status == :pending
-      assert row.attempts == closure.attempts
+      assert row.attempts == closure.attempts + 1
       assert row.last_error =~ "credential_unavailable"
       assert DateTime.diff(row.next_attempt_at, DateTime.utc_now()) > 3_000
 

@@ -1599,8 +1599,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp pr_number(%{pr_number: number}), do: {:error, {:not_recorded, number}}
 
   defp pull_request({:ok, repo}, {:ok, number}), do: source().pull_request(repo, number)
-  defp pull_request({:error, :credential_unavailable} = error, {:ok, _number}), do: error
-  defp pull_request(_repo, _number), do: {:error, :not_attempted}
+  # A missing credential is reported as itself whether or not a number was recorded, so both
+  # broken inputs are named in one refusal (the thread path does the same through `unread/1`).
+  defp pull_request(forge, _number), do: unread(forge)
 
   defp repo_files(_repo, {:ok, %{merged?: true}}, _key, _skip?), do: {:error, :not_consumed}
 

@@ -4,8 +4,8 @@ defmodule Loopctl.Forge do
   authenticates with: the merge gate, story verification, post-deploy verification, the
   thread checkpoint reads, the issue closer and thread issue links. The one forge WRITE it
   does not authenticate is the thread-mode merge, which loopctl's GitHub App performs
-  (`Loopctl.Delivery.MergeExecutor`); that write is licensed by the same credential first, and
-  a tenant token licenses it only when the token's owner can push to the repository.
+  (`Loopctl.Delivery.MergeExecutor`); that write is licensed only for a pair the operator
+  named, never by a tenant's own token.
 
   ## Why the tenant's token
 

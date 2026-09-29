@@ -788,24 +788,6 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       assert_received {:auth, "GET", ["Bearer github_pat_tenant_only"]}
     end
 
-    test "push_permission reads the token owner's push flag, and anything else is no" do
-      stub(fn conn ->
-        assert conn.request_path == "/repos/acme/widgets"
-        json(conn, %{"permissions" => %{"push" => true, "pull" => true}})
-      end)
-
-      assert {:ok, true} = Source.push_permission(@tenant_repo)
-
-      stub(fn conn -> json(conn, %{"permissions" => %{"pull" => true, "push" => false}}) end)
-      assert {:ok, false} = Source.push_permission(@tenant_repo)
-
-      stub(fn conn -> json(conn, %{"full_name" => "acme/widgets"}) end)
-      assert {:ok, false} = Source.push_permission(@tenant_repo)
-
-      stub(fn conn -> Plug.Conn.resp(conn, 404, "{}") end)
-      assert {:error, {:github_api_error, 404}} = Source.push_permission(@tenant_repo)
-    end
-
     test "a bare repository name is refused before any request, whatever it names" do
       assert {:error, {:invalid_repo, :unreadable}} = Source.branch_head("acme/widgets", "main")
       assert {:error, {:invalid_repo, :unreadable}} = Source.pull_request("acme/widgets", 7)

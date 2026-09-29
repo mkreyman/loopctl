@@ -7630,7 +7630,7 @@ const TOOLS = [
       "operator's token is lent for while you have no token of your own. NEVER returns the " +
       "token. Reach for it when a merge gate refusal says " +
       "`{pull_request_unavailable, credential_unavailable}`, a verification run records " +
-      "`credential_unavailable`, or an issue closure was abandoned with that reason: it " +
+      "`credential_unavailable`, or an issue closure is waiting on that reason: it " +
       "tells you whether the repository has any credential at all. Requires " +
       "LOOPCTL_USER_KEY (403 for any other role).",
     inputSchema: { type: "object", properties: {}, required: [] },
@@ -7648,9 +7648,10 @@ const TOOLS = [
       "the issues stories came from. Stored encrypted, never returned. NOT checked against " +
       "GitHub here: a token that cannot read a repository shows up as that repository's forge " +
       "refusal (a 403/404 in the merge gate or verification), so check a story after setting " +
-      "it. A thread-mode MERGE is still written by loopctl's GitHub App, and only when this " +
-      "token's owner can push to the repository (escalated `tenant_cannot_push` otherwise). " +
-      "422 when blank, over the server's length bound or containing whitespace; 403 " +
+      "it. A thread-mode MERGE is still written by loopctl's GitHub App, and only for a " +
+      "repository the operator named for your tenant: this token never licenses it (escalated " +
+      "`app_not_licensed`). 422 when blank, over the server's length bound or containing " +
+      "anything but letters, digits and underscores; 403 " +
       "custody_tier_required on an agent-rooted tenant. Requires LOOPCTL_USER_KEY (403 for " +
       "any other role).",
     inputSchema: {

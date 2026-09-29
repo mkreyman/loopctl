@@ -162,8 +162,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert Enum.any?(reasons, &match?({:repository_unresolved, {:no_intake_source, _}}, &1))
     end
 
-    test "#936: no credential for the pair is a failed deployments fact, and nothing is read",
-         ctx do
+    test "#936: no credential WAITS (unresolved, never failed), and nothing is read", ctx do
       Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
         {:error, :credential_unavailable}
       end)
@@ -172,7 +171,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
         flunk("the forge was asked with no credential")
       end)
 
-      assert {:ok, %Result{reasons: reasons}} = evaluate(ctx)
+      assert {:ok, %Result{decision: :unresolved, reasons: reasons}} = evaluate(ctx)
       assert {:deployments_unavailable, :credential_unavailable} in reasons
     end
 

@@ -110,7 +110,6 @@ defmodule Loopctl.Delivery.MergeExecutor do
   alias Loopctl.Delivery.MergeForge
   alias Loopctl.Delivery.MergeMessage
   alias Loopctl.Delivery.MergePrecondition
-  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -322,33 +321,23 @@ defmodule Loopctl.Delivery.MergeExecutor do
   # repository it is installed on, so every session — the squash, the base update, the
   # orphan check's reads — is licensed per (tenant, repository) first, here and nowhere else:
   #
-  # - a pair the operator named in `VERIFICATION_OPERATOR_TOKEN_TENANTS` is the operator
-  #   vouching for it;
-  # - a tenant with its own token must be a principal that can push there itself
-  #   (`push_permission/1`, asked WITH that token). That is GitHub's `permissions.push`, the
-  #   token OWNER's role on the repository, and that is the question on purpose: the App
-  #   writes, not the token, so what has to be established is that the tenant's principal
-  #   controls the repository, never that the token it lent loopctl could write. A read-only
-  #   token from a user with push rights licenses a merge that user could make themselves;
-  # - anything else has no credential and no session.
+  # ONLY a pair the operator named in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, the operator
+  # vouching for it. A tenant's own token licenses no App session, whatever its owner may do on
+  # GitHub: rulesets name the App as the one bypass actor on a protected base, so a write
+  # collaborator whose own pushes the ruleset blocks would otherwise have the App push past it
+  # for them (#938 round 3). The token owner's `permissions.push` cannot see that, and no
+  # repository-level answer can; the operator naming the pair can. Anything else is
+  # `{:error, :app_not_licensed}` (a tenant token) or `credential_unavailable` (none), and
+  # escalates rather than merging.
   defp app_session(forge, tenant_id, repo) do
-    with :ok <- write_licensed(tenant_id, repo), do: forge.session(repo)
+    with :ok <- app_licensed(tenant_id, repo), do: forge.session(repo)
   end
 
-  defp write_licensed(tenant_id, repo) do
+  defp app_licensed(tenant_id, repo) do
     case Credential.for_read(tenant_id, repo) do
-      {:ok, %Credential{kind: :operator_token}} ->
-        :ok
-
-      {:ok, %Credential{kind: :tenant_token, repo: forge_repo}} ->
-        case PullRequestSource.push_permission(forge_repo) do
-          {:ok, true} -> :ok
-          {:ok, false} -> {:error, :tenant_cannot_push}
-          {:error, _reason} = error -> error
-        end
-
-      {:error, :credential_unavailable} = error ->
-        error
+      {:ok, %Credential{kind: :operator_token}} -> :ok
+      {:ok, %Credential{kind: :tenant_token}} -> {:error, :app_not_licensed}
+      {:error, :credential_unavailable} = error -> error
     end
   end
 

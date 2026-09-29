@@ -3834,7 +3834,7 @@ defmodule Loopctl.ApiSpec.Schemas do
           description:
             "The token. Trimmed; blank, over " <>
               "#{TenantCredential.max_token_length()} characters or " <>
-              "containing whitespace is 422."
+              "containing anything but letters, digits and underscores is 422."
         }
       },
       required: [:token]

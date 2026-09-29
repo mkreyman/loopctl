@@ -57,7 +57,16 @@ defmodule Loopctl.ForgeTest do
     test "a blank, whitespace-bearing, oversized or non-string token is refused" do
       tenant = fixture(:tenant)
 
-      for bad <- ["   ", "github pat", String.duplicate("a", 501), nil, 42] do
+      for bad <- [
+            "   ",
+            "github pat",
+            "ghp_zero\u200Bwidth",
+            "ghp_no\u00A0break",
+            "ghp_ctl\u0000byte",
+            String.duplicate("a", 501),
+            nil,
+            42
+          ] do
         assert {:error, %Ecto.Changeset{errors: [token: _]}} =
                  Forge.set_token(tenant.id, bad, nil)
       end

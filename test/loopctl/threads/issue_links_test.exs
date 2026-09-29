@@ -239,7 +239,7 @@ defmodule Loopctl.Threads.IssueLinksTest do
       assert [] == IssueLinks.due(50) |> Enum.filter(&(&1.id == ctx.link.id))
     end
 
-    test "#936: no credential PARKS the link with its attempt given back, nothing posted", ctx do
+    test "#936: no credential waits an hour within its budget, nothing posted", ctx do
       stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, "acme/widgets" ->
         assert tenant_id == ctx.tenant.id
         {:error, :credential_unavailable}
@@ -251,7 +251,7 @@ defmodule Loopctl.Threads.IssueLinksTest do
 
       link = IssueLinks.get(ctx.tenant.id, ctx.story.id)
       assert link.status == :pending
-      assert link.attempts == ctx.link.attempts
+      assert link.attempts == ctx.link.attempts + 1
       assert DateTime.diff(link.next_attempt_at, DateTime.utc_now()) > 3_000
     end
 

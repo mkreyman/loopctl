@@ -236,11 +236,6 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
-    # #936: the merge executor's push check for a tenant's own token, fail-closed.
-    Mox.stub(Loopctl.MockPullRequestSource, :push_permission, fn _repo ->
-      {:error, :not_stubbed}
-    end)
-
     # #936: every forge call asks `for_read/2` for its (tenant, repository) credential, and
     # the forge itself is `MockPullRequestSource`, fail-closed above. The two defaults are
     # the pair the real `ForgeCredential` gives a tenant that has one: a credential for every

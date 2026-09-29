@@ -44,6 +44,18 @@ defmodule Loopctl.Verification.OperatorCredential do
   def any_for_tenant?(_tenant_id), do: false
 
   @doc """
+  The repositories (`owner/name`, lower case) the operator lends its token for to `tenant_id`,
+  by the same matching `for_read/2` applies. What `GET /tenants/me/github-credential` shows.
+  """
+  @spec repositories_for(term()) :: [String.t()]
+  def repositories_for(tenant_id) when is_binary(tenant_id) do
+    tenant = String.downcase(tenant_id)
+    for {^tenant, repo} <- allowlist(), do: repo
+  end
+
+  def repositories_for(_tenant_id), do: []
+
+  @doc """
   The (tenant, repository) pairs the operator token may read for, normalised to lower case.
   Public for the operator's check.
   """

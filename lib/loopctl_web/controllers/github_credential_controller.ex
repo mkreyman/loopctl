@@ -33,9 +33,14 @@ defmodule LoopctlWeb.GitHubCredentialController do
 
   tags(["GitHub Credential"])
 
+  # 422 on every action: `impersonation_tenant_required` for a tenant-less superadmin key
+  # (`require_tenant/2`); on `:update` also the token's validation.
   @common_errors %{
     401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
     403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+    422 =>
+      {"impersonation_tenant_required (a superadmin key names no tenant), or on PUT a " <>
+         "token that fails validation", "application/json", Schemas.ErrorResponse},
     429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
   }
 
@@ -65,15 +70,18 @@ defmodule LoopctlWeb.GitHubCredentialController do
         "tenant's intake-source repositories, and issues: write for issue closing. The token " <>
         "is not checked against GitHub here: a token that cannot read a repository shows up " <>
         "as that repository's forge refusal. Thread-mode merges are still WRITTEN by " <>
-        "loopctl's GitHub App, and only when this token's owner can push to the " <>
-        "repository (escalated `tenant_cannot_push` otherwise). 422 when blank, over " <>
+        "loopctl's GitHub App, and only for a pair the operator named: this token never " <>
+        "licenses them (escalated `app_not_licensed`). 422 when blank, over " <>
         "#{TenantCredential.max_token_length()} characters or " <>
-        "containing whitespace. 403 custody_tier_required on an agent-rooted tenant. Role: user+.",
+        "containing anything but letters, digits and underscores. 403 custody_tier_required " <>
+        "on an agent-rooted tenant. Role: user+.",
     request_body: {"Token", "application/json", Schemas.GitHubCredentialRequest},
     responses:
-      @common_errors
-      |> Map.put(200, {"Credential", "application/json", Schemas.GitHubCredentialResponse})
-      |> Map.put(422, {"Validation error", "application/json", Schemas.ErrorResponse})
+      Map.put(
+        @common_errors,
+        200,
+        {"Credential", "application/json", Schemas.GitHubCredentialResponse}
+      )
   )
 
   operation(:delete,
@@ -136,12 +144,6 @@ defmodule LoopctlWeb.GitHubCredentialController do
     |> halt()
   end
 
-  defp respond(tenant_id, view) do
-    tenant = String.downcase(tenant_id)
-
-    lent =
-      for {^tenant, repo} <- OperatorCredential.allowlist(), do: repo
-
-    Map.put(view, :operator_repositories, lent)
-  end
+  defp respond(tenant_id, view),
+    do: Map.put(view, :operator_repositories, OperatorCredential.repositories_for(tenant_id))
 end
