@@ -315,7 +315,7 @@ defmodule LoopctlRunner.ProcessGroup do
   # SSH_AUTH_SOCK, SSH_AGENT_PID and GPG_AGENT_INFO are sockets to agents holding the operator's
   # keys. GH_TOKEN and GITHUB_TOKEN are forge tokens. The askpass pair is a credential-ACQUISITION
   # path: git falls through GIT_ASKPASS -> core.askPass -> SSH_ASKPASS, so both names are needed,
-  # and `Worktree.fetch_base/2` closes the config rung itself with an empty `core.askPass`.
+  # and `Worktree.fetch_base/3` closes the config rung itself with an empty `core.askPass`.
   @runner_credential_env ~w(SSH_AUTH_SOCK SSH_AGENT_PID GPG_AGENT_INFO GH_TOKEN GITHUB_TOKEN
                             GIT_ASKPASS SSH_ASKPASS)
 
@@ -365,7 +365,7 @@ defmodule LoopctlRunner.ProcessGroup do
 
   `inherit:` (in `opts`) is the one way a scrubbed name reaches the child, and only with the value
   the runner itself has: those names are left out of the scrub, and are otherwise untouched. The
-  runner's own `Worktree.fetch_base/2` names the operator's ssh agent and forge token this way,
+  runner's own `Worktree.fetch_base/3` names the operator's ssh agent and forge token this way,
   because it authenticates as the operator does. A name that is unset in the runner stays unset.
 
   A Port child is its own session leader with no controlling terminal (measured on OTP 28, Linux
@@ -395,7 +395,7 @@ defmodule LoopctlRunner.ProcessGroup do
         # (`Session.unset_names/0`); what runs here is the runner acting for itself — the liveness
         # probe (`claude agents --json`), the base fetch, the submodule step — and none of it needs
         # a credential it does not name through `inherit:`. GIT_SSH_COMMAND and GIT_SSH are
-        # deliberately NOT unset, though this Port does run git. The runner's own `Worktree.fetch_base/2` goes
+        # deliberately NOT unset, though this Port does run git. The runner's own `Worktree.fetch_base/3` goes
         # through here and must reach origin with the operator's ssh program: it passes
         # GIT_SSH_COMMAND itself, with BatchMode added, and inherits a GIT_SSH program as it is;
         # scrubbing that would swap in plain ssh. The runner's own submodule step (`run_group/4`)
@@ -410,7 +410,7 @@ defmodule LoopctlRunner.ProcessGroup do
 
     {:os_pid, os_pid} = Port.info(port, :os_pid)
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    collect(port, os_pid, deadline, [])
+    collect(port, os_pid, deadline, [], Keyword.get(opts, :term_grace_ms, 0))
   end
 
   # Leader of its own session (so of its own group) before the command is exec'd, exactly as
@@ -436,18 +436,40 @@ defmodule LoopctlRunner.ProcessGroup do
     run(perl, ["-MPOSIX", "-e", @setsid_exec, "--", executable | args], timeout_ms, extra_env)
   end
 
-  defp collect(port, os_pid, deadline, acc) do
+  # On expiry: with `term_grace_ms`, TERM first and that long to exit (git removes its own lock
+  # files on TERM, and a KILL leaves them behind), then KILL.
+  defp collect(port, os_pid, deadline, acc, grace_ms) do
     remaining = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
-      {^port, {:data, data}} -> collect(port, os_pid, deadline, [acc, data])
+      {^port, {:data, data}} -> collect(port, os_pid, deadline, [acc, data], grace_ms)
       {^port, {:exit_status, status}} -> {:ok, IO.iodata_to_binary(acc), status}
     after
       remaining ->
         target = if leader?(os_pid), do: "-#{os_pid}", else: "#{os_pid}"
-        System.cmd("kill", ["-KILL", "--", target], stderr_to_stdout: true)
-        await_exit(port, System.monotonic_time(:millisecond) + 2_000)
+
+        unless grace_ms > 0 and terminated?(port, target, grace_ms) do
+          System.cmd("kill", ["-KILL", "--", target], stderr_to_stdout: true)
+          await_exit(port, System.monotonic_time(:millisecond) + 2_000)
+        end
+
         {:error, :timeout}
+    end
+  end
+
+  defp terminated?(port, target, grace_ms) do
+    System.cmd("kill", ["-TERM", "--", target], stderr_to_stdout: true)
+    exited?(port, System.monotonic_time(:millisecond) + grace_ms)
+  end
+
+  defp exited?(port, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:exit_status, _}} -> true
+      {^port, {:data, _}} -> exited?(port, deadline)
+    after
+      remaining -> false
     end
   end
 

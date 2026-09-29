@@ -24,6 +24,7 @@ defmodule LoopctlRunner.Worktree do
 
   require Logger
 
+  alias LoopctlRunner.FetchLock
   alias LoopctlRunner.ProcessGroup
 
   @worktrees_subdir ".claude/worktrees"
@@ -39,8 +40,21 @@ defmodule LoopctlRunner.Worktree do
   @fetch_timeout_ms 30_000
   # A fetch error is shipped in a trace event, whose data loopctl caps.
   @fetch_error_chars 300
-  # A ref lock is usually a concurrent fetch or gc in the same repository finishing: one retry.
-  @lock_retry_ms 500
+  # How long a fetch waits for a ref another git holds locked (the operator's own fetch or gc in
+  # the same repository finishing): git waits itself, 100 ms by default, per ref backend
+  # (`core.filesRefLockTimeout`, `reftable.lockTimeout`), per locked ref. Kept short: the fetch's
+  # bound kills git with SIGKILL, and a kill landing while git holds one ref's lock and waits on
+  # another's leaves the first behind.
+  @ref_lock_wait_ms 1_000
+  # What else a fetch needs, beyond git's own lock wait, before it is worth starting.
+  @min_git_ms 2_000
+  # The `LoopctlRunner.FetchLock` server that serialises this BEAM's fetches of one repository.
+  @fetch_locks LoopctlRunner.FetchLocks
+  # The short git reads around a fetch (its common directory, its refs' values).
+  @git_probe_ms 5_000
+  # A fetch that outlives its bound is sent TERM and given this long to remove its lock files
+  # before KILL, which would leave them behind.
+  @fetch_term_grace_ms 1_000
   # The squash search reads origin's history since the fork point, which on a busy base is large.
   @log_timeout_ms 30_000
   # Past this many paths the squash search is not run: the arguments would approach ARG_MAX.
@@ -52,7 +66,7 @@ defmodule LoopctlRunner.Worktree do
   @unscanned ~w(deps _build node_modules .elixir_ls .lexical)
   # The operator's ssh agent and forge token, as the runner has them. `ProcessGroup.run/5` scrubs
   # credentials from the runner's own commands, and its list (`ProcessGroup.scrubbed_env/0`) names
-  # all four; `fetch_base/2` is the
+  # all four; `fetch_base/3` is the
   # runner's own fetch, which authenticates as the operator does, so it INHERITS them — the
   # runner's own values, never ones a caller chose, and an unset one stays unset. With BatchMode on,
   # a passphrase-protected key reachable only through the agent would otherwise fail every ssh
@@ -76,7 +90,7 @@ defmodule LoopctlRunner.Worktree do
   @spec repo_locating_env() :: [String.t()]
   def repo_locating_env, do: @repo_locating_env
 
-  @doc "How long `fetch_base/2` lets a fetch run before killing it."
+  @doc "How long `fetch_base/3` lets a fetch run before killing it."
   @spec fetch_timeout_ms() :: pos_integer()
   def fetch_timeout_ms, do: @fetch_timeout_ms
 
@@ -166,7 +180,7 @@ defmodule LoopctlRunner.Worktree do
   fetches nothing at all when one ref of a fetch is missing on origin (measured, git 2.50: "fatal:
   couldn't find remote ref"), so when that fetch fails — the branch merged and deleted, most
   often — the base is fetched alone. Only when the commit is STILL missing is it fetched by its
-  id. Every fetch is `fetch_base/2`'s: bounded and never prompting, writing only origin's
+  id. Every fetch is `fetch_base/3`'s: bounded and never prompting, writing only origin's
   remote-tracking refs for those branches, and the fetch by id no ref at all.
 
   `{:ok, sha, base_fetched}`, where `base_fetched` is how the base's fetch went, for
@@ -215,7 +229,7 @@ defmodule LoopctlRunner.Worktree do
   defp fetched({:error, why}, _said), do: "could not be fetched (#{why})"
 
   @doc """
-  The ref that names `base` in `repo_path`, given how its fetch from origin went (`fetch_base/2`,
+  The ref that names `base` in `repo_path`, given how its fetch from origin went (`fetch_base/3`,
   or `locate_checkpoint/4`'s): `origin/<base>` once fetched, the local `base` when that fetch
   failed and the checkout has one, and `:none` when neither resolves. A review names it to the
   session as the ref its change is measured against, so it must be one that resolves in the
@@ -1004,7 +1018,20 @@ defmodule LoopctlRunner.Worktree do
   Bounded, because `System.cmd/3` is not: a hung remote must not hang a teardown. The explicit
   refspec updates origin's ref whatever the repo's fetch config says. It writes nothing else: no
   `FETCH_HEAD`, which a session's own `git pull` in the same repository reads, and no automatic
-  maintenance. A ref another git process holds locked is retried once, within the same bound.
+  maintenance.
+
+  Fetches of one repository made in this BEAM run one at a time (a unique `Registry` key on the
+  repository's git common directory, which its holder's death releases), so the daemon's own
+  fetches never race for its refs; a `mix` task is another BEAM and is not serialised with them.
+  Waiting for another counts against the same bound, and git is started only with room left for
+  its own lock wait. A ref another git holds locked (the operator's own fetch or gc, or a `mix`
+  task) is waited for by git itself, up to `@ref_lock_wait_ms`, whatever its version or locale. A
+  fetch git refused a ref update in (exit status 1: a lock held past that wait, or a ref another git
+  moved meanwhile, "incorrect old value provided" on git 2.53.0) is made once more, reading the
+  ref afresh, with the same room; a refusal that would repeat costs that second fetch too. A lock
+  on a ref the fetch writes, older than a live fetch can hold one, explains the refusal instead:
+  it is not retried, and the lock is named in the error with its age. `:timeout_ms` replaces
+  `fetch_timeout_ms/0` as the bound, and `:fetch_locks` names the registry that serialises.
 
   This is the RUNNER's own fetch, never a session's, so it must never prompt: stdin is /dev/null,
   git's terminal prompt is off, no askpass program runs, a credential helper is told not to
@@ -1012,25 +1039,157 @@ defmodule LoopctlRunner.Worktree do
   `ProcessGroup.run/5` supplies the rest — no controlling terminal, and the whole group killed on
   timeout.
   """
-  @spec fetch_base(String.t(), String.t()) :: :ok | {:error, String.t()}
-  def fetch_base(repo_path, base), do: fetch(repo_path, [branch_refspec(base)])
+  @spec fetch_base(String.t(), String.t(), keyword()) :: :ok | {:error, String.t()}
+  def fetch_base(repo_path, base, opts \\ []),
+    do: fetch(repo_path, [branch_refspec(base)], opts)
+
+  @doc """
+  `fetch_base/3` for several bases of one repository, in one fetch. Git fetches nothing when one of
+  them is missing on origin, so a caller that must tell them apart fetches each after a failure.
+  """
+  @spec fetch_bases(String.t(), [String.t()], keyword()) :: :ok | {:error, String.t()}
+  def fetch_bases(repo_path, bases, opts \\ []),
+    do: fetch(repo_path, Enum.map(bases, &branch_refspec/1), opts)
+
+  @doc "Whether a fetch's error is its bound running out, which fetching again would only repeat."
+  @spec fetch_timed_out?(String.t()) :: boolean()
+  def fetch_timed_out?(reason), do: String.starts_with?(reason, "timed out after ")
 
   defp branch_refspec(branch), do: "+refs/heads/#{name(branch)}:#{origin_ref(branch)}"
 
   # `refspecs` from origin, in one fetch. A bare commit id (`fetch_by_id/5`) has no destination,
   # so no ref is written: the commit lands in the object store, where a detached worktree can be
   # cut at it.
-  defp fetch(repo_path, refspecs) do
+  defp fetch(repo_path, refspecs, opts \\ []) do
     case System.find_executable("git") do
       nil ->
         {:error, "git is not on PATH"}
 
       git ->
-        deadline = System.monotonic_time(:millisecond) + @fetch_timeout_ms
+        timeout_ms = Keyword.get(opts, :timeout_ms, @fetch_timeout_ms)
+        started = System.monotonic_time(:millisecond)
+        deadline = started + timeout_ms
+        # Read once: the lock key and the stale-lock check both need it.
+        common = common_dir_bounded(repo_path)
         attempt = fn -> fetch_once(git, repo_path, refspecs, deadline) end
-        attempt.() |> retry_if_locked(attempt) |> fetch_outcome()
+        locks = Keyword.get(opts, :fetch_locks, @fetch_locks)
+        fetch = %{repo: repo_path, common: common, refspecs: refspecs, timeout_ms: timeout_ms}
+
+        common
+        |> with_fetch_lock(locks, deadline, fn -> fetch_with_room(attempt, deadline, fetch) end)
+        |> fetch_outcome(timeout_ms, System.monotonic_time(:millisecond) - started)
+        |> cap_error()
     end
   end
+
+  defp fetch_with_room(attempt, deadline, fetch) do
+    if room?(deadline) do
+      before = ref_values(fetch.repo, fetch.refspecs)
+      attempt.() |> retry_moved(attempt, deadline, fetch, before)
+    else
+      :no_room
+    end
+  end
+
+  # Room for git's own lock wait and a fetch around it: a git killed while it holds one ref's lock
+  # and waits on another's leaves the first behind.
+  defp room?(deadline), do: room_left(deadline) > 0
+
+  defp room_left(deadline),
+    do: deadline - System.monotonic_time(:millisecond) - @ref_lock_wait_ms - @min_git_ms
+
+  # git fetch exits 1 when it refused a ref update, 128 on anything fatal. Fetched once more only
+  # when a ref this fetch writes CHANGED during the attempt: another git moved it while this one
+  # waited ("incorrect old value provided", git 2.53.0), and a second fetch reads it afresh. A
+  # refusal with the refs unchanged (a lock held past the wait, a ref that cannot sit beside
+  # another) would only repeat. A stale lock on a ref this fetch writes explains a refusal, and is
+  # reported.
+  defp retry_moved({:ok, _out, 1} = result, attempt, deadline, fetch, before) do
+    cond do
+      (stale = stale_locks(fetch)) != [] -> {:stale, result, stale}
+      room?(deadline) and ref_values(fetch.repo, fetch.refspecs) != before -> attempt.()
+      true -> result
+    end
+  end
+
+  defp retry_moved(result, _attempt, _deadline, _fetch, _before), do: result
+
+  # One fetch of a repository at a time in this BEAM (`LoopctlRunner.FetchLock`, first come first
+  # served), waited for only while a fetch could still start. A repository whose common directory
+  # cannot be read, or a BEAM without the lock server (a script that never started the
+  # application), is not serialised.
+  defp with_fetch_lock(common, locks, deadline, fun) do
+    key = lock_key(common)
+
+    cond do
+      key == nil or GenServer.whereis(locks) == nil ->
+        fun.()
+
+      FetchLock.acquire(locks, key, max(room_left(deadline), 0)) == :ok ->
+        try do
+          fun.()
+        after
+          FetchLock.release(locks, key)
+        end
+
+      true ->
+        :no_room
+    end
+  end
+
+  @doc false
+  # The repository's identity: its git common directory, as git resolves it, the same for every
+  # path that reaches it (a symlink, a linked worktree).
+  @spec fetch_lock_key(String.t()) :: {:fetch, String.t()} | nil
+  def fetch_lock_key(repo_path), do: repo_path |> common_dir_bounded() |> lock_key()
+
+  defp lock_key(nil), do: nil
+  defp lock_key(common), do: {:fetch, common}
+
+  # `common_dir/1` under a bound: a repository on a stalled volume must not hang the fetch before
+  # its own bound starts.
+  defp common_dir_bounded(repo_path) do
+    script = ~s(exec git -C "$1" rev-parse --path-format=absolute --git-common-dir </dev/null)
+
+    case bounded(script, [repo_path], @git_probe_ms) do
+      {:ok, out, 0} -> String.trim(out)
+      _ -> nil
+    end
+  end
+
+  # The values of the refs `refspecs` write, one line each ("none" for one that does not exist),
+  # or nil when they cannot be read: then no change can be seen, and nothing is retried.
+  defp ref_values(repo_path, refspecs) do
+    refs = for spec <- refspecs, [_src, dest] <- [String.split(spec, ":", parts: 2)], do: dest
+
+    script =
+      ~s(dir=$1; shift; for r; do git -C "$dir" rev-parse -q --verify "$r" </dev/null || echo none; done)
+
+    case bounded(script, [repo_path | refs], @git_probe_ms) do
+      {:ok, out, 0} -> out
+      _ -> nil
+    end
+  end
+
+  # Locks on the refs this fetch writes older than its whole bound, which no live fetch holds: a
+  # git killed mid-update left them. Files backend only; reftable keeps no per-ref lock.
+  defp stale_locks(%{common: nil}), do: []
+
+  defp stale_locks(%{common: common, refspecs: refspecs, timeout_ms: timeout_ms}) do
+    now = System.os_time(:second)
+
+    for refspec <- refspecs,
+        [_source, dest] <- [String.split(refspec, ":", parts: 2)],
+        lock = Path.join(common, dest <> ".lock"),
+        {:ok, %File.Stat{mtime: mtime}} <- [File.stat(lock, time: :posix)],
+        (now - mtime) * 1000 > timeout_ms,
+        do: {lock, now - mtime}
+  end
+
+  # The error is shipped in a trace event whose data loopctl caps: git's words and any stale-lock
+  # notes together stay within twice `@fetch_error_chars`.
+  defp cap_error({:error, reason}), do: {:error, String.slice(reason, 0, 2 * @fetch_error_chars)}
+  defp cap_error(result), do: result
 
   # `exec` keeps the pid, so the git ProcessGroup.run times out is still the group leader.
   #
@@ -1046,6 +1205,8 @@ defmodule LoopctlRunner.Worktree do
   defp fetch_once(git, repo_path, refspecs, deadline) do
     args =
       [git, "-C", repo_path, "-c", "core.askPass=", "-c", "credential.interactive=false"] ++
+        ["-c", "core.filesRefLockTimeout=#{@ref_lock_wait_ms}"] ++
+        ["-c", "reftable.lockTimeout=#{@ref_lock_wait_ms}"] ++
         ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance"] ++
         ["origin" | refspecs]
 
@@ -1053,24 +1214,37 @@ defmodule LoopctlRunner.Worktree do
 
     env = [{"SSH_ASKPASS_REQUIRE", "never"}, {"GCM_INTERACTIVE", "never"} | batch_ssh(repo_path)]
 
-    bounded(~s(exec "$@" </dev/null), args, remaining, env, inherit: @operator_auth_env)
+    bounded(~s(exec "$@" </dev/null), args, remaining, env,
+      inherit: @operator_auth_env,
+      term_grace_ms: @fetch_term_grace_ms
+    )
   end
 
-  defp retry_if_locked({:ok, out, status} = result, attempt) when status != 0 do
-    if out =~ "cannot lock ref" do
-      Process.sleep(@lock_retry_ms)
-      attempt.()
-    else
-      result
-    end
+  defp fetch_outcome(:no_room, timeout_ms, elapsed),
+    do:
+      {:error,
+       "not fetched: #{elapsed} ms into its #{timeout_ms} ms bound, fewer than " <>
+         "#{@ref_lock_wait_ms + @min_git_ms} ms were left to start git in"}
+
+  defp fetch_outcome({:stale, result, stale}, timeout_ms, elapsed) do
+    {:error, said} = fetch_outcome(result, timeout_ms, elapsed)
+
+    notes =
+      stale
+      |> Enum.map_join("; ", fn {lock, age} ->
+        "#{lock} is #{age} s old, left by a git that no longer runs: remove it"
+      end)
+
+    # One note per ref the fetch writes: two at most, so the error stays near its cap.
+    {:error, said <> "; " <> notes}
   end
 
-  defp retry_if_locked(result, _attempt), do: result
+  defp fetch_outcome({:ok, _out, 0}, _timeout_ms, _waited), do: :ok
 
-  defp fetch_outcome({:ok, _out, 0}), do: :ok
-  defp fetch_outcome({:error, :timeout}), do: {:error, "timed out after #{@fetch_timeout_ms} ms"}
+  defp fetch_outcome({:error, :timeout}, timeout_ms, _waited),
+    do: {:error, "timed out after #{timeout_ms} ms"}
 
-  defp fetch_outcome({:ok, out, status}) do
+  defp fetch_outcome({:ok, out, status}, _timeout_ms, _waited) do
     said =
       out
       |> String.split()

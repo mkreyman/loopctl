@@ -107,27 +107,56 @@ defmodule LoopctlRunner.Reaper do
     end)
   end
 
-  # One fetch per distinct repo and base, all at once: in series a reap of N repos offline waited
-  # N times the fetch timeout. A fetch that outlives its own bound is reported as failed.
+  # One fetch per repository of every base it asks about, repositories at once: in series a reap of
+  # N repos offline waited N times the fetch timeout, and a repository's fetches are serialised
+  # anyway (`Worktree.fetch_base/3`). Grouped by the repository itself, not the path a run
+  # recorded, so two paths to one repository share the fetch. Git fetches nothing when one base is
+  # missing on origin, so after a failure that was not the bound running out, each base is
+  # fetched on its own and fails only its own trees. A task that outlives its fetches' bounds is
+  # reported as failed.
   defp fetch_origins(plans) do
-    keys =
+    groups =
       for {_run_dir, _state, _group, {:remove, recorded, repo, work, _seen}} <- plans,
           Worktree.asks_origin?(work),
-          uniq: true,
-          do: {repo, recorded["base"]}
+          uniq: true do
+        {repo, recorded["base"]}
+      end
+      |> Enum.group_by(fn {repo, _base} -> Worktree.fetch_lock_key(repo) || repo end)
+      |> Map.values()
 
-    keys
-    |> Task.async_stream(fn {repo, base} -> Worktree.fetch_base(repo, base) end,
-      max_concurrency: max(length(keys), 1),
-      timeout: Worktree.fetch_timeout_ms() + 5_000,
+    most = groups |> Enum.map(&length/1) |> Enum.max(fn -> 1 end)
+
+    groups
+    |> Task.async_stream(&fetch_group/1,
+      max_concurrency: max(length(groups), 1),
+      timeout: (1 + most) * (Worktree.fetch_timeout_ms() + 5_000),
       on_timeout: :kill_task
     )
-    |> Enum.zip_with(keys, fn
-      {:ok, fetch}, key -> {key, fetch}
-      {:exit, reason}, key -> {key, {:error, "fetch did not return: #{inspect(reason)}"}}
+    |> Enum.zip_with(groups, fn
+      {:ok, fetched}, _keys ->
+        fetched
+
+      {:exit, reason}, keys ->
+        for key <- keys, do: {key, {:error, "fetch did not return: #{inspect(reason)}"}}
     end)
+    |> Enum.concat()
     |> Map.new()
   end
+
+  defp fetch_group([{repo, _base} | _] = keys) do
+    bases = keys |> Enum.map(fn {_repo, base} -> base end) |> Enum.uniq()
+    per_key(keys, Worktree.fetch_bases(repo, bases), length(bases))
+  end
+
+  # One base, or a combined fetch that worked or ran out of bound: every key shares its result.
+  # Otherwise each base is fetched on its own, so one missing on origin fails only its own trees.
+  defp per_key(keys, {:error, reason} = failed, bases) when bases > 1 do
+    if Worktree.fetch_timed_out?(reason),
+      do: for(key <- keys, do: {key, failed}),
+      else: for({repo, base} = key <- keys, do: {key, Worktree.fetch_base(repo, base)})
+  end
+
+  defp per_key(keys, fetched, _bases), do: for(key <- keys, do: {key, fetched})
 
   # Scratch only: an implement run's project directory is its session's record, and a kept
   # worktree's session may be resumed. `ScratchRun.remove_project_dir/2` matches only a directory

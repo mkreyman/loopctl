@@ -44,7 +44,7 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   that neither its remotes nor a submodule's recorded commit reach — for a nested worktree of the
   same repository, a HEAD no branch reaches, since its branches outlive the tree. `deps`,
   `_build`, `node_modules` and editor build dirs are not scanned. The fetch is the runner's own and
-  can never prompt (`Worktree.fetch_base/2`: stdin from /dev/null, `GIT_TERMINAL_PROMPT=0`, no
+  can never prompt (`Worktree.fetch_base/3`: stdin from /dev/null, `GIT_TERMINAL_PROMPT=0`, no
   askpass, `credential.interactive=false`, ssh in BatchMode, the group killed at thirty seconds)
   and writes only origin's ref. The reaper fetches each repo's base at most once per reap, all
   repos at once, only when a removal asks origin, and removes a tree under its lock after checking

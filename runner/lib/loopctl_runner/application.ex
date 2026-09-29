@@ -15,7 +15,9 @@ defmodule LoopctlRunner.Application do
   def start(_type, _args) do
     # Before anything can judge an owner: every mix task, the daemon and the suite start here.
     LoopctlRunner.Owner.init_outage_counter()
-    children = if daemon?(), do: daemon_children!(), else: []
+    # Every BEAM serialises its own fetches of one repository (`Worktree.fetch_base/3`).
+    fetch_locks = {LoopctlRunner.FetchLock, name: LoopctlRunner.FetchLocks}
+    children = [fetch_locks | if(daemon?(), do: daemon_children!(), else: [])]
     Supervisor.start_link(children, strategy: :one_for_one, name: LoopctlRunner.Supervisor)
   end
 

@@ -528,25 +528,126 @@ defmodule LoopctlRunner.WorktreeTest do
       refute File.exists?(Path.join(dir, "gc-ran"))
     end
 
-    test "a ref another git holds locked is fetched on a second attempt",
-         %{repo: repo} = ctx do
-      # The first attempt finds origin's ref locked, as a concurrent fetch or gc leaves it; the
-      # second upload-pack is started only by a retry, and releases the lock as it starts.
-      lock = locked_origin_ref!(repo)
-      upload_pack = counting_upload_pack!(repo, ~s(if [ "$n" -ge 2 ]; then rm -f #{lock}; fi))
+    test "a ref another git holds locked is fetched once it is released", ctx do
+      # Released 200 ms after upload-pack is done, so git finds it held and waits, in the one fetch,
+      # past its own 100 ms default; the wait is 1000 ms, so a release late by 800 ms still lands.
+      lock = locked_origin_ref!(ctx.repo)
+      log = wrapped_upload_pack!(ctx.repo, "", "sleep 0.2; rm -f #{lock}")
 
-      assert :ok = Worktree.fetch_base(repo, "master")
-      assert git!(repo, ["rev-parse", "refs/remotes/origin/master"]) == ctx.shipped
-      assert upload_pack |> File.read!() |> String.trim() == "2"
+      assert :ok = Worktree.fetch_base(ctx.repo, "master")
+      assert git!(ctx.repo, ["rev-parse", "refs/remotes/origin/master"]) == ctx.shipped
+      # One fetch: git waited, rather than failing and being fetched again.
+      assert log |> File.read!() |> String.split() == ["start", "end"]
     end
 
-    test "a ref that stays locked is retried once, then reported", %{repo: repo} do
+    test "a ref that stays locked is reported, and not fetched again", %{repo: repo} do
       locked_origin_ref!(repo)
       upload_pack = counting_upload_pack!(repo, "")
 
       assert {:error, error} = Worktree.fetch_base(repo, "master")
-      assert error =~ "cannot lock ref"
-      assert upload_pack |> File.read!() |> String.trim() == "2"
+      assert error =~ "git fetch exited 1"
+      assert error =~ "refs/remotes/origin/master"
+      # Held by a live git, as far as its age says: not called stale. Its refs did not move, so a
+      # second fetch would only repeat the refusal.
+      refute error =~ "no longer runs"
+      assert upload_pack |> File.read!() |> String.trim() == "1"
+    end
+
+    test "a ref another git moved while this fetch waited is fetched again, afresh", ctx do
+      # The other git releases its lock having written a value this fetch did not read, which git
+      # refuses as an old value that no longer holds. (A ref that did not exist yet is written over
+      # whatever another git put there, so the race needs one that does.)
+      git!(ctx.repo, ["update-ref", "refs/remotes/origin/master", "HEAD"])
+      lock = locked_origin_ref!(ctx.repo)
+      ref = String.replace_suffix(lock, ".lock", "")
+      moved = git!(ctx.repo, ["commit-tree", "HEAD^{tree}", "-m", "moved"])
+
+      log =
+        wrapped_upload_pack!(ctx.repo, "", """
+        if [ "$(grep -c start $LOG)" -eq 1 ]; then sleep 0.2; echo #{moved} > #{lock}; mv #{lock} #{ref}; fi
+        """)
+
+      assert :ok = Worktree.fetch_base(ctx.repo, "master")
+      assert git!(ctx.repo, ["rev-parse", "refs/remotes/origin/master"]) == ctx.shipped
+      assert log |> File.read!() |> String.split() == ["start", "end", "start", "end"]
+    end
+
+    test "a lock older than any live fetch is named, with its age, and not waited on twice",
+         %{repo: repo} do
+      lock = locked_origin_ref!(repo)
+      File.touch!(lock, System.os_time(:second) - 120)
+      upload_pack = counting_upload_pack!(repo, "")
+
+      assert {:error, error} = Worktree.fetch_base(repo, "master")
+      assert error =~ ~r/#{Regex.escape(lock)} is \d+ s old, left by a git that no longer runs/
+      assert upload_pack |> File.read!() |> String.trim() == "1"
+    end
+
+    test "a fetch that waited out its bound for another fetches nothing, and says so",
+         %{repo: repo} do
+      # This test holds the repository's fetch lock, as another fetch would, in a registry of its
+      # own. The bound leaves room to fetch at first, so only waiting uses it up.
+      locks = start_fetch_locks!()
+      :ok = LoopctlRunner.FetchLock.acquire(locks, Worktree.fetch_lock_key(repo), 1_000)
+      upload_pack = counting_upload_pack!(repo, "")
+
+      fetch = fn ->
+        Worktree.fetch_base(repo, "master", timeout_ms: 3_500, fetch_locks: locks)
+      end
+
+      assert {:error, error} = Task.await(Task.async(fetch))
+      # Given up once no fetch could start (about 500 ms in), not at the deadline.
+      [_, waited] = Regex.run(~r/not fetched: (\d+) ms into its 3500 ms bound/, error)
+      assert String.to_integer(waited) < 2_000
+      refute File.exists?(upload_pack)
+    end
+
+    test "a bound with no room for git's own lock wait fetches nothing", %{repo: repo} do
+      upload_pack = counting_upload_pack!(repo, "")
+
+      assert {:error, error} = Worktree.fetch_base(repo, "master", timeout_ms: 500)
+      assert error =~ "fewer than 3000 ms were left to start git in"
+      refute File.exists?(upload_pack)
+    end
+
+    test "without a lock server, a bound with no room still fetches nothing", %{repo: repo} do
+      upload_pack = counting_upload_pack!(repo, "")
+
+      assert {:error, error} =
+               Worktree.fetch_base(repo, "master", timeout_ms: 500, fetch_locks: :no_lock_server)
+
+      assert error =~ "fewer than 3000 ms were left to start git in"
+      refute File.exists?(upload_pack)
+    end
+
+    test "every path to one repository takes the same fetch lock", %{repo: repo} do
+      link = Path.join(Path.dirname(repo), "repo-link")
+      File.ln_s!(repo, link)
+      assert Worktree.fetch_lock_key(link) == Worktree.fetch_lock_key(repo)
+      assert Worktree.fetch_lock_key(repo) != nil
+    end
+
+    test "the runner's own fetches of one repository run one at a time", %{repo: repo} do
+      log = wrapped_upload_pack!(repo, "sleep 0.3")
+
+      locks = start_fetch_locks!()
+
+      [
+        Task.async(fn -> Worktree.fetch_base(repo, "master", fetch_locks: locks) end),
+        Task.async(fn -> Worktree.fetch_base(repo, "master", fetch_locks: locks) end)
+      ]
+      |> Task.await_many(15_000)
+      |> Enum.each(&assert(&1 == :ok))
+
+      assert log |> File.read!() |> String.split() == ["start", "end", "start", "end"]
+    end
+
+    test "a fatal fetch is reported as git said it", %{repo: repo} do
+      upload_pack = counting_upload_pack!(repo, "")
+
+      assert {:error, error} = Worktree.fetch_base(repo, "no-such-branch")
+      assert error =~ "git fetch exited 128"
+      assert upload_pack |> File.read!() |> String.trim() == "1"
     end
 
     test "a base only origin has is counted against origin's", %{repo: repo, path: path} do
@@ -790,6 +891,37 @@ defmodule LoopctlRunner.WorktreeTest do
     File.mkdir_p!(Path.dirname(lock))
     File.write!(lock, "")
     lock
+  end
+
+  # A fetch-lock registry of the test's own, so no test shares the application's.
+  defp start_fetch_locks! do
+    name = :"fetch_locks_#{System.unique_integer([:positive])}"
+    start_supervised!({LoopctlRunner.FetchLock, name: name})
+    name
+  end
+
+  # An upload-pack that logs each run, runs the real one, then logs its end and runs `detached`
+  # cut off from its pipes (git reads upload-pack's output to its end, so anything holding them
+  # would hold git too). Returns the log. `before` runs first, with $LOG set.
+  defp wrapped_upload_pack!(repo, before \\ "", detached \\ "") do
+    dir = Path.dirname(repo)
+    log = Path.join(dir, "upload-pack.log")
+    script = Path.join(dir, "upload-pack")
+
+    File.write!(script, """
+    #!/bin/sh
+    LOG=#{log}
+    echo start >> "$LOG"
+    #{before}
+    git upload-pack "$@"; status=$?
+    echo end >> "$LOG"
+    (#{if detached == "", do: ":", else: detached}) </dev/null >/dev/null 2>&1 &
+    exit $status
+    """)
+
+    File.chmod!(script, 0o755)
+    git!(repo, ["config", "remote.origin.uploadpack", script])
+    log
   end
 
   # An upload-pack that counts its runs into the returned file, then runs `then` with $n set.
