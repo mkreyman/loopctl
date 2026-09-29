@@ -27,7 +27,10 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   state.
   """
 
-  use Loopctl.DataCase, async: true
+  # `async: false`: `force_live_denorm/4` runs `ALTER TABLE ... DISABLE TRIGGER`, a SHARE ROW
+  # EXCLUSIVE lock the sandbox holds to the end of the test, which blocks every concurrent
+  # async INSERT into that embeddings table until it is cancelled 57014 (KB 493d2020).
+  use Loopctl.DataCase, async: false
 
   # #645 — vacuum the pgvector graph before each test in this module. Rolled-back tests
   # leave DEAD HNSW entries behind, and pgvector's scan skips dead elements rather than
