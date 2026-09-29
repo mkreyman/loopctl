@@ -61,16 +61,9 @@ defmodule Loopctl.Verification.Credential do
   @doc """
   The `Loopctl.Delivery.ForgeRepo` to call the forge with, or `{:error,
   :credential_unavailable}`: `for_read/2` for callers that want only the repository.
-
-  Also takes a resolved FACT, `{:ok, name}` or `{:error, reason}`, the shape the gates carry a
-  repository in: an unresolved repository stays its own error, unchanged, so every caller has
-  one resolution and one set of answers.
   """
-  @spec repo(Ecto.UUID.t(), String.t() | {:ok, String.t()} | {:error, term()}) ::
-          {:ok, ForgeRepo.t()} | {:error, term()}
-  def repo(tenant_id, {:ok, repo_full_name}), do: repo(tenant_id, repo_full_name)
-  def repo(_tenant_id, {:error, _reason} = unresolved), do: unresolved
-
+  @spec repo(Ecto.UUID.t(), String.t()) ::
+          {:ok, ForgeRepo.t()} | {:error, :credential_unavailable}
   def repo(tenant_id, repo_full_name) do
     case for_read(tenant_id, repo_full_name) do
       {:ok, %__MODULE__{repo: %ForgeRepo{} = repo}} -> {:ok, repo}

@@ -714,7 +714,7 @@ defmodule Loopctl.Threads do
       # call: none is `{:error, :credential_unavailable}`, shown beside the ledger.
       with {:ok, repo} <- Credential.repo(tenant_id, source.repo_full_name),
            {:ok, diff} <-
-             PullRequestSource.impl().checkpoint_diff(repo, base, checkpoint.commit_sha) do
+             PullRequestSource.checkpoint_diff(repo, base, checkpoint.commit_sha) do
         {:ok, Map.merge(diff, %{base: base, base_placed: is_binary(route.base_branch)})}
       end
     end

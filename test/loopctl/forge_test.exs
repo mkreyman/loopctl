@@ -11,6 +11,7 @@ defmodule Loopctl.ForgeTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Delivery.ForgeRepo
+  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Forge
   alias Loopctl.Forge.TenantCredential
   alias Loopctl.Verification.Credential
@@ -199,6 +200,63 @@ defmodule Loopctl.ForgeTest do
       assert cleared == 1
     end
   end
+
+  describe "who may build a ForgeRepo (#936)" do
+    # A ForgeRepo carries the credential a forge call authenticates with. Built anywhere but
+    # the credential modules, it would let a caller mint an operator-token read for a
+    # repository the operator never named, past `Credential.for_read/2` — the cross-tenant
+    # oracle #936 closes, back with no other test failing.
+    @builders ~w(
+      lib/loopctl/delivery/forge_repo.ex
+      lib/loopctl/verification/operator_credential.ex
+      lib/loopctl/verification/forge_credential.ex
+    )
+
+    test "only the credential modules construct one" do
+      builders =
+        "lib/**/*.ex"
+        |> Path.wildcard()
+        |> Enum.filter(fn path ->
+          source = File.read!(path)
+
+          Regex.match?(
+            ~r/ForgeRepo\.(operator|tenant)\(|%(Loopctl\.Delivery\.)?ForgeRepo\{[^}]*auth:/,
+            source
+          )
+        end)
+        |> Enum.sort()
+
+      assert builders != [], "the scan matched nothing, so it proves nothing"
+      assert builders -- @builders == []
+    end
+  end
+
+  describe "the checked entry points (#936)" do
+    # A literal bare name is already a compile-time type warning, which is the guard working;
+    # this pins the runtime refusal for a name that arrives as data.
+    test "PullRequestSource refuses a bare repository name before reaching any forge" do
+      assert_raise FunctionClauseError, fn ->
+        PullRequestSource.pull_request(bare_name(), 7)
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        PullRequestSource.comment_issue(bare_name(), 7, "x")
+      end
+    end
+
+    test "no caller outside the behaviour calls the configured forge directly" do
+      direct =
+        "lib/**/*.ex"
+        |> Path.wildcard()
+        |> Enum.reject(&(&1 == "lib/loopctl/delivery/pull_request_source.ex"))
+        |> Enum.filter(&(File.read!(&1) =~ "PullRequestSource.impl()"))
+
+      assert direct == []
+    end
+  end
+
+  # Opaque to the type checker on purpose: see the entry-point test.
+  defp bare_name, do: Enum.at(["acme/widgets"], 0)
 
   describe "ForgeRepo" do
     test "inspect never shows the token" do

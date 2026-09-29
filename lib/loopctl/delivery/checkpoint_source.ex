@@ -245,5 +245,5 @@ defmodule Loopctl.Delivery.CheckpointSource do
     end
   end
 
-  defp source, do: PullRequestSource.impl()
+  defp source, do: PullRequestSource
 end

@@ -121,15 +121,19 @@ defmodule Loopctl.Verification.GitHubActions do
         [{name, why} | _rest] = result.failed
 
         {:fail,
-         %{url: failing_url(request.repo, name, why, counted), check: name, conclusion: why}}
+         %{url: failing_url(repo_name(request), name, why, counted), check: name, conclusion: why}}
 
       result.pending != [] or result.missing != [] ->
         {:wait, :ci_pending}
 
       true ->
-        {:pass, %{url: passing_url(request.repo, result.passed, counted)}}
+        {:pass, %{url: passing_url(repo_name(request), result.passed, counted)}}
     end
   end
+
+  # ONE source for the repository (#936): the credential's, which is also what every read went
+  # to, so an evidence URL can never name a repository other than the one judged.
+  defp repo_name(%{credential: %Credential{repo: %ForgeRepo{full_name: name}}}), do: name
 
   # The failing JOB, among the jobs the judgement counted. A name that failed because a run
   # DIED with no jobs at all (`run_<conclusion>`) points at a run that failed it that way —
@@ -202,7 +206,7 @@ defmodule Loopctl.Verification.GitHubActions do
   defp code({:invalid_ref, _ref}, _stage), do: "invalid_ref"
   defp code(_other, _stage), do: "forge_unreadable"
 
-  defp source, do: PullRequestSource.impl()
+  defp source, do: PullRequestSource
 
   @doc """
   The `Authorization` header for `token`, or none when there is no usable token.

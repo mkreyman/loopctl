@@ -1179,6 +1179,28 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       refute Enum.any?(reasons, &match?({:no_checkpoint_recorded, _}, &1))
     end
 
+    test "#936: no credential AND an ended claim refuses naming BOTH", ctx do
+      {1, _} =
+        from(s in Story, where: s.id == ^ctx.story_id)
+        |> AdminRepo.update_all(set: [claim_epoch: 1])
+
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(r in StoryStage, where: r.story_id == ^ctx.story_id)
+          |> Repo.update_all(set: [claim_epoch: 1])
+        end)
+
+      set_dispatch(ctx, claim_epoch: 1)
+
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
+      assert {:claim_ended, :no_checkpoint_under_current_claim} in reasons
+      assert {:pull_request_unavailable, :credential_unavailable} in reasons
+    end
+
     test "a branch naming another commit is judged without reading the checkpoint commit",
          ctx do
       make_claim_live(ctx)
@@ -1469,6 +1491,20 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       # Not on the base: ordinary, and skipped.
       set_stage(ctx, :implementing)
       stub_ancestors(%{})
+
+      assert {:skipped, {:not_at_ci, :implementing}} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+    end
+
+    test "#936: the orphan check opens no App session for a pair with no credential", ctx do
+      set_merge_commit(ctx, @merge)
+      set_stage(ctx, :implementing)
+
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      Mox.stub(MockMergeForge, :session, fn _repo -> flunk("the App opened a session") end)
 
       assert {:skipped, {:not_at_ci, :implementing}} =
                MergeExecutor.run(ctx.tenant_id, ctx.story_id)

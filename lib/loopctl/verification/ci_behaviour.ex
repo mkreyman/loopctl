@@ -46,13 +46,13 @@ defmodule Loopctl.Verification.CiBehaviour do
           | {:no_verdict, String.t()}
 
   @typedoc """
-  What one verification asks: the story's repository and branch (both resolved from loopctl's
-  own records, never from the caller), the base branch its change is compared against, the
-  commit's FULL id, the checks the intake source requires, and the credential that licenses
-  the read.
+  What one verification asks: the story's branch (resolved from loopctl's own records, never
+  from the caller), the base branch its change is compared against, the commit's FULL id, the
+  checks the intake source requires, and the credential the reads authenticate with. The
+  REPOSITORY is the credential's (`credential.repo.full_name`, #936) and nowhere else, so the
+  reads and the evidence URLs cannot name two different repositories.
   """
   @type request :: %{
-          repo: String.t(),
           branch: String.t(),
           base_branch: String.t(),
           sha: String.t(),

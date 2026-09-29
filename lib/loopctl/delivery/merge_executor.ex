@@ -297,7 +297,6 @@ defmodule Loopctl.Delivery.MergeExecutor do
          {:ok, allow} <- recorded_allow(tenant_id, story.id, stage),
          {:ok, checkpoint} <- allowed_checkpoint(tenant_id, story.id, allow),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
-         :ok <- write_licensed(tenant_id, source.repo_full_name),
          {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
       {:ok,
        Map.merge(base, %{
@@ -319,18 +318,30 @@ defmodule Loopctl.Delivery.MergeExecutor do
       else: {:escalate, base, reason}
   end
 
-  # #936: the App below can write to any repository it is installed on, so a merge is licensed
-  # per (tenant, repository) FIRST. A tenant with its own token must be able to push there
-  # itself (`push_permission/1`, asked with that token); a pair the operator named in
-  # `VERIFICATION_OPERATOR_TOKEN_TENANTS` is the operator vouching for it; anything else has no
-  # credential and escalates rather than merging.
+  # #936: THE ONE WAY this module opens an App session. The App can read and write any
+  # repository it is installed on, so every session — the squash, the base update, the
+  # orphan check's reads — is licensed per (tenant, repository) first, here and nowhere else:
+  #
+  # - a pair the operator named in `VERIFICATION_OPERATOR_TOKEN_TENANTS` is the operator
+  #   vouching for it;
+  # - a tenant with its own token must be a principal that can push there itself
+  #   (`push_permission/1`, asked WITH that token). That is GitHub's `permissions.push`, the
+  #   token OWNER's role on the repository, and that is the question on purpose: the App
+  #   writes, not the token, so what has to be established is that the tenant's principal
+  #   controls the repository, never that the token it lent loopctl could write. A read-only
+  #   token from a user with push rights licenses a merge that user could make themselves;
+  # - anything else has no credential and no session.
+  defp app_session(forge, tenant_id, repo) do
+    with :ok <- write_licensed(tenant_id, repo), do: forge.session(repo)
+  end
+
   defp write_licensed(tenant_id, repo) do
     case Credential.for_read(tenant_id, repo) do
       {:ok, %Credential{kind: :operator_token}} ->
         :ok
 
       {:ok, %Credential{kind: :tenant_token, repo: forge_repo}} ->
-        case PullRequestSource.impl().push_permission(forge_repo) do
+        case PullRequestSource.push_permission(forge_repo) do
           {:ok, true} -> :ok
           {:ok, false} -> {:error, :tenant_cannot_push}
           {:error, _reason} = error -> error
@@ -381,7 +392,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
   defp execute(ctx) do
     forge = MergeForge.impl()
 
-    with {:ok, session} <- forge.session(ctx.repo),
+    with {:ok, session} <- app_session(forge, ctx.tenant_id, ctx.repo),
          ctx = Map.merge(ctx, %{forge: forge, session: session}),
          {:ok, base_head} <- forge.branch_head(session, ctx.base_branch) do
       squash(ctx, base_head)
@@ -693,7 +704,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
 
     with {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
-         {:ok, session} <- forge.session(source.repo_full_name),
+         {:ok, session} <- app_session(forge, tenant_id, source.repo_full_name),
          {:ok, head} <-
            forge.branch_head(session, DispatchPayload.placed_base_branch(route, source)) do
       forge.ancestor?(session, sha, head)

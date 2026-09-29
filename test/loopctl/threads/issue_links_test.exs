@@ -239,7 +239,7 @@ defmodule Loopctl.Threads.IssueLinksTest do
       assert [] == IssueLinks.due(50) |> Enum.filter(&(&1.id == ctx.link.id))
     end
 
-    test "#936: no credential for the pair abandons with nothing posted", ctx do
+    test "#936: no credential PARKS the link with its attempt given back, nothing posted", ctx do
       stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, "acme/widgets" ->
         assert tenant_id == ctx.tenant.id
         {:error, :credential_unavailable}
@@ -247,8 +247,12 @@ defmodule Loopctl.Threads.IssueLinksTest do
 
       expect(Loopctl.MockPullRequestSource, :comment_issue, 0, fn _, _, _ -> :ok end)
 
-      assert {:abandoned, nil} = IssueLinks.attempt(ctx.link, @url)
-      assert %IssueLink{status: :abandoned} = IssueLinks.get(ctx.tenant.id, ctx.story.id)
+      assert {:deferred, nil} = IssueLinks.attempt(ctx.link, @url)
+
+      link = IssueLinks.get(ctx.tenant.id, ctx.story.id)
+      assert link.status == :pending
+      assert link.attempts == ctx.link.attempts
+      assert DateTime.diff(link.next_attempt_at, DateTime.utc_now()) > 3_000
     end
 
     test "a transient failure backs off and stays pending; a permanent one abandons", ctx do

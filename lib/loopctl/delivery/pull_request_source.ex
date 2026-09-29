@@ -99,6 +99,7 @@ defmodule Loopctl.Delivery.PullRequestSource do
   freely and a close may not.
   """
 
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.DeliveryGates.DiffNames
 
   @typedoc "A repository and the credential its calls authenticate with (#936). Never a bare `owner/name`."
@@ -329,4 +330,59 @@ defmodule Loopctl.Delivery.PullRequestSource do
   """
   @callback close_issue(repo(), pos_integer(), :completed | :not_planned) ::
               :ok | {:error, term()}
+
+  # -- the checked entry points (#936) -------------------------------------------------------
+  #
+  # Every caller goes through THESE, never `impl/0` directly: each one takes only a
+  # `Loopctl.Delivery.ForgeRepo`, so a bare `owner/name` is a FunctionClauseError at the
+  # boundary in every environment — including tests, where `impl/0` is a Mox mock that would
+  # otherwise accept anything and let a caller skip the credential seam unnoticed.
+
+  @doc false
+  def pull_request(%ForgeRepo{} = repo, a), do: impl().pull_request(repo, a)
+
+  @doc false
+  def branch_head(%ForgeRepo{} = repo, a), do: impl().branch_head(repo, a)
+
+  @doc false
+  def commit(%ForgeRepo{} = repo, a), do: impl().commit(repo, a)
+
+  @doc false
+  def repository_readable(%ForgeRepo{} = repo), do: impl().repository_readable(repo)
+
+  @doc false
+  def push_permission(%ForgeRepo{} = repo), do: impl().push_permission(repo)
+
+  @doc false
+  def checkpoint_diff(%ForgeRepo{} = repo, a, b), do: impl().checkpoint_diff(repo, a, b)
+
+  @doc false
+  def compare(%ForgeRepo{} = repo, a, b), do: impl().compare(repo, a, b)
+
+  @doc false
+  def check_evidence(%ForgeRepo{} = repo, a, b), do: impl().check_evidence(repo, a, b)
+
+  @doc false
+  def resolve_commit(%ForgeRepo{} = repo, a), do: impl().resolve_commit(repo, a)
+
+  @doc false
+  def repo_files(%ForgeRepo{} = repo, a), do: impl().repo_files(repo, a)
+
+  @doc false
+  def deployments_since(%ForgeRepo{} = repo, a, b), do: impl().deployments_since(repo, a, b)
+
+  @doc false
+  def contains?(%ForgeRepo{} = repo, a, b), do: impl().contains?(repo, a, b)
+
+  @doc false
+  def issue(%ForgeRepo{} = repo, a), do: impl().issue(repo, a)
+
+  @doc false
+  def label_issue(%ForgeRepo{} = repo, a, b), do: impl().label_issue(repo, a, b)
+
+  @doc false
+  def comment_issue(%ForgeRepo{} = repo, a, b), do: impl().comment_issue(repo, a, b)
+
+  @doc false
+  def close_issue(%ForgeRepo{} = repo, a, b), do: impl().close_issue(repo, a, b)
 end

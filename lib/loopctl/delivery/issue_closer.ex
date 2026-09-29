@@ -145,10 +145,15 @@ defmodule Loopctl.Delivery.IssueCloser do
   defp attempt(%IssueClosure{} = closure) do
     if IssueClosures.source_live?(closure) do
       # The credential is resolved ONCE per attempt (#936) and every call below uses it. None
-      # is a fault like any permanent forge refusal: nothing is sent.
+      # is a configuration state, not a forge fault: nothing is sent, the row is PARKED without
+      # spending an attempt, and it is tried again once a credential can exist.
       case Credential.repo(closure.tenant_id, closure.repo_full_name) do
-        {:ok, repo} -> read_issue(closure, repo)
-        {:error, reason} -> fault(closure, reason)
+        {:ok, repo} ->
+          read_issue(closure, repo)
+
+        {:error, :credential_unavailable} = error ->
+          IssueClosures.park_unlicensed(closure, error)
+          {:deferred, nil}
       end
     else
       abandon(closure, :source_revoked, nil)
@@ -393,5 +398,5 @@ defmodule Loopctl.Delivery.IssueCloser do
     )
   end
 
-  defp source, do: PullRequestSource.impl()
+  defp source, do: PullRequestSource
 end

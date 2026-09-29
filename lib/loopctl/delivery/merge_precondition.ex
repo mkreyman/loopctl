@@ -1343,10 +1343,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp gather(story, stage, opts) do
     source = source_for_story(story)
     repo = repo_of(source)
-    # The repository with the credential every forge read below authenticates with (#936),
-    # chosen per (tenant, repository). `repo` itself stays the bare name: the exclusion list
-    # and Gate B's trigger list are keyed by it.
-    forge = Credential.repo(story.tenant_id, repo)
 
     # The MODE and the BASE BRANCH are the ones this claim's implement dispatch was PLACED
     # under (US-45.4), never the source's now: a source changed after placement decides only
@@ -1355,19 +1351,26 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # story is pr, and the source's current mode cannot stand in for it (a story placed as a
     # thread under a source since flipped back to pr must still be judged as a thread). Its
     # lock wait is bounded and contention answers `:unevaluated`, which the loop retries.
-    {mode, {pr_number, checkpoint, pull_request}} =
+    {mode, forge, {pr_number, checkpoint, pull_request}} =
       case DispatchPayload.dispatch_route(story.tenant_id, story) do
         {:ok, route} ->
+          # The repository with the credential every forge read below authenticates with
+          # (#936), chosen per (tenant, repository) and only once there is a route to read
+          # for. `repo` itself stays the bare name: the exclusion list and Gate B's trigger
+          # list are keyed by it.
+          forge = with {:ok, name} <- repo, do: Credential.repo(story.tenant_id, name)
+
           case placed_mode(route, source) do
-            :thread -> {:thread, thread_facts(story, stage, source, forge, route)}
-            :pr -> {:pr, pr_facts(stage, forge)}
+            :thread -> {:thread, forge, thread_facts(story, stage, source, forge, route)}
+            :pr -> {:pr, forge, pr_facts(stage, forge)}
           end
 
         # The route could not be read (contention): nothing is judged on a guessed route, and
         # the mode is reported as UNKNOWN (nil), not as `pr`. The failure travels as the pull
         # request fact, so `:busy` answers `:unevaluated`.
         {:error, reason} ->
-          {nil, {{:error, :not_attempted}, {:ok, nil}, {:error, reason}}}
+          {nil, {:error, :not_attempted},
+           {{:error, :not_attempted}, {:ok, nil}, {:error, reason}}}
       end
 
     facts = %{
@@ -1516,21 +1519,32 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # The branch is the one the story was DISPATCHED on, never re-derived here.
   # A thread-mode story whose project has no single source still has no repository: the input
   # reasons refuse it `:repository_unresolved`, and nothing is read.
-  # A repository with no credential for this tenant (#936) is refused as ITSELF, through the
-  # pull request fact (`{:pull_request_unavailable, :credential_unavailable}`), because that
-  # is the thing a human has to fix; the checkpoint was not read and is not a finding.
-  defp thread_facts(_story, _stage, _source, {:error, :credential_unavailable} = error, _route),
-    do: {{:ok, nil}, {:error, :not_attempted}, error}
+  # A repository with no credential for this tenant (#936) still has its checkpoint READ — that
+  # is a database read and needs no credential — so the refusal names every broken input: the
+  # missing credential through the pull request fact (`{:pull_request_unavailable,
+  # :credential_unavailable}`), and an ended claim or a missing checkpoint beside it.
+  defp thread_facts(
+         story,
+         stage,
+         {:ok, source},
+         {:error, :credential_unavailable} = forge,
+         route
+       ),
+       do: thread_checkpoint_facts(story, stage, source, forge, route)
 
   defp thread_facts(_story, _stage, _source, {:error, _reason}, _route),
     do: {{:ok, nil}, {:error, :not_attempted}, {:error, :not_attempted}}
 
-  defp thread_facts(story, stage, {:ok, source}, {:ok, repo}, route) do
+  defp thread_facts(story, stage, {:ok, source}, {:ok, _repo} = forge, route),
+    do: thread_checkpoint_facts(story, stage, source, forge, route)
+
+  defp thread_checkpoint_facts(story, stage, source, forge, route) do
     case Threads.claim_checkpoints(story.tenant_id, story.id) do
       {:ok, %{latest: %Checkpoint{} = checkpoint} = claim} ->
         # The branch is resolved HERE, for a thread only: a pull request names its own head.
         pull_request =
-          with {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
+          with {:ok, repo} <- forge,
+               {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
             repo
             |> CheckpointSource.pull_request(
               DispatchPayload.placed_base_branch(route, source),
@@ -1544,15 +1558,20 @@ defmodule Loopctl.Delivery.MergePrecondition do
         {{:ok, nil}, {:ok, checkpoint_fact(checkpoint, claim.earlier_shas)}, pull_request}
 
       {:ok, %{earlier_claim_recorded?: true}} ->
-        {{:ok, nil}, {:error, :claim_ended}, {:error, :not_attempted}}
+        {{:ok, nil}, {:error, :claim_ended}, unread(forge)}
 
       {:ok, _none} ->
-        {{:ok, nil}, {:error, :none}, {:error, :not_attempted}}
+        {{:ok, nil}, {:error, :none}, unread(forge)}
 
       {:error, reason} ->
-        {{:ok, nil}, {:error, reason}, {:error, :not_attempted}}
+        {{:ok, nil}, {:error, reason}, unread(forge)}
     end
   end
+
+  # The pull request fact where nothing was read: a missing credential is still reported as
+  # itself beside whatever else is wrong; otherwise it is only the consequence, `:not_attempted`.
+  defp unread({:error, :credential_unavailable} = error), do: error
+  defp unread(_forge), do: {:error, :not_attempted}
 
   # The mode the claim's ROUTE records (`DispatchPayload.dispatch_route/2`): the accepted
   # implement row of a placed claim, or the route an interactive claim recorded when it was made
@@ -1621,7 +1640,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp repo_of({:ok, source}), do: {:ok, source.repo_full_name}
   defp repo_of(error), do: error
 
-  defp source, do: PullRequestSource.impl()
+  defp source, do: PullRequestSource
 
   # -- the one write ---------------------------------------------------------------------
 

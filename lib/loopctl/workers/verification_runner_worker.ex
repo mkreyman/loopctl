@@ -196,7 +196,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
          {:ok, target} <- CiTarget.gather(tenant_id, run.story_id),
          {:ok, credential} <- credential(tenant_id, target.repo),
          {:ok, run, full} <- full_sha(run, sha, credential) do
-      judge(run, Map.merge(target, %{sha: full, credential: credential}))
+      judge(run, target |> Map.delete(:repo) |> Map.merge(%{sha: full, credential: credential}))
     else
       outcome -> {run, outcome}
     end

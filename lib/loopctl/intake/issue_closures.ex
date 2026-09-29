@@ -341,6 +341,12 @@ defmodule Loopctl.Intake.IssueClosures do
           {:ok, IssueClosure.t()} | {:error, :not_pending}
   def claim_attempt(tenant_id, id), do: ForgeOutbox.claim_attempt(IssueClosure, tenant_id, id)
 
+  @doc "Parks a closure whose tenant has no credential for its repository (`ForgeOutbox.park_unlicensed/4`)."
+  @spec park_unlicensed(IssueClosure.t(), term()) ::
+          {:ok, IssueClosure.t()} | {:error, :not_pending}
+  def park_unlicensed(%IssueClosure{} = closure, reason),
+    do: ForgeOutbox.park_unlicensed(IssueClosure, closure.tenant_id, closure.id, reason)
+
   @doc "Records that the resolution label is on the issue."
   @spec mark_labelled(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, IssueClosure.t()} | {:error, :not_pending}

@@ -140,18 +140,18 @@ defmodule Loopctl.Threads.IssueLinks do
 
   defp post(link, url) do
     if source_live?(link) do
-      # As the credential chosen for this (tenant, repository) (#936); none is a permanent
-      # failure like a 403, so nothing is sent.
-      sent =
-        case Credential.repo(link.tenant_id, link.repo_full_name) do
-          {:ok, repo} ->
-            PullRequestSource.impl().comment_issue(repo, link.issue_number, body(url))
+      # As the credential chosen for this (tenant, repository) (#936).
+      case Credential.repo(link.tenant_id, link.repo_full_name) do
+        {:ok, repo} ->
+          repo
+          |> PullRequestSource.comment_issue(link.issue_number, body(url))
+          |> recorded(link)
 
-          {:error, _reason} = error ->
-            error
-        end
-
-      recorded(sent, link)
+        # A configuration state, not a forge fault: parked without spending an attempt.
+        {:error, :credential_unavailable} = error ->
+          ForgeOutbox.park_unlicensed(IssueLink, link.tenant_id, link.id, error)
+          {:deferred, nil}
+      end
     else
       abandon(link, :source_revoked)
       {:abandoned, nil}

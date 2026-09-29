@@ -106,6 +106,34 @@ defmodule Loopctl.ForgeOutbox do
     )
   end
 
+  # How long a row with no credential for its (tenant, repository) waits before it is asked
+  # again (#936): long enough not to churn, short enough that setting a token is noticed within
+  # the hour.
+  @unlicensed_park_seconds 3_600
+
+  @doc """
+  Parks a `:pending` row that could not be attempted because its tenant has no GitHub
+  credential for its repository (#936). A missing credential is a CONFIGURATION state, not a
+  forge failure: counting it against `max_attempts/0` would abandon every row attempted
+  between a deploy and the operator setting a credential, or between a tenant clearing its
+  token and setting a new one, and nothing would ever retry them. So the attempt the claim
+  counted is given back, the row stays `:pending`, and it is due again in an hour.
+  """
+  @spec park_unlicensed(module(), Ecto.UUID.t(), Ecto.UUID.t(), term()) ::
+          {:ok, struct()} | {:error, :not_pending}
+  def park_unlicensed(schema, tenant_id, id, reason) do
+    now = DateTime.utc_now()
+
+    update_pending(schema, tenant_id, id,
+      set: [
+        next_attempt_at: DateTime.add(now, @unlicensed_park_seconds, :second),
+        last_error: error_text(reason),
+        updated_at: now
+      ],
+      inc: [attempts: -1]
+    )
+  end
+
   @doc "Stamps `field` with now on a `:pending` row."
   @spec stamp(module(), Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
           {:ok, struct()} | {:error, :not_pending}
