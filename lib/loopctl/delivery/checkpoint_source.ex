@@ -76,6 +76,7 @@ defmodule Loopctl.Delivery.CheckpointSource do
   (a checkpoint GitHub never had, say) leaves the branch `:missing`.
   """
 
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Threads.Checkpoint
@@ -86,7 +87,7 @@ defmodule Loopctl.Delivery.CheckpointSource do
   its implement ledger row (the source's current one only for a row that pinned none);
   `branch` is the one the current claim's dispatch named.
   """
-  @spec pull_request(String.t(), String.t(), String.t(), Checkpoint.t(), String.t() | nil) ::
+  @spec pull_request(ForgeRepo.t(), String.t(), String.t(), Checkpoint.t(), String.t() | nil) ::
           {:ok, map()} | {:error, term()}
   def pull_request(repo, base_branch, branch, checkpoint, allowed_sha \\ nil)
 
@@ -244,5 +245,5 @@ defmodule Loopctl.Delivery.CheckpointSource do
     end
   end
 
-  defp source, do: PullRequestSource.impl()
+  defp source, do: PullRequestSource
 end

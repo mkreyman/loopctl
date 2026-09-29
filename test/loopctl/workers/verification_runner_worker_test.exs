@@ -20,6 +20,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   import Mox
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
   alias Loopctl.Verification
@@ -50,8 +51,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   defp with_credential do
     stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
 
-    stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
-      {:ok, %Credential{kind: :operator_token}}
+    stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
+      {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
     end)
   end
 
@@ -231,6 +232,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
     # reaches the required-checks opt-in, so its pr source naming none is credential_unavailable.
     test "an unnamed tenant's pr source naming no checks records credential_unavailable" do
       ctx = setup_ctx()
+      stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> false end)
       fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
       run = run!(ctx)
 
@@ -266,10 +268,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
     test "a tenant named for no repository records credential_unavailable before CiTarget" do
       ctx = setup_ctx()
       test_pid = self()
+      stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> false end)
 
-      stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+      stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
         send(test_pid, :pair_asked)
-        {:ok, %Credential{kind: :operator_token}}
+        {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
       end)
 
       run = run!(ctx)

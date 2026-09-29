@@ -50,25 +50,26 @@ defmodule Loopctl.Verification.GitHubActions do
   alias Loopctl.Delivery.CiDefinition
   alias Loopctl.Delivery.CiEvidence
   alias Loopctl.Delivery.EmptyChange
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Verification.Credential
 
   @impl true
-  def resolve_commit(repo, sha, %Credential{kind: :operator_token}) do
-    case source().resolve_commit(repo, sha) do
+  def resolve_commit(sha, %Credential{repo: %ForgeRepo{} = forge_repo}) do
+    case source().resolve_commit(forge_repo, sha) do
       {:ok, full} -> {:ok, full}
       {:error, reason} -> classify(reason, :resolve)
     end
   end
 
-  def resolve_commit(_repo, _sha, _credential), do: {:refused, "credential_unavailable"}
+  def resolve_commit(_sha, _credential), do: {:refused, "credential_unavailable"}
 
   @impl true
-  def check_change(%{credential: %Credential{kind: :operator_token}} = request) do
-    with {:ok, commit} <- read(source().commit(request.repo, request.sha)),
+  def check_change(%{credential: %Credential{repo: %ForgeRepo{} = forge_repo}} = request) do
+    with {:ok, commit} <- read(source().commit(forge_repo, request.sha)),
          {:ok, comparison} <-
-           read(source().compare(request.repo, request.base_branch, request.sha)) do
+           read(source().compare(forge_repo, request.base_branch, request.sha)) do
       change(commit, comparison)
     end
   end
@@ -76,14 +77,14 @@ defmodule Loopctl.Verification.GitHubActions do
   def check_change(_request), do: {:refused, "credential_unavailable"}
 
   @impl true
-  def verdict(%{credential: %Credential{kind: :operator_token}} = request) do
+  def verdict(%{credential: %Credential{repo: %ForgeRepo{} = forge_repo}} = request) do
     if CiEvidence.lookup_names(request.required_checks) == [] do
       # The worker refuses this before asking; refused here too, so the adapter can never
       # judge an empty list — over which every check "passed".
       {:refused, "no_required_checks"}
     else
       with {:ok, evidence} <-
-             read(source().check_evidence(request.repo, request.sha, request.branch)) do
+             read(source().check_evidence(forge_repo, request.sha, request.branch)) do
         judge(request, evidence)
       end
     end
@@ -120,15 +121,19 @@ defmodule Loopctl.Verification.GitHubActions do
         [{name, why} | _rest] = result.failed
 
         {:fail,
-         %{url: failing_url(request.repo, name, why, counted), check: name, conclusion: why}}
+         %{url: failing_url(repo_name(request), name, why, counted), check: name, conclusion: why}}
 
       result.pending != [] or result.missing != [] ->
         {:wait, :ci_pending}
 
       true ->
-        {:pass, %{url: passing_url(request.repo, result.passed, counted)}}
+        {:pass, %{url: passing_url(repo_name(request), result.passed, counted)}}
     end
   end
+
+  # ONE source for the repository (#936): the credential's, which is also what every read went
+  # to, so an evidence URL can never name a repository other than the one judged.
+  defp repo_name(%{credential: %Credential{repo: %ForgeRepo{full_name: name}}}), do: name
 
   # The failing JOB, among the jobs the judgement counted. A name that failed because a run
   # DIED with no jobs at all (`run_<conclusion>`) points at a run that failed it that way —
@@ -201,7 +206,7 @@ defmodule Loopctl.Verification.GitHubActions do
   defp code({:invalid_ref, _ref}, _stage), do: "invalid_ref"
   defp code(_other, _stage), do: "forge_unreadable"
 
-  defp source, do: PullRequestSource.impl()
+  defp source, do: PullRequestSource
 
   @doc """
   The `Authorization` header for `token`, or none when there is no usable token.

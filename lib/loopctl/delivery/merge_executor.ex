@@ -117,6 +117,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
   alias Loopctl.Repo
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
+  alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
 
   @actor_label "control:merge_executor"
@@ -316,6 +317,30 @@ defmodule Loopctl.Delivery.MergeExecutor do
       else: {:escalate, base, reason}
   end
 
+  # #936: THE ONE WAY this module opens an App session. The App can read and write any
+  # repository it is installed on, so every session — the squash, the base update, the
+  # orphan check's reads — is licensed per (tenant, repository) first, here and nowhere else:
+  #
+  # ONLY a pair the operator named in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, the operator
+  # vouching for it. A tenant's own token licenses no App session, whatever its owner may do on
+  # GitHub: rulesets name the App as the one bypass actor on a protected base, so a write
+  # collaborator whose own pushes the ruleset blocks would otherwise have the App push past it
+  # for them (#938 round 3). The token owner's `permissions.push` cannot see that, and no
+  # repository-level answer can; the operator naming the pair can. Anything else is
+  # `{:error, :app_not_licensed}` (a tenant token) or `credential_unavailable` (none), and
+  # escalates rather than merging.
+  defp app_session(forge, tenant_id, repo) do
+    with :ok <- app_licensed(tenant_id, repo), do: forge.session(repo)
+  end
+
+  defp app_licensed(tenant_id, repo) do
+    case Credential.for_read(tenant_id, repo) do
+      {:ok, %Credential{kind: :operator_token}} -> :ok
+      {:ok, %Credential{kind: :tenant_token}} -> {:error, :app_not_licensed}
+      {:error, :credential_unavailable} = error -> error
+    end
+  end
+
   defp thread_mode(%{mode: :thread}), do: :ok
   defp thread_mode(_route), do: {:skip, :not_thread_mode}
 
@@ -356,7 +381,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
   defp execute(ctx) do
     forge = MergeForge.impl()
 
-    with {:ok, session} <- forge.session(ctx.repo),
+    with {:ok, session} <- app_session(forge, ctx.tenant_id, ctx.repo),
          ctx = Map.merge(ctx, %{forge: forge, session: session}),
          {:ok, base_head} <- forge.branch_head(session, ctx.base_branch) do
       squash(ctx, base_head)
@@ -668,7 +693,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
 
     with {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
-         {:ok, session} <- forge.session(source.repo_full_name),
+         {:ok, session} <- app_session(forge, tenant_id, source.repo_full_name),
          {:ok, head} <-
            forge.branch_head(session, DispatchPayload.placed_base_branch(route, source)) do
       forge.ancestor?(session, sha, head)

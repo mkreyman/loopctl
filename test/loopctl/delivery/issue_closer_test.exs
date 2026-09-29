@@ -9,12 +9,14 @@ defmodule Loopctl.Delivery.IssueCloserTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.IssueCloser
   alias Loopctl.Delivery.Resolution
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.IssueClosures
   alias Loopctl.MockPullRequestSource
+  alias Loopctl.Verification.Credential
 
   setup :verify_on_exit!
 
@@ -55,7 +57,10 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
       assert {:closed, nil} = IssueCloser.close(closure)
 
-      assert_received {:labelled, "mkreyman/home_care_billing", 77, @shipped_label}
+      assert_received {:labelled,
+                       %Loopctl.Delivery.ForgeRepo{full_name: "mkreyman/home_care_billing"}, 77,
+                       @shipped_label}
+
       assert_received {:commented, body}
       assert body == Resolution.for_verdict(:shipped).resolution_notes
       assert_received {:closed, :completed}
@@ -267,6 +272,44 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
       # And nothing of the label TEXT reached the row.
       refute row.last_error =~ "🇺🇸"
+    end
+
+    test "#936: no credential waits an hour within its budget, and closes once one exists", ctx do
+      closure = closure(ctx, :shipped)
+
+      stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, repo ->
+        assert tenant_id == ctx.tenant.id
+        assert repo == "mkreyman/home_care_billing"
+        {:error, :credential_unavailable}
+      end)
+
+      expect(MockPullRequestSource, :issue, 0, fn _repo, _number -> flunk("read") end)
+
+      # nil: the wait is this row's, and must not halt the rest of the batch.
+      assert {:deferred, nil} = IssueCloser.close(closure)
+
+      row = reload(ctx)
+      assert row.status == :pending
+      assert row.attempts == closure.attempts + 1
+      assert row.last_error =~ "credential_unavailable"
+      assert DateTime.diff(row.next_attempt_at, DateTime.utc_now()) > 3_000
+
+      # A credential appears; the parked row, once due, runs the whole sequence.
+      stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, repo ->
+        {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
+      end)
+
+      {1, _} =
+        AdminRepo.update_all(from(c in IssueClosure, where: c.id == ^row.id),
+          set: [next_attempt_at: nil]
+        )
+
+      expect_open_issue()
+      expect(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
+      expect(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
+      expect(MockPullRequestSource, :close_issue, fn _r, _n, _s -> :ok end)
+
+      assert {:closed, nil} = IssueCloser.close(reload(ctx))
     end
 
     test "a 404 is abandoned on the first attempt and never retried", ctx do

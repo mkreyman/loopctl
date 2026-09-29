@@ -26,6 +26,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.PostDeployVerification
   alias Loopctl.Delivery.PostDeployVerification.Result
   alias Loopctl.Delivery.Resolution
@@ -67,7 +68,9 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
     test "resolves the repository and the environment and reads the DEPLOYMENT", ctx do
       # Design §9: never the workflow run's head. The environment is fleet configuration,
       # never a caller's, and the repository comes from the story's intake source.
-      Mox.expect(MockPullRequestSource, :deployments_since, fn @repo, "production", since ->
+      Mox.expect(MockPullRequestSource, :deployments_since, fn %ForgeRepo{full_name: @repo},
+                                                               "production",
+                                                               since ->
         # The `since` the forge is asked for is the moment the merge was RECORDED, read from
         # the stage event — a deployment created before it cannot carry the merge.
         assert %DateTime{} = since
@@ -136,7 +139,11 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
     test "a merge BEHIND the deployed commit is asked about, and shipped", ctx do
       stub_deployment()
 
-      Mox.expect(MockPullRequestSource, :contains?, fn @repo, @merge, @deployed -> {:ok, true} end)
+      Mox.expect(MockPullRequestSource, :contains?, fn %ForgeRepo{full_name: @repo},
+                                                       @merge,
+                                                       @deployed ->
+        {:ok, true}
+      end)
 
       assert {:ok, %Result{decision: :verified}} = evaluate(ctx)
     end
@@ -153,6 +160,19 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
 
       assert {:ok, %Result{decision: :failed, reasons: reasons}} = evaluate(ctx)
       assert Enum.any?(reasons, &match?({:repository_unresolved, {:no_intake_source, _}}, &1))
+    end
+
+    test "#936: no credential WAITS (unresolved, never failed), and nothing is read", ctx do
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        flunk("the forge was asked with no credential")
+      end)
+
+      assert {:ok, %Result{decision: :unresolved, reasons: reasons}} = evaluate(ctx)
+      assert {:deployments_unavailable, :credential_unavailable} in reasons
     end
 
     test "a story that is not in the tenant is :not_found", ctx do

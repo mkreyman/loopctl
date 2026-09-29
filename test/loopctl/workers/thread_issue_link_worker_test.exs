@@ -36,7 +36,11 @@ defmodule Loopctl.Workers.ThreadIssueLinkWorkerTest do
     url = ThreadIssueLinkWorker.thread_url(story.id)
     assert String.ends_with?(url, "/threads/#{story.id}")
 
-    expect(Loopctl.MockPullRequestSource, :comment_issue, 1, fn "acme/widgets", 314, body ->
+    expect(Loopctl.MockPullRequestSource, :comment_issue, 1, fn %Loopctl.Delivery.ForgeRepo{
+                                                                  full_name: "acme/widgets"
+                                                                },
+                                                                314,
+                                                                body ->
       assert body =~ url
       :ok
     end)

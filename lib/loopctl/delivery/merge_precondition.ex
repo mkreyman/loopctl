@@ -282,6 +282,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   alias Loopctl.Progress
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
+  alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
   alias Loopctl.Workers.ThreadMergeWorker
 
@@ -1350,19 +1351,26 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # story is pr, and the source's current mode cannot stand in for it (a story placed as a
     # thread under a source since flipped back to pr must still be judged as a thread). Its
     # lock wait is bounded and contention answers `:unevaluated`, which the loop retries.
-    {mode, {pr_number, checkpoint, pull_request}} =
+    {mode, forge, {pr_number, checkpoint, pull_request}} =
       case DispatchPayload.dispatch_route(story.tenant_id, story) do
         {:ok, route} ->
+          # The repository with the credential every forge read below authenticates with
+          # (#936), chosen per (tenant, repository) and only once there is a route to read
+          # for. `repo` itself stays the bare name: the exclusion list and Gate B's trigger
+          # list are keyed by it.
+          forge = with {:ok, name} <- repo, do: Credential.repo(story.tenant_id, name)
+
           case placed_mode(route, source) do
-            :thread -> {:thread, thread_facts(story, stage, source, repo, route)}
-            :pr -> {:pr, pr_facts(stage, repo)}
+            :thread -> {:thread, forge, thread_facts(story, stage, source, forge, route)}
+            :pr -> {:pr, forge, pr_facts(stage, forge)}
           end
 
         # The route could not be read (contention): nothing is judged on a guessed route, and
         # the mode is reported as UNKNOWN (nil), not as `pr`. The failure travels as the pull
         # request fact, so `:busy` answers `:unevaluated`.
         {:error, reason} ->
-          {nil, {{:error, :not_attempted}, {:ok, nil}, {:error, reason}}}
+          {nil, {:error, :not_attempted},
+           {{:error, :not_attempted}, {:ok, nil}, {:error, reason}}}
       end
 
     facts = %{
@@ -1411,9 +1419,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # timeouts; the order of the results is fixed.
     [head_files, base_files, ci_evidence] =
       [
-        fn -> repo_files(repo, pull_request, :head_sha, skip?) end,
-        fn -> repo_files(repo, pull_request, :merge_base_sha, skip?) end,
-        fn -> ci_evidence(facts, pull_request, skip?) end
+        fn -> repo_files(forge, pull_request, :head_sha, skip?) end,
+        fn -> repo_files(forge, pull_request, :merge_base_sha, skip?) end,
+        fn -> ci_evidence(facts, forge, pull_request, skip?) end
       ]
       |> Task.async_stream(& &1.(), timeout: :infinity)
       |> Enum.map(fn {:ok, fact} -> fact end)
@@ -1454,6 +1462,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # checkpoint decides without it, and a source requiring nothing is refused without a read.
   defp ci_evidence(
          %{mode: :thread} = facts,
+         forge,
          {:ok, %{merged?: false, thread_branch: branch}},
          false = _skip?
        ) do
@@ -1462,7 +1471,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # A repository or checkpoint that could not be read is already refused as itself; only
     # the evidence read's OWN failure is this fact's. The BRANCH is the one the thread is
     # judged on: only the runs a push of it triggered are trusted (`CiEvidence`).
-    with {:ok, repo} <- facts.repo,
+    with {:ok, repo} <- forge,
          {:ok, %{commit_sha: sha}} <- facts.checkpoint,
          [_ | _] <- names do
       # Stamped BEFORE the read: evidence is ordered by when it was read FROM, so a slow read
@@ -1478,7 +1487,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     end
   end
 
-  defp ci_evidence(_facts, _pull_request, _skip?), do: {:ok, nil}
+  defp ci_evidence(_facts, _forge, _pull_request, _skip?), do: {:ok, nil}
 
   # The branch travels with the thread's facts so the CI read can name it.
   defp with_thread_branch({:ok, %{} = facts}, branch),
@@ -1510,15 +1519,32 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # The branch is the one the story was DISPATCHED on, never re-derived here.
   # A thread-mode story whose project has no single source still has no repository: the input
   # reasons refuse it `:repository_unresolved`, and nothing is read.
+  # A repository with no credential for this tenant (#936) still has its checkpoint READ — that
+  # is a database read and needs no credential — so the refusal names every broken input: the
+  # missing credential through the pull request fact (`{:pull_request_unavailable,
+  # :credential_unavailable}`), and an ended claim or a missing checkpoint beside it.
+  defp thread_facts(
+         story,
+         stage,
+         {:ok, source},
+         {:error, :credential_unavailable} = forge,
+         route
+       ),
+       do: thread_checkpoint_facts(story, stage, source, forge, route)
+
   defp thread_facts(_story, _stage, _source, {:error, _reason}, _route),
     do: {{:ok, nil}, {:error, :not_attempted}, {:error, :not_attempted}}
 
-  defp thread_facts(story, stage, {:ok, source}, {:ok, repo}, route) do
+  defp thread_facts(story, stage, {:ok, source}, {:ok, _repo} = forge, route),
+    do: thread_checkpoint_facts(story, stage, source, forge, route)
+
+  defp thread_checkpoint_facts(story, stage, source, forge, route) do
     case Threads.claim_checkpoints(story.tenant_id, story.id) do
       {:ok, %{latest: %Checkpoint{} = checkpoint} = claim} ->
         # The branch is resolved HERE, for a thread only: a pull request names its own head.
         pull_request =
-          with {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
+          with {:ok, repo} <- forge,
+               {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
             repo
             |> CheckpointSource.pull_request(
               DispatchPayload.placed_base_branch(route, source),
@@ -1532,15 +1558,20 @@ defmodule Loopctl.Delivery.MergePrecondition do
         {{:ok, nil}, {:ok, checkpoint_fact(checkpoint, claim.earlier_shas)}, pull_request}
 
       {:ok, %{earlier_claim_recorded?: true}} ->
-        {{:ok, nil}, {:error, :claim_ended}, {:error, :not_attempted}}
+        {{:ok, nil}, {:error, :claim_ended}, unread(forge)}
 
       {:ok, _none} ->
-        {{:ok, nil}, {:error, :none}, {:error, :not_attempted}}
+        {{:ok, nil}, {:error, :none}, unread(forge)}
 
       {:error, reason} ->
-        {{:ok, nil}, {:error, reason}, {:error, :not_attempted}}
+        {{:ok, nil}, {:error, reason}, unread(forge)}
     end
   end
+
+  # The pull request fact where nothing was read: a missing credential is still reported as
+  # itself beside whatever else is wrong; otherwise it is only the consequence, `:not_attempted`.
+  defp unread({:error, :credential_unavailable} = error), do: error
+  defp unread(_forge), do: {:error, :not_attempted}
 
   # The mode the claim's ROUTE records (`DispatchPayload.dispatch_route/2`): the accepted
   # implement row of a placed claim, or the route an interactive claim recorded when it was made
@@ -1568,7 +1599,9 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp pr_number(%{pr_number: number}), do: {:error, {:not_recorded, number}}
 
   defp pull_request({:ok, repo}, {:ok, number}), do: source().pull_request(repo, number)
-  defp pull_request(_repo, _number), do: {:error, :not_attempted}
+  # A missing credential is reported as itself whether or not a number was recorded, so both
+  # broken inputs are named in one refusal (the thread path does the same through `unread/1`).
+  defp pull_request(forge, _number), do: unread(forge)
 
   defp repo_files(_repo, {:ok, %{merged?: true}}, _key, _skip?), do: {:error, :not_consumed}
 
@@ -1608,7 +1641,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp repo_of({:ok, source}), do: {:ok, source.repo_full_name}
   defp repo_of(error), do: error
 
-  defp source, do: PullRequestSource.impl()
+  defp source, do: PullRequestSource
 
   # -- the one write ---------------------------------------------------------------------
 

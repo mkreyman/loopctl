@@ -1101,9 +1101,10 @@ describe("the descriptions carry what a caller needs instead of the controller",
       assert.match(text, /story verification/, name);
       assert.match(text, /no_required_checks/, name);
       assert.match(text, /PUSH run of the story's branch/, name);
-      // Round 4, finding 2: the order the worker checks, exactly. ANY entry for the tenant
-      // first; then the pr opt-in; then the (tenant, repository) pair, before a GitHub read.
-      assert.match(text, /entry for this tenant[\s\S]*VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks[\s\S]*\(tenant, repository\) pair[\s\S]*before any GitHub read/, name);
+      // Round 4, finding 2: the order the worker checks, exactly. ANY credential for the
+      // tenant first (its own token, #936, or an allowlist entry); then the pr opt-in; then
+      // the (tenant, repository) credential, before a GitHub read.
+      assert.match(text, /credential for this tenant[\s\S]*set_github_credential[\s\S]*VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks[\s\S]*\(tenant, repository\) credential[\s\S]*before any GitHub read/, name);
       assert.ok(!/tenant and (this )?repository in/.test(text), `${name} still says the pair gates no_required_checks`);
       assert.ok(!/mode never reads it/.test(text), `${name} still says pr mode never reads it`);
     }
@@ -1111,7 +1112,7 @@ describe("the descriptions carry what a caller needs instead of the controller",
       assert.match(row(name), /no_required_checks/, `${name}'s README row`);
       assert.match(
         row(name),
-        /VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks[\s\S]*\(tenant, repository\) pair[\s\S]*before any GitHub read/,
+        /set_github_credential[\s\S]*VERIFICATION_OPERATOR_TOKEN_TENANTS[\s\S]*credential_unavailable[\s\S]*no_required_checks[\s\S]*\(tenant, repository\) credential[\s\S]*before any GitHub read/,
         `${name}'s README row`,
       );
       assert.ok(!/tenant and (this )?repository (are )?in/.test(row(name)), `${name}'s README row still says the pair gates no_required_checks`);

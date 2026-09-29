@@ -150,6 +150,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   alias Loopctl.Delivery.Resolution
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
 
   @default_environment "production"
@@ -346,16 +347,21 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   defp transient_reasons(facts) do
     for {key, kind} <- @judged_facts,
         reason = error_reason(facts, key),
-        MergePrecondition.transient?(reason),
+        waits?(reason),
         do: {kind, reason}
   end
 
   defp broken_reasons(facts) do
     for {key, kind} <- @judged_facts,
         reason = error_reason(facts, key),
-        not MergePrecondition.transient?(reason),
+        not waits?(reason),
         do: {kind, reason}
   end
+
+  # A missing credential (#936) waits like a transient forge fault, under the same bound: a
+  # story that shipped must not be judged failed because a tenant was between tokens.
+  defp waits?(reason),
+    do: MergePrecondition.transient?(reason) or Credential.configuration?(reason)
 
   defp error_reason(facts, key) do
     case Map.get(facts, key) do
@@ -568,7 +574,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
       # inside the transition into `merged` and named in that transition's chain entry.
       merge_sha: stage.merge_sha,
       merged_at: merged_at,
-      deployments: deployments(repo, env, merged_at, stage.merge_sha)
+      deployments: deployments(tenant_id, repo, env, merged_at, stage.merge_sha)
     }
   end
 
@@ -613,8 +619,21 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # reaches the merge: that one settles the verdict, whatever its state, so nothing older
   # needs asking about. On the common path this is one containment call, and on the very
   # common early path the list is empty and there are none.
-  defp deployments({:ok, repo}, environment, {:ok, merged_at}, merge_sha)
+  #
+  # The credential (#936) is resolved only here, once every other fact the read needs is in
+  # hand; none is the deployments fact's own failure, so the verdict names it rather than
+  # calling the fact unattempted.
+  defp deployments(tenant_id, {:ok, name}, environment, {:ok, merged_at}, merge_sha)
        when is_binary(merge_sha) do
+    case Credential.repo(tenant_id, name) do
+      {:ok, repo} -> read_deployments(repo, environment, merged_at, merge_sha)
+      {:error, :credential_unavailable} = error -> error
+    end
+  end
+
+  defp deployments(_tenant_id, _repo, _environment, _merged_at, _merge_sha), do: :not_attempted
+
+  defp read_deployments(repo, environment, merged_at, merge_sha) do
     # The tolerance is subtracted HERE, building the query, and nowhere else. Folding it
     # into the fact made `Result.merged_at` two minutes earlier than the merge it documents,
     # so every escalation reason and telemetry consumer read a time that never happened.
@@ -632,8 +651,6 @@ defmodule Loopctl.Delivery.PostDeployVerification do
         {:error, reason}
     end
   end
-
-  defp deployments(_repo, _environment, _merged_at, _merge_sha), do: :not_attempted
 
   # Containment for every candidate, because the rule is "does ANY carrying deployment say
   # it succeeded" and that cannot be answered from one of them. The walk halts early on the
@@ -694,7 +711,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     end
   end
 
-  defp source, do: PullRequestSource.impl()
+  defp source, do: PullRequestSource
 
   # -- the writes ------------------------------------------------------------------------
 

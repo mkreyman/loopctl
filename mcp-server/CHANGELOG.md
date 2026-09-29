@@ -5,6 +5,15 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.112.0 — 2026-09-29 (the tenant's own GitHub token)
+
+- New tools `github_credential`, `set_github_credential` and `clear_github_credential`
+  (#936) over `GET|PUT|DELETE /api/v1/tenants/me/github-credential`. Every GitHub call
+  loopctl makes for a tenant uses the tenant's own token when one is set. All three pin
+  `LOOPCTL_USER_KEY`.
+- `intake_source_enroll` / `intake_source_update`: the `required_checks` description now
+  names a tenant token as the other way to get a credential.
+
 ## 2.111.2 — 2026-09-28 (required_checks: the allowlist comes first)
 
 ### Changed

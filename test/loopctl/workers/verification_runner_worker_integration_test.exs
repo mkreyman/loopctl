@@ -34,6 +34,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
@@ -84,7 +85,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
     stub(MockVerificationCredential, :for_read, fn tenant_id, repo ->
       send(test_pid, {:credential_asked, tenant_id, repo})
-      {:ok, %Credential{kind: :operator_token}}
+      {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
     end)
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id, test_pid: test_pid}
@@ -157,7 +158,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     diff = Map.get(answers, :diff, ["lib/widgets/thing.ex"])
 
     stub(MockPullRequestSource, :commit, fn
-      @repo, sha ->
+      %ForgeRepo{full_name: @repo}, sha ->
         send(ctx.test_pid, {:commit, sha})
         {:ok, %{tree_sha: Map.get(answers, :tree, @head_tree), parents: [@fork_point]}}
 
@@ -167,7 +168,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end)
 
     stub(MockPullRequestSource, :compare, fn
-      @repo, ^base, sha ->
+      %ForgeRepo{full_name: @repo}, ^base, sha ->
         send(ctx.test_pid, {:compare, sha})
         answers |> Map.get_lazy(:compare, fn -> {:ok, clean(diff)} end) |> answer()
 
@@ -177,7 +178,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end)
 
     stub(MockPullRequestSource, :check_evidence, fn
-      @repo, sha, ^branch ->
+      %ForgeRepo{full_name: @repo}, sha, ^branch ->
         send(ctx.test_pid, {:evidence, sha})
         answers |> Map.fetch!(:evidence) |> answer()
 
@@ -284,7 +285,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       # Allowlisted for ANOTHER repository only: this story's is not licensed.
       stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
         if repo == "acme/other",
-          do: {:ok, %Credential{kind: :operator_token}},
+          do: {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}},
           else: {:error, :credential_unavailable}
       end)
 
@@ -474,7 +475,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       assert %{change_checked_at: %DateTime{}} = reload(ctx, run)
 
       # Merged: the comparison now answers an empty diff.
-      stub(MockPullRequestSource, :compare, fn @repo, "master", sha ->
+      stub(MockPullRequestSource, :compare, fn %ForgeRepo{full_name: @repo}, "master", sha ->
         send(ctx.test_pid, {:compare, sha})
         {:ok, clean([], @sha)}
       end)
@@ -733,7 +734,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           ])
       })
 
-      expect(MockPullRequestSource, :resolve_commit, 1, fn @repo, @short -> {:ok, @sha} end)
+      expect(MockPullRequestSource, :resolve_commit, 1, fn %ForgeRepo{full_name: @repo}, @short ->
+        {:ok, @sha}
+      end)
 
       run = run!(ctx, @short)
       assert {:snooze, _} = perform(ctx, run)
@@ -759,7 +762,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "resolving an abbreviated SHA leaves the fault streak alone", ctx do
       stage_branch!(ctx, @branch)
       stub_forge(ctx, %{compare: {:error, {:github_api_error, 502}}, evidence: green()})
-      expect(MockPullRequestSource, :resolve_commit, 1, fn @repo, @short -> {:ok, @sha} end)
+
+      expect(MockPullRequestSource, :resolve_commit, 1, fn %ForgeRepo{full_name: @repo}, @short ->
+        {:ok, @sha}
+      end)
 
       run = ctx |> run!(@short) |> set_faults!(4)
       assert {:snooze, 900} = perform(ctx, run)
@@ -775,7 +781,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       stub_forge(ctx, %{evidence: green()})
 
       for {status, code} <- [{422, "unresolved_sha"}, {404, "repository_unreadable"}] do
-        expect(MockPullRequestSource, :resolve_commit, fn @repo, @short ->
+        expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, @short ->
           {:error, {:github_api_error, status}}
         end)
 
@@ -835,7 +841,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       run = ctx |> run!(@short) |> ready!()
       before = snapshot(ctx, run)
 
-      expect(MockPullRequestSource, :resolve_commit, 2, fn @repo, @short ->
+      expect(MockPullRequestSource, :resolve_commit, 2, fn %ForgeRepo{full_name: @repo}, @short ->
         lock_run_once!(run)
         {:ok, @sha}
       end)

@@ -11,16 +11,17 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
      without any read (the stale-run age gate, below).
   3. The run is started once; `started_at` is written on the first poll only.
   4. The reads are resolved from loopctl's records, in an order that reads nothing from the
-     forge until each is settled: the run's commit (`no_commit_sha`); whether the tenant is
-     named for ANY repository (`Loopctl.Verification.Credential.any_for_tenant?/1`;
-     `credential_unavailable`), before any read of the story, so an unnamed tenant costs no
-     database read; the story's repository, required checks and branch
-     (`Loopctl.Verification.CiTarget`; `no_intake_source`, `ambiguous_intake_source`,
-     `no_required_checks`, `no_story_branch`); and the credential for that tenant AND that
-     repository (`Credential.for_read/2`; `credential_unavailable`), before any forge read. So
-     a tenant with no allowlist entry at all records `credential_unavailable` even when its
-     source names no required checks; a tenant with an entry, whose pr source names none,
-     records `no_required_checks` whichever repository its entry names.
+     forge until each is settled: the run's commit (`no_commit_sha`); whether the tenant has
+     ANY credential (`Loopctl.Verification.Credential.any_for_tenant?/1`: its own GitHub token,
+     #936, or an allowlist entry; `credential_unavailable`), before any read of the story, so
+     a tenant with neither costs one indexed existence check and none of the story reads; the
+     story's repository, required checks and branch (`Loopctl.Verification.CiTarget`;
+     `no_intake_source`, `ambiguous_intake_source`, `no_required_checks`, `no_story_branch`);
+     and the credential for that tenant AND that repository (`Credential.for_read/2`;
+     `credential_unavailable`), before any forge read. So a tenant with no token and no
+     allowlist entry records `credential_unavailable` even when its source names no required
+     checks; a tenant with a token, or with an entry, whose pr source names none records
+     `no_required_checks`.
   5. An abbreviated SHA is resolved to its full id ONCE and persisted on the run
      (`resolved_commit_sha`); every later poll reuses it.
   6. THE CHANGE CHECK (`CiBehaviour.check_change/1`), ONCE per run, by the thread merge
@@ -194,8 +195,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
          :ok <- tenant_named(tenant_id),
          {:ok, target} <- CiTarget.gather(tenant_id, run.story_id),
          {:ok, credential} <- credential(tenant_id, target.repo),
-         {:ok, run, full} <- full_sha(run, target.repo, sha, credential) do
-      judge(run, Map.merge(target, %{sha: full, credential: credential}))
+         {:ok, run, full} <- full_sha(run, sha, credential) do
+      judge(run, target |> Map.delete(:repo) |> Map.merge(%{sha: full, credential: credential}))
     else
       outcome -> {run, outcome}
     end
@@ -222,9 +223,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   defp commit_sha(%{commit_sha: sha}) when is_binary(sha) and sha != "", do: {:ok, sha}
   defp commit_sha(_run), do: {:unconfigured, "no_commit_sha"}
 
-  # Before any read of the story (finding 9, round 2): a tenant the operator named for no
-  # repository at all records `credential_unavailable` without the intake-source, stage-row or
-  # dispatch-ledger reads `CiTarget` makes. The pair is still checked once the repository is
+  # Before any read of the story (finding 9, round 2): a tenant with no token of its own and
+  # no allowlist entry records `credential_unavailable` without the intake-source, stage-row or
+  # dispatch-ledger reads `CiTarget` makes. The pair is still resolved once the repository is
   # known (`credential/2`).
   defp tenant_named(tenant_id) do
     if Credential.any_for_tenant?(tenant_id),
@@ -232,8 +233,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
       else: {:unconfigured, "credential_unavailable"}
   end
 
-  # Asked for the (tenant, repository) pair: an allowlisted tenant gets no credential for a
-  # repository it enrolled that the operator did not name with it.
+  # Asked for the (tenant, repository) pair (#936): the tenant's own token for any repository;
+  # without one, an allowlisted tenant gets no credential for a repository it enrolled that the
+  # operator did not name with it.
   defp credential(tenant_id, repo) do
     case Credential.for_read(tenant_id, repo) do
       {:ok, %Credential{} = credential} -> {:ok, credential}
@@ -244,15 +246,15 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   # AC-26.4.6.7: a full id is used as it is; an abbreviated one is resolved ONCE and the
   # answer persisted, so no later poll of this run reads the commit again. It leaves the fault
   # streak alone: it is not a CI answer, and it happens once per run.
-  defp full_sha(%{resolved_commit_sha: full} = run, _repo, _sha, _credential)
+  defp full_sha(%{resolved_commit_sha: full} = run, _sha, _credential)
        when is_binary(full),
        do: {:ok, run, full}
 
-  defp full_sha(run, repo, sha, credential) do
+  defp full_sha(run, sha, credential) do
     if Loopctl.GitSha.valid?(sha) do
       {:ok, run, sha}
     else
-      case @ci_adapter.resolve_commit(repo, sha, credential) do
+      case @ci_adapter.resolve_commit(sha, credential) do
         {:ok, full} -> record_resolved(run, full)
         outcome -> outcome
       end

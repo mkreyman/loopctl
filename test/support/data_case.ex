@@ -18,6 +18,7 @@ defmodule Loopctl.DataCase do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Custody.Coverage
+  alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Egress.Scope, as: EgressScope
   alias Loopctl.Embeddings.LegacyRetirement
   alias Loopctl.Embeddings.SystemConfigReadPath
@@ -235,12 +236,16 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
-    # US-26.4.6: story verification reads nothing without a credential. A test that wants one
-    # says so, for the tenant check and the (tenant, repository) pair both.
-    Mox.stub(Loopctl.MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> false end)
+    # #936: every forge call asks `for_read/2` for its (tenant, repository) credential, and
+    # the forge itself is `MockPullRequestSource`, fail-closed above. The two defaults are
+    # the pair the real `ForgeCredential` gives a tenant that has one: a credential for every
+    # repository, and `any_for_tenant?` true. A test about a MISSING credential stubs BOTH to
+    # say so, and each caller has one (they flunk if the forge is reached).
+    Mox.stub(Loopctl.MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
 
-    Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
-      {:error, :credential_unavailable}
+    Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, repo ->
+      {:ok,
+       %Loopctl.Verification.Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
     end)
 
     # US-45.5: the merge executor's App writes, on the same fail-closed default.
