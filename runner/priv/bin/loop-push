@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# loop-push — how a loop session pushes its branch: fetch first, integrate, never force.
+#
+#   /abs/path/loop-push
+#
+# loopctl's merge executor may move a thread branch itself: when the base moved on, its App
+# merges the base into loop/<story> and records a base_update checkpoint, and nothing tells the
+# session. A push from the stale local head is then refused as non-fast-forward, and a FORCED
+# push would erase the base update and create a head nobody reported (loopctl-runner#56). So:
+#
+#   1. fetch origin's copy of the session's branch;
+#   2. if origin has commits this branch lacks, MERGE them (merge, not rebase: a rebase rewrites
+#      commits that may already be reported as checkpoints);
+#   3. push without force; a non-fast-forward means origin moved again, so go back to 1.
+#
+# Only the session's own branch, named by LOOP_BRANCH, which the runner sets. Unset is a refusal,
+# not permission to push whatever is checked out: fail closed.
+#
+# Exit 0 pushed (the sha is printed); 2 refused to run (LOOP_BRANCH unset, a detached HEAD, or
+# another branch); 3 origin's commits CONFLICT with yours (the merge was aborted, nothing pushed);
+# 4 the push failed, or origin kept moving; 5 git refused to merge at all (uncommitted changes
+# in the way, or a repository error), or a conflicted merge could not be aborted, with git's words.
+#
+# Nothing it runs can wait on a person or on a dead connection: no credential prompt, ssh in
+# BatchMode with keepalives, and https given up when it stalls. An operator's own GIT_SSH_COMMAND
+# is kept.
+
+set -u
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4}"
+net=(-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60)
+
+if [ -z "${LOOP_BRANCH:-}" ]; then
+    echo "loop-push: LOOP_BRANCH is not set, so there is no branch this session may push" >&2
+    exit 2
+fi
+
+# The FULL ref: --short turns into "heads/<branch>" when a tag or remote shares the short name.
+head_ref=$(git symbolic-ref --quiet HEAD) || {
+    echo "loop-push: HEAD is not on a branch; check out $LOOP_BRANCH first" >&2
+    exit 2
+}
+
+if [ "$head_ref" != "refs/heads/$LOOP_BRANCH" ]; then
+    echo "loop-push: on ${head_ref#refs/heads/}, but this session's branch is $LOOP_BRANCH" >&2
+    exit 2
+fi
+
+branch=$LOOP_BRANCH
+
+remote="refs/remotes/origin/$branch"
+fetch_error=""
+
+for attempt in 1 2 3; do
+    # A branch origin does not have yet fetches nothing, and a failed fetch is not fatal: a push
+    # from a stale view is refused by origin, which sends this loop round again. Its words are
+    # kept, because a fetch that fails every time is the real reason a push keeps being refused.
+    # Only a ref THIS fetch refreshed is merged: a failed fetch leaves whatever the repository held
+    # before, and for a branch origin deleted (a squash-merged story re-dispatched) that is old,
+    # already-shipped history.
+    fetched=""
+    if out=$(git "${net[@]}" fetch --quiet origin "+refs/heads/$branch:$remote" 2>&1); then
+        fetch_error=""
+        fetched=1
+    else
+        fetch_error=$out
+    fi
+
+    if [ -n "$fetched" ] && git rev-parse --verify --quiet "$remote" > /dev/null; then
+        git merge-base --is-ancestor "$remote" HEAD
+        case $? in
+            0) ;; # origin has nothing this branch lacks
+            1)
+                if ! merge_out=$(git merge --no-edit "$remote" 2>&1); then
+                    # MERGE_HEAD exists only when the merge started and stopped on conflicts.
+                    if git rev-parse --verify --quiet MERGE_HEAD > /dev/null; then
+                        if ! abort_out=$(git merge --abort 2>&1); then
+                            echo "loop-push: origin/$branch conflicts with yours, and the merge could not be aborted; the tree is mid-merge: $abort_out" >&2
+                            exit 5
+                        fi
+                        echo "loop-push: origin/$branch has commits that conflict with yours; nothing was pushed." >&2
+                        echo "Merge origin/$branch, resolve the conflicts, commit, and run loop-push again." >&2
+                        exit 3
+                    fi
+                    echo "loop-push: git would not merge origin/$branch: $merge_out" >&2
+                    exit 5
+                fi
+                ;;
+            *)
+                echo "loop-push: could not compare origin/$branch with HEAD (a repository error)" >&2
+                exit 5
+                ;;
+        esac
+    fi
+
+    if out=$(git "${net[@]}" push --porcelain origin "HEAD:refs/heads/$branch" 2>&1); then
+        echo "pushed $(git rev-parse HEAD) to origin/$branch"
+        exit 0
+    fi
+
+    case "$out" in
+        # Refused because origin moved: before the push (the first three), or between origin
+        # advertising its refs and updating one (the remote's lock or old-value check), which a
+        # long pre-push hook widens.
+        *"[rejected]"* | *"non-fast-forward"* | *"fetch first"* | *"cannot lock ref"* | *"incorrect old value"*) continue ;;
+        *)
+            echo "loop-push: the push failed: $out" >&2
+            exit 4
+            ;;
+    esac
+done
+
+if [ -n "$fetch_error" ]; then
+    echo "loop-push: origin refused every push, and the fetch that should have caught up failed: $fetch_error" >&2
+else
+    echo "loop-push: origin/$branch kept moving across $attempt attempts; nothing more was pushed" >&2
+fi
+exit 4

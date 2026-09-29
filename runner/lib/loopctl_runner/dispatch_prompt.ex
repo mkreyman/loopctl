@@ -105,10 +105,13 @@ defmodule LoopctlRunner.DispatchPrompt do
            #{push_script}
 
        It fetches first, merges what origin has that your branch lacks, and never forces. If it
-       reports that origin's commits conflict with yours, merge them, resolve the conflict,
-       commit, and run it again. Do not run git push yourself, do not open a pull request, do not
-       merge anything, and never force-push: loopctl's merge executor merges the checkpoints it
-       records from your pushes.
+       reports that origin's commits conflict with yours (exit 3), merge them, resolve the
+       conflict, commit, and run it again. If it says git would not merge at all (exit 5), commit
+       or discard the changes it names that are in the way and run it again. If the push failed
+       (exit 4), read what it printed; if it names a network or permission failure you cannot
+       fix, escalate with that text. Do not run git push yourself, do not open a pull request, do
+       not merge anything else, and never force-push: loopctl's merge executor merges the
+       checkpoints it records from your pushes.
     """
   end
 

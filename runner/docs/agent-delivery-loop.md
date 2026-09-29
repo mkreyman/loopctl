@@ -306,8 +306,7 @@ without `--delete-branch`. **Nothing else runs, absence included**: a repository
 `.loopctl/mode` is refused `repository has no .loopctl/mode`, because `pr` merges autonomously and
 a repository that never opted in has not asked for that; an empty file or any other value is
 refused naming what it said. A `thread` repository is also refused on a build without `loop-push`
-(PR #60) or without checkpoint reporting (PR #59), which land in that order before thread mode is
-usable. Pr mode's promise that the runner removes a shipped branch's worktree holds because
+or without checkpoint reporting (PR #59), which thread mode needs before it is usable. Pr mode's promise that the runner removes a shipped branch's worktree holds because
 teardown decides by merged content.
 
 **`auto` is not used, for its own reason.** Its classifier approves whatever it judges safe:

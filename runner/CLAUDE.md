@@ -201,12 +201,12 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   reviewing → pr_open → ci → merged → deployed`, since 1.12.0). The RUNNER itself commits,
   pushes and merges nothing, and its teardown deletes a branch only when `origin`'s base already
   carries its content.
-- **Thread mode waits on #60 and then #59.** #60 adds `priv/bin/loop-push`; #59 adds
+- **Thread mode waits on #59.** `priv/bin/loop-push` is how a thread session pushes; #59 adds
   `LoopctlRunner.CheckpointStream`, which reports each pushed commit as the checkpoint loopctl's
-  merge executor merges. Until both are in, a thread-mode run is refused before a session starts:
-  `push helper missing` without the first (`DispatchPolicy.push_helper/2`), `checkpoint reporting
-  not available` without the second (`DispatchPolicy.checkpoint_reporting/2`), rather than
-  started on a prompt naming a command that is not there, or pushing work nothing ever merges.
+  merge executor merges. Until it is in, a thread-mode run is refused before a session starts:
+  `checkpoint reporting not available` (`DispatchPolicy.checkpoint_reporting/2`), rather than
+  pushing work nothing ever merges; `push helper missing` (`DispatchPolicy.push_helper/2`)
+  refuses a build whose release lacks the script.
 - **The story-lifecycle protocol lives in the operator's skills and commands, NOT in this repo.**
   `loopctl-contract`, `loopctl-status`, `loopctl-mcp`, `loopctl-plan`, `loopctl-verify-artifacts`
   and `/loopctl:implement` already carry contract, claim, stage reporting and verification, and a
