@@ -19,8 +19,14 @@ defmodule Loopctl.Test.LockGuardTest do
   # Once per module, committed, and dropped after the LAST test: a per-test drop would run
   # before the sandbox rolls back and wait on the very lock the test took.
   setup_all do
-    probe = "lock_guard_probe_#{System.unique_integer([:positive])}"
-    Sandbox.unboxed_run(AdminRepo, fn -> AdminRepo.query!("CREATE TABLE #{probe} (id int)") end)
+    # A FIXED name, dropped if an interrupted run left it behind, so leftovers never pile up.
+    # This module is async: false, and each partition or worktree has its own database.
+    probe = "lock_guard_probe"
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      AdminRepo.query!("DROP TABLE IF EXISTS #{probe}")
+      AdminRepo.query!("CREATE TABLE #{probe} (id int)")
+    end)
 
     on_exit(fn ->
       Sandbox.unboxed_run(AdminRepo, fn -> AdminRepo.query!("DROP TABLE #{probe}") end)
@@ -93,6 +99,11 @@ defmodule Loopctl.Test.LockGuardTest do
       end)
 
     assert log =~ "LockGuard could not read locks: gone"
+    assert {_setups, _teardowns, skipped} = LockGuard.stats()
+    assert skipped >= 1
+
+    assert ExUnit.CaptureIO.capture_io(:stderr, fn -> LockGuard.report_skips() end) =~
+             "could not run"
   end
 
   test "starting it again keeps the pool it has" do
@@ -100,7 +111,7 @@ defmodule Loopctl.Test.LockGuardTest do
     assert {:ok, ^pid} = LockGuard.start()
   end
 
-  test "a sync test records no backend PIDs, so its teardown checks nothing" do
-    assert Process.get(:lock_guard_backend_pids) == nil
+  test "a sync test records no backend PIDs, so its teardown checks nothing", context do
+    assert context.lock_guard_backend_pids == nil
   end
 end

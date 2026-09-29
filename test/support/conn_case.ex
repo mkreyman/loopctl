@@ -36,7 +36,7 @@ defmodule LoopctlWeb.ConnCase do
   end
 
   setup tags do
-    Loopctl.DataCase.setup_sandbox(tags)
+    sandbox = Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     Loopctl.DataCase.stub_all_defaults()
     # Per-test embedding axis (see Loopctl.DataCase.test_vec/2): unique per test so
@@ -48,6 +48,6 @@ defmodule LoopctlWeb.ConnCase do
       Phoenix.ConnTest.build_conn()
       |> Plug.Conn.put_req_header("x-loopctl-last-known-sth", "0:AAAAAAAAAAAAAAAAAAAAAA")
 
-    {:ok, conn: conn}
+    {:ok, Map.put(sandbox, :conn, conn)}
   end
 end

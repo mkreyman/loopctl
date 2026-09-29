@@ -2,6 +2,7 @@ ExUnit.start()
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 {:ok, _lock_guard} = Loopctl.Test.LockGuard.start()
+ExUnit.after_suite(fn _result -> Loopctl.Test.LockGuard.report_skips() end)
 
 # VM-global :atomics counter backing `Loopctl.Fixtures.next_story_number/0`.
 # Initialized once here, single-threaded, before any (async) test runs, so the

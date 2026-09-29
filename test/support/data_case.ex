@@ -47,14 +47,14 @@ defmodule Loopctl.DataCase do
 
   setup tags do
     if tags[:vacuum_vector_indexes], do: Loopctl.DataCase.vacuum_vector_indexes()
-    Loopctl.DataCase.setup_sandbox(tags)
+    sandbox = Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     stub_all_defaults()
     # Per-test embedding axis: every test gets a UNIQUE integer, so `test_vec/2` hashes
     # this test's vectors onto its own sparse dimensions of the shared pgvector HNSW index.
     # Setup runs in the test process, so `Process.get(:test_vec_axis)` at insert time sees it.
     Process.put(:test_vec_axis, System.unique_integer([:positive]))
-    :ok
+    {:ok, sandbox}
   end
 
   # Tables carrying a pgvector HNSW index. Vacuuming these is what removes dead index
@@ -140,13 +140,15 @@ defmodule Loopctl.DataCase do
     # An async test must not END holding a DDL lock on a shared table (LockGuard); read
     # before the owners stop, because stopping rolls the sandbox back and frees the locks.
     backend_pids =
-      if tags[:async],
-        do: LockGuard.backend_pids([Loopctl.Repo, Loopctl.AdminRepo, Loopctl.HeavyReadRepo])
-
-    # Kept where a test can read it, so the wiring is pinned (`LockGuardTest`), not assumed.
-    Process.put(:lock_guard_backend_pids, backend_pids)
+      if tags[:async] do
+        LockGuard.note_setup()
+        LockGuard.backend_pids([Loopctl.Repo, Loopctl.AdminRepo, Loopctl.HeavyReadRepo])
+      end
 
     on_exit(fn -> release_sandbox([pid, admin_pid, heavy_pid], backend_pids) end)
+
+    # Returned into the test context: the same value the teardown closure received.
+    %{lock_guard_backend_pids: backend_pids}
   end
 
   @doc """
@@ -155,7 +157,10 @@ defmodule Loopctl.DataCase do
   then the owners stop — whether or not the check raised.
   """
   def release_sandbox(owners, backend_pids) do
-    if backend_pids, do: LockGuard.check!(backend_pids)
+    if backend_pids do
+      LockGuard.note_teardown()
+      LockGuard.check!(backend_pids)
+    end
   after
     Enum.each(owners, &Sandbox.stop_owner/1)
   end

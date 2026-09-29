@@ -25,9 +25,22 @@ defmodule Loopctl.Test.LockGuard do
 
   It reads LOCKS, not source, so it catches DDL however it is spelled: a literal, a variable,
   a helper, `Ecto.Adapters.SQL.query!/3`, a migration run inline.
+
+  WHAT IT CANNOT SEE: a lock taken and released BEFORE the test ends — DDL inside a
+  `Repo.transaction` that rolls back is a savepoint in the sandbox, and rolling back frees
+  its locks, though it blocked other tests while held. Only a teardown check exists, so that
+  shape is not caught.
+
+  WHERE IT RUNS: every async `Loopctl.DataCase`/`LoopctlWeb.ConnCase` test, and every async
+  bare `ExUnit.Case` test that opens its sandbox through `start_owner!/1` rather than
+  `Sandbox.start_owner!/2`. It counts what it does (`stats/0`): `LockGuardCoverageTest`
+  proves the teardown ran a check for every async setup, and a check the guard itself could
+  not run is printed at the end of the suite (`report_skips/0`) where `capture_log` cannot
+  swallow it.
   """
 
   alias Ecto.Adapters.SQL
+  alias Ecto.Adapters.SQL.Sandbox
 
   require Logger
 
@@ -45,26 +58,90 @@ defmodule Loopctl.Test.LockGuard do
   ORDER BY 1, 2
   """
 
+  # The AdminRepo connection options that say WHERE and HOW to connect, taken from its own
+  # config so the guard's pool can never drift from the repos' (ssl, a socket, parameters...).
+  @connect_keys ~w(hostname port username password database socket socket_dir ssl ssl_opts
+                   parameters connect_timeout timeout types)a
+
+  # {async setups that recorded PIDs, teardowns that checked them, checks the guard could not
+  # run}. Only the WIRING moves the first two, so their equality is the proof it is wired.
+  @stats {__MODULE__, :stats}
+
   @doc """
   Starts the non-sandbox connection pool the check reads through, from test_helper.exs. One
   connection per concurrent test case, so teardowns never queue on it. Idempotent: a helper
-  evaluated twice in one VM keeps the pool it has.
+  evaluated twice in one VM keeps the pool and the counts it has.
   """
   @spec start() :: {:ok, pid()}
   def start do
-    config = Loopctl.AdminRepo.config()
+    unless :persistent_term.get(@stats, nil),
+      do: :persistent_term.put(@stats, :counters.new(3, []))
 
-    case Postgrex.start_link(
-           name: @conn,
-           hostname: config[:hostname],
-           port: config[:port],
-           username: config[:username],
-           password: config[:password],
-           database: config[:database],
-           pool_size: ExUnit.configuration()[:max_cases] || System.schedulers_online()
-         ) do
+    opts =
+      Loopctl.AdminRepo.config()
+      |> Keyword.take(@connect_keys)
+      |> Keyword.merge(
+        name: @conn,
+        pool_size: ExUnit.configuration()[:max_cases] || System.schedulers_online()
+      )
+
+    case Postgrex.start_link(opts) do
       {:ok, pid} -> {:ok, pid}
       {:error, {:already_started, pid}} -> {:ok, pid}
+    end
+  end
+
+  @doc """
+  For an async bare `ExUnit.Case` test that owns its sandbox: starts the owner, records its
+  backend PID, and registers the teardown (the check, then the owner stops). Call it from
+  `setup`; returns the owner.
+  """
+  @spec start_owner!(module()) :: pid()
+  def start_owner!(repo) do
+    owner = Sandbox.start_owner!(repo, shared: false)
+    pids = backend_pids([repo])
+    note_setup()
+
+    ExUnit.Callbacks.on_exit(fn ->
+      try do
+        note_teardown()
+        check!(pids)
+      after
+        Sandbox.stop_owner(owner)
+      end
+    end)
+
+    owner
+  end
+
+  @doc "Counts an async setup whose PIDs a teardown must check."
+  @spec note_setup() :: :ok
+  def note_setup, do: count(1)
+
+  @doc "Counts a teardown that checked the PIDs its setup recorded."
+  @spec note_teardown() :: :ok
+  def note_teardown, do: count(2)
+
+  @doc "{async setups recorded, teardowns that checked, checks the guard could not run} so far."
+  @spec stats() :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
+  def stats do
+    ref = :persistent_term.get(@stats)
+    {:counters.get(ref, 1), :counters.get(ref, 2), :counters.get(ref, 3)}
+  end
+
+  @doc "Prints how many checks the guard itself could not run. From `ExUnit.after_suite/1`."
+  @spec report_skips() :: :ok
+  def report_skips do
+    case stats() do
+      {_setups, _checks, 0} ->
+        :ok
+
+      {_setups, _checks, skipped} ->
+        IO.puts(
+          :stderr,
+          "LockGuard: #{skipped} teardown lock check(s) could not run (the guard's own " <>
+            "connection failed); those tests were not checked for held DDL locks."
+        )
     end
   end
 
@@ -97,10 +174,13 @@ defmodule Loopctl.Test.LockGuard do
 
       # The GUARD could not ask, which says nothing about the test: warn, never fail it.
       {:error, reason} ->
+        count(3)
         Logger.warning("LockGuard could not read locks: #{Exception.message(reason)}")
         :ok
     end
   end
+
+  defp count(index), do: @stats |> :persistent_term.get() |> :counters.add(index, 1)
 
   defp message(held) do
     "this async test ends holding table-level locks on shared relations, which block " <>

@@ -6,8 +6,8 @@ defmodule Loopctl.Test.LockGuardWiringTest do
 
   use Loopctl.DataCase, async: true
 
-  test "an async test's setup records a backend PID per repo for the teardown check" do
-    pids = Process.get(:lock_guard_backend_pids)
+  test "an async test's setup records a backend PID per repo for the teardown check", context do
+    pids = context.lock_guard_backend_pids
 
     assert is_list(pids) and length(pids) == 3
     assert Enum.all?(pids, &(is_integer(&1) and &1 > 0))

@@ -11,13 +11,13 @@ defmodule Loopctl.Repo.HnswIndexParamsTest do
   """
   use ExUnit.Case, async: true
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Repo.HnswIndex
+  alias Loopctl.Test.LockGuard
 
   setup do
-    pid = Sandbox.start_owner!(AdminRepo, shared: false)
-    on_exit(fn -> Sandbox.stop_owner(pid) end)
+    # Owns its sandbox, so the teardown lock check comes with it (Loopctl.Test.LockGuard).
+    _owner = LockGuard.start_owner!(AdminRepo)
 
     table = "hnsw_params_test_#{System.unique_integer([:positive])}"
     AdminRepo.query!("CREATE TABLE #{table} (id bigserial PRIMARY KEY, embedding vector(1536))")
