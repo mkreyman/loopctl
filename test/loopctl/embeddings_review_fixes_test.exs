@@ -24,13 +24,12 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   `async: true` for the same reason as `Loopctl.EmbeddingsSideTableReadsTest`: the
   cutover read-path decision is injected (`Loopctl.Embeddings.ReadPathBehaviour`)
   and stubbed per-process, never flipped VM-globally, so nothing here writes shared
-  state.
+  state — and no DDL: `force_live_denorm/4` skips the trigger with a transaction-local
+  `session_replication_role`, never `ALTER TABLE ... DISABLE TRIGGER`, whose SHARE ROW
+  EXCLUSIVE lock the sandbox would hold to the end of the test (KB 493d2020).
   """
 
-  # `async: false`: `force_live_denorm/4` runs `ALTER TABLE ... DISABLE TRIGGER`, a SHARE ROW
-  # EXCLUSIVE lock the sandbox holds to the end of the test, which blocks every concurrent
-  # async INSERT into that embeddings table until it is cancelled 57014 (KB 493d2020).
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   # #645 — vacuum the pgvector graph before each test in this module. Rolled-back tests
   # leave DEAD HNSW entries behind, and pgvector's scan skips dead elements rather than
@@ -1070,15 +1069,17 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   # cannot be produced by an ordinary UPDATE. Disabling the trigger for one statement
   # reproduces the state the INSERT-time write skew used to leave behind (and that a
   # COPY/restore could still leave), which is what the sweep exists to repair.
-  defp force_live_denorm(table, trigger, id, value) do
-    AdminRepo.query!("ALTER TABLE #{table} DISABLE TRIGGER #{trigger}")
+  # `replica` skips ordinary triggers for this transaction only and takes no lock; it is put
+  # back to `origin` at once, because the sandbox transaction is the whole test.
+  defp force_live_denorm(table, _trigger, id, value) do
+    AdminRepo.query!("SET LOCAL session_replication_role = replica")
 
     AdminRepo.query!("UPDATE #{table} SET live_denorm = $1 WHERE id = $2", [
       value,
       Ecto.UUID.dump!(id)
     ])
 
-    AdminRepo.query!("ALTER TABLE #{table} ENABLE TRIGGER #{trigger}")
+    AdminRepo.query!("SET LOCAL session_replication_role = origin")
   end
 
   defp system_article_ids(articles), do: Enum.map(articles, & &1.id)
