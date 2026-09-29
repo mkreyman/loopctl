@@ -139,17 +139,25 @@ defmodule Loopctl.DataCase do
 
     # An async test must not END holding a DDL lock on a shared table (LockGuard); read
     # before the owners stop, because stopping rolls the sandbox back and frees the locks.
-    backend_pids = if tags[:async], do: LockGuard.backend_pids([Loopctl.Repo, Loopctl.AdminRepo])
+    backend_pids =
+      if tags[:async],
+        do: LockGuard.backend_pids([Loopctl.Repo, Loopctl.AdminRepo, Loopctl.HeavyReadRepo])
 
-    on_exit(fn ->
-      try do
-        if backend_pids, do: LockGuard.check!(backend_pids)
-      after
-        Sandbox.stop_owner(pid)
-        Sandbox.stop_owner(admin_pid)
-        Sandbox.stop_owner(heavy_pid)
-      end
-    end)
+    # Kept where a test can read it, so the wiring is pinned (`LockGuardTest`), not assumed.
+    Process.put(:lock_guard_backend_pids, backend_pids)
+
+    on_exit(fn -> release_sandbox([pid, admin_pid, heavy_pid], backend_pids) end)
+  end
+
+  @doc """
+  The sandbox teardown every DataCase/ConnCase test runs: for an async test, the lock check
+  (`Loopctl.Test.LockGuard.check!/1`) FIRST, while the sandbox still holds what the test took,
+  then the owners stop — whether or not the check raised.
+  """
+  def release_sandbox(owners, backend_pids) do
+    if backend_pids, do: LockGuard.check!(backend_pids)
+  after
+    Enum.each(owners, &Sandbox.stop_owner/1)
   end
 
   @doc """

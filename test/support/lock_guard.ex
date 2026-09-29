@@ -12,9 +12,11 @@ defmodule Loopctl.Test.LockGuard do
 
   HOW: the test's sandbox connections' backend PIDs are recorded at setup (`backend_pids/1`).
   At teardown, BEFORE the sandbox rolls back, a SEPARATE non-sandbox connection lists the
-  relation locks those PIDs hold in the four modes only DDL and `LOCK TABLE` take (ordinary
-  reads and writes take ACCESS SHARE, ROW SHARE and ROW EXCLUSIVE; `ANALYZE` and
-  `CREATE INDEX CONCURRENTLY` take SHARE UPDATE EXCLUSIVE, which blocks no DML).
+  relation locks those PIDs hold in the modes only DDL, maintenance and `LOCK TABLE` take.
+  Ordinary reads and writes take ACCESS SHARE, ROW SHARE and ROW EXCLUSIVE and are never
+  reported. SHARE UPDATE EXCLUSIVE (`ANALYZE`, `ALTER TABLE ... SET`, `VALIDATE CONSTRAINT`) IS
+  reported: it blocks no DML, but it blocks another test's `VACUUM` or `ANALYZE` of the same
+  table — the per-test `vacuum_vector_indexes` VACUUM among them — until the test ends.
 
   WHY A SEPARATE CONNECTION, twice over: it still answers when the test's own transaction is
   aborted (a test that provoked a DB error on purpose), and it cannot see a relation the test
@@ -27,9 +29,11 @@ defmodule Loopctl.Test.LockGuard do
 
   alias Ecto.Adapters.SQL
 
+  require Logger
+
   @conn __MODULE__.Conn
 
-  @ddl_modes ~w(ShareLock ShareRowExclusiveLock ExclusiveLock AccessExclusiveLock)
+  @ddl_modes ~w(ShareUpdateExclusiveLock ShareLock ShareRowExclusiveLock ExclusiveLock AccessExclusiveLock)
 
   @locks """
   SELECT n.nspname || '.' || c.relname, l.mode
@@ -41,20 +45,27 @@ defmodule Loopctl.Test.LockGuard do
   ORDER BY 1, 2
   """
 
-  @doc "Starts the one non-sandbox connection the check reads through. From test_helper.exs."
+  @doc """
+  Starts the non-sandbox connection pool the check reads through, from test_helper.exs. One
+  connection per concurrent test case, so teardowns never queue on it. Idempotent: a helper
+  evaluated twice in one VM keeps the pool it has.
+  """
   @spec start() :: {:ok, pid()}
   def start do
     config = Loopctl.AdminRepo.config()
 
-    Postgrex.start_link(
-      name: @conn,
-      hostname: config[:hostname],
-      port: config[:port],
-      username: config[:username],
-      password: config[:password],
-      database: config[:database],
-      pool_size: 2
-    )
+    case Postgrex.start_link(
+           name: @conn,
+           hostname: config[:hostname],
+           port: config[:port],
+           username: config[:username],
+           password: config[:password],
+           database: config[:database],
+           pool_size: ExUnit.configuration()[:max_cases] || System.schedulers_online()
+         ) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+    end
   end
 
   @doc "The backend PID of each repo's sandbox connection, as the test process sees it."
@@ -71,19 +82,34 @@ defmodule Loopctl.Test.LockGuard do
   session can see. Call it before the sandbox rolls back.
   """
   @spec check!([integer()]) :: :ok
-  def check!(pids) do
-    case Postgrex.query!(@conn, @locks, [pids, @ddl_modes]).rows do
-      [] ->
+  def check!(pids), do: judge(Postgrex.query(@conn, @locks, [pids, @ddl_modes]))
+
+  @doc false
+  # What a lock query's result means; public so the error branch is testable.
+  @spec judge({:ok, Postgrex.Result.t()} | {:error, Exception.t()}) :: :ok
+  def judge(result) do
+    case result do
+      {:ok, %{rows: []}} ->
         :ok
 
-      held ->
-        raise ExUnit.AssertionError,
-          message:
-            "this async test ends holding table-level locks on shared relations, which " <>
-              "block every concurrent async test touching them until 57014 (KB 493d2020): " <>
-              inspect(held) <>
-              ". Make the DDL lock-free (SET LOCAL session_replication_role = replica, " <>
-              "a transaction-local setting) or make the module async: false with the reason."
+      {:ok, %{rows: held}} ->
+        raise ExUnit.AssertionError, message: message(held)
+
+      # The GUARD could not ask, which says nothing about the test: warn, never fail it.
+      {:error, reason} ->
+        Logger.warning("LockGuard could not read locks: #{Exception.message(reason)}")
+        :ok
     end
+  end
+
+  defp message(held) do
+    "this async test ends holding table-level locks on shared relations, which block " <>
+      "every concurrent async test touching them until 57014 (KB 493d2020): " <>
+      inspect(held) <>
+      ". Remedies, by what the DDL was for: skipping a trigger — SET LOCAL " <>
+      "session_replication_role = replica (needs the superuser test role); provoking a DB " <>
+      "error — a transaction-local setting such as SET LOCAL search_path; exercising a " <>
+      "table of the test's own — create it inside the test (it is then invisible here); " <>
+      "anything else, where the DDL itself is the point — async: false, with the reason."
   end
 end
