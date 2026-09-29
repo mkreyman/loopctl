@@ -24,7 +24,9 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   `async: true` for the same reason as `Loopctl.EmbeddingsSideTableReadsTest`: the
   cutover read-path decision is injected (`Loopctl.Embeddings.ReadPathBehaviour`)
   and stubbed per-process, never flipped VM-globally, so nothing here writes shared
-  state.
+  state — and no DDL: `force_live_denorm/4` skips the trigger with a transaction-local
+  `session_replication_role`, never `ALTER TABLE ... DISABLE TRIGGER`, whose SHARE ROW
+  EXCLUSIVE lock the sandbox would hold to the end of the test (KB 493d2020).
   """
 
   use Loopctl.DataCase, async: true
@@ -450,7 +452,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
 
       # Force the exact state the INSERT write skew produced: a superseded parent with
       # a row still marked live, IN the partial HNSW index.
-      force_live_denorm("article_embeddings", "article_embeddings_live_denorm_trg", row.id, true)
+      force_live_denorm("article_embeddings", row.id, true)
 
       assert row.id in Embeddings.article_live_denorm_drift()
       assert {:ok, %{live_denorm_repaired: n}} = Embeddings.reconcile_articles()
@@ -464,7 +466,7 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
       memory = fixture(:memory, %{tenant_id: tenant.id, tier: :long_term})
       {:ok, row} = Embeddings.upsert_memory_embedding(tenant.id, memory, vec(1536), nil, 1536)
 
-      force_live_denorm("memory_embeddings", "memory_embeddings_live_denorm_trg", row.id, false)
+      force_live_denorm("memory_embeddings", row.id, false)
 
       assert row.id in Embeddings.memory_live_denorm_drift()
       assert {:ok, %{live_denorm_repaired: n}} = Embeddings.reconcile_memories()
@@ -1067,15 +1069,21 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   # cannot be produced by an ordinary UPDATE. Disabling the trigger for one statement
   # reproduces the state the INSERT-time write skew used to leave behind (and that a
   # COPY/restore could still leave), which is what the sweep exists to repair.
-  defp force_live_denorm(table, trigger, id, value) do
-    AdminRepo.query!("ALTER TABLE #{table} DISABLE TRIGGER #{trigger}")
+  # `replica` skips EVERY ordinary trigger on the table — the live_denorm BEFORE UPDATE trigger
+  # among them — and FK checks, for this transaction only, and takes no lock. The UPDATE sets
+  # one column on an existing row, so nothing else those would do applies. Put back to
+  # `origin` at once, because the sandbox transaction is the whole test. Setting it needs a
+  # superuser, which the test database's AdminRepo role is — the same dependency
+  # `Loopctl.Fixtures.delete_audit_chain_rows!/1` already has.
+  defp force_live_denorm(table, id, value) do
+    AdminRepo.query!("SET LOCAL session_replication_role = replica")
 
     AdminRepo.query!("UPDATE #{table} SET live_denorm = $1 WHERE id = $2", [
       value,
       Ecto.UUID.dump!(id)
     ])
 
-    AdminRepo.query!("ALTER TABLE #{table} ENABLE TRIGGER #{trigger}")
+    AdminRepo.query!("SET LOCAL session_replication_role = origin")
   end
 
   defp system_article_ids(articles), do: Enum.map(articles, & &1.id)

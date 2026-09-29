@@ -7,8 +7,13 @@ defmodule Loopctl.Vault.RotationRaceTest do
   are reproduced here with a Postgres trigger as the concurrent writer — the pass SELECTs a
   batch and then compare-and-sets each row in turn, so an AFTER UPDATE trigger firing on
   the first row is exactly the application write that races the second.
+
+  `async: false` because `CREATE TRIGGER` takes SHARE ROW EXCLUSIVE on `tenant_llm_settings`
+  and the sandbox holds it until the test ends: every concurrent async test that INSERTs into
+  that table (any `Llm.upsert_settings/2`) waited out the statement timeout and failed
+  57014 `query_canceled` — the gate flake seen twice on 2026-09-29 (KB 493d2020).
   """
-  use Loopctl.DataCase, async: true
+  use Loopctl.DataCase, async: false
 
   alias Cloak.Ciphers.AES.GCM
   alias Loopctl.AdminRepo
