@@ -26,20 +26,14 @@ defmodule Loopctl.Test.LockGuard do
   - a lock taken and released BEFORE the test ends (DDL inside a `Repo.transaction` that
     rolls back is a sandbox savepoint, and rolling back frees its locks);
   - a connection the test checks out itself (`Sandbox.checkout/1` in a Task) or one that
-    reconnected mid-test under a new backend PID;
-  - `Loopctl.HeavyReadRepo` used directly: the recorded repos are `Loopctl.Repo`,
-    `Loopctl.AdminRepo` and `Loopctl.HeavyRead.repo/0`, the facade application code goes
-    through (AdminRepo under test).
+    reconnected mid-test under a new backend PID.
 
-  A check the guard itself cannot run (its connection failing) warns and passes the test,
-  and is counted: `report_skips/0` prints the count after the suite, where `capture_log`
-  cannot swallow it.
+  It fails CLOSED: `start/0` refuses to start a guard that cannot read `pg_locks`, and a
+  teardown whose own query fails raises rather than passing a test it never checked.
   """
 
   alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
-
-  require Logger
 
   @conn __MODULE__.Conn
 
@@ -58,48 +52,53 @@ defmodule Loopctl.Test.LockGuard do
   @connect_keys ~w(hostname port username password database socket socket_dir ssl ssl_opts
                    parameters connect_timeout timeout types)a
 
-  @skips {__MODULE__, :skips}
-
   @doc """
   Starts the non-sandbox pool the check reads through, from test_helper.exs: one connection
-  per concurrent test case, so teardowns never queue on it. Idempotent.
+  per concurrent test case, so teardowns never queue on it. Idempotent. Raises when the pool
+  cannot read `pg_locks`, so a misconfigured guard stops the suite instead of checking nothing.
+  `name` and `overrides` exist for LockGuardTest, which starts one that cannot.
   """
-  @spec start() :: {:ok, pid()}
-  def start do
-    unless :persistent_term.get(@skips, nil),
-      do: :persistent_term.put(@skips, :counters.new(1, []))
-
+  @spec start(atom(), keyword()) :: {:ok, pid()}
+  def start(name \\ @conn, overrides \\ []) do
     opts =
       Loopctl.AdminRepo.config()
       |> Keyword.take(@connect_keys)
       |> Keyword.merge(
-        name: @conn,
+        name: name,
         pool_size: ExUnit.configuration()[:max_cases] || System.schedulers_online()
       )
+      |> Keyword.merge(overrides)
 
-    case Postgrex.start_link(opts) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-    end
+    pid =
+      case Postgrex.start_link(opts) do
+        {:ok, pid} -> pid
+        {:error, {:already_started, pid}} -> pid
+      end
+
+    Postgrex.query!(name, @locks, [[], @ddl_modes])
+    {:ok, pid}
   end
 
   @doc """
-  Starts a sandbox owner per repo and returns `{owners, backend_pids}`: the PIDs of the
-  `guarded` repos' sandbox connections, or nil when `guarded` is nil (a sync test). If
-  reading a PID fails, the owners it started are stopped before the error propagates, so no
-  checked-out connection outlives a failed setup.
+  Starts a sandbox owner per repo, shared unless `async?`, and returns `{owners, pids}`:
+  for an async test the backend PID of every repo's sandbox connection, for a sync test nil.
+  If any start or PID read fails, every owner already started is stopped before the error
+  propagates, so no checked-out connection outlives a failed setup.
   """
-  @spec start_owners!([module()], [module()] | nil) :: {[pid()], [integer()] | nil}
-  def start_owners!(repos, guarded) do
-    owners = Enum.map(repos, &Sandbox.start_owner!(&1, shared: is_nil(guarded)))
+  @spec start_owners!([module()], boolean()) :: {[pid()], [integer()] | nil}
+  def start_owners!(repos, async?) do
+    {owners, pids} = Enum.reduce(repos, {[], []}, &start_owner(&1, &2, async?))
+    {Enum.reverse(owners), if(async?, do: Enum.reverse(pids))}
+  end
 
-    try do
-      {owners, if(guarded, do: backend_pids(guarded))}
-    rescue
-      error ->
-        Enum.each(owners, &Sandbox.stop_owner/1)
-        reraise error, __STACKTRACE__
-    end
+  defp start_owner(repo, {owners, pids}, async?) do
+    owners = [
+      unwinding(owners, fn -> Sandbox.start_owner!(repo, shared: not async?) end) | owners
+    ]
+
+    if async?,
+      do: {owners, [unwinding(owners, fn -> backend_pid(repo) end) | pids]},
+      else: {owners, pids}
   end
 
   @doc """
@@ -120,9 +119,9 @@ defmodule Loopctl.Test.LockGuard do
   its own to capture the teardown and run it). Returns the recorded PIDs, nil for a sync
   test. `Loopctl.DataCase.setup_sandbox/1` and `start_owner!/1` both come through here.
   """
-  @spec guard_sandbox!([module()], [module()] | nil, (fun() -> term())) :: [integer()] | nil
-  def guard_sandbox!(repos, guarded, register \\ &ExUnit.Callbacks.on_exit/1) do
-    {owners, pids} = start_owners!(repos, guarded)
+  @spec guard_sandbox!([module()], boolean(), (fun() -> term())) :: [integer()] | nil
+  def guard_sandbox!(repos, async?, register \\ &ExUnit.Callbacks.on_exit/1) do
+    {owners, pids} = start_owners!(repos, async?)
     register.(fn -> release(owners, pids) end)
     pids
   end
@@ -132,63 +131,39 @@ defmodule Loopctl.Test.LockGuard do
   Call it from `setup`.
   """
   @spec start_owner!(module()) :: [integer()]
-  def start_owner!(repo), do: guard_sandbox!([repo], [repo])
-
-  @doc "The repos an async test's sandbox is recorded for."
-  @spec guarded_repos() :: [module()]
-  def guarded_repos, do: Enum.uniq([Loopctl.Repo, Loopctl.AdminRepo, Loopctl.HeavyRead.repo()])
+  def start_owner!(repo), do: guard_sandbox!([repo], true)
 
   @doc false
-  def backend_pids(repos) do
-    for repo <- Enum.uniq(repos) do
-      %{rows: [[pid]]} = SQL.query!(repo, "SELECT pg_backend_pid()")
-      pid
-    end
+  def backend_pid(repo) do
+    %{rows: [[pid]]} = SQL.query!(repo, "SELECT pg_backend_pid()")
+    pid
+  end
+
+  defp unwinding(owners, fun) do
+    fun.()
+  catch
+    kind, reason ->
+      Enum.each(owners, &Sandbox.stop_owner/1)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   @doc """
   Raises naming every relation lock in a DDL-only mode `pids` hold on a relation another
-  session can see; `:ok` otherwise. A failure of the guard's OWN query warns, counts a skip
-  and returns `:ok`: it says nothing about the test.
+  session can see; `:ok` otherwise. Raises too when the guard's OWN query fails: a test the
+  guard could not check is not a test that passed it.
   """
   @spec check!([integer()], GenServer.server()) :: :ok
   def check!(pids, conn \\ @conn) do
-    case judge(Postgrex.query(conn, @locks, [pids, @ddl_modes])) do
-      :ok ->
+    case Postgrex.query(conn, @locks, [pids, @ddl_modes]) do
+      {:ok, %{rows: []}} ->
         :ok
 
-      {:skipped, message} ->
-        @skips |> :persistent_term.get() |> :counters.add(1, 1)
-        Logger.warning("LockGuard could not read locks: #{message}")
-        :ok
-    end
-  end
+      {:ok, %{rows: held}} ->
+        raise ExUnit.AssertionError, message: message(held)
 
-  @doc false
-  # What a lock query's result means, without side effects: `:ok`, a raise naming the locks,
-  # or `{:skipped, message}` when the guard could not ask.
-  def judge({:ok, %{rows: []}}), do: :ok
-  def judge({:ok, %{rows: held}}), do: raise(ExUnit.AssertionError, message: message(held))
-  def judge({:error, reason}), do: {:skipped, Exception.message(reason)}
-
-  @doc false
-  # For LockGuardTest only: takes back a skip its deliberate connection failure counted, so the
-  # end-of-suite report counts real ones.
-  def forget_skip, do: @skips |> :persistent_term.get() |> :counters.sub(1, 1)
-
-  @doc "Prints how many checks the guard could not run. From `ExUnit.after_suite/1`."
-  @spec report_skips() :: :ok
-  def report_skips do
-    case @skips |> :persistent_term.get() |> :counters.get(1) do
-      0 ->
-        :ok
-
-      skipped ->
-        IO.puts(
-          :stderr,
-          "LockGuard: #{skipped} teardown lock check(s) could not run (the guard's own " <>
-            "connection failed); those tests were not checked for held DDL locks."
-        )
+      {:error, reason} ->
+        raise "LockGuard could not read locks through its own connection, so this test " <>
+                "was not checked for held DDL locks: " <> Exception.message(reason)
     end
   end
 

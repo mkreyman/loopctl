@@ -32,7 +32,7 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "a DDL-mode lock on a table other sessions can see is reported" do
-    pids = LockGuard.backend_pids([AdminRepo])
+    pids = [LockGuard.backend_pid(AdminRepo)]
     AdminRepo.query!("LOCK TABLE #{@probe} IN SHARE ROW EXCLUSIVE MODE")
 
     error = assert_raise ExUnit.AssertionError, fn -> LockGuard.check!(pids) end
@@ -41,7 +41,7 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "SHARE UPDATE EXCLUSIVE (ANALYZE) is reported too" do
-    pids = LockGuard.backend_pids([AdminRepo])
+    pids = [LockGuard.backend_pid(AdminRepo)]
     AdminRepo.query!("ANALYZE #{@probe}")
 
     assert_raise ExUnit.AssertionError, ~r/ShareUpdateExclusiveLock/, fn ->
@@ -50,7 +50,7 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "it still reads the locks after the test's own transaction has aborted" do
-    pids = LockGuard.backend_pids([AdminRepo])
+    pids = [LockGuard.backend_pid(AdminRepo)]
     AdminRepo.query!("LOCK TABLE #{@probe} IN ACCESS EXCLUSIVE MODE")
     assert {:error, _} = AdminRepo.query("SELECT * FROM no_such_table_for_the_guard")
 
@@ -58,7 +58,7 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "DDL on a table the test created itself is not reported" do
-    pids = LockGuard.backend_pids([AdminRepo])
+    pids = [LockGuard.backend_pid(AdminRepo)]
     AdminRepo.query!("CREATE TABLE lock_guard_private (id int)")
     AdminRepo.query!("CREATE INDEX ON lock_guard_private (id)")
     AdminRepo.query!("CREATE TEMP TABLE lock_guard_temp (id int)")
@@ -67,7 +67,7 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "ordinary reads and writes take no reported lock" do
-    pids = LockGuard.backend_pids([AdminRepo])
+    pids = [LockGuard.backend_pid(AdminRepo)]
     AdminRepo.query!("INSERT INTO #{@probe} VALUES (1)")
     AdminRepo.query!("SELECT * FROM #{@probe} FOR UPDATE")
 
@@ -75,7 +75,7 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "release/2 checks FIRST and stops the owners even when the check raises" do
-    {[owner], pids} = LockGuard.start_owners!([AdminRepo], [AdminRepo])
+    {[owner], pids} = LockGuard.start_owners!([AdminRepo], true)
     AdminRepo.query!("LOCK TABLE #{@probe} IN EXCLUSIVE MODE")
 
     assert_raise ExUnit.AssertionError, fn -> LockGuard.release([owner], pids) end
@@ -83,15 +83,33 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "guard_sandbox!/3 registers a teardown that checks the recorded PIDs" do
-    test_pid = self()
-    register = fn teardown -> send(test_pid, {:teardown, teardown}) end
-
-    pids = LockGuard.guard_sandbox!([AdminRepo], [AdminRepo], register)
-    assert [_pid] = pids
-    assert_received {:teardown, teardown}
+    pids = LockGuard.guard_sandbox!([AdminRepo], true, capture_teardown())
+    teardown = received_teardown()
+    assert pids == [LockGuard.backend_pid(AdminRepo)]
 
     AdminRepo.query!("LOCK TABLE #{@probe} IN EXCLUSIVE MODE")
     assert_raise ExUnit.AssertionError, ~r/ExclusiveLock/, teardown
+  end
+
+  test "DataCase's async setup records every sandbox connection and fails on a held lock" do
+    # In a fresh process, so its sandbox owners are its own and not this sync module's.
+    register = capture_teardown()
+
+    {pids, actual} =
+      Task.async(fn ->
+        %{lock_guard_backend_pids: pids} =
+          Loopctl.DataCase.setup_sandbox(%{async: true}, register)
+
+        actual = Enum.map(Loopctl.DataCase.sandbox_repos(), &LockGuard.backend_pid/1)
+        AdminRepo.query!("LOCK TABLE #{@probe} IN EXCLUSIVE MODE")
+        {pids, actual}
+      end)
+      |> Task.await()
+
+    teardown = received_teardown()
+    assert pids == actual
+    assert length(Enum.uniq(pids)) == length(Loopctl.DataCase.sandbox_repos())
+    assert_raise ExUnit.AssertionError, ~r/public\.#{@probe}/, teardown
   end
 
   test "start_owner!/1, for bare-case tests, records the owner's PID for its teardown" do
@@ -104,11 +122,11 @@ defmodule Loopctl.Test.LockGuardTest do
     assert LockGuard.release([], nil) == :ok
   end
 
-  test "start_owners!/2 stops what it started when reading a PID fails" do
+  test "start_owners!/2 stops what it started when a later start fails" do
     before = MapSet.new(Process.list())
 
-    assert_raise RuntimeError, ~r/could not lookup Ecto repo/, fn ->
-      LockGuard.start_owners!([AdminRepo], [NoSuchRepoForTheGuard])
+    assert_raise MatchError, fn ->
+      LockGuard.start_owners!([AdminRepo, NoSuchRepoForTheGuard], true)
     end
 
     leaked =
@@ -119,7 +137,7 @@ defmodule Loopctl.Test.LockGuardTest do
     assert leaked == []
   end
 
-  test "a failure of the guard's own connection warns, counts a skip, and passes" do
+  test "a failure of the guard's own connection fails the check" do
     # A pool that can never connect: its queries return {:error, _} after a short queue wait.
     {:ok, dead} =
       AdminRepo.config()
@@ -128,22 +146,18 @@ defmodule Loopctl.Test.LockGuardTest do
       |> Keyword.merge(queue_interval: 10)
       |> Postgrex.start_link()
 
-    on_exit(fn -> LockGuard.forget_skip() end)
-
-    log =
-      ExUnit.CaptureLog.capture_log(fn -> assert LockGuard.check!([1], dead) == :ok end)
-
-    assert log =~ "LockGuard could not read locks"
-
-    assert ExUnit.CaptureIO.capture_io(:stderr, fn -> LockGuard.report_skips() end) =~
-             "could not run"
+    assert_raise RuntimeError, ~r/could not read locks/, fn -> LockGuard.check!([1], dead) end
   end
 
-  test "judge/1 reads each result shape without side effects" do
-    assert LockGuard.judge({:ok, %Postgrex.Result{rows: []}}) == :ok
-
-    assert {:skipped, "gone"} =
-             LockGuard.judge({:error, %DBConnection.ConnectionError{message: "gone"}})
+  test "a guard that cannot read pg_locks refuses to start" do
+    assert_raise DBConnection.ConnectionError, fn ->
+      LockGuard.start(:lock_guard_that_cannot_read,
+        database: "no_such_db_for_guard",
+        pool_size: 1,
+        queue_target: 10,
+        queue_interval: 10
+      )
+    end
   end
 
   test "starting it again keeps the pool it has" do
@@ -151,25 +165,56 @@ defmodule Loopctl.Test.LockGuardTest do
     assert {:ok, ^pid} = LockGuard.start()
   end
 
-  test "an async test's sandbox is recorded for Repo, AdminRepo and the heavy-read facade" do
-    assert LockGuard.guarded_repos() ==
-             Enum.uniq([Loopctl.Repo, AdminRepo, Loopctl.HeavyRead.repo()])
-  end
-
   test "no async bare ExUnit.Case module opens its own sandbox outside LockGuard" do
-    offenders =
+    async_bare =
       for path <- Path.wildcard("test/**/*_test.exs"),
           source = File.read!(path),
           source =~ ~r/^\s*use ExUnit\.Case,\s*async:\s*true/m,
-          source =~ ~r/\bSandbox\.start_owner!\(/,
+          into: %{},
+          do: {path, source}
+
+    offenders =
+      for {path, source} <- async_bare,
+          source =~ ~r/\bSandbox\.(start_owner!|checkout)\(/,
           do: path
 
     assert offenders == [],
            "use Loopctl.Test.LockGuard.start_owner!/1, which carries the teardown lock " <>
-             "check, instead of Sandbox.start_owner!/2 in: #{inspect(offenders)}"
+             "check, instead of opening a sandbox directly in: #{inspect(offenders)}"
 
-    # The scan has something to read: the three bare-case modules that do own a sandbox.
-    assert length(Path.wildcard("test/loopctl/repo/*_test.exs")) >= 3
+    # The classifier sees every bare-case module that adopted the guard, so the scan is not
+    # vacuous.
+    adopters =
+      for path <- Path.wildcard("test/**/*_test.exs"),
+          source = File.read!(path),
+          source =~ ~r/^\s*use ExUnit\.Case\b/m,
+          source =~ ~r/\bLockGuard\.start_owner!\(/,
+          do: path
+
+    assert adopters != []
+    assert Enum.reject(adopters, &Map.has_key?(async_bare, &1)) == []
+  end
+
+  # A register function that hands the teardown to the test, from whichever process runs the
+  # setup; `received_teardown/0` takes it and backstops it with on_exit, so a failing
+  # assertion never leaves an owner holding a connection or a probe lock.
+  defp capture_teardown do
+    test_pid = self()
+    fn teardown -> send(test_pid, {:teardown, teardown}) end
+  end
+
+  defp received_teardown do
+    assert_received {:teardown, teardown}
+    on_exit(fn -> quietly(teardown) end)
+    teardown
+  end
+
+  defp quietly(fun) do
+    fun.()
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
   end
 
   # A sandbox owner is the process `Sandbox.start_owner!/2` spawns; its initial call names it.

@@ -1098,9 +1098,9 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
     end
   end
 
-  describe "EXPLAIN plan — uses the project_id index (US-25.2 AC-25.2.8 TC-25.2.9)" do
+  describe "the project_id composite index (US-25.2 AC-25.2.8 TC-25.2.9)" do
     @tag :slow
-    test "top-articles with project_id filter hits the composite index" do
+    test "exists, and the top-articles query shape with a project_id filter EXPLAINs" do
       tenant = fixture(:tenant)
       {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
       article = fixture(:article, %{tenant_id: tenant.id, status: :published})
