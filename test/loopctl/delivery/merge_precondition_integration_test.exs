@@ -1754,6 +1754,47 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert id == ctx.checkpoint.id
     end
 
+    defp tenant_token_credential(ctx) do
+      repo = ForgeRepo.tenant(@repo, "github_pat_merge_0001")
+
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn tenant_id, @repo ->
+        assert tenant_id == ctx.tenant_id
+        {:ok, %Loopctl.Verification.Credential{kind: :tenant_token, repo: repo}}
+      end)
+
+      repo
+    end
+
+    test "#936: a tenant token whose owner cannot push escalates, and the App is never asked",
+         ctx do
+      repo = tenant_token_credential(ctx)
+      Mox.stub(MockPullRequestSource, :push_permission, fn ^repo -> {:ok, false} end)
+      Mox.stub(MockMergeForge, :session, fn _repo -> flunk("the App opened a session") end)
+
+      assert {:escalated, :tenant_cannot_push} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "#936: a tenant token whose owner can push merges as before", ctx do
+      repo = tenant_token_credential(ctx)
+      Mox.stub(MockPullRequestSource, :push_permission, fn ^repo -> {:ok, true} end)
+      Mox.stub(MockMergeForge, :create_commit, fn @session, _commit -> {:ok, @merge} end)
+      Mox.stub(MockMergeForge, :update_ref, fn @session, "master", @merge -> :ok end)
+
+      assert {:merged, @merge} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+    end
+
+    test "#936: no credential for the pair escalates, and the App is never asked", ctx do
+      Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
+        {:error, :credential_unavailable}
+      end)
+
+      Mox.stub(MockMergeForge, :session, fn _repo -> flunk("the App opened a session") end)
+
+      assert {:escalated, :credential_unavailable} =
+               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
+    end
+
     test "TC-45.5.4 without the App's credentials it escalates app_unconfigured and merges nothing",
          ctx do
       Mox.stub(MockMergeForge, :session, fn @repo -> {:error, :app_unconfigured} end)

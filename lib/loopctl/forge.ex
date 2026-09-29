@@ -2,7 +2,10 @@ defmodule Loopctl.Forge do
   @moduledoc """
   A tenant's own GitHub token (#936), which every forge call made on that tenant's behalf
   authenticates with: the merge gate, story verification, post-deploy verification, the
-  thread checkpoint reads and the issue closer.
+  thread checkpoint reads, the issue closer and thread issue links. The one forge WRITE it
+  does not authenticate is the thread-mode merge, which loopctl's GitHub App performs
+  (`Loopctl.Delivery.MergeExecutor`); that write is licensed by the same credential first, and
+  a tenant token licenses it only when the token's owner can push to the repository.
 
   ## Why the tenant's token
 
@@ -47,54 +50,79 @@ defmodule Loopctl.Forge do
 
   def token(_tenant_id), do: :none
 
-  @doc "Whether the tenant has a token set."
+  @doc "Whether the tenant has a token set: one indexed existence check, nothing decrypted."
   @spec token?(Ecto.UUID.t()) :: boolean()
-  def token?(tenant_id), do: token(tenant_id) != :none
+  def token?(tenant_id) when is_binary(tenant_id) do
+    case Ecto.UUID.cast(tenant_id) do
+      {:ok, id} -> AdminRepo.exists?(from c in TenantCredential, where: c.tenant_id == ^id)
+      :error -> false
+    end
+  end
+
+  def token?(_tenant_id), do: false
 
   @doc """
   Sets or replaces the tenant's token. `actor_id` is the calling API key's id, recorded on the
   audit entry with the action and never with the value.
+
+  One upsert on the `tenant_id` unique index, so two concurrent first-time sets, or a set racing
+  a clear, each land as a whole write instead of one of them failing on a row the other moved.
+  Whether it SET or REPLACED is read from the row the write returns: a replaced row keeps its
+  `inserted_at`.
   """
   @spec set_token(Ecto.UUID.t(), term(), Ecto.UUID.t() | nil) ::
-          {:ok, map()} | {:error, Ecto.Changeset.t()}
+          {:ok, map()} | {:error, Ecto.Changeset.t()} | {:error, term()}
   def set_token(tenant_id, token, actor_id) when is_binary(tenant_id) do
-    existing = load(tenant_id)
-    changeset = TenantCredential.token_changeset(existing || new(tenant_id), token)
-    action = if existing, do: "github_credential.replaced", else: "github_credential.set"
+    changeset = TenantCredential.token_changeset(%TenantCredential{tenant_id: tenant_id}, token)
 
     Multi.new()
-    |> Multi.insert_or_update(:credential, changeset)
+    |> Multi.insert(:credential, changeset,
+      on_conflict: {:replace, [:token, :updated_at]},
+      conflict_target: :tenant_id,
+      returning: true
+    )
     |> Audit.log_in_multi(:audit, fn %{credential: credential} ->
+      action =
+        if credential.inserted_at == credential.updated_at,
+          do: "github_credential.set",
+          else: "github_credential.replaced"
+
       audit_attrs(tenant_id, credential.id, action, actor_id)
     end)
     |> AdminRepo.transaction()
     |> case do
       {:ok, %{credential: credential}} -> {:ok, view(credential)}
-      {:error, :credential, changeset, _changes} -> {:error, changeset}
+      {:error, :credential, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+      {:error, _step, reason, _changes} -> {:error, reason}
     end
   end
 
   @doc """
   Removes the tenant's token. Every forge call for the tenant then falls back to what the
   operator lent it, which by default is nothing. `{:ok, view}` whether or not one was set, so
-  a retried clear is not an error.
+  a retried or concurrent clear is not an error: the delete is by `tenant_id`, and only the
+  call that actually removed a row writes the audit entry.
   """
-  @spec clear_token(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: {:ok, map()}
+  @spec clear_token(Ecto.UUID.t(), Ecto.UUID.t() | nil) :: {:ok, map()} | {:error, term()}
   def clear_token(tenant_id, actor_id) when is_binary(tenant_id) do
-    case load(tenant_id) do
-      nil ->
-        {:ok, view(nil)}
+    Multi.new()
+    |> Multi.delete_all(
+      :deleted,
+      from(c in TenantCredential, where: c.tenant_id == ^tenant_id, select: c.id)
+    )
+    |> Multi.merge(fn
+      %{deleted: {0, _ids}} ->
+        Multi.new()
 
-      %TenantCredential{} = credential ->
-        {:ok, _changes} =
-          Multi.new()
-          |> Multi.delete(:credential, credential)
-          |> Audit.log_in_multi(:audit, fn _changes ->
-            audit_attrs(tenant_id, credential.id, "github_credential.cleared", actor_id)
-          end)
-          |> AdminRepo.transaction()
-
-        {:ok, view(nil)}
+      %{deleted: {_count, [id | _]}} ->
+        Audit.log_in_multi(Multi.new(), :audit, fn _changes ->
+          audit_attrs(tenant_id, id, "github_credential.cleared", actor_id)
+        end)
+    end)
+    |> AdminRepo.transaction()
+    |> case do
+      {:ok, _changes} -> {:ok, view(nil)}
+      {:error, _step, reason, _changes} -> {:error, reason}
     end
   end
 
@@ -116,8 +144,6 @@ defmodule Loopctl.Forge do
   defp load(tenant_id) do
     AdminRepo.one(from c in TenantCredential, where: c.tenant_id == ^tenant_id)
   end
-
-  defp new(tenant_id), do: %TenantCredential{tenant_id: tenant_id}
 
   defp audit_attrs(tenant_id, entity_id, action, actor_id) do
     %{

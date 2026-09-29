@@ -120,6 +120,25 @@ defmodule Loopctl.ForgeTest do
       assert ForgeCredential.any_for_tenant?(tenant.id)
     end
 
+    test "a tenant with its own token never falls back to the operator's, even for a pair the " <>
+           "allowlist names" do
+      # The allowlisted tenant id, given a row of its own so it can hold a token.
+      tenant = fixture(:tenant)
+
+      {1, _} =
+        AdminRepo.update_all(from(t in Loopctl.Tenants.Tenant, where: t.id == ^tenant.id),
+          set: [id: @allowlisted]
+        )
+
+      {:ok, _} = Forge.set_token(@allowlisted, "github_pat_allowlisted1", nil)
+
+      assert {:ok,
+              %Credential{
+                kind: :tenant_token,
+                repo: %ForgeRepo{auth: {:token, "github_pat_allowlisted1"}}
+              }} = ForgeCredential.for_read(@allowlisted, "acme/widgets")
+    end
+
     test "a tenant with no token and no allowlist entry gets nothing" do
       tenant = fixture(:tenant)
 
@@ -137,6 +156,47 @@ defmodule Loopctl.ForgeTest do
                {:error, :credential_unavailable}
 
       assert ForgeCredential.any_for_tenant?(@allowlisted)
+    end
+  end
+
+  describe "repeated writes" do
+    # Sandbox tasks share one connection, so these run one after another: this pins the
+    # upsert and delete-by-tenant SHAPES (one row; only a clear that removed a row audits),
+    # not the interleaving itself, which the single-statement writes rule out by construction.
+    test "repeated sets keep one row, and repeated clears all succeed with one audit" do
+      tenant = fixture(:tenant)
+
+      sets =
+        1..4
+        |> Enum.map(fn i ->
+          Task.async(fn -> Forge.set_token(tenant.id, "github_pat_race_000#{i}", nil) end)
+        end)
+        |> Enum.map(&Task.await/1)
+
+      assert Enum.all?(sets, &match?({:ok, %{has_token: true}}, &1))
+
+      assert AdminRepo.aggregate(
+               from(c in TenantCredential, where: c.tenant_id == ^tenant.id),
+               :count
+             ) == 1
+
+      clears =
+        1..3
+        |> Enum.map(fn _ -> Task.async(fn -> Forge.clear_token(tenant.id, nil) end) end)
+        |> Enum.map(&Task.await/1)
+
+      assert Enum.all?(clears, &match?({:ok, %{has_token: false}}, &1))
+      assert Forge.token(tenant.id) == :none
+
+      cleared =
+        AdminRepo.aggregate(
+          from(a in AuditLog,
+            where: a.tenant_id == ^tenant.id and a.action == "github_credential.cleared"
+          ),
+          :count
+        )
+
+      assert cleared == 1
     end
   end
 

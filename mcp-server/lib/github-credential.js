@@ -33,7 +33,7 @@ export async function setGithubCredential({ token } = {}, { apiCall } = {}) {
     return refuse(
       "`token` is required: a GitHub token (a fine-grained token limited to your own " +
         "repositories is the intended shape) with read access to contents, pull requests, " +
-        "actions and commit statuses, plus issues: write for issue closing.",
+        "actions, commit statuses and deployments, plus issues: write for issue closing.",
     );
   }
 

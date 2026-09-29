@@ -14,6 +14,10 @@ defmodule Loopctl.Forge.TenantCredential do
 
   @max_token_length 500
 
+  @doc "The longest token accepted, in characters: the ONE value the API docs cite too."
+  @spec max_token_length() :: pos_integer()
+  def max_token_length, do: @max_token_length
+
   schema "tenant_github_credentials" do
     tenant_field()
     field :token, Loopctl.Vault.Binary, redact: true

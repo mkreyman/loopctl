@@ -237,6 +237,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
+  @impl true
+  def push_permission(repo) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, body} <- get(repo, "") do
+      case body do
+        %{"permissions" => %{"push" => push}} when is_boolean(push) -> {:ok, push}
+        _no_permissions -> {:ok, false}
+      end
+    end
+  end
+
   # US-26.4.6: an abbreviated commit SHA, resolved to its full id through
   # `GET /repos/:repo/commits/:ref` with the `sha` media type, which answers the id as plain
   # text rather than the whole commit and its file list. The answer must be a full id that

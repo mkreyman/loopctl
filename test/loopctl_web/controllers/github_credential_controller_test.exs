@@ -80,6 +80,22 @@ defmodule LoopctlWeb.GitHubCredentialControllerTest do
     end
   end
 
+  describe "a tenant-less superadmin key" do
+    test "is refused naming the impersonation header, on every verb", %{conn: conn} do
+      {raw_super, _key} = fixture(:api_key, %{role: :superadmin})
+      conn = auth_conn(conn, raw_super)
+
+      for response <- [
+            get(conn, ~p"/api/v1/tenants/me/github-credential"),
+            put(conn, ~p"/api/v1/tenants/me/github-credential", %{token: "github_pat_super01"}),
+            delete(conn, ~p"/api/v1/tenants/me/github-credential")
+          ] do
+        assert %{"error" => %{"code" => code}} = json_response(response, 422)
+        assert code == "impersonation_tenant_required"
+      end
+    end
+  end
+
   describe "GET and DELETE" do
     test "GET reports the tenant's own state only; DELETE clears it, twice safely", %{conn: conn} do
       {conn, tenant} = user_conn(conn)

@@ -232,6 +232,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
     # reaches the required-checks opt-in, so its pr source naming none is credential_unavailable.
     test "an unnamed tenant's pr source naming no checks records credential_unavailable" do
       ctx = setup_ctx()
+      stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> false end)
       fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
       run = run!(ctx)
 
@@ -267,6 +268,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
     test "a tenant named for no repository records credential_unavailable before CiTarget" do
       ctx = setup_ctx()
       test_pid = self()
+      stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> false end)
 
       stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
         send(test_pid, :pair_asked)

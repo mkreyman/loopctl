@@ -7644,11 +7644,13 @@ const TOOLS = [
       "checkpoint reads and issue closing — for EVERY repository, replacing the operator's " +
       "token even for repositories the operator lent it for. Use a fine-grained token limited " +
       "to your own intake-source repositories with read access to Contents, Pull requests, " +
-      "Actions and Commit statuses, plus Issues: write if loopctl should close the issues " +
-      "stories came from. Stored encrypted, never returned. NOT checked against GitHub here: " +
-      "a token that cannot read a repository shows up as that repository's forge refusal " +
-      "(a 403/404 in the merge gate or verification), so check a story after setting it. " +
-      "422 when blank, over 500 characters or containing whitespace; 403 " +
+      "Actions, Commit statuses and Deployments, plus Issues: write if loopctl should close " +
+      "the issues stories came from. Stored encrypted, never returned. NOT checked against " +
+      "GitHub here: a token that cannot read a repository shows up as that repository's forge " +
+      "refusal (a 403/404 in the merge gate or verification), so check a story after setting " +
+      "it. A thread-mode MERGE is still written by loopctl's GitHub App, and only when this " +
+      "token's owner can push to the repository (escalated `tenant_cannot_push` otherwise). " +
+      "422 when blank, over the server's length bound or containing whitespace; 403 " +
       "custody_tier_required on an agent-rooted tenant. Requires LOOPCTL_USER_KEY (403 for " +
       "any other role).",
     inputSchema: {

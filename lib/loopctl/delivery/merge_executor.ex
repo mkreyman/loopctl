@@ -110,6 +110,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
   alias Loopctl.Delivery.MergeForge
   alias Loopctl.Delivery.MergeMessage
   alias Loopctl.Delivery.MergePrecondition
+  alias Loopctl.Delivery.PullRequestSource
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -117,6 +118,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
   alias Loopctl.Repo
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
+  alias Loopctl.Verification.Credential
   alias Loopctl.WorkBreakdown.Stories
 
   @actor_label "control:merge_executor"
@@ -295,6 +297,7 @@ defmodule Loopctl.Delivery.MergeExecutor do
          {:ok, allow} <- recorded_allow(tenant_id, story.id, stage),
          {:ok, checkpoint} <- allowed_checkpoint(tenant_id, story.id, allow),
          {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
+         :ok <- write_licensed(tenant_id, source.repo_full_name),
          {:ok, branch} <- DispatchPayload.thread_branch(route, story, stage.branch) do
       {:ok,
        Map.merge(base, %{
@@ -314,6 +317,28 @@ defmodule Loopctl.Delivery.MergeExecutor do
     if MergePrecondition.transient?(reason),
       do: {:error, reason},
       else: {:escalate, base, reason}
+  end
+
+  # #936: the App below can write to any repository it is installed on, so a merge is licensed
+  # per (tenant, repository) FIRST. A tenant with its own token must be able to push there
+  # itself (`push_permission/1`, asked with that token); a pair the operator named in
+  # `VERIFICATION_OPERATOR_TOKEN_TENANTS` is the operator vouching for it; anything else has no
+  # credential and escalates rather than merging.
+  defp write_licensed(tenant_id, repo) do
+    case Credential.for_read(tenant_id, repo) do
+      {:ok, %Credential{kind: :operator_token}} ->
+        :ok
+
+      {:ok, %Credential{kind: :tenant_token, repo: forge_repo}} ->
+        case PullRequestSource.impl().push_permission(forge_repo) do
+          {:ok, true} -> :ok
+          {:ok, false} -> {:error, :tenant_cannot_push}
+          {:error, _reason} = error -> error
+        end
+
+      {:error, :credential_unavailable} = error ->
+        error
+    end
   end
 
   defp thread_mode(%{mode: :thread}), do: :ok

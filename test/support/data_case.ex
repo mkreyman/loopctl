@@ -236,14 +236,17 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
-    # US-26.4.6: story verification reads nothing unless the tenant has SOME credential, so
-    # `any_for_tenant?` defaults to false and a verification test that wants one says so.
-    #
-    # #936: every forge call now asks `for_read/2` for its (tenant, repository) credential,
-    # and the forge itself is `MockPullRequestSource`, fail-closed above. So `for_read`
-    # defaults to the operator credential: a test of the merge gate or the issue closer is
-    # about those, and one that is about a MISSING credential stubs `for_read` to say so.
-    Mox.stub(Loopctl.MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> false end)
+    # #936: the merge executor's push check for a tenant's own token, fail-closed.
+    Mox.stub(Loopctl.MockPullRequestSource, :push_permission, fn _repo ->
+      {:error, :not_stubbed}
+    end)
+
+    # #936: every forge call asks `for_read/2` for its (tenant, repository) credential, and
+    # the forge itself is `MockPullRequestSource`, fail-closed above. The two defaults are
+    # the pair the real `ForgeCredential` gives a tenant that has one: a credential for every
+    # repository, and `any_for_tenant?` true. A test about a MISSING credential stubs BOTH to
+    # say so, and each caller has one (they flunk if the forge is reached).
+    Mox.stub(Loopctl.MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
 
     Mox.stub(Loopctl.MockVerificationCredential, :for_read, fn _tenant_id, repo ->
       {:ok,

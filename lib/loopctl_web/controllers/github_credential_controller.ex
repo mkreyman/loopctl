@@ -20,6 +20,7 @@ defmodule LoopctlWeb.GitHubCredentialController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Forge
+  alias Loopctl.Forge.TenantCredential
   alias Loopctl.Verification.OperatorCredential
 
   action_fallback LoopctlWeb.FallbackController
@@ -28,6 +29,7 @@ defmodule LoopctlWeb.GitHubCredentialController do
   # The token authenticates the delivery loop's forge calls, a custody surface an agent-rooted
   # tenant cannot use; setting one is part of the human-anchored intake surface.
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:update, :delete]
+  plug :require_tenant
 
   tags(["GitHub Credential"])
 
@@ -58,10 +60,14 @@ defmodule LoopctlWeb.GitHubCredentialController do
         "for the tenant from then on: the merge gate, story and post-deploy verification, " <>
         "thread checkpoint reads and issue closing. It replaces the operator's token for " <>
         "every repository, including pairs `VERIFICATION_OPERATOR_TOKEN_TENANTS` names. It " <>
-        "needs read access to contents, pull requests, actions and commit statuses on the " <>
+        "needs read access to contents, pull requests, actions, commit statuses and " <>
+        "deployments on the " <>
         "tenant's intake-source repositories, and issues: write for issue closing. The token " <>
         "is not checked against GitHub here: a token that cannot read a repository shows up " <>
-        "as that repository's forge refusal. 422 when blank, over 500 characters or " <>
+        "as that repository's forge refusal. Thread-mode merges are still WRITTEN by " <>
+        "loopctl's GitHub App, and only when this token's owner can push to the " <>
+        "repository (escalated `tenant_cannot_push` otherwise). 422 when blank, over " <>
+        "#{TenantCredential.max_token_length()} characters or " <>
         "containing whitespace. 403 custody_tier_required on an agent-rooted tenant. Role: user+.",
     request_body: {"Token", "application/json", Schemas.GitHubCredentialRequest},
     responses:
@@ -102,8 +108,32 @@ defmodule LoopctlWeb.GitHubCredentialController do
   @doc "DELETE /api/v1/tenants/me/github-credential"
   def delete(conn, _params) do
     api_key = conn.assigns.current_api_key
-    {:ok, view} = Forge.clear_token(api_key.tenant_id, api_key.id)
-    json(conn, respond(api_key.tenant_id, view))
+
+    with {:ok, view} <- Forge.clear_token(api_key.tenant_id, api_key.id) do
+      json(conn, respond(api_key.tenant_id, view))
+    end
+  end
+
+  # A superadmin key is tenant-less, and `role: :user` admits it: without an impersonation
+  # target there is no "me" to read or write, so it is refused naming the header rather than
+  # reaching a function that needs a tenant.
+  defp require_tenant(%{assigns: %{current_api_key: %{tenant_id: tenant_id}}} = conn, _opts)
+       when is_binary(tenant_id),
+       do: conn
+
+  defp require_tenant(conn, _opts) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "impersonation_tenant_required",
+        message:
+          "A superadmin key is tenant-less. Set the X-Impersonate-Tenant header to name the " <>
+            "tenant whose GitHub credential this is."
+      }
+    })
+    |> halt()
   end
 
   defp respond(tenant_id, view) do

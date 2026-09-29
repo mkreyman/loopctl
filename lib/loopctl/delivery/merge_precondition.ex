@@ -1346,7 +1346,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # The repository with the credential every forge read below authenticates with (#936),
     # chosen per (tenant, repository). `repo` itself stays the bare name: the exclusion list
     # and Gate B's trigger list are keyed by it.
-    forge = forge_repo(story.tenant_id, repo)
+    forge = Credential.repo(story.tenant_id, repo)
 
     # The MODE and the BASE BRANCH are the ones this claim's implement dispatch was PLACED
     # under (US-45.4), never the source's now: a source changed after placement decides only
@@ -1620,11 +1620,6 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp repo_of({:ok, source}), do: {:ok, source.repo_full_name}
   defp repo_of(error), do: error
-
-  # No credential for the pair is a refusal that names it (`credential_unavailable`, not
-  # transient): retrying cannot produce one, and setting a token or naming the pair can.
-  defp forge_repo(tenant_id, {:ok, repo}), do: Credential.repo(tenant_id, repo)
-  defp forge_repo(_tenant_id, error), do: error
 
   defp source, do: PullRequestSource.impl()
 

@@ -3820,6 +3820,8 @@ defmodule Loopctl.ApiSpec.Schemas do
     @moduledoc false
     require OpenApiSpex
 
+    alias Loopctl.Forge.TenantCredential
+
     OpenApiSpex.schema(%{
       title: "GitHubCredentialRequest",
       description:
@@ -3830,7 +3832,9 @@ defmodule Loopctl.ApiSpec.Schemas do
         token: %Schema{
           type: :string,
           description:
-            "The token. Trimmed; blank, over 500 characters or containing whitespace is 422."
+            "The token. Trimmed; blank, over " <>
+              "#{TenantCredential.max_token_length()} characters or " <>
+              "containing whitespace is 422."
         }
       },
       required: [:token]

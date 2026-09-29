@@ -147,7 +147,7 @@ defmodule Loopctl.Threads.IssueLinks do
           {:ok, repo} ->
             PullRequestSource.impl().comment_issue(repo, link.issue_number, body(url))
 
-          {:error, :credential_unavailable} = error ->
+          {:error, _reason} = error ->
             error
         end
 

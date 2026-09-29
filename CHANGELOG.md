@@ -11,8 +11,12 @@ All notable changes to loopctl are documented here.
   checkpoint reads, the issue closer and thread issue links all authenticate per (tenant,
   repository): the tenant's own token when it has set one, else the operator's `GITHUB_TOKEN`
   for the pairs named in `VERIFICATION_OPERATOR_TOKEN_TENANTS`, else nothing. Set it with
-  `PUT /api/v1/tenants/me/github-credential` (MCP `set_github_credential`, `:user` key); it is
-  stored encrypted and never returned. A tenant reading with its own token can learn nothing
+  `PUT /api/v1/tenants/me/github-credential` (MCP `set_github_credential`, `:user` key,
+  human-anchored tenant); it is stored encrypted and never returned. The token needs read
+  access to contents, pull requests, actions, commit statuses and deployments, plus issues:
+  write for issue closing. The thread-mode merge is still WRITTEN by loopctl's GitHub App, but
+  now only for a pair the operator named or when the tenant's token owner can push to the
+  repository; otherwise it escalates (`tenant_cannot_push`, `credential_unavailable`). A tenant reading with its own token can learn nothing
   that token could not already read, which closes the cross-tenant disclosure where a tenant
   enrolled another party's private repository and read it through the operator's token.
   **Behaviour change, operator action:** before this the MERGE GATE (and post-deploy

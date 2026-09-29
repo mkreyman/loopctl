@@ -569,7 +569,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
       # inside the transition into `merged` and named in that transition's chain entry.
       merge_sha: stage.merge_sha,
       merged_at: merged_at,
-      deployments: deployments(forge_repo(tenant_id, repo), env, merged_at, stage.merge_sha)
+      deployments: deployments(Credential.repo(tenant_id, repo), env, merged_at, stage.merge_sha)
     }
   end
 
@@ -641,11 +641,6 @@ defmodule Loopctl.Delivery.PostDeployVerification do
        do: error
 
   defp deployments(_repo, _environment, _merged_at, _merge_sha), do: :not_attempted
-
-  # The repository with the credential the deployment reads authenticate with (#936). An
-  # unresolved repository stays unresolved and is refused as itself.
-  defp forge_repo(tenant_id, {:ok, repo}), do: Credential.repo(tenant_id, repo)
-  defp forge_repo(_tenant_id, error), do: error
 
   # Containment for every candidate, because the rule is "does ANY carrying deployment say
   # it succeeded" and that cannot be answered from one of them. The walk halts early on the

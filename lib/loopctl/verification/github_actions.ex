@@ -56,14 +56,14 @@ defmodule Loopctl.Verification.GitHubActions do
   alias Loopctl.Verification.Credential
 
   @impl true
-  def resolve_commit(_repo, sha, %Credential{repo: %ForgeRepo{} = forge_repo}) do
+  def resolve_commit(sha, %Credential{repo: %ForgeRepo{} = forge_repo}) do
     case source().resolve_commit(forge_repo, sha) do
       {:ok, full} -> {:ok, full}
       {:error, reason} -> classify(reason, :resolve)
     end
   end
 
-  def resolve_commit(_repo, _sha, _credential), do: {:refused, "credential_unavailable"}
+  def resolve_commit(_sha, _credential), do: {:refused, "credential_unavailable"}
 
   @impl true
   def check_change(%{credential: %Credential{repo: %ForgeRepo{} = forge_repo}} = request) do

@@ -66,7 +66,7 @@ defmodule Loopctl.Verification.CiBehaviour do
   (GitHub answers an unknown prefix and an ambiguous one with the same 422), and a repository
   it cannot read `{:no_verdict, "repository_unreadable"}`.
   """
-  @callback resolve_commit(repo :: String.t(), sha :: String.t(), Credential.t()) ::
+  @callback resolve_commit(sha :: String.t(), Credential.t()) ::
               {:ok, String.t()} | wait() | {:refused, String.t()} | {:no_verdict, String.t()}
 
   @doc """

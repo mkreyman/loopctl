@@ -144,15 +144,20 @@ defmodule Loopctl.Delivery.IssueCloser do
   # then; this covers one revoked between the verdict and the sweep.
   defp attempt(%IssueClosure{} = closure) do
     if IssueClosures.source_live?(closure) do
-      read_issue(closure)
+      # The credential is resolved ONCE per attempt (#936) and every call below uses it. None
+      # is a fault like any permanent forge refusal: nothing is sent.
+      case Credential.repo(closure.tenant_id, closure.repo_full_name) do
+        {:ok, repo} -> read_issue(closure, repo)
+        {:error, reason} -> fault(closure, reason)
+      end
     else
       abandon(closure, :source_revoked, nil)
     end
   end
 
-  defp read_issue(%IssueClosure{} = closure) do
-    case forge(closure, &source().issue(&1, closure.issue_number)) do
-      {:ok, issue} -> proceed(closure, issue)
+  defp read_issue(%IssueClosure{} = closure, repo) do
+    case source().issue(repo, closure.issue_number) do
+      {:ok, issue} -> proceed(closure, repo, issue)
       {:error, reason} -> fault(closure, reason)
     end
   end
@@ -174,7 +179,7 @@ defmodule Loopctl.Delivery.IssueCloser do
   #
   # Either way the answer is `closed_by_other`: it is not this closure's close, and
   # re-closing is not the remedy.
-  defp proceed(%IssueClosure{} = closure, %{state: "closed", labels: labels}) do
+  defp proceed(%IssueClosure{} = closure, _repo, %{state: "closed", labels: labels}) do
     %Resolution{label: own_label} = IssueClosure.resolution(closure)
 
     case Enum.filter(labels, &(&1 in Resolution.labels())) do
@@ -193,13 +198,13 @@ defmodule Loopctl.Delivery.IssueCloser do
     end
   end
 
-  defp proceed(%IssueClosure{} = closure, %{state: _open, labels: live_labels}) do
+  defp proceed(%IssueClosure{} = closure, repo, %{state: _open, labels: live_labels}) do
     resolution = IssueClosure.resolution(closure)
 
-    with {:ok, closure} <- apply_label(closure, resolution, live_labels),
-         {:ok, closure} <- apply_comment(closure, resolution),
-         :open <- recheck_state(closure) do
-      apply_close(closure, resolution)
+    with {:ok, closure} <- apply_label(closure, repo, resolution, live_labels),
+         {:ok, closure} <- apply_comment(closure, repo, resolution),
+         :open <- recheck_state(closure, repo) do
+      apply_close(closure, repo, resolution)
     else
       {:fault, reason} -> fault(closure, reason)
       {:error, :not_pending} -> {:skipped, nil}
@@ -231,10 +236,10 @@ defmodule Loopctl.Delivery.IssueCloser do
   # is what tells an operator whether the reporter likely got the right text or the reporting
   # system's default — a close that landed before our label POST fired the webhook unlabelled.
   # It is a boolean, never the label names.
-  defp recheck_state(%IssueClosure{} = closure) do
+  defp recheck_state(%IssueClosure{} = closure, repo) do
     %Resolution{label: own_label} = IssueClosure.resolution(closure)
 
-    case forge(closure, &source().issue(&1, closure.issue_number)) do
+    case source().issue(repo, closure.issue_number) do
       {:ok, %{state: "closed", labels: labels}} ->
         {:closed, abandon(closure, :closed_by_other, {:closed_mid_attempt, own_label in labels})}
 
@@ -262,11 +267,11 @@ defmodule Loopctl.Delivery.IssueCloser do
   #
   # Re-applying a label that IS present would be harmless at the forge — the endpoint is
   # additive — so this test is about spending a call, not about safety. Its absence is not.
-  defp apply_label(%IssueClosure{} = closure, %Resolution{label: label}, live_labels) do
+  defp apply_label(%IssueClosure{} = closure, repo, %Resolution{label: label}, live_labels) do
     if label in live_labels do
       {:ok, closure}
     else
-      case forge(closure, &source().label_issue(&1, closure.issue_number, label)) do
+      case source().label_issue(repo, closure.issue_number, label) do
         :ok -> IssueClosures.mark_labelled(closure.tenant_id, closure.id)
         {:error, reason} -> {:fault, reason}
       end
@@ -276,12 +281,12 @@ defmodule Loopctl.Delivery.IssueCloser do
   # STEP 3. The one call here that is NOT idempotent at the forge, which is exactly why its
   # marker is load-bearing rather than an optimisation: without it every transient failure at
   # step 4 would add another copy of the resolution to the reporter's ticket.
-  defp apply_comment(%IssueClosure{commented_at: %DateTime{}} = closure, _resolution),
+  defp apply_comment(%IssueClosure{commented_at: %DateTime{}} = closure, _repo, _resolution),
     do: {:ok, closure}
 
-  defp apply_comment(%IssueClosure{} = closure, %Resolution{resolution_notes: notes})
+  defp apply_comment(%IssueClosure{} = closure, repo, %Resolution{resolution_notes: notes})
        when is_binary(notes) do
-    case forge(closure, &source().comment_issue(&1, closure.issue_number, notes)) do
+    case source().comment_issue(repo, closure.issue_number, notes) do
       :ok -> IssueClosures.mark_commented(closure.tenant_id, closure.id)
       {:error, reason} -> {:fault, reason}
     end
@@ -291,13 +296,13 @@ defmodule Loopctl.Delivery.IssueCloser do
   # only to `:escalated`, which never produces a row — so this clause is a fail-safe, not a
   # path. Skipping the comment is the right fail-safe: the LABEL is what the reporting system
   # binds to, so the close still says the right thing.
-  defp apply_comment(%IssueClosure{} = closure, %Resolution{}), do: {:ok, closure}
+  defp apply_comment(%IssueClosure{} = closure, _repo, %Resolution{}), do: {:ok, closure}
 
   # STEP 4. The outward act. Everything above exists so that this happens at most once.
-  defp apply_close(%IssueClosure{} = closure, %Resolution{} = resolution) do
+  defp apply_close(%IssueClosure{} = closure, repo, %Resolution{} = resolution) do
     reason = state_reason(resolution)
 
-    case forge(closure, &source().close_issue(&1, closure.issue_number, reason)) do
+    case source().close_issue(repo, closure.issue_number, reason) do
       :ok -> record_closed(closure, :closed)
       {:error, forge_reason} -> fault(closure, forge_reason)
     end
@@ -386,15 +391,6 @@ defmodule Loopctl.Delivery.IssueCloser do
       tenant_id: closure.tenant_id,
       story_id: closure.story_id
     )
-  end
-
-  # Every forge call authenticates as the credential chosen for this closure's (tenant,
-  # repository) (#936). None is a fault like any permanent forge refusal: nothing is sent.
-  defp forge(%IssueClosure{} = closure, call) do
-    case Credential.repo(closure.tenant_id, closure.repo_full_name) do
-      {:ok, repo} -> call.(repo)
-      {:error, :credential_unavailable} = error -> error
-    end
   end
 
   defp source, do: PullRequestSource.impl()

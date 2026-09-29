@@ -377,28 +377,28 @@ defmodule Loopctl.Verification.GitHubActionsTest do
         {:error, {:github_api_error, 422}}
       end)
 
-      assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
+      assert GitHubActions.resolve_commit("aaaaaaa", @credential) ==
                {:no_verdict, "unresolved_sha"}
 
       expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, "aaaaaaa" ->
         {:error, {:github_api_error, 404}}
       end)
 
-      assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
+      assert GitHubActions.resolve_commit("aaaaaaa", @credential) ==
                {:no_verdict, "repository_unreadable"}
 
       expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, "aaaaaaa" ->
         {:error, {:github_api_error, 502}}
       end)
 
-      assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) ==
+      assert GitHubActions.resolve_commit("aaaaaaa", @credential) ==
                {:wait, {:transient, nil}}
 
       expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, "aaaaaaa" ->
         {:ok, @sha}
       end)
 
-      assert GitHubActions.resolve_commit(@repo, "aaaaaaa", @credential) == {:ok, @sha}
+      assert GitHubActions.resolve_commit("aaaaaaa", @credential) == {:ok, @sha}
     end
   end
 
@@ -407,7 +407,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
     credential = %Credential{kind: :tenant_token, repo: tenant_repo}
 
     expect(MockPullRequestSource, :resolve_commit, fn ^tenant_repo, "aaaaaaa" -> {:ok, @sha} end)
-    assert GitHubActions.resolve_commit(@repo, "aaaaaaa", credential) == {:ok, @sha}
+    assert GitHubActions.resolve_commit("aaaaaaa", credential) == {:ok, @sha}
 
     expect(MockPullRequestSource, :commit, fn ^tenant_repo, @sha ->
       {:ok, %{tree_sha: @head_tree, parents: [@fork_point]}}
@@ -433,7 +433,7 @@ defmodule Loopctl.Verification.GitHubActionsTest do
     assert GitHubActions.check_change(request(%{credential: nil})) ==
              {:refused, "credential_unavailable"}
 
-    assert GitHubActions.resolve_commit(@repo, "aaaaaaa", nil) ==
+    assert GitHubActions.resolve_commit("aaaaaaa", nil) ==
              {:refused, "credential_unavailable"}
   end
 end
