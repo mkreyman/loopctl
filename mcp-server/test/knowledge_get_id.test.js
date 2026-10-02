@@ -15,7 +15,8 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 
 import { applyArgAliases, TOOL_SCOPED_ALIASES } from "../lib/arg-aliases.js";
-import { uuid, articleId } from "../lib/delivery-loop.js";
+import { uuid } from "../lib/delivery-loop.js";
+import { articleId } from "../lib/article-id.js";
 import { readFileSync } from "node:fs";
 import { stripComments } from "./tool-surface.js";
 import { loadTools } from "./tool-surface.js";
@@ -34,8 +35,16 @@ test("knowledge_get rescues {id} into article_id, and reports the rescue", () =>
   assert.equal(call("knowledge_get", { article_id: UUID, id: "other" }).article_id, UUID);
 });
 
-test("the alias is knowledge_get only: siblings and write verbs are not renamed", () => {
-  for (const tool of ["knowledge_progressive_drill", "knowledge_archive", "knowledge_delete", "knowledge_update"]) {
+test("knowledge_progressive_drill rescues a stub's {id} too", () => {
+  assert.equal(call("knowledge_progressive_drill", { id: UUID }).article_id, UUID);
+});
+
+test("a whitespace article_id does not block the rescue from id", () => {
+  assert.equal(call("knowledge_get", { article_id: "  ", id: UUID }).article_id, UUID);
+});
+
+test("write verbs and unmeasured siblings are not renamed", () => {
+  for (const tool of ["knowledge_article_stats", "knowledge_archive", "knowledge_delete", "knowledge_update"]) {
     assert.ok(DECLARED.get(tool).includes("article_id"), tool);
     assert.equal(call(tool, { id: UUID }).article_id, undefined, tool);
   }
@@ -78,22 +87,29 @@ test("articleId trims, then checks, and hands back the id to interpolate", () =>
   assert.deepEqual(articleId(" f7e1b841 ", { prefix: true }), { id: "f7e1b841" });
   assert.equal(articleId("f7e1b841").refusal?.status, 0, "write verbs take a full UUID");
   assert.equal(articleId(null, { prefix: true }).refusal?.status, 0);
+  const typed = articleId(12345678, { prefix: true }).refusal;
+  assert.match(typed.body, /must be a string; got a number/);
+  assert.doesNotMatch(typed.body, /required/);
 });
 
-test("WIRING: every handler that puts an article id in a path goes through articleId", () => {
+test("WIRING: every handler that takes article_id checks it with articleId, and sends only art.id", () => {
   const src = stripComments(readFileSync(join(here, "..", "index.js"), "utf8"));
-  assert.doesNotMatch(src, /\$\{article_id\}/, "no raw article_id is interpolated anywhere");
   const prefix = ["knowledgeGet", "knowledgeProgressiveDrill", "knowledgeArticleStats"];
-  for (const m of src.matchAll(/\nasync function (\w+)\(/g)) {
+  const handlers = [...src.matchAll(/\nasync function (\w+)\(\{([^}]*)\}/g)].filter((m) =>
+    /\barticle_id\b/.test(m[2]),
+  );
+  assert.ok(handlers.length > 0, "the scan must find the article handlers");
+  for (const m of handlers) {
     const end = src.indexOf("\nasync function ", m.index + 10);
-    const body = src.slice(m.index, end === -1 ? undefined : end);
-    if (!/\$\{art\.id\}/.test(body)) continue;
+    const body = src.slice(m.index + m[0].length, end === -1 ? undefined : end);
     const opt = prefix.includes(m[1]) ? ", \\{ prefix: true \\}" : "";
     assert.match(
       body,
-      new RegExp(`^  const art = articleId\\(article_id${opt}\\);\\n  if \\(art\\.refusal\\) return toContent\\(art\\.refusal\\);`, "m"),
+      new RegExp(`^\\s*const art = articleId\\(article_id${opt}\\);\\n\\s*if \\(art\\.refusal\\) return toContent\\(art\\.refusal\\);`, "m"),
       m[1],
     );
+    const rest = body.replace(/const art = articleId\(article_id[^)]*\);/, "");
+    assert.doesNotMatch(rest, /\barticle_id\b(?!")/, `${m[1]} must use art.id after the check, not the raw value`);
   }
 });
 
@@ -159,8 +175,8 @@ test("WIRING, end to end: the real server rescues {id} and sends nothing for a b
       ["knowledge_get", { article_id: "#" }],
       ["knowledge_get", { article_id: "x?/y" }],
       ["knowledge_get", { article_id: ".." }],
-      ["knowledge_progressive_drill", { id: UUID }],
       ["knowledge_archive", { article_id: "f7e1b841" }],
+      ["knowledge_graph", {}],
     ];
     for (const [tool, args] of refusedCalls) {
       const before = seen.length;

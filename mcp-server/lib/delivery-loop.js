@@ -48,7 +48,9 @@ function refuse(body) {
 }
 
 /**
- * A client-side shape check on the ids that go into a URL PATH: `story_id` and `runner_id`.
+ * A client-side shape check on the ids that go into a URL PATH: `story_id` and `runner_id`
+ * here, and `article_id` on the knowledge verbs through `lib/article-id.js` (which adds the
+ * `prefix` grammar its reads accept).
  *
  * EXPORTED, because it is one check and not a pattern to copy. `update_story`
  * (`lib/story-update.js`) interpolates a `story_id` into a path exactly as the verbs below do
@@ -116,11 +118,17 @@ const PREFIX_RE = /^[0-9a-f-]+$/i;
 // `prefix: true` also accepts what the server's id-prefix fallback resolves (#652,
 // `Knowledge.id_prefix_range/1`, reached by knowledge_get, knowledge_progressive_drill and
 // knowledge_article_stats): hex digits and dashes with at least 8 hex digits, dashless or
-// partial. The server matches on the first 8 and resolves only when exactly one article does.
+// partial. The server compares only the FIRST 8 hex digits and resolves when exactly one
+// article has them: the rest of a longer value is not checked, so a full-length id with a
+// wrong tail resolves to the article owning its first 8 (#652's design, for confabulated tails).
 // Only hex and dashes are accepted, so nothing in a prefix can change the route ('#', '?', '/').
 export function uuid(value, field, { prefix = false } = {}) {
-  if (typeof value !== "string" || value.trim() === "") {
+  if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) {
     return refuse(`\`${field}\` is required.`);
+  }
+
+  if (typeof value !== "string") {
+    return refuse(`\`${field}\` must be a string; got a ${Array.isArray(value) ? "array" : typeof value}.`);
   }
 
   if (prefix && PREFIX_RE.test(value) && value.replace(/-/g, "").length >= 8) return null;
@@ -136,17 +144,6 @@ export function uuid(value, field, { prefix = false } = {}) {
   }
 
   return null;
-}
-
-/**
- * An `article_id` bound for a URL path: trimmed (an id pasted with a trailing newline is the
- * id), then held to `uuid()`. Returns `{ id }` to interpolate, or `{ refusal }`. Article verbs
- * whose server path resolves a prefix pass `{ prefix: true }`; the write verbs take a full UUID.
- */
-export function articleId(value, { prefix = false } = {}) {
-  const trimmed = typeof value === "string" ? value.trim() : value;
-  const refusal = uuid(trimmed, "article_id", { prefix });
-  return refusal ? { refusal } : { id: trimmed };
 }
 
 export function placementPath(runnerId) {

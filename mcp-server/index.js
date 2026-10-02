@@ -15,7 +15,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import path from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
-import { articleId } from "./lib/delivery-loop.js";
+import { articleId } from "./lib/article-id.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { degradedSearchNotice } from "./lib/search-notices.js";
@@ -1669,8 +1669,10 @@ async function knowledgeStats({ project_id }) {
 }
 
 async function knowledgeGraph({ article_id, depth, project_id }) {
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
   const params = new URLSearchParams();
-  params.set("article_id", article_id);
+  params.set("article_id", art.id);
   if (depth != null) params.set("depth", String(depth));
   if (project_id) params.set("project_id", project_id);
   const result = await apiCall(
@@ -5568,7 +5570,8 @@ const TOOLS = [
         article_id: {
           type: "string",
           format: "uuid",
-          description: "Starting article UUID (required).",
+          description:
+            "Starting article UUID (required). A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
         depth: {
           type: "integer",
@@ -5601,7 +5604,8 @@ const TOOLS = [
         article_id: {
           type: "string",
           format: "uuid",
-          description: "The article to suggest links for (required).",
+          description:
+            "The article to suggest links for (required). A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
         limit: { type: "integer", description: "Max candidates (default 5)." },
         threshold: {
@@ -5951,8 +5955,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          format: "uuid",
-          description: "The UUID of the article to open (from a progressive index stub).",
+          description:
+            "The UUID of the article to open (from a progressive index stub). Or a prefix of at least 8 hex digits (the server matches its first 8). A missing, blank, shorter or non-hex value is refused locally with status 0 and no request is sent.",
         },
         body_max_bytes: {
           type: "integer",
@@ -6011,9 +6015,10 @@ const TOOLS = [
           description:
             "The UUID of the article. A unique ID PREFIX (>= 8 hex characters) also " +
             "resolves, so copy what you have rather than reconstructing 36 characters " +
-            "from memory; an ambiguous prefix is a 404, never a guess. Anything that is not " +
-            "hex digits and dashes (missing, blank, or containing '#', '?', '/') is refused " +
-            "locally with status 0 and no request is sent.",
+            "from memory; an ambiguous prefix is a 404, never a guess. The server matches a " +
+            "prefix on its first 8 hex digits only. Surrounding whitespace is trimmed. A " +
+            "missing or blank id, fewer than 8 hex digits, or any character other than hex " +
+            "digits and dashes is refused locally with status 0 and no request is sent.",
         },
         links: {
           type: "string",
@@ -6260,7 +6265,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the article to edit (preserved across the update).",
+          description:
+            "The UUID of the article to edit (preserved across the update). A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
         title: {
           type: "string",
@@ -6638,7 +6644,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the draft article to publish.",
+          description:
+            "The UUID of the draft article to publish. A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
       },
       required: ["article_id"],
@@ -6706,7 +6713,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the published article to unpublish.",
+          description:
+            "The UUID of the published article to unpublish. A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
       },
       required: ["article_id"],
@@ -6729,7 +6737,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the article to archive.",
+          description:
+            "The UUID of the article to archive. A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
       },
       required: ["article_id"],
@@ -6764,7 +6773,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the article to take out of retrieval.",
+          description:
+            "The UUID of the article to take out of retrieval. A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
         reason: {
           type: "string",
@@ -6792,7 +6802,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the article to restore to retrieval.",
+          description:
+            "The UUID of the article to restore to retrieval. A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
       },
       required: ["article_id"],
@@ -6814,7 +6825,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the article to delete.",
+          description:
+            "The UUID of the article to delete. A full UUID: anything else (missing, blank, a prefix) is refused locally with status 0 and no request is sent.",
         },
       },
       required: ["article_id"],
@@ -8120,7 +8132,8 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the article to inspect.",
+          description:
+            "The UUID of the article to inspect. Or a prefix of at least 8 hex digits (the server matches its first 8). A missing, blank, shorter or non-hex value is refused locally with status 0 and no request is sent.",
         },
       },
       required: ["article_id"],

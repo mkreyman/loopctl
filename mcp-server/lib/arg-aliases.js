@@ -73,15 +73,19 @@ const ARG_ALIASES = {
 // `article_id <- id` on knowledge_get is measured: 17 of 96 knowledge_get calls in mac-mini's
 // session transcripts (2026-10-01) passed `{"id": ...}`, the key every search result carries
 // its id under, and the request went out as `/api/v1/articles/undefined`. All 30
-// knowledge_get 404s in production for 2026-09-25..30 were that request. Per the rule above,
-// a sibling tool joins when a failing call on it is observed. A write verb never should: there
+// knowledge_get 404s in production for 2026-09-25..30 were that request.
+// knowledge_progressive_drill is the same mechanism: its documented input is a progressive
+// index stub, which carries the id under the same `id` key. A write verb never joins: there
 // the alias would turn a harmless miss into a write against an id copied from the wrong row.
 const TOOL_SCOPED_ALIASES = {
   knowledge_get: { article_id: ["id"] },
+  knowledge_progressive_drill: { article_id: ["id"] },
 };
 
+// Whitespace-only is blank, matching articleId(), which trims: otherwise a "  " article_id
+// blocks the rescue here and is then refused as missing there, discarding a good `id`.
 function isBlank(v) {
-  return v === undefined || v === null || v === "";
+  return v === undefined || v === null || (typeof v === "string" && v.trim() === "");
 }
 
 /**
