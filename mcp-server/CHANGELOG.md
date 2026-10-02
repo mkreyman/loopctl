@@ -14,12 +14,19 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   server answered 404, which agents read as "the article does not exist". All 30
   `knowledge_get` 404s in production logs for 2026-09-25..30 were that request. It is a
   silent rescue: the schema is unchanged, and no write verb takes `id`.
-- **`knowledge_get` checks `article_id` before sending**: a full UUID, or exactly its first 8
-  hex digits (the prefix the server resolves). Anything else, including a missing, blank or
-  `null` id, is refused with `status: 0` and the value is not echoed. Before, it was sent as
-  spelled: `''` reached the article index and returned unrelated articles as a success, and
-  `#`, `?` or `..` reached other routes. `uuid()` in `lib/delivery-loop.js` gains the
-  `prefix` option for this; its other callers are unchanged.
+- **Every article verb that puts `article_id` in a URL path checks it before sending**:
+  `knowledge_get`, `knowledge_progressive_drill`, `knowledge_article_stats`,
+  `knowledge_suggest_links` and the write verbs (update, publish, unpublish, archive,
+  suppress, unsuppress, delete). The id is trimmed first. The three reads whose server path
+  resolves a prefix (#652) accept what that fallback accepts: hex digits and dashes with at
+  least 8 hex digits, dashless or partial. The rest take a full UUID. Anything else,
+  including a missing, blank or `null` id, is refused with `status: 0` and the value is not
+  echoed. Before, it was sent as spelled: a missing id became `/undefined` and a 404, `''`
+  reached the article index and returned unrelated articles as a success, and `#`, `?` or
+  `..` reached other routes. A non-hex prefix such as `f7e1b841zz`, which the server's
+  fallback would have read by its first 8 digits, is now refused. `uuid()` in
+  `lib/delivery-loop.js` gains the `prefix` option and `articleId()` wraps it; their other
+  callers are unchanged.
 
 ## 2.112.0 — 2026-09-29 (the tenant's own GitHub token)
 

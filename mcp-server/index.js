@@ -15,7 +15,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import path from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
-import { uuid } from "./lib/delivery-loop.js";
+import { articleId } from "./lib/delivery-loop.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { degradedSearchNotice } from "./lib/search-notices.js";
@@ -1683,11 +1683,13 @@ async function knowledgeGraph({ article_id, depth, project_id }) {
 }
 
 async function knowledgeSuggestLinks({ article_id, limit, threshold }) {
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
   const params = new URLSearchParams();
   if (limit != null) params.set("limit", String(limit));
   if (threshold != null) params.set("threshold", String(threshold));
   const qs = params.toString();
-  const base = `/api/v1/knowledge/articles/${article_id}/suggested_links`;
+  const base = `/api/v1/knowledge/articles/${art.id}/suggested_links`;
   const result = await apiCall(
     "GET",
     qs ? `${base}?${qs}` : base,
@@ -1872,6 +1874,8 @@ async function knowledgeHeatIndex({ category, limit, since }) {
 }
 
 async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offset }) {
+  const art = articleId(article_id, { prefix: true });
+  if (art.refusal) return toContent(art.refusal);
   const params = new URLSearchParams();
   // 0 is meaningful on both (whole body / start at the beginning), so test for
   // null/undefined rather than truthiness.
@@ -1880,7 +1884,7 @@ async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offs
   if (body_offset !== undefined && body_offset !== null)
     params.set("body_offset", String(body_offset));
   const qs = params.toString();
-  const base = `/api/v1/knowledge/progressive/${article_id}`;
+  const base = `/api/v1/knowledge/progressive/${art.id}`;
   const result = await apiCall(
     "GET",
     qs ? `${base}?${qs}` : base,
@@ -1943,11 +1947,11 @@ async function knowledgeGet({
   body_max_bytes,
   body_offset,
 }) {
-  // A missing id went out as /api/v1/articles/undefined and a malformed one as whatever it
-  // spelled ('', '#', '..', 'x?y' each reach a different route), and the server's answer read
-  // as "this article does not exist". Refused here with status 0, before any request.
-  const badId = uuid(article_id, "article_id", { prefix: true });
-  if (badId) return toContent(badId);
+  // A missing id went out as /undefined and a malformed one as whatever it spelled
+  // ('', '#', '..', 'x?y' each reach a different route); the server's answer read as
+  // "this article does not exist". Refused here with status 0, before any request.
+  const art = articleId(article_id, { prefix: true });
+  if (art.refusal) return toContent(art.refusal);
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
@@ -1959,7 +1963,7 @@ async function knowledgeGet({
   if (body_offset !== undefined && body_offset !== null)
     params.set("body_offset", String(body_offset));
   const qs = params.toString();
-  const path = qs ? `/api/v1/articles/${article_id}?${qs}` : `/api/v1/articles/${article_id}`;
+  const path = qs ? `/api/v1/articles/${art.id}?${qs}` : `/api/v1/articles/${art.id}`;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
   return toContent(result);
 }
@@ -2037,6 +2041,8 @@ async function knowledgeCreate({
 // provided fields change. Agent role — KB-content curation, visibility-scoped
 // server-side (another agent's private/owner memory 404s).
 async function knowledgeUpdate({ article_id, title, body, category, tags, metadata }) {
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
   const payload = {};
   if (title != null) payload.title = title;
   if (body != null) payload.body = body;
@@ -2046,7 +2052,7 @@ async function knowledgeUpdate({ article_id, title, body, category, tags, metada
 
   const result = await apiCall(
     "PATCH",
-    `/api/v1/articles/${article_id}`,
+    `/api/v1/articles/${art.id}`,
     payload,
     process.env.LOOPCTL_AGENT_KEY,
   );
@@ -2237,7 +2243,9 @@ async function memoryGraduate({ memory_id, re_scope }) {
 // --- Knowledge Management Tools (orch key) ---
 
 async function knowledgePublish({ article_id }) {
-  const result = await apiCall("POST", `/api/v1/articles/${article_id}/publish`, null, process.env.LOOPCTL_ORCH_KEY);
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
+  const result = await apiCall("POST", `/api/v1/articles/${art.id}/publish`, null, process.env.LOOPCTL_ORCH_KEY);
   return toContent(result);
 }
 
@@ -2292,9 +2300,11 @@ async function knowledgeBulkUnpublish({ article_ids }) {
 }
 
 async function knowledgeUnpublish({ article_id }) {
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
   const result = await apiCall(
     "POST",
-    `/api/v1/articles/${article_id}/unpublish`,
+    `/api/v1/articles/${art.id}/unpublish`,
     null,
     process.env.LOOPCTL_USER_KEY
   );
@@ -2305,9 +2315,11 @@ async function knowledgeUnpublish({ article_id }) {
 // audited, visibility-scoped server-side). NOT reversible in code — #606/#605: `:archived`
 // is a terminal status. The row survives; nothing automated brings it back.
 async function knowledgeArchive({ article_id }) {
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
   const result = await apiCall(
     "POST",
-    `/api/v1/articles/${article_id}/archive`,
+    `/api/v1/articles/${art.id}/archive`,
     null,
     process.env.LOOPCTL_AGENT_KEY
   );
@@ -2318,9 +2330,11 @@ async function knowledgeArchive({ article_id }) {
 // one member of that family that undoes: nothing is destroyed and nothing is rebuilt, so
 // knowledge_unsuppress restores the article to every read path immediately.
 async function knowledgeSuppress({ article_id, reason }) {
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
   const result = await apiCall(
     "POST",
-    `/api/v1/articles/${article_id}/suppress`,
+    `/api/v1/articles/${art.id}/suppress`,
     { reason },
     process.env.LOOPCTL_AGENT_KEY
   );
@@ -2328,9 +2342,11 @@ async function knowledgeSuppress({ article_id, reason }) {
 }
 
 async function knowledgeUnsuppress({ article_id }) {
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
   const result = await apiCall(
     "POST",
-    `/api/v1/articles/${article_id}/unsuppress`,
+    `/api/v1/articles/${art.id}/unsuppress`,
     null,
     process.env.LOOPCTL_AGENT_KEY
   );
@@ -2339,9 +2355,11 @@ async function knowledgeUnsuppress({ article_id }) {
 
 // #331: soft-delete (archive) is agent-role KB curation, same as knowledge_archive.
 async function knowledgeDelete({ article_id }) {
+  const art = articleId(article_id);
+  if (art.refusal) return toContent(art.refusal);
   const result = await apiCall(
     "DELETE",
-    `/api/v1/articles/${article_id}`,
+    `/api/v1/articles/${art.id}`,
     null,
     process.env.LOOPCTL_AGENT_KEY
   );
@@ -2818,9 +2836,11 @@ async function knowledgeCurationLog({ kind, since, limit, offset } = {}) {
 }
 
 async function knowledgeArticleStats({ article_id }) {
+  const art = articleId(article_id, { prefix: true });
+  if (art.refusal) return toContent(art.refusal);
   const result = await apiCall(
     "GET",
-    `/api/v1/knowledge/articles/${article_id}/stats`,
+    `/api/v1/knowledge/articles/${art.id}/stats`,
     null,
     process.env.LOOPCTL_ORCH_KEY
   );
@@ -5991,7 +6011,9 @@ const TOOLS = [
           description:
             "The UUID of the article. A unique ID PREFIX (>= 8 hex characters) also " +
             "resolves, so copy what you have rather than reconstructing 36 characters " +
-            "from memory; an ambiguous prefix is a 404, never a guess.",
+            "from memory; an ambiguous prefix is a 404, never a guess. Anything that is not " +
+            "hex digits and dashes (missing, blank, or containing '#', '?', '/') is refused " +
+            "locally with status 0 and no request is sent.",
         },
         links: {
           type: "string",

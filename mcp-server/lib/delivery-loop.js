@@ -111,23 +111,24 @@ function refuse(body) {
  * into the transcript.
  */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const PREFIX_RE = /^[0-9a-f]{8}$/i;
+const PREFIX_RE = /^[0-9a-f-]+$/i;
 
-// `prefix: true` also accepts exactly the first 8 hex digits, for the one read whose server
-// path resolves an id prefix (`Knowledge.get_article/3`, #652, via knowledge_get). The server
-// matches on those 8 digits only, so a longer partial id is refused here rather than silently
-// resolving to whichever article owns its first 8.
+// `prefix: true` also accepts what the server's id-prefix fallback resolves (#652,
+// `Knowledge.id_prefix_range/1`, reached by knowledge_get, knowledge_progressive_drill and
+// knowledge_article_stats): hex digits and dashes with at least 8 hex digits, dashless or
+// partial. The server matches on the first 8 and resolves only when exactly one article does.
+// Only hex and dashes are accepted, so nothing in a prefix can change the route ('#', '?', '/').
 export function uuid(value, field, { prefix = false } = {}) {
   if (typeof value !== "string" || value.trim() === "") {
     return refuse(`\`${field}\` is required.`);
   }
 
-  if (prefix && PREFIX_RE.test(value)) return null;
+  if (prefix && PREFIX_RE.test(value) && value.replace(/-/g, "").length >= 8) return null;
 
   if (!UUID_RE.test(value)) {
     return refuse(
       `\`${field}\` must be a UUID (8-4-4-4 hex digits then 12, lowercase or upper)` +
-        (prefix ? " or its first 8 hex digits. " : ". ") +
+        (prefix ? " or a prefix of at least 8 hex digits. " : ". ") +
         `Got a ${value.length}-character string that is not one. The value is not repeated ` +
         `here: a malformed id is often something pasted into the wrong argument, and a tool ` +
         `result lands in the transcript.`,
@@ -135,6 +136,17 @@ export function uuid(value, field, { prefix = false } = {}) {
   }
 
   return null;
+}
+
+/**
+ * An `article_id` bound for a URL path: trimmed (an id pasted with a trailing newline is the
+ * id), then held to `uuid()`. Returns `{ id }` to interpolate, or `{ refusal }`. Article verbs
+ * whose server path resolves a prefix pass `{ prefix: true }`; the write verbs take a full UUID.
+ */
+export function articleId(value, { prefix = false } = {}) {
+  const trimmed = typeof value === "string" ? value.trim() : value;
+  const refusal = uuid(trimmed, "article_id", { prefix });
+  return refusal ? { refusal } : { id: trimmed };
 }
 
 export function placementPath(runnerId) {
