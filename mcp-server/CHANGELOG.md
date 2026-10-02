@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.113.0 — 2026-10-01 (knowledge_get stops reporting real articles as missing)
+
+### Fixed
+
+- **`knowledge_get` accepts `id`** as well as `article_id`. Agents copy the `id` key from
+  search results; without `article_id` the server was asked for
+  `/api/v1/articles/undefined` and answered 404, which agents read as "the article does not
+  exist". All 30 `knowledge_get` 404s in production logs for 2026-09-25..30 were that
+  request. The alias applies only to a tool that declares `article_id` and does not declare
+  `id` itself, so `memory_forget`'s `id` is untouched.
+- **Any tool called without a declared-required argument is refused before a request is
+  sent**, with `isError` and code `missing_required_argument`, naming what was missing and
+  what arrived. Before, the call went out with `undefined` in the path (a misleading 404) or
+  without the query parameter (an oracle-safe empty 200 on the channel reads).
+
 ## 2.112.0 — 2026-09-29 (the tenant's own GitHub token)
 
 - New tools `github_credential`, `set_github_credential` and `clear_github_credential`

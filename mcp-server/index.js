@@ -15,6 +15,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import path from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
+import { missingRequiredArgs, requiredArgsRefusal } from "./lib/required-args.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { degradedSearchNotice } from "./lib/search-notices.js";
@@ -9874,6 +9875,10 @@ const DECLARED_TOOL_ARGS = new Map(
   TOOLS.map((t) => [t.name, Object.keys(t.inputSchema?.properties ?? {})]),
 );
 
+// Static tool schemas, for the required-argument check at dispatch. Generated `cr_*` tools
+// are absent and pass through to the server's own validation.
+const TOOL_SCHEMAS = new Map(TOOLS.map((t) => [t.name, t.inputSchema]));
+
 function declaredToolArgs(name) {
   return DECLARED_TOOL_ARGS.get(name);
 }
@@ -9905,6 +9910,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     },
     declaredToolArgs(name),
   );
+
+  const missing = missingRequiredArgs(args, TOOL_SCHEMAS.get(name));
+  if (missing.length > 0) return requiredArgsRefusal(name, missing, args);
 
   switch (name) {
     // Project Tools

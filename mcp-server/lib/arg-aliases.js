@@ -66,6 +66,20 @@ const ARG_ALIASES = {
   limit: ["max_results"],
 };
 
+// DECLARATION-SCOPED aliases: applied only when the called tool declares the canonical AND
+// does not declare the alias itself. `id` cannot go in the global table above — memory_forget
+// and others declare `id` as their own parameter, and the drift guard refuses it there.
+//
+// `article_id <- id` is measured, not guessed: 17 of 96 `knowledge_get` calls in this
+// machine's transcripts (2026-10-01) passed `{"id": ...}`, the key every search result
+// carries its id under. With no `article_id` the server asked for `/api/v1/articles/undefined`
+// and answered 404, which the agent read as "the article is gone": all 30 knowledge_get
+// 404s in loopctl's production logs for 2026-09-25..30 were that request, against 38 of 38
+// reads that carried a real id and succeeded.
+const DECLARED_SCOPED_ALIASES = {
+  article_id: ["id"],
+};
+
 function isBlank(v) {
   return v === undefined || v === null || v === "";
 }
@@ -109,6 +123,22 @@ function applyArgAliases(args, onAliasUsed, declared) {
     }
   }
 
+  if (declaredSet !== null) {
+    for (const [canonical, aliases] of Object.entries(DECLARED_SCOPED_ALIASES)) {
+      if (!declaredSet.has(canonical) || !isBlank(out[canonical])) continue;
+      const alias = aliases.find((a) => !declaredSet.has(a) && !isBlank(out[a]));
+      if (alias === undefined) continue;
+      out[canonical] = out[alias];
+      if (typeof onAliasUsed === "function") {
+        try {
+          onAliasUsed({ canonical, alias });
+        } catch {
+          // Telemetry must never break a tool call.
+        }
+      }
+    }
+  }
+
   // Some callers send a numeric arg as a string ("6"). Coerce so downstream validation and
   // the outbound query string both see a number rather than rejecting or double-encoding.
   if (typeof out.limit === "string" && /^\d+$/.test(out.limit.trim())) {
@@ -118,4 +148,4 @@ function applyArgAliases(args, onAliasUsed, declared) {
   return out;
 }
 
-export { ARG_ALIASES, applyArgAliases };
+export { ARG_ALIASES, DECLARED_SCOPED_ALIASES, applyArgAliases };
