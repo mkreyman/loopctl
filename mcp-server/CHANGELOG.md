@@ -5,6 +5,31 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.113.0 — 2026-10-01 (knowledge_get stops reporting real articles as missing)
+
+### Fixed
+
+- **`knowledge_get` and `knowledge_progressive_drill` accept `id` for `article_id`.**
+  Agents copy the `id` key from search results and index stubs; without `article_id` the request went out as `/api/v1/articles/undefined` and the
+  server answered 404, which agents read as "the article does not exist". All 30
+  `knowledge_get` 404s in production logs for 2026-09-25..30 were that request. It is a
+  silent rescue: the schema is unchanged, and no write verb takes `id`.
+- **Every article verb that puts `article_id` in a URL path checks it before sending**:
+  `knowledge_get`, `knowledge_progressive_drill`, `knowledge_article_stats`,
+  `knowledge_suggest_links`, `knowledge_graph` (whose id is a query parameter) and the write
+  verbs (update, publish, unpublish, archive, suppress, unsuppress, delete). The id is
+  trimmed first, and each tool's `article_id` description states what it refuses. The three reads whose server path
+  resolves a prefix (#652) accept what that fallback accepts: hex digits and dashes with at
+  least 8 hex digits, dashless or partial. The rest take a full UUID. Anything else,
+  including a missing, blank or `null` id, is refused with `status: 0` and the value is not
+  echoed. Before, it was sent as spelled: a missing id became `/undefined` and a 404, `''`
+  reached the article index and returned unrelated articles as a success, and `#`, `?` or
+  `..` reached other routes. A non-string id is refused as the wrong type. A non-hex prefix such as `f7e1b841zz`, which the server's
+  fallback would have read by its first 8 digits, is now refused, and so is a numeric id
+  such as `12345678`, which the server used to resolve by those 8 digits. `uuid()` in
+  `lib/delivery-loop.js` gains the `prefix` option and `lib/article-id.js` wraps it; its
+  other callers are unchanged apart from the wrong-type message.
+
 ## 2.112.0 — 2026-09-29 (the tenant's own GitHub token)
 
 - New tools `github_credential`, `set_github_credential` and `clear_github_credential`

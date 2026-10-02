@@ -48,7 +48,9 @@ function refuse(body) {
 }
 
 /**
- * A client-side shape check on the ids that go into a URL PATH: `story_id` and `runner_id`.
+ * A client-side shape check on the ids that go into a URL PATH: `story_id` and `runner_id`
+ * here, and `article_id` on the knowledge verbs through `lib/article-id.js` (which adds the
+ * `prefix` grammar its reads accept).
  *
  * EXPORTED, because it is one check and not a pattern to copy. `update_story`
  * (`lib/story-update.js`) interpolates a `story_id` into a path exactly as the verbs below do
@@ -111,15 +113,30 @@ function refuse(body) {
  * into the transcript.
  */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PREFIX_RE = /^[0-9a-f-]+$/i;
 
-export function uuid(value, field) {
-  if (typeof value !== "string" || value.trim() === "") {
+// `prefix: true` also accepts what the server's id-prefix fallback resolves (#652,
+// `Knowledge.id_prefix_range/1`, reached by knowledge_get, knowledge_progressive_drill and
+// knowledge_article_stats): hex digits and dashes with at least 8 hex digits, dashless or
+// partial. The server compares only the FIRST 8 hex digits and resolves when exactly one
+// article has them: the rest of a longer value is not checked, so a full-length id with a
+// wrong tail resolves to the article owning its first 8 (#652's design, for confabulated tails).
+// Only hex and dashes are accepted, so nothing in a prefix can change the route ('#', '?', '/').
+export function uuid(value, field, { prefix = false } = {}) {
+  if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) {
     return refuse(`\`${field}\` is required.`);
   }
 
+  if (typeof value !== "string") {
+    return refuse(`\`${field}\` must be a string; got a ${Array.isArray(value) ? "array" : typeof value}.`);
+  }
+
+  if (prefix && PREFIX_RE.test(value) && value.replace(/-/g, "").length >= 8) return null;
+
   if (!UUID_RE.test(value)) {
     return refuse(
-      `\`${field}\` must be a UUID (8-4-4-4 hex digits then 12, lowercase or upper). ` +
+      `\`${field}\` must be a UUID (8-4-4-4 hex digits then 12, lowercase or upper)` +
+        (prefix ? " or a prefix of at least 8 hex digits. " : ". ") +
         `Got a ${value.length}-character string that is not one. The value is not repeated ` +
         `here: a malformed id is often something pasted into the wrong argument, and a tool ` +
         `result lands in the transcript.`,
