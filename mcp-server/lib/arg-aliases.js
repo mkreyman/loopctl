@@ -66,6 +66,22 @@ const ARG_ALIASES = {
   limit: ["max_results"],
 };
 
+// TOOL-SCOPED aliases, keyed by tool name, applied only when the called tool declares the
+// canonical and not the alias. `id` cannot go in the global table above: memory_forget and
+// others declare `id` as their own parameter, and the drift guard refuses it there.
+//
+// `article_id <- id` is measured, not guessed: 17 of 96 `knowledge_get` calls in mac-mini's
+// session transcripts (2026-10-01) passed `{"id": ...}`, the key every search result and
+// index stub carries its id under, and the request went out as `/api/v1/articles/undefined`.
+// It covers the three READS an agent reaches with an id copied from a result or a stub. It
+// is deliberately absent from knowledge_archive, knowledge_delete and the other write verbs:
+// there it would turn a harmless miss into a write against an id copied from the wrong row.
+const TOOL_SCOPED_ALIASES = {
+  knowledge_get: { article_id: ["id"] },
+  knowledge_progressive_drill: { article_id: ["id"] },
+  knowledge_article_stats: { article_id: ["id"] },
+};
+
 function isBlank(v) {
   return v === undefined || v === null || v === "";
 }
@@ -79,7 +95,7 @@ function isBlank(v) {
  * conveniences. Omit it and every fill is reported (the conservative default for a tool
  * whose schema is not known, e.g. the per-tenant `cr_*` tools).
  */
-function applyArgAliases(args, onAliasUsed, declared) {
+function applyArgAliases(args, onAliasUsed, declared, toolName) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args;
 
   const out = { ...args };
@@ -109,6 +125,24 @@ function applyArgAliases(args, onAliasUsed, declared) {
     }
   }
 
+  const scoped =
+    declaredSet !== null && toolName && Object.hasOwn(TOOL_SCOPED_ALIASES, toolName)
+      ? TOOL_SCOPED_ALIASES[toolName]
+      : {};
+  for (const [canonical, aliases] of Object.entries(scoped)) {
+    if (!declaredSet.has(canonical) || !isBlank(out[canonical])) continue;
+    const alias = aliases.find((a) => !declaredSet.has(a) && !isBlank(out[a]));
+    if (alias === undefined) continue;
+    out[canonical] = out[alias];
+    if (typeof onAliasUsed === "function") {
+      try {
+        onAliasUsed({ canonical, alias });
+      } catch {
+        // Telemetry must never break a tool call.
+      }
+    }
+  }
+
   // Some callers send a numeric arg as a string ("6"). Coerce so downstream validation and
   // the outbound query string both see a number rather than rejecting or double-encoding.
   if (typeof out.limit === "string" && /^\d+$/.test(out.limit.trim())) {
@@ -118,4 +152,4 @@ function applyArgAliases(args, onAliasUsed, declared) {
   return out;
 }
 
-export { ARG_ALIASES, applyArgAliases };
+export { ARG_ALIASES, TOOL_SCOPED_ALIASES, applyArgAliases };

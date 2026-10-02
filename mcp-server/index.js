@@ -15,6 +15,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import path from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
+import { unfilledPathRefusal } from "./lib/path-guard.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { degradedSearchNotice } from "./lib/search-notices.js";
@@ -196,6 +197,8 @@ async function apiCall(
   keyOverride,
   { exactKey = false, timeoutMs, keyHint } = {},
 ) {
+  const unfilled = unfilledPathRefusal(path);
+  if (unfilled) return unfilled;
   const url = `${getBaseUrl()}${path}`;
   // `exactKey` sends `keyOverride` VERBATIM instead of consulting `resolveKey`
   // (defined above), whose priority is LOOPCTL_API_KEY > keyOverride >
@@ -5926,7 +5929,9 @@ const TOOLS = [
         article_id: {
           type: "string",
           format: "uuid",
-          description: "The UUID of the article to open (from a progressive index stub).",
+          description:
+            "The UUID of the article to open (from a progressive index stub). Also accepted " +
+            "under id, the key stubs carry it under.",
         },
         body_max_bytes: {
           type: "integer",
@@ -5949,6 +5954,8 @@ const TOOLS = [
     name: "knowledge_get",
     description:
       "Get full article content by ID. Use after search to read an article in detail. " +
+      "Pass the id as article_id; this tool also accepts it under id, the key search results " +
+      "carry it under. " +
       "Resolves tenant-owned articles AND published system canonicals. Records a COUNTED " +
       "read (it feeds knowledge_heat_index); use knowledge_progressive_drill instead when " +
       "you are merely following an index this system just handed you. " +
@@ -8092,7 +8099,9 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description: "The UUID of the article to inspect.",
+          description:
+            "The UUID of the article to inspect. Also accepted under id, the key search " +
+            "results carry it under.",
         },
       },
       required: ["article_id"],
@@ -9904,6 +9913,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       );
     },
     declaredToolArgs(name),
+    name,
   );
 
   switch (name) {
