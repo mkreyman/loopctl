@@ -13,12 +13,20 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   search results; without `article_id` the server was asked for
   `/api/v1/articles/undefined` and answered 404, which agents read as "the article does not
   exist". All 30 `knowledge_get` 404s in production logs for 2026-09-25..30 were that
-  request. The alias applies only to a tool that declares `article_id` and does not declare
-  `id` itself, so `memory_forget`'s `id` is untouched.
+  request. The alias is `knowledge_get` only: the archive, delete and other write verbs do
+  not take an `id`, so a copied id can never trigger a terminal write.
 - **Any tool called without a declared-required argument is refused before a request is
-  sent**, with `isError` and code `missing_required_argument`, naming what was missing and
-  what arrived. Before, the call went out with `undefined` in the path (a misleading 404) or
-  without the query parameter (an oracle-safe empty 200 on the channel reads).
+  sent.** The result is `{ error: true, status: 0, body }` with `code:
+  "missing_required_argument"`, the `missing` and `passed` keys, and `guidance` carrying each
+  missing argument's description. Before, the call went out with `undefined` in the path (a
+  misleading 404) or without the query parameter (an oracle-safe empty 200 on the channel
+  reads). A caller branching on a missing-argument result now sees `status: 0` where it saw
+  a 404 or a 422, and the lib-level messages for those arguments are replaced by `guidance`.
+- **A malformed `article_id` is refused locally** (`status: 0`) on every tool that puts it in
+  a URL path, instead of reaching the server as a generic 404 or a different route.
+  `knowledge_get`, `knowledge_progressive_drill` and `knowledge_article_stats` accept a full
+  UUID or a unique prefix of at least 8 hex digits, which the server resolves; the other
+  article verbs take a full UUID.
 
 ## 2.112.0 — 2026-09-29 (the tenant's own GitHub token)
 

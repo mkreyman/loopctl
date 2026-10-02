@@ -14,8 +14,8 @@ import { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync } from "
 import os from "node:os";
 import crypto from "node:crypto";
 import path from "node:path";
-import { applyArgAliases } from "./lib/arg-aliases.js";
-import { missingRequiredArgs, requiredArgsRefusal } from "./lib/required-args.js";
+import { prepareToolCall } from "./lib/dispatch-prep.js";
+import { articleIdRefusal } from "./lib/article-id.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { degradedSearchNotice } from "./lib/search-notices.js";
@@ -1683,6 +1683,8 @@ async function knowledgeGraph({ article_id, depth, project_id }) {
 }
 
 async function knowledgeSuggestLinks({ article_id, limit, threshold }) {
+  const badArticleId = articleIdRefusal(article_id);
+  if (badArticleId) return toContent(badArticleId);
   const params = new URLSearchParams();
   if (limit != null) params.set("limit", String(limit));
   if (threshold != null) params.set("threshold", String(threshold));
@@ -1872,6 +1874,8 @@ async function knowledgeHeatIndex({ category, limit, since }) {
 }
 
 async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offset }) {
+  const badArticleId = articleIdRefusal(article_id, { prefix: true });
+  if (badArticleId) return toContent(badArticleId);
   const params = new URLSearchParams();
   // 0 is meaningful on both (whole body / start at the beginning), so test for
   // null/undefined rather than truthiness.
@@ -1943,6 +1947,8 @@ async function knowledgeGet({
   body_max_bytes,
   body_offset,
 }) {
+  const badArticleId = articleIdRefusal(article_id, { prefix: true });
+  if (badArticleId) return toContent(badArticleId);
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
@@ -2032,6 +2038,8 @@ async function knowledgeCreate({
 // provided fields change. Agent role — KB-content curation, visibility-scoped
 // server-side (another agent's private/owner memory 404s).
 async function knowledgeUpdate({ article_id, title, body, category, tags, metadata }) {
+  const badArticleId = articleIdRefusal(article_id);
+  if (badArticleId) return toContent(badArticleId);
   const payload = {};
   if (title != null) payload.title = title;
   if (body != null) payload.body = body;
@@ -2232,6 +2240,8 @@ async function memoryGraduate({ memory_id, re_scope }) {
 // --- Knowledge Management Tools (orch key) ---
 
 async function knowledgePublish({ article_id }) {
+  const badArticleId = articleIdRefusal(article_id);
+  if (badArticleId) return toContent(badArticleId);
   const result = await apiCall("POST", `/api/v1/articles/${article_id}/publish`, null, process.env.LOOPCTL_ORCH_KEY);
   return toContent(result);
 }
@@ -2287,6 +2297,8 @@ async function knowledgeBulkUnpublish({ article_ids }) {
 }
 
 async function knowledgeUnpublish({ article_id }) {
+  const badArticleId = articleIdRefusal(article_id);
+  if (badArticleId) return toContent(badArticleId);
   const result = await apiCall(
     "POST",
     `/api/v1/articles/${article_id}/unpublish`,
@@ -2300,6 +2312,8 @@ async function knowledgeUnpublish({ article_id }) {
 // audited, visibility-scoped server-side). NOT reversible in code — #606/#605: `:archived`
 // is a terminal status. The row survives; nothing automated brings it back.
 async function knowledgeArchive({ article_id }) {
+  const badArticleId = articleIdRefusal(article_id);
+  if (badArticleId) return toContent(badArticleId);
   const result = await apiCall(
     "POST",
     `/api/v1/articles/${article_id}/archive`,
@@ -2313,6 +2327,8 @@ async function knowledgeArchive({ article_id }) {
 // one member of that family that undoes: nothing is destroyed and nothing is rebuilt, so
 // knowledge_unsuppress restores the article to every read path immediately.
 async function knowledgeSuppress({ article_id, reason }) {
+  const badArticleId = articleIdRefusal(article_id);
+  if (badArticleId) return toContent(badArticleId);
   const result = await apiCall(
     "POST",
     `/api/v1/articles/${article_id}/suppress`,
@@ -2323,6 +2339,8 @@ async function knowledgeSuppress({ article_id, reason }) {
 }
 
 async function knowledgeUnsuppress({ article_id }) {
+  const badArticleId = articleIdRefusal(article_id);
+  if (badArticleId) return toContent(badArticleId);
   const result = await apiCall(
     "POST",
     `/api/v1/articles/${article_id}/unsuppress`,
@@ -2334,6 +2352,8 @@ async function knowledgeUnsuppress({ article_id }) {
 
 // #331: soft-delete (archive) is agent-role KB curation, same as knowledge_archive.
 async function knowledgeDelete({ article_id }) {
+  const badArticleId = articleIdRefusal(article_id);
+  if (badArticleId) return toContent(badArticleId);
   const result = await apiCall(
     "DELETE",
     `/api/v1/articles/${article_id}`,
@@ -2813,6 +2833,8 @@ async function knowledgeCurationLog({ kind, since, limit, offset } = {}) {
 }
 
 async function knowledgeArticleStats({ article_id }) {
+  const badArticleId = articleIdRefusal(article_id, { prefix: true });
+  if (badArticleId) return toContent(badArticleId);
   const result = await apiCall(
     "GET",
     `/api/v1/knowledge/articles/${article_id}/stats`,
@@ -5950,6 +5972,10 @@ const TOOLS = [
     name: "knowledge_get",
     description:
       "Get full article content by ID. Use after search to read an article in detail. " +
+      "Pass the id as article_id; this tool also accepts it under id, the key search results " +
+      "carry it under. A missing argument, or a value that is neither a UUID nor a unique " +
+      "8+ hex-digit prefix, is refused locally with status 0 and no request is sent, so that " +
+      "refusal never means the article does not exist. " +
       "Resolves tenant-owned articles AND published system canonicals. Records a COUNTED " +
       "read (it feeds knowledge_heat_index); use knowledge_progressive_drill instead when " +
       "you are merely following an index this system just handed you. " +
@@ -9868,20 +9894,11 @@ const server = new Server(
   }
 );
 
-// The parameter names each STATIC tool declares, so the alias layer can tell a rescue from
-// an inert convenience fill. Dynamic per-tenant `cr_*` tools are absent here and fall back
-// to reporting every fill (the conservative default).
-const DECLARED_TOOL_ARGS = new Map(
-  TOOLS.map((t) => [t.name, Object.keys(t.inputSchema?.properties ?? {})]),
-);
-
-// Static tool schemas, for the required-argument check at dispatch. Generated `cr_*` tools
-// are absent and pass through to the server's own validation.
+// Static tool schemas: the alias layer reads the declared parameter names (to tell a rescue
+// from an inert convenience fill) and the required check reads `required`. Dynamic
+// per-tenant `cr_*` tools are absent and fall back to reporting every alias fill and to the
+// server's own validation.
 const TOOL_SCHEMAS = new Map(TOOLS.map((t) => [t.name, t.inputSchema]));
-
-function declaredToolArgs(name) {
-  return DECLARED_TOOL_ARGS.get(name);
-}
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Static hand-maintained tools PLUS the calling tenant's per-tenant generated
@@ -9901,18 +9918,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // fill is bidirectional, so without this a correct `knowledge_search` call carrying `q`
   // also filled `query` and logged a "rescue" — counting normal traffic, and drowning the
   // signal the count exists to carry.
-  const args = applyArgAliases(
+  const prepared = prepareToolCall(
+    name,
     request.params.arguments,
+    TOOL_SCHEMAS,
     ({ canonical, alias }) => {
       process.stderr.write(
         `[loopctl-mcp] arg alias applied: '${alias}' -> '${canonical}' on tool '${name}'\n`,
       );
     },
-    declaredToolArgs(name),
   );
-
-  const missing = missingRequiredArgs(args, TOOL_SCHEMAS.get(name));
-  if (missing.length > 0) return requiredArgsRefusal(name, missing, args);
+  if (prepared.refusal) return toContent(prepared.refusal);
+  const args = prepared.args;
 
   switch (name) {
     // Project Tools

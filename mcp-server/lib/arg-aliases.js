@@ -22,7 +22,9 @@
  *
  * CANONICAL WINS. An explicit canonical value is never overwritten, so a caller passing both
  * `q` and `query` gets exactly what it asked for. Only a missing/blank canonical is filled.
- */
+*/
+
+import { isBlank } from "./required-args.js";
 
 // BIDIRECTIONAL BY DESIGN. The 86 failures were not agents guessing wrong — this MCP
 // server's own surface is inconsistent, and `knowledge_search` is the odd one out:
@@ -66,9 +68,11 @@ const ARG_ALIASES = {
   limit: ["max_results"],
 };
 
-// DECLARATION-SCOPED aliases: applied only when the called tool declares the canonical AND
-// does not declare the alias itself. `id` cannot go in the global table above — memory_forget
-// and others declare `id` as their own parameter, and the drift guard refuses it there.
+// TOOL-SCOPED aliases, keyed by tool name. `id` cannot go in the global table above:
+// memory_forget and others declare `id` as their own parameter, and the drift guard refuses
+// it there. It is also scoped to ONE tool on purpose. The evidence below is about reads, and
+// the same alias on knowledge_archive or knowledge_delete would turn a harmless miss into a
+// terminal write against whatever id was copied from the wrong result.
 //
 // `article_id <- id` is measured, not guessed: 17 of 96 `knowledge_get` calls in this
 // machine's transcripts (2026-10-01) passed `{"id": ...}`, the key every search result
@@ -76,13 +80,10 @@ const ARG_ALIASES = {
 // and answered 404, which the agent read as "the article is gone": all 30 knowledge_get
 // 404s in loopctl's production logs for 2026-09-25..30 were that request, against 38 of 38
 // reads that carried a real id and succeeded.
-const DECLARED_SCOPED_ALIASES = {
-  article_id: ["id"],
+const TOOL_SCOPED_ALIASES = {
+  knowledge_get: { article_id: ["id"] },
 };
 
-function isBlank(v) {
-  return v === undefined || v === null || v === "";
-}
 
 /**
  * Returns a NEW args object with canonical keys filled in from any alias present.
@@ -93,7 +94,7 @@ function isBlank(v) {
  * conveniences. Omit it and every fill is reported (the conservative default for a tool
  * whose schema is not known, e.g. the per-tenant `cr_*` tools).
  */
-function applyArgAliases(args, onAliasUsed, declared) {
+function applyArgAliases(args, onAliasUsed, declared, toolName) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args;
 
   const out = { ...args };
@@ -123,8 +124,9 @@ function applyArgAliases(args, onAliasUsed, declared) {
     }
   }
 
+  const scoped = (toolName && Object.hasOwn(TOOL_SCOPED_ALIASES, toolName) && TOOL_SCOPED_ALIASES[toolName]) || {};
   if (declaredSet !== null) {
-    for (const [canonical, aliases] of Object.entries(DECLARED_SCOPED_ALIASES)) {
+    for (const [canonical, aliases] of Object.entries(scoped)) {
       if (!declaredSet.has(canonical) || !isBlank(out[canonical])) continue;
       const alias = aliases.find((a) => !declaredSet.has(a) && !isBlank(out[a]));
       if (alias === undefined) continue;
@@ -148,4 +150,4 @@ function applyArgAliases(args, onAliasUsed, declared) {
   return out;
 }
 
-export { ARG_ALIASES, DECLARED_SCOPED_ALIASES, applyArgAliases };
+export { ARG_ALIASES, TOOL_SCOPED_ALIASES, applyArgAliases };

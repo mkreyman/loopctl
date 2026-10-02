@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { applyArgAliases } from "../lib/arg-aliases.js";
+import { stripComments } from "./tool-surface.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -154,12 +155,13 @@ test("a rescue is counted only when the CALLED TOOL declares the key it filled",
   assert.deepEqual(mirrored, [{ canonical: "query", alias: "q" }]);
 });
 
-test("WIRING: the dispatch passes the called tool's declared parameters", () => {
-  // Without this argument the gate above is inert in production — the exact shape of
-  // failure (correct logic nothing calls) this investigation started from.
-  const src = readFileSync(join(here, "..", "index.js"), "utf8");
-  assert.match(src, /declaredToolArgs\(name\),/);
-  assert.match(src, /DECLARED_TOOL_ARGS = new Map\(/);
+test("WIRING: the dispatch passes the called tool's declared parameters and name", () => {
+  // Without these arguments the gate above is inert in production — the exact shape of
+  // failure (correct logic nothing calls) this investigation started from. The aliasing
+  // moved into lib/dispatch-prep.js (#942) so it can be driven with real schemas.
+  const src = stripComments(readFileSync(join(here, "..", "lib", "dispatch-prep.js"), "utf8"));
+  assert.match(src, /applyArgAliases\(rawArgs, onAliasUsed, declared, name\)/);
+  assert.match(src, /Object\.keys\(schema\.properties \?\? \{\}\)/);
 });
 
 test("the alias callback fires with the pair, so the rescue stays measurable", () => {
@@ -222,13 +224,12 @@ test("the bidirectional pair really is canonical on BOTH sides (not a rationalis
   assert.match(src, /^\s{6,}query:\s*\{\s*$/m, "expected some tool to declare `query`");
 });
 
-test("WIRING: index.js applies the aliases at the CallTool dispatch point", () => {
-  const src = readFileSync(join(here, "..", "index.js"), "utf8");
-  assert.match(src, /import \{ applyArgAliases \} from "\.\/lib\/arg-aliases\.js";/);
-  // The dispatch must alias the incoming arguments, not read request.params.arguments raw.
-  // Matches the call regardless of whether a telemetry callback is passed, but still
-  // pins that the DISPATCH ARGUMENTS are what gets aliased.
-  assert.match(src, /const args = applyArgAliases\(\s*request\.params\.arguments/);
+test("WIRING: index.js routes every call through prepareToolCall at the CallTool dispatch", () => {
+  const src = stripComments(readFileSync(join(here, "..", "index.js"), "utf8"));
+  assert.match(src, /import \{ prepareToolCall \} from "\.\/lib\/dispatch-prep\.js";/);
+  // The dispatch arguments must be what gets prepared, and `args` must come ONLY from it.
+  assert.match(src, /const prepared = prepareToolCall\(\s*name,\s*request\.params\.arguments,\s*TOOL_SCHEMAS,/);
+  assert.match(src, /^\s*if \(prepared\.refusal\) return toContent\(prepared\.refusal\);\s*\n\s*const args = prepared\.args;/m);
   assert.doesNotMatch(
     src,
     /const \{ name, arguments: args \} = request\.params;/,
