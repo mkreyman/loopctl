@@ -73,17 +73,14 @@ const ARG_ALIASES = {
 // `article_id <- id` is measured, not guessed: 17 of 96 `knowledge_get` calls in mac-mini's
 // session transcripts (2026-10-01) passed `{"id": ...}`, the key every search result and
 // index stub carries its id under, and the request went out as `/api/v1/articles/undefined`.
-// It covers the READS an agent reaches with an id copied from a result or a stub, and is
-// deliberately absent from knowledge_archive, knowledge_delete and the other write verbs:
-// there it would turn a harmless miss into a write against an id copied from the wrong row.
+// It is knowledge_get only, because that is the only tool with measured failures; per the
+// rule above, a sibling read joins when a failing call on it is observed. It is deliberately
+// absent from knowledge_archive, knowledge_delete and the other write verbs: there it would
+// turn a harmless miss into a write against an id copied from the wrong row.
 // It is a silent rescue for clients that do not validate input against the schema (Claude
 // Code does not); the schemas still declare only article_id, so nothing advertises it.
 const TOOL_SCOPED_ALIASES = {
   knowledge_get: { article_id: ["id"] },
-  knowledge_progressive_drill: { article_id: ["id"] },
-  knowledge_article_stats: { article_id: ["id"] },
-  knowledge_suggest_links: { article_id: ["id"] },
-  knowledge_graph: { article_id: ["id"] },
 };
 
 // Report a rescue. Telemetry must never break a tool call.
@@ -96,8 +93,10 @@ function reportRescue(onAliasUsed, canonical, alias) {
   }
 }
 
+// Whitespace-only is blank: it cannot name anything, and treating it as present would block
+// a rescue from a real value in the alias.
 function isBlank(v) {
-  return v === undefined || v === null || v === "";
+  return v === undefined || v === null || (typeof v === "string" && v.trim() === "");
 }
 
 /**
@@ -144,7 +143,13 @@ function applyArgAliases(args, onAliasUsed, declared, toolName) {
   for (const [canonical, aliases] of Object.entries(scoped)) {
     if (!declaredSet.has(canonical) || !isBlank(out[canonical])) continue;
     const alias = aliases.find((a) => !declaredSet.has(a) && !isBlank(out[a]));
-    if (alias === undefined) continue;
+    if (alias === undefined) {
+      // Nothing to rescue from. A blank id must not reach the path as "null" or "%20", which
+      // the server would answer with a 404: drop it, so it arrives as undefined and is refused
+      // locally before sending.
+      delete out[canonical];
+      continue;
+    }
     out[canonical] = out[alias];
     reportRescue(onAliasUsed, canonical, alias);
   }

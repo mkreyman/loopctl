@@ -1672,7 +1672,9 @@ async function knowledgeStats({ project_id }) {
 
 async function knowledgeGraph({ article_id, depth, project_id }) {
   const params = new URLSearchParams();
-  params.set("article_id", article_id);
+  // Unset rather than the string "undefined", so a missing id gets the server's own
+  // "article_id is required" instead of a UUID-format error about a value never sent.
+  if (article_id != null && article_id !== "") params.set("article_id", article_id);
   if (depth != null) params.set("depth", String(depth));
   if (project_id) params.set("project_id", project_id);
   const result = await apiCall(

@@ -26,18 +26,23 @@ const UUID = "f7e1b841-4102-4e72-83bc-81cfe4a65129";
 const call = (tool, args, seen) =>
   applyArgAliases(args, seen ? (p) => seen.push(p) : undefined, DECLARED.get(tool), tool);
 
-test("the article reads rescue {id} into article_id, and report the rescue", () => {
-  const reads = [
-    "knowledge_get",
-    "knowledge_progressive_drill",
-    "knowledge_article_stats",
-    "knowledge_suggest_links",
-    "knowledge_graph",
-  ];
-  for (const tool of reads) {
-    const seen = [];
-    assert.equal(call(tool, { id: UUID }, seen).article_id, UUID, tool);
-    assert.deepEqual(seen, [{ canonical: "article_id", alias: "id" }], tool);
+test("knowledge_get rescues {id} into article_id, and reports the rescue", () => {
+  const seen = [];
+  assert.equal(call("knowledge_get", { id: UUID }, seen).article_id, UUID);
+  assert.deepEqual(seen, [{ canonical: "article_id", alias: "id" }]);
+});
+
+test("the alias is knowledge_get only: unmeasured siblings are not silently renamed", () => {
+  for (const tool of ["knowledge_progressive_drill", "knowledge_article_stats", "knowledge_suggest_links"]) {
+    assert.equal(call(tool, { id: UUID }).article_id, undefined, tool);
+  }
+});
+
+test("a blank article_id is rescued from id, and with no id it is dropped, never sent", () => {
+  assert.equal(call("knowledge_get", { article_id: "  ", id: UUID }).article_id, UUID);
+  for (const blank of [null, "", "  "]) {
+    const out = call("knowledge_get", { article_id: blank });
+    assert.equal(Object.hasOwn(out, "article_id"), false, JSON.stringify(blank));
   }
 });
 
@@ -67,27 +72,42 @@ test("every TOOL_SCOPED_ALIASES key is a real tool declaring the canonical", () 
   }
 });
 
-test("unfilled, blank and dot segments are refused locally; filled ones and the query are not", () => {
+test("a path that would not reach its route is refused locally; the query is not checked", () => {
   for (const p of [
     "/api/v1/articles/undefined",
     "/api/v1/articles/undefined?links=none",
     "/api/v1/articles/",
     "/api/v1/articles/?links=none",
+    "/api/v1/articles/%20",
+    "/api/v1/articles/#",
+    `/api/v1/articles/${UUID}#x`,
+    "/api/v1/articles/\n",
     "/api/v1/knowledge/articles//stats",
+    "/api/v1/knowledge/articles/x#/stats",
     "/api/v1/knowledge/articles/../../stories/stats",
+    "/api/v1/knowledge/articles/%2e%2e/%2e%2e/stories/stats",
+    "/api/v1/knowledge/articles/.%2E/stats",
+    "/api/v1/knowledge/articles/..\\..\\stories/stats",
     "/api/v1/articles/./x",
   ]) {
     const r = unfilledPathRefusal(p);
-    assert.equal(r?.error, true, p);
+    assert.equal(r?.error, true, JSON.stringify(p));
     assert.equal(r.status, 0, p);
     assert.match(r.body, /never requested/);
     assert.match(r.body, /<missing>/);
     assert.doesNotMatch(r.body, /article_id/, "the guard knows no tool, so it names no parameter");
   }
-  assert.equal(unfilledPathRefusal(`/api/v1/articles/${UUID}`), null);
-  assert.equal(unfilledPathRefusal("/api/v1/knowledge/search?q=undefined"), null);
-  assert.equal(unfilledPathRefusal("/api/v1/articles/undefined-behaviour"), null);
-  assert.equal(unfilledPathRefusal("/api/v1/egress/trusted-endpoints/null"), null, "null is a value");
+  for (const p of [
+    `/api/v1/articles/${UUID}`,
+    `/api/v1/articles/${UUID}?links=none&x=undefined`,
+    "/api/v1/knowledge/search?q=undefined",
+    "/api/v1/articles/undefined-behaviour",
+    "/api/v1/egress/trusted-endpoints/null",
+    `/api/v1/custody/claims/story/${encodeURIComponent("a/b c")}`,
+    "/api/v1/retrieve/two words",
+  ]) {
+    assert.equal(unfilledPathRefusal(p), null, p);
+  }
 });
 
 test("WIRING, end to end: the real server rescues {id} and never sends an unfilled path", async () => {
@@ -143,14 +163,27 @@ test("WIRING, end to end: the real server rescues {id} and never sends an unfill
     assert.notEqual(ok.result?.isError, true, JSON.stringify(ok));
     assert.ok(seen.some((u) => u.startsWith(`/api/v1/articles/${UUID}`)), `requested ${seen}`);
 
-    for (const [rid, args] of [[3, {}], [4, { article_id: "" }], [5, { article_id: "../../stories" }]]) {
+    const refusedCalls = [
+      [3, "knowledge_get", {}],
+      [4, "knowledge_get", { article_id: null }],
+      [5, "knowledge_article_stats", { article_id: "" }],
+      [6, "knowledge_article_stats", { article_id: "%2e%2e/%2e%2e/stories" }],
+      [7, "knowledge_get", { article_id: "#" }],
+    ];
+    for (const [rid, tool, args] of refusedCalls) {
       const before = seen.length;
-      send({ id: rid, method: "tools/call", params: { name: "knowledge_article_stats", arguments: args } });
+      send({ id: rid, method: "tools/call", params: { name: tool, arguments: args } });
       const refused = await reply(rid);
       assert.equal(refused.result?.isError, true, JSON.stringify(args));
       assert.match(refused.result.content[0].text, /never requested/);
       assert.equal(seen.length, before, `nothing may be sent for ${JSON.stringify(args)}`);
     }
+
+    send({ id: 8, method: "tools/call", params: { name: "knowledge_graph", arguments: {} } });
+    await reply(8);
+    const graph = seen.find((u) => u.startsWith("/api/v1/knowledge/graph"));
+    assert.ok(graph, `graph requested: ${seen}`);
+    assert.doesNotMatch(graph, /article_id=undefined/);
   } finally {
     child.kill();
     server.close();
