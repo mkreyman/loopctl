@@ -9,15 +9,18 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
-- **`knowledge_get`, `knowledge_progressive_drill` and `knowledge_article_stats` accept
-  `id`** as well as `article_id`. Agents copy the `id` key from search results and index
-  stubs; without `article_id` the request went out as `/api/v1/articles/undefined` and the
-  server answered 404, which agents read as "the article does not exist". All 30
-  `knowledge_get` 404s in production logs for 2026-09-25..30 were that request. The write
-  verbs (archive, delete, update and the rest) do not take `id`.
-- **A request whose URL path contains an unfilled argument (`undefined` or `null`) is
-  refused before it is sent**, on every tool, with `status: 0` and a message saying the
-  target's existence is unknown. Before, it reached the server and came back as a 404.
+- **The article reads accept `id` for `article_id`**: `knowledge_get`,
+  `knowledge_progressive_drill`, `knowledge_article_stats`, `knowledge_suggest_links` and
+  `knowledge_graph`. Agents copy the `id` key from search results and index stubs; without
+  `article_id` the request went out as `/api/v1/articles/undefined` and the server answered
+  404, which agents read as "the article does not exist". All 30 `knowledge_get` 404s in
+  production logs for 2026-09-25..30 were that request. The write verbs (archive, delete,
+  update and the rest) do not take `id`. It is a silent rescue: the schemas are unchanged.
+- **A request whose URL path has an `undefined`, empty, `.` or `..` segment is refused
+  before it is sent**, on every tool, with `status: 0`. Before, `undefined` came back as a
+  404, an empty `article_id` on `knowledge_get` reached the article index and returned
+  unrelated articles as a success, and a `..` in an id could move the request to another
+  route under the same key.
 
 ## 2.112.0 — 2026-09-29 (the tenant's own GitHub token)
 

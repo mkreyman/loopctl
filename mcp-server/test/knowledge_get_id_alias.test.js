@@ -26,8 +26,15 @@ const UUID = "f7e1b841-4102-4e72-83bc-81cfe4a65129";
 const call = (tool, args, seen) =>
   applyArgAliases(args, seen ? (p) => seen.push(p) : undefined, DECLARED.get(tool), tool);
 
-test("the three reads rescue {id} into article_id, and report the rescue", () => {
-  for (const tool of ["knowledge_get", "knowledge_progressive_drill", "knowledge_article_stats"]) {
+test("the article reads rescue {id} into article_id, and report the rescue", () => {
+  const reads = [
+    "knowledge_get",
+    "knowledge_progressive_drill",
+    "knowledge_article_stats",
+    "knowledge_suggest_links",
+    "knowledge_graph",
+  ];
+  for (const tool of reads) {
     const seen = [];
     assert.equal(call(tool, { id: UUID }, seen).article_id, UUID, tool);
     assert.deepEqual(seen, [{ canonical: "article_id", alias: "id" }], tool);
@@ -60,23 +67,92 @@ test("every TOOL_SCOPED_ALIASES key is a real tool declaring the canonical", () 
   }
 });
 
-test("an unfilled path segment is refused locally; a filled one, or one in the query, is not", () => {
-  for (const p of ["/api/v1/articles/undefined", "/api/v1/articles/undefined?links=none", "/api/v1/channel/posts/null"]) {
+test("unfilled, blank and dot segments are refused locally; filled ones and the query are not", () => {
+  for (const p of [
+    "/api/v1/articles/undefined",
+    "/api/v1/articles/undefined?links=none",
+    "/api/v1/articles/",
+    "/api/v1/articles/?links=none",
+    "/api/v1/knowledge/articles//stats",
+    "/api/v1/knowledge/articles/../../stories/stats",
+    "/api/v1/articles/./x",
+  ]) {
     const r = unfilledPathRefusal(p);
     assert.equal(r?.error, true, p);
     assert.equal(r.status, 0, p);
     assert.match(r.body, /never requested/);
     assert.match(r.body, /<missing>/);
+    assert.doesNotMatch(r.body, /article_id/, "the guard knows no tool, so it names no parameter");
   }
   assert.equal(unfilledPathRefusal(`/api/v1/articles/${UUID}`), null);
   assert.equal(unfilledPathRefusal("/api/v1/knowledge/search?q=undefined"), null);
   assert.equal(unfilledPathRefusal("/api/v1/articles/undefined-behaviour"), null);
+  assert.equal(unfilledPathRefusal("/api/v1/egress/trusted-endpoints/null"), null, "null is a value");
 });
 
-test("WIRING: apiCall refuses before building the URL, and dispatch passes the tool name", () => {
-  assert.match(
-    SRC,
-    /^\s*const unfilled = unfilledPathRefusal\(path\);\n\s*if \(unfilled\) return unfilled;\n\s*const url = `\$\{getBaseUrl\(\)\}\$\{path\}`;/m,
-  );
-  assert.match(SRC, /^\s*declaredToolArgs\(name\),\n\s*name,\n\s*\);/m);
+test("WIRING, end to end: the real server rescues {id} and never sends an unfilled path", async () => {
+  const seen = [];
+  const http = await import("node:http");
+  const { spawn } = await import("node:child_process");
+  const server = http.createServer((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: { id: UUID } }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+
+  const child = spawn(process.execPath, [join(here, "..", "index.js")], {
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      LOOPCTL_SERVER: `http://127.0.0.1:${port}`,
+      LOOPCTL_AGENT_KEY: "lc_test_agent",
+      LOOPCTL_ORCH_KEY: "lc_test_orch",
+    },
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  let buf = "";
+  const replies = new Map();
+  child.stdout.on("data", (d) => {
+    buf += d;
+    let nl;
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      try {
+        const msg = JSON.parse(line);
+        if (msg.id !== undefined) replies.set(msg.id, msg);
+      } catch {}
+    }
+  });
+  const send = (msg) => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...msg }) + "\n");
+  const reply = async (id) => {
+    for (let i = 0; i < 200 && !replies.has(id); i++) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(replies.has(id), `no reply to request ${id}`);
+    return replies.get(id);
+  };
+
+  try {
+    send({ id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
+    await reply(1);
+    send({ method: "notifications/initialized" });
+
+    send({ id: 2, method: "tools/call", params: { name: "knowledge_get", arguments: { id: UUID } } });
+    const ok = await reply(2);
+    assert.notEqual(ok.result?.isError, true, JSON.stringify(ok));
+    assert.ok(seen.some((u) => u.startsWith(`/api/v1/articles/${UUID}`)), `requested ${seen}`);
+
+    for (const [rid, args] of [[3, {}], [4, { article_id: "" }], [5, { article_id: "../../stories" }]]) {
+      const before = seen.length;
+      send({ id: rid, method: "tools/call", params: { name: "knowledge_article_stats", arguments: args } });
+      const refused = await reply(rid);
+      assert.equal(refused.result?.isError, true, JSON.stringify(args));
+      assert.match(refused.result.content[0].text, /never requested/);
+      assert.equal(seen.length, before, `nothing may be sent for ${JSON.stringify(args)}`);
+    }
+  } finally {
+    child.kill();
+    server.close();
+  }
 });

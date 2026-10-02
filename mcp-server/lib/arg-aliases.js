@@ -73,14 +73,28 @@ const ARG_ALIASES = {
 // `article_id <- id` is measured, not guessed: 17 of 96 `knowledge_get` calls in mac-mini's
 // session transcripts (2026-10-01) passed `{"id": ...}`, the key every search result and
 // index stub carries its id under, and the request went out as `/api/v1/articles/undefined`.
-// It covers the three READS an agent reaches with an id copied from a result or a stub. It
-// is deliberately absent from knowledge_archive, knowledge_delete and the other write verbs:
+// It covers the READS an agent reaches with an id copied from a result or a stub, and is
+// deliberately absent from knowledge_archive, knowledge_delete and the other write verbs:
 // there it would turn a harmless miss into a write against an id copied from the wrong row.
+// It is a silent rescue for clients that do not validate input against the schema (Claude
+// Code does not); the schemas still declare only article_id, so nothing advertises it.
 const TOOL_SCOPED_ALIASES = {
   knowledge_get: { article_id: ["id"] },
   knowledge_progressive_drill: { article_id: ["id"] },
   knowledge_article_stats: { article_id: ["id"] },
+  knowledge_suggest_links: { article_id: ["id"] },
+  knowledge_graph: { article_id: ["id"] },
 };
+
+// Report a rescue. Telemetry must never break a tool call.
+function reportRescue(onAliasUsed, canonical, alias) {
+  if (typeof onAliasUsed !== "function") return;
+  try {
+    onAliasUsed({ canonical, alias });
+  } catch {
+    // swallowed on purpose
+  }
+}
 
 function isBlank(v) {
   return v === undefined || v === null || v === "";
@@ -94,6 +108,10 @@ function isBlank(v) {
  * supplied, only a fill of a declared key is reported as a rescue — the rest are inert
  * conveniences. Omit it and every fill is reported (the conservative default for a tool
  * whose schema is not known, e.g. the per-tenant `cr_*` tools).
+ *
+ * `toolName` selects that tool's TOOL_SCOPED_ALIASES. Scoped aliases need BOTH `declared` and
+ * `toolName`: without either, they are skipped, and a call relying on one (knowledge_get with
+ * `id`) reaches the handler without its canonical argument.
  */
 function applyArgAliases(args, onAliasUsed, declared, toolName) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args;
@@ -113,13 +131,7 @@ function applyArgAliases(args, onAliasUsed, declared, toolName) {
         // keeps the residual cost on the books — which only works if the count is of calls
         // that WOULD HAVE FAILED, hence the `declared` gate.
         const rescued = declaredSet === null || declaredSet.has(canonical);
-        if (rescued && typeof onAliasUsed === "function") {
-          try {
-            onAliasUsed({ canonical, alias });
-          } catch {
-            // Telemetry must never break a tool call.
-          }
-        }
+        if (rescued) reportRescue(onAliasUsed, canonical, alias);
         break;
       }
     }
@@ -134,13 +146,7 @@ function applyArgAliases(args, onAliasUsed, declared, toolName) {
     const alias = aliases.find((a) => !declaredSet.has(a) && !isBlank(out[a]));
     if (alias === undefined) continue;
     out[canonical] = out[alias];
-    if (typeof onAliasUsed === "function") {
-      try {
-        onAliasUsed({ canonical, alias });
-      } catch {
-        // Telemetry must never break a tool call.
-      }
-    }
+    reportRescue(onAliasUsed, canonical, alias);
   }
 
   // Some callers send a numeric arg as a string ("6"). Coerce so downstream validation and

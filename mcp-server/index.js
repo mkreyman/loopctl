@@ -5929,9 +5929,7 @@ const TOOLS = [
         article_id: {
           type: "string",
           format: "uuid",
-          description:
-            "The UUID of the article to open (from a progressive index stub). Also accepted " +
-            "under id, the key stubs carry it under.",
+          description: "The UUID of the article to open (from a progressive index stub).",
         },
         body_max_bytes: {
           type: "integer",
@@ -5954,8 +5952,6 @@ const TOOLS = [
     name: "knowledge_get",
     description:
       "Get full article content by ID. Use after search to read an article in detail. " +
-      "Pass the id as article_id; this tool also accepts it under id, the key search results " +
-      "carry it under. " +
       "Resolves tenant-owned articles AND published system canonicals. Records a COUNTED " +
       "read (it feeds knowledge_heat_index); use knowledge_progressive_drill instead when " +
       "you are merely following an index this system just handed you. " +
@@ -8099,9 +8095,7 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          description:
-            "The UUID of the article to inspect. Also accepted under id, the key search " +
-            "results carry it under.",
+          description: "The UUID of the article to inspect.",
         },
       },
       required: ["article_id"],
