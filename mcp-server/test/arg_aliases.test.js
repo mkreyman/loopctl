@@ -160,8 +160,8 @@ test("WIRING: the dispatch passes the called tool's declared parameters and name
   // failure (correct logic nothing calls) this investigation started from. The aliasing
   // moved into lib/dispatch-prep.js (#942) so it can be driven with real schemas.
   const src = stripComments(readFileSync(join(here, "..", "lib", "dispatch-prep.js"), "utf8"));
-  assert.match(src, /applyArgAliases\(rawArgs, onAliasUsed, declared, name\)/);
-  assert.match(src, /Object\.keys\(schema\.properties \?\? \{\}\)/);
+  assert.match(src, /applyArgAliases\(given, onAliasUsed, declaredFor\(schema\), name\)/);
+  assert.match(src, /new Set\(Object\.keys\(schema\.properties \?\? \{\}\)\)/);
 });
 
 test("the alias callback fires with the pair, so the rescue stays measurable", () => {

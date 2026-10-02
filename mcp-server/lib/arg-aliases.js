@@ -70,9 +70,10 @@ const ARG_ALIASES = {
 
 // TOOL-SCOPED aliases, keyed by tool name. `id` cannot go in the global table above:
 // memory_forget and others declare `id` as their own parameter, and the drift guard refuses
-// it there. It is also scoped to ONE tool on purpose. The evidence below is about reads, and
-// the same alias on knowledge_archive or knowledge_delete would turn a harmless miss into a
-// terminal write against whatever id was copied from the wrong result.
+// it there. It is also scoped to the READS on purpose: knowledge_get, and the two sibling
+// reads agents reach by following a stub that carries `id` (knowledge_progressive_drill,
+// knowledge_article_stats). The same alias on knowledge_archive or knowledge_delete would
+// turn a harmless miss into a terminal write against an id copied from the wrong result.
 //
 // `article_id <- id` is measured, not guessed: 17 of 96 `knowledge_get` calls in this
 // machine's transcripts (2026-10-01) passed `{"id": ...}`, the key every search result
@@ -82,6 +83,8 @@ const ARG_ALIASES = {
 // reads that carried a real id and succeeded.
 const TOOL_SCOPED_ALIASES = {
   knowledge_get: { article_id: ["id"] },
+  knowledge_progressive_drill: { article_id: ["id"] },
+  knowledge_article_stats: { article_id: ["id"] },
 };
 
 
@@ -98,7 +101,7 @@ function applyArgAliases(args, onAliasUsed, declared, toolName) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args;
 
   const out = { ...args };
-  const declaredSet = declared ? new Set(declared) : null;
+  const declaredSet = declared ? (declared instanceof Set ? declared : new Set(declared)) : null;
 
   for (const [canonical, aliases] of Object.entries(ARG_ALIASES)) {
     if (!isBlank(out[canonical])) continue;

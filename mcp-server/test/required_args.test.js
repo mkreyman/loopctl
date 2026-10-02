@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { applyArgAliases } from "../lib/arg-aliases.js";
 import { isBlank, missingRequiredArgs } from "../lib/required-args.js";
 import { prepareToolCall } from "../lib/dispatch-prep.js";
-import { articleIdRefusal } from "../lib/article-id.js";
+import { ARTICLE_PATH_ID_TOOLS } from "../lib/article-id.js";
 import { loadTools, stripComments } from "./tool-surface.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -42,7 +42,15 @@ test("an explicit article_id wins over id", () => {
   assert.equal(args.article_id, UUID);
 });
 
-test("the id alias is knowledge_get ONLY: terminal verbs never act on a copied id", () => {
+test("the id alias covers the three reads, and only them", () => {
+  for (const tool of ["knowledge_progressive_drill", "knowledge_article_stats"]) {
+    const { args, refusal } = prepareToolCall(tool, { id: UUID }, SCHEMAS);
+    assert.equal(refusal, undefined, `${tool} must rescue {id}`);
+    assert.equal(args.article_id, UUID);
+  }
+});
+
+test("terminal verbs never act on a copied id", () => {
   for (const tool of ["knowledge_archive", "knowledge_delete", "knowledge_unpublish", "knowledge_update"]) {
     assert.ok(SCHEMAS.get(tool)?.properties?.article_id, `${tool} must declare article_id`);
     const { args, refusal } = prepareToolCall(tool, { id: UUID }, SCHEMAS);
@@ -94,34 +102,60 @@ test("a generated cr_* tool is not checked locally", () => {
   assert.deepEqual(args, {});
 });
 
-test("article ids: strict UUID by default, a unique prefix only where the server resolves one", () => {
-  assert.equal(articleIdRefusal(UUID), null);
-  assert.equal(articleIdRefusal("f7e1b841")?.status, 0, "archive-class verbs take a full UUID");
-  assert.equal(articleIdRefusal(UUID, { prefix: true }), null);
-  assert.equal(articleIdRefusal("f7e1b841", { prefix: true }), null);
-  assert.equal(articleIdRefusal("f7e1b841-41", { prefix: true }), null);
-  for (const bad of ["f7e1b84", "chain-of-custody", "../system", "[object Object]", 42]) {
-    const r = articleIdRefusal(bad, { prefix: true });
-    assert.equal(r?.status, 0, `${JSON.stringify(bad)} must be refused locally`);
-    assert.doesNotMatch(String(r.body), /chain-of-custody|\.\.\/system/, "never echo the value");
+test("no arguments at all reaches a handler as {}, never undefined", () => {
+  for (const raw of [undefined, null, "x", [1]]) {
+    const { args, refusal } = prepareToolCall("knowledge_heat_index", raw, SCHEMAS);
+    assert.equal(refusal, undefined);
+    assert.deepEqual(args, {});
   }
 });
 
-test("WIRING: every handler that puts article_id in a path checks it first", () => {
-  const prefix = ["knowledgeGet", "knowledgeProgressiveDrill", "knowledgeArticleStats"];
-  const strict = [
-    "knowledgeSuggestLinks", "knowledgeUpdate", "knowledgePublish", "knowledgeUnpublish",
-    "knowledgeArchive", "knowledgeSuppress", "knowledgeUnsuppress", "knowledgeDelete",
-  ];
-  for (const fn of [...prefix, ...strict]) {
-    const start = SRC.indexOf(`async function ${fn}(`);
-    assert.notEqual(start, -1, fn);
-    const body = SRC.slice(start, SRC.indexOf("\nasync function ", start + 10));
-    const opt = prefix.includes(fn) ? ", \\{ prefix: true \\}" : "";
-    assert.match(
-      body,
-      new RegExp(`^  const badArticleId = articleIdRefusal\\(article_id${opt}\\);\\n  if \\(badArticleId\\) return toContent\\(badArticleId\\);`, "m"),
-      `${fn} must refuse a malformed article_id before its request`,
-    );
+test("article ids: a full UUID everywhere, a prefix only where the server resolves one", () => {
+  const ok = (tool, id) => prepareToolCall(tool, { article_id: id, reason: "r" }, SCHEMAS);
+  assert.equal(ok("knowledge_get", UUID).args.article_id, UUID);
+  assert.equal(ok("knowledge_get", "f7e1b841").args.article_id, "f7e1b841");
+  assert.equal(ok("knowledge_progressive_drill", "f7e1b841-41").args.article_id, "f7e1b841-41");
+  assert.equal(ok("knowledge_archive", UUID).args.article_id, UUID);
+  const r = ok("knowledge_archive", "f7e1b841").refusal;
+  assert.equal(r?.status, 0, "write verbs take a full UUID");
+  assert.match(r.body, /full article UUID/);
+  for (const bad of ["f7e1b84", "chain-of-custody", "../system", "[object Object]"]) {
+    const refused = ok("knowledge_get", bad).refusal;
+    assert.equal(refused?.status, 0, `${JSON.stringify(bad)} must be refused locally`);
+    assert.doesNotMatch(refused.body, /chain-of-custody|\.\.\/system/, "never echo the value");
+  }
+});
+
+test("a padded id is trimmed and used, not refused", () => {
+  const { args, refusal } = prepareToolCall("knowledge_get", { article_id: ` ${UUID}\n` }, SCHEMAS);
+  assert.equal(refusal, undefined);
+  assert.equal(args.article_id, UUID);
+});
+
+test("a supplied non-string id is told its type, never that it is missing", () => {
+  const { refusal } = prepareToolCall("knowledge_archive", { article_id: 42 }, SCHEMAS);
+  assert.equal(refusal.status, 0);
+  assert.match(refusal.body, /must be a string id; got a number/);
+  assert.doesNotMatch(refusal.body, /required/);
+});
+
+test("COMPLETENESS: every handler that puts article_id in a URL path is in ARTICLE_PATH_ID_TOOLS", () => {
+  // The check runs at dispatch from the table, so a new handler is covered only by an entry.
+  const handlerTool = new Map();
+  for (const m of SRC.matchAll(/case "([a-z_]+)":\s*\n\s*return await (\w+)\(args\);/g)) {
+    handlerTool.set(m[2], m[1]);
+  }
+  const interpolating = [];
+  for (const m of SRC.matchAll(/\nasync function (\w+)\(/g)) {
+    const start = m.index + 1;
+    const end = SRC.indexOf("\nasync function ", start + 10);
+    const body = SRC.slice(start, end === -1 ? undefined : end);
+    if (/`[^`]*\/\$\{article_id\}/.test(body)) interpolating.push(m[1]);
+  }
+  assert.ok(interpolating.length > 0, "the scan must find the article handlers");
+  for (const fn of interpolating) {
+    const tool = handlerTool.get(fn);
+    assert.ok(tool, `${fn} interpolates article_id but no tool dispatches to it`);
+    assert.ok(Object.hasOwn(ARTICLE_PATH_ID_TOOLS, tool), `${tool} (${fn}) puts article_id in a path without a dispatch check`);
   }
 });
