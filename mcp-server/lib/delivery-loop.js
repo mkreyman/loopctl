@@ -111,15 +111,23 @@ function refuse(body) {
  * into the transcript.
  */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PREFIX_RE = /^[0-9a-f]{8}$/i;
 
-export function uuid(value, field) {
+// `prefix: true` also accepts exactly the first 8 hex digits, for the one read whose server
+// path resolves an id prefix (`Knowledge.get_article/3`, #652, via knowledge_get). The server
+// matches on those 8 digits only, so a longer partial id is refused here rather than silently
+// resolving to whichever article owns its first 8.
+export function uuid(value, field, { prefix = false } = {}) {
   if (typeof value !== "string" || value.trim() === "") {
     return refuse(`\`${field}\` is required.`);
   }
 
+  if (prefix && PREFIX_RE.test(value)) return null;
+
   if (!UUID_RE.test(value)) {
     return refuse(
-      `\`${field}\` must be a UUID (8-4-4-4 hex digits then 12, lowercase or upper). ` +
+      `\`${field}\` must be a UUID (8-4-4-4 hex digits then 12, lowercase or upper)` +
+        (prefix ? " or its first 8 hex digits. " : ". ") +
         `Got a ${value.length}-character string that is not one. The value is not repeated ` +
         `here: a malformed id is often something pasted into the wrong argument, and a tool ` +
         `result lands in the transcript.`,

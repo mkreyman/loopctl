@@ -15,6 +15,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import path from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
+import { uuid } from "./lib/delivery-loop.js";
 import { clientContextHeader } from "./lib/client-context.js";
 import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { degradedSearchNotice } from "./lib/search-notices.js";
@@ -1942,6 +1943,11 @@ async function knowledgeGet({
   body_max_bytes,
   body_offset,
 }) {
+  // A missing id went out as /api/v1/articles/undefined and a malformed one as whatever it
+  // spelled ('', '#', '..', 'x?y' each reach a different route), and the server's answer read
+  // as "this article does not exist". Refused here with status 0, before any request.
+  const badId = uuid(article_id, "article_id", { prefix: true });
+  if (badId) return toContent(badId);
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
@@ -9904,6 +9910,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       );
     },
     declaredToolArgs(name),
+    name,
   );
 
   switch (name) {

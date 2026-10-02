@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.113.0 — 2026-10-01 (knowledge_get stops reporting real articles as missing)
+
+### Fixed
+
+- **`knowledge_get` accepts `id` for `article_id`.** Agents copy the `id` key from search
+  results; without `article_id` the request went out as `/api/v1/articles/undefined` and the
+  server answered 404, which agents read as "the article does not exist". All 30
+  `knowledge_get` 404s in production logs for 2026-09-25..30 were that request. It is a
+  silent rescue: the schema is unchanged, and no write verb takes `id`.
+- **`knowledge_get` checks `article_id` before sending**: a full UUID, or exactly its first 8
+  hex digits (the prefix the server resolves). Anything else, including a missing, blank or
+  `null` id, is refused with `status: 0` and the value is not echoed. Before, it was sent as
+  spelled: `''` reached the article index and returned unrelated articles as a success, and
+  `#`, `?` or `..` reached other routes. `uuid()` in `lib/delivery-loop.js` gains the
+  `prefix` option for this; its other callers are unchanged.
+
 ## 2.112.0 — 2026-09-29 (the tenant's own GitHub token)
 
 - New tools `github_credential`, `set_github_credential` and `clear_github_credential`
