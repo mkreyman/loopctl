@@ -6,60 +6,71 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   `SET LOCAL hnsw.ef_search` on its own transaction (never at the default, so a
   role-level `ALTER ROLE ... SET hnsw.ef_search` is honored, not shadowed).
 
-  ## Why `async: false` (deliberate, not an oversight)
+  ## Its own config and its own probe verdict
 
-  `hnsw_ef_search/0` reads `SystemConfig.get_int("hnsw_ef_search", ...)`, which reads the
-  VM-global `:persistent_term` key `{Loopctl.SystemConfig, "hnsw_ef_search"}`. The tests
-  below PRIME that key to a non-default value (see `prime_ef_search/1`). That key is the
-  SAME global read by every `@ann_endpoint` heavy read fleet-wide — including the REAL
-  ANN reads in the `async: true` files `test/loopctl/memory/dual_index_recall_test.exs`
-  and `test/loopctl/knowledge/vector_search_test.exs`. Priming it from an `async: true`
-  module would let a concurrently-running cross-file ANN reader observe the primed value
-  and emit a different `SET LOCAL hnsw.ef_search` in its own transaction — an
-  async-global-state flake. The `[1, 1000]` clamp in `hnsw_ef_search/0` does NOT provide
-  cross-test isolation: it only prevents pgvector from RAISING on an out-of-range GUC; a
-  primed in-range value still bleeds into a concurrent reader's recall breadth. So these
-  persistent_term-mutating tests live here, isolated: a non-async module never runs
-  concurrently with any other module (`ExUnit.Case` `:async` docs), so no ANN reader is
-  running while the global is primed. The purely-structural sibling assertions on the
-  same wrapper stay in the `async: true` `HeavyReadTest`.
+  Every test reads the live tunables from a `SystemConfig` namespace of its own and the
+  iterative-scan capability verdict from a probe namespace of its own, handed to
+  `HeavyRead.opts/2`, `hnsw_ef_search/1`, `hnsw_iterative_scan/1`, `hnsw_max_scan_tuples/1`
+  and `iterative_scan_supported?/1`. A value primed here therefore reaches only the read
+  this test builds — never a concurrent ANN reader's `SET LOCAL`, which is what kept this
+  module sync while the primes went to the node-wide keys. The response-meta disclosure
+  tests that go through `Knowledge`/`Memory` reads, which build their opts from the
+  node-wide keys, live in `Loopctl.HeavyReadAnnDisclosureTest`.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
-  alias Loopctl.Embeddings
   alias Loopctl.HeavyRead
-  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
-  alias Loopctl.Memory
 
   import Ecto.Query
-  import ExUnit.CaptureLog
+  import Loopctl.OwnLog, only: [capture_own_log: 1]
 
   setup :verify_on_exit!
+
+  # The namespaces this test reads its tunables and its probe verdict from, kept in the
+  # test process so the helpers below need no context threading. Every key under either
+  # is erased on exit.
+  setup do
+    cache = {Loopctl.SystemConfig, make_ref()}
+    probe = {HeavyRead, make_ref()}
+    Process.put(:heavy_read_test_namespaces, {cache, probe})
+
+    on_exit(fn ->
+      for {key, _value} <- :persistent_term.get(),
+          is_tuple(key) and tuple_size(key) > 0 and elem(key, 0) in [cache, probe],
+          do: :persistent_term.erase(key)
+    end)
+
+    :ok
+  end
+
+  defp cache, do: elem(Process.get(:heavy_read_test_namespaces), 0)
+  defp probe, do: elem(Process.get(:heavy_read_test_namespaces), 1)
+  defp config, do: [system_config: cache(), probe_cache: probe()]
 
   describe "per-query hnsw.ef_search (US-38.4, TC-38.4.1 query side)" do
     test "opts/1 attaches :hnsw_ef_search for ANN endpoints ONLY on a non-default value" do
       # At the pgvector default (40) NO ef_search key is attached — so an unconditional
       # SET LOCAL never shadows a role-level `ALTER ROLE SET hnsw.ef_search` (US-38.4 review).
-      assert HeavyRead.hnsw_ef_search() == 40, "precondition: default config"
+      assert HeavyRead.hnsw_ef_search(cache()) == 40, "precondition: default config"
 
       for endpoint <- HeavyRead.ann_endpoints() do
-        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_ef_search),
+        refute Keyword.has_key?(HeavyRead.opts(endpoint, config()), :hnsw_ef_search),
                "expected #{endpoint} opts to carry NO :hnsw_ef_search at the default"
       end
 
       # A non-default SystemConfig value → every ANN endpoint carries it (the fleet-wide
       # override), and every non-ANN endpoint still never does.
       prime_ef_search(100)
-      assert HeavyRead.hnsw_ef_search() == 100
+      assert HeavyRead.hnsw_ef_search(cache()) == 100
 
       for endpoint <- HeavyRead.ann_endpoints() do
-        assert Keyword.get(HeavyRead.opts(endpoint), :hnsw_ef_search) == 100,
+        assert Keyword.get(HeavyRead.opts(endpoint, config()), :hnsw_ef_search) == 100,
                "expected non-default #{endpoint} opts to carry :hnsw_ef_search = 100"
       end
 
       for endpoint <- HeavyRead.known_endpoints() -- HeavyRead.ann_endpoints() do
-        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_ef_search),
+        refute Keyword.has_key?(HeavyRead.opts(endpoint, config()), :hnsw_ef_search),
                "expected non-ANN #{endpoint} opts to NOT carry :hnsw_ef_search"
       end
     end
@@ -80,7 +91,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end
 
     test "hnsw_ef_search/0 reads the SystemConfig default (40)" do
-      assert HeavyRead.hnsw_ef_search() == 40
+      assert HeavyRead.hnsw_ef_search(cache()) == 40
     end
 
     test "hnsw_ef_search/0 clamps an out-of-range SystemConfig value into [1, 1000]" do
@@ -88,16 +99,20 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # read), so the max(1) |> min(1000) clamp is load-bearing for availability. Exercise
       # both bounds AND the interior via the live-tunable SystemConfig cache.
       prime_ef_search(5_000)
-      assert HeavyRead.hnsw_ef_search() == 1_000, "above-range value clamps to the max bound"
+
+      assert HeavyRead.hnsw_ef_search(cache()) == 1_000,
+             "above-range value clamps to the max bound"
 
       prime_ef_search(0)
-      assert HeavyRead.hnsw_ef_search() == 1, "zero clamps to the min bound"
+      assert HeavyRead.hnsw_ef_search(cache()) == 1, "zero clamps to the min bound"
 
       prime_ef_search(-5)
-      assert HeavyRead.hnsw_ef_search() == 1, "a negative value clamps to the min bound"
+      assert HeavyRead.hnsw_ef_search(cache()) == 1, "a negative value clamps to the min bound"
 
       prime_ef_search(100)
-      assert HeavyRead.hnsw_ef_search() == 100, "an in-range value passes through unclamped"
+
+      assert HeavyRead.hnsw_ef_search(cache()) == 100,
+             "an in-range value passes through unclamped"
     end
 
     test "an ANN heavy read issues SET LOCAL hnsw.ef_search for a non-default value" do
@@ -107,7 +122,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       captured =
         Loopctl.PlanAssertions.capture_repo_queries(fn ->
-          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search))
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search, config()))
         end)
 
       sqls = Enum.map(captured, fn {sql, _params} -> sql end)
@@ -117,13 +132,13 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end
 
     test "an ANN heavy read at the default value issues NO SET LOCAL hnsw.ef_search (ALTER ROLE preserved)" do
-      assert HeavyRead.hnsw_ef_search() == 40, "precondition: default config"
+      assert HeavyRead.hnsw_ef_search(cache()) == 40, "precondition: default config"
       tenant = fixture(:tenant)
       q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
 
       captured =
         Loopctl.PlanAssertions.capture_repo_queries(fn ->
-          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search))
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search, config()))
         end)
 
       sqls = Enum.map(captured, fn {sql, _params} -> sql end)
@@ -141,7 +156,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       captured =
         Loopctl.PlanAssertions.capture_repo_queries(fn ->
-          HeavyRead.all(tenant.id, q, HeavyRead.opts(:change_feed))
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:change_feed, config()))
         end)
 
       sqls = Enum.map(captured, fn {sql, _params} -> sql end)
@@ -156,26 +171,26 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # Prime 0 EXPLICITLY rather than relying on the ambient default, so the mapping
       # contract is pinned independently of what the shipped default happens to be.
       prime_iterative_scan(0)
-      assert HeavyRead.hnsw_iterative_scan() == "off", "explicit 0 => off"
+      assert HeavyRead.hnsw_iterative_scan(cache()) == "off", "explicit 0 => off"
 
       prime_iterative_scan(1)
-      assert HeavyRead.hnsw_iterative_scan() == "relaxed_order"
+      assert HeavyRead.hnsw_iterative_scan(cache()) == "relaxed_order"
 
       prime_iterative_scan(2)
-      assert HeavyRead.hnsw_iterative_scan() == "strict_order"
+      assert HeavyRead.hnsw_iterative_scan(cache()) == "strict_order"
 
       prime_iterative_scan(99)
-      assert HeavyRead.hnsw_iterative_scan() == "off", "an unknown code falls back to off"
+      assert HeavyRead.hnsw_iterative_scan(cache()) == "off", "an unknown code falls back to off"
     end
 
     test "hnsw_max_scan_tuples/0 reads the pgvector default and clamps out-of-range" do
-      assert HeavyRead.hnsw_max_scan_tuples() == 20_000, "default"
+      assert HeavyRead.hnsw_max_scan_tuples(cache()) == 20_000, "default"
 
       prime_max_scan_tuples(5_000_000)
-      assert HeavyRead.hnsw_max_scan_tuples() == 1_000_000, "above-range clamps to max"
+      assert HeavyRead.hnsw_max_scan_tuples(cache()) == 1_000_000, "above-range clamps to max"
 
       prime_max_scan_tuples(0)
-      assert HeavyRead.hnsw_max_scan_tuples() == 1, "zero clamps to min"
+      assert HeavyRead.hnsw_max_scan_tuples(cache()) == 1, "zero clamps to min"
     end
 
     test "opts/1 attaches :hnsw_iterative_scan for ANN endpoints ONLY when enabled" do
@@ -184,19 +199,20 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       prime_iterative_scan(0)
 
       for endpoint <- HeavyRead.ann_endpoints() do
-        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_iterative_scan),
+        refute Keyword.has_key?(HeavyRead.opts(endpoint, config()), :hnsw_iterative_scan),
                "expected #{endpoint} opts to carry NO :hnsw_iterative_scan at OFF"
       end
 
       prime_iterative_scan(1)
 
       for endpoint <- HeavyRead.ann_endpoints() do
-        assert Keyword.get(HeavyRead.opts(endpoint), :hnsw_iterative_scan) == "relaxed_order",
+        assert Keyword.get(HeavyRead.opts(endpoint, config()), :hnsw_iterative_scan) ==
+                 "relaxed_order",
                "expected enabled ANN #{endpoint} opts to carry :hnsw_iterative_scan"
       end
 
       for endpoint <- HeavyRead.known_endpoints() -- HeavyRead.ann_endpoints() do
-        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_iterative_scan),
+        refute Keyword.has_key?(HeavyRead.opts(endpoint, config()), :hnsw_iterative_scan),
                "expected non-ANN #{endpoint} opts to NOT carry :hnsw_iterative_scan"
       end
     end
@@ -209,7 +225,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       sqls =
         Loopctl.PlanAssertions.capture_repo_queries(fn ->
-          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search))
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search, config()))
         end)
         |> Enum.map(fn {sql, _params} -> sql end)
 
@@ -231,13 +247,13 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # These assertions are the compensating coverage `config/test.exs` cites for the OFF
       # path — if this test moves, update that citation.
       prime_iterative_scan(0)
-      assert HeavyRead.hnsw_iterative_scan() == "off", "precondition: OFF"
+      assert HeavyRead.hnsw_iterative_scan(cache()) == "off", "precondition: OFF"
       tenant = fixture(:tenant)
       q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
 
       sqls =
         Loopctl.PlanAssertions.capture_repo_queries(fn ->
-          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search))
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:vector_search, config()))
         end)
         |> Enum.map(fn {sql, _params} -> sql end)
 
@@ -252,7 +268,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       sqls =
         Loopctl.PlanAssertions.capture_repo_queries(fn ->
-          HeavyRead.all(tenant.id, q, HeavyRead.opts(:change_feed))
+          HeavyRead.all(tenant.id, q, HeavyRead.opts(:change_feed, config()))
         end)
         |> Enum.map(fn {sql, _params} -> sql end)
 
@@ -281,7 +297,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # (that iterative scan CAN be enabled) is real, not assumed.
       clear_iterative_scan_probe_cache()
 
-      assert HeavyRead.iterative_scan_supported?(), """
+      assert HeavyRead.iterative_scan_supported?(probe()), """
       The live pgvector capability probe did NOT report >= 0.8 against the test database.
 
       Either the backend's pgvector is too old (CI must run the pgvector/pgvector:pg16
@@ -300,7 +316,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       prime_iterative_scan_supported(false)
 
       for endpoint <- HeavyRead.ann_endpoints() do
-        refute Keyword.has_key?(HeavyRead.opts(endpoint), :hnsw_iterative_scan),
+        refute Keyword.has_key?(HeavyRead.opts(endpoint, config()), :hnsw_iterative_scan),
                "expected #{endpoint} to carry NO :hnsw_iterative_scan on an unsupported backend"
       end
     end
@@ -310,7 +326,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # operator's lever forever, and a stale `true` must not outlive a backend change.
       prime_expired_iterative_scan_supported(false)
 
-      assert HeavyRead.iterative_scan_supported?(),
+      assert HeavyRead.iterative_scan_supported?(probe()),
              "expected an expired cache entry to re-probe the live backend"
     end
   end
@@ -327,17 +343,17 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # disclosure must describe the read that ran, and a lookalike could drift from it.
       prime_iterative_scan(0)
 
-      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search)) ==
+      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search, config())) ==
                %{ann_iterative_scan: "off"}
 
       prime_iterative_scan(1)
       prime_iterative_scan_supported(true)
 
-      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search)) ==
+      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search, config())) ==
                %{ann_iterative_scan: "applied"}
 
       prime_iterative_scan_supported(false)
-      degraded = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
+      degraded = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search, config()))
 
       assert degraded.ann_iterative_scan == "unavailable"
       assert degraded.ann_iterative_scan_reason =~ "capability probe"
@@ -346,7 +362,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       # A NON-ANN endpoint's opts never carry the state, and a read that cannot touch the
       # HNSW index must not emit a degradation warning about it.
-      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:enumeration)) == %{}
+      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:enumeration, config())) == %{}
     end
 
     test "a CONCLUSIVELY unsupported backend is not reported as a self-healing blip" do
@@ -357,7 +373,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       prime_iterative_scan(1)
       prime_iterative_scan_supported(false, :conclusive)
 
-      unsupported = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
+      unsupported = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search, config()))
 
       assert unsupported.ann_iterative_scan == "unavailable"
       assert unsupported.ann_iterative_scan_reason =~ "does NOT support it"
@@ -375,32 +391,12 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       prime_last_conclusive(false)
       prime_iterative_scan_supported(false, :reused)
 
-      reused = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
+      reused = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search, config()))
 
       assert reused.ann_iterative_scan == "unavailable"
       assert reused.ann_iterative_scan_reason =~ "capability probe"
       assert reused.ann_iterative_scan_reason =~ "self-heals"
       refute reused.ann_iterative_scan_reason =~ "does NOT support it"
-    end
-
-    test "the LEGACY semantic response meta carries the disclosure, both states" do
-      tenant = fixture(:tenant)
-      refute Embeddings.side_table_reads_enabled?(), "precondition: legacy read path"
-
-      prime_iterative_scan(1)
-      prime_iterative_scan_supported(false)
-
-      assert {:ok, %{meta: degraded}} = Knowledge.search_semantic(tenant.id, test_vec(1536))
-      assert degraded.ann_iterative_scan == "unavailable"
-      assert degraded.ann_iterative_scan_reason =~ "may be missing from these results"
-
-      prime_iterative_scan_supported(true)
-
-      assert {:ok, %{meta: healthy}} = Knowledge.search_semantic(tenant.id, test_vec(1536))
-      assert healthy.ann_iterative_scan == "applied"
-
-      refute Map.has_key?(healthy, :ann_iterative_scan_reason),
-             "a healthy read states the state and adds no degradation prose"
     end
 
     test "warn_if_ann_degraded/2 logs an ENVELOPE-LESS degraded read once per window" do
@@ -410,192 +406,43 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # it FIRES on `unavailable`, and it is SILENT on the repeat and on a healthy read.
       prime_iterative_scan(1)
       prime_iterative_scan_supported(false)
-      opts = HeavyRead.opts(:novelty)
+      opts = HeavyRead.opts(:novelty, config())
       path = "test.ann_write_#{System.unique_integer([:positive])}"
 
       on_exit(fn ->
         :persistent_term.erase({HeavyRead, :iterative_scan_warned, {:degraded_ann_write, path}})
       end)
 
-      first = capture_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts) end)
+      # Only this test's own lines: `capture_log/1` collects every process's, and a
+      # concurrent test's warning would break the `== ""` halves.
+
+      first = capture_own_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts) end)
       assert first =~ "#{path} ran WITHOUT hnsw.iterative_scan"
 
-      assert capture_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts) end) == "",
+      assert capture_own_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts) end) == "",
              "a standing degradation must warn on a window, not once per write"
 
       prime_iterative_scan_supported(true)
 
-      assert capture_log(fn ->
-               HeavyRead.warn_if_ann_degraded("#{path}_healthy", HeavyRead.opts(:novelty))
+      assert capture_own_log(fn ->
+               HeavyRead.warn_if_ann_degraded(
+                 "#{path}_healthy",
+                 HeavyRead.opts(:novelty, config())
+               )
              end) == "",
              "a healthy read has nothing to warn about"
     end
-
-    test "the SUGGESTED-LINKS meta discloses, and the no-embedding short-circuit does not" do
-      # `:suggested_links` is an ANN endpoint whose meta already flags one incompleteness
-      # cause (`recall_truncated` = the anti-join cutting a FULL pool) and could not name
-      # the other: an index batch that never reached this tenant's rows reads as
-      # `recall_truncated: false` plus a short list, i.e. "this article has no neighbours".
-      # Both halves are pinned — the merge onto a REAL read, and its absence on the
-      # short-circuit that runs no vector read at all.
-      tenant = fixture(:tenant)
-      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
-
-      prime_iterative_scan(1)
-      prime_iterative_scan_supported(false)
-
-      assert {:ok, [], bare} = Knowledge.suggest_links_with_meta(tenant.id, article.id)
-
-      refute Map.has_key?(bare, :ann_iterative_scan),
-             "the no-embedding short-circuit runs no vector read and must say nothing"
-
-      {:ok, _} = Knowledge.update_embedding(tenant.id, article.id, test_vec(1536))
-
-      assert {:ok, _suggestions, meta} =
-               Knowledge.suggest_links_with_meta(tenant.id, article.id)
-
-      assert meta.ann_iterative_scan == "unavailable"
-      assert meta.ann_iterative_scan_reason =~ "may be missing from these results"
-
-      prime_iterative_scan_supported(true)
-
-      assert {:ok, _suggestions, healthy} =
-               Knowledge.suggest_links_with_meta(tenant.id, article.id)
-
-      assert healthy.ann_iterative_scan == "applied"
-    end
-
-    test "the SIDE-TABLE semantic response meta carries the disclosure too" do
-      tenant = fixture(:tenant)
-      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
-      assert Embeddings.side_table_reads_enabled?(), "precondition: side-table read path"
-
-      prime_iterative_scan(1)
-      prime_iterative_scan_supported(false)
-
-      assert {:ok, %{meta: meta}} = Knowledge.search_semantic(tenant.id, test_vec(1536))
-      assert meta.ann_iterative_scan == "unavailable"
-    end
   end
 
-  describe "iterative-scan DISCLOSURE on AGENT MEMORY recall (#634)" do
-    # `Memory.recall/2` runs the SAME `:memory_recall` ANN through the same `HeavyRead`,
-    # with the same post-index residual filter — and disclosed nothing, so an
-    # under-returning recall was indistinguishable from a complete one. That is the
-    # condition #631 removed from knowledge search, on the surface where a short recall is
-    # LEAST likely to be noticed: nothing downstream cross-checks it, and `underfilled`
-    # is already true for a genuinely sparse scope.
-    test "the semantic recall meta carries the disclosure, both states" do
-      scope = fixture(:memory_scope)
-      Knowledge.reset_circuit_breaker(scope.tenant_id)
-      {:ok, _} = Memory.remember(scope, %{tier: :long_term, text: "ecto multi is atomic"})
+  defp probe_cache_key, do: {probe(), :iterative_scan_supported}
+  defp last_conclusive_key, do: {probe(), :iterative_scan_last_conclusive}
 
-      prime_iterative_scan(1)
-      prime_iterative_scan_supported(false)
-
-      degraded = Memory.recall(scope, query: "ecto", limit: 5).meta
-
-      assert degraded.ann_iterative_scan == "unavailable"
-      assert degraded.ann_iterative_scan_reason =~ "may be missing from these results"
-      assert degraded.fallback == false, "precondition: the SEMANTIC path, not the ILIKE one"
-
-      prime_iterative_scan_supported(true)
-
-      healthy = Memory.recall(scope, query: "ecto", limit: 5).meta
-
-      assert healthy.ann_iterative_scan == "applied"
-
-      refute Map.has_key?(healthy, :ann_iterative_scan_reason),
-             "a healthy read states the state and adds no degradation prose"
-    end
-
-    test "the field names and values MATCH knowledge search exactly" do
-      # One vocabulary across both surfaces, not two for the same fact. Asserted by
-      # comparing the two metas' disclosure slices under one primed verdict rather than
-      # by re-listing the strings. Both slices are asserted NON-EMPTY first: they derive
-      # from ONE function, so a rename propagates to both and the equality alone would
-      # degenerate to `%{} == %{}` and pass vacuously (the sibling tests above pin the
-      # literal key names).
-      scope = fixture(:memory_scope)
-      Knowledge.reset_circuit_breaker(scope.tenant_id)
-
-      prime_iterative_scan(1)
-      prime_iterative_scan_supported(false)
-
-      disclosure_keys = [:ann_iterative_scan, :ann_iterative_scan_reason]
-
-      assert {:ok, %{meta: knowledge_meta}} =
-               Knowledge.search_semantic(scope.tenant_id, test_vec(1536))
-
-      memory_meta = Memory.recall(scope, query: "anything", limit: 5).meta
-
-      memory_slice = Map.take(memory_meta, disclosure_keys)
-
-      assert map_size(memory_slice) == length(disclosure_keys),
-             "both disclosure keys must be present, or this comparison is vacuous"
-
-      assert memory_slice == Map.take(knowledge_meta, disclosure_keys)
-    end
-
-    test "the include_superseded SIDE-TABLE recall discloses NOTHING — it runs no HNSW scan" do
-      # `include_superseded: true` drops the `live_denorm` predicate, so no per-dimension
-      # PARTIAL index matches and the read plans as a bounded top-k SORT — an exact top-k
-      # that cannot under-return. A verdict there describes a scan that never ran, the same
-      # rule the ILIKE fallback follows. The LIVE read in the same shape still discloses,
-      # which is what keeps this exclusion narrow rather than a blanket opt-out.
-      scope = fixture(:memory_scope)
-      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
-      Knowledge.reset_circuit_breaker(scope.tenant_id)
-
-      prime_iterative_scan(1)
-      prime_iterative_scan_supported(false)
-
-      meta = Memory.recall(scope, query: "ecto", limit: 5, include_superseded: true).meta
-
-      assert meta.fallback == false, "precondition: the SEMANTIC path"
-      refute Map.has_key?(meta, :ann_iterative_scan)
-
-      live = Memory.recall(scope, query: "ecto", limit: 5).meta
-      assert live.ann_iterative_scan == "unavailable"
-    end
-
-    test "the ILIKE FALLBACK path discloses NOTHING — it runs no vector read" do
-      # These opts DO carry the resolved state (`:memory_recall` is an ANN endpoint, so
-      # `opts/1` stamps every read on it), so disclosing here is one `Map.merge` away and
-      # would be WRONG: the fallback query is a recency-ordered ILIKE that never touches
-      # the HNSW index, and an "unavailable" verdict about a scan that was never attempted
-      # is a degradation report for nothing. Same rule combined search applies when its
-      # semantic half fell back to keyword-only.
-      scope = fixture(:memory_scope)
-
-      prime_iterative_scan(1)
-      prime_iterative_scan_supported(false)
-
-      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, _text ->
-        {:error, :provider_unavailable}
-      end)
-
-      meta = Memory.recall(scope, query: "ecto", limit: 5).meta
-
-      assert meta.fallback == true, "precondition: the ILIKE fallback path"
-      refute Map.has_key?(meta, :ann_iterative_scan)
-      refute Map.has_key?(meta, :ann_iterative_scan_reason)
-    end
-  end
-
-  @probe_cache_key {Loopctl.HeavyRead, :iterative_scan_supported}
-  @last_conclusive_key {Loopctl.HeavyRead, :iterative_scan_last_conclusive}
-
-  # A live probe writes TWO VM-global `:persistent_term` keys: the live cache AND the
-  # last-conclusive record it falls back on (a ONE-HOUR reuse window). Both are erased here and
-  # on exit, like the prime_* helpers below — restoring only the live cache left the recorded
-  # verdict standing, so a later test's inconclusive probe REUSED it instead of failing closed.
+  # A live probe writes TWO keys: the live cache AND the last-conclusive record it falls back
+  # on (a ONE-HOUR reuse window). Both start empty in this test's probe namespace; this
+  # clears them again so a test that needs a FRESH probe cannot inherit one from earlier in
+  # itself. (setup erases the whole namespace on exit.)
   defp clear_iterative_scan_probe_cache do
-    for key <- [@probe_cache_key, @last_conclusive_key], do: :persistent_term.erase(key)
-
-    on_exit(fn ->
-      for key <- [@probe_cache_key, @last_conclusive_key], do: :persistent_term.erase(key)
-    end)
+    for key <- [probe_cache_key(), last_conclusive_key()], do: :persistent_term.erase(key)
   end
 
   # `provenance` is HOW the cached verdict was reached (`:conclusive` | `:reused` | `:guess`),
@@ -603,53 +450,33 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   # test that only cares about the boolean cannot accidentally assert backend incapability.
   defp prime_iterative_scan_supported(verdict, provenance \\ :reused) do
     :persistent_term.put(
-      @probe_cache_key,
+      probe_cache_key(),
       {verdict, System.monotonic_time(:millisecond) + 60_000, provenance}
     )
-
-    on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
   end
 
   defp prime_last_conclusive(verdict) do
-    :persistent_term.put(@last_conclusive_key, {verdict, System.monotonic_time(:millisecond)})
-    on_exit(fn -> :persistent_term.erase(@last_conclusive_key) end)
+    :persistent_term.put(last_conclusive_key(), {verdict, System.monotonic_time(:millisecond)})
   end
 
   defp prime_expired_iterative_scan_supported(verdict) do
     :persistent_term.put(
-      @probe_cache_key,
+      probe_cache_key(),
       {verdict, System.monotonic_time(:millisecond) - 1, :conclusive}
     )
-
-    on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
   end
 
-  defp prime_iterative_scan(code) do
-    pt_key = {Loopctl.SystemConfig, "hnsw_iterative_scan"}
-    :persistent_term.put(pt_key, code)
-    on_exit(fn -> :persistent_term.erase(pt_key) end)
-  end
+  # The live tunables, primed in this test's `SystemConfig` namespace (the documented
+  # `{cache, key}` persistent_term format) — never the node-wide key a concurrent ANN reader
+  # builds its `SET LOCAL`s from. The `[1, 1000]` clamp only keeps pgvector from raising; it
+  # was never isolation.
+  defp prime_iterative_scan(code),
+    do: :persistent_term.put({cache(), "hnsw_iterative_scan"}, code)
 
-  defp prime_max_scan_tuples(value) do
-    pt_key = {Loopctl.SystemConfig, "hnsw_max_scan_tuples"}
-    :persistent_term.put(pt_key, value)
-    on_exit(fn -> :persistent_term.erase(pt_key) end)
-  end
+  defp prime_max_scan_tuples(value),
+    do: :persistent_term.put({cache(), "hnsw_max_scan_tuples"}, value)
 
-  # US-38.4: prime the live-tunable `SystemConfig "hnsw_ef_search"` cache directly (the
-  # documented persistent_term key format) rather than `SystemConfig.put/2`, to avoid a
-  # leaked DB row, and erase on exit. This module is `async: false` precisely BECAUSE this
-  # mutates a VM-global key that concurrent cross-file ANN readers also read (see the
-  # @moduledoc); the `[1, 1000]` clamp in `hnsw_ef_search/0` prevents pgvector raising on an
-  # out-of-range GUC but provides NO cross-test isolation, so async isolation is what keeps a
-  # primed value from bleeding into another file's recall. Mirrors the
-  # `provider_admission_snooze_seconds` precedent in `provider/admission_test.exs` (which is
-  # safe under `async: true` only because no concurrent file reads that key for real behavior).
-  defp prime_ef_search(value) do
-    pt_key = {Loopctl.SystemConfig, "hnsw_ef_search"}
-    :persistent_term.put(pt_key, value)
-    on_exit(fn -> :persistent_term.erase(pt_key) end)
-  end
+  defp prime_ef_search(value), do: :persistent_term.put({cache(), "hnsw_ef_search"}, value)
 
   describe "inconclusive probe classification (negative-cache eligibility)" do
     # The class decides whether an inconclusive probe is negative-cached. Sweeping every
@@ -694,9 +521,9 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # checkout blip — the documented flake of the sibling test above) records NOTHING, so
       # each outcome is asserted on its own terms: asserting the record unconditionally would
       # report a pool blip as a fallback regression.
-      verdict = HeavyRead.iterative_scan_supported?()
+      verdict = HeavyRead.iterative_scan_supported?(probe())
 
-      case :persistent_term.get(@last_conclusive_key, :none) do
+      case :persistent_term.get(last_conclusive_key(), :none) do
         {recorded, recorded_at} when is_integer(recorded_at) ->
           assert recorded == verdict,
                  "a conclusive probe must record what the backend actually said, so a later " <>

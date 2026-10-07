@@ -24,35 +24,34 @@ defmodule Loopctl.HeavyReadSavepointProbeTest do
   nothing. Not so for the RETRY, which therefore drives the probe end to end.
   All of it runs against `HeavyRead.repo/0` — the repo the probe actually uses
   (`config/test.exs` points it at `AdminRepo`), not `HeavyReadRepo`.
+
+  The idle-connection cases run in a task of their own (`on_idle_connection/1`), which
+  checks out a dedicated NON-sandboxed connection — the prod shape of `HeavyRead.opts/2` —
+  while this test's sandboxed one stays where it is. The probe writes its verdict into a
+  probe namespace of this test's own (`HeavyRead.iterative_scan_supported?/1`), never the
+  node's, which every ANN read consults.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.HeavyRead
 
   setup :verify_on_exit!
 
-  @last_conclusive_key {HeavyRead, :iterative_scan_last_conclusive}
-  @probe_cache_keys [
-    {HeavyRead, :iterative_scan_supported},
-    @last_conclusive_key,
-    {HeavyRead, :iterative_scan_guess_ttl}
-  ]
-
   describe "savepoint mode on an idle connection" do
     test "is refused with a TransactionError, not silently accepted" do
-      # The sandbox checks out a connection inside a transaction; this module is
-      # async: false so a dedicated non-sandboxed checkout still wins ownership
-      # for this process, leaving the connection genuinely idle — the prod shape
-      # of HeavyRead.opts/1. Assert it TOOK: checkout/2 returns
-      # `{:already, :owner | :allowed}` instead of raising when the process is
-      # already bound to a sandboxed connection, and the query would then run
-      # inside the sandbox transaction, testing nothing. `in_transaction?/0`
-      # cannot stand in for this check (see the test below).
-      assert :ok = Sandbox.checkout(HeavyRead.repo(), sandbox: false)
-
-      result = HeavyRead.repo().query("SELECT 1", [], timeout: 2_000, mode: :savepoint)
+      # The sandbox checks out a connection inside a transaction; `on_idle_connection/1`
+      # runs in a task holding a dedicated non-sandboxed connection instead, genuinely
+      # idle — the prod shape of HeavyRead.opts/2. It asserts the checkout TOOK:
+      # checkout/2 returns `{:already, :owner | :allowed}` instead of raising when the
+      # process is already bound to a sandboxed connection, and the query would then run
+      # inside the sandbox transaction, testing nothing. `in_transaction?/0` cannot stand
+      # in for this check (see the test below).
+      result =
+        on_idle_connection(fn ->
+          HeavyRead.repo().query("SELECT 1", [], timeout: 2_000, mode: :savepoint)
+        end)
 
       assert {:error, %DBConnection.TransactionError{status: :idle}} = result,
              "savepoint-on-idle must stay refused — probe_iterative_scan_support/0's " <>
@@ -63,9 +62,10 @@ defmodule Loopctl.HeavyReadSavepointProbeTest do
       # Establishes that the refusal above is caused by `mode: :savepoint` and
       # not by the connection being unusable — without this, the assertion could
       # pass for the wrong reason and keep passing after the premise changed.
-      assert :ok = Sandbox.checkout(HeavyRead.repo(), sandbox: false)
-
-      assert {:ok, %{rows: [[1]]}} = HeavyRead.repo().query("SELECT 1", [], timeout: 2_000)
+      assert {:ok, %{rows: [[1]]}} =
+               on_idle_connection(fn ->
+                 HeavyRead.repo().query("SELECT 1", [], timeout: 2_000)
+               end)
     end
 
     test "the probe reaches a CONCLUSIVE verdict there — the retry, driven end to end" do
@@ -73,12 +73,14 @@ defmodule Loopctl.HeavyReadSavepointProbeTest do
       # every prod probe inconclusive, fails closed, iterative scan off fleet-wide.
       # Asserted on the last-CONCLUSIVE record, not on `true`, so it means "the backend
       # answered" for any installed pgvector version.
-      assert :ok = Sandbox.checkout(HeavyRead.repo(), sandbox: false)
-      clear_probe_cache()
-      on_exit(&clear_probe_cache/0)
+      probe = {HeavyRead, make_ref()}
+      on_exit(fn -> clear_probe_cache(probe) end)
 
-      verdict = HeavyRead.iterative_scan_supported?()
-      recorded = :persistent_term.get(@last_conclusive_key, :none)
+      {verdict, recorded} =
+        on_idle_connection(fn ->
+          verdict = HeavyRead.iterative_scan_supported?(probe)
+          {verdict, :persistent_term.get({probe, :iterative_scan_last_conclusive}, :none)}
+        end)
 
       assert match?({answered, _at} when is_boolean(answered), recorded),
              "the probe was INCONCLUSIVE on an idle connection (got #{inspect(recorded)}) — " <>
@@ -114,5 +116,22 @@ defmodule Loopctl.HeavyReadSavepointProbeTest do
     end
   end
 
-  defp clear_probe_cache, do: Enum.each(@probe_cache_keys, &:persistent_term.erase/1)
+  # Runs `fun` in a task that first checks out a dedicated NON-sandboxed connection, so
+  # every query in `fun` runs on a genuinely idle connection. The task is a fresh process,
+  # so the checkout is its own and is returned when the task exits.
+  defp on_idle_connection(fun) do
+    Task.async(fn ->
+      assert :ok = Sandbox.checkout(HeavyRead.repo(), sandbox: false)
+      fun.()
+    end)
+    |> Task.await(10_000)
+  end
+
+  # Every key under this test's probe namespace: the verdict, the last conclusive verdict,
+  # the guess TTL and any warning deadline the probe wrote.
+  defp clear_probe_cache(probe) do
+    for {key, _value} <- :persistent_term.get(),
+        is_tuple(key) and tuple_size(key) > 0 and elem(key, 0) == probe,
+        do: :persistent_term.erase(key)
+  end
 end

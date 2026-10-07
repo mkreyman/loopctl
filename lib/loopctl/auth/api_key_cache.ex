@@ -57,6 +57,11 @@ defmodule Loopctl.Auth.ApiKeyCache do
   happens in the GenServer, so there is no Ecto Sandbox ownership concern in
   tests.
 
+  The owner registers as `__MODULE__` and owns the table every caller reads by default.
+  `start_link/1` takes `:name` and `:table`, and the table functions take the table as a
+  trailing argument, so a test can start, break and restart an instance of its own
+  without touching the app's.
+
   ## Never-stale under the read-through repopulation race
 
   Plain cache-aside has a well-known staleness race: a reader can MISS, snapshot
@@ -152,7 +157,7 @@ defmodule Loopctl.Auth.ApiKeyCache do
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @doc """
@@ -168,10 +173,11 @@ defmodule Loopctl.Auth.ApiKeyCache do
   (`verify_api_key/1`) re-enforces those against wall-clock now (AC-33.3.5).
   """
   @spec fetch(String.t()) :: {:ok, ApiKey.t()} | :miss
-  def fetch(key_hash) when is_binary(key_hash) do
-    case :ets.lookup(@table, key_hash) do
+  @spec fetch(String.t(), :ets.table()) :: {:ok, ApiKey.t()} | :miss
+  def fetch(key_hash, table \\ @table) when is_binary(key_hash) do
+    case :ets.lookup(table, key_hash) do
       [{^key_hash, value, stamp, expires_at}] ->
-        if stamp == current_generation(key_hash) and not expired?(expires_at),
+        if stamp == current_generation(key_hash, table) and not expired?(expires_at),
           do: {:ok, value},
           else: :miss
 
@@ -191,8 +197,9 @@ defmodule Loopctl.Auth.ApiKeyCache do
   `fetch/1` (never serves a stale/revoked key).
   """
   @spec generation(String.t()) :: non_neg_integer()
-  def generation(key_hash) when is_binary(key_hash) do
-    current_generation(key_hash)
+  @spec generation(String.t(), :ets.table()) :: non_neg_integer()
+  def generation(key_hash, table \\ @table) when is_binary(key_hash) do
+    current_generation(key_hash, table)
   rescue
     ArgumentError -> 0
   end
@@ -205,9 +212,10 @@ defmodule Loopctl.Auth.ApiKeyCache do
   AND it is within its TTL.
   """
   @spec put(String.t(), ApiKey.t(), non_neg_integer()) :: :ok
-  def put(key_hash, %ApiKey{} = value, read_generation)
+  @spec put(String.t(), ApiKey.t(), non_neg_integer(), :ets.table()) :: :ok
+  def put(key_hash, %ApiKey{} = value, read_generation, table \\ @table)
       when is_binary(key_hash) and is_integer(read_generation) do
-    :ets.insert(@table, {key_hash, value, read_generation, now_ms() + @ttl_ms})
+    :ets.insert(table, {key_hash, value, read_generation, now_ms() + @ttl_ms})
     :ok
   rescue
     ArgumentError -> :ok
@@ -236,9 +244,10 @@ defmodule Loopctl.Auth.ApiKeyCache do
   peer nodes bust their node-local entries too.
   """
   @spec invalidate(String.t()) :: :ok
-  def invalidate(key_hash) when is_binary(key_hash) do
-    bump_generation(key_hash)
-    :ets.delete(@table, key_hash)
+  @spec invalidate(String.t(), :ets.table()) :: :ok
+  def invalidate(key_hash, table \\ @table) when is_binary(key_hash) do
+    bump_generation(key_hash, table)
+    :ets.delete(table, key_hash)
     :ok
   rescue
     ArgumentError -> :ok
@@ -285,8 +294,8 @@ defmodule Loopctl.Auth.ApiKeyCache do
   # (a 3-tuple `{{:gen, key_hash}, gen, reap_after}`) that a binary-`key_hash`
   # `fetch/1` lookup can never match, so it never collides with a cached-value
   # entry. Defaults to 0 for a hash never invalidated.
-  defp current_generation(key_hash) do
-    case :ets.lookup(@table, {:gen, key_hash}) do
+  defp current_generation(key_hash, table) do
+    case :ets.lookup(table, {:gen, key_hash}) do
       [{{:gen, ^key_hash}, gen, _reap_after}] -> gen
       [] -> 0
     end
@@ -298,10 +307,10 @@ defmodule Loopctl.Auth.ApiKeyCache do
   # `:ets.update_counter/4` is lock-free and serializes concurrent invalidations;
   # the default seeds a future `reap_after` so a freshly-created entry is never
   # eligible for the sweep before its bump is observable.
-  defp bump_generation(key_hash) do
+  defp bump_generation(key_hash, table) do
     reap_after = now_ms() + @gen_reap_grace_ms
-    gen = :ets.update_counter(@table, {:gen, key_hash}, {2, 1}, {{:gen, key_hash}, 0, reap_after})
-    :ets.update_element(@table, {:gen, key_hash}, {3, reap_after})
+    gen = :ets.update_counter(table, {:gen, key_hash}, {2, 1}, {{:gen, key_hash}, 0, reap_after})
+    :ets.update_element(table, {:gen, key_hash}, {3, reap_after})
     gen
   end
 
@@ -313,13 +322,17 @@ defmodule Loopctl.Auth.ApiKeyCache do
   # --- Server callbacks ---
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    # `:table` names the table this owner creates — `@table`, the one every caller reads by
+    # default, unless a caller (a test of this owner's restart) starts an instance of its own.
+    name = Keyword.get(opts, :table, @table)
+
     # Create + own the table here (in the GenServer process) so it persists for
     # the node's lifetime. Idempotent if it somehow already exists.
     table =
-      case :ets.whereis(@table) do
+      case :ets.whereis(name) do
         :undefined ->
-          :ets.new(@table, [
+          :ets.new(name, [
             :set,
             :public,
             :named_table,
@@ -352,12 +365,12 @@ defmodule Loopctl.Auth.ApiKeyCache do
   @impl true
   def handle_info({:invalidate, key_hash}, state) when is_binary(key_hash) do
     # A peer node revoked/rotated this key; bust our node-local entry.
-    invalidate(key_hash)
+    invalidate(key_hash, state.table)
     {:noreply, state}
   end
 
   def handle_info(:sweep, state) do
-    sweep_expired()
+    sweep_expired(state.table)
     schedule_sweep()
     {:noreply, state}
   end
@@ -380,11 +393,11 @@ defmodule Loopctl.Auth.ApiKeyCache do
   #
   # The heads are disjoint (4-tuple binary key vs 3-tuple `{:gen, _}` key), so
   # neither spec ever matches the other kind.
-  defp sweep_expired do
+  defp sweep_expired(table) do
     now = now_ms()
     value_spec = [{{:_, :_, :_, :"$1"}, [{:"=<", :"$1", now}], [true]}]
     gen_spec = [{{{:gen, :_}, :_, :"$1"}, [{:"=<", :"$1", now}], [true]}]
-    :ets.select_delete(@table, value_spec) + :ets.select_delete(@table, gen_spec)
+    :ets.select_delete(table, value_spec) + :ets.select_delete(table, gen_spec)
   rescue
     ArgumentError -> 0
   end

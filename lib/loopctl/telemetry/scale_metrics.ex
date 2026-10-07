@@ -878,9 +878,9 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   `egress_posture` instead. A missing reason defaults to `"unknown"` so a direct
   `:telemetry.execute/3` with a partial map never emits a blank label.
   """
-  @spec egress_blocked_tags(map()) :: map()
-  def egress_blocked_tags(metadata) do
-    %{reason: Map.get(metadata, :reason, "unknown"), tenant_id: gated_tenant_id(metadata)}
+  @spec egress_blocked_tags(map(), term()) :: map()
+  def egress_blocked_tags(metadata, gate \\ @persistent_term_key) do
+    %{reason: Map.get(metadata, :reason, "unknown"), tenant_id: gated_tenant_id(metadata, gate)}
   end
 
   @doc """
@@ -901,9 +901,9 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   other scale counters, so its cardinality is bounded identically) — the unbounded
   `article_id`/`project_id` carried in the event metadata are never tagged.
   """
-  @spec article_linking_corpus_size_tags(map()) :: map()
-  def article_linking_corpus_size_tags(metadata) do
-    %{tenant_id: gated_tenant_id(metadata)}
+  @spec article_linking_corpus_size_tags(map(), term()) :: map()
+  def article_linking_corpus_size_tags(metadata, gate \\ @persistent_term_key) do
+    %{tenant_id: gated_tenant_id(metadata, gate)}
   end
 
   @doc """
@@ -923,12 +923,12 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   `tenant_id` reuses the SAME cap-gated sentinel collapse as the other two counters
   (`gated_tenant_id/1`) to keep its cardinality bounded identically.
   """
-  @spec hybrid_provenance_tags(map()) :: map()
-  def hybrid_provenance_tags(metadata) do
+  @spec hybrid_provenance_tags(map(), term()) :: map()
+  def hybrid_provenance_tags(metadata, gate \\ @persistent_term_key) do
     %{
       provenance: Map.get(metadata, :provenance, "unknown"),
       hit: Map.get(metadata, :hit, false),
-      tenant_id: gated_tenant_id(metadata)
+      tenant_id: gated_tenant_id(metadata, gate)
     }
   end
 
@@ -945,11 +945,11 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   `tenant_id` reuses the same cap-gated sentinel collapse as the other scale counters to
   keep cardinality bounded.
   """
-  @spec degraded_read_tags(map()) :: map()
-  def degraded_read_tags(metadata) do
+  @spec degraded_read_tags(map(), term()) :: map()
+  def degraded_read_tags(metadata, gate \\ @persistent_term_key) do
     %{
       error_class: Map.get(metadata, :error_class, "unknown"),
-      tenant_id: gated_tenant_id(metadata)
+      tenant_id: gated_tenant_id(metadata, gate)
     }
   end
 
@@ -970,12 +970,12 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   Bounded at three values (`:admitted | :unmetered | :exhausted`);
   `Loopctl.TelemetryEvents.ingestion_backlog_gate_failed_open/0` is the source of truth.
   """
-  @spec backlog_gate_tags(map()) :: map()
-  def backlog_gate_tags(metadata) do
+  @spec backlog_gate_tags(map(), term()) :: map()
+  def backlog_gate_tags(metadata, gate \\ @persistent_term_key) do
     %{
       error_class: Map.get(metadata, :error_class, "unknown"),
       outcome: Map.get(metadata, :outcome, :admitted),
-      tenant_id: gated_tenant_id(metadata)
+      tenant_id: gated_tenant_id(metadata, gate)
     }
   end
 
@@ -993,12 +993,12 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       `#{inspect(@aggregated_sentinel)}` sentinel (cardinality 1). A missing/`nil`
       tenant_id also collapses to the sentinel so the label is never blank.
   """
-  @spec scale_tags(map()) :: map()
-  def scale_tags(metadata) do
+  @spec scale_tags(map(), term()) :: map()
+  def scale_tags(metadata, gate \\ @persistent_term_key) do
     %{
       endpoint: Map.get(metadata, :endpoint, :unknown),
       mapped_code: Map.get(metadata, :mapped_code, "unknown"),
-      tenant_id: gated_tenant_id(metadata)
+      tenant_id: gated_tenant_id(metadata, gate)
     }
   end
 
@@ -1381,15 +1381,24 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   """
   @impl true
   @spec cached_executing_orphan_count() :: {:ok, non_neg_integer()} | :not_yet_polled
-  def cached_executing_orphan_count do
-    case :persistent_term.get(@executing_orphan_cache_key, :not_yet_polled) do
+  def cached_executing_orphan_count,
+    do: cached_executing_orphan_count(@executing_orphan_cache_key)
+
+  @doc """
+  `cached_executing_orphan_count/0` read from the `:persistent_term` key `cache_key` —
+  the node's one unless a test names its own, which `poll_oban_executing_orphans/1`
+  then writes.
+  """
+  @spec cached_executing_orphan_count(term()) :: {:ok, non_neg_integer()} | :not_yet_polled
+  def cached_executing_orphan_count(cache_key) do
+    case :persistent_term.get(cache_key, :not_yet_polled) do
       :not_yet_polled -> :not_yet_polled
       count when is_integer(count) -> {:ok, count}
     end
   end
 
-  @spec poll_oban_executing_orphans() :: :ok
-  def poll_oban_executing_orphans do
+  @spec poll_oban_executing_orphans(term()) :: :ok
+  def poll_oban_executing_orphans(cache_key \\ @executing_orphan_cache_key) do
     guarded_measurement(
       :executing_orphans,
       "Oban executing-orphan poll",
@@ -1399,7 +1408,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       fn ->
         count = count_oban_executing_orphans()
 
-        :persistent_term.put(@executing_orphan_cache_key, count)
+        :persistent_term.put(cache_key, count)
 
         :telemetry.execute(
           [:loopctl, :oban, :jobs, :executing_orphan, :count],
@@ -1614,8 +1623,8 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   # The cap gate read on the hot path: a lock-free O(1) persistent_term lookup,
   # defaulting to `false` (aggregate) if unseeded — an un-warmed boot can never emit
   # an unbounded tenant label.
-  defp gated_tenant_id(metadata) do
-    if tenant_label?() do
+  defp gated_tenant_id(metadata, gate) do
+    if tenant_label?(gate) do
       case Map.get(metadata, :tenant_id) do
         nil -> @aggregated_sentinel
         tenant_id -> tenant_id
@@ -1630,10 +1639,14 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
 
   Reads the boolean from `:persistent_term`, defaulting to `false` (drop/aggregate)
   when unseeded — so the safe, bounded behavior holds before the first poll.
+
+  `gate` is the `:persistent_term` key the boolean lives under: the node's one by default.
+  The gated `*_tags` functions and `refresh_tenant_label_gate/1` take it too, so a test
+  flips a gate of its own rather than the one every metric on the node reads.
   """
-  @spec tenant_label?() :: boolean()
-  def tenant_label? do
-    :persistent_term.get(@persistent_term_key, false)
+  @spec tenant_label?(term()) :: boolean()
+  def tenant_label?(gate \\ @persistent_term_key) do
+    :persistent_term.get(gate, false)
   end
 
   @doc """
@@ -1652,8 +1665,8 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   itself — the poller only needs the side effect of refreshing the cached gate, and
   no metric is derived from a `[:loopctl, :telemetry, :tenant_label_gate]` event.
   """
-  @spec refresh_tenant_label_gate() :: boolean()
-  def refresh_tenant_label_gate do
+  @spec refresh_tenant_label_gate(term()) :: boolean()
+  def refresh_tenant_label_gate(gate \\ @persistent_term_key) do
     # Fail-soft for EVERY failure shape — this is a `telemetry_poller` measurement, and
     # telemetry_poller PERMANENTLY drops an MFA that escapes. A narrow rescue (DB exceptions
     # only, everything else re-raised) did not surface a programmer error here: it froze the
@@ -1670,14 +1683,14 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
         :failed,
         fn -> Tenants.count() <= tenant_label_cap() end
       )
-      |> resolve_gate()
+      |> resolve_gate(gate)
 
     # Put ONLY on an actual transition (team review F3). `:persistent_term.put/2` triggers
     # a global term-table scan, so writing the unchanged steady-state value every 10s is
     # wasteful; the gate is stable once a fleet settles above/below the cap, so this makes
     # the steady-state cost zero puts and writes only on a real gate flip.
-    if :persistent_term.get(@persistent_term_key, :unset) != allowed? do
-      :persistent_term.put(@persistent_term_key, allowed?)
+    if :persistent_term.get(gate, :unset) != allowed? do
+      :persistent_term.put(gate, allowed?)
     end
 
     allowed?
@@ -1692,11 +1705,11 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   # leave an unbounded label live (AC-27.15.3). The streak lives in the poller PROCESS's
   # dictionary — this measurement always runs in the single `telemetry_poller` process, so it
   # costs no global write and needs no extra term.
-  defp resolve_gate(:failed) do
-    if Process.put(@gate_failure_key, true), do: false, else: tenant_label?()
+  defp resolve_gate(:failed, gate) do
+    if Process.put(@gate_failure_key, true), do: false, else: tenant_label?(gate)
   end
 
-  defp resolve_gate(allowed?) do
+  defp resolve_gate(allowed?, _gate) do
     Process.delete(@gate_failure_key)
     allowed?
   end

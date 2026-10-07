@@ -461,7 +461,11 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       ])
 
     reset_counters(table)
-    attach_handlers(table)
+    # `:only_from` (a pid) narrows what this instance counts to the events THAT process —
+    # or a task it started — emits. `nil`, the default and the app's instance, counts every
+    # event on the node; a test passes itself so a concurrent test's heavy read, DB error or
+    # Oban job never lands in its window.
+    attach_handlers(table, Keyword.get(opts, :only_from))
 
     # No work in init beyond table creation; schedule the first tick out of band.
     schedule_tick()
@@ -525,7 +529,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
   # --- Telemetry attach (idempotent, per-table handler id) ---
 
-  defp attach_handlers(table) do
+  defp attach_handlers(table, only_from) do
     events = [
       @db_error_event,
       @under_fill_event,
@@ -537,7 +541,8 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
     ]
 
     case :telemetry.attach_many(handler_id(table), events, &__MODULE__.handle_event/4, %{
-           table: table
+           table: table,
+           only_from: only_from
          }) do
       :ok -> :ok
       {:error, :already_exists} -> :ok
@@ -550,9 +555,22 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   defp handler_id(table), do: {@handler_id, table}
 
   @doc false
+  # The telemetry entry point: counts the event unless this instance was started
+  # `:only_from` a process that did not emit it (see `init/1`). A handler runs in the
+  # emitting process, so `self()` here IS the emitter.
+  def handle_event(event, measurements, metadata, %{only_from: pid} = config)
+      when is_pid(pid) do
+    if self() == pid or pid in Process.get(:"$callers", []),
+      do: count_event(event, measurements, metadata, config),
+      else: :ok
+  end
+
+  def handle_event(event, measurements, metadata, config),
+    do: count_event(event, measurements, metadata, config)
+
   # The request-path handlers: cheap, atomic ETS counter writes, self-rescuing so a
   # raise can NEVER break the request being observed (mirrors SlowQueryLogger).
-  def handle_event(@db_error_event, _measurements, metadata, %{table: table}) do
+  defp count_event(@db_error_event, _measurements, metadata, %{table: table}) do
     if Map.get(metadata, :mapped_code) == "db_statement_timeout" do
       :ets.update_counter(table, :timeout_count, 1)
     end
@@ -564,7 +582,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       :ok
   end
 
-  def handle_event(@under_fill_event, _measurements, _metadata, %{table: table}) do
+  defp count_event(@under_fill_event, _measurements, _metadata, %{table: table}) do
     :ets.update_counter(table, :under_fill_count, 1)
     :ok
   rescue
@@ -573,7 +591,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       :ok
   end
 
-  def handle_event(@heavy_read_event, measurements, _metadata, %{table: table}) do
+  defp count_event(@heavy_read_event, measurements, _metadata, %{table: table}) do
     total_native = Map.get(measurements, :total_time, 0)
     duration_ms = System.convert_time_unit(total_native, :native, :millisecond)
     idx = bucket_index(duration_ms)
@@ -606,7 +624,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # ScaleMetrics`'s `Telemetry.Metrics` distribution, which silently skips a
   # datapoint when its measurement key is absent — instead of counting a phantom 0ms
   # checkout.
-  def handle_event(@repo_query_event, measurements, _metadata, %{table: table}) do
+  defp count_event(@repo_query_event, measurements, _metadata, %{table: table}) do
     case Map.fetch(measurements, :queue_time) do
       :error ->
         :ok
@@ -630,8 +648,8 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # exhausted job converting to a terminal discard — no metadata filtering, mirrors
   # `:under_fill_count`. See the `@oban_stop_event` clause below for half (b): a
   # DELIBERATE discard/cancel, which this event never observes.
-  def handle_event(@oban_exception_event, _measurements, %{worker: worker}, %{table: table})
-      when worker != @scale_alert_delivery_worker do
+  defp count_event(@oban_exception_event, _measurements, %{worker: worker}, %{table: table})
+       when worker != @scale_alert_delivery_worker do
     :ets.update_counter(table, :oban_discard_count, 1)
     :ok
   rescue
@@ -643,17 +661,17 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
   # Review fix (LOW): the alerter's OWN delivery worker — excluded above so a
   # degraded operator webhook (exactly when alerts are firing) never inflates the
   # discard-rate signal it feeds. See `@scale_alert_delivery_worker`.
-  def handle_event(@oban_exception_event, _measurements, _metadata, _config), do: :ok
+  defp count_event(@oban_exception_event, _measurements, _metadata, _config), do: :ok
 
   # Review fix (MEDIUM, AC-34.3.2): the sibling half of the discard signal — a
   # deliberate `{:discard, _}`/bare `:discard` or `{:cancel, _}` job return emits
   # `[:oban, :job, :stop]` (`meta.state` `:discard` / `:cancelled`), never the
   # `:exception` event above. Only these two terminal, non-retryable states count;
   # `:success` and `:snoozed` (the OTHER `:stop` states) are explicitly excluded.
-  def handle_event(@oban_stop_event, _measurements, %{state: state, worker: worker}, %{
-        table: table
-      })
-      when state in [:discard, :cancelled] and worker != @scale_alert_delivery_worker do
+  defp count_event(@oban_stop_event, _measurements, %{state: state, worker: worker}, %{
+         table: table
+       })
+       when state in [:discard, :cancelled] and worker != @scale_alert_delivery_worker do
     :ets.update_counter(table, :oban_discard_count, 1)
     :ok
   rescue
@@ -664,14 +682,14 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
 
   # Review fix (LOW): mirrors the `@oban_exception_event` exclusion above — the
   # alerter's own delivery worker never inflates the discard-rate signal it feeds.
-  def handle_event(@oban_stop_event, _measurements, _metadata, _config), do: :ok
+  defp count_event(@oban_stop_event, _measurements, _metadata, _config), do: :ok
 
   # US-34.3 (AC-34.3.3): genuine LLM/embedding provider-error rate, sourced from the
   # NEW `[:loopctl, :llm, :provider_error]` event (emitted from exactly one choke
   # point, `Loopctl.Llm.record_provider_error/2`) — deliberately NOT
   # `[:loopctl, :llm, :blocked]` (a missing-key config signal, not a provider-error
   # one; see the moduledoc). A single unconditional counter mirrors `:under_fill_count`.
-  def handle_event(@provider_error_event, _measurements, _metadata, %{table: table}) do
+  defp count_event(@provider_error_event, _measurements, _metadata, %{table: table}) do
     :ets.update_counter(table, :provider_error_count, 1)
     :ok
   rescue
@@ -680,7 +698,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       :ok
   end
 
-  def handle_event(_event, _measurements, _metadata, _config), do: :ok
+  defp count_event(_event, _measurements, _metadata, _config), do: :ok
 
   # --- Window evaluation + edge-triggered firing + bounded re-notify (US-34.5) ---
 

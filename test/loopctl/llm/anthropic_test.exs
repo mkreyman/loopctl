@@ -3,37 +3,21 @@ defmodule Loopctl.Llm.AnthropicTest do
   The tenant's API key is a secret — it must NEVER appear in any log line, across
   ALL response branches of the client (review #16).
 
-  ## Why `async: false` (deliberate, not an oversight)
-
-  Most tests here attach a GLOBAL `:telemetry` handler on the VM-global event
-  `[:loopctl, :llm, :provider_error]` and assert on what lands in the test
-  process mailbox (`assert_received` / `refute_received`). The emitter in
-  `Loopctl.LLM.record_provider_error/2` DELIBERATELY puts NO `tenant_id` (nor any
-  high-cardinality id) in the event metadata — see the "NEVER `tenant_id`" note
-  in `lib/loopctl/llm.ex`. Because the metadata carries no tenant, the handlers
-  CANNOT be tenant-scoped: the best they can do is filter on `provider:
-  "anthropic"` (which they do). Under `async: true` that filter is not enough —
-  ANY concurrently-running test whose Anthropic path emits a `provider_error`
-  with `provider: "anthropic"` (content extraction/classification/merge/
-  memory-promotion all funnel through this shared client) would leak a
-  `{:provider_error_emitted, ...}` / `:unexpected_provider_error` message into a
-  listener's mailbox and trip the `refute_received` / metadata assertions
-  non-deterministically. The admission-gate listener does not even filter by
-  provider, so an embedding-path emission would leak into it too. This file is
-  ALSO an emitter: its 401/429/500/transport capture_log tests each record a
-  `provider_error`, so under async it would leak INTO other files' listeners.
-  A non-async module never runs concurrently with any other module
-  (`ExUnit.Case` `:async` docs), so no cross-file emitter is running while these
-  listeners are attached and no other file's listener is attached while these
-  emitters run. This mirrors `test/loopctl/knowledge_semantic_search_provider_error_test.exs`,
-  which documents `async: false` for exactly this VM-global-telemetry reason.
+  The provider-error listeners are `Loopctl.TelemetryHelpers.attach_own/1`. The emitter
+  in `Loopctl.Llm.record_provider_error/2` deliberately carries no `tenant_id` (see the
+  "NEVER `tenant_id`" note in `lib/loopctl/llm.ex`), so a handler cannot filter on the
+  tenant; it filters on the EMITTING process instead — this test's own — so a concurrent
+  test's `provider_error` never reaches this mailbox, and this file's own emissions never
+  reach another test's listener built the same way.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   import ExUnit.CaptureLog
 
   alias Loopctl.Llm
   alias Loopctl.Llm.Anthropic
+
+  @provider_error [:loopctl, :llm, :provider_error]
 
   # A distinctive, per-test key so a hit in captured output is unambiguous and can
   # never be another test's key (avoids cross-test capture_log leakage concerns).
@@ -133,37 +117,13 @@ defmodule Loopctl.Llm.AnthropicTest do
     # ScaleAlerts signal: only the embedding worker path recorded it. Attaching a
     # listener here proves the client itself is now the single choke point for
     # every Anthropic call site.
-    defp attach_provider_error_listener(test_pid) do
-      handler_id = {:anthropic_provider_error_test, System.unique_integer([:positive])}
-
-      :telemetry.attach(
-        handler_id,
-        [:loopctl, :llm, :provider_error],
-        fn
-          # Forward ONLY this provider's events. `[:loopctl, :llm, :provider_error]`
-          # is a VM-GLOBAL telemetry event: a concurrent embedding-path test
-          # (Knowledge.generate_embedding / the US-37.1 embedding worker tests)
-          # emitting it with provider="embedding" must NOT be mistaken for this
-          # test's Anthropic call. Filtering at the handler keeps the
-          # `assert_received {:provider_error_emitted, ...}` assertion targeting
-          # only anthropic events. (This module is `async: false` — so no
-          # cross-file emitter runs concurrently at all — for exactly this
-          # VM-global-telemetry reason; see @moduledoc.)
-          _event, measurements, %{provider: "anthropic"} = metadata, _config ->
-            send(test_pid, {:provider_error_emitted, measurements, metadata})
-
-          _event, _measurements, _metadata, _config ->
-            :ok
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+    defp attach_provider_error_listener do
+      Loopctl.TelemetryHelpers.attach_own([@provider_error])
     end
 
     test "a permanent 4xx API error (e.g. revoked key) is recorded provider=anthropic class=:permanent" do
       tenant = tenant_with_key()
-      attach_provider_error_listener(self())
+      ref = attach_provider_error_listener()
 
       Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
         conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "bad key"})
@@ -171,13 +131,13 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       assert {:error, {:api_error, 401, :provider_error}} = run(tenant)
 
-      assert_received {:provider_error_emitted, %{count: 1}, metadata}
+      assert_received {@provider_error, ^ref, %{count: 1}, metadata}
       assert metadata == %{provider: "anthropic", class: :permanent}
     end
 
     test "a 5xx API error is recorded provider=anthropic class=:transient" do
       tenant = tenant_with_key()
-      attach_provider_error_listener(self())
+      ref = attach_provider_error_listener()
 
       Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
         conn |> Plug.Conn.put_status(500) |> Req.Test.json(%{"error" => "boom"})
@@ -185,13 +145,13 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       assert {:error, {:api_error, 500, :provider_error}} = run(tenant)
 
-      assert_received {:provider_error_emitted, %{count: 1}, metadata}
+      assert_received {@provider_error, ^ref, %{count: 1}, metadata}
       assert metadata == %{provider: "anthropic", class: :transient}
     end
 
     test "a 429 rate-limit is classified :transient (not permanent — it can succeed on retry)" do
       tenant = tenant_with_key()
-      attach_provider_error_listener(self())
+      ref = attach_provider_error_listener()
 
       Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
         conn |> Plug.Conn.put_status(429) |> Req.Test.json(%{"error" => "rate limited"})
@@ -199,13 +159,13 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       assert {:error, {:api_error, 429, :provider_error}} = run(tenant)
 
-      assert_received {:provider_error_emitted, %{count: 1}, metadata}
+      assert_received {@provider_error, ^ref, %{count: 1}, metadata}
       assert metadata == %{provider: "anthropic", class: :transient}
     end
 
     test "a transport error is recorded provider=anthropic class=:transient" do
       tenant = tenant_with_key()
-      attach_provider_error_listener(self())
+      ref = attach_provider_error_listener()
 
       Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
         Req.Test.transport_error(conn, :econnrefused)
@@ -213,13 +173,13 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       assert {:error, {:request_failed, _}} = run(tenant)
 
-      assert_received {:provider_error_emitted, %{count: 1}, metadata}
+      assert_received {@provider_error, ^ref, %{count: 1}, metadata}
       assert metadata == %{provider: "anthropic", class: :transient}
     end
 
     test "a 200-with-unexpected-shape response is NEVER recorded (review fix LOW: a 200 is a provider SUCCESS, not an outage)" do
       tenant = tenant_with_key()
-      attach_provider_error_listener(self())
+      ref = attach_provider_error_listener()
 
       Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
         Req.Test.json(conn, %{"error" => %{"message" => "unexpected"}})
@@ -227,32 +187,12 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       assert {:error, {:api_error, 200, :provider_error}} = run(tenant)
 
-      refute_received {:provider_error_emitted, _measurements, _metadata}
+      refute_received {@provider_error, ^ref, _measurements, _metadata}
     end
 
     test "a successful 200 call never emits provider_error" do
       tenant = tenant_with_key()
-      test_pid = self()
-      handler_id = {:anthropic_provider_error_success_test, System.unique_integer([:positive])}
-
-      :telemetry.attach(
-        handler_id,
-        [:loopctl, :llm, :provider_error],
-        fn
-          # Filter to this provider — the event is VM-global, so an unrelated
-          # embedding-path emission must NOT be mistaken for this test's call
-          # emitting a provider_error on a successful 200. (Module is
-          # `async: false` so no concurrent emitter runs; see @moduledoc.)
-          _event, _measurements, %{provider: "anthropic"}, _config ->
-            send(test_pid, :unexpected_provider_error)
-
-          _event, _measurements, _metadata, _config ->
-            :ok
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      ref = attach_provider_error_listener()
 
       Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
         Req.Test.json(conn, %{
@@ -262,7 +202,7 @@ defmodule Loopctl.Llm.AnthropicTest do
       end)
 
       assert {:ok, "ok"} = run(tenant)
-      refute_received :unexpected_provider_error
+      refute_received {@provider_error, ^ref, _measurements, _metadata}
     end
   end
 
@@ -276,18 +216,7 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       # A provider_error emission or an HTTP call would signal the short-circuit ran
       # too late (after building/sending the request or after the error branches).
-      handler_id = {:anthropic_admission_test, System.unique_integer([:positive])}
-
-      :telemetry.attach(
-        handler_id,
-        [:loopctl, :llm, :provider_error],
-        fn _event, _measurements, _metadata, _config ->
-          send(test_pid, :unexpected_provider_error)
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
+      ref = Loopctl.TelemetryHelpers.attach_own([@provider_error])
 
       Req.Test.stub(Loopctl.Llm.Anthropic, fn conn ->
         send(test_pid, :unexpected_http_call)
@@ -296,7 +225,7 @@ defmodule Loopctl.Llm.AnthropicTest do
 
       assert {:error, :rate_limited_local} = run(tenant)
       refute_received :unexpected_http_call
-      refute_received :unexpected_provider_error
+      refute_received {@provider_error, ^ref, _measurements, _metadata}
     end
 
     test "token available → the request is issued and the success path is unchanged" do

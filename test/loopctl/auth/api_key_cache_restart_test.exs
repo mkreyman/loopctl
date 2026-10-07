@@ -1,88 +1,129 @@
 defmodule Loopctl.Auth.ApiKeyCacheRestartTest do
-  # async: false ON PURPOSE. These tests mutate NODE-GLOBAL supervised state — they
-  # delete the single shared `:named_table` — so no concurrent async test may
-  # observe the momentarily-absent table. Keep them OUT of the async
-  # `ApiKeyCacheTest` module.
+  # The restart path (AC-33.3.7) runs on an instance of this test's OWN: a
+  # `Loopctl.Auth.ApiKeyCache` started under the test supervisor with its own `:name` and
+  # `:table`. Stopping it destroys THAT table and the test supervisor restarts it, so the
+  # real "owner died -> table destroyed -> recreated EMPTY" path is exercised without ever
+  # touching the app's owner (whose table every authenticated request reads), its table, or
+  # the root supervisor's restart-intensity window.
   #
-  # NOTE on why we do NOT stop the supervised owner (unlike a naive mirror of
-  # `settings_cache_restart_test.exs`): `Loopctl.Auth.ApiKeyCache` and
-  # `Loopctl.Llm.SettingsCache` are BOTH `:one_for_one` children of the same root
-  # `Loopctl.Supervisor`. A `GenServer.stop` of either triggers a supervised
-  # restart that counts against the root supervisor's shared restart-intensity
-  # window. The SettingsCache restart test already spends restarts in that window;
-  # adding more here can exceed `max_restarts` and take the whole app (Repo,
-  # Endpoint, sandbox owners) down mid-run. So we reproduce the SAME observable
-  # failure mode — "table destroyed -> recreated EMPTY -> repopulates
-  # read-through", plus the rescue clauses that keep fetch/put/invalidate/
-  # generation safe while the table is momentarily absent — by deleting the ETS
-  # table and handing a fresh empty one back to the live owner via
-  # `:ets.give_away/3` (exactly the empty table `init/1` would create), with zero
-  # root-supervisor restart cost.
-
-  use Loopctl.DataCase, async: false
+  # The read-through is driven by hand against this instance's table — capture the
+  # generation, resolve the key, `put/4` under that generation — because the auth boundary
+  # (`Loopctl.Auth.verify_api_key/1`) only ever reads the app's table, and the caller's key
+  # is not something a test injects into it.
+  use Loopctl.DataCase, async: true
 
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.ApiKeyCache
 
+  setup do
+    unique = System.unique_integer([:positive])
+    name = :"api_key_cache_restart_#{unique}"
+    table = :"api_key_cache_restart_table_#{unique}"
+
+    start_supervised!({ApiKeyCache, name: name, table: table})
+
+    {:ok, name: name, table: table}
+  end
+
   describe "cold start / table-missing resilience (AC-33.3.7)" do
-    test "with the ETS table absent, fetch/put/invalidate/generation are safe (rescue clauses)" do
+    test "with the ETS table absent, fetch/put/invalidate/generation are safe (rescue clauses)",
+         %{name: name, table: table} do
       {_raw, ak} = fixture(:api_key, role: :agent)
 
       # Destroy the table out from under the owner, simulating the window after a
       # crash and before init/1 has recreated it.
-      true = :ets.delete(ApiKeyCache.table_name())
-      assert :ets.whereis(ApiKeyCache.table_name()) == :undefined
+      true = :ets.delete(table)
+      assert :ets.whereis(table) == :undefined
 
-      # Every direct ETS op must rescue "table does not exist" to a safe default so
-      # an auth request never crashes mid-restart.
-      assert ApiKeyCache.fetch(ak.key_hash) == :miss
-      assert ApiKeyCache.generation(ak.key_hash) == 0
-      assert ApiKeyCache.put(ak.key_hash, ak, 0) == :ok
-      assert ApiKeyCache.put(ak.key_hash, ak) == :ok
-      assert ApiKeyCache.invalidate(ak.key_hash) == :ok
+      # Every direct ETS op must rescue "table does not exist" to a safe default so an
+      # auth request never crashes mid-restart.
+      assert ApiKeyCache.fetch(ak.key_hash, table) == :miss
+      assert ApiKeyCache.generation(ak.key_hash, table) == 0
+      assert ApiKeyCache.put(ak.key_hash, ak, 0, table) == :ok
+      assert ApiKeyCache.invalidate(ak.key_hash, table) == :ok
 
-      restore_empty_table!()
+      restart_owner!(name, table)
 
       # The recreated EMPTY table repopulates read-through with correct auth material.
       {raw2, ak2} = fixture(:api_key, role: :agent)
-      assert ApiKeyCache.fetch(ak2.key_hash) == :miss
-      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw2)
-      assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak2.key_hash)
+      await_invalidation_broadcast!(name)
+      assert ApiKeyCache.fetch(ak2.key_hash, table) == :miss
+      assert {:ok, %ApiKey{}} = read_through(raw2, ak2.key_hash, table)
+      assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak2.key_hash, table)
     end
 
-    test "an emptied table repopulates read-through and persists no secrets" do
+    test "a restart empties the table, which repopulates read-through and persists no secrets",
+         %{name: name, table: table} do
       {raw, ak} = fixture(:api_key, role: :agent)
+      await_invalidation_broadcast!(name)
 
-      # Warm the cache.
-      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw)
-      assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak.key_hash)
+      # Warm this instance's cache.
+      assert {:ok, %ApiKey{}} = read_through(raw, ak.key_hash, table)
+      assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak.key_hash, table)
 
-      # Cold start: destroy the table and hand back a fresh EMPTY one (what init/1
-      # would create on a supervised restart) — nothing is persisted (AC-33.3.7).
-      true = :ets.delete(ApiKeyCache.table_name())
-      restore_empty_table!()
+      # Cold start: the owner dies, its table goes with it, and init/1 recreates it EMPTY —
+      # nothing is persisted (AC-33.3.7).
+      restart_owner!(name, table)
 
       # The previously-cached key is now a miss (empty table)...
-      assert ApiKeyCache.fetch(ak.key_hash) == :miss
+      assert ApiKeyCache.fetch(ak.key_hash, table) == :miss
 
-      # ...and a verify repopulates read-through from the DB.
-      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw)
-      assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak.key_hash)
+      # ...and a read-through repopulates it from the DB.
+      assert {:ok, %ApiKey{}} = read_through(raw, ak.key_hash, table)
+      assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak.key_hash, table)
     end
   end
 
-  # Recreate the shared named table exactly as `init/1` does and transfer ownership
-  # to the live supervised owner, so the table survives this test process and no
-  # supervised restart (root restart-intensity cost) is incurred. The owner's
-  # `handle_info/2` catch-all swallows the `{'ETS-TRANSFER', ...}` message.
-  defp restore_empty_table! do
-    owner = Process.whereis(ApiKeyCache)
-
-    table =
-      :ets.new(ApiKeyCache.table_name(), [:set, :public, :named_table, read_concurrency: true])
-
-    true = :ets.give_away(table, owner, :restored)
+  # Creating a key invalidates its key_hash cluster-wide: the app's owner broadcasts, and
+  # this instance subscribes to the same topic, so it bumps the generation in ITS table too
+  # — asynchronously. Wait for both hops before populating, or that bump lands after the
+  # put and the entry reads as stale (which is the bridge working, not a failure).
+  defp await_invalidation_broadcast!(name) do
+    _ = :sys.get_state(ApiKeyCache)
+    _ = :sys.get_state(name)
     :ok
+  end
+
+  # A miss's read-through against this instance's table: the generation is captured BEFORE
+  # the key is resolved, exactly as `Auth.verify_api_key/1` does on the app's table.
+  defp read_through(raw, key_hash, table) do
+    generation = ApiKeyCache.generation(key_hash, table)
+
+    with {:ok, %ApiKey{} = api_key} <- Auth.verify_api_key(raw) do
+      :ok = ApiKeyCache.put(key_hash, api_key, generation, table)
+      {:ok, api_key}
+    end
+  end
+
+  # Stop this test's owner and wait for the test supervisor to restart it (a :permanent
+  # child) and for init/1 to recreate its table.
+  defp restart_owner!(name, table) do
+    pid = Process.whereis(name)
+    ref = Process.monitor(pid)
+    :ok = GenServer.stop(name, :normal)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _} -> :ok
+    after
+      2_000 -> flunk("ApiKeyCache owner did not stop")
+    end
+
+    wait_until(fn ->
+      new_pid = Process.whereis(name)
+      is_pid(new_pid) and new_pid != pid and :ets.whereis(table) != :undefined
+    end)
+  end
+
+  defp wait_until(fun, attempts \\ 200)
+  defp wait_until(_fun, 0), do: flunk("condition not met within the retry window")
+
+  defp wait_until(fun, attempts) do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(5)
+      wait_until(fun, attempts - 1)
+    end
   end
 end

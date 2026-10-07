@@ -1,16 +1,10 @@
 defmodule Loopctl.Workers.ContentIngestionWorkerTest do
   @moduledoc """
-  `async: false` ON PURPOSE. The US-37.4 batching test seeds the NODE-GLOBAL
-  `{Loopctl.SystemConfig, "embedding_batch_max"}` `:persistent_term` knob (the
-  documented key format, erased on exit) to drive the batch-size math. That key
-  is VM-global — NOT ExUnit-sandbox/transaction scoped — and is read globally by
-  `Knowledge.embedding_batch_max/0`, so mutating it while an async peer (e.g.
-  `KnowledgeLintWorkerTest`, which relies on the default batch_max) runs
-  concurrently would cross-contaminate the peer's chunk math. A sync test never
-  runs concurrently with any other test, so the seed can't leak — mirrors
-  `Loopctl.KnowledgeBreakerLatencyTest`.
+  The US-37.4 batching test seeds `embedding_batch_max` in its OWN `SystemConfig`
+  namespace and hands it to `ContentIngestionWorker.perform/2`, so the node-wide knob
+  every other test reads never moves.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
   setup :verify_on_exit!
@@ -356,11 +350,11 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       %{tenant: tenant} = setup_tenant()
       test_pid = self()
 
-      # env-driven batch_max WITHOUT Application.put_env: drive the SystemConfig cache
-      # directly and erase on exit. 5 ingested articles / batch_max 2 => ceil = 3 calls.
-      pt_key = {Loopctl.SystemConfig, "embedding_batch_max"}
-      :persistent_term.put(pt_key, 2)
-      on_exit(fn -> :persistent_term.erase(pt_key) end)
+      # batch_max from this test's own SystemConfig namespace, handed to perform/2.
+      # 5 ingested articles / batch_max 2 => ceil = 3 calls.
+      cache = {Loopctl.SystemConfig, make_ref()}
+      :persistent_term.put({cache, "embedding_batch_max"}, 2)
+      on_exit(fn -> :persistent_term.erase({cache, "embedding_batch_max"}) end)
 
       expect(Loopctl.MockContentExtractor, :extract_from_content, fn _t, _c, _o ->
         {:ok,
@@ -382,16 +376,19 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       end)
 
       assert :ok =
-               ContentIngestionWorker.perform(%Oban.Job{
-                 id: 44,
-                 args: %{
-                   "tenant_id" => tenant.id,
-                   "content" => "raw",
-                   "content_hash" => "batch123",
-                   "source_type" => "newsletter",
-                   "publish" => true
-                 }
-               })
+               ContentIngestionWorker.perform(
+                 %Oban.Job{
+                   id: 44,
+                   args: %{
+                     "tenant_id" => tenant.id,
+                     "content" => "raw",
+                     "content_hash" => "batch123",
+                     "source_type" => "newsletter",
+                     "publish" => true
+                   }
+                 },
+                 cache
+               )
 
       # ceil(5 / 2) = 3 provider calls (chunks of 2, 2, 1) — NOT 5.
       calls = drain_batch_calls([])

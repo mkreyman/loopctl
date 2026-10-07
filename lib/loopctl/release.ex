@@ -202,12 +202,15 @@ defmodule Loopctl.Release do
   # --- signed-profile helpers (public @doc false so the release-command logic is
   # unit-testable against the sandbox without re-entering with_admin_repo/1) ---
 
+  # `cache` is the `SystemConfig` namespace the value is cached in and read back from: the
+  # node-wide one for the release command, a test's own so its flip reaches no other test.
+  # The ROW written is the deployment's one row either way.
   @doc false
-  def set_custody_profile(value) when value in [0, 1] do
+  def set_custody_profile(value, cache \\ SystemConfig) when value in [0, 1] do
     # Capture the OLD stored value first so the audit record carries old -> new.
-    old_value = current_stored_profile()
+    old_value = current_stored_profile(cache)
 
-    case SystemConfig.put(SignedProfilePolicy.profile_key(), value) do
+    case SystemConfig.put(SignedProfilePolicy.profile_key(), value, cache) do
       {:ok, setting} ->
         # Record the flip in the immutable, append-only audit log BEFORE reporting
         # success. Flipping this switch is a deployment-wide security control —
@@ -220,10 +223,10 @@ defmodule Loopctl.Release do
         # Reflect the just-written value in THIS node's cache so the status
         # printout below reads back the new value (running server nodes refresh
         # via the cron).
-        SystemConfig.refresh()
+        SystemConfig.refresh(cache)
 
         IO.puts("Set custody_signed_profile_enforcement = #{value} (#{profile_label(value)}).")
-        print_custody_profile_status()
+        print_custody_profile_status(cache)
         :ok
 
       {:error, reason} ->
@@ -232,9 +235,9 @@ defmodule Loopctl.Release do
     end
   end
 
-  defp current_stored_profile do
-    SystemConfig.refresh()
-    SystemConfig.get_int(SignedProfilePolicy.profile_key(), 0)
+  defp current_stored_profile(cache) do
+    SystemConfig.refresh(cache)
+    SystemConfig.get_int(SignedProfilePolicy.profile_key(), 0, cache)
   end
 
   # The deployment-wide custody profile has NO tenant, so the per-tenant
@@ -277,13 +280,13 @@ defmodule Loopctl.Release do
   end
 
   @doc false
-  def print_custody_profile_status do
+  def print_custody_profile_status(cache \\ SystemConfig) do
     # The eval node does not run the app supervision tree, so its SystemConfig
     # persistent_term cache is unprimed — refresh from the DB before reading. Read
     # the STORED SystemConfig value (the deployment source of truth) rather than
     # SignedProfilePolicy.profile/0, which a test env can redirect through a stub.
-    SystemConfig.refresh()
-    code = SystemConfig.get_int(SignedProfilePolicy.profile_key(), 0)
+    SystemConfig.refresh(cache)
+    code = SystemConfig.get_int(SignedProfilePolicy.profile_key(), 0, cache)
     profile = profile_label(code)
     enrolled = count_enrolled_agent_keys()
     owner_tenants = count_owner_key_tenants()

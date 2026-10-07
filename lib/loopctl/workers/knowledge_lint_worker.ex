@@ -1394,22 +1394,24 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # operator's only mid-incident lever, and a lever nothing tests is a lever nobody can
   # trust to be there when it is needed.
   @doc false
-  @spec applies_cap() :: integer()
-  def applies_cap do
+  @spec applies_cap(SystemConfig.cache()) :: integer()
+  def applies_cap(cache \\ SystemConfig) do
     tunable(
       "knowledge_consolidation_max_applies",
       :knowledge_consolidation_max_applies,
-      Consolidation.default_max_applies()
+      Consolidation.default_max_applies(),
+      cache
     )
   end
 
   @doc false
-  @spec unpublishes_cap() :: integer()
-  def unpublishes_cap do
+  @spec unpublishes_cap(SystemConfig.cache()) :: integer()
+  def unpublishes_cap(cache \\ SystemConfig) do
     tunable(
       "knowledge_consolidation_max_unpublishes",
       :knowledge_consolidation_max_unpublishes,
-      Consolidation.default_max_unpublishes()
+      Consolidation.default_max_unpublishes(),
+      cache
     )
   end
 
@@ -1418,12 +1420,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # this is the one nightly step that spends a tenant's provider budget per item, and `0` is
   # an explicit pause an operator can reach without a deploy.
   @doc false
-  @spec retitles_cap() :: integer()
-  def retitles_cap do
+  @spec retitles_cap(SystemConfig.cache()) :: integer()
+  def retitles_cap(cache \\ SystemConfig) do
     tunable(
       "knowledge_consolidation_max_retitles",
       :knowledge_consolidation_max_retitles,
-      Consolidation.default_max_retitles()
+      Consolidation.default_max_retitles(),
+      cache
     )
   end
 
@@ -1432,30 +1435,39 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # drain: this step spends a tenant's embedding budget per item, and `0` is an explicit pause
   # an operator can reach mid-incident without a deploy.
   @doc false
-  @spec draft_publishes_cap() :: integer()
-  def draft_publishes_cap do
+  @spec draft_publishes_cap(SystemConfig.cache()) :: integer()
+  def draft_publishes_cap(cache \\ SystemConfig) do
     tunable(
       "knowledge_draft_consumer_max_publishes",
       :knowledge_draft_consumer_max_publishes,
-      DraftConsumer.default_max_publishes()
+      DraftConsumer.default_max_publishes(),
+      cache
     )
   end
 
   @doc false
-  @spec per_class_cap() :: integer()
-  def per_class_cap do
+  @spec per_class_cap(SystemConfig.cache()) :: integer()
+  def per_class_cap(cache \\ SystemConfig) do
     tunable(
       "knowledge_consolidation_max_per_class",
       :knowledge_consolidation_max_per_class,
-      Consolidation.default_max_per_class()
+      Consolidation.default_max_per_class(),
+      cache
     )
   end
 
   # `get_int/2`'s own contract is that a missing row, a non-integer row, or ANY error
   # returns the default — so the app-config value is what a fresh install and an unprimed
   # cache both see, exactly as before this indirection existed.
-  defp tunable(db_key, app_key, default) do
-    SystemConfig.get_int(db_key, coerce_int(Application.get_env(:loopctl, app_key), default))
+  #
+  # `cache` is the `SystemConfig` namespace the row is read from: the node-wide one in
+  # production, a test's own when it seeds a cap without moving it for every other test.
+  defp tunable(db_key, app_key, default, cache) do
+    SystemConfig.get_int(
+      db_key,
+      coerce_int(Application.get_env(:loopctl, app_key), default),
+      cache
+    )
   end
 
   # The app-config layer is type-checked rather than trusted: `SystemConfig.get_int/2`

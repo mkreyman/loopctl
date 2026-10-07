@@ -33,13 +33,13 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   `Loopctl.Telemetry.ScaleMetrics`'s moduledoc "Wiring emitted-but-dead events" for
   the full inventory, including the events deliberately left out of scope.
 
-  `async: false` (R2 review): the cap-gate tests MUTATE the process-global
-  `:persistent_term` gate (`{ScaleMetrics, :tenant_label?}`), which is shared across the
-  whole VM. Running concurrently with another async test that reads the gate (e.g. via
-  `scale_tags/1`) could make that test observe the flipped value mid-run. Matching the
-  project's existing async:false precedent for shared-global-state tests.
+  The cap-gate tests flip a gate of their OWN (`:persistent_term` key passed to
+  `scale_tags/2`, `tenant_label?/1`, `refresh_tenant_label_gate/1`), never the node's
+  `{ScaleMetrics, :tenant_label?}` every metric reads. The reporter round-trips start their
+  reporter on `own_metrics/1`, whose `:keep` also requires that the EMITTING process is this
+  test's, so a concurrent test's repo query or blocked decision is never counted here.
   """
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   alias Loopctl.SystemConfig.CachePrimer
   alias Loopctl.Telemetry.ScaleMetrics
@@ -130,6 +130,17 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   defp metric(name) do
     Enum.find(scale_metrics(), fn m -> Enum.join(m.name, ".") == name end) ||
       flunk("scale metric #{name} not found")
+  end
+
+  # `metrics`, each kept only for events the calling test process emits: a telemetry
+  # handler runs in the emitter, so `self()` inside `:keep` is whoever fired the event.
+  defp own_metrics(metrics) do
+    test_pid = self()
+
+    for metric <- metrics do
+      keep = metric.keep
+      %{metric | keep: fn meta -> self() == test_pid and (is_nil(keep) or keep.(meta)) end}
+    end
   end
 
   describe "scale_metrics/0 — bounded, safe label set (TC-27.15.2, AC-27.15.3)" do
@@ -286,25 +297,29 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
   describe "tenant-label cap gate — the cardinality proof (AC-27.15.3)" do
     setup do
-      # The gate lives in process-global :persistent_term. Snapshot + restore so this
-      # test can flip it without leaking into a concurrent async test that reads it.
-      original = ScaleMetrics.tenant_label?()
-      on_exit(fn -> :persistent_term.put({ScaleMetrics, :tenant_label?}, original) end)
-      :ok
+      # A gate of this test's own: flipping it moves no metric anywhere else.
+      gate = {ScaleMetrics, :tenant_label?, make_ref()}
+      on_exit(fn -> :persistent_term.erase(gate) end)
+      {:ok, gate: gate}
     end
 
-    defp gate_off, do: :persistent_term.put({ScaleMetrics, :tenant_label?}, false)
-    defp gate_on, do: :persistent_term.put({ScaleMetrics, :tenant_label?}, true)
+    defp gate_off(gate), do: :persistent_term.put(gate, false)
+    defp gate_on(gate), do: :persistent_term.put(gate, true)
 
-    test "gate OFF (over cap): scale_tags/1 collapses tenant_id to the :_aggregated sentinel" do
-      gate_off()
+    test "gate OFF (over cap): scale_tags/1 collapses tenant_id to the :_aggregated sentinel", %{
+      gate: gate
+    } do
+      gate_off(gate)
 
       tags =
-        ScaleMetrics.scale_tags(%{
-          endpoint: :suggested_links,
-          mapped_code: "db_error",
-          tenant_id: "t-123"
-        })
+        ScaleMetrics.scale_tags(
+          %{
+            endpoint: :suggested_links,
+            mapped_code: "db_error",
+            tenant_id: "t-123"
+          },
+          gate
+        )
 
       assert tags.tenant_id == :_aggregated
       assert tags.tenant_id == ScaleMetrics.aggregated_sentinel()
@@ -314,70 +329,95 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert tags.mapped_code == "db_error"
     end
 
-    test "gate ON (<= cap): scale_tags/1 includes the real tenant_id" do
-      gate_on()
+    test "gate ON (<= cap): scale_tags/1 includes the real tenant_id", %{gate: gate} do
+      gate_on(gate)
 
       tags =
-        ScaleMetrics.scale_tags(%{
-          endpoint: :suggested_links,
-          mapped_code: "db_error",
-          tenant_id: "t-123"
-        })
+        ScaleMetrics.scale_tags(
+          %{
+            endpoint: :suggested_links,
+            mapped_code: "db_error",
+            tenant_id: "t-123"
+          },
+          gate
+        )
 
       assert tags.tenant_id == "t-123"
     end
 
-    test "gate ON but tenant_id missing/nil still collapses to the sentinel (never blank)" do
-      gate_on()
+    test "gate ON but tenant_id missing/nil still collapses to the sentinel (never blank)", %{
+      gate: gate
+    } do
+      gate_on(gate)
 
-      assert ScaleMetrics.scale_tags(%{endpoint: :x, mapped_code: "y"}).tenant_id == :_aggregated
+      assert ScaleMetrics.scale_tags(%{endpoint: :x, mapped_code: "y"}, gate).tenant_id ==
+               :_aggregated
 
-      assert ScaleMetrics.scale_tags(%{endpoint: :x, mapped_code: "y", tenant_id: nil}).tenant_id ==
+      assert ScaleMetrics.scale_tags(%{endpoint: :x, mapped_code: "y", tenant_id: nil}, gate).tenant_id ==
                :_aggregated
     end
 
-    test "hybrid_provenance_tags/1 reuses the SAME cap-gated tenant_id collapse" do
-      gate_off()
+    test "hybrid_provenance_tags/1 reuses the SAME cap-gated tenant_id collapse", %{gate: gate} do
+      gate_off(gate)
 
-      assert ScaleMetrics.hybrid_provenance_tags(%{
-               provenance: "curated",
-               hit: true,
-               tenant_id: "t-123"
-             }) == %{provenance: "curated", hit: true, tenant_id: :_aggregated}
+      assert ScaleMetrics.hybrid_provenance_tags(
+               %{
+                 provenance: "curated",
+                 hit: true,
+                 tenant_id: "t-123"
+               },
+               gate
+             ) == %{provenance: "curated", hit: true, tenant_id: :_aggregated}
 
-      gate_on()
+      gate_on(gate)
 
-      assert ScaleMetrics.hybrid_provenance_tags(%{
-               provenance: "retrieved",
-               hit: false,
-               tenant_id: "t-123"
-             }) == %{provenance: "retrieved", hit: false, tenant_id: "t-123"}
+      assert ScaleMetrics.hybrid_provenance_tags(
+               %{
+                 provenance: "retrieved",
+                 hit: false,
+                 tenant_id: "t-123"
+               },
+               gate
+             ) == %{provenance: "retrieved", hit: false, tenant_id: "t-123"}
     end
 
-    test "article_linking_corpus_size_tags/1 reuses the SAME cap-gated tenant_id collapse" do
-      gate_off()
+    test "article_linking_corpus_size_tags/1 reuses the SAME cap-gated tenant_id collapse", %{
+      gate: gate
+    } do
+      gate_off(gate)
 
-      assert ScaleMetrics.article_linking_corpus_size_tags(%{
-               tenant_id: "t-123",
-               article_id: "a-1",
-               project_id: "p-1"
-             }) == %{tenant_id: :_aggregated}
+      assert ScaleMetrics.article_linking_corpus_size_tags(
+               %{
+                 tenant_id: "t-123",
+                 article_id: "a-1",
+                 project_id: "p-1"
+               },
+               gate
+             ) == %{tenant_id: :_aggregated}
 
-      gate_on()
+      gate_on(gate)
 
-      assert ScaleMetrics.article_linking_corpus_size_tags(%{
-               tenant_id: "t-123",
-               article_id: "a-1",
-               project_id: "p-1"
-             }) == %{tenant_id: "t-123"}
+      assert ScaleMetrics.article_linking_corpus_size_tags(
+               %{
+                 tenant_id: "t-123",
+                 article_id: "a-1",
+                 project_id: "p-1"
+               },
+               gate
+             ) == %{tenant_id: "t-123"}
     end
 
-    test "tenant_id over the cap is bounded to cardinality 1 across many distinct tenants" do
-      gate_off()
+    test "tenant_id over the cap is bounded to cardinality 1 across many distinct tenants", %{
+      gate: gate
+    } do
+      gate_off(gate)
 
       distinct =
         for i <- 1..1_000 do
-          ScaleMetrics.scale_tags(%{endpoint: :e, mapped_code: "c", tenant_id: "tenant-#{i}"}).tenant_id
+          ScaleMetrics.scale_tags(
+            %{endpoint: :e, mapped_code: "c", tenant_id: "tenant-#{i}"},
+            gate
+          ).tenant_id
         end
         |> Enum.uniq()
 
@@ -385,12 +425,14 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert distinct == [:_aggregated]
     end
 
-    test "defaults: unseeded gate reads false (safe/bounded), cap is the documented 1000" do
-      # Force the unseeded-read path by deleting the key, then restore in on_exit.
-      :persistent_term.erase({ScaleMetrics, :tenant_label?})
-      refute ScaleMetrics.tenant_label?()
+    test "defaults: unseeded gate reads false (safe/bounded), cap is the documented 1000", %{
+      gate: gate
+    } do
+      # Force the unseeded-read path: this test's gate was never seeded, and is erased anyway.
+      :persistent_term.erase(gate)
+      refute ScaleMetrics.tenant_label?(gate)
 
-      assert ScaleMetrics.scale_tags(%{endpoint: :e, mapped_code: "c", tenant_id: "t"}).tenant_id ==
+      assert ScaleMetrics.scale_tags(%{endpoint: :e, mapped_code: "c", tenant_id: "t"}, gate).tenant_id ==
                :_aggregated
 
       assert ScaleMetrics.tenant_label_cap() == 1_000
@@ -486,7 +528,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       pid =
         start_supervised!(
           {TelemetryMetricsPrometheus.Core,
-           [metrics: metrics, name: reporter_name, start_async: false]}
+           [metrics: own_metrics(metrics), name: reporter_name, start_async: false]}
         )
 
       %{reporter: reporter_name, reporter_pid: pid}
@@ -586,7 +628,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       pid =
         start_supervised!(
           {TelemetryMetricsPrometheus.Core,
-           [metrics: [counter], name: reporter_name, start_async: false]}
+           [metrics: own_metrics([counter]), name: reporter_name, start_async: false]}
         )
 
       :telemetry.execute([:loopctl, :llm, :blocked], %{count: 1}, %{provider: "anthropic"})
@@ -807,7 +849,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       pid =
         start_supervised!(
           {TelemetryMetricsPrometheus.Core,
-           [metrics: metrics, name: reporter_name, start_async: false]}
+           [metrics: own_metrics(metrics), name: reporter_name, start_async: false]}
         )
 
       %{reporter: reporter_name, reporter_pid: pid}
@@ -1174,37 +1216,41 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
   describe "tenant-label gate — one grace cycle before a failed count flips it" do
     setup do
-      original = :persistent_term.get({ScaleMetrics, :tenant_label?}, :unset)
-      on_exit(fn -> :persistent_term.put({ScaleMetrics, :tenant_label?}, original) end)
+      # A gate of this test's own: the refreshes below write it, never the node's.
+      gate = {ScaleMetrics, :tenant_label?, make_ref()}
+      on_exit(fn -> :persistent_term.erase(gate) end)
 
       # Make `Tenants.count()` fail DETERMINISTICALLY and without a DB: an Ecto dynamic repo
       # that was never started raises on lookup. Process-local, so it dies with this test.
       Loopctl.AdminRepo.put_dynamic_repo(:scale_metrics_unstarted_repo)
-      :ok
+      {:ok, gate: gate}
     end
 
-    test "the first failure HOLDS the gate; the second consecutive failure forces it OFF" do
-      :persistent_term.put({ScaleMetrics, :tenant_label?}, true)
+    test "the first failure HOLDS the gate; the second consecutive failure forces it OFF", %{
+      gate: gate
+    } do
+      :persistent_term.put(gate, true)
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
           # Cycle 1: held. An intermittently wedged pool used to flip the gate (and every
           # per-tenant series' label) OFF here, then back ON the next cycle, paying the
           # global `:persistent_term.put/2` term-table scan on each flap.
-          assert ScaleMetrics.refresh_tenant_label_gate()
-          assert ScaleMetrics.tenant_label?()
+          assert ScaleMetrics.refresh_tenant_label_gate(gate)
+          assert ScaleMetrics.tenant_label?(gate)
 
           # Cycle 2: a PERSISTENTLY unmeasurable count can never leave an unbounded tenant
           # label live (AC-27.15.3), so the grace is exactly one cycle.
-          refute ScaleMetrics.refresh_tenant_label_gate()
-          refute ScaleMetrics.tenant_label?()
+          refute ScaleMetrics.refresh_tenant_label_gate(gate)
+          refute ScaleMetrics.tenant_label?(gate)
         end)
 
       assert log =~ "tenant-label gate refresh failed"
       assert log =~ "holding the gate for one cycle"
     end
 
-    test "a failed refresh is alertable: it fires the poll-failure counter like every other measurement" do
+    test "a failed refresh is alertable: it fires the poll-failure counter like every other measurement",
+         %{gate: gate} do
       test_pid = self()
       handler_id = "test-gate-poll-error-#{System.unique_integer([:positive])}"
 
@@ -1222,7 +1268,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      ExUnit.CaptureLog.capture_log(fn -> ScaleMetrics.refresh_tenant_label_gate() end)
+      ExUnit.CaptureLog.capture_log(fn -> ScaleMetrics.refresh_tenant_label_gate(gate) end)
 
       assert_receive {:poll_error, %{poller: :tenant_label_gate}, %{count: 1}}, 500
     end
@@ -1245,7 +1291,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       pid =
         start_supervised!(
           {TelemetryMetricsPrometheus.Core,
-           [metrics: metrics, name: reporter_name, start_async: false]}
+           [metrics: own_metrics(metrics), name: reporter_name, start_async: false]}
         )
 
       :telemetry.execute([:loopctl, :oban, :jobs, :count], %{count: 3}, %{
@@ -1345,7 +1391,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       start_supervised!(
         {TelemetryMetricsPrometheus.Core,
-         [metrics: [counter], name: reporter_name, start_async: false]}
+         [metrics: own_metrics([counter]), name: reporter_name, start_async: false]}
       )
 
       for _i <- 1..3 do
@@ -1401,7 +1447,8 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
         handler_id,
         [:loopctl, :cluster, :peers],
         fn _event, measurements, metadata, _cfg ->
-          send(parent, {:cluster_peers, ref, measurements, metadata})
+          # Only this test's own emission: the app's poller emits the same event.
+          if self() == parent, do: send(parent, {:cluster_peers, ref, measurements, metadata})
         end,
         nil
       )
@@ -1450,7 +1497,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       start_supervised!(
         {TelemetryMetricsPrometheus.Core,
-         [metrics: [counter], name: reporter_name, start_async: false]}
+         [metrics: own_metrics([counter]), name: reporter_name, start_async: false]}
       )
 
       # Drive the label through the PRODUCER's own classifier rather than a literal, so a

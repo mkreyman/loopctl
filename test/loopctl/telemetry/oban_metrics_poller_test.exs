@@ -57,14 +57,15 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
   the queue name — the old per-test-unique name was defensive
   belt-and-suspenders, not a correctness requirement.
 
-  `async: false`: the executing_orphan gauge is UNTAGGED (a single global telemetry
-  channel + Prometheus series), and `:telemetry.attach/4` registers by EVENT NAME
-  (not by calling process) — running serially avoids a concurrently-running test's
-  poll invocation firing through this test's attached handler.
+  The gauges are UNTAGGED and a handler is attached by EVENT NAME, so every listener
+  here forwards only what its own poll emitted: a handler runs in the EMITTING process,
+  and a poll runs in this test's process (or, for a DB fault, in a process this test
+  spawned with no sandbox access — `in_unowned_process/1`). The app's own poller and a
+  concurrent test's poll never reach these mailboxes. The orphan-count cache is read and
+  written under a `:persistent_term` key of this test's own.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.Telemetry.ScaleMetrics
 
   describe "poll_oban_queue_state/0 (AC-34.1.1, TC-34.1.1)" do
@@ -77,7 +78,8 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         handler_id,
         [:loopctl, :oban, :jobs, :count],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:oban_queue_state, metadata, measurements})
+          if self() == test_pid,
+            do: send(test_pid, {:oban_queue_state, metadata, measurements})
         end,
         nil
       )
@@ -103,7 +105,8 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         handler_id,
         [:loopctl, :oban, :jobs, :count],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:oban_queue_state, metadata, measurements})
+          if self() == test_pid,
+            do: send(test_pid, {:oban_queue_state, metadata, measurements})
         end,
         nil
       )
@@ -130,7 +133,8 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         handler_id,
         [:loopctl, :oban, :jobs, :count],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:oban_queue_state, metadata, measurements})
+          if self() == test_pid,
+            do: send(test_pid, {:oban_queue_state, metadata, measurements})
         end,
         nil
       )
@@ -165,7 +169,8 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         handler_id,
         [:loopctl, :oban, :jobs, :count],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:oban_queue_state, metadata, measurements})
+          if self() == test_pid,
+            do: send(test_pid, {:oban_queue_state, metadata, measurements})
         end,
         nil
       )
@@ -198,7 +203,8 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         handler_id,
         [:loopctl, :oban, :jobs, :count],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:oban_queue_state, metadata, measurements})
+          if self() == test_pid,
+            do: send(test_pid, {:oban_queue_state, metadata, measurements})
         end,
         nil
       )
@@ -249,7 +255,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         handler_id,
         [:loopctl, :oban, :jobs, :executing_orphan, :count],
         fn _event, measurements, _metadata, _config ->
-          send(test_pid, {:oban_orphan, measurements})
+          if self() == test_pid, do: send(test_pid, {:oban_orphan, measurements})
         end,
         nil
       )
@@ -303,7 +309,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         handler_id,
         [:loopctl, :oban, :jobs, :executing_orphan, :count],
         fn _event, measurements, _metadata, _config ->
-          send(test_pid, {:oban_orphan, measurements})
+          if self() == test_pid, do: send(test_pid, {:oban_orphan, measurements})
         end,
         nil
       )
@@ -317,14 +323,20 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     end
   end
 
-  describe "cached_executing_orphan_count/0 (US-34.2 review finding — health-check reuse of the poller's cache)" do
-    test "returns :not_yet_polled before any poll has ever completed" do
-      :persistent_term.erase({ScaleMetrics, :cached_executing_orphan_count})
-
-      assert ScaleMetrics.cached_executing_orphan_count() == :not_yet_polled
+  describe "cached_executing_orphan_count/1 (US-34.2 review finding — health-check reuse of the poller's cache)" do
+    setup do
+      # The cache key of this test's own: the app's poller writes the node's.
+      cache_key = {ScaleMetrics, :cached_executing_orphan_count, make_ref()}
+      on_exit(fn -> :persistent_term.erase(cache_key) end)
+      {:ok, cache_key: cache_key}
     end
 
-    test "returns {:ok, count} reflecting the last successful poll, without issuing a fresh query" do
+    test "returns :not_yet_polled before any poll has ever completed", %{cache_key: cache_key} do
+      assert ScaleMetrics.cached_executing_orphan_count(cache_key) == :not_yet_polled
+    end
+
+    test "returns {:ok, count} reflecting the last successful poll, without issuing a fresh query",
+         %{cache_key: cache_key} do
       threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
       now = DateTime.utc_now()
 
@@ -334,11 +346,12 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
       )
 
-      assert ScaleMetrics.poll_oban_executing_orphans() == :ok
-      assert ScaleMetrics.cached_executing_orphan_count() == {:ok, 1}
+      assert ScaleMetrics.poll_oban_executing_orphans(cache_key) == :ok
+      assert ScaleMetrics.cached_executing_orphan_count(cache_key) == {:ok, 1}
     end
 
-    test "a FAILED poll leaves the prior cached value in place (same staleness semantics as the last_value gauge)" do
+    test "a FAILED poll leaves the prior cached value in place (same staleness semantics as the last_value gauge)",
+         %{cache_key: cache_key} do
       threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
       now = DateTime.utc_now()
 
@@ -348,65 +361,53 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
       )
 
-      assert ScaleMetrics.poll_oban_executing_orphans() == :ok
-      assert ScaleMetrics.cached_executing_orphan_count() == {:ok, 1}
+      assert ScaleMetrics.poll_oban_executing_orphans(cache_key) == :ok
+      assert ScaleMetrics.cached_executing_orphan_count(cache_key) == {:ok, 1}
 
-      # Force the NEXT poll to fail (same technique as "poller defensiveness"
-      # below): drop this test process's sandbox ownership so its next Repo call
-      # raises a genuine DBConnection.OwnershipError.
-      Sandbox.mode(Loopctl.Repo, :manual)
+      # The NEXT poll fails: it runs in a process with no sandbox access, so its Repo
+      # call raises a genuine DBConnection.OwnershipError.
+      {_pid, result, log} =
+        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache_key) end)
 
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert ScaleMetrics.poll_oban_executing_orphans() == :ok
-        end)
-
+      assert result == :ok
       assert log =~ "Oban executing-orphan poll failed"
 
       # The cache retains the last SUCCESSFUL value — never resets to 0/unknown
       # just because a poll cycle failed.
-      assert ScaleMetrics.cached_executing_orphan_count() == {:ok, 1}
+      assert ScaleMetrics.cached_executing_orphan_count(cache_key) == {:ok, 1}
     end
   end
 
   describe "poller defensiveness (AC-34.1.3, TC-34.1.3)" do
-    # DataCase's setup checks Repo out in :shared mode (this whole file is
-    # async: false), under which EVERY process — including this test process for
-    # any FURTHER call — routes to the same shared connection regardless of
-    # per-process ownership, so a plain `checkin` doesn't disconnect anything.
-    # Switching the pool back to `:manual` here removes that shared mapping
-    # without touching the dedicated owner process DataCase started, so THIS
-    # test process (which never explicitly checked out its own connection — it
-    # was only riding the shared one) has no ownership at all afterward: its
-    # very next Repo call raises a genuine `DBConnection.OwnershipError` — a
-    # REAL DB fault, not a stub. Self-contained: the NEXT test's `setup` calls
-    # `start_owner!(shared: true)` again, which re-establishes shared mode fresh.
-    setup do
-      Sandbox.mode(Loopctl.Repo, :manual)
-      :ok
-    end
+    # Every poll here runs in `in_unowned_process/1`: a plain `spawn`, which records no
+    # `:"$callers"`, so DBConnection finds no sandbox owner for it and its very next Repo
+    # call raises a genuine `DBConnection.OwnershipError` — a REAL DB fault, not a stub,
+    # and one that reaches no other test. Listeners forward the emitter's pid so the
+    # assertions bind to THAT process's emissions.
 
     test "poll_oban_queue_state/0 logs and returns :ok without raising on a DB fault" do
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert ScaleMetrics.poll_oban_queue_state() == :ok
-        end)
+      {_pid, result, log} = in_unowned_process(&ScaleMetrics.poll_oban_queue_state/0)
 
+      assert result == :ok
       assert log =~ "Oban queue/state poll failed"
     end
 
-    test "poll_oban_executing_orphans/0 logs and returns :ok without raising on a DB fault" do
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert ScaleMetrics.poll_oban_executing_orphans() == :ok
-        end)
+    test "poll_oban_executing_orphans/1 logs and returns :ok without raising on a DB fault" do
+      cache_key = {ScaleMetrics, :cached_executing_orphan_count, make_ref()}
+      on_exit(fn -> :persistent_term.erase(cache_key) end)
 
+      {_pid, result, log} =
+        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache_key) end)
+
+      assert result == :ok
       assert log =~ "Oban executing-orphan poll failed"
     end
 
     test "no metric corruption: neither gauge emits when the poll fails" do
       test_pid = self()
       handler_id = "test-oban-no-corruption-#{System.unique_integer([:positive])}"
+      cache_key = {ScaleMetrics, :cached_executing_orphan_count, make_ref()}
+      on_exit(fn -> :persistent_term.erase(cache_key) end)
 
       :telemetry.attach_many(
         handler_id,
@@ -415,52 +416,52 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
           [:loopctl, :oban, :jobs, :executing_orphan, :count]
         ],
         fn event, measurements, metadata, _config ->
-          send(test_pid, {:unexpected_emit, event, measurements, metadata})
+          send(test_pid, {:emitted, self(), event, measurements, metadata})
         end,
         nil
       )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      ExUnit.CaptureLog.capture_log(fn ->
-        ScaleMetrics.poll_oban_queue_state()
-        ScaleMetrics.poll_oban_executing_orphans()
-      end)
+      {pid, _result, _log} =
+        in_unowned_process(fn ->
+          ScaleMetrics.poll_oban_queue_state()
+          ScaleMetrics.poll_oban_executing_orphans(cache_key)
+        end)
 
-      refute_receive {:unexpected_emit, _event, _measurements, _metadata}, 200
+      refute_receive {:emitted, ^pid, _event, _measurements, _metadata}, 200
     end
 
     test "the poll-failure counter fires from both pollers on a DB fault (review finding)" do
       test_pid = self()
       handler_id = "test-oban-poll-error-#{System.unique_integer([:positive])}"
+      cache_key = {ScaleMetrics, :cached_executing_orphan_count, make_ref()}
+      on_exit(fn -> :persistent_term.erase(cache_key) end)
 
       :telemetry.attach(
         handler_id,
         [:loopctl, :oban, :poll, :error],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:oban_poll_error, metadata, measurements})
+          send(test_pid, {:oban_poll_error, self(), metadata, measurements})
         end,
         nil
       )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      ExUnit.CaptureLog.capture_log(fn ->
-        ScaleMetrics.poll_oban_queue_state()
-      end)
+      {pid, _result, _log} = in_unowned_process(&ScaleMetrics.poll_oban_queue_state/0)
 
-      assert_receive {:oban_poll_error, %{poller: :queue_state, exception: exception},
+      assert_receive {:oban_poll_error, ^pid, %{poller: :queue_state, exception: exception},
                       %{count: 1}},
                      500
 
       assert exception.__struct__ in [DBConnection.OwnershipError, Postgrex.Error]
 
-      ExUnit.CaptureLog.capture_log(fn ->
-        ScaleMetrics.poll_oban_executing_orphans()
-      end)
+      {pid2, _result, _log} =
+        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache_key) end)
 
-      assert_receive {:oban_poll_error, %{poller: :executing_orphans, exception: exception2},
-                      %{count: 1}},
+      assert_receive {:oban_poll_error, ^pid2,
+                      %{poller: :executing_orphans, exception: exception2}, %{count: 1}},
                      500
 
       assert exception2.__struct__ in [DBConnection.OwnershipError, Postgrex.Error]
@@ -470,7 +471,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
   # The catch-all `rescue e ->` clause (review finding — broadened from a narrow
   # DB-fault-only rescue) has NO type restriction, so the SAME code path proven
   # above via `DBConnection.OwnershipError` (a real DB fault, simulated via
-  # Sandbox mode rather than any `Application.put_env` config mutation) also
+  # an unowned process rather than any `Application.put_env` config mutation) also
   # covers a non-DB exception class (e.g. an `ArgumentError` from an invalid
   # config tunable, or the `FunctionClauseError` `oban_queues/0` itself now
   # guards against). The classification of NON-DB exceptions into the bounded
@@ -479,6 +480,24 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
   # validators themselves (`validate_positive_poll_timeout!/1`,
   # `queues_from_config/1`) are exposed as pure functions there too — so neither
   # needs an `Application.put_env` integration test here.
+
+  # Runs `fun` in a process with NO sandbox access and returns `{pid, result, log}`, where
+  # `log` is only the entries THAT process emitted. A plain `spawn` records no
+  # `:"$callers"`, so DBConnection resolves no owner for it: its first Repo call raises a
+  # genuine `DBConnection.OwnershipError`.
+  defp in_unowned_process(fun) do
+    parent = self()
+    ref = make_ref()
+
+    pid =
+      spawn(fn -> send(parent, {ref, self(), Loopctl.OwnLog.with_own_log(fun)}) end)
+
+    receive do
+      {^ref, ^pid, {result, log}} -> {pid, result, log}
+    after
+      5_000 -> flunk("the unowned poll did not finish")
+    end
+  end
 
   defp insert_job(attrs) do
     attrs

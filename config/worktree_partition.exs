@@ -50,10 +50,12 @@ defmodule Loopctl.Config.WorktreePartition do
   that reaches the derivation, which mirrors the shell's `[ -n "${MIX_TEST_PARTITION+x}" ]`
   (set at all) rather than a truthiness test.
 
-  `cd` runs the git queries in another directory; it exists for the tests.
+  `cd` runs the git queries in another directory, and `env` is the environment they run
+  under (the BEAM's own by default); both exist for the tests, so a test hands the
+  derivation an environment instead of setting a variable every other test shares.
   """
-  def suffix(cd \\ nil) do
-    choose(System.get_env("MIX_TEST_PARTITION"), fn -> derive(cd) end)
+  def suffix(cd \\ nil, env \\ System.get_env()) do
+    choose(Map.get(env, "MIX_TEST_PARTITION"), fn -> derive(cd, env) end)
   end
 
   @doc """
@@ -74,12 +76,15 @@ defmodule Loopctl.Config.WorktreePartition do
   shared database name in place rather than inventing one no tooling knows about.
 
   The question is about `cd` and about nothing else, so the git query runs with the ambient
-  git environment cleared — see `cleared_git_env/0`, which is what keeps an inherited
+  git environment cleared — see `cleared_git_env/1`, which is what keeps an inherited
   `GIT_DIR` from answering in this one's place.
+
+  `env` is the environment git runs under — the BEAM's own unless a caller (a test) hands
+  in another; it is applied EXACTLY, so a variable the BEAM has and `env` lacks is unset.
   """
-  def derive(cd \\ nil) do
+  def derive(cd \\ nil, env \\ System.get_env()) do
     with {:ok, base} <- base_dir(cd),
-         {:ok, [git_dir, common_dir, root]} <- rev_parse(cd),
+         {:ok, [git_dir, common_dir, root]} <- rev_parse(cd, env),
          :linked <-
            linked_worktree_status(Path.expand(git_dir, base), Path.expand(common_dir, base)) do
       partition_for_root(root)
@@ -176,8 +181,9 @@ defmodule Loopctl.Config.WorktreePartition do
   @doc """
   The `:env` overrides that strip the ambient git environment from the query.
 
-  A list of `{name, nil}` pairs for `System.cmd/3`'s `:env`, covering every inherited
-  `GIT_*` variable except the `GIT_TRACE*` diagnostics.
+  A list of `{name, nil}` pairs for `System.cmd/3`'s `:env`, covering every `GIT_*` variable
+  in `env` (the BEAM's own environment by default) except the `GIT_TRACE*` diagnostics and
+  the `GIT_CONFIG*` exception below.
 
   WHY THIS EXISTS. `derive/1` asks ONE question — which worktree does this PATH belong to —
   and an ambient `GIT_DIR` describing some OTHER directory is never an input to it. A git
@@ -255,8 +261,8 @@ defmodule Loopctl.Config.WorktreePartition do
   `cleared_git_env/0 clears an unknown GIT_ variable by default` is what keeps the deny-list
   default itself honest.
   """
-  def cleared_git_env do
-    for {name, _value} <- System.get_env(), clear_for_query?(name), do: {name, nil}
+  def cleared_git_env(env \\ System.get_env()) do
+    for {name, _value} <- env, clear_for_query?(name), do: {name, nil}
   end
 
   defp clear_for_query?("GIT_TRACE" <> _), do: false
@@ -281,11 +287,11 @@ defmodule Loopctl.Config.WorktreePartition do
   #
   # THE ENVIRONMENT IS CLEARED IN THE `:env` OPTION, NOT IN THIS STRING, so that the
   # discovery variables are gone before `sh` starts and nothing has to be quoted into a
-  # command line. `cleared_git_env/0` says what is cleared, what is not, and why.
+  # command line. `cleared_git_env/1` says what is cleared, what is not, and why.
   @rev_parse_cmd "git rev-parse --git-dir --git-common-dir --show-toplevel 2>/dev/null"
 
-  defp rev_parse(cd) do
-    opts = [env: cleared_git_env()] ++ if cd, do: [cd: cd], else: []
+  defp rev_parse(cd, env) do
+    opts = [env: query_env(env)] ++ if cd, do: [cd: cd], else: []
 
     case System.cmd("sh", ["-c", @rev_parse_cmd], opts) do
       {out, 0} ->
@@ -301,5 +307,16 @@ defmodule Loopctl.Config.WorktreePartition do
     _ -> :error
   catch
     _, _ -> :error
+  end
+
+  # The child's environment is `env` EXACTLY, minus what `cleared_git_env/1` clears: every
+  # variable the BEAM has and `env` lacks is unset, every one `env` carries is set to its
+  # value. With the default `env` (the BEAM's own) the first part is empty and the second
+  # re-sets each variable to the value it already had, so the query runs exactly as it did
+  # when this only passed the cleared list.
+  defp query_env(env) do
+    unset = for {name, _value} <- System.get_env(), not Map.has_key?(env, name), do: {name, nil}
+    kept = for {name, value} <- env, not clear_for_query?(name), do: {name, value}
+    unset ++ kept ++ cleared_git_env(env)
   end
 end

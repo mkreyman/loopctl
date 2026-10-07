@@ -4,6 +4,21 @@
 # only bounds a FAILURE: a passing assertion returns as soon as its message arrives.
 # refute_receive keeps its own 100ms default.
 ExUnit.start(assert_receive_timeout: 2_000)
+# Modules whose `:info` lines a test asserts on, let past `config/test.exs`'s `:warning`
+# primary level ONCE, here, before any test runs. A module level is VM-global, so setting
+# and deleting it around one test made every such test `async: false`. `capture_log: true`
+# (config/test.exs) keeps the extra lines out of the suite output.
+for module <- [
+      LoopctlWeb.StoryStatusController,
+      Loopctl.Workers.ReclaimExpiredClaimsWorker,
+      LoopctlWeb.RunnerChannel,
+      LoopctlWeb.RunnerSocket,
+      LoopctlWeb.RunnerShutdownNotice,
+      Loopctl.Runners
+    ] do
+  Logger.put_module_level(module, :info)
+end
+
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 {:ok, _lock_guard} = Loopctl.Test.LockGuard.start()

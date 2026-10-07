@@ -5,17 +5,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
   operator watching an apply go wrong had no way to halt it in the minutes that
   matter.
 
-  `async: false` DELIBERATELY, for the same reason
-  `Loopctl.ReleaseCustodyProfileTest` is: `SystemConfig.put/2` writes
-  `:persistent_term`, which is VM-GLOBAL. Seeding a cap row from an `async: true`
-  module would bleed that cap into every other test running concurrently. This is
-  the documented exception to the repo's `async: true` rule, not a lapse from it —
-  and it is why the production code reads the lever from the DB rather than from
-  `Application.put_env/3`, which would have the same global-mutation problem in
-  production as it does here.
+  Every test seeds its caps in its OWN `SystemConfig` namespace (`SystemConfig.put/3`) and
+  reads them back through that namespace (`KnowledgeLintWorker.applies_cap/1`,
+  `Consolidation.apply_confirmed_duplicates/2`'s `:system_config`), so the node-wide
+  `:persistent_term` every other test reads is never moved. The row write is the real one,
+  in this test's sandbox transaction. That is also why the production lever is a DB row
+  rather than `Application.put_env/3`, which is per-node and global in production too.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
 
@@ -36,27 +34,29 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
   )
 
   setup do
+    cache = {SystemConfig, make_ref()}
+
     on_exit(fn ->
-      # The DB row dies with the sandbox transaction; the persistent_term does NOT.
-      # Erasing it is what keeps this module from leaking a cap into the rest of the run.
-      Enum.each(@keys, &:persistent_term.erase({SystemConfig, &1}))
+      # The DB row dies with the sandbox transaction; the persistent_term does NOT, so
+      # this test's namespace is erased with it.
+      Enum.each(@keys, &:persistent_term.erase({cache, &1}))
     end)
 
-    :ok
+    {:ok, cache: cache}
   end
 
   describe "cap resolution order: DB row -> app config -> module default" do
-    test "with no DB row, the app config value is what the nightly uses" do
+    test "with no DB row, the app config value is what the nightly uses", %{cache: cache} do
       # config/test.exs sets max_applies: 2 / max_unpublishes: 1. The SystemConfig
       # indirection must not change what a deployment without a row already saw.
-      assert KnowledgeLintWorker.applies_cap() ==
+      assert KnowledgeLintWorker.applies_cap(cache) ==
                Application.get_env(:loopctl, :knowledge_consolidation_max_applies)
 
-      assert KnowledgeLintWorker.unpublishes_cap() ==
+      assert KnowledgeLintWorker.unpublishes_cap(cache) ==
                Application.get_env(:loopctl, :knowledge_consolidation_max_unpublishes)
     end
 
-    test "the app config layer beats the module default when it is set" do
+    test "the app config layer beats the module default when it is set", %{cache: cache} do
       # config/config.exs sets all three. The module default is the LAST resort, reached
       # only when neither a DB row nor an app config exists — see the coerce_int/2 block
       # below, which pins that leg without mutating VM-global state to remove the config.
@@ -65,31 +65,33 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
       assert is_integer(configured),
              "config/config.exs is expected to set :knowledge_consolidation_max_per_class"
 
-      assert KnowledgeLintWorker.per_class_cap() == configured
+      assert KnowledgeLintWorker.per_class_cap(cache) == configured
     end
 
-    test "a DB row OVERRIDES the app config, live, with no redeploy" do
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_max_applies", 7)
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_max_unpublishes", 9)
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_max_per_class", 11)
+    test "a DB row OVERRIDES the app config, live, with no redeploy", %{cache: cache} do
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_max_applies", 7, cache)
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_max_unpublishes", 9, cache)
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_max_per_class", 11, cache)
 
-      assert KnowledgeLintWorker.applies_cap() == 7
-      assert KnowledgeLintWorker.unpublishes_cap() == 9
-      assert KnowledgeLintWorker.per_class_cap() == 11
+      assert KnowledgeLintWorker.applies_cap(cache) == 7
+      assert KnowledgeLintWorker.unpublishes_cap(cache) == 9
+      assert KnowledgeLintWorker.per_class_cap(cache) == 11
     end
 
-    test "0 is reachable through the lever — the operator HALT must survive the indirection" do
+    test "0 is reachable through the lever — the operator HALT must survive the indirection", %{
+      cache: cache
+    } do
       # `apply_confirmed_duplicates/2` honours 0 as an explicit pause (`gate:
       # :drain_disabled`) rather than rounding it up. If the lever could not express 0,
       # the halt an operator reaches for mid-incident would not exist.
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_max_unpublishes", 0)
+      {:ok, _} = SystemConfig.put("knowledge_consolidation_max_unpublishes", 0, cache)
 
-      assert KnowledgeLintWorker.unpublishes_cap() == 0
+      assert KnowledgeLintWorker.unpublishes_cap(cache) == 0
     end
   end
 
   describe "the duplicate-similarity threshold is the same kind of lever" do
-    test "a DB row moves the content gate live, with no redeploy" do
+    test "a DB row moves the content gate live, with no redeploy", %{cache: cache} do
       # This threshold decides whether the only self-writing class applies anything at all.
       # Until #617 it was `Application.get_env/3` only, so an operator watching an
       # auto-unpublish behave wrong could move it only by deploying.
@@ -105,17 +107,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
       {:ok, _} = Consolidation.run(tenant.id)
 
       assert %{applied: 0, uncorroborated: 1} =
-               Consolidation.apply_confirmed_duplicates(tenant.id)
+               Consolidation.apply_confirmed_duplicates(tenant.id, system_config: cache)
 
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 50)
+      {:ok, _} =
+        SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 50, cache)
 
       assert %{applied: 1, uncorroborated: 0} =
-               Consolidation.apply_confirmed_duplicates(tenant.id)
+               Consolidation.apply_confirmed_duplicates(tenant.id, system_config: cache)
 
       assert AdminRepo.get!(Article, loser).status == :draft
     end
 
-    test "0 does NOT mean 'off' here — it is refused, not honoured as a pause" do
+    test "0 does NOT mean 'off' here — it is refused, not honoured as a pause", %{cache: cache} do
       # The sibling drain caps read 0 as an explicit pause, so 0 is the value an operator
       # reaches for to "turn the corroboration gate off". On THIS knob it does the
       # opposite: `min_sim >= 0.0` holds for every pair, so every title collision would
@@ -129,15 +132,19 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
 
       {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
       {:ok, _} = Consolidation.run(tenant.id)
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 0)
+
+      {:ok, _} =
+        SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 0, cache)
 
       assert %{applied: 0, uncorroborated: 1} =
-               Consolidation.apply_confirmed_duplicates(tenant.id)
+               Consolidation.apply_confirmed_duplicates(tenant.id, system_config: cache)
 
       assert AdminRepo.get!(Article, loser).status == :published
     end
 
-    test "100 or more DISABLES the class instead of quietly re-enabling it at the default" do
+    test "100 or more DISABLES the class instead of quietly re-enabling it at the default", %{
+      cache: cache
+    } do
       # An impossible threshold has one reading: an operator shutting the auto-applying
       # class down mid-incident, without a deploy. Treating it as out-of-range and falling
       # back did the OPPOSITE of what was asked — it re-enabled auto-unpublish at 0.80 on
@@ -153,21 +160,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
 
       {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
       {:ok, _} = Consolidation.run(tenant.id)
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 100)
+
+      {:ok, _} =
+        SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", 100, cache)
 
       assert %{applied: 0, uncorroborated: 1} =
-               Consolidation.apply_confirmed_duplicates(tenant.id)
+               Consolidation.apply_confirmed_duplicates(tenant.id, system_config: cache)
 
       assert AdminRepo.get!(Article, loser).status == :published
     end
 
-    test "a STORED value is never mistaken for an unset one, even at the old sentinel" do
+    test "a STORED value is never mistaken for an unset one, even at the old sentinel", %{
+      cache: cache
+    } do
       # The percent was read with a `-1` sentinel default, so a row STORING -1 was
       # indistinguishable from no row: the operator's value was dropped in silence and the
       # app layer answered as if nothing had been configured. Presence is now answered on
       # its own terms, so an out-of-range STORED value is refused OUT LOUD (and still falls
       # back — below the range is the conservative direction) rather than vanishing.
-      {:ok, _} = SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", -1)
+      {:ok, _} =
+        SystemConfig.put("knowledge_consolidation_min_duplicate_similarity_pct", -1, cache)
 
       tenant = fixture(:tenant)
       winner = publish!(tenant.id, "Sentinel Doc", String.duplicate("long ", 40))
@@ -181,7 +193,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
 
       log =
         capture_log(fn ->
-          assert %{applied: 1} = Consolidation.apply_confirmed_duplicates(tenant.id)
+          assert %{applied: 1} =
+                   Consolidation.apply_confirmed_duplicates(tenant.id, system_config: cache)
         end)
 
       assert log =~ "ignoring duplicate similarity percent -1"

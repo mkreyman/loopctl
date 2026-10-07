@@ -11,14 +11,13 @@ defmodule Loopctl.Egress.DegradedSearchTest do
   a bare empty list, that the breaker stays CLOSED, and that no provider-error
   storm signal is emitted for what is a local configuration decision.
 
-  `async: false`: the provider-error assertion below is a `refute_received` on
-  `[:loopctl, :llm, :provider_error]`, a VM-GLOBAL telemetry event whose metadata
-  carries no tenant — a concurrent embedding test emitting it is indistinguishable
-  from a leak here. Same reasoning (and same remedy) as `Loopctl.ProviderTest` and
-  `Loopctl.Llm.AnthropicTest`.
+  The provider-error assertion below is a `refute_received` on
+  `[:loopctl, :llm, :provider_error]`, an event whose metadata carries no tenant, so the
+  handler is `Loopctl.TelemetryHelpers.attach_own/1`: it forwards only emissions from this
+  test's process and the tasks it started, and a concurrent test's emission never reaches it.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Mox
 
@@ -98,8 +97,7 @@ defmodule Loopctl.Egress.DegradedSearchTest do
          %{conn: conn, tenant: tenant} do
       seed_article(tenant)
 
-      ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :llm, :provider_error]])
-      on_exit(fn -> :telemetry.detach(ref) end)
+      ref = Loopctl.TelemetryHelpers.attach_own([[:loopctl, :llm, :provider_error]])
 
       # Well past the breaker's failure threshold: if an egress refusal counted, the
       # breaker would open and the reason would flip to "embedding_circuit_open".

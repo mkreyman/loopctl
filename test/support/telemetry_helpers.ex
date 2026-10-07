@@ -22,6 +22,41 @@ defmodule Loopctl.TelemetryHelpers do
   @default_timeout 1_000
 
   @doc """
+  Attaches a handler for `events` that forwards ONLY the emissions this test caused, and
+  returns the ref the forwarded messages carry.
+
+  Messages have the `:telemetry_test` shape — `{event, ref, measurements, metadata}` — so
+  `assert_receive`/`refute_received` patterns written for `attach_event_handlers/2` work
+  unchanged. A telemetry handler runs synchronously in the EMITTING process, so the handler
+  can tell whose emission it is: it forwards when that process is the attaching test, or a
+  process the test started (`Task`s record their starter in `:"$callers"`). That is the key
+  only this test produces, which is what lets a `refute_received` on an event with no tenant
+  in its metadata (`[:loopctl, :llm, :provider_error]`) run beside other tests emitting it.
+
+  The handler id is unique per call and detached when the test exits.
+  """
+  @spec attach_own([[atom()]]) :: reference()
+  def attach_own(events) do
+    ref = make_ref()
+    handler_id = {__MODULE__, ref}
+    config = %{pid: self(), ref: ref}
+
+    :ok = :telemetry.attach_many(handler_id, events, &__MODULE__.forward_own/4, config)
+    ExUnit.Callbacks.on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    ref
+  end
+
+  @doc false
+  def forward_own(event, measurements, metadata, %{pid: pid, ref: ref}) do
+    if self() == pid or pid in Process.get(:"$callers", []) do
+      send(pid, {event, ref, measurements, metadata})
+    end
+
+    :ok
+  end
+
+  @doc """
   Waits for a `:telemetry_test` message for `event`/`ref` whose METADATA satisfies
   `match_fun`, and returns `{measurements, metadata}`.
 

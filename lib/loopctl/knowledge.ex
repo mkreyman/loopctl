@@ -4736,7 +4736,9 @@ defmodule Loopctl.Knowledge do
   - `tenant_id` -- the tenant UUID
   - `article_ids` -- list of article UUIDs (any length up to #{@bulk_publish_max};
     deduplicated)
-  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`, and
+    `:system_config`, the `Loopctl.SystemConfig` namespace `embedding_batch_max/1` is
+    read from when the published rows are chunked for embedding (node-wide by default)
 
   ## Returns
 
@@ -5038,7 +5040,7 @@ defmodule Loopctl.Knowledge do
         :published,
         "article.published",
         opts,
-        &enqueue_bulk_embeddings(tenant_id, &1)
+        &enqueue_bulk_embeddings(tenant_id, &1, Keyword.get(opts, :system_config, SystemConfig))
       )
 
     published_ids = MapSet.new(published, & &1.id)
@@ -5227,11 +5229,11 @@ defmodule Loopctl.Knowledge do
   #
   # NB: the INTERACTIVE single-article publish path (`maybe_enqueue_embedding/2`)
   # stays on the per-record `ArticleEmbeddingWorker` — batching is only for bulk.
-  defp enqueue_bulk_embeddings(_tenant_id, []), do: :ok
+  defp enqueue_bulk_embeddings(_tenant_id, [], _cache), do: :ok
 
-  defp enqueue_bulk_embeddings(tenant_id, published) do
+  defp enqueue_bulk_embeddings(tenant_id, published, cache) do
     published
-    |> Enum.chunk_every(embedding_batch_max())
+    |> Enum.chunk_every(embedding_batch_max(cache))
     |> Enum.each(fn chunk ->
       %{article_ids: Enum.map(chunk, & &1.id), tenant_id: tenant_id}
       |> BatchArticleEmbeddingWorker.new()
@@ -5269,10 +5271,10 @@ defmodule Loopctl.Knowledge do
       (100 × ~8k tokens ≈ 800k > a ~300k ceiling), which is why this second cap
       exists.
   """
-  @spec embedding_batch_max() :: pos_integer()
-  def embedding_batch_max do
+  @spec embedding_batch_max(SystemConfig.cache()) :: pos_integer()
+  def embedding_batch_max(cache \\ SystemConfig) do
     "embedding_batch_max"
-    |> SystemConfig.get_int(@default_embedding_batch_max)
+    |> SystemConfig.get_int(@default_embedding_batch_max, cache)
     |> max(1)
   end
 
@@ -5290,10 +5292,10 @@ defmodule Loopctl.Knowledge do
   `@max_text_length` in the worker so a single oversized (already-sliced) input still
   forms its own chunk rather than wedging into an empty one.
   """
-  @spec embedding_batch_max_chars() :: pos_integer()
-  def embedding_batch_max_chars do
+  @spec embedding_batch_max_chars(SystemConfig.cache()) :: pos_integer()
+  def embedding_batch_max_chars(cache \\ SystemConfig) do
     "embedding_batch_max_chars"
-    |> SystemConfig.get_int(@default_embedding_batch_max_chars)
+    |> SystemConfig.get_int(@default_embedding_batch_max_chars, cache)
     |> max(1)
   end
 
@@ -13055,6 +13057,9 @@ defmodule Loopctl.Knowledge do
       `local_only` marking is enforced at the provider chokepoint.
     * `:project_id` — shorthand for building the scope from an already-present
       search/ingest filter.
+    * `:system_config` — the `Loopctl.SystemConfig` namespace the breaker's tunables
+      (latency threshold/count, cooldown and its ceiling) are read from. Defaults to the
+      node-wide one; a test passes its own so its knobs reach no other test.
   """
   @spec generate_embedding(Ecto.UUID.t(), String.t(), keyword()) ::
           {:ok, [float()]} | {:error, term()}
@@ -13096,7 +13101,8 @@ defmodule Loopctl.Knowledge do
         egress_scope(tenant_id, opts),
         query_string,
         timeout,
-        embedding_model_override(tenant_id, opts)
+        embedding_model_override(tenant_id, opts),
+        Keyword.get(opts, :system_config, SystemConfig)
       )
     end
   end
@@ -13136,11 +13142,11 @@ defmodule Loopctl.Knowledge do
   # fallback and the workers snooze on — so the interactive path degrades gracefully
   # instead of blocking, and NO circuit-breaker / provider-error signal is recorded
   # (self-imposed backpressure is not a provider failure).
-  defp run_embedding_task(tenant_id, scope, query_string, timeout, model) do
+  defp run_embedding_task(tenant_id, scope, query_string, timeout, model, cache) do
     case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
-          run_capped_embedding_task(tenant_id, scope, query_string, timeout, model)
+          run_capped_embedding_task(tenant_id, scope, query_string, timeout, model, cache)
         after
           embedding_concurrency().release(tenant_id)
         end
@@ -13150,7 +13156,7 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp run_capped_embedding_task(tenant_id, scope, query_string, timeout, model) do
+  defp run_capped_embedding_task(tenant_id, scope, query_string, timeout, model, cache) do
     # Task.Supervisor.async_nolink so an embedding task crash surfaces as
     # {:exit, reason} from Task.yield (the `_ ->` clause -> {:error, :timeout})
     # rather than crashing THIS process (AC-37.2.5). The inner rescue still catches
@@ -13177,7 +13183,7 @@ defmodule Loopctl.Knowledge do
 
     case Task.yield(task, timeout) || Task.shutdown(task) do
       {:ok, {:ok, embedding}} ->
-        record_call_outcome(tenant_id, System.monotonic_time(:millisecond) - started_ms)
+        record_call_outcome(tenant_id, System.monotonic_time(:millisecond) - started_ms, cache)
         {:ok, embedding}
 
       # A missing tenant key is a config gap, not a provider failure — do NOT
@@ -13186,14 +13192,14 @@ defmodule Loopctl.Knowledge do
         {:error, :no_api_key}
 
       {:ok, {:error, reason} = err} ->
-        maybe_record_failure(tenant_id, reason)
+        maybe_record_failure(tenant_id, reason, cache)
         maybe_record_provider_error(reason)
         err
 
       _ ->
         # nil (yield timeout), an abnormal task exit, or an async_nolink task crash
         # surfacing as {:exit, reason} — a provider/infra failure.
-        record_failure(tenant_id)
+        record_failure(tenant_id, nil, cache)
         maybe_record_provider_error(:timeout)
         {:error, :timeout}
     end
@@ -13215,6 +13221,8 @@ defmodule Loopctl.Knowledge do
 
   `opts`:
     * `:timeout` — Task.yield budget in ms (default `#{@embedding_yield_ms}`).
+    * `:system_config` — the `Loopctl.SystemConfig` namespace the breaker's tunables are
+      read from, as in `generate_embedding/3`.
     * `:scope` / `:project_id` — the egress scope (US-41.4, AC-41.4.2); see
       `generate_embedding/3`.
   """
@@ -13242,7 +13250,8 @@ defmodule Loopctl.Knowledge do
         egress_scope(tenant_id, opts),
         texts,
         timeout,
-        embedding_model_override(tenant_id, opts)
+        embedding_model_override(tenant_id, opts),
+        Keyword.get(opts, :system_config, SystemConfig)
       )
     end
   end
@@ -13250,11 +13259,11 @@ defmodule Loopctl.Knowledge do
   # Mirrors `run_embedding_task/3`: ONE concurrency slot for the WHOLE batch
   # (US-37.2 — a batch is one outbound call, so it charges one slot), released in an
   # `after`. Over the cap → `{:error, :rate_limited_local}` (worker snoozes).
-  defp run_embeddings_task(tenant_id, scope, texts, timeout, model) do
+  defp run_embeddings_task(tenant_id, scope, texts, timeout, model, cache) do
     case embedding_concurrency().acquire(tenant_id) do
       :ok ->
         try do
-          run_capped_embeddings_task(tenant_id, scope, texts, timeout, model)
+          run_capped_embeddings_task(tenant_id, scope, texts, timeout, model, cache)
         after
           embedding_concurrency().release(tenant_id)
         end
@@ -13269,7 +13278,7 @@ defmodule Loopctl.Knowledge do
   # signal per batch — a batch failure counts once, not per text. UNLIKE the single
   # path it is EXEMPT from latency-based tripping (a batch's wall-clock is inherently
   # larger than one text; see the success clause below).
-  defp run_capped_embeddings_task(tenant_id, scope, texts, timeout, model) do
+  defp run_capped_embeddings_task(tenant_id, scope, texts, timeout, model, cache) do
     started_ms = System.monotonic_time(:millisecond)
 
     task =
@@ -13303,22 +13312,24 @@ defmodule Loopctl.Knowledge do
         {:error, :no_api_key}
 
       {:ok, {:error, reason} = err} ->
-        maybe_record_failure(tenant_id, reason)
+        maybe_record_failure(tenant_id, reason, cache)
         maybe_record_provider_error(reason)
         err
 
       _ ->
-        record_failure(tenant_id)
+        record_failure(tenant_id, nil, cache)
         maybe_record_provider_error(:timeout)
         {:error, :timeout}
     end
   end
 
-  defp maybe_record_failure(tenant_id, reason) do
+  # `cache` is the `SystemConfig` namespace the breaker's tunables are read from — the
+  # `:system_config` option of `generate_embedding/3` and `generate_embeddings/3`.
+  defp maybe_record_failure(tenant_id, reason, cache) do
     # US-37.3: a throttle error may carry a provider Retry-After — thread it so the
-    # breaker cooldown honors it (see `record_failure/2` -> `cooldown_seconds/1`).
+    # breaker cooldown honors it (see `record_failure/3` -> `cooldown_seconds/2`).
     if breaker_countable?(reason),
-      do: record_failure(tenant_id, RetryAfter.from_error(reason))
+      do: record_failure(tenant_id, RetryAfter.from_error(reason), cache)
 
     :ok
   end
@@ -13434,8 +13445,6 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp record_failure(tenant_id), do: record_failure(tenant_id, nil)
-
   # The failure counter is keyed by the WINDOW PERIOD (review #2): each rolling
   # window is a DISTINCT ETS key, so an expired window is simply a different key —
   # there is no non-atomic "check the timestamp, then reset the counter in place"
@@ -13445,7 +13454,7 @@ defmodule Loopctl.Knowledge do
   # US-37.3: `retry_after` (seconds, or nil) is a provider Retry-After parsed from a
   # throttle response — it RAISES the cooldown floor when the breaker opens (see
   # `cooldown_seconds/1`) so we back off for at least as long as the provider asked.
-  defp record_failure(tenant_id, retry_after) do
+  defp record_failure(tenant_id, retry_after, cache) do
     ensure_circuit_breaker_table()
     now = System.monotonic_time(:second)
     period = period_for(now)
@@ -13463,7 +13472,7 @@ defmodule Loopctl.Knowledge do
       )
 
     if count >= @failure_threshold do
-      open_breaker(tenant_id, now, retry_after)
+      open_breaker(tenant_id, now, retry_after, cache)
     end
 
     :ok
@@ -13474,11 +13483,11 @@ defmodule Loopctl.Knowledge do
   # (over the configured threshold) records a slow-call toward the latency trip.
   # Disabled-safe: a threshold of 0/unset means the latency trip never fires and a
   # success always just clears state (identical to pre-US-37.3 behavior).
-  defp record_call_outcome(tenant_id, elapsed_ms) do
-    threshold = latency_threshold_ms()
+  defp record_call_outcome(tenant_id, elapsed_ms, cache) do
+    threshold = latency_threshold_ms(cache)
 
     if threshold > 0 and elapsed_ms > threshold do
-      record_slow_call(tenant_id)
+      record_slow_call(tenant_id, cache)
     else
       record_success(tenant_id)
     end
@@ -13489,7 +13498,7 @@ defmodule Loopctl.Knowledge do
   # WITHOUT a fast success in between resetting it (a fast success clears both
   # counters via `record_success/1` -> `clear_tenant_breaker/2`). The cooldown here
   # uses the base cooldown (no provider Retry-After on a 200).
-  defp record_slow_call(tenant_id) do
+  defp record_slow_call(tenant_id, cache) do
     ensure_circuit_breaker_table()
     now = System.monotonic_time(:second)
     period = period_for(now)
@@ -13504,17 +13513,17 @@ defmodule Loopctl.Knowledge do
         {slow_key(tenant_id, period), 0}
       )
 
-    if count >= latency_count() do
-      open_breaker(tenant_id, now, nil)
+    if count >= latency_count(cache) do
+      open_breaker(tenant_id, now, nil, cache)
     end
 
     :ok
   end
 
-  defp open_breaker(tenant_id, now, retry_after) do
+  defp open_breaker(tenant_id, now, retry_after, cache) do
     :ets.insert(
       @circuit_breaker_table,
-      {{tenant_id, :open_until}, now + cooldown_seconds(retry_after)}
+      {{tenant_id, :open_until}, now + cooldown_seconds(retry_after, cache)}
     )
   end
 
@@ -13522,14 +13531,14 @@ defmodule Loopctl.Knowledge do
   # RAISES the floor (back off at least as long as asked), bounded by the
   # SystemConfig max so a hostile header can't wedge the breaker open. Absent
   # Retry-After keeps the base cooldown.
-  defp cooldown_seconds(nil), do: base_cooldown_seconds()
+  defp cooldown_seconds(nil, cache), do: base_cooldown_seconds(cache)
 
-  defp cooldown_seconds(retry_after) when is_integer(retry_after) do
-    retry_after |> max(base_cooldown_seconds()) |> min(max_cooldown_seconds())
+  defp cooldown_seconds(retry_after, cache) when is_integer(retry_after) do
+    retry_after |> max(base_cooldown_seconds(cache)) |> min(max_cooldown_seconds(cache))
   end
 
-  defp base_cooldown_seconds do
-    SystemConfig.get_int("embedding_breaker_cooldown_seconds", @cooldown_seconds)
+  defp base_cooldown_seconds(cache) do
+    SystemConfig.get_int("embedding_breaker_cooldown_seconds", @cooldown_seconds, cache)
   end
 
   # The breaker's OWN open-cooldown ceiling — an embedding-breaker-specific key,
@@ -13537,16 +13546,20 @@ defmodule Loopctl.Knowledge do
   # client too). Keeping them separate lets an operator cap how long the embedding
   # breaker stays open without moving the shared Retry-After parser's ceiling.
   # Defaults to the same 300s, so behavior is unchanged until the key is tuned.
-  defp max_cooldown_seconds do
-    SystemConfig.get_int("embedding_breaker_max_cooldown_seconds", @max_cooldown_seconds)
+  defp max_cooldown_seconds(cache) do
+    SystemConfig.get_int("embedding_breaker_max_cooldown_seconds", @max_cooldown_seconds, cache)
   end
 
-  defp latency_threshold_ms do
-    SystemConfig.get_int("embedding_breaker_latency_threshold_ms", @default_latency_threshold_ms)
+  defp latency_threshold_ms(cache) do
+    SystemConfig.get_int(
+      "embedding_breaker_latency_threshold_ms",
+      @default_latency_threshold_ms,
+      cache
+    )
   end
 
-  defp latency_count do
-    SystemConfig.get_int("embedding_breaker_latency_count", @default_latency_count)
+  defp latency_count(cache) do
+    SystemConfig.get_int("embedding_breaker_latency_count", @default_latency_count, cache)
   end
 
   defp record_success(tenant_id) do

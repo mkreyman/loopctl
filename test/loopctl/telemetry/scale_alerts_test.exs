@@ -19,11 +19,12 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
   POST), bounded periodic re-notify while a breach stays sustained (AC-34.5.2), re-arm on
   clear (AC-34.5.3), and the nil-url path still never enqueues (AC-34.5.4).
 
-  `async: false`: the handlers attach GLOBAL `:telemetry` listeners on the three scale
-  events, so a concurrent async test issuing a real heavy-read / db-error would pollute
-  this instance's window counters. Running serially keeps the counts deterministic. It
-  also lets us use Mox GLOBAL mode so the alert POST (which happens INSIDE the ScaleAlerts
-  process, not the test process) is allowed without per-pid `Mox.allow`.
+  Every instance is started `only_from: self()`: its handlers are attached VM-wide, but it
+  counts only the events this test's process emits, so a concurrent test's real heavy
+  read, DB error or Oban job never lands in its window. The alert POST happens INSIDE the
+  ScaleAlerts process (Oban runs the delivery job inline there), so each instance's pid is
+  `Mox.allow`ed on the delivery mock, and the Oban job-lifecycle listeners forward only the
+  events that instance's process emits.
 
   Config (config/test.exs, NO put_env in the body): `:webhook_delivery` →
   `Loopctl.MockDelivery`, a deterministic `:scale_alert_webhook_url`, a 60s window.
@@ -31,7 +32,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
   env; we choose event COUNTS relative to the documented defaults instead, so we never
   mutate global config.
   """
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   import Mox
 
@@ -39,7 +40,6 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
   alias Loopctl.TelemetryEvents
   alias Loopctl.Workers.ScaleAlertDeliveryWorker
 
-  setup :set_mox_global
   setup :verify_on_exit!
 
   # Documented defaults (config.exs): timeouts 5/min, p95 2000ms, under-fill 30/min.
@@ -52,11 +52,12 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     table = :"scale_alerts_test_#{System.unique_integer([:positive])}"
     name = :"scale_alerts_srv_#{System.unique_integer([:positive])}"
 
-    pid = start_supervised!({ScaleAlerts, table: table, name: name})
+    pid = start_supervised!({ScaleAlerts, table: table, name: name, only_from: self()})
+    Mox.allow(Loopctl.MockDelivery, self(), pid)
 
     # Default permissive stub (DataCase isn't used here — this is a plain ExUnit.Case),
     # so an unexpected deliver doesn't crash; tests that assert a POST override with
-    # expect/3. Allowed in global mode for any process.
+    # expect/3. The instance's pid is allowed on the mock above.
     stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
       {:ok, %{status: 200, body: "ok"}}
     end)
@@ -481,7 +482,8 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         handler_id,
         [:loopctl, :llm, :provider_error],
         fn _event, measurements, metadata, _config ->
-          send(test_pid, {:emitted, measurements, metadata})
+          # Only this test's own emission: concurrent embedding tests emit it too.
+          if self() == test_pid, do: send(test_pid, {:emitted, measurements, metadata})
         end,
         nil
       )
@@ -500,18 +502,45 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     end
 
     test "is best-effort: a raising downstream handler never propagates to the caller" do
+      test_pid = self()
       handler_id = {:record_provider_error_raising, System.unique_integer([:positive])}
 
+      # Raises only on THIS test's emission: telemetry detaches a handler that raises, so
+      # one raising on a concurrent test's emission would be gone before the call below.
       :telemetry.attach(
         handler_id,
         [:loopctl, :llm, :provider_error],
-        fn _event, _measurements, _metadata, _config -> raise "boom" end,
+        fn _event, _measurements, _metadata, _config ->
+          if self() == test_pid, do: raise("boom")
+        end,
         nil
       )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
       assert :ok = Loopctl.Llm.record_provider_error("embedding", :permanent)
+    end
+  end
+
+  describe "an instance counts only the events its :only_from process emits" do
+    test "a breach emitted by ANOTHER process never lands in this instance's window",
+         %{server: server} do
+      # What lets this module run beside every other test: the handlers are attached
+      # VM-wide, and a concurrent test's real DB errors must not reach this window.
+      test_pid = self()
+
+      stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
+        send(test_pid, :fired)
+        {:ok, %{status: 200, body: "ok"}}
+      end)
+
+      # 6 timeouts is a breach (> 5/min) — had this instance counted them.
+      other = spawn(fn -> emit_timeout(6) end)
+      ref = Process.monitor(other)
+      assert_receive {:DOWN, ^ref, :process, ^other, :normal}
+
+      assert :ok = ScaleAlerts.evaluate(server)
+      refute_received :fired
     end
   end
 
@@ -624,6 +653,21 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         {:ok, %{status: 200, body: "ok"}}
       end)
 
+      # Start a SEPARATE instance with the URL overridden to nil via a start opt (NO
+      # put_env in the body — the override is instance config, restored automatically when
+      # this supervised process stops). A breach must log, not POST, and (US-34.5) must
+      # NOT enqueue a durable-delivery job either.
+      table = :"scale_alerts_nilurl_#{System.unique_integer([:positive])}"
+      name = :"scale_alerts_nilurl_srv_#{System.unique_integer([:positive])}"
+
+      pid =
+        start_supervised!(
+          {ScaleAlerts, table: table, name: name, webhook_url: nil, only_from: self()},
+          id: name
+        )
+
+      Mox.allow(Loopctl.MockDelivery, self(), pid)
+
       # A nil-url breach must never even reach Oban — assert no [:oban, :job, :start]
       # (or any other oban job event) fires for our worker at all (US-34.5: the nil
       # branch stays a SYNCHRONOUS log-only no-op, it must not enqueue).
@@ -633,22 +677,13 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         handler_id,
         [:oban, :job, :start],
         fn _event, _measurements, meta, _config ->
-          send(test_pid, {:unexpected_oban_job, meta.job.worker})
+          # Only a job run by THIS instance (Oban runs it inline in the instance process).
+          if self() == pid, do: send(test_pid, {:unexpected_oban_job, meta.job.worker})
         end,
         nil
       )
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
-
-      # Start a SEPARATE instance with the URL overridden to nil via a start opt (NO
-      # put_env in the body — the override is instance config, restored automatically when
-      # this supervised process stops). A breach must log, not POST, and (US-34.5) must
-      # NOT enqueue a durable-delivery job either.
-      table = :"scale_alerts_nilurl_#{System.unique_integer([:positive])}"
-      name = :"scale_alerts_nilurl_srv_#{System.unique_integer([:positive])}"
-
-      _pid =
-        start_supervised!({ScaleAlerts, table: table, name: name, webhook_url: nil}, id: name)
 
       for _ <- 1..6 do
         :telemetry.execute(TelemetryEvents.db_error(), %{count: 1}, %{
@@ -677,7 +712,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     # (`scale_alert_delivery_worker_test.exs`) covers the complementary unit proof that
     # `perform/1` itself returns `{:error, _}` on failure and `:ok` on success.
     test "a delivery failure is classified by Oban as a retryable failure, not dropped",
-         %{server: server} do
+         %{server: server, pid: server_pid} do
       test_pid = self()
 
       stub(Loopctl.MockDelivery, :deliver, fn _url, _body, _headers, _scope ->
@@ -690,7 +725,9 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         handler_id,
         [:oban, :job, :exception],
         fn _event, _measurements, meta, _config ->
-          send(test_pid, {:oban_job_failed, meta.job.worker, meta.state})
+          # Only the job THIS instance ran (inline, in its own process).
+          if self() == server_pid,
+            do: send(test_pid, {:oban_job_failed, meta.job.worker, meta.state})
         end,
         nil
       )
@@ -706,7 +743,7 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
     end
 
     test "a delivery success runs through the durable worker path (not a bare POST)",
-         %{server: server} do
+         %{server: server, pid: server_pid} do
       test_pid = self()
 
       handler_id = {:scale_alerts_oban_stop, System.unique_integer([:positive])}
@@ -715,7 +752,9 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
         handler_id,
         [:oban, :job, :stop],
         fn _event, _measurements, meta, _config ->
-          send(test_pid, {:oban_job_succeeded, meta.job.worker, meta.state})
+          # Only the job THIS instance ran (inline, in its own process).
+          if self() == server_pid,
+            do: send(test_pid, {:oban_job_succeeded, meta.job.worker, meta.state})
         end,
         nil
       )
@@ -762,10 +801,13 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       table = :"scale_alerts_dropped_enqueue_#{System.unique_integer([:positive])}"
       name = :"scale_alerts_dropped_enqueue_srv_#{System.unique_integer([:positive])}"
 
-      _pid =
-        start_supervised!({ScaleAlerts, table: table, name: name, insert_fn: insert_fn},
+      pid =
+        start_supervised!(
+          {ScaleAlerts, table: table, name: name, insert_fn: insert_fn, only_from: self()},
           id: name
         )
+
+      Mox.allow(Loopctl.MockDelivery, self(), pid)
 
       # Edge fire: the enqueue is dropped -> nothing is ever delivered for this tick, and
       # (the bug this finding describes) `last_notified_at` must NOT have been stamped.
@@ -798,9 +840,12 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       name = :"scale_alerts_raise_srv_#{System.unique_integer([:positive])}"
 
       pid =
-        start_supervised!({ScaleAlerts, table: table, name: name, insert_fn: insert_fn},
+        start_supervised!(
+          {ScaleAlerts, table: table, name: name, insert_fn: insert_fn, only_from: self()},
           id: name
         )
+
+      Mox.allow(Loopctl.MockDelivery, self(), pid)
 
       emit_timeout(6)
       # The call itself must complete normally (not crash/timeout) — proving `deliver/4`
@@ -831,10 +876,13 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       table = :"scale_alerts_no_url_in_args_#{System.unique_integer([:positive])}"
       name = :"scale_alerts_no_url_in_args_srv_#{System.unique_integer([:positive])}"
 
-      _pid =
-        start_supervised!({ScaleAlerts, table: table, name: name, insert_fn: insert_fn},
+      pid =
+        start_supervised!(
+          {ScaleAlerts, table: table, name: name, insert_fn: insert_fn, only_from: self()},
           id: name
         )
+
+      Mox.allow(Loopctl.MockDelivery, self(), pid)
 
       emit_timeout(6)
       assert :ok = ScaleAlerts.evaluate(name)
@@ -862,9 +910,11 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
 
       pid =
         start_supervised!(
-          {ScaleAlerts, table: table, name: name, webhook_url: :not_a_url},
+          {ScaleAlerts, table: table, name: name, webhook_url: :not_a_url, only_from: self()},
           id: name
         )
+
+      Mox.allow(Loopctl.MockDelivery, self(), pid)
 
       emit_timeout(6)
       # Must complete normally (not crash/timeout) — proving the catch-all `deliver/4`
@@ -901,11 +951,18 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       table = :"scale_alerts_renotify_#{System.unique_integer([:positive])}"
       name = :"scale_alerts_renotify_srv_#{System.unique_integer([:positive])}"
 
-      _pid =
+      pid =
         start_supervised!(
-          {ScaleAlerts, table: table, name: name, now_fn: now_fn, renotify_interval_ms: 1_000},
+          {ScaleAlerts,
+           table: table,
+           name: name,
+           now_fn: now_fn,
+           renotify_interval_ms: 1_000,
+           only_from: self()},
           id: name
         )
+
+      Mox.allow(Loopctl.MockDelivery, self(), pid)
 
       # Edge fire: false -> true.
       emit_timeout(6)

@@ -104,7 +104,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @doc """
@@ -144,13 +144,18 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   request (`run_embedding_task/3` calls `acquire/1` OUTSIDE the supervised task, so no
   `async_nolink` isolates it — only this guard does). Symmetric with `release/1`, which
   swallows the same exit.
+
+  `server` is the gate to call — the app's one (`__MODULE__`) unless a caller names
+  another, which is how a test reaches a gate that is down without stopping the app's.
   """
-  @spec acquire(binary(), pos_integer(), pos_integer()) ::
+  @spec acquire(binary(), pos_integer(), pos_integer(), GenServer.server()) ::
           :ok | {:error, :rate_limited_local}
-  def acquire(tenant_id, global_max, tenant_max)
+  def acquire(tenant_id, global_max, tenant_max, server \\ __MODULE__)
+
+  def acquire(tenant_id, global_max, tenant_max, server)
       when is_binary(tenant_id) and is_integer(global_max) and global_max > 0 and
              is_integer(tenant_max) and tenant_max > 0 do
-    GenServer.call(__MODULE__, {:acquire, self(), tenant_id, global_max, tenant_max})
+    GenServer.call(server, {:acquire, self(), tenant_id, global_max, tenant_max})
   catch
     :exit, _ -> {:error, :rate_limited_local}
   end
@@ -174,8 +179,12 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   """
   @impl Loopctl.Knowledge.EmbeddingConcurrency.Behaviour
   @spec release(binary()) :: :ok
-  def release(tenant_id) when is_binary(tenant_id) do
-    GenServer.call(__MODULE__, {:release, self(), tenant_id})
+  def release(tenant_id), do: release(tenant_id, __MODULE__)
+
+  @doc "`release/1` against the gate `server` (see `acquire/4`)."
+  @spec release(binary(), GenServer.server()) :: :ok
+  def release(tenant_id, server) when is_binary(tenant_id) do
+    GenServer.call(server, {:release, self(), tenant_id})
   catch
     :exit, _ -> :ok
   end

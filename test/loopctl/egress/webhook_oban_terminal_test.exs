@@ -8,11 +8,12 @@ defmodule Loopctl.Egress.WebhookObanTerminalTest do
   cannot change on its own. This file proves the consequence: a batch of events
   against a blocked subscription leaves NO retry backlog and issues NO request.
 
-  `async: false`: the drain runs jobs through the real Oban queue (inserted under
-  a process-scoped `:manual` testing mode) and the counts asserted are queue-wide.
+  The drain runs jobs through the real Oban queue, inserted under a process-scoped
+  `:manual` testing mode in this test's sandbox transaction, and the job counts asserted
+  are filtered to this test's tenant.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
   import Ecto.Query
@@ -49,10 +50,11 @@ defmodule Loopctl.Egress.WebhookObanTerminalTest do
     {:ok, tenant: tenant, webhook: webhook}
   end
 
-  defp job_states(queue) do
+  # Scoped to THIS test's tenant: the counts are this test's jobs, never the queue's.
+  defp job_states(queue, tenant_id) do
     Loopctl.Repo.all(
       from j in "oban_jobs",
-        where: j.queue == ^queue,
+        where: j.queue == ^queue and fragment("?->>'tenant_id'", j.args) == ^tenant_id,
         group_by: j.state,
         select: {j.state, count(j.id)}
     )
@@ -103,7 +105,7 @@ defmodule Loopctl.Egress.WebhookObanTerminalTest do
       assert Map.get(drained, :failure, 0) == 0
       assert Map.get(drained, :snoozed, 0) == 0
 
-      states = job_states("webhooks")
+      states = job_states("webhooks", tenant.id)
       assert Map.get(states, "retryable", 0) == 0
       assert Map.get(states, "available", 0) == 0
       assert Map.get(states, "scheduled", 0) == 0
@@ -166,7 +168,7 @@ defmodule Loopctl.Egress.WebhookObanTerminalTest do
 
       assert passes < 20, "the job never reached a terminal state (unbounded snooze)"
 
-      states = job_states("webhooks")
+      states = job_states("webhooks", tenant.id)
       assert Map.get(states, "scheduled", 0) == 0
       assert Map.get(states, "available", 0) == 0
       assert Map.get(states, "retryable", 0) == 0

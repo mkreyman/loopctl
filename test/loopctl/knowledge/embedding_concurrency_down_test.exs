@@ -12,43 +12,36 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrencyDownTest do
   500), and `release` no-ops with `:ok` (a dead GenServer is itself a counter reset,
   so nothing leaks).
 
-  This is `async: false` and terminates the SINGLETON app-supervised GenServer via the
-  supervisor (so it is NOT auto-restarted until we restart it), then restores it in an
-  `on_exit` — exclusive execution guarantees no concurrent test observes the gate down.
+  Each test starts a gate of its OWN under a unique name, stops it, and calls that name
+  (`acquire/4`, `release/2`) — the app's gate, which every other test's embeddings go
+  through, is never taken down.
   """
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   alias Loopctl.Knowledge.EmbeddingConcurrency, as: EC
 
-  @sup Loopctl.Supervisor
-
   setup do
-    # Terminate the singleton gate WITHOUT auto-restart; guarantee restoration.
-    :ok = Supervisor.terminate_child(@sup, EC)
+    # A gate of this test's own, then DOWN: its registered name is free again, so a call
+    # to it exits with :noproc exactly as a call to a terminated app gate would.
+    name = :"embedding_concurrency_down_#{System.unique_integer([:positive])}"
+    start_supervised!({EC, name: name})
+    :ok = stop_supervised(EC)
+    refute Process.whereis(name)
 
-    on_exit(fn ->
-      # restart_child returns {:ok, pid} (or {:error, :running} if a prior restore
-      # already brought it back) — either way the gate is up again for later tests.
-      case Supervisor.restart_child(@sup, EC) do
-        {:ok, _pid} -> :ok
-        {:error, :running} -> :ok
-        {:error, {:already_started, _pid}} -> :ok
-      end
-    end)
-
-    :ok
+    {:ok, gate: name}
   end
 
-  test "acquire/1 fails safe to {:error, :rate_limited_local} when the gate is down" do
+  test "acquire fails safe to {:error, :rate_limited_local} when the gate is down", %{
+    gate: gate
+  } do
     tenant_id = Ecto.UUID.generate()
-    # The registered name is unregistered while the child is terminated, so the
-    # GenServer.call inside acquire/3 exits with :noproc — the catch converts it.
-    assert {:error, :rate_limited_local} = EC.acquire(tenant_id)
-    assert {:error, :rate_limited_local} = EC.acquire(tenant_id, 10, 5)
+    # The gate's name is unregistered while it is down, so the GenServer.call inside
+    # acquire/4 exits with :noproc — the catch converts it.
+    assert {:error, :rate_limited_local} = EC.acquire(tenant_id, 10, 5, gate)
   end
 
-  test "release/1 no-ops to :ok when the gate is down" do
+  test "release no-ops to :ok when the gate is down", %{gate: gate} do
     tenant_id = Ecto.UUID.generate()
-    assert :ok = EC.release(tenant_id)
+    assert :ok = EC.release(tenant_id, gate)
   end
 end

@@ -4,11 +4,23 @@ defmodule LoopctlWeb.TelemetryPrometheusTest do
   (`TelemetryMetricsPrometheus`) actually registers it. The reporter drops a summary at boot
   ("Metric type summary is unsupported") and a metric whose name collides, silently.
 
-  `async: false`: a started reporter attaches telemetry handlers VM-wide, so every repo
-  query any concurrent test made would run through them.
+  A started reporter attaches its handlers VM-wide, so the counting tests start theirs on
+  `own_metrics/0`: every metric's `:keep` also requires that the EMITTING process is this
+  test's (a telemetry handler runs in the emitter), so a concurrent test's event — a runner
+  refusal, a channel event — is never counted in this scrape.
   """
 
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
+
+  # `LoopctlWeb.Telemetry.metrics/0`, each kept only for events this test process emits.
+  defp own_metrics do
+    test_pid = self()
+
+    for metric <- LoopctlWeb.Telemetry.metrics() do
+      keep = metric.keep
+      %{metric | keep: fn meta -> self() == test_pid and (is_nil(keep) or keep.(meta)) end}
+    end
+  end
 
   describe "metrics/0 under the Prometheus reporter (issue #815)" do
     test "every metric registers: none is a summary the reporter drops, none collides" do
@@ -29,8 +41,7 @@ defmodule LoopctlWeb.TelemetryPrometheusTest do
       name = :"telemetry_test_runner_#{System.unique_integer([:positive])}"
 
       start_supervised!(
-        {TelemetryMetricsPrometheus.Core,
-         metrics: LoopctlWeb.Telemetry.metrics(), name: name, start_async: false}
+        {TelemetryMetricsPrometheus.Core, metrics: own_metrics(), name: name, start_async: false}
       )
 
       :telemetry.execute([:loopctl, :runners, :message_refused], %{count: 1}, %{
@@ -67,8 +78,7 @@ defmodule LoopctlWeb.TelemetryPrometheusTest do
       name = :"telemetry_test_events_#{System.unique_integer([:positive])}"
 
       start_supervised!(
-        {TelemetryMetricsPrometheus.Core,
-         metrics: LoopctlWeb.Telemetry.metrics(), name: name, start_async: false}
+        {TelemetryMetricsPrometheus.Core, metrics: own_metrics(), name: name, start_async: false}
       )
 
       for event <- ["trace", "made-up-#{System.unique_integer([:positive])}", "another-one"] do

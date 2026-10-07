@@ -33,7 +33,15 @@ defmodule Loopctl.Embeddings.SystemConfigReadPath do
   def read_flag_key, do: @read_flag_key
 
   @impl Loopctl.Embeddings.ReadPathBehaviour
-  def side_table_reads_enabled? do
-    SystemConfig.get_int(@read_flag_key, 0) == 1
+  def side_table_reads_enabled?, do: side_table_reads_enabled?(SystemConfig)
+
+  @doc """
+  The decision read from the `SystemConfig` namespace `cache` (see `Loopctl.SystemConfig`)
+  rather than the node-wide one — how a test flips the flag without flipping it for every
+  other test.
+  """
+  @spec side_table_reads_enabled?(SystemConfig.cache()) :: boolean()
+  def side_table_reads_enabled?(cache) do
+    SystemConfig.get_int(@read_flag_key, 0, cache) == 1
   end
 end

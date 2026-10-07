@@ -1,76 +1,97 @@
 defmodule Loopctl.Llm.SettingsCacheRestartTest do
-  # async: false ON PURPOSE. These tests mutate NODE-GLOBAL supervised state — they
-  # delete the single shared `:named_table` and stop the app-supervised
-  # `Loopctl.Llm.SettingsCache` owner (a `:permanent` child of `Loopctl.Supervisor`)
-  # to exercise the real "owner died -> table destroyed -> recreated empty" restart
-  # path (AC-32.3.5). Running them serially (never concurrently with any async test)
-  # means (a) no concurrent test observes the momentarily-absent table, and (b) the
-  # 2 deliberate restarts here can't combine with another module's restart inside
-  # the root supervisor's shared restart-intensity window. Keep them OUT of the
-  # async `SettingsCacheTest` module.
-  use Loopctl.DataCase, async: false
+  # The restart path (AC-32.3.5) runs on an instance of this test's OWN: a
+  # `Loopctl.Llm.SettingsCache` started under the test supervisor with its own `:name` and
+  # `:table`. Stopping it destroys THAT table and the test supervisor restarts it, so the
+  # real "owner died -> table destroyed -> recreated empty" path is exercised without ever
+  # touching the app's owner, its table, or the root supervisor's restart-intensity window.
+  use Loopctl.DataCase, async: true
 
   alias Loopctl.Llm
   alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
 
-  # AC-32.3.5: a GenServer restart yields an EMPTY table that repopulates read-through.
-  # These exercise the ACTUAL restart failure mode — the owner dying destroys the whole
-  # named ETS table and init/1 recreates it — plus the rescue clauses that keep fetch/
-  # put/invalidate safe while the table is momentarily absent mid-restart.
+  setup do
+    unique = System.unique_integer([:positive])
+    name = :"settings_cache_restart_#{unique}"
+    table = :"settings_cache_restart_table_#{unique}"
+
+    start_supervised!({SettingsCache, name: name, table: table})
+
+    {:ok, name: name, table: table}
+  end
+
   describe "restart / table-missing resilience (AC-32.3.5)" do
-    test "with the ETS table absent, fetch/put/invalidate/generation are safe (rescue clauses)" do
+    test "with the ETS table absent, fetch/put/invalidate/generation are safe (rescue clauses)",
+         %{name: name, table: table} do
       tenant = fixture(:tenant)
 
       # Destroy the table out from under the owner, simulating the window after the
       # owner has died and before init/1 has recreated it.
-      true = :ets.delete(SettingsCache.table_name())
-      assert :ets.whereis(SettingsCache.table_name()) == :undefined
+      true = :ets.delete(table)
+      assert :ets.whereis(table) == :undefined
 
       # Every direct ETS op must rescue "table does not exist" to a safe default so a
       # provider call never crashes mid-restart.
-      assert SettingsCache.fetch(tenant.id) == :miss
-      assert SettingsCache.generation(tenant.id) == 0
-      assert SettingsCache.put(tenant.id, %TenantLlmSettings{tenant_id: tenant.id}, 0) == :ok
-      assert SettingsCache.put(tenant.id, nil) == :ok
-      assert SettingsCache.invalidate(tenant.id) == :ok
+      assert SettingsCache.fetch(tenant.id, table) == :miss
+      assert SettingsCache.generation(tenant.id, table) == 0
 
-      # Restore the shared table by restarting its supervised owner (init recreates it).
-      restart_settings_cache!()
+      assert SettingsCache.put(tenant.id, %TenantLlmSettings{tenant_id: tenant.id}, 0, table) ==
+               :ok
+
+      assert SettingsCache.invalidate(tenant.id, table) == :ok
+
+      # Restore the table by restarting its supervised owner (init recreates it).
+      restart_owner!(name, table)
 
       # The recreated table repopulates read-through with fresh, correct credentials.
       {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-after-recreate"})
-      assert {:ok, %{api_key: "sk-after-recreate"}} = Llm.resolve(tenant.id, :extraction)
+      await_invalidation_broadcast!(name)
+      assert %TenantLlmSettings{api_key: "sk-after-recreate"} = repopulate!(tenant.id, table)
+      assert {:ok, %TenantLlmSettings{}} = SettingsCache.fetch(tenant.id, table)
     end
 
-    test "a GenServer restart yields an empty table that repopulates read-through" do
+    test "a GenServer restart yields an empty table that repopulates read-through",
+         %{name: name, table: table} do
       tenant = fixture(:tenant)
       {:ok, _} = Llm.upsert_settings(tenant.id, %{"api_key" => "sk-survives-restart"})
+      await_invalidation_broadcast!(name)
 
-      # Warm the cache.
-      assert %TenantLlmSettings{} = Llm.get_settings(tenant.id)
-      assert {:ok, %TenantLlmSettings{}} = SettingsCache.fetch(tenant.id)
+      # Warm this instance's cache.
+      assert %TenantLlmSettings{} = repopulate!(tenant.id, table)
+      assert {:ok, %TenantLlmSettings{}} = SettingsCache.fetch(tenant.id, table)
 
       # Restart the owner: its ETS table is destroyed and init/1 recreates an EMPTY one
       # (nothing is persisted — AC-32.3.5).
-      restart_settings_cache!()
+      restart_owner!(name, table)
 
       # The previously-cached tenant is now a miss (empty table)...
-      assert SettingsCache.fetch(tenant.id) == :miss
+      assert SettingsCache.fetch(tenant.id, table) == :miss
 
       # ...and a read repopulates read-through from the DB with the same decrypted key.
-      assert {:ok, %{api_key: "sk-survives-restart"}} = Llm.resolve(tenant.id, :extraction)
-      assert {:ok, %TenantLlmSettings{}} = SettingsCache.fetch(tenant.id)
+      assert %TenantLlmSettings{api_key: "sk-survives-restart"} = repopulate!(tenant.id, table)
+      assert {:ok, %TenantLlmSettings{}} = SettingsCache.fetch(tenant.id, table)
     end
   end
 
-  # Stop the supervised SettingsCache owner and wait for the app supervisor to restart
-  # it (a :permanent child) and for init/1 to recreate the named table. This reproduces
-  # the real "owner died -> table destroyed -> recreated empty" restart path.
-  defp restart_settings_cache! do
-    pid = Process.whereis(SettingsCache)
+  # `upsert_settings/2` invalidates cluster-wide: the app's owner broadcasts, and this
+  # instance subscribes to the same topic, so it bumps the tenant's generation in ITS table
+  # too — asynchronously. Wait for both hops before populating, or that bump lands after
+  # the put and the entry reads as stale (which is the bridge working, not a failure).
+  defp await_invalidation_broadcast!(name) do
+    _ = :sys.get_state(SettingsCache)
+    _ = :sys.get_state(name)
+    :ok
+  end
+
+  # The real read-through (`Llm.get_settings/2`) against this instance's table.
+  defp repopulate!(tenant_id, table), do: Llm.get_settings(tenant_id, table)
+
+  # Stop this test's owner and wait for the test supervisor to restart it (a :permanent
+  # child) and for init/1 to recreate its table.
+  defp restart_owner!(name, table) do
+    pid = Process.whereis(name)
     ref = Process.monitor(pid)
-    :ok = GenServer.stop(SettingsCache, :normal)
+    :ok = GenServer.stop(name, :normal)
 
     receive do
       {:DOWN, ^ref, :process, ^pid, _} -> :ok
@@ -79,8 +100,8 @@ defmodule Loopctl.Llm.SettingsCacheRestartTest do
     end
 
     wait_until(fn ->
-      is_pid(Process.whereis(SettingsCache)) and
-        :ets.whereis(SettingsCache.table_name()) != :undefined
+      new_pid = Process.whereis(name)
+      is_pid(new_pid) and new_pid != pid and :ets.whereis(table) != :undefined
     end)
   end
 

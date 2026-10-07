@@ -12,16 +12,14 @@ defmodule Loopctl.Delivery.BudgetEscalationRefusedTest do
   clause's wiring by the lock-busy test in `Loopctl.Delivery.SessionEndReleaseTest`, which
   reaches this function through `end_session/4`.
 
-  `async: false` because two of these tests assert on what is logged at error, and
-  `capture_log` collects EVERY process's logs. ExUnit runs sync modules one at a time after
-  all the async ones, so nothing else is logging during the capture and the whole capture
-  is this call's. In an async module, an unrelated test's error line landed in the capture
-  and failed `log == ""` at random.
+  The log assertions read `Loopctl.OwnLog.capture_own_log/2`, which keeps only the entries
+  this test's process emitted: `ExUnit.CaptureLog` is VM-global, and an unrelated test's error
+  line landing in the capture failed `log == ""` at random.
   """
 
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
-  import ExUnit.CaptureLog
+  import Loopctl.OwnLog, only: [capture_own_log: 2]
 
   alias Loopctl.Delivery.RunnerStages
 
@@ -30,7 +28,7 @@ defmodule Loopctl.Delivery.BudgetEscalationRefusedTest do
 
   test "a chain that refuses appends is answered PERMANENTLY, and logged at error" do
     log =
-      capture_log([level: :error], fn ->
+      capture_own_log([level: :error], fn ->
         assert {:error, :audit_chain_append_failed} =
                  RunnerStages.budget_escalation_refused(
                    :audit_chain_append_failed,
@@ -55,7 +53,7 @@ defmodule Loopctl.Delivery.BudgetEscalationRefusedTest do
 
   test "a lock that was not free is the one retry, and is not logged at error" do
     log =
-      capture_log([level: :error], fn ->
+      capture_own_log([level: :error], fn ->
         assert {:error, :busy} =
                  RunnerStages.budget_escalation_refused(
                    :busy,

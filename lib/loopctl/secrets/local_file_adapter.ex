@@ -59,8 +59,16 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
 
   @impl true
   @spec get(String.t()) :: {:ok, binary()} | {:error, term()}
-  def get(name) when is_binary(name) do
-    with {:ok, map} <- read_all(),
+  def get(name), do: get(name, path())
+
+  @doc """
+  `get/1` against the store at `path` instead of the configured `:secrets_file` — the
+  behaviour callbacks pass the configured one; a test passes a file in its own `tmp_dir`.
+  The same holds for `set/3` and `delete/2`.
+  """
+  @spec get(String.t(), Path.t()) :: {:ok, binary()} | {:error, term()}
+  def get(name, path) when is_binary(name) and is_binary(path) do
+    with {:ok, map} <- read_all(path),
          {:ok, b64} <- fetch(map, name) do
       decode(b64, name)
     end
@@ -68,24 +76,32 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
 
   @impl true
   @spec set(String.t(), binary()) :: :ok | {:error, term()}
-  def set(name, value) when is_binary(name) and is_binary(value) do
-    with_write_lock(fn ->
-      with {:ok, map} <- read_all() do
+  def set(name, value), do: set(name, value, path())
+
+  @doc "`set/2` against the store at `path` (see `get/2`)."
+  @spec set(String.t(), binary(), Path.t()) :: :ok | {:error, term()}
+  def set(name, value, path) when is_binary(name) and is_binary(value) and is_binary(path) do
+    with_write_lock(path, fn ->
+      with {:ok, map} <- read_all(path) do
         map
         |> Map.put(name, Base.encode64(value))
-        |> write_all()
+        |> write_all(path)
       end
     end)
   end
 
   @impl true
   @spec delete(String.t()) :: :ok | {:error, term()}
-  def delete(name) when is_binary(name) do
-    with_write_lock(fn ->
-      with {:ok, map} <- read_all() do
+  def delete(name), do: delete(name, path())
+
+  @doc "`delete/1` against the store at `path` (see `get/2`)."
+  @spec delete(String.t(), Path.t()) :: :ok | {:error, term()}
+  def delete(name, path) when is_binary(name) and is_binary(path) do
+    with_write_lock(path, fn ->
+      with {:ok, map} <- read_all(path) do
         map
         |> Map.delete(name)
-        |> write_all()
+        |> write_all(path)
       end
     end)
   end
@@ -97,8 +113,8 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
   # defaults to infinite retries, so it blocks until the lock is acquired and then
   # returns the function's own result. The lock id is keyed on the target path so
   # distinct files (should there ever be more than one) don't contend.
-  defp with_write_lock(fun) do
-    :global.trans({{__MODULE__, path()}, self()}, fun)
+  defp with_write_lock(path, fun) do
+    :global.trans({{__MODULE__, path}, self()}, fun)
   end
 
   defp fetch(map, name) do
@@ -130,9 +146,7 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
   end
 
   # A MISSING file is an empty store, not an error — first write creates it.
-  defp read_all do
-    path = path()
-
+  defp read_all(path) do
     case File.read(path) do
       {:ok, ""} -> {:ok, %{}}
       {:ok, contents} -> decode_json(contents, path)
@@ -152,13 +166,12 @@ defmodule Loopctl.Secrets.LocalFileAdapter do
     end
   end
 
-  defp write_all(map) do
-    path = path()
+  defp write_all(map, path) do
     tmp = path <> ".tmp.#{System.unique_integer([:positive])}"
 
     # Bound the temp-file leak: a hard crash (power loss / SIGKILL) between
     # `File.touch/1` and `File.rename/2` leaves a `.tmp.N` sibling that the
-    # same-invocation error path never reaches. This runs under `with_write_lock/1`,
+    # same-invocation error path never reaches. This runs under `with_write_lock/2`,
     # so no other write is in flight and every existing sibling temp is a genuine
     # orphan — best-effort remove them before creating our own.
     sweep_stale_temps(path)

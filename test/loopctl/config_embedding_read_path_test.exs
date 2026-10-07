@@ -39,13 +39,13 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
   hardcoded list, so a key added in a new config file cannot slip past.
 
   A third guard covers the flag WRITER: the read-flag key names a VM-GLOBAL
-  `:persistent_term`-cached `SystemConfig` row, and exactly ONE test module may write it
-  (`test/loopctl/embeddings/system_config_read_path_test.exs`, which is `async: false`
-  precisely for that reason). A second writer would reintroduce the cross-module leakage
-  that produced the flaky empty-result failures — stub `Loopctl.MockEmbeddingReadPath`
-  instead. That guard matches on the AST (any `SystemConfig.put/2` whose first argument
-  mentions `read_flag_key` or the literal key string), not on a formatted call string, so
-  an alias, a pipe, or a reflow does not evade it.
+  `:persistent_term`-cached `SystemConfig` row, and NO test module may write the node-wide
+  copy. `test/loopctl/embeddings/system_config_read_path_test.exs` writes the flag into its
+  OWN namespace with `SystemConfig.put/3`, which no other test reads. A node-wide writer
+  would reintroduce the cross-module leakage that produced the flaky empty-result
+  failures — stub `Loopctl.MockEmbeddingReadPath` instead. That guard matches on the AST
+  (any `put/2` in a module that mentions `read_flag_key` or the literal key string), not on
+  a formatted call string, so an alias, a pipe, or a reflow does not evade it.
 
   A fourth guard covers the OTHER side of the same DI seam: a `*_scale_test.exs` module on
   bare `ExUnit.Case` gets no `stub_all_defaults/0`, so a read reaching
@@ -64,7 +64,6 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
   @forbidden_keys [:hnsw_iterative_scan, :hnsw_iterative_scan_default]
   @test_pinned_key :hnsw_iterative_scan_default
 
-  @flag_writer "test/loopctl/embeddings/system_config_read_path_test.exs"
   @self_path "test/loopctl/config_embedding_read_path_test.exs"
 
   @read_flag_key Loopctl.Embeddings.SystemConfigReadPath.read_flag_key()
@@ -142,8 +141,8 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
     end
   end
 
-  describe "the cutover flag has exactly one writer" do
-    test "no module other than the SystemConfigReadPath test writes the read flag key" do
+  describe "the node-wide cutover flag has no test writer" do
+    test "no test module writes the node-wide read flag key" do
       writers =
         "test/**/*.exs"
         |> Path.wildcard()
@@ -151,10 +150,11 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
         |> Enum.reject(&(&1 == @self_path))
         |> Enum.filter(&writes_read_flag?/1)
 
-      assert writers == [@flag_writer],
+      assert writers == [],
              """
-             The VM-global US-41.1 cutover flag must be written by exactly one module
-             (#{@flag_writer}, which is `async: false` for that reason). Found: #{inspect(writers)}.
+             No test module may write the VM-global US-41.1 cutover flag (`SystemConfig.put/2`).
+             A test that needs a value writes its own namespace with `SystemConfig.put/3`, as
+             test/loopctl/embeddings/system_config_read_path_test.exs does. Found: #{inspect(writers)}.
 
              If a test needs the side-table read path, stub
              `Loopctl.MockEmbeddingReadPath` per-process — do NOT flip this flag.
@@ -176,6 +176,11 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
 
       refute writes_read_flag_in_source?("SystemConfig.put(\"hnsw_ef_search\", 1)")
       refute writes_read_flag_in_source?("Embeddings.read_flag_key()")
+
+      refute writes_read_flag_in_source?(
+               "SystemConfig.put(Embeddings.read_flag_key(), 1, cache)"
+             ),
+             "a write into a test's own namespace (put/3) never reaches the node-wide flag"
     end
   end
 

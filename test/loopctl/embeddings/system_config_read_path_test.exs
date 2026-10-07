@@ -9,21 +9,18 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
   there would only have asserted the injected Mox mock — so it moved here, where
   it exercises the real implementation.
 
-  ## Why `async: false`
+  ## Its own flag, not the node's
 
-  This module is the ONE place that still writes the VM-global flag, because the
-  flag IS what it tests. Isolation comes from `async: false` ORDERING, not from
-  the injected mock: `DataCase.stub_embedding_read_path/0` DELEGATES to the real
-  `SystemConfigReadPath`, so a leaked `1` would reroute every other test onto the
-  side-table path. That is exactly why cleanup below resets the
-  `:persistent_term` cache DIRECTLY rather than through a DB write that can
-  silently no-op during sandbox teardown, and why
-  `Loopctl.ConfigEmbeddingReadPathTest` fails the build on a second writer. If a
-  future test needs the side-table path, stub `Loopctl.MockEmbeddingReadPath`,
-  do not flip this flag.
+  Every test writes the flag into its OWN `SystemConfig` namespace (`SystemConfig.put/3`)
+  and reads it back through `SystemConfigReadPath.side_table_reads_enabled?/1`, so the
+  node-wide flag every other test reads — `DataCase.stub_embedding_read_path/0` DELEGATES to
+  this module — is never moved. The row write is the real one, in this test's sandbox
+  transaction. If a future test needs the side-table path, stub
+  `Loopctl.MockEmbeddingReadPath`, do not flip the node-wide flag
+  (`Loopctl.ConfigEmbeddingReadPathTest` fails the build on a writer of it).
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   # #645 — vacuum the pgvector graph before each test in this module. Rolled-back tests
   # leave DEAD HNSW entries behind, and pgvector's scan skips dead elements rather than
@@ -39,39 +36,33 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
   alias Loopctl.SystemConfig
 
   setup do
-    # Reset the VM-global flag DETERMINISTICALLY. `SystemConfig.put/2` only updates the
-    # `:persistent_term` cache on a successful DB write, and its result was discarded here —
-    # so an ownership blip or a closed connection during sandbox teardown (on_exit runs in
-    # ANOTHER process, after the test) would leave the flag pinned at 1 for the rest of the
-    # VM, silently rerouting every later test onto the side-table path. The sibling
-    # `heavy_read_hnsw_ef_search_test.exs` primes/erases `:persistent_term` directly for the
-    # same reason.
-    on_exit(fn -> :persistent_term.put({SystemConfig, Embeddings.read_flag_key()}, 0) end)
-    :ok
+    cache = {SystemConfig, make_ref()}
+    on_exit(fn -> :persistent_term.erase({cache, Embeddings.read_flag_key()}) end)
+    {:ok, cache: cache}
   end
 
-  describe "side_table_reads_enabled?/0" do
-    test "defaults to false (legacy column) when the flag is unset/0" do
-      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 0)
-      refute SystemConfigReadPath.side_table_reads_enabled?()
+  describe "side_table_reads_enabled?/1" do
+    test "defaults to false (legacy column) when the flag is unset/0", %{cache: cache} do
+      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 0, cache)
+      refute SystemConfigReadPath.side_table_reads_enabled?(cache)
     end
 
-    test "is true when the operator sets the flag to 1" do
-      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 1)
-      assert SystemConfigReadPath.side_table_reads_enabled?()
+    test "is true when the operator sets the flag to 1", %{cache: cache} do
+      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 1, cache)
+      assert SystemConfigReadPath.side_table_reads_enabled?(cache)
     end
 
-    test "the cutover is REVERSIBLE with a single UPDATE (AC-41.1.8(iii))" do
-      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 1)
-      assert SystemConfigReadPath.side_table_reads_enabled?()
+    test "the cutover is REVERSIBLE with a single UPDATE (AC-41.1.8(iii))", %{cache: cache} do
+      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 1, cache)
+      assert SystemConfigReadPath.side_table_reads_enabled?(cache)
 
-      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 0)
-      refute SystemConfigReadPath.side_table_reads_enabled?()
+      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 0, cache)
+      refute SystemConfigReadPath.side_table_reads_enabled?(cache)
     end
 
-    test "any value other than 1 reads as legacy (fails safe)" do
-      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 2)
-      refute SystemConfigReadPath.side_table_reads_enabled?()
+    test "any value other than 1 reads as legacy (fails safe)", %{cache: cache} do
+      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 2, cache)
+      refute SystemConfigReadPath.side_table_reads_enabled?(cache)
     end
   end
 
@@ -88,7 +79,13 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
     # the decision through the Mox mock, so on its own it proves nothing about the flag
     # reaching `Knowledge.search_semantic/3`. DataCase's default stub DELEGATES to
     # `SystemConfigReadPath`, so this exercises the production resolution unmodified.
-    test "flipping the real flag reroutes Knowledge.search_semantic onto the side table" do
+    test "flipping the real flag reroutes Knowledge.search_semantic onto the side table",
+         %{cache: cache} do
+      # The production resolution, unmodified, reading this test's namespace.
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
+        SystemConfigReadPath.side_table_reads_enabled?(cache)
+      end)
+
       tenant = fixture(:tenant)
       article = fixture(:article, tenant_id: tenant.id, status: :published)
       vector = test_vec(1536, :primary)
@@ -101,7 +98,7 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
       refute Map.has_key?(legacy_meta, :embedding_dimension)
 
       # ONE UPDATE, no redeploy...
-      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 1)
+      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 1, cache)
       assert Embeddings.side_table_reads_enabled?()
 
       # ...and the real query is now served from the side table at the tenant's dimension.
@@ -112,7 +109,7 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
       assert meta.embedding_dimension == 1536
 
       # ...and the REVERT lands on the request path too (AC-41.1.8(iii)).
-      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 0)
+      {:ok, _} = SystemConfig.put(Embeddings.read_flag_key(), 0, cache)
       assert {:ok, %{meta: reverted}} = Knowledge.search_semantic(tenant.id, vector, limit: 50)
       refute Map.has_key?(reverted, :embedding_dimension)
     end
