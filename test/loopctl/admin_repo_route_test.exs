@@ -13,6 +13,7 @@ defmodule Loopctl.AdminRepoRouteTest do
   alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.AdminRepo.Route
+  alias Loopctl.Knowledge.ScaleSeed
   alias Loopctl.Repo
   alias Loopctl.Tenants.Tenant
 
@@ -89,6 +90,55 @@ defmodule Loopctl.AdminRepoRouteTest do
       refute Repo.in_transaction?()
     end
 
+    test "connection_in_transaction?/1 answers for the connection, whichever repo opened it" do
+      refute Route.connection_in_transaction?(AdminRepo)
+
+      assert {:ok, {true, false}} =
+               Repo.transaction(fn ->
+                 {Route.connection_in_transaction?(AdminRepo), AdminRepo.in_transaction?()}
+               end)
+
+      assert {:ok, {true, false}} =
+               AdminRepo.transaction(fn ->
+                 {Route.connection_in_transaction?(Repo), Repo.in_transaction?()}
+               end)
+    end
+
+    test "ScaleSeed refuses a Repo transaction too: the connection's transaction decides" do
+      tenant = fixture(:tenant)
+
+      assert_raise RuntimeError, ~r/inside an open transaction/, fn ->
+        Repo.transaction(fn -> ScaleSeed.seed(tenant.id, count: 1) end)
+      end
+    end
+
+    test "a with_tenant raise inside an AdminRepo transaction fails that transaction, then nothing is left" do
+      # Under the route the tenant transaction NESTS in the AdminRepo one (one connection), and
+      # a raise through a nested transaction fails the whole of it: the AdminRepo transaction
+      # cannot run another statement, so the tenant's SET LOCAL ROLE never reaches a
+      # BYPASSRLS read, and the rollback reverts it. Production differs: there the tenant
+      # transaction is on Repo's own connection and the AdminRepo one carries on
+      # (`Loopctl.AdminRepo.Route`, "What the shared connection cannot show").
+      tenant = fixture(:tenant)
+
+      assert {:error, :rollback} =
+               AdminRepo.transaction(fn ->
+                 assert_raise RuntimeError, fn ->
+                   Repo.with_tenant(tenant.id, fn -> raise "body failed" end)
+                 end
+
+                 assert_raise DBConnection.ConnectionError, ~r/transaction rolling back/, fn ->
+                   AdminRepo.query!("SELECT 1")
+                 end
+               end)
+
+      %{rows: [[user, tenant_setting]]} =
+        AdminRepo.query!("SELECT current_user, current_setting('app.current_tenant_id', true)")
+
+      refute user == Application.fetch_env!(:loopctl, :rls_role)
+      assert tenant_setting in [nil, ""]
+    end
+
     test "a module-atom call that skips the route fails on ownership instead of committing" do
       # test_helper.exs keeps AdminRepo's own pool in :manual; its default (:auto) would hand
       # this call an unsandboxed connection, and a write through it would commit.
@@ -153,6 +203,26 @@ defmodule Loopctl.AdminRepoRouteTest do
             do: "#{path}:#{line}"
 
       assert offenders == []
+    end
+
+    test "in test/, only Loopctl.Test.ProductionTopology moves AdminRepo off the route" do
+      # Any other per-test swap is the manipulated global the DI rule forbids. The one other
+      # call points AdminRepo at a repo that was never started, to make a read fail without
+      # a database, and changes no connection.
+      allowed = %{
+        "test/support/production_topology.ex" => 1,
+        "test/loopctl/telemetry/scale_metrics_test.exs" => 1
+      }
+
+      found =
+        for path <- Path.wildcard("test/**/*.{ex,exs}"),
+            path != "test/loopctl/admin_repo_route_test.exs",
+            lines = calls_named(Code.string_to_quoted!(File.read!(path)), :put_dynamic_repo),
+            lines != [],
+            into: %{},
+            do: {path, length(lines)}
+
+      assert found == allowed
     end
   end
 

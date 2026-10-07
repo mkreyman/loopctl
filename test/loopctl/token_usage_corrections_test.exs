@@ -695,12 +695,9 @@ defmodule Loopctl.TokenUsageCorrectionsTest do
       test_pid = self()
       handler_id = "tokens-02-lock-#{System.unique_integer([:positive])}"
 
-      # Both events: the lock is a raw `repo.query!/2` on AdminRepo, and a raw query takes
-      # none of AdminRepo's default options, so under the test route onto Repo's connection
-      # (US-46.2) it is reported on Repo's event. Which repo reports it is not the subject.
-      :telemetry.attach_many(
+      :telemetry.attach(
         handler_id,
-        [[:loopctl, :admin_repo, :query], [:loopctl, :repo, :query]],
+        [:loopctl, :admin_repo, :query],
         fn _event, _measurements, %{query: query}, _config ->
           if query =~ "pg_advisory_xact_lock" do
             send(test_pid, {:advisory_lock_query, query})

@@ -79,6 +79,7 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   import Ecto.Query, only: [from: 2]
 
   alias Loopctl.AdminRepo
+  alias Loopctl.AdminRepo.Route
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -397,13 +398,14 @@ defmodule Loopctl.Knowledge.ScaleSeed do
     # Guard: refuse to run inside an open transaction. ScaleSeed must run UNBOXED
     # (committed) — inside the DataCase async sandbox every insert_all + ANALYZE is
     # rolled back, so ANALYZE sees n≈0 and the planner builds bogus stats. The seed
-    # opens no transaction of its own (insert_all per batch), so `in_transaction?/0`
-    # being true means we're inside the sandbox's wrapping transaction (or some other
-    # caller transaction) — exactly the misuse this guard exists to prevent. This is
+    # opens no transaction of its own (insert_all per batch), so the connection being in a
+    # transaction (`Route.connection_in_transaction?/1`, whichever repo opened it) means
+    # we're inside the sandbox's wrapping transaction (or some other caller transaction) —
+    # exactly the misuse this guard exists to prevent. This is
     # functional, unlike the prior checked_out?/sentinel approaches (both no-ops): the
     # correct usage (`Ecto.Adapters.SQL.Sandbox.unboxed_run/2`) runs with no open
     # transaction, so the guard passes there.
-    if AdminRepo.in_transaction?() do
+    if Route.connection_in_transaction?(AdminRepo) do
       raise """
       ScaleSeed.seed/2 was called inside an open transaction (e.g. the DataCase
       async SQL sandbox). Rows inserted in a sandbox transaction are rolled back, so
@@ -461,7 +463,7 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   """
   @spec seed_changes(binary(), keyword()) :: {:ok, %{changes: non_neg_integer()}}
   def seed_changes(tenant_id, opts \\ []) when is_binary(tenant_id) do
-    if AdminRepo.in_transaction?() do
+    if Route.connection_in_transaction?(AdminRepo) do
       raise """
       ScaleSeed.seed_changes/2 was called inside an open transaction (e.g. the
       DataCase async SQL sandbox). Rows inserted in a sandbox transaction are rolled

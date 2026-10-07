@@ -961,6 +961,31 @@ defmodule Loopctl.CustodyClaimTest do
       assert claim.highest_assigned_sequence == 0
     end
 
+    test "an AdminRepo assignment fault inside a Repo transaction leaves that transaction usable",
+         %{tenant: t} do
+      all_endpoints_local()
+      :ok = mark_local_only(t.id)
+
+      # In production AdminRepo is not in the Repo transaction at all. In test it shares the
+      # connection (`Loopctl.AdminRepo.Route`), so the savepoint is decided by the CONNECTION's
+      # transaction, not AdminRepo's own: without one the failed insert aborts the Repo
+      # transaction and the next statement fails 25P02.
+      assert {:ok, :usable} =
+               Loopctl.Repo.transaction(fn ->
+                 assert {:error, _reason} =
+                          Custody.assign(
+                            AdminRepo,
+                            Scope.new(t.id),
+                            "article",
+                            Ecto.UUID.generate(),
+                            :bogus
+                          )
+
+                 Loopctl.Repo.query!("SELECT 1")
+                 :usable
+               end)
+    end
+
     test "an invalid subject_type is refused BEFORE a sequence is consumed", %{tenant: t} do
       all_endpoints_local()
       :ok = mark_local_only(t.id)

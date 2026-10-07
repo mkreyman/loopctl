@@ -37,19 +37,8 @@ defmodule Loopctl.Repo do
   # Ecto's `in_transaction?/0` would also be true inside an AdminRepo transaction. Counting
   # this repo's own transactions keeps the production answer. Never compiled in production,
   # where the route is AdminRepo's own pool.
-  if Application.compile_env(:loopctl, :admin_repo_route, Loopctl.AdminRepo) == __MODULE__ do
-    alias Loopctl.AdminRepo.Route
-
-    defoverridable transact: 2, in_transaction?: 0
-
-    @impl true
-    def transact(fun_or_multi, opts) do
-      Route.counting_transaction(__MODULE__, fn -> super(fun_or_multi, opts) end)
-    end
-
-    @impl true
-    def in_transaction?, do: super() and Route.own_transaction?(__MODULE__)
-  end
+  if Application.compile_env(:loopctl, :admin_repo_route, Loopctl.AdminRepo) == __MODULE__,
+    do: use(Loopctl.AdminRepo.Route)
 
   @doc """
   Stores the tenant_id in the process dictionary for RLS context.

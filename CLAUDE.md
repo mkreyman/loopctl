@@ -373,12 +373,8 @@ config :loopctl, :health_checker, Loopctl.MockHealthChecker
 A dependency a library reads only at compile time (the `compile_env` above) cannot be an
 option; it stays config, and a test needing another value says so at its `async: false` line.
 
-**NEVER** use `Application.put_env` in test files, and never reach for another global a test
-changes in its place (a registered name, a module-level Logger change): inject it. A value set
-once in `config/test.exs` and constant for the whole run is configuration, not that: in test
-`Loopctl.AdminRepo` is routed onto `Loopctl.Repo`'s sandbox connection
-(`:admin_repo_route`, `Loopctl.AdminRepo.Route`) so a test sees one transaction for both repos.
-No test sets or changes it, and a compile-time guard refuses it outside a sandbox pool.
+**NEVER** use `Application.put_env` in test files, and never reach for another global in its
+place (a config-swapped repo, a registered name, a module-level Logger change): inject it.
 
 The sync modules this rule turns into defects are converted by Epic 46
 (`docs/user_stories/epic_46_async_suite/`), which owns the inventory and the order.

@@ -33,7 +33,8 @@ defmodule Loopctl.AdminRepo do
   test runs on Repo's sandbox connection (`Loopctl.AdminRepo.Route`). Production is
   unrouted. Call AdminRepo's own `query/3` (or `repo.query/3` on a variable) rather than
   `Ecto.Adapters.SQL.query(Loopctl.AdminRepo, ...)`: the module-atom form looks the pool up
-  directly and skips the route (`test/loopctl/admin_repo_route_test.exs` scans for it).
+  directly and skips the route (`test/loopctl/admin_repo_route_test.exs` scans for it). What
+  the one connection cannot show, and how a test shows it: `Loopctl.AdminRepo.Route`.
   """
 
   alias Loopctl.AdminRepo.Route
@@ -58,24 +59,8 @@ defmodule Loopctl.AdminRepo do
   @spec shares_repo_connection?() :: boolean()
   def shares_repo_connection?, do: @shares_repo_connection
 
-  if @shares_repo_connection do
-    # Routed queries run through Repo's adapter meta, so without this they would emit on
-    # Repo's `[:loopctl, :repo, :query]` event; the handlers that watch AdminRepo traffic
-    # (`Loopctl.Telemetry.SlowQueryLogger`, `ScaleMetrics`, query-counting tests) keep seeing
-    # it under the production name. Raw `query/3` takes no default options, so it does not.
-    @impl true
-    def default_options(_operation), do: [telemetry_event: [:loopctl, :admin_repo, :query]]
-
-    # On a shared connection Ecto's `in_transaction?/0` cannot tell this repo's transaction
-    # from Repo's; these keep the production answer (`Loopctl.AdminRepo.Route`).
-    defoverridable transact: 2, in_transaction?: 0
-
-    @impl true
-    def transact(fun_or_multi, opts) do
-      Route.counting_transaction(__MODULE__, fn -> super(fun_or_multi, opts) end)
-    end
-
-    @impl true
-    def in_transaction?, do: super() and Route.own_transaction?(__MODULE__)
-  end
+  # Under the route: the per-repo transaction answer, and AdminRepo's own telemetry event on
+  # every call, raw `query/3` included (`Loopctl.AdminRepo.Route.__using__/1`).
+  if @shares_repo_connection,
+    do: use(Route, telemetry_event: [:loopctl, :admin_repo, :query])
 end

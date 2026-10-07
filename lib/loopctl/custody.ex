@@ -143,6 +143,7 @@ defmodule Loopctl.Custody do
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.AdminRepo.Route
   alias Loopctl.AuditChain
   alias Loopctl.Custody.PostureEntry
   alias Loopctl.Egress
@@ -758,8 +759,10 @@ defmodule Loopctl.Custody do
   # status tracking stays in sync. The first cut issued raw `SAVEPOINT` /
   # `ROLLBACK TO SAVEPOINT` statements, which depends on Postgrex recovering the
   # aborted transaction from the ReadyForQuery status behind DBConnection's back.
+  # Asked of the CONNECTION, not `repo.in_transaction?/0`: in test AdminRepo shares Repo's
+  # connection, and an enclosing Repo transaction needs the savepoint just the same.
   defp guarded_query(repo, sql, params) do
-    opts = if repo.in_transaction?(), do: [mode: :savepoint], else: []
+    opts = if Route.connection_in_transaction?(repo), do: [mode: :savepoint], else: []
     repo.query(sql, params, opts)
   rescue
     e -> {:error, e}

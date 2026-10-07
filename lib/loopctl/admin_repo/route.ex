@@ -15,13 +15,30 @@ defmodule Loopctl.AdminRepo.Route do
   the Repo transaction had set, which is the cross-tenant failure the split repos exist to
   prevent. It raises at compile time, before such a build can start.
 
-  What production has and the sharing does not: AdminRepo's own connection. An AdminRepo call
-  made INSIDE a `Loopctl.Repo.with_tenant/2` body runs in test on the tenant transaction, under
-  the RLS role and seeing that transaction's uncommitted rows, where production runs it
-  BYPASSRLS on its own connection and sees only committed ones. Measured on 2026-10-07 over the
-  delivery, web, runners, context retriever, custody, knowledge, e2e and workers directories:
-  one call site does it, `Loopctl.Threads.not_halted/1` reading the tenant row inside
-  `in_story_lock/3`, and `tenants` carries no RLS, so it reads the same row either way.
+  ## What the shared connection cannot show
+
+  Production gives AdminRepo its OWN connection; the route takes it away, in every test that
+  does not put it back. Three behaviours exist only with the second connection:
+
+  - **Atomicity.** An AdminRepo transaction opened inside a Repo transaction (an
+    `Loopctl.AuditChain.append/2` inside `Loopctl.Repo.with_tenant/2`) commits or rolls back
+    on its own in production. On the route it nests in the Repo transaction and shares its
+    fate; a raise through it fails the whole outer transaction.
+  - **Self-blocking locks.** A process holding a row lock through one repo and writing the
+    row through the other waits on itself in production, until `lock_timeout`. On the route
+    the one connection already holds the lock and nothing waits.
+  - **Visibility and role.** An AdminRepo read inside a tenant transaction runs BYPASSRLS
+    and sees only committed rows in production; on the route it runs under the tenant's RLS
+    role and sees the transaction's own uncommitted writes. Measured on 2026-10-07 over the
+    delivery, web, runners, context retriever, custody, knowledge, e2e and workers
+    directories: one call site, `Loopctl.Threads.not_halted/1` reading the tenant row inside
+    `in_story_lock/3`, and `tenants` carries no RLS, so it reads the same row either way.
+
+  A test whose SUBJECT is one of these shows it with `Loopctl.Test.ProductionTopology`, which
+  puts a process back on AdminRepo's own pool (`Loopctl.AdminRepoTopologyTest` proves the
+  first two both ways). Two answers the route would otherwise change are kept as in
+  production: `in_transaction?/0` answers per repo (`__using__/1`), and a SAVEPOINT decision
+  asks the connection (`connection_in_transaction?/1`).
   """
 
   @doc """
@@ -42,6 +59,71 @@ defmodule Loopctl.AdminRepo.Route do
   end
 
   @doc """
+  Compiled into a repo that shares the route's connection (`Loopctl.Repo` and
+  `Loopctl.AdminRepo`, each only under the route): `transact/2` and `in_transaction?/0` keep
+  the per-repo production answer (`counting_transaction/2`). With `telemetry_event:`, the
+  repo's Ecto operations and its raw `query/3` and `query!/3` report on that event, where
+  Repo's adapter meta would otherwise report them on Repo's (the Postgres adapter has no
+  `query_many`).
+  """
+  defmacro __using__(opts) do
+    event = Keyword.get(opts, :telemetry_event)
+
+    quote do
+      defoverridable transact: 2, in_transaction?: 0
+
+      @impl true
+      def transact(fun_or_multi, opts) do
+        unquote(__MODULE__).counting_transaction(__MODULE__, fn -> super(fun_or_multi, opts) end)
+      end
+
+      @impl true
+      def in_transaction?, do: super() and unquote(__MODULE__).own_transaction?(__MODULE__)
+
+      unquote(
+        if event do
+          quote do
+            @impl true
+            def default_options(_operation), do: [telemetry_event: unquote(event)]
+
+            @route_telemetry_event unquote(event)
+            @before_compile {unquote(__MODULE__), :__raw_query_telemetry__}
+          end
+        end
+      )
+    end
+  end
+
+  # The adapter defines `query/3` and `query!/3` in its own `__before_compile__`, after the
+  # module body, and they take no default options; this runs after it and overrides them.
+  @doc false
+  defmacro __raw_query_telemetry__(env) do
+    event = Module.get_attribute(env.module, :route_telemetry_event)
+
+    for fun <- [:query, :query!] do
+      quote do
+        defoverridable [{unquote(fun), 3}]
+
+        def unquote(fun)(sql, params, opts),
+          do: super(sql, params, Keyword.put_new(opts, :telemetry_event, unquote(event)))
+      end
+    end
+  end
+
+  @doc """
+  Whether the connection this process holds for `repo` is inside a transaction, opened by
+  EITHER repo. Every SAVEPOINT decision asks this, never `repo.in_transaction?/0`: under the
+  route that answers for the repo's own transactions only, and a statement that needs a
+  savepoint to keep its error from aborting the enclosing transaction needs it whichever repo
+  opened that transaction. In production the two answers are the same.
+  """
+  @spec connection_in_transaction?(module()) :: boolean()
+  def connection_in_transaction?(repo) do
+    %{adapter: adapter} = meta = Ecto.Adapter.lookup_meta(repo.get_dynamic_repo())
+    adapter.in_transaction?(meta)
+  end
+
+  @doc """
   Runs `fun` (a repo's own `transact/2`) counted as a transaction of `repo` in this process.
 
   Under the route both repos share one connection, and Ecto's `in_transaction?/0` reads the
@@ -49,9 +131,8 @@ defmodule Loopctl.AdminRepo.Route do
   and the reverse, where production keeps them apart. The guards that say which transaction a
   write must run in (`Loopctl.Webhooks.insert_events_with_delivery/4` refusing a Repo
   transaction, `Loopctl.Delivery.Stages.follow_release/5` requiring the AdminRepo one) would
-  then refuse what production allows and allow what it refuses. Both repos call this from
-  `transact/2`, and `in_transaction?/0` also asks `own_transaction?/1`. Compiled into the
-  repos only under the route.
+  then refuse what production allows and allow what it refuses. `__using__/1` compiles this
+  into both repos, under the route only.
   """
   @spec counting_transaction(module(), (-> result)) :: result when result: term()
   def counting_transaction(repo, fun) do

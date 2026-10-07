@@ -48,20 +48,18 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
   end
 
   test "covers all repos uniformly (AdminRepo too)" do
-    # The logger handles AdminRepo's own event. In test AdminRepo runs on Repo's connection
-    # (`:admin_repo_route`): an Ecto call still emits on AdminRepo's event, but its metadata
-    # names Loopctl.Repo, so the log line's repo label cannot tell the two apart here.
+    # In test AdminRepo runs on Repo's connection (`:admin_repo_route`), so its metadata names
+    # Loopctl.Repo; its raw query still reports on AdminRepo's event, and the logger labels
+    # the line from the event.
     assert Enum.any?(
              :telemetry.list_handlers([:loopctl, :admin_repo, :query]),
              &(&1.id == Loopctl.Telemetry.SlowQueryLogger)
            )
 
-    log =
-      capture_log(fn ->
-        AdminRepo.one(from(s in fragment("SELECT pg_sleep(1.1) AS slept"), select: s.slept))
-      end)
+    log = capture_log(fn -> AdminRepo.query!("SELECT pg_sleep(1.1)") end)
 
     assert log =~ "slow_query"
+    assert log =~ "AdminRepo"
   end
 
   test "threshold_ms/0 reads the configurable value (default 1000)" do
