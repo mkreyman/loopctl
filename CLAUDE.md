@@ -374,12 +374,16 @@ A dependency a library reads only at compile time (the `compile_env` above) cann
 option; it stays config, and a test needing another value says so at its `async: false` line.
 
 **NEVER** use `Application.put_env` in test files, and never reach for another global in its
-place (a repo swapped with `put_dynamic_repo` to change what the code under test reads, a
-registered name, a module-level Logger change): inject it. A sync module whose SUBJECT is the
-second connection may put the production topology back, under rule 1's exception below.
-A value `config/test.exs` sets once for the whole run, such as the `:admin_repo_route` that puts
-`AdminRepo` on `Repo`'s sandbox connection, is configuration by the rule above, not a global a
-test manipulates.
+place (a repo re-pointed for a test so the code under test reads a different one, a registered
+name, a module-level Logger change): inject it. A process-local override such as
+`put_dynamic_repo` touches no other test, but it is still an input the code never declared, so
+each use is listed with its reason in `test/loopctl/admin_repo_route_test.exs`, which fails on
+any other. The one sanctioned helper is `Loopctl.Test.ProductionTopology`, for a sync module
+whose subject is cross-connection behaviour (rule 1 below).
+
+The `:admin_repo_route` that `config/test.exs` sets, putting `AdminRepo` on `Repo`'s sandbox
+connection, is the compile-time case two paragraphs up: `AdminRepo` reads it with
+`compile_env` as Ecto's default dynamic repo, so it stays config and is the same for every test.
 
 The sync modules this rule turns into defects are converted by Epic 46
 (`docs/user_stories/epic_46_async_suite/`), which owns the inventory and the order.
@@ -391,8 +395,8 @@ production code; then the reason goes at the `async: false` line, as above.
 
 ### ABSOLUTE RULES
 
-1. **`async: true` on EVERY test file** via DataCase/ConnCase. A test that wants `async: false` because the code reads shared state is a design defect in the code: inject that state (see Dependency Injection above). The exceptions are tests whose SUBJECT is the shared thing — DDL on a shared table, planner statistics over a committed corpus, committed transactions racing each other (scoped to the race itself, on unique rows no other test counts) — and a compile-time-only dependency: then `async: false`, with the reason in the module's moduledoc. An async test that ends holding a DDL lock on a shared table through one of its sandbox OWNER connections fails at teardown (`Loopctl.Test.LockGuard`); a connection it checks out itself is not checked
-2. **NEVER `Application.put_env` in tests** — behaviour mocks via config/test.exs; any other value a test needs is injected (Dependency Injection above)
+1. **`async: true` on EVERY test file** via DataCase/ConnCase. A test that wants `async: false` because the code reads shared state is a design defect in the code: inject that state (see Dependency Injection above). The exceptions are tests whose SUBJECT is the shared thing — DDL on a shared table, planner statistics over a committed corpus, committed transactions racing each other (scoped to the race itself, on unique rows no other test counts), behaviour that needs two connections (an `AdminRepo` write committing apart from a failed `Repo` transaction, a lock one connection holds against the other; `Loopctl.Test.ProductionTopology` restores the second connection) — and a compile-time-only dependency: then `async: false`, with the reason in the module's moduledoc. An async test that ends holding a DDL lock on a shared table through one of its sandbox OWNER connections fails at teardown (`Loopctl.Test.LockGuard`); a connection it checks out itself is not checked
+2. **NEVER `Application.put_env` in tests** — behaviour mocks via config/test.exs; any other value a test needs is injected (Dependency Injection above, which says where the process-local repo overrides it allows are listed)
 3. **`Mox.set_mox_from_context(tags)`** in DataCase/ConnCase setup for async isolation
 4. **`setup :verify_on_exit!`** on EVERY test file using Mox
 5. **Default permissive stubs** in DataCase/ConnCase setup via `stub_all_defaults/0`
