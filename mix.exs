@@ -64,7 +64,21 @@ defmodule Loopctl.MixProject do
           # (status and body, `Loopctl.Webhooks.ReqDelivery`) and never acted on, so a
           # smuggled response can at worst put one tenant's relay response in
           # another's delivery record. Accepted against the crash above.
-          "CVE-2026-94194"
+          "CVE-2026-94194",
+          # cloak 1.1.4 and cloak_ecto 1.3.0 — no patched release exists for either
+          # advisory below: as of 2026-10-07 both are the newest on hex (both 2024-04-06).
+          # Each affects a module loopctl never uses. Every vault cipher is
+          # Cloak.Ciphers.AES.GCM, which is authenticated, and no schema hashes a field
+          # with a PBKDF2 type. test/loopctl/vault/cloak_advisory_reachability_test.exs
+          # fails if compiled loopctl code references either module or a vault cipher
+          # list holds anything but AES.GCM, and fails on any cloak or cloak_ecto version
+          # change. Recheck when cloak > 1.1.4 or cloak_ecto > 1.3.0.
+          # CVE-2026-95105 (HIGH): Cloak.Ciphers.AES.CTR has no ciphertext
+          # authentication, so a ciphertext can be bit-flipped into a chosen plaintext.
+          "CVE-2026-95105",
+          # CVE-2026-94206 (MEDIUM): Cloak.Ecto.PBKDF2 ignores the configured iteration
+          # count and runs only :size rounds.
+          "CVE-2026-94206"
         ]
       ],
       dialyzer: [
@@ -234,6 +248,40 @@ defmodule Loopctl.MixProject do
     ]
   end
 
+  # `mix hex.audit` reports a failing audit by setting the VM's exit status, not by raising,
+  # so as a plain alias step every later step still ran and `mix precommit` exited 1 only at
+  # the very end, after a green suite, with nothing pointing back at the audit (#948). In its
+  # own VM its exit status is readable, and a non-zero one halts the alias here. The separate
+  # VM also keeps the old ordering hazard away: in-VM, a `hex.audit` chained after `compile`
+  # failed with "task could not be found" because `compile` purges the archive code path.
+  #
+  # The child is the Elixir install running this alias, not whatever is first on PATH, so the
+  # audit sees the same Hex archive as every other step. That takes running its `bin/elixir`
+  # with its `bin/mix` as the script: `bin/mix` alone starts with `#!/usr/bin/env elixir`
+  # and would resolve PATH again. Its output is streamed as it arrives, so a slow advisory
+  # fetch shows up as the audit, not as a silent hang; Hex's own HTTP client bounds that fetch.
+  defp hex_audit!(_args) do
+    bin = Path.expand("../../bin", :code.lib_dir(:elixir))
+    [elixir, mix] = Enum.map(["elixir", "mix"], &Path.join(bin, &1))
+
+    Enum.all?([elixir, mix], &File.exists?/1) ||
+      Mix.raise("cannot find this Elixir install's elixir and mix in #{bin}")
+
+    {_streamed, status} =
+      System.cmd(elixir, [mix, "hex.audit"],
+        stderr_to_stdout: true,
+        into: IO.stream(:stdio, :line),
+        env: [{"MIX_ENV", to_string(Mix.env())}]
+      )
+
+    if status != 0 do
+      Mix.raise(
+        "mix hex.audit exited #{status}: fix or acknowledge the advisory above " <>
+          "(hex: [ignore_advisories: ...] in mix.exs, with its reasoning)"
+      )
+    end
+  end
+
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup", "assets.setup"],
@@ -246,12 +294,9 @@ defmodule Loopctl.MixProject do
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.deploy": ["tailwind loopctl --minify", "esbuild loopctl --minify", "phx.digest"],
       precommit: [
-        # hex.audit MUST run BEFORE `compile`: `compile` purges the archive code
-        # path, after which a chained `hex.audit` (a Hex archive task) fails with
-        # "task could not be found" — which silently broke every local `mix precommit`
-        # (CI was unaffected: it runs `mix hex.audit` as its own step). Running it
-        # first also fails fast on a retired/advised dependency.
-        "hex.audit",
+        # The audit runs first and in its own VM (`hex_audit!/1`), and stops the alias on
+        # an unacknowledged advisory. See that function for why it is not a plain step.
+        &hex_audit!/1,
         "compile --warnings-as-errors",
         "deps.unlock --check-unused",
         "format --check-formatted",
