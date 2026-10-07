@@ -64,7 +64,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   ## Config-based DI
 
   The tunables resolve from `Application.get_env(:loopctl, :ingestion_health, [])`
-  with in-code defaults (never opts, never `Application.put_env` in tests):
+  with in-code defaults (never `Application.put_env` in tests):
 
   - `:monitored_source_types` -- default `:all` (every source_type that crosses the
     established threshold; a list narrows monitoring to specific source_types)

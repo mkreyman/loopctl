@@ -369,7 +369,7 @@ defmodule Loopctl.Knowledge.StreamingExport do
     e -> {:error, e, writer}
   end
 
-  # Config-based DI (`CLAUDE.md`: behaviours + `Application.get_env`, never opts, never
+  # Config-based DI (`CLAUDE.md`: behaviours + `Application.get_env`, never
   # `put_env` from a test). Production resolves to `NoopBodyProbe`; `config/test.exs`
   # points at a Mox mock whose DEFAULT stub is equally a no-op, so only the one scale test
   # that injects a retaining probe sees any retention.

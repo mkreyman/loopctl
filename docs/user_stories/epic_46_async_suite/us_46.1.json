@@ -1,0 +1,42 @@
+{
+  "id": "US-46.1",
+  "title": "Flip the sync modules that have no sync reason; inject the executor's query step",
+  "epic": {
+    "id": "epic_46",
+    "name": "Async test suite through dependency injection"
+  },
+  "priority": "high",
+  "story": {
+    "as_a": "commit gate",
+    "i_want_to": "the sync modules that state no real need for it to run async",
+    "so_that": "their time leaves the sync phase"
+  },
+  "rationale": "Their stated reason (Repo.with_tenant needs shared sandbox mode) is false: each seeds and reads on Repo in the test process. Run together async three times, all passed except ContextRetriever.ExecutorTest TC-30.3.6, which drops a column on stories to provoke :undefined_column and so holds a DDL lock (Loopctl.Test.LockGuard refuses it).",
+  "acceptance_criteria": [
+    {
+      "id": "AC-46.1.1",
+      "description": "Every converted module is `async: true`; the commit gate passes; production behaviour is unchanged (the injected input defaults to the value the code read before)."
+    },
+    {
+      "id": "AC-46.1.2",
+      "description": "Executor.run/4 takes an injectable query step defaulting to the Repo read; TC-30.3.6 supplies one that raises Postgrex :undefined_column and asserts :stale_entity, with no DDL."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-46.1.1",
+      "name": "Flipped modules pass async",
+      "type": "integration",
+      "steps": [
+        "Run the listed files together three times with different seeds"
+      ],
+      "expected_results": [
+        "0 failures each run; no LockGuard refusal"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Files: test/loopctl/context_retriever/dogfood_test.exs; test/loopctl/context_retriever/executor_test.exs; test/loopctl/context_retriever/registry_test.exs; test/loopctl/corpus_rls_test.exs; test/loopctl/embeddings_rls_test.exs; test/loopctl/embeddings_side_table_reads_test.exs; test/loopctl/heavy_read_pool_isolation_test.exs; test/loopctl/pgbouncer_startup_params_test.exs; test/loopctl/repo/rls_test.exs; test/loopctl/token_usage/default_archival_test.exs; test/loopctl/work_breakdown/stories_rls_pilot_test.exs"
+  ],
+  "dependencies": []
+}

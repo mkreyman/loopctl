@@ -1,0 +1,53 @@
+{
+  "id": "US-46.2",
+  "title": "Inject the resolved API key at the auth boundary",
+  "epic": {
+    "id": "epic_46",
+    "name": "Async test suite through dependency injection"
+  },
+  "priority": "high",
+  "story": {
+    "as_a": "controller test",
+    "i_want_to": "hand the pipeline the API key I inserted",
+    "so_that": "the test need not commit a key AdminRepo can see"
+  },
+  "rationale": "Loopctl.Auth.verify_api_key resolves the key on AdminRepo; a key inserted in the test's Repo sandbox transaction is invisible there, so these tests commit rows and run sync.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-46.2.1",
+      "description": "Every converted module is `async: true`; the commit gate passes; production behaviour is unchanged (the injected input defaults to the value the code read before)."
+    },
+    {
+      "id": "AC-46.2.2",
+      "description": "The ResolveApiKey plug reads the key through an injected resolver defaulting to Auth.verify_api_key; a test supplies the key it inserted."
+    },
+    {
+      "id": "AC-46.2.3",
+      "description": "The resolver is set only by server-side code and test setup, never from request data (CLAUDE.md, custody identity)."
+    },
+    {
+      "id": "AC-46.2.4",
+      "description": "One boundary test keeps exercising the real AdminRepo resolution."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-46.2.1",
+      "name": "Auth-boundary tests run async",
+      "type": "integration",
+      "steps": [
+        "Convert the listed files",
+        "Run them together three times"
+      ],
+      "expected_results": [
+        "0 failures; no committed rows left behind"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Files: test/e2e/context_retriever_journey_test.exs; test/e2e/context_retriever_security_test.exs; test/loopctl_web/controllers/context_retriever_controller_test.exs; test/loopctl_web/controllers/merge_precondition_controller_test.exs; test/loopctl_web/controllers/runner_unsupported_kinds_test.exs; test/loopctl_web/controllers/story_escalation_controller_test.exs; test/loopctl_web/controllers/thread_controller_test.exs; test/loopctl_web/controllers/thread_review_controller_test.exs"
+  ],
+  "dependencies": [
+    "US-46.1"
+  ]
+}

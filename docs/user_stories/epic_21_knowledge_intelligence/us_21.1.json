@@ -199,7 +199,7 @@
     }
   ],
   "technical_notes": [
-    "Worker MUST use compile-time DI: `@extractor Application.compile_env(:loopctl, :knowledge_extractor, Loopctl.Knowledge.LlmExtractor)`. NEVER use opts-based DI.",
+    "Worker MUST use compile-time DI: `@extractor Application.compile_env(:loopctl, :knowledge_extractor, Loopctl.Knowledge.LlmExtractor)`.",
     "Follow the EventGenerator pattern for enqueuing: the Oban.insert is part of the same Ecto.Multi that creates the review_record, ensuring atomicity.",
     "The `:knowledge` Oban queue should be added to config/config.exs alongside existing queues like `:webhooks` and `:embeddings`.",
     "Duplicate detection query: `Repo.exists?(from a in Article, where: a.source_type == ^source_type and a.source_id == ^source_id and a.tenant_id == ^tenant_id)`.",

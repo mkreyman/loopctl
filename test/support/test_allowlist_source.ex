@@ -10,7 +10,7 @@ defmodule Loopctl.Test.AllowlistSource do
   allowlists at the same instant without interfering.
 
   Wired via `config :loopctl, :local_allowlist_source` in `config/test.exs`
-  (config-based DI, never opts-based). Falls back to the real deployment config
+  (config-based DI). Falls back to the real deployment config
   when a test has set nothing, so the default (empty) posture is what an
   unconfigured test sees.
   """

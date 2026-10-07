@@ -1,0 +1,50 @@
+{
+  "id": "US-46.4",
+  "title": "Inject the remaining cross-repo boundary reads",
+  "epic": {
+    "id": "epic_46",
+    "name": "Async test suite through dependency injection"
+  },
+  "priority": "medium",
+  "story": {
+    "as_a": "delivery-loop test",
+    "i_want_to": "the inner logic to receive the row a boundary read",
+    "so_that": "the test passes its own row instead of committing one"
+  },
+  "rationale": "The rest of the cross-repo group reads on AdminRepo (claim, precondition, candidates, custody halt) what the test wrote on Repo.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-46.4.1",
+      "description": "Every converted module is `async: true`; the commit gate passes; production behaviour is unchanged (the injected input defaults to the value the code read before)."
+    },
+    {
+      "id": "AC-46.4.2",
+      "description": "Each boundary keeps one test of the real read; the inner logic takes the row as a value."
+    },
+    {
+      "id": "AC-46.4.3",
+      "description": "Tests that rely on two transactions being independent (needs_commit_independence) stay in a sync module scoped to that test, with the reason stated."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-46.4.1",
+      "name": "Converted delivery tests run async",
+      "type": "integration",
+      "steps": [
+        "Convert the listed files",
+        "Run them together three times"
+      ],
+      "expected_results": [
+        "0 failures"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Files (boundary noted): test/loopctl/delivery/completion_test.exs — Loopctl.Delivery.Completion.candidates (fleet-wide AdminRepo read) vs Stages on Repo; test/loopctl/delivery/dispatch_driver_test.exs — Loopctl.Progress.claim_story (AdminRepo) + Stages transition (Repo); DispatchDriver.candidates fleet-wide; test/loopctl/delivery/escalations_resolve_test.exs — Loopctl.Progress.force_unclaim_story/contract_story (AdminRepo) vs Stages (Repo); test/loopctl/delivery/merge_precondition_integration_test.exs — Loopctl.Delivery.MergePrecondition.evaluate (story/intake/dispatch reads on AdminRepo); test/loopctl/delivery/placement_test.exs — Loopctl.Progress.claim_story (AdminRepo) + Stages transition (Repo); test/loopctl/delivery/post_deploy_verification_test.exs — PostDeployVerificationWorker candidate read + verification reads on AdminRepo; test/loopctl/delivery/session_end_release_test.exs — Loopctl.Delivery.RunnerStages.end_session release (AdminRepo) vs ledger (Repo); test/loopctl/delivery/triage_trigger_test.exs — Loopctl.WorkBreakdown.Stories.create_story (AdminRepo) then Stages.open (Repo); test/loopctl/runners/dispatch_ledger_test.exs — Fixtures commit tenant/runner via AdminRepo; DispatchLedger FKs on Repo; test/loopctl_web/controllers/story_stage_report_controller_test.exs — Loopctl.Progress.claim_story (AdminRepo) + Stages transition (Repo); test/loopctl_web/live/thread_live_halt_test.exs — Loopctl.Runners.custody_halted? (AdminRepo); test/loopctl_web/runner_first_stage_report_test.exs — Loopctl.Progress.claim_story (AdminRepo) + Stages transition (Repo); test/loopctl/workers/review_ceiling_worker_test.exs — Loopctl.Workers.ReviewCeilingWorker candidates (fleet-wide AdminRepo read); test/loopctl/workers/triage_trigger_worker_test.exs — Loopctl.WorkBreakdown.Stories.create_story (AdminRepo) then Stages.open (Repo); test/loopctl/workers/verification_runner_worker_integration_test.exs — VerificationRunnerWorker: run/story/intake on AdminRepo vs ledger/stage on Repo"
+  ],
+  "dependencies": [
+    "US-46.2",
+    "US-46.3"
+  ]
+}

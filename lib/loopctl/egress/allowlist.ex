@@ -189,7 +189,7 @@ defmodule Loopctl.Egress.Allowlist do
     |> Enum.map(&to_string/1)
   end
 
-  # Config-based DI (never opts-based, never `Application.put_env` in a test).
+  # Config-based DI (never `Application.put_env` in a test).
   # Production reads deployment config; `config/test.exs` maps this to a
   # PROCESS-LOCAL source so an `async: true` test can exercise an operator
   # carve-out without mutating global state for its neighbours.

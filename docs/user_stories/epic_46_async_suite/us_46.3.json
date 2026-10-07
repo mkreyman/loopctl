@@ -1,0 +1,49 @@
+{
+  "id": "US-46.3",
+  "title": "Inject the runner identity at the socket boundary",
+  "epic": {
+    "id": "epic_46",
+    "name": "Async test suite through dependency injection"
+  },
+  "priority": "high",
+  "story": {
+    "as_a": "runner channel test",
+    "i_want_to": "give the socket the runner I inserted",
+    "so_that": "the test need not commit one"
+  },
+  "rationale": "Loopctl.Runners.authenticate_identified (RunnerSocket.connect) resolves the runner on another repo connection than the test writes on.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-46.3.1",
+      "description": "Every converted module is `async: true`; the commit gate passes; production behaviour is unchanged (the injected input defaults to the value the code read before)."
+    },
+    {
+      "id": "AC-46.3.2",
+      "description": "RunnerSocket.connect authenticates through an injected resolver defaulting to Runners.authenticate_identified, set only server-side."
+    },
+    {
+      "id": "AC-46.3.3",
+      "description": "Tests whose subject is a committed lock holder move to a sync module of their own, with the reason stated."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-46.3.1",
+      "name": "Runner socket tests run async",
+      "type": "integration",
+      "steps": [
+        "Convert the listed files",
+        "Run them together three times"
+      ],
+      "expected_results": [
+        "0 failures"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Files: test/loopctl/delivery/review_placement_test.exs; test/loopctl/delivery/triage_dispatcher_test.exs; test/loopctl_web/runner_channel_dispatch_test.exs; test/loopctl_web/runner_channel_stage_test.exs; test/loopctl_web/runner_channel_thread_test.exs; test/loopctl_web/runner_channel_usage_test.exs"
+  ],
+  "dependencies": [
+    "US-46.1"
+  ]
+}

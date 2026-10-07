@@ -312,9 +312,45 @@ only be minted by a principal that has none. Do NOT "fix" this by giving an
 (`Dispatches.lineage_for_api_key/2`), and a second source the custody gates do not
 read reopens the same hole one layer down.
 
-## Dependency Injection — Config-Based (NOT Opts-Based)
+## Dependency Injection — inputs, never manipulated globals
 
-**All external dependencies use behaviours + config-based DI:**
+Mark, 2026-10-06, on congregation (KB `e6fc183e`): *"If a test requires sync execution, it's
+usually an indication of bad design where we try to manipulate global state. Instead, we
+should refactor to use dependency injection, so we're passing the param we were trying to
+manipulate globally."* And for this repo, 2026-10-07: *"refactor all code that is trying to
+manipulate global state instead of passing that input as a param -- what's called dependency
+injection."* An `async: false` test is the symptom: it exists because the code reads
+something every test shares, so a test can only change it for everyone.
+
+**Reading configuration is fine; a test needing a DIFFERENT value is the signal.** A behaviour
+module or a tunable resolved from `Application.get_env` / `compile_env` and set once in
+`config/test.exs` is constant for the whole run, so every test sees the same value and nothing
+is manipulated. When a test needs another value than that, the code takes it as an INPUT:
+
+- **app env or a tunable**: an argument or option whose default is the configured value, read
+  once at the boundary and threaded down;
+- **a named server, ETS table, cache, rate limiter, telemetry handler**: a `:name` (or handler
+  id), so each test `start_supervised!`s or attaches its own and filters on its own key;
+- **a Logger level**: raised once in `test_helper.exs`, never per test;
+- **a system env var**: an argument defaulting to `System.get_env/1`; **an output directory**:
+  the test's own `tmp_dir`;
+- **a row a boundary resolved on another repo** (a story read on `AdminRepo` before the work
+  continues on `Repo`): the inner logic takes the row as a value, so a test passes the row it
+  inserted rather than committing one; the boundary read itself keeps one test of its own.
+
+The production default is the code path that did the global read before, so production
+behaviour does not change.
+
+**Custody identity is never an injectable input.** The caller's API key, `agent_id`, role and
+dispatch lineage are resolved server-side from the authenticating key (see Chain-of-Custody
+Enforcement), and nothing in this section changes that. An option that carries one of them is
+set only by the server-side resolver, never defaulted from or overridable by request data, and
+a controller never forwards params into it: that is the self-verify launder the custody gates
+exist to stop. Inject the SEAM around identity (the repo read, the clock, the mint), not the
+identity.
+
+**External services stay behaviours + config-based DI**, because the behaviour module IS the
+configured input the boundary reads:
 
 ```elixir
 # Define the behaviour
@@ -334,15 +370,24 @@ config :loopctl, :health_checker, Loopctl.MockHealthChecker
 @delivery_client Application.compile_env(:loopctl, :webhook_delivery, Loopctl.Webhooks.ReqDelivery)
 ```
 
-**NEVER** use `Application.put_env` in test files. **NEVER** pass dependencies as function opts.
-Opts are for query parameters (limit, offset, filters) only.
+A dependency a library reads only at compile time (the `compile_env` above) cannot be an
+option; it stays config, and a test needing another value says so at its `async: false` line.
+
+**NEVER** use `Application.put_env` in test files, and never reach for another global in its
+place (a config-swapped repo, a registered name, a module-level Logger change): inject it.
+
+The sync modules this rule turns into defects are converted by Epic 46
+(`docs/user_stories/epic_46_async_suite/`), which owns the inventory and the order.
+
+**What would overturn this:** a global that cannot be parameterised without contorting
+production code; then the reason goes at the `async: false` line, as above.
 
 ## Test Conventions
 
 ### ABSOLUTE RULES
 
-1. **`async: true` on EVERY test file** via DataCase/ConnCase — except where the test's subject is shared state the sandbox cannot isolate (DDL on a shared table, planner statistics, VM-global processes): then `async: false`, with the reason in the module's moduledoc. An async test that ends holding a DDL lock on a shared table through one of its sandbox OWNER connections fails at teardown (`Loopctl.Test.LockGuard`); a connection it checks out itself is not checked
-2. **NEVER `Application.put_env` in tests** — all service swapping via config/test.exs
+1. **`async: true` on EVERY test file** via DataCase/ConnCase. A test that wants `async: false` because the code reads shared state is a design defect in the code: inject that state (see Dependency Injection above). The exceptions are tests whose SUBJECT is the shared thing — DDL on a shared table, planner statistics over a committed corpus, committed transactions racing each other (scoped to the race itself, on unique rows no other test counts) — and a compile-time-only dependency: then `async: false`, with the reason in the module's moduledoc. An async test that ends holding a DDL lock on a shared table through one of its sandbox OWNER connections fails at teardown (`Loopctl.Test.LockGuard`); a connection it checks out itself is not checked
+2. **NEVER `Application.put_env` in tests** — behaviour mocks via config/test.exs; any other value a test needs is injected (Dependency Injection above)
 3. **`Mox.set_mox_from_context(tags)`** in DataCase/ConnCase setup for async isolation
 4. **`setup :verify_on_exit!`** on EVERY test file using Mox
 5. **Default permissive stubs** in DataCase/ConnCase setup via `stub_all_defaults/0`
