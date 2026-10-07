@@ -342,7 +342,6 @@ defmodule Loopctl.Llm.SettingsCacheTest do
   end
 
   # NOTE: the restart / table-missing resilience tests (AC-32.3.5) live in
-  # `Loopctl.Llm.SettingsCacheRestartTest` (async: false). They delete the shared
-  # named table and stop the app-supervised owner — node-global mutations that must
-  # not run concurrently with these async tests.
+  # `Loopctl.Llm.SettingsCacheRestartTest`. They delete the table of, and restart, an
+  # owner instance of their own (`start_link/1`'s `:name` and `:table`), never the app's.
 end

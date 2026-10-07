@@ -113,10 +113,20 @@ defmodule Loopctl.Auth do
   ZERO AdminRepo statements per request.
   """
   @spec verify_api_key(String.t()) :: {:ok, ApiKey.t()} | {:error, :unauthorized}
-  def verify_api_key(raw_key) when is_binary(raw_key) do
+  def verify_api_key(raw_key), do: verify_api_key(raw_key, ApiKeyCache.table_name())
+
+  @doc """
+  `verify_api_key/1` read through the `Loopctl.Auth.ApiKeyCache` table `cache_table` instead
+  of the app's — how a test of the cache owner's restart runs this exact read-through
+  protocol against an owner of its own. Only WHERE the cache lives is a parameter: the key
+  is still the one presented, resolved by the same DB read, and every caller that
+  authenticates a request uses `verify_api_key/1`.
+  """
+  @spec verify_api_key(String.t(), :ets.table()) :: {:ok, ApiKey.t()} | {:error, :unauthorized}
+  def verify_api_key(raw_key, cache_table) when is_binary(raw_key) do
     key_hash = hash_key(raw_key)
 
-    case ApiKeyCache.fetch(key_hash) do
+    case ApiKeyCache.fetch(key_hash, cache_table) do
       {:ok, %ApiKey{} = api_key} ->
         # HIT: the SQL guards were not applied, so re-enforce revoked_at/
         # expires_at against wall-clock now before trusting the cached struct.
@@ -127,7 +137,7 @@ defmodule Loopctl.Auth do
       :miss ->
         # Capture the generation BEFORE the DB read so a concurrent invalidation
         # rejects this (possibly stale) repopulation at the next fetch/1.
-        generation = ApiKeyCache.generation(key_hash)
+        generation = ApiKeyCache.generation(key_hash, cache_table)
 
         case load_active_api_key(key_hash) do
           nil ->
@@ -136,7 +146,7 @@ defmodule Loopctl.Auth do
           api_key ->
             # Cache only POSITIVE resolutions (the SQL guards already excluded
             # revoked/expired rows), so a revoked/expired key is never cached.
-            ApiKeyCache.put(key_hash, api_key, generation)
+            ApiKeyCache.put(key_hash, api_key, generation, cache_table)
             verify_and_touch(api_key, key_hash)
         end
     end

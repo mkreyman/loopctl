@@ -3,7 +3,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency.Behaviour do
   DI seam for the per-node outbound-embedding concurrency gate (US-37.2).
 
   The interactive query path and both Oban embedding workers funnel through
-  `Loopctl.Knowledge.run_embedding_task/3`, which `acquire/1`s a slot (for the
+  `Loopctl.Knowledge.run_embedding_task/6`, which `acquire/1`s a slot (for the
   request's `tenant_id`) before spawning the supervised embedding task and
   `release/1`s it afterwards. Resolving the gate through config
   (`Application.get_env(:loopctl, :embedding_concurrency,

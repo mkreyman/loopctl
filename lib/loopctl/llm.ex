@@ -124,15 +124,23 @@ defmodule Loopctl.Llm do
   crash-window cases. See `Loopctl.Llm.SettingsCache` for the full guarantee.
   """
   @spec get_settings(Ecto.UUID.t()) :: TenantLlmSettings.t() | nil
-  def get_settings(tenant_id) when is_binary(tenant_id) do
-    case SettingsCache.fetch(tenant_id) do
+  def get_settings(tenant_id), do: get_settings(tenant_id, SettingsCache.table_name())
+
+  @doc """
+  `get_settings/1` read through the `SettingsCache` table `table` rather than the app's
+  — how a test of the cache owner's restart drives the real read-through against an
+  instance of its own.
+  """
+  @spec get_settings(Ecto.UUID.t(), :ets.table()) :: TenantLlmSettings.t() | nil
+  def get_settings(tenant_id, table) when is_binary(tenant_id) do
+    case SettingsCache.fetch(tenant_id, table) do
       {:ok, value} ->
         value
 
       :miss ->
-        generation = SettingsCache.generation(tenant_id)
+        generation = SettingsCache.generation(tenant_id, table)
         settings = load_settings(tenant_id)
-        SettingsCache.put(tenant_id, settings, generation)
+        SettingsCache.put(tenant_id, settings, generation, table)
         settings
     end
   end
@@ -452,7 +460,7 @@ defmodule Loopctl.Llm do
   coordination" moduledoc note.
 
   Call this from EXACTLY ONE choke point per failure at each call site — currently
-  `Loopctl.Knowledge.run_embedding_task/3` (`provider: "embedding"`) — the SINGLE
+  `Loopctl.Knowledge.run_embedding_task/6` (`provider: "embedding"`) — the SINGLE
   guarded entry point shared by both Oban workers (`ArticleEmbeddingWorker`/
   `MemoryEmbeddingWorker`) AND every query-time embedding caller (combined/semantic
   search, novelty scoring, `Memory.recall/2`, promotion near-dup lookup), gated by

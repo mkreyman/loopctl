@@ -57,9 +57,15 @@ defmodule Loopctl.SystemConfig do
   so the primer can make a failed boot prime loud — a silently empty cache is what
   turns a bounded startup window into an unbounded one.
 
-  The `:persistent_term` key is `{__MODULE__, key_string}` — string keys are used
-  verbatim (never `String.to_atom/1` on them).
+  The cache is a `Loopctl.TermCache` namespace: `__MODULE__` everywhere in production,
+  which is the `:persistent_term` key `{__MODULE__, key_string}` — string keys are used
+  verbatim (never `String.to_atom/1` on them). `get_int/3`, `fetch_int/2`, `put/3` and
+  `refresh/1` take the namespace as an argument so a test reads and writes its OWN — an ETS
+  table it owns — instead of the node-wide one every other test reads.
   """
+
+  @typedoc "The `Loopctl.TermCache` namespace a value is cached under — `__MODULE__` in production."
+  @type cache :: Loopctl.TermCache.namespace()
 
   import Ecto.Query, only: [from: 2]
 
@@ -68,16 +74,18 @@ defmodule Loopctl.SystemConfig do
   alias Loopctl.AdminRepo
   alias Loopctl.ExitClass
   alias Loopctl.SystemConfig.Setting
+  alias Loopctl.TermCache
 
   @doc """
   Reads an integer config value from the `:persistent_term` cache.
 
   Returns `default` on a cache miss, a non-integer cached value, or any error.
-  Never raises — safe to call on the hot path.
+  Never raises — safe to call on the hot path. `cache` is the namespace (see the
+  moduledoc); it defaults to the node-wide one.
   """
-  @spec get_int(String.t(), integer()) :: integer()
-  def get_int(key, default) when is_binary(key) and is_integer(default) do
-    case :persistent_term.get(pt_key(key), :__miss__) do
+  @spec get_int(String.t(), integer(), cache()) :: integer()
+  def get_int(key, default, cache \\ __MODULE__) when is_binary(key) and is_integer(default) do
+    case TermCache.get(cache, key, :__miss__) do
       value when is_integer(value) -> value
       _ -> default
     end
@@ -96,9 +104,9 @@ defmodule Loopctl.SystemConfig do
   happens to equal it indistinguishable from unset, so an operator who deliberately
   stores that value silently gets the caller's fallback instead.
   """
-  @spec fetch_int(String.t()) :: {:ok, integer()} | :error
-  def fetch_int(key) when is_binary(key) do
-    case :persistent_term.get(pt_key(key), :__miss__) do
+  @spec fetch_int(String.t(), cache()) :: {:ok, integer()} | :error
+  def fetch_int(key, cache \\ __MODULE__) when is_binary(key) do
+    case TermCache.get(cache, key, :__miss__) do
       value when is_integer(value) -> {:ok, value}
       _ -> :error
     end
@@ -115,9 +123,12 @@ defmodule Loopctl.SystemConfig do
   failed prime (see `Loopctl.SystemConfig.CachePrimer`) match on the error tuple;
   callers that only want best-effort propagation (the cron worker,
   `Loopctl.Release`) ignore it.
+
+  `cache` is the namespace the rows are loaded into — the node-wide one unless a caller
+  (a test of `Loopctl.Release`) names its own.
   """
-  @spec refresh() :: :ok | {:error, term()}
-  def refresh, do: refresh_from(fn -> AdminRepo.all(Setting) end)
+  @spec refresh(cache()) :: :ok | {:error, term()}
+  def refresh(cache \\ __MODULE__), do: refresh_from(fn -> AdminRepo.all(Setting) end, cache)
 
   @doc "The PubSub topic a refresh is broadcast on (`Loopctl.SystemConfig.RefreshListener`)."
   @spec refresh_topic() :: String.t()
@@ -137,11 +148,11 @@ defmodule Loopctl.SystemConfig do
   # `AdminRepo.all/1` successfully, so left inline the `catch` arm below would be a guard
   # nothing ever exercises — the same reason `Knowledge.heat_projection_exit/2` is public.
   # `refresh/0` is the sole production caller and passes the real read.
-  @spec refresh_from((-> [Setting.t()])) :: :ok | {:error, term()}
-  def refresh_from(load) when is_function(load, 0) do
+  @spec refresh_from((-> [Setting.t()]), cache()) :: :ok | {:error, term()}
+  def refresh_from(load, cache \\ __MODULE__) when is_function(load, 0) do
     load.()
     |> Enum.each(fn %Setting{key: key, value: value} ->
-      :persistent_term.put(pt_key(key), value)
+      TermCache.put(cache, key, value)
     end)
 
     :ok
@@ -178,10 +189,12 @@ defmodule Loopctl.SystemConfig do
   @doc """
   Upserts a setting row (via `AdminRepo`) AND updates the `:persistent_term`
   cache immediately, so the new value is live on this node without waiting for the
-  refresh cron. For a future admin API.
+  refresh cron. For a future admin API. `cache` is the namespace the value is cached
+  under (see the moduledoc); the ROW is the one row for `key` whatever it is.
   """
-  @spec put(String.t(), integer()) :: {:ok, Setting.t()} | {:error, Ecto.Changeset.t()}
-  def put(key, value) when is_binary(key) and is_integer(value) do
+  @spec put(String.t(), integer(), cache()) ::
+          {:ok, Setting.t()} | {:error, Ecto.Changeset.t()}
+  def put(key, value, cache \\ __MODULE__) when is_binary(key) and is_integer(value) do
     now = DateTime.utc_now()
 
     %Setting{}
@@ -193,7 +206,7 @@ defmodule Loopctl.SystemConfig do
     )
     |> case do
       {:ok, setting} ->
-        :persistent_term.put(pt_key(key), value)
+        TermCache.put(cache, key, value)
         {:ok, setting}
 
       {:error, _changeset} = error ->
@@ -208,6 +221,4 @@ defmodule Loopctl.SystemConfig do
   def all do
     AdminRepo.all(from s in Setting, order_by: [asc: s.key])
   end
-
-  defp pt_key(key), do: {__MODULE__, key}
 end

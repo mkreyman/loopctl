@@ -11,14 +11,13 @@ defmodule Loopctl.Egress.DegradedSearchTest do
   a bare empty list, that the breaker stays CLOSED, and that no provider-error
   storm signal is emitted for what is a local configuration decision.
 
-  `async: false`: the provider-error assertion below is a `refute_received` on
-  `[:loopctl, :llm, :provider_error]`, a VM-GLOBAL telemetry event whose metadata
-  carries no tenant — a concurrent embedding test emitting it is indistinguishable
-  from a leak here. Same reasoning (and same remedy) as `Loopctl.ProviderTest` and
-  `Loopctl.Llm.AnthropicTest`.
+  The provider-error assertion below is a `refute_received` on
+  `[:loopctl, :llm, :provider_error]`, an event whose metadata carries no tenant, so the
+  handler is `Loopctl.TelemetryHelpers.attach_own/1`: it forwards only emissions from this
+  test's process and the tasks it started, and a concurrent test's emission never reaches it.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Mox
 
@@ -94,12 +93,46 @@ defmodule Loopctl.Egress.DegradedSearchTest do
       refute_received :unexpected_http_call
     end
 
+    # POSITIVE CONTROL for the refute below: the same listener DOES see the provider_error
+    # this search path emits when the provider genuinely fails — from the embedding task the
+    # request starts — on a tenant that is NOT local_only. Without it, a listener that
+    # forwarded nothing would pass the refute by construction.
+    test "the listener sees the provider_error a genuinely failing provider emits", %{
+      conn: conn
+    } do
+      other = fixture(:tenant)
+      {raw, _} = fixture(:api_key, %{tenant_id: other.id, role: :agent})
+
+      {:ok, _} =
+        Llm.upsert_settings(other.id, %{
+          "embedding_api_key" => "test-openai-key-CONTROL",
+          "embedding_model" => "text-embedding-3-small"
+        })
+
+      Knowledge.reset_circuit_breaker(other.id)
+      on_exit(fn -> PinCache.invalidate_tenant(other.id) end)
+      seed_article(other)
+
+      Req.Test.stub(EmbeddingClient, fn conn ->
+        conn |> Plug.Conn.put_status(500) |> Req.Test.json(%{"error" => "boom"})
+      end)
+
+      ref = Loopctl.TelemetryHelpers.attach_own([[:loopctl, :llm, :provider_error]])
+
+      assert conn
+             |> put_req_header("authorization", "Bearer #{raw}")
+             |> get(~p"/api/v1/knowledge/search", %{"q" => "advisory locks"})
+             |> json_response(200)
+
+      assert_receive {[:loopctl, :llm, :provider_error], ^ref, %{count: 1},
+                      %{provider: "embedding"}}
+    end
+
     test "no [:loopctl, :llm, :provider_error] telemetry is emitted, and the breaker stays CLOSED",
          %{conn: conn, tenant: tenant} do
       seed_article(tenant)
 
-      ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :llm, :provider_error]])
-      on_exit(fn -> :telemetry.detach(ref) end)
+      ref = Loopctl.TelemetryHelpers.attach_own([[:loopctl, :llm, :provider_error]])
 
       # Well past the breaker's failure threshold: if an egress refusal counted, the
       # breaker would open and the reason would flip to "embedding_circuit_open".

@@ -4,11 +4,15 @@ defmodule LoopctlWeb.TelemetryPrometheusTest do
   (`TelemetryMetricsPrometheus`) actually registers it. The reporter drops a summary at boot
   ("Metric type summary is unsupported") and a metric whose name collides, silently.
 
-  `async: false`: a started reporter attaches telemetry handlers VM-wide, so every repo
-  query any concurrent test made would run through them.
+  A started reporter attaches its handlers VM-wide, so the counting tests start theirs on
+  `Loopctl.TelemetryHelpers.own_metrics/1`: every metric's `:keep` also requires that the EMITTING process is this
+  test's (a telemetry handler runs in the emitter), so a concurrent test's event — a runner
+  refusal, a channel event — is never counted in this scrape.
   """
 
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
+
+  alias Loopctl.TelemetryHelpers
 
   describe "metrics/0 under the Prometheus reporter (issue #815)" do
     test "every metric registers: none is a summary the reporter drops, none collides" do
@@ -30,7 +34,9 @@ defmodule LoopctlWeb.TelemetryPrometheusTest do
 
       start_supervised!(
         {TelemetryMetricsPrometheus.Core,
-         metrics: LoopctlWeb.Telemetry.metrics(), name: name, start_async: false}
+         metrics: TelemetryHelpers.own_metrics(LoopctlWeb.Telemetry.metrics()),
+         name: name,
+         start_async: false}
       )
 
       :telemetry.execute([:loopctl, :runners, :message_refused], %{count: 1}, %{
@@ -68,7 +74,9 @@ defmodule LoopctlWeb.TelemetryPrometheusTest do
 
       start_supervised!(
         {TelemetryMetricsPrometheus.Core,
-         metrics: LoopctlWeb.Telemetry.metrics(), name: name, start_async: false}
+         metrics: TelemetryHelpers.own_metrics(LoopctlWeb.Telemetry.metrics()),
+         name: name,
+         start_async: false}
       )
 
       for event <- ["trace", "made-up-#{System.unique_integer([:positive])}", "another-one"] do

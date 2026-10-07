@@ -165,7 +165,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   @title_key_sql "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))"
 
   # The idempotency-key twin, referenced by `idempotency_drift_groups/1` (which DERIVES the
-  # groups) and by `still_colliding/5` (which RE-CHECKS them at apply time) so the two cannot
+  # groups) and by `still_colliding/6` (which RE-CHECKS them at apply time) so the two cannot
   # drift apart — the same pinning `@title_key_sql` gets, for the same reason. Deliberately
   # NOT `lower()`-ed: an `idempotency_key` is an opaque writer-chosen token where case can be
   # the only thing separating two of them, so folding it is a collision, not a normalization.
@@ -457,7 +457,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   group left with fewer than two live published members is skipped, not forced. Reading a
   winner chosen hours ago would be applying a decision to a corpus that no longer matches it.
 
-  The COLLISION is re-derived here too (`still_colliding/5`): the grouping signal that
+  The COLLISION is re-derived here too (`still_colliding/6`): the grouping signal that
   FORMED the group — normalized title, or normalized idempotency key — is recomputed over
   the live rows, and a group that has dissolved, split, or lost any live member to another
   key is skipped WHOLE rather than applied to what is left. The two-run agreement gate
@@ -474,7 +474,10 @@ defmodule Loopctl.Knowledge.Consolidation do
   normalized key that formed the group, worst pair at or above
   `#{@default_min_duplicate_similarity}` (tunable). One that cannot is REPORTED, counted in
   `uncorroborated`, and has its missing vectors enqueued so the withhold clears itself; a
-  group withheld because the scoring READ failed enqueues nothing (`corroborated?/3`).
+  group withheld because the scoring READ failed enqueues nothing (`corroborated?/4`).
+
+  The threshold is read from `Loopctl.SystemConfig` per group; `:system_config` names the
+  namespace it is read from (the node-wide one by default, a test's own otherwise).
   """
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
@@ -502,7 +505,8 @@ defmodule Loopctl.Knowledge.Consolidation do
       log_gate_blocked(tenant_id, :duplicate_capture, :drain_disabled)
       %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: :drain_disabled}
     else
-      run_confirmed_duplicates(tenant_id, cap, unpublish_cap)
+      cache = Keyword.get(opts, :system_config, SystemConfig)
+      run_confirmed_duplicates(tenant_id, cap, unpublish_cap, cache)
     end
   end
 
@@ -544,7 +548,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     @default_max_per_class
   end
 
-  defp run_confirmed_duplicates(tenant_id, cap, unpublish_cap) do
+  defp run_confirmed_duplicates(tenant_id, cap, unpublish_cap, cache) do
     case confirmed_proposals(tenant_id, :duplicate_capture, cap) do
       {:error, reason} ->
         log_gate_blocked(tenant_id, :duplicate_capture, reason)
@@ -554,13 +558,15 @@ defmodule Loopctl.Knowledge.Consolidation do
         # Scored ONCE for the whole batch, then consulted per group AFTER its liveness
         # re-check — so a group that dissolved between the scan and now still reports
         # `skipped` (the accurate reason) rather than being relabelled uncorroborated.
+        # `cache` travels beside it: the `SystemConfig` namespace the similarity threshold
+        # is read from, so `corroborate/6` judges against the lever the caller named.
         scored = score_groups(tenant_id, proposals)
 
         result =
           proposals
           |> Enum.reduce(
             %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: :open},
-            &tally_apply(tenant_id, &1, &2, unpublish_cap, scored)
+            &tally_apply(tenant_id, &1, &2, unpublish_cap, scored, cache)
           )
 
         log_permanent_withhold(tenant_id, result)
@@ -603,7 +609,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp log_permanent_withhold(_tenant_id, _result), do: :ok
 
   # The ONLY heavy read on the apply path, and it runs BEFORE the reduce — so a statement
-  # timeout or a `HeavyRead` shed would escape past `tally_apply/5`'s per-group rescue and
+  # timeout or a `HeavyRead` shed would escape past `tally_apply/6`'s per-group rescue and
   # cost the whole night's drain, deterministically, every night. A failure degrades to
   # `:unavailable` instead, which withholds every group one by one (fail-closed, counted in
   # `uncorroborated`) rather than raising out of the run.
@@ -696,8 +702,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   # that LEAVE the published set; and the proposal's `article_ids` is a scan-time snapshot, so
   # charging its length skipped groups for budget they would never have spent (the same reason
   # the winner is recomputed from live rows).
-  defp tally_apply(tenant_id, proposal, acc, unpublish_cap, scored) do
-    case apply_duplicate_group(tenant_id, proposal, unpublish_cap - acc.applied, scored) do
+  defp tally_apply(tenant_id, proposal, acc, unpublish_cap, scored, cache) do
+    case apply_duplicate_group(tenant_id, proposal, unpublish_cap - acc.applied, scored, cache) do
       {:ok, applied, failed} ->
         %{acc | applied: acc.applied + applied, failed: acc.failed + failed}
 
@@ -795,7 +801,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     |> AdminRepo.all()
   end
 
-  defp apply_duplicate_group(tenant_id, proposal, budget, scored) do
+  defp apply_duplicate_group(tenant_id, proposal, budget, scored, cache) do
     live =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
@@ -822,7 +828,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     if length(live) < 2 or budget < 1 do
       :skip
     else
-      still_colliding(tenant_id, proposal, live, budget, scored)
+      still_colliding(tenant_id, proposal, live, budget, scored, cache)
     end
   end
 
@@ -859,10 +865,10 @@ defmodule Loopctl.Knowledge.Consolidation do
   # WAS confirmed. `drained_by_this_pass?/2` is what tells the two apart.
   #
   # The predicate re-checked is the one that FORMED the group — `drift_signal/1` is the same
-  # classifier `corroborated?/3` scores under, so the two cannot disagree about what a group
+  # classifier `corroborated?/4` scores under, so the two cannot disagree about what a group
   # is. Re-checking titles on an idempotency-drift group would reject every one of them:
   # those members collide on a writer-supplied key and have no reason to share a title.
-  defp still_colliding(tenant_id, proposal, live, budget, scored) do
+  defp still_colliding(tenant_id, proposal, live, budget, scored, cache) do
     {signal, key_fun} =
       case drift_signal(proposal) do
         :title -> {"normalized title", &title_group_key/1}
@@ -873,7 +879,7 @@ defmodule Loopctl.Knowledge.Consolidation do
 
     case colliding_subgroups(live, key_fun) do
       [members] when length(members) == length(live) ->
-        whole_group(tenant_id, proposal, members, confirmed, {budget, scored})
+        whole_group(tenant_id, proposal, members, confirmed, {budget, scored}, cache)
 
       other ->
         log_dissolved(tenant_id, proposal, live, other, signal)
@@ -881,11 +887,11 @@ defmodule Loopctl.Knowledge.Consolidation do
     end
   end
 
-  defp whole_group(tenant_id, proposal, live, confirmed, {budget, scored}) do
+  defp whole_group(tenant_id, proposal, live, confirmed, {budget, scored}, cache) do
     departed = confirmed -- Enum.map(live, & &1.id)
 
     if departed == [] or drained_by_this_pass?(tenant_id, departed) do
-      corroborate(tenant_id, proposal, live, budget, scored)
+      corroborate(tenant_id, proposal, live, budget, scored, cache)
     else
       log_shrunk(tenant_id, proposal, live, departed)
       :skip
@@ -962,13 +968,13 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   defp idempotency_group_key(_member), do: :ineligible
 
-  defp corroborate(tenant_id, proposal, live, budget, scored) do
-    case corroborated?(proposal, live, scored) do
+  defp corroborate(tenant_id, proposal, live, budget, scored, cache) do
+    case corroborated?(proposal, live, scored, cache) do
       :ok ->
         apply_live_group(tenant_id, proposal, live, budget)
 
       {:withheld, entry, unscored} ->
-        log_uncorroborated(tenant_id, proposal, live, entry, unscored)
+        log_uncorroborated(tenant_id, proposal, live, entry, unscored, cache)
         backfill_missing_embeddings(tenant_id, unscored)
         :uncorroborated
     end
@@ -1023,7 +1029,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     # EVERY read on this path is guarded, not just the enqueue. The group has ALREADY been
     # decided uncorroborated when we get here — a withhold is a normal, correct outcome —
     # so a repo fault while looking up the tenant's embedding key or its stored hashes must
-    # not escape into `tally_apply/5`'s rescue, which would report the group as `failed`:
+    # not escape into `tally_apply/6`'s rescue, which would report the group as `failed`:
     # a WRITE that could not be made, counted in loser articles, for a night on which no
     # write was ever going to be attempted. The withhold stands and the backfill is retried
     # next run.
@@ -1258,7 +1264,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   still be published, still shared-visibility, and its title must still match the placeholder
   pattern. Between the scan and the write a human may have retitled it, and completing their
   edit for them — with a machine title, hours later — is exactly the failure
-  `still_colliding/5` exists to prevent on the other class. A CURATED article is skipped too:
+  `still_colliding/6` exists to prevent on the other class. A CURATED article is skipped too:
   `Article.update_changeset/2` clears the governed curated marker on any title change, and
   clearing it is the one part of this write that putting the title back would NOT undo. So is
   a title that normalizes onto another live SHARED published article's (`title_key_taken`) —
@@ -1431,7 +1437,7 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   defp log_retitle_truncation(_tenant_id, _budget_ms, _result), do: :ok
 
-  # Per-item containment, exactly like `tally_apply/5`: this reduce is not transactional, so
+  # Per-item containment, exactly like `tally_apply/6`: this reduce is not transactional, so
   # a raise escaping it would discard the tally of the articles ALREADY retitled and report
   # zero writes that really happened.
   defp tally_retitle(tenant_id, proposal, acc, opts) do
@@ -1471,7 +1477,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # Re-derivation, not trust — the twin of `apply_duplicate_group/3`'s live re-fetch and of
-  # `still_colliding/5`'s re-check of the signal that formed the group. The body comes back
+  # `still_colliding/6`'s re-check of the signal that formed the group. The body comes back
   # pre-truncated from SQL (`@title_source_chars`) so this can never pull a whole corpus of
   # 100 KB bodies into memory, and `shared_only/1` keeps an agent's `private`/`owner` memory
   # out of a step that ships bytes to a provider.
@@ -1485,7 +1491,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         where: a.tenant_id == ^tenant_id,
         where: a.id in ^proposal.article_ids,
         where: a.status == :published,
-        # Same apply-time liveness rule as `apply_duplicate_group/4`: never retitle an
+        # Same apply-time liveness rule as `apply_duplicate_group/5`: never retitle an
         # article somebody has taken out of retrieval.
         where: is_nil(a.suppressed_at),
         select: %{
@@ -1553,7 +1559,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # long enough for every state it validated to move. So it is made again, against the row
   # as it is NOW, and the write is built from THAT row rather than from the pre-call
   # snapshot. Three things ride on it: a human who retitled the article during the call does
-  # not get their edit completed for them by a machine title (the failure `still_colliding/5`
+  # not get their edit completed for them by a machine title (the failure `still_colliding/6`
   # exists to prevent on the other class); a curation that landed during the call is not
   # silently cleared by the title change; and the metadata merged into is the LIVE map, so a
   # concurrent `visibility` flip or ingestion write is not reverted by a snapshot one round
@@ -1955,7 +1961,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     # entry it meets first and the interleave meets the title entry first, so a re-import that
     # drifted in its tag format AND (being one capture) carries the same title kept the weaker
     # label — and was then held to the embedding gate the idempotency signal is exempt from
-    # (`corroborated?/3`), forever on a tenant with no vectors.
+    # (`corroborated?/4`), forever on a tenant with no vectors.
     titles =
       title_drift_groups(tenant_id)
       |> Enum.sort_by(by_ids)
@@ -2134,13 +2140,13 @@ defmodule Loopctl.Knowledge.Consolidation do
   #
   # Scored over the LIVE members, never the scan-time id set, so what is checked is the group
   # that would actually be unpublished.
-  defp corroborated?(proposal, live, scored) do
+  defp corroborated?(proposal, live, scored, cache) do
     # Sorted so the entry a group resolves to is deterministic, and looked up by ANY live
     # member rather than by the smallest id: the batch is scored once over the union of
     # every confirmed proposal's SCAN-time ids, so the smallest member of THIS group may
     # have been unpublished by an earlier group in the same reduce.
     ids = live |> Enum.map(& &1.id) |> Enum.sort()
-    judge_similarity(lookup_score(scored, ids, drift_signal(proposal)), ids)
+    judge_similarity(lookup_score(scored, ids, drift_signal(proposal)), ids, cache)
   end
 
   # Keyed by `{signal, member_id}`, never by member id alone: one article can belong to a
@@ -2164,13 +2170,13 @@ defmodule Loopctl.Knowledge.Consolidation do
   # Treating it as "no vectors" answered a DB outage with an embedding job per member of
   # every confirmed group, against the same shedding database, under a message that pointed
   # the operator at embeddings.
-  defp judge_similarity(:unavailable, _ids), do: {:withheld, :unavailable, []}
+  defp judge_similarity(:unavailable, _ids, _cache), do: {:withheld, :unavailable, []}
 
-  defp judge_similarity(nil, ids), do: {:withheld, nil, ids}
+  defp judge_similarity(nil, ids, _cache), do: {:withheld, nil, ids}
 
-  defp judge_similarity(%{scored: scored_ids, min_sim: min_sim} = entry, ids) do
+  defp judge_similarity(%{scored: scored_ids, min_sim: min_sim} = entry, ids, cache) do
     case Enum.reject(ids, &MapSet.member?(scored_ids, &1)) do
-      [] -> if min_sim >= min_duplicate_similarity(), do: :ok, else: {:withheld, entry, []}
+      [] -> if min_sim >= min_duplicate_similarity(cache), do: :ok, else: {:withheld, entry, []}
       unscored -> {:withheld, entry, unscored}
     end
   end
@@ -2183,7 +2189,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # "backfill enqueued" there made a PERMANENT configuration state read as a transient gap,
   # which is the exact misreading that module comment exists to prevent. The enqueue owns
   # its own statement, in all three of its outcomes.
-  defp log_uncorroborated(tenant_id, proposal, _live, :unavailable, _unscored) do
+  defp log_uncorroborated(tenant_id, proposal, _live, :unavailable, _unscored, _cache) do
     Logger.warning(
       "Consolidation: tenant=#{tenant_id} WITHHELD duplicate_capture proposal " <>
         "##{proposal.number} from auto-apply — similarity scoring failed this run, so there " <>
@@ -2192,7 +2198,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     )
   end
 
-  defp log_uncorroborated(tenant_id, proposal, live, entry, unscored) do
+  defp log_uncorroborated(tenant_id, proposal, live, entry, unscored, cache) do
     detail =
       case {entry, unscored} do
         {_entry, [_ | _] = missing} ->
@@ -2200,7 +2206,7 @@ defmodule Loopctl.Knowledge.Consolidation do
 
         {%{min_sim: sim, pairs: pairs}, []} ->
           "min cosine #{Float.round(sim, 4)} across #{pairs} scored pair(s), " <>
-            threshold_detail()
+            threshold_detail(cache)
       end
 
     key =
@@ -2221,8 +2227,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   # rather than printing an impossible number and leaving the operator to work out that
   # "threshold 2.0" is their own setting rather than a bug. This is where the disable is
   # visible: it is intentional configuration, so it earns no repeated warning of its own.
-  defp threshold_detail do
-    case min_duplicate_similarity() do
+  defp threshold_detail(cache) do
+    case min_duplicate_similarity(cache) do
       threshold when threshold >= 1.0 ->
         "auto-apply DISABLED by configuration — the threshold is set above any reachable " <>
           "cosine, so no group can corroborate"
@@ -2338,7 +2344,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # added for) then score near 1.0 against each other. Corroborating a title collision on
   # that is the auto-unpublish the gate exists to prevent, arriving through the gate
   # itself. A marked member is therefore treated as MISSING evidence — it drops out of
-  # `scored`, so `judge_similarity/2` withholds the whole group, which fails closed.
+  # `scored`, so `judge_similarity/3` withholds the whole group, which fails closed.
   defp score_pairs(query, :legacy) do
     from([a1, a2] in query,
       where: not is_nil(a1.embedding) and not is_nil(a2.embedding),
@@ -2430,8 +2436,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   # percent be range-checked as the INTEGER an operator types: 1..99 is a threshold, `>= 100`
   # is the hard disable, and anything at or below `0` falls through to the app layer — the
   # conservative direction, per the asymmetry explained above.
-  defp min_duplicate_similarity do
-    case SystemConfig.fetch_int(@min_similarity_pct_key) do
+  defp min_duplicate_similarity(cache) do
+    case SystemConfig.fetch_int(@min_similarity_pct_key, cache) do
       {:ok, pct} -> stored_pct_threshold(pct)
       :error -> app_layer_similarity()
     end

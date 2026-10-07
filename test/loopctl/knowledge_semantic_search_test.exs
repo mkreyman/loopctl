@@ -468,7 +468,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
   # --- US-37.2: per-node embedding concurrency cap gates the interactive path ---
   #
-  # The cap is enforced inside `run_embedding_task/3` (the single guarded entry
+  # The cap is enforced inside `run_embedding_task/6` (the single guarded entry
   # point). In :test the gate is the config-DI mock (`Loopctl.MockEmbeddingConcurrency`,
   # default-stubbed to grant every slot) so we can force saturation deterministically
   # WITHOUT holding the real, VM-wide global counter saturated (which would starve
@@ -1240,13 +1240,10 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
   # NOTE: the `generate_embedding/3 - provider_error telemetry (US-34.3 review fix
   # MED #1)` describe block was EXTRACTED to the sibling module
-  # `test/loopctl/knowledge_semantic_search_provider_error_test.exs`, which runs
-  # `async: false`. Those tests attach a handler on the VM-global
-  # `[:loopctl, :llm, :provider_error]` telemetry event, whose metadata carries no
-  # `tenant_id` (see `Loopctl.LLM.record_provider_error/2`), so the handler cannot
-  # be tenant-scoped and a concurrent embedding emitter would leak into its mailbox
-  # and trip `refute_received`. Keeping this file `async: true` requires them to
-  # live in the non-async sibling.
+  # `test/loopctl/knowledge_semantic_search_provider_error_test.exs`. Those tests
+  # attach a handler on `[:loopctl, :llm, :provider_error]`, whose metadata carries no
+  # `tenant_id` (see `Loopctl.Llm.record_provider_error/2`), so they filter on the
+  # EMITTING process instead (`Loopctl.TelemetryHelpers.attach_own/1`).
 
   # --- Score normalization edge case ---
 

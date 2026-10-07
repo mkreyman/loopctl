@@ -5,17 +5,13 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
   worker's error taxonomy — while keeping the interactive memory/promotion path
   per-record (that write-then-recall guarantee is covered by the memory suite).
 
-  `async: false` ON PURPOSE. The `TC-37.4.2` test seeds the NODE-GLOBAL
-  `{Loopctl.SystemConfig, "embedding_batch_max"}` `:persistent_term` knob (the
-  documented key format, erased on exit) to drive the batch-size math. That key
-  is VM-global — NOT ExUnit-sandbox/transaction scoped — and is read globally by
-  `Knowledge.embedding_batch_max/0`, so mutating it while an async peer (e.g.
-  `KnowledgeLintWorkerTest`, which relies on the default batch_max) runs
-  concurrently would cross-contaminate the peer's chunk math. A sync test never
-  runs concurrently with any other test, so the seed can't leak — mirrors
-  `Loopctl.KnowledgeBreakerLatencyTest`.
+  The tests that move a `SystemConfig` knob (`embedding_batch_max`, the char and yield
+  budgets, the breaker's latency trip) seed it in their OWN namespace and hand that
+  namespace to the code — `Knowledge.bulk_publish/3`'s `:system_config`,
+  `BatchArticleEmbeddingWorker.perform/2`, `Knowledge.embedding_batch_max/1` — so the
+  node-wide knobs every other test reads never move.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
   setup :verify_on_exit!
@@ -50,11 +46,16 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
     |> Loopctl.AdminRepo.update!()
   end
 
-  defp perform(tenant_id, article_ids) do
-    BatchArticleEmbeddingWorker.perform(%Oban.Job{
-      id: System.unique_integer([:positive]),
-      args: %{"article_ids" => article_ids, "tenant_id" => tenant_id}
-    })
+  # `cache` is the `SystemConfig` namespace the worker reads its tunables from — the
+  # node-wide one unless the test seeded its own with `put_cfg/3`.
+  defp perform(tenant_id, article_ids, cache \\ Loopctl.SystemConfig) do
+    BatchArticleEmbeddingWorker.perform(
+      %Oban.Job{
+        id: System.unique_integer([:positive]),
+        args: %{"article_ids" => article_ids, "tenant_id" => tenant_id}
+      },
+      cache
+    )
   end
 
   describe "batch efficiency (AC-37.4.2)" do
@@ -88,12 +89,10 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
       tenant = fixture(:tenant)
       test_pid = self()
 
-      # Drive batch_max from the SystemConfig cache directly (the documented key
-      # format) — env-driven WITHOUT Application.put_env — and erase on exit. Small
-      # value keeps the test cheap: 5 records / batch_max 2 => ceil = 3 calls.
-      pt_key = {Loopctl.SystemConfig, "embedding_batch_max"}
-      :persistent_term.put(pt_key, 2)
-      on_exit(fn -> :persistent_term.erase(pt_key) end)
+      # batch_max from this test's own SystemConfig namespace, handed to bulk_publish.
+      # Small value keeps the test cheap: 5 records / batch_max 2 => ceil = 3 calls.
+      cache = own_config()
+      put_cfg(cache, "embedding_batch_max", 2)
 
       # 5 DRAFTS (no create-time enqueue), published together via bulk_publish. Oban is
       # :inline in test, so the enqueued batch workers execute synchronously.
@@ -116,7 +115,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
       end)
 
       assert {:ok, %{counts: %{published: 5}}} =
-               Knowledge.bulk_publish(tenant.id, Enum.map(drafts, & &1.id), [])
+               Knowledge.bulk_publish(tenant.id, Enum.map(drafts, & &1.id), system_config: cache)
 
       # ceil(5 / 2) = 3 provider calls (chunks of 2, 2, 1) — NOT 5.
       calls = drain_batch_calls([])
@@ -293,9 +292,8 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
       test_pid = self()
 
       # One article per sub-batch: a tiny cumulative byte budget forces the split.
-      pt_key = {Loopctl.SystemConfig, "embedding_batch_max_chars"}
-      :persistent_term.put(pt_key, 1)
-      on_exit(fn -> :persistent_term.erase(pt_key) end)
+      cache = own_config()
+      put_cfg(cache, "embedding_batch_max_chars", 1)
 
       articles = for _ <- 1..3, do: create_published_article(tenant.id)
       ids = Enum.map(articles, & &1.id)
@@ -310,7 +308,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
         {:ok, vec_for(text)}
       end)
 
-      assert :ok = perform(tenant.id, ids)
+      assert :ok = perform(tenant.id, ids, cache)
 
       assert_received {:batch_call, 1}
       refute_received {:batch_call, _}
@@ -401,7 +399,8 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
 
       # Budget fits ~2 of these ~320-char texts per array call, not all 3. env-driven
       # WITHOUT Application.put_env (SystemConfig cache), erased on exit.
-      put_cfg("embedding_batch_max_chars", 700)
+      cache = own_config()
+      put_cfg(cache, "embedding_batch_max_chars", 700)
 
       body = String.duplicate("a", 300)
 
@@ -417,7 +416,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
         {:ok, Enum.map(texts, &vec_for/1)}
       end)
 
-      assert :ok = perform(tenant.id, ids)
+      assert :ok = perform(tenant.id, ids, cache)
 
       # 3 texts, budget fits 2 per call => 2 provider calls (sizes 2 + 1), NOT 1.
       assert Enum.sort(drain_batch_calls([]), :desc) == [2, 1]
@@ -445,15 +444,16 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
 
       # Tiny yield (20ms base + 1ms/item) < 200ms call => the guard shuts the task down
       # => transient error, NO vector written.
-      put_cfg("embedding_batch_yield_base_ms", 20)
-      put_cfg("embedding_batch_yield_per_item_ms", 1)
-      assert {:error, _} = perform(tenant.id, [a1.id])
+      cache = own_config()
+      put_cfg(cache, "embedding_batch_yield_base_ms", 20)
+      put_cfg(cache, "embedding_batch_yield_per_item_ms", 1)
+      assert {:error, _} = perform(tenant.id, [a1.id], cache)
       {:ok, l1} = Knowledge.get_article_with_embedding(tenant.id, a1.id)
       assert l1.embedding == nil
 
       # Raise the SAME knob live (no redeploy): yield now 2000ms > 200ms => success.
-      put_cfg("embedding_batch_yield_base_ms", 2000)
-      assert :ok = perform(tenant.id, [a2.id])
+      put_cfg(cache, "embedding_batch_yield_base_ms", 2000)
+      assert :ok = perform(tenant.id, [a2.id], cache)
       {:ok, l2} = Knowledge.get_article_with_embedding(tenant.id, a2.id)
       assert l2.embedding != nil
     end
@@ -467,8 +467,9 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
       # Enable the latency trip aggressively: any call slower than 1ms is 'slow', and a
       # single slow call would trip — so the OLD (record_call_outcome) batch path would
       # have opened the breaker here.
-      put_cfg("embedding_breaker_latency_threshold_ms", 1)
-      put_cfg("embedding_breaker_latency_count", 1)
+      cache = own_config()
+      put_cfg(cache, "embedding_breaker_latency_threshold_ms", 1)
+      put_cfg(cache, "embedding_breaker_latency_count", 1)
 
       article = create_published_article(tenant.id)
 
@@ -478,7 +479,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
         {:ok, Enum.map(texts, &vec_for/1)}
       end)
 
-      assert :ok = perform(tenant.id, [article.id])
+      assert :ok = perform(tenant.id, [article.id], cache)
 
       # Batch path is EXEMPT: the breaker stays CLOSED — a follow-up embedding call
       # reaches the provider instead of short-circuiting on {:error, :circuit_open}.
@@ -488,19 +489,17 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
 
   describe "embedding_batch_max/0 (AC-37.4.4)" do
     test "reads the live SystemConfig value" do
-      pt_key = {Loopctl.SystemConfig, "embedding_batch_max"}
-      :persistent_term.put(pt_key, 42)
-      on_exit(fn -> :persistent_term.erase(pt_key) end)
+      cache = own_config()
+      put_cfg(cache, "embedding_batch_max", 42)
 
-      assert Knowledge.embedding_batch_max() == 42
+      assert Knowledge.embedding_batch_max(cache) == 42
     end
 
     test "floors a non-positive tuned value at 1 (never an empty chunk)" do
-      pt_key = {Loopctl.SystemConfig, "embedding_batch_max"}
-      :persistent_term.put(pt_key, 0)
-      on_exit(fn -> :persistent_term.erase(pt_key) end)
+      cache = own_config()
+      put_cfg(cache, "embedding_batch_max", 0)
 
-      assert Knowledge.embedding_batch_max() == 1
+      assert Knowledge.embedding_batch_max(cache) == 1
     end
   end
 
@@ -514,11 +513,9 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
     end
   end
 
-  # Drive a SystemConfig knob from the persistent_term cache (the documented key
-  # format) — env-driven WITHOUT Application.put_env — and erase on exit.
-  defp put_cfg(key, value) do
-    pt_key = {Loopctl.SystemConfig, key}
-    :persistent_term.put(pt_key, value)
-    on_exit(fn -> :persistent_term.erase(pt_key) end)
-  end
+  # A SystemConfig namespace of this test's own — an ETS table this test process owns, gone
+  # when it exits: a knob seeded into it reaches only the code this test hands it to.
+  defp own_config, do: :ets.new(:batch_worker_config, [:set, :public])
+
+  defp put_cfg(cache, key, value), do: :ets.insert(cache, {key, value})
 end

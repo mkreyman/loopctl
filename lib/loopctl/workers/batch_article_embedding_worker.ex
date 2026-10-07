@@ -5,7 +5,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   This is the truly-bulk background ingest counterpart to
   `Loopctl.Workers.ArticleEmbeddingWorker` (which embeds a single article on the
   interactive publish path). Enqueued by every BULK background path — `Knowledge`
-  bulk publish (`enqueue_bulk_embeddings/2`), `ContentIngestionWorker` auto-publish
+  bulk publish (`enqueue_bulk_embeddings/3`), `ContentIngestionWorker` auto-publish
   ingest, and the `KnowledgeLintWorker` orphan-embedding backfill — each of which
   chunks its rows into groups of `Knowledge.embedding_batch_max/0` (~100) and
   enqueues one job per chunk. The interactive single-article/memory/promotion paths
@@ -94,16 +94,24 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   @default_yield_per_item_ms 100
 
   @impl Oban.Worker
-  def perform(%Oban.Job{
-        id: id,
-        args: %{"article_ids" => article_ids, "tenant_id" => tenant_id}
-      })
+  def perform(%Oban.Job{} = job), do: perform(job, SystemConfig)
+
+  @doc """
+  `perform/1` with the `Loopctl.SystemConfig` namespace its tunables are read from — the
+  char budget, the yield budget, and the breaker's — named instead of node-wide. Oban
+  calls `perform/1`, which passes the node-wide one; a test passes its own.
+  """
+  @spec perform(Oban.Job.t(), SystemConfig.cache()) :: Oban.Worker.result()
+  def perform(
+        %Oban.Job{id: id, args: %{"article_ids" => article_ids, "tenant_id" => tenant_id}},
+        cache
+      )
       when is_list(article_ids) do
     # US-36.2: ONE per-tenant fair-share gate for the whole batch. `id` excludes THIS
     # already-executing job from its own count — see FairShare.
     case FairShare.gate(tenant_id, :embeddings, id) do
       {:snooze, _n} = snooze -> snooze
-      :ok -> embed_batch(tenant_id, article_ids)
+      :ok -> embed_batch(tenant_id, article_ids, cache)
     end
   end
 
@@ -112,7 +120,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     trunc(:math.pow(attempt, 4) + 15 + :rand.uniform(30) * attempt)
   end
 
-  defp embed_batch(tenant_id, article_ids) do
+  defp embed_batch(tenant_id, article_ids, cache) do
     articles = Knowledge.get_articles_with_embedding_status(tenant_id, article_ids)
 
     # Split into (a) already-embedded (idempotent skip — re-ensure linking) and
@@ -128,10 +136,10 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
 
     Enum.each(already, fn {article, _text, _hash} -> enqueue_linking(article.id, tenant_id) end)
 
-    generate_and_store(tenant_id, to_embed)
+    generate_and_store(tenant_id, to_embed, cache)
   end
 
-  defp generate_and_store(_tenant_id, []), do: :ok
+  defp generate_and_store(_tenant_id, [], _cache), do: :ok
 
   # AC-37.4.4 (review MED #2): in ADDITION to the count cap applied at enqueue
   # (`Knowledge.embedding_batch_max/0`), bound each provider array call by a
@@ -143,7 +151,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   # embedded+stored before the next, so an Oban retry idempotently skips already-stored
   # sub-batches (no re-bill). Stops at the first non-`:ok` sub-batch result
   # (snooze/discard/error), which the perform/1 caller returns to Oban.
-  defp generate_and_store(tenant_id, to_embed) do
+  defp generate_and_store(tenant_id, to_embed, cache) do
     to_embed
     # US-41.4 (AC-41.4.2): group by the article's PROJECT first, so every provider
     # array call carries exactly ONE egress scope. Mixing projects into one call would
@@ -152,15 +160,15 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     # are not marked. Grouping keeps each decision exact.
     |> Enum.group_by(fn {article, _text, _hash} -> article.project_id end)
     |> Enum.to_list()
-    |> embed_groups(tenant_id)
+    |> embed_groups(tenant_id, cache)
   end
 
-  defp embed_groups([], _tenant_id), do: :ok
+  defp embed_groups([], _tenant_id, _cache), do: :ok
 
-  defp embed_groups([{project_id, group} | rest], tenant_id) do
-    case generate_and_store_project_group(tenant_id, project_id, group) do
+  defp embed_groups([{project_id, group} | rest], tenant_id, cache) do
+    case generate_and_store_project_group(tenant_id, project_id, group, cache) do
       :ok ->
-        embed_groups(rest, tenant_id)
+        embed_groups(rest, tenant_id, cache)
 
       # Once ONE array has been rejected for length, this job stops sending arrays
       # ENTIRELY: the rejected sub-batch AND everything queued behind it are handed to
@@ -175,33 +183,37 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
     end
   end
 
-  defp generate_and_store_project_group(tenant_id, project_id, to_embed) do
+  defp generate_and_store_project_group(tenant_id, project_id, to_embed, cache) do
     to_embed
     # The SHARED greedy byte-splitter (#617 review follow-up). This worker's private
     # `chunk_by_char_budget/2` was the original; `ShrinkLadder.chunk_by_bytes/3` is that
     # function with the empty-input case fixed (it returned `[[]]`, a phantom sub-batch
     # that made one no-op provider call), and the re-embed and system-corpus workers
     # already call it. Two copies of a greedy chunker is one copy too many.
-    |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(), fn {_a, text, _h} ->
+    |> ShrinkLadder.chunk_by_bytes(Knowledge.embedding_batch_max_chars(cache), fn {_a, text, _h} ->
       text
     end)
-    |> embed_sub_batches(tenant_id, project_id)
+    |> embed_sub_batches(tenant_id, project_id, cache)
   end
 
-  defp embed_sub_batches([], _tenant_id, _project_id), do: :ok
+  defp embed_sub_batches([], _tenant_id, _project_id, _cache), do: :ok
 
-  defp embed_sub_batches([sub_batch | rest], tenant_id, project_id) do
-    case embed_and_store_sub_batch(tenant_id, project_id, sub_batch) do
-      :ok -> embed_sub_batches(rest, tenant_id, project_id)
+  defp embed_sub_batches([sub_batch | rest], tenant_id, project_id, cache) do
+    case embed_and_store_sub_batch(tenant_id, project_id, sub_batch, cache) do
+      :ok -> embed_sub_batches(rest, tenant_id, project_id, cache)
       :dissolve -> {:dissolve, sub_batch ++ Enum.concat(rest)}
       other -> other
     end
   end
 
-  defp embed_and_store_sub_batch(tenant_id, project_id, to_embed) do
+  defp embed_and_store_sub_batch(tenant_id, project_id, to_embed, cache) do
     texts = Enum.map(to_embed, fn {_article, text, _hash} -> text end)
 
-    opts = [timeout: batch_yield_ms(length(texts)), project_id: project_id]
+    opts = [
+      timeout: batch_yield_ms(length(texts), cache),
+      project_id: project_id,
+      system_config: cache
+    ]
 
     # US-41.7 (AC-41.7.1): this is the BULK path — the harvest load profile the
     # custody story is scoped around — and every article's body in `texts` is
@@ -482,11 +494,15 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   # to the in-code values on a cache miss. The client's batch receive_timeout uses
   # the same base+per-item shape with a strictly smaller base, so the HTTP call
   # always fails cleanly before this yield shuts the task down.
-  defp batch_yield_ms(text_count) do
-    base = SystemConfig.get_int("embedding_batch_yield_base_ms", @default_yield_base_ms)
+  defp batch_yield_ms(text_count, cache) do
+    base = SystemConfig.get_int("embedding_batch_yield_base_ms", @default_yield_base_ms, cache)
 
     per_item =
-      SystemConfig.get_int("embedding_batch_yield_per_item_ms", @default_yield_per_item_ms)
+      SystemConfig.get_int(
+        "embedding_batch_yield_per_item_ms",
+        @default_yield_per_item_ms,
+        cache
+      )
 
     base + per_item * max(text_count, 1)
   end

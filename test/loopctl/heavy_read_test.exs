@@ -232,6 +232,28 @@ defmodule Loopctl.HeavyReadTest do
     end
   end
 
+  describe "read_config/1 — what a read function's caller may hand opts/2" do
+    test "takes only opts/2's keys, and only from keyword opts" do
+      config = [system_config: :cfg, probe_cache: :probe, statement_timeout: 1]
+
+      assert HeavyRead.read_config(heavy_read_config: config) ==
+               [system_config: :cfg, probe_cache: :probe]
+
+      assert HeavyRead.read_config(limit: 5) == []
+    end
+
+    test "a request's params never choose the tunables a read uses" do
+      # `Memory.recall/2` also takes a params MAP; whichever key spelling it carries, the
+      # read keeps the node's own tunables and probe verdict.
+      for params <- [
+            %{"heavy_read_config" => [system_config: :cfg]},
+            %{heavy_read_config: [system_config: :cfg]}
+          ] do
+        assert HeavyRead.read_config(params) == []
+      end
+    end
+  end
+
   describe "all/3 + one/3 guard" do
     test "raise ArgumentError when tenant_id is not a binary" do
       q = from(a in Article, where: a.tenant_id == ^"t")
@@ -526,7 +548,7 @@ defmodule Loopctl.HeavyReadTest do
 
     test "restore logs a STABLE TAG on failure — never the raw error, which carries the backend host/database/role" do
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           assert Loopctl.LocalGuc.restore(ExitingRepo, [{"statement_timeout", "1234ms"}]) == :ok
         end)
 
@@ -539,7 +561,7 @@ defmodule Loopctl.HeavyReadTest do
 
     test "an ALREADY-ABORTED (25P02) transaction is NOT reported as a leak" do
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           assert Loopctl.LocalGuc.restore(AbortedTxnRepo, [{"statement_timeout", "1234ms"}]) ==
                    :ok
         end)
@@ -660,13 +682,10 @@ defmodule Loopctl.HeavyReadTest do
     value
   end
 
-  # NOTE (US-38.4): the per-query `hnsw.ef_search` tests that PRIME the VM-global
-  # `SystemConfig "hnsw_ef_search"` persistent_term key live in the sibling `async: false`
-  # `Loopctl.HeavyReadHnswEfSearchTest` (test/loopctl/heavy_read_hnsw_ef_search_test.exs).
-  # They were split out because that key is also read by real ANN reads in other `async: true`
-  # files (dual_index_recall_test, vector_search_test), so priming it from an async module
-  # would let a concurrent cross-file reader observe the primed value. This file stays
-  # `async: true` — it mutates no global state.
+  # NOTE (US-38.4): the per-query `hnsw.ef_search` / iterative-scan tests that PRIME a
+  # tunable live in the sibling `Loopctl.HeavyReadHnswEfSearchTest`
+  # (test/loopctl/heavy_read_hnsw_ef_search_test.exs), which primes `SystemConfig` and probe
+  # namespaces of its own through `HeavyRead.opts/2`. This file mutates no global state.
 
   describe "with_slot/3 (#567) — one gate slot across a multi-query read unit" do
     alias Loopctl.HeavyRead.TenantGate

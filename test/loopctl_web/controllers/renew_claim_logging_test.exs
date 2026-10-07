@@ -4,22 +4,17 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
   the reclaimer, and before this nothing recorded the presented epoch against the current
   one.
 
-  `async: false` because the `:info` line is let past `config/test.exs`'s `:warning` primary
-  level with a VM-global module level (see `LoopctlWeb.RunnerObservabilityTest`).
+  The controller's `:info` level is raised once in `test/test_helper.exs`, never per test.
+  Captures are `Loopctl.OwnLog.capture_own_log/2` — only this test's own lines — because
+  the refutations below name generic text a concurrent test could log.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Ecto.Query
-  import ExUnit.CaptureLog
+  import Loopctl.OwnLog, only: [capture_own_log: 2]
 
   setup :verify_on_exit!
-
-  setup do
-    Logger.put_module_level(LoopctlWeb.StoryStatusController, :info)
-    on_exit(fn -> Logger.delete_module_level(LoopctlWeb.StoryStatusController) end)
-    :ok
-  end
 
   test "a stale renewal logs story, presented and current epoch, agent and reason", %{conn: conn} do
     tenant = fixture(:tenant)
@@ -33,7 +28,7 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
     |> json_response(200)
 
     log =
-      capture_log([level: :info], fn ->
+      capture_own_log([level: :info], fn ->
         build_conn()
         |> put_req_header("authorization", "Bearer #{raw_key}")
         |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 0})
@@ -61,7 +56,7 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
 
     for epoch <- [marker, %{"nested" => %{"deep" => marker}}, 9_223_372_036_854_775_808, -1] do
       log =
-        capture_log([level: :info], fn ->
+        capture_own_log([level: :info], fn ->
           build_conn()
           |> put_req_header("authorization", "Bearer #{raw_key}")
           |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => epoch})
@@ -83,7 +78,7 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
 
     # A string epoch is refused before the story is read, so the junk id reaches the log.
     log =
-      capture_log([level: :info], fn ->
+      capture_own_log([level: :info], fn ->
         conn
         |> put_req_header("authorization", "Bearer #{raw_key}")
         |> post("/api/v1/stories/#{junk}/renew-claim", %{"claim_epoch" => "1"})
@@ -115,7 +110,7 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
       )
 
     log =
-      capture_log([level: :info], fn ->
+      capture_own_log([level: :info], fn ->
         conn
         |> put_req_header("authorization", "Bearer #{raw_key}")
         |> post("/api/v1/stories/#{segment}/renew-claim", %{"claim_epoch" => "1"})
