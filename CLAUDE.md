@@ -374,10 +374,12 @@ A dependency a library reads only at compile time (the `compile_env` above) cann
 option; it stays config, and a test needing another value says so at its `async: false` line.
 
 **NEVER** use `Application.put_env` in test files, and never reach for another global in its
-place (a repo a test swaps with `put_dynamic_repo`, a registered name, a module-level Logger
-change): inject it. A value `config/test.exs` sets once for the whole run, such as the
-`:admin_repo_route` that puts `AdminRepo` on `Repo`'s sandbox connection, is configuration by
-the rule above, not a global a test manipulates.
+place (a repo swapped with `put_dynamic_repo` to change what the code under test reads, a
+registered name, a module-level Logger change): inject it. A sync module whose SUBJECT is the
+second connection may put the production topology back, under rule 1's exception below.
+A value `config/test.exs` sets once for the whole run, such as the `:admin_repo_route` that puts
+`AdminRepo` on `Repo`'s sandbox connection, is configuration by the rule above, not a global a
+test manipulates.
 
 The sync modules this rule turns into defects are converted by Epic 46
 (`docs/user_stories/epic_46_async_suite/`), which owns the inventory and the order.
