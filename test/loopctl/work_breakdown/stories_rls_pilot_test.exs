@@ -117,16 +117,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
     Enum.map(data, &{&1.number, &1.title, &1.sort_key})
   end
 
-  # `Stories.list_stories_by_project(..., strategy: :rls)` and raw `Repo.with_tenant/2`
-  # run `SET LOCAL ROLE <rls_role>`, which persists for the rest of the enclosing sandbox
-  # transaction once the inner savepoint releases. Reset to the owner role after
-  # every RLS-touching read so the sandbox connection is left clean and no
-  # later owner-role assertion in the same test silently runs as the non-owner
-  # `loopctl_app`. Uniform across ALL RLS-touching tests (including the fail-closed
-  # guard cases, where it is a harmless no-op) — no contradictory reset/no-reset
-  # split. Mirrors TC-33.7.5.
-  defp reset_role, do: Repo.query!("RESET ROLE")
-
   describe "TC-33.7.1 — RLS path returns identical rows to the AdminRepo path (same tenant)" do
     test "same tenant: RLS row set matches AdminRepo path and returns exactly its seeded ids" do
       story_specs = [
@@ -146,8 +136,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
 
       assert {:ok, rls_page} =
                Stories.list_stories_by_project(rls_ids.tenant, rls_ids.project, strategy: :rls)
-
-      reset_role()
 
       # Identical totals and identical ordered logical row sets.
       assert admin_page.total == 3
@@ -187,8 +175,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
                  offset: 2
                )
 
-      reset_role()
-
       assert rls_page.total == 5
       assert admin_page.total == 5
       assert rls_page.limit == 2
@@ -208,8 +194,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
       assert {:ok, page} =
                Stories.list_stories_by_project(ids_a.tenant, ids_a.project, strategy: :rls)
 
-      reset_role()
-
       assert page.total == 1
       assert Enum.map(page.data, & &1.title) == ["Alpha only"]
       refute Enum.any?(page.data, &(&1.tenant_id == ids_b.tenant))
@@ -224,8 +208,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
       assert {:ok, page} =
                Stories.list_stories_by_project(ids_a.tenant, ids_b.project, strategy: :rls)
 
-      reset_role()
-
       assert page.total == 0
       assert page.data == []
     end
@@ -238,10 +220,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
       assert {:ok, page} =
                Stories.list_stories_by_project(nil, ids.project, strategy: :rls)
 
-      # No-op here (the app guard short-circuits before with_tenant sets a role);
-      # kept for uniform hygiene across all RLS-touching tests.
-      reset_role()
-
       assert page.total == 0
       assert page.data == []
     end
@@ -251,10 +229,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
 
       assert {:ok, page} =
                Stories.list_stories_by_project("", ids.project, strategy: :rls)
-
-      # No-op here (blank tenant hits the app guard before any role switch);
-      # kept for uniform hygiene across all RLS-touching tests.
-      reset_role()
 
       assert page.total == 0
       assert page.data == []
@@ -338,10 +312,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
                  )
                end)
 
-      # `with_tenant/2`'s SET LOCAL ROLE persists for the rest of the sandbox
-      # transaction; reset to the owner role so DataCase teardown is unaffected.
-      reset_role()
-
       assert Enum.map(rows, & &1.title) == ["Alpha only"]
       assert Enum.all?(rows, &(&1.tenant_id == ids_a.tenant))
       refute Enum.any?(rows, &(&1.tenant_id == ids_b.tenant))
@@ -364,8 +334,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
                  Repo.query!("SET LOCAL ROLE #{rls_role}", [])
                  Repo.all(from(s in Story, where: s.project_id == ^ids.project))
                end)
-
-      reset_role()
 
       assert rows == []
     end

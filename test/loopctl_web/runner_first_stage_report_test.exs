@@ -187,10 +187,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
   end
 
   defp sandboxed_stage(story) do
-    {:ok, row} =
-      Loopctl.Repo.with_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end)
-
-    row.stage
+    Stages.get(story.tenant_id, story.id).stage
   end
 
   # The STORY's epoch, which is what every transition is fenced on. The stage row carries one

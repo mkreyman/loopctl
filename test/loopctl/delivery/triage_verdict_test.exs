@@ -118,7 +118,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
   end
 
   defp stage_of(story),
-    do: as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end).stage
+    do: Stages.get(story.tenant_id, story.id).stage
 
   # Read on the same RLS connection the draft is written on — `Loopctl.WorkBreakdown.Stories`
   # is an AdminRepo context and this suite is `async: true`, so its pool is a different
@@ -195,15 +195,12 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
         if data = opts[:event_data], do: Keyword.put(o, :event_data, data), else: o
       end)
 
-    as_tenant(story.tenant_id, fn ->
-      {:ok, _row} =
-        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward}, advance_opts)
-    end)
+    {:ok, _row} =
+      Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward}, advance_opts)
   end
 
   defp escalation_reason(story),
-    do:
-      as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end).escalation_reason
+    do: Stages.get(story.tenant_id, story.id).escalation_reason
 
   defp as_tenant(tenant_id, fun) do
     {:ok, result} = Repo.with_tenant(tenant_id, fun)
@@ -573,7 +570,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
       assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
 
-      bound = as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end)
+      bound = Stages.get(story.tenant_id, story.id)
       assert bound.triage_dispatch_id == record.dispatch_id
 
       # The reason GateAInput matches a Gate A escalation on, exactly as the path stores it.
@@ -1255,7 +1252,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       # The escalation reason lands in the APPEND-ONLY hash chain, and the verdict was
       # composed by a session that had just read attacker-controllable reporter text. It is
       # built from the enum, so the session's prose cannot reach a record nobody can correct.
-      row = as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end)
+      row = Stages.get(story.tenant_id, story.id)
       assert row.escalation_reason == "triage_verdict:escalate"
       refute row.escalation_reason =~ "ignore previous"
 
@@ -1285,7 +1282,7 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
         assert saved.outcome == nil
         assert saved.detail == "the check that refused it"
 
-        row = as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end)
+        row = Stages.get(story.tenant_id, story.id)
         assert row.escalation_reason == "triage_verdict:" <> reason
       end
     end
