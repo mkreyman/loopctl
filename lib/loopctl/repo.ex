@@ -29,7 +29,7 @@ defmodule Loopctl.Repo do
 
   alias Ecto.Adapters.SQL
 
-  @sandbox_tenant_scope {__MODULE__, :sandbox_tenant_scope}
+  @sandbox? Application.compile_env(:loopctl, [__MODULE__, :pool]) == Ecto.Adapters.SQL.Sandbox
 
   @tenant_key {__MODULE__, :tenant_id}
 
@@ -83,7 +83,7 @@ defmodule Loopctl.Repo do
   transaction makes every call a nested one; there a `with_tenant/2` nested in
   another `with_tenant/2` still raises. Under the sandbox the prior tenant and role
   are also put back when the body returns, since the test's transaction outlives
-  this one (see `run_in_tenant/3`).
+  this one (see `enter_tenant/2`).
 
   ## Examples
 
@@ -98,66 +98,72 @@ defmodule Loopctl.Repo do
   @spec with_tenant(Ecto.UUID.t(), (-> result)) :: {:ok, result} | {:error, term()}
         when result: term()
   def with_tenant(tenant_id, fun) when is_binary(tenant_id) and is_function(fun, 0) do
-    sandbox? = sandbox_pool?()
-    assert_not_nested!(in_transaction?(), sandbox?)
+    assert_not_nested!(in_transaction?(), @sandbox?)
     put_tenant_id(tenant_id)
 
-    transaction(fn -> run_in_tenant(tenant_id, fun, sandbox?) end)
+    transaction(fn ->
+      prior = enter_tenant(tenant_id)
+      result = fun.()
+      leave_tenant(prior)
+      result
+    end)
   end
 
   # Under the SQL sandbox (test) a tenant transaction is a SAVEPOINT inside the test's own, and
   # the tenant setting and `SET LOCAL ROLE` outlive its RELEASE, so whatever ran next on the
-  # connection would read as this tenant's RLS role. There the prior values are read before the
-  # context is set and put back when the body returns (two statements; a raise or a failed
-  # Multi rolls the savepoint back, which reverts them by itself). Every other pool skips both:
+  # connection would read as this tenant's RLS role. There the prior values are read in the same
+  # statement that sets the tenant, and put back when the body returns; a raise or a failed
+  # Multi rolls the savepoint back, which reverts them by itself. Every other pool skips both:
   # its transaction is real and ends with the body. `enter_tenant/2` and `leave_tenant/1` are
   # the one implementation, shared by `with_tenant/2` and `tenant_multi/2`.
   #
-  # A `with_tenant/2` nested in another one raises under the sandbox exactly as it does in
-  # production, where the outer transaction makes `assert_not_nested!/2` fire: without this
-  # the restore would hide the nesting from the suite.
-  defp run_in_tenant(tenant_id, fun, sandbox?) do
-    if sandbox? and Process.get(@sandbox_tenant_scope), do: assert_not_nested!(true, false)
+  # A tenant already set when one is entered is nesting: production raises on it through
+  # `assert_not_nested!/2`, whose transaction check is inert under the sandbox, so the sandbox
+  # raises here instead, whatever the enclosing transaction is (another `with_tenant/2`, a
+  # `tenant_multi/2`, a `Multi.run`). Without this the restore would hide the nesting.
+  if @sandbox? do
+    defp enter_tenant(tenant_id) do
+      %{rows: [[prior_tenant, prior_role, _]]} =
+        SQL.query!(
+          __MODULE__,
+          "SELECT p.tenant, p.role, set_config('app.current_tenant_id', $1, true) " <>
+            "FROM (SELECT current_setting('app.current_tenant_id', true) AS tenant, " <>
+            "current_setting('role') AS role) AS p",
+          [tenant_id]
+        )
 
-    prior = enter_tenant(tenant_id, sandbox?)
-    if sandbox?, do: Process.put(@sandbox_tenant_scope, true)
+      if prior_tenant not in [nil, ""], do: assert_not_nested!(true, false)
 
-    try do
-      result = fun.()
-      leave_tenant(prior)
-      result
-    after
-      if sandbox?, do: Process.delete(@sandbox_tenant_scope)
+      maybe_set_local_role()
+      prior_role
     end
-  end
 
-  defp enter_tenant(tenant_id, false = _sandbox?) do
-    set_rls_context(tenant_id)
-    :none
-  end
-
-  defp enter_tenant(tenant_id, true = _sandbox?) do
-    %{rows: [[prior_tenant, prior_role]]} =
+    defp leave_tenant(prior_role) do
       SQL.query!(
         __MODULE__,
-        "SELECT current_setting('app.current_tenant_id', true), current_setting('role')",
-        []
+        "SELECT set_config('app.current_tenant_id', '', true), set_config('role', $1, true)",
+        [prior_role]
       )
 
-    set_rls_context(tenant_id)
-    {:restore, prior_tenant || "", prior_role}
-  end
+      :ok
+    rescue
+      # The body swallowed a failed statement, so the transaction is aborted and will roll
+      # back, which reverts both settings; there is nothing to put back.
+      error in Postgrex.Error ->
+        if error.postgres[:code] == :in_failed_sql_transaction,
+          do: :ok,
+          else: reraise(error, __STACKTRACE__)
+    end
 
-  defp leave_tenant(:none), do: :ok
-
-  defp leave_tenant({:restore, prior_tenant, prior_role}) do
-    SQL.query!(
-      __MODULE__,
-      "SELECT set_config('app.current_tenant_id', $1, true), set_config('role', $2, true)",
-      [prior_tenant, prior_role]
-    )
-
-    :ok
+    defp append_restore(multi) do
+      Ecto.Multi.run(multi, :rls_restore, fn _repo, %{rls_context: prior} ->
+        {:ok, leave_tenant(prior)}
+      end)
+    end
+  else
+    defp enter_tenant(tenant_id), do: set_rls_context(tenant_id)
+    defp leave_tenant(_prior), do: :ok
+    defp append_restore(multi), do: multi
   end
 
   @doc """
@@ -169,16 +175,15 @@ defmodule Loopctl.Repo do
   """
   @spec tenant_multi(Ecto.UUID.t(), Ecto.Multi.t()) :: Ecto.Multi.t()
   def tenant_multi(tenant_id, %Ecto.Multi{} = multi) when is_binary(tenant_id) do
-    sandbox? = sandbox_pool?()
+    # Built where it will run: inside an open transaction its SET LOCAL would leak into it.
+    assert_not_nested!(in_transaction?(), @sandbox?)
 
     Ecto.Multi.new()
     |> Ecto.Multi.run(:rls_context, fn _repo, _changes ->
-      {:ok, enter_tenant(tenant_id, sandbox?)}
+      {:ok, enter_tenant(tenant_id)}
     end)
     |> Ecto.Multi.append(multi)
-    |> Ecto.Multi.run(:rls_restore, fn _repo, %{rls_context: prior} ->
-      {:ok, leave_tenant(prior)}
-    end)
+    |> append_restore()
   end
 
   # US-33.7 guard: `with_tenant/2` must own its transaction (see @doc above).
@@ -188,7 +193,7 @@ defmodule Loopctl.Repo do
   #
   # Under the SQL sandbox this guard is inert (the pool is the sandbox), so the suite
   # cannot catch `with_tenant/2` nested in some OTHER transaction. A `with_tenant/2` nested
-  # in another `with_tenant/2` is caught there too, by `run_in_tenant/3`. The decision
+  # in another tenant transaction is caught there too, by `enter_tenant/2`. The decision
   # function is exposed as `assert_not_nested!/2` so the RULE is covered in CI
   # (`test/loopctl/repo_nested_transaction_guard_test.exs`).
   @doc """
@@ -205,15 +210,11 @@ defmodule Loopctl.Repo do
     raise "Loopctl.Repo.with_tenant/2 called inside an existing Repo transaction. " <>
             "It must own its transaction: SET LOCAL app.current_tenant_id / ROLE are " <>
             "transaction-scoped and would leak past the inner savepoint into the outer " <>
-            "transaction's tenant/role context. Set the RLS context directly in the " <>
-            "enclosing transaction instead (see Loopctl.Repo.set_rls_context/1)."
+            "transaction's tenant/role context. Open the tenant transaction at the top " <>
+            "instead: Loopctl.Repo.with_tenant/2, or Loopctl.Repo.tenant_multi/2 for a Multi."
   end
 
   def assert_not_nested!(_in_transaction?, _sandbox_pool?), do: :ok
-
-  defp sandbox_pool? do
-    Keyword.get(config(), :pool) == Ecto.Adapters.SQL.Sandbox
-  end
 
   @doc """
   Sets the PostgreSQL RLS context for the current transaction.

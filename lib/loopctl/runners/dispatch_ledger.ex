@@ -580,7 +580,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   decided it.
 
   The caller owns the transaction and must already be in it; on `Loopctl.Repo` it must also
-  carry the tenant's RLS context (`Repo.set_rls_context/1`), or the row is invisible and the
+  carry the tenant's RLS context (`Repo.with_tenant/2`, or `Repo.tenant_multi/2` for a Multi), or the row is invisible and the
   answer is `{:error, :unknown_dispatch}`. Keep the lock order: the story row (if the caller
   locks one) before this row, and the `runners` row after it — which is what this does.
   """

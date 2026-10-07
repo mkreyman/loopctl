@@ -110,13 +110,14 @@ defmodule Loopctl.ContextRetriever.Registry do
   `{:error, :entity_limit}` WITHOUT inserting. Otherwise validates via
   `Entity.create_changeset/2` and inserts.
 
-  Runs as an `Ecto.Multi` inside `Repo.with_tenant/2`, so the advisory lock, the cap
+  Runs as an `Ecto.Multi` wrapped by `Repo.tenant_multi/2`, so the advisory lock, the cap
   check, the insert, and the audit entry all execute in ONE RLS-scoped transaction and the write's
   `unique_constraint` is caught as an `{:error, changeset}` (a bare `Repo.insert`
   inside `Repo.with_tenant` would poison the transaction on a constraint
-  violation — Ecto only savepoints per-op under `Multi`). `with_tenant/2` sets
-  `SET LOCAL app.current_tenant_id` + `SET LOCAL ROLE`, so the cap count, insert,
-  and audit write are RLS-scoped to this tenant.
+  violation — Ecto only savepoints per-op under `Multi`). `tenant_multi/2`'s first step sets
+  `SET LOCAL app.current_tenant_id` + `SET LOCAL ROLE`, so the cap count, insert, and audit
+  write are RLS-scoped to this tenant, and each step keeps its own error tuple (a Multi
+  nested inside `with_tenant/2` would lose them to the outer rollback).
 
   ## Race-free cap (advisory lock)
 

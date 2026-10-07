@@ -31,17 +31,15 @@ defmodule Loopctl.Repo.WithTenantRestoreTest do
     assert connection_state() == before
   end
 
-  test "the outer role and tenant come back, not the connection defaults" do
+  test "a role set before with_tenant comes back, not the connection default" do
     # Only a restore of what was there passes this; a reset to defaults leaves postgres.
-    outer_tenant = Ecto.UUID.generate()
-    Repo.query!("SELECT set_config('app.current_tenant_id', $1, true)", [outer_tenant])
     Repo.query!("SET LOCAL ROLE loopctl_app")
     before = connection_state()
 
     assert {:ok, _} = Repo.with_tenant(Ecto.UUID.generate(), fn -> :ok end)
 
     assert connection_state() == before
-    assert before == {"loopctl_app", outer_tenant}
+    assert before == {"loopctl_app", :unset}
     Repo.query!("RESET ROLE")
   end
 
@@ -51,6 +49,35 @@ defmodule Loopctl.Repo.WithTenantRestoreTest do
         Repo.with_tenant(Ecto.UUID.generate(), fn -> :ok end)
       end)
     end
+  end
+
+  test "a with_tenant inside a tenant_multi step raises, as it does outside the sandbox" do
+    tenant_id = Ecto.UUID.generate()
+
+    multi =
+      Ecto.Multi.run(Ecto.Multi.new(), :inner, fn _repo, _changes ->
+        Repo.with_tenant(tenant_id, fn -> :ok end)
+      end)
+
+    assert_raise RuntimeError, ~r/called inside an existing Repo transaction/, fn ->
+      tenant_id |> Repo.tenant_multi(multi) |> Repo.transaction()
+    end
+  end
+
+  test "a body that swallows a failed statement rolls back, as it does outside the sandbox" do
+    before = connection_state()
+
+    result =
+      Repo.with_tenant(Ecto.UUID.generate(), fn ->
+        try do
+          Repo.query!("SELECT 1/0")
+        rescue
+          Postgrex.Error -> :swallowed
+        end
+      end)
+
+    assert {:error, :rollback} = result
+    assert connection_state() == before
   end
 
   test "tenant_multi/2 puts the context back after its transaction" do

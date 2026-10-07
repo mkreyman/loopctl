@@ -220,9 +220,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
       assert {:ok, page} =
                Stories.list_stories_by_project(nil, ids.project, strategy: :rls)
 
-      # No-op here (the app guard short-circuits before with_tenant sets a role);
-      # kept for uniform hygiene across all RLS-touching tests.
-
       assert page.total == 0
       assert page.data == []
     end
@@ -232,9 +229,6 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
 
       assert {:ok, page} =
                Stories.list_stories_by_project("", ids.project, strategy: :rls)
-
-      # No-op here (blank tenant hits the app guard before any role switch);
-      # kept for uniform hygiene across all RLS-touching tests.
 
       assert page.total == 0
       assert page.data == []
