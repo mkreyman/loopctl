@@ -158,6 +158,12 @@ defmodule Loopctl.ContextRetriever.Executor do
       `params["query"]` is the search string. `params["limit"]`/`params["offset"]`
       drive pagination and are clamped. Any `tenant_id` here is IGNORED.
 
+  ## Options
+
+    * `:read` — `(base_query, page_query -> {total_count, rows})`, run inside the tenant's
+      RLS transaction. Defaults to the count + page read. Only test code passes it, to
+      supply a failing read without DDL; no caller forwards request data into it.
+
   ## Returns
 
     * `{:ok, %{results: [map()], meta: %{total_count, limit, offset}}}`
@@ -168,14 +174,14 @@ defmodule Loopctl.ContextRetriever.Executor do
       `:unsupported_filter_type` (equality filter on a `:decimal` column, which
       only supports representation-fragile exact equality — rejected in v1).
   """
-  @spec run(Scope.t(), dispatch(), map()) :: {:ok, result()} | {:error, error()}
-  def run(scope, dispatch, params \\ %{})
+  @spec run(Scope.t(), dispatch(), map(), keyword()) :: {:ok, result()} | {:error, error()}
+  def run(scope, dispatch, params \\ %{}, opts \\ [])
 
   # AC-30.3.7a: a superadmin / no-impersonation context is refused BEFORE any DB
   # access — never a cross-tenant AdminRepo read.
-  def run(%Scope{tenant_id: nil}, _dispatch, _params), do: {:error, :no_tenant}
+  def run(%Scope{tenant_id: nil}, _dispatch, _params, _opts), do: {:error, :no_tenant}
 
-  def run(%Scope{tenant_id: tenant_id} = scope, {entity_name, field, operation}, params)
+  def run(%Scope{tenant_id: tenant_id} = scope, {entity_name, field, operation}, params, opts)
       when is_binary(tenant_id) and is_map(params) do
     with {:ok, entity} <- resolve_entity(tenant_id, entity_name),
          {:ok, schema, allowlist} <- resolve_source(entity),
@@ -185,7 +191,9 @@ defmodule Loopctl.ContextRetriever.Executor do
       limit = page_limit(params)
       offset = page_offset(params)
 
-      case run_query(tenant_id, schema, select_cols, plan, limit, offset) do
+      read = Keyword.get(opts, :read, &read_page/2)
+
+      case run_query(read, tenant_id, schema, select_cols, plan, limit, offset) do
         {:ok, total_count, rows} ->
           meta = %{total_count: total_count, limit: limit, offset: offset}
           finalize_read(scope, entity, operation, field, params, rows, meta)
@@ -202,7 +210,7 @@ defmodule Loopctl.ContextRetriever.Executor do
   # above and MUST return an error rather than raise `FunctionClauseError`. The
   # module is THE fail-closed security boundary; a crash on malformed input is
   # inconsistent with that contract.
-  def run(_scope, _dispatch, _params), do: {:error, :invalid_params}
+  def run(_scope, _dispatch, _params, _opts), do: {:error, :invalid_params}
 
   # AC-30.3.6: the audit write is part of the read's correctness. If it fails we
   # FAIL CLOSED — no rows are returned without a persisted audit trail (chain of
@@ -374,19 +382,19 @@ defmodule Loopctl.ContextRetriever.Executor do
   # `:no_match` never touches the DB — a validly-shaped request that cannot match
   # any row (bad-typed filter value, blank search) returns an empty page and is
   # still audited (row_count 0).
-  defp run_query(_tenant_id, _schema, _select_cols, %{kind: :no_match}, _limit, _offset) do
+  defp run_query(_read, _tenant_id, _schema, _select_cols, %{kind: :no_match}, _limit, _offset) do
     {:ok, 0, []}
   end
 
-  defp run_query(tenant_id, schema, select_cols, plan, limit, offset) do
+  # `read` is the step that runs the two queries inside the tenant's RLS transaction: the
+  # count over `base` and the page itself. `run/4` takes it as the `:read` option so a test
+  # can supply a failing read (an `undefined_column` from a stale entity def) without DDL on
+  # a shared table; production always uses `read_page/2`.
+  defp run_query(read, tenant_id, schema, select_cols, plan, limit, offset) do
     base = base_query(schema, tenant_id, plan)
     page_query = page_query(base, plan, select_cols, limit, offset)
 
-    Repo.with_tenant(tenant_id, fn ->
-      total = Repo.aggregate(base, :count, :id)
-      rows = Repo.all(page_query)
-      {total, rows}
-    end)
+    Repo.with_tenant(tenant_id, fn -> read.(base, page_query) end)
     |> case do
       {:ok, {total, rows}} -> {:ok, total, rows}
       {:error, reason} -> {:error, translate_db_error(reason)}
@@ -423,6 +431,10 @@ defmodule Loopctl.ContextRetriever.Executor do
       )
 
       {:error, :stale_entity}
+  end
+
+  defp read_page(base, page_query) do
+    {Repo.aggregate(base, :count, :id), Repo.all(page_query)}
   end
 
   # Where-only base query: RLS (via with_tenant) + explicit tenant predicate

@@ -4,13 +4,10 @@ defmodule Loopctl.TokenUsage.DefaultArchivalTest do
 
   Because DefaultArchival uses Repo.with_tenant (RLS-enforced Repo transactions),
   all test data is inserted via Repo (not AdminRepo) so that it is visible within
-  the same DB connection context. async: false is required for shared sandbox mode.
+  the same DB connection context.
   """
 
-  # Must be async: false — DefaultArchival uses Repo.with_tenant which requires
-  # the sandbox owner to be shared so that data and FKs are visible in both
-  # the test process's Repo connection and the DefaultArchival Repo transactions.
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   alias Loopctl.Agents.Agent
   alias Loopctl.Projects.Project

@@ -10,18 +10,18 @@ defmodule Loopctl.EmbeddingsRlsTest do
     * on `Loopctl.Repo` it is the `tenant_isolation` RLS POLICY the
       `enable_rls/1` macro created on the new side tables — asserted here.
 
-  ## Why `async: false` + `Repo`-connection seeding
+  ## Why `Repo`-connection seeding
 
   `Repo.with_tenant/2` runs inside an RLS transaction with
-  `SET LOCAL ROLE loopctl_app`, so it needs shared sandbox mode and rows on the
-  SAME connection. The tenants/articles/embedding rows are therefore seeded via
+  `SET LOCAL ROLE loopctl_app` on the test's own sandbox connection, so the rows
+  must be on that SAME connection. The tenants/articles/embedding rows are therefore seeded via
   `Repo` (NOT the AdminRepo-backed `fixture/2`), mirroring
   `context_retriever/executor_test.exs`. Because the assertion runs under the
   NON-owner app role (RLS is ENABLE, not FORCE), it actually proves isolation
   instead of silently passing as the table owner.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding

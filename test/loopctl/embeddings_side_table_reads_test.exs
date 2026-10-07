@@ -61,19 +61,6 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   `SET LOCAL` through), and no failure mode has EVER returned another tenant's rows — this
   was never an isolation defect.
 
-  ## Why this is `async: false`
-
-  Not the flake. The read-path CUTOVER FLAG is an injected collaborator
-  (`Loopctl.Embeddings.ReadPathBehaviour`), so `enable_side_table_reads/0` is a
-  PROCESS-SCOPED `Mox.stub/3` and nothing VM-global is written for it. (The flag's real
-  per-node globality is covered in `test/loopctl/embeddings/system_config_read_path_test.exs`.)
-
-  `async: false` is kept as cheap insurance — these are the suite's heaviest vector
-  reads and serializing them lowers DB contention. It is NOT a fix: #519 added it on the
-  theory that concurrent async inserts perturbed a shared index, which is impossible
-  (ExUnit runs every async module to completion BEFORE any sync one), and the same
-  failure simply reappeared in `system_config_read_path_test.exs`.
-
   ## What #535 did fix (real, and still in place)
 
   `SET LOCAL` leaks out of a committed SAVEPOINT. Under Sandbox every heavy read nests in
@@ -152,7 +139,7 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   vectors and a page size wider than the candidate set (below).
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   # #645 — vacuum the pgvector graph before each test in this module. Rolled-back tests
   # leave DEAD HNSW entries behind, and pgvector's scan skips dead elements rather than

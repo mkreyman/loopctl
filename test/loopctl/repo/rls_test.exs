@@ -1,7 +1,5 @@
 defmodule Loopctl.Repo.RlsTest do
-  # RLS tests are not async because they need shared sandbox mode
-  # for cross-repo data visibility between Repo and AdminRepo.
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
 

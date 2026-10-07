@@ -1,12 +1,10 @@
 defmodule Loopctl.ContextRetriever.RegistryTest do
-  # async: false — the Registry reads/writes through `Loopctl.Repo.with_tenant`
-  # (RLS-enforced Repo transactions with `SET LOCAL ROLE loopctl_app`), which
-  # needs shared sandbox mode and same-connection seeding (see `repo_tenant/0`).
-  # This mirrors the documented RLS exception in `default_archival_test.exs` and
-  # `rls_test.exs`. Because the isolation assertion runs under the NON-owner app
+  # The Registry reads/writes through `Loopctl.Repo.with_tenant` (RLS-enforced Repo
+  # transactions with `SET LOCAL ROLE loopctl_app`), so rows are seeded on the same
+  # `Repo` connection (see `repo_tenant/0`). Because the isolation assertion runs under the NON-owner app
   # role (not a superuser/owner connection that would bypass ENABLE-only RLS), it
   # actually proves tenant isolation rather than silently passing (AC-30.1.4).
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
 
