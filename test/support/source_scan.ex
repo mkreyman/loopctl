@@ -51,28 +51,6 @@ defmodule Loopctl.SourceScan do
     |> elem(1)
   end
 
-  @doc """
-  True when `path` contains a module alias whose LAST segment is in `last_segments` — any
-  reference to the module, not only a call: an `alias`, a `use`, a bare module passed as a
-  value, and each child of a multi-alias (`alias Cloak.Ciphers.AES.{CTR, GCM}` parses `CTR`
-  as an alias node of its own). Matching the last segment over-reports on purpose: a guard
-  that must never miss a reference may flag an unrelated module of the same last name.
-  """
-  @spec references_alias?(String.t(), [atom()]) :: boolean()
-  def references_alias?(path, last_segments) when is_list(last_segments) do
-    path
-    |> File.read!()
-    |> Code.string_to_quoted!()
-    |> Macro.prewalk(false, fn
-      {:__aliases__, _, segments} = node, found when is_list(segments) ->
-        {node, found or List.last(segments) in last_segments}
-
-      node, found ->
-        {node, found}
-    end)
-    |> elem(1)
-  end
-
   @doc "The module name a file declares, as a string."
   @spec defmodule_name!(String.t()) :: String.t()
   def defmodule_name!(path) do

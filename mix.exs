@@ -70,8 +70,9 @@ defmodule Loopctl.MixProject do
           # Each affects a module loopctl never uses. Every vault cipher is
           # Cloak.Ciphers.AES.GCM, which is authenticated, and no schema hashes a field
           # with a PBKDF2 type. test/loopctl/vault/cloak_advisory_reachability_test.exs
-          # fails if lib/ or config/ ever names either module. Recheck when cloak > 1.1.4
-          # or cloak_ecto > 1.3.0.
+          # fails if compiled loopctl code references either module or a vault cipher
+          # list holds anything but AES.GCM, and fails on any cloak or cloak_ecto version
+          # change. Recheck when cloak > 1.1.4 or cloak_ecto > 1.3.0.
           # CVE-2026-95105 (HIGH): Cloak.Ciphers.AES.CTR has no ciphertext
           # authentication, so a ciphertext can be bit-flipped into a chosen plaintext.
           "CVE-2026-95105",
@@ -253,14 +254,25 @@ defmodule Loopctl.MixProject do
   # own VM its exit status is readable, and a non-zero one halts the alias here. The separate
   # VM also keeps the old ordering hazard away: in-VM, a `hex.audit` chained after `compile`
   # failed with "task could not be found" because `compile` purges the archive code path.
+  #
+  # The child is the Elixir install running this alias, not whatever is first on PATH, so the
+  # audit sees the same Hex archive as every other step. That takes running its `bin/elixir`
+  # with its `bin/mix` as the script: `bin/mix` alone starts with `#!/usr/bin/env elixir`
+  # and would resolve PATH again. Its output is streamed as it arrives, so a slow advisory
+  # fetch shows up as the audit, not as a silent hang; Hex's own HTTP client bounds that fetch.
   defp hex_audit!(_args) do
-    {output, status} =
-      System.cmd("mix", ["hex.audit"],
+    bin = Path.expand("../../bin", :code.lib_dir(:elixir))
+    [elixir, mix] = Enum.map(["elixir", "mix"], &Path.join(bin, &1))
+
+    Enum.all?([elixir, mix], &File.exists?/1) ||
+      Mix.raise("cannot find this Elixir install's elixir and mix in #{bin}")
+
+    {_streamed, status} =
+      System.cmd(elixir, [mix, "hex.audit"],
         stderr_to_stdout: true,
+        into: IO.stream(:stdio, :line),
         env: [{"MIX_ENV", to_string(Mix.env())}]
       )
-
-    IO.write(output)
 
     if status != 0 do
       Mix.raise(
