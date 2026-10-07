@@ -57,15 +57,15 @@ defmodule Loopctl.SystemConfig do
   so the primer can make a failed boot prime loud — a silently empty cache is what
   turns a bounded startup window into an unbounded one.
 
-  The `:persistent_term` key is `{cache, key_string}` — string keys are used
-  verbatim (never `String.to_atom/1` on them). `cache` is `__MODULE__` everywhere in
-  production; `get_int/3`, `fetch_int/2`, `put/3` and `refresh/1` take it as an argument
-  so a test reads and writes its OWN namespace (`{__MODULE__, make_ref()}`, say) instead
-  of the node-wide one every other test reads.
+  The cache is a `Loopctl.TermCache` namespace: `__MODULE__` everywhere in production,
+  which is the `:persistent_term` key `{__MODULE__, key_string}` — string keys are used
+  verbatim (never `String.to_atom/1` on them). `get_int/3`, `fetch_int/2`, `put/3` and
+  `refresh/1` take the namespace as an argument so a test reads and writes its OWN — an ETS
+  table it owns — instead of the node-wide one every other test reads.
   """
 
-  @typedoc "The `:persistent_term` namespace a value is cached under — `__MODULE__` in production."
-  @type cache :: term()
+  @typedoc "The `Loopctl.TermCache` namespace a value is cached under — `__MODULE__` in production."
+  @type cache :: Loopctl.TermCache.namespace()
 
   import Ecto.Query, only: [from: 2]
 
@@ -74,6 +74,7 @@ defmodule Loopctl.SystemConfig do
   alias Loopctl.AdminRepo
   alias Loopctl.ExitClass
   alias Loopctl.SystemConfig.Setting
+  alias Loopctl.TermCache
 
   @doc """
   Reads an integer config value from the `:persistent_term` cache.
@@ -84,7 +85,7 @@ defmodule Loopctl.SystemConfig do
   """
   @spec get_int(String.t(), integer(), cache()) :: integer()
   def get_int(key, default, cache \\ __MODULE__) when is_binary(key) and is_integer(default) do
-    case :persistent_term.get(pt_key(cache, key), :__miss__) do
+    case TermCache.get(cache, key, :__miss__) do
       value when is_integer(value) -> value
       _ -> default
     end
@@ -105,7 +106,7 @@ defmodule Loopctl.SystemConfig do
   """
   @spec fetch_int(String.t(), cache()) :: {:ok, integer()} | :error
   def fetch_int(key, cache \\ __MODULE__) when is_binary(key) do
-    case :persistent_term.get(pt_key(cache, key), :__miss__) do
+    case TermCache.get(cache, key, :__miss__) do
       value when is_integer(value) -> {:ok, value}
       _ -> :error
     end
@@ -151,7 +152,7 @@ defmodule Loopctl.SystemConfig do
   def refresh_from(load, cache \\ __MODULE__) when is_function(load, 0) do
     load.()
     |> Enum.each(fn %Setting{key: key, value: value} ->
-      :persistent_term.put(pt_key(cache, key), value)
+      TermCache.put(cache, key, value)
     end)
 
     :ok
@@ -205,7 +206,7 @@ defmodule Loopctl.SystemConfig do
     )
     |> case do
       {:ok, setting} ->
-        :persistent_term.put(pt_key(cache, key), value)
+        TermCache.put(cache, key, value)
         {:ok, setting}
 
       {:error, _changeset} = error ->
@@ -220,6 +221,4 @@ defmodule Loopctl.SystemConfig do
   def all do
     AdminRepo.all(from s in Setting, order_by: [asc: s.key])
   end
-
-  defp pt_key(cache, key), do: {cache, key}
 end

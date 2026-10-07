@@ -460,7 +460,7 @@ defmodule Loopctl.Llm do
   coordination" moduledoc note.
 
   Call this from EXACTLY ONE choke point per failure at each call site — currently
-  `Loopctl.Knowledge.run_embedding_task/3` (`provider: "embedding"`) — the SINGLE
+  `Loopctl.Knowledge.run_embedding_task/6` (`provider: "embedding"`) — the SINGLE
   guarded entry point shared by both Oban workers (`ArticleEmbeddingWorker`/
   `MemoryEmbeddingWorker`) AND every query-time embedding caller (combined/semantic
   search, novelty scoring, `Memory.recall/2`, promotion near-dup lookup), gated by

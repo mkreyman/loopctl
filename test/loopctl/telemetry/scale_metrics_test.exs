@@ -33,7 +33,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   `Loopctl.Telemetry.ScaleMetrics`'s moduledoc "Wiring emitted-but-dead events" for
   the full inventory, including the events deliberately left out of scope.
 
-  The cap-gate tests flip a gate of their OWN (`:persistent_term` key passed to
+  The cap-gate tests flip a gate of their OWN (an ETS table passed as the namespace to
   `scale_tags/2`, `tenant_label?/1`, `refresh_tenant_label_gate/1`), never the node's
   `{ScaleMetrics, :tenant_label?}` every metric reads. The reporter round-trips start their
   reporter on `Loopctl.TelemetryHelpers.own_metrics/1`, whose `:keep` also requires that the EMITTING process is this
@@ -287,14 +287,13 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
   describe "tenant-label cap gate — the cardinality proof (AC-27.15.3)" do
     setup do
-      # A gate of this test's own: flipping it moves no metric anywhere else.
-      gate = {ScaleMetrics, :tenant_label?, make_ref()}
-      on_exit(fn -> :persistent_term.erase(gate) end)
-      {:ok, gate: gate}
+      # A gate of this test's own — an ETS table this test owns: flipping it moves no metric
+      # anywhere else, and it is gone when the test exits.
+      {:ok, gate: :ets.new(:tenant_label_gate, [:set, :public])}
     end
 
-    defp gate_off(gate), do: :persistent_term.put(gate, false)
-    defp gate_on(gate), do: :persistent_term.put(gate, true)
+    defp gate_off(gate), do: :ets.insert(gate, {:tenant_label?, false})
+    defp gate_on(gate), do: :ets.insert(gate, {:tenant_label?, true})
 
     test "gate OFF (over cap): scale_tags/1 collapses tenant_id to the :_aggregated sentinel", %{
       gate: gate
@@ -419,7 +418,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       gate: gate
     } do
       # Force the unseeded-read path: this test's gate was never seeded, and is erased anyway.
-      :persistent_term.erase(gate)
+      :ets.delete(gate, :tenant_label?)
       refute ScaleMetrics.tenant_label?(gate)
 
       assert ScaleMetrics.scale_tags(%{endpoint: :e, mapped_code: "c", tenant_id: "t"}, gate).tenant_id ==
@@ -1218,9 +1217,9 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
   describe "tenant-label gate — one grace cycle before a failed count flips it" do
     setup do
-      # A gate of this test's own: the refreshes below write it, never the node's.
-      gate = {ScaleMetrics, :tenant_label?, make_ref()}
-      on_exit(fn -> :persistent_term.erase(gate) end)
+      # A gate of this test's own (an ETS table it owns): the refreshes below write it,
+      # never the node's.
+      gate = :ets.new(:tenant_label_gate, [:set, :public])
 
       # Make `Tenants.count()` fail DETERMINISTICALLY and without a DB: an Ecto dynamic repo
       # that was never started raises on lookup. Process-local, so it dies with this test.
@@ -1231,7 +1230,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     test "the first failure HOLDS the gate; the second consecutive failure forces it OFF", %{
       gate: gate
     } do
-      :persistent_term.put(gate, true)
+      :ets.insert(gate, {:tenant_label?, true})
 
       log =
         Loopctl.OwnLog.capture_own_log(fn ->

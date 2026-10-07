@@ -530,7 +530,7 @@ defmodule Loopctl.Knowledge.ConsolidationFollowupsTest do
 
     test "a repo fault while reading backfill evidence is a WITHHOLD, not a phantom failure" do
       # By the time the backfill runs, the group has ALREADY been decided uncorroborated —
-      # a normal, correct outcome. An unguarded read there escaped into `tally_apply/5`'s
+      # a normal, correct outcome. An unguarded read there escaped into `tally_apply/6`'s
       # rescue, which reports the group as `failed`: a WRITE that could not be made,
       # counted in loser articles, on a night when no write was ever going to be attempted.
       tenant = fixture(:tenant)

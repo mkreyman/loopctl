@@ -513,15 +513,9 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorkerTest do
     end
   end
 
-  # A SystemConfig namespace of this test's own: a knob seeded into it reaches only the
-  # code this test hands it to.
-  defp own_config, do: {Loopctl.SystemConfig, make_ref()}
+  # A SystemConfig namespace of this test's own — an ETS table this test process owns, gone
+  # when it exits: a knob seeded into it reaches only the code this test hands it to.
+  defp own_config, do: :ets.new(:batch_worker_config, [:set, :public])
 
-  # Seeds a knob into `cache` (the documented `{cache, key}` persistent_term format) and
-  # erases it on exit.
-  defp put_cfg(cache, key, value) do
-    pt_key = {cache, key}
-    :persistent_term.put(pt_key, value)
-    on_exit(fn -> :persistent_term.erase(pt_key) end)
-  end
+  defp put_cfg(cache, key, value), do: :ets.insert(cache, {key, value})
 end

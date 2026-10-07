@@ -3,7 +3,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrencyDownTest do
   US-37.2 (AC-37.2.3 / AC-37.2.5): the concurrency gate FAILS SAFE when its GenServer
   is down.
 
-  `run_embedding_task/3` calls `acquire/1` OUTSIDE the supervised embedding task, so
+  `run_embedding_task/6` calls `acquire/1` OUTSIDE the supervised embedding task, so
   no `async_nolink` isolates it — if the `EmbeddingConcurrency` GenServer is down or
   mid-restart (a restart storm during exactly the burst this gate defends against, or
   app shutdown), an UNGUARDED `GenServer.call` would raise `:exit` and 500 the
@@ -75,7 +75,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrencyDownTest do
       tenant_id = Ecto.UUID.generate()
 
       calls =
-        traced_calls([{EC, :acquire, 4}, {EC, :release, 2}], fn ->
+        Loopctl.CallTrace.calls([{EC, :acquire, 4}, {EC, :release, 2}], fn ->
           assert :ok = EC.acquire(tenant_id)
           assert :ok = EC.release(tenant_id)
         end)
@@ -85,37 +85,6 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrencyDownTest do
                {EC, :release, [^tenant_id, EC]}
              ] =
                calls
-    end
-  end
-
-  # Local calls to `mfas` made by THIS process while `fun` runs, in order. Tracing is scoped
-  # to the calling process, so no other test's calls are observed; the trace messages go to
-  # a collector process (a process does not receive its own call traces reliably).
-  defp traced_calls(mfas, fun) do
-    collector = spawn_link(fn -> collect_calls([]) end)
-    Enum.each(mfas, fn mfa -> assert :erlang.trace_pattern(mfa, true, [:local]) == 1 end)
-    :erlang.trace(self(), true, [:call, {:tracer, collector}])
-
-    try do
-      fun.()
-    after
-      :erlang.trace(self(), false, [:call])
-      Enum.each(mfas, &:erlang.trace_pattern(&1, false, [:local]))
-    end
-
-    send(collector, {:report, self()})
-
-    receive do
-      {:calls, calls} -> calls
-    after
-      2_000 -> flunk("the trace collector never reported")
-    end
-  end
-
-  defp collect_calls(acc) do
-    receive do
-      {:trace, _pid, :call, mfa} -> collect_calls([mfa | acc])
-      {:report, pid} -> send(pid, {:calls, Enum.reverse(acc)})
     end
   end
 end

@@ -200,7 +200,7 @@ defmodule Loopctl.Workers.MemoryEmbeddingWorker do
       {:error, reason} ->
         # US-34.3 (review MED #1): the `[:loopctl, :llm, :provider_error]` telemetry
         # signal is now recorded ONCE, upstream, in
-        # `Loopctl.Knowledge.run_embedding_task/3` — the single choke point shared by
+        # `Loopctl.Knowledge.run_embedding_task/6` — the single choke point shared by
         # this worker AND every query-time embedding caller. Do NOT re-record here.
         sanitized = ProviderError.sanitize(reason)
 

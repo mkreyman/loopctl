@@ -7,8 +7,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
 
   Every test seeds its caps in its OWN `SystemConfig` namespace (`SystemConfig.put/3`) and
   reads them back through that namespace (`KnowledgeLintWorker.applies_cap/1`,
-  `Consolidation.apply_confirmed_duplicates/2`'s `:system_config`), so the node-wide
-  `:persistent_term` every other test reads is never moved. The row write is the real one,
+  `Consolidation.apply_confirmed_duplicates/2`'s `:system_config`) — an ETS table this test
+  owns — so the node-wide `:persistent_term` every other test reads is never moved. The row write is the real one,
   in this test's sandbox transaction. That is also why the production lever is a DB row
   rather than `Application.put_env/3`, which is per-node and global in production too.
   """
@@ -26,23 +26,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerCapsTest do
   alias Loopctl.SystemConfig
   alias Loopctl.Workers.KnowledgeLintWorker
 
-  @keys ~w(
-    knowledge_consolidation_max_applies
-    knowledge_consolidation_max_unpublishes
-    knowledge_consolidation_max_per_class
-    knowledge_consolidation_min_duplicate_similarity_pct
-  )
-
   setup do
-    cache = {SystemConfig, make_ref()}
-
-    on_exit(fn ->
-      # The DB row dies with the sandbox transaction; the persistent_term does NOT, so
-      # this test's namespace is erased with it.
-      Enum.each(@keys, &:persistent_term.erase({cache, &1}))
-    end)
-
-    {:ok, cache: cache}
+    # The DB row dies with the sandbox transaction, and the cached value with this table,
+    # which this test process owns.
+    {:ok, cache: :ets.new(:lint_caps_config, [:set, :public])}
   end
 
   describe "cap resolution order: DB row -> app config -> module default" do

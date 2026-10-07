@@ -352,9 +352,8 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
       # batch_max from this test's own SystemConfig namespace, handed to perform/2.
       # 5 ingested articles / batch_max 2 => ceil = 3 calls.
-      cache = {Loopctl.SystemConfig, make_ref()}
-      :persistent_term.put({cache, "embedding_batch_max"}, 2)
-      on_exit(fn -> :persistent_term.erase({cache, "embedding_batch_max"}) end)
+      cache = :ets.new(:ingestion_config, [:set, :public])
+      :ets.insert(cache, {"embedding_batch_max", 2})
 
       expect(Loopctl.MockContentExtractor, :extract_from_content, fn _t, _c, _o ->
         {:ok,

@@ -11,8 +11,9 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
 
   ## Its own flag, not the node's
 
-  Every test writes and reads a flag ROW of its own — a per-test key handed to
-  `SystemConfigReadPath.side_table_reads_enabled?/1` — through the real `SystemConfig.put/2`.
+  Every test writes and reads a flag ROW of its own — a per-test key, cached in an ETS table
+  it owns, both handed to `SystemConfigReadPath.side_table_reads_enabled?/2` — through the
+  real `SystemConfig.put/3`.
   So neither the `embedding_side_table_reads` row (which other tests insert, e.g.
   `Loopctl.Embeddings.LegacyRetirementTest`, and whose row lock a concurrent upsert would
   wait on) nor its node-wide cache entry, which `DataCase.stub_embedding_read_path/0`
@@ -37,37 +38,57 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
   alias Loopctl.SystemConfig
 
   setup do
-    key = "side_table_reads_test_#{System.unique_integer([:positive])}"
-    on_exit(fn -> :persistent_term.erase({SystemConfig, key}) end)
-    {:ok, key: key}
+    {:ok,
+     key: "side_table_reads_test_#{System.unique_integer([:positive])}",
+     cache: :ets.new(:read_path_flag, [:set, :public])}
   end
 
-  describe "side_table_reads_enabled?/1" do
-    test "defaults to false (legacy column) when the flag is unset/0", %{key: key} do
-      {:ok, _} = SystemConfig.put(key, 0)
-      refute SystemConfigReadPath.side_table_reads_enabled?(key)
+  describe "side_table_reads_enabled?/2" do
+    test "defaults to false (legacy column) when the flag is unset/0", %{key: key, cache: cache} do
+      {:ok, _} = SystemConfig.put(key, 0, cache)
+      refute SystemConfigReadPath.side_table_reads_enabled?(key, cache)
     end
 
-    test "is true when the operator sets the flag to 1", %{key: key} do
-      {:ok, _} = SystemConfig.put(key, 1)
-      assert SystemConfigReadPath.side_table_reads_enabled?(key)
+    test "is true when the operator sets the flag to 1", %{key: key, cache: cache} do
+      {:ok, _} = SystemConfig.put(key, 1, cache)
+      assert SystemConfigReadPath.side_table_reads_enabled?(key, cache)
     end
 
-    test "the cutover is REVERSIBLE with a single UPDATE (AC-41.1.8(iii))", %{key: key} do
-      {:ok, _} = SystemConfig.put(key, 1)
-      assert SystemConfigReadPath.side_table_reads_enabled?(key)
+    test "the cutover is REVERSIBLE with a single UPDATE (AC-41.1.8(iii))", %{
+      key: key,
+      cache: cache
+    } do
+      {:ok, _} = SystemConfig.put(key, 1, cache)
+      assert SystemConfigReadPath.side_table_reads_enabled?(key, cache)
 
-      {:ok, _} = SystemConfig.put(key, 0)
-      refute SystemConfigReadPath.side_table_reads_enabled?(key)
+      {:ok, _} = SystemConfig.put(key, 0, cache)
+      refute SystemConfigReadPath.side_table_reads_enabled?(key, cache)
     end
 
-    test "any value other than 1 reads as legacy (fails safe)", %{key: key} do
-      {:ok, _} = SystemConfig.put(key, 2)
-      refute SystemConfigReadPath.side_table_reads_enabled?(key)
+    test "any value other than 1 reads as legacy (fails safe)", %{key: key, cache: cache} do
+      {:ok, _} = SystemConfig.put(key, 2, cache)
+      refute SystemConfigReadPath.side_table_reads_enabled?(key, cache)
     end
   end
 
   describe "production wiring" do
+    test "the arity-0 callback reads the cutover flag's documented row in the node's cache" do
+      # Every other test here reads a row of its own, so a typo in the key the production
+      # entry point reads would pass all of them. The key is pinned to the documented name
+      # (the runbook and `mix loopctl.embeddings` operate it), and /0 to that key.
+      assert SystemConfigReadPath.read_flag_key() == "embedding_side_table_reads"
+
+      calls =
+        Loopctl.CallTrace.calls([{SystemConfigReadPath, :side_table_reads_enabled?, 2}], fn ->
+          SystemConfigReadPath.side_table_reads_enabled?()
+        end)
+
+      assert calls == [
+               {SystemConfigReadPath, :side_table_reads_enabled?,
+                ["embedding_side_table_reads", SystemConfig]}
+             ]
+    end
+
     test "implements the read-path behaviour" do
       assert Loopctl.Embeddings.ReadPathBehaviour in SystemConfigReadPath.module_info(:attributes)[
                :behaviour
@@ -80,11 +101,11 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
     # the decision through the Mox mock, so on its own it proves nothing about the flag
     # reaching `Knowledge.search_semantic/3`. DataCase's default stub DELEGATES to
     # `SystemConfigReadPath`, so this exercises the production resolution unmodified.
-    test "flipping the real flag reroutes Knowledge.search_semantic onto the side table",
-         %{key: key} do
+    test "flipping a flag row reroutes Knowledge.search_semantic onto the side table",
+         %{key: key, cache: cache} do
       # The production resolution, unmodified, reading this test's own flag row.
       stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn ->
-        SystemConfigReadPath.side_table_reads_enabled?(key)
+        SystemConfigReadPath.side_table_reads_enabled?(key, cache)
       end)
 
       tenant = fixture(:tenant)
@@ -99,7 +120,7 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
       refute Map.has_key?(legacy_meta, :embedding_dimension)
 
       # ONE UPDATE, no redeploy...
-      {:ok, _} = SystemConfig.put(key, 1)
+      {:ok, _} = SystemConfig.put(key, 1, cache)
       assert Embeddings.side_table_reads_enabled?()
 
       # ...and the real query is now served from the side table at the tenant's dimension.
@@ -110,7 +131,7 @@ defmodule Loopctl.Embeddings.SystemConfigReadPathTest do
       assert meta.embedding_dimension == 1536
 
       # ...and the REVERT lands on the request path too (AC-41.1.8(iii)).
-      {:ok, _} = SystemConfig.put(key, 0)
+      {:ok, _} = SystemConfig.put(key, 0, cache)
       assert {:ok, %{meta: reverted}} = Knowledge.search_semantic(tenant.id, vector, limit: 50)
       refute Map.has_key?(reverted, :embedding_dimension)
     end

@@ -12,7 +12,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   the per-node ceiling REAL: EVERY `generate_embedding` entry point — the interactive
   query path AND both Oban embedding workers
   (`ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`) — funnels through
-  `Loopctl.Knowledge.run_embedding_task/3`, which `acquire/1`s a slot here before
+  `Loopctl.Knowledge.run_embedding_task/6`, which `acquire/1`s a slot here before
   spawning its supervised task and `release/1`s it after. Over the cap, `acquire/1`
   fast-fails with `{:error, :rate_limited_local}` (the breaker-exempt reason shared
   with the US-37.1 admission gate): the interactive path degrades to keyword search
@@ -75,7 +75,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   request/worker process that incremented it, and MONITORS acquirers: an acquirer that
   crashes WITHOUT calling `release/1` would otherwise leak its slot forever, drifting
   the effective cap up; a `:DOWN` reclaims the leaked slot. The slot is charged to the
-  CALLING process (the request/worker running `run_embedding_task/3`, which acquires →
+  CALLING process (the request/worker running `run_embedding_task/6`, which acquires →
   runs the task → releases synchronously), NOT to the off-process supervised task.
 
   ## Node-local by design
@@ -144,7 +144,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   is caught and converted to `{:error, :rate_limited_local}`. This is the fail-SAFE
   direction: an unverifiable cap degrades the interactive path to keyword search (same
   as any over-cap refusal) rather than raising an unguarded `:exit` that would 500 the
-  request (`run_embedding_task/3` calls `acquire/1` OUTSIDE the supervised task, so no
+  request (`run_embedding_task/6` calls `acquire/1` OUTSIDE the supervised task, so no
   `async_nolink` isolates it — only this guard does). Symmetric with `release/1`, which
   swallows the same exit.
 
@@ -176,7 +176,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
 
   CRASH-SAFE: if this GenServer is down (so the `call` would `:exit`), `release/1`
   swallows the exit and returns `:ok` — it is invoked from an `after` block in
-  `run_embedding_task/3`, and a raised `:exit` there would MASK the embedding
+  `run_embedding_task/6`, and a raised `:exit` there would MASK the embedding
   result. A dead GenServer is itself a restart that resets the counters, so nothing
   leaks.
   """
@@ -268,7 +268,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
     # Re-entrant guard (review #5): if this pid is ALREADY tracked it holds a slot,
     # so a second acquire must NOT increment again — that would over-count the
     # semaphore and permanently leak a slot on the single release/:DOWN. Currently
-    # unreachable (run_embedding_task/3 acquires → runs → releases synchronously, so
+    # unreachable (run_embedding_task/6 acquires → runs → releases synchronously, so
     # a pid never holds two concurrent slots), but gated here BEFORE reserve_slots so
     # the counters and the monitor map can never diverge under any future re-entrant
     # reuse. One in-flight slot per caller pid is the invariant the accounting relies
@@ -361,7 +361,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   end
 
   # Register the crash-safe monitor. One in-flight acquire per caller pid:
-  # `run_embedding_task/3` acquires → runs → releases synchronously, so a pid is
+  # `run_embedding_task/6` acquires → runs → releases synchronously, so a pid is
   # never tracked twice concurrently (and the handle_call re-entrant guard rejects a
   # second acquire before this runs). `Process.monitor` on an already-dead pid still
   # returns a ref and immediately delivers `:DOWN`, which the handler reclaims — so

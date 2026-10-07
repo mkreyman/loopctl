@@ -125,7 +125,7 @@ defmodule Loopctl.Telemetry.ScaleAlerts do
       `[:loopctl, :llm, :provider_error]` event (`Loopctl.TelemetryEvents.llm_provider_error/0`),
       emitted from the shared `Loopctl.Llm.Anthropic` HTTP client (every Anthropic
       call site — content extraction/classification/merge/memory-promotion — funnels
-      through it) AND from `Loopctl.Knowledge.run_embedding_task/3` (review fix,
+      through it) AND from `Loopctl.Knowledge.run_embedding_task/6` (review fix,
       MEDIUM: the single guarded entry point shared by BOTH embedding Oban workers
       — `ArticleEmbeddingWorker`/`MemoryEmbeddingWorker` — AND every query-time
       embedding caller — combined/semantic search, novelty scoring,

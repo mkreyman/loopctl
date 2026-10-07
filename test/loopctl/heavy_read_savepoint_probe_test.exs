@@ -73,13 +73,13 @@ defmodule Loopctl.HeavyReadSavepointProbeTest do
       # every prod probe inconclusive, fails closed, iterative scan off fleet-wide.
       # Asserted on the last-CONCLUSIVE record, not on `true`, so it means "the backend
       # answered" for any installed pgvector version.
-      probe = {HeavyRead, make_ref()}
-      on_exit(fn -> clear_probe_cache(probe) end)
+      # A probe namespace of this test's own: an ETS table it owns, gone when it exits.
+      probe = :ets.new(:savepoint_probe, [:set, :public])
 
       {verdict, recorded} =
         on_idle_connection(fn ->
           verdict = HeavyRead.iterative_scan_supported?(probe)
-          {verdict, :persistent_term.get({probe, :iterative_scan_last_conclusive}, :none)}
+          {verdict, Loopctl.TermCache.get(probe, :iterative_scan_last_conclusive, :none)}
         end)
 
       assert match?({answered, _at} when is_boolean(answered), recorded),
@@ -125,13 +125,5 @@ defmodule Loopctl.HeavyReadSavepointProbeTest do
       fun.()
     end)
     |> Task.await(10_000)
-  end
-
-  # Every key under this test's probe namespace: the verdict, the last conclusive verdict,
-  # the guess TTL and any warning deadline the probe wrote.
-  defp clear_probe_cache(probe) do
-    for {key, _value} <- :persistent_term.get(),
-        is_tuple(key) and tuple_size(key) > 0 and elem(key, 0) == probe,
-        do: :persistent_term.erase(key)
   end
 end

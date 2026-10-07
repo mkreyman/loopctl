@@ -9,38 +9,35 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   ## Its own config and its own probe verdict
 
   Every test reads the live tunables from a `SystemConfig` namespace of its own and the
-  iterative-scan capability verdict from a probe namespace of its own, handed to
-  `HeavyRead.opts/2`, `hnsw_ef_search/1`, `hnsw_iterative_scan/1`, `hnsw_max_scan_tuples/1`
-  and `iterative_scan_supported?/1`. A value primed here therefore reaches only the read
-  this test builds — never a concurrent ANN reader's `SET LOCAL`, which is what kept this
-  module sync while the primes went to the node-wide keys. The response-meta disclosure
-  tests that go through `Knowledge`/`Memory` reads, which build their opts from the
-  node-wide keys, live in `Loopctl.HeavyReadAnnDisclosureTest`.
+  iterative-scan capability verdict from a probe namespace of its own — ETS tables it owns
+  (`Loopctl.TermCache`) — handed to `HeavyRead.opts/2`, `hnsw_ef_search/1`,
+  `hnsw_iterative_scan/1`, `hnsw_max_scan_tuples/1` and `iterative_scan_supported?/1`, and to
+  `Knowledge.search_semantic/3`, `Knowledge.suggest_links_with_meta/3` and `Memory.recall/2`
+  as `:heavy_read_config`. A value primed here therefore reaches only the reads this test
+  makes — never a concurrent ANN reader's `SET LOCAL` — which is what kept this module
+  (and the disclosure tests now back in it) sync while the primes went to node-wide keys.
   """
   use Loopctl.DataCase, async: true
 
+  alias Loopctl.Embeddings
   alias Loopctl.HeavyRead
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Memory
+  alias Loopctl.TermCache
 
   import Ecto.Query
   import Loopctl.OwnLog, only: [capture_own_log: 1]
 
   setup :verify_on_exit!
 
-  # The namespaces this test reads its tunables and its probe verdict from, kept in the
-  # test process so the helpers below need no context threading. Every key under either
-  # is erased on exit.
+  # The namespaces this test reads its tunables and its probe verdict from: two ETS tables
+  # this test process owns (`Loopctl.TermCache`), gone when it exits. Kept in the process
+  # dictionary so the helpers below need no context threading.
   setup do
-    cache = {Loopctl.SystemConfig, make_ref()}
-    probe = {HeavyRead, make_ref()}
+    cache = :ets.new(:hnsw_test_config, [:set, :public])
+    probe = :ets.new(:hnsw_test_probe, [:set, :public])
     Process.put(:heavy_read_test_namespaces, {cache, probe})
-
-    on_exit(fn ->
-      for {key, _value} <- :persistent_term.get(),
-          is_tuple(key) and tuple_size(key) > 0 and elem(key, 0) in [cache, probe],
-          do: :persistent_term.erase(key)
-    end)
-
     :ok
   end
 
@@ -236,6 +233,26 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
              "expected SET LOCAL hnsw.max_scan_tuples = 50000, got: #{inspect(sqls)}"
     end
 
+    test "a ceiling in the read's opts is clamped where it is consumed, never sent raw" do
+      # `opts/2` stamps a clamped ceiling, but `all/3` takes any opts list: what reaches
+      # `SET LOCAL` must pass the same clamp either way, or pgvector rejects it and the read
+      # 500s. A ceiling that is not an integer falls back to the node-wide one.
+      tenant = fixture(:tenant)
+      q = from(a in Article, where: a.tenant_id == ^tenant.id, select: %{id: a.id})
+      node_wide = HeavyRead.hnsw_max_scan_tuples()
+
+      for {given, applied} <- [{0, 1}, {-1, 1}, {10_000_000, 1_000_000}, {"50000", node_wide}] do
+        opts = [hnsw_iterative_scan: "relaxed_order", hnsw_max_scan_tuples: given]
+
+        sqls =
+          Loopctl.PlanAssertions.capture_repo_queries(fn -> HeavyRead.all(tenant.id, q, opts) end)
+          |> Enum.map(fn {sql, _params} -> sql end)
+
+        assert Enum.any?(sqls, &(&1 == "SET LOCAL hnsw.max_scan_tuples = #{applied}")),
+               "#{inspect(given)} must reach SET LOCAL as #{applied}, got: #{inspect(sqls)}"
+      end
+    end
+
     test "an ANN heavy read at OFF issues NO SET LOCAL hnsw.iterative_scan" do
       # OFF must touch NOTHING iterative-scan — this is what keeps the feature inert (and
       # safe on a pgvector < 0.8 backend without the GUC) until an operator opts in.
@@ -382,7 +399,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end
 
     test "a REUSED stale `false` is not reported as a backend incapability" do
-      # The other side of the split, and the one a second `last_conclusive_verdict/0` read got
+      # The other side of the split, and the one a second `last_conclusive_verdict/1` read got
       # wrong: an inconclusive probe (HeavyReadRepo saturation) that falls back on a recent
       # conclusive `false` produces the same boolean as a fresh conclusive `false`. Classifying
       # on the record rather than on the probe's provenance sent the operator to upgrade an
@@ -417,8 +434,8 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       # Its throttle deadline is in this test's probe namespace, not the node's.
       deadline_key = {:iterative_scan_warned, {:degraded_ann_write, path}}
-      assert :persistent_term.get(Tuple.insert_at(deadline_key, 0, probe()), nil)
-      refute :persistent_term.get(Tuple.insert_at(deadline_key, 0, HeavyRead), nil)
+      assert TermCache.get(probe(), deadline_key, nil)
+      refute TermCache.get(HeavyRead, deadline_key, nil)
 
       assert capture_own_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts, probe()) end) ==
                "",
@@ -437,49 +454,243 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end
   end
 
-  defp probe_cache_key, do: {probe(), :iterative_scan_supported}
-  defp last_conclusive_key, do: {probe(), :iterative_scan_last_conclusive}
+  describe "iterative-scan DISCLOSURE through the Knowledge and Memory reads" do
+    test "the LEGACY semantic response meta carries the disclosure, both states" do
+      tenant = fixture(:tenant)
+      refute Embeddings.side_table_reads_enabled?(), "precondition: legacy read path"
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      assert {:ok, %{meta: degraded}} =
+               Knowledge.search_semantic(tenant.id, test_vec(1536), heavy_read_config: config())
+
+      assert degraded.ann_iterative_scan == "unavailable"
+      assert degraded.ann_iterative_scan_reason =~ "may be missing from these results"
+
+      prime_iterative_scan_supported(true)
+
+      assert {:ok, %{meta: healthy}} =
+               Knowledge.search_semantic(tenant.id, test_vec(1536), heavy_read_config: config())
+
+      assert healthy.ann_iterative_scan == "applied"
+
+      refute Map.has_key?(healthy, :ann_iterative_scan_reason),
+             "a healthy read states the state and adds no degradation prose"
+    end
+
+    test "the SUGGESTED-LINKS meta discloses, and the no-embedding short-circuit does not" do
+      # `:suggested_links` is an ANN endpoint whose meta already flags one incompleteness
+      # cause (`recall_truncated` = the anti-join cutting a FULL pool) and could not name
+      # the other: an index batch that never reached this tenant's rows reads as
+      # `recall_truncated: false` plus a short list, i.e. "this article has no neighbours".
+      # Both halves are pinned — the merge onto a REAL read, and its absence on the
+      # short-circuit that runs no vector read at all.
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      assert {:ok, [], bare} =
+               Knowledge.suggest_links_with_meta(tenant.id, article.id,
+                 heavy_read_config: config()
+               )
+
+      refute Map.has_key?(bare, :ann_iterative_scan),
+             "the no-embedding short-circuit runs no vector read and must say nothing"
+
+      {:ok, _} = Knowledge.update_embedding(tenant.id, article.id, test_vec(1536))
+
+      assert {:ok, _suggestions, meta} =
+               Knowledge.suggest_links_with_meta(tenant.id, article.id,
+                 heavy_read_config: config()
+               )
+
+      assert meta.ann_iterative_scan == "unavailable"
+      assert meta.ann_iterative_scan_reason =~ "may be missing from these results"
+
+      prime_iterative_scan_supported(true)
+
+      assert {:ok, _suggestions, healthy} =
+               Knowledge.suggest_links_with_meta(tenant.id, article.id,
+                 heavy_read_config: config()
+               )
+
+      assert healthy.ann_iterative_scan == "applied"
+    end
+
+    test "the SIDE-TABLE semantic response meta carries the disclosure too" do
+      tenant = fixture(:tenant)
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
+      assert Embeddings.side_table_reads_enabled?(), "precondition: side-table read path"
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.search_semantic(tenant.id, test_vec(1536), heavy_read_config: config())
+
+      assert meta.ann_iterative_scan == "unavailable"
+    end
+  end
+
+  describe "iterative-scan DISCLOSURE on AGENT MEMORY recall (#634)" do
+    # `Memory.recall/2` runs the SAME `:memory_recall` ANN through the same `HeavyRead`,
+    # with the same post-index residual filter — and disclosed nothing, so an
+    # under-returning recall was indistinguishable from a complete one. That is the
+    # condition #631 removed from knowledge search, on the surface where a short recall is
+    # LEAST likely to be noticed: nothing downstream cross-checks it, and `underfilled`
+    # is already true for a genuinely sparse scope.
+    test "the semantic recall meta carries the disclosure, both states" do
+      scope = fixture(:memory_scope)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+      {:ok, _} = Memory.remember(scope, %{tier: :long_term, text: "ecto multi is atomic"})
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      degraded = Memory.recall(scope, query: "ecto", limit: 5, heavy_read_config: config()).meta
+
+      assert degraded.ann_iterative_scan == "unavailable"
+      assert degraded.ann_iterative_scan_reason =~ "may be missing from these results"
+      assert degraded.fallback == false, "precondition: the SEMANTIC path, not the ILIKE one"
+
+      prime_iterative_scan_supported(true)
+
+      healthy = Memory.recall(scope, query: "ecto", limit: 5, heavy_read_config: config()).meta
+
+      assert healthy.ann_iterative_scan == "applied"
+
+      refute Map.has_key?(healthy, :ann_iterative_scan_reason),
+             "a healthy read states the state and adds no degradation prose"
+    end
+
+    test "the field names and values MATCH knowledge search exactly" do
+      # One vocabulary across both surfaces, not two for the same fact. Asserted by
+      # comparing the two metas' disclosure slices under one primed verdict rather than
+      # by re-listing the strings. Both slices are asserted NON-EMPTY first: they derive
+      # from ONE function, so a rename propagates to both and the equality alone would
+      # degenerate to `%{} == %{}` and pass vacuously (the sibling tests above pin the
+      # literal key names).
+      scope = fixture(:memory_scope)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      disclosure_keys = [:ann_iterative_scan, :ann_iterative_scan_reason]
+
+      assert {:ok, %{meta: knowledge_meta}} =
+               Knowledge.search_semantic(scope.tenant_id, test_vec(1536),
+                 heavy_read_config: config()
+               )
+
+      memory_meta =
+        Memory.recall(scope, query: "anything", limit: 5, heavy_read_config: config()).meta
+
+      memory_slice = Map.take(memory_meta, disclosure_keys)
+
+      assert map_size(memory_slice) == length(disclosure_keys),
+             "both disclosure keys must be present, or this comparison is vacuous"
+
+      assert memory_slice == Map.take(knowledge_meta, disclosure_keys)
+    end
+
+    test "the include_superseded SIDE-TABLE recall discloses NOTHING — it runs no HNSW scan" do
+      # `include_superseded: true` drops the `live_denorm` predicate, so no per-dimension
+      # PARTIAL index matches and the read plans as a bounded top-k SORT — an exact top-k
+      # that cannot under-return. A verdict there describes a scan that never ran, the same
+      # rule the ILIKE fallback follows. The LIVE read in the same shape still discloses,
+      # which is what keeps this exclusion narrow rather than a blanket opt-out.
+      scope = fixture(:memory_scope)
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
+      Knowledge.reset_circuit_breaker(scope.tenant_id)
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      meta =
+        Memory.recall(scope,
+          query: "ecto",
+          limit: 5,
+          include_superseded: true,
+          heavy_read_config: config()
+        ).meta
+
+      assert meta.fallback == false, "precondition: the SEMANTIC path"
+      refute Map.has_key?(meta, :ann_iterative_scan)
+
+      live = Memory.recall(scope, query: "ecto", limit: 5, heavy_read_config: config()).meta
+      assert live.ann_iterative_scan == "unavailable"
+    end
+
+    test "the ILIKE FALLBACK path discloses NOTHING — it runs no vector read" do
+      # These opts DO carry the resolved state (`:memory_recall` is an ANN endpoint, so
+      # `opts/1` stamps every read on it), so disclosing here is one `Map.merge` away and
+      # would be WRONG: the fallback query is a recency-ordered ILIKE that never touches
+      # the HNSW index, and an "unavailable" verdict about a scan that was never attempted
+      # is a degradation report for nothing. Same rule combined search applies when its
+      # semantic half fell back to keyword-only.
+      scope = fixture(:memory_scope)
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, _text ->
+        {:error, :provider_unavailable}
+      end)
+
+      meta = Memory.recall(scope, query: "ecto", limit: 5, heavy_read_config: config()).meta
+
+      assert meta.fallback == true, "precondition: the ILIKE fallback path"
+      refute Map.has_key?(meta, :ann_iterative_scan)
+      refute Map.has_key?(meta, :ann_iterative_scan_reason)
+    end
+  end
 
   # A live probe writes TWO keys: the live cache AND the last-conclusive record it falls back
   # on (a ONE-HOUR reuse window). Both start empty in this test's probe namespace; this
   # clears them again so a test that needs a FRESH probe cannot inherit one from earlier in
-  # itself. (setup erases the whole namespace on exit.)
+  # itself.
   defp clear_iterative_scan_probe_cache do
-    for key <- [probe_cache_key(), last_conclusive_key()], do: :persistent_term.erase(key)
+    for key <- [:iterative_scan_supported, :iterative_scan_last_conclusive],
+        do: TermCache.erase(probe(), key)
   end
 
   # `provenance` is HOW the cached verdict was reached (`:conclusive` | `:reused` | `:guess`),
   # which is what the disclosure classifies on. Defaults to the non-committal `:reused` so a
   # test that only cares about the boolean cannot accidentally assert backend incapability.
   defp prime_iterative_scan_supported(verdict, provenance \\ :reused) do
-    :persistent_term.put(
-      probe_cache_key(),
+    TermCache.put(
+      probe(),
+      :iterative_scan_supported,
       {verdict, System.monotonic_time(:millisecond) + 60_000, provenance}
     )
   end
 
   defp prime_last_conclusive(verdict) do
-    :persistent_term.put(last_conclusive_key(), {verdict, System.monotonic_time(:millisecond)})
+    TermCache.put(
+      probe(),
+      :iterative_scan_last_conclusive,
+      {verdict, System.monotonic_time(:millisecond)}
+    )
   end
 
   defp prime_expired_iterative_scan_supported(verdict) do
-    :persistent_term.put(
-      probe_cache_key(),
+    TermCache.put(
+      probe(),
+      :iterative_scan_supported,
       {verdict, System.monotonic_time(:millisecond) - 1, :conclusive}
     )
   end
 
-  # The live tunables, primed in this test's `SystemConfig` namespace (the documented
-  # `{cache, key}` persistent_term format) — never the node-wide key a concurrent ANN reader
-  # builds its `SET LOCAL`s from. The `[1, 1000]` clamp only keeps pgvector from raising; it
-  # was never isolation.
-  defp prime_iterative_scan(code),
-    do: :persistent_term.put({cache(), "hnsw_iterative_scan"}, code)
-
-  defp prime_max_scan_tuples(value),
-    do: :persistent_term.put({cache(), "hnsw_max_scan_tuples"}, value)
-
-  defp prime_ef_search(value), do: :persistent_term.put({cache(), "hnsw_ef_search"}, value)
+  # The live tunables, primed in this test's `SystemConfig` namespace — never the node-wide
+  # key a concurrent ANN reader builds its `SET LOCAL`s from. The `[1, 1000]` clamp only
+  # keeps pgvector from raising; it was never isolation.
+  defp prime_iterative_scan(code), do: TermCache.put(cache(), "hnsw_iterative_scan", code)
+  defp prime_max_scan_tuples(value), do: TermCache.put(cache(), "hnsw_max_scan_tuples", value)
+  defp prime_ef_search(value), do: TermCache.put(cache(), "hnsw_ef_search", value)
 
   describe "inconclusive probe classification (negative-cache eligibility)" do
     # The class decides whether an inconclusive probe is negative-cached. Sweeping every
@@ -526,7 +737,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       # report a pool blip as a fallback regression.
       verdict = HeavyRead.iterative_scan_supported?(probe())
 
-      case :persistent_term.get(last_conclusive_key(), :none) do
+      case TermCache.get(probe(), :iterative_scan_last_conclusive, :none) do
         {recorded, recorded_at} when is_integer(recorded_at) ->
           assert recorded == verdict,
                  "a conclusive probe must record what the backend actually said, so a later " <>

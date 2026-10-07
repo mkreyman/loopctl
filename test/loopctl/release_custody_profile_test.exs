@@ -22,16 +22,9 @@ defmodule Loopctl.ReleaseCustodyProfileTest do
   alias Loopctl.Test.CustodyEnrollment
 
   setup do
-    cache = {SystemConfig, make_ref()}
-
-    # `refresh/1` loads EVERY row this test's sandbox can see into its namespace, so the
-    # whole namespace is erased on exit, not just the profile key.
-    on_exit(fn ->
-      for {{^cache, _key} = pt_key, _value} <- :persistent_term.get(),
-          do: :persistent_term.erase(pt_key)
-    end)
-
-    {:ok, cache: cache}
+    # `refresh/1` loads EVERY row this test's sandbox can see into its namespace — an ETS
+    # table this test process owns, so all of it is gone when the test exits.
+    {:ok, cache: :ets.new(:custody_profile_config, [:set, :public])}
   end
 
   # `SignedProfilePolicy.profile/0` is redirected through a process-dict stub in
@@ -64,7 +57,7 @@ defmodule Loopctl.ReleaseCustodyProfileTest do
       capture_io(fn -> Release.set_custody_profile(1, cache) end)
       # Drop the local cache entirely, then reload from the DB — proves the write
       # landed in the durable SystemConfig row the running nodes refresh from.
-      :persistent_term.erase({cache, SignedProfilePolicy.profile_key()})
+      :ets.delete(cache, SignedProfilePolicy.profile_key())
       SystemConfig.refresh(cache)
       assert stored_profile_code(cache) == 1
     end

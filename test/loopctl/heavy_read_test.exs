@@ -232,6 +232,28 @@ defmodule Loopctl.HeavyReadTest do
     end
   end
 
+  describe "read_config/1 — what a read function's caller may hand opts/2" do
+    test "takes only opts/2's keys, and only from keyword opts" do
+      config = [system_config: :cfg, probe_cache: :probe, statement_timeout: 1]
+
+      assert HeavyRead.read_config(heavy_read_config: config) ==
+               [system_config: :cfg, probe_cache: :probe]
+
+      assert HeavyRead.read_config(limit: 5) == []
+    end
+
+    test "a request's params never choose the tunables a read uses" do
+      # `Memory.recall/2` also takes a params MAP; whichever key spelling it carries, the
+      # read keeps the node's own tunables and probe verdict.
+      for params <- [
+            %{"heavy_read_config" => [system_config: :cfg]},
+            %{heavy_read_config: [system_config: :cfg]}
+          ] do
+        assert HeavyRead.read_config(params) == []
+      end
+    end
+  end
+
   describe "all/3 + one/3 guard" do
     test "raise ArgumentError when tenant_id is not a binary" do
       q = from(a in Article, where: a.tenant_id == ^"t")

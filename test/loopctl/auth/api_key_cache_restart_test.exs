@@ -6,11 +6,12 @@ defmodule Loopctl.Auth.ApiKeyCacheRestartTest do
   # touching the app's owner (whose table every authenticated request reads), its table, or
   # the root supervisor's restart-intensity window.
   #
-  # The read-through is driven by hand against this instance's table — capture the
-  # generation, resolve the key, `put/4` under that generation — because the auth boundary
-  # (`Loopctl.Auth.verify_api_key/1`) only ever reads the app's table, and the caller's key
-  # is not something a test injects into it.
+  # The read-through is the production one, `Loopctl.Auth.verify_api_key/2`, pointed at this
+  # instance's table. Only the cache TABLE is a parameter: the key is the one the fixture
+  # minted, resolved by the same DB read every request makes.
   use Loopctl.DataCase, async: true
+
+  import Ecto.Query, only: [from: 2]
 
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
@@ -29,7 +30,8 @@ defmodule Loopctl.Auth.ApiKeyCacheRestartTest do
   describe "cold start / table-missing resilience (AC-33.3.7)" do
     test "with the ETS table absent, fetch/put/invalidate/generation are safe (rescue clauses)",
          %{name: name, table: table} do
-      {_raw, ak} = fixture(:api_key, role: :agent)
+      {raw, ak} = fixture(:api_key, role: :agent)
+      await_invalidation_broadcast!(name)
 
       # Destroy the table out from under the owner, simulating the window after a
       # crash and before init/1 has recreated it.
@@ -43,13 +45,22 @@ defmodule Loopctl.Auth.ApiKeyCacheRestartTest do
       assert ApiKeyCache.put(ak.key_hash, ak, 0, table) == :ok
       assert ApiKeyCache.invalidate(ak.key_hash, table) == :ok
 
+      # `put/2` (stamp with the current generation) is `generation/2` then `put/4`, both
+      # just shown safe; composed here against this instance's absent table.
+      assert ApiKeyCache.put(ak.key_hash, ak, ApiKeyCache.generation(ak.key_hash, table), table) ==
+               :ok
+
+      # And the production read-through still AUTHENTICATES mid-restart: its miss, its
+      # generation read and its repopulating put all land on the absent table.
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw, table)
+
       restart_owner!(name, table)
 
       # The recreated EMPTY table repopulates read-through with correct auth material.
       {raw2, ak2} = fixture(:api_key, role: :agent)
       await_invalidation_broadcast!(name)
       assert ApiKeyCache.fetch(ak2.key_hash, table) == :miss
-      assert {:ok, %ApiKey{}} = read_through(raw2, ak2.key_hash, table)
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw2, table)
       assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak2.key_hash, table)
     end
 
@@ -59,7 +70,7 @@ defmodule Loopctl.Auth.ApiKeyCacheRestartTest do
       await_invalidation_broadcast!(name)
 
       # Warm this instance's cache.
-      assert {:ok, %ApiKey{}} = read_through(raw, ak.key_hash, table)
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw, table)
       assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak.key_hash, table)
 
       # Cold start: the owner dies, its table goes with it, and init/1 recreates it EMPTY —
@@ -70,8 +81,18 @@ defmodule Loopctl.Auth.ApiKeyCacheRestartTest do
       assert ApiKeyCache.fetch(ak.key_hash, table) == :miss
 
       # ...and a read-through repopulates it from the DB.
-      assert {:ok, %ApiKey{}} = read_through(raw, ak.key_hash, table)
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw, table)
       assert {:ok, %ApiKey{}} = ApiKeyCache.fetch(ak.key_hash, table)
+
+      # The next request is a HIT on THIS table: a revoke written straight to the row,
+      # bypassing every invalidation, is not seen — the read never reached the DB.
+      {1, _} =
+        Loopctl.AdminRepo.update_all(
+          from(k in ApiKey, where: k.id == ^ak.id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      assert {:ok, %ApiKey{}} = Auth.verify_api_key(raw, table)
     end
   end
 
@@ -83,17 +104,6 @@ defmodule Loopctl.Auth.ApiKeyCacheRestartTest do
     _ = :sys.get_state(ApiKeyCache)
     _ = :sys.get_state(name)
     :ok
-  end
-
-  # A miss's read-through against this instance's table: the generation is captured BEFORE
-  # the key is resolved, exactly as `Auth.verify_api_key/1` does on the app's table.
-  defp read_through(raw, key_hash, table) do
-    generation = ApiKeyCache.generation(key_hash, table)
-
-    with {:ok, %ApiKey{} = api_key} <- Auth.verify_api_key(raw) do
-      :ok = ApiKeyCache.put(key_hash, api_key, generation, table)
-      {:ok, api_key}
-    end
   end
 
   # Stop this test's owner and wait for the test supervisor to restart it (a :permanent

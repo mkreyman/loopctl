@@ -212,7 +212,7 @@ defmodule Loopctl.TelemetryEvents do
   each the ONE call site for its provider: `Loopctl.Llm.Anthropic`'s shared HTTP
   client (`provider: "anthropic"` — every Anthropic call site, content extraction/
   classification/merge/memory-promotion, funnels through it) and
-  `Loopctl.Knowledge.run_embedding_task/3` (`provider: "embedding"`) — the SINGLE
+  `Loopctl.Knowledge.run_embedding_task/6` (`provider: "embedding"`) — the SINGLE
   guarded entry point shared by both embedding Oban workers
   (`Loopctl.Workers.ArticleEmbeddingWorker` / `Loopctl.Workers.MemoryEmbeddingWorker`)
   AND every query-time embedding caller (combined/semantic search, novelty scoring,

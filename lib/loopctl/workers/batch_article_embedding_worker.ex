@@ -5,7 +5,7 @@ defmodule Loopctl.Workers.BatchArticleEmbeddingWorker do
   This is the truly-bulk background ingest counterpart to
   `Loopctl.Workers.ArticleEmbeddingWorker` (which embeds a single article on the
   interactive publish path). Enqueued by every BULK background path — `Knowledge`
-  bulk publish (`enqueue_bulk_embeddings/2`), `ContentIngestionWorker` auto-publish
+  bulk publish (`enqueue_bulk_embeddings/3`), `ContentIngestionWorker` auto-publish
   ingest, and the `KnowledgeLintWorker` orphan-embedding backfill — each of which
   chunks its rows into groups of `Knowledge.embedding_batch_max/0` (~100) and
   enqueues one job per chunk. The interactive single-article/memory/promotion paths

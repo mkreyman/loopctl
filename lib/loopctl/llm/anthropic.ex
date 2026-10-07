@@ -317,7 +317,7 @@ defmodule Loopctl.Llm.Anthropic do
   # SUCCEEDED (and been billed to the tenant) by the time we get here, so a DB
   # blip / FK race while inserting the usage row must NEVER raise — that would
   # crash the job, trigger an Oban retry, and RE-BILL the tenant. Mirror
-  # `ContentIngestionWorker.enqueue_embeddings/2`: log-and-continue, always :ok.
+  # `ContentIngestionWorker.enqueue_embeddings/3`: log-and-continue, always :ok.
   defp record_usage_safe(tenant_id, operation, model, usage, meta) do
     record_usage(tenant_id, operation, model, usage, meta)
   rescue

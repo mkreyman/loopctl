@@ -468,7 +468,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
   # --- US-37.2: per-node embedding concurrency cap gates the interactive path ---
   #
-  # The cap is enforced inside `run_embedding_task/3` (the single guarded entry
+  # The cap is enforced inside `run_embedding_task/6` (the single guarded entry
   # point). In :test the gate is the config-DI mock (`Loopctl.MockEmbeddingConcurrency`,
   # default-stubbed to grant every slot) so we can force saturation deterministically
   # WITHOUT holding the real, VM-wide global counter saturated (which would starve

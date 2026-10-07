@@ -93,6 +93,41 @@ defmodule Loopctl.Egress.DegradedSearchTest do
       refute_received :unexpected_http_call
     end
 
+    # POSITIVE CONTROL for the refute below: the same listener DOES see the provider_error
+    # this search path emits when the provider genuinely fails — from the embedding task the
+    # request starts — on a tenant that is NOT local_only. Without it, a listener that
+    # forwarded nothing would pass the refute by construction.
+    test "the listener sees the provider_error a genuinely failing provider emits", %{
+      conn: conn
+    } do
+      other = fixture(:tenant)
+      {raw, _} = fixture(:api_key, %{tenant_id: other.id, role: :agent})
+
+      {:ok, _} =
+        Llm.upsert_settings(other.id, %{
+          "embedding_api_key" => "test-openai-key-CONTROL",
+          "embedding_model" => "text-embedding-3-small"
+        })
+
+      Knowledge.reset_circuit_breaker(other.id)
+      on_exit(fn -> PinCache.invalidate_tenant(other.id) end)
+      seed_article(other)
+
+      Req.Test.stub(EmbeddingClient, fn conn ->
+        conn |> Plug.Conn.put_status(500) |> Req.Test.json(%{"error" => "boom"})
+      end)
+
+      ref = Loopctl.TelemetryHelpers.attach_own([[:loopctl, :llm, :provider_error]])
+
+      assert conn
+             |> put_req_header("authorization", "Bearer #{raw}")
+             |> get(~p"/api/v1/knowledge/search", %{"q" => "advisory locks"})
+             |> json_response(200)
+
+      assert_receive {[:loopctl, :llm, :provider_error], ^ref, %{count: 1},
+                      %{provider: "embedding"}}
+    end
+
     test "no [:loopctl, :llm, :provider_error] telemetry is emitted, and the breaker stays CLOSED",
          %{conn: conn, tenant: tenant} do
       seed_article(tenant)

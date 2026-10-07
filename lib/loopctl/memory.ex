@@ -632,6 +632,8 @@ defmodule Loopctl.Memory do
     * `:limit` — max results (clamped to `[1, Loopctl.Knowledge.VectorSearch.max_k/0]`,
       default #{@default_recall_k}).
     * `:include_superseded` — include superseded rows (default `false`).
+    * `:heavy_read_config` — where the ANN read's tunables and probe verdict are read from
+      (`Loopctl.HeavyRead.read_config/1`, keyword opts only); the node's own by default.
 
   Returns `%{results: [{memory, score} | ...], meta: %{total_count, fallback, reason,
   underfilled}}`, plus `ann_iterative_scan` (+ `ann_iterative_scan_reason`) on the
@@ -643,6 +645,7 @@ defmodule Loopctl.Memory do
     k = clamp_k(opt(opts, :limit, @default_recall_k))
     include_superseded? = truthy?(opt(opts, :include_superseded, false))
     on_overload = recall_on_overload(opt(opts, :on_overload, :raise))
+    read = {on_overload, HeavyRead.read_config(opts)}
 
     # Reuse a precomputed embedding when the caller supplies one (the merged recall
     # generates it ONCE for both halves — #411 Gap 2); otherwise generate here.
@@ -650,10 +653,10 @@ defmodule Loopctl.Memory do
       case opt(opts, :embedding, nil) ||
              Knowledge.generate_embedding(scope.tenant_id, query_text, egress_opts(scope)) do
         {:ok, embedding} ->
-          recall_semantic(scope, embedding, k, include_superseded?, on_overload)
+          recall_semantic(scope, embedding, k, include_superseded?, read)
 
         {:error, reason} ->
-          recall_fallback(scope, reason, query_text, k, include_superseded?, on_overload)
+          recall_fallback(scope, reason, query_text, k, include_superseded?, read)
       end
 
     maybe_bump_recall(scope, envelope, include_superseded?)
@@ -823,12 +826,12 @@ defmodule Loopctl.Memory do
   # in-flight recall could validate the query vector against the legacy 1536 and then scan the
   # 768 side table — the raw Postgrex "different vector dimensions" 500 the dimension check
   # exists to prevent. Mirrors `Knowledge.suggest_links_with_meta/3`.
-  defp recall_semantic(scope, embedding, k, include_superseded?, on_overload) do
+  defp recall_semantic(scope, embedding, k, include_superseded?, read) do
     side_table? = Embeddings.side_table_reads_enabled?()
 
     case recall_dimension_check(scope, embedding, side_table?) do
       :ok ->
-        do_recall_semantic(scope, embedding, k, include_superseded?, on_overload, side_table?)
+        do_recall_semantic(scope, embedding, k, include_superseded?, read, side_table?)
 
       {:error, reason} ->
         unavailable_memory_env(scope.tenant_id, k, reason)
@@ -865,11 +868,11 @@ defmodule Loopctl.Memory do
     }
   end
 
-  defp do_recall_semantic(scope, embedding, k, include_superseded?, on_overload, side_table?) do
+  defp do_recall_semantic(scope, embedding, k, include_superseded?, read, side_table?) do
     query = memory_candidate_query(scope, embedding, k, include_superseded?, side_table?)
     # Resolved ONCE and threaded into BOTH the read and its disclosure below, so the two
     # cannot describe different executions (#631, #634).
-    heavy_opts = memory_recall_opts(on_overload)
+    heavy_opts = memory_recall_opts(read)
 
     case HeavyRead.all_memory(
            scope.tenant_id,
@@ -942,10 +945,12 @@ defmodule Loopctl.Memory do
 
   # HeavyRead opts for a memory recall, with the caller's shed policy layered on. `:raise`
   # is `all_memory`'s own default, so it is only threaded explicitly for `:tag`.
-  defp memory_recall_opts(:tag),
-    do: Keyword.put(HeavyRead.opts(:memory_recall), :on_overload, :tag)
+  # `read` is `{on_overload, config}`: how a shed is handled, and `HeavyRead.opts/2`'s config
+  # from the caller's `:heavy_read_config`.
+  defp memory_recall_opts({:tag, config}),
+    do: Keyword.put(HeavyRead.opts(:memory_recall, config), :on_overload, :tag)
 
-  defp memory_recall_opts(_), do: HeavyRead.opts(:memory_recall)
+  defp memory_recall_opts({_on_overload, config}), do: HeavyRead.opts(:memory_recall, config)
 
   # The empty, degraded memory envelope returned when the per-tenant HeavyRead cap SHED
   # the memory read on the merged `/recall` path (`on_overload: :tag`). Emits an
@@ -1189,7 +1194,7 @@ defmodule Loopctl.Memory do
     struct(MemorySchema, Map.drop(row, [:distance]))
   end
 
-  defp recall_fallback(scope, reason, query_text, k, include_superseded?, on_overload) do
+  defp recall_fallback(scope, reason, query_text, k, include_superseded?, read) do
     reason_tag = fallback_reason_tag(reason)
 
     query =
@@ -1208,7 +1213,7 @@ defmodule Loopctl.Memory do
            scope.tenant_id,
            scope.subject_id,
            query,
-           memory_recall_opts(on_overload)
+           memory_recall_opts(read)
          ) do
       {:error, :heavy_read_overloaded} ->
         overloaded_memory_env(scope.tenant_id, k)

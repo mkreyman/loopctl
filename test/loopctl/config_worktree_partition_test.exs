@@ -39,9 +39,9 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
   # The ORACLE's own copy of the command, hand-written and deliberately NOT read from the
   # module: an oracle derived from the code under test cannot contradict it. The copy is
   # safe to keep because drift between the two is LOUD, not silent — a flag added to the
-  # module makes `rev_parse/1` see four lines, return `:error` and degrade to nil while this
+  # module makes `rev_parse/2` see four lines, return `:error` and degrade to nil while this
   # oracle still resolves, which fails "agrees with git's own answer" — and because
-  # "the command rev_parse/1 actually runs" below pins the module's own value directly.
+  # "the command rev_parse/2 actually runs" below pins the module's own value directly.
   @rev_parse_sh "git rev-parse --git-dir --git-common-dir --show-toplevel 2>/dev/null"
 
   @rev_parse_flags ~w(--git-dir --git-common-dir --show-toplevel)
@@ -280,7 +280,7 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
     end
   end
 
-  describe "the command rev_parse/1 actually runs" do
+  describe "the command rev_parse/2 actually runs" do
     # Pinned against the MODULE's own `@rev_parse_cmd`, read out of the source AST, never
     # against a copy in this file: a copy proves only that the copy is well-formed. The two
     # halves are both load-bearing. (a) alone is satisfied by any quiet command, so it could
@@ -297,7 +297,7 @@ defmodule Loopctl.ConfigWorktreePartitionTest do
 
       for flag <- @rev_parse_flags do
         assert String.contains?(cmd, flag),
-               "#{flag} is one of the three answers `rev_parse/1` splits out, in flag order; " <>
+               "#{flag} is one of the three answers `rev_parse/2` splits out, in flag order; " <>
                  "got #{inspect(cmd)}"
       end
     end

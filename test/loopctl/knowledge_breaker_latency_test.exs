@@ -20,17 +20,12 @@ defmodule Loopctl.KnowledgeBreakerLatencyTest do
   @cooldown_key "embedding_breaker_cooldown_seconds"
 
   setup do
-    cache = {Loopctl.SystemConfig, make_ref()}
+    # A SystemConfig namespace of this test's own: an ETS table this test process owns,
+    # gone when it exits.
+    cache = :ets.new(:breaker_latency_config, [:set, :public])
 
     # Enable a low latency threshold, trip after 2 slow calls, recover after 1s.
-    :persistent_term.put({cache, @threshold_key}, 40)
-    :persistent_term.put({cache, @count_key}, 2)
-    :persistent_term.put({cache, @cooldown_key}, 1)
-
-    on_exit(fn ->
-      for key <- [@threshold_key, @count_key, @cooldown_key],
-          do: :persistent_term.erase({cache, key})
-    end)
+    :ets.insert(cache, [{@threshold_key, 40}, {@count_key, 2}, {@cooldown_key, 1}])
 
     {:ok, opts: [system_config: cache], cache: cache}
   end
@@ -65,7 +60,7 @@ defmodule Loopctl.KnowledgeBreakerLatencyTest do
        %{opts: opts, cache: cache} do
     tenant = fixture(:tenant)
     Knowledge.reset_circuit_breaker(tenant.id)
-    :persistent_term.put({cache, @threshold_key}, 0)
+    :ets.insert(cache, {@threshold_key, 0})
 
     Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
       Process.sleep(60)

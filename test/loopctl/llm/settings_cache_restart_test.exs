@@ -40,6 +40,14 @@ defmodule Loopctl.Llm.SettingsCacheRestartTest do
 
       assert SettingsCache.invalidate(tenant.id, table) == :ok
 
+      # `put/2` (stamp with the current generation) is `generation/2` then `put/4`, both just
+      # shown safe; composed here against this instance's absent table. And the production
+      # read-through still answers mid-restart (a tenant with no row reads `nil`).
+      assert SettingsCache.put(tenant.id, nil, SettingsCache.generation(tenant.id, table), table) ==
+               :ok
+
+      assert Llm.get_settings(tenant.id, table) == nil
+
       # Restore the table by restarting its supervised owner (init recreates it).
       restart_owner!(name, table)
 

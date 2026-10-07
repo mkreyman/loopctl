@@ -19,6 +19,8 @@ defmodule Loopctl.ProviderTest do
   alias Loopctl.Egress
   alias Loopctl.Egress.PinCache
   alias Loopctl.Egress.Scope
+  alias Loopctl.Llm
+  alias Loopctl.Llm.Anthropic
   alias Loopctl.Provider
   alias Loopctl.Provider.Admission
   alias Loopctl.Test.AllowlistSource
@@ -147,6 +149,28 @@ defmodule Loopctl.ProviderTest do
                Provider.post("https://api.openai.com/v1/embeddings", [], %{scope: scope})
 
       refute_receive {[:loopctl, :llm, :provider_error], ^ref, _, _}
+    end
+
+    # POSITIVE CONTROL for the refute above: the same listener DOES see a provider_error
+    # emitted through `Provider.post` from this process — an Anthropic call (which posts
+    # through the chokepoint in the caller) answered 500 on a tenant that is NOT local_only.
+    # Without this, a listener that forwarded nothing would pass the refute by construction.
+    test "the listener sees a provider_error that does go through the chokepoint" do
+      ref = Loopctl.TelemetryHelpers.attach_own([[:loopctl, :llm, :provider_error]])
+      other = fixture(:tenant)
+      {:ok, _} = Llm.upsert_settings(other.id, %{"api_key" => "sk-ant-control"})
+
+      Req.Test.stub(Anthropic, fn conn ->
+        conn |> Plug.Conn.put_status(500) |> Req.Test.json(%{"error" => "boom"})
+      end)
+
+      body = fn _model -> %{max_tokens: 10, system: "s", messages: []} end
+
+      assert {:error, {:api_error, 500, _}} =
+               Anthropic.message(other.id, :extraction, body)
+
+      assert_receive {[:loopctl, :llm, :provider_error], ^ref, %{count: 1},
+                      %{provider: "anthropic"}}
     end
 
     test "N refusals in one window write a BOUNDED, aggregated audit trail",

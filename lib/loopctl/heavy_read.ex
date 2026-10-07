@@ -59,6 +59,7 @@ defmodule Loopctl.HeavyRead do
   alias Loopctl.ExitTag
   alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.LocalGuc
+  alias Loopctl.TermCache
 
   @doc "Resolved heavy-read repo (DI). `HeavyReadRepo` in prod/dev, `AdminRepo` in test."
   @spec repo() :: module()
@@ -187,13 +188,19 @@ defmodule Loopctl.HeavyRead do
   (US-38.4) — the per-query recall breadth applied via `SET LOCAL hnsw.ef_search` inside
   the same heavy-read transaction — but ONLY when the live `SystemConfig` value differs
   from pgvector's default (at the default no key is attached, so a role-level `ALTER ROLE`
-  override is not shadowed; see `hnsw_ef_search/0`). `all/3`/`one/3`/`all_memory/4` pop it
-  (like `:statement_timeout`) before handing the remaining opts to the repo.
+  override is not shadowed; see `hnsw_ef_search/1`). When an operator has enabled iterative
+  scan and the backend supports it, it also carries `:hnsw_iterative_scan` and its clamped
+  `:hnsw_max_scan_tuples` ceiling, and every ANN endpoint carries the disclosure-only
+  `:hnsw_iterative_scan_state` (`iterative_scan_meta/1`). `all/3`/`one/3`/`all_memory/4`
+  pop all of these (like `:statement_timeout`) before handing the remaining opts to the repo.
+
+  `config` (`opts/2`) names where those tunables and the capability verdict are read from —
+  see the comment above `opts/2`; production passes none.
 
   This is the SINGLE source of truth for heavy-read opts — every consumer
   (`Loopctl.Knowledge`, `Loopctl.Audit`) builds opts via this function so the
-  `[timeout, telemetry_options, statement_timeout, hnsw_ef_search]` shape can't drift
-  between callers.
+  `[timeout, telemetry_options, statement_timeout, hnsw_ef_search, hnsw_iterative_scan,
+  hnsw_max_scan_tuples, hnsw_iterative_scan_state]` shape can't drift between callers.
   Known endpoints are enumerated in `known_endpoints/0`: `:suggested_links`,
   `:semantic_search`, `:distant_pairs`, `:distant_pairs_bridge` (the slower
   `bridge_path=true` branch — its own key so its statement_timeout/slow-query
@@ -272,6 +279,20 @@ defmodule Loopctl.HeavyRead do
     |> maybe_put_ef_search(endpoint, cache)
     |> maybe_put_iterative_scan(endpoint, cache, probe)
   end
+
+  @doc """
+  The `opts/2` config a read function's caller hands it as `:heavy_read_config` — only the
+  keys `opts/2` reads (`:system_config`, `:probe_cache`), and only from a keyword list. A
+  request's params (a map) never carry one: which tunables a read uses is not something a
+  request chooses. `Knowledge.search_semantic/3`, `Knowledge.suggest_links_with_meta/3` and
+  `Memory.recall/2` take it so a test can read its own tunables and probe verdict.
+  """
+  @spec read_config(keyword() | map()) :: keyword()
+  def read_config(opts) when is_list(opts) do
+    opts |> Keyword.get(:heavy_read_config, []) |> Keyword.take([:system_config, :probe_cache])
+  end
+
+  def read_config(_params), do: []
 
   # US-38.4: attach the per-QUERY `hnsw.ef_search` recall breadth ONLY to the
   # pgvector-ANN endpoints (`ann_endpoints/0`), and ONLY when the live SystemConfig value
@@ -359,7 +380,7 @@ defmodule Loopctl.HeavyRead do
   `hnsw.iterative_scan`, derived from the `opts` that read was issued with.
 
   Pass the SAME keyword list handed to `all/3` / `one/3`. It reads ONLY the
-  `:hnsw_iterative_scan_state` `opts/1` stamped at build time — never a fresh probe or a
+  `:hnsw_iterative_scan_state` `opts/2` stamped at build time — never a fresh probe or a
   fresh config read — so it cannot disagree with the rows it accompanies, and opts from a
   NON-ANN endpoint (which carry no state) disclose nothing rather than a false degradation.
 
@@ -448,8 +469,8 @@ defmodule Loopctl.HeavyRead do
     end
   end
 
-  # Every endpoint atom a caller passes to `opts/1` / stamps into `telemetry_options`.
-  # `opts/1` itself accepts ANY atom (the timeout defaults are endpoint-agnostic), but
+  # Every endpoint atom a caller passes to `opts/2` / stamps into `telemetry_options`.
+  # `opts/2` itself accepts ANY atom (the timeout defaults are endpoint-agnostic), but
   # `Loopctl.HeavyRead.TenantGate.weight_for/1` partitions these into heavy vs light
   # cost weights — so this list is the SOURCE OF TRUTH the gate's drift guard
   # (`tenant_gate_test.exs`) checks its `@heavy_endpoints` against: a new endpoint
@@ -477,7 +498,7 @@ defmodule Loopctl.HeavyRead do
   )a
 
   @doc """
-  The known heavy-read endpoint atoms (documented in `opts/1`).
+  The known heavy-read endpoint atoms (documented in `opts/2`).
 
   The canonical set `Loopctl.HeavyRead.TenantGate` assigns cost weights to; the gate's
   drift guard test partitions exactly this set into heavy vs light so a newly-added
@@ -620,10 +641,15 @@ defmodule Loopctl.HeavyRead do
   """
   @spec hnsw_max_scan_tuples(Loopctl.SystemConfig.cache()) :: pos_integer()
   def hnsw_max_scan_tuples(cache \\ Loopctl.SystemConfig) do
-    Loopctl.SystemConfig.get_int("hnsw_max_scan_tuples", @default_hnsw_max_scan_tuples, cache)
-    |> max(1)
-    |> min(1_000_000)
+    "hnsw_max_scan_tuples"
+    |> Loopctl.SystemConfig.get_int(@default_hnsw_max_scan_tuples, cache)
+    |> clamp_max_scan_tuples()
   end
+
+  # The one clamp every `hnsw.max_scan_tuples` value passes on its way to `SET LOCAL` —
+  # pgvector rejects a value outside it and the read 500s.
+  defp clamp_max_scan_tuples(value) when is_integer(value),
+    do: value |> max(1) |> min(1_000_000)
 
   # The per-read `hnsw.iterative_scan` DECISION for an ANN endpoint. `{:applied, mode}` is the
   # only shape that emits a `SET LOCAL`; `:off` (the default) short-circuits BEFORE the probe,
@@ -640,8 +666,8 @@ defmodule Loopctl.HeavyRead do
   # extension when the real cause was pool saturation.
   #
   # Which one it is comes from the PROVENANCE the verdict carries out of the probe that
-  # produced it (`iterative_scan_verdict/0`), never from a second read of
-  # `last_conclusive_verdict/0`: a `false` an inconclusive probe merely REUSED from that
+  # produced it (`iterative_scan_verdict/1`), never from a second read of
+  # `last_conclusive_verdict/1`: a `false` an inconclusive probe merely REUSED from that
   # record is indistinguishable there from a `false` the backend just gave, so classifying on
   # it labelled a transient degradation permanent.
   @spec iterative_scan_state(Loopctl.SystemConfig.cache(), term()) ::
@@ -730,9 +756,10 @@ defmodule Loopctl.HeavyRead do
       so a single boot-time blip cannot pin the operator's lever OFF for a whole minute and a
       sustained incident still converges on one probe per window.
 
-  `probe` is the `:persistent_term` namespace the verdict, the last conclusive verdict, the
-  guess TTL and the warning deadlines live under — this module, the node's one, unless a
-  test names its own so its primed or probed verdict reaches no other read.
+  `probe` is the `Loopctl.TermCache` namespace the verdict, the last conclusive verdict, the
+  guess TTL and the warning deadlines live under — this module (`:persistent_term`, the
+  node's one) unless a test hands in an ETS table of its own, so its primed or probed
+  verdict reaches no other read.
   """
   @spec iterative_scan_supported?(term()) :: boolean()
   def iterative_scan_supported?(probe \\ __MODULE__) do
@@ -747,7 +774,7 @@ defmodule Loopctl.HeavyRead do
   # backend incapability.
   @spec iterative_scan_verdict(term()) :: {boolean(), :conclusive | :reused | :guess}
   defp iterative_scan_verdict(probe) do
-    case :persistent_term.get({probe, :iterative_scan_supported}, :unknown) do
+    case TermCache.get(probe, :iterative_scan_supported, :unknown) do
       {verdict, expires_at, provenance} when is_boolean(verdict) ->
         if now_ms() < expires_at,
           do: {verdict, provenance},
@@ -785,7 +812,7 @@ defmodule Loopctl.HeavyRead do
       {:ok, supported, version} ->
         maybe_warn_unsupported(supported, version)
         cache_iterative_scan_verdict(supported, @iterative_scan_cache_ttl_ms, :conclusive, probe)
-        :persistent_term.put({probe, :iterative_scan_last_conclusive}, {supported, now_ms()})
+        TermCache.put(probe, :iterative_scan_last_conclusive, {supported, now_ms()})
         reset_guess_ttl(probe)
         {supported, :conclusive}
 
@@ -841,17 +868,18 @@ defmodule Loopctl.HeavyRead do
   # triggers a VM-global GC whenever it REPLACES a value — the cost that makes a hot guess
   # cadence expensive in the first place.
   defp next_guess_ttl_ms(probe) do
-    ttl = :persistent_term.get({probe, :iterative_scan_guess_ttl}, @iterative_scan_unknown_ttl_ms)
+    ttl = TermCache.get(probe, :iterative_scan_guess_ttl, @iterative_scan_unknown_ttl_ms)
     next = min(ttl * 2, @iterative_scan_negative_ttl_ms)
-    if next != ttl, do: :persistent_term.put({probe, :iterative_scan_guess_ttl}, next)
+    if next != ttl, do: TermCache.put(probe, :iterative_scan_guess_ttl, next)
     ttl
   end
 
   # A CONCLUSIVE probe means the node recovered, so the short window is available again to
   # the next blip. Erase only when set, for the same global-GC reason.
   defp reset_guess_ttl(probe) do
-    key = {probe, :iterative_scan_guess_ttl}
-    if :persistent_term.get(key, nil), do: :persistent_term.erase(key)
+    if TermCache.get(probe, :iterative_scan_guess_ttl, nil),
+      do: TermCache.erase(probe, :iterative_scan_guess_ttl)
+
     :ok
   end
 
@@ -865,11 +893,11 @@ defmodule Loopctl.HeavyRead do
   # so `now_ms() >= 0` is false for the VM's whole life — a `0` default did not throttle the
   # warning, it deleted it, in exactly the incident it exists to describe.
   defp maybe_log_inconclusive(class, message, probe) do
-    key = {probe, :iterative_scan_warned, class}
-    deadline = :persistent_term.get(key, :never)
+    key = {:iterative_scan_warned, class}
+    deadline = TermCache.get(probe, key, :never)
 
     if deadline == :never or now_ms() >= deadline do
-      :persistent_term.put(key, now_ms() + @iterative_scan_negative_ttl_ms)
+      TermCache.put(probe, key, now_ms() + @iterative_scan_negative_ttl_ms)
       Logger.warning(message)
     end
 
@@ -883,7 +911,7 @@ defmodule Loopctl.HeavyRead do
   # This is the fallback for "the probe failed", not a second source of truth for "what is
   # supported": the live cache above is still the answer whenever it has one.
   defp last_conclusive_verdict(probe) do
-    case :persistent_term.get({probe, :iterative_scan_last_conclusive}, :none) do
+    case TermCache.get(probe, :iterative_scan_last_conclusive, :none) do
       {verdict, at} when is_boolean(verdict) and is_integer(at) ->
         if now_ms() - at < @iterative_scan_last_conclusive_ttl_ms, do: {:ok, verdict}, else: :none
 
@@ -926,10 +954,7 @@ defmodule Loopctl.HeavyRead do
   end
 
   defp cache_iterative_scan_verdict(verdict, ttl_ms, provenance, probe) do
-    :persistent_term.put(
-      {probe, :iterative_scan_supported},
-      {verdict, now_ms() + ttl_ms, provenance}
-    )
+    TermCache.put(probe, :iterative_scan_supported, {verdict, now_ms() + ttl_ms, provenance})
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)
@@ -963,7 +988,7 @@ defmodule Loopctl.HeavyRead do
           {:ok, boolean(), String.t() | :not_installed}
           | {:inconclusive, String.t(), :ownership | :transaction | :pool | :unexpected}
   defp probe_iterative_scan_support do
-    # TIGHT timeout, because this round trip runs from `opts/1` — i.e. BEFORE `TenantGate`
+    # TIGHT timeout, because this round trip runs from `opts/2` — i.e. BEFORE `TenantGate`
     # can shed and before any `SET LOCAL statement_timeout` applies. DBConnection derives the
     # checkout DEADLINE from PER-ATTEMPT `:timeout` (`Holder.abs_timeout/2`), and
     # `savepoint_first_probe/0` can take two attempts, so each gets HALF
@@ -989,7 +1014,7 @@ defmodule Loopctl.HeavyRead do
     # `repo().in_transaction?()`: that reads a per-process dict entry set only by
     # `Repo.transaction`/`Repo.checkout`, which `Sandbox.start_owner!` never sets — the same
     # blindness documented at `run_timed_transaction/5` — so gating on it left the protection
-    # DEAD in the one shape that has an enclosing transaction to poison, while prod (`opts/1`
+    # DEAD in the one shape that has an enclosing transaction to poison, while prod (`opts/2`
     # runs outside any transaction) took the plain branch either way.
     case savepoint_first_probe() do
       {:ok, %{rows: [[version]]}} when is_binary(version) ->
@@ -1008,7 +1033,7 @@ defmodule Loopctl.HeavyRead do
   catch
     # DBConnection/Postgrex EXIT rather than raise when the pool is not started (`:noproc`)
     # or wedged (`{:timeout, {GenServer, :call, _}}`). Without this clause the exit
-    # propagates out of `opts/1` and aborts the caller's ANN read — the OPPOSITE of the
+    # propagates out of `opts/2` and aborts the caller's ANN read — the OPPOSITE of the
     # documented fail-closed guarantee. That IS the saturation case, so it keeps `:pool`.
     :exit, reason ->
       {:inconclusive, "exit:" <> exit_tag(reason), :pool}
@@ -1316,8 +1341,8 @@ defmodule Loopctl.HeavyRead do
     raise Loopctl.HeavyRead.OverloadedError, tenant_id: tenant_id
   end
 
-  # The endpoint atom `opts/1` stamps into `telemetry_options` — the natural per-query
-  # weight key. Absent (a bare call with no `opts/1`) → nil → TenantGate weights it light.
+  # The endpoint atom `opts/2` stamps into `telemetry_options` — the natural per-query
+  # weight key. Absent (a bare call with no `opts/2`) → nil → TenantGate weights it light.
   defp endpoint(opts) do
     opts
     |> Keyword.get(:telemetry_options, [])
@@ -1440,7 +1465,7 @@ defmodule Loopctl.HeavyRead do
   def force_exact_scan?, do: Application.get_env(:loopctl, :heavy_read_force_exact_scan, false)
 
   # `SET LOCAL hnsw.ef_search = N` for an ANN read (US-38.4). Only fired when the caller
-  # (via `HeavyRead.opts/1` for an `ann_endpoints/0` endpoint) supplies a positive integer
+  # (via `HeavyRead.opts/2` for an `ann_endpoints/0` endpoint) supplies a positive integer
   # — non-ANN reads pass `nil` and set nothing. The value is pre-clamped to pgvector's
   # accepted `[1, 1000]` by `hnsw_ef_search/0`, and is an integer (not user text), so the
   # interpolation is injection-safe. Transaction-scoped, so it resets at COMMIT and never
@@ -1472,8 +1497,10 @@ defmodule Loopctl.HeavyRead do
   end
 
   # The iterative-scan mode and its `max_scan_tuples` ceiling, popped together: `opts/2`
-  # stamps both from one `SystemConfig` namespace. A hand-built opts list carrying only the
-  # mode gets the node-wide ceiling, read here.
+  # stamps both from one `SystemConfig` namespace. Whatever arrives here is clamped where it
+  # is consumed, so no opts list — `opts/2`'s or a hand-built one — can put a value pgvector
+  # rejects into `SET LOCAL`; one that is not an integer, or is absent, gets the node-wide
+  # ceiling. A ceiling with no mode is dropped: it bounds iterative scan and nothing else.
   defp pop_iterative_scan(opts) do
     {mode, opts} = Keyword.pop(opts, :hnsw_iterative_scan, nil)
     {max_scan_tuples, opts} = Keyword.pop(opts, :hnsw_max_scan_tuples, nil)
@@ -1481,8 +1508,11 @@ defmodule Loopctl.HeavyRead do
   end
 
   defp iterative_scan_gucs(nil, _max_scan_tuples), do: nil
-  defp iterative_scan_gucs(mode, nil), do: {mode, hnsw_max_scan_tuples()}
-  defp iterative_scan_gucs(mode, max_scan_tuples), do: {mode, max_scan_tuples}
+
+  defp iterative_scan_gucs(mode, max_scan_tuples) when is_integer(max_scan_tuples),
+    do: {mode, clamp_max_scan_tuples(max_scan_tuples)}
+
+  defp iterative_scan_gucs(mode, _absent_or_invalid), do: {mode, hnsw_max_scan_tuples()}
 
   @doc """
   Like `Repo.stream/2`, with the same tenant-scoping guard. Must run inside a

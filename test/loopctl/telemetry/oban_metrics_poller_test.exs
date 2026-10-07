@@ -62,7 +62,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
   and a poll runs in this test's process (or, for a DB fault, in a process this test
   spawned with no sandbox access — `in_unowned_process/1`). The app's own poller and a
   concurrent test's poll never reach these mailboxes. The orphan-count cache is read and
-  written under a `:persistent_term` key of this test's own.
+  written in an ETS table of this test's own, handed to `poll_oban_executing_orphans/1`.
   """
   use Loopctl.DataCase, async: true
 
@@ -325,18 +325,17 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
 
   describe "cached_executing_orphan_count/1 (US-34.2 review finding — health-check reuse of the poller's cache)" do
     setup do
-      # The cache key of this test's own: the app's poller writes the node's.
-      cache_key = {ScaleMetrics, :cached_executing_orphan_count, make_ref()}
-      on_exit(fn -> :persistent_term.erase(cache_key) end)
-      {:ok, cache_key: cache_key}
+      # A cache of this test's own (an ETS table it owns): the app's poller writes the
+      # node's.
+      {:ok, cache: :ets.new(:orphan_count_cache, [:set, :public])}
     end
 
-    test "returns :not_yet_polled before any poll has ever completed", %{cache_key: cache_key} do
-      assert ScaleMetrics.cached_executing_orphan_count(cache_key) == :not_yet_polled
+    test "returns :not_yet_polled before any poll has ever completed", %{cache: cache} do
+      assert ScaleMetrics.cached_executing_orphan_count(cache) == :not_yet_polled
     end
 
     test "returns {:ok, count} reflecting the last successful poll, without issuing a fresh query",
-         %{cache_key: cache_key} do
+         %{cache: cache} do
       threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
       now = DateTime.utc_now()
 
@@ -346,12 +345,12 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
       )
 
-      assert ScaleMetrics.poll_oban_executing_orphans(cache_key) == :ok
-      assert ScaleMetrics.cached_executing_orphan_count(cache_key) == {:ok, 1}
+      assert ScaleMetrics.poll_oban_executing_orphans(cache) == :ok
+      assert ScaleMetrics.cached_executing_orphan_count(cache) == {:ok, 1}
     end
 
     test "a FAILED poll leaves the prior cached value in place (same staleness semantics as the last_value gauge)",
-         %{cache_key: cache_key} do
+         %{cache: cache} do
       threshold_minutes = ScaleMetrics.oban_metrics_orphan_threshold_minutes()
       now = DateTime.utc_now()
 
@@ -361,20 +360,20 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
         attempted_at: DateTime.add(now, -(threshold_minutes + 5) * 60, :second)
       )
 
-      assert ScaleMetrics.poll_oban_executing_orphans(cache_key) == :ok
-      assert ScaleMetrics.cached_executing_orphan_count(cache_key) == {:ok, 1}
+      assert ScaleMetrics.poll_oban_executing_orphans(cache) == :ok
+      assert ScaleMetrics.cached_executing_orphan_count(cache) == {:ok, 1}
 
       # The NEXT poll fails: it runs in a process with no sandbox access, so its Repo
       # call raises a genuine DBConnection.OwnershipError.
       {_pid, result, log} =
-        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache_key) end)
+        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache) end)
 
       assert result == :ok
       assert log =~ "Oban executing-orphan poll failed"
 
       # The cache retains the last SUCCESSFUL value — never resets to 0/unknown
       # just because a poll cycle failed.
-      assert ScaleMetrics.cached_executing_orphan_count(cache_key) == {:ok, 1}
+      assert ScaleMetrics.cached_executing_orphan_count(cache) == {:ok, 1}
     end
   end
 
@@ -393,11 +392,10 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     end
 
     test "poll_oban_executing_orphans/1 logs and returns :ok without raising on a DB fault" do
-      cache_key = {ScaleMetrics, :cached_executing_orphan_count, make_ref()}
-      on_exit(fn -> :persistent_term.erase(cache_key) end)
+      cache = :ets.new(:orphan_count_cache, [:set, :public])
 
       {_pid, result, log} =
-        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache_key) end)
+        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache) end)
 
       assert result == :ok
       assert log =~ "Oban executing-orphan poll failed"
@@ -406,8 +404,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     test "no metric corruption: neither gauge emits when the poll fails" do
       test_pid = self()
       handler_id = "test-oban-no-corruption-#{System.unique_integer([:positive])}"
-      cache_key = {ScaleMetrics, :cached_executing_orphan_count, make_ref()}
-      on_exit(fn -> :persistent_term.erase(cache_key) end)
+      cache = :ets.new(:orphan_count_cache, [:set, :public])
 
       :telemetry.attach_many(
         handler_id,
@@ -426,7 +423,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
       {pid, _result, _log} =
         in_unowned_process(fn ->
           ScaleMetrics.poll_oban_queue_state()
-          ScaleMetrics.poll_oban_executing_orphans(cache_key)
+          ScaleMetrics.poll_oban_executing_orphans(cache)
         end)
 
       refute_receive {:emitted, ^pid, _event, _measurements, _metadata}, 200
@@ -435,8 +432,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
     test "the poll-failure counter fires from both pollers on a DB fault (review finding)" do
       test_pid = self()
       handler_id = "test-oban-poll-error-#{System.unique_integer([:positive])}"
-      cache_key = {ScaleMetrics, :cached_executing_orphan_count, make_ref()}
-      on_exit(fn -> :persistent_term.erase(cache_key) end)
+      cache = :ets.new(:orphan_count_cache, [:set, :public])
 
       :telemetry.attach(
         handler_id,
@@ -458,7 +454,7 @@ defmodule Loopctl.Telemetry.ObanMetricsPollerTest do
       assert exception.__struct__ in [DBConnection.OwnershipError, Postgrex.Error]
 
       {pid2, _result, _log} =
-        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache_key) end)
+        in_unowned_process(fn -> ScaleMetrics.poll_oban_executing_orphans(cache) end)
 
       assert_receive {:oban_poll_error, ^pid2,
                       %{poller: :executing_orphans, exception: exception2}, %{count: 1}},
