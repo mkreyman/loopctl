@@ -99,6 +99,20 @@ config :loopctl, Loopctl.AdminRepo,
   # Allow the unboxed connection to be held long enough for the prod-floor seed.
   ownership_timeout: :timer.minutes(30)
 
+# AdminRepo runs on Loopctl.Repo's sandbox connection in test (Epic 46, US-46.2). A test
+# inserts on one repo and the code under test reads on the other, as production does with
+# committed rows; with two pools the read sees nothing until the test COMMITS, which forced
+# those modules sync. One connection makes the rows visible inside the test's own
+# transaction. Constant for the whole run, never set per test, and compile-time: AdminRepo's
+# `:default_dynamic_repo` (`Loopctl.AdminRepo.Route`), which refuses to compile this route
+# unless Repo's pool is the SQL sandbox, so a production build cannot share. Routed AdminRepo
+# queries keep AdminRepo's telemetry event. The AdminRepo pool above still starts (LockGuard
+# reads its connect options); nothing checks a connection out of it, and test_helper.exs
+# keeps it in :manual so a call that bypasses the route fails loudly instead of committing.
+# What production still has and this does not: AdminRepo's own connection, so a read inside
+# a `with_tenant` body is BYPASSRLS and blind to the tenant transaction's uncommitted rows.
+config :loopctl, :admin_repo_route, Loopctl.Repo
+
 # HeavyReadRepo (US-27.11) — sandbox mode for tests. Nothing in the default suite routes
 # heavy DATA reads here — `:heavy_read_repo` below points heavy reads at AdminRepo so they
 # share the sandbox connection fixtures insert through; only the dedicated HeavyReadRepo

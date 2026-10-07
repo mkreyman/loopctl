@@ -53,8 +53,8 @@ defmodule Loopctl.Delivery.StagesLockTest do
 
     # `fixture(:committed_tenant)` runs its own unboxed AdminRepo checkout, so it goes first.
     tenant = fixture(:committed_tenant, %{})
+    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
     :ok = Sandbox.checkout(Repo, sandbox: false)
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
 
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: 1})
 

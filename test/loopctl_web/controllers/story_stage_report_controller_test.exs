@@ -40,7 +40,7 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
 
   @sha String.duplicate("a", 40)
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Repo, fun) end)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Repo, fun)
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 

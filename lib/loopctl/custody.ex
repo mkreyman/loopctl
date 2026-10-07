@@ -141,7 +141,6 @@ defmodule Loopctl.Custody do
 
   require Logger
 
-  alias Ecto.Adapters.SQL
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
@@ -761,7 +760,7 @@ defmodule Loopctl.Custody do
   # aborted transaction from the ReadyForQuery status behind DBConnection's back.
   defp guarded_query(repo, sql, params) do
     opts = if repo.in_transaction?(), do: [mode: :savepoint], else: []
-    SQL.query(repo, sql, params, opts)
+    repo.query(sql, params, opts)
   rescue
     e -> {:error, e}
   end

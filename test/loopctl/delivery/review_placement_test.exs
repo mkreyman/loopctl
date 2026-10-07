@@ -780,6 +780,12 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
 
       assert row.stage == :escalated
 
+      # The two accepted reviews hold both of the runner's slots (`max_sessions: 2`), and a
+      # placement checks the slot before the ceiling. Free them, as the sessions' ends would,
+      # so the third placement is refused by the CEILING. Without this it was refused on
+      # capacity once the slot counts and this read shared a connection (US-46.2).
+      AdminRepo.update_all(from(r in Runner, where: r.id == ^ctx.runner.id), set: [in_flight: 0])
+
       assert {:error, {:conflict, "review_ceiling_reached", _}} = place(ctx)
     end
   end

@@ -19,7 +19,7 @@
     },
     {
       "id": "AC-46.2.2",
-      "description": "The ResolveApiKey plug reads the key through an injected resolver defaulting to Auth.verify_api_key; a test supplies the key it inserted."
+      "description": "The boundary's real Auth.verify_api_key read runs against the test's own sandbox connection (Loopctl.AdminRepo routed onto Loopctl.Repo in test); no resolver is injected, since the resolved key is caller identity (CLAUDE.md, custody identity)."
     },
     {
       "id": "AC-46.2.3",

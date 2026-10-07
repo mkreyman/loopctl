@@ -290,9 +290,9 @@ defmodule Loopctl.Progress.ClaimLockTest do
 
     reclaimer =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
-        # The reclaim first reads the dispatch ledger, on the RLS repo, for a budget kill it
-        # must re-drive rather than re-queue (US-44.3).
+        # The reclaim reads the dispatch ledger on the RLS repo too, for a budget kill it must
+        # re-drive rather than re-queue (US-44.3). AdminRepo runs on Repo's connection in
+        # test, so this one checkout carries both.
         :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
       end)
@@ -319,7 +319,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
     # two overlapping cron runs, or two nodes, produce.
     reclaim = fn ->
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
         :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
       end)

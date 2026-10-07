@@ -792,10 +792,10 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     end
   end
 
-  # BOTH repos on real connections — a placement writes through each of them, and the sandbox
-  # gives them separate, mutually invisible transactions.
+  # A real connection: AdminRepo runs on Repo's in test, so one unboxed Repo checkout carries
+  # both repos' writes, and they commit.
   defp unboxed(fun) do
-    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   # A story contracted and standing at `queued` — what a placement takes. Called OUTSIDE

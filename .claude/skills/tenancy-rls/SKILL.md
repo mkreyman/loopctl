@@ -22,6 +22,15 @@ every heavy read shares the AdminRepo sandbox connection and the `SET LOCAL stat
 assertions on that routed path are unsound under Sandbox (`config/test.exs:74-83`). Assert pool/timeout
 behavior against `HeavyReadRepo` directly.
 
+**In TEST, `AdminRepo` runs on `Repo`'s sandbox connection** (`config :loopctl, :admin_repo_route`,
+`Loopctl.AdminRepo.Route`), so a row a test writes through either repo is visible to the other inside
+the test's transaction. Production is unrouted, and `Route.check!/2` refuses to compile the route
+unless Repo's pool is the SQL sandbox. Two consequences: reach AdminRepo through its own functions
+(`AdminRepo.query/3`, `repo.query/3`), never `Ecto.Adapters.SQL.query(AdminRepo, ...)`, which skips the
+route (`test/loopctl/admin_repo_route_test.exs` scans `lib/` for it); and an AdminRepo call made inside
+a `with_tenant/2` body runs in test under the tenant's RLS role on the tenant transaction, where
+production runs it BYPASSRLS on its own connection, blind to that transaction's uncommitted rows.
+
 There are **three** repos (CLAUDE.md "Multi-Tenant Rules" #6 says the same). Never route a
 heavy vector/enumeration read through `AdminRepo`: that shares a tiny 3-connection pool with every
 other admin op and three concurrent heavy reads starve it (`heavy_read_repo.ex:5-17`). Route heavy
@@ -29,11 +38,11 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
 
 ## Invariants (must hold — cited)
 
-1. **`with_tenant/2` must OWN its transaction** — `repo.ex:100-110`. The RLS context is set with
+1. **`with_tenant/2` must OWN its transaction** — `repo.ex:118-128`. The RLS context is set with
    `SET LOCAL app.current_tenant_id` / `SET LOCAL ROLE`, which are transaction-scoped. If `with_tenant`
    runs *inside* an existing transaction, its `SET LOCAL` lands in a SAVEPOINT and **persists past the
    savepoint into the outer transaction** — overriding the outer tenant/role for the rest of its life
-   (a cross-tenant / role leak). `assert_not_nested!/2` (`repo.ex:207-215`) raises to prevent it.
+   (a cross-tenant / role leak). `assert_not_nested!/2` (`repo.ex:225-233`) raises to prevent it.
    Under the SQL sandbox that guard is inert (every test runs inside a transaction), so the suite
    cannot catch `with_tenant/2` nested in some OTHER transaction; a `with_tenant/2` nested in another
    `with_tenant/2` does raise there too. Verify non-nesting by inspection; the RULE itself is unit-tested
@@ -42,10 +51,10 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
    the body returns, because each test transaction is a SAVEPOINT inside the test's own and would
    otherwise leave the connection in that tenant's RLS role. A test needs no `RESET ROLE` after them;
    one that sets the role by hand still does. A Multi that needs RLS scoping and its per-step error
-   tuples goes through `Repo.tenant_multi/2` (`repo.ex:177`), not a `Repo.set_rls_context/1` step of
+   tuples goes through `Repo.tenant_multi/2` (`repo.ex:195`), not a `Repo.set_rls_context/1` step of
    its own, which would leak under the sandbox.
-2. **RLS context = `set_config('app.current_tenant_id', $1, true)`** — `repo.ex:228-237`. In dev/test the
-   connection is a superuser, so `maybe_set_local_role/0` (`repo.ex:249-255`) additionally `SET LOCAL ROLE`
+2. **RLS context = `set_config('app.current_tenant_id', $1, true)`** — `repo.ex:246-255`. In dev/test the
+   connection is a superuser, so `maybe_set_local_role/0` (`repo.ex:267-273`) additionally `SET LOCAL ROLE`
    to a non-superuser (`:rls_role`) so policies actually apply; prod connects as a non-superuser natively.
 3. **New tables: `ENABLE ROW LEVEL SECURITY`, never `FORCE`** — the prod role (`schema_admin`) owns the
    tables without BYPASSRLS, so `ENABLE` already applies to it; `FORCE` would also gate the admin paths.

@@ -1981,10 +1981,10 @@ defmodule Loopctl.Delivery.PlacementTest do
     unboxed(fn -> Placement.place(runner.tenant_id, runner.id, payload, opts) end)
   end
 
-  # BOTH repos on real connections. A placement writes through each of them and the sandbox
-  # gives them separate, mutually invisible transactions — see the moduledoc.
+  # A real connection: AdminRepo runs on Repo's in test, so one unboxed Repo checkout carries
+  # both repos' writes, and they commit.
   defp unboxed(fun) do
-    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   # A story contracted and standing at `queued`, which is what a placement takes.

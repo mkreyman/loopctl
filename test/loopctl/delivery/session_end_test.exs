@@ -5,8 +5,8 @@ defmodule Loopctl.Delivery.SessionEndTest do
 
   `completed`, the budget kills' ESCALATION, and every refusal are here, async, on one sandbox
   connection. Ending the CLAIM — what `crashed` and `usage_exhausted` do, and what a budget kill
-  does after it escalates — is an `AdminRepo` transaction, and the two sandbox connections
-  cannot see each other's rows (here the release finds no story and does nothing); those are in
+  does after it escalates — is an `AdminRepo` transaction; AdminRepo shares this connection in
+  test (US-46.2), so a budget kill's release runs here too. The release paths themselves are in
   `Loopctl.Delivery.SessionEndReleaseTest` on committed rows.
   """
 
@@ -157,7 +157,14 @@ defmodule Loopctl.Delivery.SessionEndTest do
       assert {:ok, %{row: row, replayed?: false}} = end_session(ctx, "wall_clock_exceeded")
 
       assert row.stage == :escalated
-      assert row.claim_epoch == @epoch
+      # The kill also releases the claim (`release_ended_session`, on AdminRepo), which bumps
+      # the story's epoch and rebinds the escalated row to it. This asserted @epoch while the
+      # release read the story on a second sandbox connection that could not see it (US-46.2).
+      assert row.claim_epoch == @epoch + 1
+
+      released = as_tenant(ctx.story.tenant_id, fn -> Repo.get!(Story, ctx.story.id) end)
+      assert {released.agent_status, released.claim_epoch} == {:pending, @epoch + 1}
+
       assert row.attempts == %{"budget_reported" => 1}
       # Built from the enum, never from anything a session wrote.
       assert row.escalation_reason == "session_ended:wall_clock_exceeded"

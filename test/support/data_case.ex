@@ -142,8 +142,17 @@ defmodule Loopctl.DataCase do
     %{lock_guard_backend_pids: backend_pids}
   end
 
-  @doc "The repos every DataCase/ConnCase test gets a sandbox owner for."
-  def sandbox_repos, do: [Loopctl.Repo, Loopctl.AdminRepo, Loopctl.HeavyReadRepo]
+  @doc """
+  The repos every DataCase/ConnCase test gets a sandbox owner for. AdminRepo is left out
+  while it is routed onto Repo's connection (`config :loopctl, :admin_repo_route`): its
+  owner would be a SECOND checkout of Repo's pool, a different connection than the one the
+  test's Repo owner holds, and the test would see only one of them.
+  """
+  @sandbox_repos if(Loopctl.AdminRepo.shares_repo_connection?(),
+                   do: [Loopctl.Repo, Loopctl.HeavyReadRepo],
+                   else: [Loopctl.Repo, Loopctl.AdminRepo, Loopctl.HeavyReadRepo]
+                 )
+  def sandbox_repos, do: @sandbox_repos
 
   @doc """
   US-41.1: default the injected read-path decision to the REAL SystemConfig-backed

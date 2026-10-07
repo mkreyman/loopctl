@@ -65,8 +65,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     # `fixture(:committed_tenant)` runs its own unboxed AdminRepo checkout, so it goes first.
     tenant = fixture(:committed_tenant, %{})
+    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
     :ok = Sandbox.checkout(Repo, sandbox: false)
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
 
     ctx = build_story(tenant)
     on_exit(fn -> purge_tenant(tenant.id) end)

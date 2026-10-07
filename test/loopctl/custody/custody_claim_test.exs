@@ -15,7 +15,6 @@ defmodule Loopctl.CustodyClaimTest do
   import Ecto.Query
   import Mox
 
-  alias Ecto.Adapters.SQL
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
@@ -695,8 +694,7 @@ defmodule Loopctl.CustodyClaimTest do
     test "the table carries tenant_id and an RLS tenant_isolation policy (AC-41.7.9)" do
       for table <- ["custody_posture_entries", "custody_row_sequences"] do
         %{rows: [[count]]} =
-          SQL.query!(
-            AdminRepo,
+          AdminRepo.query!(
             "SELECT count(*) FROM pg_policies WHERE tablename = $1 AND policyname = 'tenant_isolation'",
             [table]
           )
@@ -704,8 +702,7 @@ defmodule Loopctl.CustodyClaimTest do
         assert count == 1
 
         %{rows: [[relrowsecurity, relforcerowsecurity]]} =
-          SQL.query!(
-            AdminRepo,
+          AdminRepo.query!(
             "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1",
             [table]
           )
@@ -723,18 +720,17 @@ defmodule Loopctl.CustodyClaimTest do
     defp unscoped_posture_rows_visible_as(tenant_id) do
       {:ok, count} =
         AdminRepo.transaction(fn ->
-          SQL.query!(
-            AdminRepo,
+          AdminRepo.query!(
             "SELECT set_config('app.current_tenant_id', $1, true)",
             [tenant_id]
           )
 
-          SQL.query!(AdminRepo, "SET LOCAL ROLE loopctl_app", [])
+          AdminRepo.query!("SET LOCAL ROLE loopctl_app", [])
 
           %{rows: [[count]]} =
-            SQL.query!(AdminRepo, "SELECT count(*) FROM custody_posture_entries", [])
+            AdminRepo.query!("SELECT count(*) FROM custody_posture_entries", [])
 
-          SQL.query!(AdminRepo, "RESET ROLE", [])
+          AdminRepo.query!("RESET ROLE", [])
           count
         end)
 

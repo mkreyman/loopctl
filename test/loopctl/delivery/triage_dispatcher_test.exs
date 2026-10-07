@@ -486,7 +486,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   # -- helpers ---------------------------------------------------------------------------
 
   defp unboxed(fun) do
-    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   # A story as INTAKE leaves it: created from a record, its stage row open at `detected`, its

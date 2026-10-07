@@ -57,8 +57,8 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
     # `sandbox: false` connections below.
     tenant = fixture(:committed_tenant, %{})
     other_tenant = fixture(:committed_tenant, %{})
+    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
     :ok = Sandbox.checkout(Repo, sandbox: false)
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
 
     # `fixture(:committed_tenant)` writes the DEFAULT tier, `:agent_rooted`, and the
     # delivery loop is work-breakdown surface behind `RequireHumanAnchor`.

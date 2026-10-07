@@ -19,7 +19,7 @@
     },
     {
       "id": "AC-46.3.2",
-      "description": "RunnerSocket.connect authenticates through an injected resolver defaulting to Runners.authenticate_identified, set only server-side."
+      "description": "The real Runners.authenticate_identified read runs against the test's own sandbox connection (AdminRepo routed onto Repo in test); no resolver is injected, since the resolved runner is caller identity."
     },
     {
       "id": "AC-46.3.3",

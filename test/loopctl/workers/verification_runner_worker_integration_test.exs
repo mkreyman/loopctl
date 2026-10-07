@@ -57,8 +57,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     Loopctl.DataCase.stub_all_defaults()
 
     tenant = fixture(:committed_tenant, %{})
+    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
     :ok = Sandbox.checkout(Repo, sandbox: false)
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
 
     on_exit(fn ->
       purge(tenant.id)
