@@ -28,6 +28,7 @@ defmodule Loopctl.Repo do
     prepare: :unnamed
 
   alias Ecto.Adapters.SQL
+  alias Loopctl.LocalGuc
 
   @tenant_key {__MODULE__, :tenant_id}
 
@@ -93,13 +94,28 @@ defmodule Loopctl.Repo do
   @spec with_tenant(Ecto.UUID.t(), (-> result)) :: {:ok, result} | {:error, term()}
         when result: term()
   def with_tenant(tenant_id, fun) when is_binary(tenant_id) and is_function(fun, 0) do
-    assert_not_nested!()
+    sandbox? = sandbox_pool?()
+    assert_not_nested!(in_transaction?(), sandbox?)
     put_tenant_id(tenant_id)
 
-    transaction(fn ->
-      set_rls_context(tenant_id)
-      fun.()
+    transaction(fn -> run_in_tenant(tenant_id, fun, sandbox?) end)
+  end
+
+  # Only the SQL sandbox pool (test) takes the scoped branch: there `with_tenant/2`'s
+  # transaction is a SAVEPOINT inside the test's own, and the tenant setting and
+  # `SET LOCAL ROLE` outlive its RELEASE for the rest of the test, so whatever ran next on the
+  # connection would read as this tenant's RLS role. `LocalGuc.scoped/3` puts both back when
+  # the body returns. Every other pool takes the plain branch, unchanged: its transaction is
+  # real and ends with the body.
+  defp run_in_tenant(tenant_id, fun, true = _sandbox?) do
+    LocalGuc.scoped(__MODULE__, ["app.current_tenant_id", "role"], fn ->
+      run_in_tenant(tenant_id, fun, false)
     end)
+  end
+
+  defp run_in_tenant(tenant_id, fun, false = _sandbox?) do
+    set_rls_context(tenant_id)
+    fun.()
   end
 
   # US-33.7 guard: `with_tenant/2` must own its transaction (see @doc above).
@@ -113,10 +129,6 @@ defmodule Loopctl.Repo do
   # function is exposed as `assert_not_nested!/2` so at least the RULE is
   # covered in CI (`test/loopctl/repo_nested_transaction_guard_test.exs`);
   # actual nesting must be verified by inspection or in dev/prod.
-  defp assert_not_nested! do
-    assert_not_nested!(in_transaction?(), sandbox_pool?())
-  end
-
   @doc """
   The pure decision behind the `with_tenant/2` nested-transaction guard.
 
