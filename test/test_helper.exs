@@ -1,4 +1,9 @@
-ExUnit.start()
+# assert_receive and LiveViewTest.render_async wait assert_receive_timeout, 100ms by default.
+# A loaded full-suite run can take longer than that to schedule an async task and reach a
+# mock (ThreadLiveTest TC-45.7.2 failed on it once, 2026-10-07, and passed alone). The wait
+# only bounds a FAILURE: a passing assertion returns as soon as its message arrives.
+# refute_receive keeps its own 100ms default.
+ExUnit.start(assert_receive_timeout: 2_000)
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 {:ok, _lock_guard} = Loopctl.Test.LockGuard.start()
