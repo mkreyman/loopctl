@@ -63,19 +63,16 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
 
   ## Why this is `async: false`
 
-  Not the flake, and not the read-path flag: that is an injected collaborator
+  Not the flake. The read-path CUTOVER FLAG is an injected collaborator
   (`Loopctl.Embeddings.ReadPathBehaviour`), so `enable_side_table_reads/0` is a
   PROCESS-SCOPED `Mox.stub/3` and nothing VM-global is written for it. (The flag's real
   per-node globality is covered in `test/loopctl/embeddings/system_config_read_path_test.exs`.)
 
-  The reason is `@moduletag :vacuum_vector_indexes`: every test here VACUUMs the vector tables
-  through `Loopctl.DataCase.vacuum_vector_indexes/0`, which repairs the HNSW graph only on a
-  QUIET database. As a sync module this file runs after every async module has finished, so it
-  gets that quiet phase; run async, its VACUUMs would compete with the async suite's open
-  transactions and with the other vacuum-tagged modules (VACUUM's ShareUpdateExclusiveLock
-  conflicts with itself). #519 first added `async: false` on a different theory, that
-  concurrent inserts perturbed a shared index; that one was wrong, and the same failure
-  reappeared in `system_config_read_path_test.exs`.
+  `async: false` is kept as cheap insurance — these are the suite's heaviest vector
+  reads and serializing them lowers DB contention. It is NOT a fix: #519 added it on the
+  theory that concurrent async inserts perturbed a shared index, which is impossible
+  (ExUnit runs every async module to completion BEFORE any sync one), and the same
+  failure simply reappeared in `system_config_read_path_test.exs`.
 
   ## What #535 did fix (real, and still in place)
 

@@ -58,7 +58,9 @@ defmodule Loopctl.EmbeddingsRlsTest do
   defp repo_embedding(tenant_id, article, dim) do
     %ArticleEmbedding{tenant_id: tenant_id}
     |> ArticleEmbedding.changeset(
-      %{article_id: article.id, embedding: Enum.map(1..dim, &(&1 / dim))},
+      # The per-test sparse axis, not a shared dense vector: this module runs async, and
+      # identical dense rows from concurrent tests crowd the shared HNSW graph (#645).
+      %{article_id: article.id, embedding: test_vec(dim)},
       dim
     )
     |> Repo.insert!()

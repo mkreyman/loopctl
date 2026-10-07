@@ -14,13 +14,15 @@ defmodule Loopctl.ContextRetriever.ExecutorStaleColumnTest do
 
   use Loopctl.DataCase, async: false
 
+  import ExUnit.CaptureLog
+  import Loopctl.ContextRetrieverE2EHelpers, only: [seed_story: 2]
+
   alias Loopctl.ContextRetriever.Executor
   alias Loopctl.ContextRetriever.Registry
   alias Loopctl.ContextRetriever.Scope
-  alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
-  alias Loopctl.WorkBreakdown.Epic
-  alias Loopctl.WorkBreakdown.Story
+
+  setup :verify_on_exit!
 
   defp repo_tenant do
     seq = System.unique_integer([:positive])
@@ -32,22 +34,6 @@ defmodule Loopctl.ContextRetriever.ExecutorStaleColumnTest do
       email: "test-#{seq}@example.com",
       status: :active
     })
-    |> Repo.insert!()
-  end
-
-  defp seed_story(tenant_id, attrs) do
-    project =
-      %Project{tenant_id: tenant_id}
-      |> Project.create_changeset(build(:project, %{}))
-      |> Repo.insert!()
-
-    epic =
-      %Epic{tenant_id: tenant_id, project_id: project.id}
-      |> Epic.create_changeset(build(:epic, %{}))
-      |> Repo.insert!()
-
-    %Story{tenant_id: tenant_id, project_id: project.id, epic_id: epic.id}
-    |> Story.create_changeset(build(:story, attrs))
     |> Repo.insert!()
   end
 
@@ -80,7 +66,14 @@ defmodule Loopctl.ContextRetriever.ExecutorStaleColumnTest do
       actor_label: "agent:test"
     }
 
-    assert {:error, :stale_entity} =
-             Executor.run(scope, {"story", "sort_key", :filter}, %{"sort_key" => "3"})
+    # The executor maps EVERY Postgrex error to :stale_entity, so the result alone cannot tell
+    # the dropped column from any other failure; the logged code can.
+    log =
+      capture_log(fn ->
+        assert {:error, :stale_entity} =
+                 Executor.run(scope, {"story", "sort_key", :filter}, %{"sort_key" => "3"})
+      end)
+
+    assert log =~ ":undefined_column"
   end
 end

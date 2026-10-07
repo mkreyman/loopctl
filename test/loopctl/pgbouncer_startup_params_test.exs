@@ -20,7 +20,7 @@ defmodule Loopctl.PgbouncerStartupParamsTest do
     3. the FIX's mechanism — a server-side `statement_timeout` applied via `SET LOCAL`
        inside a transaction — actually ENFORCES through pgbouncer (cancels a slow query).
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   @moduletag :pgbouncer
 
