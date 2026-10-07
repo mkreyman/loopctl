@@ -24,6 +24,10 @@ defmodule LoopctlWeb.ThreadLiveTest do
 
   setup :verify_on_exit!
 
+  # render_async/1 waits 100ms by default. Under a loaded full-suite run that is not enough
+  # for the diff and checkpoint fetches, and TC-45.7.2 failed on it once (2026-10-07) while
+  # passing alone. The wait only bounds a failure; a passing render returns as soon as it can.
+  @async_timeout 2_000
   @epoch 2
   @tree String.duplicate("e", 40)
   @sha1 String.duplicate("1", 40)
@@ -305,12 +309,12 @@ defmodule LoopctlWeb.ThreadLiveTest do
       {:ok, view, _html} = open(ctx)
 
       view |> element("#diff-button-#{cp1.id}") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
       assert has_element?(view, "#diff-#{cp1.id}-base", "release-1")
       refute has_element?(view, "#diff-#{cp1.id}-base", "CURRENT base")
 
       view |> element("#diff-button-#{cp2.id}") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
       assert has_element?(view, "#diff-#{cp2.id}", "+second")
     end
 
@@ -328,7 +332,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
 
       {:ok, view, _html} = open(ctx)
       view |> element("#diff-button-#{cp.id}") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
 
       assert has_element?(view, "#diff-#{cp.id}", "+fallback")
       assert has_element?(view, "#diff-#{cp.id}-base", "CURRENT base")
@@ -348,7 +352,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
 
       {:ok, view, _html} = open(ctx)
       view |> element("#diff-button-#{cp.id}") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
 
       assert has_element?(view, "#diff-#{cp.id}", "no GitHub credential for this repository")
     end
@@ -363,9 +367,9 @@ defmodule LoopctlWeb.ThreadLiveTest do
 
       {:ok, view, _html} = open(ctx)
       view |> element("#diff-button-#{cp1.id}") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
       view |> element("#diff-button-#{cp2.id}") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
 
       assert has_element?(view, "#diff-#{cp2.id}", "+of #{@sha2}")
       refute has_element?(view, "#diff-#{cp1.id}")
@@ -382,14 +386,14 @@ defmodule LoopctlWeb.ThreadLiveTest do
 
       {:ok, view, _html} = open(ctx)
       render_hook(view, "load_diff", %{"id" => Ecto.UUID.generate()})
-      render_async(view)
+      render_async(view, @async_timeout)
       # Nothing was opened for an id this page does not show.
       assert :sys.get_state(view.pid).socket.assigns.open_diff == nil
 
       view |> element("#diff-button-#{cp.id}") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
       render_hook(view, "load_diff", %{"id" => cp.id})
-      render_async(view)
+      render_async(view, @async_timeout)
 
       assert has_element?(view, "#diff-#{cp.id}", "+once")
     end
@@ -416,7 +420,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
       assert has_element?(view, "#thread-entries pre", "implemented the thing")
 
       send(forge, :answer)
-      render_async(view)
+      render_async(view, @async_timeout)
       assert has_element?(view, "#diff-#{cp.id}", "did not answer")
 
       expect(Loopctl.MockPullRequestSource, :checkpoint_diff, fn _repo, "trunk", @sha1 ->
@@ -424,7 +428,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
       end)
 
       view |> element("#diff-#{cp.id}-retry") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
       assert has_element?(view, "#diff-#{cp.id}", "+second time")
     end
 
@@ -563,7 +567,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
 
       {:ok, view, _html} = open(ctx)
       view |> element("#diff-button-#{cp.id}") |> render_click()
-      render_async(view)
+      render_async(view, @async_timeout)
 
       # Written behind the page's back: a write that re-read the thread would show it.
       message(ctx, "behind", "written elsewhere")
