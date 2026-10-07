@@ -312,9 +312,25 @@ only be minted by a principal that has none. Do NOT "fix" this by giving an
 (`Dispatches.lineage_for_api_key/2`), and a second source the custody gates do not
 read reopens the same hole one layer down.
 
-## Dependency Injection — Config-Based (NOT Opts-Based)
+## Dependency Injection — inputs, never manipulated globals
 
-**All external dependencies use behaviours + config-based DI:**
+Mark, 2026-10-06 (KB `e6fc183e`), and again on 2026-10-07 for this repo: *"refactor all code
+that is trying to manipulate global state instead of passing that input as a param."* An
+`async: false` test is the symptom: it exists because the code reads something every test
+shares (app env, a named process or table, a telemetry handler, a Logger level, a row read on
+another repo's connection), so a test can only change it for everyone.
+
+**Shared state the code reads is an INPUT.** A function takes it as an argument or option
+whose default is the configured value, read once at the boundary and threaded down. A named
+server, table, cache or rate limiter takes a `:name`, so each test `start_supervised!`s its
+own. A row a boundary resolved (an API key, a story read on `AdminRepo`) reaches the inner
+logic as a value, so a test passes the row it inserted rather than committing one. The
+production default is the code path that did the global read before, so production behaviour
+does not change. This replaces the earlier rule here that opts were for query parameters only:
+that rule is what pushed test seams into globals.
+
+**External services stay behaviours + config-based DI**, because the behaviour IS the input
+the boundary reads:
 
 ```elixir
 # Define the behaviour
@@ -334,14 +350,14 @@ config :loopctl, :health_checker, Loopctl.MockHealthChecker
 @delivery_client Application.compile_env(:loopctl, :webhook_delivery, Loopctl.Webhooks.ReqDelivery)
 ```
 
-**NEVER** use `Application.put_env` in test files. **NEVER** pass dependencies as function opts.
-Opts are for query parameters (limit, offset, filters) only.
+**NEVER** use `Application.put_env` in test files, and never reach for another global in its
+place (a config-swapped repo, a registered name, a module-level Logger change): inject it.
 
 ## Test Conventions
 
 ### ABSOLUTE RULES
 
-1. **`async: true` on EVERY test file** via DataCase/ConnCase — except where the test's subject is shared state the sandbox cannot isolate (DDL on a shared table, planner statistics, VM-global processes): then `async: false`, with the reason in the module's moduledoc. An async test that ends holding a DDL lock on a shared table through one of its sandbox OWNER connections fails at teardown (`Loopctl.Test.LockGuard`); a connection it checks out itself is not checked
+1. **`async: true` on EVERY test file** via DataCase/ConnCase. A test that wants `async: false` because the code reads shared state is a design defect in the code: inject that state (see Dependency Injection above). The exceptions are tests whose SUBJECT is the shared thing — DDL on a shared table, planner statistics, committed transactions racing each other: then `async: false`, with the reason in the module's moduledoc. An async test that ends holding a DDL lock on a shared table through one of its sandbox OWNER connections fails at teardown (`Loopctl.Test.LockGuard`); a connection it checks out itself is not checked
 2. **NEVER `Application.put_env` in tests** — all service swapping via config/test.exs
 3. **`Mox.set_mox_from_context(tags)`** in DataCase/ConnCase setup for async isolation
 4. **`setup :verify_on_exit!`** on EVERY test file using Mox

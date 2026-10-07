@@ -46,7 +46,7 @@ The ACs may be incomplete. Also check:
 - **Missing validation** — Are changeset validations comprehensive? String lengths, required fields, enum constraints?
 - **Missing indexes** — Will the queries added by this story perform? Check for missing indexes on foreign keys and filter columns.
 - **N+1 queries** — Are associations preloaded where needed?
-- **Config-based DI** — Are external dependencies resolved via `Application.get_env` with behaviour-based mocks? NOT opts-based injection. NOT `Application.put_env` in tests.
+- **Dependency injection** — External services resolve through behaviours with config-based mocks. Shared state the code reads (app env, a named process or table, a telemetry handler, a row read on another repo) is an argument or option defaulting to the configured value, so tests inject it. A new `async: false` caused by the code reading shared state is a finding. NOT `Application.put_env` in tests.
 - **Fixture usage** — Tests use `fixture(:type, attrs)` from test/support/fixtures.ex, not inline record creation.
 
 ### 5. Classify Findings
