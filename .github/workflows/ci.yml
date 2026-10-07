@@ -938,10 +938,13 @@ jobs:
         # The data directory is a tmpfs, not the image's declared VOLUME. The runner removes a
         # service container without -v, so the anonymous volume outlived every run: 221 of them,
         # 476.7 GB, on beelink by 2026-10-07 (#946). A tmpfs gets no volume, so it dies with the
-        # container. It is capped because tmpfs pages are RAM shared with the slot's other jobs:
-        # a run's whole data dir, WAL included, measured ~2.2 GB as a leaked volume, and the
-        # report step at the end of this job prints the current figure. A run that outgrows the
-        # cap fails on ENOSPC instead of squeezing beelink's memory. Raise it when that report says so.
+        # container. Its pages are beelink's RAM (or swap) for the whole run, shared with every
+        # OTHER repo's CI runner on the host (home_care_billing's among them) and beelink's own
+        # Docker Postgres; this repo's jobs there run one at a time. The cap bounds that: a run's
+        # end-of-run data dir, WAL included, measured ~2.17 GB as a leaked volume, so a run that
+        # outgrows 4g fails on ENOSPC instead of growing without limit. The report step at the
+        # end of this job prints the container's PEAK memory, which bounds the tmpfs high-water
+        # mark from above; raise the cap when that peak nears it.
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -1070,16 +1073,29 @@ jobs:
         env:
           EMBEDDING_PLAN_GATE_DIMENSIONS: "1536"
 
-      # The figure the service's tmpfs cap is set against. Reported, never gating: the cap
-      # itself is what fails a run that outgrows it.
+      # The figures the service's tmpfs cap is set against. Reported, never gating: the cap
+      # itself is what fails a run that outgrows it. memory.peak is the container's cgroup
+      # high-water mark, and tmpfs pages are charged to it, so it bounds the data dir's PEAK
+      # from above (Postgres's own memory is in it too); df and du only see the end of the run,
+      # after WAL is recycled and sort files are gone. The log tail is the one record left when
+      # the cap WAS hit: Postgres PANICs on ENOSPC and the container may already be down.
+      # `set +e`, so one failing probe (du racing a recycled WAL file, a dead container) does
+      # not hide the rest.
       - name: Report the Postgres data directory's size against its tmpfs cap
         if: ${{ always() }}
         continue-on-error: true
         run: |
-          docker exec ${{ job.services.postgres.id }} df -h /var/lib/postgresql/data
-          docker exec ${{ job.services.postgres.id }} du -sh /var/lib/postgresql/data /var/lib/postgresql/data/pg_wal
+          set +e
+          pg=${{ job.services.postgres.id }}
+          echo "tmpfs cap: 4g; container memory.peak (bytes):"
+          docker exec "$pg" cat /sys/fs/cgroup/memory.peak
+          docker exec "$pg" df -h /var/lib/postgresql/data
+          docker exec "$pg" du -sh /var/lib/postgresql/data /var/lib/postgresql/data/pg_wal
           PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -Atc \
             "select 'loopctl_test: ' || pg_size_pretty(pg_database_size('loopctl_test'))"
+          echo "postgres log tail:"
+          docker logs --tail 50 "$pg" 2>&1
+          exit 0
 
   pgbouncer-e2e:
     name: Pgbouncer e2e (US-27.13)
