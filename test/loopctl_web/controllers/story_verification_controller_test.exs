@@ -1094,7 +1094,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       task_1 =
         Task.async(fn ->
           Sandbox.allow(Loopctl.Repo, parent, self())
-          Sandbox.allow(Loopctl.AdminRepo, parent, self())
+          Sandbox.allow(Loopctl.Repo, parent, self())
 
           build_conn()
           |> auth_conn(key_1)
@@ -1104,7 +1104,7 @@ defmodule LoopctlWeb.StoryVerificationControllerTest do
       task_2 =
         Task.async(fn ->
           Sandbox.allow(Loopctl.Repo, parent, self())
-          Sandbox.allow(Loopctl.AdminRepo, parent, self())
+          Sandbox.allow(Loopctl.Repo, parent, self())
 
           build_conn()
           |> auth_conn(key_2)

@@ -46,7 +46,7 @@ defmodule Loopctl.IntakeEscalationConcurrencyTest do
     # failure. It takes the row lock, tells the test, and waits to commit until told.
     holder =
       spawn_link(fn ->
-        Sandbox.unboxed_run(AdminRepo, fn ->
+        Sandbox.unboxed_run(Loopctl.Repo, fn ->
           AdminRepo.transaction(fn ->
             locked =
               AdminRepo.one!(from r in Record, where: r.id == ^record.id, lock: "FOR UPDATE")
@@ -70,7 +70,7 @@ defmodule Loopctl.IntakeEscalationConcurrencyTest do
 
     contender =
       Task.async(fn ->
-        Sandbox.unboxed_run(AdminRepo, fn ->
+        Sandbox.unboxed_run(Loopctl.Repo, fn ->
           Intake.escalate_record(tenant.id, record.id, "triage_trigger:target_epic_missing")
         end)
       end)
@@ -101,6 +101,6 @@ defmodule Loopctl.IntakeEscalationConcurrencyTest do
   end
 
   defp reloaded(id) do
-    Sandbox.unboxed_run(AdminRepo, fn -> AdminRepo.get!(Record, id) end)
+    Sandbox.unboxed_run(Loopctl.Repo, fn -> AdminRepo.get!(Record, id) end)
   end
 end

@@ -79,7 +79,6 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   import Ecto.Query, only: [from: 2]
 
   alias Loopctl.AdminRepo
-  alias Loopctl.AdminRepo.Route
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -370,6 +369,20 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   defp seed_status(_i, true), do: :published
 
   @doc """
+  Whether `repo`'s connection in this process is inside a transaction block, asked of the
+  DATABASE: `now()` is the transaction's start time, so two statements read the same value
+  only inside one. Ecto cannot answer this for a sandboxed test connection, whose wrapping
+  transaction the SQL sandbox hides (`in_transaction?/0` reads false there). Two round
+  trips, no writes; the seed guards' only cost.
+  """
+  @spec in_transaction_block?(module()) :: boolean()
+  def in_transaction_block?(repo) do
+    %{rows: [[first]]} = repo.query!("SELECT now()", [], log: false)
+    %{rows: [[second]]} = repo.query!("SELECT now()", [], log: false)
+    first == second
+  end
+
+  @doc """
   Seeds `count` published articles for `tenant_id`, seeds inter-article links,
   runs ANALYZE, and verifies statistics.
 
@@ -395,20 +408,16 @@ defmodule Loopctl.Knowledge.ScaleSeed do
           {:ok, %{articles: non_neg_integer(), links: non_neg_integer()}}
           | {:error, term()}
   def seed(tenant_id, opts \\ []) when is_binary(tenant_id) do
-    # Guard: refuse to run inside an open transaction. ScaleSeed must run UNBOXED
-    # (committed) — inside the DataCase async sandbox every insert_all + ANALYZE is
-    # rolled back, so ANALYZE sees n≈0 and the planner builds bogus stats. The seed
-    # opens no transaction of its own (insert_all per batch), so the connection being in a
-    # transaction (`Route.connection_in_transaction?/1`, whichever repo opened it) means
-    # we're inside the sandbox's wrapping transaction (or some other caller transaction) —
-    # exactly the misuse this guard exists to prevent. This is
-    # functional, unlike the prior checked_out?/sentinel approaches (both no-ops): the
-    # correct usage (`Ecto.Adapters.SQL.Sandbox.unboxed_run/2`) runs with no open
-    # transaction, so the guard passes there.
-    if Route.connection_in_transaction?(AdminRepo) do
+    # Guard: refuse to run inside a transaction block. ScaleSeed must run UNBOXED
+    # (committed): inside the DataCase sandbox every insert_all + ANALYZE is rolled back, so
+    # ANALYZE sees n≈0 and the planner builds bogus stats. The sandbox hides its wrapping
+    # transaction from Ecto, so the DATABASE is asked (`in_transaction_block?/1`); that also
+    # refuses any caller's open transaction. The correct usage (`Sandbox.unboxed_run/2`, or a
+    # production connection) autocommits, so the guard passes there.
+    if in_transaction_block?(AdminRepo) do
       raise """
-      ScaleSeed.seed/2 was called inside an open transaction (e.g. the DataCase
-      async SQL sandbox). Rows inserted in a sandbox transaction are rolled back, so
+      ScaleSeed.seed/2 was called inside a transaction block (e.g. on a DataCase SQL
+      sandbox connection). Rows inserted in a sandbox transaction are rolled back, so
       ANALYZE sees n≈0 and verify_stats! produces confusing false-RED results.
 
       Call ScaleSeed.seed/2 from a @tag :scale test that uses ExUnit.Case directly
@@ -463,10 +472,10 @@ defmodule Loopctl.Knowledge.ScaleSeed do
   """
   @spec seed_changes(binary(), keyword()) :: {:ok, %{changes: non_neg_integer()}}
   def seed_changes(tenant_id, opts \\ []) when is_binary(tenant_id) do
-    if Route.connection_in_transaction?(AdminRepo) do
+    if in_transaction_block?(AdminRepo) do
       raise """
-      ScaleSeed.seed_changes/2 was called inside an open transaction (e.g. the
-      DataCase async SQL sandbox). Rows inserted in a sandbox transaction are rolled
+      ScaleSeed.seed_changes/2 was called inside a transaction block (e.g. on a
+      DataCase SQL sandbox connection). Rows inserted in a sandbox transaction are rolled
       back, so ANALYZE sees n≈0. Call it from a @tag :scale_nightly test that uses
       ExUnit.Case directly and wraps DB ops in Sandbox.unboxed_run/2.
       """

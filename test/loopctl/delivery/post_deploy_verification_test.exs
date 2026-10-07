@@ -856,7 +856,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
   end
 
   defp full_sweep do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       purge_dependents(
         "tenant_id IN (SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')",
         []
@@ -895,7 +895,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
   end
 
   defp checkout_admin do
-    case Sandbox.checkout(AdminRepo, sandbox: false) do
+    case Sandbox.checkout(Loopctl.Repo, sandbox: false) do
       :ok -> :ok
       {:already, :owner} -> :ok
     end

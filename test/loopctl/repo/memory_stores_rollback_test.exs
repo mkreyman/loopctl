@@ -66,7 +66,7 @@ defmodule Loopctl.Repo.MemoryStoresRollbackTest do
   MigrationFile.require!(CreateEmbeddingSideTables, @side_tables_version)
 
   setup do
-    pid = Sandbox.start_owner!(AdminRepo)
+    pid = Sandbox.start_owner!(Loopctl.Repo)
     on_exit(fn -> Sandbox.stop_owner(pid) end)
     :ok
   end

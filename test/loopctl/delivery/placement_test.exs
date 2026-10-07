@@ -2256,7 +2256,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   # the TRIGGER, the object that does the damage. Run sequentially, the trigger goes first and
   # a failed `DROP FUNCTION` leaves an orphan nothing fires.
   defp drop_the_release_trigger!(name) do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON story_stages")
       AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)
@@ -2303,7 +2303,7 @@ defmodule Loopctl.Delivery.PlacementTest do
 
   # Unguarded and untransactioned for the reasons `drop_the_release_trigger!/1` states.
   defp drop_the_clear_trigger!(name) do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON stories")
       AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)
@@ -2355,7 +2355,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   # `IF EXISTS` on both, so the mid-test drop and the `on_exit` one compose. Unguarded and
   # untransactioned for the reasons `drop_the_release_trigger!/1` states at length.
   defp drop_the_revoke_trigger!(name) do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON dispatches")
       AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)

@@ -109,7 +109,7 @@ defmodule Loopctl.DataCase do
   """
   @spec vacuum_vector_indexes() :: :ok
   def vacuum_vector_indexes do
-    Sandbox.unboxed_run(Loopctl.AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       for table <- @vector_tables do
         Loopctl.AdminRepo.query!("VACUUM (INDEX_CLEANUP ON) #{table}", [])
       end

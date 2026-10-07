@@ -19,7 +19,6 @@ defmodule Loopctl.Delivery.StagesLockTest do
   import Ecto.Query, only: [from: 2]
   import Loopctl.Fixtures
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
@@ -88,12 +87,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
   defp with_chain_delete_trigger_disabled(fun) do
     # `on_exit` runs in its own process (which must check out), the tests run in this one
     # (which already has).
-    ProductionTopology.admin_repo_on_own_pool!()
-
-    case Sandbox.checkout(AdminRepo, sandbox: false) do
-      :ok -> :ok
-      {:already, :owner} -> :ok
-    end
+    :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
 
     {:ok, result} =
       AdminRepo.transaction(fn ->

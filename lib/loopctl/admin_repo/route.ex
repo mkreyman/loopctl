@@ -18,27 +18,49 @@ defmodule Loopctl.AdminRepo.Route do
   ## What the shared connection cannot show
 
   Production gives AdminRepo its OWN connection; the route takes it away, in every test that
-  does not put it back. Three behaviours exist only with the second connection:
+  does not put it back. These exist only with the second connection:
 
-  - **Atomicity.** An AdminRepo transaction opened inside a Repo transaction (an
-    `Loopctl.AuditChain.append/2` inside `Loopctl.Repo.with_tenant/2`) commits or rolls back
-    on its own in production. On the route it nests in the Repo transaction and shares its
-    fate; a raise through it fails the whole outer transaction.
+  - **Atomicity.** An AdminRepo transaction opened inside a Repo transaction (or the reverse)
+    commits or rolls back on its own in production. On the route it NESTS in the outer one,
+    and any failure of the inner one, a raise, a `rollback/1`, an `{:error, _}` return or a
+    failed Multi, fails the whole outer transaction, in either direction; the outer one can
+    then run no further statement.
   - **Self-blocking locks.** A process holding a row lock through one repo and writing the
     row through the other waits on itself in production, until `lock_timeout`. On the route
     the one connection already holds the lock and nothing waits.
   - **Visibility and role.** An AdminRepo read inside a tenant transaction runs BYPASSRLS
     and sees only committed rows in production; on the route it runs under the tenant's RLS
-    role and sees the transaction's own uncommitted writes. Measured on 2026-10-07 over the
-    delivery, web, runners, context retriever, custody, knowledge, e2e and workers
-    directories: one call site, `Loopctl.Threads.not_halted/1` reading the tenant row inside
-    `in_story_lock/3`, and `tenants` carries no RLS, so it reads the same row either way.
+    role (`tenant_id = current_tenant_id()` policies hide other tenants' and `tenant_id`
+    NULL system rows) and sees the transaction's own uncommitted writes.
+  - **Telemetry `metadata.repo`.** It comes from the pool's adapter meta, so routed AdminRepo
+    queries carry `Loopctl.Repo` there; the event name stays AdminRepo's (`__using__/1`), and
+    `Loopctl.Telemetry.SlowQueryLogger`, the one consumer, labels from the event.
+
+  **Measured, 2026-10-07**, by a temporary runtime trace over the whole default suite
+  (`test/loopctl`, `test/loopctl_web`, `test/mix`, `test/e2e` with `E2E_TESTS=true`: 12,202
+  tests; the 63 `:scale`, `:scale_nightly`, `:pgbouncer` and IPv6-tagged tests excluded):
+  - AdminRepo statements under the tenant's RLS role came from ONE lib call site,
+    `Loopctl.Threads.not_halted/1` reading the tenant row inside `in_story_lock/3`, and
+    `tenants` carries no RLS policy, so it reads the same row either way.
+  - A transaction of one repo nested in the other's in lib code: only
+    `Loopctl.Embeddings.off_dimension_rows?/3` (a heavy read inside a Repo transaction),
+    which handles only the overload shed, decided before its transaction opens. No inner
+    transaction returned an error; a lexical scan of lib finds no transaction body of one
+    repo containing the other's.
+  - No AdminRepo statement touched a table its enclosing Repo transaction had row-locked,
+    nor the reverse. The cross-connection lock paths are proved on two connections:
+    `Loopctl.Progress.ClaimLockTest` (the claim and reclaim locks),
+    `Loopctl.Delivery.StagesLockTest` (the stage, story and chain locks) and
+    `Loopctl.AdminRepoTopologyTest` (both behaviours above, both ways). There is no cheap
+    detector for the self-block under the route: Postgres keeps row locks in the tuple, not in
+    `pg_locks`, so "would this write wait on a row this process locked through the other
+    repo" cannot be asked without running it on a second connection, and a table-level proxy
+    would refuse legitimate writes to other rows.
 
   A test whose SUBJECT is one of these shows it with `Loopctl.Test.ProductionTopology`, which
-  puts a process back on AdminRepo's own pool (`Loopctl.AdminRepoTopologyTest` proves the
-  first two both ways). Two answers the route would otherwise change are kept as in
-  production: `in_transaction?/0` answers per repo (`__using__/1`), and a SAVEPOINT decision
-  asks the connection (`connection_in_transaction?/1`).
+  puts a process back on AdminRepo's own pool. Two answers the route would otherwise change
+  are kept as in production: `in_transaction?/0` answers per repo (`__using__/1`), and a
+  SAVEPOINT decision asks the connection (`connection_in_transaction?/1`).
   """
 
   @doc """

@@ -30,11 +30,18 @@ defmodule Loopctl.Test.ProductionTopology do
 
   @doc """
   `admin_repo_on_own_pool!/0`, then an unsandboxed checkout of each of `repos` in this
-  process: one real connection per repo, as in production.
+  process: one real connection per repo, as in production. A repo this process already
+  holds a checkout of is left as it is.
   """
   @spec checkout_unboxed!([module()], keyword()) :: :ok
   def checkout_unboxed!(repos, opts \\ []) do
     admin_repo_on_own_pool!()
-    Enum.each(repos, fn repo -> :ok = Sandbox.checkout(repo, [sandbox: false] ++ opts) end)
+
+    Enum.each(repos, fn repo ->
+      case Sandbox.checkout(repo, [sandbox: false] ++ opts) do
+        :ok -> :ok
+        {:already, :owner} -> :ok
+      end
+    end)
   end
 end

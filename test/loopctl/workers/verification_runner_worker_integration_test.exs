@@ -993,7 +993,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   end
 
   defp checkout_admin do
-    case Sandbox.checkout(AdminRepo, sandbox: false) do
+    case Sandbox.checkout(Loopctl.Repo, sandbox: false) do
       :ok -> :ok
       {:already, :owner} -> :ok
     end
@@ -1087,7 +1087,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
     holder =
       spawn(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
 
         AdminRepo.transaction(fn ->
           AdminRepo.query!("SELECT 1 FROM verification_runs WHERE id = $1 FOR UPDATE", [
@@ -1101,7 +1101,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           end
         end)
 
-        Sandbox.checkin(AdminRepo)
+        Sandbox.checkin(Loopctl.Repo)
       end)
 
     assert_receive :held, 5_000

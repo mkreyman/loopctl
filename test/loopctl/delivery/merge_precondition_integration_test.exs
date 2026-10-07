@@ -2363,7 +2363,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     parent = self()
 
     Task.start(fn ->
-      :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+      :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
 
       AdminRepo.transaction(fn ->
         AdminRepo.query!("SELECT 1 FROM story_stages WHERE story_id = $1 FOR UPDATE", [
@@ -2684,7 +2684,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   # both module boundaries: an earlier run that died mid-test leaves rows behind, and the
   # sweep alone cannot delete a tenant they still reference.
   defp full_sweep do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       purge_dependents(
         "tenant_id IN (SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')",
         []
@@ -2729,7 +2729,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   end
 
   defp checkout_admin do
-    case Sandbox.checkout(AdminRepo, sandbox: false) do
+    case Sandbox.checkout(Loopctl.Repo, sandbox: false) do
       :ok -> :ok
       {:already, :owner} -> :ok
     end

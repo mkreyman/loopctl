@@ -2123,7 +2123,7 @@ defmodule Loopctl.Fixtures do
     tenant_id = Map.get_lazy(attrs, :tenant_id, fn -> fixture(:committed_tenant, %{}).id end)
     name = Map.get(attrs, :name, "runner-#{System.unique_integer([:positive])}")
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       {:ok, {raw_key, api_key}} =
         Auth.generate_api_key(%{tenant_id: tenant_id, name: "runner:" <> name, role: :agent})
 
@@ -2162,7 +2162,7 @@ defmodule Loopctl.Fixtures do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       agent =
         %Agent{tenant_id: tenant_id}
         |> Agent.register_changeset(build(:agent, Map.take(attrs, [:name, :agent_type])))
@@ -2194,7 +2194,7 @@ defmodule Loopctl.Fixtures do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       {:ok, {raw_key, api_key}} =
         Auth.generate_api_key(%{
           tenant_id: tenant_id,
@@ -2618,7 +2618,7 @@ defmodule Loopctl.Fixtures do
     attrs = Enum.into(attrs, %{})
     seq = System.unique_integer([:positive])
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       tenant =
         %Tenant{}
         |> Tenant.create_changeset(%{
@@ -2857,7 +2857,7 @@ defmodule Loopctl.Fixtures do
     tenant_id = Map.fetch!(attrs, :tenant_id)
     now = DateTime.utc_now()
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       project_id =
         Map.get_lazy(attrs, :project_id, fn ->
           unique = System.unique_integer([:positive])
@@ -3415,7 +3415,7 @@ defmodule Loopctl.Fixtures do
   def sweep_committed_runner_tenants do
     import Ecto.Query, only: [from: 2]
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       ids =
         AdminRepo.all(
           from(t in Tenant, where: like(t.slug, ^"#{@committed_runner_marker}%"), select: t.id)
@@ -3464,7 +3464,7 @@ defmodule Loopctl.Fixtures do
   def sweep_committed_tenants(ids) when is_list(ids) do
     import Ecto.Query, only: [from: 2]
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       ours =
         AdminRepo.all(
           from(t in Tenant,

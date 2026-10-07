@@ -30,7 +30,7 @@ Ecto.Adapters.SQL.Sandbox.mode(Process.whereis(Loopctl.AdminRepo), :manual)
 # execute inside the sandbox transaction and be rolled back before any test sees it.
 # AdminRepo, because the worker issues its DDL through AdminRepo (it owns the partitions); in
 # test that is Repo's pool, checked out unsandboxed here, so the DDL still commits.
-Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.AdminRepo, fn ->
+Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.Repo, fn ->
   Loopctl.Workers.AuditPartitionWorker.ensure_partitions(back: 12)
 end)
 

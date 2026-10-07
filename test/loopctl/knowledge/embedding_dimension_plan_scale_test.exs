@@ -81,7 +81,7 @@ defmodule Loopctl.Knowledge.EmbeddingDimensionPlanScaleTest do
   # Rows must be COMMITTED (outside the sandbox transaction) for ANALYZE to build
   # real statistics — an in-sandbox seed yields n≈0 and the planner would pick a
   # Seq Scan for reasons that have nothing to do with the index.
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   setup do
     # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole

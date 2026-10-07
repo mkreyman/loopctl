@@ -2,15 +2,15 @@ import Config
 
 # Test concurrency + pool sizing — BOUNDED, and the two MUST move together.
 #
-# Three repos (Repo, AdminRepo, HeavyReadRepo) each open `pool_size` connections
-# EAGERLY at boot, so the suite's floor demand is 3 * pool_size before a single
-# test runs. Sizing that purely off the core count overruns a stock Postgres
+# Repo and HeavyReadRepo each open `pool_size` connections EAGERLY at boot, and AdminRepo
+# a small fixed pool (below), so the suite's floor demand is 2 * pool_size + 7 before a
+# single test runs. Sizing that purely off the core count overruns a stock Postgres
 # `max_connections` (100) on a high-core dev box: 24 cores * 2 * 3 repos = 144,
 # which fails as `DBConnection.ConnectionError ... queue_timeout` on sandbox
 # checkout — a full DB that reads like a missing one. Capping keeps the floor at
-# 3 * 16 = 48 on every machine (mac-mini, blockit, beelink) and in CI, plus
+# 2 * 16 + 7 = 39 on every machine (mac-mini, blockit, beelink) and in CI, plus
 # `Loopctl.Test.LockGuard`'s own non-sandbox pool of `max_cases` connections (at most 8
-# unless `mix test --max-cases` raises it, so at most 56 in all by default), leaving room for
+# unless `mix test --max-cases` raises it, so at most 47 in all by default), leaving room for
 # a second Elixir app on the same local Postgres.
 #
 # `max_cases` is derived from the SAME number on purpose: the pool must never be
@@ -83,9 +83,19 @@ config :loopctl, Loopctl.Repo,
   port: test_db_port,
   database: "loopctl_test#{test_partition}",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: test_pool_size
+  pool_size: test_pool_size,
+  # Scale tests seed ~80k rows under Sandbox.unboxed_run/2, which can exceed the
+  # default 60s ownership timeout (the seed takes >2 min) → "owner process crashed".
+  # Allow the unboxed connection to be held long enough for the prod-floor seed. On
+  # Repo's pool because AdminRepo's traffic, the seeds' included, runs on it in test (the
+  # route below).
+  ownership_timeout: :timer.minutes(30)
 
-# AdminRepo — same database, sandbox mode for tests
+# AdminRepo's OWN pool — same database, sandbox mode for tests. Only
+# `Loopctl.Test.ProductionTopology` checks a connection out of it (every other AdminRepo
+# call follows the route below onto Repo's pool), so it is sized for the most such
+# checkouts one test holds at once: `Loopctl.Delivery.StagesLockTest`'s AdminRepo race,
+# `@max_racers` (6) Tasks plus the test process's own checkout.
 config :loopctl, Loopctl.AdminRepo,
   username: "postgres",
   password: "postgres",
@@ -93,11 +103,7 @@ config :loopctl, Loopctl.AdminRepo,
   port: test_db_port,
   database: "loopctl_test#{test_partition}",
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: test_pool_size,
-  # Scale tests seed ~80k rows under Sandbox.unboxed_run/2, which can exceed the
-  # default 60s ownership timeout (the seed takes >2 min) → "owner process crashed".
-  # Allow the unboxed connection to be held long enough for the prod-floor seed.
-  ownership_timeout: :timer.minutes(30)
+  pool_size: 7
 
 # AdminRepo runs on Loopctl.Repo's sandbox connection in test (Epic 46, US-46.2). A test
 # inserts on one repo and the code under test reads on the other, as production does with
@@ -107,10 +113,10 @@ config :loopctl, Loopctl.AdminRepo,
 # `:default_dynamic_repo` (`Loopctl.AdminRepo.Route`), which refuses to compile this route
 # unless Repo's pool is the SQL sandbox, so a production build cannot share. Routed AdminRepo
 # queries keep AdminRepo's telemetry event. The AdminRepo pool above still starts (LockGuard
-# reads its connect options); nothing checks a connection out of it, and test_helper.exs
-# keeps it in :manual so a call that bypasses the route fails loudly instead of committing.
-# What production still has and this does not: AdminRepo's own connection, so a read inside
-# a `with_tenant` body is BYPASSRLS and blind to the tenant transaction's uncommitted rows.
+# reads its connect options; `Loopctl.Test.ProductionTopology` checks out of it), and
+# test_helper.exs keeps it in :manual so a call that bypasses the route fails loudly instead
+# of committing. What production still has and this does not, and how a test shows it:
+# `Loopctl.AdminRepo.Route`.
 config :loopctl, :admin_repo_route, Loopctl.Repo
 
 # HeavyReadRepo (US-27.11) — sandbox mode for tests. Nothing in the default suite routes

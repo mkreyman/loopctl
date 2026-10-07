@@ -204,7 +204,7 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       # AdminRepo; the enqueue writes oban_jobs via Loopctl.Repo — distinct repos,
       # so the two never contend on one connection.
       Sandbox.allow(Loopctl.Repo, self(), pid)
-      Sandbox.allow(Loopctl.AdminRepo, self(), pid)
+      Sandbox.allow(Loopctl.Repo, self(), pid)
 
       # The app-wide Oban testing mode is :inline, which EXECUTES each insert
       # immediately and so bypasses both `unique` and `schedule_in` — the very
@@ -267,7 +267,7 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
         )
 
       Sandbox.allow(Loopctl.Repo, self(), pid)
-      Sandbox.allow(Loopctl.AdminRepo, self(), pid)
+      Sandbox.allow(Loopctl.Repo, self(), pid)
 
       # Real append: broadcasts {:audit_chain_entry, entry} to the fixed firehose
       # the live enqueuer subscribed to in init. Local PubSub delivery is a

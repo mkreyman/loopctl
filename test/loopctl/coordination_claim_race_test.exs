@@ -27,7 +27,7 @@ defmodule Loopctl.CoordinationClaimRaceTest do
   alias Loopctl.Tenants.Tenant
 
   setup do
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+    :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
     :ok
   end
 
@@ -37,7 +37,7 @@ defmodule Loopctl.CoordinationClaimRaceTest do
     agents = for _ <- 1..n, do: fixture(:agent, %{tenant_id: tenant.id}).id
 
     on_exit(fn ->
-      :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+      :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
       # Deleting the tenant cascades to channel_claims (FK on_delete: delete_all)
       # but NOT to audit_log: its tenant FK was dropped in migration
       # 20260401031345 and audit_log is append-only (a delete-blocking trigger),
@@ -61,7 +61,7 @@ defmodule Loopctl.CoordinationClaimRaceTest do
     tasks =
       for agent_id <- agents do
         Task.async(fn ->
-          :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+          :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
           # role: :user bypasses the membership gate so the race isolates the
           # unique-constraint serialization, not the D3 gate.
           Coordination.claim(tenant.id, agent_id, project.id, "handoff:repo#812",

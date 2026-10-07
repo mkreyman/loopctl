@@ -13,7 +13,6 @@ defmodule Loopctl.AdminRepoRouteTest do
   alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.AdminRepo.Route
-  alias Loopctl.Knowledge.ScaleSeed
   alias Loopctl.Repo
   alias Loopctl.Tenants.Tenant
 
@@ -102,14 +101,6 @@ defmodule Loopctl.AdminRepoRouteTest do
                AdminRepo.transaction(fn ->
                  {Route.connection_in_transaction?(Repo), Repo.in_transaction?()}
                end)
-    end
-
-    test "ScaleSeed refuses a Repo transaction too: the connection's transaction decides" do
-      tenant = fixture(:tenant)
-
-      assert_raise RuntimeError, ~r/inside an open transaction/, fn ->
-        Repo.transaction(fn -> ScaleSeed.seed(tenant.id, count: 1) end)
-      end
     end
 
     test "a with_tenant raise inside an AdminRepo transaction fails that transaction, then nothing is left" do
@@ -205,6 +196,20 @@ defmodule Loopctl.AdminRepoRouteTest do
       assert offenders == []
     end
 
+    test "no Sandbox call names AdminRepo outside Loopctl.Test.ProductionTopology" do
+      # `Ecto.Adapters.SQL.Sandbox` resolves a repo atom through `get_dynamic_repo/0`, so a
+      # call naming AdminRepo acts on REPO's pool under the route: `mode(AdminRepo, :auto)`
+      # flips Repo's, a second `start_owner!` double-owns Repo's. Name Loopctl.Repo for that
+      # pool; AdminRepo's own pool is reached through the topology helper.
+      found =
+        for path <- Path.wildcard("{lib,test}/**/*.{ex,exs}"),
+            path != "test/support/production_topology.ex",
+            line <- sandbox_admin_calls(Code.string_to_quoted!(File.read!(path))),
+            do: "#{path}:#{line}"
+
+      assert found == []
+    end
+
     test "in test/, only Loopctl.Test.ProductionTopology moves AdminRepo off the route" do
       # Any other per-test swap is the manipulated global the DI rule forbids. The one other
       # call points AdminRepo at a repo that was never started, to make a read fail without
@@ -232,6 +237,8 @@ defmodule Loopctl.AdminRepoRouteTest do
   end
 
   defp lib_files, do: Path.wildcard("lib/**/*.ex")
+
+  @admin_repo_names ["AdminRepo", "Loopctl.AdminRepo"]
 
   @sql_functions ~w(query query! query_many query_many! stream explain table_exists? disconnect_all)a
 
@@ -289,6 +296,21 @@ defmodule Loopctl.AdminRepoRouteTest do
         when is_list(opts) ->
           if Keyword.has_key?(opts, :as),
             do: {node, [{"alias as", meta[:line]} | acc]},
+            else: {node, acc}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    acc
+  end
+
+  defp sandbox_admin_calls(ast) do
+    {_, acc} =
+      Macro.prewalk(ast, [], fn
+        {{:., _, [{:__aliases__, _, parts}, _fun]}, meta, [first | _]} = node, acc ->
+          if List.last(parts) == :Sandbox and Macro.to_string(first) in @admin_repo_names,
+            do: {node, [meta[:line] | acc]},
             else: {node, acc}
 
         node, acc ->

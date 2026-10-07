@@ -30,7 +30,7 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
   alias Loopctl.Tenants.Tenant
 
   setup do
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+    :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
     :ok
   end
 
@@ -61,7 +61,7 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
 
   defp cleanup(tenant) do
     on_exit(fn ->
-      :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+      :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
       AdminRepo.delete_all(from(t in Tenant, where: t.id == ^tenant.id))
     end)
   end
@@ -74,7 +74,7 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
 
     holder =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
 
         AdminRepo.transaction(fn ->
           from(t in Tenant, where: t.id == ^tenant.id, lock: "FOR UPDATE") |> AdminRepo.one()
@@ -92,7 +92,7 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
     # complete instantly — it blocks until the holder's transaction ends.
     waiter =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         start = System.monotonic_time(:millisecond)
 
         AdminRepo.transaction(fn ->
@@ -123,13 +123,13 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
 
     task_a =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Enrollment.enroll(tenant.id, attestation_attrs(), false)
       end)
 
     task_b =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Enrollment.enroll(tenant.id, attestation_attrs(), false)
       end)
 
@@ -170,13 +170,13 @@ defmodule Loopctl.Tenants.EnrollmentLockTest do
 
     task_a =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Enrollment.revoke(tenant.id, auth_a.id)
       end)
 
     task_b =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
         Enrollment.revoke(tenant.id, auth_b.id)
       end)
 

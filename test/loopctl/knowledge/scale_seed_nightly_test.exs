@@ -39,7 +39,7 @@ defmodule Loopctl.Knowledge.ScaleSeedNightlyTest do
   alias Loopctl.Tenants.Tenant
 
   defp with_unboxed_db(fun) do
-    Sandbox.unboxed_run(AdminRepo, fun)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   setup do

@@ -103,7 +103,6 @@ defmodule Loopctl.Memory.ScaleSeed do
   import Ecto.Query, only: [from: 2]
 
   alias Loopctl.AdminRepo
-  alias Loopctl.AdminRepo.Route
   alias Loopctl.Knowledge.ScaleSeed, as: KnowledgeScaleSeed
   alias Loopctl.Memory.Memory, as: MemorySchema
 
@@ -216,10 +215,10 @@ defmodule Loopctl.Memory.ScaleSeed do
              decoy_ids: [binary()]
            }}
   def seed_multi_subject(tenant_id, opts \\ []) when is_binary(tenant_id) do
-    if Route.connection_in_transaction?(AdminRepo) do
+    if KnowledgeScaleSeed.in_transaction_block?(AdminRepo) do
       raise """
-      Loopctl.Memory.ScaleSeed.seed_multi_subject/2 was called inside an open
-      transaction (e.g. the DataCase async SQL sandbox). Rows inserted in a
+      Loopctl.Memory.ScaleSeed.seed_multi_subject/2 was called inside a transaction
+      block (e.g. on a DataCase SQL sandbox connection). Rows inserted in a
       sandbox transaction are rolled back, so ANALYZE sees n≈0 and recall reads
       nothing. Call it from a @tag :scale test that uses ExUnit.Case directly
       (not DataCase) and wraps DB ops in Ecto.Adapters.SQL.Sandbox.unboxed_run/2.

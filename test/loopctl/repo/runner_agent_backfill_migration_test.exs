@@ -39,7 +39,7 @@ defmodule Loopctl.Repo.RunnerAgentBackfillMigrationTest do
   MigrationFile.require!(AddAgentIdToRunners, @version)
 
   setup do
-    pid = Sandbox.start_owner!(AdminRepo)
+    pid = Sandbox.start_owner!(Loopctl.Repo)
     on_exit(fn -> Sandbox.stop_owner(pid) end)
 
     # Back to the pre-column world, which is the only state the backfill ever sees.

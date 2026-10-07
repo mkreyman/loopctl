@@ -171,7 +171,7 @@ defmodule Loopctl.Runners.CapacityTest do
   # function itself: its audit-chain entry cannot be deleted, so the sweep could not remove
   # the committed tenant.
   defp revoke(runner) do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       {1, _} =
         from(r in Runner, where: r.id == ^runner.id)
         |> AdminRepo.update_all(set: [revoked_at: DateTime.utc_now()])
@@ -1035,7 +1035,7 @@ defmodule Loopctl.Runners.CapacityTest do
       slot = generation(runner, d.dispatch_id)
 
       outcome =
-        Sandbox.unboxed_run(AdminRepo, fn ->
+        Sandbox.unboxed_run(Loopctl.Repo, fn ->
           AdminRepo.transaction(fn ->
             DispatchLedger.release_slot_in(AdminRepo, runner.tenant_id, d.dispatch_id, slot)
           end)
@@ -1070,7 +1070,7 @@ defmodule Loopctl.Runners.CapacityTest do
       slot = generation(runner, d.dispatch_id)
 
       assert_raise ArgumentError, ~r/must run inside the caller's/, fn ->
-        Sandbox.unboxed_run(AdminRepo, fn ->
+        Sandbox.unboxed_run(Loopctl.Repo, fn ->
           DispatchLedger.release_slot_in(AdminRepo, runner.tenant_id, d.dispatch_id, slot)
         end)
       end
@@ -1084,7 +1084,7 @@ defmodule Loopctl.Runners.CapacityTest do
       {:ok, _} = send_dispatch(runner, d)
       slot = generation(runner, d.dispatch_id)
 
-      Sandbox.unboxed_run(AdminRepo, fn ->
+      Sandbox.unboxed_run(Loopctl.Repo, fn ->
         AdminRepo.transaction(fn ->
           {:ok, :released} =
             DispatchLedger.release_slot_in(AdminRepo, runner.tenant_id, d.dispatch_id, slot)
@@ -1442,7 +1442,7 @@ defmodule Loopctl.Runners.CapacityTest do
       assert unreleased(dead) == 1
 
       unboxed(fn ->
-        Sandbox.unboxed_run(AdminRepo, fn ->
+        Sandbox.unboxed_run(Loopctl.Repo, fn ->
           assert :ok = HealRunnerCapacityWorker.perform(%Oban.Job{args: %{}})
         end)
       end)
@@ -1456,7 +1456,7 @@ defmodule Loopctl.Runners.CapacityTest do
       {:ok, _} = send_dispatch(runner, dispatch(runner.tenant_id))
 
       unboxed(fn ->
-        Sandbox.unboxed_run(AdminRepo, fn ->
+        Sandbox.unboxed_run(Loopctl.Repo, fn ->
           assert :ok = HealRunnerCapacityWorker.perform(%Oban.Job{args: %{}})
         end)
       end)
@@ -1474,7 +1474,7 @@ defmodule Loopctl.Runners.CapacityTest do
       assert in_flight(runner) == 2
 
       unboxed(fn ->
-        Sandbox.unboxed_run(AdminRepo, fn ->
+        Sandbox.unboxed_run(Loopctl.Repo, fn ->
           assert :ok = HealRunnerCapacityWorker.perform(%Oban.Job{args: %{}})
         end)
       end)

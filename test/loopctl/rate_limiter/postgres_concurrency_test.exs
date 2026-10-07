@@ -48,7 +48,7 @@ defmodule Loopctl.RateLimiter.PostgresConcurrencyTest do
     :ok
   end
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   test "concurrent independent connections are capped at the GLOBAL budget (not N×)" do
     bucket = "test:cluster-real:#{Ecto.UUID.generate()}"
