@@ -935,11 +935,19 @@ jobs:
           # Loopback only, on a port Docker picks: postgres/postgres must not be offered to the
           # LAN, and a fixed 5432 would collide with the host's own Postgres.
           - 127.0.0.1::5432
+        # The data directory is a tmpfs, not the image's declared VOLUME. The runner removes a
+        # service container without -v, so the anonymous volume outlived every run: 221 of them,
+        # 476.7 GB, on beelink by 2026-10-07 (#946). A tmpfs gets no volume, so it dies with the
+        # container. It is capped because tmpfs pages are RAM shared with the slot's other jobs:
+        # a run's whole data dir, WAL included, measured ~2.2 GB as a leaked volume, and the
+        # report step at the end of this job prints the current figure. A run that outgrows the
+        # cap fails on ENOSPC instead of squeezing beelink's memory. Raise it when that report says so.
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+          --tmpfs /var/lib/postgresql/data:rw,size=4g
 
     steps:
       - uses: actions/checkout@v4
@@ -1061,6 +1069,17 @@ jobs:
             test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs
         env:
           EMBEDDING_PLAN_GATE_DIMENSIONS: "1536"
+
+      # The figure the service's tmpfs cap is set against. Reported, never gating: the cap
+      # itself is what fails a run that outgrows it.
+      - name: Report the Postgres data directory's size against its tmpfs cap
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          docker exec ${{ job.services.postgres.id }} df -h /var/lib/postgresql/data
+          docker exec ${{ job.services.postgres.id }} du -sh /var/lib/postgresql/data /var/lib/postgresql/data/pg_wal
+          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_test -Atc \
+            "select 'loopctl_test: ' || pg_size_pretty(pg_database_size('loopctl_test'))"
 
   pgbouncer-e2e:
     name: Pgbouncer e2e (US-27.13)
