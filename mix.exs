@@ -64,7 +64,20 @@ defmodule Loopctl.MixProject do
           # (status and body, `Loopctl.Webhooks.ReqDelivery`) and never acted on, so a
           # smuggled response can at worst put one tenant's relay response in
           # another's delivery record. Accepted against the crash above.
-          "CVE-2026-94194"
+          "CVE-2026-94194",
+          # cloak 1.1.4 and cloak_ecto 1.3.0 — no patched release exists for either
+          # advisory below: as of 2026-10-07 both are the newest on hex (both 2024-04-06).
+          # Each affects a module loopctl never uses. Every vault cipher is
+          # Cloak.Ciphers.AES.GCM, which is authenticated, and no schema hashes a field
+          # with a PBKDF2 type. test/loopctl/vault/cloak_advisory_reachability_test.exs
+          # fails if lib/ or config/ ever names either module. Recheck when cloak > 1.1.4
+          # or cloak_ecto > 1.3.0.
+          # CVE-2026-95105 (HIGH): Cloak.Ciphers.AES.CTR has no ciphertext
+          # authentication, so a ciphertext can be bit-flipped into a chosen plaintext.
+          "CVE-2026-95105",
+          # CVE-2026-94206 (MEDIUM): Cloak.Ecto.PBKDF2 ignores the configured iteration
+          # count and runs only :size rounds.
+          "CVE-2026-94206"
         ]
       ],
       dialyzer: [
