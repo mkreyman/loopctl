@@ -1,0 +1,57 @@
+{
+  "id": "US-46.6",
+  "title": "Port the test-suite hygiene guard",
+  "epic": {
+    "id": "epic_46",
+    "name": "Async test suite through dependency injection"
+  },
+  "priority": "high",
+  "story": {
+    "as_a": "suite",
+    "i_want_to": "a test that fails when a sync module has no stated reason or a test writes global state",
+    "so_that": "the suite cannot drift back"
+  },
+  "rationale": "home_care_billing's test/home_care_billing/test_suite_hygiene_test.exs (PR #2272) does this; without it every conversion here decays.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-46.6.1",
+      "description": "A module running sync and not on the guard's allow-list with a reason fails the suite."
+    },
+    {
+      "id": "AC-46.6.2",
+      "description": "Writes to application env, OS env, Logger config or levels, persistent_term and Mox global mode fail the suite."
+    },
+    {
+      "id": "AC-46.6.3",
+      "description": "Async DDL or LOCK TABLE on a table an app schema uses fails the suite."
+    },
+    {
+      "id": "AC-46.6.4",
+      "description": "The allow-list holds only the legitimately sync modules below, each with its reason."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-46.6.1",
+      "name": "Guard catches a regression",
+      "type": "integration",
+      "steps": [
+        "Add async: false to a module not on the allow-list",
+        "Run the guard"
+      ],
+      "expected_results": [
+        "The guard fails naming the module"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Legitimately sync (real concurrency, committed-corpus scale and plan tests, migration DDL, the lock guard itself): test/loopctl/coordination_claim_race_test.exs; test/loopctl/delivery/stages_lock_test.exs; test/loopctl/intake_escalation_concurrency_test.exs; test/loopctl/progress/claim_lock_test.exs; test/loopctl/rate_limiter/postgres_concurrency_test.exs; test/loopctl/runners/capacity_test.exs; test/loopctl/tenants/enrollment_lock_test.exs; test/loopctl/threads/review_dispatch_race_test.exs; test/loopctl/token_usage/correction_lock_test.exs; test/loopctl/context_retriever/entity_definitions_rollback_test.exs; test/loopctl/embeddings/hnsw_dead_entry_recall_test.exs; test/loopctl/knowledge/by_source_change_feed_plan_scale_test.exs; test/loopctl/knowledge/consolidation_scoring_failure_test.exs; test/loopctl/knowledge/cosine_lint_vs_scale_gate_scale_test.exs; test/loopctl/knowledge/distant_pairs_novelty_scale_test.exs; test/loopctl/knowledge/embedding_dimension_plan_scale_test.exs; test/loopctl/knowledge/keyset_plan_scale_test.exs; test/loopctl/knowledge/plan_assertions_scale_test.exs; test/loopctl/knowledge/remediation_matrix_scale_test.exs; test/loopctl/knowledge/scale_calibration_mismatch_scale_test.exs; test/loopctl/knowledge/scale_seed_nightly_test.exs; test/loopctl/knowledge/scale_seed_test.exs; test/loopctl/knowledge/streaming_export_scale_test.exs; test/loopctl/knowledge/topk_endpoints_scale_test.exs; test/loopctl/knowledge/vector_endpoint_e2e_latency_scale_test.exs; test/loopctl/knowledge/vector_search_scale_test.exs; test/loopctl/knowledge/vector_search_under_fill_scale_test.exs; test/loopctl/memory/scale_recall_test.exs; test/loopctl/migrations/fresh_db_embedding_guard_test.exs; test/loopctl/repo/add_articles_published_reconciliation_index_migration_test.exs; test/loopctl/repo/drop_legacy_articles_embedding_hnsw_index_migration_test.exs; test/loopctl/repo/drop_redundant_channel_posts_recent_idx_migration_test.exs; test/loopctl/repo/memory_stores_rollback_test.exs; test/loopctl/repo/runner_agent_backfill_migration_test.exs; test/loopctl/repo/triage_dispatch_backfill_migration_test.exs; test/loopctl/test_lock_guard_test.exs; test/loopctl/threads/thread_reviews_rollback_test.exs; test/loopctl/vault/rotation_race_test.exs; test/loopctl/workers/audit_partition_worker_test.exs; test/loopctl/workers/revoke_expired_dispatches_plan_scale_test.exs",
+    "Two DDL tests are convertible by injection rather than allow-listed: consolidation_scoring_failure (inject the similarity reader) and vault/rotation_race (inject a write hook)."
+  ],
+  "dependencies": [
+    "US-46.2",
+    "US-46.3",
+    "US-46.4",
+    "US-46.5"
+  ]
+}

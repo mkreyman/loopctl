@@ -1,0 +1,45 @@
+{
+  "id": "US-46.5",
+  "title": "Inject named processes, telemetry handlers, Logger levels, Oban and env",
+  "epic": {
+    "id": "epic_46",
+    "name": "Async test suite through dependency injection"
+  },
+  "priority": "medium",
+  "story": {
+    "as_a": "test",
+    "i_want_to": "my own instance of every named process, handler and setting I touch",
+    "so_that": "I never change it for another test"
+  },
+  "rationale": "These modules are sync because they start a named process, attach a VM-global telemetry handler, change a Logger level, use a global Oban mode, or read an env var or path.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-46.5.1",
+      "description": "Every converted module is `async: true`; the commit gate passes; production behaviour is unchanged (the injected input defaults to the value the code read before)."
+    },
+    {
+      "id": "AC-46.5.2",
+      "description": "Named servers and tables take :name; handlers take a per-test id and filter on the test's key; Logger levels are raised once in test_helper.exs; Oban takes the instance; env and paths are arguments."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-46.5.1",
+      "name": "Global-state tests run async",
+      "type": "integration",
+      "steps": [
+        "Convert the listed files",
+        "Run them together three times"
+      ],
+      "expected_results": [
+        "0 failures"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Files (global noted): test/loopctl/auth/api_key_cache_restart_test.exs — ApiKeyCache named ETS table + supervised owner restart; test/loopctl/embeddings/system_config_read_path_test.exs — SystemConfig persistent_term read-path flag; test/loopctl/heavy_read_hnsw_ef_search_test.exs — persistent_term {Loopctl.SystemConfig, \"hnsw_ef_search\"}; test/loopctl/heavy_read_savepoint_probe_test.exs — persistent_term HeavyRead iterative_scan probe cache + idle sandbox:false checkout; test/loopctl/knowledge_breaker_latency_test.exs — SystemConfig persistent_term breaker latency knobs; test/loopctl/knowledge/embedding_concurrency_down_test.exs — Singleton app-supervised Loopctl.Knowledge.EmbeddingConcurrency GenServer; test/loopctl/llm/settings_cache_restart_test.exs — Loopctl.Llm.SettingsCache named ETS table + permanent supervised owner; test/loopctl/release_custody_profile_test.exs — SystemConfig persistent_term custody profile; test/loopctl/telemetry/metrics_reporter_test.exs — Registered name Loopctl.Telemetry.MetricsReporter; test/loopctl/telemetry/scale_metrics_test.exs — persistent_term {ScaleMetrics, :tenant_label?} gate; test/loopctl/workers/batch_article_embedding_worker_test.exs — SystemConfig persistent_term embedding_batch_max; test/loopctl/workers/content_ingestion_worker_test.exs — SystemConfig persistent_term embedding_batch_max; test/loopctl/workers/knowledge_lint_worker_caps_test.exs — SystemConfig persistent_term consolidation caps; test/loopctl/egress/degraded_search_test.exs — [:loopctl,:llm,:provider_error] VM-global telemetry; test/loopctl/knowledge_semantic_search_provider_error_test.exs — [:loopctl,:llm,:provider_error] VM-global telemetry; test/loopctl/llm/anthropic_test.exs — [:loopctl,:llm,:provider_error] VM-global telemetry (listener and emitter); test/loopctl/provider_test.exs — [:loopctl,:llm,:provider_error] VM-global telemetry; test/loopctl/telemetry/oban_metrics_poller_test.exs — Untagged executing_orphan telemetry event; Sandbox.mode toggling; test/loopctl/telemetry/scale_alerts_test.exs — Global :telemetry listeners on scale events; Mox global; test/loopctl_web/telemetry_prometheus_test.exs — Started Prometheus reporter attaches VM-wide handlers; test/loopctl/delivery/budget_escalation_refused_test.exs — capture_log collects every process's logs; test/loopctl/telemetry/slow_query_logger_test.exs — capture_log + app-attached SlowQueryLogger telemetry handler; test/loopctl_web/controllers/renew_claim_logging_test.exs — Logger.put_module_level VM-global; test/loopctl_web/runner_observability_test.exs — Logger.put_module_level VM-global; RunnerSocket auth on AdminRepo; test/loopctl/workers/reclaim_expired_claims_logging_test.exs — Logger.put_module_level VM-global; test/loopctl/egress/oban_terminal_test.exs — Real Oban queue drain; queue-wide counts; test/loopctl/egress/webhook_oban_terminal_test.exs — Real Oban queue drain; queue-wide counts; test/loopctl/config_worktree_partition_test.exs — OS env MIX_TEST_PARTITION (System.put_env); test/loopctl/secrets/local_file_adapter_test.exs — App env :secrets_file single shared file path"
+  ],
+  "dependencies": [
+    "US-46.1"
+  ]
+}
