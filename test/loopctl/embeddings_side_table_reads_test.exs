@@ -61,6 +61,22 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   `SET LOCAL` through), and no failure mode has EVER returned another tenant's rows — this
   was never an isolation defect.
 
+  ## Why this is `async: false`
+
+  Not the flake, and not the read-path flag: that is an injected collaborator
+  (`Loopctl.Embeddings.ReadPathBehaviour`), so `enable_side_table_reads/0` is a
+  PROCESS-SCOPED `Mox.stub/3` and nothing VM-global is written for it. (The flag's real
+  per-node globality is covered in `test/loopctl/embeddings/system_config_read_path_test.exs`.)
+
+  The reason is `@moduletag :vacuum_vector_indexes`: every test here VACUUMs the vector tables
+  through `Loopctl.DataCase.vacuum_vector_indexes/0`, which repairs the HNSW graph only on a
+  QUIET database. As a sync module this file runs after every async module has finished, so it
+  gets that quiet phase; run async, its VACUUMs would compete with the async suite's open
+  transactions and with the other vacuum-tagged modules (VACUUM's ShareUpdateExclusiveLock
+  conflicts with itself). #519 first added `async: false` on a different theory, that
+  concurrent inserts perturbed a shared index; that one was wrong, and the same failure
+  reappeared in `system_config_read_path_test.exs`.
+
   ## What #535 did fix (real, and still in place)
 
   `SET LOCAL` leaks out of a committed SAVEPOINT. Under Sandbox every heavy read nests in
@@ -139,7 +155,7 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   vectors and a page size wider than the candidate set (below).
   """
 
-  use Loopctl.DataCase, async: true
+  use Loopctl.DataCase, async: false
 
   # #645 — vacuum the pgvector graph before each test in this module. Rolled-back tests
   # leave DEAD HNSW entries behind, and pgvector's scan skips dead elements rather than

@@ -15,7 +15,7 @@ defmodule Loopctl.Repo.RlsTest do
       id: UUID.generate(),
       name: name,
       slug: "#{name}-#{System.unique_integer([:positive])}",
-      email: "#{name}@example.com",
+      email: "#{name}-#{System.unique_integer([:positive])}@example.com",
       status: :active
     }
     |> Repo.insert!()
@@ -139,7 +139,7 @@ defmodule Loopctl.Repo.RlsTest do
           id: UUID.generate(),
           name: "admin-a",
           slug: "admin-a-#{System.unique_integer([:positive])}",
-          email: "admin-a@example.com",
+          email: "admin-a-#{System.unique_integer([:positive])}@example.com",
           status: :active
         }
         |> AdminRepo.insert!()
@@ -149,7 +149,7 @@ defmodule Loopctl.Repo.RlsTest do
           id: UUID.generate(),
           name: "admin-b",
           slug: "admin-b-#{System.unique_integer([:positive])}",
-          email: "admin-b@example.com",
+          email: "admin-b-#{System.unique_integer([:positive])}@example.com",
           status: :active
         }
         |> AdminRepo.insert!()

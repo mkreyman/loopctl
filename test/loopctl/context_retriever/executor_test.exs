@@ -273,37 +273,14 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
   end
 
   describe "TC-30.3.6 — fail-closed edges" do
+    # The stale-backing-column edge is in `executor_stale_column_test.exs`: it runs DDL on
+    # `stories`, so it is the one TC-30.3.6 case that cannot run async.
+
     test "a nil-tenant (superadmin) scope is refused with no cross-tenant read" do
       superadmin_scope = %Scope{tenant_id: nil, role: :superadmin, actor_label: "superadmin"}
 
       assert {:error, :no_tenant} =
                Executor.run(superadmin_scope, {"story", "title", :filter}, %{"title" => "x"})
-    end
-
-    test "a declared field whose backing column was dropped returns :stale_entity" do
-      tenant = repo_tenant()
-      seed_story(tenant.id, %{title: "Some story", number: "101"})
-
-      # sort_key is a server-allowlisted :integer column, not part of the
-      # search_vector and not :decimal (so it is filter-supported).
-      create_story_entity(tenant.id, [
-        %{name: "sort_key", type: :integer, filterable: true, searchable: false}
-      ])
-
-      # A stale entity def is one whose backing column no longer exists: the read raises
-      # Postgres `undefined_column`. The read is injected rather than provoked with
-      # `ALTER TABLE stories DROP COLUMN`, which held a lock on `stories` for the whole test.
-      dropped_column = fn _base, _page ->
-        raise %Postgrex.Error{postgres: %{code: :undefined_column, message: "no sort_key"}}
-      end
-
-      assert {:error, :stale_entity} =
-               Executor.run(
-                 scope_for(tenant),
-                 {"story", "sort_key", :filter},
-                 %{"sort_key" => "3"},
-                 read: dropped_column
-               )
     end
   end
 
