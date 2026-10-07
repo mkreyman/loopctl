@@ -150,8 +150,10 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Runners.Runner
   alias Loopctl.WorkBreakdown.Story
 
-  @lock_timeout "2000ms"
-  @statement_timeout "5000ms"
+  # 2s / 5s in every deployed environment; tunables for the same reason as
+  # `Loopctl.Runners.Capacity`'s lock timeout (config/test.exs sets shorter waits).
+  @lock_timeout "#{Application.compile_env(:loopctl, :stages_lock_timeout_ms, 2_000)}ms"
+  @statement_timeout "#{Application.compile_env(:loopctl, :stages_statement_timeout_ms, 5_000)}ms"
 
   # The story statuses a claim holds. Entering `claimed` needs one.
   @claimed_statuses [:assigned, :implementing]

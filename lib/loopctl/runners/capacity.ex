@@ -206,7 +206,10 @@ defmodule Loopctl.Runners.Capacity do
   alias Loopctl.WorkBreakdown.Story
 
   @default_limit 6
-  @lock_timeout_ms 5_000
+  # 5s in every deployed environment. A tunable rather than a literal so the test env can set
+  # a shorter wait (config/test.exs): the busy-path tests each wait it out in full, and the
+  # value is the input they need, not something to change per test.
+  @lock_timeout_ms Application.compile_env(:loopctl, :capacity_lock_timeout_ms, 5_000)
   @release_grace_seconds 300
   @unpushed_grace_seconds 120
   @reply_grace_seconds 120

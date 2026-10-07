@@ -126,6 +126,15 @@ config :loopctl, Loopctl.HeavyReadRepo,
 # tests stay sub-second.
 config :loopctl, :heavy_read_statement_timeout_ms, 250
 
+# Delivery-loop lock waits (`Loopctl.Runners.Capacity`, `Loopctl.Delivery.Stages`): 5s, 2s and
+# 5s when deployed. The busy-path tests hold a lock on a second connection and wait each of
+# these out in full, so at the deployed values they cost about 5s apiece. Shorter here, with
+# the statement timeout kept above the lock timeout as in production, and long enough that a
+# waiter behind a lock held for a moment still gets it.
+config :loopctl, :capacity_lock_timeout_ms, 1_000
+config :loopctl, :stages_lock_timeout_ms, 1_000
+config :loopctl, :stages_statement_timeout_ms, 2_500
+
 # US-33.4: set the touch-buffer flush interval very high in tests so the
 # app-tree singleton NEVER auto-flushes during a run — its timer would fire in
 # the GenServer process without a checked-out sandbox connection and could drain
