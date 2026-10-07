@@ -6,12 +6,12 @@ defmodule Loopctl.ReleaseCustodyProfileTest do
   the repo lifecycle for the ephemeral eval node) so the LOGIC runs in the test
   sandbox.
 
-  `async: false` DELIBERATELY: `set_custody_profile/1` writes the VM-global
-  `SystemConfig` `:persistent_term` cache (the same key every deployment node
-  reads), so priming it from an `async: true` module would bleed the profile into
-  a concurrently-running custody test — mirrors `heavy_read_hnsw_ef_search_test`.
+  Each test hands the helpers its OWN `SystemConfig` namespace (`set_custody_profile/2`,
+  `print_custody_profile_status/1`), so the row they write and refresh is cached where no
+  other test reads it, and the node-wide custody profile every custody test reads never
+  moves.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   import ExUnit.CaptureIO
 
@@ -22,10 +22,9 @@ defmodule Loopctl.ReleaseCustodyProfileTest do
   alias Loopctl.Test.CustodyEnrollment
 
   setup do
-    # Restore the shipped default (bearer) after each test so a primed `signed`
-    # never leaks past this module — erase mirrors the #488 prime helpers.
-    on_exit(fn -> :persistent_term.erase({SystemConfig, SignedProfilePolicy.profile_key()}) end)
-    :ok
+    # `refresh/1` loads EVERY row this test's sandbox can see into its namespace — an ETS
+    # table this test process owns, so all of it is gone when the test exits.
+    {:ok, cache: :ets.new(:custody_profile_config, [:set, :public])}
   end
 
   # `SignedProfilePolicy.profile/0` is redirected through a process-dict stub in
@@ -33,31 +32,40 @@ defmodule Loopctl.ReleaseCustodyProfileTest do
   # the SystemConfig row the command writes. Assert on the STORED SystemConfig value
   # directly — that is the deployment source of truth the running nodes refresh from
   # and, in prod (no stub), exactly what `profile/0` reads.
-  defp stored_profile_code,
-    do: SystemConfig.get_int(SignedProfilePolicy.profile_key(), 0)
+  defp stored_profile_code(cache),
+    do: SystemConfig.get_int(SignedProfilePolicy.profile_key(), 0, cache)
 
   describe "custody_signed_profile enable/disable" do
-    test "enable writes signed (1); disable restores bearer (0)" do
-      assert capture_io(fn -> Release.set_custody_profile(1) end) =~ "signed"
-      assert stored_profile_code() == 1
+    test "enable writes signed (1); disable restores bearer (0)", %{cache: cache} do
+      node_wide = {SystemConfig, SignedProfilePolicy.profile_key()}
+      before = :persistent_term.get(node_wide, :unset)
 
-      assert capture_io(fn -> Release.set_custody_profile(0) end) =~ "bearer"
-      assert stored_profile_code() == 0
+      assert capture_io(fn -> Release.set_custody_profile(1, cache) end) =~ "signed"
+      assert stored_profile_code(cache) == 1
+
+      assert :persistent_term.get(node_wide, :unset) == before,
+             "the flip must land in this test's namespace, never the node-wide profile " <>
+               "every custody test reads"
+
+      assert capture_io(fn -> Release.set_custody_profile(0, cache) end) =~ "bearer"
+      assert stored_profile_code(cache) == 0
     end
 
-    test "the written value survives a cache refresh (it is persisted, not just cached)" do
-      capture_io(fn -> Release.set_custody_profile(1) end)
+    test "the written value survives a cache refresh (it is persisted, not just cached)", %{
+      cache: cache
+    } do
+      capture_io(fn -> Release.set_custody_profile(1, cache) end)
       # Drop the local cache entirely, then reload from the DB — proves the write
       # landed in the durable SystemConfig row the running nodes refresh from.
-      :persistent_term.erase({SystemConfig, SignedProfilePolicy.profile_key()})
-      SystemConfig.refresh()
-      assert stored_profile_code() == 1
+      :ets.delete(cache, SignedProfilePolicy.profile_key())
+      SystemConfig.refresh(cache)
+      assert stored_profile_code(cache) == 1
     end
   end
 
   describe "custody_signed_profile status" do
-    test "status reports the profile and the enforcement/KB-safety boundary" do
-      out = capture_io(fn -> Release.print_custody_profile_status() end)
+    test "status reports the profile and the enforcement/KB-safety boundary", %{cache: cache} do
+      out = capture_io(fn -> Release.print_custody_profile_status(cache) end)
 
       assert out =~ "signed custody profile"
       assert out =~ "enrolled dispatches"
@@ -66,25 +74,26 @@ defmodule Loopctl.ReleaseCustodyProfileTest do
       assert out =~ "Knowledge Wiki"
     end
 
-    test "status flags a signed-but-inert deployment (0 enrolled agents)" do
-      capture_io(fn -> Release.set_custody_profile(1) end)
-      out = capture_io(fn -> Release.print_custody_profile_status() end)
+    test "status flags a signed-but-inert deployment (0 enrolled agents)", %{cache: cache} do
+      capture_io(fn -> Release.set_custody_profile(1, cache) end)
+      out = capture_io(fn -> Release.print_custody_profile_status(cache) end)
       assert out =~ "INERT"
     end
 
-    test "status names the bulk-refusal footgun under signed" do
-      out = capture_io(fn -> Release.print_custody_profile_status() end)
+    test "status names the bulk-refusal footgun under signed", %{cache: cache} do
+      out = capture_io(fn -> Release.print_custody_profile_status(cache) end)
       assert out =~ "bulk custody paths"
       assert out =~ "bulk_signature_unsupported"
     end
 
-    test "status does not crash on an out-of-range stored value (fail-safe, not FunctionClauseError)" do
+    test "status does not crash on an out-of-range stored value (fail-safe, not FunctionClauseError)",
+         %{cache: cache} do
       # Reachable out-of-band: direct SQL, a raw SystemConfig.put/2, a future admin
       # API — set_custody_profile/1 guards [0,1] but the row is not otherwise pinned.
-      {:ok, _} = SystemConfig.put(SignedProfilePolicy.profile_key(), 7)
-      SystemConfig.refresh()
+      {:ok, _} = SystemConfig.put(SignedProfilePolicy.profile_key(), 7, cache)
+      SystemConfig.refresh(cache)
 
-      out = capture_io(fn -> assert Release.print_custody_profile_status() == :ok end)
+      out = capture_io(fn -> assert Release.print_custody_profile_status(cache) == :ok end)
       assert out =~ "unknown"
       assert out =~ "custody_signed_profile_enforcement=7"
     end

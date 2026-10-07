@@ -198,7 +198,7 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
   describe "re-derivation against the live row" do
     test "skips a title that was FIXED between the scan and the write" do
       # The one remedy a human has is to retitle the article. Completing their edit for
-      # them, with a machine title, hours later, is the failure `still_colliding/5` exists
+      # them, with a machine title, hours later, is the failure `still_colliding/6` exists
       # to prevent on the other class. `skipped` (not `abstained`) is the assertion: an
       # abstention would mean the extractor was reached, i.e. the re-check never ran.
       tenant = fixture(:tenant)

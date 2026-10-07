@@ -2,12 +2,13 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
   @moduledoc """
   US-27.4 (AC-27.4.4/.5/.6): the SlowQueryLogger telemetry handler logs queries over
   the configurable threshold (with duration + source, no raw SQL) and stays silent for
-  fast queries. async: false so the global log capture isn't polluted by concurrent
-  async tests' queries.
+  fast queries. The handler runs in the process that issued the query, so every capture is
+  `Loopctl.OwnLog.capture_own_log/1`: only this test's own queries' lines, never a
+  concurrent test's.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
-  import ExUnit.CaptureLog
+  import Loopctl.OwnLog, only: [capture_own_log: 1]
   import Ecto.Query
 
   alias Loopctl.AdminRepo
@@ -19,7 +20,7 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
 
   test "logs a query slower than the threshold with duration + source + endpoint (if provided), NOT the raw SQL" do
     # Test without endpoint (direct query, not through heavy_read_opts)
-    log = capture_log(fn -> Repo.query!("SELECT pg_sleep(1.1)") end)
+    log = capture_own_log(fn -> Repo.query!("SELECT pg_sleep(1.1)") end)
     assert log =~ "slow_query"
     assert log =~ "duration_ms="
     assert log =~ "endpoint="
@@ -36,14 +37,15 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
         select: fragment("1")
       )
 
-    log = capture_log(fn -> Repo.all(slow, telemetry_options: [endpoint: :probe_endpoint]) end)
+    log =
+      capture_own_log(fn -> Repo.all(slow, telemetry_options: [endpoint: :probe_endpoint]) end)
 
     assert log =~ "slow_query"
     assert log =~ "endpoint=probe_endpoint"
   end
 
   test "does NOT log a query under the threshold (no per-query noise)" do
-    log = capture_log(fn -> Repo.query!("SELECT 1") end)
+    log = capture_own_log(fn -> Repo.query!("SELECT 1") end)
     refute log =~ "slow_query"
   end
 
@@ -56,8 +58,7 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
              &(&1.id == Loopctl.Telemetry.SlowQueryLogger)
            )
 
-    log = capture_log(fn -> AdminRepo.query!("SELECT pg_sleep(1.1)") end)
-
+    log = capture_own_log(fn -> AdminRepo.query!("SELECT pg_sleep(1.1)") end)
     assert log =~ "slow_query"
     assert log =~ "AdminRepo"
   end
@@ -71,7 +72,7 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
     tenant_id = "test-tenant-123"
     Logger.metadata(tenant_id: tenant_id)
 
-    log = capture_log(fn -> Repo.query!("SELECT pg_sleep(1.1)") end)
+    log = capture_own_log(fn -> Repo.query!("SELECT pg_sleep(1.1)") end)
 
     assert log =~ "slow_query"
     assert log =~ "tenant_id=#{tenant_id}"
@@ -90,7 +91,7 @@ defmodule Loopctl.Telemetry.SlowQueryLoggerTest do
       )
 
     log =
-      capture_log(fn ->
+      capture_own_log(fn ->
         # Repo.all with :telemetry_options (not through HeavyRead — direct repo call).
         Repo.all(slow, telemetry_options: [endpoint: :test_endpoint])
       end)

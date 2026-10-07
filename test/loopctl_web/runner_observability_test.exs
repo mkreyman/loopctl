@@ -6,11 +6,11 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
 
   ## Why `async: false`
 
-  The log assertions need `:info` lines, and `config/test.exs` pins the primary level to
-  `:warning`. A MODULE level (`Logger.put_module_level/2`) lets one module's `:info` through,
-  but it is VM-global, so it is set and removed around each test only in a module no other
-  test runs beside. Dispatch tests also need committed runners (see
-  `LoopctlWeb.RunnerChannelDispatchTest`).
+  Every test here authenticates a runner through `LoopctlWeb.RunnerSocket`, which reads on
+  `Loopctl.AdminRepo`, so its runners are COMMITTED fixtures (see
+  `LoopctlWeb.RunnerChannelDispatchTest`), visible to every running test and swept in
+  `setup_all`. The `:info` module levels the log assertions need are raised once in
+  `test/test_helper.exs`.
   """
 
   use LoopctlWeb.ChannelCase, async: false
@@ -29,25 +29,12 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
 
   setup :verify_on_exit!
 
-  @logged_modules [
-    LoopctlWeb.RunnerChannel,
-    LoopctlWeb.RunnerSocket,
-    LoopctlWeb.RunnerShutdownNotice,
-    Loopctl.Runners
-  ]
-
   # A bound on a real round trip, never a delay.
   @reply_timeout 2_000
 
   setup_all do
     sweep_committed_runner_tenants()
     on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  setup do
-    for module <- @logged_modules, do: Logger.put_module_level(module, :info)
-    on_exit(fn -> for module <- @logged_modules, do: Logger.delete_module_level(module) end)
     :ok
   end
 

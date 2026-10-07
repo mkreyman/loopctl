@@ -6,23 +6,21 @@ defmodule Loopctl.ProviderTest do
   (AC-41.4.6, TC-41.4.10/.15), and the pinned path is used when allowed
   (AC-41.4.12).
 
-  `async: false` (flake fix): the "emits NO provider-error storm signal" test does a
-  `refute_receive` on `[:loopctl, :llm, :provider_error]`, which is a VM-GLOBAL
-  telemetry event with no tenant in its metadata — a concurrent embedding-path test
-  emitting it with `provider: "embedding"` is indistinguishable from a leak here and
-  fails this assertion intermittently. Filtering at the handler cannot separate them
-  (this test's own path would carry the same provider tag), so the only sound fix is
-  the same one `Loopctl.Llm.AnthropicTest` already uses: no concurrent emitter at
-  all. ExUnit runs sync files alone, after the async ones.
+  The "emits NO provider-error storm signal" test refutes `[:loopctl, :llm, :provider_error]`,
+  an event with no tenant in its metadata, so its handler is
+  `Loopctl.TelemetryHelpers.attach_own/1`: it forwards only emissions from this test's own
+  process, and a concurrent embedding-path test's emission never reaches it.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   import Mox
 
   alias Loopctl.Egress
   alias Loopctl.Egress.PinCache
   alias Loopctl.Egress.Scope
+  alias Loopctl.Llm
+  alias Loopctl.Llm.Anthropic
   alias Loopctl.Provider
   alias Loopctl.Provider.Admission
   alias Loopctl.Test.AllowlistSource
@@ -145,13 +143,34 @@ defmodule Loopctl.ProviderTest do
     end
 
     test "emits NO provider-error storm signal", %{scope: scope} do
-      ref =
-        :telemetry_test.attach_event_handlers(self(), [[:loopctl, :llm, :provider_error]])
+      ref = Loopctl.TelemetryHelpers.attach_own([[:loopctl, :llm, :provider_error]])
 
       assert {:error, {:egress_blocked, _details}} =
                Provider.post("https://api.openai.com/v1/embeddings", [], %{scope: scope})
 
       refute_receive {[:loopctl, :llm, :provider_error], ^ref, _, _}
+    end
+
+    # POSITIVE CONTROL for the refute above: the same listener DOES see a provider_error
+    # emitted through `Provider.post` from this process — an Anthropic call (which posts
+    # through the chokepoint in the caller) answered 500 on a tenant that is NOT local_only.
+    # Without this, a listener that forwarded nothing would pass the refute by construction.
+    test "the listener sees a provider_error that does go through the chokepoint" do
+      ref = Loopctl.TelemetryHelpers.attach_own([[:loopctl, :llm, :provider_error]])
+      other = fixture(:tenant)
+      {:ok, _} = Llm.upsert_settings(other.id, %{"api_key" => "sk-ant-control"})
+
+      Req.Test.stub(Anthropic, fn conn ->
+        conn |> Plug.Conn.put_status(500) |> Req.Test.json(%{"error" => "boom"})
+      end)
+
+      body = fn _model -> %{max_tokens: 10, system: "s", messages: []} end
+
+      assert {:error, {:api_error, 500, _}} =
+               Anthropic.message(other.id, :extraction, body)
+
+      assert_receive {[:loopctl, :llm, :provider_error], ^ref, %{count: 1},
+                      %{provider: "anthropic"}}
     end
 
     test "N refusals in one window write a BOUNDED, aggregated audit trail",

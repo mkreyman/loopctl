@@ -3,11 +3,10 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsLoggingTest do
   Issue #815: the sweep names every candidate it did not skip, with its tenant, story and
   epoch — the summary line only counts them.
 
-  `async: false` because the `:info` line is let past `config/test.exs`'s `:warning` primary
-  level with a VM-global module level (see `LoopctlWeb.RunnerObservabilityTest`).
+  The worker's `:info` level is raised once in `test/test_helper.exs`, never per test.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   import Ecto.Query
   import ExUnit.CaptureLog
@@ -18,12 +17,6 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsLoggingTest do
   alias Loopctl.Workers.ReclaimExpiredClaimsWorker
 
   setup :verify_on_exit!
-
-  setup do
-    Logger.put_module_level(ReclaimExpiredClaimsWorker, :info)
-    on_exit(fn -> Logger.delete_module_level(ReclaimExpiredClaimsWorker) end)
-    :ok
-  end
 
   test "a reclaimed candidate is logged with its tenant, story, old and new epoch" do
     tenant = fixture(:tenant)

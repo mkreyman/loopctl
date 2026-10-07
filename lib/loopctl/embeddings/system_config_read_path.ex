@@ -33,7 +33,16 @@ defmodule Loopctl.Embeddings.SystemConfigReadPath do
   def read_flag_key, do: @read_flag_key
 
   @impl Loopctl.Embeddings.ReadPathBehaviour
-  def side_table_reads_enabled? do
-    SystemConfig.get_int(@read_flag_key, 0) == 1
+  def side_table_reads_enabled?, do: side_table_reads_enabled?(@read_flag_key, SystemConfig)
+
+  @doc """
+  The same decision read from the `SystemConfig` row `key`, cached in the namespace `cache`,
+  instead of the cutover flag's row and the node-wide cache — how a test flips a flag of its
+  own, row and cached value both, without touching the row or the cache entry every other
+  test reads. The arity-0 callback is this with `read_flag_key/0` and `Loopctl.SystemConfig`.
+  """
+  @spec side_table_reads_enabled?(String.t(), SystemConfig.cache()) :: boolean()
+  def side_table_reads_enabled?(key, cache \\ SystemConfig) when is_binary(key) do
+    SystemConfig.get_int(key, 0, cache) == 1
   end
 end

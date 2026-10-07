@@ -27,7 +27,6 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageDispatcher
   alias Loopctl.Progress
-  alias Loopctl.Runners.Selection
   alias Loopctl.Runners.Usage
   alias LoopctlWeb.RunnerSocket
 
@@ -159,9 +158,6 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         :ok =
           Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
       end)
-
-      Logger.put_module_level(Selection, :info)
-      on_exit(fn -> Logger.delete_module_level(Selection) end)
 
       log =
         capture_log([level: :info], fn ->

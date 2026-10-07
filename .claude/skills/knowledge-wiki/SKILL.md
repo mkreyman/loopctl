@@ -174,7 +174,7 @@ exactly the pollution the separate tables prevent.
    withhold both articles with nothing able to release them. Ids are cast (`cast_distinct_pair/2`) before any query interpolates them,
    and visibility is checked BEFORE existence so an invisible id and a nonexistent one are
    one answer. Hiding a pair behind a row that will never apply is the black hole to avoid.
-   **Corroboration covers BOTH duplicate signals** (`Consolidation.corroborated?/3`), and the
+   **Corroboration covers BOTH duplicate signals** (`Consolidation.corroborated?/4`), and the
    winner is the OLDEST member, not the longest. An `idempotency_key` AND a normalized title
    are both caller-controlled, so corroborating content the same party wrote proves nothing —
    age is the one input a later writer cannot manufacture. Scoring is keyed by
@@ -197,7 +197,7 @@ exactly the pollution the separate tables prevent.
    Full pipeline: `docs/agent-memory.md`, "Diversity selection on the knowledge half".
 
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:11962`; the counted set is `@heat_read_access_types`, `:11832`). The heat index is the one retrieval route that
+   (`knowledge.ex:11973`; the counted set is `@heat_read_access_types`, `:11843`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

@@ -2261,7 +2261,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   defp iso8601(value), do: value |> to_utc_datetime() |> DateTime.to_iso8601()
 
   # DB row -> app config -> module default, the resolution order (and the reasoning)
-  # `Loopctl.Workers.KnowledgeLintWorker.tunable/3` established for the nightly caps: the
+  # `Loopctl.Workers.KnowledgeLintWorker.tunable/4` established for the nightly caps: the
   # DB row is the only layer an operator can move mid-incident without a deploy, and it
   # survives a restart and propagates to the fleet, which `Application.put_env/3` does
   # neither of. `SystemConfig.get_int/2` reads `:persistent_term` and never raises, so

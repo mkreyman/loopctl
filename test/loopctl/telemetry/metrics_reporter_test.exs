@@ -16,25 +16,33 @@ defmodule Loopctl.Telemetry.MetricsReporterTest do
     * the retry RECOVERS: a start that fails once then succeeds adopts the reporter pid on
       the next `:retry_start`.
 
-  `async: false`: the wrapper registers its name as `Loopctl.Telemetry.MetricsReporter`
-  (a singleton), so instances cannot run concurrently. NO real port is ever bound — the
+  Each test starts its own wrapper under its own `:server_name` (the app's instance
+  registers as `Loopctl.Telemetry.MetricsReporter`). NO real port is ever bound — the
   injected `start_fun` returns/raises synthetic results.
   """
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   alias Loopctl.Telemetry.MetricsReporter
 
-  # The wrapper hardcodes `name: __MODULE__`; start it supervised so it auto-stops between
-  # tests and the singleton name is freed.
+  # A wrapper of this test's own, under a unique `:server_name`, supervised so it stops
+  # with the test.
   defp start_wrapper(start_fun) do
-    start_supervised!(
-      %{
-        id: MetricsReporter,
-        start:
-          {MetricsReporter, :start_link, [[start_fun: start_fun, port: 0, name: :test_reporter]]}
-      },
-      restart: :temporary
-    )
+    server_name = :"metrics_reporter_test_#{System.unique_integer([:positive])}"
+
+    pid =
+      start_supervised!(
+        %{
+          id: server_name,
+          start:
+            {MetricsReporter, :start_link,
+             [[start_fun: start_fun, port: 0, name: :test_reporter, server_name: server_name]]}
+        },
+        restart: :temporary
+      )
+
+    # Registered under THIS test's name, never the app's `Loopctl.Telemetry.MetricsReporter`.
+    assert Process.whereis(server_name) == pid
+    pid
   end
 
   defp state(pid), do: :sys.get_state(pid)

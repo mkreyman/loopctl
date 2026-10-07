@@ -30,7 +30,7 @@ defmodule Loopctl.EmbeddingsTest do
 
   # Traced by `count_calls/2` for the AC-41.1.11 N+1 guards (see the helpers at the bottom).
   @resolve_dimension_mfa {Loopctl.Embeddings, :resolve_write_dimension, 1}
-  @sub_batch_mfa {Loopctl.Workers.BatchArticleEmbeddingWorker, :embed_and_store_sub_batch, 3}
+  @sub_batch_mfa {Loopctl.Workers.BatchArticleEmbeddingWorker, :embed_and_store_sub_batch, 4}
 
   # Both helpers ride this test's OWN sparse dimensions (`test_vec/2`, seeded per test by
   # `Process.put(:test_vec_axis, ...)` in DataCase.setup) rather than a shape every test
@@ -814,15 +814,15 @@ defmodule Loopctl.EmbeddingsTest do
 
   # Runs the REAL batch worker over `n` articles and returns how many times it resolved the
   # dimension, alongside how many provider sub-batches it ran. Both numbers are returned
-  # because the caller needs BOTH: `generate_and_store_project_group/3` splits by
-  # `Knowledge.embedding_batch_max_chars/0`, and at a budget that puts one article per
+  # because the caller needs BOTH: `generate_and_store_project_group/4` splits by
+  # `Knowledge.embedding_batch_max_chars/1`, and at a budget that puts one article per
   # sub-batch a per-ARTICLE resolution and a per-SUB-BATCH one are the same number, so a
-  # bare ratio between them would be inert. The budget here is the 1_000_000-char default:
-  # its `:persistent_term` cache is VM-global, but every test that shrinks it lives in
-  # `batch_article_embedding_worker_test.exs`, which is `async: false` PRECISELY so the
-  # write cannot leak (ExUnit runs sync modules only after every async module has finished).
-  # Do NOT add such a write to an async module — that is the cross-module leakage
-  # `config_embedding_read_path_test.exs` guards against.
+  # bare ratio between them would be inert. The budget here is the 1_000_000-char default,
+  # read from the node-wide `SystemConfig` cache: every test that shrinks it
+  # (`batch_article_embedding_worker_test.exs`) does so in a `SystemConfig` namespace of its
+  # own, handed to `BatchArticleEmbeddingWorker.perform/2`. Do NOT write the node-wide key
+  # from a test — that is the cross-module leakage `config_embedding_read_path_test.exs`
+  # guards against.
   defp batch_worker_dimension_resolutions(n) do
     tenant = fixture(:tenant)
     articles = for _ <- 1..n, do: fixture(:article, tenant_id: tenant.id)

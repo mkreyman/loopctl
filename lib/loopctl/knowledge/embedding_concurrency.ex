@@ -12,7 +12,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   the per-node ceiling REAL: EVERY `generate_embedding` entry point — the interactive
   query path AND both Oban embedding workers
   (`ArticleEmbeddingWorker`/`MemoryEmbeddingWorker`) — funnels through
-  `Loopctl.Knowledge.run_embedding_task/3`, which `acquire/1`s a slot here before
+  `Loopctl.Knowledge.run_embedding_task/6`, which `acquire/1`s a slot here before
   spawning its supervised task and `release/1`s it after. Over the cap, `acquire/1`
   fast-fails with `{:error, :rate_limited_local}` (the breaker-exempt reason shared
   with the US-37.1 admission gate): the interactive path degrades to keyword search
@@ -75,7 +75,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   request/worker process that incremented it, and MONITORS acquirers: an acquirer that
   crashes WITHOUT calling `release/1` would otherwise leak its slot forever, drifting
   the effective cap up; a `:DOWN` reclaims the leaked slot. The slot is charged to the
-  CALLING process (the request/worker running `run_embedding_task/3`, which acquires →
+  CALLING process (the request/worker running `run_embedding_task/6`, which acquires →
   runs the task → releases synchronously), NOT to the off-process supervised task.
 
   ## Node-local by design
@@ -101,10 +101,13 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
 
   # --- Client API ---
 
+  # `:name` and `:table` are the server name and the ETS table this gate owns — the app's
+  # (`__MODULE__` and `@table`) unless a caller (a test of the gate being down) starts a
+  # gate of its own, which then shares nothing with the app's.
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @doc """
@@ -121,7 +124,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   @impl Loopctl.Knowledge.EmbeddingConcurrency.Behaviour
   @spec acquire(binary()) :: :ok | {:error, :rate_limited_local}
   def acquire(tenant_id) when is_binary(tenant_id) do
-    acquire(tenant_id, max_concurrent(), max_per_tenant())
+    acquire(tenant_id, max_concurrent(), max_per_tenant(), __MODULE__)
   end
 
   @doc """
@@ -141,16 +144,21 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   is caught and converted to `{:error, :rate_limited_local}`. This is the fail-SAFE
   direction: an unverifiable cap degrades the interactive path to keyword search (same
   as any over-cap refusal) rather than raising an unguarded `:exit` that would 500 the
-  request (`run_embedding_task/3` calls `acquire/1` OUTSIDE the supervised task, so no
+  request (`run_embedding_task/6` calls `acquire/1` OUTSIDE the supervised task, so no
   `async_nolink` isolates it — only this guard does). Symmetric with `release/1`, which
   swallows the same exit.
+
+  `server` is the gate to call — the app's one (`__MODULE__`) unless a caller names
+  another, which is how a test reaches a gate that is down without stopping the app's.
   """
-  @spec acquire(binary(), pos_integer(), pos_integer()) ::
+  @spec acquire(binary(), pos_integer(), pos_integer(), GenServer.server()) ::
           :ok | {:error, :rate_limited_local}
-  def acquire(tenant_id, global_max, tenant_max)
+  def acquire(tenant_id, global_max, tenant_max, server \\ __MODULE__)
+
+  def acquire(tenant_id, global_max, tenant_max, server)
       when is_binary(tenant_id) and is_integer(global_max) and global_max > 0 and
              is_integer(tenant_max) and tenant_max > 0 do
-    GenServer.call(__MODULE__, {:acquire, self(), tenant_id, global_max, tenant_max})
+    GenServer.call(server, {:acquire, self(), tenant_id, global_max, tenant_max})
   catch
     :exit, _ -> {:error, :rate_limited_local}
   end
@@ -168,29 +176,34 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
 
   CRASH-SAFE: if this GenServer is down (so the `call` would `:exit`), `release/1`
   swallows the exit and returns `:ok` — it is invoked from an `after` block in
-  `run_embedding_task/3`, and a raised `:exit` there would MASK the embedding
+  `run_embedding_task/6`, and a raised `:exit` there would MASK the embedding
   result. A dead GenServer is itself a restart that resets the counters, so nothing
   leaks.
   """
   @impl Loopctl.Knowledge.EmbeddingConcurrency.Behaviour
   @spec release(binary()) :: :ok
-  def release(tenant_id) when is_binary(tenant_id) do
-    GenServer.call(__MODULE__, {:release, self(), tenant_id})
+  def release(tenant_id), do: release(tenant_id, __MODULE__)
+
+  @doc "`release/1` against the gate `server` (see `acquire/4`)."
+  @spec release(binary(), GenServer.server()) :: :ok
+  def release(tenant_id, server) when is_binary(tenant_id) do
+    GenServer.call(server, {:release, self(), tenant_id})
   catch
     :exit, _ -> :ok
   end
 
   @doc "Current node-wide in-flight embedding count (for tests/telemetry)."
   @spec count() :: non_neg_integer()
-  def count, do: counter(@global_key)
+  def count, do: counter(@table, @global_key)
 
   @doc "Alias of `count/0` — current global in-flight embedding count."
-  @spec global_count() :: non_neg_integer()
-  def global_count, do: counter(@global_key)
+  @spec global_count(:ets.table()) :: non_neg_integer()
+  def global_count(table \\ @table), do: counter(table, @global_key)
 
   @doc "Current in-flight embedding count for `tenant_id` (for tests/telemetry)."
-  @spec tenant_count(binary()) :: non_neg_integer()
-  def tenant_count(tenant_id) when is_binary(tenant_id), do: counter(tenant_key(tenant_id))
+  @spec tenant_count(binary(), :ets.table()) :: non_neg_integer()
+  def tenant_count(tenant_id, table \\ @table) when is_binary(tenant_id),
+    do: counter(table, tenant_key(tenant_id))
 
   @doc """
   Configured per-node GLOBAL concurrent-embedding cap.
@@ -228,11 +241,13 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   # --- Server callbacks ---
 
   @impl GenServer
-  def init(_opts) do
+  def init(opts) do
+    name = Keyword.get(opts, :table, @table)
+
     table =
-      case :ets.whereis(@table) do
+      case :ets.whereis(name) do
         :undefined ->
-          :ets.new(@table, [
+          :ets.new(name, [
             :set,
             :public,
             :named_table,
@@ -253,7 +268,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
     # Re-entrant guard (review #5): if this pid is ALREADY tracked it holds a slot,
     # so a second acquire must NOT increment again — that would over-count the
     # semaphore and permanently leak a slot on the single release/:DOWN. Currently
-    # unreachable (run_embedding_task/3 acquires → runs → releases synchronously, so
+    # unreachable (run_embedding_task/6 acquires → runs → releases synchronously, so
     # a pid never holds two concurrent slots), but gated here BEFORE reserve_slots so
     # the counters and the monitor map can never diverge under any future re-entrant
     # reuse. One in-flight slot per caller pid is the invariant the accounting relies
@@ -293,7 +308,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
       ref ->
         {^pid, tenant_id} = Map.fetch!(state.monitors, ref)
         Process.demonitor(ref, [:flush])
-        decrement(tenant_id)
+        decrement(state.table, tenant_id)
         {:reply, :ok, untrack(state, ref, pid)}
     end
   end
@@ -306,7 +321,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
     # exactly-once with release.
     case Map.get(state.monitors, ref) do
       {^pid, tenant_id} ->
-        decrement(tenant_id)
+        decrement(state.table, tenant_id)
         Logger.warning("embedding concurrency: reclaimed leaked slot for crashed caller")
         {:noreply, untrack(state, ref, pid)}
 
@@ -346,7 +361,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   end
 
   # Register the crash-safe monitor. One in-flight acquire per caller pid:
-  # `run_embedding_task/3` acquires → runs → releases synchronously, so a pid is
+  # `run_embedding_task/6` acquires → runs → releases synchronously, so a pid is
   # never tracked twice concurrently (and the handle_call re-entrant guard rejects a
   # second acquire before this runs). `Process.monitor` on an already-dead pid still
   # returns a ref and immediately delivers `:DOWN`, which the handler reclaims — so
@@ -369,14 +384,14 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   # should never fire, but it's kept as defense-in-depth so a stray decrement can
   # never drive a counter negative (which would inflate the effective cap). Called
   # ONLY from the GenServer process (release/DOWN), so decrements are serialized.
-  defp decrement(tenant_id) do
-    dec_floor(@global_key)
-    dec_tenant(tenant_key(tenant_id))
+  defp decrement(table, tenant_id) do
+    dec_floor(table, @global_key)
+    dec_tenant(table, tenant_key(tenant_id))
     :ok
   end
 
-  defp dec_floor(key) do
-    :ets.update_counter(@table, key, {2, -1, 0, 0}, {key, 0})
+  defp dec_floor(table, key) do
+    :ets.update_counter(table, key, {2, -1, 0, 0}, {key, 0})
   end
 
   # Per-tenant rows are REAPED once they reach zero, so the table doesn't accumulate a
@@ -386,15 +401,15 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   # concurrent acquire can interleave to observe a transiently-absent row, and a fresh
   # acquire re-creates the row via `update_counter`'s `{key, 0}` default. The global row
   # is deliberately kept (single, always-present, hot).
-  defp dec_tenant(key) do
-    case :ets.update_counter(@table, key, {2, -1, 0, 0}, {key, 0}) do
-      0 -> :ets.delete(@table, key)
+  defp dec_tenant(table, key) do
+    case :ets.update_counter(table, key, {2, -1, 0, 0}, {key, 0}) do
+      0 -> :ets.delete(table, key)
       _ -> :ok
     end
   end
 
-  defp counter(key) do
-    case :ets.lookup(@table, key) do
+  defp counter(table, key) do
+    case :ets.lookup(table, key) do
       [{^key, n}] -> n
       [] -> 0
     end

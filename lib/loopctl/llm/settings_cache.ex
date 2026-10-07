@@ -50,6 +50,11 @@ defmodule Loopctl.Llm.SettingsCache do
   cross-node invalidation broadcasts. No DB access happens in the GenServer, so
   there is no Ecto Sandbox ownership concern in tests.
 
+  The owner registers as `__MODULE__` and owns the table every caller reads by default.
+  `start_link/1` takes `:name` and `:table`, and the table functions take the table as a
+  trailing argument, so a test can start, break and restart an instance of its own
+  without touching the app's.
+
   ## Never-stale under the read-through repopulation race (AC-32.3.3)
 
   Plain cache-aside (invalidate-then-repopulate) has a well-known staleness race:
@@ -131,7 +136,7 @@ defmodule Loopctl.Llm.SettingsCache do
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @doc """
@@ -146,14 +151,15 @@ defmodule Loopctl.Llm.SettingsCache do
   the caller loads read-through and `put/3`s under a freshly captured generation.
   """
   @spec fetch(Ecto.UUID.t()) :: {:ok, term()} | :miss
-  def fetch(tenant_id) when is_binary(tenant_id) do
-    case :ets.lookup(@table, tenant_id) do
+  @spec fetch(Ecto.UUID.t(), :ets.table()) :: {:ok, term()} | :miss
+  def fetch(tenant_id, table \\ @table) when is_binary(tenant_id) do
+    case :ets.lookup(table, tenant_id) do
       [{^tenant_id, value, stamp, expires_at}] ->
         # Trust the entry only if (a) no invalidation bumped the generation since
         # the value's DB read (AC-32.3.3 intra-node race) AND (b) it has not passed
         # its TTL (cross-node / crash-window backstop). Either failing => miss, so
         # the caller reloads and never serves stale.
-        if stamp == current_generation(tenant_id) and not expired?(expires_at),
+        if stamp == current_generation(tenant_id, table) and not expired?(expires_at),
           do: {:ok, value},
           else: :miss
 
@@ -172,8 +178,9 @@ defmodule Loopctl.Llm.SettingsCache do
   detected and the repopulation rejected at `fetch/1` (never serves stale).
   """
   @spec generation(Ecto.UUID.t()) :: non_neg_integer()
-  def generation(tenant_id) when is_binary(tenant_id) do
-    current_generation(tenant_id)
+  @spec generation(Ecto.UUID.t(), :ets.table()) :: non_neg_integer()
+  def generation(tenant_id, table \\ @table) when is_binary(tenant_id) do
+    current_generation(tenant_id, table)
   rescue
     ArgumentError -> 0
   end
@@ -188,9 +195,10 @@ defmodule Loopctl.Llm.SettingsCache do
   outlived a dropped cross-node broadcast — is not served on the next `fetch/1`.
   """
   @spec put(Ecto.UUID.t(), term(), non_neg_integer()) :: :ok
-  def put(tenant_id, value, read_generation)
+  @spec put(Ecto.UUID.t(), term(), non_neg_integer(), :ets.table()) :: :ok
+  def put(tenant_id, value, read_generation, table \\ @table)
       when is_binary(tenant_id) and is_integer(read_generation) do
-    :ets.insert(@table, {tenant_id, value, read_generation, now_ms() + @ttl_ms})
+    :ets.insert(table, {tenant_id, value, read_generation, now_ms() + @ttl_ms})
     :ok
   rescue
     ArgumentError -> :ok
@@ -218,9 +226,10 @@ defmodule Loopctl.Llm.SettingsCache do
   `invalidate_cluster/1` so peer nodes bust their node-local entries too.
   """
   @spec invalidate(Ecto.UUID.t()) :: :ok
-  def invalidate(tenant_id) when is_binary(tenant_id) do
-    bump_generation(tenant_id)
-    :ets.delete(@table, tenant_id)
+  @spec invalidate(Ecto.UUID.t(), :ets.table()) :: :ok
+  def invalidate(tenant_id, table \\ @table) when is_binary(tenant_id) do
+    bump_generation(tenant_id, table)
+    :ets.delete(table, tenant_id)
     :ok
   rescue
     ArgumentError -> :ok
@@ -265,8 +274,8 @@ defmodule Loopctl.Llm.SettingsCache do
   # key that a binary-`tenant_id` `fetch/1` lookup can never match, so it never
   # collides with a cached-settings entry. Defaults to 0 for a tenant that has never
   # been invalidated.
-  defp current_generation(tenant_id) do
-    case :ets.lookup(@table, {:gen, tenant_id}) do
+  defp current_generation(tenant_id, table) do
+    case :ets.lookup(table, {:gen, tenant_id}) do
       [{{:gen, ^tenant_id}, gen}] -> gen
       [] -> 0
     end
@@ -275,8 +284,8 @@ defmodule Loopctl.Llm.SettingsCache do
   # Atomically increment the tenant's generation (creating it at 1 on first bump).
   # `:ets.update_counter/4` is lock-free and serializes concurrent invalidations, so
   # the generation is a monotonic authority no reader can observe half-applied.
-  defp bump_generation(tenant_id) do
-    :ets.update_counter(@table, {:gen, tenant_id}, {2, 1}, {{:gen, tenant_id}, 0})
+  defp bump_generation(tenant_id, table) do
+    :ets.update_counter(table, {:gen, tenant_id}, {2, 1}, {{:gen, tenant_id}, 0})
   end
 
   # Monotonic clock (not affected by wall-clock jumps) for TTL comparisons. Stored
@@ -288,14 +297,18 @@ defmodule Loopctl.Llm.SettingsCache do
   # --- Server callbacks ---
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    # `:table` names the table this owner creates — `@table`, the one every caller reads by
+    # default, unless a caller (a test of this owner's restart) starts an instance of its own.
+    name = Keyword.get(opts, :table, @table)
+
     # Create + own the table here (in the GenServer process) so it persists for the
     # node's lifetime. Idempotent if it somehow already exists (mirrors
     # ExportConcurrency's whereis guard).
     table =
-      case :ets.whereis(@table) do
+      case :ets.whereis(name) do
         :undefined ->
-          :ets.new(@table, [
+          :ets.new(name, [
             :set,
             :public,
             :named_table,
@@ -328,12 +341,12 @@ defmodule Loopctl.Llm.SettingsCache do
   @impl true
   def handle_info({:invalidate, tenant_id}, state) when is_binary(tenant_id) do
     # A peer node rotated this tenant's settings; bust our node-local entry.
-    invalidate(tenant_id)
+    invalidate(tenant_id, state.table)
     {:noreply, state}
   end
 
   def handle_info(:sweep, state) do
-    sweep_expired()
+    sweep_expired(state.table)
     schedule_sweep()
     {:noreply, state}
   end
@@ -348,10 +361,10 @@ defmodule Loopctl.Llm.SettingsCache do
   # even for tenants that are never read again (bounded residency, AC-32.3.5). Only
   # the 4-tuple value entries carry an expiry; the 2-tuple `{:gen, _}` generation
   # entries never match this head, so the monotonic authority is preserved.
-  defp sweep_expired do
+  defp sweep_expired(table) do
     now = now_ms()
     match_spec = [{{:_, :_, :_, :"$1"}, [{:"=<", :"$1", now}], [true]}]
-    :ets.select_delete(@table, match_spec)
+    :ets.select_delete(table, match_spec)
   rescue
     ArgumentError -> 0
   end

@@ -158,15 +158,26 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   @max_tag_length Loopctl.Knowledge.Article.max_tag_length()
 
   @impl Oban.Worker
-  def perform(%Oban.Job{
-        id: id,
-        args:
-          %{
-            "tenant_id" => tenant_id,
-            "source_type" => source_type,
-            "content_hash" => content_hash
-          } = args
-      }) do
+  def perform(%Oban.Job{} = job), do: perform(job, SystemConfig)
+
+  @doc """
+  `perform/1` with the `Loopctl.SystemConfig` namespace `Knowledge.embedding_batch_max/1`
+  is read from when the published articles are chunked for embedding. Oban calls
+  `perform/1`, which passes the node-wide one; a test passes its own.
+  """
+  @spec perform(Oban.Job.t(), SystemConfig.cache()) :: Oban.Worker.result()
+  def perform(
+        %Oban.Job{
+          id: id,
+          args:
+            %{
+              "tenant_id" => tenant_id,
+              "source_type" => source_type,
+              "content_hash" => content_hash
+            } = args
+        },
+        cache
+      ) do
     # US-36.2: per-tenant fair-share gate on the :ingestion queue. These are long
     # (~6-min) LLM jobs, so one tenant's bulk ingest can otherwise hold both slots
     # for many minutes. Yield loss-free ({:snooze, n}, no attempt consumed) BEFORE
@@ -177,7 +188,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     # queue permanently (every lone job would snooze forever). See FairShare.
     case FairShare.gate(tenant_id, :ingestion, id) do
       {:snooze, _n} = snooze -> snooze
-      :ok -> ingest_result(ingest(tenant_id, source_type, content_hash, args))
+      :ok -> ingest_result(ingest(tenant_id, source_type, content_hash, args, cache))
     end
   end
 
@@ -192,7 +203,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   defp ingest_result(other), do: other
 
-  defp ingest(tenant_id, source_type, content_hash, args) do
+  defp ingest(tenant_id, source_type, content_hash, args, cache) do
     url = args["url"]
     # Normalize "" -> nil (a blank project_id is "tenant-wide", not a value to dump
     # against the :binary_id column).
@@ -231,7 +242,8 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         project_id: project_id,
         url: url,
         source_ref: source_ref(url, args["metadata"]),
-        publish: publish
+        publish: publish,
+        system_config: cache
       }
 
       ingest_chunks(ctx, content)
@@ -1192,7 +1204,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
       {:ok, %{articles: {_count, returned}}} ->
         # Published articles need embeddings; enqueue AFTER commit, best-effort,
         # and ONLY for the rows that were genuinely inserted this run.
-        if ctx.publish, do: enqueue_embeddings(ctx.tenant_id, returned)
+        if ctx.publish, do: enqueue_embeddings(ctx.tenant_id, returned, ctx.system_config)
 
         Logger.info(
           "ContentIngestionWorker: persisted #{length(returned)} new article(s) " <>
@@ -1259,9 +1271,9 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   # targets. Per-chunk `Oban.insert/1` (NOT `insert_all`) so the batch worker's
   # `unique:` window is honored (the basic Oban engine ignores `unique:` for
   # `insert_all`). The interactive single-article publish path stays per-record.
-  defp enqueue_embeddings(tenant_id, returned) do
+  defp enqueue_embeddings(tenant_id, returned, cache) do
     returned
-    |> Enum.chunk_every(Knowledge.embedding_batch_max())
+    |> Enum.chunk_every(Knowledge.embedding_batch_max(cache))
     |> Enum.each(fn chunk ->
       %{article_ids: Enum.map(chunk, & &1.id), tenant_id: tenant_id}
       |> BatchArticleEmbeddingWorker.new()
