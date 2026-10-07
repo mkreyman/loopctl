@@ -222,8 +222,7 @@ defmodule Loopctl.TokenUsage.DefaultArchivalTest do
 
       assert {:ok, 1} = DefaultArchival.soft_delete_old_reports(ctx_a.tenant.id, 90)
 
-      # Verify tenant_a's report is soft-deleted — use with_tenant since SET LOCAL ROLE
-      # persists in the sandbox outer transaction after DefaultArchival runs.
+      # Verify tenant_a's report is soft-deleted, read RLS-scoped as tenant_a.
       {:ok, fetched_a} =
         Repo.with_tenant(ctx_a.tenant.id, fn -> Repo.get!(Report, report_a.id) end)
 

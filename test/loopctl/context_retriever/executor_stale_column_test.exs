@@ -53,10 +53,6 @@ defmodule Loopctl.ContextRetriever.ExecutorStaleColumnTest do
       })
 
     # Drop the backing column on the Repo connection (rolls back at test exit).
-    # `Registry.create_entity/2` ran through `Repo.with_tenant`, whose
-    # `SET LOCAL ROLE loopctl_app` persists for the rest of the sandbox
-    # transaction; reset to the owner role so the DDL is permitted.
-    Repo.query!("RESET ROLE")
     Repo.query!("ALTER TABLE stories DROP COLUMN sort_key")
 
     scope = %Scope{

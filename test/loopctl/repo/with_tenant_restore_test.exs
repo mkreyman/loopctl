@@ -31,12 +31,37 @@ defmodule Loopctl.Repo.WithTenantRestoreTest do
     assert connection_state() == before
   end
 
-  test "a raise inside the body leaves nothing behind either" do
+  test "the outer role and tenant come back, not the connection defaults" do
+    # Only a restore of what was there passes this; a reset to defaults leaves postgres.
+    outer_tenant = Ecto.UUID.generate()
+    Repo.query!("SELECT set_config('app.current_tenant_id', $1, true)", [outer_tenant])
+    Repo.query!("SET LOCAL ROLE loopctl_app")
     before = connection_state()
 
-    assert_raise RuntimeError, fn ->
-      Repo.with_tenant(Ecto.UUID.generate(), fn -> raise "boom" end)
+    assert {:ok, _} = Repo.with_tenant(Ecto.UUID.generate(), fn -> :ok end)
+
+    assert connection_state() == before
+    assert before == {"loopctl_app", outer_tenant}
+    Repo.query!("RESET ROLE")
+  end
+
+  test "a with_tenant nested in another raises, as it does outside the sandbox" do
+    assert_raise RuntimeError, ~r/called inside an existing Repo transaction/, fn ->
+      Repo.with_tenant(Ecto.UUID.generate(), fn ->
+        Repo.with_tenant(Ecto.UUID.generate(), fn -> :ok end)
+      end)
     end
+  end
+
+  test "tenant_multi/2 puts the context back after its transaction" do
+    before = connection_state()
+    tenant_id = Ecto.UUID.generate()
+
+    multi =
+      Ecto.Multi.run(Ecto.Multi.new(), :seen, fn _repo, _changes -> {:ok, connection_state()} end)
+
+    assert {:ok, %{seen: {_rls_user, ^tenant_id}}} =
+             tenant_id |> Repo.tenant_multi(multi) |> Repo.transaction()
 
     assert connection_state() == before
   end

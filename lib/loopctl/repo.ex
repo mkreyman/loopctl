@@ -28,7 +28,8 @@ defmodule Loopctl.Repo do
     prepare: :unnamed
 
   alias Ecto.Adapters.SQL
-  alias Loopctl.LocalGuc
+
+  @sandbox_tenant_scope {__MODULE__, :sandbox_tenant_scope}
 
   @tenant_key {__MODULE__, :tenant_id}
 
@@ -78,8 +79,11 @@ defmodule Loopctl.Repo do
   rest of its lifetime. That is a cross-tenant / role leak, exactly the failure
   the RLS pattern exists to prevent. So this function fails loud (raises) when it
   detects it is nested inside a Repo transaction, rather than silently leaking.
-  The check is skipped under the Ecto SQL sandbox, whose per-test transaction
-  legitimately makes `in_transaction?/0` return true.
+  The transaction check is skipped under the Ecto SQL sandbox, whose per-test
+  transaction makes every call a nested one; there a `with_tenant/2` nested in
+  another `with_tenant/2` still raises. Under the sandbox the prior tenant and role
+  are also put back when the body returns, since the test's transaction outlives
+  this one (see `run_in_tenant/3`).
 
   ## Examples
 
@@ -101,21 +105,80 @@ defmodule Loopctl.Repo do
     transaction(fn -> run_in_tenant(tenant_id, fun, sandbox?) end)
   end
 
-  # Only the SQL sandbox pool (test) takes the scoped branch: there `with_tenant/2`'s
-  # transaction is a SAVEPOINT inside the test's own, and the tenant setting and
-  # `SET LOCAL ROLE` outlive its RELEASE for the rest of the test, so whatever ran next on the
-  # connection would read as this tenant's RLS role. `LocalGuc.scoped/3` puts both back when
-  # the body returns. Every other pool takes the plain branch, unchanged: its transaction is
-  # real and ends with the body.
-  defp run_in_tenant(tenant_id, fun, true = _sandbox?) do
-    LocalGuc.scoped(__MODULE__, ["app.current_tenant_id", "role"], fn ->
-      run_in_tenant(tenant_id, fun, false)
-    end)
+  # Under the SQL sandbox (test) a tenant transaction is a SAVEPOINT inside the test's own, and
+  # the tenant setting and `SET LOCAL ROLE` outlive its RELEASE, so whatever ran next on the
+  # connection would read as this tenant's RLS role. There the prior values are read before the
+  # context is set and put back when the body returns (two statements; a raise or a failed
+  # Multi rolls the savepoint back, which reverts them by itself). Every other pool skips both:
+  # its transaction is real and ends with the body. `enter_tenant/2` and `leave_tenant/1` are
+  # the one implementation, shared by `with_tenant/2` and `tenant_multi/2`.
+  #
+  # A `with_tenant/2` nested in another one raises under the sandbox exactly as it does in
+  # production, where the outer transaction makes `assert_not_nested!/2` fire: without this
+  # the restore would hide the nesting from the suite.
+  defp run_in_tenant(tenant_id, fun, sandbox?) do
+    if sandbox? and Process.get(@sandbox_tenant_scope), do: assert_not_nested!(true, false)
+
+    prior = enter_tenant(tenant_id, sandbox?)
+    if sandbox?, do: Process.put(@sandbox_tenant_scope, true)
+
+    try do
+      result = fun.()
+      leave_tenant(prior)
+      result
+    after
+      if sandbox?, do: Process.delete(@sandbox_tenant_scope)
+    end
   end
 
-  defp run_in_tenant(tenant_id, fun, false = _sandbox?) do
+  defp enter_tenant(tenant_id, false = _sandbox?) do
     set_rls_context(tenant_id)
-    fun.()
+    :none
+  end
+
+  defp enter_tenant(tenant_id, true = _sandbox?) do
+    %{rows: [[prior_tenant, prior_role]]} =
+      SQL.query!(
+        __MODULE__,
+        "SELECT current_setting('app.current_tenant_id', true), current_setting('role')",
+        []
+      )
+
+    set_rls_context(tenant_id)
+    {:restore, prior_tenant || "", prior_role}
+  end
+
+  defp leave_tenant(:none), do: :ok
+
+  defp leave_tenant({:restore, prior_tenant, prior_role}) do
+    SQL.query!(
+      __MODULE__,
+      "SELECT set_config('app.current_tenant_id', $1, true), set_config('role', $2, true)",
+      [prior_tenant, prior_role]
+    )
+
+    :ok
+  end
+
+  @doc """
+  Wraps `multi` so it runs RLS-scoped to `tenant_id` when passed to `transaction/2`: a first
+  step sets the tenant context and, under the SQL sandbox only, a last step puts the prior
+  context back (see `with_tenant/2`). For callers that need a Multi's per-step error tuples,
+  which a Multi nested inside `with_tenant/2` would lose to the outer rollback. Its step names
+  are `:rls_context` and `:rls_restore`.
+  """
+  @spec tenant_multi(Ecto.UUID.t(), Ecto.Multi.t()) :: Ecto.Multi.t()
+  def tenant_multi(tenant_id, %Ecto.Multi{} = multi) when is_binary(tenant_id) do
+    sandbox? = sandbox_pool?()
+
+    Ecto.Multi.new()
+    |> Ecto.Multi.run(:rls_context, fn _repo, _changes ->
+      {:ok, enter_tenant(tenant_id, sandbox?)}
+    end)
+    |> Ecto.Multi.append(multi)
+    |> Ecto.Multi.run(:rls_restore, fn _repo, %{rls_context: prior} ->
+      {:ok, leave_tenant(prior)}
+    end)
   end
 
   # US-33.7 guard: `with_tenant/2` must own its transaction (see @doc above).
@@ -123,12 +186,11 @@ defmodule Loopctl.Repo do
   # nested-transaction caller that silently leaks tenant/role context. No current
   # caller nests.
   #
-  # IMPORTANT: the guard is INERT under the SQL sandbox (whose per-test
-  # transaction makes `in_transaction?/0` true by design), i.e. for the entire
-  # test suite. No integration test can catch a nested caller — the decision
-  # function is exposed as `assert_not_nested!/2` so at least the RULE is
-  # covered in CI (`test/loopctl/repo_nested_transaction_guard_test.exs`);
-  # actual nesting must be verified by inspection or in dev/prod.
+  # Under the SQL sandbox this guard is inert (the pool is the sandbox), so the suite
+  # cannot catch `with_tenant/2` nested in some OTHER transaction. A `with_tenant/2` nested
+  # in another `with_tenant/2` is caught there too, by `run_in_tenant/3`. The decision
+  # function is exposed as `assert_not_nested!/2` so the RULE is covered in CI
+  # (`test/loopctl/repo_nested_transaction_guard_test.exs`).
   @doc """
   The pure decision behind the `with_tenant/2` nested-transaction guard.
 

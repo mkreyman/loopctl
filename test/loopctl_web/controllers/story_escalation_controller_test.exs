@@ -182,7 +182,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       # but the transition the request just made lives in this process's `Loopctl.Repo`
       # transaction — an unboxed read sees the committed `escalated` and would call a working
       # write a failure.
-      assert as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end).stage ==
+      assert Stages.get(story.tenant_id, story.id).stage ==
                :done
     end
 

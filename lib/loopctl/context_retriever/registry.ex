@@ -110,11 +110,11 @@ defmodule Loopctl.ContextRetriever.Registry do
   `{:error, :entity_limit}` WITHOUT inserting. Otherwise validates via
   `Entity.create_changeset/2` and inserts.
 
-  Runs as an `Ecto.Multi` so the RLS context, the advisory lock, the cap check,
-  the insert, and the audit entry all execute in ONE transaction and the write's
+  Runs as an `Ecto.Multi` inside `Repo.with_tenant/2`, so the advisory lock, the cap
+  check, the insert, and the audit entry all execute in ONE RLS-scoped transaction and the write's
   `unique_constraint` is caught as an `{:error, changeset}` (a bare `Repo.insert`
   inside `Repo.with_tenant` would poison the transaction on a constraint
-  violation — Ecto only savepoints per-op under `Multi`). The `:rls` step sets
+  violation — Ecto only savepoints per-op under `Multi`). `with_tenant/2` sets
   `SET LOCAL app.current_tenant_id` + `SET LOCAL ROLE`, so the cap count, insert,
   and audit write are RLS-scoped to this tenant.
 
@@ -150,10 +150,6 @@ defmodule Loopctl.ContextRetriever.Registry do
     metadata = Keyword.get(opts, :metadata, %{})
 
     Multi.new()
-    |> Multi.run(:rls, fn _repo, _changes ->
-      Repo.set_rls_context(tenant_id)
-      {:ok, :ok}
-    end)
     |> Multi.run(:lock, fn repo, _changes ->
       # Serialize concurrent same-tenant creates so the count-then-insert cap is
       # race-free. Two-int form isolates this lock class by namespace.
@@ -165,7 +161,7 @@ defmodule Loopctl.ContextRetriever.Registry do
       # The cap check shares this transaction with the insert (under the advisory
       # lock). RLS already scopes the count to this tenant; the explicit
       # `tenant_id` predicate is defense-in-depth on the security-root count so a
-      # future reorder/removal of `:rls` can't silently make it cross-tenant.
+      # future change to the RLS scoping can't silently make it cross-tenant.
       count = repo.aggregate(from(e in Entity, where: e.tenant_id == ^tenant_id), :count, :id)
 
       if count >= max_entities() do
@@ -192,7 +188,7 @@ defmodule Loopctl.ContextRetriever.Registry do
         }
       }
     end)
-    |> Repo.transaction()
+    |> transact_in_tenant(tenant_id)
     |> case do
       {:ok, %{entity: entity}} -> {:ok, entity}
       {:error, :cap, :entity_limit, _changes} -> {:error, :entity_limit}
@@ -258,7 +254,6 @@ defmodule Loopctl.ContextRetriever.Registry do
 
       {:ok, uuid} ->
         Multi.new()
-        |> put_rls(tenant_id)
         |> fetch_entity(tenant_id, uuid)
         |> Multi.update(:entity, fn %{fetch: entity} ->
           Entity.update_changeset(entity, attrs)
@@ -269,7 +264,7 @@ defmodule Loopctl.ContextRetriever.Registry do
             new_state: state_snapshot(entity)
           })
         end)
-        |> finish_entity_write()
+        |> finish_entity_write(tenant_id)
     end
   end
 
@@ -293,13 +288,12 @@ defmodule Loopctl.ContextRetriever.Registry do
 
       {:ok, uuid} ->
         Multi.new()
-        |> put_rls(tenant_id)
         |> fetch_entity(tenant_id, uuid)
         |> Multi.delete(:entity, fn %{fetch: entity} -> entity end)
         |> Audit.log_in_multi(:audit, fn %{entity: entity} ->
           audit_attrs(tenant_id, entity, "deleted", opts, %{old_state: state_snapshot(entity)})
         end)
-        |> finish_entity_write()
+        |> finish_entity_write(tenant_id)
     end
   end
 
@@ -312,9 +306,9 @@ defmodule Loopctl.ContextRetriever.Registry do
   # Run the update/delete Multi and normalize its result. The `:entity` changeset
   # branch is only reachable from `update_entity/4` (a delete never re-validates);
   # `delete_entity/3` simply never produces it.
-  defp finish_entity_write(multi) do
+  defp finish_entity_write(multi, tenant_id) do
     multi
-    |> Repo.transaction()
+    |> transact_in_tenant(tenant_id)
     |> case do
       {:ok, %{entity: entity}} -> {:ok, entity}
       {:error, :fetch, :not_found, _changes} -> {:error, :not_found}
@@ -325,14 +319,11 @@ defmodule Loopctl.ContextRetriever.Registry do
 
   # --- Shared Multi steps (update/delete) ---
 
-  # Set the RLS context (`SET LOCAL app.current_tenant_id` + `SET LOCAL ROLE`) so
-  # the scoped fetch, the write, and the audit insert all run RLS-scoped to this
-  # tenant — mirroring `create_entity/3`'s `:rls` step.
-  defp put_rls(multi, tenant_id) do
-    Multi.run(multi, :rls, fn _repo, _changes ->
-      Repo.set_rls_context(tenant_id)
-      {:ok, :ok}
-    end)
+  # Runs the Multi RLS-scoped to this tenant, so the scoped fetch, the write and the audit
+  # insert all see only its rows. `Repo.tenant_multi/2` sets the context (and, under the test
+  # sandbox, puts it back), keeping each step's error tuple.
+  defp transact_in_tenant(multi, tenant_id) do
+    tenant_id |> Repo.tenant_multi(multi) |> Repo.transaction()
   end
 
   # Fetch the row inside the transaction, scoped by RLS + an explicit tenant

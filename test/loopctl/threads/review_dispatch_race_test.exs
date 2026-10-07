@@ -115,7 +115,9 @@ defmodule Loopctl.Threads.ReviewDispatchRaceTest do
     winner =
       Task.async(fn ->
         unboxed(fn ->
-          Repo.with_tenant(tenant.id, fn ->
+          # A plain transaction to hold the thread lock: record_review/3 sets the tenant
+          # itself, and a with_tenant/2 around it would be nested.
+          Repo.transaction(fn ->
             Repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
               Threads.lock_namespace(),
               story.id
