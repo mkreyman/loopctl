@@ -4,11 +4,10 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
   security boundary that turns a generated tool call into a safe, parameterized,
   tenant-scoped Ecto query.
 
-  ## Why `async: false` + `Repo`-connection seeding
+  ## Why `Repo`-connection seeding
 
   The executor reads through `Loopctl.Repo.with_tenant/2` (RLS transactions with
-  `SET LOCAL ROLE loopctl_app`), which needs shared sandbox mode and
-  same-connection seeding. The backing rows (projects/epics/stories) and the
+  `SET LOCAL ROLE loopctl_app`) on the test's own sandbox connection. The backing rows (projects/epics/stories) and the
   tenant are therefore seeded via `Repo` (NOT the AdminRepo-backed `fixture/2`),
   so they live on the SAME DB connection the executor reads on — mirroring
   `registry_test.exs`'s `repo_tenant/0` pattern.
@@ -18,7 +17,7 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
   (AC-30.3.2). Audit rows are written by the executor via `AdminRepo`
   (`Audit.create_log_entry/2`) and read back via `AdminRepo` here.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
 
@@ -274,36 +273,14 @@ defmodule Loopctl.ContextRetriever.ExecutorTest do
   end
 
   describe "TC-30.3.6 — fail-closed edges" do
+    # The stale-backing-column edge is in `executor_stale_column_test.exs`: it runs DDL on
+    # `stories`, so it is the one TC-30.3.6 case that cannot run async.
+
     test "a nil-tenant (superadmin) scope is refused with no cross-tenant read" do
       superadmin_scope = %Scope{tenant_id: nil, role: :superadmin, actor_label: "superadmin"}
 
       assert {:error, :no_tenant} =
                Executor.run(superadmin_scope, {"story", "title", :filter}, %{"title" => "x"})
-    end
-
-    test "a declared field whose backing column was dropped returns :stale_entity" do
-      tenant = repo_tenant()
-      seed_story(tenant.id, %{title: "Some story", number: "101"})
-
-      # sort_key is a server-allowlisted :integer column, not part of the
-      # search_vector and not :decimal (so it is filter-supported). Declaring it
-      # filterable, then dropping the underlying column, simulates a stale entity
-      # def whose backing column no longer exists.
-      create_story_entity(tenant.id, [
-        %{name: "sort_key", type: :integer, filterable: true, searchable: false}
-      ])
-
-      # Drop the backing column on the Repo connection (rolls back at test exit).
-      # `create_story_entity/2` ran through `Repo.with_tenant`, whose
-      # `SET LOCAL ROLE loopctl_app` persists for the rest of the sandbox
-      # transaction; reset to the owner role so the DDL is permitted.
-      Repo.query!("RESET ROLE")
-      Repo.query!("ALTER TABLE stories DROP COLUMN sort_key")
-
-      assert {:error, :stale_entity} =
-               Executor.run(scope_for(tenant), {"story", "sort_key", :filter}, %{
-                 "sort_key" => "3"
-               })
     end
   end
 

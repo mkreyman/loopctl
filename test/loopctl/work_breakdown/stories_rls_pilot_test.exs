@@ -6,13 +6,12 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
   This is a SECURITY-BOUNDARY change: the parity, tenant-isolation, and fail-closed
   tests below are gates, not nice-to-haves.
 
-  ## Why `async: false` + dual-repo seeding
+  ## Why dual-repo seeding
 
   The RLS path reads through `Loopctl.Repo.with_tenant/2` (an RLS transaction that
   runs `SET LOCAL ROLE loopctl_app`, a NON-BYPASSRLS role — see config/test.exs
   `:rls_role`). RLS only genuinely enforces when the read runs on the same
-  connection the rows were seeded on, under that non-owner role — which requires
-  the SHARED sandbox (`async: false`). This mirrors
+  connection the rows were seeded on, under that non-owner role. This mirrors
   `test/loopctl/context_retriever/executor_test.exs`.
 
   `Loopctl.Repo` and `Loopctl.AdminRepo` are SEPARATE sandbox connections over the
@@ -44,7 +43,7 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
   (b) under `SET LOCAL ROLE <rls_role>` with NO `app.current_tenant_id` set, asserting
   RLS alone fails closed to zero rows. If RLS were a no-op, both tests would fail.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
 
@@ -119,8 +118,7 @@ defmodule Loopctl.WorkBreakdown.StoriesRlsPilotTest do
   end
 
   # `Stories.list_stories_by_project(..., strategy: :rls)` and raw `Repo.with_tenant/2`
-  # run `SET LOCAL ROLE <rls_role>`, which — because this suite shares one sandbox
-  # connection (async: false) — persists for the rest of the enclosing sandbox
+  # run `SET LOCAL ROLE <rls_role>`, which persists for the rest of the enclosing sandbox
   # transaction once the inner savepoint releases. Reset to the owner role after
   # every RLS-touching read so the sandbox connection is left clean and no
   # later owner-role assertion in the same test silently runs as the non-owner

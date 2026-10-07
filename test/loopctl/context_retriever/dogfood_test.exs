@@ -6,11 +6,11 @@ defmodule Loopctl.ContextRetriever.DogfoodTest do
   `Loopctl.WorkBreakdown.Stories` oracle, expose ONLY server-allowlisted columns,
   and are tenant-isolated under the non-owner app role.
 
-  ## Why `async: false` + `Repo`-connection seeding
+  ## Why `Repo`-connection seeding
 
   Same as `executor_test.exs`: the executor (`Executor.run/3`) reads through
   `Loopctl.Repo.with_tenant/2` (RLS transactions with `SET LOCAL ROLE
-  loopctl_app`), which needs shared sandbox mode and same-connection seeding. The
+  loopctl_app`) on the test's own sandbox connection. The
   backing rows the EXECUTOR reads are therefore seeded via `Repo` (NOT the
   AdminRepo-backed `fixture/2`) so they live on the SAME DB connection the
   executor reads on. Because the isolation assertions run under the NON-owner app
@@ -48,7 +48,7 @@ defmodule Loopctl.ContextRetriever.DogfoodTest do
   standing in for identity: if the generated path exposed a story the oracle
   hides, its title would appear generated-side but not oracle-side.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
 

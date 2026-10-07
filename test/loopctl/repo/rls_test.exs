@@ -1,7 +1,5 @@
 defmodule Loopctl.Repo.RlsTest do
-  # RLS tests are not async because they need shared sandbox mode
-  # for cross-repo data visibility between Repo and AdminRepo.
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
 
@@ -17,7 +15,7 @@ defmodule Loopctl.Repo.RlsTest do
       id: UUID.generate(),
       name: name,
       slug: "#{name}-#{System.unique_integer([:positive])}",
-      email: "#{name}@example.com",
+      email: "#{name}-#{System.unique_integer([:positive])}@example.com",
       status: :active
     }
     |> Repo.insert!()
@@ -141,7 +139,7 @@ defmodule Loopctl.Repo.RlsTest do
           id: UUID.generate(),
           name: "admin-a",
           slug: "admin-a-#{System.unique_integer([:positive])}",
-          email: "admin-a@example.com",
+          email: "admin-a-#{System.unique_integer([:positive])}@example.com",
           status: :active
         }
         |> AdminRepo.insert!()
@@ -151,7 +149,7 @@ defmodule Loopctl.Repo.RlsTest do
           id: UUID.generate(),
           name: "admin-b",
           slug: "admin-b-#{System.unique_integer([:positive])}",
-          email: "admin-b@example.com",
+          email: "admin-b-#{System.unique_integer([:positive])}@example.com",
           status: :active
         }
         |> AdminRepo.insert!()
