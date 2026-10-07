@@ -91,7 +91,7 @@ defmodule Loopctl.Delivery.Stages do
     repeated here because this module owns the other half of the order): the capacity lock
     is taken FIRST, so a dispatch holding it and waiting on a story row makes every other
     dispatch in that tenant queue behind the capacity lock and fall out as
-    `:capacity_busy` once the 5s `lock_timeout` elapses. A burst of them therefore means a
+    `:capacity_busy` once Capacity's `lock_timeout` (5s by default) elapses. A burst of them therefore means a
     LONG-HELD STORY LOCK — a claim release, a reclaim sweep, a transition that is waiting
     on something — not a capacity shortage. Look at what is holding the story row before
     raising a tenant's cap.
@@ -150,10 +150,8 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Runners.Runner
   alias Loopctl.WorkBreakdown.Story
 
-  # 2s / 5s in every deployed environment; tunables for the same reason as
-  # `Loopctl.Runners.Capacity`'s lock timeout (config/test.exs sets shorter waits).
-  @lock_timeout "#{Application.compile_env(:loopctl, :stages_lock_timeout_ms, 2_000)}ms"
-  @statement_timeout "#{Application.compile_env(:loopctl, :stages_statement_timeout_ms, 5_000)}ms"
+  @lock_timeout "2000ms"
+  @statement_timeout "5000ms"
 
   # The story statuses a claim holds. Entering `claimed` needs one.
   @claimed_statuses [:assigned, :implementing]

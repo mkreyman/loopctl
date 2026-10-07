@@ -242,6 +242,17 @@ defmodule Loopctl.Runners.CapacityTest do
     unboxed(fn -> Runners.release_slot(runner.tenant_id, dispatch_id, generation) end)
   end
 
+  describe "lock_timeout_ms/0" do
+    test "deployed environments wait 5s; only configuration shortens it" do
+      # The deployed value lives only as the compile-env fallback, and the test env overrides
+      # it, so nothing else here would notice a mistyped default shipping a shorter wait.
+      assert Capacity.default_lock_timeout_ms() == 5_000
+
+      assert Capacity.lock_timeout_ms() ==
+               Application.get_env(:loopctl, :capacity_lock_timeout_ms, 5_000)
+    end
+  end
+
   describe "reserve_slot/2" do
     test "from more concurrent callers than slots, exactly max_sessions win" do
       runner = runner(%{max_sessions: 3})
@@ -846,7 +857,9 @@ defmodule Loopctl.Runners.CapacityTest do
       assert reply(runner, d, %{}) == {:error, :capacity_busy}
       elapsed = System.monotonic_time(:millisecond) - started
       assert elapsed >= Capacity.lock_timeout_ms() - 100
-      assert elapsed < Capacity.lock_timeout_ms() * 3
+      # A fixed ceiling, not a multiple of the configured wait: it catches an UNBOUNDED wait,
+      # and must not tighten when the test env shortens the lock timeout.
+      assert elapsed < 15_000
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)

@@ -1250,7 +1250,7 @@ defmodule Loopctl.Runners do
   `:ok` means the declaration is SETTLED — applied, already equal, nothing declared, or a
   runner that is gone. `{:error, reason}` means the write was attempted and did not land, and
   it is returned rather than swallowed so the caller can try again: the realistic failure is
-  `:capacity_busy`, the `runners` row's 5-second `lock_timeout` running out against the row
+  `:capacity_busy`, the `runners` row's `lock_timeout` (5s by default) running out against the row
   every dispatch in the tenant contends on — which is exactly the load under which
   over-dispatching hurts most. Nothing else reconciles it: `Capacity.heal/3` recomputes
   `in_flight` and never touches `max_sessions`, so a swallowed failure left the machine
