@@ -52,7 +52,9 @@ defmodule Loopctl.Delivery.Stages do
 
   ## Slow connections
 
-  Every transaction here sets `lock_timeout` (2s) and `statement_timeout` (5s) locally, so a transaction waiting behind a lock holder — the reclaimer, a
+  Every transition here sets `lock_timeout` (2s) and `statement_timeout` (5s) locally; the
+  read paths (`fetch/2`, `entered_at/3`) wait `Loopctl.Runners.Capacity.lock_timeout_ms/0` (5s)
+  instead. Either way a transaction waiting behind a lock holder — the reclaimer, a
   claim, a concurrent transition, the tenant's audit-chain head — gives up instead of
   waiting without bound while holding a pooled connection. That, and a pool checkout that
   times out, is `{:error, :busy}`: nothing committed, and the call may be retried.
@@ -91,7 +93,7 @@ defmodule Loopctl.Delivery.Stages do
     repeated here because this module owns the other half of the order): the capacity lock
     is taken FIRST, so a dispatch holding it and waiting on a story row makes every other
     dispatch in that tenant queue behind the capacity lock and fall out as
-    `:capacity_busy` once Capacity's `lock_timeout` (5s by default) elapses. A burst of them therefore means a
+    `:capacity_busy` once the 5s `lock_timeout` elapses. A burst of them therefore means a
     LONG-HELD STORY LOCK — a claim release, a reclaim sweep, a transition that is waiting
     on something — not a capacity shortage. Look at what is holding the story row before
     raising a tenant's cap.

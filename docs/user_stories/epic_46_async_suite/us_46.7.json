@@ -1,0 +1,64 @@
+{
+  "id": "US-46.7",
+  "title": "Busy-path tests take the lock wait as a per-call input",
+  "epic": {
+    "id": "epic_46",
+    "name": "Async test suite through dependency injection"
+  },
+  "priority": "high",
+  "story": {
+    "as_a": "busy-path test",
+    "i_want_to": "give the call I am testing a short lock wait",
+    "so_that": "I stop waiting out the deployed 5s while the race tests keep their full margin"
+  },
+  "rationale": "The slowest sync modules wait out Loopctl.Runners.Capacity's 5s lock_timeout once per busy-path test. Measured on minis, 2026-10-07: the six slowest delivery modules took 168.6 s at 5s and 101.6 s with the wait at 2s (402 tests, 0 failures), and the gate's test step fell from about 254 s to 165 s at 1s. A suite-wide test-config value was tried in PR #954 and withdrawn after two review rounds: the race tests (up to ten callers on one lock, exact outcome counts) need the full wait, the busy-path tests want a short one, and one knob cannot serve both. Production sets lock_timeout inside its own transaction, so a test cannot shorten it from outside.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-46.7.1",
+      "description": "The Capacity entry points the busy-path tests exercise take the lock wait as an option defaulting to Capacity.lock_timeout_ms/0 (5s); production callers pass nothing and behave exactly as today."
+    },
+    {
+      "id": "AC-46.7.2",
+      "description": "The option is never fed from request data or channel params; it carries no identity (CLAUDE.md, custody identity)."
+    },
+    {
+      "id": "AC-46.7.3",
+      "description": "The busy-path tests in VerificationRunnerWorkerIntegration, RunnerChannelDispatch, MergePreconditionIntegration and Capacity pass a short wait; the race tests pass nothing."
+    },
+    {
+      "id": "AC-46.7.4",
+      "description": "The PR reports the six slow modules' time and the gate's test step before and after."
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-46.7.1",
+      "name": "Busy path answers within the injected wait",
+      "type": "integration",
+      "steps": [
+        "Hold the runner row on a second connection",
+        "Call the entry point with a 100ms wait"
+      ],
+      "expected_results": [
+        "{:error, :capacity_busy} after roughly 100ms, not 5s"
+      ]
+    },
+    {
+      "id": "TC-46.7.2",
+      "name": "Seam is load-bearing",
+      "type": "integration",
+      "steps": [
+        "Make the entry point ignore the option",
+        "Run TC-46.7.1"
+      ],
+      "expected_results": [
+        "The test fails on elapsed time"
+      ]
+    }
+  ],
+  "technical_notes": [
+    "Capacity.set_lock_timeout!/1 is the one place the wait is applied; thread an optional ms through it from the entry points the busy tests call.",
+    "Channel-process paths (RunnerChannelDispatch) need the wait to reach the channel; a socket-assign set only by test setup, never from connect params, is one route."
+  ],
+  "dependencies": []
+}
