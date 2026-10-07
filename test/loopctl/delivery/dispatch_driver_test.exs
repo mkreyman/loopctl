@@ -38,7 +38,6 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   alias Loopctl.Progress
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
-  alias Loopctl.Runners.Selection
   alias Loopctl.Runners.Usage
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.RunnerSocket
@@ -554,15 +553,8 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   end
 
   describe "an exhausted subscription is not capacity (US-44.6)" do
-    # The reset line is `:info`, below `config/test.exs`'s `:warning` primary level; a module
-    # level lets it past for the module that logs it — `Selection.note_no_runner/3`, which both
-    # passes share — the way `Loopctl.Workers.ReclaimExpiredClaimsLoggingTest` does. VM-global,
-    # which this module's `async: false` already covers.
-    setup do
-      Logger.put_module_level(Selection, :info)
-      on_exit(fn -> Logger.delete_module_level(Selection) end)
-      :ok
-    end
+    # The reset line is `:info`, below `config/test.exs`'s `:warning` primary level;
+    # `test/test_helper.exs` lets `Selection.note_no_runner/3`'s `:info` past once for the run.
 
     test "an exhausted account is excluded everywhere: the driver places nothing, and a " <>
            "placement naming the OTHER machine on that account is refused (TC-44.6.5)",

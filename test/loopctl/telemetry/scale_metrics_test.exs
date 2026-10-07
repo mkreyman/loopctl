@@ -36,13 +36,14 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   The cap-gate tests flip a gate of their OWN (`:persistent_term` key passed to
   `scale_tags/2`, `tenant_label?/1`, `refresh_tenant_label_gate/1`), never the node's
   `{ScaleMetrics, :tenant_label?}` every metric reads. The reporter round-trips start their
-  reporter on `own_metrics/1`, whose `:keep` also requires that the EMITTING process is this
+  reporter on `Loopctl.TelemetryHelpers.own_metrics/1`, whose `:keep` also requires that the EMITTING process is this
   test's, so a concurrent test's repo query or blocked decision is never counted here.
   """
   use ExUnit.Case, async: true
 
   alias Loopctl.SystemConfig.CachePrimer
   alias Loopctl.Telemetry.ScaleMetrics
+  alias Loopctl.TelemetryHelpers
 
   @scale_metric_names [
     "loopctl.db.error.count",
@@ -130,17 +131,6 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
   defp metric(name) do
     Enum.find(scale_metrics(), fn m -> Enum.join(m.name, ".") == name end) ||
       flunk("scale metric #{name} not found")
-  end
-
-  # `metrics`, each kept only for events the calling test process emits: a telemetry
-  # handler runs in the emitter, so `self()` inside `:keep` is whoever fired the event.
-  defp own_metrics(metrics) do
-    test_pid = self()
-
-    for metric <- metrics do
-      keep = metric.keep
-      %{metric | keep: fn meta -> self() == test_pid and (is_nil(keep) or keep.(meta)) end}
-    end
   end
 
   describe "scale_metrics/0 — bounded, safe label set (TC-27.15.2, AC-27.15.3)" do
@@ -528,7 +518,11 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       pid =
         start_supervised!(
           {TelemetryMetricsPrometheus.Core,
-           [metrics: own_metrics(metrics), name: reporter_name, start_async: false]}
+           [
+             metrics: TelemetryHelpers.own_metrics(metrics),
+             name: reporter_name,
+             start_async: false
+           ]}
         )
 
       %{reporter: reporter_name, reporter_pid: pid}
@@ -628,7 +622,11 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       pid =
         start_supervised!(
           {TelemetryMetricsPrometheus.Core,
-           [metrics: own_metrics([counter]), name: reporter_name, start_async: false]}
+           [
+             metrics: TelemetryHelpers.own_metrics([counter]),
+             name: reporter_name,
+             start_async: false
+           ]}
         )
 
       :telemetry.execute([:loopctl, :llm, :blocked], %{count: 1}, %{provider: "anthropic"})
@@ -849,7 +847,11 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       pid =
         start_supervised!(
           {TelemetryMetricsPrometheus.Core,
-           [metrics: own_metrics(metrics), name: reporter_name, start_async: false]}
+           [
+             metrics: TelemetryHelpers.own_metrics(metrics),
+             name: reporter_name,
+             start_async: false
+           ]}
         )
 
       %{reporter: reporter_name, reporter_pid: pid}
@@ -1151,7 +1153,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
     test "an EXITING body returns the fallback, logs a BOUNDED tag, and fires the counter" do
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           assert guarded(fn -> exit({:noproc, {DBConnection, :execute, []}}) end) == :held
         end)
 
@@ -1175,7 +1177,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
     test "a THROWING body is guarded too — telemetry_poller drops an MFA on all three kinds" do
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           assert guarded(fn -> throw(:boom) end) == :held
         end)
 
@@ -1190,7 +1192,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
     test "a RAISING body keeps its own message and passes the struct through for classification" do
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           assert guarded(fn -> raise ArgumentError, "bad tunable" end) == :held
         end)
 
@@ -1232,7 +1234,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       :persistent_term.put(gate, true)
 
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           # Cycle 1: held. An intermittently wedged pool used to flip the gate (and every
           # per-tenant series' label) OFF here, then back ON the next cycle, paying the
           # global `:persistent_term.put/2` term-table scan on each flap.
@@ -1268,7 +1270,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      ExUnit.CaptureLog.capture_log(fn -> ScaleMetrics.refresh_tenant_label_gate(gate) end)
+      Loopctl.OwnLog.capture_own_log(fn -> ScaleMetrics.refresh_tenant_label_gate(gate) end)
 
       assert_receive {:poll_error, %{poller: :tenant_label_gate}, %{count: 1}}, 500
     end
@@ -1291,7 +1293,11 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       pid =
         start_supervised!(
           {TelemetryMetricsPrometheus.Core,
-           [metrics: own_metrics(metrics), name: reporter_name, start_async: false]}
+           [
+             metrics: TelemetryHelpers.own_metrics(metrics),
+             name: reporter_name,
+             start_async: false
+           ]}
         )
 
       :telemetry.execute([:loopctl, :oban, :jobs, :count], %{count: 3}, %{
@@ -1391,7 +1397,11 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       start_supervised!(
         {TelemetryMetricsPrometheus.Core,
-         [metrics: own_metrics([counter]), name: reporter_name, start_async: false]}
+         [
+           metrics: TelemetryHelpers.own_metrics([counter]),
+           name: reporter_name,
+           start_async: false
+         ]}
       )
 
       for _i <- 1..3 do
@@ -1497,7 +1507,11 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
 
       start_supervised!(
         {TelemetryMetricsPrometheus.Core,
-         [metrics: own_metrics([counter]), name: reporter_name, start_async: false]}
+         [
+           metrics: TelemetryHelpers.own_metrics([counter]),
+           name: reporter_name,
+           start_async: false
+         ]}
       )
 
       # Drive the label through the PRODUCER's own classifier rather than a literal, so a

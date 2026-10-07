@@ -49,12 +49,28 @@ defmodule Loopctl.TelemetryHelpers do
 
   @doc false
   def forward_own(event, measurements, metadata, %{pid: pid, ref: ref}) do
-    if self() == pid or pid in Process.get(:"$callers", []) do
-      send(pid, {event, ref, measurements, metadata})
-    end
-
+    if emitted_by?(pid), do: send(pid, {event, ref, measurements, metadata})
     :ok
   end
+
+  @doc """
+  `metrics`, each kept only for events the calling test emits — by the same emitter test
+  as `attach_own/1` — so a reporter started on them counts no concurrent test's events.
+  A reporter's handlers are attached VM-wide; `:keep` runs in the emitting process.
+  """
+  @spec own_metrics([Telemetry.Metrics.t()]) :: [Telemetry.Metrics.t()]
+  def own_metrics(metrics) do
+    pid = self()
+
+    for metric <- metrics do
+      keep = metric.keep
+      %{metric | keep: fn meta -> emitted_by?(pid) and (is_nil(keep) or keep.(meta)) end}
+    end
+  end
+
+  # The emitter test: a telemetry handler runs in the EMITTING process, which is `pid`
+  # itself or a process it started (`Task`s record their starter in `:"$callers"`).
+  defp emitted_by?(pid), do: self() == pid or pid in Process.get(:"$callers", [])
 
   @doc """
   Waits for a `:telemetry_test` message for `event`/`ref` whose METADATA satisfies

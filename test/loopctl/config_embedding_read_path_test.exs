@@ -40,12 +40,14 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
 
   A third guard covers the flag WRITER: the read-flag key names a VM-GLOBAL
   `:persistent_term`-cached `SystemConfig` row, and NO test module may write the node-wide
-  copy. `test/loopctl/embeddings/system_config_read_path_test.exs` writes the flag into its
-  OWN namespace with `SystemConfig.put/3`, which no other test reads. A node-wide writer
-  would reintroduce the cross-module leakage that produced the flaky empty-result
-  failures — stub `Loopctl.MockEmbeddingReadPath` instead. That guard matches on the AST
-  (any `put/2` in a module that mentions `read_flag_key` or the literal key string), not on
-  a formatted call string, so an alias, a pipe, or a reflow does not evade it.
+  copy. `test/loopctl/embeddings/system_config_read_path_test.exs` reads and writes a flag
+  row of its OWN (a per-test key), which no other test reads. A node-wide writer would
+  reintroduce the cross-module leakage that produced the flaky empty-result failures — stub
+  `Loopctl.MockEmbeddingReadPath` instead. That guard matches on the AST, not on a formatted
+  call string: any `put` into the NODE-WIDE namespace (`put/2`, or `put/3` naming
+  `SystemConfig` itself, piped or not) in a module that mentions `read_flag_key` or the
+  literal key string. A put into a test's own namespace (`put/3` with anything else) is not a
+  node-wide write.
 
   A fourth guard covers the OTHER side of the same DI seam: a `*_scale_test.exs` module on
   bare `ExUnit.Case` gets no `stub_all_defaults/0`, so a read reaching
@@ -152,8 +154,9 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
 
       assert writers == [],
              """
-             No test module may write the VM-global US-41.1 cutover flag (`SystemConfig.put/2`).
-             A test that needs a value writes its own namespace with `SystemConfig.put/3`, as
+             No test module may write the VM-global US-41.1 cutover flag into the node-wide
+             namespace (`SystemConfig.put/2`, or `put/3` naming `SystemConfig`). A test that
+             needs a flag reads and writes a row of its own, as
              test/loopctl/embeddings/system_config_read_path_test.exs does. Found: #{inspect(writers)}.
 
              If a test needs the side-table read path, stub
@@ -181,6 +184,21 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
                "SystemConfig.put(Embeddings.read_flag_key(), 1, cache)"
              ),
              "a write into a test's own namespace (put/3) never reaches the node-wide flag"
+
+      for node_wide <- [
+            "SystemConfig.put(Embeddings.read_flag_key(), 1, SystemConfig)",
+            "Loopctl.SystemConfig.put(Embeddings.read_flag_key(), 1, Loopctl.SystemConfig)",
+            "Embeddings.read_flag_key() |> SystemConfig.put(1)",
+            "Embeddings.read_flag_key() |> SystemConfig.put(1, SystemConfig)"
+          ] do
+        assert writes_read_flag_in_source?(node_wide),
+               "#{node_wide} writes the NODE-WIDE namespace and must be caught"
+      end
+
+      refute writes_read_flag_in_source?(
+               "Embeddings.read_flag_key() |> SystemConfig.put(1, cache)"
+             ),
+             "a piped write into a test's own namespace is not a node-wide write"
     end
   end
 
@@ -335,24 +353,42 @@ defmodule Loopctl.ConfigEmbeddingReadPathTest do
 
   defp writes_read_flag?(file), do: file |> File.read!() |> writes_read_flag_in_source?()
 
-  # SEMANTIC match, not a call-string match: the module contains a `*.put/2` call AND
-  # mentions the flag (via `read_flag_key` or the literal key string) somewhere — so an
-  # alias, a full qualification, a module attribute holding the key, a pipe, or any
-  # reformatting is still caught. Deliberately strict: over-matching costs a reviewer one
-  # look, under-matching silently reopens the cross-module leak.
+  # SEMANTIC match, not a call-string match: the module contains a `*.put` into the
+  # NODE-WIDE namespace AND mentions the flag (via `read_flag_key` or the literal key
+  # string) somewhere — so an alias, a full qualification, a module attribute holding the
+  # key, a pipe, or any reformatting is still caught. Deliberately strict: over-matching
+  # costs a reviewer one look, under-matching silently reopens the cross-module leak.
   defp writes_read_flag_in_source?(source) do
     ast = Code.string_to_quoted!(source)
-    put_call?(ast) and mentions_read_flag?(ast)
+    node_wide_put?(ast) and mentions_read_flag?(ast)
   end
 
-  defp put_call?(ast) do
+  # A put's arguments as written, plus one for a piped call (`key |> put(value)` puts the
+  # key in front). `put/2` has no namespace argument, so it writes the node-wide one; a
+  # `put/3` does only when its namespace IS `SystemConfig`.
+  defp node_wide_put?(ast) do
     ast
     |> Macro.prewalk(false, fn
-      {{:., _, [_mod, :put]}, _, [_key, _value]} = node, _acc -> {node, true}
-      node, acc -> {node, acc}
+      # Judged here as a whole, then only the piped-in side is walked on: the inner call
+      # alone is one argument short and would read as a `put/2`.
+      {:|>, _, [lhs, {{:., _, [_mod, :put]}, _, rest}]}, acc ->
+        {lhs, acc or node_wide_args?([:piped | rest])}
+
+      {{:., _, [_mod, :put]}, _, args} = node, acc ->
+        {node, acc or node_wide_args?(args)}
+
+      node, acc ->
+        {node, acc}
     end)
     |> elem(1)
   end
+
+  defp node_wide_args?([_key, _value]), do: true
+  defp node_wide_args?([_key, _value, namespace]), do: system_config_alias?(namespace)
+  defp node_wide_args?(_args), do: false
+
+  defp system_config_alias?({:__aliases__, _, parts}), do: List.last(parts) == :SystemConfig
+  defp system_config_alias?(_other), do: false
 
   defp mentions_read_flag?(ast) do
     ast

@@ -526,7 +526,7 @@ defmodule Loopctl.HeavyReadTest do
 
     test "restore logs a STABLE TAG on failure — never the raw error, which carries the backend host/database/role" do
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           assert Loopctl.LocalGuc.restore(ExitingRepo, [{"statement_timeout", "1234ms"}]) == :ok
         end)
 
@@ -539,7 +539,7 @@ defmodule Loopctl.HeavyReadTest do
 
     test "an ALREADY-ABORTED (25P02) transaction is NOT reported as a leak" do
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        Loopctl.OwnLog.capture_own_log(fn ->
           assert Loopctl.LocalGuc.restore(AbortedTxnRepo, [{"statement_timeout", "1234ms"}]) ==
                    :ok
         end)

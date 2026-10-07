@@ -101,6 +101,9 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
 
   # --- Client API ---
 
+  # `:name` and `:table` are the server name and the ETS table this gate owns — the app's
+  # (`__MODULE__` and `@table`) unless a caller (a test of the gate being down) starts a
+  # gate of its own, which then shares nothing with the app's.
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -121,7 +124,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   @impl Loopctl.Knowledge.EmbeddingConcurrency.Behaviour
   @spec acquire(binary()) :: :ok | {:error, :rate_limited_local}
   def acquire(tenant_id) when is_binary(tenant_id) do
-    acquire(tenant_id, max_concurrent(), max_per_tenant())
+    acquire(tenant_id, max_concurrent(), max_per_tenant(), __MODULE__)
   end
 
   @doc """
@@ -191,15 +194,16 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
 
   @doc "Current node-wide in-flight embedding count (for tests/telemetry)."
   @spec count() :: non_neg_integer()
-  def count, do: counter(@global_key)
+  def count, do: counter(@table, @global_key)
 
   @doc "Alias of `count/0` — current global in-flight embedding count."
-  @spec global_count() :: non_neg_integer()
-  def global_count, do: counter(@global_key)
+  @spec global_count(:ets.table()) :: non_neg_integer()
+  def global_count(table \\ @table), do: counter(table, @global_key)
 
   @doc "Current in-flight embedding count for `tenant_id` (for tests/telemetry)."
-  @spec tenant_count(binary()) :: non_neg_integer()
-  def tenant_count(tenant_id) when is_binary(tenant_id), do: counter(tenant_key(tenant_id))
+  @spec tenant_count(binary(), :ets.table()) :: non_neg_integer()
+  def tenant_count(tenant_id, table \\ @table) when is_binary(tenant_id),
+    do: counter(table, tenant_key(tenant_id))
 
   @doc """
   Configured per-node GLOBAL concurrent-embedding cap.
@@ -237,11 +241,13 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   # --- Server callbacks ---
 
   @impl GenServer
-  def init(_opts) do
+  def init(opts) do
+    name = Keyword.get(opts, :table, @table)
+
     table =
-      case :ets.whereis(@table) do
+      case :ets.whereis(name) do
         :undefined ->
-          :ets.new(@table, [
+          :ets.new(name, [
             :set,
             :public,
             :named_table,
@@ -302,7 +308,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
       ref ->
         {^pid, tenant_id} = Map.fetch!(state.monitors, ref)
         Process.demonitor(ref, [:flush])
-        decrement(tenant_id)
+        decrement(state.table, tenant_id)
         {:reply, :ok, untrack(state, ref, pid)}
     end
   end
@@ -315,7 +321,7 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
     # exactly-once with release.
     case Map.get(state.monitors, ref) do
       {^pid, tenant_id} ->
-        decrement(tenant_id)
+        decrement(state.table, tenant_id)
         Logger.warning("embedding concurrency: reclaimed leaked slot for crashed caller")
         {:noreply, untrack(state, ref, pid)}
 
@@ -378,14 +384,14 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   # should never fire, but it's kept as defense-in-depth so a stray decrement can
   # never drive a counter negative (which would inflate the effective cap). Called
   # ONLY from the GenServer process (release/DOWN), so decrements are serialized.
-  defp decrement(tenant_id) do
-    dec_floor(@global_key)
-    dec_tenant(tenant_key(tenant_id))
+  defp decrement(table, tenant_id) do
+    dec_floor(table, @global_key)
+    dec_tenant(table, tenant_key(tenant_id))
     :ok
   end
 
-  defp dec_floor(key) do
-    :ets.update_counter(@table, key, {2, -1, 0, 0}, {key, 0})
+  defp dec_floor(table, key) do
+    :ets.update_counter(table, key, {2, -1, 0, 0}, {key, 0})
   end
 
   # Per-tenant rows are REAPED once they reach zero, so the table doesn't accumulate a
@@ -395,15 +401,15 @@ defmodule Loopctl.Knowledge.EmbeddingConcurrency do
   # concurrent acquire can interleave to observe a transiently-absent row, and a fresh
   # acquire re-creates the row via `update_counter`'s `{key, 0}` default. The global row
   # is deliberately kept (single, always-present, hot).
-  defp dec_tenant(key) do
-    case :ets.update_counter(@table, key, {2, -1, 0, 0}, {key, 0}) do
-      0 -> :ets.delete(@table, key)
+  defp dec_tenant(table, key) do
+    case :ets.update_counter(table, key, {2, -1, 0, 0}, {key, 0}) do
+      0 -> :ets.delete(table, key)
       _ -> :ok
     end
   end
 
-  defp counter(key) do
-    case :ets.lookup(@table, key) do
+  defp counter(table, key) do
+    case :ets.lookup(table, key) do
       [{^key, n}] -> n
       [] -> 0
     end

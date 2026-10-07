@@ -409,17 +409,19 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       opts = HeavyRead.opts(:novelty, config())
       path = "test.ann_write_#{System.unique_integer([:positive])}"
 
-      on_exit(fn ->
-        :persistent_term.erase({HeavyRead, :iterative_scan_warned, {:degraded_ann_write, path}})
-      end)
-
-      # Only this test's own lines: `capture_log/1` collects every process's, and a
-      # concurrent test's warning would break the `== ""` halves.
-
-      first = capture_own_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts) end)
+      # The throttle deadline lands in this test's probe namespace (erased by setup). Only
+      # this test's own log lines are read: a concurrent test's warning would break the
+      # `== ""` halves.
+      first = capture_own_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts, probe()) end)
       assert first =~ "#{path} ran WITHOUT hnsw.iterative_scan"
 
-      assert capture_own_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts) end) == "",
+      # Its throttle deadline is in this test's probe namespace, not the node's.
+      deadline_key = {:iterative_scan_warned, {:degraded_ann_write, path}}
+      assert :persistent_term.get(Tuple.insert_at(deadline_key, 0, probe()), nil)
+      refute :persistent_term.get(Tuple.insert_at(deadline_key, 0, HeavyRead), nil)
+
+      assert capture_own_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts, probe()) end) ==
+               "",
              "a standing degradation must warn on a window, not once per write"
 
       prime_iterative_scan_supported(true)
@@ -427,7 +429,8 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
       assert capture_own_log(fn ->
                HeavyRead.warn_if_ann_degraded(
                  "#{path}_healthy",
-                 HeavyRead.opts(:novelty, config())
+                 HeavyRead.opts(:novelty, config()),
+                 probe()
                )
              end) == "",
              "a healthy read has nothing to warn about"

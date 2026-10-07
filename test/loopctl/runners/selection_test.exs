@@ -9,7 +9,7 @@ defmodule Loopctl.Runners.SelectionTest do
   use Loopctl.DataCase, async: true
 
   import Ecto.Query
-  import ExUnit.CaptureLog
+  import Loopctl.OwnLog, only: [capture_own_log: 2]
 
   alias Loopctl.Repo
   alias Loopctl.Runners.Runner
@@ -17,14 +17,6 @@ defmodule Loopctl.Runners.SelectionTest do
   alias Loopctl.Runners.Usage
 
   setup :verify_on_exit!
-
-  # The line is `:info`, below `config/test.exs`'s `:warning` primary level; a module level
-  # lets it past for the module that logs it.
-  setup do
-    Logger.put_module_level(Selection, :info)
-    on_exit(fn -> Logger.delete_module_level(Selection) end)
-    :ok
-  end
 
   defp runner(tenant_id), do: fixture(:stage_runner, %{tenant_id: tenant_id})
 
@@ -39,8 +31,11 @@ defmodule Loopctl.Runners.SelectionTest do
 
   defp candidate(tenant_id), do: %{tenant_id: tenant_id, story_id: Ecto.UUID.generate()}
 
+  # The line is `:info`; `test/test_helper.exs` lets `Selection`'s `:info` past the `:warning`
+  # primary level once for the whole run. Only this test's own lines are read: a concurrent
+  # test's `Selection` logs the same `earliest_usage_reset=` line.
   defp noted(fun) do
-    log = capture_log([level: :info], fun)
+    log = capture_own_log([level: :info], fun)
     log |> String.split("\n") |> Enum.filter(&(&1 =~ "earliest_usage_reset="))
   end
 

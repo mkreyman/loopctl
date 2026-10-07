@@ -415,16 +415,20 @@ defmodule Loopctl.HeavyRead do
   line per write, forever, burying the signal it exists to raise. Keyed on `path` and not
   on the tenant: the degradation is a per-NODE backend capability that says nothing about
   whose read tripped it, and a per-tenant key would grow `:persistent_term` (and its
-  global GC) without adding information.
+  global GC) without adding information. `probe` is the namespace that deadline lives
+  under — the same one `opts/2` and `iterative_scan_supported?/1` take, this module by
+  default.
   """
-  @spec warn_if_ann_degraded(String.t(), keyword()) :: :ok
-  def warn_if_ann_degraded(path, opts) when is_binary(path) and is_list(opts) do
+  @spec warn_if_ann_degraded(String.t(), keyword(), term()) :: :ok
+  def warn_if_ann_degraded(path, opts, probe \\ __MODULE__)
+      when is_binary(path) and is_list(opts) do
     case iterative_scan_meta(opts) do
       %{ann_iterative_scan: "unavailable", ann_iterative_scan_reason: reason} ->
         maybe_log_inconclusive(
           {:degraded_ann_write, path},
           "#{path} ran WITHOUT hnsw.iterative_scan — a write decision (novelty / near-dup) " <>
-            "was taken on a possibly-incomplete ANN batch. #{reason}"
+            "was taken on a possibly-incomplete ANN batch. #{reason}",
+          probe
         )
 
       _ ->
@@ -860,7 +864,7 @@ defmodule Loopctl.HeavyRead do
   # is `System.monotonic_time/1`, which the BEAM deliberately starts at a large NEGATIVE value,
   # so `now_ms() >= 0` is false for the VM's whole life — a `0` default did not throttle the
   # warning, it deleted it, in exactly the incident it exists to describe.
-  defp maybe_log_inconclusive(class, message, probe \\ __MODULE__) do
+  defp maybe_log_inconclusive(class, message, probe) do
     key = {probe, :iterative_scan_warned, class}
     deadline = :persistent_term.get(key, :never)
 
