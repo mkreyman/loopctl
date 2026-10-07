@@ -247,6 +247,29 @@ defmodule Loopctl.MixProject do
     ]
   end
 
+  # `mix hex.audit` reports a failing audit by setting the VM's exit status, not by raising,
+  # so as a plain alias step every later step still ran and `mix precommit` exited 1 only at
+  # the very end, after a green suite, with nothing pointing back at the audit (#948). In its
+  # own VM its exit status is readable, and a non-zero one halts the alias here. The separate
+  # VM also keeps the old ordering hazard away: in-VM, a `hex.audit` chained after `compile`
+  # failed with "task could not be found" because `compile` purges the archive code path.
+  defp hex_audit!(_args) do
+    {output, status} =
+      System.cmd("mix", ["hex.audit"],
+        stderr_to_stdout: true,
+        env: [{"MIX_ENV", to_string(Mix.env())}]
+      )
+
+    IO.write(output)
+
+    if status != 0 do
+      Mix.raise(
+        "mix hex.audit exited #{status}: fix or acknowledge the advisory above " <>
+          "(hex: [ignore_advisories: ...] in mix.exs, with its reasoning)"
+      )
+    end
+  end
+
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup", "assets.setup"],
@@ -259,12 +282,9 @@ defmodule Loopctl.MixProject do
       "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
       "assets.deploy": ["tailwind loopctl --minify", "esbuild loopctl --minify", "phx.digest"],
       precommit: [
-        # hex.audit MUST run BEFORE `compile`: `compile` purges the archive code
-        # path, after which a chained `hex.audit` (a Hex archive task) fails with
-        # "task could not be found" — which silently broke every local `mix precommit`
-        # (CI was unaffected: it runs `mix hex.audit` as its own step). Running it
-        # first also fails fast on a retired/advised dependency.
-        "hex.audit",
+        # The audit runs first and in its own VM (`hex_audit!/1`), and stops the alias on
+        # an unacknowledged advisory. See that function for why it is not a plain step.
+        &hex_audit!/1,
         "compile --warnings-as-errors",
         "deps.unlock --check-unused",
         "format --check-formatted",
