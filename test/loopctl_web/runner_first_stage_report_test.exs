@@ -16,21 +16,14 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
   state hide it — and its review question is the one this file answers: what production call
   path writes the field this reads, and which test fails if that write is deleted?
 
-  `async: false` and COMMITTED, for the reason `Loopctl.Delivery.PlacementTest` gives: a
-  placement writes through BOTH repos — the claim on `AdminRepo`, the transition on
-  `Loopctl.Repo` — and those two sandbox connections cannot see each other's uncommitted work.
-
-  What is NOT the reason, because a maintainer acting on it would break the file: the channel
-  process CAN see this test's uncommitted rows. `Loopctl.DataCase` starts every sandbox owner
-  with `shared: not tags[:async]`, so under `async: false` the channel runs on exactly this
-  connection — which is why the stage assertion below reads the SANDBOX row and not the
-  committed one, and why rewriting it as the `unboxed(...)` read `PlacementTest` uses would
-  report a working write as a failure.
+  A placement writes through BOTH repos, the claim on `AdminRepo` and the transition on
+  `Loopctl.Repo`; in test both run on the test's one sandbox connection
+  (`Loopctl.AdminRepo.Route`), which the channel process reaches through `$callers`, so the
+  placement, the channel's transition and the reads below all see one transaction.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.Placement
@@ -40,21 +33,15 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  @reply_timeout 2_000
+  # A bound, never a delay. 10 s because this module runs in the ASYNC phase of the full
+  # suite, where a channel reply missed a 2 s bound under load (commit gate, 2026-10-07).
+  @reply_timeout 10_000
   @repo "mkreyman/home_care_billing"
 
   setup do
-    sweep_committed_runner_tenants()
-
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id, name: "minis"})
-    {_raw, operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "minis"})
+    {_raw, operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
     {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
 
@@ -63,9 +50,9 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
 
     _ = :sys.get_state(channel.channel_pid)
 
-    story = fixture(:committed_story, %{tenant_id: tenant.id})
-    story = unboxed(fn -> contract_and_queue(tenant.id, story) end)
-    unboxed(fn -> bind_repo(tenant.id, story) end)
+    story = fixture(:ledger_story, %{tenant_id: tenant.id})
+    story = contract_and_queue(tenant.id, story)
+    bind_repo(tenant.id, story)
 
     %{tenant: tenant, runner: runner, channel: channel, story: story, operator: operator}
   end
@@ -93,11 +80,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
       assert_reply ref, :ok, reply, @reply_timeout
       assert reply.stage == "worktree"
 
-      # Read on the SANDBOX connection the channel wrote on, not unboxed: the fixtures and the
-      # placement are committed, but the transition the channel just made lives in this
-      # process's transaction — an unboxed read sees the committed `claimed` and would call a
-      # working write a failure.
-      assert sandboxed_stage(story) == :worktree
+      assert stage(story) == :worktree
     end
 
     test "and the SAME report is refused when nothing claimed the story", ctx do
@@ -124,7 +107,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
           "repo" => @repo
         })
 
-      :ok = unboxed(fn -> Loopctl.Runners.dispatch(runner.tenant_id, runner.id, payload) end)
+      :ok = Loopctl.Runners.dispatch(runner.tenant_id, runner.id, payload)
       assert_push "dispatch", _pushed, @reply_timeout
       accept!(channel, payload["dispatch_id"], epoch)
 
@@ -137,9 +120,8 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
         })
 
       # THE REASON IS THE WHOLE ASSERTION, and there is deliberately no row read beside it: the
-      # control writes nothing, so `queued` is equally true of the committed row and of the
-      # sandbox one, and asserting it would look like evidence the row was inspected while
-      # being true either way.
+      # control writes nothing, so `queued` is true whether or not the report was judged, and
+      # asserting it would look like evidence the row was inspected while being true either way.
       assert_reply ref, :error, %{reason: "stale_stage"}, @reply_timeout
     end
   end
@@ -159,12 +141,10 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
     }
 
     {:ok, placed} =
-      unboxed(fn ->
-        Placement.place(runner.tenant_id, runner.id, payload,
-          api_key: operator,
-          actor_label: "test:first_stage_report"
-        )
-      end)
+      Placement.place(runner.tenant_id, runner.id, payload,
+        api_key: operator,
+        actor_label: "test:first_stage_report"
+      )
 
     assert_push "dispatch", _pushed, @reply_timeout
 
@@ -186,7 +166,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
     assert_reply ref, :ok, _reply, @reply_timeout
   end
 
-  defp sandboxed_stage(story) do
+  defp stage(story) do
     Stages.get(story.tenant_id, story.id).stage
   end
 
@@ -194,7 +174,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
   # too and they are in lockstep here, but a reclaim moves the story's without rebinding the
   # row — and reading the row's would then fence a message against a number nothing checks.
   defp story_epoch(ctx) do
-    unboxed(fn -> AdminRepo.get!(Loopctl.WorkBreakdown.Story, ctx.story.id) end).claim_epoch
+    AdminRepo.get!(Loopctl.WorkBreakdown.Story, ctx.story.id).claim_epoch
   end
 
   defp contract_and_queue(tenant_id, story) do
@@ -224,10 +204,6 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
       inserted_at: now,
       updated_at: now
     })
-  end
-
-  defp unboxed(fun) do
-    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   defp connect_info(token) do

@@ -3,84 +3,31 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
   US-30.4 — HTTP JSON API for the Context Retriever (`/api/v1/entities*`,
   `/api/v1/retrieve/*`).
 
-  ## Why `async: false` + a COMMITTED tenant
+  ## One sandbox connection for both repos
 
   The executor and registry read/write through `Loopctl.Repo.with_tenant/2` (RLS
   transactions with `SET LOCAL ROLE loopctl_app`) on the `Loopctl.Repo`
   connection, while the AUTH pipeline resolves the API key through
-  `Loopctl.AdminRepo` — two distinct sandbox connections that cannot see each
-  other's UNCOMMITTED rows. A single tenant row must therefore be visible to
-  BOTH: we insert it via `Sandbox.unboxed_run/2` (a real, committed connection)
-  and delete it on exit. The api_key/agent (AdminRepo) and the entity
-  definitions + backing rows (Repo) then reference that committed tenant from
-  their own rolled-back sandbox transactions.
+  `Loopctl.AdminRepo`. In test both run on the test's one sandbox connection
+  (`Loopctl.AdminRepo.Route`), so the tenant, its keys, the entity definitions
+  and the backing rows are all sandboxed and rolled back.
 
   Because the executor's isolation runs under the NON-owner `loopctl_app` role
   (RLS is ENABLE, not FORCE), the cross-tenant assertions actually prove
   isolation rather than silently passing — mirroring `executor_test.exs` /
   `registry_test.exs`.
   """
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   setup :verify_on_exit!
 
-  import Ecto.Query
-
-  alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
   alias Loopctl.ContextRetriever.Registry
   alias Loopctl.Projects.Project
   alias Loopctl.Repo
-  alias Loopctl.Tenants.Tenant
 
-  # Slug marker so the committed test tenants can be swept without touching real
-  # data. See `commit_tenant/0` + the module teardown below.
-  @tenant_marker "ctrtest-"
-
-  # Sweep every committed marker tenant at module setup AND teardown. This runs
-  # OUTSIDE any per-test sandbox transaction, so no open transaction holds an FK
-  # lock on the tenant rows (a per-test on_exit delete deadlocks: it fires BEFORE
-  # the sandbox transaction that inserted the FK-referencing api_keys/entities is
-  # rolled back). Cleaning at module boundaries sidesteps that entirely.
-  setup_all do
-    sweep_marker_tenants()
-    on_exit(&sweep_marker_tenants/0)
-    :ok
-  end
-
-  defp sweep_marker_tenants do
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      AdminRepo.delete_all(from(t in Tenant, where: like(t.slug, ^"#{@tenant_marker}%")))
-    end)
-  end
-
-  # --- Committed-tenant + seeding helpers (see moduledoc) ---
-
-  # Insert a tenant on a real (committed) connection so BOTH the AdminRepo auth
-  # path and the Repo executor path can see it. Cleanup is handled by the
-  # module-level sweep (see above), not a per-test on_exit.
-  defp commit_tenant do
-    seq = System.unique_integer([:positive])
-    id = Ecto.UUID.generate()
-
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      %Tenant{}
-      |> Tenant.create_changeset(%{
-        name: "T#{seq}",
-        slug: "#{@tenant_marker}#{seq}",
-        email: "#{@tenant_marker}#{seq}@example.com"
-      })
-      |> Ecto.Changeset.put_change(:id, id)
-      # Defining/mutating entity definitions is gated behind RequireHumanAnchor
-      # (a security root), so the test tenant must be human-anchored. trust_tier is
-      # excluded from create_changeset's cast, so set it programmatically (mirrors
-      # the tenant fixture's post-insert convention).
-      |> Ecto.Changeset.put_change(:trust_tier, :human_anchored)
-      |> AdminRepo.insert!()
-    end)
-
-    AdminRepo.get!(Tenant, id)
-  end
+  # A human-anchored tenant: defining/mutating entity definitions is gated behind
+  # RequireHumanAnchor (a security root).
+  defp tenant, do: fixture(:tenant, %{trust_tier: :human_anchored})
 
   # A user-role key (may define/mutate entity definitions).
   defp user_key(tenant_id) do
@@ -161,7 +108,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
 
   describe "TC-30.4.1: CRUD create, tools, retrieve" do
     test "user creates an entity, agent lists tools and retrieves rows", %{conn: conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -201,7 +148,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
 
   describe "TC-30.4.1: GET /entities (index) and GET /entities/:id (show)" do
     test "index lists the tenant's definitions ordered by name", %{conn: _conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -234,7 +181,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     end
 
     test "show returns one definition by id (query role allowed)", %{conn: conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -248,7 +195,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     end
 
     test "show is 404 for an unknown id", %{conn: _conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       agent = agent_key(tenant.id)
 
       resp = base_conn() |> auth(agent) |> get(~p"/api/v1/entities/#{Ecto.UUID.generate()}")
@@ -256,8 +203,8 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     end
 
     test "show is 404 for another tenant's id (no cross-tenant read over HTTP)", %{conn: conn} do
-      tenant_t = commit_tenant()
-      tenant_u = commit_tenant()
+      tenant_t = tenant()
+      tenant_u = tenant()
       user_t = user_key(tenant_t.id)
       agent_u = agent_key(tenant_u.id)
 
@@ -273,7 +220,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
 
   describe "TC-30.4.2: role gating" do
     test "agent key cannot create an entity (403, below user)", %{conn: conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       agent = agent_key(tenant.id)
 
       resp = create_project_entity(conn, agent, project_status_fields())
@@ -286,7 +233,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
       # entity definition is the executor's field allowlist (a security root), so
       # RequireRole role: :user must still block it — the more meaningful negative
       # case than the below-floor agent.
-      tenant = commit_tenant()
+      tenant = tenant()
       orchestrator = orchestrator_key(tenant.id)
 
       resp = create_project_entity(conn, orchestrator, project_status_fields())
@@ -296,7 +243,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     test "orchestrator key cannot PATCH or DELETE an entity (403)", %{conn: conn} do
       # The same role gate covers the other define/mutate verbs. Create as a user,
       # then prove an orchestrator key is refused on both PATCH and DELETE.
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       orchestrator = orchestrator_key(tenant.id)
 
@@ -333,7 +280,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
 
   describe "TC-30.4.4: PATCH + DELETE reflected in generated tools" do
     test "patch adds a filterable field; delete removes the entity's tools", %{conn: conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
 
       created = create_project_entity(conn, user, project_status_fields())
@@ -376,7 +323,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
 
   describe "TC-30.4.5: retrieve is rate-limited per tenant" do
     test "over-limit returns 429 and does not execute", %{conn: conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -406,7 +353,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     end
 
     test "a limiter-store FAULT fails CLOSED (429), not open (#461 item 7)", %{conn: conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -446,7 +393,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
       # name it — the executor's execute-time re-check must REJECT it (422
       # field_not_allowlisted), never run the query. This is the most
       # security-relevant branch of the story (the raw-/retrieve bypass close).
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -468,7 +415,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     test "op:filter naming a field the entity never declares is 422", %{conn: conn} do
       # `mission` is a server-allowlisted projects column, but this entity does not
       # declare it — the executor rejects it the same way (never executed).
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -493,7 +440,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
   describe "TC-30.4.7: retrieve op:search" do
     test "search over a vector-covered text field returns 200 with results + meta",
          %{conn: conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -523,7 +470,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
       # surface suppresses the search tool, but a raw POST op:"search" must be
       # rejected (422 search_not_indexed), never silently searched against the
       # vector's different columns.
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -542,7 +489,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     end
 
     test "an unknown op is 422 invalid_operation", %{conn: conn} do
-      tenant = commit_tenant()
+      tenant = tenant()
       user = user_key(tenant.id)
       agent = agent_key(tenant.id)
 
@@ -561,8 +508,8 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
 
   describe "TC-30.4.3: tenant isolation" do
     test "another tenant's key sees none of tenant_t's tools or rows", %{conn: conn} do
-      tenant_t = commit_tenant()
-      tenant_u = commit_tenant()
+      tenant_t = tenant()
+      tenant_u = tenant()
 
       user_t = user_key(tenant_t.id)
       agent_u = agent_key(tenant_u.id)
@@ -590,8 +537,8 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     end
 
     test "the registry cannot read another tenant's entity by id", %{conn: conn} do
-      tenant_t = commit_tenant()
-      tenant_u = commit_tenant()
+      tenant_t = tenant()
+      tenant_u = tenant()
       user_t = user_key(tenant_t.id)
 
       created = create_project_entity(conn, user_t, project_status_fields())

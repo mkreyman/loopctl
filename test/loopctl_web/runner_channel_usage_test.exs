@@ -3,21 +3,17 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
   US-44.6, contract 1.17.0: a runner's `status` message carrying `usage`, end to end through the
   channel — cast, stored on the `runners` row, and kept OUT of the Presence meta.
 
-  `async: false`, and COMMITTED rather than sandboxed, for the reason
-  `LoopctlWeb.RunnerChannelDispatchTest` gives: the socket authenticates the runner through
-  `Loopctl.AdminRepo`, while `Loopctl.Runners.Usage` writes the row through the RLS
-  `Loopctl.Repo`, and the two sandbox connections cannot see each other's uncommitted rows — a
-  sandboxed runner would be updated on a connection where it does not exist, zero rows, and
-  every assertion below would read NULL for the wrong reason. `sweep_committed_runner_tenants/0`
-  removes what these tests commit.
+  The socket authenticates the runner through `Loopctl.AdminRepo`, while
+  `Loopctl.Runners.Usage` writes the row through the RLS `Loopctl.Repo`. In test both run on the
+  test's one sandbox connection (`Loopctl.AdminRepo.Route`), and the channel process reaches it
+  through `$callers`, so the runner is sandboxed and the channel's write is visible here.
 
   Status messages are rate-limited to one per second per socket, so every test pushes at most
   one; a second runner is joined where a test needs two machines (story technical notes).
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Runners
   alias Loopctl.Runners.Runner
@@ -26,18 +22,14 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  @reply_timeout 2_000
+  # A bound, never a delay. 10 s because this module runs in the ASYNC phase of the full
+  # suite, where a channel reply missed a 2 s bound under load (commit gate, 2026-10-07).
+  @reply_timeout 10_000
   @eight_days 8 * 24 * 60 * 60
 
   setup do
-    tenant = fixture(:committed_tenant, %{})
-    {raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id, name: "minis"})
+    tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+    {raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "minis"})
     %{tenant: tenant, runner: runner, channel: join_as(runner, raw, "minis")}
   end
 
@@ -105,7 +97,7 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
     end
 
     test "exhausted with no reset holds for eight days (TC-44.6.3)", ctx do
-      {raw, other} = fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink"})
+      {raw, other} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "beelink"})
       channel = join_as(other, raw, "beelink")
 
       ref = push(channel, "status", %{"usage" => %{"exhausted" => true}})
@@ -117,12 +109,10 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
     end
 
     test "exhausted: false from one machine clears the whole account (TC-44.6.6)", ctx do
-      {raw, r2} = fixture(:committed_runner, %{tenant_id: ctx.tenant.id, name: "beelink"})
+      {raw, r2} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "beelink"})
 
-      unboxed(fn ->
-        :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, account_ref: "a"})
-        :ok = Usage.record(ctx.tenant.id, r2.id, %{exhausted: true, account_ref: "a"})
-      end)
+      :ok = Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, account_ref: "a"})
+      :ok = Usage.record(ctx.tenant.id, r2.id, %{exhausted: true, account_ref: "a"})
 
       channel = join_as(r2, raw, "beelink")
 
@@ -138,13 +128,9 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
-  defp unboxed(fun) do
-    Sandbox.unboxed_run(Loopctl.Repo, fun)
-  end
-
-  # Read through the SAME connection the channel wrote on: in a non-async ChannelCase the
-  # channel's `Loopctl.Repo` is the test's shared sandbox connection, so its write is visible
-  # here and nowhere else until the sandbox rolls it back.
+  # Read through the SAME connection the channel wrote on: the channel's `Loopctl.Repo` is the
+  # test's sandbox connection, so its write is visible here and nowhere else until the sandbox
+  # rolls it back.
   defp row(runner) do
     {:ok, row} =
       Loopctl.Repo.with_tenant(runner.tenant_id, fn -> Loopctl.Repo.get!(Runner, runner.id) end)

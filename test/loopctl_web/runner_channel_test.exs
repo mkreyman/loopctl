@@ -4,9 +4,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
   vanishes when its process dies — with no sweeper involved — and an invalid or revoked
   token is refused.
 
-  Dispatch, `dispatch_reply` and `trace` are in `LoopctlWeb.RunnerChannelDispatchTest`,
-  which cannot run async (see its moduledoc); everything that writes no dispatch ledger row
-  stays here.
+  Dispatch, `dispatch_reply` and `trace` are in `LoopctlWeb.RunnerChannelDispatchTest`;
+  everything that writes no dispatch ledger row stays here.
   """
 
   use LoopctlWeb.ChannelCase, async: true

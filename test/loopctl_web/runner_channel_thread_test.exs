@@ -9,18 +9,17 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
   own bucket, answers with the recorded id and `replayed`, and puts each refusal on the wire
   as the contract's published `reason`.
 
-  `async: false` for the reason `LoopctlWeb.RunnerChannelStageTest` gives: the socket
-  authenticates its runner through `Loopctl.AdminRepo` while the ledger and the thread live on
-  the RLS `Loopctl.Repo`, so the runner and its tenant are COMMITTED. The broken-chain test
-  also installs committed DDL.
+  The socket authenticates its runner through `Loopctl.AdminRepo` while the ledger and the
+  thread live on the RLS `Loopctl.Repo`; in test both run on the test's one sandbox connection
+  (`Loopctl.AdminRepo.Route`), which the channel process reaches through `$callers`, so every
+  row is sandboxed. A write the audit chain refuses needs committed DDL on the shared
+  `audit_chain` table, so it is in `LoopctlWeb.RunnerChannelThreadBrokenChainTest`, sync.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
@@ -31,13 +30,9 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  @reply_timeout 2_000
+  # A bound, never a delay. 10 s because this module runs in the ASYNC phase of the full
+  # suite, where a channel reply missed a 2 s bound under load (commit gate, 2026-10-07).
+  @reply_timeout 10_000
   @epoch 3
   @sha1 String.duplicate("a", 40)
   @sha2 String.duplicate("b", 40)
@@ -66,7 +61,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
   # A joined runner holding an ACCEPTED implement dispatch for a story its agent has claimed
   # at `@epoch`, through a custody dispatch as a placement would have minted it.
   setup do
-    {raw, runner} = fixture(:committed_runner, %{name: "minis"})
+    {raw, runner} = fixture(:runner, %{name: "minis"})
     {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
 
     {:ok, _reply, channel} =
@@ -343,56 +338,6 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       assert {tokens, _refilled_at} = assigns(channel).thread_entry_bucket
       assert tokens == capacity - 1
       assert assigns(channel).checkpoint_bucket == :full
-    end
-  end
-
-  # A TENANT CHAIN THAT REFUSES APPENDS AS A HASH VIOLATION — the technique and the reason for
-  # it are `Loopctl.Delivery.SessionEndReleaseTest`'s: the chain's own trigger cannot be driven
-  # to that state through the application, so a trigger raising exactly what it raises is
-  # installed for THIS tenant only, committed, and dropped at exit.
-  describe "a broken chain at the runner-message boundary" do
-    @describetag :capture_log
-
-    defp break_chain(tenant_id) do
-      name = "test_broken_chain_" <> String.replace(tenant_id, "-", "")
-
-      unboxed(fn ->
-        AdminRepo.query!("""
-        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
-        BEGIN
-          RAISE EXCEPTION 'audit_chain_hash_violation: injected by test' USING ERRCODE = 'P0001';
-        END
-        $$
-        """)
-
-        AdminRepo.query!("""
-        CREATE TRIGGER #{name} BEFORE INSERT ON audit_chain FOR EACH ROW
-        WHEN (NEW.tenant_id = '#{tenant_id}') EXECUTE FUNCTION #{name}()
-        """)
-      end)
-
-      on_exit(fn ->
-        unboxed(fn ->
-          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON audit_chain")
-          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-        end)
-      end)
-    end
-
-    defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
-
-    test "a write the chain refuses is audit_chain_append_failed, and the socket lives", ctx do
-      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
-      break_chain(runner.tenant_id)
-
-      ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id))
-      assert_reply ref, :error, %{reason: "audit_chain_append_failed"}, @reply_timeout
-
-      ref = push(channel, "thread_entry", entry_msg(dispatch_id))
-      assert_reply ref, :error, %{reason: "audit_chain_append_failed"}, @reply_timeout
-
-      assert Process.alive?(channel.channel_pid)
-      assert thread(ctx).entries == []
     end
   end
 end

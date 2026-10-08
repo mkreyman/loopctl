@@ -9,18 +9,13 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
   from "nothing to do" — and a runner that maps a transient local condition to that reason
   bricks itself until a human revokes and re-enrols it.
 
-  ## Why `async: false`
-
   The auth pipeline resolves the API key through `Loopctl.AdminRepo` while the ledger row this
-  read derives from is written on the RLS `Loopctl.Repo`. Those are separate sandbox
-  connections that cannot see each other's uncommitted rows, so the TENANT, the KEY and the
-  RUNNER are committed and swept at the module boundary, while the story and the dispatch row
-  stay inside the `Repo` sandbox. A committed row is visible to every concurrently running
-  async test, which is what makes this module serial. The derivation itself is tested without
-  a key or a socket in `Loopctl.Runners.DispatchLedgerTest`.
+  read derives from is written on the RLS `Loopctl.Repo`. In test both run on the test's one
+  sandbox connection (`Loopctl.AdminRepo.Route`), so every row here is sandboxed. The
+  derivation itself is tested without a key or a socket in `Loopctl.Runners.DispatchLedgerTest`.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Runners
@@ -29,18 +24,12 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
   defp operator_ctx do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {_raw, runner} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant.id})
-    {raw_key, _api_key} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {_raw, runner} = fixture(:runner, %{name: "minis", tenant_id: tenant.id})
+    {raw_key, _api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
     %{tenant: tenant, runner: runner, operator_key: raw_key}
   end
 
@@ -186,9 +175,9 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
     ctx = operator_ctx()
     :ok = refuse_kind(ctx.runner, "kind_not_supported")
 
-    other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {_raw, theirs} = fixture(:committed_runner, %{name: "blockit", tenant_id: other.id})
-    {other_key, _other_api_key} = fixture(:committed_operator_key, %{tenant_id: other.id})
+    other = fixture(:tenant, %{trust_tier: :human_anchored})
+    {_raw, theirs} = fixture(:runner, %{name: "blockit", tenant_id: other.id})
+    {other_key, _other_api_key} = fixture(:api_key, %{tenant_id: other.id, role: :user})
 
     assert [listed] =
              conn

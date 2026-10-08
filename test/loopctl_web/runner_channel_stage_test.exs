@@ -7,13 +7,13 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
   see: that the channel casts through the contract, meters the event with its own bucket,
   answers with the row, and maps each refusal onto the contract's published `reason` codes.
 
-  `async: false` for the same reason as `LoopctlWeb.RunnerChannelDispatchTest`: the socket
-  authenticates its runner through `Loopctl.AdminRepo` while the ledger and the stage row
-  live on the RLS `Loopctl.Repo`, so the runner and its tenant must be COMMITTED to be
-  visible to both, and a committed row is visible to every concurrently running async test.
+  The socket authenticates its runner through `Loopctl.AdminRepo` while the ledger and the
+  stage row live on the RLS `Loopctl.Repo`; in test both run on the test's one sandbox
+  connection (`Loopctl.AdminRepo.Route`), which the channel process reaches through
+  `$callers`, so every row is sandboxed.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.RunnerStages
@@ -24,13 +24,9 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  @reply_timeout 2_000
+  # A bound, never a delay. 10 s because this module runs in the ASYNC phase of the full
+  # suite, where a channel reply missed a 2 s bound under load (commit gate, 2026-10-07).
+  @reply_timeout 10_000
   @epoch 3
 
   defp connect_info(token) do
@@ -54,7 +50,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
   end
 
   setup do
-    {raw, runner} = fixture(:committed_runner, %{name: "minis"})
+    {raw, runner} = fixture(:runner, %{name: "minis"})
     {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
 
     {:ok, _reply, channel} =
@@ -206,6 +202,8 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
     test "a runner that joined on a contract older than 1.22.0 is sent the code it knows", ctx do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
+      # The handler is VM-global, so its events are matched on this test's runner.
+      runner_id = ctx.runner.id
 
       :sys.replace_state(channel.channel_pid, fn socket ->
         put_in(socket.assigns.meta.contract_version, "1.21.0")
@@ -234,7 +232,9 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
 
       # The operator still sees the code control DECIDED.
-      assert_receive {:refused, %{event: "stage", reason: "claim_epoch_mismatch"}}
+      assert_receive {:refused,
+                      %{event: "stage", reason: "claim_epoch_mismatch", runner_id: ^runner_id}},
+                     @reply_timeout
     end
 
     test "a transition the machine has no edge for never reaches the database", ctx do
@@ -489,7 +489,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       %{channel: channel, runner: runner} = ctx
 
       {raw_b, runner_b} =
-        fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+        fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
 
       {:ok, socket_b} = connect(RunnerSocket, %{}, connect_info: connect_info(raw_b))
 
@@ -608,9 +608,8 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
     test "the channel hands its runner's OWN key to end_held_session, for the release's audit",
          ctx do
       # The release a report causes is attributed to the runner's `api_key_id`, and the channel
-      # is the one place that holds it (`socket.assigns.runner`). A release cannot be observed
-      # from here — the ledger's lock on the sandbox connection would hold `AdminRepo`'s — so
-      # the CALL is observed instead, traced on the channel process alone.
+      # is the one place that holds it (`socket.assigns.runner`), so the CALL is observed,
+      # traced on the channel process alone: no other test's process is traced.
       %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
       # `end_held_session/5`: the channel reads the row once (`held_dispatch/3`) and routes on
       # its kind, so this is the call an implement session's report reaches.

@@ -1018,8 +1018,9 @@ defmodule LoopctlWeb.TenantAuthenticatorControllerTest do
   #
   # This invariant is proven DETERMINISTICALLY by
   # `test/loopctl/tenants/enrollment_lock_test.exs`, which races the enroll path
-  # over two GENUINELY independent DB sessions (`async: false` +
-  # `Sandbox.checkout(AdminRepo, sandbox: false)`). It cannot be proven at this
+  # over two GENUINELY independent DB sessions (`async: false` + one
+  # `Sandbox.checkout(Loopctl.Repo, sandbox: false)` per racer, which carries AdminRepo
+  # too under `Loopctl.AdminRepo.Route`). It cannot be proven at this
   # HTTP layer under `use ConnCase, async: true`: a `Task.async` race there
   # multiplexes every `Sandbox.allow`-shared process onto ONE checked-out
   # sandbox connection, so the two enroll transactions never truly contend on the
