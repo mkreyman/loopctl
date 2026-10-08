@@ -7,65 +7,41 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
   see: that the channel casts through the contract, meters the event with its own bucket,
   answers with the row, and maps each refusal onto the contract's published `reason` codes.
 
-  `async: false` for the same reason as `LoopctlWeb.RunnerChannelDispatchTest`: the socket
-  authenticates its runner through `Loopctl.AdminRepo` while the ledger and the stage row
-  live on the RLS `Loopctl.Repo`, so the runner and its tenant must be COMMITTED to be
-  visible to both, and a committed row is visible to every concurrently running async test.
+  The socket authenticates its runner through `Loopctl.AdminRepo` while the ledger and the
+  stage row live on the RLS `Loopctl.Repo`; in test both run on the test's one sandbox
+  connection (`Loopctl.AdminRepo.Route`), which the channel process reaches through
+  `$callers`, so every row is sandboxed.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.Delivery.Stages
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
-  alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  @reply_timeout 2_000
   @epoch 3
 
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine) do
-    %{
-      "contract_version" => RunnerContract.version(),
-      "machine" => machine,
-      "cores" => 16,
-      "memory_mb" => 28_000,
-      "repos" => ["mkreyman/home_care_billing"],
-      "max_sessions" => 2,
-      "in_flight" => 0,
-      "draining" => false
-    }
-  end
-
   setup do
-    {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
+    {raw, runner} = fixture(:runner, %{name: "minis"})
+    {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, join_payload("minis"))
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        build(:runner_join_payload, %{"machine" => "minis"})
+      )
 
     _ = :sys.get_state(channel.channel_pid)
 
     story = fixture(:ledger_story, %{tenant_id: runner.tenant_id, claim_epoch: @epoch})
     payload = build(:runner_dispatch, %{"story_id" => story.id, "claim_epoch" => @epoch})
     :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-    assert_push "dispatch", _, @reply_timeout
+    assert_push "dispatch", _, reply_timeout()
 
     ref =
       push(channel, "dispatch_reply", %{
@@ -74,7 +50,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
         "decision" => "accepted"
       })
 
-    assert_reply ref, :ok, _, @reply_timeout
+    assert_reply ref, :ok, _, reply_timeout()
 
     fixture(:story_stage, %{
       tenant_id: runner.tenant_id,
@@ -134,7 +110,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           verdict_payload(dispatch_id, [lens("analyst"), lens("analyst")])
         )
 
-      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
       assert verdict_count(runner.tenant_id) == 0
     end
 
@@ -144,7 +120,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
       ref = push(channel, "triage_verdict", verdict_payload(dispatch_id, lenses))
 
-      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, reply_timeout()
       assert verdict_count(runner.tenant_id) == 0
     end
   end
@@ -160,7 +136,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           stage_message(dispatch_id, %{"from" => "implementing", "to" => "reviewing"})
         )
 
-      assert_reply ref, :ok, reply, @reply_timeout
+      assert_reply ref, :ok, reply, reply_timeout()
       assert reply.stage == "reviewing"
       assert reply.claim_epoch == @epoch
       assert is_integer(reply.lock_version)
@@ -182,7 +158,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           })
         )
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert Stages.get(runner.tenant_id, story.id).head_sha == sha
     end
 
@@ -200,12 +176,14 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           })
         )
 
-      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, reply_timeout()
       assert Stages.get(runner.tenant_id, story.id).stage == :implementing
     end
 
     test "a runner that joined on a contract older than 1.22.0 is sent the code it knows", ctx do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
+      # The handler is VM-global, so its events are matched on this test's runner.
+      runner_id = ctx.runner.id
 
       :sys.replace_state(channel.channel_pid, fn socket ->
         put_in(socket.assigns.meta.contract_version, "1.21.0")
@@ -231,10 +209,12 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       on_exit(fn -> :telemetry.detach(handler) end)
 
       ref = push(channel, "stage", message)
-      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, reply_timeout()
 
       # The operator still sees the code control DECIDED.
-      assert_receive {:refused, %{event: "stage", reason: "claim_epoch_mismatch"}}
+      assert_receive {:refused,
+                      %{event: "stage", reason: "claim_epoch_mismatch", runner_id: ^runner_id}},
+                     reply_timeout()
     end
 
     test "a transition the machine has no edge for never reaches the database", ctx do
@@ -247,7 +227,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           stage_message(dispatch_id, %{"from" => "implementing", "to" => "merged"})
         )
 
-      assert_reply ref, :error, %{reason: "invalid_payload", details: details}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload", details: details}, reply_timeout()
       assert Enum.any?(details, &String.contains?(&1, "not a transition a runner may report"))
       assert Stages.get(runner.tenant_id, story.id).stage == :implementing
     end
@@ -269,7 +249,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
             })
           )
 
-        assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+        assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
       end
     end
 
@@ -298,7 +278,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
             })
           )
 
-        assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+        assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
       end
 
       assert Stages.get(runner.tenant_id, story.id).stage == :implementing
@@ -327,7 +307,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           })
         )
 
-      assert_reply ref, :error, %{reason: "invalid_payload", details: details}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload", details: details}, reply_timeout()
       assert Enum.any?(details, &String.contains?(&1, "codepoints"))
       assert Stages.get(runner.tenant_id, story.id).stage == :implementing
     end
@@ -349,7 +329,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           })
         )
 
-      assert_reply ref, :ok, reply, @reply_timeout
+      assert_reply ref, :ok, reply, reply_timeout()
       assert reply.effects == %{head_sha: sha}
 
       # Only what is SET: an absent key means nothing was recorded.
@@ -370,7 +350,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       end
 
       ref = push(channel, "stage", message.(String.duplicate("a", 40)))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       refill_bucket(channel)
       ref = push(channel, "stage", message.(String.duplicate("b", 40)))
@@ -382,7 +362,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       assert_reply ref,
                    :error,
                    %{reason: "effect_conflict", effects: %{head_sha: recorded}},
-                   @reply_timeout
+                   reply_timeout()
 
       assert recorded == String.duplicate("a", 40)
       assert Stages.get(runner.tenant_id, story.id).head_sha == String.duplicate("a", 40)
@@ -393,11 +373,11 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       message = stage_message(dispatch_id, %{"from" => "implementing", "to" => "reviewing"})
 
       ref = push(channel, "stage", message)
-      assert_reply ref, :ok, first, @reply_timeout
+      assert_reply ref, :ok, first, reply_timeout()
 
       refill_bucket(channel)
       ref = push(channel, "stage", message)
-      assert_reply ref, :ok, second, @reply_timeout
+      assert_reply ref, :ok, second, reply_timeout()
 
       assert second.lock_version == first.lock_version
       assert second.stage == "reviewing"
@@ -413,7 +393,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           stage_message(dispatch_id, %{"from" => "implementing", "to" => "reviewing"})
         )
 
-      assert_reply ref, :ok, ack, @reply_timeout
+      assert_reply ref, :ok, ack, reply_timeout()
 
       # A legal transition from a stage the row has not reached — the shape a runner sends
       # when it has lost track, which is the case the contract answers with "re-read the
@@ -431,7 +411,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           stage_message(dispatch_id, %{"from" => "pr_open", "to" => "ci"})
         )
 
-      assert_reply ref, :error, refusal, @reply_timeout
+      assert_reply ref, :error, refusal, reply_timeout()
 
       assert refusal.reason == "stale_stage"
       assert refusal.stage == "reviewing"
@@ -459,7 +439,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           })
         )
 
-      assert_reply ref, :ok, reply, @reply_timeout
+      assert_reply ref, :ok, reply, reply_timeout()
       assert reply.stage == "escalated"
 
       record = DispatchLedger.get_record(runner.tenant_id, dispatch_id)
@@ -480,7 +460,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           })
         )
 
-      assert_reply ref, :error, %{reason: "invalid_payload", details: details}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload", details: details}, reply_timeout()
       assert Enum.any?(details, &String.contains?(&1, "reason is required"))
       assert Stages.get(runner.tenant_id, story.id).stage == :implementing
     end
@@ -489,12 +469,16 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       %{channel: channel, runner: runner} = ctx
 
       {raw_b, runner_b} =
-        fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+        fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
 
-      {:ok, socket_b} = connect(RunnerSocket, %{}, connect_info: connect_info(raw_b))
+      {:ok, socket_b} = connect_runner_socket(raw_b)
 
       {:ok, _reply, channel_b} =
-        subscribe_and_join(socket_b, "runner:" <> runner_b.id, join_payload("blockit"))
+        subscribe_and_join(
+          socket_b,
+          "runner:" <> runner_b.id,
+          build(:runner_join_payload, %{"machine" => "blockit"})
+        )
 
       _ = :sys.get_state(channel_b.channel_pid)
 
@@ -505,7 +489,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           stage_message(ctx.dispatch_id, %{"from" => "implementing", "to" => "reviewing"})
         )
 
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, reply_timeout()
       _ = channel
     end
 
@@ -527,7 +511,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           stage_message(dispatch_id, %{"from" => "reviewing", "to" => "pr_open"})
         )
 
-      assert_reply ref, :error, %{reason: "stale_stage"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "stale_stage"}, reply_timeout()
 
       # ONE push against a `:full` bucket, so the token count is exactly `capacity - 1`
       # however long the round trip took. This is what binds the channel's constant to the
@@ -554,7 +538,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           stage_message(dispatch_id, %{"from" => "implementing", "to" => "reviewing"})
         )
 
-      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, reply_timeout()
       assert ms == RunnerContract.stage_burst() |> Map.fetch!("refill_interval_ms")
 
       # And nothing was written: a message refused by the bucket never reaches the machine.
@@ -579,7 +563,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
       ref = push(channel, "session_ended", ended(dispatch_id, "bored"))
 
-      assert_reply ref, :error, %{reason: "invalid_payload", details: [_ | _]}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload", details: [_ | _]}, reply_timeout()
       assert recorded_reason(runner.tenant_id, dispatch_id) == nil
 
       # Refused at the cast, before the database, so it spent nothing of the bucket.
@@ -590,7 +574,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx
 
       ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
-      assert_reply ref, :ok, reply, @reply_timeout
+      assert_reply ref, :ok, reply, reply_timeout()
 
       assert reply.stage == "implementing"
       assert reply.claim_epoch == @epoch
@@ -602,15 +586,14 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       assert recorded_reason(runner.tenant_id, dispatch_id) == "completed"
 
       ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
-      assert_reply ref, :ok, %{replayed: true, stage: "implementing"}, @reply_timeout
+      assert_reply ref, :ok, %{replayed: true, stage: "implementing"}, reply_timeout()
     end
 
     test "the channel hands its runner's OWN key to end_held_session, for the release's audit",
          ctx do
       # The release a report causes is attributed to the runner's `api_key_id`, and the channel
-      # is the one place that holds it (`socket.assigns.runner`). A release cannot be observed
-      # from here — the ledger's lock on the sandbox connection would hold `AdminRepo`'s — so
-      # the CALL is observed instead, traced on the channel process alone.
+      # is the one place that holds it (`socket.assigns.runner`), so the CALL is observed,
+      # traced on the channel process alone: no other test's process is traced.
       %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
       # `end_held_session/5`: the channel reads the row once (`held_dispatch/3`) and routes on
       # its kind, so this is the call an implement session's report reaches.
@@ -622,7 +605,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
       try do
         ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
-        assert_reply ref, :ok, _, @reply_timeout
+        assert_reply ref, :ok, _, reply_timeout()
       after
         :erlang.trace(channel.channel_pid, false, [:call])
         :erlang.trace_pattern(mfa, false, [:local])
@@ -639,7 +622,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx
 
       ref = push(channel, "session_ended", ended(dispatch_id, "max_turns_exceeded"))
-      assert_reply ref, :ok, %{stage: "escalated", replayed: false}, @reply_timeout
+      assert_reply ref, :ok, %{stage: "escalated", replayed: false}, reply_timeout()
 
       assert Stages.get(runner.tenant_id, story.id).stage == :escalated
     end
@@ -654,16 +637,16 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           ended(dispatch_id, "completed", %{"claim_epoch" => @epoch + 1})
         )
 
-      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, reply_timeout()
 
       ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       ref = push(channel, "session_ended", ended(dispatch_id, "crashed"))
-      assert_reply ref, :error, %{reason: "already_recorded"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "already_recorded"}, reply_timeout()
 
       ref = push(channel, "session_ended", ended(Ecto.UUID.generate(), "completed"))
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, reply_timeout()
 
       for reason <- ~w(claim_epoch_mismatch already_recorded unknown_dispatch) do
         assert reason in RunnerContract.error_reasons()["session_ended"]
@@ -680,7 +663,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
       ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
 
-      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, reply_timeout()
       assert ms == RunnerContract.session_ended_burst() |> Map.fetch!("refill_interval_ms")
       assert recorded_reason(runner.tenant_id, dispatch_id) == nil
     end
@@ -690,7 +673,7 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       capacity = RunnerContract.session_ended_burst() |> Map.fetch!("capacity")
 
       ref = push(channel, "session_ended", ended(dispatch_id, "completed"))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert {tokens, _refilled_at} =
                :sys.get_state(channel.channel_pid).assigns.session_ended_bucket

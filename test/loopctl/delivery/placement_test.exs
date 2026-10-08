@@ -53,7 +53,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       subscribe_and_join(
         socket,
         "runner:" <> runner.id,
-        build(:runner_join, %{"machine" => "minis"})
+        build(:runner_join_payload, %{"machine" => "minis"})
       )
 
     _ = :sys.get_state(channel.channel_pid)
@@ -1817,7 +1817,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       subscribe_and_join(
         socket,
         "runner:" <> runner.id,
-        Map.merge(build(:runner_join, %{"machine" => "minis"}), overrides)
+        Map.merge(build(:runner_join_payload, %{"machine" => "minis"}), overrides)
       )
 
     _ = :sys.get_state(channel.channel_pid)

@@ -5,11 +5,12 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
   `Loopctl.Delivery.ReviewPlacementTest`; this pins the HTTP surface: role gates, statuses,
   refusal codes and the untrusted markers. There is no endpoint for a finding or a verdict.
 
-  `async: false` for the reason `LoopctlWeb.ThreadControllerTest` gives: keys resolve on
-  `AdminRepo` and the story lives on the RLS `Repo`, so the tenant and the keys are committed.
+  Keys resolve on `AdminRepo` and the story lives on the RLS `Repo`; in test both run on the
+  test's one sandbox connection (`Loopctl.AdminRepo.Route`), so every row is sandboxed. The
+  runner's channel process runs on that connection through `$callers`.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Ecto.Query
   import Phoenix.ChannelTest, only: [subscribe_and_join: 3]
@@ -24,20 +25,15 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
   @epoch 4
   @tree String.duplicate("e", 40)
 
   setup do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {impl_raw, _impl_key, implementer} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
-    {operator_raw, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
-    {runner_raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id, name: "reviewer"})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {impl_raw, _impl_key, implementer} = fixture(:agent_key, %{tenant_id: tenant.id})
+
+    {operator_raw, _operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+    {runner_raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "reviewer"})
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})
     session = fixture(:stage_dispatch, %{tenant_id: tenant.id, agent_id: implementer.id})
 
