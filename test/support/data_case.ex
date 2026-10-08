@@ -106,12 +106,28 @@ defmodule Loopctl.DataCase do
   Runs unboxed (VACUUM cannot run inside a transaction) and never fails a test: a vacuum
   that cannot run leaves the suite exactly as flaky as it was before, which is a worse
   outcome to hide behind an exception than to carry on with.
+
+  ## Why `TRUNCATE OFF, SKIP_LOCKED`: so a tagged module can run async (#953)
+
+  A plain VACUUM ends by truncating the table's empty tail pages, which needs ACCESS
+  EXCLUSIVE; with any other transaction holding a lock on the table it retries for up to
+  5s per table before giving up (`wait_event` `VacuumTruncate`), and a second VACUUM of the
+  same table queues behind the first on SHARE UPDATE EXCLUSIVE (`Lock`/`relation`). Beside
+  the async suite's open sandbox transactions both happen on every call. Measured on minis,
+  2026-10-07, running the vector-reading modules together with
+  `Loopctl.EmbeddingsSideTableReadsTest` async: 88-190s a run against 18-27s with it sync,
+  and 2 runs in 10 failed on a vacuum query passing its 15s timeout. Neither phase removes
+  anything this repair needs: truncation only returns empty pages to the OS, and a table
+  another test is vacuuming at that moment is being cleaned by that vacuum.
   """
   @spec vacuum_vector_indexes() :: :ok
   def vacuum_vector_indexes do
     Sandbox.unboxed_run(Loopctl.Repo, fn ->
       for table <- @vector_tables do
-        Loopctl.AdminRepo.query!("VACUUM (INDEX_CLEANUP ON) #{table}", [])
+        Loopctl.AdminRepo.query!(
+          "VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF, SKIP_LOCKED) #{table}",
+          []
+        )
       end
     end)
 

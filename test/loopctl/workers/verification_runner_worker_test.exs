@@ -8,9 +8,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
   are integration tests.
 
   The paths that DO read the forge need a branch, which lives on the RLS `Loopctl.Repo`
-  (the dispatch ledger and the stage row) while the run and its story live on `AdminRepo` —
-  two sandbox owners that cannot see each other's rows. Those are in
-  `Loopctl.Workers.VerificationRunnerWorkerIntegrationTest`, on committed rows.
+  (the dispatch ledger and the stage row) while the run and its story live on `AdminRepo`.
+  Those are in `Loopctl.Workers.VerificationRunnerWorkerIntegrationTest`, and the ones whose
+  subject is a lock another connection holds in `Loopctl.Workers.VerificationRunnerWorkerLockTest`.
 
   Every forge read is RECORDED by the stubs below, so a test can refute that one happened.
   """

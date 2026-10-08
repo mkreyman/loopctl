@@ -478,6 +478,11 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   The threshold is read from `Loopctl.SystemConfig` per group; `:system_config` names the
   namespace it is read from (the node-wide one by default, a test's own otherwise).
+
+  `:similarity_reader` is the read that scores one chunk of members,
+  `(tenant_id, article_ids, signal) -> %{{signal, article_id} => %{min_sim:, pairs:, scored:}}`,
+  defaulting to the real pairwise query. A test passes one that fails, to reach the degraded
+  path a scoring outage takes without taking the vector tables away from every other test.
   """
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
@@ -506,7 +511,8 @@ defmodule Loopctl.Knowledge.Consolidation do
       %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: :drain_disabled}
     else
       cache = Keyword.get(opts, :system_config, SystemConfig)
-      run_confirmed_duplicates(tenant_id, cap, unpublish_cap, cache)
+      reader = Keyword.get(opts, :similarity_reader, &pairwise_similarity_by_group/3)
+      run_confirmed_duplicates(tenant_id, cap, unpublish_cap, cache, reader)
     end
   end
 
@@ -548,7 +554,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     @default_max_per_class
   end
 
-  defp run_confirmed_duplicates(tenant_id, cap, unpublish_cap, cache) do
+  defp run_confirmed_duplicates(tenant_id, cap, unpublish_cap, cache, reader) do
     case confirmed_proposals(tenant_id, :duplicate_capture, cap) do
       {:error, reason} ->
         log_gate_blocked(tenant_id, :duplicate_capture, reason)
@@ -560,7 +566,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         # `skipped` (the accurate reason) rather than being relabelled uncorroborated.
         # `cache` travels beside it: the `SystemConfig` namespace the similarity threshold
         # is read from, so `corroborate/6` judges against the lever the caller named.
-        scored = score_groups(tenant_id, proposals)
+        scored = score_groups(tenant_id, proposals, reader)
 
         result =
           proposals
@@ -643,11 +649,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   # a member shared between groups of the SAME signal resolves to the same entry either way.
   @score_groups_per_query 25
 
-  defp score_groups(tenant_id, proposals) do
+  defp score_groups(tenant_id, proposals, reader) do
     proposals
     |> Enum.group_by(&drift_signal/1)
     |> Enum.reduce(%{}, fn {signal, class_proposals}, acc ->
-      Map.merge(acc, score_signal(tenant_id, signal, class_proposals))
+      Map.merge(acc, score_signal(tenant_id, signal, class_proposals, reader))
     end)
   rescue
     e -> log_scoring_failed(tenant_id, ExitTag.tag(e))
@@ -655,13 +661,13 @@ defmodule Loopctl.Knowledge.Consolidation do
     :exit, reason -> log_scoring_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
   end
 
-  defp score_signal(tenant_id, signal, proposals) do
+  defp score_signal(tenant_id, signal, proposals, reader) do
     proposals
     |> Enum.chunk_every(@score_groups_per_query)
     |> Enum.reduce(%{}, fn chunk, acc ->
       ids = chunk |> Enum.flat_map(& &1.article_ids) |> Enum.uniq()
 
-      Map.merge(acc, pairwise_similarity_by_group(tenant_id, ids, signal))
+      Map.merge(acc, reader.(tenant_id, ids, signal))
     end)
   end
 

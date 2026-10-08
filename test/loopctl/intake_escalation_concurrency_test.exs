@@ -4,8 +4,10 @@ defmodule Loopctl.IntakeEscalationConcurrencyTest do
   property no sandboxed test can express: the sandbox gives every process the SAME connection,
   so two "concurrent" escalations there are serial by construction and the defect is invisible.
 
-  `async: false` and COMMITTED rows, on two real connections, because the row lock is the thing
-  under test and a lock only exists between transactions that are actually separate.
+  `async: false` and COMMITTED rows, on two real connections, because the subject is the
+  `intake_records` row lock (`FOR UPDATE`) between two transactions, and a lock only exists
+  between transactions that are actually separate. The record is this module's own, under a
+  committed tenant it sweeps.
 
   ## What this does NOT prove
 

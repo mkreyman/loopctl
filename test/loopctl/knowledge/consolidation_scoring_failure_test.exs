@@ -2,20 +2,18 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
   @moduledoc """
   The corroboration gate's DEGRADED path: what happens when the similarity read itself fails.
 
-  `async: false` ON PURPOSE, and it is not a style choice. The only honest way to make the
-  scoring read fail is to take its tables away, and `ALTER TABLE ... RENAME` acquires an
-  ACCESS EXCLUSIVE lock — which blocks or breaks any concurrently-running async test that
-  touches `article_embeddings` (it took out `EmbeddingsSideTableReadsTest` when this lived in
-  the async consolidation suite). A sync test never runs alongside another, so the lock cannot
-  leak. Mirrors `BatchArticleEmbeddingWorkerTest`'s reasoning for its own `async: false`.
+  The failing read is INJECTED (`apply_confirmed_duplicates/2`'s `:similarity_reader`), so
+  the module runs async. It used to take the vector tables away with `ALTER TABLE ... RENAME`,
+  whose ACCESS EXCLUSIVE lock blocked every concurrent test touching `article_embeddings`
+  and forced the module sync. The reader here fails the way an outage does, with a
+  connection error, and every other step of the run is the real one.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
   setup :verify_on_exit!
 
   import Ecto.Query
-  import ExUnit.CaptureLog, only: [with_log: 1]
 
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
@@ -61,23 +59,26 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
     {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
     {:ok, _} = Consolidation.run(tenant.id)
 
-    # Break BOTH vector sources, not just one. `score_pairs/2` picks its source from the
-    # US-41.1 side-table cutover flag, so breaking only `article_embeddings` leaves a
-    # pre-cutover tenant (which is what :test is) reading `articles.embedding` happily, and
-    # the test passes while proving nothing. Both are restored immediately either way; the
-    # DDL is also inside the sandbox transaction and rolls back with the test.
-    {result, log} =
-      with_log(fn ->
-        AdminRepo.query!("ALTER TABLE article_embeddings RENAME TO article_embeddings_broken")
-        AdminRepo.query!("ALTER TABLE articles RENAME COLUMN embedding TO embedding_broken")
+    # The scoring read fails whichever vector source the tenant reads from: it is the read
+    # itself that is replaced. It records that it was asked, so a run that never reached the
+    # read cannot pass on the assertions below.
+    test_pid = self()
 
-        try do
-          Consolidation.apply_confirmed_duplicates(tenant.id)
-        after
-          AdminRepo.query!("ALTER TABLE articles RENAME COLUMN embedding_broken TO embedding")
-          AdminRepo.query!("ALTER TABLE article_embeddings_broken RENAME TO article_embeddings")
-        end
+    failing_read = fn tenant_id, ids, signal ->
+      send(test_pid, {:scoring_read, tenant_id, Enum.sort(ids), signal})
+      raise DBConnection.ConnectionError, "tcp recv: closed"
+    end
+
+    # This process's OWN log: the module runs async, and the `refute` below over every
+    # process's log would fail on a concurrent consolidation test's line.
+    {result, log} =
+      Loopctl.OwnLog.with_own_log(fn ->
+        Consolidation.apply_confirmed_duplicates(tenant.id, similarity_reader: failing_read)
       end)
+
+    tenant_id = tenant.id
+    members = Enum.sort([a.id, b.id])
+    assert_received {:scoring_read, ^tenant_id, ^members, :title}
 
     assert %{applied: 0, skipped: 0, uncorroborated: 1} = result
     assert status(a.id) == :published

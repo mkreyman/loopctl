@@ -4,16 +4,18 @@ defmodule Loopctl.Vault.RotationRaceTest do
 
   A 0-row compare-and-set used to be tallied `skipped_concurrent`, which the report
   DESCRIBES as "already on the active cipher". That claim is false in two ways, and both
-  are reproduced here with a Postgres trigger as the concurrent writer — the pass SELECTs a
-  batch and then compare-and-sets each row in turn, so an AFTER UPDATE trigger firing on
-  the first row is exactly the application write that races the second.
+  are reproduced here with an injected concurrent writer — the pass SELECTs a batch and then
+  compare-and-sets each row in turn, so a write landing right after the first row's
+  compare-and-set is exactly the application write that races the second.
 
-  `async: false` because `CREATE TRIGGER` takes SHARE ROW EXCLUSIVE on `tenant_llm_settings`
-  and the sandbox holds it until the test ends: every concurrent async test that INSERTs into
-  that table (any `Llm.upsert_settings/2`) waited out the statement timeout and failed
-  57014 `query_canceled` — the gate flake seen twice on 2026-09-29 (KB 493d2020).
+  The writer is `Loopctl.Vault.Rotation.reencrypt/1`'s `:around_write`, wrapped around each
+  compare-and-set exactly where the AFTER UPDATE trigger these tests used to install fired:
+  after a write that changed a row, on every write the pass makes (its retry included), or in
+  place of the write when it raises. The module runs async: a `CREATE TRIGGER` took SHARE
+  ROW EXCLUSIVE on `tenant_llm_settings` until the test ended, and every concurrent test
+  inserting there waited out the statement timeout (57014, KB 493d2020).
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   alias Cloak.Ciphers.AES.GCM
   alias Loopctl.AdminRepo
@@ -26,13 +28,16 @@ defmodule Loopctl.Vault.RotationRaceTest do
 
   test "a row raced on ONE column is re-decided, not counted as already-converted" do
     rows = two_rows_on_retired_key()
-    raced = Base.encode16(Vault.encrypt!("raced-by-the-application"), case: :lower)
+    raced = Vault.encrypt!("raced-by-the-application")
 
     # The guard spans every rewritten column, so touching just chat_api_key voids it —
     # while api_key is still on the key the operator is about to delete.
-    race_trigger(~s|UPDATE #{@table} SET chat_api_key = '\\x#{raced}'::bytea WHERE id <> NEW.id;|)
+    racer =
+      after_each_write(fn pk ->
+        AdminRepo.query!(~s|UPDATE "#{@table}" SET chat_api_key = $1 WHERE id <> $2|, [raced, pk])
+      end)
 
-    assert {:ok, report} = Rotation.reencrypt(table: @table, batch_size: 2)
+    assert {:ok, report} = Rotation.reencrypt(table: @table, batch_size: 2, around_write: racer)
 
     assert report.totals.reencrypted == 2
     assert report.totals.skipped_concurrent == 0
@@ -40,14 +45,20 @@ defmodule Loopctl.Vault.RotationRaceTest do
     for row <- rows do
       assert Rotation.tag_of(raw("api_key", row.id)) == {:ok, Rotation.active_tag()}
     end
+
+    # The race really landed: the last write raced the other row's chat_api_key.
+    assert Enum.any?(rows, &(raw("chat_api_key", &1.id) == raced))
   end
 
   test "a row deleted mid-pass counts as skipped_gone, not as already-converted" do
     _rows = two_rows_on_retired_key()
 
-    race_trigger(~s|DELETE FROM #{@table} WHERE id <> NEW.id;|)
+    racer =
+      after_each_write(fn pk ->
+        AdminRepo.query!(~s|DELETE FROM "#{@table}" WHERE id <> $1|, [pk])
+      end)
 
-    assert {:ok, report} = Rotation.reencrypt(table: @table, batch_size: 2)
+    assert {:ok, report} = Rotation.reencrypt(table: @table, batch_size: 2, around_write: racer)
 
     assert report.totals.skipped_gone == 1
     assert report.totals.skipped_concurrent == 0
@@ -59,9 +70,12 @@ defmodule Loopctl.Vault.RotationRaceTest do
   test "a DB error mid-pass returns the partial report instead of throwing it away" do
     _rows = two_rows_on_retired_key()
 
-    race_trigger(~s|RAISE EXCEPTION 'connection went away';|)
-
-    assert {:error, report} = Rotation.reencrypt(table: @table, batch_size: 2)
+    assert {:error, report} =
+             Rotation.reencrypt(
+               table: @table,
+               batch_size: 2,
+               around_write: fn _pk, _write -> raise_db_error() end
+             )
 
     assert report.aborted
     assert [failure] = report.failures
@@ -78,16 +92,39 @@ defmodule Loopctl.Vault.RotationRaceTest do
       |> Enum.sort_by(&Ecto.UUID.dump!(&1.id))
       |> List.last()
 
-    race_trigger(
-      ~s|IF NEW.id = '#{last.id}' THEN RAISE EXCEPTION 'connection went away'; | <>
-        "END IF;"
-    )
+    last_pk = Ecto.UUID.dump!(last.id)
 
-    assert {:error, report} = Rotation.reencrypt(table: @table, batch_size: 2)
+    fail_last = fn
+      ^last_pk, _write -> raise_db_error()
+      _pk, write -> write.()
+    end
+
+    assert {:error, report} =
+             Rotation.reencrypt(table: @table, batch_size: 2, around_write: fail_last)
 
     assert report.aborted
     assert report.totals.reencrypted == 1
     assert report.totals.examined == 1
+  end
+
+  # What the AFTER UPDATE trigger did: `race` runs after a write that changed a row, given
+  # that row's key, and never for a write that changed nothing.
+  defp after_each_write(race) do
+    fn pk, write ->
+      case write.() do
+        0 ->
+          0
+
+        rows ->
+          race.(pk)
+          rows
+      end
+    end
+  end
+
+  # The error the trigger's RAISE produced: the compare-and-set itself fails.
+  defp raise_db_error do
+    raise Postgrex.Error, message: "connection went away"
   end
 
   defp retired_opts do
@@ -117,24 +154,5 @@ defmodule Loopctl.Vault.RotationRaceTest do
       ])
 
     value
-  end
-
-  # The WHEN clause is evaluated BEFORE the trigger function runs, so `= 0` (not 1) is what
-  # keeps the trigger's own write from re-entering it — at 1 the trigger never fires at all
-  # and every test above goes vacuous. The sandbox rolls the DDL back.
-  defp race_trigger(body) do
-    name = "rotation_race_#{System.unique_integer([:positive])}"
-
-    AdminRepo.query!(
-      "CREATE FUNCTION #{name}() RETURNS trigger AS $fn$ BEGIN #{body} RETURN NEW; END; " <>
-        "$fn$ LANGUAGE plpgsql"
-    )
-
-    AdminRepo.query!(
-      ~s|CREATE TRIGGER #{name}_t AFTER UPDATE ON "#{@table}" FOR EACH ROW | <>
-        "WHEN (pg_trigger_depth() = 0) EXECUTE FUNCTION #{name}()"
-    )
-
-    :ok
   end
 end

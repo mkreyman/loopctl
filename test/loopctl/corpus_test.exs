@@ -9,8 +9,8 @@ defmodule Loopctl.CorpusTest do
   join satisfies `Loopctl.HeavyRead`'s conjunctive tenant guard) and TC-43.1.8
   (corpus delete cascades to chunks and vectors).
 
-  TC-43.1.5's RLS half lives in `Loopctl.CorpusRlsTest` (it needs `async: false`
-  and `Repo`-connection seeding); TC-43.1.6's exclusion guard lives in
+  TC-43.1.5's RLS half lives in `Loopctl.CorpusRlsTest` (it needs `Repo`-connection
+  seeding, under the non-owner app role); TC-43.1.6's exclusion guard lives in
   `Loopctl.CorpusIsolationGuardTest`.
   """
 

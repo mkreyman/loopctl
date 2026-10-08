@@ -18,8 +18,8 @@ defmodule Loopctl.RateLimiter.PostgresConcurrencyTest do
   We therefore run each racer under `Sandbox.unboxed_run/2` (the codebase's scale
   gates use the same pattern for `Loopctl.AdminRepo`) so its upserts COMMIT to a
   real connection, and clean the single global bucket up afterwards. The bucket
-  key is uniquified so nothing else touches it; `async: false` guarantees no
-  other test observes the committed rows in the window before cleanup.
+  key is uniquified so nothing else touches it. `async: false` because the subject
+  is that one committed `rate_limit_counters` row raced by independent connections.
   """
   use ExUnit.Case, async: false
 
@@ -40,10 +40,9 @@ defmodule Loopctl.RateLimiter.PostgresConcurrencyTest do
   @fixed_now ~U[2026-07-15 12:00:30Z]
 
   setup do
-    # async: false ⇒ global Mox mode is safe, and the racer Tasks (spawned
-    # processes) need the clock stub reachable without per-process allowances.
-    # Postgres.check_rate/3 resolves the wall clock through the :clock DI.
-    Mox.set_mox_global()
+    # Postgres.check_rate/3 resolves the wall clock through the :clock DI. The stub is
+    # this test's own: the racers are `Task.async` children, which Mox resolves to the
+    # test process through `$callers`, so no global mode is needed.
     Mox.stub(Loopctl.MockClock, :utc_now, fn -> @fixed_now end)
     :ok
   end

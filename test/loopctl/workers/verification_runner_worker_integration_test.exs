@@ -3,216 +3,43 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
   US-26.4.6 end to end through `VerificationRunnerWorker.perform/1`: every path that reads the
   forge, which needs the story's BRANCH.
 
-  ## Why this module is `async: false` with committed rows
-
   The branch lives on the RLS `Loopctl.Repo` (the dispatch ledger and the stage row), while
   the run, its story and the intake source live on `AdminRepo`, and `verification_runs`
-  references `stories`. Under `Ecto.Adapters.SQL.Sandbox` those are two owners with two
-  transactions that cannot see each other's rows, so — exactly as
-  `Loopctl.Delivery.MergePreconditionIntegrationTest` does for the merge gate — the rows are
-  COMMITTED under a `fixture(:committed_tenant)`. Every path that needs no branch is in the
-  `async: true` `VerificationRunnerWorkerTest`. It is `async: false` because the rows are
-  committed and the forge mock is GLOBAL (`Mox.set_mox_global/0`), so two tests at once would
-  answer each other's reads.
+  references `stories`. AdminRepo shares Repo's sandbox connection in test, so every row is
+  sandboxed and the module runs async. The forge mock is process-scoped: the worker runs in
+  the test process, so no test answers another's reads (`Loopctl.Test.VerificationRunnerForge`
+  holds the stubs and their wrong-read trap).
 
-  Cleanup deletes ONLY what this module created: each test's own tenant, by id, on exit
-  (`purge/1`, then `sweep_committed_tenants/1`). Never the `committed-runner-%` slug sweep: every
-  worktree on a box shares one test database, and that sweep deletes the committed rows of a
-  suite running concurrently in another tree.
-
-  The forge is `Loopctl.MockPullRequestSource` (global mode). Each stub answers ONLY for the
-  intake source's repository and the story's own branch; anything else is recorded as
-  `{:wrong_read, ...}` and answered with green evidence, so reading the wrong repository or
-  branch shows up as a wrong VERDICT, not only as a missing message.
+  The paths whose subject is a lock another connection holds (a write loopctl cannot make, a
+  stage row or ledger it cannot read) are in `Loopctl.Workers.VerificationRunnerWorkerLockTest`.
+  Every path that needs no branch is in `VerificationRunnerWorkerTest`.
   """
 
-  use ExUnit.Case, async: false
+  use Loopctl.DataCase, async: true
 
-  import Ecto.Query, only: [from: 2]
-  import Loopctl.Fixtures
-  import Mox
+  import Loopctl.Test.VerificationRunnerForge
 
-  alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
-  alias Loopctl.Repo
-  alias Loopctl.Verification
+  alias Loopctl.Test.VerificationRunnerForge
   alias Loopctl.Verification.Credential
-  alias Loopctl.Verification.VerificationRun
-  alias Loopctl.Workers.VerificationRunnerWorker
 
-  @repo "acme/widgets"
-  @branch "loop/story-branch"
-  @sha String.duplicate("a", 40)
-  @short "aaaaaaa"
-  @fork_point String.duplicate("b", 40)
-  @head_tree String.duplicate("e", 40)
-  @base_tree String.duplicate("f", 40)
+  @repo VerificationRunnerForge.repo()
+  @branch VerificationRunnerForge.branch()
+  @sha VerificationRunnerForge.sha()
+  @short VerificationRunnerForge.short()
+  @fork_point VerificationRunnerForge.fork_point()
+  @base_tree VerificationRunnerForge.base_tree()
+
+  setup :verify_on_exit!
 
   setup do
-    Mox.set_mox_global()
-    Loopctl.DataCase.stub_all_defaults()
-
-    tenant = fixture(:committed_tenant, %{})
-    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
-    :ok = Sandbox.checkout(Repo, sandbox: false)
-
-    on_exit(fn ->
-      purge(tenant.id)
-      sweep_committed_tenants([tenant.id])
-    end)
-
-    # `repo_url` names ANOTHER repository: nothing may read it (#931 finding a).
-    project =
-      fixture(:project, %{tenant_id: tenant.id, repo_url: "https://github.com/evil/other"})
-
-    epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
-    story = fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, project_id: project.id})
-
-    fixture(:intake_source, %{
-      tenant_id: tenant.id,
-      project_id: project.id,
-      repo_full_name: @repo,
-      required_checks: ["test"]
-    })
-
-    test_pid = self()
-
-    stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
-
-    stub(MockVerificationCredential, :for_read, fn tenant_id, repo ->
-      send(test_pid, {:credential_asked, tenant_id, repo})
-      {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
-    end)
-
-    %{tenant_id: tenant.id, project_id: project.id, story_id: story.id, test_pid: test_pid}
+    setup_story!(fixture(:tenant, %{trust_tier: :agent_rooted}).id)
   end
-
-  # -- helpers ---------------------------------------------------------------------------
-
-  defp stage_branch!(ctx, branch) do
-    fixture(:story_stage, %{
-      tenant_id: ctx.tenant_id,
-      story_id: ctx.story_id,
-      stage: :implementing,
-      branch: branch
-    })
-  end
-
-  defp run!(ctx, sha \\ @sha) do
-    {:ok, run} = Verification.create_run(ctx.tenant_id, ctx.story_id, %{commit_sha: sha})
-    run
-  end
-
-  defp perform(ctx, run) do
-    VerificationRunnerWorker.perform(%Oban.Job{
-      args: %{"run_id" => run.id, "tenant_id" => ctx.tenant_id}
-    })
-  end
-
-  defp reload(ctx, run) do
-    {:ok, reloaded} = Verification.get_run(ctx.tenant_id, run.id)
-    reloaded
-  end
-
-  defp age!(run, seconds_ago, started? \\ true) do
-    at = DateTime.add(DateTime.utc_now(), -seconds_ago, :second)
-    set = [inserted_at: at] ++ if(started?, do: [started_at: at, status: "running"], else: [])
-    {1, _} = AdminRepo.update_all(from(r in VerificationRun, where: r.id == ^run.id), set: set)
-    run
-  end
-
-  defp green(run_id \\ 5),
-    do:
-      evidence([ci_run(run_id, "completed", "success")], [ci_job(run_id, "completed", "success")])
-
-  defp evidence(runs, jobs), do: {:ok, %{runs: runs, jobs: jobs, statuses: []}}
-
-  defp ci_run(id, status, conclusion, workflow \\ ".github/workflows/ci.yml"),
-    do: %{id: id, workflow: workflow, status: status, conclusion: conclusion}
-
-  # An unrelated workflow file (`lint.yml`) that succeeded, carrying its own job.
-  defp lint_run(id), do: ci_run(id, "completed", "success", ".github/workflows/lint.yml")
-
-  defp lint_job(run_id),
-    do: %{ci_job(run_id, "completed", "success", "lint") | workflow: ".github/workflows/lint.yml"}
-
-  defp ci_job(run_id, status, conclusion, name \\ "test"),
-    do: %{
-      id: run_id * 10,
-      run_id: run_id,
-      name: name,
-      status: status,
-      conclusion: conclusion,
-      workflow: ".github/workflows/ci.yml"
-    }
-
-  # The story's own reads answer `answers`; any other repository, branch or base is recorded
-  # and answered GREEN, so a read of the wrong target would pass a run that must not pass.
-  defp stub_forge(ctx, answers) do
-    base = Map.get(answers, :base, "master")
-    branch = Map.get(answers, :branch, @branch)
-    diff = Map.get(answers, :diff, ["lib/widgets/thing.ex"])
-
-    stub(MockPullRequestSource, :commit, fn
-      %ForgeRepo{full_name: @repo}, sha ->
-        send(ctx.test_pid, {:commit, sha})
-        {:ok, %{tree_sha: Map.get(answers, :tree, @head_tree), parents: [@fork_point]}}
-
-      repo, _sha ->
-        send(ctx.test_pid, {:wrong_read, :commit, repo, nil})
-        {:ok, %{tree_sha: @head_tree, parents: []}}
-    end)
-
-    stub(MockPullRequestSource, :compare, fn
-      %ForgeRepo{full_name: @repo}, ^base, sha ->
-        send(ctx.test_pid, {:compare, sha})
-        answers |> Map.get_lazy(:compare, fn -> {:ok, clean(diff)} end) |> answer()
-
-      repo, other_base, _sha ->
-        send(ctx.test_pid, {:wrong_read, :compare, repo, other_base})
-        {:ok, clean(["lib/x.ex"])}
-    end)
-
-    stub(MockPullRequestSource, :check_evidence, fn
-      %ForgeRepo{full_name: @repo}, sha, ^branch ->
-        send(ctx.test_pid, {:evidence, sha})
-        answers |> Map.fetch!(:evidence) |> answer()
-
-      repo, _sha, other_branch ->
-        send(ctx.test_pid, {:wrong_read, :check_evidence, repo, other_branch})
-        green(99)
-    end)
-  end
-
-  # An answer given as a value, or as a function called at the read.
-  defp answer(fun) when is_function(fun, 0), do: fun.()
-  defp answer(value), do: value
-
-  defp clean(files, merge_base \\ @fork_point),
-    do: %{
-      merge_base_sha: merge_base,
-      base_tree_sha: @base_tree,
-      diffstat: %{files: length(files), changed_lines: 3 * length(files)},
-      diff: {:ok, %{files: files, renames: []}}
-    }
 
   defp refute_wrong_reads, do: refute_received({:wrong_read, _, _, _})
-
-  # A sequence of answers, one per call, from a process-held queue.
-  defp sequence(answers) do
-    {:ok, agent} = Agent.start_link(fn -> answers end)
-
-    fn ->
-      Agent.get_and_update(agent, fn
-        [only] -> {only, [only]}
-        [next | rest] -> {next, rest}
-      end)
-    end
-  end
 
   # -- TC-26.4.6.1 --------------------------------------------------------------------------
 
@@ -496,50 +323,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       assert_received {:commit, @sha}
       refute_received {:evidence, _}
     end
-
-    # Round 4, finding 4: a check that passed but could not be RECORDED is loopctl's database,
-    # not a verdict: a wait that leaves the fault streak alone, and the next poll checks again.
-    test "a passed check loopctl cannot record is a wait, never internal_error", ctx do
-      run = ctx |> run!() |> set_faults!(2)
-
-      # The run row is locked AFTER the run started and before the stamp is written.
-      stub_forge(ctx, %{
-        compare: fn ->
-          lock_run_once!(run)
-          {:ok, clean(["lib/widgets/thing.ex"])}
-        end,
-        evidence: green()
-      })
-
-      assert {:snooze, 60} = perform_busy(ctx, run)
-      release_run_lock!()
-
-      reloaded = reload(ctx, run)
-      assert reloaded.status == "running"
-      assert reloaded.change_checked_at == nil
-      assert reloaded.ci_forge_faults == 2
-      assert_received {:compare, @sha}
-      refute_received {:evidence, _}
-
-      # Released: the next poll checks again, records it, and is judged.
-      assert :ok = perform(ctx, run)
-      assert_received {:compare, @sha}
-      assert %{status: "pass", change_checked_at: %DateTime{}} = reload(ctx, run)
-    end
-
-    test "a stage row loopctl cannot read is a wait, not a verdict", ctx do
-      stub_forge(ctx, %{evidence: green()})
-      run = ctx |> run!() |> set_faults!(2)
-      hold_table_lock!("story_stages")
-
-      assert {:snooze, 60} = perform(ctx, run)
-
-      reloaded = reload(ctx, run)
-      assert reloaded.status == "running"
-      assert reloaded.ci_forge_faults == 2
-      refute_received {:credential_asked, _, _}
-      refute_received {:compare, _}
-    end
   end
 
   # -- TC-26.4.6.4 --------------------------------------------------------------------------
@@ -614,35 +397,6 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
       run = run!(ctx)
       assert {:snooze, 3_600} = perform(ctx, run)
-    end
-
-    # Review round 1, finding 3(b): the dispatch ledger is loopctl's own database, not the
-    # forge. Contention there snoozes without touching the fault streak, and reads nothing.
-    test "database contention resolving the branch is not a forge fault", ctx do
-      stub_forge(ctx, %{evidence: green()})
-      run = ctx |> run!() |> set_faults!(2)
-      hold_ledger_lock!()
-
-      assert {:snooze, 60} = perform(ctx, run)
-
-      reloaded = reload(ctx, run)
-      assert reloaded.status == "running"
-      assert reloaded.ci_forge_faults == 2
-      refute_received {:compare, _}
-      refute_received {:credential_asked, _, _}
-    end
-
-    test "database contention past the age window records database_busy", ctx do
-      stub_forge(ctx, %{evidence: green()})
-      run = ctx |> run!() |> age!(25 * 60 * 60)
-      hold_ledger_lock!()
-
-      assert :ok = perform(ctx, run)
-
-      assert reload(ctx, run).ac_results == %{
-               "source" => "ci",
-               "ci_unavailable_reason" => "database_busy"
-             }
     end
 
     test "an answered wait resets the fault streak", ctx do
@@ -794,184 +548,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
   end
 
-  # -- every write the runner makes to its run ------------------------------------------------
-
-  # Round 5: every write the worker makes to its own run is bounded, and one it cannot make is
-  # a snooze on the database cadence with the run EXACTLY as it was (`updated_at` included):
-  # never `internal_error`, never a forge fault counted. Each test locks the run from inside
-  # the read just before the write under test; the run is already started and change-checked
-  # (`ready!/1`), so that write is the only one the poll makes. Released, the next poll redoes
-  # the work and records it.
-  describe "a write loopctl cannot make to its run is a wait, and changes nothing" do
-    setup ctx do
-      stage_branch!(ctx, @branch)
-      :ok
-    end
-
-    test "starting the run", ctx do
-      stub_forge(ctx, %{evidence: green()})
-      run = run!(ctx)
-      before = snapshot(ctx, run)
-      lock_run_once!(run)
-
-      assert {:snooze, 60} = perform_busy(ctx, run)
-      assert snapshot(ctx, run) == before
-      refute_received {:credential_asked, _, _}
-
-      release_run_lock!()
-      assert :ok = perform(ctx, run)
-      assert reload(ctx, run).status == "pass"
-    end
-
-    test "retiring a stale run", ctx do
-      run = ctx |> run!() |> age!(25 * 60 * 60, false)
-      before = snapshot(ctx, run)
-      lock_run_once!(run)
-
-      assert {:snooze, 900} = perform_busy(ctx, run)
-      assert snapshot(ctx, run) == before
-
-      release_run_lock!()
-      assert {:cancel, :stale_run} = perform(ctx, run)
-      assert reload(ctx, run).status == "skipped"
-    end
-
-    test "recording the resolved SHA", ctx do
-      stub_forge(ctx, %{evidence: green()})
-      run = ctx |> run!(@short) |> ready!()
-      before = snapshot(ctx, run)
-
-      expect(MockPullRequestSource, :resolve_commit, 2, fn %ForgeRepo{full_name: @repo}, @short ->
-        lock_run_once!(run)
-        {:ok, @sha}
-      end)
-
-      assert {:snooze, 60} = perform_busy(ctx, run)
-      assert snapshot(ctx, run) == before
-      refute_received {:evidence, _}
-
-      release_run_lock!()
-      assert :ok = perform(ctx, run)
-      assert %{status: "pass", resolved_commit_sha: @sha} = reload(ctx, run)
-    end
-
-    test "recording a pass", ctx do
-      run = ctx |> run!() |> ready!()
-      stub_forge(ctx, %{evidence: locking(run, green())})
-      before = snapshot(ctx, run)
-
-      assert {:snooze, 60} = perform_busy(ctx, run)
-      assert snapshot(ctx, run) == before
-
-      release_run_lock!()
-      assert :ok = perform(ctx, run)
-      assert reload(ctx, run).status == "pass"
-    end
-
-    test "recording a fail", ctx do
-      run = ctx |> run!() |> ready!()
-      failed = evidence([ci_run(5, "completed", "failure")], [ci_job(5, "completed", "failure")])
-      stub_forge(ctx, %{evidence: locking(run, failed)})
-      before = snapshot(ctx, run)
-
-      assert {:snooze, 60} = perform_busy(ctx, run)
-      assert snapshot(ctx, run) == before
-
-      release_run_lock!()
-      assert :ok = perform(ctx, run)
-      assert reload(ctx, run).status == "fail"
-    end
-
-    # The fault is not counted, and the snooze is the database's, not the streak's backoff.
-    test "counting a forge fault", ctx do
-      run = ctx |> run!() |> ready!() |> set_faults!(2)
-      stub_forge(ctx, %{evidence: locking(run, {:error, {:github_api_error, 503}})})
-      before = snapshot(ctx, run)
-
-      assert {:snooze, 60} = perform_busy(ctx, run)
-      assert snapshot(ctx, run) == before
-
-      release_run_lock!()
-      assert {:snooze, 240} = perform(ctx, run)
-      assert reload(ctx, run).ci_forge_faults == 3
-    end
-
-    test "resetting the fault streak on an answered wait", ctx do
-      run = ctx |> run!() |> ready!() |> set_faults!(2)
-      pending = evidence([ci_run(5, "queued", nil)], [ci_job(5, "queued", nil)])
-      stub_forge(ctx, %{evidence: locking(run, pending)})
-      before = snapshot(ctx, run)
-
-      assert {:snooze, 60} = perform_busy(ctx, run)
-      assert snapshot(ctx, run) == before
-
-      release_run_lock!()
-      assert {:snooze, 60} = perform(ctx, run)
-      assert reload(ctx, run).ci_forge_faults == 0
-    end
-
-    test "recording a no-verdict", ctx do
-      run = ctx |> run!() |> ready!()
-      stub_forge(ctx, %{evidence: locking(run, {:error, {:github_api_error, 404}})})
-      before = snapshot(ctx, run)
-
-      assert {:snooze, 60} = perform_busy(ctx, run)
-      assert snapshot(ctx, run) == before
-
-      release_run_lock!()
-      assert :ok = perform(ctx, run)
-
-      assert %{status: "error", ac_results: %{"ci_unavailable_reason" => "forge_not_found"}} =
-               reload(ctx, run)
-    end
-
-    test "recording internal_error after a crash", ctx do
-      run = ctx |> run!() |> ready!()
-
-      stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
-        lock_run_once!(run)
-        raise "boom"
-      end)
-
-      before = snapshot(ctx, run)
-
-      {result, log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run) end)
-      assert result == {:snooze, 60}
-      assert log =~ "crashed"
-      assert busy_warnings(ctx, log) == 1
-      assert snapshot(ctx, run) == before
-
-      release_run_lock!()
-      {result, _log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run) end)
-      assert result == {:cancel, :internal_error}
-      assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "internal_error"
-    end
-  end
-
-  # Review round 1, finding 10: this module's cleanup deletes its own tenant and nothing of
-  # another suite's, which shares the test database from another worktree.
-  test "cleanup deletes only the tenants it names", ctx do
-    other = fixture(:committed_tenant, %{})
-    on_exit(fn -> sweep_committed_tenants([other.id]) end)
-
-    # Both calls run unboxed, which gives up this process's AdminRepo checkout.
-    :ok = sweep_committed_tenants([Ecto.UUID.generate()])
-    checkout_admin()
-
-    assert AdminRepo.get(Loopctl.Tenants.Tenant, other.id)
-    assert AdminRepo.get(Loopctl.Tenants.Tenant, ctx.tenant_id)
-
-    :ok = sweep_committed_tenants([other.id])
-    checkout_admin()
-    refute AdminRepo.get(Loopctl.Tenants.Tenant, other.id)
-  end
-
   # -- plumbing ------------------------------------------------------------------------------
 
   defp place_thread!(ctx, branch, base_branch) do
-    {_raw_key, runner} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id})
-    # The fixture's unboxed run gives up this process's AdminRepo checkout; take it back.
-    checkout_admin()
+    runner = fixture(:stage_runner, %{tenant_id: ctx.tenant_id})
 
     {:ok, _row} =
       Repo.with_tenant(ctx.tenant_id, fn ->
@@ -990,146 +570,5 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           released_at: DateTime.utc_now()
         })
       end)
-  end
-
-  defp checkout_admin do
-    case Sandbox.checkout(Loopctl.Repo, sandbox: false) do
-      :ok -> :ok
-      {:already, :owner} -> :ok
-    end
-  end
-
-  # `verification_runs` and `api_keys` reference the tenant without a cascade, so they go
-  # before `sweep_committed_tenants/1` can delete it. By this test's tenant id only.
-  defp purge(tenant_id) do
-    checkout_admin()
-    raw = Ecto.UUID.dump!(tenant_id)
-    AdminRepo.query!("DELETE FROM verification_runs WHERE tenant_id = $1", [raw])
-    AdminRepo.query!("DELETE FROM api_keys WHERE tenant_id = $1", [raw])
-  end
-
-  defp set_faults!(run, faults) do
-    {1, _} =
-      AdminRepo.update_all(from(r in VerificationRun, where: r.id == ^run.id),
-        set: [ci_forge_faults: faults]
-      )
-
-    run
-  end
-
-  # A lock on the dispatch ledger held by another connection until the test ends: the
-  # route read waits out its lock_timeout and answers `:busy` (as in the merge gate's own
-  # integration test).
-  defp hold_ledger_lock!, do: hold_table_lock!("runner_dispatches")
-
-  @run_fields [
-    :status,
-    :started_at,
-    :completed_at,
-    :ac_results,
-    :ci_forge_faults,
-    :resolved_commit_sha,
-    :change_checked_at,
-    :updated_at
-  ]
-
-  # Everything a poll may write on the run, `updated_at` included.
-  defp snapshot(ctx, run), do: ctx |> reload(run) |> Map.take(@run_fields)
-
-  # Started and change-checked, so a poll's only write is the one after the forge's answer.
-  defp ready!(run) do
-    now = DateTime.utc_now()
-
-    {1, _} =
-      AdminRepo.update_all(from(r in VerificationRun, where: r.id == ^run.id),
-        set: [status: "running", started_at: now, change_checked_at: now]
-      )
-
-    run
-  end
-
-  # A poll whose write waits out its lock_timeout, answered as a wait: ONE busy warning, naming
-  # 55P03 (lock_not_available, so the bounded wait and not the query timeout's lost connection),
-  # and no crash. A write that raised instead would reach the rescue arm, log the crash, and
-  # try its `internal_error` write against the same lock: a second warning.
-  defp perform_busy(ctx, run) do
-    {result, log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run) end)
-    assert busy_warnings(ctx, log) == 1
-    refute log =~ "crashed"
-    result
-  end
-
-  defp busy_warnings(ctx, log) do
-    ~r/gave up waiting: tenant_id=#{ctx.tenant_id} error="55P03"/ |> Regex.scan(log) |> length()
-  end
-
-  # An evidence answer that locks the run first, once.
-  defp locking(run, answer) do
-    fn ->
-      lock_run_once!(run)
-      answer
-    end
-  end
-
-  # Locks the run on the FIRST call only (`hold_run_lock!/1`), so the poll after
-  # `release_run_lock!/0` writes freely.
-  defp lock_run_once!(run) do
-    unless Process.get(:run_lock), do: Process.put(:run_lock, hold_run_lock!(run))
-    :ok
-  end
-
-  defp release_run_lock!, do: send(Process.get(:run_lock), :release)
-
-  # A row lock on one verification run, held by another connection until released (or the
-  # test ends): the run's next write waits out its lock_timeout.
-  defp hold_run_lock!(run) do
-    test_pid = self()
-
-    holder =
-      spawn(fn ->
-        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
-
-        AdminRepo.transaction(fn ->
-          AdminRepo.query!("SELECT 1 FROM verification_runs WHERE id = $1 FOR UPDATE", [
-            Ecto.UUID.dump!(run.id)
-          ])
-
-          send(test_pid, :held)
-
-          receive do
-            :release -> :ok
-          end
-        end)
-
-        Sandbox.checkin(Loopctl.Repo)
-      end)
-
-    assert_receive :held, 5_000
-    on_exit(fn -> send(holder, :release) end)
-    holder
-  end
-
-  defp hold_table_lock!(table) do
-    test_pid = self()
-
-    holder =
-      spawn(fn ->
-        :ok = Sandbox.checkout(Repo, sandbox: false)
-
-        Repo.transaction(fn ->
-          Repo.query!("LOCK TABLE #{table} IN ACCESS EXCLUSIVE MODE")
-          send(test_pid, :held)
-
-          receive do
-            :release -> :ok
-          end
-        end)
-
-        Sandbox.checkin(Repo)
-      end)
-
-    assert_receive :held, 5_000
-    on_exit(fn -> send(holder, :release) end)
-    holder
   end
 end

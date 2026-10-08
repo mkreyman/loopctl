@@ -2837,97 +2837,102 @@ defmodule Loopctl.Fixtures do
     end
   end
 
-  # An intake SOURCE and RECORD, with the project and epic they need, COMMITTED outside the
-  # sandbox (#803's `Loopctl.Delivery.TriageTrigger`). Promotion straddles both repos — the
-  # story is created in an `AdminRepo` transaction and `Loopctl.Delivery.Stages.open/3` then
-  # reads that story on the RLS `Loopctl.Repo`; see `fixture(:committed_story)` for when
-  # committing is still needed.
-  #
-  # Same rules as `fixture(:committed_runner)`: only an `async: false` module may use it, and
-  # it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
+  # An intake SOURCE and RECORD, with the project and epic they need, on the test's own
+  # sandbox connection (#803's `Loopctl.Delivery.TriageTrigger`). Promotion straddles both
+  # repos — the story is created in an `AdminRepo` transaction and
+  # `Loopctl.Delivery.Stages.open/3` then reads that story on the RLS `Loopctl.Repo` — and
+  # AdminRepo shares Repo's sandbox connection in test, so an async test sees both halves.
+  # `fixture(:committed_intake)` commits the same rows, for a test whose subject spans
+  # connections (a lock held by another session).
   #
   # Pass `target_epic_id: nil` for the source that names no epic, which is the ESCALATION
-  # case rather than a degenerate one; omitting the key commits an epic and points the source
+  # case rather than a degenerate one; omitting the key inserts an epic and points the source
   # at it. `:project_id` puts a second source in an existing project, which is what makes two
   # repositories able to report the same issue number into one `stories.number` space.
   #
   # Returns `{source, record}`.
-  def fixture(:committed_intake, attrs) do
+  def fixture(:intake_pair, attrs) do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
     now = DateTime.utc_now()
 
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      project_id =
-        Map.get_lazy(attrs, :project_id, fn ->
-          unique = System.unique_integer([:positive])
+    project_id =
+      Map.get_lazy(attrs, :project_id, fn ->
+        unique = System.unique_integer([:positive])
 
-          AdminRepo.insert!(%Project{
-            tenant_id: tenant_id,
-            name: "intake-#{unique}",
-            slug: "intake-#{unique}",
-            kind: :work,
-            status: :active
-          }).id
-        end)
-
-      # `Map.fetch/2`, not `Map.get/3`: an EXPLICIT nil is the case under test, so it must be
-      # distinguishable from the key being absent.
-      target_epic_id =
-        case Map.fetch(attrs, :target_epic_id) do
-          {:ok, id} ->
-            id
-
-          :error ->
-            # A BOUNDED epic number, deliberately, and not what `build(:epic)` gives.
-            # That builder uses a raw `System.unique_integer/1`, which is small when a file
-            # runs alone and six or seven digits in a full suite — and a story number's
-            # parts must be under 10_000, so an epic numbered above that makes every story
-            # in it unnumberable. `Loopctl.Delivery.TriageTrigger` refuses such an epic
-            # rather than emitting an illegal number (`:epic_number_unnumberable`), which is
-            # correct and is not what these tests are about; they need an epic a story can
-            # actually be numbered under. The refusal has its own test.
-            %Epic{tenant_id: tenant_id, project_id: project_id}
-            |> Epic.create_changeset(
-              build(:epic, %{
-                number:
-                  Map.get_lazy(attrs, :epic_number, fn ->
-                    rem(System.unique_integer([:positive]), 9_000) + 1
-                  end)
-              })
-            )
-            |> AdminRepo.insert!()
-            |> Map.fetch!(:id)
-        end
-
-      source =
-        AdminRepo.insert!(%IntakeSource{
+        AdminRepo.insert!(%Project{
           tenant_id: tenant_id,
-          project_id: project_id,
-          target_epic_id: target_epic_id,
-          repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
-          webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
-          revoked_at: Map.get(attrs, :revoked_at),
-          inserted_at: now,
-          updated_at: now
-        })
+          name: "intake-#{unique}",
+          slug: "intake-#{unique}",
+          kind: :work,
+          status: :active
+        }).id
+      end)
 
-      record =
-        AdminRepo.insert!(%IntakeRecord{
-          tenant_id: tenant_id,
-          source_id: source.id,
-          project_id: project_id,
-          issue_number: Map.get(attrs, :issue_number, System.unique_integer([:positive])),
-          untrusted_title: Map.get(attrs, :untrusted_title, "a reported problem"),
-          # Overridable so a test can build a record the triage payload cannot fit: the bound
-          # is on the RENDERED object, so the only way to reach it is real reporter text.
-          untrusted_body: Map.get(attrs, :untrusted_body, ""),
-          inserted_at: now,
-          updated_at: now
-        })
+    # `Map.fetch/2`, not `Map.get/3`: an EXPLICIT nil is the case under test, so it must be
+    # distinguishable from the key being absent.
+    target_epic_id =
+      case Map.fetch(attrs, :target_epic_id) do
+        {:ok, id} ->
+          id
 
-      {source, record}
-    end)
+        :error ->
+          # A BOUNDED epic number, deliberately, and not what `build(:epic)` gives.
+          # That builder uses a raw `System.unique_integer/1`, which is small when a file
+          # runs alone and six or seven digits in a full suite — and a story number's
+          # parts must be under 10_000, so an epic numbered above that makes every story
+          # in it unnumberable. `Loopctl.Delivery.TriageTrigger` refuses such an epic
+          # rather than emitting an illegal number (`:epic_number_unnumberable`), which is
+          # correct and is not what these tests are about; they need an epic a story can
+          # actually be numbered under. The refusal has its own test.
+          %Epic{tenant_id: tenant_id, project_id: project_id}
+          |> Epic.create_changeset(
+            build(:epic, %{
+              number:
+                Map.get_lazy(attrs, :epic_number, fn ->
+                  rem(System.unique_integer([:positive]), 9_000) + 1
+                end)
+            })
+          )
+          |> AdminRepo.insert!()
+          |> Map.fetch!(:id)
+      end
+
+    source =
+      AdminRepo.insert!(%IntakeSource{
+        tenant_id: tenant_id,
+        project_id: project_id,
+        target_epic_id: target_epic_id,
+        repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
+        webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
+        revoked_at: Map.get(attrs, :revoked_at),
+        inserted_at: now,
+        updated_at: now
+      })
+
+    record =
+      AdminRepo.insert!(%IntakeRecord{
+        tenant_id: tenant_id,
+        source_id: source.id,
+        project_id: project_id,
+        issue_number: Map.get(attrs, :issue_number, System.unique_integer([:positive])),
+        untrusted_title: Map.get(attrs, :untrusted_title, "a reported problem"),
+        # Overridable so a test can build a record the triage payload cannot fit: the bound
+        # is on the RENDERED object, so the only way to reach it is real reporter text.
+        untrusted_body: Map.get(attrs, :untrusted_body, ""),
+        inserted_at: now,
+        updated_at: now
+      })
+
+    {source, record}
+  end
+
+  # `fixture(:intake_pair)`, COMMITTED outside the sandbox: for a test whose subject spans
+  # two connections, like a story row another session holds `FOR UPDATE`. Same rules as
+  # `fixture(:committed_runner)`: only an `async: false` module may use it, and it must call
+  # `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
+  def fixture(:committed_intake, attrs) do
+    Sandbox.unboxed_run(Loopctl.Repo, fn -> fixture(:intake_pair, attrs) end)
   end
 
   # A PENDING issue-closure row (#805), inserted directly so a closer/worker test can start
