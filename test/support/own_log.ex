@@ -50,4 +50,22 @@ defmodule Loopctl.OwnLog do
     {_result, log} = with_own_log(opts, fun)
     log
   end
+
+  @doc """
+  The entries of an `ExUnit.CaptureLog.capture_log/2` string that name `id`, joined in order.
+
+  The key for a line that may be logged outside the calling process (a channel, a pass over
+  the whole fleet), which `with_own_log/2`'s pid key would drop: every concurrent test's
+  entries are in the capture, and an id this test generated is in none of theirs. `capture_log/2`'s format
+  opens each entry with a timestamp after a newline, so the split is there and a multi-line
+  entry stays whole. A `refute` over the result is only as strong as the refuted line's
+  promise to carry `id`, so key on an id the line actually prints.
+  """
+  @spec entries_naming(String.t(), String.t()) :: String.t()
+  def entries_naming(log, id) when is_binary(log) and is_binary(id) do
+    log
+    |> String.split(~r/\n(?=\d{2}:\d{2}:\d{2}\.\d{3} )/)
+    |> Enum.filter(&String.contains?(&1, id))
+    |> Enum.join("\n")
+  end
 end

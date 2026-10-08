@@ -50,6 +50,17 @@ Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.Repo, fn ->
   Loopctl.Workers.AuditPartitionWorker.ensure_partitions(back: 12)
 end)
 
+# Committed rows a KILLED earlier run left behind, swept once before any test runs. The delivery
+# passes read the whole fleet (`DispatchDriver.run_with/2`, `TriageDispatcher.run_with/2`, the
+# post-deploy and completion passes), and their async tests assert EXACT outcome lists, trusting
+# the sandbox to hide every other test's rows. It hides nothing that was committed: a
+# `fixture(:committed_runner)` tenant whose module was killed before its `on_exit` sweep is a
+# queued candidate of every later pass, and its outcome lands in a test that never made it.
+# Nothing else runs yet, and this tree's test database is its own (config/test.exs,
+# MIX_TEST_PARTITION), so the marker sweep removes only leftovers. Best effort, like every other
+# call of it: a role that cannot suppress triggers keeps its rows and warns.
+Loopctl.Fixtures.sweep_committed_runner_tenants()
+
 # Scale tests (US-27.1) are opt-in: they seed large corpora, commit rows
 # directly to the DB, and run ANALYZE. They must NEVER run inside the normal
 # async sandbox suite — doing so would silently produce n≈0 statistics.

@@ -27,6 +27,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   alias Loopctl.Delivery.DispatchDriver
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageDispatcher
+  alias Loopctl.OwnLog
   alias Loopctl.Progress
   alias Loopctl.Runners.Usage
   alias LoopctlWeb.RunnerSocket
@@ -141,7 +142,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     # does, so an exhausted subscription holds a triage-capable machine out too — and the pass
     # names the tenant's earliest reset, once for the tenant.
     test "an EXHAUSTED runner is not sent triage, and the pass logs the earliest reset", ctx do
-      _story = detected_story(ctx)
+      story = detected_story(ctx)
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
       resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
 
@@ -154,7 +155,10 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         end)
 
       refute_push "dispatch", _pushed
-      assert [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, log)
+
+      assert [_, logged] =
+               Regex.run(~r/earliest_usage_reset=(\S+)/, OwnLog.entries_naming(log, story.id))
+
       assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
       assert DateTime.compare(logged, resets_at) == :eq
 

@@ -3462,9 +3462,9 @@ defmodule Loopctl.Fixtures do
 
   @doc """
   `sweep_committed_runner_tenants/0` for the given tenant ids ONLY, and only those that are
-  committed-runner tenants. For a module that must not delete ANOTHER tree's committed tenants:
-  every worktree on a box shares one test database, and the marker sweep deletes every tenant
-  carrying the slug prefix, including the rows a concurrently running suite is still using.
+  committed-runner tenants. For a module that must not delete tenants it did not commit: the
+  marker sweep deletes every tenant carrying the slug prefix, including the rows another run
+  against the same test database is still using (two runs in one tree share it).
   """
   def sweep_committed_tenants(ids) when is_list(ids) do
     import Ecto.Query, only: [from: 2]

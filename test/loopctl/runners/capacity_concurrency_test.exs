@@ -57,9 +57,14 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
     fun.()
   end
 
-  # A runner in this test's committed tenant unless `attrs` names one.
+  # A runner in this test's committed tenant unless `attrs` names one. `:committed_runner`,
+  # not `:runner`: enrolling appends a `runner_enrolled` audit-chain entry to a COMMITTED
+  # tenant, and the sweep removes one only on a role that may suppress triggers. The fixture's
+  # own unboxed run checks this process's Repo connection in on its way out, so the process
+  # takes it back.
   defp runner(ctx, attrs) do
-    {_raw, runner} = fixture(:runner, Map.put_new(attrs, :tenant_id, ctx.tenant.id))
+    {_raw, runner} = fixture(:committed_runner, Map.put_new(attrs, :tenant_id, ctx.tenant.id))
+    :ok = ProductionTopology.checkout_unboxed!([Repo])
     runner
   end
 

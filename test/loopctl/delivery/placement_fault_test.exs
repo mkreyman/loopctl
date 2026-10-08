@@ -11,9 +11,15 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
   holds its lock until the transaction ends, so inside an async test's sandbox transaction it
   would stall every other test writing that table. The sweep test is about committed rows and
   a pooled connection by definition. So the rows are committed (`fixture(:committed_tenant)`
-  and its siblings, then production's two connections, `Loopctl.Test.ProductionTopology`),
-  every trigger is dropped on exit, and `sweep_committed_runner_tenants/0` removes the rows,
-  chain entries included. Everything else about placement is
+  and its siblings), every trigger is dropped on exit, and `sweep_committed_runner_tenants/0`
+  removes the rows, chain entries included.
+
+  Which process has which connections: the TEST process runs on production's two
+  (`Loopctl.Test.ProductionTopology`), and it is the one that calls `place/4`, so every
+  injected failure is hit there. The runner CHANNEL process does not call `checkout_unboxed!`:
+  it inherits the test's `$callers`, so its Repo calls and its AdminRepo calls (routed onto
+  Repo in test, `Loopctl.AdminRepo.Route`) both run on the test process's unboxed Repo
+  connection, and commit. Nothing here needs the channel to hold a second connection. Everything else about placement is
   `Loopctl.Delivery.PlacementTest`, which is `async: true`.
   """
 

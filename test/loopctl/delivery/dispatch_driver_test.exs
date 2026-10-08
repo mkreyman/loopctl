@@ -34,6 +34,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Source
+  alias Loopctl.OwnLog
   alias Loopctl.Progress
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
@@ -571,7 +572,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     test "the pool shows the reset per runner, and the pass logs the earliest one, once per " <>
            "tenant (TC-44.6.7)",
          ctx do
-      bind_repo(ctx, queued_story(ctx), @repo)
+      first = bind_repo(ctx, queued_story(ctx), @repo)
       # A second story the same exhausted runner is refused for (a repository is one active
       # source, so it is the runner's second checkout): `:no_runner` too, and the reset is
       # still logged ONCE for the tenant.
@@ -600,8 +601,12 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
                    [:no_runner, :no_runner]
         end)
 
+      # The note names the oldest candidate, and only that story's entries are this test's.
       [line] =
-        log |> String.split("\n") |> Enum.filter(&(&1 =~ "earliest_usage_reset="))
+        log
+        |> OwnLog.entries_naming(first.id)
+        |> String.split("\n")
+        |> Enum.filter(&(&1 =~ "earliest_usage_reset="))
 
       [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, line)
       assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
@@ -649,7 +654,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
                  end) == [:no_runner]
         end)
 
-      assert log =~ "earliest_usage_reset="
+      assert OwnLog.entries_naming(log, story.id) =~ "earliest_usage_reset="
       refute_push "dispatch", _pushed
       assert Stages.get(ctx.tenant.id, story.id).stage == :queued
       assert AdminRepo.get!(Runner, ctx.runner.id).in_flight == 0
@@ -660,7 +665,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     test "an exhausted runner that is also FULL still names its reset: its slots are held by " <>
            "sessions about to end",
          ctx do
-      bind_repo(ctx, queued_story(ctx), @repo)
+      story = bind_repo(ctx, queued_story(ctx), @repo)
       channel = join_runner(ctx)
       resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
 
@@ -678,7 +683,9 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
           assert DispatchDriver.run_with(20, @budgets) == [:no_runner]
         end)
 
-      [_, logged] = Regex.run(~r/earliest_usage_reset=(\S+)/, log)
+      [_, logged] =
+        Regex.run(~r/earliest_usage_reset=(\S+)/, OwnLog.entries_naming(log, story.id))
+
       assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
       assert DateTime.compare(logged, resets_at) == :eq
 

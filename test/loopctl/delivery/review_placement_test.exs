@@ -25,6 +25,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.RunnerReviews
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.OwnLog
   alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.Runners
@@ -608,16 +609,18 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
     end
 
     test "freeing a review session's slot never raises: a database failure is logged", ctx do
+      dispatch_id = Ecto.UUID.generate()
+
       log =
         capture_log(fn ->
           Repo.transaction(fn ->
             {:error, _} = Repo.query("SELECT 1 / 0")
-            assert :ok = RunnerReviews.free_slot(ctx.tenant_id, Ecto.UUID.generate(), 0)
+            assert :ok = RunnerReviews.free_slot(ctx.tenant_id, dispatch_id, 0)
             Repo.rollback(:done)
           end)
         end)
 
-      assert log =~ "review slot not released"
+      assert OwnLog.entries_naming(log, dispatch_id) =~ "review slot not released"
     end
 
     test "a review session that never ran cannot report ending", ctx do

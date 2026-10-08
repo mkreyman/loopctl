@@ -28,6 +28,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.OwnLog
   alias Loopctl.Progress
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
@@ -601,7 +602,7 @@ defmodule Loopctl.Delivery.PlacementTest do
           assert {:error, :runner_not_connected} = place(ctx, dispatch_payload(story))
         end)
 
-      refute log =~ "placement undo did not fully undo"
+      refute OwnLog.entries_naming(log, story.id) =~ "placement undo did not fully undo"
 
       # TC-44.4.1 (AC-44.4.1, AC-44.4.2): the runner refused before any work, so the undo's
       # release spends nothing and RE-CONTRACTS the story — back in front of the driver. It
@@ -764,7 +765,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       # `@in_flight ++ [:merged, :deployed]` — `queued` is in none of them — so an escalation
       # that fired here would not move the row at all and would only be visible as the LOUD
       # "COULD NOT ESCALATE" error. Asserting on the row alone could not see it.
-      refute log =~ "ESCALATE"
+      refute OwnLog.entries_naming(log, story.id) =~ "ESCALATE"
 
       row = Stages.get(runner.tenant_id, story.id)
       assert row.stage == :queued
@@ -799,7 +800,7 @@ defmodule Loopctl.Delivery.PlacementTest do
 
       row = Stages.get(runner.tenant_id, story.id)
       assert row.stage == :escalated
-      assert log =~ "the story is ESCALATED"
+      assert OwnLog.entries_naming(log, story.id) =~ "the story is ESCALATED"
 
       # THE REASON IS OPERATOR-FACING AND NAMES THE REMEDY, which is the whole of what makes
       # this better than the `Logger.error` it replaces: an operator reading the escalated
@@ -956,9 +957,9 @@ defmodule Loopctl.Delivery.PlacementTest do
 
       # NAMED, not reported as a bare `:invalid_transition` an operator has to decode — and
       # loud, because this is the story that is neither placeable nor parked.
-      assert log =~ "COULD NOT ESCALATE"
-      assert log =~ "no_escalation_edge"
-      assert log =~ "force-unclaim"
+      assert OwnLog.entries_naming(log, story.id) =~ "COULD NOT ESCALATE"
+      assert OwnLog.entries_naming(log, story.id) =~ "no_escalation_edge"
+      assert OwnLog.entries_naming(log, story.id) =~ "force-unclaim"
 
       row = Stages.get(runner.tenant_id, story.id)
       assert row.stage == :queued
@@ -993,8 +994,8 @@ defmodule Loopctl.Delivery.PlacementTest do
                    )
         end)
 
-      assert log =~ "COULD NOT ESCALATE"
-      assert log =~ "stale_claim_epoch"
+      assert OwnLog.entries_naming(log, story.id) =~ "COULD NOT ESCALATE"
+      assert OwnLog.entries_naming(log, story.id) =~ "stale_claim_epoch"
 
       row = Stages.get(runner.tenant_id, story.id)
       assert row.stage == :claimed
@@ -1095,8 +1096,8 @@ defmodule Loopctl.Delivery.PlacementTest do
                    )
         end)
 
-      assert log =~ "the story is ESCALATED"
-      refute log =~ "COULD NOT ESCALATE"
+      assert OwnLog.entries_naming(log, story.id) =~ "the story is ESCALATED"
+      refute OwnLog.entries_naming(log, story.id) =~ "COULD NOT ESCALATE"
 
       row = Stages.get(runner.tenant_id, story.id)
       assert row.stage == :escalated
@@ -1150,8 +1151,8 @@ defmodule Loopctl.Delivery.PlacementTest do
                    )
         end)
 
-      assert log =~ "the story is ESCALATED"
-      refute log =~ "COULD NOT ESCALATE"
+      assert OwnLog.entries_naming(log, story.id) =~ "the story is ESCALATED"
+      refute OwnLog.entries_naming(log, story.id) =~ "COULD NOT ESCALATE"
 
       row = Stages.get(runner.tenant_id, story.id)
       assert row.stage == :escalated
@@ -1191,7 +1192,8 @@ defmodule Loopctl.Delivery.PlacementTest do
                    )
         end)
 
-      assert log =~ "COULD NOT ESCALATE"
+      # Keyed on the session: the line names the unusable story id, not this story's.
+      assert OwnLog.entries_naming(log, session.id) =~ "COULD NOT ESCALATE"
 
       # And it changed nothing on the way past.
       assert Stages.get(runner.tenant_id, story.id).stage == :claimed
@@ -1231,8 +1233,8 @@ defmodule Loopctl.Delivery.PlacementTest do
       # `StoryPayload.settle_if_parked/3` doing its job: without the re-read this would take
       # the loud "COULD NOT ESCALATE" branch on a story that is parked, which is exactly the
       # noise that trains an operator to skip the line that matters.
-      assert repeat_log =~ "the story is ESCALATED"
-      refute repeat_log =~ "COULD NOT ESCALATE"
+      assert OwnLog.entries_naming(repeat_log, story.id) =~ "the story is ESCALATED"
+      refute OwnLog.entries_naming(repeat_log, story.id) =~ "COULD NOT ESCALATE"
 
       assert second.stage == :escalated
       assert second.lock_version == first.lock_version

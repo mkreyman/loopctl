@@ -31,6 +31,12 @@ defmodule Loopctl.Delivery.TriageTriggerLockTest do
   end
 
   setup do
+    # This module is on ExUnit.Case, so it gets none of DataCase's stubs: installed here, so a
+    # Mox-resolved dependency the promote reaches answers with the default instead of raising.
+    # Global mode is safe in an `async: false` module.
+    Mox.set_mox_global()
+    Loopctl.DataCase.stub_all_defaults()
+
     # `fixture(:committed_tenant)` runs its own unboxed checkout, so it goes first; from the
     # checkout on, every write of this process commits.
     tenant = fixture(:committed_tenant, %{})

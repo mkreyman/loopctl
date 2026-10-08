@@ -8,8 +8,8 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   lock cannot be held against the connection that waits on it, and a second connection
   cannot see a sandbox transaction's rows. So the tenant is `fixture(:committed_tenant)`,
   every process runs on production's two connections (`Loopctl.Test.ProductionTopology`),
-  and the tenant and the rows that block its delete are purged after each test and at the
-  module boundaries. Everything else about the gate and the executor is
+  and the tenant is swept after each test (`sweep_committed_tenants/1`) and every
+  committed-runner tenant at the module boundaries. Everything else about the gate and the executor is
   `Loopctl.Delivery.MergePreconditionIntegrationTest`, which is `async: true`.
   """
 
@@ -17,7 +17,6 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
 
   import Loopctl.Fixtures
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.MergeExecutor
@@ -39,8 +38,8 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   @session %{repo: @repo, token: "ghs_test"}
 
   setup_all do
-    full_sweep()
-    on_exit(&full_sweep/0)
+    sweep_committed_runner_tenants()
+    on_exit(&sweep_committed_runner_tenants/0)
     :ok
   end
 
@@ -56,7 +55,7 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
     :ok = ProductionTopology.checkout_unboxed!([Repo, AdminRepo])
 
     ctx = build_story(tenant)
-    on_exit(fn -> purge_tenant(tenant.id) end)
+    on_exit(fn -> sweep_committed_tenants([tenant.id]) end)
 
     ctx
   end
@@ -129,7 +128,11 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   # claim's first checkpoint. Written to the ledger row directly: placement is
   # `DispatchLedger.record_sent/4`'s, tested there.
   defp thread_setup(ctx) do
-    {_raw_key, runner} = fixture(:runner, %{tenant_id: ctx.tenant_id})
+    # `:committed_runner`, not `:runner`: enrolling appends a `runner_enrolled` audit-chain
+    # entry to the COMMITTED tenant. The fixture's own unboxed run checks this process's Repo
+    # connection in on its way out, so the process takes it back.
+    {_raw_key, runner} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id})
+    :ok = ProductionTopology.checkout_unboxed!([Repo])
 
     {:ok, dispatch_row} =
       Repo.with_tenant(ctx.tenant_id, fn ->
@@ -292,62 +295,5 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
     fixture(:triage_verdict, %{tenant_id: tenant.id, story_id: story.id})
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}
-  end
-
-  # Three things block the sweep of a committed tenant, and all three are this module's own
-  # committed test data: `dispatches` and `api_keys` have tenant FKs that do not cascade,
-  # and `audit_chain` has one with a delete-BLOCKING trigger (entering `escalated` is a
-  # chained transition, so every refusal appends to it).
-  defp purge_tenant(tenant_id) do
-    :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
-    purge_dependents("tenant_id = $1", [Ecto.UUID.dump!(tenant_id)])
-  end
-
-  # The same purge over every committed-runner tenant, then the tenants themselves. Run at
-  # both module boundaries: an earlier run that died mid-test leaves rows behind, and the
-  # sweep alone cannot delete a tenant they still reference.
-  defp full_sweep do
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      purge_dependents(
-        "tenant_id IN (SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')",
-        []
-      )
-    end)
-
-    sweep_committed_runner_tenants()
-  end
-
-  # ONE transaction around the trigger toggle and the deletes: DDL is transactional in
-  # Postgres, so a failing DELETE rolls the DISABLE back with it. Run as separate
-  # autocommitted statements, a failure in the middle would leave the audit chain's
-  # delete-blocking trigger OFF for the rest of the run, in a database every branch on this
-  # box shares.
-  defp purge_dependents(predicate, params) do
-    {:ok, :ok} =
-      AdminRepo.transaction(fn ->
-        AdminRepo.query!(
-          "ALTER TABLE audit_chain DISABLE TRIGGER audit_chain_prevent_delete_trigger"
-        )
-
-        AdminRepo.query!("DELETE FROM audit_chain WHERE #{predicate}", params)
-
-        # `stories` references both dispatch columns, so the refs go before the rows.
-        AdminRepo.query!(
-          "UPDATE stories SET implementer_dispatch_id = NULL, verifier_dispatch_id = NULL " <>
-            "WHERE #{predicate}",
-          params
-        )
-
-        AdminRepo.query!("DELETE FROM dispatches WHERE #{predicate}", params)
-        AdminRepo.query!("DELETE FROM api_keys WHERE #{predicate}", params)
-
-        AdminRepo.query!(
-          "ALTER TABLE audit_chain ENABLE TRIGGER audit_chain_prevent_delete_trigger"
-        )
-
-        :ok
-      end)
-
-    :ok
   end
 end
