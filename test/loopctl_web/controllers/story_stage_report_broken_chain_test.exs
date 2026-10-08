@@ -16,8 +16,8 @@ defmodule LoopctlWeb.StoryStageReportBrokenChainTest do
 
   The rows are committed too, for an ordering reason: the setup's contract and claim append to
   the chain, so a sandboxed setup would hold a row lock on `audit_chain` that the committed
-  `CREATE TRIGGER` waits on for the rest of the test. `sweep_committed_runner_tenants/0`
-  removes them at the module boundary.
+  `CREATE TRIGGER` waits on for the rest of the test. The tenants the module made are swept
+  when it ends (`track_committed_tenants/0`).
   """
 
   use LoopctlWeb.ConnCase, async: false
@@ -29,13 +29,12 @@ defmodule LoopctlWeb.StoryStageReportBrokenChainTest do
   alias Loopctl.Intake.Source
   alias Loopctl.Progress
   alias Loopctl.Repo
+  alias Loopctl.Test.BrokenChain
 
   setup :verify_on_exit!
 
   setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
+    %{committed: track_committed_tenants()}
   end
 
   defp unboxed(fun), do: Sandbox.unboxed_run(Repo, fun)
@@ -44,8 +43,11 @@ defmodule LoopctlWeb.StoryStageReportBrokenChainTest do
 
   # A contracted story standing at `queued`, its project bound to a thread-mode source, and a
   # claim on it by the agent whose key reports.
-  defp claimed_story do
+  # This module's tenants only: the marker sweep would also delete another worktree's
+  # committed rows.
+  defp claimed_story(ctx) do
     tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+    track_committed_tenant(ctx.committed, tenant.id)
     {raw_key, _api_key, agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
     story = fixture(:committed_story, %{tenant_id: tenant.id})
 
@@ -95,37 +97,11 @@ defmodule LoopctlWeb.StoryStageReportBrokenChainTest do
     })
   end
 
-  # A tenant chain that refuses appends as a HASH VIOLATION, installed for this tenant only.
-  defp break_chain(tenant_id) do
-    name = "test_broken_chain_" <> String.replace(tenant_id, "-", "")
-
-    unboxed(fn ->
-      AdminRepo.query!("""
-      CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        RAISE EXCEPTION 'audit_chain_hash_violation: injected by test' USING ERRCODE = 'P0001';
-      END
-      $$
-      """)
-
-      AdminRepo.query!("""
-      CREATE TRIGGER #{name} BEFORE INSERT ON audit_chain FOR EACH ROW
-      WHEN (NEW.tenant_id = '#{tenant_id}') EXECUTE FUNCTION #{name}()
-      """)
-    end)
-
-    on_exit(fn ->
-      unboxed(fn ->
-        AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON audit_chain")
-        AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-      end)
-    end)
-  end
-
   @tag :capture_log
-  test "a broken audit chain answers audit_chain_append_failed, not a 500", %{conn: conn} do
-    %{tenant: tenant, story: story, raw: raw} = claimed_story()
-    break_chain(tenant.id)
+  test "a broken audit chain answers audit_chain_append_failed, not a 500",
+       %{conn: conn} = ctx do
+    %{tenant: tenant, story: story, raw: raw} = claimed_story(ctx)
+    BrokenChain.install!(tenant.id)
 
     body = %{"claim_epoch" => story.claim_epoch, "from" => "claimed", "to" => "worktree"}
 

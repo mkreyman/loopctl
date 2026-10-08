@@ -11,10 +11,9 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
   and the channel's write on the test's sandbox connection really waits on it (until a
   statement timeout or `Capacity.lock_timeout_ms/0`). One sandbox connection cannot block
   itself, so the holder needs a second, and a row two connections both see must be COMMITTED:
-  the runner (`fixture(:committed_runner)`) and, where a test locks it, the dispatch. A
-  committed row is visible to every concurrently running test, so the module runs alone and
-  `sweep_committed_runner_tenants/0` removes its rows at the module boundary. Every lock is on
-  this test's own rows.
+  the runner (`committed_runner/2`) and, where a test locks it, the dispatch. A committed row
+  is visible to every concurrently running test, so the module runs alone and the tenants it
+  made are swept when it ends. Every lock is on this test's own rows.
   """
 
   use LoopctlWeb.ChannelCase, async: false
@@ -31,50 +30,28 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
   alias Loopctl.Tenants
-  alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
 
   setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
+    %{committed: track_committed_tenants()}
   end
 
-  # A BOUND on a real round trip, never a delay.
-  @reply_timeout 2_000
-
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
+  # A committed runner whose tenant, and only the tenants this module made, are swept when the
+  # module ends: the marker sweep would also delete the committed rows of another worktree's
+  # suite running against the same test database.
+  defp committed_runner(ctx, attrs) do
+    {raw, runner} = fixture(:committed_runner, attrs)
+    track_committed_tenant(ctx.committed, runner.tenant_id)
+    {raw, runner}
   end
-
-  defp join_payload(machine, overrides) do
-    Map.merge(
-      %{
-        "contract_version" => RunnerContract.version(),
-        "machine" => machine,
-        "cores" => 16,
-        "memory_mb" => 28_000,
-        "repos" => ["mkreyman/home_care_billing"],
-        "max_sessions" => 2,
-        "in_flight" => 0,
-        "draining" => false
-      },
-      overrides
-    )
-  end
-
-  defp connect_runner(token), do: connect(RunnerSocket, %{}, connect_info: connect_info(token))
 
   # Joins and waits for the channel to process :after_join (the Presence track).
   defp topic(socket), do: "runner:" <> socket.assigns.runner.id
 
   defp join_pool(socket, machine, overrides) do
     {:ok, reply, channel} =
-      subscribe_and_join(socket, topic(socket), join_payload(machine, overrides))
+      subscribe_and_join(socket, topic(socket), runner_join_payload(machine, overrides))
 
     _ = :sys.get_state(channel.channel_pid)
     {reply, channel}
@@ -106,10 +83,10 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
   defp rejoin(runner, raw, channel, overrides) do
     Process.unlink(channel.channel_pid)
     ref = leave(channel)
-    assert_reply ref, :ok, _, @reply_timeout
-    assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+    assert_reply ref, :ok, _, reply_timeout()
+    assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
 
-    {:ok, socket} = connect_runner(raw)
+    {:ok, socket} = connect_runner_socket(raw)
     {_reply, channel} = join_pool(socket, "minis", overrides)
     channel
   end
@@ -138,7 +115,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
 
     locker = Task.async(fn -> hold_then_release(runner, test, ref) end)
 
-    assert_receive {:locked, ^ref}, @reply_timeout
+    assert_receive {:locked, ^ref}, reply_timeout()
     {locker, ref}
   end
 
@@ -172,8 +149,8 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
   # Postgrex and logs a disconnect that has nothing to do with what is under test.
   defp release_runner_row(%Task{} = locker, ref) do
     send(locker.pid, {:release, ref})
-    assert_receive {:released, ^ref}, @reply_timeout
-    Task.await(locker, @reply_timeout)
+    assert_receive {:released, ^ref}, reply_timeout()
+    Task.await(locker, reply_timeout())
   end
 
   # A row every connection can see, and a transaction of its own to lock it from — the only
@@ -224,7 +201,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
   end
 
   describe "the capacity a joining machine declares" do
-    test "survives a database failure and re-applies the declaration on the next recheck" do
+    test "survives a database failure and re-applies the declaration on the next recheck", ctx do
       # #846.4 review findings 4 and 5, together, because they are two halves of one event.
       #
       # Before this, the capacity write rescued `Postgrex.Error` and only the RETRYABLE codes
@@ -238,7 +215,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
       # And the write was never retried. The machine stayed dispatchable against the STALE
       # LARGER number until it happened to reconnect: `Capacity.heal/3` recomputes `in_flight`
       # and never `max_sessions`, so nothing else reconciles it.
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
+      {raw, runner} = committed_runner(ctx, %{name: "minis", max_sessions: 2})
 
       # A real committed transaction on its OWN connection holding the runners row, so the
       # channel's UPDATE genuinely waits on a lock rather than on a stub.
@@ -251,7 +228,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
 
       log =
         capture_log(fn ->
-          {:ok, socket} = connect_runner(raw)
+          {:ok, socket} = connect_runner_socket(raw)
           {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 1})
 
           # THE CHANNEL IS ALIVE AND THE RUNNER IS IN THE POOL. That is the whole of finding 4:
@@ -276,7 +253,8 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
       assert log =~ "will retry on this socket's next recheck"
     end
 
-    test "is not re-asserted on recheck by a socket that is no longer the runner's only one" do
+    test "is not re-asserted on recheck by a socket that is no longer the runner's only one",
+         ctx do
       # #846.4 review ROUND 2, finding 3. `declaration_pending` stays true until a write lands,
       # and the retry re-applied THIS socket's `meta` with no check that the socket is still
       # the one the runner is dispatched through — unlike the join-time write, whose whole
@@ -285,7 +263,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
       # silent node re-asserted its stale declaration over a newer connection's, every 30
       # seconds, leaving the machine dispatched against a capacity it no longer declares — the
       # defect this story exists to end.
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 4})
+      {raw, runner} = committed_runner(ctx, %{name: "minis", max_sessions: 4})
 
       # The row starts at 1 under a ceiling of 4, so the socket under test has something to
       # write. Done as a COMMITTED update rather than by joining a first socket: a channel's
@@ -302,7 +280,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
 
       {socket_a, log} =
         with_log(fn ->
-          {:ok, socket} = connect_runner(raw)
+          {:ok, socket} = connect_runner_socket(raw)
           {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
           channel
         end)
@@ -319,7 +297,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
       # SOCKET B — the machine reconnected after being reconfigured — declares 1, which is
       # what the row already holds, so B's own write is a no-op and the row stands at B's
       # number. Both sockets are now live.
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, socket_b} = join_pool(socket, "minis", %{"max_sessions" => 1})
       assert length(Runners.live_metas(runner.tenant_id, runner.id)) == 2
 
@@ -339,11 +317,11 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
       # visible when A asks.
       Process.unlink(socket_b.channel_pid)
       ref = leave(socket_b)
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert eventually(
                fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end,
-               @reply_timeout
+               reply_timeout()
              )
 
       send(socket_a.channel_pid, :recheck)
@@ -364,9 +342,9 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
   end
 
   describe "a database lock the channel cannot get" do
-    setup do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 4})
-      {:ok, socket} = connect_runner(raw)
+    setup ctx do
+      {raw, runner} = committed_runner(ctx, %{name: "minis", max_sessions: 4})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
       %{runner: runner, channel: channel}
     end

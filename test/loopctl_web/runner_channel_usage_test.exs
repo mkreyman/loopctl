@@ -14,17 +14,12 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
 
   use LoopctlWeb.ChannelCase, async: true
 
-  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Runners
   alias Loopctl.Runners.Runner
   alias Loopctl.Runners.Usage
-  alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
 
-  # A bound, never a delay. 10 s because this module runs in the ASYNC phase of the full
-  # suite, where a channel reply missed a 2 s bound under load (commit gate, 2026-10-07).
-  @reply_timeout 10_000
   @eight_days 8 * 24 * 60 * 60
 
   setup do
@@ -37,7 +32,7 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
     test "a malformed usage object is refused invalid_payload and writes nothing (TC-44.6.1)",
          ctx do
       ref = push(ctx.channel, "status", %{"usage" => %{"exhausted" => "yes"}})
-      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
 
       assert row(ctx.runner).usage_exhausted_until == nil
     end
@@ -51,7 +46,7 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
           "usage" => %{"exhausted" => true, "resets_at" => far, "account_ref" => "acct-a"}
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       stored = row(ctx.runner)
       assert_in_delta seconds_from_now(stored.usage_exhausted_until), @eight_days, 5
@@ -78,7 +73,7 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
           "usage" => %{"exhausted" => true, "resets_at" => DateTime.to_iso8601(in_window)}
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert DateTime.compare(row(ctx.runner).usage_exhausted_until, in_window) == :eq
     end
 
@@ -91,7 +86,7 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
       before = presence_ref(ctx.channel)
 
       ref = push(ctx.channel, "status", %{"usage" => %{"exhausted" => false}})
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert presence_ref(ctx.channel) == before
     end
@@ -101,7 +96,7 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
       channel = join_as(other, raw, "beelink")
 
       ref = push(channel, "status", %{"usage" => %{"exhausted" => true}})
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert_in_delta seconds_from_now(row(other).usage_exhausted_until), @eight_days, 5
       # Only the reporting machine: the other has no account to share.
@@ -119,7 +114,7 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
       ref =
         push(channel, "status", %{"usage" => %{"exhausted" => false, "account_ref" => "a"}})
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert row(ctx.runner).usage_exhausted_until == nil
       assert row(r2).usage_exhausted_until == nil
@@ -143,32 +138,12 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
   defp presence_ref(channel), do: :sys.get_state(channel.channel_pid).assigns.presence_ref
 
   defp join_as(runner, raw, machine) do
-    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
+    {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, join_payload(machine))
+      subscribe_and_join(socket, "runner:" <> runner.id, runner_join_payload(machine))
 
     _ = :sys.get_state(channel.channel_pid)
     channel
-  end
-
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine) do
-    %{
-      "contract_version" => RunnerContract.version(),
-      "machine" => machine,
-      "cores" => 16,
-      "memory_mb" => 28_000,
-      "repos" => ["mkreyman/home_care_billing"],
-      "max_sessions" => 2,
-      "in_flight" => 0,
-      "draining" => false
-    }
   end
 end

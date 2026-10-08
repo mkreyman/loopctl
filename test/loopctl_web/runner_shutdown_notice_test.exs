@@ -1,72 +1,104 @@
 defmodule LoopctlWeb.RunnerShutdownNoticeTest do
   @moduledoc """
   Issue #815: draining the runner socket tells every connected runner `server_shutdown`
-  before the drain closes it (`LoopctlWeb.RunnerShutdownNotice`). The rest of what the runner
-  control plane records about itself is in `LoopctlWeb.RunnerObservabilityTest`, async.
+  before the drain closes it (`LoopctlWeb.RunnerShutdownNotice`).
 
-  ## Why `async: false`
-
-  The SUBJECT is a node-wide notice: the drain handler is attached once for the VM and turns
-  the `[:phoenix, :socket_drain]` event into a broadcast on `Loopctl.Runners.shutdown_topic/0`,
-  which every runner channel on the node subscribes to. That fan-out to every runner is the
-  behaviour under test, so it reaches every runner channel any concurrently running test has
-  joined, pushing `disconnecting` into those tests' mailboxes. ExUnit runs this module alone.
+  The notice is a node-wide broadcast, so these tests never fire the real drain: each link of
+  the chain is checked on its own. The handler is called with this test's own topic, the
+  handler the application attached is read for the topic it broadcasts on, the runner channel
+  is checked to be subscribed to that topic, and the channel is sent the message the broadcast
+  delivers. Nothing here reaches another test's runner, so the module runs async.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
   import ExUnit.CaptureLog
 
-  alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.Runners
+  alias LoopctlWeb.RunnerShutdownNotice
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
 
-  @reply_timeout 2_000
+  @drain_measurements %{count: 1, total: 1, index: 1, rounds: 1}
+
+  defp drain_metadata(socket),
+    do: %{endpoint: @endpoint, socket: socket, interval: 1_000, log: :info}
+
+  defp own_config do
+    topic = "runner_shutdown_test:#{System.unique_integer([:positive])}"
+    :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, topic)
+    %{topic: topic, grace_ms: 0}
+  end
 
   defp joined_runner do
     {raw, runner} = fixture(:runner, %{name: "minis"})
-
-    {:ok, socket} =
-      connect(RunnerSocket, %{},
-        connect_info: %{
-          x_headers: [{RunnerSocket.token_header(), raw}],
-          peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-        }
-      )
+    {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, %{
-        "contract_version" => RunnerContract.version(),
-        "machine" => "minis",
-        "cores" => 16,
-        "memory_mb" => 28_000,
-        "repos" => ["mkreyman/home_care_billing"],
-        "max_sessions" => 2,
-        "in_flight" => 0,
-        "draining" => false
-      })
+      subscribe_and_join(socket, "runner:" <> runner.id, runner_join_payload("minis"))
 
     _ = :sys.get_state(channel.channel_pid)
     %{runner: runner, channel: channel}
   end
 
-  test "draining the runner socket tells every runner server_shutdown" do
-    %{runner: runner, channel: channel} = joined_runner()
+  test "draining the runner socket broadcasts server_shutdown on the configured topic" do
+    config = own_config()
 
     log =
       capture_log([level: :info], fn ->
-        :telemetry.execute(
+        RunnerShutdownNotice.handle_event(
           [:phoenix, :socket_drain],
-          %{count: 1, total: 1, index: 1, rounds: 1},
-          %{endpoint: @endpoint, socket: RunnerSocket, interval: 1_000, log: :info}
+          @drain_measurements,
+          drain_metadata(RunnerSocket),
+          config
         )
+      end)
 
-        assert_push "disconnecting", %{reason: "server_shutdown"}, @reply_timeout
+    assert_receive :server_shutdown
+    assert log =~ "runner socket draining"
+  end
+
+  test "draining another socket broadcasts nothing" do
+    config = own_config()
+
+    RunnerShutdownNotice.handle_event(
+      [:phoenix, :socket_drain],
+      @drain_measurements,
+      drain_metadata(Phoenix.LiveView.Socket),
+      config
+    )
+
+    refute_receive :server_shutdown, 200
+  end
+
+  test "the application's handler broadcasts on the topic runner channels subscribe to" do
+    assert [handler] =
+             Enum.filter(
+               :telemetry.list_handlers([:phoenix, :socket_drain]),
+               &(&1.id == RunnerShutdownNotice.handler_id())
+             )
+
+    assert handler.config == RunnerShutdownNotice.default_config()
+    assert handler.config.topic == Runners.shutdown_topic()
+    assert handler.config.grace_ms == RunnerShutdownNotice.grace_ms()
+  end
+
+  test "a joined runner channel is subscribed to the shutdown topic and tells its runner" do
+    %{runner: runner, channel: channel} = joined_runner()
+
+    assert channel.channel_pid in Enum.map(
+             Registry.lookup(Loopctl.PubSub, Runners.shutdown_topic()),
+             &elem(&1, 0)
+           )
+
+    log =
+      capture_log([level: :info], fn ->
+        send(channel.channel_pid, :server_shutdown)
+        assert_push "disconnecting", %{reason: "server_shutdown"}, reply_timeout()
       end)
 
     assert Process.alive?(channel.channel_pid)
-    assert log =~ "runner socket draining"
     assert log =~ "runner disconnecting: reason=server_shutdown runner_id=#{runner.id}"
   end
 end

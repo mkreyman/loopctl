@@ -2149,13 +2149,12 @@ defmodule Loopctl.Fixtures do
     end)
   end
 
-  # An agent and its `:agent`-role key, COMMITTED outside the sandbox, for a CONTROLLER test
-  # of a path whose context runs on the RLS `Loopctl.Repo` (#803's escalate endpoint). The
-  # auth pipeline resolves the key on `AdminRepo` while `Loopctl.Delivery.Stages` reads the
-  # story on `Repo`. AdminRepo shares Repo's sandbox connection in test (US-46.2), so
-  # committing is needed only where a test's own subject spans connections. Only an
-  # `async: false` module may use it, and it must call `sweep_committed_runner_tenants/0` in
-  # `setup_all` and on exit; the tenant it makes carries the sweep's slug marker.
+  # An agent and its `:agent`-role key, COMMITTED outside the sandbox. AdminRepo shares Repo's
+  # sandbox connection in test (US-46.2), so a controller test of an endpoint whose auth reads
+  # on `AdminRepo` and whose context reads on `Repo` uses the sandboxed `:api_key` fixture;
+  # this one is only for a test whose own subject spans connections (a committed trigger, a
+  # lock another connection holds). Only an `async: false` module may use it, and it sweeps
+  # its tenant on exit (`sweep_committed_tenants/1`); the tenant carries the sweep's marker.
   #
   # Returns `{raw_key, api_key, agent}`.
   def fixture(:committed_agent_key, attrs) do
@@ -2180,10 +2179,9 @@ defmodule Loopctl.Fixtures do
     end)
   end
 
-  # A committed `:user`-role key, for a CONTROLLER test of an operator-facing read whose data
-  # is written on the RLS `Loopctl.Repo` — the runner registry's `unsupported_kinds`, which is
-  # derived from `runner_dispatches`. Same two-repo constraint as `:committed_agent_key`
-  # above: only an `async: false` module may use it, and it must sweep at the boundary.
+  # A committed `:user`-role key, for a test whose own subject spans connections, like
+  # `:committed_agent_key` above: only an `async: false` module may use it, and it must sweep
+  # its tenant on exit.
   #
   # Returns `{raw_key, api_key}`. A controller test wants the raw token; a CONTEXT test wants
   # the `%ApiKey{}` struct, because `Loopctl.Delivery.Placement.place/4` resolves the caller's
@@ -3454,6 +3452,29 @@ defmodule Loopctl.Fixtures do
 
     :ok
   end
+
+  @doc """
+  Starts a ledger of the committed tenants ONE `async: false` module creates, for its
+  `setup_all`, and sweeps exactly those (`sweep_committed_tenants/1`) when the module ends.
+
+  At module end and not per test: a test's sandbox transaction outlives the test's own
+  `on_exit` callbacks, and any row it inserted that references a committed tenant holds a lock
+  on that tenant's row, so a per-test sweep waits on it until the statement is cancelled.
+  """
+  def track_committed_tenants do
+    {:ok, ledger} = Elixir.Agent.start(fn -> [] end)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      sweep_committed_tenants(Elixir.Agent.get(ledger, & &1))
+      Elixir.Agent.stop(ledger)
+    end)
+
+    ledger
+  end
+
+  @doc "Records `tenant_id` in a `track_committed_tenants/0` ledger."
+  def track_committed_tenant(ledger, tenant_id),
+    do: Elixir.Agent.update(ledger, &[tenant_id | &1])
 
   @doc """
   `sweep_committed_runner_tenants/0` for the given tenant ids ONLY, and only those that are

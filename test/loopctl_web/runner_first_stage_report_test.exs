@@ -25,17 +25,12 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
   use LoopctlWeb.ChannelCase, async: true
 
   alias Loopctl.AdminRepo
-  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
   alias Loopctl.Progress
-  alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
 
-  # A bound, never a delay. 10 s because this module runs in the ASYNC phase of the full
-  # suite, where a channel reply missed a 2 s bound under load (commit gate, 2026-10-07).
-  @reply_timeout 10_000
   @repo "mkreyman/home_care_billing"
 
   setup do
@@ -43,10 +38,14 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
     {raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "minis"})
     {_raw, operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
-    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
+    {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, join_payload("minis"))
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        runner_join_payload("minis", %{"repos" => [@repo]})
+      )
 
     _ = :sys.get_state(channel.channel_pid)
 
@@ -77,7 +76,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
           "to" => "worktree"
         })
 
-      assert_reply ref, :ok, reply, @reply_timeout
+      assert_reply ref, :ok, reply, reply_timeout()
       assert reply.stage == "worktree"
 
       assert stage(story) == :worktree
@@ -108,7 +107,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
         })
 
       :ok = Loopctl.Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _pushed, @reply_timeout
+      assert_push "dispatch", _pushed, reply_timeout()
       accept!(channel, payload["dispatch_id"], epoch)
 
       ref =
@@ -122,7 +121,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
       # THE REASON IS THE WHOLE ASSERTION, and there is deliberately no row read beside it: the
       # control writes nothing, so `queued` is true whether or not the report was judged, and
       # asserting it would look like evidence the row was inspected while being true either way.
-      assert_reply ref, :error, %{reason: "stale_stage"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "stale_stage"}, reply_timeout()
     end
   end
 
@@ -146,7 +145,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
         actor_label: "test:first_stage_report"
       )
 
-    assert_push "dispatch", _pushed, @reply_timeout
+    assert_push "dispatch", _pushed, reply_timeout()
 
     # The epoch the CLAIM produced, not the one the story had: claiming bumps it, and every
     # message about this dispatch is fenced on the new one.
@@ -163,7 +162,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
         "decision" => "accepted"
       })
 
-    assert_reply ref, :ok, _reply, @reply_timeout
+    assert_reply ref, :ok, _reply, reply_timeout()
   end
 
   defp stage(story) do
@@ -204,25 +203,5 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
       inserted_at: now,
       updated_at: now
     })
-  end
-
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine) do
-    %{
-      "contract_version" => RunnerContract.version(),
-      "machine" => machine,
-      "cores" => 16,
-      "memory_mb" => 28_000,
-      "repos" => [@repo],
-      "max_sessions" => 2,
-      "in_flight" => 0,
-      "draining" => false
-    }
   end
 end

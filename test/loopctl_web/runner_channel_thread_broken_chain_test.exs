@@ -14,7 +14,7 @@ defmodule LoopctlWeb.RunnerChannelThreadBrokenChainTest do
   (`Loopctl.Test.LockGuard` fails such a test at teardown). So it is COMMITTED and dropped at
   exit, which only a module ExUnit runs alone may do.
 
-  The runner is committed too (`fixture(:committed_runner)`, swept at the module boundary),
+  The runner is committed too (`committed_runner/2`, its tenant swept when the module ends),
   for an ordering reason: `fixture(:runner)` enrols through `Loopctl.Runners.enroll_runner/3`,
   which appends to the chain inside the sandbox, and the committed `CREATE TRIGGER` would then
   wait on that row lock for the rest of the test. Everything else stays in the sandbox.
@@ -24,64 +24,47 @@ defmodule LoopctlWeb.RunnerChannelThreadBrokenChainTest do
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
-  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
   alias Loopctl.Runners
+  alias Loopctl.Test.BrokenChain
   alias Loopctl.Threads
   alias Loopctl.WorkBreakdown.Story
-  alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
 
   setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
+    %{committed: track_committed_tenants()}
   end
 
-  @reply_timeout 2_000
+  # A committed runner whose tenant, and only the tenants this module made, are swept when the
+  # module ends: the marker sweep would also delete the committed rows of another worktree's
+  # suite running against the same test database.
+  defp committed_runner(ctx, attrs) do
+    {raw, runner} = fixture(:committed_runner, attrs)
+    track_committed_tenant(ctx.committed, runner.tenant_id)
+    {raw, runner}
+  end
+
   @epoch 3
   @sha1 String.duplicate("a", 40)
   @tree String.duplicate("c", 40)
 
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine) do
-    %{
-      "contract_version" => RunnerContract.version(),
-      "machine" => machine,
-      "cores" => 16,
-      "memory_mb" => 28_000,
-      "repos" => ["mkreyman/home_care_billing"],
-      "max_sessions" => 2,
-      "in_flight" => 0,
-      "draining" => false
-    }
-  end
-
   # A joined runner holding an ACCEPTED implement dispatch for a story its agent has claimed
   # at `@epoch`, through a custody dispatch as a placement would have minted it.
-  setup do
-    {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
+  setup ctx do
+    {raw, runner} = committed_runner(ctx, %{name: "minis"})
+    {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, join_payload("minis"))
+      subscribe_and_join(socket, "runner:" <> runner.id, runner_join_payload("minis"))
 
     _ = :sys.get_state(channel.channel_pid)
 
     story = fixture(:ledger_story, %{tenant_id: runner.tenant_id, claim_epoch: @epoch})
     payload = build(:runner_dispatch, %{"story_id" => story.id, "claim_epoch" => @epoch})
     :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-    assert_push "dispatch", _, @reply_timeout
+    assert_push "dispatch", _, reply_timeout()
 
     ref =
       push(channel, "dispatch_reply", %{
@@ -90,7 +73,7 @@ defmodule LoopctlWeb.RunnerChannelThreadBrokenChainTest do
         "decision" => "accepted"
       })
 
-    assert_reply ref, :ok, _, @reply_timeout
+    assert_reply ref, :ok, _, reply_timeout()
 
     custody_id = Ecto.UUID.generate()
     now = DateTime.utc_now()
@@ -150,44 +133,16 @@ defmodule LoopctlWeb.RunnerChannelThreadBrokenChainTest do
     thread
   end
 
-  defp break_chain(tenant_id) do
-    name = "test_broken_chain_" <> String.replace(tenant_id, "-", "")
-
-    unboxed(fn ->
-      AdminRepo.query!("""
-      CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        RAISE EXCEPTION 'audit_chain_hash_violation: injected by test' USING ERRCODE = 'P0001';
-      END
-      $$
-      """)
-
-      AdminRepo.query!("""
-      CREATE TRIGGER #{name} BEFORE INSERT ON audit_chain FOR EACH ROW
-      WHEN (NEW.tenant_id = '#{tenant_id}') EXECUTE FUNCTION #{name}()
-      """)
-    end)
-
-    on_exit(fn ->
-      unboxed(fn ->
-        AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON audit_chain")
-        AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-      end)
-    end)
-  end
-
-  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
-
   @tag :capture_log
   test "a write the chain refuses is audit_chain_append_failed, and the socket lives", ctx do
     %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
-    break_chain(runner.tenant_id)
+    BrokenChain.install!(runner.tenant_id)
 
     ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id))
-    assert_reply ref, :error, %{reason: "audit_chain_append_failed"}, @reply_timeout
+    assert_reply ref, :error, %{reason: "audit_chain_append_failed"}, reply_timeout()
 
     ref = push(channel, "thread_entry", entry_msg(dispatch_id))
-    assert_reply ref, :error, %{reason: "audit_chain_append_failed"}, @reply_timeout
+    assert_reply ref, :error, %{reason: "audit_chain_append_failed"}, reply_timeout()
 
     assert Process.alive?(channel.channel_pid)
     assert thread(ctx).entries == []

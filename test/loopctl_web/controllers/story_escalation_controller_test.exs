@@ -152,9 +152,6 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       # could take it — so a story a session parked for a person stayed parked for ever,
       # including the one the loop's first end-to-end run left behind.
       #
-      # `done` rather than `queued` HERE: re-queueing also releases the claim and re-contracts
-      # the story, and that path is covered end to end in
-      # `Loopctl.Delivery.EscalationsResolveTest`.
       body =
         conn
         |> auth(operator_key)
@@ -168,6 +165,32 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
       assert Stages.get(story.tenant_id, story.id).stage ==
                :done
+    end
+
+    test "a human re-queues an escalated story: the claim is released and it is contracted",
+         %{conn: conn} do
+      %{story: story, operator_key: operator_key} = escalated_story()
+
+      # Re-queueing crosses both repos: the stage row moves on `Repo` while the claim release
+      # and the re-contract run on `AdminRepo`. The release bumps the claim epoch, and the row
+      # is bound to the epoch it produced.
+      body =
+        conn
+        |> auth(operator_key)
+        |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{
+          "to" => "queued",
+          "reason" => "the blocker is gone"
+        })
+        |> json_response(200)
+
+      assert body["stage"]["stage"] == "queued"
+
+      reloaded = AdminRepo.get!(Story, story.id)
+      assert reloaded.agent_status == :contracted
+      assert reloaded.assigned_agent_id == nil
+      assert reloaded.claim_epoch > @epoch
+      assert body["stage"]["claim_epoch"] == reloaded.claim_epoch
+      assert Stages.get(story.tenant_id, story.id).stage == :queued
     end
 
     test "an AGENT key cannot resolve, which is the separation", %{conn: conn} do
