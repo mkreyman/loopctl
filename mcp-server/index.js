@@ -946,13 +946,16 @@ async function channelGraduate({ post_id, title, tags, category }) {
   return toContent(result);
 }
 
+// Pinned like `userKeyApiCall` (LOOPCTL_USER_KEY verbatim when set, so a global
+// LOOPCTL_API_KEY cannot displace it), spelled out so the route sweep sees the call.
 async function deleteProject({ project_id }) {
-  const result = await apiCall(
-    "DELETE",
-    `/api/v1/projects/${project_id}`,
-    null,
-    process.env.LOOPCTL_USER_KEY
-  );
+  const path = `/api/v1/projects/${project_id}`;
+  const key = process.env.LOOPCTL_USER_KEY;
+
+  const result = key
+    ? await apiCall("DELETE", path, null, key, { exactKey: true, keyHint: "LOOPCTL_USER_KEY" })
+    : await apiCall("DELETE", path, null);
+
   return toContent(result);
 }
 
@@ -1125,8 +1128,8 @@ async function getStory({ story_id }) {
 // Reads travel on the default key (any role passes). Create and update go through
 // `orchestratorPinnedApiCall`: the named orchestrator or user key VERBATIM, so a global
 // LOOPCTL_API_KEY of a lesser role cannot displace it, and the global key when neither is set. The deletes go through `userKeyApiCall`, pinned to LOOPCTL_USER_KEY so a
-// global LOOPCTL_API_KEY cannot displace it: they destroy rows. (`delete_project` is not
-// pinned this way.)
+// global LOOPCTL_API_KEY cannot displace it: they destroy rows. `delete_project` (an
+// archive) is pinned the same way, because its gate is `role: :user`.
 
 // ONE pinning rule for the epic and story writes: the env var `hint()` names is sent VERBATIM
 // when it is set, so a global LOOPCTL_API_KEY of a lesser role cannot displace it, and with none
@@ -4239,7 +4242,7 @@ const TOOLS = [
   {
     name: "delete_project",
     description:
-      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, and no API call changes or releases one. REQUIRES LOOPCTL_USER_KEY (user role; orchestrator role is NOT sufficient).",
+      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, resolve_project by that slug still returns the archived project, create_project with it is refused 422, and no API call changes or releases a slug, so a new project needs a different one. The way back: restore_kb_scope for a kb scope; a work project is restored by PATCH /api/v1/projects/:id with status active, which no MCP tool reaches yet. Sent with LOOPCTL_USER_KEY verbatim when it is set (a global LOOPCTL_API_KEY does not displace it), else with the default key. Refusals: 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant.",
     inputSchema: {
       type: "object",
       properties: {
