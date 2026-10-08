@@ -15,7 +15,6 @@ defmodule Loopctl.Workers.ReviewCeilingWorkerTest do
   import ExUnit.CaptureLog
 
   alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Repo
@@ -34,7 +33,7 @@ defmodule Loopctl.Workers.ReviewCeilingWorkerTest do
   @epoch 2
   @tree String.duplicate("c", 40)
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Repo, fun) end)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Repo, fun)
 
   # A story whose round 2 reached the ceiling with a critical finding, and whose stage row is
   # still in flight: the escalation is recorded and the stage has not moved.

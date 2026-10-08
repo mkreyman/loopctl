@@ -223,7 +223,7 @@ defmodule Loopctl.TouchBufferTest do
 
       # Let the GenServer use this test's sandbox connection so its terminate/2
       # flush can write during the (in-process) shutdown.
-      Sandbox.allow(Loopctl.AdminRepo, self(), server)
+      Sandbox.allow(Loopctl.Repo, self(), server)
 
       # Graceful shutdown → trap_exit → terminate/2 → final flush.
       assert :ok = stop_supervised!(name)

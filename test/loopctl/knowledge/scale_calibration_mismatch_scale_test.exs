@@ -38,7 +38,7 @@ defmodule Loopctl.Knowledge.ScaleCalibrationMismatchScaleTest do
   @moduletag :scale_nightly
   @moduletag timeout: :timer.minutes(30)
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   setup do
     # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole

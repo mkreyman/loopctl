@@ -171,7 +171,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   # for why a join would not do. `max_sessions` only; `enrolled_max_sessions` is the grant and
   # nothing but an enrollment writes it.
   defp hold_capacity_at!(runner, max_sessions) do
-    Sandbox.unboxed_run(Loopctl.AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       {1, _} =
         Loopctl.AdminRepo.update_all(
           from(r in Runner, where: r.id == ^runner.id and r.tenant_id == ^runner.tenant_id),
@@ -196,7 +196,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   end
 
   defp hold_then_release(runner, test, ref) do
-    Sandbox.unboxed_run(Loopctl.AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       Loopctl.AdminRepo.transaction(fn -> hold_runner_row(runner, test, ref) end)
     end)
 

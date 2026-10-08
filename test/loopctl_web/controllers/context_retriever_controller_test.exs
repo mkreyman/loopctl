@@ -49,7 +49,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
   end
 
   defp sweep_marker_tenants do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.delete_all(from(t in Tenant, where: like(t.slug, ^"#{@tenant_marker}%")))
     end)
   end
@@ -63,7 +63,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
     seq = System.unique_integer([:positive])
     id = Ecto.UUID.generate()
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       %Tenant{}
       |> Tenant.create_changeset(%{
         name: "T#{seq}",

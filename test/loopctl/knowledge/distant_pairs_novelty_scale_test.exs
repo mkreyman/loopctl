@@ -79,7 +79,7 @@ defmodule Loopctl.Knowledge.DistantPairsNoveltyScaleTest do
   # the property instead.
   @latency_ceiling_ms 7_000
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   # Median of an odd-length sample list.
   defp median(samples) do

@@ -2017,8 +2017,7 @@ defmodule Loopctl.Fixtures do
 
   # A SystemCorpusEmbeddingWorker row in a given Oban state. The suite runs Oban in
   # `testing: :inline`, which never persists a job, so the row is written directly, as a
-  # real run would leave it, and through OBAN's repo (`Loopctl.Repo`): `AdminRepo` is a
-  # separate sandbox connection. Returns the job id.
+  # real run would leave it, and through OBAN's repo (`Loopctl.Repo`). Returns the job id.
   def fixture(:system_corpus_job, attrs) do
     attrs = Enum.into(attrs, %{})
 
@@ -2112,8 +2111,9 @@ defmodule Loopctl.Fixtures do
 
   # A tenant, runner key and runner row COMMITTED outside the sandbox, for tests of the
   # runner dispatch ledger (#803). The ledger lives on the RLS `Loopctl.Repo`, while the
-  # runner socket authenticates through `Loopctl.AdminRepo`; the two are separate sandbox
-  # connections, so both the runner row and its tenant must be visible to both. Only a
+  # runner socket authenticates through `Loopctl.AdminRepo`. AdminRepo shares Repo's sandbox
+  # connection in test (US-46.2), so committing is needed only where a test's own subject
+  # spans connections (a lock holder, a committed trigger). Only a
   # `async: false` module may use these (a committed row is visible to every running
   # test), and it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
   # No audit-chain entry is written: those rows cannot be deleted, so the sweep could not
@@ -2123,7 +2123,7 @@ defmodule Loopctl.Fixtures do
     tenant_id = Map.get_lazy(attrs, :tenant_id, fn -> fixture(:committed_tenant, %{}).id end)
     name = Map.get(attrs, :name, "runner-#{System.unique_integer([:positive])}")
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       {:ok, {raw_key, api_key}} =
         Auth.generate_api_key(%{tenant_id: tenant_id, name: "runner:" <> name, role: :agent})
 
@@ -2152,9 +2152,8 @@ defmodule Loopctl.Fixtures do
   # An agent and its `:agent`-role key, COMMITTED outside the sandbox, for a CONTROLLER test
   # of a path whose context runs on the RLS `Loopctl.Repo` (#803's escalate endpoint). The
   # auth pipeline resolves the key on `AdminRepo` while `Loopctl.Delivery.Stages` reads the
-  # story on `Repo`, and those are separate sandbox connections that cannot see each other's
-  # uncommitted rows — so the TENANT and the KEY must be committed (both connections see
-  # them) while the story stays inside the `Repo` sandbox (`fixture(:ledger_story)`). Only an
+  # story on `Repo`. AdminRepo shares Repo's sandbox connection in test (US-46.2), so
+  # committing is needed only where a test's own subject spans connections. Only an
   # `async: false` module may use it, and it must call `sweep_committed_runner_tenants/0` in
   # `setup_all` and on exit; the tenant it makes carries the sweep's slug marker.
   #
@@ -2163,7 +2162,7 @@ defmodule Loopctl.Fixtures do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       agent =
         %Agent{tenant_id: tenant_id}
         |> Agent.register_changeset(build(:agent, Map.take(attrs, [:name, :agent_type])))
@@ -2195,7 +2194,7 @@ defmodule Loopctl.Fixtures do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       {:ok, {raw_key, api_key}} =
         Auth.generate_api_key(%{
           tenant_id: tenant_id,
@@ -2209,9 +2208,8 @@ defmodule Loopctl.Fixtures do
 
   # A story (with its project and epic) on the RLS `Loopctl.Repo` connection, at a given
   # `claim_epoch`, for the dispatch ledger's claim fence (#803). The ledger reads
-  # `stories.claim_epoch` on `Repo` inside its own transaction, and `Repo` and `AdminRepo`
-  # hold separate sandbox transactions, so a story made by `fixture(:story)` (AdminRepo) is
-  # invisible to it. `tenant_id` must be visible to `Repo` (a committed tenant).
+  # `stories.claim_epoch` on `Repo` inside its own transaction. `tenant_id` must be visible
+  # to `Repo`.
   def fixture(:ledger_story, attrs) do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
@@ -2239,9 +2237,9 @@ defmodule Loopctl.Fixtures do
 
   # A story (with its project and epic) COMMITTED outside the sandbox, for a path that writes
   # it through BOTH repos (#803's `Loopctl.Delivery.Placement`: the claim runs on `AdminRepo`
-  # and the stage transition on the RLS `Loopctl.Repo`, which are separate sandbox connections
-  # that cannot see each other's uncommitted rows). `fixture(:ledger_story)` is the sandboxed
-  # sibling and is enough whenever only `Repo` reads the story.
+  # and the stage transition on the RLS `Loopctl.Repo`). AdminRepo shares Repo's sandbox
+  # connection in test (US-46.2), so `fixture(:ledger_story)`, the sandboxed sibling, is
+  # enough unless a test's own subject spans connections (a lock holder, a committed trigger).
   #
   # Same rules as `fixture(:committed_runner)`: only an `async: false` module may use it, and
   # it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit — the sweep
@@ -2620,7 +2618,7 @@ defmodule Loopctl.Fixtures do
     attrs = Enum.into(attrs, %{})
     seq = System.unique_integer([:positive])
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       tenant =
         %Tenant{}
         |> Tenant.create_changeset(%{
@@ -2842,9 +2840,8 @@ defmodule Loopctl.Fixtures do
   # An intake SOURCE and RECORD, with the project and epic they need, COMMITTED outside the
   # sandbox (#803's `Loopctl.Delivery.TriageTrigger`). Promotion straddles both repos — the
   # story is created in an `AdminRepo` transaction and `Loopctl.Delivery.Stages.open/3` then
-  # reads that story on the RLS `Loopctl.Repo` — and those are separate sandbox connections
-  # which cannot see each other's uncommitted rows, the same constraint
-  # `fixture(:committed_story)` carries.
+  # reads that story on the RLS `Loopctl.Repo`; see `fixture(:committed_story)` for when
+  # committing is still needed.
   #
   # Same rules as `fixture(:committed_runner)`: only an `async: false` module may use it, and
   # it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
@@ -2860,7 +2857,7 @@ defmodule Loopctl.Fixtures do
     tenant_id = Map.fetch!(attrs, :tenant_id)
     now = DateTime.utc_now()
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       project_id =
         Map.get_lazy(attrs, :project_id, fn ->
           unique = System.unique_integer([:positive])
@@ -3418,7 +3415,7 @@ defmodule Loopctl.Fixtures do
   def sweep_committed_runner_tenants do
     import Ecto.Query, only: [from: 2]
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       ids =
         AdminRepo.all(
           from(t in Tenant, where: like(t.slug, ^"#{@committed_runner_marker}%"), select: t.id)
@@ -3467,7 +3464,7 @@ defmodule Loopctl.Fixtures do
   def sweep_committed_tenants(ids) when is_list(ids) do
     import Ecto.Query, only: [from: 2]
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       ours =
         AdminRepo.all(
           from(t in Tenant,

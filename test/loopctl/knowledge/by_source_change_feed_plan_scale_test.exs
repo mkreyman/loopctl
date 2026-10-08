@@ -45,7 +45,7 @@ defmodule Loopctl.Knowledge.BySourceChangeFeedPlanScaleTest do
   @heavy_read_statement_timeout_ms System.get_env("HEAVY_READ_STATEMENT_TIMEOUT_MS", "10000")
                                    |> String.to_integer()
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   setup do
     # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole

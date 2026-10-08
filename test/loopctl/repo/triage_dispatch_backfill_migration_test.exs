@@ -31,7 +31,7 @@ defmodule Loopctl.Repo.TriageDispatchBackfillMigrationTest do
   MigrationFile.require!(AddStoryStagesTriageDispatchId, @version)
 
   setup do
-    pid = Sandbox.start_owner!(AdminRepo)
+    pid = Sandbox.start_owner!(Loopctl.Repo)
     on_exit(fn -> Sandbox.stop_owner(pid) end)
     :ok
   end

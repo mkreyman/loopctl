@@ -18,7 +18,6 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
   use LoopctlWeb.ChannelCase, async: false
 
   alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Runners
   alias Loopctl.Runners.Runner
@@ -140,7 +139,7 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
   # -- helpers ---------------------------------------------------------------------------
 
   defp unboxed(fun) do
-    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   # Read through the SAME connection the channel wrote on: in a non-async ChannelCase the

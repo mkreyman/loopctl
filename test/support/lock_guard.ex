@@ -34,7 +34,6 @@ defmodule Loopctl.Test.LockGuard do
   teardown whose own query fails raises rather than passing a test it never checked.
   """
 
-  alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
 
   @conn __MODULE__.Conn
@@ -143,9 +142,11 @@ defmodule Loopctl.Test.LockGuard do
   @spec start_owner!(module()) :: [integer()]
   def start_owner!(repo), do: guard_sandbox!([repo], true)
 
+  # `repo.query!/1`, not `SQL.query!(repo, ...)`: the module-atom form skips AdminRepo's test
+  # route onto Repo's connection and would read AdminRepo's own (unowned) pool.
   @doc false
   def backend_pid(repo) do
-    %{rows: [[pid]]} = SQL.query!(repo, "SELECT pg_backend_pid()")
+    %{rows: [[pid]]} = repo.query!("SELECT pg_backend_pid()")
     pid
   end
 

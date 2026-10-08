@@ -9,7 +9,6 @@ defmodule Loopctl.AuditChainTest do
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
@@ -103,8 +102,7 @@ defmodule Loopctl.AuditChainTest do
       {:ok, tenant_uuid} = Ecto.UUID.dump(tenant.id)
 
       assert_raise Postgrex.Error, ~r/audit_chain_position_violation/, fn ->
-        SQL.query!(
-          AdminRepo,
+        AdminRepo.query!(
           """
           INSERT INTO audit_chain (id, tenant_id, chain_position, prev_entry_hash, action, actor_lineage, entity_type, payload, entry_hash, inserted_at)
           VALUES (gen_random_uuid(), $1, 5, $2, 'bad', '[]', 'test', '{}', $3, NOW())
@@ -122,8 +120,7 @@ defmodule Loopctl.AuditChainTest do
       wrong_hash = :binary.copy(<<42>>, 32)
 
       assert_raise Postgrex.Error, ~r/audit_chain_hash_violation/, fn ->
-        SQL.query!(
-          AdminRepo,
+        AdminRepo.query!(
           """
           INSERT INTO audit_chain (id, tenant_id, chain_position, prev_entry_hash, action, actor_lineage, entity_type, payload, entry_hash, inserted_at)
           VALUES (gen_random_uuid(), $1, $2, $3, 'bad', '[]', 'test', '{}', $4, NOW())

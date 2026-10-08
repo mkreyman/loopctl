@@ -65,7 +65,7 @@ defmodule Loopctl.Knowledge.VectorEndpointE2eLatencyScaleTest do
   defp latency_budget_ms,
     do: Application.get_env(:loopctl, :scale_latency_budget_ms, 2000)
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   setup do
     # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole
@@ -130,11 +130,11 @@ defmodule Loopctl.Knowledge.VectorEndpointE2eLatencyScaleTest do
         )
       end)
 
-    # 2. Take SHARED sandbox ownership for the test process on all three repos so the conn
+    # 2. Take SHARED sandbox ownership for the test process on both pools so the conn
     #    request (running in this process) has connections; committed rows are visible to a
-    #    shared checkout. Drop ownership + clean up committed rows on exit.
+    #    shared checkout. AdminRepo runs on Repo's pool in test (`Loopctl.AdminRepo.Route`),
+    #    so Repo's owner covers it. Drop ownership + clean up committed rows on exit.
     repo_pid = Sandbox.start_owner!(Loopctl.Repo, shared: true)
-    admin_pid = Sandbox.start_owner!(AdminRepo, shared: true)
     heavy_pid = Sandbox.start_owner!(Loopctl.HeavyReadRepo, shared: true)
 
     # 3. The real request pipeline calls config-DI mock dependencies (clock, rate limiter,
@@ -152,7 +152,6 @@ defmodule Loopctl.Knowledge.VectorEndpointE2eLatencyScaleTest do
 
     on_exit(fn ->
       Sandbox.stop_owner(repo_pid)
-      Sandbox.stop_owner(admin_pid)
       Sandbox.stop_owner(heavy_pid)
 
       try do

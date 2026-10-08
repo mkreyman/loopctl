@@ -21,7 +21,11 @@ for module <- [
 end
 
 Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
-Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
+# AdminRepo is routed onto Repo's connection in test (config :loopctl, :admin_repo_route), and
+# `Sandbox.mode/2` follows that route, so its own pool is reached by pid. :manual keeps a call
+# that bypasses the route (`Ecto.Adapters.SQL.query(Loopctl.AdminRepo, ...)`) failing on
+# ownership; the pool's default, :auto, would hand it an unsandboxed connection that COMMITS.
+Ecto.Adapters.SQL.Sandbox.mode(Process.whereis(Loopctl.AdminRepo), :manual)
 {:ok, _lock_guard} = Loopctl.Test.LockGuard.start()
 
 # VM-global :atomics counter backing `Loopctl.Fixtures.next_story_number/0`.
@@ -40,8 +44,9 @@ Ecto.Adapters.SQL.Sandbox.mode(Loopctl.AdminRepo, :manual)
 # (Prod is unaffected: the nightly AuditPartitionWorker keeps the window ahead.) Ensure a
 # generous window here. It must be COMMITTED DDL, so run it unboxed — a plain query would
 # execute inside the sandbox transaction and be rolled back before any test sees it.
-# AdminRepo, because the worker issues its DDL through AdminRepo (it owns the partitions).
-Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.AdminRepo, fn ->
+# AdminRepo, because the worker issues its DDL through AdminRepo (it owns the partitions); in
+# test that is Repo's pool, checked out unsandboxed here, so the DDL still commits.
+Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.Repo, fn ->
   Loopctl.Workers.AuditPartitionWorker.ensure_partitions(back: 12)
 end)
 

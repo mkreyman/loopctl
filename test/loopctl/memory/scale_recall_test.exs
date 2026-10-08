@@ -100,7 +100,7 @@ defmodule Loopctl.Memory.ScaleRecallTest do
 
   @query "recall my distinctive facts"
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   setup do
     # The embedding client runs inside a Task.async (Knowledge.generate_embedding),

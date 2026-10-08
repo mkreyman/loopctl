@@ -42,7 +42,7 @@ defmodule Loopctl.Knowledge.CosineLintVsScaleGateScaleTest do
   # The ~2% tag ScaleSeed stamps, so the genuine (bounded) novelty shape is selective.
   @prior_tag "scale-tag-3"
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   setup do
     # `config/test.exs` points EVERY injected collaborator at a Mox mock for the whole

@@ -379,7 +379,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       end)
     end
 
-    defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+    defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
     test "a write the chain refuses is audit_chain_append_failed, and the socket lives", ctx do
       %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx

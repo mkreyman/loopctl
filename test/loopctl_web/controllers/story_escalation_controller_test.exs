@@ -110,7 +110,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
   end
 
   defp unboxed(fun) do
-    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Repo, fun) end)
+    Sandbox.unboxed_run(Repo, fun)
   end
 
   describe "GET /api/v1/stories/:id/stage" do
@@ -452,7 +452,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
       for role <- [:orchestrator, :user] do
         {raw_key, _} =
-          Sandbox.unboxed_run(AdminRepo, fn ->
+          Sandbox.unboxed_run(Loopctl.Repo, fn ->
             {:ok, pair} =
               Auth.generate_api_key(%{
                 tenant_id: tenant.id,

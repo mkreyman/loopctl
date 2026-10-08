@@ -43,7 +43,6 @@ defmodule Loopctl.Knowledge do
 
   require Logger
 
-  alias Ecto.Adapters.SQL
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
@@ -7853,12 +7852,7 @@ defmodule Loopctl.Knowledge do
     LIMIT $4
     """
 
-    case SQL.query(
-           AdminRepo,
-           node_sql,
-           params,
-           timeout: 5_000
-         ) do
+    case AdminRepo.query(node_sql, params, timeout: 5_000) do
       {:ok, %{rows: node_rows}} ->
         nodes_truncated = length(node_rows) >= max_graph_nodes()
 

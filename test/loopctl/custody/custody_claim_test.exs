@@ -15,7 +15,6 @@ defmodule Loopctl.CustodyClaimTest do
   import Ecto.Query
   import Mox
 
-  alias Ecto.Adapters.SQL
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
@@ -695,8 +694,7 @@ defmodule Loopctl.CustodyClaimTest do
     test "the table carries tenant_id and an RLS tenant_isolation policy (AC-41.7.9)" do
       for table <- ["custody_posture_entries", "custody_row_sequences"] do
         %{rows: [[count]]} =
-          SQL.query!(
-            AdminRepo,
+          AdminRepo.query!(
             "SELECT count(*) FROM pg_policies WHERE tablename = $1 AND policyname = 'tenant_isolation'",
             [table]
           )
@@ -704,8 +702,7 @@ defmodule Loopctl.CustodyClaimTest do
         assert count == 1
 
         %{rows: [[relrowsecurity, relforcerowsecurity]]} =
-          SQL.query!(
-            AdminRepo,
+          AdminRepo.query!(
             "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1",
             [table]
           )
@@ -723,18 +720,17 @@ defmodule Loopctl.CustodyClaimTest do
     defp unscoped_posture_rows_visible_as(tenant_id) do
       {:ok, count} =
         AdminRepo.transaction(fn ->
-          SQL.query!(
-            AdminRepo,
+          AdminRepo.query!(
             "SELECT set_config('app.current_tenant_id', $1, true)",
             [tenant_id]
           )
 
-          SQL.query!(AdminRepo, "SET LOCAL ROLE loopctl_app", [])
+          AdminRepo.query!("SET LOCAL ROLE loopctl_app", [])
 
           %{rows: [[count]]} =
-            SQL.query!(AdminRepo, "SELECT count(*) FROM custody_posture_entries", [])
+            AdminRepo.query!("SELECT count(*) FROM custody_posture_entries", [])
 
-          SQL.query!(AdminRepo, "RESET ROLE", [])
+          AdminRepo.query!("RESET ROLE", [])
           count
         end)
 
@@ -963,6 +959,31 @@ defmodule Loopctl.CustodyClaimTest do
       claim = claim!(t.id, article.id)
       assert claim.completeness == "incomplete"
       assert claim.highest_assigned_sequence == 0
+    end
+
+    test "an AdminRepo assignment fault inside a Repo transaction leaves that transaction usable",
+         %{tenant: t} do
+      all_endpoints_local()
+      :ok = mark_local_only(t.id)
+
+      # In production AdminRepo is not in the Repo transaction at all. In test it shares the
+      # connection (`Loopctl.AdminRepo.Route`), so the savepoint is decided by the CONNECTION's
+      # transaction, not AdminRepo's own: without one the failed insert aborts the Repo
+      # transaction and the next statement fails 25P02.
+      assert {:ok, :usable} =
+               Loopctl.Repo.transaction(fn ->
+                 assert {:error, _reason} =
+                          Custody.assign(
+                            AdminRepo,
+                            Scope.new(t.id),
+                            "article",
+                            Ecto.UUID.generate(),
+                            :bogus
+                          )
+
+                 Loopctl.Repo.query!("SELECT 1")
+                 :usable
+               end)
     end
 
     test "an invalid subject_type is refused BEFORE a sequence is consumed", %{tenant: t} do

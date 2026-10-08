@@ -57,8 +57,8 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
     # `sandbox: false` connections below.
     tenant = fixture(:committed_tenant, %{})
     other_tenant = fixture(:committed_tenant, %{})
+    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
     :ok = Sandbox.checkout(Repo, sandbox: false)
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
 
     # `fixture(:committed_tenant)` writes the DEFAULT tier, `:agent_rooted`, and the
     # delivery loop is work-breakdown surface behind `RequireHumanAnchor`.
@@ -477,7 +477,7 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
   end
 
   defp full_sweep do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       purge_dependents(
         "tenant_id IN (SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')",
         []
@@ -526,7 +526,7 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
   end
 
   defp checkout_admin do
-    case Sandbox.checkout(AdminRepo, sandbox: false) do
+    case Sandbox.checkout(Loopctl.Repo, sandbox: false) do
       :ok -> :ok
       {:already, :owner} -> :ok
     end

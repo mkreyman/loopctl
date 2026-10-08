@@ -95,7 +95,7 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
   # — and doing it unboxed is what makes the dead tuples vacuumable later, so this test can
   # demonstrate the remedy as well as the failure.
   defp poison_index do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.transaction(&seed_doomed_embeddings/0)
     end)
   end

@@ -94,7 +94,7 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
   # INVALID leftover is exactly what a killed `CREATE INDEX CONCURRENTLY` produces,
   # including this one. So clear it first, mirroring the migration's own `down/0`.
   defp restore_canonical_state do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DELETE FROM system_configs WHERE key = $1", [
         Embeddings.read_flag_key()
       ])
@@ -110,7 +110,7 @@ defmodule Loopctl.Repo.DropLegacyArticlesEmbeddingHnswIndexMigrationTest do
     end)
   end
 
-  defp with_unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp with_unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   # Drive the real migration's up/0 in THIS process (mirrors Ecto.Migrator.attempt/7 for
   # an explicit up/0 running :forward). MUST be called inside with_unboxed/1 so the

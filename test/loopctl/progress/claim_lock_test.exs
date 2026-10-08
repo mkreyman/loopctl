@@ -16,7 +16,9 @@ defmodule Loopctl.Progress.ClaimLockTest do
   `story_status_controller_test.exs` was flaky for exactly this reason).
 
   So this uses two genuinely independent `sandbox: false` sessions,
-  `async: false`, and cleans up its own real (committed) rows via `on_exit`
+  `async: false`, every process on production's two connections
+  (`Loopctl.Test.ProductionTopology`: in test AdminRepo otherwise shares Repo's,
+  which would hide the reclaim's cross-repo read), and cleans up its own real (committed) rows via `on_exit`
   (deleting the tenant cascades ON DELETE CASCADE to its project/epic/story/
   agent rows; the audit-log rows have no tenant FK and are harmless orphans).
   Without the lock, two separate sessions could both read `:contracted`, both
@@ -28,11 +30,11 @@ defmodule Loopctl.Progress.ClaimLockTest do
   import Ecto.Query, only: [from: 2]
   import Loopctl.Fixtures
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Capabilities.CapabilityToken
   alias Loopctl.Progress
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Story
 
   setup do
@@ -46,7 +48,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
     Mox.set_mox_global()
     Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :not_found} end)
 
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+    :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
     :ok
   end
 
@@ -78,7 +80,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
 
   defp cleanup(tenant) do
     on_exit(fn ->
-      :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+      :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
       # capability_tokens has ON DELETE :nothing, so clear any row a best-effort
       # start_cap mint may have created before deleting the tenant.
       AdminRepo.delete_all(from(c in CapabilityToken, where: c.tenant_id == ^tenant.id))
@@ -93,7 +95,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
 
     holder =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
 
         AdminRepo.transaction(fn ->
           lock_row(tenant.id, story.id)
@@ -111,7 +113,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
     # instantly — it blocks until the holder's transaction ends.
     waiter =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
         start = System.monotonic_time(:millisecond)
         AdminRepo.transaction(fn -> lock_row(tenant.id, story.id) end)
         System.monotonic_time(:millisecond) - start
@@ -146,7 +148,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
 
     holder =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
 
         AdminRepo.transaction(fn ->
           lock_row(tenant.id, story.id)
@@ -171,7 +173,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
 
     renewer =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
         %{rows: [[backend]]} = AdminRepo.query!("SELECT pg_backend_pid()")
         send(holder.pid, {:renewer_backend, backend})
 
@@ -220,13 +222,13 @@ defmodule Loopctl.Progress.ClaimLockTest do
 
     task_a =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
         Progress.claim_story(tenant.id, story.id, agent_id: agent_a.id)
       end)
 
     task_b =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
         Progress.claim_story(tenant.id, story.id, agent_id: agent_b.id)
       end)
 
@@ -271,7 +273,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
     # FOR SHARE lock the reclaim reads the last COMMITTED row (not halted) and releases.
     halter =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
 
         AdminRepo.transaction(fn ->
           {1, _} =
@@ -290,10 +292,9 @@ defmodule Loopctl.Progress.ClaimLockTest do
 
     reclaimer =
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
         # The reclaim first reads the dispatch ledger, on the RLS repo, for a budget kill it
-        # must re-drive rather than re-queue (US-44.3).
-        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
+        # must re-drive rather than re-queue (US-44.3): a second real connection.
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo, Loopctl.Repo])
         Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
       end)
 
@@ -319,8 +320,7 @@ defmodule Loopctl.Progress.ClaimLockTest do
     # two overlapping cron runs, or two nodes, produce.
     reclaim = fn ->
       Task.async(fn ->
-        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
-        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
+        :ok = ProductionTopology.checkout_unboxed!([AdminRepo, Loopctl.Repo])
         Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
       end)
     end

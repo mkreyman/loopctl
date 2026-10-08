@@ -227,7 +227,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
   end
 
   defp unboxed(fun) do
-    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   defp connect_info(token) do

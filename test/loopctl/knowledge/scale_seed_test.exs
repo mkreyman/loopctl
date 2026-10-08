@@ -63,7 +63,7 @@ defmodule Loopctl.Knowledge.ScaleSeedTest do
   # ---------------------------------------------------------------------------
 
   defp with_unboxed_db(fun) do
-    Sandbox.unboxed_run(AdminRepo, fun)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   # ---------------------------------------------------------------------------

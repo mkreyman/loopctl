@@ -60,7 +60,7 @@ defmodule Loopctl.Repo.DropRedundantChannelPostsRecentIdxMigrationTest do
   # DB. DROP ... CONCURRENTLY IF EXISTS is a no-op when it is already absent.
   setup do
     on_exit(fn ->
-      Sandbox.unboxed_run(AdminRepo, fn ->
+      Sandbox.unboxed_run(Loopctl.Repo, fn ->
         AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS channel_posts_recent_idx")
       end)
     end)
@@ -69,7 +69,7 @@ defmodule Loopctl.Repo.DropRedundantChannelPostsRecentIdxMigrationTest do
   end
 
   # Run a real (non-sandboxed) committed connection where CONCURRENTLY is legal.
-  defp with_unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp with_unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   # Drive the real migration's up/0 in THIS process (mirrors Ecto.Migrator.attempt/7
   # for an explicit up/0 running :forward). MUST be called inside with_unboxed/1 so

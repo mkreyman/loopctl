@@ -8,7 +8,6 @@ defmodule Loopctl.Auth.ApiKeyInvariantsTest do
   import Ecto.Query
   import Loopctl.Fixtures
 
-  alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Progress
@@ -47,8 +46,7 @@ defmodule Loopctl.Auth.ApiKeyInvariantsTest do
       {:ok, agent_uuid} = Ecto.UUID.dump(fake_agent_id)
 
       assert_raise Postgrex.Error, ~r/api_keys_agent_id_fkey/, fn ->
-        SQL.query!(
-          AdminRepo,
+        AdminRepo.query!(
           """
           INSERT INTO api_keys (id, tenant_id, agent_id, name, key_hash, key_prefix, role, inserted_at, updated_at)
           VALUES (gen_random_uuid(), $1, $2, 'test', 'hash', 'lc_xxx', 'agent', NOW(), NOW())
@@ -83,8 +81,7 @@ defmodule Loopctl.Auth.ApiKeyInvariantsTest do
       {:ok, agent_uuid} = Ecto.UUID.dump(agent.id)
 
       assert_raise Postgrex.Error, ~r/api_keys_one_role_per_agent_idx/, fn ->
-        SQL.query!(
-          AdminRepo,
+        AdminRepo.query!(
           """
           INSERT INTO api_keys (id, tenant_id, agent_id, name, key_hash, key_prefix, role, inserted_at, updated_at)
           VALUES (gen_random_uuid(), $1, $2, 'second', 'hash2', 'lc_yyy', 'agent', NOW(), NOW())

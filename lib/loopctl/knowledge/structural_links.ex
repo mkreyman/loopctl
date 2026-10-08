@@ -61,7 +61,6 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
@@ -735,7 +734,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   # a correctness condition, and the ledger in `retitle/4` lets the next run upgrade it.
   defp naming_scan(tenant_id, sql, params) do
     HeavyRead.with_slot(tenant_id, [on_overload: :tag], fn ->
-      SQL.query!(HeavyRead.repo_for(nil), sql, params)
+      HeavyRead.repo_for(nil).query!(sql, params)
     end)
   end
 

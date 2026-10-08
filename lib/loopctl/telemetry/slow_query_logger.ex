@@ -22,11 +22,17 @@ defmodule Loopctl.Telemetry.SlowQueryLogger do
   require Logger
 
   @handler_id __MODULE__
-  @events [
-    [:loopctl, :repo, :query],
-    [:loopctl, :admin_repo, :query],
-    [:loopctl, :heavy_read_repo, :query]
-  ]
+
+  # The repo a line is labelled with comes from the EVENT, one per repo, not from
+  # `metadata.repo`: in test `Loopctl.AdminRepo` runs on Repo's connection
+  # (`Loopctl.AdminRepo.Route`), so its metadata names Loopctl.Repo while its event stays
+  # AdminRepo's. In production the two always agree.
+  @repo_by_event %{
+    [:loopctl, :repo, :query] => Loopctl.Repo,
+    [:loopctl, :admin_repo, :query] => Loopctl.AdminRepo,
+    [:loopctl, :heavy_read_repo, :query] => Loopctl.HeavyReadRepo
+  }
+  @events Map.keys(@repo_by_event)
 
   @default_threshold_ms 1_000
 
@@ -56,12 +62,12 @@ defmodule Loopctl.Telemetry.SlowQueryLogger do
   end
 
   @doc false
-  def handle_event(_event, measurements, metadata, _config) do
+  def handle_event(event, measurements, metadata, _config) do
     total_native = Map.get(measurements, :total_time, 0)
     duration_ms = System.convert_time_unit(total_native, :native, :millisecond)
 
     if duration_ms >= threshold_ms() do
-      log_slow(duration_ms, metadata)
+      log_slow(duration_ms, Map.get(@repo_by_event, event, metadata[:repo]), metadata)
     end
 
     :ok
@@ -72,8 +78,7 @@ defmodule Loopctl.Telemetry.SlowQueryLogger do
       :ok
   end
 
-  defp log_slow(duration_ms, metadata) do
-    repo = metadata[:repo]
+  defp log_slow(duration_ms, repo, metadata) do
     source = to_string(metadata[:source] || "")
     options = metadata[:options] || []
     endpoint = options[:endpoint]

@@ -80,13 +80,18 @@ defmodule Loopctl.Knowledge.StreamingExportScaleTest do
   setup_all do
     # The export is served by a REAL HTTP server whose request handlers run in
     # separate processes that check out their OWN repo connections. Sandbox `:manual`
-    # mode would deny those checkouts, so switch AdminRepo / HeavyReadRepo to `:auto`
-    # for this module: checkouts use real auto-committing connections that see the
-    # ScaleSeed-committed corpus. Safe here — `async: false`, and the nightly CI leg
-    # runs ONLY this file against a fresh Postgres. Restored on exit.
-    Sandbox.mode(Loopctl.AdminRepo, :auto)
+    # mode would deny those checkouts, so switch Repo / HeavyReadRepo to `:auto` for
+    # this module: checkouts use real auto-committing connections that see the
+    # ScaleSeed-committed corpus. Repo's pool, because AdminRepo's traffic runs on it in
+    # test (`Loopctl.AdminRepo.Route`). Safe here — `async: false`, and the nightly CI
+    # leg runs ONLY this file against a fresh Postgres. Restored on exit.
+    Sandbox.mode(Loopctl.Repo, :auto)
     Sandbox.mode(Loopctl.HeavyReadRepo, :auto)
-    on_exit(fn -> Sandbox.mode(Loopctl.AdminRepo, :manual) end)
+
+    on_exit(fn ->
+      Sandbox.mode(Loopctl.Repo, :manual)
+      Sandbox.mode(Loopctl.HeavyReadRepo, :manual)
+    end)
 
     # The big tenant: ~80k committed articles (prod floor). A separate SMALL tenant
     # gives the 500-article memory baseline for the ratio assertion.

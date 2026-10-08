@@ -14,7 +14,7 @@ defmodule Loopctl.SystemConfig.RefreshListenerTest do
   setup do
     name = :"refresh_listener_#{System.unique_integer([:positive])}"
     pid = start_supervised!({RefreshListener, name: name})
-    Sandbox.allow(Loopctl.AdminRepo, self(), pid)
+    Sandbox.allow(Loopctl.Repo, self(), pid)
     %{listener: pid}
   end
 

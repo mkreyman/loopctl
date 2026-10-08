@@ -34,7 +34,7 @@ defmodule Loopctl.Threads.ReviewDispatchRaceTest do
   @epoch 2
   @tree String.duplicate("d", 40)
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Repo, fun) end)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Repo, fun)
 
   # A story claimed through a dispatch, with one checkpoint of the claim.
   defp claimed_story(tenant_id, implementer, session) do

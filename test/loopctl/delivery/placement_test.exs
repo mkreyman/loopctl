@@ -1981,10 +1981,10 @@ defmodule Loopctl.Delivery.PlacementTest do
     unboxed(fn -> Placement.place(runner.tenant_id, runner.id, payload, opts) end)
   end
 
-  # BOTH repos on real connections. A placement writes through each of them and the sandbox
-  # gives them separate, mutually invisible transactions — see the moduledoc.
+  # A real connection: AdminRepo runs on Repo's in test, so one unboxed Repo checkout carries
+  # both repos' writes, and they commit.
   defp unboxed(fun) do
-    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 
   # A story contracted and standing at `queued`, which is what a placement takes.
@@ -2256,7 +2256,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   # the TRIGGER, the object that does the damage. Run sequentially, the trigger goes first and
   # a failed `DROP FUNCTION` leaves an orphan nothing fires.
   defp drop_the_release_trigger!(name) do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON story_stages")
       AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)
@@ -2303,7 +2303,7 @@ defmodule Loopctl.Delivery.PlacementTest do
 
   # Unguarded and untransactioned for the reasons `drop_the_release_trigger!/1` states.
   defp drop_the_clear_trigger!(name) do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON stories")
       AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)
@@ -2355,7 +2355,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   # `IF EXISTS` on both, so the mid-test drop and the `on_exit` one compose. Unguarded and
   # untransactioned for the reasons `drop_the_release_trigger!/1` states at length.
   defp drop_the_revoke_trigger!(name) do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DROP TRIGGER IF EXISTS #{name}_t ON dispatches")
       AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
     end)

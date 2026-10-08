@@ -49,7 +49,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesPlanScaleTest do
 
   setup :verify_on_exit!
 
-  defp unboxed(fun), do: Sandbox.unboxed_run(AdminRepo, fun)
+  defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   setup do
     Loopctl.DataCase.stub_all_defaults()

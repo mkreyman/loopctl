@@ -34,7 +34,7 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
 
   # Restore the canonical index after every test, whatever the test left behind.
   setup do
-    on_exit(fn -> Sandbox.unboxed_run(AdminRepo, &run_up/0) end)
+    on_exit(fn -> Sandbox.unboxed_run(Loopctl.Repo, &run_up/0) end)
     :ok
   end
 
@@ -66,7 +66,7 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
   end
 
   test "up/0 replaces a same-named index whose trim set cannot serve the query" do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DROP INDEX CONCURRENTLY IF EXISTS #{@index}")
 
       AdminRepo.query!("""
@@ -82,7 +82,7 @@ defmodule Loopctl.Repo.AddArticlesPublishedReconciliationIndexMigrationTest do
   end
 
   test "up/0 leaves the canonical index in place rather than rebuilding it" do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       assert :ok = run_up()
       {oid, _def} = catalog()
 

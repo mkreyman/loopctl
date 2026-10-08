@@ -348,6 +348,6 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
   end
 
   defp unboxed(fun) do
-    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)
+    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 end

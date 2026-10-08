@@ -18,8 +18,6 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
 
   require Logger
 
-  alias Ecto.Adapters.SQL
-
   @default_retention_days 90
   @future_months 3
 
@@ -100,7 +98,7 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
         FOR VALUES FROM ('#{from_date}') TO ('#{to_date}')
       """
 
-      case SQL.query(@ddl_repo, sql, []) do
+      case @ddl_repo.query(sql, []) do
         {:ok, _} ->
           stamp_autovacuum(partition_name)
 
@@ -142,8 +140,7 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
     # requires BOTH reloptions: keying on the analyze factor alone would read a partition
     # that lost only `vacuum_insert` as tuned and never restore the insert-driven trigger.
     already_tuned =
-      SQL.query(
-        @ddl_repo,
+      @ddl_repo.query(
         "SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND $2 <@ reloptions",
         [partition_name, @reloptions]
       )
@@ -158,7 +155,7 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
   defp apply_autovacuum_opts(partition_name) do
     sql = "ALTER TABLE #{partition_name} SET (#{@reloptions_sql})"
 
-    case SQL.query(@ddl_repo, sql, []) do
+    case @ddl_repo.query(sql, []) do
       {:ok, _} -> :ok
       {:error, reason} -> log_tuning_failure(partition_name, reason)
     end
@@ -180,8 +177,7 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
     # and the test helper: a sub-partitioned child ('p') has no heap and would reject the
     # ALTER the retained branch now issues.
     {:ok, %{rows: rows}} =
-      SQL.query(
-        @ddl_repo,
+      @ddl_repo.query(
         """
         SELECT child.relname
         FROM pg_inherits
@@ -197,7 +193,7 @@ defmodule Loopctl.Workers.AuditPartitionWorker do
         partition_name =~ ~r/^audit_log_y\d{4}m\d{2}$/ do
       case parse_partition_date(partition_name) do
         {year, month} when year < cutoff_year or (year == cutoff_year and month < cutoff_month) ->
-          SQL.query(@ddl_repo, "DROP TABLE IF EXISTS #{partition_name}", [])
+          @ddl_repo.query("DROP TABLE IF EXISTS #{partition_name}", [])
 
           Logger.info("AuditPartitionWorker dropped expired partition: #{partition_name}")
 

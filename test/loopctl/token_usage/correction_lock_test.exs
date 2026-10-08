@@ -58,7 +58,7 @@ defmodule Loopctl.TokenUsage.CorrectionLockTest do
       # open transaction and waits, so the lock stays held.
       holder =
         Task.async(fn ->
-          :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+          :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
 
           AdminRepo.transaction(fn ->
             AdminRepo.query!("SELECT pg_advisory_xact_lock($1)", [key])
@@ -75,7 +75,7 @@ defmodule Loopctl.TokenUsage.CorrectionLockTest do
       # A DIFFERENT real session must NOT be able to take the same xact lock
       # while the holder's transaction holds it. If the lock were a no-op or
       # re-entrant per-connection, this try would wrongly succeed.
-      :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+      :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
 
       %{rows: [[got_while_held]]} =
         AdminRepo.query!("SELECT pg_try_advisory_xact_lock($1)", [key])

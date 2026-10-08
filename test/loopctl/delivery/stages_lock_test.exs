@@ -7,7 +7,9 @@ defmodule Loopctl.Delivery.StagesLockTest do
   process shares one checked-out connection, which serialises the transactions on its own
   (see `progress/claim_lock_test.exs`). So these tests use `sandbox: false` sessions,
   commit their rows under a `fixture(:committed_tenant)`, run `async: false`, and sweep the
-  committed tenants at module boundaries. Two tests DO append to the audit chain (the
+  committed tenants at module boundaries. Every process runs on production's two
+  connections (`Loopctl.Test.ProductionTopology`): in test AdminRepo otherwise shares Repo's,
+  and the reclaimer, the raw row writes and the chain appends are AdminRepo's. Two tests DO append to the audit chain (the
   per-tenant chain lock is what they prove), and those rows would block the tenant delete —
   `purge_chain/1` removes them at the end of every test.
   """
@@ -17,7 +19,6 @@ defmodule Loopctl.Delivery.StagesLockTest do
   import Ecto.Query, only: [from: 2]
   import Loopctl.Fixtures
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
@@ -27,6 +28,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Progress
   alias Loopctl.Repo
+  alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Story
 
   # The test process holds one connection of the pool the racers share; the second is left
@@ -53,8 +55,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
 
     # `fixture(:committed_tenant)` runs its own unboxed AdminRepo checkout, so it goes first.
     tenant = fixture(:committed_tenant, %{})
-    :ok = Sandbox.checkout(Repo, sandbox: false)
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+    :ok = ProductionTopology.checkout_unboxed!([Repo, AdminRepo])
 
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: 1})
 
@@ -86,10 +87,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
   defp with_chain_delete_trigger_disabled(fun) do
     # `on_exit` runs in its own process (which must check out), the tests run in this one
     # (which already has).
-    case Sandbox.checkout(AdminRepo, sandbox: false) do
-      :ok -> :ok
-      {:already, :owner} -> :ok
-    end
+    :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
 
     {:ok, result} =
       AdminRepo.transaction(fn ->
@@ -125,10 +123,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
   # this box (#821: "connection not available and request was dropped from queue").
   defp unboxed(repos, fun) do
     Task.async(fn ->
-      Enum.each(repos, fn repo ->
-        :ok = Sandbox.checkout(repo, sandbox: false, ownership_timeout: @ownership_timeout)
-      end)
-
+      :ok = ProductionTopology.checkout_unboxed!(repos, ownership_timeout: @ownership_timeout)
       fun.()
     end)
   end

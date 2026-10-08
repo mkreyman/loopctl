@@ -22,13 +22,13 @@ defmodule Loopctl.Test.LockGuardTest do
   # sandbox rolls back and wait on the very lock the test took); dropped first if an
   # interrupted run left it behind.
   setup_all do
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.query!("DROP TABLE IF EXISTS #{@probe}")
       AdminRepo.query!("CREATE TABLE #{@probe} (id int)")
     end)
 
     on_exit(fn ->
-      Sandbox.unboxed_run(AdminRepo, fn -> AdminRepo.query!("DROP TABLE #{@probe}") end)
+      Sandbox.unboxed_run(Loopctl.Repo, fn -> AdminRepo.query!("DROP TABLE #{@probe}") end)
     end)
   end
 
@@ -137,7 +137,7 @@ defmodule Loopctl.Test.LockGuardTest do
   end
 
   test "sandbox_owner?/1 recognises an owner, so the leak check above is not vacuous" do
-    owner = Sandbox.start_owner!(AdminRepo)
+    owner = Sandbox.start_owner!(Loopctl.Repo)
     on_exit(fn -> quietly(fn -> Sandbox.stop_owner(owner) end) end)
 
     assert sandbox_owner?(owner)

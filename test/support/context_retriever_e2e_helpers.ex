@@ -63,7 +63,7 @@ defmodule Loopctl.ContextRetrieverE2EHelpers do
   def sweep_marker_tenants(base) do
     marker = run_marker(base)
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       AdminRepo.delete_all(from(t in Tenant, where: like(t.slug, ^"#{marker}%")))
     end)
   end
@@ -78,7 +78,7 @@ defmodule Loopctl.ContextRetrieverE2EHelpers do
     marker = run_marker(base)
     id = Ecto.UUID.generate()
 
-    Sandbox.unboxed_run(AdminRepo, fn ->
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
       %Tenant{}
       |> Tenant.create_changeset(%{
         name: "T#{seq}",

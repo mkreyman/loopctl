@@ -101,7 +101,7 @@ defmodule Loopctl.Delivery.SessionEndReleaseTest do
   end
 
   defp unboxed(fun),
-    do: Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Loopctl.Repo, fun) end)
+    do: Sandbox.unboxed_run(Loopctl.Repo, fun)
 
   defp story(ctx), do: unboxed(fn -> AdminRepo.get!(Story, ctx.story.id) end)
 

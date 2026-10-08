@@ -171,7 +171,7 @@ defmodule Loopctl.OrchestratorTest do
       # statements at the DB and makes the winner/conflict split deterministic.
       allow_sandbox = fn ->
         Sandbox.allow(Loopctl.Repo, parent, self())
-        Sandbox.allow(Loopctl.AdminRepo, parent, self())
+        Sandbox.allow(Loopctl.Repo, parent, self())
       end
 
       task1 =
