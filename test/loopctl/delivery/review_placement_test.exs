@@ -17,7 +17,6 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
   use LoopctlWeb.ChannelCase, async: true
 
   import Ecto.Query
-  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
@@ -612,7 +611,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       dispatch_id = Ecto.UUID.generate()
 
       log =
-        capture_log(fn ->
+        OwnLog.capture_naming(dispatch_id, fn ->
           Repo.transaction(fn ->
             {:error, _} = Repo.query("SELECT 1 / 0")
             assert :ok = RunnerReviews.free_slot(ctx.tenant_id, dispatch_id, 0)
@@ -620,7 +619,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
           end)
         end)
 
-      assert OwnLog.entries_naming(log, dispatch_id) =~ "review slot not released"
+      assert log =~ "review slot not released"
     end
 
     test "a review session that never ran cannot report ending", ctx do

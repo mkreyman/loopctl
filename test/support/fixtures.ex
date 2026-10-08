@@ -14,6 +14,7 @@ defmodule Loopctl.Fixtures do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
+  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Artifacts.ArtifactReport
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Artifacts.VerificationResult
@@ -22,8 +23,10 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriageVerdictRecord
+  alias Loopctl.Dispatches
   alias Loopctl.Intake.Delivery, as: IntakeDelivery
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.Record, as: IntakeRecord
@@ -67,6 +70,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.WorkBreakdown.StoryDependency
+  alias LoopctlWeb.RunnerSocket
 
   # Persistent-term key holding the VM-global :atomics counter that backs
   # `next_story_number/0`. The counter is initialized once, single-threaded, in
@@ -785,6 +789,49 @@ defmodule Loopctl.Fixtures do
           Enum.map(seqs, &build(:runner_trace_event, %{"run_id" => run_id, "seq" => &1}))
       },
       Map.delete(attrs, :seqs)
+    )
+  end
+
+  # The payload an operator hands `Loopctl.Delivery.Placement.place/4` for a story: pass
+  # "story_id".
+  #
+  # NO `story` KEY: loopctl builds the object itself now (`attach_story/6`), and `place/4`
+  # REFUSES a caller-supplied one — a caller able to hand a runner prose is able to run
+  # anything on that machine; what the runner receives is asserted in `PlacementTest`'s "the
+  # dispatch carries the story object loopctl built". NO `branch`, which is the shape an
+  # operator sends now that
+  # loopctl derives one from the target runner's declaration (story 846.2) and the endpoint
+  # documents OMIT THIS. `build(:runner_dispatch)` names a branch of its own, and that branch
+  # is REFUSED `branch_not_unique`, because a caller-supplied name must still carry the
+  # story's own suffix or two stories on one repository could share one. A test that is ABOUT
+  # a caller-supplied branch puts one back explicitly.
+  def build(:placement_dispatch, attrs) do
+    :runner_dispatch |> build(attrs) |> Map.delete("branch")
+  end
+
+  # The `connect_info` a runner socket test connects with: pass `:token`, the runner key.
+  def build(:runner_connect_info, attrs) do
+    %{
+      x_headers: [{RunnerSocket.token_header(), Map.fetch!(Map.new(attrs), :token)}],
+      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
+    }
+  end
+
+  # A runner channel JOIN payload satisfying the runner contract, string-keyed as the runner
+  # sends it. Pass "machine"; the rest defaults.
+  def build(:runner_join, attrs) do
+    Map.merge(
+      %{
+        "contract_version" => RunnerContract.version(),
+        "machine" => "minis",
+        "cores" => 16,
+        "memory_mb" => 28_000,
+        "repos" => ["mkreyman/home_care_billing"],
+        "max_sessions" => 2,
+        "in_flight" => 0,
+        "draining" => false
+      },
+      Enum.into(attrs, %{})
     )
   end
 
@@ -2456,6 +2503,101 @@ defmodule Loopctl.Fixtures do
     runner
   end
 
+  # A story the merge precondition can judge (#803, US-45.4): reported done and verified by
+  # separate dispatches, its repository bound to an intake source requiring the `test` check,
+  # its stage row at `ci` on PR 4242 at `:head_sha`, and a triage verdict. Pass `:tenant_id`,
+  # `:repo` and `:head_sha`. Returns `%{tenant_id:, project_id:, story_id:}`, the context the
+  # merge tests run on.
+  def fixture(:merge_ready_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    project = fixture(:project, %{tenant_id: tenant_id})
+    epic = fixture(:epic, %{tenant_id: tenant_id, project_id: project.id})
+    agent = fixture(:agent, %{tenant_id: tenant_id, agent_type: :implementer})
+    verifier_agent = fixture(:agent, %{tenant_id: tenant_id, agent_type: :orchestrator})
+
+    fixture(:intake_source, %{
+      tenant_id: tenant_id,
+      project_id: project.id,
+      repo_full_name: Map.fetch!(attrs, :repo),
+      required_checks: ["test"]
+    })
+
+    {:ok, %{dispatch: implementer}} =
+      Dispatches.create_dispatch(tenant_id, %{role: :agent, agent_id: agent.id})
+
+    {:ok, %{dispatch: verifier}} =
+      Dispatches.create_dispatch(tenant_id, %{
+        role: :orchestrator,
+        agent_id: verifier_agent.id
+      })
+
+    story =
+      fixture(:story, %{tenant_id: tenant_id, epic_id: epic.id, project_id: project.id})
+      |> Ecto.Changeset.change(%{
+        agent_status: :reported_done,
+        verified_status: :verified,
+        assigned_agent_id: agent.id,
+        implementer_dispatch_id: implementer.id,
+        verifier_dispatch_id: verifier.id
+      })
+      |> AdminRepo.update!()
+
+    fixture(:story_stage, %{
+      tenant_id: tenant_id,
+      story_id: story.id,
+      stage: :ci,
+      claim_epoch: 0,
+      pr_number: 4242,
+      head_sha: Map.fetch!(attrs, :head_sha)
+    })
+
+    fixture(:triage_verdict, %{tenant_id: tenant_id, story_id: story.id})
+
+    %{tenant_id: tenant_id, project_id: project.id, story_id: story.id}
+  end
+
+  # The claim's implement dispatch, PLACED in thread mode on `master` (US-45.4) — the merge
+  # gate reads the mode, the base branch and the branch from this row, never from the intake
+  # source — and the claim's first checkpoint at `:commit_sha`/`:tree_sha`. Written to the
+  # ledger row directly: placement is `DispatchLedger.record_sent/4`'s, tested there. Pass
+  # `:tenant_id`, `:story_id` and `:runner_id`. Returns `%{checkpoint:, dispatch_row:}`.
+  def fixture(:thread_claim, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    story_id = Map.fetch!(attrs, :story_id)
+
+    {:ok, dispatch_row} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        Loopctl.Repo.insert!(%DispatchRecord{
+          tenant_id: tenant_id,
+          runner_id: Map.fetch!(attrs, :runner_id),
+          dispatch_id: Ecto.UUID.generate(),
+          story_id: story_id,
+          claim_epoch: 0,
+          kind: "implement",
+          mode: "thread",
+          base_branch: "master",
+          # Released, so the row holds no slot and `runner_dispatches_unreleased_bounded`
+          # has nothing to bound.
+          status: "accepted",
+          wall_clock_seconds: 3_600,
+          released_at: DateTime.utc_now()
+        })
+      end)
+
+    checkpoint =
+      fixture(:thread_checkpoint, %{
+        tenant_id: tenant_id,
+        story_id: story_id,
+        seq: 1,
+        commit_sha: Map.fetch!(attrs, :commit_sha),
+        tree_sha: Map.fetch!(attrs, :tree_sha)
+      })
+
+    %{checkpoint: checkpoint, dispatch_row: dispatch_row}
+  end
+
   # A delivery stage row inserted DIRECTLY at any stage (#803), bypassing
   # `Loopctl.Delivery.Stages` so a test can start from `ci` or `implementing` without
   # walking the machine there. `:repo` picks the sandbox connection the story lives on:
@@ -2842,8 +2984,8 @@ defmodule Loopctl.Fixtures do
   # repos — the story is created in an `AdminRepo` transaction and
   # `Loopctl.Delivery.Stages.open/3` then reads that story on the RLS `Loopctl.Repo` — and
   # AdminRepo shares Repo's sandbox connection in test, so an async test sees both halves.
-  # `fixture(:committed_intake)` commits the same rows, for a test whose subject spans
-  # connections (a lock held by another session).
+  # `fixture(:committed_intake)` commits the same rows from a test process still on the
+  # sandbox; a test on production's connections uses this fixture as it is.
   #
   # Pass `target_epic_id: nil` for the source that names no epic, which is the ESCALATION
   # case rather than a degenerate one; omitting the key inserts an epic and points the source
@@ -2927,12 +3069,61 @@ defmodule Loopctl.Fixtures do
     {source, record}
   end
 
-  # `fixture(:intake_pair)`, COMMITTED outside the sandbox: for a test whose subject spans
-  # two connections, like a story row another session holds `FOR UPDATE`. Same rules as
-  # `fixture(:committed_runner)`: only an `async: false` module may use it, and it must call
-  # `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
+  # `fixture(:intake_pair)`, COMMITTED through its own unboxed run, for a test process that is
+  # still on the SANDBOX while another connection must see the rows: a holder process that
+  # locks the record from a connection of its own, or a worker the test runs UNBOXED, outside
+  # its sandbox transaction. Same rules as `fixture(:committed_runner)`: only an
+  # `async: false` module may use it, and it must call `sweep_committed_runner_tenants/0` in
+  # `setup_all` and on exit.
+  #
+  # A test that has already put its process on production's connections
+  # (`Loopctl.Test.ProductionTopology.checkout_unboxed!/1`), as a lock-holder test does, uses
+  # plain `fixture(:intake_pair)` instead: its writes commit already, and this fixture's
+  # unboxed run would check that process's Repo connection in on its way out.
   def fixture(:committed_intake, attrs) do
     Sandbox.unboxed_run(Loopctl.Repo, fn -> fixture(:intake_pair, attrs) end)
+  end
+
+  # A story as INTAKE leaves it (#803 §4): created from a record, its stage row open at
+  # `detected`, its project bound to a repository. Pass `:tenant_id`.
+  #
+  # The record AND its source go on the story's own project, because
+  # `intake_sources_active_repo_uidx` allows ONE active source per repository per tenant, so
+  # the fixture's source has to BE the story's rather than a second one beside it. Options:
+  # `intake_record: false` for a story with no record at all; `bind_repo: false` for the real
+  # shape of a story whose project nobody bound (a record, on the fixture's own project, and no
+  # repository); `:body` for the record's untrusted reporter text.
+  def fixture(:detected_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    story = fixture(:ledger_story, %{tenant_id: tenant_id})
+
+    if Map.get(attrs, :intake_record, true) do
+      repo = "mkreyman/repo-#{System.unique_integer([:positive])}"
+      pair = %{tenant_id: tenant_id, issue_number: 412, repo_full_name: repo}
+
+      pair =
+        if Map.get(attrs, :bind_repo, true),
+          do: Map.put(pair, :project_id, story.project_id),
+          else: pair
+
+      pair =
+        case Map.get(attrs, :body) do
+          nil -> pair
+          body -> Map.put(pair, :untrusted_body, body)
+        end
+
+      {_source, record} = fixture(:intake_pair, pair)
+
+      {1, _} =
+        AdminRepo.update_all(
+          from(s in Story, where: s.id == ^story.id),
+          set: [intake_record_id: record.id]
+        )
+    end
+
+    {:ok, _row} = Stages.open(tenant_id, story.id, actor_label: "test")
+    story
   end
 
   # A PENDING issue-closure row (#805), inserted directly so a closer/worker test can start

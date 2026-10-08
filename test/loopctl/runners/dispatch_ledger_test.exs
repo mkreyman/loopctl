@@ -25,6 +25,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Delivery.DispatchLease
+  alias Loopctl.OwnLog
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
@@ -1237,8 +1238,10 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
       bad = update_in(batch, [:events, Access.at(0)], &Map.put(&1, :type, "SECRET" <> <<0>>))
 
+      # Only the entries naming this test's run: the module is async, and another test's
+      # rejected write logs the same line.
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
+        OwnLog.capture_naming(run_id, fn ->
           assert {:error, :rejected_by_database} =
                    DispatchLedger.record_trace(runner.tenant_id, runner.id, bad)
         end)

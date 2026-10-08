@@ -16,6 +16,7 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   use ExUnit.Case, async: false
 
   import Loopctl.Fixtures
+  import Mox, only: [verify_on_exit!: 1]
 
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.DispatchPayload
@@ -23,19 +24,19 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.Stages
-  alias Loopctl.Dispatches
   alias Loopctl.MockMergeForge
   alias Loopctl.Repo
+  alias Loopctl.Test.MergeForge
   alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Story
 
-  @repo "acme/widgets"
-  @head String.duplicate("a", 40)
-  @tree String.duplicate("e", 40)
-  @base_tree String.duplicate("f", 40)
-  @base_head String.duplicate("8", 40)
-  @merge String.duplicate("c", 40)
-  @session %{repo: @repo, token: "ghs_test"}
+  @head MergeForge.head()
+  @tree MergeForge.tree()
+  @base_head MergeForge.base_head()
+  @merge MergeForge.merge()
+  @session MergeForge.session()
+
+  setup :verify_on_exit!
 
   setup_all do
     sweep_committed_runner_tenants()
@@ -51,13 +52,13 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
 
     # `fixture(:committed_tenant)` runs its own unboxed checkout, so it goes first; from the
     # checkout on, every write of this process commits.
+    # The sweep is registered before anything else can fail, so a setup that raises part-way
+    # still leaves nothing behind.
     tenant = fixture(:committed_tenant, %{})
+    on_exit(fn -> sweep_committed_tenants([tenant.id]) end)
     :ok = ProductionTopology.checkout_unboxed!([Repo, AdminRepo])
 
-    ctx = build_story(tenant)
-    on_exit(fn -> sweep_committed_tenants([tenant.id]) end)
-
-    ctx
+    fixture(:merge_ready_story, %{tenant_id: tenant.id, repo: MergeForge.repo(), head_sha: @head})
   end
 
   describe "thread mode (US-45.4)" do
@@ -95,11 +96,11 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
     setup :thread_setup
 
     setup ctx do
-      record_thread_allow(ctx, ctx.checkpoint, @head)
+      MergeForge.record_thread_allow(ctx, ctx.checkpoint, @head)
       story = AdminRepo.get!(Story, ctx.story_id)
       {:ok, route} = DispatchPayload.dispatch_route(ctx.tenant_id, story)
       {:ok, branch} = DispatchPayload.thread_branch(route, story, nil)
-      stub_forge(branch)
+      MergeForge.stub_forge(branch)
       %{branch: branch}
     end
 
@@ -118,103 +119,27 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
       assert_receive :row_released, 10_000
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
 
-      stub_ancestors(%{{@merge, @base_head} => true})
+      MergeForge.stub_ancestors(%{{@merge, @base_head} => true})
       assert {:already_merged, @merge} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
     end
   end
 
-  # The claim's implement dispatch, PLACED in thread mode on `master` — the gate reads the
-  # mode, the base branch and the branch from this row, never from the intake source — and the
-  # claim's first checkpoint. Written to the ledger row directly: placement is
-  # `DispatchLedger.record_sent/4`'s, tested there.
+  # The claim's thread-mode dispatch and first checkpoint (`fixture(:thread_claim)`), on a
+  # runner of this committed tenant. `:committed_runner`, not `:runner`: enrolling appends a
+  # `runner_enrolled` audit-chain entry. The fixture's own unboxed run checks this process's
+  # Repo connection in on its way out, so the process takes it back.
   defp thread_setup(ctx) do
-    # `:committed_runner`, not `:runner`: enrolling appends a `runner_enrolled` audit-chain
-    # entry to the COMMITTED tenant. The fixture's own unboxed run checks this process's Repo
-    # connection in on its way out, so the process takes it back.
     {_raw_key, runner} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id})
     :ok = ProductionTopology.checkout_unboxed!([Repo])
+    MergeForge.stub_app_unreachable()
 
-    {:ok, dispatch_row} =
-      Repo.with_tenant(ctx.tenant_id, fn ->
-        Repo.insert!(%Loopctl.Runners.DispatchRecord{
-          tenant_id: ctx.tenant_id,
-          runner_id: runner.id,
-          dispatch_id: Ecto.UUID.generate(),
-          story_id: ctx.story_id,
-          claim_epoch: 0,
-          kind: "implement",
-          mode: "thread",
-          base_branch: "master",
-          # Released, so the row holds no slot and `runner_dispatches_unreleased_bounded`
-          # has nothing to bound.
-          status: "accepted",
-          wall_clock_seconds: 3_600,
-          released_at: DateTime.utc_now()
-        })
-      end)
-
-    checkpoint =
-      fixture(:thread_checkpoint, %{
-        tenant_id: ctx.tenant_id,
-        story_id: ctx.story_id,
-        seq: 1,
-        commit_sha: @head,
-        tree_sha: @tree
-      })
-
-    # US-45.5: every recorded thread allow enqueues the merge executor, and Oban runs it
-    # INLINE here. These tests judge the gate, so the executor finds the App unreachable —
-    # a transient fault it answers by retrying later, which changes nothing now. The
-    # executor's own behaviour is `Loopctl.Delivery.MergePreconditionIntegrationTest`'s
-    # `merge executor (US-45.5)` block.
-    Mox.stub(MockMergeForge, :session, fn _repo ->
-      {:error, {:github_unreachable, :econnrefused}}
-    end)
-
-    %{checkpoint: checkpoint, dispatch_row: dispatch_row}
-  end
-
-  defp record_thread_allow(ctx, checkpoint, sha) do
-    {:ok, _row} =
-      Stages.record_effect(ctx.tenant_id, ctx.story_id, :merge_gate_allowed_sha, sha,
-        claim_epoch: 0,
-        event_data: %{
-          "checkpoint_id" => checkpoint.id,
-          "checkpoint_sha" => sha,
-          "base_sha" => @base_head
-        }
-      )
-  end
-
-  defp stub_forge(branch) do
-    Mox.stub(MockMergeForge, :session, fn @repo -> {:ok, @session} end)
-    stub_base_head(@base_head, branch)
-
-    Mox.stub(MockMergeForge, :commit, fn
-      @session, @head -> {:ok, %{sha: @head, tree_sha: @tree, parents: [@base_head]}}
-      @session, sha -> {:ok, %{sha: sha, tree_sha: @base_tree, parents: []}}
-    end)
-
-    stub_ancestors(%{{@base_head, @head} => true})
-    Mox.stub(MockMergeForge, :create_commit, fn @session, _commit -> {:ok, @merge} end)
-    Mox.stub(MockMergeForge, :update_ref, fn @session, "master", _sha -> :ok end)
-    Mox.stub(MockMergeForge, :create_ref, fn @session, _temp, @head -> :ok end)
-    Mox.stub(MockMergeForge, :delete_ref, fn @session, _temp -> :ok end)
-    Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> flunk("no base merge expected") end)
-  end
-
-  defp stub_base_head(base_head, branch) do
-    Mox.stub(MockMergeForge, :branch_head, fn
-      @session, "master" -> {:ok, base_head}
-      @session, thread when thread == branch or is_nil(branch) -> {:ok, @head}
-    end)
-  end
-
-  # `ancestor?/3` answers from `known`, false for any pair it does not name.
-  defp stub_ancestors(known) do
-    Mox.stub(MockMergeForge, :ancestor?, fn @session, ancestor, descendant ->
-      {:ok, Map.get(known, {ancestor, descendant}, false)}
-    end)
+    fixture(:thread_claim, %{
+      tenant_id: ctx.tenant_id,
+      story_id: ctx.story_id,
+      runner_id: runner.id,
+      commit_sha: @head,
+      tree_sha: @tree
+    })
   end
 
   # Holds the story's stage row FOR UPDATE from another connection for longer than a stage
@@ -251,49 +176,5 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
       # that does not declare the actor's lineage. An operator key legitimately has none.
       actor_lineage: []
     ]
-  end
-
-  defp build_story(tenant) do
-    project = fixture(:project, %{tenant_id: tenant.id})
-    epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
-    agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
-    verifier_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
-
-    fixture(:intake_source, %{
-      tenant_id: tenant.id,
-      project_id: project.id,
-      repo_full_name: @repo,
-      required_checks: ["test"]
-    })
-
-    {:ok, %{dispatch: implementer}} =
-      Dispatches.create_dispatch(tenant.id, %{role: :agent, agent_id: agent.id})
-
-    {:ok, %{dispatch: verifier}} =
-      Dispatches.create_dispatch(tenant.id, %{role: :orchestrator, agent_id: verifier_agent.id})
-
-    story =
-      fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, project_id: project.id})
-      |> Ecto.Changeset.change(%{
-        agent_status: :reported_done,
-        verified_status: :verified,
-        assigned_agent_id: agent.id,
-        implementer_dispatch_id: implementer.id,
-        verifier_dispatch_id: verifier.id
-      })
-      |> AdminRepo.update!()
-
-    fixture(:story_stage, %{
-      tenant_id: tenant.id,
-      story_id: story.id,
-      stage: :ci,
-      claim_epoch: 0,
-      pr_number: 4242,
-      head_sha: @head
-    })
-
-    fixture(:triage_verdict, %{tenant_id: tenant.id, story_id: story.id})
-
-    %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}
   end
 end

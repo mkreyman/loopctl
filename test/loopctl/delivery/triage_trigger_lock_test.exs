@@ -16,6 +16,7 @@ defmodule Loopctl.Delivery.TriageTriggerLockTest do
   use ExUnit.Case, async: false
 
   import Loopctl.Fixtures
+  import Mox, only: [verify_on_exit!: 1]
 
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.Stages
@@ -23,6 +24,8 @@ defmodule Loopctl.Delivery.TriageTriggerLockTest do
   alias Loopctl.Repo
   alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Stories
+
+  setup :verify_on_exit!
 
   setup_all do
     sweep_committed_runner_tenants()

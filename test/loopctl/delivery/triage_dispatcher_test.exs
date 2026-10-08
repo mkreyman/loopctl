@@ -6,7 +6,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   The push goes through a real runner socket. The channel process inherits the test's
   `$callers`, and AdminRepo runs on Repo's sandbox connection in test
   (`Loopctl.AdminRepo.Route`), so the socket and both repos see this test's own rows and
-  nothing here commits. The two tests that inject a fault with DDL on `story_stages` are
+  nothing here commits. The tests that inject a fault with DDL on `story_stages` are
   `Loopctl.Delivery.TriageDispatcherFaultTest`.
 
   Every selection test binds a fact the pass reads. What is NOT tested here is the
@@ -18,7 +18,6 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   use LoopctlWeb.ChannelCase, async: true
 
   import Ecto.Query
-  import ExUnit.CaptureLog
 
   require Logger
 
@@ -30,6 +29,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   alias Loopctl.OwnLog
   alias Loopctl.Progress
   alias Loopctl.Runners.Usage
+  alias Loopctl.Test.TriageDispatch
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
@@ -46,9 +46,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   describe "candidates/1" do
     test "selects stories at DETECTED that came from an intake record", ctx do
-      detected = detected_story(ctx)
-      no_record = detected_story(ctx, intake_record: false)
-      queued = detected_story(ctx) |> queue()
+      detected = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      no_record = fixture(:detected_story, %{tenant_id: ctx.tenant.id, intake_record: false})
+      queued = fixture(:detected_story, %{tenant_id: ctx.tenant.id}) |> queue()
 
       ids = candidate_ids(50)
 
@@ -66,7 +66,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "a LIVE triage dispatch excludes its story, and its release brings it back", ctx do
-      story = detected_story(ctx)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       assert story.id in candidate_ids(50)
 
       # What stops a second session on one ticket. A triage dispatch claims nothing and writes
@@ -88,7 +88,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "an IMPLEMENT dispatch on the story does not exclude it from triage", ctx do
-      story = detected_story(ctx)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
 
       # The predicate is scoped to the triage kind on purpose. A story at `detected` should
       # not have an implement dispatch at all — placement requires `queued` — but a predicate
@@ -101,7 +101,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   describe "run_with/2" do
     test "sends a triage dispatch to a runner that DECLARES the kind", ctx do
-      story = detected_story(ctx)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       record_id = reload_story(ctx, story.id).intake_record_id
       channel = join_runner(ctx, %{"kinds" => ["triage", "implement"]})
 
@@ -128,7 +128,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "a runner that declares only IMPLEMENT is not sent triage", ctx do
-      _story = detected_story(ctx)
+      _story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       join_runner(ctx, %{"kinds" => ["implement"]})
 
       # The declaration decides, and `Runners.accepts?/5` reads it before anything is written.
@@ -142,7 +142,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     # does, so an exhausted subscription holds a triage-capable machine out too — and the pass
     # names the tenant's earliest reset, once for the tenant.
     test "an EXHAUSTED runner is not sent triage, and the pass logs the earliest reset", ctx do
-      story = detected_story(ctx)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
       resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
 
@@ -150,14 +150,14 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
 
       log =
-        capture_log([level: :info], fn ->
+        OwnLog.capture_naming(story.id, [level: :info], fn ->
           assert TriageDispatcher.run_with(20, @budgets) == [:no_runner]
         end)
 
       refute_push "dispatch", _pushed
 
       assert [_, logged] =
-               Regex.run(~r/earliest_usage_reset=(\S+)/, OwnLog.entries_naming(log, story.id))
+               Regex.run(~r/earliest_usage_reset=(\S+)/, log)
 
       assert {:ok, logged, 0} = DateTime.from_iso8601(logged)
       assert DateTime.compare(logged, resets_at) == :eq
@@ -168,7 +168,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     test "the only runner going dry between selection and the push is :no_runner, and " <>
            "Runners.dispatch/3 records nothing",
          ctx do
-      story = detected_story(ctx)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
 
       assert exhaust_after_selection(ctx.runner.id, fn ->
@@ -188,7 +188,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "a runner that declares NOTHING is not sent triage either", ctx do
-      _story = detected_story(ctx)
+      _story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       join_runner(ctx, %{})
 
       # THE ASYMMETRY THAT MAKES 1.10.0 SAFE TO DEPLOY AHEAD OF THE FLEET: a machine built
@@ -200,7 +200,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "a second pass starts NO second session on the same ticket", ctx do
-      story = detected_story(ctx)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
 
       assert TriageDispatcher.run_with(20, @budgets) == [:dispatched]
@@ -226,7 +226,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "a ticket too large to describe is ESCALATED, not logged every minute", ctx do
-      story = detected_story(ctx, body: String.duplicate("x", 12_000))
+      story =
+        fixture(:detected_story, %{tenant_id: ctx.tenant.id, body: String.duplicate("x", 12_000)})
+
       join_runner(ctx, %{"kinds" => ["triage"]})
 
       # `TriagePayload` states this contract in its own moduledoc — "its caller escalates it
@@ -249,8 +251,8 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "a too-large route that stopped HALFWAY is finished by the next pass", ctx do
-      story = detected_story(ctx)
-      half_take(ctx, story)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      TriageDispatch.half_take(ctx.tenant.id, story)
 
       assert TriageDispatcher.run_with(20, @budgets) == [stranded: :escalated]
 
@@ -261,14 +263,14 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
     test "stranded rows are ranked per tenant: one tenant's backlog does not starve another",
          ctx do
-      first = detected_story(ctx, intake_record: false)
-      half_take(ctx, first)
-      second = detected_story(ctx, intake_record: false)
-      half_take(ctx, second)
+      first = fixture(:detected_story, %{tenant_id: ctx.tenant.id, intake_record: false})
+      TriageDispatch.half_take(ctx.tenant.id, first)
+      second = fixture(:detected_story, %{tenant_id: ctx.tenant.id, intake_record: false})
+      TriageDispatch.half_take(ctx.tenant.id, second)
 
-      other = %{ctx | tenant: fixture(:tenant, %{trust_tier: :human_anchored})}
-      theirs = detected_story(other, intake_record: false)
-      half_take(other, theirs)
+      other = fixture(:tenant, %{trust_tier: :human_anchored})
+      theirs = fixture(:detected_story, %{tenant_id: other.id, intake_record: false})
+      TriageDispatch.half_take(other.id, theirs)
 
       ids = TriageDispatcher.stranded(500) |> Enum.map(& &1.story_id)
 
@@ -279,8 +281,8 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "an unbound triaged row WITH a recorded verdict is not swept", ctx do
-      story = detected_story(ctx)
-      half_take(ctx, story)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      TriageDispatch.half_take(ctx.tenant.id, story)
 
       # A row triaged before the binding existed: it has a verdict, so this module's route did
       # not leave it here and escalating it as too large would misreport it.
@@ -291,7 +293,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "a LEGACY source whose base_branch is not a git ref name is blocked, not pushed", ctx do
-      story = detected_story(ctx)
+      story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       join_runner(ctx, %{"kinds" => ["triage"]})
 
       # WRITTEN PAST THE CHANGESET ON PURPOSE, because that is the only way this row can exist:
@@ -319,7 +321,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     end
 
     test "a story whose project has no intake source is not a candidate at all", ctx do
-      _story = detected_story(ctx, bind_repo: false)
+      _story = fixture(:detected_story, %{tenant_id: ctx.tenant.id, bind_repo: false})
       join_runner(ctx, %{"kinds" => ["triage"]})
 
       # No source means no repository, and a dispatch must name one. Nothing clears that but a
@@ -335,7 +337,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   describe "the config gate" do
     test "nothing is dispatched while the unattended loop is off", ctx do
-      _story = detected_story(ctx)
+      _story = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
       join_runner(ctx, %{"kinds" => ["triage"]})
 
       # One switch for the whole unattended loop: triage running while nothing places the
@@ -384,18 +386,6 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
-  # A story as INTAKE leaves it: created from a record, its stage row open at `detected`, its
-  # project bound to a repository.
-  defp detected_story(ctx, opts \\ []) do
-    story = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})
-
-    if Keyword.get(opts, :intake_record, true),
-      do: attach_record(ctx, story, Keyword.get(opts, :bind_repo, true), opts)
-
-    {:ok, _row} = Stages.open(ctx.tenant.id, story.id, actor_label: "test")
-    story
-  end
-
   defp queue(story) do
     {:ok, story} =
       Progress.contract_story(story.tenant_id, story.id, %{},
@@ -414,42 +404,6 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       )
 
     story
-  end
-
-  # The record AND its source, on the story's own project when the story is meant to be
-  # addressable. `intake_sources_active_repo_uidx` allows ONE active source per repository per
-  # tenant, so the fixture's source has to BE the story's rather than a second one beside it.
-  #
-  # `bind_repo: false` leaves the source on the fixture's own project instead, which is the
-  # real shape of a story whose project nobody bound: it has a record and no repository.
-  defp attach_record(ctx, story, bind_repo?, opts) do
-    repo = "mkreyman/repo-#{System.unique_integer([:positive])}"
-
-    attrs =
-      if bind_repo?,
-        do: %{
-          tenant_id: ctx.tenant.id,
-          project_id: story.project_id,
-          issue_number: 412,
-          repo_full_name: repo
-        },
-        else: %{tenant_id: ctx.tenant.id, issue_number: 412, repo_full_name: repo}
-
-    attrs =
-      case Keyword.get(opts, :body) do
-        nil -> attrs
-        body -> Map.put(attrs, :untrusted_body, body)
-      end
-
-    {_source, record} = fixture(:intake_pair, attrs)
-
-    {1, _} =
-      AdminRepo.update_all(
-        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
-        set: [intake_record_id: record.id]
-      )
-
-    record
   end
 
   defp reload_story(ctx, story_id) do
@@ -586,18 +540,5 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       "in_flight" => 0,
       "draining" => false
     }
-  end
-
-  # The FIRST half of the too-large route alone: `triaged`, nothing bound, no verdict.
-  defp half_take(ctx, story) do
-    row = Stages.get(ctx.tenant.id, story.id)
-
-    {:ok, _row} =
-      Stages.advance(ctx.tenant.id, story.id, {:detected, :triaged, :forward},
-        claim_epoch: row.claim_epoch,
-        actor_label: "worker:triage_dispatcher",
-        actor_role: :agent,
-        actor_lineage: []
-      )
   end
 end

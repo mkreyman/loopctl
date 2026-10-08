@@ -8,7 +8,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   writer of that table). AdminRepo runs on Repo's sandbox connection in test
   (`Loopctl.AdminRepo.Route`), so both see this test's own rows and nothing here commits.
 
-  The two tests whose subject is a lock ANOTHER session holds (on the dispatch ledger, on the
+  The tests whose subject is a lock ANOTHER session holds (on the dispatch ledger, on the
   stage row) are `Loopctl.Delivery.MergePreconditionLockTest`. The whole decision without
   the database is `Loopctl.Delivery.MergePreconditionJudgeTest`, and the custody clause is
   `Loopctl.Progress.MergeCustodyStatusTest`.
@@ -26,24 +26,25 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   alias Loopctl.Delivery.MergePrecondition.Verdict
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
-  alias Loopctl.Dispatches
   alias Loopctl.MockMergeForge
   alias Loopctl.MockPullRequestSource
   alias Loopctl.Repo
+  alias Loopctl.Test.MergeForge
   alias Loopctl.Threads
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.ThreadMergeSweepWorker
   alias Loopctl.Workers.ThreadMergeWorker
 
-  @repo "acme/widgets"
-  @head String.duplicate("a", 40)
+  @repo MergeForge.repo()
+  @head MergeForge.head()
   @base String.duplicate("b", 40)
   @repo_files ["priv/rates/2026.csv", "lib/widgets_web/router.ex", "lib/widgets/thing.ex"]
 
   setup :verify_on_exit!
 
   setup do
-    build_story(fixture(:tenant, %{trust_tier: :agent_rooted}))
+    tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+    fixture(:merge_ready_story, %{tenant_id: tenant.id, repo: @repo, head_sha: @head})
   end
 
   describe "evaluate/3" do
@@ -483,11 +484,11 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   # -- helpers ---------------------------------------------------------------------------
 
   describe "thread mode (US-45.4)" do
-    @tree String.duplicate("e", 40)
-    @base_tree String.duplicate("f", 40)
+    @tree MergeForge.tree()
+    @base_tree MergeForge.base_tree()
     # The comparison's merge base: what the judged three-dot diff is relative to, and so the
     # `base_sha` an allow records.
-    @base_head String.duplicate("8", 40)
+    @base_head MergeForge.base_head()
 
     setup :thread_setup
 
@@ -1231,22 +1232,22 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   end
 
   describe "merge executor (US-45.5)" do
-    @merge String.duplicate("c", 40)
+    @merge MergeForge.merge()
     @moved_base String.duplicate("9", 40)
     @base_update String.duplicate("d", 40)
     @base_update_tree String.duplicate("7", 40)
-    @session %{repo: @repo, token: "ghs_test"}
+    @session MergeForge.session()
 
     setup :thread_setup
 
     setup ctx do
       # A recorded thread-mode allow for the checkpoint, exactly as the gate records one: the
       # row's allow and the event naming the checkpoint and the merge base.
-      record_thread_allow(ctx, ctx.checkpoint, @head)
+      MergeForge.record_thread_allow(ctx, ctx.checkpoint, @head)
       story = AdminRepo.get!(Story, ctx.story_id)
       {:ok, route} = DispatchPayload.dispatch_route(ctx.tenant_id, story)
       {:ok, branch} = DispatchPayload.thread_branch(route, story, nil)
-      stub_forge(branch)
+      MergeForge.stub_forge(branch)
       %{branch: branch}
     end
 
@@ -1289,8 +1290,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       # The retry finds the base moved ON — past the merge commit — and asks whether the
       # recorded commit is an ancestor of it, not whether the trees match.
-      stub_base_head(@moved_base)
-      stub_ancestors(%{{@merge, @moved_base} => true})
+      MergeForge.stub_base_head(@moved_base)
+      MergeForge.stub_ancestors(%{{@merge, @moved_base} => true})
 
       Mox.stub(MockMergeForge, :create_commit, fn _session, _commit ->
         flunk("an already-merged checkpoint is not squashed again")
@@ -1304,7 +1305,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     test "finding 4: a checkpoint the base already contains (a gated fast-forward) is adopted",
          ctx do
-      stub_ancestors(%{{@head, @base_head} => true})
+      MergeForge.stub_ancestors(%{{@head, @base_head} => true})
       Mox.stub(MockMergeForge, :create_commit, fn _s, _c -> flunk("nothing to squash") end)
 
       assert {:already_merged, @head} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
@@ -1351,7 +1352,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     test "a retry on an unmoved base reuses the commit it recorded rather than minting another",
          ctx do
       set_merge_commit(ctx, @merge)
-      stub_ancestors(%{{@merge, @base_head} => false, {@base_head, @head} => true})
+      MergeForge.stub_ancestors(%{{@merge, @base_head} => false, {@base_head, @head} => true})
 
       Mox.stub(MockMergeForge, :commit, fn
         @session, @head -> {:ok, %{sha: @head, tree_sha: @tree, parents: [@base_head]}}
@@ -1419,7 +1420,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
          ctx do
       set_merge_commit(ctx, @merge)
       set_stage(ctx, :implementing)
-      stub_ancestors(%{{@merge, @base_head} => true})
+      MergeForge.stub_ancestors(%{{@merge, @base_head} => true})
 
       assert {:escalated, {:merged_outside_ci, @merge}} =
                MergeExecutor.run(ctx.tenant_id, ctx.story_id)
@@ -1430,7 +1431,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       # Not on the base: ordinary, and skipped.
       set_stage(ctx, :implementing)
-      stub_ancestors(%{})
+      MergeForge.stub_ancestors(%{})
 
       assert {:skipped, {:not_at_ci, :implementing}} =
                MergeExecutor.run(ctx.tenant_id, ctx.story_id)
@@ -1520,7 +1521,10 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
           {:ok, %{sha: sha, tree_sha: @base_tree, parents: []}}
       end)
 
-      stub_ancestors(%{{@base_head, @head} => true, {@moved_base, @moved_base} => true})
+      MergeForge.stub_ancestors(%{
+        {@base_head, @head} => true,
+        {@moved_base, @moved_base} => true
+      })
 
       # GitHub merges that same base commit into the checkpoint again: the identical tree.
       Mox.stub(MockMergeForge, :merge, fn @session,
@@ -1564,7 +1568,10 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
           {:ok, %{sha: sha, tree_sha: @base_tree, parents: []}}
       end)
 
-      stub_ancestors(%{{@base_head, @head} => true, {@moved_base, @moved_base} => true})
+      MergeForge.stub_ancestors(%{
+        {@base_head, @head} => true,
+        {@moved_base, @moved_base} => true
+      })
 
       Mox.stub(MockMergeForge, :merge, fn @session, _temp, @moved_base, _m ->
         {:ok,
@@ -1602,7 +1609,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       end)
 
       # The second parent is NOT an ancestor of the base head: not a merge of the base.
-      stub_ancestors(%{{@base_head, @head} => true})
+      MergeForge.stub_ancestors(%{{@base_head, @head} => true})
 
       Mox.stub(MockMergeForge, :merge, fn @session, _temp, @moved_base, _m ->
         {:ok,
@@ -1632,9 +1639,9 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         end)
 
       reset_allow(ctx)
-      record_thread_allow(ctx, chain, chain.commit_sha)
+      MergeForge.record_thread_allow(ctx, chain, chain.commit_sha)
       set_head(ctx, chain.commit_sha)
-      stub_base_head(@moved_base)
+      MergeForge.stub_base_head(@moved_base)
 
       Mox.stub(MockMergeForge, :commit, fn
         @session, sha -> {:ok, %{sha: sha, tree_sha: @tree, parents: [@base_head]}}
@@ -1651,11 +1658,11 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
          ctx do
       test_pid = self()
       stub_base_update(ctx, test_pid)
-      stub_base_head(@moved_base, ctx.branch)
+      MergeForge.stub_base_head(@moved_base, ctx.branch)
 
       # Even a checkpoint that CONTAINS the new base head is not squashed onto it: the judged
       # diff was relative to the allow's `base_sha`, and only that base is fresh.
-      stub_ancestors(%{{@base_head, @head} => true, {@moved_base, @head} => true})
+      MergeForge.stub_ancestors(%{{@base_head, @head} => true, {@moved_base, @head} => true})
 
       Mox.stub(MockMergeForge, :create_commit, fn _session, _commit ->
         send(test_pid, :squashed)
@@ -1669,7 +1676,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     test "a base merge that conflicts goes back to implementing over base_moved", ctx do
       make_claim_live(ctx)
-      stub_base_head(@moved_base, ctx.branch)
+      MergeForge.stub_base_head(@moved_base, ctx.branch)
       Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> {:error, :merge_conflict} end)
 
       assert {:base_moved, :merge_conflict} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
@@ -1681,7 +1688,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     test "a conflict with nobody able to fix it escalates claim_not_live instead of looping",
          ctx do
-      stub_base_head(@moved_base, ctx.branch)
+      MergeForge.stub_base_head(@moved_base, ctx.branch)
       Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> {:error, :merge_conflict} end)
 
       assert {:escalated, {:claim_not_live, :merge_conflict}} =
@@ -1710,7 +1717,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
     test "a base merge whose first parent is not the checkpoint is escalated, never recorded",
          ctx do
-      stub_base_head(@moved_base, ctx.branch)
+      MergeForge.stub_base_head(@moved_base, ctx.branch)
       pushed = String.duplicate("4", 40)
 
       # Somebody wrote to the temporary branch between its creation and the merge.
@@ -1793,7 +1800,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         })
 
       reset_allow(ctx)
-      record_thread_allow(ctx, other, @head)
+      MergeForge.record_thread_allow(ctx, other, @head)
 
       assert {:skipped, :allow_not_for_checkpoint} =
                MergeExecutor.run(ctx.tenant_id, ctx.story_id)
@@ -1912,7 +1919,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         from(r in StoryStage, where: r.story_id == ^ctx.story_id)
         |> AdminRepo.update_all(set: [stage: :deployed, merge_sha: @merge])
 
-      stub_ancestors(%{{@merge, @base_head} => true})
+      MergeForge.stub_ancestors(%{{@merge, @base_head} => true})
 
       assert {:skipped, {:not_at_ci, :deployed}} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :deployed
@@ -1932,7 +1939,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
           })
 
         reset_allow(ctx)
-        record_thread_allow(ctx, other, @base)
+        MergeForge.record_thread_allow(ctx, other, @base)
         {:error, {:github_unreachable, :timeout}}
       end)
 
@@ -1951,7 +1958,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       Mox.stub(MockMergeForge, :session, fn @repo ->
         reset_allow(ctx)
-        record_thread_allow(ctx, ctx.checkpoint, @head)
+        MergeForge.record_thread_allow(ctx, ctx.checkpoint, @head)
         {:error, {:github_unreachable, :timeout}}
       end)
 
@@ -1964,7 +1971,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         {:error, {:github_unreachable, :timeout}}
       end)
 
-      stub_ancestors(%{{@merge, @base_head} => true})
+      MergeForge.stub_ancestors(%{{@merge, @base_head} => true})
 
       assert {:merged, @merge} = MergeExecutor.run(ctx.tenant_id, ctx.story_id, true)
 
@@ -1979,7 +1986,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         {:error, {:github_unreachable, :timeout}}
       end)
 
-      stub_ancestors(%{{@merge, @base_head} => true})
+      MergeForge.stub_ancestors(%{{@merge, @base_head} => true})
 
       assert {:escalated, {{:merged_not_recorded, :stale_stage}, @merge}} =
                MergeExecutor.run(ctx.tenant_id, ctx.story_id, true)
@@ -2059,7 +2066,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
         {:ok, true}
       end)
 
-      stub_ancestors(%{{@merge, @base_head} => true})
+      MergeForge.stub_ancestors(%{{@merge, @base_head} => true})
 
       assert {:ok, %Verdict{decision: :already_merged, merge_sha: @merge}} = enforce(ctx)
 
@@ -2074,7 +2081,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       # CI ran green on the base update's exact sha; the base has not moved again.
       stub_thread(ctx, head: @base_update, tree: @base_update_tree, merge_base: @moved_base)
-      stub_base_head(@moved_base, ctx.branch)
+      MergeForge.stub_base_head(@moved_base, ctx.branch)
 
       Mox.stub(MockMergeForge, :commit, fn
         @session, @base_update ->
@@ -2084,7 +2091,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
           {:ok, %{sha: @moved_base, tree_sha: @base_tree, parents: []}}
       end)
 
-      stub_ancestors(%{{@moved_base, @base_update} => true})
+      MergeForge.stub_ancestors(%{{@moved_base, @base_update} => true})
 
       Mox.stub(MockMergeForge, :create_commit, fn @session, commit ->
         send(test_pid, {:created, commit})
@@ -2123,50 +2130,19 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end
   end
 
-  # The claim's implement dispatch, PLACED in thread mode on `master` — the gate reads the
-  # mode, the base branch and the branch from this row, never from the intake source — and the
-  # claim's first checkpoint. Written to the ledger row directly: placement is
-  # `DispatchLedger.record_sent/4`'s, tested there.
+  # The claim's thread-mode dispatch and first checkpoint (`fixture(:thread_claim)`). The
+  # executor's own behaviour is the `merge executor (US-45.5)` block above.
   defp thread_setup(ctx) do
     {_raw_key, runner} = fixture(:runner, %{tenant_id: ctx.tenant_id})
+    MergeForge.stub_app_unreachable()
 
-    {:ok, dispatch_row} =
-      Repo.with_tenant(ctx.tenant_id, fn ->
-        Repo.insert!(%Loopctl.Runners.DispatchRecord{
-          tenant_id: ctx.tenant_id,
-          runner_id: runner.id,
-          dispatch_id: Ecto.UUID.generate(),
-          story_id: ctx.story_id,
-          claim_epoch: 0,
-          kind: "implement",
-          mode: "thread",
-          base_branch: "master",
-          # Released, so the row holds no slot and `runner_dispatches_unreleased_bounded`
-          # has nothing to bound.
-          status: "accepted",
-          wall_clock_seconds: 3_600,
-          released_at: DateTime.utc_now()
-        })
-      end)
-
-    checkpoint =
-      fixture(:thread_checkpoint, %{
-        tenant_id: ctx.tenant_id,
-        story_id: ctx.story_id,
-        seq: 1,
-        commit_sha: @head,
-        tree_sha: @tree
-      })
-
-    # US-45.5: every recorded thread allow enqueues the merge executor, and Oban runs it
-    # INLINE here. These tests judge the gate, so the executor finds the App unreachable —
-    # a transient fault it answers by retrying later, which changes nothing now. The
-    # executor's own behaviour is the `merge executor (US-45.5)` block below.
-    Mox.stub(MockMergeForge, :session, fn _repo ->
-      {:error, {:github_unreachable, :econnrefused}}
-    end)
-
-    %{checkpoint: checkpoint, dispatch_row: dispatch_row}
+    fixture(:thread_claim, %{
+      tenant_id: ctx.tenant_id,
+      story_id: ctx.story_id,
+      runner_id: runner.id,
+      commit_sha: @head,
+      tree_sha: @tree
+    })
   end
 
   # The executor's refused fast-forward, then GitHub's clean merge of the moved base into the
@@ -2210,21 +2186,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end)
   end
 
-  defp record_thread_allow(ctx, checkpoint, sha) do
-    {:ok, _row} =
-      Stages.record_effect(ctx.tenant_id, ctx.story_id, :merge_gate_allowed_sha, sha,
-        claim_epoch: 0,
-        event_data: %{
-          "checkpoint_id" => checkpoint.id,
-          "checkpoint_sha" => sha,
-          "base_sha" => @base_head
-        }
-      )
-  end
-
-  # The forge as the executor sees it on the happy path: the base head is the allow's
-  # `base_sha`, the thread branch names the checkpoint, the checkpoint contains the base, and
-  # every write succeeds. A test overrides what it is about.
   defp stub_flunk(call, 2),
     do:
       Mox.stub(MockPullRequestSource, call, fn _a, _b ->
@@ -2236,37 +2197,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       Mox.stub(MockPullRequestSource, call, fn _a, _b, _c ->
         flunk("#{call} read with no credential")
       end)
-
-  defp stub_forge(branch) do
-    Mox.stub(MockMergeForge, :session, fn @repo -> {:ok, @session} end)
-    stub_base_head(@base_head, branch)
-
-    Mox.stub(MockMergeForge, :commit, fn
-      @session, @head -> {:ok, %{sha: @head, tree_sha: @tree, parents: [@base_head]}}
-      @session, sha -> {:ok, %{sha: sha, tree_sha: @base_tree, parents: []}}
-    end)
-
-    stub_ancestors(%{{@base_head, @head} => true})
-    Mox.stub(MockMergeForge, :create_commit, fn @session, _commit -> {:ok, @merge} end)
-    Mox.stub(MockMergeForge, :update_ref, fn @session, "master", _sha -> :ok end)
-    Mox.stub(MockMergeForge, :create_ref, fn @session, _temp, @head -> :ok end)
-    Mox.stub(MockMergeForge, :delete_ref, fn @session, _temp -> :ok end)
-    Mox.stub(MockMergeForge, :merge, fn _s, _b, _h, _m -> flunk("no base merge expected") end)
-  end
-
-  defp stub_base_head(base_head, branch \\ nil) do
-    Mox.stub(MockMergeForge, :branch_head, fn
-      @session, "master" -> {:ok, base_head}
-      @session, thread when thread == branch or is_nil(branch) -> {:ok, @head}
-    end)
-  end
-
-  # `ancestor?/3` answers from `known`, false for any pair it does not name.
-  defp stub_ancestors(known) do
-    Mox.stub(MockMergeForge, :ancestor?, fn @session, ancestor, descendant ->
-      {:ok, Map.get(known, {ancestor, descendant}, false)}
-    end)
-  end
 
   defp merge_commit(ctx) do
     AdminRepo.get!(Loopctl.Threads.Checkpoint, ctx.checkpoint.id).merge_commit_sha
@@ -2523,49 +2453,5 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     Mox.stub(MockPullRequestSource, :repo_files, fn %ForgeRepo{full_name: @repo}, _ref ->
       {:ok, @repo_files}
     end)
-  end
-
-  defp build_story(tenant) do
-    project = fixture(:project, %{tenant_id: tenant.id})
-    epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
-    agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
-    verifier_agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :orchestrator})
-
-    fixture(:intake_source, %{
-      tenant_id: tenant.id,
-      project_id: project.id,
-      repo_full_name: @repo,
-      required_checks: ["test"]
-    })
-
-    {:ok, %{dispatch: implementer}} =
-      Dispatches.create_dispatch(tenant.id, %{role: :agent, agent_id: agent.id})
-
-    {:ok, %{dispatch: verifier}} =
-      Dispatches.create_dispatch(tenant.id, %{role: :orchestrator, agent_id: verifier_agent.id})
-
-    story =
-      fixture(:story, %{tenant_id: tenant.id, epic_id: epic.id, project_id: project.id})
-      |> Ecto.Changeset.change(%{
-        agent_status: :reported_done,
-        verified_status: :verified,
-        assigned_agent_id: agent.id,
-        implementer_dispatch_id: implementer.id,
-        verifier_dispatch_id: verifier.id
-      })
-      |> AdminRepo.update!()
-
-    fixture(:story_stage, %{
-      tenant_id: tenant.id,
-      story_id: story.id,
-      stage: :ci,
-      claim_epoch: 0,
-      pr_number: 4242,
-      head_sha: @head
-    })
-
-    fixture(:triage_verdict, %{tenant_id: tenant.id, story_id: story.id})
-
-    %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}
   end
 end

@@ -52,20 +52,30 @@ defmodule Loopctl.OwnLog do
   end
 
   @doc """
-  The entries of an `ExUnit.CaptureLog.capture_log/2` string that name `id`, joined in order.
+  Runs `fun` and returns, joined in order, the captured entries that name `id`. `opts` go to
+  `ExUnit.CaptureLog.with_log/2`.
 
   The key for a line that may be logged outside the calling process (a channel, a pass over
   the whole fleet), which `with_own_log/2`'s pid key would drop: every concurrent test's
-  entries are in the capture, and an id this test generated is in none of theirs. `capture_log/2`'s format
-  opens each entry with a timestamp after a newline, so the split is there and a multi-line
-  entry stays whole. A `refute` over the result is only as strong as the refuted line's
-  promise to carry `id`, so key on an id the line actually prints.
+  entries are in the capture, and an id this test generated is in none of theirs. Every
+  entry is rendered with its metadata, so an id carried only as metadata (`tenant_id:`)
+  matches too, and opens with the record separator, so the split never depends on the
+  message's own text and a multi-line entry stays whole. A `refute` over the result is only as
+  strong as the refuted line's promise to carry `id`, so key on an id the line actually names.
   """
-  @spec entries_naming(String.t(), String.t()) :: String.t()
-  def entries_naming(log, id) when is_binary(log) and is_binary(id) do
+  @spec capture_naming(String.t(), keyword(), (-> term())) :: String.t()
+  def capture_naming(id, opts \\ [], fun) when is_binary(id) do
+    formatter = [
+      format: "#{@sep}$metadata[$level] $message\n",
+      metadata: :all,
+      colors: [enabled: false]
+    ]
+
+    {_result, log} = with_log(Keyword.merge(opts, formatter), fun)
+
     log
-    |> String.split(~r/\n(?=\d{2}:\d{2}:\d{2}\.\d{3} )/)
+    |> String.split(@sep, trim: true)
     |> Enum.filter(&String.contains?(&1, id))
-    |> Enum.join("\n")
+    |> Enum.join()
   end
 end

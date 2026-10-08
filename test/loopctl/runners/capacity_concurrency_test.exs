@@ -19,6 +19,7 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
 
   import Ecto.Query
   import Loopctl.Fixtures
+  import Mox, only: [verify_on_exit!: 1]
 
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
@@ -30,6 +31,8 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
   alias Loopctl.Runners.Runner
   alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Story
+
+  setup :verify_on_exit!
 
   setup_all do
     sweep_committed_runner_tenants()

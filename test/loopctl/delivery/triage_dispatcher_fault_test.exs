@@ -15,16 +15,19 @@ defmodule Loopctl.Delivery.TriageDispatcherFaultTest do
 
   use ExUnit.Case, async: false
 
-  import Ecto.Query
   import Loopctl.Fixtures
+  import Mox, only: [verify_on_exit!: 1]
 
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageDispatcher
   alias Loopctl.Repo
   alias Loopctl.Test.ProductionTopology
+  alias Loopctl.Test.TriageDispatch
 
   @budgets %{wall_clock_seconds: 900, max_turns: 30}
+
+  setup :verify_on_exit!
 
   setup_all do
     sweep_committed_runner_tenants()
@@ -49,34 +52,13 @@ defmodule Loopctl.Delivery.TriageDispatcherFaultTest do
 
   describe "run_with/2 over stranded rows" do
     test "a stranded row whose escalation RAISES does not stop the rest of the pass", ctx do
-      broken = detected_story(ctx)
-      half_take(ctx, broken)
-      fine = detected_story(ctx)
-      half_take(ctx, fine)
+      broken = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      TriageDispatch.half_take(ctx.tenant.id, broken)
+      fine = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      TriageDispatch.half_take(ctx.tenant.id, fine)
 
-      # A fault no refusal names, on the broken row only: committed DDL, which is why this
-      # module is `async: false` (see the moduledoc).
-      name = "test_stranded_fault_" <> String.replace(broken.id, "-", "")
-
-      AdminRepo.query!("""
-      CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        RAISE EXCEPTION 'some_other_fault: injected by test';
-      END
-      $$
-      """)
-
-      AdminRepo.query!("""
-      CREATE TRIGGER #{name} BEFORE UPDATE ON story_stages FOR EACH ROW
-      WHEN (NEW.story_id = '#{broken.id}') EXECUTE FUNCTION #{name}()
-      """)
-
-      on_exit(fn ->
-        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
-
-        AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON story_stages")
-        AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-      end)
+      # A fault no refusal names, on the broken row only.
+      fail_stage_updates!(broken.id)
 
       outcomes =
         ExUnit.CaptureLog.with_log(fn ->
@@ -92,32 +74,12 @@ defmodule Loopctl.Delivery.TriageDispatcherFaultTest do
     end
 
     test "failing stranded rows do not hold every slot: a later one is still finished", ctx do
-      broken = detected_story(ctx)
-      half_take(ctx, broken)
-      fine = detected_story(ctx)
-      half_take(ctx, fine)
+      broken = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      TriageDispatch.half_take(ctx.tenant.id, broken)
+      fine = fixture(:detected_story, %{tenant_id: ctx.tenant.id})
+      TriageDispatch.half_take(ctx.tenant.id, fine)
 
-      name = "test_stranded_hol_" <> String.replace(broken.id, "-", "")
-
-      AdminRepo.query!("""
-      CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        RAISE EXCEPTION 'some_other_fault: injected by test';
-      END
-      $$
-      """)
-
-      AdminRepo.query!("""
-      CREATE TRIGGER #{name} BEFORE UPDATE ON story_stages FOR EACH ROW
-      WHEN (NEW.story_id = '#{broken.id}') EXECUTE FUNCTION #{name}()
-      """)
-
-      on_exit(fn ->
-        :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
-
-        AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON story_stages")
-        AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-      end)
+      fail_stage_updates!(broken.id)
 
       # A pass limit of ONE, and the failing row is the older: bounded by the pass's limit, the
       # sweep would take only it, every pass, and never reach `fine`.
@@ -129,64 +91,48 @@ defmodule Loopctl.Delivery.TriageDispatcherFaultTest do
     end
   end
 
-  # A story as INTAKE leaves it: created from a record, its stage row open at `detected`, its
-  # project bound to a repository.
-  defp detected_story(ctx, opts \\ []) do
-    story = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})
-
-    if Keyword.get(opts, :intake_record, true),
-      do: attach_record(ctx, story, Keyword.get(opts, :bind_repo, true), opts)
-
-    {:ok, _row} = Stages.open(ctx.tenant.id, story.id, actor_label: "test")
-    story
-  end
-
-  # The record AND its source, on the story's own project when the story is meant to be
-  # addressable. `intake_sources_active_repo_uidx` allows ONE active source per repository per
-  # tenant, so the fixture's source has to BE the story's rather than a second one beside it.
+  # Every UPDATE of `story_id`'s stage row raises a fault no refusal names. Committed DDL,
+  # which is why this module is `async: false` (see the moduledoc).
   #
-  # `bind_repo: false` leaves the source on the fixture's own project instead, which is the
-  # real shape of a story whose project nobody bound: it has a record and no repository.
-  defp attach_record(ctx, story, bind_repo?, opts) do
-    repo = "mkreyman/repo-#{System.unique_integer([:positive])}"
+  # The drop is registered BEFORE the create, so no path out of this function leaves the
+  # objects with nothing registered to drop them (`IF EXISTS` makes it a no-op when the create
+  # never committed).
+  # `SET LOCAL`, never a bare `SET`: `CREATE TRIGGER` takes an ACCESS EXCLUSIVE lock, so this
+  # fails fast instead of hanging the run, and the setting reverts with the transaction rather
+  # than riding a pooled connection into the next test.
+  defp fail_stage_updates!(story_id) do
+    name = "test_stage_fault_" <> String.replace(story_id, "-", "")
+    on_exit(fn -> drop_stage_fault!(name) end)
 
-    attrs =
-      if bind_repo?,
-        do: %{
-          tenant_id: ctx.tenant.id,
-          project_id: story.project_id,
-          issue_number: 412,
-          repo_full_name: repo
-        },
-        else: %{tenant_id: ctx.tenant.id, issue_number: 412, repo_full_name: repo}
+    {:ok, _} =
+      AdminRepo.transaction(fn ->
+        AdminRepo.query!("SET LOCAL lock_timeout = '5s'")
 
-    attrs =
-      case Keyword.get(opts, :body) do
-        nil -> attrs
-        body -> Map.put(attrs, :untrusted_body, body)
-      end
+        AdminRepo.query!("""
+        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'some_other_fault: injected by test';
+        END
+        $$
+        """)
 
-    {_source, record} = fixture(:intake_pair, attrs)
+        AdminRepo.query!("""
+        CREATE TRIGGER #{name} BEFORE UPDATE ON story_stages FOR EACH ROW
+        WHEN (NEW.story_id = '#{story_id}') EXECUTE FUNCTION #{name}()
+        """)
+      end)
 
-    {1, _} =
-      AdminRepo.update_all(
-        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
-        set: [intake_record_id: record.id]
-      )
-
-    record
+    :ok
   end
 
-  # The FIRST half of the too-large route alone: `triaged`, nothing bound, no verdict.
-  defp half_take(ctx, story) do
-    row = Stages.get(ctx.tenant.id, story.id)
-
-    {:ok, _row} =
-      Stages.advance(ctx.tenant.id, story.id, {:detected, :triaged, :forward},
-        claim_epoch: row.claim_epoch,
-        actor_label: "worker:triage_dispatcher",
-        actor_role: :agent,
-        actor_lineage: []
-      )
+  # Unguarded and outside a transaction, deliberately. A `lock_timeout` here would abort with
+  # the trigger still installed, which IS the leak the drop exists to prevent; unguarded it
+  # waits and then succeeds. Unwrapped, the trigger (the object that does the damage) goes
+  # first, and a failed function drop leaves an orphan nothing fires.
+  defp drop_stage_fault!(name) do
+    :ok = ProductionTopology.checkout_unboxed!([AdminRepo])
+    AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON story_stages")
+    AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
+    :ok
   end
 end

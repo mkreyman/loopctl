@@ -27,24 +27,24 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
 
   import Ecto.Query
   import Loopctl.Fixtures
+  import Loopctl.Test.Placement
+  import Mox, only: [verify_on_exit!: 1]
   import Phoenix.ChannelTest
 
   alias Loopctl.AdminRepo
-  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Delivery.Placement
-  alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
-  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.Test.ProductionTopology
-  alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.RunnerSocket
 
   @endpoint LoopctlWeb.Endpoint
   @reply_timeout 2_000
+
+  setup :verify_on_exit!
 
   setup_all do
     sweep_committed_runner_tenants()
@@ -69,10 +69,15 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
     story = fixture(:committed_story, %{tenant_id: runner.tenant_id})
     :ok = ProductionTopology.checkout_unboxed!([Repo, AdminRepo])
 
-    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
+    {:ok, socket} =
+      connect(RunnerSocket, %{}, connect_info: build(:runner_connect_info, %{token: raw}))
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, join_payload("minis"))
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        build(:runner_join, %{"machine" => "minis"})
+      )
 
     _ = :sys.get_state(channel.channel_pid)
 
@@ -114,7 +119,9 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
         AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
       end)
 
-      assert {:error, :dependencies_not_met} = place(ctx, dispatch_payload(story))
+      assert {:error, :dependencies_not_met} =
+               place(ctx, build(:placement_dispatch, %{"story_id" => story.id}))
+
       refute_push "dispatch", _pushed, 200
 
       session = session_dispatch(runner.tenant_id, story.id)
@@ -143,7 +150,9 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
           # decision — the return value is the PUSH refusal, never the release's or the
           # escalation's.
           assert {:error, :runner_not_connected} =
-                   place(ctx, dispatch_payload(story), actor_label: "api:dispatch_placement")
+                   place(ctx, build(:placement_dispatch, %{"story_id" => story.id}),
+                     actor_label: "api:dispatch_placement"
+                   )
         end)
 
       assert log =~ "the story is ESCALATED"
@@ -201,7 +210,9 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
       log =
         ExUnit.CaptureLog.capture_log(fn ->
           assert {:error, :runner_not_connected} =
-                   place(ctx, dispatch_payload(story), actor_label: "api:dispatch_placement")
+                   place(ctx, build(:placement_dispatch, %{"story_id" => story.id}),
+                     actor_label: "api:dispatch_placement"
+                   )
         end)
 
       # THE TWO STATEMENTS AFTER THE CLEAR BOTH RAN. `log_undo/5` reports the undo, and the
@@ -245,7 +256,8 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
           # Claims, is refused by the absent runner, then compensates. The caller still gets
           # its own refusal — a revoke that RAISES used to replace it with a Postgrex error
           # and skip both steps after it, `park_unreleased_claim/6` included.
-          assert {:error, :runner_not_connected} = place(ctx, dispatch_payload(story))
+          assert {:error, :runner_not_connected} =
+                   place(ctx, build(:placement_dispatch, %{"story_id" => story.id}))
         end)
 
       assert log =~ "placement could not revoke the session dispatch"
@@ -292,7 +304,7 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
     test "deletes immutable entries, and leaves the connection's triggers ON", ctx do
       %{runner: runner, story: story} = ctx
 
-      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert {:ok, _placed} = place(ctx, build(:placement_dispatch, %{"story_id" => story.id}))
       assert_push "dispatch", _pushed, @reply_timeout
       assert claimed_entry(runner.tenant_id, story.id)
 
@@ -498,23 +510,6 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
     Placement.place(runner.tenant_id, runner.id, payload, opts)
   end
 
-  # A story contracted and standing at `queued`, which is what a placement takes.
-  defp contract_and_queue(tenant_id, story) do
-    {:ok, story} =
-      Progress.contract_story(tenant_id, story.id, %{},
-        actor_label: "test",
-        skip_contract_check: true
-      )
-
-    {:ok, _row} = Stages.open(tenant_id, story.id, actor_label: "test")
-
-    epoch = story.claim_epoch
-    {:ok, _} = Stages.advance(tenant_id, story.id, {:detected, :triaged}, claim_epoch: epoch)
-    {:ok, _} = Stages.advance(tenant_id, story.id, {:triaged, :queued}, claim_epoch: epoch)
-
-    story
-  end
-
   defp chain_entry_count(tenant_id) do
     AdminRepo.aggregate(
       from(e in AuditChain.Entry, where: e.tenant_id == ^tenant_id),
@@ -526,95 +521,5 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
   defp replication_role do
     %{rows: [[role]]} = AdminRepo.query!("SHOW session_replication_role")
     role
-  end
-
-  defp session_dispatch(tenant_id, story_id) do
-    AdminRepo.one!(
-      from d in Dispatch, where: d.tenant_id == ^tenant_id and d.story_id == ^story_id
-    )
-  end
-
-  # NO `story` KEY: loopctl builds the object itself now (`attach_story/6`), and `place/4`
-  # REFUSES a caller-supplied one — a caller able to hand a runner prose is able to run
-  # anything on that machine. What the runner receives is asserted in "the dispatch carries
-  # the story object loopctl built" rather than echoed from here.
-  # NO `branch`, which is the shape an operator sends now that loopctl derives one from the
-  # target runner's declaration (story 846.2) and the endpoint documents OMIT THIS. The
-  # fixture names a branch of its own; since round 2 that branch is REFUSED
-  # `branch_not_unique`, because a caller-supplied name must still carry the story's own
-  # suffix or two stories on one repository could share one. Tests that are ABOUT a
-  # caller-supplied branch put one back explicitly.
-  defp dispatch_payload(story) do
-    :runner_dispatch |> build(%{"story_id" => story.id}) |> Map.delete("branch")
-  end
-
-  defp reload(tenant_id, story_id) do
-    {:ok, story} = Stories.get_story(tenant_id, story_id)
-    story
-  end
-
-  defp claimed_entry(tenant_id, story_id) do
-    AdminRepo.one!(
-      from e in AuditChain.Entry,
-        where: e.tenant_id == ^tenant_id and e.entity_id == ^story_id,
-        where: e.action == "story_stage_claimed"
-    )
-  end
-
-  # The STAGE EVENT rather than the chain entry, because `actor_label` is a column on
-  # `story_stage_events` and is not on a chain entry at all.
-  defp escalation_events(tenant_id, story_id) do
-    AdminRepo.all(
-      from e in StageEvent,
-        where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
-        where: e.to_stage == "escalated",
-        order_by: e.inserted_at
-    )
-  end
-
-  # Unlinked first: `leave/1` shuts the channel down with `{:shutdown, :left}`, and
-  # `subscribe_and_join/3` linked it to the test process, so the exit would take the test with
-  # it before a single assertion ran.
-  defp disconnect(channel, runner) do
-    Process.unlink(channel.channel_pid)
-    leave(channel)
-    wait_until_disconnected(runner)
-  end
-
-  # Presence untracks when the channel process EXITS, which happens after `leave/1` returns, so
-  # this polls rather than asserting once. It needs a real pause between attempts: a tight
-  # recursion spent all fifty in well under a millisecond and flaked roughly one run in four.
-  defp wait_until_disconnected(runner, attempts \\ 100) do
-    cond do
-      Loopctl.Runners.live_metas(runner.tenant_id, runner.id) == [] ->
-        :ok
-
-      attempts == 0 ->
-        flunk("the runner's presence entry never went away")
-
-      true ->
-        Process.sleep(20)
-        wait_until_disconnected(runner, attempts - 1)
-    end
-  end
-
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine) do
-    %{
-      "contract_version" => RunnerContract.version(),
-      "machine" => machine,
-      "cores" => 16,
-      "memory_mb" => 28_000,
-      "repos" => ["mkreyman/home_care_billing"],
-      "max_sessions" => 2,
-      "in_flight" => 0,
-      "draining" => false
-    }
   end
 end

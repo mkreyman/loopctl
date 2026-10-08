@@ -20,6 +20,7 @@ defmodule Loopctl.Delivery.SessionEndReleaseFaultTest do
 
   import Ecto.Query
   import Loopctl.Fixtures
+  import Mox, only: [verify_on_exit!: 1]
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
@@ -36,6 +37,8 @@ defmodule Loopctl.Delivery.SessionEndReleaseFaultTest do
   alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Queries
   alias Loopctl.WorkBreakdown.Story
+
+  setup :verify_on_exit!
 
   setup_all do
     sweep_committed_runner_tenants()
