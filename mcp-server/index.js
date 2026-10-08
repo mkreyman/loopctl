@@ -4239,13 +4239,13 @@ const TOOLS = [
   {
     name: "delete_project",
     description:
-      "Delete a project and all of its dependent resources (epics, stories, audit entries scoped to it). REQUIRES LOOPCTL_USER_KEY to be set in the MCP server env (user role — orchestrator role is NOT sufficient for this destructive operation). The deletion is irreversible.",
+      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, and no API call changes or releases one. REQUIRES LOOPCTL_USER_KEY (user role; orchestrator role is NOT sufficient).",
     inputSchema: {
       type: "object",
       properties: {
         project_id: {
           type: "string",
-          description: "The UUID of the project to delete.",
+          description: "The UUID of the project to archive.",
         },
       },
       required: ["project_id"],
