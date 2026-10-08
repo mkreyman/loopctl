@@ -30,10 +30,7 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
 
   setup do
     tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-    implementer = fixture(:agent, %{tenant_id: tenant.id})
-
-    {impl_raw, _impl_key} =
-      fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: implementer.id})
+    {impl_raw, _impl_key, implementer} = fixture(:agent_key, %{tenant_id: tenant.id})
 
     {operator_raw, _operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
     {runner_raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "reviewer"})

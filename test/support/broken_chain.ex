@@ -22,16 +22,22 @@ defmodule Loopctl.Test.BrokenChain do
   """
   @spec install!(String.t(), String.t()) :: :ok
   def install!(tenant_id, text \\ @default_text) do
+    {:ok, _} = Ecto.UUID.cast(tenant_id)
     name = trigger_name(tenant_id)
+    # Registered first, so a CREATE TRIGGER that fails after its function committed still
+    # drops the function. `remove!/1` is IF EXISTS throughout.
+    on_exit(fn -> remove!(tenant_id) end)
 
     unboxed(fn ->
       AdminRepo.query!("""
-      CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
+      CREATE OR REPLACE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
       BEGIN
-        RAISE EXCEPTION '#{text}' USING ERRCODE = 'P0001';
+        RAISE EXCEPTION '%', #{quote_literal(text)} USING ERRCODE = 'P0001';
       END
       $$
       """)
+
+      AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON audit_chain")
 
       AdminRepo.query!("""
       CREATE TRIGGER #{name} BEFORE INSERT ON audit_chain FOR EACH ROW
@@ -39,8 +45,11 @@ defmodule Loopctl.Test.BrokenChain do
       """)
     end)
 
-    on_exit(fn -> remove!(tenant_id) end)
+    :ok
   end
+
+  # A SQL string literal; `text` is test-supplied, and a quote in it must not end the literal.
+  defp quote_literal(text), do: "'" <> String.replace(text, "'", "''") <> "'"
 
   @doc "Drops `tenant_id`'s refusing trigger, if it is installed."
   @spec remove!(String.t()) :: :ok

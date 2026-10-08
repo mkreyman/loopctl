@@ -34,20 +34,10 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
 
   setup :verify_on_exit!
 
-  defp topic(socket), do: "runner:" <> socket.assigns.runner.id
-
-  defp join_pool(socket, machine) do
-    {:ok, _reply, channel} =
-      subscribe_and_join(socket, topic(socket), runner_join_payload(machine))
-
-    _ = :sys.get_state(channel.channel_pid)
-    channel
-  end
-
   defp joined_runner(name \\ "minis") do
     {raw, runner} = fixture(:runner, %{name: name})
     {:ok, socket} = connect_runner_socket(raw)
-    %{runner: runner, raw: raw, channel: join_pool(socket, name)}
+    %{runner: runner, raw: raw, channel: elem(join_pool(socket, name), 1)}
   end
 
   defp dispatch_payload(tenant_id, attrs \\ %{}) do
@@ -89,8 +79,9 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
   # Under `async: true` a capture also holds entries other tests logged meanwhile, so a refute
   # or a count over it would judge them too. Every entry the runner control plane logs names
   # its runner, as Logger metadata or in the message, so this keeps the entries naming `id`.
-  # It splits where `capture_log`'s format starts an entry (its timestamp), never on bare
-  # newlines, so a multi-line entry (a crash report, its stacktrace) is kept whole.
+  # The capture starts every entry with the ASCII record separator, which never appears in a
+  # log message, and is split on it, never on bare newlines, so a multi-line entry (a crash
+  # report, its stacktrace) is kept whole.
   defp capture_runner_log(id, opts \\ [level: :info], fun) do
     {own, _all} = capture_runner_logs(id, opts, fun)
     own
@@ -99,11 +90,12 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
   # `{entries naming id, the whole capture}`: the whole capture is for refuting a value only
   # this test holds, which no other test's entry can contain.
   defp capture_runner_logs(id, opts \\ [level: :info], fun) do
-    all = capture_log(opts, fun)
+    all =
+      capture_log(Keyword.put(opts, :format, "\u001E$time $metadata[$level] $message\n"), fun)
 
     own =
       all
-      |> String.split(~r/\n(?=\d{2}:\d{2}:\d{2}\.\d{3} )/)
+      |> String.split("\u001E", trim: true)
       |> Enum.filter(&String.contains?(&1, id))
       |> Enum.join("\n")
 
@@ -368,7 +360,11 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       log =
         capture_runner_log(runner.id, fn ->
           assert {:error, %{reason: "machine_mismatch"}} =
-                   subscribe_and_join(socket, topic(socket), runner_join_payload("mac-mini"))
+                   subscribe_and_join(
+                     socket,
+                     runner_topic(socket),
+                     build(:runner_join_payload, %{"machine" => "mac-mini"})
+                   )
         end)
 
       assert_received {:refused, _,
@@ -436,7 +432,11 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
         capture_runner_log(runner.id, fn ->
           assert {:error,
                   %{reason: "not_authorized", disconnecting: "join_refused_not_authorized"}} =
-                   subscribe_and_join(socket, topic(socket), runner_join_payload("minis"))
+                   subscribe_and_join(
+                     socket,
+                     runner_topic(socket),
+                     build(:runner_join_payload, %{"machine" => "minis"})
+                   )
         end)
 
       assert log =~ "runner disconnecting: reason=join_refused_not_authorized"
@@ -448,11 +448,22 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       {raw, runner} = fixture(:runner, %{name: "minis"})
       {:ok, _} = Runners.revoke_runner(runner.tenant_id, runner.id)
 
-      # Unfiltered: a token that resolves to nothing names no runner. The positive match is
-      # this module's own line shape and the refute is over a token no other test holds.
-      log = capture_log([level: :info], fn -> assert :error = connect_runner_socket(raw) end)
+      # A token that resolves to nothing names no runner, so this connection comes from a peer
+      # address no other test uses, and the line is matched on it. The refute is over a token
+      # no other test holds.
+      n = System.unique_integer([:positive])
+      address = {127, rem(div(n, 65_536), 256), rem(div(n, 256), 256), rem(n, 256)}
+      ip = address |> :inet.ntoa() |> to_string()
 
-      assert log =~ "runner socket refused: reason=:invalid_token client_ip=127.0.0.1"
+      log =
+        capture_log([level: :info], fn ->
+          assert :error =
+                   connect(RunnerSocket, %{},
+                     connect_info: build(:runner_connect_info, %{token: raw, address: address})
+                   )
+        end)
+
+      assert log =~ "runner socket refused: reason=:invalid_token client_ip=#{ip} "
       refute log =~ raw
     end
 

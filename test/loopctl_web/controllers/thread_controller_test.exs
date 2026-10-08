@@ -25,10 +25,7 @@ defmodule LoopctlWeb.ThreadControllerTest do
 
   defp claimed_story do
     tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-    agent = fixture(:agent, %{tenant_id: tenant.id})
-
-    {raw_key, _api_key} =
-      fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+    {raw_key, _api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
     {operator_key, _operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})

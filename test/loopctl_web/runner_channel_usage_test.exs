@@ -141,7 +141,11 @@ defmodule LoopctlWeb.RunnerChannelUsageTest do
     {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, runner_join_payload(machine))
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        build(:runner_join_payload, %{"machine" => machine})
+      )
 
     _ = :sys.get_state(channel.channel_pid)
     channel

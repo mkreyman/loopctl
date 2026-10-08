@@ -38,8 +38,7 @@ defmodule LoopctlWeb.ContextRetrieverControllerTest do
   # An agent-role key (query only). api_keys.agent_id FKs agents, so mint a real
   # agent per agent key.
   defp agent_key(tenant_id) do
-    agent = fixture(:agent, %{tenant_id: tenant_id})
-    {raw, _key} = fixture(:api_key, %{tenant_id: tenant_id, role: :agent, agent_id: agent.id})
+    {raw, _key, _agent} = fixture(:agent_key, %{tenant_id: tenant_id})
     raw
   end
 

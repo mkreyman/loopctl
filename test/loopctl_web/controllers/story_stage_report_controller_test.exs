@@ -36,15 +36,9 @@ defmodule LoopctlWeb.StoryStageReportControllerTest do
   # source in `mode`, and an agent key to claim it with.
   defp setup_story(opts \\ []) do
     tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-    agent = fixture(:agent, %{tenant_id: tenant.id})
+    {raw_key, api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
-    {raw_key, api_key} =
-      fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
-
-    other = fixture(:agent, %{tenant_id: tenant.id})
-
-    {other_raw, _other_key} =
-      fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: other.id})
+    {other_raw, _other_key, _other} = fixture(:agent_key, %{tenant_id: tenant.id})
 
     story = fixture(:ledger_story, %{tenant_id: tenant.id})
 

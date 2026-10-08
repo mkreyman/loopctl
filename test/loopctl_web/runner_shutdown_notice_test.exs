@@ -36,7 +36,11 @@ defmodule LoopctlWeb.RunnerShutdownNoticeTest do
     {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, runner_join_payload("minis"))
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        build(:runner_join_payload, %{"machine" => "minis"})
+      )
 
     _ = :sys.get_state(channel.channel_pid)
     %{runner: runner, channel: channel}
@@ -84,6 +88,39 @@ defmodule LoopctlWeb.RunnerShutdownNoticeTest do
     assert handler.config.grace_ms == RunnerShutdownNotice.grace_ms()
   end
 
+  test "the attached handler function, given a real drain event, broadcasts the notice" do
+    assert [handler] =
+             Enum.filter(
+               :telemetry.list_handlers([:phoenix, :socket_drain]),
+               &(&1.id == RunnerShutdownNotice.handler_id())
+             )
+
+    # The function telemetry would call, with this test's topic in place of the node-wide one:
+    # the attached function, its metadata match and its config shape, as one path.
+    config = own_config()
+
+    handler.function.(
+      [:phoenix, :socket_drain],
+      @drain_measurements,
+      drain_metadata(RunnerSocket),
+      Map.merge(handler.config, config)
+    )
+
+    assert_receive :server_shutdown
+  end
+
+  test "attach refuses a config that could never send the notice" do
+    default = RunnerShutdownNotice.default_config()
+
+    for config <- [
+          Map.delete(default, :grace_ms),
+          %{default | topic: nil},
+          %{default | grace_ms: -1}
+        ] do
+      assert_raise FunctionClauseError, fn -> RunnerShutdownNotice.attach(config) end
+    end
+  end
+
   test "a joined runner channel is subscribed to the shutdown topic and tells its runner" do
     %{runner: runner, channel: channel} = joined_runner()
 
@@ -96,6 +133,9 @@ defmodule LoopctlWeb.RunnerShutdownNoticeTest do
       capture_log([level: :info], fn ->
         send(channel.channel_pid, :server_shutdown)
         assert_push "disconnecting", %{reason: "server_shutdown"}, reply_timeout()
+        # The push can reach this process before the channel's handler has logged; wait for
+        # the handler to return so its line is inside the capture.
+        _ = :sys.get_state(channel.channel_pid)
       end)
 
     assert Process.alive?(channel.channel_pid)

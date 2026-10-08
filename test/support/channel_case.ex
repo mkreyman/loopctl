@@ -10,8 +10,11 @@ defmodule LoopctlWeb.ChannelCase do
 
   use ExUnit.CaseTemplate
 
-  alias Loopctl.ApiSpec.RunnerContract
-  alias LoopctlWeb.RunnerSocket
+  import Ecto.Query, only: [from: 2]
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.Runners
+  alias Loopctl.Runners.Runner
 
   using do
     quote do
@@ -40,40 +43,84 @@ defmodule LoopctlWeb.ChannelCase do
   @spec reply_timeout() :: pos_integer()
   def reply_timeout, do: 10_000
 
-  @doc "The connect info a runner presents: its token header and a loopback peer."
-  @spec runner_connect_info(String.t()) :: map()
-  def runner_connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  @doc "Connects `LoopctlWeb.RunnerSocket` with `token`."
+  @doc "Connects `LoopctlWeb.RunnerSocket` with `token` (`build(:runner_connect_info, ...)`)."
   defmacro connect_runner_socket(token) do
     quote do
       connect(LoopctlWeb.RunnerSocket, %{},
-        connect_info: LoopctlWeb.ChannelCase.runner_connect_info(unquote(token))
+        connect_info: Loopctl.Fixtures.build(:runner_connect_info, %{token: unquote(token)})
       )
     end
   end
 
-  @doc "A conforming join payload for a runner on `machine`, with `overrides` merged in."
-  @spec runner_join_payload(String.t(), map()) :: map()
-  def runner_join_payload(machine, overrides \\ %{}) do
-    Map.merge(
-      %{
-        "contract_version" => RunnerContract.version(),
-        "machine" => machine,
-        "cores" => 16,
-        "memory_mb" => 28_000,
-        "repos" => ["mkreyman/home_care_billing"],
-        "max_sessions" => 2,
-        "in_flight" => 0,
-        "draining" => false
-      },
-      overrides
+  @doc "The runner's own channel topic."
+  @spec runner_topic(Phoenix.Socket.t()) :: String.t()
+  def runner_topic(socket), do: "runner:" <> socket.assigns.runner.id
+
+  @doc """
+  Joins the runner's channel declaring `overrides` and waits for `:after_join` (the Presence
+  track). Returns `{reply, channel}`. A macro, like `connect_runner_socket/1`, because the
+  channel test helpers it calls belong to the test module.
+  """
+  defmacro join_pool(socket, machine, overrides \\ quote(do: %{})) do
+    quote do
+      socket = unquote(socket)
+
+      {:ok, reply, channel} =
+        subscribe_and_join(
+          socket,
+          LoopctlWeb.ChannelCase.runner_topic(socket),
+          Loopctl.Fixtures.build(
+            :runner_join_payload,
+            Map.put(unquote(overrides), "machine", unquote(machine))
+          )
+        )
+
+      _ = :sys.get_state(channel.channel_pid)
+      {reply, channel}
+    end
+  end
+
+  @doc "Whether a runner named `name` is in `tenant_id`'s pool."
+  def in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
+
+  @doc """
+  The capacity loopctl DECIDES from, as Postgres holds it on the connection the channel writes
+  on, not the meta the runner reported.
+  """
+  def held_capacity(runner) do
+    AdminRepo.one!(
+      from r in Runner,
+        where: r.id == ^runner.id,
+        select: %{
+          max_sessions: r.max_sessions,
+          in_flight: r.in_flight,
+          enrolled_max_sessions: r.enrolled_max_sessions,
+          updated_at: r.updated_at
+        }
     )
+  end
+
+  @doc """
+  The machine drops its socket and connects again declaring `overrides`. Capacity is
+  per-CONNECTION, so a rejoin is the only way to change one. Returns the new channel.
+  """
+  defmacro rejoin(runner, raw, channel, overrides) do
+    quote do
+      runner = unquote(runner)
+      channel = unquote(channel)
+      Process.unlink(channel.channel_pid)
+      ref = leave(channel)
+      assert_reply ref, :ok, _, LoopctlWeb.ChannelCase.reply_timeout()
+
+      assert LoopctlWeb.ChannelCase.eventually(
+               fn -> not LoopctlWeb.ChannelCase.in_pool?(runner.tenant_id, "minis") end,
+               LoopctlWeb.ChannelCase.reply_timeout()
+             )
+
+      {:ok, socket} = connect_runner_socket(unquote(raw))
+      {_reply, channel} = join_pool(socket, "minis", unquote(overrides))
+      channel
+    end
   end
 
   @doc """

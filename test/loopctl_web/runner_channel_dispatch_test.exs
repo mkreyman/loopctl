@@ -15,7 +15,6 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   use LoopctlWeb.ChannelCase, async: true
 
-  import Ecto.Query
   import ExUnit.CaptureLog
 
   alias Loopctl.ApiSpec.RunnerContract
@@ -23,7 +22,6 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Auth
-  alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
@@ -34,19 +32,6 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   alias Loopctl.Tenants
 
   setup :verify_on_exit!
-
-  # Joins and waits for the channel to process :after_join (the Presence track).
-  defp topic(socket), do: "runner:" <> socket.assigns.runner.id
-
-  defp join_pool(socket, machine, overrides \\ %{}) do
-    {:ok, reply, channel} =
-      subscribe_and_join(socket, topic(socket), runner_join_payload(machine, overrides))
-
-    _ = :sys.get_state(channel.channel_pid)
-    {reply, channel}
-  end
-
-  defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
 
   # The channel's own view of the runner's meta — what Presence replicates and what both
   # `Runners.declared_kinds/1` and `Runners.suppressed_kinds/1` read at the decision.
@@ -85,37 +70,6 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     epoch = Map.get(attrs, "claim_epoch", 0)
     story = fixture(:ledger_story, %{tenant_id: tenant_id, claim_epoch: epoch})
     build(:runner_dispatch, Map.put(attrs, "story_id", story.id))
-  end
-
-  # The capacity loopctl DECIDES from, read on the RLS connection the channel writes on.
-  defp held_capacity(runner) do
-    {:ok, held} =
-      Repo.with_tenant(runner.tenant_id, fn ->
-        Repo.one!(
-          from r in Runner,
-            where: r.id == ^runner.id,
-            select: %{
-              max_sessions: r.max_sessions,
-              in_flight: r.in_flight,
-              updated_at: r.updated_at
-            }
-        )
-      end)
-
-    held
-  end
-
-  # The machine drops its socket and connects again declaring `overrides`. Capacity is
-  # per-CONNECTION, so a rejoin is the only way to change one.
-  defp rejoin(runner, raw, channel, overrides) do
-    Process.unlink(channel.channel_pid)
-    ref = leave(channel)
-    assert_reply ref, :ok, _, reply_timeout()
-    assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
-
-    {:ok, socket} = connect_runner_socket(raw)
-    {_reply, channel} = join_pool(socket, "minis", overrides)
-    channel
   end
 
   describe "the capacity a joining machine declares" do
@@ -187,17 +141,20 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # Zero is inside `RunnerJoin`'s range and outside the column's. Ignoring it would leave
       # the enrolled two standing — the exact over-reservation this path exists to end. A
       # machine that wants NO work sets `draining`.
-      {raw, runner} = fixture(:runner, %{name: "minis", max_sessions: 2})
+      # A runner name no other test holds: under async the capture also holds other tests'
+      # lines, and the assertion below must match this runner's.
+      name = "minis-#{System.unique_integer([:positive])}"
+      {raw, runner} = fixture(:runner, %{name: name, max_sessions: 2})
       {:ok, socket} = connect_runner_socket(raw)
 
       log =
         capture_log(fn ->
-          {reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 0})
+          {reply, _channel} = join_pool(socket, name, %{"max_sessions" => 0})
           assert reply == %{contract_version: RunnerContract.version()}
         end)
 
       assert held_capacity(runner).max_sessions == 1
-      assert log =~ "declared max_sessions 0"
+      assert log =~ "runner #{name} declared max_sessions 0"
 
       # #846.4 review ROUND 2, finding 4: the held number (1, asserted above) and the one the
       # pool reports are NOT equal here, and this is the one case where that is correct rather
@@ -778,7 +735,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
       assert_push "dispatch", _, reply_timeout()
 
-      held = in_flight_of(runner)
+      held = held_capacity(runner).in_flight
       assert held >= 1
 
       ref =
@@ -794,7 +751,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       # A capability statement costs the runner no capacity: the refusal gave the slot back
       # in the same transaction that recorded it, exactly as every other refusal does.
-      assert in_flight_of(runner) == held - 1
+      assert held_capacity(runner).in_flight == held - 1
 
       assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
 
@@ -807,7 +764,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       refute_push "dispatch", _
       assert DispatchLedger.get_record(runner.tenant_id, second["dispatch_id"]) == nil
-      assert in_flight_of(runner) == held - 1
+      assert held_capacity(runner).in_flight == held - 1
     end
 
     test "an ordinary refusal does not make a kind unsupported",
@@ -911,7 +868,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       first = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
       assert_push "dispatch", _, reply_timeout()
-      held = in_flight_of(runner)
+      held = held_capacity(runner).in_flight
 
       ref =
         push(channel, "dispatch_reply", %{
@@ -922,7 +879,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         })
 
       assert_reply ref, :ok, _, reply_timeout()
-      assert in_flight_of(runner) == held - 1
+      assert held_capacity(runner).in_flight == held - 1
 
       # Without the brake this is :ok and the loop has no bound at all.
       second = dispatch_payload(runner.tenant_id)
@@ -932,7 +889,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       refute_push "dispatch", _
       assert DispatchLedger.get_record(runner.tenant_id, second["dispatch_id"]) == nil
-      assert in_flight_of(runner) == held - 1
+      assert held_capacity(runner).in_flight == held - 1
 
       # #834 round 2, finding 4. The DECLARATION is untouched — a suppression is loopctl
       # withholding work, not the runner revising what it said. Folding the two made the
@@ -1194,7 +1151,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # vocabulary and is what a triage-only machine would say.
       _channel = rejoin_declaring(channel, raw, runner, ["triage"])
 
-      held = in_flight_of(runner)
+      held = held_capacity(runner).in_flight
       payload = dispatch_payload(runner.tenant_id)
 
       assert {:error, :kind_not_supported} =
@@ -1202,7 +1159,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       refute_push "dispatch", _
       assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
-      assert in_flight_of(runner) == held
+      assert held_capacity(runner).in_flight == held
 
       # Refused on the declaration alone: the ledger holds no refusal for this pair, so
       # nothing but the join payload can have decided it.
@@ -1329,21 +1286,6 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   defp status_of(runner, dispatch),
     do: DispatchLedger.get_record(runner.tenant_id, dispatch["dispatch_id"]).status
-
-  # The runner's `in_flight` as Postgres holds it, read on the RLS connection the dispatch
-  # path reserves on.
-  defp in_flight_of(runner) do
-    {:ok, in_flight} =
-      Loopctl.Repo.with_tenant(runner.tenant_id, fn ->
-        Loopctl.Repo.one!(
-          from r in Loopctl.Runners.Runner,
-            where: r.id == ^runner.id and r.tenant_id == ^runner.tenant_id,
-            select: r.in_flight
-        )
-      end)
-
-    in_flight
-  end
 
   describe "dispatch_reply" do
     setup do

@@ -26,6 +26,12 @@ Ecto.Adapters.SQL.Sandbox.mode(Loopctl.Repo, :manual)
 # that bypasses the route (`Ecto.Adapters.SQL.query(Loopctl.AdminRepo, ...)`) failing on
 # ownership; the pool's default, :auto, would hand it an unsandboxed connection that COMMITS.
 Ecto.Adapters.SQL.Sandbox.mode(Process.whereis(Loopctl.AdminRepo), :manual)
+
+# Committed rows a killed earlier run left behind (its modules sweep their own tenants only
+# when they END). Once, before any test, so a fleet-wide pass asserting an exact outcome list
+# never sees them. Only rows older than any module holds one: two runs in one tree share its
+# test database, and a younger tenant may belong to a run still going.
+Loopctl.Fixtures.sweep_committed_runner_tenants(older_than: 600)
 {:ok, _lock_guard} = Loopctl.Test.LockGuard.start()
 
 # VM-global :atomics counter backing `Loopctl.Fixtures.next_story_number/0`.

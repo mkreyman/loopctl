@@ -11,7 +11,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
   and the channel's write on the test's sandbox connection really waits on it (until a
   statement timeout or `Capacity.lock_timeout_ms/0`). One sandbox connection cannot block
   itself, so the holder needs a second, and a row two connections both see must be COMMITTED:
-  the runner (`committed_runner/2`) and, where a test locks it, the dispatch. A committed row
+  the runner (`tracked_committed_runner/2`) and, where a test locks it, the dispatch. A committed row
   is visible to every concurrently running test, so the module runs alone and the tenants it
   made are swept when it ends. Every lock is on this test's own rows.
   """
@@ -35,60 +35,6 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
 
   setup_all do
     %{committed: track_committed_tenants()}
-  end
-
-  # A committed runner whose tenant, and only the tenants this module made, are swept when the
-  # module ends: the marker sweep would also delete the committed rows of another worktree's
-  # suite running against the same test database.
-  defp committed_runner(ctx, attrs) do
-    {raw, runner} = fixture(:committed_runner, attrs)
-    track_committed_tenant(ctx.committed, runner.tenant_id)
-    {raw, runner}
-  end
-
-  # Joins and waits for the channel to process :after_join (the Presence track).
-  defp topic(socket), do: "runner:" <> socket.assigns.runner.id
-
-  defp join_pool(socket, machine, overrides) do
-    {:ok, reply, channel} =
-      subscribe_and_join(socket, topic(socket), runner_join_payload(machine, overrides))
-
-    _ = :sys.get_state(channel.channel_pid)
-    {reply, channel}
-  end
-
-  defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
-
-  # The capacity loopctl DECIDES from, read on the sandbox connection the channel writes on:
-  # the channel's write is uncommitted, so the holder's connection cannot see it.
-  defp held_capacity(runner) do
-    {:ok, held} =
-      Repo.with_tenant(runner.tenant_id, fn ->
-        Repo.one!(
-          from r in Runner,
-            where: r.id == ^runner.id,
-            select: %{
-              max_sessions: r.max_sessions,
-              in_flight: r.in_flight,
-              updated_at: r.updated_at
-            }
-        )
-      end)
-
-    held
-  end
-
-  # The machine drops its socket and connects again declaring `overrides`. Capacity is
-  # per-CONNECTION, so a rejoin is the only way to change one.
-  defp rejoin(runner, raw, channel, overrides) do
-    Process.unlink(channel.channel_pid)
-    ref = leave(channel)
-    assert_reply ref, :ok, _, reply_timeout()
-    assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
-
-    {:ok, socket} = connect_runner_socket(raw)
-    {_reply, channel} = join_pool(socket, "minis", overrides)
-    channel
   end
 
   # Moves the capacity Postgres holds, COMMITTED, with no channel involved — see the caller
@@ -215,7 +161,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
       # And the write was never retried. The machine stayed dispatchable against the STALE
       # LARGER number until it happened to reconnect: `Capacity.heal/3` recomputes `in_flight`
       # and never `max_sessions`, so nothing else reconciles it.
-      {raw, runner} = committed_runner(ctx, %{name: "minis", max_sessions: 2})
+      {raw, runner} = tracked_committed_runner(ctx.committed, %{name: "minis", max_sessions: 2})
 
       # A real committed transaction on its OWN connection holding the runners row, so the
       # channel's UPDATE genuinely waits on a lock rather than on a stub.
@@ -263,7 +209,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
       # silent node re-asserted its stale declaration over a newer connection's, every 30
       # seconds, leaving the machine dispatched against a capacity it no longer declares — the
       # defect this story exists to end.
-      {raw, runner} = committed_runner(ctx, %{name: "minis", max_sessions: 4})
+      {raw, runner} = tracked_committed_runner(ctx.committed, %{name: "minis", max_sessions: 4})
 
       # The row starts at 1 under a ceiling of 4, so the socket under test has something to
       # write. Done as a COMMITTED update rather than by joining a first socket: a channel's
@@ -343,7 +289,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
 
   describe "a database lock the channel cannot get" do
     setup ctx do
-      {raw, runner} = committed_runner(ctx, %{name: "minis", max_sessions: 4})
+      {raw, runner} = tracked_committed_runner(ctx.committed, %{name: "minis", max_sessions: 4})
       {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
       %{runner: runner, channel: channel}

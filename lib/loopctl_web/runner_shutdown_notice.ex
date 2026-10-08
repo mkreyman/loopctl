@@ -27,9 +27,16 @@ defmodule LoopctlWeb.RunnerShutdownNotice do
   @handler_id {__MODULE__, :socket_drain}
   @grace_ms 500
 
-  @doc "Attaches the drain handler, broadcasting on `config.topic`. Idempotent."
+  @doc """
+  Attaches the drain handler, broadcasting on `config.topic`. Idempotent. A config without a
+  string topic and a non-negative grace raises here rather than attaching a handler that
+  could never send the notice.
+  """
   @spec attach(%{topic: String.t(), grace_ms: non_neg_integer()}) :: :ok
-  def attach(config \\ default_config()) do
+  def attach(config \\ default_config())
+
+  def attach(%{topic: topic, grace_ms: grace_ms} = config)
+      when is_binary(topic) and is_integer(grace_ms) and grace_ms >= 0 do
     :telemetry.detach(@handler_id)
 
     :ok =
@@ -58,8 +65,12 @@ defmodule LoopctlWeb.RunnerShutdownNotice do
         [:phoenix, :socket_drain],
         measurements,
         %{socket: LoopctlWeb.RunnerSocket},
-        %{topic: topic, grace_ms: grace_ms}
+        config
       ) do
+    # Matched in the body, not the head: a config of another shape must crash the handler
+    # (telemetry then detaches and logs it), never fall through to the no-op clause below.
+    %{topic: topic, grace_ms: grace_ms} = config
+
     Logger.info(
       "runner socket draining: node=#{Runners.node_name()} machine=#{inspect(Runners.machine_id())} " <>
         "sockets=#{inspect(Map.get(measurements, :count))}"

@@ -41,7 +41,11 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
     {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, runner_join_payload("minis"))
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        build(:runner_join_payload, %{"machine" => "minis"})
+      )
 
     _ = :sys.get_state(channel.channel_pid)
 

@@ -44,7 +44,7 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
       subscribe_and_join(
         socket,
         "runner:" <> runner.id,
-        runner_join_payload("minis", %{"repos" => [@repo]})
+        build(:runner_join_payload, Map.put(%{"repos" => [@repo]}, "machine", "minis"))
       )
 
     _ = :sys.get_state(channel.channel_pid)

@@ -33,10 +33,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
   # stage row at `stage`, both inside the `Repo` sandbox.
   defp claimed_story(stage \\ :implementing) do
     tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-    agent = fixture(:agent, %{tenant_id: tenant.id})
-
-    {raw_key, _api_key} =
-      fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+    {raw_key, _api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})
 
@@ -74,10 +71,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
   # `contract_story/3` run on `AdminRepo`. Both see the test's one sandbox connection.
   defp escalated_story do
     tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-    agent = fixture(:agent, %{tenant_id: tenant.id})
-
-    {raw_key, _api_key} =
-      fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+    {raw_key, _api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
     {operator_key, _operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
     story = fixture(:ledger_story, %{tenant_id: tenant.id})
@@ -123,10 +117,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
     test "a story the delivery loop has never touched answers null, not 404", %{conn: conn} do
       tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-      agent = fixture(:agent, %{tenant_id: tenant.id})
-
-      {raw_key, _api_key} =
-        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+      {raw_key, _api_key, _agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
       story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: 0})
 
@@ -303,10 +294,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
     test "409 not_claimant for an agent that is not the story's", %{conn: conn} do
       %{tenant: tenant, story: story} = claimed_story()
-      agent = fixture(:agent, %{tenant_id: tenant.id})
-
-      {other_key, _api_key} =
-        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+      {other_key, _api_key, _agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
       conn =
         conn
@@ -422,10 +410,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
     test "404 when the story has no delivery stage row", %{conn: conn} do
       tenant = fixture(:tenant, %{trust_tier: :human_anchored})
-      agent = fixture(:agent, %{tenant_id: tenant.id})
-
-      {raw_key, _api_key} =
-        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+      {raw_key, _api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
       story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})
 
@@ -445,10 +430,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
     test "a story in ANOTHER tenant is a 404, not another tenant's escalation", %{conn: conn} do
       %{story: story} = claimed_story()
       intruder = fixture(:tenant, %{trust_tier: :human_anchored})
-      agent = fixture(:agent, %{tenant_id: intruder.id})
-
-      {raw_key, _api_key} =
-        fixture(:api_key, %{tenant_id: intruder.id, role: :agent, agent_id: agent.id})
+      {raw_key, _api_key, _agent} = fixture(:agent_key, %{tenant_id: intruder.id})
 
       conn =
         conn

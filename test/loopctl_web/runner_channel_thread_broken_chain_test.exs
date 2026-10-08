@@ -14,7 +14,7 @@ defmodule LoopctlWeb.RunnerChannelThreadBrokenChainTest do
   (`Loopctl.Test.LockGuard` fails such a test at teardown). So it is COMMITTED and dropped at
   exit, which only a module ExUnit runs alone may do.
 
-  The runner is committed too (`committed_runner/2`, its tenant swept when the module ends),
+  The runner is committed too (`tracked_committed_runner/2`, its tenant swept when the module ends),
   for an ordering reason: `fixture(:runner)` enrols through `Loopctl.Runners.enroll_runner/3`,
   which appends to the chain inside the sandbox, and the committed `CREATE TRIGGER` would then
   wait on that row lock for the rest of the test. Everything else stays in the sandbox.
@@ -37,15 +37,6 @@ defmodule LoopctlWeb.RunnerChannelThreadBrokenChainTest do
     %{committed: track_committed_tenants()}
   end
 
-  # A committed runner whose tenant, and only the tenants this module made, are swept when the
-  # module ends: the marker sweep would also delete the committed rows of another worktree's
-  # suite running against the same test database.
-  defp committed_runner(ctx, attrs) do
-    {raw, runner} = fixture(:committed_runner, attrs)
-    track_committed_tenant(ctx.committed, runner.tenant_id)
-    {raw, runner}
-  end
-
   @epoch 3
   @sha1 String.duplicate("a", 40)
   @tree String.duplicate("c", 40)
@@ -53,11 +44,15 @@ defmodule LoopctlWeb.RunnerChannelThreadBrokenChainTest do
   # A joined runner holding an ACCEPTED implement dispatch for a story its agent has claimed
   # at `@epoch`, through a custody dispatch as a placement would have minted it.
   setup ctx do
-    {raw, runner} = committed_runner(ctx, %{name: "minis"})
+    {raw, runner} = tracked_committed_runner(ctx.committed, %{name: "minis"})
     {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, runner_join_payload("minis"))
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        build(:runner_join_payload, %{"machine" => "minis"})
+      )
 
     _ = :sys.get_state(channel.channel_pid)
 
