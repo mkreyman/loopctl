@@ -8,23 +8,20 @@ defmodule Loopctl.Delivery.CompletionTest do
   not even an operator could move it. The same defect as `triaged -> queued` (#847), at the
   other end of the line.
 
-  `async: false` and COMMITTED, for the reason `Loopctl.Delivery.PostDeployVerificationTest`
-  records and this module shares: the sweep's candidate read is a FLEET-WIDE query on
-  `Loopctl.AdminRepo` that resolves the tenant from the row rather than assuming one, while
-  the stage write goes through the RLS `Loopctl.Repo`. Two sandbox connections cannot see each
-  other's uncommitted rows, so a sandboxed version of this file would assert a selection that
-  never sees its own fixtures. `sweep_committed_runner_tenants/0` removes them.
+  The sweep's candidate read is a FLEET-WIDE query on `Loopctl.AdminRepo` that resolves the
+  tenant from the row rather than assuming one, while the stage write goes through the RLS
+  `Loopctl.Repo`. AdminRepo runs on Repo's sandbox connection in test
+  (`Loopctl.AdminRepo.Route`), so both see this test's own rows and nothing here commits.
 
   Every test binds a fact the sweep reads. The two that matter most are the SETTLEMENT rule's
   halves: a story whose reporter is still owed a comment must WAIT, and a story that owes
   nobody anything must not wait for ever.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.Completion
   alias Loopctl.Delivery.StageMachine
@@ -32,45 +29,32 @@ defmodule Loopctl.Delivery.CompletionTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
   @epoch 2
 
   setup do
-    sweep_committed_runner_tenants()
-    %{tenant: fixture(:committed_tenant, %{trust_tier: :human_anchored})}
-  end
-
-  defp unboxed(fun) do
-    Sandbox.unboxed_run(Loopctl.Repo, fun)
+    %{tenant: fixture(:tenant, %{trust_tier: :human_anchored})}
   end
 
   # A story at `verified`: the stage the loop leaves it in once the deploy has been checked.
   defp verified_story(ctx) do
-    story = fixture(:committed_story, %{tenant_id: ctx.tenant.id})
+    story = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})
 
-    unboxed(fn ->
-      # The STORY's epoch is what `advance/4` fences on — the stage row's is what the sweep
-      # READS and passes back. They agree on every story the loop actually produces; the
-      # epoch test below is the one that drives them apart on purpose.
-      {1, _} =
-        AdminRepo.update_all(
-          from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
-          set: [claim_epoch: @epoch]
-        )
+    # The STORY's epoch is what `advance/4` fences on — the stage row's is what the sweep
+    # READS and passes back. They agree on every story the loop actually produces; the
+    # epoch test below is the one that drives them apart on purpose.
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+        set: [claim_epoch: @epoch]
+      )
 
-      fixture(:story_stage, %{
-        repo: AdminRepo,
-        tenant_id: ctx.tenant.id,
-        story_id: story.id,
-        stage: :verified,
-        claim_epoch: @epoch
-      })
-    end)
+    fixture(:story_stage, %{
+      repo: AdminRepo,
+      tenant_id: ctx.tenant.id,
+      story_id: story.id,
+      stage: :verified,
+      claim_epoch: @epoch
+    })
 
     story
   end
@@ -87,28 +71,24 @@ defmodule Loopctl.Delivery.CompletionTest do
         :pending -> %{}
       end
 
-    unboxed(fn ->
-      fixture(
-        :issue_closure,
-        Map.merge(
-          %{repo: AdminRepo, tenant_id: ctx.tenant.id, story_id: story.id, status: status},
-          extra
-        )
+    fixture(
+      :issue_closure,
+      Map.merge(
+        %{repo: AdminRepo, tenant_id: ctx.tenant.id, story_id: story.id, status: status},
+        extra
       )
-    end)
+    )
   end
 
   defp candidate_ids(limit \\ 50),
-    do: unboxed(fn -> Enum.map(Completion.candidates(limit), & &1.story_id) end)
+    do: Enum.map(Completion.candidates(limit), & &1.story_id)
 
-  defp stage_of(story), do: unboxed(fn -> Stages.get(story.tenant_id, story.id) end).stage
+  defp stage_of(story), do: Stages.get(story.tenant_id, story.id).stage
 
   defp complete(story, opts \\ []) do
-    unboxed(fn ->
-      Completion.complete(story.tenant_id, story.id,
-        claim_epoch: Keyword.get(opts, :claim_epoch, @epoch)
-      )
-    end)
+    Completion.complete(story.tenant_id, story.id,
+      claim_epoch: Keyword.get(opts, :claim_epoch, @epoch)
+    )
   end
 
   describe "candidates/1 — the settlement rule" do
@@ -161,30 +141,26 @@ defmodule Loopctl.Delivery.CompletionTest do
       closure(ctx, story, :abandoned)
       refute story.id in candidate_ids()
 
-      unboxed(fn ->
-        AdminRepo.update_all(
-          from(c in Loopctl.Intake.IssueClosure,
-            where: c.tenant_id == ^ctx.tenant.id and c.story_id == ^story.id
-          ),
-          set: [status: :pending, abandoned_reason: nil, updated_at: DateTime.utc_now()]
-        )
-      end)
+      AdminRepo.update_all(
+        from(c in Loopctl.Intake.IssueClosure,
+          where: c.tenant_id == ^ctx.tenant.id and c.story_id == ^story.id
+        ),
+        set: [status: :pending, abandoned_reason: nil, updated_at: DateTime.utc_now()]
+      )
 
       refute story.id in candidate_ids()
     end
 
     test "a story at any OTHER stage is nobody's business here", ctx do
-      story = fixture(:committed_story, %{tenant_id: ctx.tenant.id})
+      story = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})
 
-      unboxed(fn ->
-        fixture(:story_stage, %{
-          repo: AdminRepo,
-          tenant_id: ctx.tenant.id,
-          story_id: story.id,
-          stage: :deployed,
-          claim_epoch: @epoch
-        })
-      end)
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: ctx.tenant.id,
+        story_id: story.id,
+        stage: :deployed,
+        claim_epoch: @epoch
+      })
 
       refute story.id in candidate_ids()
     end

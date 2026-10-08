@@ -4,18 +4,19 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   a reply applies once and only from the runner it was sent to at the dispatched epoch, and
   a trace is stored once per `(run_id, seq)` with a contiguous ack computed in SQL.
 
-  ## Why `async: false` and COMMITTED runners
-
   The ledger runs on the RLS `Loopctl.Repo` (inside `Repo.with_tenant/2`), while tenants,
-  runner keys and runner rows are written through `Loopctl.AdminRepo`. The two are separate
-  sandbox connections that cannot see each other's uncommitted rows, and a ledger row's
-  foreign keys must see its tenant and runner — so those are committed
-  (`fixture(:committed_runner)`), swept at module boundaries, and no other test may run
-  meanwhile. Every read of a ledger or trace row here goes through `Repo.with_tenant/2`,
-  the path the code uses, so the RLS policy is exercised rather than bypassed.
+  runner keys and runner rows are written through `Loopctl.AdminRepo`. AdminRepo runs on
+  Repo's sandbox connection in test (`Loopctl.AdminRepo.Route`), so a ledger row's foreign
+  keys see the tenant and runner this test inserted and nothing here commits. Every read of
+  a ledger or trace row here goes through `Repo.with_tenant/2`, the path the code uses, so
+  the RLS policy is exercised rather than bypassed.
+
+  Telemetry handlers are global, so each one here takes only events emitted by this test's
+  own processes (`own_process?/1`): another module running at the same time emits the same
+  events.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   import Ecto.Query
 
@@ -31,17 +32,15 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
   setup do
     # Room for every dispatch a test here sends: capacity is tested in
     # `Loopctl.Runners.CapacityTest`, and a slot limit would only cap how many rows a test can
     # write.
-    {_raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 64})
+    tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+
+    {_raw, runner} =
+      fixture(:runner, %{tenant_id: tenant.id, name: "minis", max_sessions: 64})
+
     %{runner: runner}
   end
 
@@ -203,7 +202,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "refuses a dispatch_id already recorded with a different identity", %{runner: runner} do
-      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
       record = sent(runner)
 
       base =
@@ -263,8 +262,8 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "the same dispatch_id in another tenant is a separate row", %{runner: runner} do
       record = sent(runner)
-      tenant_b = fixture(:committed_tenant, %{})
-      {_raw, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
 
       {:ok, dispatch} =
         RunnerContract.cast_dispatch(
@@ -322,7 +321,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "one runner's refusal does not speak for another", %{runner: runner} do
-      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
 
       record = sent(runner)
 
@@ -337,7 +336,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   describe "unsupported_kinds/1" do
     test "groups the tenant's barred kinds by runner, and omits runners with none",
          %{runner: runner} do
-      {_raw, clean} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, clean} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
 
       barred = sent(runner)
 
@@ -360,7 +359,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "is tenant-scoped", %{runner: runner} do
-      other_tenant = fixture(:committed_tenant, %{})
+      other_tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
 
       record = sent(runner)
 
@@ -520,7 +519,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "a reply for another runner's dispatch is unknown and changes nothing",
          %{runner: runner} do
-      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
       record = sent(other)
 
       assert {:error, :unknown_dispatch} = reply(runner, record)
@@ -529,8 +528,8 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "a reply for another tenant's dispatch is unknown and changes nothing",
          %{runner: runner} do
-      tenant_b = fixture(:committed_tenant, %{})
-      {_raw, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
       record_b = sent(runner_b)
 
       assert {:error, :unknown_dispatch} = reply(runner, record_b)
@@ -812,6 +811,11 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
   end
 
+  # Whether a telemetry handler is running in `test_pid` or a process it started: handlers are
+  # global, and a module running concurrently emits the same events.
+  defp own_process?(test_pid),
+    do: self() == test_pid or test_pid in Process.get(:"$callers", [])
+
   # The row-lock clause of every `stories` query `fun` issues on `Repo`, in order.
   defp story_locks(fun) do
     test_pid = self()
@@ -976,7 +980,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "a batch for another runner's dispatch is refused", %{runner: runner, run_id: run_id} do
-      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
       theirs = accepted(other)
 
       assert {:error, :unknown_dispatch} = trace(runner, theirs, run_id, [0])
@@ -1000,8 +1004,8 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       record: record,
       run_id: run_id
     } do
-      tenant_b = fixture(:committed_tenant, %{})
-      {_raw, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
       record_b = accepted(runner_b)
 
       assert {:ok, 1} = trace(runner, record, run_id, [0, 1])
@@ -1025,7 +1029,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "answers -1 for a run another runner holds", %{runner: runner} do
-      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
       theirs = accepted(other)
       run_id = Ecto.UUID.generate()
       assert {:ok, 0} = trace(other, theirs, run_id, [0])
@@ -1095,7 +1099,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "another tenant's story is not a story for this tenant's dispatch", %{runner: runner} do
-      tenant_b = fixture(:committed_tenant, %{})
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
       theirs = fixture(:ledger_story, %{tenant_id: tenant_b.id})
 
       {:ok, dispatch} =
@@ -1214,7 +1218,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
         handler,
         [:loopctl, :runners, :ledger_rejected_by_database],
         fn _event, measurements, metadata, _ ->
-          send(test_pid, {:rejected, measurements, metadata})
+          if own_process?(test_pid), do: send(test_pid, {:rejected, measurements, metadata})
         end,
         nil
       )
@@ -1286,8 +1290,9 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
         handler,
         [[:loopctl, :repo, :query], [:loopctl, :admin_repo, :query]],
         fn [:loopctl, repo, :query], _measurements, metadata, _config ->
-          if metadata[:source] in ["runner_dispatches", "runner_trace_events"] or
-               String.contains?(metadata[:query] || "", "app.current_tenant_id") do
+          if own_process?(test_pid) and
+               (metadata[:source] in ["runner_dispatches", "runner_trace_events"] or
+                  String.contains?(metadata[:query] || "", "app.current_tenant_id")) do
             send(test_pid, {:ledger_query, repo, metadata[:source], metadata[:params]})
           end
         end,
@@ -1320,8 +1325,8 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "under RLS alone, one tenant's context reads none of another tenant's rows",
          %{runner: runner} do
-      tenant_b = fixture(:committed_tenant, %{})
-      {_raw, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
       run_a = Ecto.UUID.generate()
       run_b = Ecto.UUID.generate()
 

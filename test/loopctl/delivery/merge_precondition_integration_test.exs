@@ -2,30 +2,20 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   @moduledoc """
   `Loopctl.Delivery.MergePrecondition.evaluate/3` and `enforce/3` end to end (issue #803).
 
-  ## Why this module is `async: false` with committed rows
-
   The precondition reads the story, the intake source and the dispatch lineage on
   `AdminRepo` (as `Loopctl.Progress`, `Loopctl.Intake` and `Loopctl.Dispatches` all do) and
   the stage row on `Loopctl.Repo` (as `Loopctl.Delivery.Stages` does, and it is the only
-  writer of that table). In production both see the same committed database. Under
-  `Ecto.Adapters.SQL.Sandbox` each repo is a SEPARATE owner with its own transaction, so a
-  row one repo inserted is invisible to the other and its FKs fail — measured, not assumed:
-  a sandboxed `AdminRepo` tenant makes a `Repo` insert into `story_stages` fail
-  `story_stages_tenant_id_fkey`.
+  writer of that table). AdminRepo runs on Repo's sandbox connection in test
+  (`Loopctl.AdminRepo.Route`), so both see this test's own rows and nothing here commits.
 
-  So the rows here are COMMITTED under a `fixture(:committed_tenant)`, exactly as
-  `Loopctl.Delivery.StagesLockTest` does for its own reason, and the tenant is swept at
-  module boundaries. Everything that can be tested without this — the whole decision, in
-  `Loopctl.Delivery.MergePreconditionJudgeTest`, and the custody clause, in
-  `Loopctl.Progress.MergeCustodyStatusTest` — is `async: true` and touches none of it.
+  The two tests whose subject is a lock ANOTHER session holds (on the dispatch ledger, on the
+  stage row) are `Loopctl.Delivery.MergePreconditionLockTest`. The whole decision without
+  the database is `Loopctl.Delivery.MergePreconditionJudgeTest`, and the custody clause is
+  `Loopctl.Progress.MergeCustodyStatusTest`.
   """
 
-  use ExUnit.Case, async: false
+  use Loopctl.DataCase, async: true
 
-  import Ecto.Query, only: [from: 2]
-  import Loopctl.Fixtures
-
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.Escalations
@@ -50,28 +40,10 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   @base String.duplicate("b", 40)
   @repo_files ["priv/rates/2026.csv", "lib/widgets_web/router.ex", "lib/widgets/thing.ex"]
 
-  setup_all do
-    full_sweep()
-    on_exit(&full_sweep/0)
-    :ok
-  end
+  setup :verify_on_exit!
 
   setup do
-    # This module is on ExUnit.Case, so it gets none of DataCase's stubs, and several
-    # dependencies resolve through Mox. `stub_all_defaults/0` is the shared set, called
-    # directly as the `:scale` modules do. Global mode is safe in an `async: false` module.
-    Mox.set_mox_global()
-    Loopctl.DataCase.stub_all_defaults()
-
-    # `fixture(:committed_tenant)` runs its own unboxed AdminRepo checkout, so it goes first.
-    tenant = fixture(:committed_tenant, %{})
-    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
-    :ok = Sandbox.checkout(Repo, sandbox: false)
-
-    ctx = build_story(tenant)
-    on_exit(fn -> purge_tenant(tenant.id) end)
-
-    ctx
+    build_story(fixture(:tenant, %{trust_tier: :agent_rooted}))
   end
 
   describe "evaluate/3" do
@@ -936,35 +908,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:ok, %Verdict{decision: :allow, mode: :thread}} = evaluate(ctx)
     end
 
-    test "a route the ledger cannot answer is unevaluated with the mode UNKNOWN, never pr",
-         ctx do
-      test_pid = self()
-
-      # A lock on the ledger held elsewhere: the route read waits out its lock_timeout and
-      # answers :busy, so nothing is judged on a guessed route.
-      holder =
-        spawn(fn ->
-          :ok = Sandbox.checkout(Repo, sandbox: false)
-
-          Repo.transaction(fn ->
-            Repo.query!("LOCK TABLE runner_dispatches IN ACCESS EXCLUSIVE MODE")
-            send(test_pid, :held)
-
-            receive do
-              :release -> :ok
-            end
-          end)
-
-          Sandbox.checkin(Repo)
-        end)
-
-      assert_receive :held, 5_000
-      on_exit(fn -> send(holder, :release) end)
-
-      assert {:ok, %Verdict{decision: :unevaluated, mode: nil}} = evaluate(ctx)
-      send(holder, :release)
-    end
-
     test "a base that moved on since the checkpoint still allows, claim live or not", ctx do
       # The diff judged is the three-dot diff against the merge base; base freshness is the
       # merge executor's (US-45.5, AC-45.5.8), so the allow records THAT merge base.
@@ -1403,25 +1346,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
                MergeExecutor.run(ctx.tenant_id, ctx.story_id)
 
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
-    end
-
-    test "round 2, finding 4: a transient failure writing merged retries, and the retry adopts it",
-         ctx do
-      test_pid = self()
-
-      Mox.stub(MockMergeForge, :update_ref, fn @session, "master", @merge ->
-        hold_stage_row(ctx, test_pid)
-        :ok
-      end)
-
-      assert {:retry, {:merged_not_recorded, @merge, :busy}} =
-               MergeExecutor.run(ctx.tenant_id, ctx.story_id)
-
-      assert_receive :row_released, 10_000
-      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
-
-      stub_ancestors(%{{@merge, @base_head} => true})
-      assert {:already_merged, @merge} = MergeExecutor.run(ctx.tenant_id, ctx.story_id)
     end
 
     test "a retry on an unmoved base reuses the commit it recorded rather than minting another",
@@ -2204,9 +2128,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   # claim's first checkpoint. Written to the ledger row directly: placement is
   # `DispatchLedger.record_sent/4`'s, tested there.
   defp thread_setup(ctx) do
-    {_raw_key, runner} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id})
-    # The fixture's unboxed run gives up this process's AdminRepo checkout; take it back.
-    checkout_admin()
+    {_raw_key, runner} = fixture(:runner, %{tenant_id: ctx.tenant_id})
 
     {:ok, dispatch_row} =
       Repo.with_tenant(ctx.tenant_id, fn ->
@@ -2354,30 +2276,6 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     ThreadMergeSweepWorker.candidates_query()
     |> Ecto.Query.exclude(:limit)
     |> AdminRepo.all()
-  end
-
-  # Holds the story's stage row FOR UPDATE from another connection for longer than a stage
-  # write waits, so the executor's `ci -> merged` meets real contention (`:busy`). Returns once
-  # the lock is held; `:row_released` arrives when it is let go.
-  defp hold_stage_row(ctx, test_pid) do
-    parent = self()
-
-    Task.start(fn ->
-      :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
-
-      AdminRepo.transaction(fn ->
-        AdminRepo.query!("SELECT 1 FROM story_stages WHERE story_id = $1 FOR UPDATE", [
-          Ecto.UUID.dump!(ctx.story_id)
-        ])
-
-        send(parent, :row_held)
-        Process.sleep(3_000)
-      end)
-
-      send(test_pid, :row_released)
-    end)
-
-    assert_receive :row_held, 5_000
   end
 
   defp set_stage(ctx, stage) do
@@ -2669,69 +2567,5 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     fixture(:triage_verdict, %{tenant_id: tenant.id, story_id: story.id})
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}
-  end
-
-  # Three things block the sweep of a committed tenant, and all three are this module's own
-  # committed test data: `dispatches` and `api_keys` have tenant FKs that do not cascade,
-  # and `audit_chain` has one with a delete-BLOCKING trigger (entering `escalated` is a
-  # chained transition, so every refusal appends to it).
-  defp purge_tenant(tenant_id) do
-    checkout_admin()
-    purge_dependents("tenant_id = $1", [Ecto.UUID.dump!(tenant_id)])
-  end
-
-  # The same purge over every committed-runner tenant, then the tenants themselves. Run at
-  # both module boundaries: an earlier run that died mid-test leaves rows behind, and the
-  # sweep alone cannot delete a tenant they still reference.
-  defp full_sweep do
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      purge_dependents(
-        "tenant_id IN (SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')",
-        []
-      )
-    end)
-
-    sweep_committed_runner_tenants()
-  end
-
-  # ONE transaction around the trigger toggle and the deletes: DDL is transactional in
-  # Postgres, so a failing DELETE rolls the DISABLE back with it. Run as separate
-  # autocommitted statements, a failure in the middle would leave the audit chain's
-  # delete-blocking trigger OFF for the rest of the run, in a database every branch on this
-  # box shares.
-  defp purge_dependents(predicate, params) do
-    {:ok, :ok} =
-      AdminRepo.transaction(fn ->
-        AdminRepo.query!(
-          "ALTER TABLE audit_chain DISABLE TRIGGER audit_chain_prevent_delete_trigger"
-        )
-
-        AdminRepo.query!("DELETE FROM audit_chain WHERE #{predicate}", params)
-
-        # `stories` references both dispatch columns, so the refs go before the rows.
-        AdminRepo.query!(
-          "UPDATE stories SET implementer_dispatch_id = NULL, verifier_dispatch_id = NULL " <>
-            "WHERE #{predicate}",
-          params
-        )
-
-        AdminRepo.query!("DELETE FROM dispatches WHERE #{predicate}", params)
-        AdminRepo.query!("DELETE FROM api_keys WHERE #{predicate}", params)
-
-        AdminRepo.query!(
-          "ALTER TABLE audit_chain ENABLE TRIGGER audit_chain_prevent_delete_trigger"
-        )
-
-        :ok
-      end)
-
-    :ok
-  end
-
-  defp checkout_admin do
-    case Sandbox.checkout(Loopctl.Repo, sandbox: false) do
-      :ok -> :ok
-      {:already, :owner} -> :ok
-    end
   end
 end

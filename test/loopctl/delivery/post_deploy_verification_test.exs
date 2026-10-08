@@ -3,28 +3,17 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
   `Loopctl.Delivery.PostDeployVerification.evaluate/2` and `enforce/3` end to end, plus the
   `Loopctl.Workers.PostDeployVerificationWorker` sweep that drives them (issue #803 §9).
 
-  ## Why this module is `async: false` with committed rows
-
-  The same reason `Loopctl.Delivery.MergePreconditionIntegrationTest` is: the verification
-  reads the story and the intake source on `AdminRepo` and the stage row on `Loopctl.Repo`,
-  and under `Ecto.Adapters.SQL.Sandbox` each repo is a SEPARATE owner with its own
-  transaction, so a row one inserted is invisible to the other and its FKs fail. The rows
-  here are COMMITTED under a `fixture(:committed_tenant)` and swept at module boundaries.
-
-  The WORKER's tests live here rather than in a module of their own because its candidate
-  read is on `AdminRepo` over rows this same setup commits: a separate module would be a
-  second copy of a hundred lines of committed-tenant machinery for three tests.
+  The verification reads the story and the intake source on `AdminRepo` and the stage row on
+  `Loopctl.Repo`, and the WORKER's candidate read is a fleet-wide `AdminRepo` query. AdminRepo
+  runs on Repo's sandbox connection in test (`Loopctl.AdminRepo.Route`), so every read sees
+  this test's own rows, and only them, and nothing here commits.
 
   Everything decidable without any of this is in
   `Loopctl.Delivery.PostDeployVerificationJudgeTest`, which is `async: true`.
   """
 
-  use ExUnit.Case, async: false
+  use Loopctl.DataCase, async: true
 
-  import Ecto.Query, only: [from: 2]
-  import Loopctl.Fixtures
-
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.PostDeployVerification
@@ -41,27 +30,10 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
   @merge String.duplicate("a", 40)
   @deployed String.duplicate("b", 40)
 
-  setup_all do
-    full_sweep()
-    on_exit(&full_sweep/0)
-    :ok
-  end
+  setup :verify_on_exit!
 
   setup do
-    # This module is on ExUnit.Case, so it gets none of DataCase's stubs, and the forge
-    # resolves through Mox. Global mode is safe in an `async: false` module.
-    Mox.set_mox_global()
-    Loopctl.DataCase.stub_all_defaults()
-
-    # `fixture(:committed_tenant)` runs its own unboxed AdminRepo checkout, so it goes first.
-    tenant = fixture(:committed_tenant, %{})
-    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
-    :ok = Sandbox.checkout(Repo, sandbox: false)
-
-    ctx = build_story(tenant)
-    on_exit(fn -> purge_tenant(tenant.id) end)
-
-    ctx
+    build_story(fixture(:tenant, %{trust_tier: :agent_rooted}))
   end
 
   describe "evaluate/2" do
@@ -837,67 +809,5 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
     })
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}
-  end
-
-  # `audit_chain` has a tenant FK with a delete-BLOCKING trigger, and entering `escalated`
-  # is a chained transition, so every escalation here appends to it.
-  #
-  # The tenant itself goes too, which the merge precondition's equivalent does not need to
-  # do. The WORKER's candidate read is fleet-wide and bounded at `batch_size/0`, so a test
-  # whose committed story survives its own test leaves a story at `deployed` that later
-  # sweep tests then compete with for the batch — and past the bound the sweep tests stop
-  # seeing their own story at all.
-  defp purge_tenant(tenant_id) do
-    checkout_admin()
-    dumped = Ecto.UUID.dump!(tenant_id)
-    purge_dependents("tenant_id = $1", [dumped])
-    AdminRepo.query!("DELETE FROM tenants WHERE id = $1", [dumped])
-    :ok
-  end
-
-  defp full_sweep do
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      purge_dependents(
-        "tenant_id IN (SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')",
-        []
-      )
-    end)
-
-    sweep_committed_runner_tenants()
-  end
-
-  defp purge_dependents(predicate, params) do
-    {:ok, :ok} =
-      AdminRepo.transaction(fn ->
-        AdminRepo.query!(
-          "ALTER TABLE audit_chain DISABLE TRIGGER audit_chain_prevent_delete_trigger"
-        )
-
-        AdminRepo.query!("DELETE FROM audit_chain WHERE #{predicate}", params)
-
-        AdminRepo.query!(
-          "UPDATE stories SET implementer_dispatch_id = NULL, verifier_dispatch_id = NULL " <>
-            "WHERE #{predicate}",
-          params
-        )
-
-        AdminRepo.query!("DELETE FROM dispatches WHERE #{predicate}", params)
-        AdminRepo.query!("DELETE FROM api_keys WHERE #{predicate}", params)
-
-        AdminRepo.query!(
-          "ALTER TABLE audit_chain ENABLE TRIGGER audit_chain_prevent_delete_trigger"
-        )
-
-        :ok
-      end)
-
-    :ok
-  end
-
-  defp checkout_admin do
-    case Sandbox.checkout(Loopctl.Repo, sandbox: false) do
-      :ok -> :ok
-      {:already, :owner} -> :ok
-    end
   end
 end

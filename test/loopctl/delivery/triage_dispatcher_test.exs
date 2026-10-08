@@ -3,9 +3,11 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   The hop between intake and everything else (#803 §4): a story the loop has DETECTED is sent
   to a runner to be triaged.
 
-  `async: false` and COMMITTED, for the reason `Loopctl.Delivery.PlacementTest` records: the
-  push goes through a real runner socket, whose channel process cannot see a sandbox
-  connection's uncommitted rows.
+  The push goes through a real runner socket. The channel process inherits the test's
+  `$callers`, and AdminRepo runs on Repo's sandbox connection in test
+  (`Loopctl.AdminRepo.Route`), so the socket and both repos see this test's own rows and
+  nothing here commits. The two tests that inject a fault with DDL on `story_stages` are
+  `Loopctl.Delivery.TriageDispatcherFaultTest`.
 
   Every selection test binds a fact the pass reads. What is NOT tested here is the
   configuration gate — `:dispatch_driver_enabled` is false in every environment and this repo
@@ -13,14 +15,13 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   observe and the work is reached through `run_with/2`.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
   import Ecto.Query
   import ExUnit.CaptureLog
 
   require Logger
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.DispatchDriver
@@ -32,22 +33,12 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
   @reply_timeout 2_000
   @budgets %{wall_clock_seconds: 900, max_turns: 30}
 
   setup do
-    sweep_committed_runner_tenants()
-
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-
-    {raw, runner} =
-      fixture(:committed_runner, %{tenant_id: tenant.id, name: "minis", max_sessions: 9})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "minis", max_sessions: 9})
 
     %{tenant: tenant, runner: runner, runner_key: raw}
   end
@@ -80,7 +71,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # What stops a second session on one ticket. A triage dispatch claims nothing and writes
       # no stage row, so the STAGE cannot say a session is running; the unreleased ledger row
       # is the only thing that can.
-      unboxed(fn -> write_ledger_row(ctx, story.id, released_at: nil) end)
+      write_ledger_row(ctx, story.id, released_at: nil)
       refute story.id in candidate_ids(50)
 
       # AND THE HALF THE OLD DESIGN COULD NOT DO. A triage dispatch ends without a verdict
@@ -91,7 +82,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # differ and every later attempt was refused for ever, as `:dispatch_id_conflict` if
       # another runner was picked and `:dispatch_already_replied` if the same one was — the
       # second logged at `info`, as though the fleet were merely busy.
-      unboxed(fn -> release_ledger_rows(ctx, story.id) end)
+      release_ledger_rows(ctx, story.id)
       assert story.id in candidate_ids(50)
     end
 
@@ -102,7 +93,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # not have an implement dispatch at all — placement requires `queued` — but a predicate
       # reading every kind would let one stray row hide a ticket from triage for ever, which
       # is the failure mode this whole query is being corrected for.
-      unboxed(fn -> write_ledger_row(ctx, story.id, kind: "implement", released_at: nil) end)
+      write_ledger_row(ctx, story.id, kind: "implement", released_at: nil)
       assert story.id in candidate_ids(50)
     end
   end
@@ -113,7 +104,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       record_id = reload_story(ctx, story.id).intake_record_id
       channel = join_runner(ctx, %{"kinds" => ["triage", "implement"]})
 
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:dispatched]
+      assert TriageDispatcher.run_with(20, @budgets) == [:dispatched]
       assert_push "dispatch", pushed, @reply_timeout
 
       assert pushed.kind == "triage"
@@ -129,8 +120,8 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # It CLAIMS NOTHING. A triage session decides whether the story is work at all; marking
       # it as being worked by the machine that is only deciding that would put it at
       # `claimed`, which is the stage an implement session reports from.
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :detected
-      assert unboxed(fn -> reload_story(ctx, story.id) end).agent_status == :pending
+      assert Stages.get(ctx.tenant.id, story.id).stage == :detected
+      assert reload_story(ctx, story.id).agent_status == :pending
 
       leave_channel(channel)
     end
@@ -142,7 +133,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # The declaration decides, and `Runners.accepts?/5` reads it before anything is written.
       # Sent anyway, the dispatch would be refused `kind_not_supported` after a ledger row and
       # a slot — once per story per minute, for ever.
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+      assert TriageDispatcher.run_with(20, @budgets) == [:no_runner]
       refute_push "dispatch", _pushed
     end
 
@@ -154,14 +145,12 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
       resets_at = DateTime.add(DateTime.utc_now(), 3_600, :second)
 
-      unboxed(fn ->
-        :ok =
-          Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
-      end)
+      :ok =
+        Usage.record(ctx.tenant.id, ctx.runner.id, %{exhausted: true, resets_at: resets_at})
 
       log =
         capture_log([level: :info], fn ->
-          assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+          assert TriageDispatcher.run_with(20, @budgets) == [:no_runner]
         end)
 
       refute_push "dispatch", _pushed
@@ -179,19 +168,17 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
 
       assert exhaust_after_selection(ctx.runner.id, fn ->
-               unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end)
+               TriageDispatcher.run_with(20, @budgets)
              end) == [:no_runner]
 
       refute_push "dispatch", _pushed
 
       assert [] =
-               unboxed(fn ->
-                 AdminRepo.all(
-                   from r in Loopctl.Runners.DispatchRecord,
-                     where: r.story_id == ^story.id,
-                     select: r.id
-                 )
-               end)
+               AdminRepo.all(
+                 from r in Loopctl.Runners.DispatchRecord,
+                   where: r.story_id == ^story.id,
+                   select: r.id
+               )
 
       leave_channel(channel)
     end
@@ -204,7 +191,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # before the `kinds` field existed says nothing on join and is read as declaring what
       # loopctl sent then — `implement` alone. Equalising `implied_by_silence` with
       # `dispatchable` would start sending triage to every runner ever built.
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:no_runner]
+      assert TriageDispatcher.run_with(20, @budgets) == [:no_runner]
       refute_push "dispatch", _pushed
     end
 
@@ -212,7 +199,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       story = detected_story(ctx)
       channel = join_runner(ctx, %{"kinds" => ["triage"]})
 
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:dispatched]
+      assert TriageDispatcher.run_with(20, @budgets) == [:dispatched]
       assert_push "dispatch", first, @reply_timeout
 
       # The story stays at `detected` until a verdict comes back, so nothing about the STAGE
@@ -225,9 +212,9 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # `detected` story, so the id could never differ for a runner that went away or a
       # session that died. The assertion here is the same either way; the next test is the one
       # the derivation could not pass.
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == []
+      assert TriageDispatcher.run_with(20, @budgets) == []
 
-      records = unboxed(fn -> ledger_records(ctx, story.id) end)
+      records = ledger_records(ctx, story.id)
       assert [%{dispatch_id: only}] = records
       assert only == first.dispatch_id
 
@@ -243,12 +230,12 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # minute for ever about a condition that cannot change by itself, on a story the query
       # cannot exclude either: the bound is on the RENDERED object, so no predicate can see
       # it, and the story stayed at the head of the oldest-first ranking.
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:escalated]
+      assert TriageDispatcher.run_with(20, @budgets) == [:escalated]
       refute_push "dispatch", _pushed
 
       # `detected` has no edge to `escalated`, so it takes the route the machine already has
       # for this conclusion — the one an escalating verdict takes.
-      row = unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end)
+      row = Stages.get(ctx.tenant.id, story.id)
       assert row.stage == :escalated
       assert row.escalation_reason == "triage_dispatch:triage_too_large"
 
@@ -261,95 +248,11 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       story = detected_story(ctx)
       half_take(ctx, story)
 
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [stranded: :escalated]
+      assert TriageDispatcher.run_with(20, @budgets) == [stranded: :escalated]
 
-      row = unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end)
+      row = Stages.get(ctx.tenant.id, story.id)
       assert row.stage == :escalated
       assert row.escalation_reason == "triage_dispatch:triage_too_large"
-    end
-
-    test "a stranded row whose escalation RAISES does not stop the rest of the pass", ctx do
-      broken = detected_story(ctx)
-      half_take(ctx, broken)
-      fine = detected_story(ctx)
-      half_take(ctx, fine)
-
-      # A fault no refusal names, on the broken row only: committed DDL, which is why this
-      # module is `async: false`.
-      name = "test_stranded_fault_" <> String.replace(broken.id, "-", "")
-
-      unboxed(fn ->
-        AdminRepo.query!("""
-        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
-        BEGIN
-          RAISE EXCEPTION 'some_other_fault: injected by test';
-        END
-        $$
-        """)
-
-        AdminRepo.query!("""
-        CREATE TRIGGER #{name} BEFORE UPDATE ON story_stages FOR EACH ROW
-        WHEN (NEW.story_id = '#{broken.id}') EXECUTE FUNCTION #{name}()
-        """)
-      end)
-
-      on_exit(fn ->
-        unboxed(fn ->
-          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON story_stages")
-          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-        end)
-      end)
-
-      outcomes =
-        ExUnit.CaptureLog.with_log(fn ->
-          unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end)
-        end)
-        |> elem(0)
-
-      # Tagged `{:stranded, _}`, so a pass of failing stranded rows is not judged all-errored and
-      # retried whole.
-      assert Enum.sort(outcomes) == [stranded: :errored, stranded: :escalated]
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, fine.id) end).stage == :escalated
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, broken.id) end).stage == :triaged
-    end
-
-    test "failing stranded rows do not hold every slot: a later one is still finished", ctx do
-      broken = detected_story(ctx)
-      half_take(ctx, broken)
-      fine = detected_story(ctx)
-      half_take(ctx, fine)
-
-      name = "test_stranded_hol_" <> String.replace(broken.id, "-", "")
-
-      unboxed(fn ->
-        AdminRepo.query!("""
-        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
-        BEGIN
-          RAISE EXCEPTION 'some_other_fault: injected by test';
-        END
-        $$
-        """)
-
-        AdminRepo.query!("""
-        CREATE TRIGGER #{name} BEFORE UPDATE ON story_stages FOR EACH ROW
-        WHEN (NEW.story_id = '#{broken.id}') EXECUTE FUNCTION #{name}()
-        """)
-      end)
-
-      on_exit(fn ->
-        unboxed(fn ->
-          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON story_stages")
-          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-        end)
-      end)
-
-      # A pass limit of ONE, and the failing row is the older: bounded by the pass's limit, the
-      # sweep would take only it, every pass, and never reach `fine`.
-      ExUnit.CaptureLog.with_log(fn ->
-        unboxed(fn -> TriageDispatcher.run_with(1, @budgets) end)
-      end)
-
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, fine.id) end).stage == :escalated
     end
 
     test "stranded rows are ranked per tenant: one tenant's backlog does not starve another",
@@ -359,11 +262,11 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       second = detected_story(ctx, intake_record: false)
       half_take(ctx, second)
 
-      other = %{ctx | tenant: fixture(:committed_tenant, %{trust_tier: :human_anchored})}
+      other = %{ctx | tenant: fixture(:tenant, %{trust_tier: :human_anchored})}
       theirs = detected_story(other, intake_record: false)
       half_take(other, theirs)
 
-      ids = unboxed(fn -> TriageDispatcher.stranded(500) end) |> Enum.map(& &1.story_id)
+      ids = TriageDispatcher.stranded(500) |> Enum.map(& &1.story_id)
 
       # Oldest-first across ALL tenants would put both of this tenant's rows ahead of the other
       # tenant's newer one; ranked per tenant, each tenant's first row comes before any second.
@@ -377,12 +280,10 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
       # A row triaged before the binding existed: it has a verdict, so this module's route did
       # not leave it here and escalating it as too large would misreport it.
-      unboxed(fn ->
-        fixture(:triage_verdict, tenant_id: ctx.tenant.id, story_id: story.id, bind: false)
-      end)
+      fixture(:triage_verdict, tenant_id: ctx.tenant.id, story_id: story.id, bind: false)
 
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == []
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :triaged
+      assert TriageDispatcher.run_with(20, @budgets) == []
+      assert Stages.get(ctx.tenant.id, story.id).stage == :triaged
     end
 
     test "a LEGACY source whose base_branch is not a git ref name is blocked, not pushed", ctx do
@@ -399,19 +300,17 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # whose second `validate_refs/2` call is what judges a value the intake source supplied.
       # `dispatch/4` puts this column in as BOTH `branch` and `base_branch`, so without the
       # guard the string reaches git on a dev machine the first time an issue arrives.
-      unboxed(fn ->
-        {1, _} =
-          AdminRepo.update_all(
-            from(s in Loopctl.Intake.Source,
-              where: s.tenant_id == ^ctx.tenant.id and s.project_id == ^story.project_id
-            ),
-            set: [base_branch: "--upload-pack=/bin/sh"]
-          )
-      end)
+      {1, _} =
+        AdminRepo.update_all(
+          from(s in Loopctl.Intake.Source,
+            where: s.tenant_id == ^ctx.tenant.id and s.project_id == ^story.project_id
+          ),
+          set: [base_branch: "--upload-pack=/bin/sh"]
+        )
 
       # `:blocked` — "BLOCKED until somebody changes something" — which is what this is: an
       # operator has to repoint the source, and no later pass can change it by itself.
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == [:blocked]
+      assert TriageDispatcher.run_with(20, @budgets) == [:blocked]
       refute_push "dispatch", _pushed
     end
 
@@ -425,7 +324,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
       # never moves. Twenty such stories filled every batch and no newly detected story was
       # ever triaged again, while the worker reported a clean run. The predicate is in the
       # query now, the same one and for the same reason as the driver's.
-      assert unboxed(fn -> TriageDispatcher.run_with(20, @budgets) end) == []
+      assert TriageDispatcher.run_with(20, @budgets) == []
       refute_push "dispatch", _pushed
     end
   end
@@ -437,7 +336,7 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
       # One switch for the whole unattended loop: triage running while nothing places the
       # result is a state an operator should not be able to be in by accident.
-      assert unboxed(fn -> TriageDispatcher.run(20) end) == {:ok, []}
+      assert TriageDispatcher.run(20) == {:ok, []}
       refute_push "dispatch", _pushed
     end
 
@@ -481,44 +380,36 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
-  defp unboxed(fun) do
-    Sandbox.unboxed_run(Loopctl.Repo, fun)
-  end
-
   # A story as INTAKE leaves it: created from a record, its stage row open at `detected`, its
   # project bound to a repository.
   defp detected_story(ctx, opts \\ []) do
-    story = fixture(:committed_story, %{tenant_id: ctx.tenant.id})
+    story = fixture(:ledger_story, %{tenant_id: ctx.tenant.id})
 
     if Keyword.get(opts, :intake_record, true),
       do: attach_record(ctx, story, Keyword.get(opts, :bind_repo, true), opts)
 
-    unboxed(fn ->
-      {:ok, _row} = Stages.open(ctx.tenant.id, story.id, actor_label: "test")
-      story
-    end)
+    {:ok, _row} = Stages.open(ctx.tenant.id, story.id, actor_label: "test")
+    story
   end
 
   defp queue(story) do
-    unboxed(fn ->
-      {:ok, story} =
-        Progress.contract_story(story.tenant_id, story.id, %{},
-          actor_label: "test",
-          skip_contract_check: true
-        )
+    {:ok, story} =
+      Progress.contract_story(story.tenant_id, story.id, %{},
+        actor_label: "test",
+        skip_contract_check: true
+      )
 
-      {:ok, _} =
-        Stages.advance(story.tenant_id, story.id, {:detected, :triaged},
-          claim_epoch: story.claim_epoch
-        )
+    {:ok, _} =
+      Stages.advance(story.tenant_id, story.id, {:detected, :triaged},
+        claim_epoch: story.claim_epoch
+      )
 
-      {:ok, _} =
-        Stages.advance(story.tenant_id, story.id, {:triaged, :queued},
-          claim_epoch: story.claim_epoch
-        )
+    {:ok, _} =
+      Stages.advance(story.tenant_id, story.id, {:triaged, :queued},
+        claim_epoch: story.claim_epoch
+      )
 
-      story
-    end)
+    story
   end
 
   # The record AND its source, on the story's own project when the story is meant to be
@@ -546,26 +437,22 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
         body -> Map.put(attrs, :untrusted_body, body)
       end
 
-    {_source, record} = fixture(:committed_intake, attrs)
+    {_source, record} = fixture(:intake_pair, attrs)
 
-    unboxed(fn ->
-      {1, _} =
-        AdminRepo.update_all(
-          from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
-          set: [intake_record_id: record.id]
-        )
-    end)
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+        set: [intake_record_id: record.id]
+      )
 
     record
   end
 
   defp reload_story(ctx, story_id) do
-    unboxed(fn ->
-      AdminRepo.one(
-        from s in Loopctl.WorkBreakdown.Story,
-          where: s.id == ^story_id and s.tenant_id == ^ctx.tenant.id
-      )
-    end)
+    AdminRepo.one(
+      from s in Loopctl.WorkBreakdown.Story,
+        where: s.id == ^story_id and s.tenant_id == ^ctx.tenant.id
+    )
   end
 
   defp ledger_records(ctx, story_id) do
@@ -576,10 +463,8 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
     )
   end
 
-  # A ledger row as `record_sent/3` leaves one, written directly: the channel takes this row
-  # `FOR UPDATE` on the SANDBOX connection when it pushes and holds that lock for the rest of
-  # the test, so a committed write to a row a live socket has already touched waits out its
-  # lock timeout. Selection is what is under test here and it needs no socket.
+  # A ledger row as `record_sent/3` leaves one, written directly: selection is what is under
+  # test here and it needs no socket.
   defp write_ledger_row(ctx, story_id, opts) do
     now = DateTime.utc_now()
 
@@ -618,13 +503,12 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
   end
 
   defp candidate_ids(limit) do
-    unboxed(fn -> Enum.map(TriageDispatcher.candidates(limit), & &1.story_id) end)
+    Enum.map(TriageDispatcher.candidates(limit), & &1.story_id)
   end
 
   # Runs `fun` with `runner_id` exhausted the moment the pass has SELECTED its runner (the
   # free-slot query, on AdminRepo) and before it pushes: a machine running dry between the
-  # selection and `Runners.dispatch/3`. Written on AdminRepo's own connection, so it commits
-  # outside the read.
+  # selection and `Runners.dispatch/3`.
   defp exhaust_after_selection(runner_id, fun) do
     id = {__MODULE__, make_ref()}
 
@@ -702,16 +586,14 @@ defmodule Loopctl.Delivery.TriageDispatcherTest do
 
   # The FIRST half of the too-large route alone: `triaged`, nothing bound, no verdict.
   defp half_take(ctx, story) do
-    unboxed(fn ->
-      row = Stages.get(ctx.tenant.id, story.id)
+    row = Stages.get(ctx.tenant.id, story.id)
 
-      {:ok, _row} =
-        Stages.advance(ctx.tenant.id, story.id, {:detected, :triaged, :forward},
-          claim_epoch: row.claim_epoch,
-          actor_label: "worker:triage_dispatcher",
-          actor_role: :agent,
-          actor_lineage: []
-        )
-    end)
+    {:ok, _row} =
+      Stages.advance(ctx.tenant.id, story.id, {:detected, :triaged, :forward},
+        claim_epoch: row.claim_epoch,
+        actor_label: "worker:triage_dispatcher",
+        actor_role: :agent,
+        actor_lineage: []
+      )
   end
 end

@@ -8,12 +8,13 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
   cannot see — the push, the socket events, the refusals as they reach the wire, the slot the
   verdict gives back, the custody halt, and the stage the ceiling escalates.
 
-  `async: false` for the reason every runner channel test gives: the runner and its tenant are
-  COMMITTED, because the socket authenticates on `AdminRepo` while the ledger and the thread
-  live on the RLS `Repo`.
+  The socket authenticates on `AdminRepo` while the ledger and the thread live on the RLS
+  `Repo`. AdminRepo runs on Repo's sandbox connection in test (`Loopctl.AdminRepo.Route`),
+  and the channel process inherits the test's `$callers`, so the socket sees the runner this
+  test inserted and nothing here commits.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
   import Ecto.Query
   import ExUnit.CaptureLog
@@ -37,12 +38,6 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
-
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
 
   @reply_timeout 2_000
   @epoch 3
@@ -73,9 +68,9 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
   # A joined REVIEWING runner, and a story another agent has claimed through a dispatch, with
   # one checkpoint of the current claim.
   setup do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id, name: "reviewer"})
-    {_raw, operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "reviewer"})
+    {_raw, operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
     {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
 
     {:ok, _reply, channel} =
@@ -390,7 +385,7 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
       assert reviews(ctx) == []
 
       # Not on a socket at all: refused before anything is recorded.
-      {_raw, offline} = fixture(:committed_runner, %{tenant_id: ctx.tenant_id, name: "offline"})
+      {_raw, offline} = fixture(:runner, %{tenant_id: ctx.tenant_id, name: "offline"})
 
       assert {:error, :runner_not_connected} =
                Placement.place_review(ctx.tenant_id, offline.id, ctx.story.id,
@@ -405,7 +400,11 @@ defmodule Loopctl.Delivery.ReviewPlacementTest do
     end
 
     test "an agent-role key may not request one, and a halted tenant places nothing", ctx do
-      {_raw, agent_key, _agent} = fixture(:committed_agent_key, %{tenant_id: ctx.tenant_id})
+      agent = fixture(:agent, %{tenant_id: ctx.tenant_id})
+
+      {_raw, agent_key} =
+        fixture(:api_key, %{tenant_id: ctx.tenant_id, role: :agent, agent_id: agent.id})
+
       assert {:error, :insufficient_role} = place(ctx, api_key: agent_key)
 
       halt(ctx)
