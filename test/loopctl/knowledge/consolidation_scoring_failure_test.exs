@@ -2,11 +2,12 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
   @moduledoc """
   The corroboration gate's DEGRADED path: what happens when the similarity read itself fails.
 
-  The failing read is INJECTED (`apply_confirmed_duplicates/2`'s `:similarity_reader`), so
-  the module runs async. It used to take the vector tables away with `ALTER TABLE ... RENAME`,
-  whose ACCESS EXCLUSIVE lock blocked every concurrent test touching `article_embeddings`
-  and forced the module sync. The reader here fails the way an outage does, with a
-  connection error, and every other step of the run is the real one.
+  The failure is INJECTED at the read seam (`apply_confirmed_duplicates/2`'s `:scoring_read`,
+  the call that runs the pairwise-similarity query), so the module runs async. It used to
+  take the vector tables away with `ALTER TABLE ... RENAME`, whose ACCESS EXCLUSIVE lock
+  blocked every concurrent test touching `article_embeddings` and forced the module sync.
+  The real reader builds the real query and hands it to the seam, which fails the way an
+  outage does, with a connection error; every other step of the run is the real one.
   """
   use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
@@ -29,6 +30,9 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
   end
 
   defp status(id), do: AdminRepo.get!(Article, id).status
+
+  defp load_uuid(<<_::128>> = raw), do: Ecto.UUID.load!(raw)
+  defp load_uuid(other), do: other
 
   # Identical vectors => cosine 1.0, so the group would apply if scoring worked.
   defp corroborate_all!(tenant_id) do
@@ -59,13 +63,14 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
     {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
     {:ok, _} = Consolidation.run(tenant.id)
 
-    # The scoring read fails whichever vector source the tenant reads from: it is the read
-    # itself that is replaced. It records that it was asked, so a run that never reached the
-    # read cannot pass on the assertions below.
+    # Only the EXECUTION of the scoring query is replaced: the real reader builds it, so the
+    # raise travels the path a real read failure takes, out of the reader and into the
+    # scoring rescue. The seam records the query it was handed, so a run that never reached
+    # the read cannot pass on the assertions below.
     test_pid = self()
 
-    failing_read = fn tenant_id, ids, signal ->
-      send(test_pid, {:scoring_read, tenant_id, Enum.sort(ids), signal})
+    failing_read = fn query, tenant_id ->
+      send(test_pid, {:scoring_read, tenant_id, query})
       raise DBConnection.ConnectionError, "tcp recv: closed"
     end
 
@@ -73,12 +78,16 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
     # process's log would fail on a concurrent consolidation test's line.
     {result, log} =
       Loopctl.OwnLog.with_own_log(fn ->
-        Consolidation.apply_confirmed_duplicates(tenant.id, similarity_reader: failing_read)
+        Consolidation.apply_confirmed_duplicates(tenant.id, scoring_read: failing_read)
       end)
 
     tenant_id = tenant.id
-    members = Enum.sort([a.id, b.id])
-    assert_received {:scoring_read, ^tenant_id, ^members, :title}
+    assert_received {:scoring_read, ^tenant_id, %Ecto.Query{} = query}
+
+    # The pairwise self-join over THIS group's members, not some other read.
+    {sql, params} = AdminRepo.to_sql(:all, query)
+    assert sql =~ "<=>"
+    assert Enum.sort([a.id, b.id]) -- Enum.map(List.flatten(params), &load_uuid/1) == []
 
     assert %{applied: 0, skipped: 0, uncorroborated: 1} = result
     assert status(a.id) == :published

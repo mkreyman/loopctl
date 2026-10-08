@@ -160,7 +160,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   @heavy_endpoint :consolidation
 
   # The normalized-title grouping key, in ONE place. `title_drift_groups/1` forms groups with
-  # it and `pairwise_similarity_by_group/2` re-derives the same groups to score them; if the
+  # it and `pairwise_similarity_by_group/4` re-derives the same groups to score them; if the
   # two ever disagreed the gate would score the wrong sets and silently pass collisions.
   @title_key_sql "btrim(regexp_replace(lower(?), '[^[:alnum:]]+', ' ', 'g'))"
 
@@ -479,10 +479,11 @@ defmodule Loopctl.Knowledge.Consolidation do
   The threshold is read from `Loopctl.SystemConfig` per group; `:system_config` names the
   namespace it is read from (the node-wide one by default, a test's own otherwise).
 
-  `:similarity_reader` is the read that scores one chunk of members,
-  `(tenant_id, article_ids, signal) -> %{{signal, article_id} => %{min_sim:, pairs:, scored:}}`,
-  defaulting to the real pairwise query. A test passes one that fails, to reach the degraded
-  path a scoring outage takes without taking the vector tables away from every other test.
+  `:scoring_read` is the call that RUNS the pairwise-similarity query once it is built,
+  `(query, tenant_id) -> rows`, defaulting to `Loopctl.HeavyRead.all/3` on the consolidation
+  endpoint. Everything that builds the query stays the real code. A test passes one that
+  fails, to reach the degraded path a scoring outage takes without taking the vector tables
+  away from every other test.
   """
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
@@ -511,7 +512,8 @@ defmodule Loopctl.Knowledge.Consolidation do
       %{applied: 0, skipped: 0, failed: 0, uncorroborated: 0, gate: :drain_disabled}
     else
       cache = Keyword.get(opts, :system_config, SystemConfig)
-      reader = Keyword.get(opts, :similarity_reader, &pairwise_similarity_by_group/3)
+      run_read = Keyword.get(opts, :scoring_read, &heavy_all/2)
+      reader = &pairwise_similarity_by_group(&1, &2, &3, run_read)
       run_confirmed_duplicates(tenant_id, cap, unpublish_cap, cache, reader)
     end
   end
@@ -1904,7 +1906,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # place that decides whether an article of this tenant is in scope — the scans
   # (`published_base/1`), the evidence fetch (`evidence_map/2`), the apply-time live
   # re-check (`apply_duplicate_group/3`), BOTH sides of the corroboration self-join
-  # (`pairwise_similarity_by_group/2`, via the shared `shared_visibility/1` macro) and the
+  # (`pairwise_similarity_by_group/4`, via the shared `shared_visibility/1` macro) and the
   # read-time redaction liveness (`live_evidence_ids/2`) — because a guard that lives in
   # only some of them is a guard the next reader adds one more path around.
   #
@@ -2269,14 +2271,14 @@ defmodule Loopctl.Knowledge.Consolidation do
   # (`@title_key_sql` / `@idempotency_key_sql`, referenced from the deriving query and from
   # here so they cannot drift), and each entry carries the member set it scored so the caller
   # can tell a low cosine from a missing one.
-  defp pairwise_similarity_by_group(_tenant_id, [], _signal), do: %{}
+  defp pairwise_similarity_by_group(_tenant_id, [], _signal, _run_read), do: %{}
 
-  defp pairwise_similarity_by_group(tenant_id, ids, signal) do
+  defp pairwise_similarity_by_group(tenant_id, ids, signal, run_read) do
     tenant_id
     |> pair_candidates(ids, signal)
     |> score_pairs(score_source(tenant_id))
     |> group_by_signal(signal)
-    |> heavy_all(tenant_id)
+    |> run_read.(tenant_id)
     |> index_by_member(signal)
   end
 

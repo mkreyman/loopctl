@@ -9,9 +9,11 @@ defmodule Loopctl.Workers.TriageTriggerWorkerLockTest do
   sandboxed row, so the story is committed under a `fixture(:committed_tenant)` and swept.
   Every path without the second session is in the async `Loopctl.Workers.TriageTriggerWorkerTest`.
 
-  The candidate read is FLEET-WIDE, so the sweep runs before the test as well as at the
-  module boundary: a committed record left `pending_triage` by an earlier run would be a
-  candidate of this one too.
+  The run drains this test's tenant only (`drain/1`'s `:tenant_id`), so a committed record
+  some other module or an earlier run left `pending_triage` is not its candidate. The
+  tenants this module commits are recorded as they are made and swept, those and no others,
+  when the module ends: a sweep per test would wait on the test's own still-open sandbox
+  transaction.
   """
 
   use Loopctl.DataCase, async: false
@@ -20,20 +22,28 @@ defmodule Loopctl.Workers.TriageTriggerWorkerLockTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.Stages
   alias Loopctl.Intake.Record
+  alias Loopctl.Test.RowLock
   alias Loopctl.WorkBreakdown.Stories
   alias Loopctl.Workers.TriageTriggerWorker
 
   setup :verify_on_exit!
 
+  # Unlinked, so it outlives the module process and is still there for the `on_exit`.
   setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
+    {:ok, ledger} = Agent.start(fn -> [] end)
+
+    on_exit(fn ->
+      sweep_committed_tenants(Agent.get(ledger, & &1))
+      Agent.stop(ledger)
+    end)
+
+    %{ledger: ledger}
   end
 
-  setup do
-    sweep_committed_runner_tenants()
-    %{tenant: fixture(:committed_tenant, %{})}
+  setup %{ledger: ledger} do
+    tenant = fixture(:committed_tenant, %{})
+    Agent.update(ledger, &[tenant.id | &1])
+    %{tenant: tenant}
   end
 
   test "a transient failure leaves the record pending_triage and unescalated", %{
@@ -46,12 +56,12 @@ defmodule Loopctl.Workers.TriageTriggerWorkerLockTest do
     # `Stages.open/3` takes the story `FOR SHARE` before it touches the stage row, so a
     # session holding that row `FOR UPDATE` parks the open until the 2s `lock_timeout`
     # `Stages` sets locally fires. A LOCK, not a sleep: nothing here depends on timing.
-    blocker = lock_story(story.id)
+    blocker = RowLock.hold!("stories", story.id)
 
     try do
-      assert :ok = run()
+      assert :ok = run(tenant)
     after
-      release(blocker)
+      RowLock.release(blocker)
     end
 
     # The record must NOT be escalated: the next run clears this by itself, and an
@@ -61,7 +71,7 @@ defmodule Loopctl.Workers.TriageTriggerWorkerLockTest do
     assert unboxed(fn -> Stages.get(tenant.id, story.id) end) == nil
   end
 
-  defp run, do: unboxed(fn -> TriageTriggerWorker.perform(%Oban.Job{args: %{}}) end)
+  defp run(tenant), do: unboxed(fn -> TriageTriggerWorker.drain(tenant_id: tenant.id) end)
 
   # UNBOXED: the story must be COMMITTED for the second session to see and lock it, and the
   # run commits what it writes, as it does in production.
@@ -84,55 +94,5 @@ defmodule Loopctl.Workers.TriageTriggerWorkerLockTest do
       end)
 
     story
-  end
-
-  # A SEPARATE database session holding one story row `FOR UPDATE`, on its own raw connection
-  # rather than a sandbox one: the sandbox owner's connection is the one this test process
-  # already runs on, and a lock cannot be held against yourself. Copied in shape from
-  # `Loopctl.Delivery.TriageTriggerTest`, retry included — it asks the server for one more
-  # connection at the moment the suite holds the most, and a `too_many_clients` flake there
-  # names a change that did not cause it.
-  defp lock_story(story_id), do: lock_story(story_id, 5)
-
-  defp lock_story(story_id, attempts_left) do
-    config = Application.get_env(:loopctl, AdminRepo)
-
-    {:ok, conn} =
-      Postgrex.start_link(
-        hostname: config[:hostname] || "127.0.0.1",
-        port: config[:port] || 5432,
-        username: config[:username],
-        password: config[:password],
-        database: config[:database],
-        pool_size: 1
-      )
-
-    try do
-      Postgrex.query!(conn, "BEGIN", [], timeout: 10_000)
-
-      # `num_rows`, asserted: a lock on nothing blocks nothing, and the open would then succeed
-      # for the ordinary reason and this test would prove nothing at all.
-      %Postgrex.Result{num_rows: 1} =
-        Postgrex.query!(conn, "SELECT id FROM stories WHERE id = $1 FOR UPDATE", [
-          Ecto.UUID.dump!(story_id)
-        ])
-
-      conn
-    rescue
-      error in [DBConnection.ConnectionError, Postgrex.Error] ->
-        GenServer.stop(conn)
-
-        if attempts_left > 1 do
-          Process.sleep(1_000)
-          lock_story(story_id, attempts_left - 1)
-        else
-          reraise error, __STACKTRACE__
-        end
-    end
-  end
-
-  defp release(conn) do
-    Postgrex.query!(conn, "ROLLBACK", [])
-    GenServer.stop(conn)
   end
 end

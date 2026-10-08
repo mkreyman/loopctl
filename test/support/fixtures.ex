@@ -2935,6 +2935,68 @@ defmodule Loopctl.Fixtures do
     Sandbox.unboxed_run(Loopctl.Repo, fn -> fixture(:intake_pair, attrs) end)
   end
 
+  # The project, epic, story and intake source a `Loopctl.Workers.VerificationRunnerWorker`
+  # run needs, under `:tenant_id`; returns `%{tenant_id:, project_id:, story_id:}`. The
+  # source's repository is `:repo_full_name` (`"acme/widgets"` by default) and
+  # `projects.repo_url` names ANOTHER repository on purpose: nothing may read it (#931
+  # finding a). `Loopctl.Test.VerificationRunnerForge` stubs the forge around these rows.
+  def fixture(:verification_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    project =
+      fixture(:project, %{tenant_id: tenant_id, repo_url: "https://github.com/evil/other"})
+
+    epic = fixture(:epic, %{tenant_id: tenant_id, project_id: project.id})
+    story = fixture(:story, %{tenant_id: tenant_id, epic_id: epic.id, project_id: project.id})
+
+    fixture(:intake_source, %{
+      tenant_id: tenant_id,
+      project_id: project.id,
+      repo_full_name: Map.get(attrs, :repo_full_name, "acme/widgets"),
+      required_checks: ["test"]
+    })
+
+    %{tenant_id: tenant_id, project_id: project.id, story_id: story.id}
+  end
+
+  # A verification run of `:commit_sha` for `:story_id`, created through
+  # `Loopctl.Verification.create_run/3`. Other keys in `attrs` are ignored, so a test context
+  # can be passed as it is. Three optional shapings write the run's columns directly:
+  #
+  #   * `:age_seconds` moves its creation that far back and, unless `started: false`, its
+  #     start too, as `running`;
+  #   * `ready: true` marks it started and change-checked, so a poll's only write is the one
+  #     after the forge's answer;
+  #   * `:ci_forge_faults` sets its consecutive forge-fault streak.
+  #
+  # Returns the run as created; reload it to read a shaped column.
+  def fixture(:verification_run, attrs) do
+    attrs = Enum.into(attrs, %{})
+    sha = Map.get(attrs, :commit_sha, String.duplicate("a", 40))
+
+    {:ok, run} =
+      Loopctl.Verification.create_run(
+        Map.fetch!(attrs, :tenant_id),
+        Map.fetch!(attrs, :story_id),
+        %{commit_sha: sha}
+      )
+
+    set =
+      verification_run_aged(attrs) ++
+        verification_run_ready(attrs) ++ Map.to_list(Map.take(attrs, [:ci_forge_faults]))
+
+    if set != [] do
+      {1, _} =
+        AdminRepo.update_all(
+          from(r in Loopctl.Verification.VerificationRun, where: r.id == ^run.id),
+          set: set
+        )
+    end
+
+    run
+  end
+
   # A PENDING issue-closure row (#805), inserted directly so a closer/worker test can start
   # from a verdict without walking a story through the stage machine to reach one.
   #
@@ -3483,6 +3545,23 @@ defmodule Loopctl.Fixtures do
 
     :ok
   end
+
+  defp verification_run_aged(%{age_seconds: seconds} = attrs) do
+    at = DateTime.add(DateTime.utc_now(), -seconds, :second)
+
+    if Map.get(attrs, :started, true),
+      do: [inserted_at: at, started_at: at, status: "running"],
+      else: [inserted_at: at]
+  end
+
+  defp verification_run_aged(_attrs), do: []
+
+  defp verification_run_ready(%{ready: true}) do
+    now = DateTime.utc_now()
+    [status: "running", started_at: now, change_checked_at: now]
+  end
+
+  defp verification_run_ready(_attrs), do: []
 
   defp sweep_tenant_ids(ids) do
     import Ecto.Query, only: [from: 2]

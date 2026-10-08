@@ -535,8 +535,9 @@ defmodule Loopctl.Telemetry.ScaleAlertsTest do
       end)
 
       # 6 timeouts is a breach (> 5/min) — had this instance counted them.
-      other = spawn(fn -> emit_timeout(6) end)
-      ref = Process.monitor(other)
+      # `spawn_monitor`, atomically: a child that finishes before a separate
+      # `Process.monitor/1` reports `:noproc` instead of `:normal`.
+      {other, ref} = spawn_monitor(fn -> emit_timeout(6) end)
       assert_receive {:DOWN, ^ref, :process, ^other, :normal}
 
       assert :ok = ScaleAlerts.evaluate(server)

@@ -45,14 +45,20 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   describe "TC-26.4.6.1 only the story's branch in the intake source's repository is read" do
     test "pr mode: the branch the stage row records, in the intake source's repository", ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       # On the story's own branch `test` FAILED; anything else would read green.
       stub_forge(ctx, %{
         evidence:
           evidence([ci_run(5, "completed", "failure")], [ci_job(5, "completed", "failure")])
       })
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       reloaded = reload(ctx, run)
@@ -68,7 +74,13 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "thread mode: DispatchPayload.thread_branch/3 and the base the claim was placed on",
          ctx do
       # The stage row names a STALE branch; the ledger's route names the claim's own.
-      stage_branch!(ctx, "loop/stale")
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: "loop/stale"
+      })
+
       place_thread!(ctx, "loop/thread-branch", "release")
 
       stub_forge(ctx, %{
@@ -78,7 +90,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           evidence([ci_run(5, "completed", "failure")], [ci_job(5, "completed", "failure")])
       })
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       assert reload(ctx, run).status == "fail"
@@ -90,14 +102,20 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   describe "TC-26.4.6.6 the credential is asked for the (tenant, repository) pair" do
     setup ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       :ok
     end
 
     test "it is asked for the intake source's repository, never projects.repo_url", ctx do
       stub_forge(ctx, %{evidence: green()})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       tenant_id = ctx.tenant_id
@@ -116,7 +134,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           else: {:error, :credential_unavailable}
       end)
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       reloaded = reload(ctx, run)
@@ -137,7 +155,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         raise "leaky detail acme/private-repo"
       end)
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
 
       {result, log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run) end)
       assert result == {:cancel, :internal_error}
@@ -157,7 +175,13 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   describe "TC-26.4.6.2 required checks decide, one run per outcome" do
     setup ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       :ok
     end
 
@@ -170,7 +194,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           )
       })
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert {:snooze, 60} = perform(ctx, run)
       assert reload(ctx, run).status == "running"
     end
@@ -184,7 +208,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           )
       })
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       assert %{status: "fail", ac_results: %{"failed_check" => "test", "conclusion" => "failure"}} =
@@ -194,7 +218,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "test succeeded is a pass naming the judged run", ctx do
       stub_forge(ctx, %{evidence: green()})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       assert %{status: "pass", ac_results: ac} = reload(ctx, run)
@@ -210,7 +234,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         evidence: evidence([lint_run(6)], [lint_job(6)])
       })
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert {:snooze, _} = perform(ctx, run)
       assert reload(ctx, run).status == "running"
     end
@@ -220,10 +244,16 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   describe "TC-26.4.6.3 a workflow edit is refused" do
     test "no verdict, ci_definition_changed, and no evidence read", ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       stub_forge(ctx, %{diff: [".github/workflows/ci.yml"], evidence: green()})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       assert %{status: "error", ac_results: ac} = reload(ctx, run)
@@ -232,7 +262,12 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "an unreadable diff is ci_definition_unknown", ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
 
       stub_forge(ctx, %{
         compare:
@@ -246,7 +281,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         evidence: green()
       })
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "ci_definition_unknown"
     end
@@ -256,14 +291,20 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   describe "AC-26.4.6.3 the change check is the merge gate's, once per run" do
     setup ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       :ok
     end
 
     test "an old green commit of the base (its own merge base) is empty_change", ctx do
       stub_forge(ctx, %{compare: {:ok, clean([], @sha)}, evidence: green()})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       assert reload(ctx, run).ac_results == %{
@@ -279,7 +320,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "an empty commit on top of an old base commit is empty_change", ctx do
       stub_forge(ctx, %{compare: {:ok, clean([], @fork_point)}, evidence: green()})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "empty_change"
       refute_received {:evidence, _}
@@ -296,7 +337,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           ])
       })
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert {:snooze, _} = perform(ctx, run)
       assert_received {:compare, @sha}
       assert %{change_checked_at: %DateTime{}} = reload(ctx, run)
@@ -317,7 +358,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "a head whose tree is the base's is empty_change, whatever the diff lists", ctx do
       stub_forge(ctx, %{tree: @base_tree, evidence: green()})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "empty_change"
       assert_received {:commit, @sha}
@@ -329,7 +370,13 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   describe "TC-26.4.6.4 transient waits, permanent ends, age ends" do
     setup ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       :ok
     end
 
@@ -337,7 +384,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "a 502 once then success: a snooze, then a pass", ctx do
       stub_forge(ctx, %{evidence: sequence([{:error, {:github_api_error, 502}}, green()])})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert {:snooze, _} = perform(ctx, run)
       waiting = reload(ctx, run)
       assert waiting.status == "running"
@@ -351,7 +398,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     # tens of minutes of an unreachable forge rather than a few.
     test "a 502 past the merge gate's consecutive bound records forge_unavailable", ctx do
       stub_forge(ctx, %{compare: {:error, {:github_api_error, 502}}, evidence: green()})
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       bound = MergePrecondition.max_consecutive_unevaluated()
       backoff = [60, 120, 240, 480, 900, 900, 900]
 
@@ -377,7 +424,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     # only once (round 3: the change check runs once per run).
     test "an evidence read that faults every poll reaches forge_unavailable at the bound", ctx do
       stub_forge(ctx, %{evidence: {:error, {:github_api_error, 503}}})
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       bound = MergePrecondition.max_consecutive_unevaluated()
 
       for n <- 1..bound do
@@ -395,7 +442,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "a forge-supplied retry-after is honoured up to an hour", ctx do
       stub_forge(ctx, %{compare: {:error, {:github_rate_limited, 429, 7_200}}, evidence: green()})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert {:snooze, 3_600} = perform(ctx, run)
     end
 
@@ -408,7 +455,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           ])
       })
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert {:snooze, _} = perform(ctx, run)
       assert reload(ctx, run).ci_forge_faults == 1
       assert {:snooze, _} = perform(ctx, run)
@@ -418,7 +465,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "a 404 records its code at once, and ends the run", ctx do
       stub_forge(ctx, %{compare: {:error, {:github_api_error, 404}}, evidence: green()})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
 
       assert %{status: "error", ac_results: ac} = reload(ctx, run)
@@ -428,7 +475,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "a missing required check past the age window records ci_wait_exhausted", ctx do
       stub_forge(ctx, %{evidence: evidence([], [])})
 
-      run = ctx |> run!() |> age!(25 * 60 * 60)
+      run = fixture(:verification_run, Map.put(ctx, :age_seconds, 25 * 60 * 60))
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "ci_wait_exhausted"
     end
@@ -436,14 +483,14 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "inside the window a missing check waits", ctx do
       stub_forge(ctx, %{evidence: evidence([], [])})
 
-      run = ctx |> run!() |> age!(23 * 60 * 60)
+      run = fixture(:verification_run, Map.put(ctx, :age_seconds, 23 * 60 * 60))
       assert {:snooze, _} = perform(ctx, run)
     end
 
     test "a transient fault past the age window records forge_unavailable", ctx do
       stub_forge(ctx, %{evidence: {:error, {:github_api_error, 503}}})
 
-      run = ctx |> run!() |> age!(25 * 60 * 60)
+      run = fixture(:verification_run, Map.put(ctx, :age_seconds, 25 * 60 * 60))
       assert :ok = perform(ctx, run)
       assert reload(ctx, run).ac_results["ci_unavailable_reason"] == "forge_unavailable"
     end
@@ -453,7 +500,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "a rate limit waits at least the forge's own delay", ctx do
       stub_forge(ctx, %{evidence: {:error, {:github_rate_limited, 403, 600}}})
 
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       assert {:snooze, 600} = perform(ctx, run)
       assert reload(ctx, run).status == "running"
     end
@@ -465,7 +512,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       })
 
       for {age, snooze} <- [{0, 60}, {2 * 60 * 60, 720}, {10 * 60 * 60, 900}] do
-        run = ctx |> run!() |> age!(age)
+        run = fixture(:verification_run, Map.put(ctx, :age_seconds, age))
         # The age is measured a moment after it was set: allow that second.
         assert {:snooze, got} = perform(ctx, run)
         assert got in (snooze - 1)..snooze, "age #{age}: snoozed #{got}, expected #{snooze}"
@@ -477,7 +524,12 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
   describe "TC-26.4.6.5 an abbreviated SHA is resolved once per run" do
     test "one commit read across polls; the run carries the full SHA and the failing job", ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
 
       stub_forge(ctx, %{
         evidence:
@@ -492,7 +544,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         {:ok, @sha}
       end)
 
-      run = run!(ctx, @short)
+      run = fixture(:verification_run, Map.put(ctx, :commit_sha, @short))
       assert {:snooze, _} = perform(ctx, run)
       assert reload(ctx, run).resolved_commit_sha == @sha
       assert {:snooze, _} = perform(ctx, run)
@@ -514,14 +566,20 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     # Round 2, finding 1: resolving happens once per run and is not a CI answer, so it leaves
     # the streak alone. The comparison after it faulted: the fifth fault, not a new first.
     test "resolving an abbreviated SHA leaves the fault streak alone", ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       stub_forge(ctx, %{compare: {:error, {:github_api_error, 502}}, evidence: green()})
 
       expect(MockPullRequestSource, :resolve_commit, 1, fn %ForgeRepo{full_name: @repo}, @short ->
         {:ok, @sha}
       end)
 
-      run = ctx |> run!(@short) |> set_faults!(4)
+      run = fixture(:verification_run, Map.merge(ctx, %{commit_sha: @short, ci_forge_faults: 4}))
       assert {:snooze, 900} = perform(ctx, run)
 
       reloaded = reload(ctx, run)
@@ -531,7 +589,13 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
     test "an unresolvable prefix and an unreadable repository are permanent",
          ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       stub_forge(ctx, %{evidence: green()})
 
       for {status, code} <- [{422, "unresolved_sha"}, {404, "repository_unreadable"}] do
@@ -539,7 +603,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
           {:error, {:github_api_error, status}}
         end)
 
-        run = run!(ctx, @short)
+        run = fixture(:verification_run, Map.put(ctx, :commit_sha, @short))
         assert :ok = perform(ctx, run)
         assert reload(ctx, run).ac_results == %{"source" => "ci", "ci_unavailable_reason" => code}
       end

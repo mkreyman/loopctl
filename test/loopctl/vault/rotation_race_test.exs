@@ -32,9 +32,14 @@ defmodule Loopctl.Vault.RotationRaceTest do
 
     # The guard spans every rewritten column, so touching just chat_api_key voids it —
     # while api_key is still on the key the operator is about to delete.
+    # Only this test's other row: the module runs async, and an unscoped write would race
+    # every concurrent test's rows in the table.
     racer =
       after_each_write(fn pk ->
-        AdminRepo.query!(~s|UPDATE "#{@table}" SET chat_api_key = $1 WHERE id <> $2|, [raced, pk])
+        AdminRepo.query!(
+          ~s|UPDATE "#{@table}" SET chat_api_key = $1 WHERE id = ANY($2) AND id <> $3|,
+          [raced, ids(rows), pk]
+        )
       end)
 
     assert {:ok, report} = Rotation.reencrypt(table: @table, batch_size: 2, around_write: racer)
@@ -51,11 +56,14 @@ defmodule Loopctl.Vault.RotationRaceTest do
   end
 
   test "a row deleted mid-pass counts as skipped_gone, not as already-converted" do
-    _rows = two_rows_on_retired_key()
+    rows = two_rows_on_retired_key()
 
     racer =
       after_each_write(fn pk ->
-        AdminRepo.query!(~s|DELETE FROM "#{@table}" WHERE id <> $1|, [pk])
+        AdminRepo.query!(~s|DELETE FROM "#{@table}" WHERE id = ANY($1) AND id <> $2|, [
+          ids(rows),
+          pk
+        ])
       end)
 
     assert {:ok, report} = Rotation.reencrypt(table: @table, batch_size: 2, around_write: racer)
@@ -146,6 +154,8 @@ defmodule Loopctl.Vault.RotationRaceTest do
 
     rows
   end
+
+  defp ids(rows), do: Enum.map(rows, &Ecto.UUID.dump!(&1.id))
 
   defp raw(column, id) do
     %{rows: [[value]]} =

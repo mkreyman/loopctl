@@ -134,7 +134,7 @@ defmodule Loopctl.Knowledge.CosineLintExceptions do
           "target, so HNSW cannot apply) under a MIN aggregate. It asks the opposite of " <>
           "top-k — not 'what is nearest' but 'is the WORST pair in this group still close " <>
           "enough' — and a top-k helper cannot answer that: the outlier it must find is " <>
-          "precisely the row top-k drops. Called only by pairwise_similarity_by_group/2, " <>
+          "precisely the row top-k drops. Called only by pairwise_similarity_by_group/4, " <>
           "which bounds it to the id list of the few hundred articles that already collided " <>
           "on a normalized title, never a corpus scan"
     }

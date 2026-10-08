@@ -12,17 +12,14 @@ defmodule Loopctl.Test.VerificationRunnerForge do
   the worker runs in the test process, so no test can answer another's reads.
   """
 
-  import Ecto.Query, only: [from: 2]
   import Loopctl.Fixtures
   import Mox
 
-  alias Loopctl.AdminRepo
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
   alias Loopctl.Verification
   alias Loopctl.Verification.Credential
-  alias Loopctl.Verification.VerificationRun
   alias Loopctl.Workers.VerificationRunnerWorker
 
   @repo "acme/widgets"
@@ -60,24 +57,11 @@ defmodule Loopctl.Test.VerificationRunnerForge do
   def base_tree, do: @base_tree
 
   @doc """
-  The project, epic, story and intake source a run needs, under `tenant_id`, plus the
-  credential stubs; returns the test context. `projects.repo_url` names ANOTHER repository:
-  nothing may read it (#931 finding a).
+  `fixture(:verification_story)` under `tenant_id`, plus the credential stubs; returns the test
+  context. The records are the fixture's; this adds what is not a record.
   """
   def setup_story!(tenant_id) do
-    project =
-      fixture(:project, %{tenant_id: tenant_id, repo_url: "https://github.com/evil/other"})
-
-    epic = fixture(:epic, %{tenant_id: tenant_id, project_id: project.id})
-    story = fixture(:story, %{tenant_id: tenant_id, epic_id: epic.id, project_id: project.id})
-
-    fixture(:intake_source, %{
-      tenant_id: tenant_id,
-      project_id: project.id,
-      repo_full_name: @repo,
-      required_checks: ["test"]
-    })
-
+    ctx = fixture(:verification_story, %{tenant_id: tenant_id, repo_full_name: @repo})
     test_pid = self()
 
     stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
@@ -87,23 +71,7 @@ defmodule Loopctl.Test.VerificationRunnerForge do
       {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
     end)
 
-    %{tenant_id: tenant_id, project_id: project.id, story_id: story.id, test_pid: test_pid}
-  end
-
-  @doc "The stage row recording `branch` for the story."
-  def stage_branch!(ctx, branch) do
-    fixture(:story_stage, %{
-      tenant_id: ctx.tenant_id,
-      story_id: ctx.story_id,
-      stage: :implementing,
-      branch: branch
-    })
-  end
-
-  @doc "A new verification run of `sha`."
-  def run!(ctx, sha \\ @sha) do
-    {:ok, run} = Verification.create_run(ctx.tenant_id, ctx.story_id, %{commit_sha: sha})
-    run
+    Map.put(ctx, :test_pid, test_pid)
   end
 
   @doc "One poll of the worker, in the calling process."
@@ -121,36 +89,6 @@ defmodule Loopctl.Test.VerificationRunnerForge do
 
   @doc "Everything a poll may write on the run, `updated_at` included."
   def snapshot(ctx, run), do: ctx |> reload(run) |> Map.take(@run_fields)
-
-  @doc "Moves the run's creation (and, when `started?`, its start) `seconds_ago` back."
-  def age!(run, seconds_ago, started? \\ true) do
-    at = DateTime.add(DateTime.utc_now(), -seconds_ago, :second)
-    set = [inserted_at: at] ++ if(started?, do: [started_at: at, status: "running"], else: [])
-    {1, _} = AdminRepo.update_all(from(r in VerificationRun, where: r.id == ^run.id), set: set)
-    run
-  end
-
-  @doc "Sets the run's consecutive forge-fault streak."
-  def set_faults!(run, faults) do
-    {1, _} =
-      AdminRepo.update_all(from(r in VerificationRun, where: r.id == ^run.id),
-        set: [ci_forge_faults: faults]
-      )
-
-    run
-  end
-
-  @doc "Started and change-checked, so a poll's only write is the one after the forge's answer."
-  def ready!(run) do
-    now = DateTime.utc_now()
-
-    {1, _} =
-      AdminRepo.update_all(from(r in VerificationRun, where: r.id == ^run.id),
-        set: [status: "running", started_at: now, change_checked_at: now]
-      )
-
-    run
-  end
 
   @doc "Green evidence: required check `test` succeeded in workflow run `run_id`."
   def green(run_id \\ 5),

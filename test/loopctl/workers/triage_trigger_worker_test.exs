@@ -5,9 +5,10 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
 
   `promote/1` straddles BOTH repos — it creates the story through `AdminRepo` and opens the
   stage on the RLS `Loopctl.Repo` — and AdminRepo shares Repo's sandbox connection in test,
-  so every row here is sandboxed and the module runs async. The candidate read is
-  FLEET-WIDE; inside this test's sandbox transaction that fleet is this test's own rows plus
-  whatever is committed, so no assertion here counts the batch, only this test's records.
+  so every row here is sandboxed and the module runs async. The cron run's candidate read is
+  FLEET-WIDE, and inside a sandbox transaction that fleet is this test's rows plus whatever
+  is committed, so a run here drains its OWN tenant (`drain/1`'s `:tenant_id`): a committed
+  `pending_triage` row is neither promoted by this test nor able to take its batch slots.
 
   The one test whose subject needs a SECOND session, a story row another connection holds
   `FOR UPDATE` while the run opens its stage, is `Loopctl.Workers.TriageTriggerWorkerLockTest`.
@@ -30,11 +31,11 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
     %{tenant: fixture(:tenant, %{trust_tier: :agent_rooted})}
   end
 
-  describe "perform/1" do
+  describe "drain/1" do
     test "a pending record becomes a story the delivery loop can see", %{tenant: tenant} do
       {source, record} = fixture(:intake_pair, %{tenant_id: tenant.id, issue_number: 412})
 
-      assert :ok = run()
+      assert :ok = run(tenant)
 
       # All three bindings, because each is a different half of "the loop can see it": the link
       # is how triage finds its record back, the epic is where a human looks for it, and the
@@ -53,7 +54,7 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       {source, record} =
         fixture(:intake_pair, %{tenant_id: tenant.id, target_epic_id: nil})
 
-      assert :ok = run()
+      assert :ok = run(tenant)
 
       # NOT escalated, and this is the correction of the worst defect in this worker.
       # Escalation is terminal — nothing un-escalates, and `candidates/0` requires
@@ -84,7 +85,7 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
 
       {:ok, _} = Intake.repoint_source(tenant.id, source.id, epic.id)
 
-      assert :ok = run()
+      assert :ok = run(tenant)
 
       assert story = story_for(record.id)
       assert story.epic_id == epic.id
@@ -98,7 +99,7 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       # the epic. Asserted alongside `:no_target_epic` because the two reach the escalation
       # through different clauses of `promote/1` and only one of them is in the happy path of
       # the fixture.
-      assert :ok = run()
+      assert :ok = run(tenant)
 
       record = reload(record)
       assert record.status == :escalated
@@ -110,7 +111,7 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
     } do
       {source, record} = fixture(:intake_pair, %{tenant_id: tenant.id, issue_number: 412})
 
-      assert :ok = run()
+      assert :ok = run(tenant)
       story = story_for(record.id)
 
       # The target epic is then REMOVED, which makes a second promote of this record
@@ -119,11 +120,11 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       # armed to leave a trace if it is read again.
       clear_target_epic(source.id)
 
-      assert :ok = run()
+      assert :ok = run(tenant)
 
       assert %Record{status: :pending_triage, escalation_reasons: []} = reload(record)
       assert story_for(record.id).id == story.id
-      refute record.id in candidate_ids()
+      refute record.id in candidate_ids(tenant)
     end
 
     test "a story with NO stage row keeps its record a candidate, and the next run opens it",
@@ -137,9 +138,9 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       # the stage row and nothing else, so nothing would ever reach it again.
       story = create_story(tenant.id, source.target_epic_id, record.id, "43.1")
       assert Stages.get(tenant.id, story.id) == nil
-      assert record.id in candidate_ids()
+      assert record.id in candidate_ids(tenant)
 
-      assert :ok = run()
+      assert :ok = run(tenant)
 
       # The recovery is the SAME promote: the create's collision is surfaced as the existing
       # story and the open is the half that had not happened.
@@ -158,9 +159,9 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       # revocation is one-way, so this record can never leave `pending_triage`, and the read is
       # oldest-first and bounded — fetched, it would hold a slot in every batch for ever and
       # enough of them would starve the drain.
-      refute record.id in candidate_ids()
+      refute record.id in candidate_ids(tenant)
 
-      assert :ok = run()
+      assert :ok = run(tenant)
 
       # Not escalated either. Escalation is a queue of questions for a person and this one
       # carries none: the repository is no longer bound, so there is no action to take.
@@ -187,7 +188,7 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       # nothing at all.
       backdate(bad.id, DateTime.add(DateTime.utc_now(), -60, :second))
 
-      assert :ok = run()
+      assert :ok = run(tenant)
 
       assert reload(bad).status == :escalated
       assert story_for(good.id)
@@ -218,9 +219,10 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
     end
   end
 
-  defp run, do: TriageTriggerWorker.perform(%Oban.Job{args: %{}})
+  defp run(tenant), do: TriageTriggerWorker.drain(tenant_id: tenant.id)
 
-  defp candidate_ids, do: Enum.map(TriageTriggerWorker.candidates(), & &1.id)
+  defp candidate_ids(tenant),
+    do: Enum.map(TriageTriggerWorker.candidates(tenant_id: tenant.id), & &1.id)
 
   defp reload(%Record{} = record), do: AdminRepo.get!(Record, record.id)
 

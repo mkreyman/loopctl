@@ -62,9 +62,11 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
   @index "article_embeddings_hnsw_dim_1536_idx"
 
   # Start from a REPAIRED graph, so the poisoning below is the only thing this test is
-  # measuring — not whatever the modules before it left behind.
+  # measuring — not whatever the modules before it left behind. `wait: true`, here and at the
+  # repair step: the default vacuum SKIPS a table it cannot lock at once, and an assertion
+  # about the repaired graph would then be measuring a graph nobody repaired.
   setup do
-    Loopctl.DataCase.vacuum_vector_indexes()
+    Loopctl.DataCase.vacuum_vector_indexes(wait: true)
     :ok
   end
 
@@ -148,13 +150,15 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
   #
   # `enable_sort = on` as well, undoing `ann_read/1`'s `off` earlier in this transaction. Left
   # off, the exact plan (seq scan + sort) and the ANN index scan each carry one disabled-node
-  # penalty and the planner picks between them on cost. `exact_read/0` returned `[]` in a
-  # full-suite run after the per-test vacuum stopped truncating (#953); a table left with
-  # empty pages raises the seq scan's cost, which is the likely tip toward the poisoned index.
+  # penalty and the planner picks between them on cost; `exact_read/0` returned `[]` in a
+  # full-suite run after the per-test vacuum stopped truncating (#953). `assert_exact_plan!/0`
+  # pins it, so a plan that reaches the poisoned index again fails as a PLAN, not as a `[]`
+  # that reads like the graph defect this test is about.
   defp exact_read do
     AdminRepo.query!("SET LOCAL enable_seqscan = on", [])
     AdminRepo.query!("SET LOCAL enable_sort = on", [])
     AdminRepo.query!("SET LOCAL enable_indexscan = off", [])
+    assert_exact_plan!()
 
     %{rows: rows} = AdminRepo.query!(ann_sql(), ann_params())
     Enum.map(rows, fn [id] -> Ecto.UUID.load!(id) end)
@@ -166,6 +170,14 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
 
     assert plan =~ @index,
            "expected the ANN plan to be pinned, got: #{plan |> String.split("\n") |> hd()}"
+  end
+
+  defp assert_exact_plan! do
+    %{rows: rows} = AdminRepo.query!("EXPLAIN " <> ann_sql(), ann_params())
+    plan = rows |> List.flatten() |> Enum.join("\n")
+
+    assert plan =~ "Seq Scan on article_embeddings" and not (plan =~ @index),
+           "expected the exact plan (seq scan, no HNSW index), got:\n#{plan}"
   end
 
   defp ann_sql do
@@ -211,7 +223,7 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
 
       # THE FIX. The dead entries came from a transaction that aborted before this test
       # began, so they are dead to every snapshot and vacuum can remove them.
-      Loopctl.DataCase.vacuum_vector_indexes()
+      Loopctl.DataCase.vacuum_vector_indexes(wait: true)
 
       assert ann_read(mode: "off") == [article.id]
     end

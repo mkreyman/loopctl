@@ -6,8 +6,9 @@ defmodule Loopctl.Workers.ReviewCeilingWorkerTest do
 
   The cron read is fleet-wide on `AdminRepo`, which shares the RLS `Repo`'s sandbox
   connection in test, so the thread and the stage row are sandboxed rows the read sees and
-  the module runs async. Inside this test's transaction the "fleet" is its own rows plus
-  whatever is committed; every assertion is about this test's own stage row.
+  the module runs async. Inside a test's transaction that fleet is its own rows plus whatever
+  is committed, so each run here sweeps its OWN tenant (`sweep/1`'s `:tenant_id`) and never
+  escalates, or logs about, a committed story it does not own.
   """
 
   use Loopctl.DataCase, async: true
@@ -114,12 +115,12 @@ defmodule Loopctl.Workers.ReviewCeilingWorkerTest do
     row
   end
 
-  defp perform, do: ReviewCeilingWorker.perform(%Oban.Job{})
+  defp perform(ctx), do: ReviewCeilingWorker.sweep(tenant_id: ctx.tenant_id)
 
   test "moves an in-flight stage to escalated over the review_ceiling edge, once" do
     ctx = ceiling_story()
 
-    assert :ok = perform()
+    assert :ok = perform(ctx)
     assert stage_of(ctx).stage == :escalated
 
     {:ok, [event]} =
@@ -134,7 +135,7 @@ defmodule Loopctl.Workers.ReviewCeilingWorkerTest do
 
     # Landed: the next run finds nothing to do and writes nothing.
     before = stage_of(ctx).lock_version
-    assert :ok = perform()
+    assert :ok = perform(ctx)
     assert stage_of(ctx).lock_version == before
   end
 
@@ -165,10 +166,10 @@ defmodule Loopctl.Workers.ReviewCeilingWorkerTest do
 
     # Not a candidate at all, rather than one the escalation refuses every minute: a refused
     # candidate stays oldest in the batch and starves the live ones behind it.
-    # The worker's OWN log only: this module runs async, and a refute over every process's log
-    # would fail on a concurrent test's line.
-    {:ok, log} = Loopctl.OwnLog.with_own_log(fn -> perform() end)
+    # The worker's OWN log only, and only this story's line: this module runs async, and a
+    # refute over every process's log, or every story's, would fail on another test's line.
+    {:ok, log} = Loopctl.OwnLog.with_own_log(fn -> perform(ctx) end)
     assert stage_of(ctx).stage == :implementing
-    refute log =~ "review_ceiling not yet moved"
+    refute log =~ ~r/review_ceiling not yet moved.*story_id=#{ctx.story.id}/
   end
 end

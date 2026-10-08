@@ -55,14 +55,20 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
   describe "the change check, once per run" do
     setup ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       :ok
     end
 
     # Round 4, finding 4: a check that passed but could not be RECORDED is loopctl's database,
     # not a verdict: a wait that leaves the fault streak alone, and the next poll checks again.
     test "a passed check loopctl cannot record is a wait, never internal_error", ctx do
-      run = ctx |> run!() |> set_faults!(2)
+      run = fixture(:verification_run, Map.put(ctx, :ci_forge_faults, 2))
 
       # The run row is locked AFTER the run started and before the stamp is written.
       stub_forge(ctx, %{
@@ -91,7 +97,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
     test "a stage row loopctl cannot read is a wait, not a verdict", ctx do
       stub_forge(ctx, %{evidence: green()})
-      run = ctx |> run!() |> set_faults!(2)
+      run = fixture(:verification_run, Map.put(ctx, :ci_forge_faults, 2))
       hold_table_lock!("story_stages")
 
       assert {:snooze, 60} = perform(ctx, run)
@@ -106,7 +112,13 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
   describe "transient waits" do
     setup ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       :ok
     end
 
@@ -114,7 +126,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     # forge. Contention there snoozes without touching the fault streak, and reads nothing.
     test "database contention resolving the branch is not a forge fault", ctx do
       stub_forge(ctx, %{evidence: green()})
-      run = ctx |> run!() |> set_faults!(2)
+      run = fixture(:verification_run, Map.put(ctx, :ci_forge_faults, 2))
       hold_ledger_lock!()
 
       assert {:snooze, 60} = perform(ctx, run)
@@ -128,7 +140,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
     test "database contention past the age window records database_busy", ctx do
       stub_forge(ctx, %{evidence: green()})
-      run = ctx |> run!() |> age!(25 * 60 * 60)
+      run = fixture(:verification_run, Map.put(ctx, :age_seconds, 25 * 60 * 60))
       hold_ledger_lock!()
 
       assert :ok = perform(ctx, run)
@@ -150,13 +162,19 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
   # the work and records it.
   describe "a write loopctl cannot make to its run is a wait, and changes nothing" do
     setup ctx do
-      stage_branch!(ctx, @branch)
+      fixture(:story_stage, %{
+        tenant_id: ctx.tenant_id,
+        story_id: ctx.story_id,
+        stage: :implementing,
+        branch: @branch
+      })
+
       :ok
     end
 
     test "starting the run", ctx do
       stub_forge(ctx, %{evidence: green()})
-      run = run!(ctx)
+      run = fixture(:verification_run, ctx)
       before = snapshot(ctx, run)
       lock_run_once!(run)
 
@@ -170,7 +188,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "retiring a stale run", ctx do
-      run = ctx |> run!() |> age!(25 * 60 * 60, false)
+      run =
+        fixture(:verification_run, Map.merge(ctx, %{age_seconds: 25 * 60 * 60, started: false}))
+
       before = snapshot(ctx, run)
       lock_run_once!(run)
 
@@ -184,7 +204,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
     test "recording the resolved SHA", ctx do
       stub_forge(ctx, %{evidence: green()})
-      run = ctx |> run!(@short) |> ready!()
+      run = fixture(:verification_run, Map.merge(ctx, %{commit_sha: @short, ready: true}))
       before = snapshot(ctx, run)
 
       expect(MockPullRequestSource, :resolve_commit, 2, fn %ForgeRepo{full_name: @repo}, @short ->
@@ -202,7 +222,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "recording a pass", ctx do
-      run = ctx |> run!() |> ready!()
+      run = fixture(:verification_run, Map.put(ctx, :ready, true))
       stub_forge(ctx, %{evidence: locking(run, green())})
       before = snapshot(ctx, run)
 
@@ -215,7 +235,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "recording a fail", ctx do
-      run = ctx |> run!() |> ready!()
+      run = fixture(:verification_run, Map.put(ctx, :ready, true))
       failed = evidence([ci_run(5, "completed", "failure")], [ci_job(5, "completed", "failure")])
       stub_forge(ctx, %{evidence: locking(run, failed)})
       before = snapshot(ctx, run)
@@ -230,7 +250,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
     # The fault is not counted, and the snooze is the database's, not the streak's backoff.
     test "counting a forge fault", ctx do
-      run = ctx |> run!() |> ready!() |> set_faults!(2)
+      run = fixture(:verification_run, Map.merge(ctx, %{ready: true, ci_forge_faults: 2}))
       stub_forge(ctx, %{evidence: locking(run, {:error, {:github_api_error, 503}})})
       before = snapshot(ctx, run)
 
@@ -243,7 +263,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "resetting the fault streak on an answered wait", ctx do
-      run = ctx |> run!() |> ready!() |> set_faults!(2)
+      run = fixture(:verification_run, Map.merge(ctx, %{ready: true, ci_forge_faults: 2}))
       pending = evidence([ci_run(5, "queued", nil)], [ci_job(5, "queued", nil)])
       stub_forge(ctx, %{evidence: locking(run, pending)})
       before = snapshot(ctx, run)
@@ -257,7 +277,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "recording a no-verdict", ctx do
-      run = ctx |> run!() |> ready!()
+      run = fixture(:verification_run, Map.put(ctx, :ready, true))
       stub_forge(ctx, %{evidence: locking(run, {:error, {:github_api_error, 404}})})
       before = snapshot(ctx, run)
 
@@ -272,7 +292,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "recording internal_error after a crash", ctx do
-      run = ctx |> run!() |> ready!()
+      run = fixture(:verification_run, Map.put(ctx, :ready, true))
 
       stub(MockVerificationCredential, :for_read, fn _tenant_id, _repo ->
         lock_run_once!(run)

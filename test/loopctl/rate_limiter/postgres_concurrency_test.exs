@@ -42,7 +42,10 @@ defmodule Loopctl.RateLimiter.PostgresConcurrencyTest do
   setup do
     # Postgres.check_rate/3 resolves the wall clock through the :clock DI. The stub is
     # this test's own: the racers are `Task.async` children, which Mox resolves to the
-    # test process through `$callers`, so no global mode is needed.
+    # test process through `$callers`, so no global mode is needed. Private mode is SET,
+    # not assumed: a sync module that ran before this one may have left Mox global, and
+    # this module is a bare `ExUnit.Case`, so nothing else here resets it.
+    Mox.set_mox_private()
     Mox.stub(Loopctl.MockClock, :utc_now, fn -> @fixed_now end)
     :ok
   end
