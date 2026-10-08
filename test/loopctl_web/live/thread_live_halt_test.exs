@@ -3,13 +3,13 @@ defmodule LoopctlWeb.ThreadLiveHaltTest do
   US-45.7 — the thread page and a human finding under a custody HALT.
 
   The halt is the thread's one halt check, `Runners.custody_halted?/1`, which reads the tenant
-  on `AdminRepo`, while the page's session and the thread live on the RLS `Repo` — separate
-  sandbox connections. So the tenant is COMMITTED, visible to both, and the module is
-  `async: false` and sweeps it, as `LoopctlWeb.ThreadControllerTest` does. Everything else
-  about the page is in `LoopctlWeb.ThreadLiveTest`, async.
+  on `AdminRepo`, while the page's session and the thread live on the RLS `Repo`. In test both
+  run on the test's one sandbox connection (`Loopctl.AdminRepo.Route`), so the halt the test
+  writes on `AdminRepo` is the one the page reads, and nothing is committed. Everything else
+  about the page is in `LoopctlWeb.ThreadLiveTest`.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Ecto.Query
   import Phoenix.LiveViewTest
@@ -24,16 +24,10 @@ defmodule LoopctlWeb.ThreadLiveHaltTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
   @epoch 2
 
   setup %{conn: conn} do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
     auth = fixture(:root_authenticator, tenant_id: tenant.id, repo: Repo)
 
     session =

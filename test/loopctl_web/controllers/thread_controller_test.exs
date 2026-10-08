@@ -4,11 +4,11 @@ defmodule LoopctlWeb.ThreadControllerTest do
   without a socket in `Loopctl.ThreadsTest`; this module pins the HTTP surface — the role
   gates, the status codes and the untrusted marker.
 
-  `async: false` for the reason `StoryEscalationControllerTest` gives: the key is resolved on
-  `AdminRepo` and the story lives on the RLS `Repo`, so the tenant and the key are committed.
+  The key is resolved on `AdminRepo` and the story lives on the RLS `Repo`; in test both run on
+  the test's one sandbox connection (`Loopctl.AdminRepo.Route`), so every row is sandboxed.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Ecto.Query
 
@@ -17,12 +17,6 @@ defmodule LoopctlWeb.ThreadControllerTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
   @epoch 4
   @sha String.duplicate("d", 40)
   @tree String.duplicate("e", 40)
@@ -30,9 +24,10 @@ defmodule LoopctlWeb.ThreadControllerTest do
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
   defp claimed_story do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {raw_key, _api_key, agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
-    {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {raw_key, _api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
+
+    {operator_key, _operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})
 
     {:ok, _} =

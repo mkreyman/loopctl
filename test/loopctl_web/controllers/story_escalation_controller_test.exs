@@ -2,36 +2,23 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
   @moduledoc """
   Issue #803, design §8: `POST /api/v1/stories/:id/escalate`.
 
-  ## Why `async: false`
-
   The auth pipeline resolves the API key through `Loopctl.AdminRepo` while
-  `Loopctl.Delivery.Stages` reads and writes the story on the RLS `Loopctl.Repo`. Those are
-  separate sandbox connections that cannot see each other's uncommitted rows, and no sandbox
-  mode shares one transaction across two repos — so the TENANT and the KEY are committed
-  (`fixture(:committed_agent_key)`, swept at the module boundary) while the story and its
-  stage row stay inside the `Repo` sandbox. A committed row is visible to every concurrently
-  running async test, which is what makes this module serial. The gate's own logic is tested
-  without a socket or a key in `Loopctl.Delivery.EscalationsTest`, which is async.
+  `Loopctl.Delivery.Stages` reads and writes the story on the RLS `Loopctl.Repo`. In test both
+  run on the test's one sandbox connection (`Loopctl.AdminRepo.Route`), so every row here is
+  sandboxed. The gate's own logic is tested without a socket or a key in
+  `Loopctl.Delivery.EscalationsTest`.
   """
 
-  use LoopctlWeb.ConnCase, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
-  alias Loopctl.Auth
   alias Loopctl.Delivery.Stages
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Story
 
   setup :verify_on_exit!
-
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
 
   @epoch 5
 
@@ -42,11 +29,12 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
-  # A committed tenant and agent key, plus a story claimed by that agent at `@epoch` with its
+  # A tenant and agent key, plus a story claimed by that agent at `@epoch` with its
   # stage row at `stage`, both inside the `Repo` sandbox.
   defp claimed_story(stage \\ :implementing) do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {raw_key, _api_key, agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {raw_key, _api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
+
     story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})
 
     as_tenant(tenant.id, fn ->
@@ -78,39 +66,32 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
     )
   end
 
-  # ESCALATED AND COMMITTED, because resolving one crosses BOTH repos: `Stages` writes the row
-  # on the RLS `Loopctl.Repo` while `Progress.force_unclaim_story/3` and `contract_story/3`
-  # run on `AdminRepo`, and two sandbox connections cannot see each other's uncommitted rows —
-  # so a Repo-sandbox story is `:not_found` to the release the resolve has to make. Committed,
-  # both see it; `sweep_committed_runner_tenants/0` removes it at the module boundary.
-  defp committed_escalated_story do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {raw_key, _api_key, agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
-    {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
-    story = fixture(:committed_story, %{tenant_id: tenant.id})
+  # ESCALATED, written through `AdminRepo`, because resolving one crosses BOTH repos: `Stages`
+  # writes the row on the RLS `Loopctl.Repo` while `Progress.force_unclaim_story/3` and
+  # `contract_story/3` run on `AdminRepo`. Both see the test's one sandbox connection.
+  defp escalated_story do
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {raw_key, _api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
-    unboxed(fn ->
-      {1, _} =
-        AdminRepo.update_all(
-          from(s in Story, where: s.id == ^story.id),
-          set: [assigned_agent_id: agent.id, agent_status: :implementing, claim_epoch: @epoch]
-        )
+    {operator_key, _operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+    story = fixture(:ledger_story, %{tenant_id: tenant.id})
 
-      fixture(:story_stage, %{
-        repo: AdminRepo,
-        tenant_id: tenant.id,
-        story_id: story.id,
-        stage: :escalated,
-        claim_epoch: @epoch,
-        escalation_reason: "parked by the first run"
-      })
-    end)
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Story, where: s.id == ^story.id),
+        set: [assigned_agent_id: agent.id, agent_status: :implementing, claim_epoch: @epoch]
+      )
+
+    fixture(:story_stage, %{
+      repo: AdminRepo,
+      tenant_id: tenant.id,
+      story_id: story.id,
+      stage: :escalated,
+      claim_epoch: @epoch,
+      escalation_reason: "parked by the first run"
+    })
 
     %{tenant: tenant, story: story, raw_key: raw_key, operator_key: operator_key}
-  end
-
-  defp unboxed(fun) do
-    Sandbox.unboxed_run(Repo, fun)
   end
 
   describe "GET /api/v1/stories/:id/stage" do
@@ -135,8 +116,9 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
     end
 
     test "a story the delivery loop has never touched answers null, not 404", %{conn: conn} do
-      tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-      {raw_key, _api_key, _agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _api_key, _agent} = fixture(:agent_key, %{tenant_id: tenant.id})
+
       story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: 0})
 
       # A story with no stage row is an ORDINARY state — every story created outside the
@@ -154,19 +136,13 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
   describe "POST /api/v1/stories/:id/stage/resolve" do
     test "a human closes an escalated story as done", %{conn: conn} do
-      %{story: story, operator_key: operator_key} = committed_escalated_story()
+      %{story: story, operator_key: operator_key} = escalated_story()
 
       # The other half of `escalate`, and it had NO caller of any kind: `:human_resolution` is
       # in the stage machine, `Stages.advance/4` gates it, and nothing in `lib/` or on the API
       # could take it — so a story a session parked for a person stayed parked for ever,
       # including the one the loop's first end-to-end run left behind.
       #
-      # `done` rather than `queued` HERE, and the reason is the harness rather than the rule:
-      # re-queueing also releases the claim and re-contracts the story, which runs on
-      # `AdminRepo` while the transition runs on `Loopctl.Repo` — two sandbox connections in
-      # this process, so the release's row lock is held for the rest of the test and the
-      # transition times out on it. That path is covered end to end, unboxed, in
-      # `Loopctl.Delivery.EscalationsResolveTest`.
       body =
         conn
         |> auth(operator_key)
@@ -178,16 +154,38 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
       assert body["stage"]["stage"] == "done"
 
-      # Read on the SANDBOX connection, not unboxed: the rows were committed by the fixture,
-      # but the transition the request just made lives in this process's `Loopctl.Repo`
-      # transaction — an unboxed read sees the committed `escalated` and would call a working
-      # write a failure.
       assert Stages.get(story.tenant_id, story.id).stage ==
                :done
     end
 
+    test "a human re-queues an escalated story: the claim is released and it is contracted",
+         %{conn: conn} do
+      %{story: story, operator_key: operator_key} = escalated_story()
+
+      # Re-queueing crosses both repos: the stage row moves on `Repo` while the claim release
+      # and the re-contract run on `AdminRepo`. The release bumps the claim epoch, and the row
+      # is bound to the epoch it produced.
+      body =
+        conn
+        |> auth(operator_key)
+        |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{
+          "to" => "queued",
+          "reason" => "the blocker is gone"
+        })
+        |> json_response(200)
+
+      assert body["stage"]["stage"] == "queued"
+
+      reloaded = AdminRepo.get!(Story, story.id)
+      assert reloaded.agent_status == :contracted
+      assert reloaded.assigned_agent_id == nil
+      assert reloaded.claim_epoch > @epoch
+      assert body["stage"]["claim_epoch"] == reloaded.claim_epoch
+      assert Stages.get(story.tenant_id, story.id).stage == :queued
+    end
+
     test "an AGENT key cannot resolve, which is the separation", %{conn: conn} do
-      %{story: story, raw_key: raw_key} = committed_escalated_story()
+      %{story: story, raw_key: raw_key} = escalated_story()
 
       # `escalate` is `exact_role: :agent` and this is `role: :user`, so the principal that
       # raises an escalation cannot clear it. The stage machine enforces the same thing itself
@@ -198,12 +196,12 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{"to" => "queued"})
       |> json_response(403)
 
-      assert unboxed(fn -> Stages.get(story.tenant_id, story.id) end).stage == :escalated
+      assert Stages.get(story.tenant_id, story.id).stage == :escalated
     end
 
     test "a story that is NOT escalated is refused, and told which stage it is at", %{conn: conn} do
       %{story: story, tenant: tenant} = claimed_story(:implementing)
-      {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+      {operator_key, _operator} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
       # Named rather than answered with the machine's `stale_stage`, which is the word it uses
       # for a story that moved under a runner — an operator reading that would go looking for
@@ -219,7 +217,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
     end
 
     test "a target the stage machine does not have is refused", %{conn: conn} do
-      %{story: story, operator_key: operator_key} = committed_escalated_story()
+      %{story: story, operator_key: operator_key} = escalated_story()
 
       # `escalated` leads to `queued`, `done` or `failed` and nowhere else. Sending a story
       # straight back to `implementing` would skip the claim it no longer has.
@@ -228,7 +226,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{"to" => "implementing"})
       |> json_response(400)
 
-      assert unboxed(fn -> Stages.get(story.tenant_id, story.id) end).stage == :escalated
+      assert Stages.get(story.tenant_id, story.id).stage == :escalated
     end
   end
 
@@ -296,7 +294,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
     test "409 not_claimant for an agent that is not the story's", %{conn: conn} do
       %{tenant: tenant, story: story} = claimed_story()
-      {other_key, _api_key, _agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
+      {other_key, _api_key, _agent} = fixture(:agent_key, %{tenant_id: tenant.id})
 
       conn =
         conn
@@ -411,8 +409,9 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
     end
 
     test "404 when the story has no delivery stage row", %{conn: conn} do
-      tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-      {raw_key, _api_key, agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
+      tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _api_key, agent} = fixture(:agent_key, %{tenant_id: tenant.id})
+
       story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: @epoch})
 
       as_tenant(tenant.id, fn ->
@@ -430,8 +429,8 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
 
     test "a story in ANOTHER tenant is a 404, not another tenant's escalation", %{conn: conn} do
       %{story: story} = claimed_story()
-      intruder = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-      {raw_key, _api_key, _agent} = fixture(:committed_agent_key, %{tenant_id: intruder.id})
+      intruder = fixture(:tenant, %{trust_tier: :human_anchored})
+      {raw_key, _api_key, _agent} = fixture(:agent_key, %{tenant_id: intruder.id})
 
       conn =
         conn
@@ -451,17 +450,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       %{tenant: tenant, story: story} = claimed_story()
 
       for role <- [:orchestrator, :user] do
-        {raw_key, _} =
-          Sandbox.unboxed_run(Loopctl.Repo, fn ->
-            {:ok, pair} =
-              Auth.generate_api_key(%{
-                tenant_id: tenant.id,
-                name: "#{role}-key",
-                role: role
-              })
-
-            pair
-          end)
+        {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, name: "#{role}-key", role: role})
 
         conn =
           build_conn()

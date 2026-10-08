@@ -4,9 +4,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
   vanishes when its process dies — with no sweeper involved — and an invalid or revoked
   token is refused.
 
-  Dispatch, `dispatch_reply` and `trace` are in `LoopctlWeb.RunnerChannelDispatchTest`,
-  which cannot run async (see its moduledoc); everything that writes no dispatch ledger row
-  stays here.
+  Dispatch, `dispatch_reply` and `trace` are in `LoopctlWeb.RunnerChannelDispatchTest`;
+  everything that writes no dispatch ledger row stays here.
   """
 
   use LoopctlWeb.ChannelCase, async: true
@@ -18,58 +17,10 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
   setup :verify_on_exit!
 
-  # A BOUND on a real round trip, never a delay: each wait below follows a handler that
-  # reads the database (`Runners.authorized?/2`) or updates Presence, and the assertion
-  # returns the moment the reply lands. ExUnit's 100 ms default is shorter than those round
-  # trips take under a loaded full suite, which made these tests flaky. Also the deadline
-  # of every `eventually/2` poll.
-  @reply_timeout 2_000
-
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine, overrides \\ %{}) do
-    Map.merge(
-      %{
-        "contract_version" => RunnerContract.version(),
-        "machine" => machine,
-        "cores" => 16,
-        "memory_mb" => 28_000,
-        "repos" => ["mkreyman/home_care_billing"],
-        "max_sessions" => 2,
-        "in_flight" => 0,
-        "draining" => false
-      },
-      overrides
-    )
-  end
-
-  defp connect_runner(token), do: connect(RunnerSocket, %{}, connect_info: connect_info(token))
-
-  # Joins and waits for the channel to process :after_join (the Presence track).
-  defp topic(socket), do: "runner:" <> socket.assigns.runner.id
-
-  defp join_pool(socket, machine, overrides \\ %{}) do
-    {:ok, reply, channel} =
-      subscribe_and_join(socket, topic(socket), join_payload(machine, overrides))
-
-    _ = :sys.get_state(channel.channel_pid)
-    {reply, channel}
-  end
-
-  # The capacity loopctl DECIDES from, not the meta the runner reported.
-  defp held_capacity(runner), do: Map.fetch!(Runners.capacity(runner.tenant_id), runner.id)
-
-  defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
-
   describe "connect" do
     test "accepts an enrolled runner's token from the header" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      assert {:ok, socket} = connect_runner(raw)
+      assert {:ok, socket} = connect_runner_socket(raw)
       assert socket.assigns.runner.id == runner.id
       assert socket.assigns.tenant_id == runner.tenant_id
       assert RunnerSocket.id(socket) == "runner_socket:" <> runner.id
@@ -77,8 +28,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
     test "refuses a missing, empty or invalid token" do
       assert :error = connect(RunnerSocket, %{}, connect_info: %{x_headers: []})
-      assert :error = connect_runner("")
-      assert :error = connect_runner("lc_definitely_not_a_key")
+      assert :error = connect_runner_socket("")
+      assert :error = connect_runner_socket("lc_definitely_not_a_key")
     end
 
     test "ignores a token passed as a URL parameter" do
@@ -99,7 +50,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
     test "refuses a valid API key that is not enrolled as a runner" do
       tenant = fixture(:tenant)
       {raw, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
-      assert :error = connect_runner(raw)
+      assert :error = connect_runner_socket(raw)
     end
 
     test "counts the attempt against the per-IP auth bucket BEFORE resolving the token" do
@@ -111,7 +62,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
         {:allow, 1}
       end)
 
-      assert {:ok, _socket} = connect_runner(raw)
+      assert {:ok, _socket} = connect_runner_socket(raw)
       assert_received {:bucket, "auth_ip:127.0.0.1"}
     end
 
@@ -119,23 +70,23 @@ defmodule LoopctlWeb.RunnerChannelTest do
       {raw, _runner} = fixture(:runner, %{})
 
       Mox.expect(Loopctl.MockRateLimiter, :check_rate, fn _b, _w, limit -> {:deny, limit} end)
-      assert :error = connect_runner(raw)
+      assert :error = connect_runner_socket(raw)
 
       Mox.expect(Loopctl.MockRateLimiter, :check_rate, fn _b, _w, _l -> {:error, :down} end)
-      assert :error = connect_runner(raw)
+      assert :error = connect_runner_socket(raw)
     end
 
     test "refuses a revoked runner" do
       {raw, runner} = fixture(:runner, %{})
       {:ok, _} = Runners.revoke_runner(runner.tenant_id, runner.id)
-      assert :error = connect_runner(raw)
+      assert :error = connect_runner_socket(raw)
     end
   end
 
   describe "join and the pool" do
     test "a joined runner appears in its tenant's pool with its declared meta" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
 
       {reply, _channel} = join_pool(socket, "minis")
       assert reply == %{contract_version: RunnerContract.version()}
@@ -149,13 +100,16 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
     test "a declaration outside the contract's own range never reaches the row" do
       {raw, runner} = fixture(:runner, %{name: "minis", max_sessions: 2})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
 
       assert {:error, %{reason: "invalid_payload"}} =
                subscribe_and_join(
                  socket,
-                 topic(socket),
-                 join_payload("minis", %{"max_sessions" => 9_999})
+                 runner_topic(socket),
+                 build(
+                   :runner_join_payload,
+                   Map.put(%{"max_sessions" => 9_999}, "machine", "minis")
+                 )
                )
 
       assert held_capacity(runner).max_sessions == 2
@@ -163,32 +117,36 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
     test "the runner vanishes from the pool when its process is killed, with no sweeper" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis")
       assert in_pool?(runner.tenant_id, "minis")
 
       Process.unlink(channel.channel_pid)
       Process.exit(channel.channel_pid, :kill)
 
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
     end
 
     test "re-reads authorization on every join, so a revoked runner cannot rejoin" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis")
 
       Process.unlink(channel.channel_pid)
       ref = leave(channel)
-      assert_reply ref, :ok, _, @reply_timeout
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+      assert_reply ref, :ok, _, reply_timeout()
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
 
       # Revoked through the api_keys route: no broadcast reaches the unjoined socket.
       {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
       {:ok, _} = Auth.revoke_api_key(key)
 
       assert {:error, %{reason: "not_authorized"}} =
-               subscribe_and_join(socket, topic(socket), join_payload("minis"))
+               subscribe_and_join(
+                 socket,
+                 runner_topic(socket),
+                 build(:runner_join_payload, %{"machine" => "minis"})
+               )
 
       refute in_pool?(runner.tenant_id, "minis")
     end
@@ -196,31 +154,39 @@ defmodule LoopctlWeb.RunnerChannelTest do
     test "refuses a join on another runner's topic" do
       {raw, _runner} = fixture(:runner, %{name: "minis"})
       {_raw_other, other} = fixture(:runner, %{name: "blockit"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
 
       assert {:error, %{reason: "forbidden_topic"}} =
-               subscribe_and_join(socket, "runner:" <> other.id, join_payload("blockit"))
+               subscribe_and_join(
+                 socket,
+                 "runner:" <> other.id,
+                 build(:runner_join_payload, %{"machine" => "blockit"})
+               )
 
       refute in_pool?(other.tenant_id, "blockit")
     end
 
     test "a refused unauthorized join also disconnects the socket" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       @endpoint.subscribe(RunnerSocket.socket_id(runner.id))
 
       {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
       {:ok, _} = Auth.revoke_api_key(key)
 
       assert {:error, %{reason: "not_authorized"}} =
-               subscribe_and_join(socket, topic(socket), join_payload("minis"))
+               subscribe_and_join(
+                 socket,
+                 runner_topic(socket),
+                 build(:runner_join_payload, %{"machine" => "minis"})
+               )
 
-      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, @reply_timeout
+      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, reply_timeout()
     end
 
     test "joins are budgeted per runner BEFORE the authorization read" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       join_bucket = "runner_join:" <> runner.id
 
       Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
@@ -233,15 +199,23 @@ defmodule LoopctlWeb.RunnerChannelTest do
       {:ok, _} = Auth.revoke_api_key(key)
 
       assert {:error, %{reason: "rate_limited"}} =
-               subscribe_and_join(socket, topic(socket), join_payload("minis"))
+               subscribe_and_join(
+                 socket,
+                 runner_topic(socket),
+                 build(:runner_join_payload, %{"machine" => "minis"})
+               )
     end
 
     test "refuses a join under a machine name other than the enrolled one" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
 
       assert {:error, %{reason: "machine_mismatch", declared: "mac-mini"}} =
-               subscribe_and_join(socket, topic(socket), join_payload("mac-mini"))
+               subscribe_and_join(
+                 socket,
+                 runner_topic(socket),
+                 build(:runner_join_payload, %{"machine" => "mac-mini"})
+               )
 
       refute in_pool?(runner.tenant_id, "mac-mini")
       refute in_pool?(runner.tenant_id, "minis")
@@ -249,41 +223,47 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
     test "a runner built against contract 1.0.0 still joins this server" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       # Whatever minor the server is on: only the MAJOR has to match.
       version = RunnerContract.version()
 
       assert {:ok, %{contract_version: ^version}, _channel} =
                subscribe_and_join(
                  socket,
-                 topic(socket),
-                 join_payload("minis", %{"contract_version" => "1.0.0"})
+                 runner_topic(socket),
+                 build(
+                   :runner_join_payload,
+                   Map.put(%{"contract_version" => "1.0.0"}, "machine", "minis")
+                 )
                )
 
-      assert eventually(fn -> in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+      assert eventually(fn -> in_pool?(runner.tenant_id, "minis") end, reply_timeout())
     end
 
     test "refuses a contract major version the server does not speak" do
       {raw, _runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
 
       assert {:error, %{reason: "unsupported_contract_version", sent: "2.0.0"}} =
                subscribe_and_join(
                  socket,
-                 topic(socket),
-                 join_payload("minis", %{"contract_version" => "2.0.0"})
+                 runner_topic(socket),
+                 build(
+                   :runner_join_payload,
+                   Map.put(%{"contract_version" => "2.0.0"}, "machine", "minis")
+                 )
                )
     end
 
     test "refuses a payload that does not match the contract" do
       {raw, _runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
 
       assert {:error, %{reason: "invalid_payload", details: details}} =
                subscribe_and_join(
                  socket,
-                 topic(socket),
-                 Map.delete(join_payload("minis"), "cores")
+                 runner_topic(socket),
+                 Map.delete(build(:runner_join_payload, %{"machine" => "minis"}), "cores")
                )
 
       assert Enum.any?(details, &String.contains?(&1, "cores"))
@@ -291,11 +271,15 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
     test "routes no other topic, and the channel refuses one handed to it anyway" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       pool_topic = Runners.pool_topic(runner.tenant_id)
 
       assert_raise RuntimeError, ~r/no channel found/, fn ->
-        subscribe_and_join(socket, pool_topic, join_payload("minis"))
+        subscribe_and_join(
+          socket,
+          pool_topic,
+          build(:runner_join_payload, %{"machine" => "minis"})
+        )
       end
 
       assert {:error, %{reason: "unknown_topic"}} =
@@ -303,14 +287,14 @@ defmodule LoopctlWeb.RunnerChannelTest do
                  socket,
                  LoopctlWeb.RunnerChannel,
                  pool_topic,
-                 join_payload("minis")
+                 build(:runner_join_payload, %{"machine" => "minis"})
                )
     end
 
     test "a runner is invisible in another tenant's pool" do
       {raw_a, runner_a} = fixture(:runner, %{name: "minis"})
       tenant_b = fixture(:tenant)
-      {:ok, socket} = connect_runner(raw_a)
+      {:ok, socket} = connect_runner_socket(raw_a)
       {_reply, _channel} = join_pool(socket, "minis")
 
       assert in_pool?(runner_a.tenant_id, "minis")
@@ -319,7 +303,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
     test "the runner is not sent the pool" do
       {raw, _runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, _channel} = join_pool(socket, "minis")
 
       refute_push "presence_state", _
@@ -330,14 +314,14 @@ defmodule LoopctlWeb.RunnerChannelTest do
   describe "status" do
     setup do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis")
       %{runner: runner, channel: channel}
     end
 
     test "updates the runner's meta in the pool", %{runner: runner, channel: channel} do
       ref = push(channel, "status", %{"in_flight" => 1, "draining" => true})
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert %{"minis" => %{metas: [meta]}} =
                eventually(
@@ -345,7 +329,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
                    pool = Runners.pool(runner.tenant_id)
                    match?(%{"minis" => %{metas: [%{in_flight: 1}]}}, pool) && pool
                  end,
-                 @reply_timeout
+                 reply_timeout()
                )
 
       assert meta.draining == true
@@ -357,7 +341,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
       # The floor's comparison is LoopctlWeb.RunnerChannel.MinIntervalTest's, at fixed times.
       # Here only what does not depend on how long the round trips take.
       ref = push(channel, "status", %{"in_flight" => 1})
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert is_integer(:sys.get_state(channel.channel_pid).assigns.last_status_at)
 
       # Pinned in the future, so the refusal holds however long the first update took.
@@ -372,24 +356,24 @@ defmodule LoopctlWeb.RunnerChannelTest do
       assert_reply ref,
                    :error,
                    %{reason: "rate_limited", min_interval_ms: ^floor},
-                   @reply_timeout
+                   reply_timeout()
     end
 
     test "refuses a status with no known field", %{channel: channel} do
       ref = push(channel, "status", %{"bogus" => 1})
-      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
     end
 
     test "refuses an unknown event", %{channel: channel} do
       ref = push(channel, "dispatch", %{})
-      assert_reply ref, :error, %{reason: "unknown_event"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "unknown_event"}, reply_timeout()
     end
   end
 
   describe "revocation of a connected runner" do
     setup do
       {raw, runner} = fixture(:runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis")
       Process.unlink(channel.channel_pid)
       @endpoint.subscribe(RunnerSocket.socket_id(runner.id))
@@ -399,8 +383,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
     test "revoke_runner disconnects the socket and empties the pool", %{runner: runner} do
       {:ok, _} = Runners.revoke_runner(runner.tenant_id, runner.id)
 
-      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, @reply_timeout
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, reply_timeout()
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
     end
 
     test "the periodic recheck catches a key revoked through the api_keys route",
@@ -410,8 +394,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
       send(channel.channel_pid, :recheck)
 
-      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, @reply_timeout
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, reply_timeout()
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
     end
 
     test "the periodic recheck leaves an authorized runner connected",

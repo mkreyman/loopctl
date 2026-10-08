@@ -2,27 +2,16 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
   @moduledoc """
   `POST /api/v1/stories/:id/merge-precondition` (issue #803, design §5 and §9).
 
-  ## Why this module is `async: false` with committed rows
-
-  The same reason `Loopctl.Delivery.MergePreconditionIntegrationTest` is, and its moduledoc
-  has the measurement: the precondition reads the story on `AdminRepo` and the stage row on
-  `Loopctl.Repo`, which are two separate sandbox owners with two separate transactions, so
-  a sandboxed row one repo wrote is invisible to the other. A request that returns a
-  VERDICT — the endpoint's whole purpose, and the only thing that would catch a verdict
-  this controller cannot encode as JSON — therefore needs the rows committed.
-
-  `Phoenix.ConnTest.dispatch/5` runs the endpoint in the CALLING process, so the
-  `sandbox: false` connections this module checks out are the ones the request uses.
+  The precondition reads the story on `AdminRepo` and the stage row on `Loopctl.Repo`. In test
+  both run on the test's one sandbox connection (`Loopctl.AdminRepo.Route`), so a request that
+  returns a VERDICT, the endpoint's whole purpose and the only thing that would catch a verdict
+  this controller cannot encode as JSON, runs over sandboxed rows.
   """
 
-  use ExUnit.Case, async: false
+  use LoopctlWeb.ConnCase, async: true
 
   import Ecto.Query, only: [from: 2]
-  import Loopctl.Fixtures
-  import Phoenix.ConnTest
-  import Plug.Conn
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.ForgeRepo
   alias Loopctl.Delivery.Stages
@@ -30,49 +19,24 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
   alias Loopctl.MockPullRequestSource
   alias Loopctl.Repo
 
-  @endpoint LoopctlWeb.Endpoint
-
   @repo "acme/widgets"
   @head String.duplicate("a", 40)
   @base String.duplicate("b", 40)
   @repo_files ["priv/rates/2026.csv", "lib/widgets_web/router.ex", "lib/widgets/thing.ex"]
 
-  setup_all do
-    full_sweep()
-    on_exit(&full_sweep/0)
-    :ok
-  end
+  setup :verify_on_exit!
 
-  setup do
-    # This module is on `ExUnit.Case`, so it gets none of ConnCase's default stubs, and the
-    # request pipeline resolves the rate limiter, the clock and the secrets adapter through
-    # Mox. `stub_all_defaults/0` is the shared set, called directly as the `:scale` modules
-    # do. Global mode is safe in an `async: false` module.
-    Mox.set_mox_global()
-    Loopctl.DataCase.stub_all_defaults()
+  setup %{conn: conn} do
     stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 3})
 
-    # Both committed tenants are made HERE: `fixture(:committed_tenant)` runs its own
-    # unboxed AdminRepo checkout, which cannot happen while this process holds the
-    # `sandbox: false` connections below.
-    tenant = fixture(:committed_tenant, %{})
-    other_tenant = fixture(:committed_tenant, %{})
-    # AdminRepo runs on Repo's connection in test, so this one checkout carries both.
-    :ok = Sandbox.checkout(Repo, sandbox: false)
+    # The delivery loop is work-breakdown surface behind `RequireHumanAnchor`.
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    other_tenant = fixture(:tenant, %{trust_tier: :human_anchored})
 
-    # `fixture(:committed_tenant)` writes the DEFAULT tier, `:agent_rooted`, and the
-    # delivery loop is work-breakdown surface behind `RequireHumanAnchor`.
-    human_anchor(tenant.id)
-    human_anchor(other_tenant.id)
-
-    ctx = tenant |> build_story() |> Map.put(:other_tenant_id, other_tenant.id)
-
-    on_exit(fn ->
-      purge_tenant(tenant.id)
-      purge_tenant(other_tenant.id)
-    end)
-
-    Map.put(ctx, :conn, base_conn())
+    tenant
+    |> build_story()
+    |> Map.put(:other_tenant_id, other_tenant.id)
+    |> Map.put(:conn, conn)
   end
 
   describe "the role gate" do
@@ -371,11 +335,6 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
 
   # -- helpers ---------------------------------------------------------------------------
 
-  defp base_conn do
-    build_conn()
-    |> put_req_header("x-loopctl-last-known-sth", "0:AAAAAAAAAAAAAAAAAAAAAA")
-  end
-
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
 
   defp post_precondition(ctx, key) do
@@ -467,68 +426,5 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
     fixture(:triage_verdict, %{tenant_id: tenant.id, story_id: story.id})
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}
-  end
-
-  # See `Loopctl.Delivery.MergePreconditionIntegrationTest` for why each of these blocks the
-  # sweep of a committed tenant.
-  defp purge_tenant(tenant_id) do
-    checkout_admin()
-    purge_dependents("tenant_id = $1", [Ecto.UUID.dump!(tenant_id)])
-  end
-
-  defp full_sweep do
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      purge_dependents(
-        "tenant_id IN (SELECT id FROM tenants WHERE slug LIKE 'committed-runner-%')",
-        []
-      )
-    end)
-
-    sweep_committed_runner_tenants()
-  end
-
-  defp purge_dependents(predicate, params) do
-    {:ok, :ok} =
-      AdminRepo.transaction(fn ->
-        AdminRepo.query!(
-          "ALTER TABLE audit_chain DISABLE TRIGGER audit_chain_prevent_delete_trigger"
-        )
-
-        AdminRepo.query!("DELETE FROM audit_chain WHERE #{predicate}", params)
-
-        AdminRepo.query!(
-          "UPDATE stories SET implementer_dispatch_id = NULL, verifier_dispatch_id = NULL " <>
-            "WHERE #{predicate}",
-          params
-        )
-
-        AdminRepo.query!("DELETE FROM dispatches WHERE #{predicate}", params)
-        AdminRepo.query!("DELETE FROM api_keys WHERE #{predicate}", params)
-
-        AdminRepo.query!(
-          "ALTER TABLE audit_chain ENABLE TRIGGER audit_chain_prevent_delete_trigger"
-        )
-
-        :ok
-      end)
-
-    :ok
-  end
-
-  defp human_anchor(tenant_id) do
-    {1, _} =
-      AdminRepo.query!("UPDATE tenants SET trust_tier = 'human_anchored' WHERE id = $1", [
-        Ecto.UUID.dump!(tenant_id)
-      ])
-      |> then(fn %{num_rows: n} -> {n, nil} end)
-
-    :ok
-  end
-
-  defp checkout_admin do
-    case Sandbox.checkout(Loopctl.Repo, sandbox: false) do
-      :ok -> :ok
-      {:already, :owner} -> :ok
-    end
   end
 end

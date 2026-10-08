@@ -14,6 +14,7 @@ defmodule Loopctl.Fixtures do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
+  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Artifacts.ArtifactReport
   alias Loopctl.Artifacts.ReviewRecord
   alias Loopctl.Artifacts.VerificationResult
@@ -67,6 +68,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.WorkBreakdown.EpicDependency
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.WorkBreakdown.StoryDependency
+  alias LoopctlWeb.RunnerSocket
 
   # Persistent-term key holding the VM-global :atomics counter that backs
   # `next_story_number/0`. The counter is initialized once, single-threaded, in
@@ -111,6 +113,34 @@ defmodule Loopctl.Fixtures do
   @committed_runner_marker "committed-runner-"
 
   def build(type, attrs \\ %{})
+
+  # The connect info a runner presents: its token header and a peer address (loopback by
+  # default; a test that must tell its own refusal line from another test's passes a unique one).
+  def build(:runner_connect_info, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    %{
+      x_headers: [{RunnerSocket.token_header(), Map.fetch!(attrs, :token)}],
+      peer_data: %{address: Map.get(attrs, :address, {127, 0, 0, 1}), port: 40_000, ssl_cert: nil}
+    }
+  end
+
+  # A conforming runner join payload; `attrs` (string keys, "machine" among them) override.
+  def build(:runner_join_payload, attrs) do
+    Map.merge(
+      %{
+        "contract_version" => RunnerContract.version(),
+        "machine" => "minis",
+        "cores" => 16,
+        "memory_mb" => 28_000,
+        "repos" => ["mkreyman/home_care_billing"],
+        "max_sessions" => 2,
+        "in_flight" => 0,
+        "draining" => false
+      },
+      Enum.into(attrs, %{})
+    )
+  end
 
   def build(:tenant, attrs) do
     Map.merge(
@@ -2113,9 +2143,10 @@ defmodule Loopctl.Fixtures do
   # runner dispatch ledger (#803). The ledger lives on the RLS `Loopctl.Repo`, while the
   # runner socket authenticates through `Loopctl.AdminRepo`. AdminRepo shares Repo's sandbox
   # connection in test (US-46.2), so committing is needed only where a test's own subject
-  # spans connections (a lock holder, a committed trigger). Only a
-  # `async: false` module may use these (a committed row is visible to every running
-  # test), and it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
+  # spans connections (a lock holder, a committed trigger). Only an `async: false` module may
+  # use these (a committed row is visible to every running test), and it sweeps what it
+  # commits: `tracked_committed_runner/2` records the tenant in the module's
+  # `track_committed_tenants/0` ledger, which sweeps exactly those when the module ends.
   # No audit-chain entry is written: those rows cannot be deleted, so the sweep could not
   # remove the tenant.
   def fixture(:committed_runner, attrs) do
@@ -2149,13 +2180,12 @@ defmodule Loopctl.Fixtures do
     end)
   end
 
-  # An agent and its `:agent`-role key, COMMITTED outside the sandbox, for a CONTROLLER test
-  # of a path whose context runs on the RLS `Loopctl.Repo` (#803's escalate endpoint). The
-  # auth pipeline resolves the key on `AdminRepo` while `Loopctl.Delivery.Stages` reads the
-  # story on `Repo`. AdminRepo shares Repo's sandbox connection in test (US-46.2), so
-  # committing is needed only where a test's own subject spans connections. Only an
-  # `async: false` module may use it, and it must call `sweep_committed_runner_tenants/0` in
-  # `setup_all` and on exit; the tenant it makes carries the sweep's slug marker.
+  # An agent and its `:agent`-role key, COMMITTED outside the sandbox. AdminRepo shares Repo's
+  # sandbox connection in test (US-46.2), so a controller test of an endpoint whose auth reads
+  # on `AdminRepo` and whose context reads on `Repo` uses the sandboxed `:api_key` fixture;
+  # this one is only for a test whose own subject spans connections (a committed trigger, a
+  # lock another connection holds). Only an `async: false` module may use it, and it sweeps
+  # its tenant on exit (`sweep_committed_tenants/1`); the tenant carries the sweep's marker.
   #
   # Returns `{raw_key, api_key, agent}`.
   def fixture(:committed_agent_key, attrs) do
@@ -2180,10 +2210,9 @@ defmodule Loopctl.Fixtures do
     end)
   end
 
-  # A committed `:user`-role key, for a CONTROLLER test of an operator-facing read whose data
-  # is written on the RLS `Loopctl.Repo` — the runner registry's `unsupported_kinds`, which is
-  # derived from `runner_dispatches`. Same two-repo constraint as `:committed_agent_key`
-  # above: only an `async: false` module may use it, and it must sweep at the boundary.
+  # A committed `:user`-role key, for a test whose own subject spans connections, like
+  # `:committed_agent_key` above: only an `async: false` module may use it, and it must sweep
+  # its tenant on exit.
   #
   # Returns `{raw_key, api_key}`. A controller test wants the raw token; a CONTEXT test wants
   # the `%ApiKey{}` struct, because `Loopctl.Delivery.Placement.place/4` resolves the caller's
@@ -2242,8 +2271,8 @@ defmodule Loopctl.Fixtures do
   # enough unless a test's own subject spans connections (a lock holder, a committed trigger).
   #
   # Same rules as `fixture(:committed_runner)`: only an `async: false` module may use it, and
-  # it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit — the sweep
-  # deletes the tenant and the story cascades with it.
+  # its tenant goes in the module's `track_committed_tenants/0` ledger — the sweep deletes the
+  # tenant and the story cascades with it.
   def fixture(:committed_story, attrs) do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
@@ -2844,7 +2873,7 @@ defmodule Loopctl.Fixtures do
   # committing is still needed.
   #
   # Same rules as `fixture(:committed_runner)`: only an `async: false` module may use it, and
-  # it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
+  # its tenant goes in the module's `track_committed_tenants/0` ledger.
   #
   # Pass `target_epic_id: nil` for the source that names no epic, which is the ESCALATION
   # case rather than a degenerate one; omitting the key commits an epic and points the source
@@ -2978,6 +3007,19 @@ defmodule Loopctl.Fixtures do
     else
       insert.()
     end
+  end
+
+  # An agent and its `:agent`-role key, sandboxed. Returns `{raw_key, api_key, agent}`; the
+  # committed sibling is `fixture(:committed_agent_key)`.
+  def fixture(:agent_key, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    agent = fixture(:agent, Map.take(attrs, [:tenant_id, :name]))
+
+    {raw_key, api_key} =
+      fixture(:api_key, %{tenant_id: tenant_id, role: :agent, agent_id: agent.id})
+
+    {raw_key, api_key, agent}
   end
 
   def fixture(:api_key, attrs) do
@@ -3412,14 +3454,24 @@ defmodule Loopctl.Fixtures do
   Best effort: `session_replication_role` needs a superuser, and a test database whose role
   is not one keeps its marker tenants rather than failing an `on_exit`.
   """
-  def sweep_committed_runner_tenants do
+  #
+  # `older_than: seconds` sweeps only marker tenants committed at least that long ago: the
+  # leftovers of a killed earlier run, never the rows a run still going in the same tree (two
+  # runs in one tree share its test database) is using.
+  def sweep_committed_runner_tenants(opts \\ []) do
     import Ecto.Query, only: [from: 2]
 
     Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      ids =
-        AdminRepo.all(
-          from(t in Tenant, where: like(t.slug, ^"#{@committed_runner_marker}%"), select: t.id)
-        )
+      query =
+        from(t in Tenant, where: like(t.slug, ^"#{@committed_runner_marker}%"), select: t.id)
+
+      query =
+        case Keyword.get(opts, :older_than) do
+          nil -> query
+          seconds -> from(t in query, where: t.inserted_at < ago(^seconds, "second"))
+        end
+
+      ids = AdminRepo.all(query)
 
       if ids != [], do: sweep_tenant_ids(ids)
     end)
@@ -3453,6 +3505,39 @@ defmodule Loopctl.Fixtures do
       end)
 
     :ok
+  end
+
+  @doc """
+  Starts a ledger of the committed tenants ONE `async: false` module creates, for its
+  `setup_all`, and sweeps exactly those (`sweep_committed_tenants/1`) when the module ends.
+
+  At module end and not per test: a test's sandbox transaction outlives the test's own
+  `on_exit` callbacks, and any row it inserted that references a committed tenant holds a lock
+  on that tenant's row, so a per-test sweep waits on it until the statement is cancelled.
+  """
+  def track_committed_tenants do
+    {:ok, ledger} = Elixir.Agent.start(fn -> [] end)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      sweep_committed_tenants(Elixir.Agent.get(ledger, & &1))
+      Elixir.Agent.stop(ledger)
+    end)
+
+    ledger
+  end
+
+  @doc "Records `tenant_id` in a `track_committed_tenants/0` ledger."
+  def track_committed_tenant(ledger, tenant_id),
+    do: Elixir.Agent.update(ledger, &[tenant_id | &1])
+
+  @doc """
+  `fixture(:committed_runner, attrs)` with its tenant recorded in `ledger`
+  (`track_committed_tenants/0`), so the module sweeps it, and only its own, when it ends.
+  """
+  def tracked_committed_runner(ledger, attrs) do
+    {raw, runner} = fixture(:committed_runner, attrs)
+    track_committed_tenant(ledger, runner.tenant_id)
+    {raw, runner}
   end
 
   @doc """
