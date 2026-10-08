@@ -54,8 +54,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
       # On the story's own branch `test` FAILED; anything else would read green.
       stub_forge(ctx, %{
-        evidence:
-          evidence([ci_run(5, "completed", "failure")], [ci_job(5, "completed", "failure")])
+        evidence: build(:forge_evidence, %{status: "completed", conclusion: "failure"})
       })
 
       run = fixture(:verification_run, ctx)
@@ -86,8 +85,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       stub_forge(ctx, %{
         branch: "loop/thread-branch",
         base: "release",
-        evidence:
-          evidence([ci_run(5, "completed", "failure")], [ci_job(5, "completed", "failure")])
+        evidence: build(:forge_evidence, %{status: "completed", conclusion: "failure"})
       })
 
       run = fixture(:verification_run, ctx)
@@ -113,7 +111,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "it is asked for the intake source's repository, never projects.repo_url", ctx do
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
 
       run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
@@ -125,7 +123,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "a pair with no credential records credential_unavailable, no request made", ctx do
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
 
       # Allowlisted for ANOTHER repository only: this story's is not licensed.
       stub(MockVerificationCredential, :for_read, fn _tenant_id, repo ->
@@ -188,10 +186,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "test pending is a wait: the run stays running and the job snoozes", ctx do
       stub_forge(ctx, %{
         evidence:
-          evidence(
-            [ci_run(5, "in_progress", nil), lint_run(6)],
-            [ci_job(5, "in_progress", nil), lint_job(6)]
-          )
+          build(:forge_evidence, %{
+            runs: [build(:ci_run, %{status: "in_progress", conclusion: nil}), build(:lint_run)],
+            jobs: [build(:ci_job, %{status: "in_progress", conclusion: nil}), build(:lint_job)]
+          })
       })
 
       run = fixture(:verification_run, ctx)
@@ -202,10 +200,16 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     test "test failed is a fail, whatever an unrelated workflow said", ctx do
       stub_forge(ctx, %{
         evidence:
-          evidence(
-            [ci_run(5, "completed", "failure"), lint_run(6)],
-            [ci_job(5, "completed", "failure"), lint_job(6)]
-          )
+          build(:forge_evidence, %{
+            runs: [
+              build(:ci_run, %{status: "completed", conclusion: "failure"}),
+              build(:lint_run)
+            ],
+            jobs: [
+              build(:ci_job, %{status: "completed", conclusion: "failure"}),
+              build(:lint_job)
+            ]
+          })
       })
 
       run = fixture(:verification_run, ctx)
@@ -216,7 +220,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "test succeeded is a pass naming the judged run", ctx do
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
 
       run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
@@ -231,7 +235,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
     test "only an unrelated workflow succeeded: never a pass", ctx do
       stub_forge(ctx, %{
-        evidence: evidence([lint_run(6)], [lint_job(6)])
+        evidence: build(:forge_evidence, %{runs: [build(:lint_run)], jobs: [build(:lint_job)]})
       })
 
       run = fixture(:verification_run, ctx)
@@ -251,7 +255,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         branch: @branch
       })
 
-      stub_forge(ctx, %{diff: [".github/workflows/ci.yml"], evidence: green()})
+      stub_forge(ctx, %{diff: [".github/workflows/ci.yml"], evidence: build(:forge_evidence)})
 
       run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
@@ -278,7 +282,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
              diffstat: %{files: 300, changed_lines: 900},
              diff: {:error, {:file_list_truncated, 300}}
            }},
-        evidence: green()
+        evidence: build(:forge_evidence)
       })
 
       run = fixture(:verification_run, ctx)
@@ -302,7 +306,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "an old green commit of the base (its own merge base) is empty_change", ctx do
-      stub_forge(ctx, %{compare: {:ok, clean([], @sha)}, evidence: green()})
+      stub_forge(ctx, %{
+        compare: {:ok, build(:forge_comparison, %{merge_base_sha: @sha})},
+        evidence: build(:forge_evidence)
+      })
 
       run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
@@ -318,7 +325,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     # The round-2 check (`merge_base == sha`) let this through: an empty commit's merge base
     # is its parent. Only the diff tells.
     test "an empty commit on top of an old base commit is empty_change", ctx do
-      stub_forge(ctx, %{compare: {:ok, clean([], @fork_point)}, evidence: green()})
+      stub_forge(ctx, %{
+        compare: {:ok, build(:forge_comparison, %{merge_base_sha: @fork_point})},
+        evidence: build(:forge_evidence)
+      })
 
       run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
@@ -332,8 +342,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       stub_forge(ctx, %{
         evidence:
           sequence([
-            evidence([ci_run(5, "in_progress", nil)], [ci_job(5, "in_progress", nil)]),
-            green()
+            build(:forge_evidence, %{status: "in_progress", conclusion: nil}),
+            build(:forge_evidence)
           ])
       })
 
@@ -345,7 +355,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       # Merged: the comparison now answers an empty diff.
       stub(MockPullRequestSource, :compare, fn %ForgeRepo{full_name: @repo}, "master", sha ->
         send(ctx.test_pid, {:compare, sha})
-        {:ok, clean([], @sha)}
+        {:ok, build(:forge_comparison, %{merge_base_sha: @sha})}
       end)
 
       assert :ok = perform(ctx, run)
@@ -356,7 +366,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     # Round 4, finding 5: the merge gate's rule, both halves. A head whose tree is the base's
     # is empty however many files its three-dot diff lists.
     test "a head whose tree is the base's is empty_change, whatever the diff lists", ctx do
-      stub_forge(ctx, %{tree: @base_tree, evidence: green()})
+      stub_forge(ctx, %{tree: @base_tree, evidence: build(:forge_evidence)})
 
       run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
@@ -382,7 +392,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
 
     # #915 round 3, finding 1: one blip must not end a run.
     test "a 502 once then success: a snooze, then a pass", ctx do
-      stub_forge(ctx, %{evidence: sequence([{:error, {:github_api_error, 502}}, green()])})
+      stub_forge(ctx, %{
+        evidence: sequence([{:error, {:github_api_error, 502}}, build(:forge_evidence)])
+      })
 
       run = fixture(:verification_run, ctx)
       assert {:snooze, _} = perform(ctx, run)
@@ -397,7 +409,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     # Review round 1, finding 3: the snooze backs off with the STREAK, so the bound spans
     # tens of minutes of an unreachable forge rather than a few.
     test "a 502 past the merge gate's consecutive bound records forge_unavailable", ctx do
-      stub_forge(ctx, %{compare: {:error, {:github_api_error, 502}}, evidence: green()})
+      stub_forge(ctx, %{
+        compare: {:error, {:github_api_error, 502}},
+        evidence: build(:forge_evidence)
+      })
+
       run = fixture(:verification_run, ctx)
       bound = MergePrecondition.max_consecutive_unevaluated()
       backoff = [60, 120, 240, 480, 900, 900, 900]
@@ -440,7 +456,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "a forge-supplied retry-after is honoured up to an hour", ctx do
-      stub_forge(ctx, %{compare: {:error, {:github_rate_limited, 429, 7_200}}, evidence: green()})
+      stub_forge(ctx, %{
+        compare: {:error, {:github_rate_limited, 429, 7_200}},
+        evidence: build(:forge_evidence)
+      })
 
       run = fixture(:verification_run, ctx)
       assert {:snooze, 3_600} = perform(ctx, run)
@@ -451,7 +470,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         evidence:
           sequence([
             {:error, {:github_unreachable, :timeout}},
-            evidence([ci_run(5, "queued", nil)], [ci_job(5, "queued", nil)])
+            build(:forge_evidence, %{status: "queued", conclusion: nil})
           ])
       })
 
@@ -463,7 +482,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "a 404 records its code at once, and ends the run", ctx do
-      stub_forge(ctx, %{compare: {:error, {:github_api_error, 404}}, evidence: green()})
+      stub_forge(ctx, %{
+        compare: {:error, {:github_api_error, 404}},
+        evidence: build(:forge_evidence)
+      })
 
       run = fixture(:verification_run, ctx)
       assert :ok = perform(ctx, run)
@@ -473,7 +495,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "a missing required check past the age window records ci_wait_exhausted", ctx do
-      stub_forge(ctx, %{evidence: evidence([], [])})
+      stub_forge(ctx, %{evidence: build(:forge_evidence, %{runs: [], jobs: []})})
 
       run = fixture(:verification_run, Map.put(ctx, :age_seconds, 25 * 60 * 60))
       assert :ok = perform(ctx, run)
@@ -481,7 +503,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     end
 
     test "inside the window a missing check waits", ctx do
-      stub_forge(ctx, %{evidence: evidence([], [])})
+      stub_forge(ctx, %{evidence: build(:forge_evidence, %{runs: [], jobs: []})})
 
       run = fixture(:verification_run, Map.put(ctx, :age_seconds, 23 * 60 * 60))
       assert {:snooze, _} = perform(ctx, run)
@@ -508,7 +530,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
     # #931 finding i: the snooze backs off with the run's age instead of a fixed 60s.
     test "the snooze backs off with age, between one and fifteen minutes", ctx do
       stub_forge(ctx, %{
-        evidence: evidence([ci_run(5, "queued", nil)], [ci_job(5, "queued", nil)])
+        evidence: build(:forge_evidence, %{status: "queued", conclusion: nil})
       })
 
       for {age, snooze} <- [{0, 60}, {2 * 60 * 60, 720}, {10 * 60 * 60, 900}] do
@@ -534,9 +556,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
       stub_forge(ctx, %{
         evidence:
           sequence([
-            evidence([ci_run(5, "in_progress", nil)], [ci_job(5, "in_progress", nil)]),
-            evidence([ci_run(5, "in_progress", nil)], [ci_job(5, "in_progress", nil)]),
-            evidence([ci_run(5, "completed", "failure")], [ci_job(5, "completed", "failure")])
+            build(:forge_evidence, %{status: "in_progress", conclusion: nil}),
+            build(:forge_evidence, %{status: "in_progress", conclusion: nil}),
+            build(:forge_evidence, %{status: "completed", conclusion: "failure"})
           ])
       })
 
@@ -573,7 +595,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         branch: @branch
       })
 
-      stub_forge(ctx, %{compare: {:error, {:github_api_error, 502}}, evidence: green()})
+      stub_forge(ctx, %{
+        compare: {:error, {:github_api_error, 502}},
+        evidence: build(:forge_evidence)
+      })
 
       expect(MockPullRequestSource, :resolve_commit, 1, fn %ForgeRepo{full_name: @repo}, @short ->
         {:ok, @sha}
@@ -596,7 +621,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerIntegrationTest do
         branch: @branch
       })
 
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
 
       for {status, code} <- [{422, "unresolved_sha"}, {404, "repository_unreadable"}] do
         expect(MockPullRequestSource, :resolve_commit, fn %ForgeRepo{full_name: @repo}, @short ->

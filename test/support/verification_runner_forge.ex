@@ -1,9 +1,13 @@
 defmodule Loopctl.Test.VerificationRunnerForge do
   @moduledoc """
-  The forge stubs, evidence builders and run helpers shared by
+  The forge stubs and run helpers shared by
   `Loopctl.Workers.VerificationRunnerWorkerIntegrationTest` (async, sandboxed) and
   `Loopctl.Workers.VerificationRunnerWorkerLockTest` (sync, committed: its subject is a lock
   another connection holds).
+
+  The answers the stubs give are built in `Loopctl.Fixtures` (`build(:forge_evidence)`,
+  `build(:forge_comparison)`, `build(:ci_run)` and friends), and the records a run needs are
+  `fixture(:verification_story)` and `fixture(:verification_run)`.
 
   The forge is `Loopctl.MockPullRequestSource`. Each stub answers ONLY for the intake source's
   repository and the story's own branch; anything else is recorded as `{:wrong_read, ...}`
@@ -90,36 +94,6 @@ defmodule Loopctl.Test.VerificationRunnerForge do
   @doc "Everything a poll may write on the run, `updated_at` included."
   def snapshot(ctx, run), do: ctx |> reload(run) |> Map.take(@run_fields)
 
-  @doc "Green evidence: required check `test` succeeded in workflow run `run_id`."
-  def green(run_id \\ 5),
-    do:
-      evidence([ci_run(run_id, "completed", "success")], [ci_job(run_id, "completed", "success")])
-
-  @doc "A forge evidence answer."
-  def evidence(runs, jobs), do: {:ok, %{runs: runs, jobs: jobs, statuses: []}}
-
-  @doc "A workflow run of `ci.yml` (or `workflow`)."
-  def ci_run(id, status, conclusion, workflow \\ ".github/workflows/ci.yml"),
-    do: %{id: id, workflow: workflow, status: status, conclusion: conclusion}
-
-  @doc "An unrelated workflow file (`lint.yml`) that succeeded, carrying its own job."
-  def lint_run(id), do: ci_run(id, "completed", "success", ".github/workflows/lint.yml")
-
-  @doc "The job of `lint_run/1`."
-  def lint_job(run_id),
-    do: %{ci_job(run_id, "completed", "success", "lint") | workflow: ".github/workflows/lint.yml"}
-
-  @doc "A job of a `ci.yml` run, named `test` unless `name` says otherwise."
-  def ci_job(run_id, status, conclusion, name \\ "test"),
-    do: %{
-      id: run_id * 10,
-      run_id: run_id,
-      name: name,
-      status: status,
-      conclusion: conclusion,
-      workflow: ".github/workflows/ci.yml"
-    }
-
   @doc """
   The story's own reads answer `answers`; any other repository, branch or base is recorded
   and answered GREEN, so a read of the wrong target would pass a run that must not pass.
@@ -142,11 +116,14 @@ defmodule Loopctl.Test.VerificationRunnerForge do
     stub(MockPullRequestSource, :compare, fn
       %ForgeRepo{full_name: @repo}, ^base, sha ->
         send(ctx.test_pid, {:compare, sha})
-        answers |> Map.get_lazy(:compare, fn -> {:ok, clean(diff)} end) |> answer()
+
+        answers
+        |> Map.get_lazy(:compare, fn -> {:ok, build(:forge_comparison, %{files: diff})} end)
+        |> answer()
 
       repo, other_base, _sha ->
         send(ctx.test_pid, {:wrong_read, :compare, repo, other_base})
-        {:ok, clean(["lib/x.ex"])}
+        {:ok, build(:forge_comparison, %{files: ["lib/x.ex"]})}
     end)
 
     stub(MockPullRequestSource, :check_evidence, fn
@@ -156,18 +133,9 @@ defmodule Loopctl.Test.VerificationRunnerForge do
 
       repo, _sha, other_branch ->
         send(ctx.test_pid, {:wrong_read, :check_evidence, repo, other_branch})
-        green(99)
+        build(:forge_evidence, %{run_id: 99})
     end)
   end
-
-  @doc "A comparison answer listing `files` changed since `merge_base`."
-  def clean(files, merge_base \\ @fork_point),
-    do: %{
-      merge_base_sha: merge_base,
-      base_tree_sha: @base_tree,
-      diffstat: %{files: length(files), changed_lines: 3 * length(files)},
-      diff: {:ok, %{files: files, renames: []}}
-    }
 
   @doc "A sequence of answers, one per call, from a process-held queue; the last repeats."
   def sequence(answers) do

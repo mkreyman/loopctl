@@ -28,21 +28,13 @@ defmodule Loopctl.Workers.TriageTriggerWorkerLockTest do
 
   setup :verify_on_exit!
 
-  # Unlinked, so it outlives the module process and is still there for the `on_exit`.
   setup_all do
-    {:ok, ledger} = Agent.start(fn -> [] end)
-
-    on_exit(fn ->
-      sweep_committed_tenants(Agent.get(ledger, & &1))
-      Agent.stop(ledger)
-    end)
-
-    %{ledger: ledger}
+    %{ledger: track_committed_tenants()}
   end
 
   setup %{ledger: ledger} do
     tenant = fixture(:committed_tenant, %{})
-    Agent.update(ledger, &[tenant.id | &1])
+    track_committed_tenant(ledger, tenant.id)
     %{tenant: tenant}
   end
 

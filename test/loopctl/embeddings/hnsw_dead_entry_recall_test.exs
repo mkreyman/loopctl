@@ -176,8 +176,10 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
     %{rows: rows} = AdminRepo.query!("EXPLAIN " <> ann_sql(), ann_params())
     plan = rows |> List.flatten() |> Enum.join("\n")
 
-    assert plan =~ "Seq Scan on article_embeddings" and not (plan =~ @index),
-           "expected the exact plan (seq scan, no HNSW index), got:\n#{plan}"
+    # The HNSW index absent, and nothing more: any other plan (a seq scan, a bitmap scan
+    # over a btree) is exact, and only the ANN index can lose a row to a dead entry.
+    refute plan =~ @index,
+           "expected an exact plan (no HNSW index), got:\n#{plan}"
   end
 
   defp ann_sql do

@@ -166,10 +166,11 @@ defmodule Loopctl.Workers.ReviewCeilingWorkerTest do
 
     # Not a candidate at all, rather than one the escalation refuses every minute: a refused
     # candidate stays oldest in the batch and starves the live ones behind it.
-    # The worker's OWN log only, and only this story's line: this module runs async, and a
-    # refute over every process's log, or every story's, would fail on another test's line.
+    # The worker's OWN log only: this module runs async, and a refute over every process's
+    # log would fail on a concurrent test's line. The sweep reads this test's tenant alone,
+    # so every line in it is about this test's story.
     {:ok, log} = Loopctl.OwnLog.with_own_log(fn -> perform(ctx) end)
     assert stage_of(ctx).stage == :implementing
-    refute log =~ ~r/review_ceiling not yet moved.*story_id=#{ctx.story.id}/
+    refute log =~ "review_ceiling not yet moved"
   end
 end

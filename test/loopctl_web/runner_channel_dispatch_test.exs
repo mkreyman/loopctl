@@ -5,34 +5,23 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   as that runner in its tenant; and the rate limits the contract publishes are the ones the
   channel enforces. Connect, join, status and revocation are in `LoopctlWeb.RunnerChannelTest`.
 
-  ## Why `async: false`
-
   A dispatch, a reply and a trace write the dispatch ledger on the RLS `Loopctl.Repo`, while
-  the socket authenticates its runner through `Loopctl.AdminRepo` — separate sandbox
-  connections that cannot see each other's uncommitted rows. The `dispatch`,
-  `dispatch_reply` and `trace` tests therefore use COMMITTED runners
-  (`fixture(:committed_runner)`), swept at module boundaries, which no concurrently running
-  test may see. That is a property of the sandbox, not of this code: `Loopctl.Repo` and
-  `Loopctl.AdminRepo` each check out their OWN connection and open their OWN transaction for
-  a test, and a row inserted in one uncommitted transaction is invisible to the other — a
-  foreign key check against it fails. No sandbox mode shares one transaction across two
-  repos, so the only rows both can see are committed ones, and a committed row is visible to
-  every async test running at the same time (anything counting tenants or runners would
-  flake). ExUnit runs `async: false` modules after the async ones, alone.
+  the socket authenticates its runner through `Loopctl.AdminRepo`. In test both run on the
+  test's one sandbox connection (`Loopctl.AdminRepo.Route`), which the channel process reaches
+  through `$callers`, so every runner here is sandboxed. The tests whose subject is a lock the
+  channel's connection waits on, held by a second connection, are in
+  `LoopctlWeb.RunnerChannelLockTest`, sync.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
-  import Ecto.Query
   import ExUnit.CaptureLog
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Auth
-  alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
@@ -41,59 +30,8 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   alias Loopctl.Runners.Runner
   alias Loopctl.Runners.Usage
   alias Loopctl.Tenants
-  alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
-
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  # A BOUND on a real round trip, never a delay: every dispatch, reply and trace below waits
-  # on a database transaction in the channel process, and the assertion returns the moment
-  # the reply lands. ExUnit's 100 ms default is shorter than that under a loaded full suite.
-  # Also the deadline of every `eventually/2` poll.
-  @reply_timeout 2_000
-
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine, overrides) do
-    Map.merge(
-      %{
-        "contract_version" => RunnerContract.version(),
-        "machine" => machine,
-        "cores" => 16,
-        "memory_mb" => 28_000,
-        "repos" => ["mkreyman/home_care_billing"],
-        "max_sessions" => 2,
-        "in_flight" => 0,
-        "draining" => false
-      },
-      overrides
-    )
-  end
-
-  defp connect_runner(token), do: connect(RunnerSocket, %{}, connect_info: connect_info(token))
-
-  # Joins and waits for the channel to process :after_join (the Presence track).
-  defp topic(socket), do: "runner:" <> socket.assigns.runner.id
-
-  defp join_pool(socket, machine, overrides \\ %{}) do
-    {:ok, reply, channel} =
-      subscribe_and_join(socket, topic(socket), join_payload(machine, overrides))
-
-    _ = :sys.get_state(channel.channel_pid)
-    {reply, channel}
-  end
-
-  defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
 
   # The channel's own view of the runner's meta — what Presence replicates and what both
   # `Runners.declared_kinds/1` and `Runners.suppressed_kinds/1` read at the decision.
@@ -106,10 +44,10 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   defp rejoin_declaring(channel, raw, runner, kinds) do
     Process.unlink(channel.channel_pid)
     ref = leave(channel)
-    assert_reply ref, :ok, _, @reply_timeout
-    assert eventually(fn -> not in_pool?(runner.tenant_id, runner.name) end, @reply_timeout)
+    assert_reply ref, :ok, _, reply_timeout()
+    assert eventually(fn -> not in_pool?(runner.tenant_id, runner.name) end, reply_timeout())
 
-    {:ok, socket} = connect_runner(raw)
+    {:ok, socket} = connect_runner_socket(raw)
     {_reply, channel} = join_pool(socket, runner.name, %{"kinds" => kinds})
     channel
   end
@@ -134,111 +72,16 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     build(:runner_dispatch, Map.put(attrs, "story_id", story.id))
   end
 
-  # The capacity loopctl DECIDES from — read on the RLS connection, because `Loopctl.Repo`
-  # and `Loopctl.AdminRepo` hold separate sandbox transactions and the channel's write lands
-  # in the first (see this module's "Why `async: false`").
-  defp held_capacity(runner) do
-    {:ok, held} =
-      Repo.with_tenant(runner.tenant_id, fn ->
-        Repo.one!(
-          from r in Runner,
-            where: r.id == ^runner.id,
-            select: %{
-              max_sessions: r.max_sessions,
-              in_flight: r.in_flight,
-              updated_at: r.updated_at
-            }
-        )
-      end)
-
-    held
-  end
-
-  # The machine drops its socket and connects again declaring `overrides`. Capacity is
-  # per-CONNECTION, so a rejoin is the only way to change one.
-  defp rejoin(runner, raw, channel, overrides) do
-    Process.unlink(channel.channel_pid)
-    ref = leave(channel)
-    assert_reply ref, :ok, _, @reply_timeout
-    assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
-
-    {:ok, socket} = connect_runner(raw)
-    {_reply, channel} = join_pool(socket, "minis", overrides)
-    channel
-  end
-
-  # Moves the capacity Postgres holds, COMMITTED, with no channel involved — see the caller
-  # for why a join would not do. `max_sessions` only; `enrolled_max_sessions` is the grant and
-  # nothing but an enrollment writes it.
-  defp hold_capacity_at!(runner, max_sessions) do
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      {1, _} =
-        Loopctl.AdminRepo.update_all(
-          from(r in Runner, where: r.id == ^runner.id and r.tenant_id == ^runner.tenant_id),
-          set: [max_sessions: max_sessions, updated_at: DateTime.utc_now()]
-        )
-    end)
-
-    :ok
-  end
-
-  # Holds `FOR UPDATE` on the runner's row from a COMMITTED transaction on its own connection,
-  # so a write from the channel's connection really blocks. Returns the holder and a ref to
-  # release it with.
-  defp lock_runner_row(runner) do
-    test = self()
-    ref = make_ref()
-
-    locker = Task.async(fn -> hold_then_release(runner, test, ref) end)
-
-    assert_receive {:locked, ^ref}, @reply_timeout
-    {locker, ref}
-  end
-
-  defp hold_then_release(runner, test, ref) do
-    Sandbox.unboxed_run(Loopctl.Repo, fn ->
-      Loopctl.AdminRepo.transaction(fn -> hold_runner_row(runner, test, ref) end)
-    end)
-
-    # AFTER `unboxed_run/2` has checked the connection back in. Exiting straight out of the
-    # transaction tears the connection down under Postgrex and logs a disconnect that has
-    # nothing to do with what is under test.
-    send(test, {:released, ref})
-  end
-
-  defp hold_runner_row(runner, test, ref) do
-    Loopctl.AdminRepo.one!(
-      from r in Runner, where: r.id == ^runner.id, lock: "FOR UPDATE", select: r.id
-    )
-
-    send(test, {:locked, ref})
-
-    receive do
-      {:release, ^ref} -> :ok
-    after
-      30_000 -> :ok
-    end
-  end
-
-  # AWAITED, not merely signalled: the holder's connection is checked back in as its task
-  # ends, and letting the test run on while that happens tears the connection down under
-  # Postgrex and logs a disconnect that has nothing to do with what is under test.
-  defp release_runner_row(%Task{} = locker, ref) do
-    send(locker.pid, {:release, ref})
-    assert_receive {:released, ^ref}, @reply_timeout
-    Task.await(locker, @reply_timeout)
-  end
-
   describe "the capacity a joining machine declares" do
     test "is what loopctl reserves against, downward from what the machine was enrolled with" do
       # The defect this closes (846.4): minis was enrolled at two, its own runner.json says one,
       # and every rejoin left the held row at two. loopctl then placed a SECOND concurrent
       # dispatch on a machine that refuses it `at_capacity` — and a refused dispatch costs the
       # story's claim and parks it, which is the failure #865 built an escalation for.
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
+      {raw, runner} = fixture(:runner, %{name: "minis", max_sessions: 2})
       assert held_capacity(runner).max_sessions == 2
 
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 1})
 
       assert held_capacity(runner).max_sessions == 1
@@ -246,7 +89,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok =
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       assert {:error, :runner_at_capacity} =
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
@@ -255,8 +98,8 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     end
 
     test "and upward again, within the ceiling it was enrolled with, without re-enrolling" do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 3})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis", max_sessions: 3})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 1})
       assert held_capacity(runner).max_sessions == 1
 
@@ -267,7 +110,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         assert :ok =
                  Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-        assert_push "dispatch", _, @reply_timeout
+        assert_push "dispatch", _, reply_timeout()
       end
     end
 
@@ -277,8 +120,8 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # could not do before capacity followed the declaration at all. The asymmetry that makes
       # the machine's number right downward is exactly what makes it wrong upward: holding too
       # many parks stories, holding too few only under-uses a machine.
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis", max_sessions: 2})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 64})
 
       assert held_capacity(runner).max_sessions == 2
@@ -287,7 +130,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         assert :ok =
                  Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-        assert_push "dispatch", _, @reply_timeout
+        assert_push "dispatch", _, reply_timeout()
       end
 
       assert {:error, :runner_at_capacity} =
@@ -298,26 +141,27 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # Zero is inside `RunnerJoin`'s range and outside the column's. Ignoring it would leave
       # the enrolled two standing — the exact over-reservation this path exists to end. A
       # machine that wants NO work sets `draining`.
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
-      {:ok, socket} = connect_runner(raw)
+      # A runner name no other test holds: under async the capture also holds other tests'
+      # lines, and the assertion below must match this runner's.
+      name = "minis-#{System.unique_integer([:positive])}"
+      {raw, runner} = fixture(:runner, %{name: name, max_sessions: 2})
+      {:ok, socket} = connect_runner_socket(raw)
 
       log =
         capture_log(fn ->
-          {reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 0})
+          {reply, _channel} = join_pool(socket, name, %{"max_sessions" => 0})
           assert reply == %{contract_version: RunnerContract.version()}
         end)
 
       assert held_capacity(runner).max_sessions == 1
-      assert log =~ "declared max_sessions 0"
+      assert log =~ "runner #{name} declared max_sessions 0"
 
       # #846.4 review ROUND 2, finding 4: the held number (1, asserted above) and the one the
       # pool reports are NOT equal here, and this is the one case where that is correct rather
       # than drift — `Runners.capacity/1`'s docstring claimed they always match for a machine
       # declaring at or below its grant, and a declared `0` is both. This is what makes the
-      # corrected sentence checkable. Read through `held_capacity/1` rather than
-      # `Runners.capacity/1`, which is the same column and the same query but on `AdminRepo` —
-      # a second sandbox connection that cannot see the channel's uncommitted write (see this
-      # module's "Why `async: false`").
+      # corrected sentence checkable. Read through `held_capacity/1`, the column the channel
+      # writes.
       #
       # The ONE live meta is what `LoopctlWeb.RunnerController`'s `pool_entry/2` renders
       # `reported_max_sessions` from.
@@ -327,8 +171,8 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     end
 
     test "leaves the row untouched when a rejoin declares what is already held" do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 4})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis", max_sessions: 4})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 2})
 
       written_at = held_capacity(runner).updated_at
@@ -351,164 +195,26 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert held_capacity(runner).updated_at == capped_at
     end
 
-    test "survives a database failure and re-applies the declaration on the next recheck" do
-      # #846.4 review findings 4 and 5, together, because they are two halves of one event.
-      #
-      # Before this, the capacity write rescued `Postgrex.Error` and only the RETRYABLE codes
-      # at that; anything else — a dropped connection, a pool checkout timeout, a database
-      # restarting, a statement cancelled like the one below — propagated out of
-      # `handle_info(:after_join, ...)`, KILLED THE CHANNEL and took the runner out of the
-      # pool. The runner then reconnects, which under a database blip is a crash/reconnect
-      # loop across the whole fleet. `:after_join` touched no database at all before capacity
-      # followed the declaration, so this failure mode came in with it.
-      #
-      # And the write was never retried. The machine stayed dispatchable against the STALE
-      # LARGER number until it happened to reconnect: `Capacity.heal/3` recomputes `in_flight`
-      # and never `max_sessions`, so nothing else reconciles it.
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
-
-      # A real committed transaction on its OWN connection holding the runners row, so the
-      # channel's UPDATE genuinely waits on a lock rather than on a stub.
-      {locker, lock_ref} = lock_runner_row(runner)
-
-      # Cancelled at 50ms instead of waiting out `Capacity.lock_timeout_ms/0`, which also
-      # makes it the NON-retryable class (`query_canceled`) — the one that used to be
-      # re-raised. `SET LOCAL`, so it lasts this test's sandbox transaction and no longer.
-      Repo.query!("SET LOCAL statement_timeout = '50ms'")
-
-      log =
-        capture_log(fn ->
-          {:ok, socket} = connect_runner(raw)
-          {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 1})
-
-          # THE CHANNEL IS ALIVE AND THE RUNNER IS IN THE POOL. That is the whole of finding 4:
-          # the documented fallback is to keep the capacity the row holds, and it only runs if
-          # nothing escapes.
-          assert Process.alive?(channel.channel_pid)
-          assert in_pool?(runner.tenant_id, "minis")
-
-          Repo.query!("SET LOCAL statement_timeout = 0")
-          release_runner_row(locker, lock_ref)
-
-          # The stale number is still held, and nothing but this retry will move it.
-          assert held_capacity(runner).max_sessions == 2
-
-          send(channel.channel_pid, :recheck)
-          _ = :sys.get_state(channel.channel_pid)
-
-          assert held_capacity(runner).max_sessions == 1
-        end)
-
-      assert log =~ "could not apply runner minis's declared max_sessions 1"
-      assert log =~ "will retry on this socket's next recheck"
-    end
-
-    test "is not re-asserted on recheck by a socket that is no longer the runner's only one" do
-      # #846.4 review ROUND 2, finding 3. `declaration_pending` stays true until a write lands,
-      # and the retry re-applied THIS socket's `meta` with no check that the socket is still
-      # the one the runner is dispatched through — unlike the join-time write, whose whole
-      # ordering argument is that the socket is not yet dispatchable. Two sockets can be live
-      # at once (`Loopctl.Runners`' moduledoc, the reconnect window), so an older socket on a
-      # silent node re-asserted its stale declaration over a newer connection's, every 30
-      # seconds, leaving the machine dispatched against a capacity it no longer declares — the
-      # defect this story exists to end.
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 4})
-
-      # The row starts at 1 under a ceiling of 4, so the socket under test has something to
-      # write. Done as a COMMITTED update rather than by joining a first socket: a channel's
-      # capacity write lands in the shared sandbox transaction, which never commits, and the
-      # `runners` row would then stay locked for the rest of the test — the lock this test
-      # needs to hand to `lock_runner_row/1` deliberately, at a moment of its own choosing.
-      hold_capacity_at!(runner, 1)
-      assert held_capacity(runner).max_sessions == 1
-
-      # SOCKET A declares 4 and loses the runner row's lock, so its declaration is PENDING.
-      # Cancelled at 50ms rather than waiting out `Capacity.lock_timeout_ms/0`.
-      {locker, lock_ref} = lock_runner_row(runner)
-      Repo.query!("SET LOCAL statement_timeout = '50ms'")
-
-      {socket_a, log} =
-        with_log(fn ->
-          {:ok, socket} = connect_runner(raw)
-          {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
-          channel
-        end)
-
-      assert log =~ "will retry on this socket's next recheck"
-
-      Repo.query!("SET LOCAL statement_timeout = 0")
-      release_runner_row(locker, lock_ref)
-
-      # A never landed its 4, and A is still alive and tracked.
-      assert held_capacity(runner).max_sessions == 1
-      assert Process.alive?(socket_a.channel_pid)
-
-      # SOCKET B — the machine reconnected after being reconfigured — declares 1, which is
-      # what the row already holds, so B's own write is a no-op and the row stands at B's
-      # number. Both sockets are now live.
-      {:ok, socket} = connect_runner(raw)
-      {_reply, socket_b} = join_pool(socket, "minis", %{"max_sessions" => 1})
-      assert length(Runners.live_metas(runner.tenant_id, runner.id)) == 2
-
-      # A's recheck. Ungated it writes 4 back over B's 1 and re-asserts it every 30 seconds.
-      send(socket_a.channel_pid, :recheck)
-      _ = :sys.get_state(socket_a.channel_pid)
-
-      assert held_capacity(runner).max_sessions == 1
-
-      # AND IT IS STILL REFUSED ONCE B IS GONE (#846.4 review ROUND 3, finding 5). The check
-      # above is `sole_live_socket?/1`, which reads the pool AT THIS INSTANT — so B leaving
-      # makes A sole again and, on that check alone, free to write its 4 over the
-      # configuration the machine now runs. Nothing A can read tells it that a newer
-      # connection existed and has ended; B could equally have joined, written and gone
-      # between two of A's 30-second rechecks, never overlapping A at all. What holds instead
-      # is that the retry may only LOWER: A's 4 is a raise and is refused whether or not B is
-      # visible when A asks.
-      Process.unlink(socket_b.channel_pid)
-      ref = leave(socket_b)
-      assert_reply ref, :ok, _, @reply_timeout
-
-      assert eventually(
-               fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end,
-               @reply_timeout
-             )
-
-      send(socket_a.channel_pid, :recheck)
-      _ = :sys.get_state(socket_a.channel_pid)
-
-      assert held_capacity(runner).max_sessions == 1
-
-      # And it stays refused rather than being retried for ever: the machine gets its 4 back
-      # by RECONNECTING, which is a join and carries no such bound.
-      send(socket_a.channel_pid, :recheck)
-      _ = :sys.get_state(socket_a.channel_pid)
-      assert held_capacity(runner).max_sessions == 1
-
-      socket_c = rejoin(runner, raw, socket_a, %{"max_sessions" => 4})
-      assert held_capacity(runner).max_sessions == 4
-      assert Process.alive?(socket_c.channel_pid)
-    end
-
     test "lowering it under the slots the machine already holds sends no more work" do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 2})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis", max_sessions: 2})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 2})
 
       for _ <- 1..2 do
         assert :ok =
                  Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-        assert_push "dispatch", _, @reply_timeout
+        assert_push "dispatch", _, reply_timeout()
       end
 
       assert held_capacity(runner).in_flight == 2
 
       Process.unlink(channel.channel_pid)
       ref = leave(channel)
-      assert_reply ref, :ok, _, @reply_timeout
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+      assert_reply ref, :ok, _, reply_timeout()
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
 
-      {:ok, socket} = connect_runner(raw)
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, _channel} = join_pool(socket, "minis", %{"max_sessions" => 1})
 
       # `runners_in_flight_range` CHECKs in_flight <= max_sessions, so the clamp is what makes
@@ -523,8 +229,8 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   describe "dispatch" do
     setup do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis")
       %{runner: runner, raw: raw, channel: channel}
     end
@@ -534,9 +240,9 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
     test "arrives on the runner's own topic, and on no other runner's", %{runner: runner} do
       {raw_b, runner_b} =
-        fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+        fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
 
-      {:ok, socket_b} = connect_runner(raw_b)
+      {:ok, socket_b} = connect_runner_socket(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "blockit")
 
       payload = dispatch_payload(runner.tenant_id)
@@ -546,7 +252,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       other_topic = "runner:" <> runner_b.id
 
       assert_receive %Phoenix.Socket.Message{topic: ^topic, event: "dispatch", payload: pushed},
-                     @reply_timeout
+                     reply_timeout()
 
       assert pushed.dispatch_id == payload["dispatch_id"]
       assert pushed.claim_epoch == 0
@@ -559,7 +265,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       @endpoint.subscribe("runner:" <> runner.id)
 
       assert :ok = dispatch_to(runner)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
       refute_received %Phoenix.Socket.Broadcast{event: "dispatch"}
     end
 
@@ -571,7 +277,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
                  "token_budget" => 1_000
                })
 
-      assert_push "dispatch", pushed, @reply_timeout
+      assert_push "dispatch", pushed, reply_timeout()
       refute Map.has_key?(pushed, :tenant_id)
       refute Map.has_key?(pushed, :prompt)
       refute Enum.any?(Map.keys(pushed), &is_binary/1)
@@ -597,7 +303,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{runner: runner} do
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       :ok = Usage.record(runner.tenant_id, runner.id, %{exhausted: true})
 
@@ -616,7 +322,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
     test "the halt is checked before authorization and the pool", %{runner: runner} do
       {_raw, offline} =
-        fixture(:committed_runner, %{name: "offline", tenant_id: runner.tenant_id})
+        fixture(:runner, %{name: "offline", tenant_id: runner.tenant_id})
 
       {:ok, _} = Tenants.halt_custody(runner.tenant_id)
 
@@ -631,7 +337,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # The control first: with no halt this very path pushes.
       pushable = recorded_dispatch(runner)
       Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, pushable})
-      assert_push "dispatch", %{dispatch_id: pushed_id}, @reply_timeout
+      assert_push "dispatch", %{dispatch_id: pushed_id}, reply_timeout()
       assert pushed_id == pushable.dispatch_id
 
       # Then the same shape of message with a halt in place, which the channel catches
@@ -649,7 +355,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
                fn ->
                  DispatchLedger.get_record(runner.tenant_id, halted.dispatch_id).released_at
                end,
-               @reply_timeout
+               reply_timeout()
              )
     end
 
@@ -666,7 +372,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
     test "a runner that is not connected is refused", %{runner: runner} do
       {_raw, offline} =
-        fixture(:committed_runner, %{name: "offline", tenant_id: runner.tenant_id})
+        fixture(:runner, %{name: "offline", tenant_id: runner.tenant_id})
 
       assert {:error, :runner_not_connected} = dispatch_to(offline)
       refute_push "dispatch", _
@@ -675,14 +381,14 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     test "a runner whose socket left the pool is refused", %{runner: runner, channel: channel} do
       Process.unlink(channel.channel_pid)
       ref = leave(channel)
-      assert_reply ref, :ok, _, @reply_timeout
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
+      assert_reply ref, :ok, _, reply_timeout()
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, reply_timeout())
 
       assert {:error, :runner_not_connected} = dispatch_to(runner)
     end
 
     test "a credential live on two sockets is refused", %{runner: runner, raw: raw} do
-      {:ok, second} = connect_runner(raw)
+      {:ok, second} = connect_runner_socket(raw)
       {_reply, _channel} = join_pool(second, "minis")
 
       assert {:error, :runner_ambiguous} = dispatch_to(runner)
@@ -695,20 +401,20 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # The state a socket is in when `dispatch/3`'s pool read cannot see it: subscribed to
       # the runner's dispatches but absent from the pool (not yet tracked, or not yet in this
       # node's Presence view). Produced here by untracking a joined second socket.
-      {:ok, second} = connect_runner(raw)
+      {:ok, second} = connect_runner_socket(raw)
       {_reply, channel_b} = join_pool(second, "minis")
       :ok = Presence.untrack(channel_b.channel_pid, Runners.pool_topic(runner.tenant_id), "minis")
 
       assert eventually(
                fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end,
-               @reply_timeout
+               reply_timeout()
              )
 
       assert :ok = dispatch_to(runner)
 
       # Both channels receive the broadcast; only the socket that is the pool's sole live
       # meta pushes. Both transports are this test process, so count every push.
-      assert_receive %Phoenix.Socket.Message{event: "dispatch"}, @reply_timeout
+      assert_receive %Phoenix.Socket.Message{event: "dispatch"}, reply_timeout()
       refute_receive %Phoenix.Socket.Message{event: "dispatch"}
     end
 
@@ -738,27 +444,27 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       assert eventually(
                fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end,
-               @reply_timeout
+               reply_timeout()
              )
 
       Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     test "still pushes after a status update re-issues the socket's Presence ref",
          %{runner: runner, channel: channel} do
       ref = push(channel, "status", %{"in_flight" => 1})
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert eventually(
                fn ->
                  match?([%{in_flight: 1}], Runners.live_metas(runner.tenant_id, runner.id))
                end,
-               @reply_timeout
+               reply_timeout()
              )
 
       assert :ok = dispatch_to(runner)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     test "is recorded in the ledger as sent, and a re-send of the same id adds no row",
@@ -766,7 +472,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       payload = dispatch_payload(runner.tenant_id, %{"claim_epoch" => 4})
 
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       record = DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"])
       assert %DispatchRecord{status: "sent", claim_epoch: 4} = record
@@ -774,7 +480,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       # The retry of a push the channel may have dropped is sent again, onto the same row.
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
       assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).id == record.id
     end
 
@@ -785,7 +491,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       for payload <- [first, dispatch_payload(runner.tenant_id)] do
         assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-        assert_push "dispatch", _, @reply_timeout
+        assert_push "dispatch", _, reply_timeout()
       end
 
       third = dispatch_payload(runner.tenant_id)
@@ -795,19 +501,19 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       # The retry of a dispatch that already holds its slot needs no new one.
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     test "the tenant's admission limit refuses a runner that still has free slots",
          %{runner: runner} do
       {raw_b, runner_b} =
-        fixture(:committed_runner, %{
+        fixture(:runner, %{
           name: "blockit",
           tenant_id: runner.tenant_id,
           max_sessions: 8
         })
 
-      {:ok, socket_b} = connect_runner(raw_b)
+      {:ok, socket_b} = connect_runner_socket(raw_b)
       # DECLARED on the join, not merely enrolled: since contract 1.13.0 the join is what sets
       # the capacity loopctl reserves against, so a payload declaring the default 2 would give
       # this runner two slots and the tenant limit below would never be what refuses it.
@@ -839,7 +545,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
 
-      assert_receive {:runner_dispatch, broadcast}, @reply_timeout
+      assert_receive {:runner_dispatch, broadcast}, reply_timeout()
       assert broadcast.dispatch_id == payload["dispatch_id"]
       refute_received {:runner_dispatch, _, _}
     end
@@ -854,7 +560,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         {:runner_dispatch, dispatch, 7}
       )
 
-      assert_push "dispatch", pushed, @reply_timeout
+      assert_push "dispatch", pushed, reply_timeout()
       assert pushed.dispatch_id == dispatch.dispatch_id
     end
 
@@ -870,12 +576,13 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           end
         end)
 
-      assert [_one] = Regex.scan(~r/ignored an unknown channel message/, log)
+      # Scoped to this runner's lines: a capture also holds other async tests' lines.
+      assert [_one] = Regex.scan(~r/runner #{runner.id} ignored an unknown channel message/, log)
       assert Process.alive?(channel.channel_pid)
 
       # And the channel still serves its runner.
       assert :ok = dispatch_to(runner)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     test "a dispatch the channel DROPS before any push gives its slot back at once",
@@ -903,7 +610,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
                fn ->
                  DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).released_at
                end,
-               @reply_timeout
+               reply_timeout()
              )
     end
 
@@ -911,7 +618,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{runner: runner, channel: channel} do
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       record = DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"])
       assert record.pushed_at
@@ -936,7 +643,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{runner: runner} do
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       # A DIFFERENT story under the same dispatch_id. It used to be a different `kind`, which
       # since contract 1.5.0 is refused by the cast before the ledger sees it — a real
@@ -964,10 +671,10 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{runner: runner, channel: channel} do
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       ref = push(channel, "dispatch_reply", accept(payload))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert {:error, :dispatch_already_replied} =
                Runners.dispatch(runner.tenant_id, runner.id, payload)
@@ -990,9 +697,9 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     end
 
     test "another tenant cannot reach this runner by id", %{runner: runner} do
-      tenant_b = fixture(:committed_tenant, %{})
-      {raw_b, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
-      {:ok, socket_b} = connect_runner(raw_b)
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_b, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      {:ok, socket_b} = connect_runner_socket(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "minis")
 
       assert {:error, :not_authorized} =
@@ -1002,16 +709,16 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok = Runners.dispatch(tenant_b.id, runner_b.id, dispatch_payload(tenant_b.id))
       topic = "runner:" <> runner.id
       topic_b = "runner:" <> runner_b.id
-      assert_receive %Phoenix.Socket.Message{topic: ^topic_b, event: "dispatch"}, @reply_timeout
+      assert_receive %Phoenix.Socket.Message{topic: ^topic_b, event: "dispatch"}, reply_timeout()
       refute_received %Phoenix.Socket.Message{topic: ^topic, event: "dispatch"}
     end
 
     test "a halt on another tenant does not stop this one", %{runner: runner} do
-      tenant_b = fixture(:committed_tenant, %{})
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
       {:ok, _} = Tenants.halt_custody(tenant_b.id)
 
       assert :ok = dispatch_to(runner)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     test "malformed ids address no runner", %{runner: runner} do
@@ -1026,9 +733,9 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{runner: runner, channel: channel} do
       first = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
-      held = in_flight_of(runner)
+      held = held_capacity(runner).in_flight
       assert held >= 1
 
       ref =
@@ -1039,12 +746,12 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "kind_not_supported"
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert status_of(runner, first) == "refused"
 
       # A capability statement costs the runner no capacity: the refusal gave the slot back
       # in the same transaction that recorded it, exactly as every other refusal does.
-      assert in_flight_of(runner) == held - 1
+      assert held_capacity(runner).in_flight == held - 1
 
       assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
 
@@ -1057,14 +764,14 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       refute_push "dispatch", _
       assert DispatchLedger.get_record(runner.tenant_id, second["dispatch_id"]) == nil
-      assert in_flight_of(runner) == held - 1
+      assert held_capacity(runner).in_flight == held - 1
     end
 
     test "an ordinary refusal does not make a kind unsupported",
          %{runner: runner, channel: channel} do
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       ref =
         push(channel, "dispatch_reply", %{
@@ -1074,18 +781,18 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "at_capacity"
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
       assert :ok = dispatch_to(runner)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     test "one runner's kind_not_supported binds neither another runner nor another tenant",
          %{runner: runner, channel: channel} do
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       ref =
         push(channel, "dispatch_reply", %{
@@ -1095,18 +802,18 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "kind_not_supported"
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       {raw_b, runner_b} =
-        fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+        fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
 
-      {:ok, socket_b} = connect_runner(raw_b)
+      {:ok, socket_b} = connect_runner_socket(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "blockit")
 
       refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner_b.id, "implement")
       assert :ok = dispatch_to(runner_b)
 
-      tenant_b = fixture(:committed_tenant, %{})
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
       refute DispatchLedger.kind_unsupported?(tenant_b.id, runner.id, "implement")
     end
 
@@ -1118,7 +825,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{runner: runner, raw: raw, channel: channel} do
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       ref =
         push(channel, "dispatch_reply", %{
@@ -1128,7 +835,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "kind_not_supported"
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
 
       # Undeclared, the next one is refused — the behaviour the declaration overrides.
@@ -1142,7 +849,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok =
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       # And the record itself is untouched — it is the audit trail of what the machine
       # refused, which a later declaration does not rewrite.
@@ -1160,8 +867,8 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       first = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
-      assert_push "dispatch", _, @reply_timeout
-      held = in_flight_of(runner)
+      assert_push "dispatch", _, reply_timeout()
+      held = held_capacity(runner).in_flight
 
       ref =
         push(channel, "dispatch_reply", %{
@@ -1171,8 +878,8 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "kind_not_supported"
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
-      assert in_flight_of(runner) == held - 1
+      assert_reply ref, :ok, _, reply_timeout()
+      assert held_capacity(runner).in_flight == held - 1
 
       # Without the brake this is :ok and the loop has no bound at all.
       second = dispatch_payload(runner.tenant_id)
@@ -1182,7 +889,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       refute_push "dispatch", _
       assert DispatchLedger.get_record(runner.tenant_id, second["dispatch_id"]) == nil
-      assert in_flight_of(runner) == held - 1
+      assert held_capacity(runner).in_flight == held - 1
 
       # #834 round 2, finding 4. The DECLARATION is untouched — a suppression is loopctl
       # withholding work, not the runner revising what it said. Folding the two made the
@@ -1199,7 +906,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok =
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     # #834 round 3, finding 4. `record_reply/3` fences on (tenant, runner, dispatch_id) and
@@ -1213,7 +920,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       # The socket drops with the reply unflushed, and the runner reconnects declaring the
       # same kind. This connection has been sent nothing.
@@ -1228,7 +935,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "kind_not_supported"
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       # It is still recorded — the ledger is where the refusal durably lives.
       assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
@@ -1239,7 +946,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok =
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     # The blind spot a peer session found in round 3's own fix: the counter lived inside
@@ -1251,6 +958,9 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       runner: runner,
       channel: channel
     } do
+      # The handler is VM-global, so its events are matched on this test's runner.
+      runner_id = runner.id
+
       ref =
         :telemetry_test.attach_event_handlers(self(), [
           [:loopctl, :runners, :declared_kind_refused]
@@ -1260,7 +970,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       reply_ref =
         push(channel, "dispatch_reply", %{
@@ -1270,10 +980,11 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "kind_not_supported"
         })
 
-      assert_reply reply_ref, :ok, _, @reply_timeout
+      assert_reply reply_ref, :ok, _, reply_timeout()
 
-      assert_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, %{count: 1}, meta},
-                     @reply_timeout
+      assert_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, %{count: 1},
+                      %{runner_id: ^runner_id} = meta},
+                     reply_timeout()
 
       # `permanent` is the tag an operator alerts on — this machine now gets no work at all
       # and stays connected looking healthy.
@@ -1285,6 +996,9 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{runner: runner, raw: raw, channel: channel} do
       channel = rejoin_declaring(channel, raw, runner, ["implement"])
 
+      # The handler is VM-global, so its events are matched on this test's runner.
+      runner_id = runner.id
+
       ref =
         :telemetry_test.attach_event_handlers(self(), [
           [:loopctl, :runners, :declared_kind_refused]
@@ -1294,7 +1008,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       reply_ref =
         push(channel, "dispatch_reply", %{
@@ -1304,10 +1018,11 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "kind_not_supported"
         })
 
-      assert_reply reply_ref, :ok, _, @reply_timeout
+      assert_reply reply_ref, :ok, _, reply_timeout()
 
-      assert_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, %{count: 1}, meta},
-                     @reply_timeout
+      assert_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, %{count: 1},
+                      %{runner_id: ^runner_id} = meta},
+                     reply_timeout()
 
       assert meta.outcome == "suppressed"
     end
@@ -1329,6 +1044,9 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{runner: runner, raw: raw, channel: channel} do
       channel = rejoin_declaring(channel, raw, runner, ["implement"])
 
+      # The handler is VM-global, so its events are matched on this test's runner.
+      runner_id = runner.id
+
       ref =
         :telemetry_test.attach_event_handlers(self(), [
           [:loopctl, :runners, :declared_kind_refused]
@@ -1338,7 +1056,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       reply_ref =
         push(channel, "dispatch_reply", %{
@@ -1349,9 +1067,11 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "detail" => "the runner failed deciding this dispatch"
         })
 
-      assert_reply reply_ref, :ok, _, @reply_timeout
+      assert_reply reply_ref, :ok, _, reply_timeout()
 
-      refute_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, _, _}, 300
+      refute_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, _,
+                      %{runner_id: ^runner_id}},
+                     300
 
       # And a fault suppresses nothing either way — it is transient by assumption, so the
       # next dispatch is still sent.
@@ -1360,7 +1080,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok =
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     test "an ordinary refusal does not suppress a declared kind",
@@ -1369,7 +1089,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       ref =
         push(channel, "dispatch_reply", %{
@@ -1379,12 +1099,12 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           "reason" => "at_capacity"
         })
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert :ok =
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     # #834 round 2, finding 1. A runner upgraded ahead of loopctl passes the version check
@@ -1406,7 +1126,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok =
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
     end
 
     test "a declaration of ONLY unknown kinds is sent nothing, and is NOT read as silence",
@@ -1431,7 +1151,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # vocabulary and is what a triage-only machine would say.
       _channel = rejoin_declaring(channel, raw, runner, ["triage"])
 
-      held = in_flight_of(runner)
+      held = held_capacity(runner).in_flight
       payload = dispatch_payload(runner.tenant_id)
 
       assert {:error, :kind_not_supported} =
@@ -1439,7 +1159,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       refute_push "dispatch", _
       assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
-      assert in_flight_of(runner) == held
+      assert held_capacity(runner).in_flight == held
 
       # Refused on the declaration alone: the ledger holds no refusal for this pair, so
       # nothing but the join payload can have decided it.
@@ -1567,198 +1287,20 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   defp status_of(runner, dispatch),
     do: DispatchLedger.get_record(runner.tenant_id, dispatch["dispatch_id"]).status
 
-  # The runner's `in_flight` as Postgres holds it, read on the RLS connection the dispatch
-  # path reserves on — `Runners.capacity/1` reads AdminRepo, which is a different connection
-  # and cannot see this sandbox's uncommitted reservation.
-  defp in_flight_of(runner) do
-    {:ok, in_flight} =
-      Loopctl.Repo.with_tenant(runner.tenant_id, fn ->
-        Loopctl.Repo.one!(
-          from r in Loopctl.Runners.Runner,
-            where: r.id == ^runner.id and r.tenant_id == ^runner.tenant_id,
-            select: r.in_flight
-        )
-      end)
-
-    in_flight
-  end
-
-  # A row every connection can see, and a transaction of its own to lock it from — the only
-  # way to make the channel's own writes WAIT on something inside a test.
-  defp committed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
-
-  defp committed_dispatch(runner) do
-    committed(fn ->
-      story = fixture(:ledger_story, %{tenant_id: runner.tenant_id, claim_epoch: 0})
-      payload = build(:runner_dispatch, %{"story_id" => story.id})
-      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
-      {:ok, _record} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
-      %{story: story, payload: payload, dispatch: dispatch}
-    end)
-  end
-
-  # Holds `lock_query` in a committed transaction until `finish/1` is called, so a channel
-  # write that needs the same row runs into its lock_timeout for real.
-  defp hold_lock(tenant_id, lock_query) do
-    test = self()
-
-    task =
-      Task.async(fn -> committed(fn -> hold_until_finished(tenant_id, lock_query, test) end) end)
-
-    assert_receive :holding, 5_000
-    task
-  end
-
-  defp hold_until_finished(tenant_id, lock_query, test) do
-    Loopctl.Repo.with_tenant(tenant_id, fn ->
-      Loopctl.Repo.one!(lock_query)
-      send(test, :holding)
-      await_finish()
-    end)
-  end
-
-  defp await_finish do
-    receive do
-      :finish -> :ok
-    after
-      30_000 -> :timeout
-    end
-  end
-
-  defp finish(task) do
-    send(task.pid, :finish)
-    Task.await(task, 30_000)
-  end
-
-  describe "a database lock the channel cannot get" do
-    setup do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 4})
-      {:ok, socket} = connect_runner(raw)
-      {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
-      %{runner: runner, channel: channel}
-    end
-
-    @lock_timeout_reply 15_000
-
-    test "a reply blocked behind a claim release is answered rate_limited, and the channel lives",
-         %{runner: runner, channel: channel} do
-      %{story: story, dispatch: dispatch} = committed_dispatch(runner)
-      _ = story
-
-      blocker =
-        hold_lock(
-          runner.tenant_id,
-          from(s in Loopctl.WorkBreakdown.Story,
-            where: s.id == ^story.id,
-            lock: "FOR UPDATE",
-            select: s.claim_epoch
-          )
-        )
-
-      ref =
-        push(channel, "dispatch_reply", %{
-          "dispatch_id" => dispatch.dispatch_id,
-          "claim_epoch" => 0,
-          "decision" => "accepted"
-        })
-
-      # Never invalid_payload: the message is fine and the runner must send it AGAIN.
-      assert_reply ref,
-                   :error,
-                   %{reason: "rate_limited", min_interval_ms: interval},
-                   @lock_timeout_reply
-
-      # Longer than the wait that just ran out, so the retry is not straight back into the
-      # same queue.
-      assert interval == Capacity.busy_retry_ms()
-      assert interval > Capacity.lock_timeout_ms()
-      assert Process.alive?(channel.channel_pid)
-      assert finish(blocker) == {:ok, :ok}
-
-      assert DispatchLedger.get_record(runner.tenant_id, dispatch.dispatch_id).status == "sent"
-    end
-
-    test "a drop whose decision cannot be recorded logs and keeps the channel alive",
-         %{runner: runner, channel: channel} do
-      %{dispatch: dispatch} = committed_dispatch(runner)
-      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
-
-      blocker =
-        hold_lock(
-          runner.tenant_id,
-          from(d in DispatchRecord,
-            where: d.tenant_id == ^runner.tenant_id and d.dispatch_id == ^dispatch.dispatch_id,
-            lock: "FOR UPDATE",
-            select: d.id
-          )
-        )
-
-      log =
-        capture_log(fn ->
-          Phoenix.PubSub.broadcast(
-            Loopctl.PubSub,
-            Runners.dispatch_topic(runner.id),
-            {:runner_dispatch, dispatch}
-          )
-
-          # The drop's own decision runs into the lock timeout. An orderly refusal, not a
-          # crash: the slot is left to the sweep's undelivered grace.
-          refute_push "dispatch", _, Capacity.lock_timeout_ms() + 3_000
-        end)
-
-      assert log =~ "not delivered"
-      assert log =~ "capacity_busy"
-      assert Process.alive?(channel.channel_pid)
-      assert finish(blocker) == {:ok, :ok}
-    end
-
-    test "a push whose stamp cannot be written is dropped, not pushed unrecorded",
-         %{runner: runner, channel: channel} do
-      %{dispatch: dispatch} = committed_dispatch(runner)
-
-      blocker =
-        hold_lock(
-          runner.tenant_id,
-          from(d in DispatchRecord,
-            where: d.tenant_id == ^runner.tenant_id and d.dispatch_id == ^dispatch.dispatch_id,
-            lock: "FOR UPDATE",
-            select: d.id
-          )
-        )
-
-      Phoenix.PubSub.broadcast(
-        Loopctl.PubSub,
-        Runners.dispatch_topic(runner.id),
-        {:runner_dispatch, dispatch}
-      )
-
-      # The stamp runs into its lock_timeout, so the dispatch is NOT pushed: a push the
-      # ledger does not record would lose its slot to the heal sweep mid-session.
-      # Long enough for the stamp's lock_timeout to expire, short enough that the blocker's
-      # own connection checkout (15 s) does not.
-      refute_push "dispatch", _, Capacity.lock_timeout_ms() + 3_000
-      assert Process.alive?(channel.channel_pid)
-      assert finish(blocker) == {:ok, :ok}
-
-      record = DispatchLedger.get_record(runner.tenant_id, dispatch.dispatch_id)
-      refute record.pushed_at
-    end
-  end
-
   describe "dispatch_reply" do
     setup do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis")
       dispatch = dispatch_payload(runner.tenant_id, %{"claim_epoch" => 2})
       :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
       %{runner: runner, channel: channel, dispatch: dispatch}
     end
 
     test "accepted is recorded", %{runner: runner, channel: channel, dispatch: dispatch} do
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert status_of(runner, dispatch) == "accepted"
     end
 
@@ -1771,7 +1313,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           accept(dispatch, %{"decision" => "refused", "reason" => "repo_not_allowed"})
         )
 
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert %DispatchRecord{status: "refused", reason: "repo_not_allowed"} =
                DispatchLedger.get_record(runner.tenant_id, dispatch["dispatch_id"])
@@ -1780,68 +1322,68 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     test "an identical repeat is ok; a conflicting one is already_replied",
          %{runner: runner, channel: channel, dispatch: dispatch} do
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       reset_intervals(channel)
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       reset_intervals(channel)
       refusal = accept(dispatch, %{"decision" => "refused", "reason" => "draining"})
       ref = push(channel, "dispatch_reply", refusal)
-      assert_reply ref, :error, %{reason: "already_replied"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "already_replied"}, reply_timeout()
       assert status_of(runner, dispatch) == "accepted"
     end
 
     test "a stale claim_epoch is refused",
          %{runner: runner, channel: channel, dispatch: dispatch} do
       ref = push(channel, "dispatch_reply", accept(dispatch, %{"claim_epoch" => 1}))
-      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, reply_timeout()
       assert status_of(runner, dispatch) == "sent"
     end
 
     test "another runner's dispatch is unknown", %{runner: runner, channel: channel} do
       {raw_b, runner_b} =
-        fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+        fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
 
-      {:ok, socket_b} = connect_runner(raw_b)
+      {:ok, socket_b} = connect_runner_socket(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "blockit")
       theirs = dispatch_payload(runner.tenant_id)
       :ok = Runners.dispatch(runner.tenant_id, runner_b.id, theirs)
 
       ref = push(channel, "dispatch_reply", accept(theirs))
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, reply_timeout()
       assert status_of(runner_b, theirs) == "sent"
     end
 
     test "another tenant's dispatch is unknown", %{channel: channel} do
-      tenant_b = fixture(:committed_tenant, %{})
-      {raw_b, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
-      {:ok, socket_b} = connect_runner(raw_b)
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_b, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      {:ok, socket_b} = connect_runner_socket(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "minis")
       theirs = dispatch_payload(tenant_b.id)
       :ok = Runners.dispatch(tenant_b.id, runner_b.id, theirs)
 
       ref = push(channel, "dispatch_reply", accept(theirs))
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, reply_timeout()
       assert status_of(runner_b, theirs) == "sent"
     end
 
     test "an invalid reply is refused", %{channel: channel, dispatch: dispatch} do
       ref = push(channel, "dispatch_reply", accept(dispatch, %{"decision" => "refused"}))
-      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
     end
 
     test "replies to several dispatches back to back are all applied, and each dispatch's trace is accepted",
          %{runner: runner, channel: channel, dispatch: first} do
       second = dispatch_payload(runner.tenant_id, %{"claim_epoch" => 2})
       :ok = Runners.dispatch(runner.tenant_id, runner.id, second)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       # No reset between them: a single per-runner gap used to refuse the second reply.
       for dispatch <- [first, second] do
         ref = push(channel, "dispatch_reply", accept(dispatch))
-        assert_reply ref, :ok, _, @reply_timeout
+        assert_reply ref, :ok, _, reply_timeout()
       end
 
       for dispatch <- [first, second] do
@@ -1857,7 +1399,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
             "events" => [build(:runner_trace_event, %{"run_id" => run_id, "seq" => 0})]
           })
 
-        assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+        assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
       end
     end
 
@@ -1866,14 +1408,14 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       drain_reply_bucket(channel)
 
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, reply_timeout()
       assert ms == RunnerContract.dispatch_reply_burst()["refill_interval_ms"]
       assert status_of(runner, dispatch) == "sent"
     end
 
     test "an invalid reply spends no reply", %{channel: channel, dispatch: dispatch} do
       ref = push(channel, "dispatch_reply", accept(dispatch, %{"decision" => "refused"}))
-      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
       assert :sys.get_state(channel.channel_pid).assigns.reply_bucket == :full
     end
 
@@ -1883,11 +1425,11 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         accept(dispatch, %{"decision" => "refused", "reason" => "other", "detail" => "a\u0000b"})
 
       ref = push(channel, "dispatch_reply", nul)
-      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
       assert Process.alive?(channel.channel_pid)
 
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert status_of(runner, dispatch) == "accepted"
     end
 
@@ -1896,7 +1438,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       {:ok, _} = Tenants.halt_custody(runner.tenant_id)
 
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert status_of(runner, dispatch) == "accepted"
 
       batch =
@@ -1907,20 +1449,20 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         })
 
       ref = push(channel, "trace", batch)
-      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
     end
   end
 
   describe "trace" do
     setup do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis")
       dispatch = dispatch_payload(runner.tenant_id)
       :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       reset_intervals(channel)
 
       %{runner: runner, channel: channel, dispatch: dispatch, run_id: Ecto.UUID.generate()}
@@ -1944,49 +1486,49 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     test "stores a batch once, and acks the contiguous seqs",
          %{channel: channel, dispatch: dispatch, run_id: run_id} do
       ref = send_trace(channel, batch(dispatch, run_id, [0, 1, 3]))
-      assert_reply ref, :ok, %{acked_seq: 1}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 1}, reply_timeout()
 
       ref = send_trace(channel, batch(dispatch, run_id, [0, 1, 3]))
-      assert_reply ref, :ok, %{acked_seq: 1}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 1}, reply_timeout()
 
       ref = send_trace(channel, batch(dispatch, run_id, [2]))
-      assert_reply ref, :ok, %{acked_seq: 3}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 3}, reply_timeout()
     end
 
     test "trace_cursor is -1 before anything is stored, then the acked seq",
          %{channel: channel, dispatch: dispatch, run_id: run_id} do
       ref = push(channel, "trace_cursor", %{"run_id" => run_id})
-      assert_reply ref, :ok, %{acked_seq: -1}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: -1}, reply_timeout()
 
       ref = send_trace(channel, batch(dispatch, run_id, [0, 1, 2]))
-      assert_reply ref, :ok, %{acked_seq: 2}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 2}, reply_timeout()
 
       reset_intervals(channel)
       ref = push(channel, "trace_cursor", %{"run_id" => run_id})
-      assert_reply ref, :ok, %{acked_seq: 2}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 2}, reply_timeout()
     end
 
     test "a batch for an unknown dispatch, or at a wrong epoch, is refused",
          %{channel: channel, dispatch: dispatch, run_id: run_id} do
       unknown = %{dispatch | "dispatch_id" => Ecto.UUID.generate()}
       ref = send_trace(channel, batch(unknown, run_id, [0]))
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, reply_timeout()
 
       ref = send_trace(channel, batch(dispatch, run_id, [0], %{"claim_epoch" => 7}))
-      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, reply_timeout()
 
       reset_intervals(channel)
       ref = push(channel, "trace_cursor", %{"run_id" => run_id})
-      assert_reply ref, :ok, %{acked_seq: -1}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: -1}, reply_timeout()
     end
 
     test "a second run for the dispatch is refused",
          %{channel: channel, dispatch: dispatch, run_id: run_id} do
       ref = send_trace(channel, batch(dispatch, run_id, [0]))
-      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
 
       ref = send_trace(channel, batch(dispatch, Ecto.UUID.generate(), [0]))
-      assert_reply ref, :error, %{reason: "run_mismatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "run_mismatch"}, reply_timeout()
     end
 
     test "a batch within the event count but over the byte budget is batch_too_large, and the channel carries on",
@@ -2012,10 +1554,10 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert_reply ref,
                    :error,
                    %{reason: "batch_too_large", max_bytes: ^max_bytes},
-                   @reply_timeout
+                   reply_timeout()
 
       ref = send_trace(channel, batch(dispatch, run_id, [0]))
-      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
     end
 
     test "an oversize batch and an oversize event are refused with their limits",
@@ -2026,7 +1568,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert_reply ref,
                    :error,
                    %{reason: "batch_too_large", max_events: ^max_events},
-                   @reply_timeout
+                   reply_timeout()
 
       max_bytes = RunnerTraceEvent.max_data_bytes()
       big = %{"k" => String.duplicate("x", max_bytes)}
@@ -2036,28 +1578,28 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert_reply ref,
                    :error,
                    %{reason: "event_data_too_large", seq: 0, max_data_bytes: ^max_bytes},
-                   @reply_timeout
+                   reply_timeout()
     end
 
     test "the resume sequence is never rate limited: cursor, then batches, back to back",
          %{channel: channel, dispatch: dispatch, run_id: run_id} do
       # The setup's reply spent no trace or cursor floor, and no reset happens here.
       ref = push(channel, "trace_cursor", %{"run_id" => run_id})
-      assert_reply ref, :ok, %{acked_seq: -1}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: -1}, reply_timeout()
 
       ref = push(channel, "trace", batch(dispatch, run_id, [0, 1]))
-      assert_reply ref, :ok, %{acked_seq: 1}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 1}, reply_timeout()
     end
 
     test "an invalid batch starts no floor, so its corrected resend is accepted at once",
          %{channel: channel, dispatch: dispatch, run_id: run_id} do
       too_many = Enum.to_list(0..RunnerTraceBatch.max_events())
       ref = push(channel, "trace", batch(dispatch, run_id, too_many))
-      assert_reply ref, :error, %{reason: "batch_too_large"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "batch_too_large"}, reply_timeout()
       assert :sys.get_state(channel.channel_pid).assigns.last_trace_at == :never
 
       ref = push(channel, "trace", batch(dispatch, run_id, [0]))
-      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
     end
 
     test "an uppercase run_id is one run across batches",
@@ -2065,14 +1607,14 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       upper = String.upcase(run_id)
 
       ref = send_trace(channel, batch(dispatch, upper, [0]))
-      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
 
       ref = send_trace(channel, batch(dispatch, upper, [1]))
-      assert_reply ref, :ok, %{acked_seq: 1}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 1}, reply_timeout()
 
       reset_intervals(channel)
       ref = push(channel, "trace_cursor", %{"run_id" => upper})
-      assert_reply ref, :ok, %{acked_seq: 1}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 1}, reply_timeout()
     end
 
     test "a NUL in any runner-supplied string is invalid_payload, and the channel carries on",
@@ -2095,45 +1637,45 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           )
 
         ref = send_trace(channel, payload)
-        assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+        assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
 
         assert Process.alive?(channel.channel_pid),
                "a NUL in #{inspect(change)} crashed the channel"
       end
 
       ref = send_trace(channel, batch(dispatch, run_id, [0]))
-      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
     end
 
     test "a batch records its time; a batch or cursor inside its OWN minimum interval is refused",
          %{runner: runner, channel: channel, dispatch: dispatch, run_id: run_id} do
       ref = send_trace(channel, batch(dispatch, run_id, [0]))
-      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
       assert is_integer(:sys.get_state(channel.channel_pid).assigns.last_trace_at)
 
       pin_interval(channel, :last_trace_at)
       ref = push(channel, "trace", batch(dispatch, run_id, [1]))
-      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: _}, @reply_timeout
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: _}, reply_timeout()
 
       # trace_cursor has its own floor, so a held-back trace does not hold it back.
       ref = push(channel, "trace_cursor", %{"run_id" => run_id})
-      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert_reply ref, :ok, %{acked_seq: 0}, reply_timeout()
 
       pin_interval(channel, :last_cursor_at)
       ref = push(channel, "trace_cursor", %{"run_id" => run_id})
-      assert_reply ref, :error, %{reason: "rate_limited"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "rate_limited"}, reply_timeout()
       assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == 0
     end
   end
 
   describe "the published rate floors" do
     setup do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner_socket(raw)
       {_reply, channel} = join_pool(socket, "minis")
       dispatch = dispatch_payload(runner.tenant_id)
       :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
       %{runner: runner, channel: channel, dispatch: dispatch}
     end
 
@@ -2170,7 +1712,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         assert_reply ref,
                      :error,
                      %{reason: "rate_limited", min_interval_ms: refused_with},
-                     @reply_timeout
+                     reply_timeout()
 
         assert refused_with == published[event], "#{event} refuses with a different floor"
       end
@@ -2180,7 +1722,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
          %{channel: channel, dispatch: dispatch} do
       published = RunnerContract.json_schema()["x-connection"]["limits"]["min_interval_ms"]
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       for {event, pushed, assign, payload} <- floor_cases(dispatch) do
         # Timed exactly one millisecond past the published floor: an enforced floor longer
@@ -2191,7 +1733,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
         end)
 
         ref = push(channel, pushed, payload)
-        assert_reply ref, status, reply, @reply_timeout
+        assert_reply ref, status, reply, reply_timeout()
         refute match?(%{reason: "rate_limited"}, reply), "#{event} (#{status}) was rate limited"
       end
     end
@@ -2207,7 +1749,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       %{"capacity" => capacity, "refill_interval_ms" => refill} = published
 
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       # From `:full`, one reply leaves capacity - 1 whenever it lands.
       assert {left, _} = :sys.get_state(channel.channel_pid).assigns.reply_bucket
       assert left == capacity - 1
@@ -2218,7 +1760,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert_reply ref,
                    :error,
                    %{reason: "rate_limited", min_interval_ms: ^refill},
-                   @reply_timeout
+                   reply_timeout()
 
       :sys.replace_state(channel.channel_pid, fn socket ->
         at = System.monotonic_time(:millisecond) - refill - 1
@@ -2226,7 +1768,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       end)
 
       ref = push(channel, "dispatch_reply", accept(dispatch))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
       assert status_of(runner, dispatch) == "accepted"
     end
   end

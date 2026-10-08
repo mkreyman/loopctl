@@ -2,23 +2,19 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
   @moduledoc """
   `Escalations.resolve/3` — the human half of the escalation pair (#803 design §8, #851).
 
-  Its own file, `async: false` and COMMITTED, because resolving a story to `queued` crosses
-  BOTH repos: the stage transition runs on the RLS `Loopctl.Repo` while the claim release and
-  the re-contract run on `AdminRepo`. Two sandbox connections in one process cannot see each
-  other's uncommitted rows, and worse, the release's row lock is held for the rest of the test
-  — so a sandboxed version of this test times the transition out on a lock rather than
-  exercising it. Everything here is committed and run unboxed;
-  `sweep_committed_runner_tenants/0` removes it.
+  Resolving a story to `queued` crosses BOTH repos: the stage transition runs on the RLS
+  `Loopctl.Repo` while the claim release and the re-contract run on `AdminRepo`. AdminRepo
+  runs on Repo's sandbox connection in test (`Loopctl.AdminRepo.Route`), so both halves see
+  this test's own rows and nothing here commits.
 
   The property under test is the one a stage row alone cannot state: **a story sent back to
   `queued` must be PLACEABLE**, which means its `agent_status` as well as its stage.
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.Delivery.Escalations
@@ -32,39 +28,31 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
   @epoch 5
 
   setup do
-    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {_raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id, name: "minis"})
-    story = fixture(:committed_story, %{tenant_id: tenant.id})
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {_raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "minis"})
+    story = fixture(:ledger_story, %{tenant_id: tenant.id})
 
-    unboxed(fn ->
-      {1, _} =
-        AdminRepo.update_all(
-          from(s in Story, where: s.id == ^story.id),
-          set: [
-            assigned_agent_id: runner.agent_id,
-            agent_status: :implementing,
-            claim_epoch: @epoch
-          ]
-        )
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Story, where: s.id == ^story.id),
+        set: [
+          assigned_agent_id: runner.agent_id,
+          agent_status: :implementing,
+          claim_epoch: @epoch
+        ]
+      )
 
-      fixture(:story_stage, %{
-        repo: AdminRepo,
-        tenant_id: tenant.id,
-        story_id: story.id,
-        stage: :escalated,
-        claim_epoch: @epoch,
-        escalation_reason: "the session asked for a human"
-      })
-    end)
+    fixture(:story_stage, %{
+      repo: AdminRepo,
+      tenant_id: tenant.id,
+      story_id: story.id,
+      stage: :escalated,
+      claim_epoch: @epoch,
+      escalation_reason: "the session asked for a human"
+    })
 
     %{tenant: tenant, story: story, runner: runner}
   end
@@ -94,12 +82,10 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       # story. Resolution moves the row out first, so the refusal must not outlive it.
       assert {:ok, %{stage: :queued}} = resolve(ctx, :queued)
 
-      agent = unboxed(fn -> fixture(:agent, %{tenant_id: ctx.tenant.id}) end)
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id})
 
       assert {:ok, claimed} =
-               unboxed(fn ->
-                 Progress.claim_story(ctx.tenant.id, ctx.story.id, agent_id: agent.id)
-               end)
+               Progress.claim_story(ctx.tenant.id, ctx.story.id, agent_id: agent.id)
 
       assert claimed.agent_status == :assigned
     end
@@ -140,31 +126,25 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
         # The finished session's claim ends the way any claim does — the lease reclaim, or an
         # operator — and leaves the story `pending` with nobody on it: the shape of work.
-        unboxed(fn -> {:ok, _} = Progress.force_unclaim_story(ctx.tenant.id, ctx.story.id) end)
+        {:ok, _} = Progress.force_unclaim_story(ctx.tenant.id, ctx.story.id)
         assert reload(ctx).agent_status == :pending
 
         refute ctx.story.id in ready_ids(ctx)
 
         assert {:error, :story_held} =
-                 unboxed(fn ->
-                   Progress.contract_story(ctx.tenant.id, ctx.story.id, %{},
-                     skip_contract_check: true
-                   )
-                 end)
+                 Progress.contract_story(ctx.tenant.id, ctx.story.id, %{},
+                   skip_contract_check: true
+                 )
 
         # A story already `contracted` when it was finished is refused at the claim too.
-        unboxed(fn ->
-          AdminRepo.update_all(from(s in Story, where: s.id == ^ctx.story.id),
-            set: [agent_status: :contracted]
-          )
-        end)
+        AdminRepo.update_all(from(s in Story, where: s.id == ^ctx.story.id),
+          set: [agent_status: :contracted]
+        )
 
-        agent = unboxed(fn -> fixture(:agent, %{tenant_id: ctx.tenant.id}) end)
+        agent = fixture(:agent, %{tenant_id: ctx.tenant.id})
 
         assert {:error, :story_held} =
-                 unboxed(fn ->
-                   Progress.claim_story(ctx.tenant.id, ctx.story.id, agent_id: agent.id)
-                 end)
+                 Progress.claim_story(ctx.tenant.id, ctx.story.id, agent_id: agent.id)
 
         assert reload(ctx).assigned_agent_id == nil
       end
@@ -178,14 +158,14 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       # AND an empty lineage — the two halves of "a person", since a dispatch-minted user key
       # carries a lineage.
       assert {:error, :human_required} = resolve(ctx, :queued, actor_role: :agent)
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, ctx.story.id) end).stage == :escalated
+      assert Stages.get(ctx.tenant.id, ctx.story.id).stage == :escalated
     end
 
     test "a LINEAGED caller is refused even at user role", ctx do
       assert {:error, :human_required} =
                resolve(ctx, :queued, actor_lineage: [Ecto.UUID.generate()])
 
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, ctx.story.id) end).stage == :escalated
+      assert Stages.get(ctx.tenant.id, ctx.story.id).stage == :escalated
     end
 
     test "a REFUSED resolve does not revoke the implementer's session credential", ctx do
@@ -213,10 +193,10 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
       assert {:error, :human_required} = resolve(ctx, :queued, actor_lineage: lineage)
 
-      refute unboxed(fn -> AdminRepo.get!(Dispatch, session.id) end).revoked_at,
+      refute AdminRepo.get!(Dispatch, session.id).revoked_at,
              "a refused resolve must not revoke the implementer's live session credential"
 
-      assert unboxed(fn -> revoked_entries(tenant.id, session.id) end) == [],
+      assert revoked_entries(tenant.id, session.id) == [],
              "nothing was revoked, so the immutable chain must carry no revocation entry"
     end
 
@@ -237,7 +217,7 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       assert after_refusal.assigned_agent_id == before.assigned_agent_id, "the claim was released"
       assert after_refusal.agent_status == before.agent_status, "the story was re-contracted"
 
-      assert unboxed(fn -> Stages.get(tenant.id, ctx.story.id) end).stage == :escalated
+      assert Stages.get(tenant.id, ctx.story.id).stage == :escalated
     end
 
     test "a caller that PASSES the gate still gets the release, so the gate did not break it",
@@ -251,7 +231,7 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
       assert {:ok, row} = resolve(ctx, :queued)
       assert row.stage == :queued
 
-      assert unboxed(fn -> AdminRepo.get!(Dispatch, session.id) end).revoked_at,
+      assert AdminRepo.get!(Dispatch, session.id).revoked_at,
              "a human resolve to queued must still revoke the released session's credential"
 
       story = reload(ctx)
@@ -262,15 +242,13 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
   describe "what may be resolved" do
     test "a story that is not escalated is named, not answered with stale_stage", ctx do
-      unboxed(fn ->
-        {:ok, _} =
-          Stages.advance(ctx.tenant.id, ctx.story.id, {:escalated, :failed, :human_resolution},
-            claim_epoch: @epoch,
-            actor_role: :user,
-            actor_lineage: [],
-            actor_label: "test"
-          )
-      end)
+      {:ok, _} =
+        Stages.advance(ctx.tenant.id, ctx.story.id, {:escalated, :failed, :human_resolution},
+          claim_epoch: @epoch,
+          actor_role: :user,
+          actor_lineage: [],
+          actor_label: "test"
+        )
 
       # `stale_stage` is the machine's word for a story that moved under a runner. Answering it
       # here would send an operator looking for a race that did not happen.
@@ -279,51 +257,47 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
     test "a target the machine has no edge for is refused before anything is read", ctx do
       assert {:error, {:unresolvable_target, :implementing}} = resolve(ctx, :implementing)
-      assert unboxed(fn -> Stages.get(ctx.tenant.id, ctx.story.id) end).stage == :escalated
+      assert Stages.get(ctx.tenant.id, ctx.story.id).stage == :escalated
     end
   end
 
   defp resolve(ctx, to, opts \\ []) do
-    unboxed(fn ->
-      Escalations.resolve(ctx.tenant.id, ctx.story.id,
-        to: to,
-        actor_label: "test:operator",
-        actor_role: Keyword.get(opts, :actor_role, :user),
-        actor_lineage: Keyword.get(opts, :actor_lineage, [])
-      )
-    end)
+    Escalations.resolve(ctx.tenant.id, ctx.story.id,
+      to: to,
+      actor_label: "test:operator",
+      actor_role: Keyword.get(opts, :actor_role, :user),
+      actor_lineage: Keyword.get(opts, :actor_lineage, [])
+    )
   end
 
   # A session dispatch minted FOR this story, recorded on it — the shape
   # `Placement.mint_session_dispatch/5` produces, and the only shape
   # `Dispatches.revoke_story_session/4` will revoke.
   defp session_dispatch_for(ctx) do
-    unboxed(fn ->
-      agent = fixture(:agent, %{tenant_id: ctx.tenant.id})
+    agent = fixture(:agent, %{tenant_id: ctx.tenant.id})
 
-      {:ok, %{dispatch: root}} =
-        Dispatches.create_dispatch(ctx.tenant.id, %{role: :orchestrator}, actor_lineage: [])
+    {:ok, %{dispatch: root}} =
+      Dispatches.create_dispatch(ctx.tenant.id, %{role: :orchestrator}, actor_lineage: [])
 
-      {:ok, %{dispatch: session}} =
-        Dispatches.create_dispatch(
-          ctx.tenant.id,
-          %{
-            role: :agent,
-            agent_id: agent.id,
-            story_id: ctx.story.id,
-            parent_dispatch_id: root.id
-          },
-          actor_lineage: root.lineage_path
-        )
+    {:ok, %{dispatch: session}} =
+      Dispatches.create_dispatch(
+        ctx.tenant.id,
+        %{
+          role: :agent,
+          agent_id: agent.id,
+          story_id: ctx.story.id,
+          parent_dispatch_id: root.id
+        },
+        actor_lineage: root.lineage_path
+      )
 
-      {1, _} =
-        AdminRepo.update_all(
-          from(s in Story, where: s.id == ^ctx.story.id),
-          set: [implementer_dispatch_id: session.id]
-        )
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Story, where: s.id == ^ctx.story.id),
+        set: [implementer_dispatch_id: session.id]
+      )
 
-      session
-    end)
+    session
   end
 
   defp revoked_entries(tenant_id, dispatch_id) do
@@ -336,18 +310,14 @@ defmodule Loopctl.Delivery.EscalationsResolveTest do
 
   # ASKED THROUGH THE FUNCTION A PLACEMENT ASKS, never by restating its rule: a test that
   # listed the conditions itself would pass a story `place/4` still refused.
-  defp claimable(ctx), do: unboxed(fn -> Placement.claimable(ctx.tenant.id, ctx.story.id) end)
+  defp claimable(ctx), do: Placement.claimable(ctx.tenant.id, ctx.story.id)
 
-  defp reload(ctx), do: unboxed(fn -> AdminRepo.get!(Story, ctx.story.id) end)
+  defp reload(ctx), do: AdminRepo.get!(Story, ctx.story.id)
 
   defp ready_ids(ctx) do
     {:ok, %{data: stories}} =
-      unboxed(fn -> Queries.list_ready_stories(ctx.tenant.id, page_size: 500) end)
+      Queries.list_ready_stories(ctx.tenant.id, page_size: 500)
 
     Enum.map(stories, & &1.id)
-  end
-
-  defp unboxed(fun) do
-    Sandbox.unboxed_run(Loopctl.Repo, fun)
   end
 end

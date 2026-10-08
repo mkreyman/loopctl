@@ -9,75 +9,50 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
   own bucket, answers with the recorded id and `replayed`, and puts each refusal on the wire
   as the contract's published `reason`.
 
-  `async: false` for the reason `LoopctlWeb.RunnerChannelStageTest` gives: the socket
-  authenticates its runner through `Loopctl.AdminRepo` while the ledger and the thread live on
-  the RLS `Loopctl.Repo`, so the runner and its tenant are COMMITTED. The broken-chain test
-  also installs committed DDL.
+  The socket authenticates its runner through `Loopctl.AdminRepo` while the ledger and the
+  thread live on the RLS `Loopctl.Repo`; in test both run on the test's one sandbox connection
+  (`Loopctl.AdminRepo.Route`), which the channel process reaches through `$callers`, so every
+  row is sandboxed. A write the audit chain refuses needs committed DDL on the shared
+  `audit_chain` table, so it is in `LoopctlWeb.RunnerChannelThreadBrokenChainTest`, sync.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
   import Ecto.Query
 
-  alias Ecto.Adapters.SQL.Sandbox
-  alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Threads
   alias Loopctl.WorkBreakdown.Story
-  alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
 
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  @reply_timeout 2_000
   @epoch 3
   @sha1 String.duplicate("a", 40)
   @sha2 String.duplicate("b", 40)
   @tree String.duplicate("c", 40)
 
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine) do
-    %{
-      "contract_version" => RunnerContract.version(),
-      "machine" => machine,
-      "cores" => 16,
-      "memory_mb" => 28_000,
-      "repos" => ["mkreyman/home_care_billing"],
-      "max_sessions" => 2,
-      "in_flight" => 0,
-      "draining" => false
-    }
-  end
-
   # A joined runner holding an ACCEPTED implement dispatch for a story its agent has claimed
   # at `@epoch`, through a custody dispatch as a placement would have minted it.
   setup do
-    {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-    {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
+    {raw, runner} = fixture(:runner, %{name: "minis"})
+    {:ok, socket} = connect_runner_socket(raw)
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> runner.id, join_payload("minis"))
+      subscribe_and_join(
+        socket,
+        "runner:" <> runner.id,
+        build(:runner_join_payload, %{"machine" => "minis"})
+      )
 
     _ = :sys.get_state(channel.channel_pid)
 
     story = fixture(:ledger_story, %{tenant_id: runner.tenant_id, claim_epoch: @epoch})
     payload = build(:runner_dispatch, %{"story_id" => story.id, "claim_epoch" => @epoch})
     :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-    assert_push "dispatch", _, @reply_timeout
+    assert_push "dispatch", _, reply_timeout()
 
     ref =
       push(channel, "dispatch_reply", %{
@@ -86,7 +61,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
         "decision" => "accepted"
       })
 
-    assert_reply ref, :ok, _, @reply_timeout
+    assert_reply ref, :ok, _, reply_timeout()
 
     custody_id = Ecto.UUID.generate()
     now = DateTime.utc_now()
@@ -153,13 +128,13 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id, %{"note" => "first cut"}))
-      assert_reply ref, :ok, reply, @reply_timeout
+      assert_reply ref, :ok, reply, reply_timeout()
 
       assert %{seq: 1, replayed: false, checkpoint_id: checkpoint_id} = reply
       assert [%{id: ^checkpoint_id, commit_sha: @sha1}] = thread(ctx).checkpoints
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id, %{"note" => "first cut"}))
-      assert_reply ref, :ok, %{checkpoint_id: ^checkpoint_id, replayed: true}, @reply_timeout
+      assert_reply ref, :ok, %{checkpoint_id: ^checkpoint_id, replayed: true}, reply_timeout()
 
       assert length(thread(ctx).checkpoints) == 1
     end
@@ -170,7 +145,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       ref =
         push(channel, "checkpoint", checkpoint_msg(dispatch_id, %{"claim_epoch" => @epoch + 1}))
 
-      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, reply_timeout()
       assert thread(ctx).checkpoints == []
     end
 
@@ -187,10 +162,10 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
         })
 
       ref = push(channel, "checkpoint", checkpoint_msg(triage.dispatch_id))
-      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, reply_timeout()
 
       ref = push(channel, "thread_entry", entry_msg(triage.dispatch_id))
-      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "wrong_dispatch_kind"}, reply_timeout()
 
       assert thread(ctx).entries == []
     end
@@ -199,10 +174,10 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id, %{"tree_sha" => @sha2}))
-      assert_reply ref, :error, %{reason: "checkpoint_conflict"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "checkpoint_conflict"}, reply_timeout()
 
       ref =
         push(
@@ -214,7 +189,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
           })
         )
 
-      assert_reply ref, :error, %{reason: "secret_blocked"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "secret_blocked"}, reply_timeout()
 
       other = fixture(:stage_agent, %{tenant_id: runner.tenant_id})
 
@@ -225,7 +200,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
         end)
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id, %{"commit_sha" => @sha2}))
-      assert_reply ref, :error, %{reason: "not_claimant"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "not_claimant"}, reply_timeout()
 
       for reason <- ~w(checkpoint_conflict secret_blocked not_claimant) do
         assert reason in RunnerContract.error_reasons()["checkpoint"]
@@ -237,7 +212,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id, %{"commit_sha" => "nope"}))
 
-      assert_reply ref, :error, %{reason: "invalid_payload", details: [_ | _]}, @reply_timeout
+      assert_reply ref, :error, %{reason: "invalid_payload", details: [_ | _]}, reply_timeout()
       assert assigns(channel).checkpoint_bucket == :full
     end
 
@@ -251,7 +226,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id))
 
-      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, reply_timeout()
       assert ms == RunnerContract.checkpoint_burst() |> Map.fetch!("refill_interval_ms")
       assert thread(ctx).checkpoints == []
     end
@@ -261,7 +236,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       capacity = RunnerContract.checkpoint_burst() |> Map.fetch!("capacity")
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert {tokens, _refilled_at} = assigns(channel).checkpoint_bucket
       assert tokens == capacity - 1
@@ -275,10 +250,10 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
 
       ref = push(channel, "thread_entry", entry_msg(dispatch_id, %{"client_seq" => 5}))
-      assert_reply ref, :ok, %{entry_id: entry_id, seq: 1, replayed: false}, @reply_timeout
+      assert_reply ref, :ok, %{entry_id: entry_id, seq: 1, replayed: false}, reply_timeout()
 
       ref = push(channel, "thread_entry", entry_msg(dispatch_id, %{"client_seq" => 5}))
-      assert_reply ref, :ok, %{entry_id: ^entry_id, replayed: true}, @reply_timeout
+      assert_reply ref, :ok, %{entry_id: ^entry_id, replayed: true}, reply_timeout()
 
       assert [%{id: ^entry_id, kind: :message, idempotency_key: key}] = thread(ctx).entries
       assert key == "#{dispatch_id}:5"
@@ -288,10 +263,10 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
 
       ref = push(channel, "thread_entry", entry_msg(dispatch_id))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       ref = push(channel, "thread_entry", entry_msg(dispatch_id, %{"body" => "changed my mind"}))
-      assert_reply ref, :error, %{reason: "idempotency_key_reused"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "idempotency_key_reused"}, reply_timeout()
 
       assert "idempotency_key_reused" in RunnerContract.error_reasons()["thread_entry"]
     end
@@ -300,12 +275,12 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
 
       ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id))
-      assert_reply ref, :ok, %{checkpoint_id: checkpoint_id}, @reply_timeout
+      assert_reply ref, :ok, %{checkpoint_id: checkpoint_id}, reply_timeout()
 
       ref =
         push(channel, "thread_entry", entry_msg(dispatch_id, %{"checkpoint_id" => checkpoint_id}))
 
-      assert_reply ref, :ok, %{seq: 2, replayed: false}, @reply_timeout
+      assert_reply ref, :ok, %{seq: 2, replayed: false}, reply_timeout()
       assert [_checkpoint_entry, %{checkpoint_id: ^checkpoint_id}] = thread(ctx).entries
     end
 
@@ -314,7 +289,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
 
       ref = push(channel, "thread_entry", entry_msg(dispatch_id, %{"claim_epoch" => @epoch + 1}))
 
-      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "claim_epoch_mismatch"}, reply_timeout()
       assert thread(ctx).entries == []
     end
 
@@ -328,7 +303,7 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
 
       ref = push(channel, "thread_entry", entry_msg(dispatch_id))
 
-      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, reply_timeout()
       assert ms == RunnerContract.thread_entry_burst() |> Map.fetch!("refill_interval_ms")
       assert thread(ctx).entries == []
     end
@@ -338,61 +313,11 @@ defmodule LoopctlWeb.RunnerChannelThreadTest do
       capacity = RunnerContract.thread_entry_burst() |> Map.fetch!("capacity")
 
       ref = push(channel, "thread_entry", entry_msg(dispatch_id))
-      assert_reply ref, :ok, _, @reply_timeout
+      assert_reply ref, :ok, _, reply_timeout()
 
       assert {tokens, _refilled_at} = assigns(channel).thread_entry_bucket
       assert tokens == capacity - 1
       assert assigns(channel).checkpoint_bucket == :full
-    end
-  end
-
-  # A TENANT CHAIN THAT REFUSES APPENDS AS A HASH VIOLATION — the technique and the reason for
-  # it are `Loopctl.Delivery.SessionEndReleaseTest`'s: the chain's own trigger cannot be driven
-  # to that state through the application, so a trigger raising exactly what it raises is
-  # installed for THIS tenant only, committed, and dropped at exit.
-  describe "a broken chain at the runner-message boundary" do
-    @describetag :capture_log
-
-    defp break_chain(tenant_id) do
-      name = "test_broken_chain_" <> String.replace(tenant_id, "-", "")
-
-      unboxed(fn ->
-        AdminRepo.query!("""
-        CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$
-        BEGIN
-          RAISE EXCEPTION 'audit_chain_hash_violation: injected by test' USING ERRCODE = 'P0001';
-        END
-        $$
-        """)
-
-        AdminRepo.query!("""
-        CREATE TRIGGER #{name} BEFORE INSERT ON audit_chain FOR EACH ROW
-        WHEN (NEW.tenant_id = '#{tenant_id}') EXECUTE FUNCTION #{name}()
-        """)
-      end)
-
-      on_exit(fn ->
-        unboxed(fn ->
-          AdminRepo.query!("DROP TRIGGER IF EXISTS #{name} ON audit_chain")
-          AdminRepo.query!("DROP FUNCTION IF EXISTS #{name}()")
-        end)
-      end)
-    end
-
-    defp unboxed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
-
-    test "a write the chain refuses is audit_chain_append_failed, and the socket lives", ctx do
-      %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
-      break_chain(runner.tenant_id)
-
-      ref = push(channel, "checkpoint", checkpoint_msg(dispatch_id))
-      assert_reply ref, :error, %{reason: "audit_chain_append_failed"}, @reply_timeout
-
-      ref = push(channel, "thread_entry", entry_msg(dispatch_id))
-      assert_reply ref, :error, %{reason: "audit_chain_append_failed"}, @reply_timeout
-
-      assert Process.alive?(channel.channel_pid)
-      assert thread(ctx).entries == []
     end
   end
 end

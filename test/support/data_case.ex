@@ -123,14 +123,17 @@ defmodule Loopctl.DataCase do
   table whose lock cannot be had at once is SKIPPED, silently, whoever holds it — another
   test's vacuum, but equally a DDL statement or anything else conflicting with SHARE UPDATE
   EXCLUSIVE. So the per-test call is best effort: the graph is usually repaired, not always.
-  A caller whose assertion DEPENDS on the repair passes `wait: true`, which runs a plain
-  `VACUUM (INDEX_CLEANUP ON)` that waits for every table's lock and raises when it cannot
-  run; only a sync module should, since beside the async suite it waits as described above.
+  A caller whose assertion DEPENDS on the repair passes `wait: true`, which drops
+  SKIP_LOCKED and keeps TRUNCATE OFF: it WAITS for each table's lock rather than skipping
+  the table, and does not truncate, so it never asks for the ACCESS EXCLUSIVE lock the
+  caller's own open sandbox transaction would hold it off. Waiting is all it does about a
+  lock; it raises only when the statement itself fails, a timeout included. Only a sync
+  module should pass it, since beside the async suite it waits as described above.
   """
   @spec vacuum_vector_indexes(keyword()) :: :ok
   def vacuum_vector_indexes(opts \\ []) do
     if Keyword.get(opts, :wait, false) do
-      vacuum_each_vector_table("VACUUM (INDEX_CLEANUP ON)")
+      vacuum_each_vector_table("VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF)")
     else
       best_effort_vacuum()
     end

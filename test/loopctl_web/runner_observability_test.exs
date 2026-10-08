@@ -4,16 +4,21 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
   metadata, its close and refusal logs, the refusal telemetry, the `disconnecting` push
   before a server-initiated close, the socket's refusal line, and dispatch delivery.
 
-  ## Why `async: false`
-
   Every test here authenticates a runner through `LoopctlWeb.RunnerSocket`, which reads on
-  `Loopctl.AdminRepo`, so its runners are COMMITTED fixtures (see
-  `LoopctlWeb.RunnerChannelDispatchTest`), visible to every running test and swept in
-  `setup_all`. The `:info` module levels the log assertions need are raised once in
-  `test/test_helper.exs`.
+  `Loopctl.AdminRepo`; in test that runs on the test's one sandbox connection
+  (`Loopctl.AdminRepo.Route`), so every runner is sandboxed. The `:info` module levels the log
+  assertions need are raised once in `test/test_helper.exs`.
+
+  Two things are shared with every concurrently running test, and each is scoped to this
+  test's own runner rather than read whole: a captured log holds other tests' lines too
+  (`ExUnit.CaptureLog`), so `capture_runner_log/3` keeps the log entries naming this runner;
+  and the refusal telemetry handler forwards only this runner's events. A refute of a value
+  only this test holds (a raw token, a junk id) reads the whole capture instead, so a leak on
+  a line that names no runner still fails it. The drain notice is in
+  `LoopctlWeb.RunnerShutdownNoticeTest`.
   """
 
-  use LoopctlWeb.ChannelCase, async: false
+  use LoopctlWeb.ChannelCase, async: true
 
   import Ecto.Query
   import ExUnit.CaptureLog
@@ -29,52 +34,10 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
 
   setup :verify_on_exit!
 
-  # A bound on a real round trip, never a delay.
-  @reply_timeout 2_000
-
-  setup_all do
-    sweep_committed_runner_tenants()
-    on_exit(&sweep_committed_runner_tenants/0)
-    :ok
-  end
-
-  defp connect_info(token) do
-    %{
-      x_headers: [{RunnerSocket.token_header(), token}],
-      peer_data: %{address: {127, 0, 0, 1}, port: 40_000, ssl_cert: nil}
-    }
-  end
-
-  defp join_payload(machine, overrides \\ %{}) do
-    Map.merge(
-      %{
-        "contract_version" => RunnerContract.version(),
-        "machine" => machine,
-        "cores" => 16,
-        "memory_mb" => 28_000,
-        "repos" => ["mkreyman/home_care_billing"],
-        "max_sessions" => 2,
-        "in_flight" => 0,
-        "draining" => false
-      },
-      overrides
-    )
-  end
-
-  defp connect_runner(token), do: connect(RunnerSocket, %{}, connect_info: connect_info(token))
-
-  defp topic(socket), do: "runner:" <> socket.assigns.runner.id
-
-  defp join_pool(socket, machine) do
-    {:ok, _reply, channel} = subscribe_and_join(socket, topic(socket), join_payload(machine))
-    _ = :sys.get_state(channel.channel_pid)
-    channel
-  end
-
   defp joined_runner(name \\ "minis") do
-    {raw, runner} = fixture(:committed_runner, %{name: name})
-    {:ok, socket} = connect_runner(raw)
-    %{runner: runner, raw: raw, channel: join_pool(socket, name)}
+    {raw, runner} = fixture(:runner, %{name: name})
+    {:ok, socket} = connect_runner_socket(raw)
+    %{runner: runner, raw: raw, channel: elem(join_pool(socket, name), 1)}
   end
 
   defp dispatch_payload(tenant_id, attrs \\ %{}) do
@@ -94,7 +57,9 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
     dictionary |> Keyword.get(:"$logger_metadata$", %{}) |> Map.new()
   end
 
-  defp attach_refusals do
+  # The handler is VM-global: every runner channel's refusal reaches it, so it forwards only
+  # those of `runner_id`, this test's runner.
+  defp attach_refusals(runner_id) do
     handler = "runner-refusals-#{System.unique_integer([:positive])}"
     test_pid = self()
 
@@ -102,12 +67,39 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       handler,
       [:loopctl, :runners, :message_refused],
       fn _event, measurements, metadata, _ ->
-        send(test_pid, {:refused, measurements, metadata})
+        if Map.get(metadata, :runner_id) == runner_id,
+          do: send(test_pid, {:refused, measurements, metadata})
       end,
       nil
     )
 
     on_exit(fn -> :telemetry.detach(handler) end)
+  end
+
+  # Under `async: true` a capture also holds entries other tests logged meanwhile, so a refute
+  # or a count over it would judge them too. Every entry the runner control plane logs names
+  # its runner, as Logger metadata or in the message, so this keeps the entries naming `id`.
+  # The capture starts every entry with the ASCII record separator, which never appears in a
+  # log message, and is split on it, never on bare newlines, so a multi-line entry (a crash
+  # report, its stacktrace) is kept whole.
+  defp capture_runner_log(id, opts \\ [level: :info], fun) do
+    {own, _all} = capture_runner_logs(id, opts, fun)
+    own
+  end
+
+  # `{entries naming id, the whole capture}`: the whole capture is for refuting a value only
+  # this test holds, which no other test's entry can contain.
+  defp capture_runner_logs(id, opts \\ [level: :info], fun) do
+    all =
+      capture_log(Keyword.put(opts, :format, "\u001E$time $metadata[$level] $message\n"), fun)
+
+    own =
+      all
+      |> String.split("\u001E", trim: true)
+      |> Enum.filter(&String.contains?(&1, id))
+      |> Enum.join("\n")
+
+    {own, all}
   end
 
   describe "Logger metadata in the channel process" do
@@ -123,7 +115,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
     end
 
     test "a message's correlation ids label the lines logged while it is handled, then are cleared" do
-      %{channel: channel} = joined_runner()
+      %{runner: runner, channel: channel} = joined_runner()
       dispatch_id = Ecto.UUID.generate()
       run_id = Ecto.UUID.generate()
 
@@ -135,9 +127,9 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       }
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           ref = push(channel, "trace", batch)
-          assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+          assert_reply ref, :error, %{reason: "unknown_dispatch"}, reply_timeout()
         end)
 
       # The refusal line (logged while handling) carries them as metadata.
@@ -156,39 +148,36 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       payload = dispatch_payload(runner.tenant_id)
 
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
       _ = :sys.get_state(channel.channel_pid)
       refute Map.has_key?(process_metadata(channel.channel_pid), :story_id)
 
-      # EXPIRED rather than revoked: a revoke's trigger updates the runner row, which the
-      # dispatch's capacity reservation holds locked in this test's still-open `Repo` sandbox
-      # transaction, so a revoke from the `AdminRepo` connection would wait for the test to
-      # end. An expired key fails the same `authorized?/2` recheck.
+      # An EXPIRED key fails the same `authorized?/2` recheck a revoked one does.
       {1, _} =
         from(k in ApiKey, where: k.id == ^runner.api_key_id)
         |> AdminRepo.update_all(set: [expires_at: DateTime.add(DateTime.utc_now(), -60, :second)])
 
-      log =
-        capture_log([level: :info], fn ->
+      {log, all} =
+        capture_runner_logs(runner.id, fn ->
           send(channel.channel_pid, :recheck)
-          assert eventually(fn -> not Process.alive?(channel.channel_pid) end, @reply_timeout)
+          assert eventually(fn -> not Process.alive?(channel.channel_pid) end, reply_timeout())
         end)
 
       assert log =~ "runner disconnecting: reason=no_longer_authorized"
       assert log =~ "runner channel closed"
       refute log =~ "story_id="
       refute log =~ "dispatch_id="
-      refute log =~ payload["story_id"]
+      refute all =~ payload["story_id"]
     end
 
     test "a runner-supplied id or epoch not in its claimed shape is logged as :invalid, never its value" do
-      %{channel: channel} = joined_runner()
+      %{runner: runner, channel: channel} = joined_runner()
       junk = "JUNKID" <> String.duplicate("x", 5_000)
       # What the JSON decoder makes of a many-thousand-digit number.
       bignum = Integer.pow(10, 5_000)
 
-      log =
-        capture_log([level: :info], fn ->
+      {log, all} =
+        capture_runner_logs(runner.id, fn ->
           for epoch <- [bignum, -1] do
             # An invalid trace spends no floor, so every one of these is refused and logged.
             ref =
@@ -199,7 +188,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
                 "events" => "not a list"
               })
 
-            assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+            assert_reply ref, :error, %{reason: "invalid_payload"}, reply_timeout()
           end
         end)
 
@@ -214,6 +203,8 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
         refute line =~ "0000000000"
         refute line =~ "claim_epoch=-1"
       end
+
+      refute all =~ "JUNKID"
     end
 
     test "a message whose handling raises keeps its correlation ids on the crash and close lines" do
@@ -226,9 +217,9 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       dispatch = %{dispatch | dispatch_id: "not-a-uuid"}
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           send(channel.channel_pid, {:runner_dispatch, dispatch})
-          assert eventually(fn -> not Process.alive?(channel.channel_pid) end, @reply_timeout)
+          assert eventually(fn -> not Process.alive?(channel.channel_pid) end, reply_timeout())
         end)
 
       lines = String.split(log, "\n")
@@ -252,10 +243,10 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       Process.unlink(channel.channel_pid)
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           ref = leave(channel)
-          assert_reply ref, :ok, _, @reply_timeout
-          assert eventually(fn -> not Process.alive?(channel.channel_pid) end, @reply_timeout)
+          assert_reply ref, :ok, _, reply_timeout()
+          assert eventually(fn -> not Process.alive?(channel.channel_pid) end, reply_timeout())
         end)
 
       for fragment <- [
@@ -275,15 +266,15 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
 
   describe "refusals" do
     test "a refused message emits telemetry with its ids and is logged with its reason" do
-      attach_refusals()
       %{runner: runner, channel: channel} = joined_runner()
+      attach_refusals(runner.id)
       dispatch_id = Ecto.UUID.generate()
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           reply = %{"dispatch_id" => dispatch_id, "claim_epoch" => 0, "decision" => "accepted"}
           ref = push(channel, "dispatch_reply", reply)
-          assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+          assert_reply ref, :error, %{reason: "unknown_dispatch"}, reply_timeout()
         end)
 
       assert_received {:refused, %{count: 1}, metadata}
@@ -302,8 +293,8 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
     end
 
     test "rate_limited is counted but not logged" do
-      attach_refusals()
-      %{channel: channel} = joined_runner()
+      %{runner: runner, channel: channel} = joined_runner()
+      attach_refusals(runner.id)
 
       :sys.replace_state(channel.channel_pid, fn socket ->
         at = System.monotonic_time(:millisecond) + 60_000
@@ -311,9 +302,9 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       end)
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           ref = push(channel, "status", %{"in_flight" => 1})
-          assert_reply ref, :error, %{reason: "rate_limited"}, @reply_timeout
+          assert_reply ref, :error, %{reason: "rate_limited"}, reply_timeout()
         end)
 
       assert_received {:refused, _, %{event: "status", reason: "rate_limited"}}
@@ -321,22 +312,22 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
     end
 
     test "an unknown event is counted under a fixed event name, never the runner's string" do
-      attach_refusals()
-      %{channel: channel} = joined_runner()
+      %{runner: runner, channel: channel} = joined_runner()
+      attach_refusals(runner.id)
 
       ref = push(channel, "made-up-#{System.unique_integer()}", %{})
-      assert_reply ref, :error, %{reason: "unknown_event"}, @reply_timeout
+      assert_reply ref, :error, %{reason: "unknown_event"}, reply_timeout()
       assert_received {:refused, _, %{event: "unknown", reason: "unknown_event"}}
     end
 
     test "ten unknown events in one interval: ten unknown_event replies, ten telemetry events, one log line" do
-      attach_refusals()
-      %{channel: channel} = joined_runner()
+      %{runner: runner, channel: channel} = joined_runner()
+      attach_refusals(runner.id)
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           ref = push(channel, "made-up-1", %{})
-          assert_reply ref, :error, %{reason: "unknown_event"}, @reply_timeout
+          assert_reply ref, :error, %{reason: "unknown_event"}, reply_timeout()
 
           # Pinned, so the other nine land inside the interval however long the first took.
           :sys.replace_state(channel.channel_pid, fn socket ->
@@ -346,7 +337,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
 
           for n <- 2..10 do
             ref = push(channel, "made-up-#{n}", %{})
-            assert_reply ref, :error, reply, @reply_timeout
+            assert_reply ref, :error, reply, reply_timeout()
             assert reply == %{reason: "unknown_event"}
           end
         end)
@@ -362,14 +353,18 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
     end
 
     test "a refused join is counted and logged with its reason" do
-      attach_refusals()
-      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      attach_refusals(runner.id)
+      {:ok, socket} = connect_runner_socket(raw)
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           assert {:error, %{reason: "machine_mismatch"}} =
-                   subscribe_and_join(socket, topic(socket), join_payload("mac-mini"))
+                   subscribe_and_join(
+                     socket,
+                     runner_topic(socket),
+                     build(:runner_join_payload, %{"machine" => "mac-mini"})
+                   )
         end)
 
       assert_received {:refused, _,
@@ -392,7 +387,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
         %Phoenix.Socket.Broadcast{event: "disconnect"} ->
           :closed
       after
-        @reply_timeout -> :nothing
+        reply_timeout() -> :nothing
       end
     end
 
@@ -402,13 +397,13 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       @endpoint.subscribe(RunnerSocket.socket_id(runner.id))
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           {:ok, _} = Runners.revoke_runner(runner.tenant_id, runner.id)
 
           assert first_of_disconnecting_or_close() ==
                    {:disconnecting, %{reason: "runner_revoked"}}
 
-          assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, @reply_timeout
+          assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, reply_timeout()
         end)
 
       assert log =~ "runner disconnecting: reason=runner_revoked runner_id=#{runner.id}"
@@ -428,74 +423,61 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
     end
 
     test "a join refused as not_authorized carries the reason in its reply, and it is logged" do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
-      {:ok, socket} = connect_runner(raw)
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner_socket(raw)
       {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
       {:ok, _} = Auth.revoke_api_key(key)
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           assert {:error,
                   %{reason: "not_authorized", disconnecting: "join_refused_not_authorized"}} =
-                   subscribe_and_join(socket, topic(socket), join_payload("minis"))
+                   subscribe_and_join(
+                     socket,
+                     runner_topic(socket),
+                     build(:runner_join_payload, %{"machine" => "minis"})
+                   )
         end)
 
       assert log =~ "runner disconnecting: reason=join_refused_not_authorized"
-    end
-
-    test "draining the runner socket tells every runner server_shutdown" do
-      %{channel: channel} = joined_runner()
-
-      log =
-        capture_log([level: :info], fn ->
-          :telemetry.execute(
-            [:phoenix, :socket_drain],
-            %{count: 1, total: 1, index: 1, rounds: 1},
-            %{endpoint: @endpoint, socket: RunnerSocket, interval: 1_000, log: :info}
-          )
-
-          assert_push "disconnecting", %{reason: "server_shutdown"}, @reply_timeout
-        end)
-
-      assert Process.alive?(channel.channel_pid)
-      assert log =~ "runner socket draining"
-      assert log =~ "runner disconnecting: reason=server_shutdown"
-    end
-
-    test "draining another socket tells the runners nothing" do
-      _ = joined_runner()
-
-      :telemetry.execute(
-        [:phoenix, :socket_drain],
-        %{count: 1, total: 1, index: 1, rounds: 1},
-        %{endpoint: @endpoint, socket: Phoenix.LiveView.Socket, interval: 1_000, log: :info}
-      )
-
-      refute_push "disconnecting", _
     end
   end
 
   describe "the socket's refusal line" do
     test "names the reason, the client IP and what the credential resolved to — never the token" do
-      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
+      {raw, runner} = fixture(:runner, %{name: "minis"})
       {:ok, _} = Runners.revoke_runner(runner.tenant_id, runner.id)
 
-      log = capture_log([level: :info], fn -> assert :error = connect_runner(raw) end)
+      # A token that resolves to nothing names no runner, so this connection comes from a peer
+      # address no other test uses, and the line is matched on it. The refute is over a token
+      # no other test holds.
+      n = System.unique_integer([:positive])
+      address = {127, rem(div(n, 65_536), 256), rem(div(n, 256), 256), rem(n, 256)}
+      ip = address |> :inet.ntoa() |> to_string()
 
-      assert log =~ "runner socket refused: reason=:invalid_token client_ip=127.0.0.1"
+      log =
+        capture_log([level: :info], fn ->
+          assert :error =
+                   connect(RunnerSocket, %{},
+                     connect_info: build(:runner_connect_info, %{token: raw, address: address})
+                   )
+        end)
+
+      assert log =~ "runner socket refused: reason=:invalid_token client_ip=#{ip} "
       refute log =~ raw
     end
 
     test "a key that resolved but is not a runner's is named by id" do
-      tenant = fixture(:committed_tenant, %{})
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       {raw, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
 
-      log = capture_log([level: :info], fn -> assert :error = connect_runner(raw) end)
+      {log, all} =
+        capture_runner_logs(key.id, fn -> assert :error = connect_runner_socket(raw) end)
 
       assert log =~ "reason=:not_a_runner"
       assert log =~ "api_key_id=#{inspect(key.id)}"
       assert log =~ "tenant_id=#{inspect(tenant.id)}"
-      refute log =~ raw
+      refute all =~ raw
     end
   end
 
@@ -505,13 +487,13 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       payload = dispatch_payload(runner.tenant_id)
 
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
-      assert_push "dispatch", _, @reply_timeout
+      assert_push "dispatch", _, reply_timeout()
 
       assert eventually(
                fn ->
                  DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).pushed_at
                end,
-               @reply_timeout
+               reply_timeout()
              )
 
       assert [meta] = Runners.live_metas(runner.tenant_id, runner.id)
@@ -527,7 +509,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       {:ok, _} = Tenants.halt_custody(runner.tenant_id)
 
       log =
-        capture_log([level: :warning], fn ->
+        capture_runner_log(runner.id, [level: :warning], fn ->
           send(channel.channel_pid, {:runner_dispatch, dispatch})
           _ = :sys.get_state(channel.channel_pid)
         end)
@@ -544,7 +526,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       {:ok, _} = Tenants.halt_custody(runner.tenant_id)
 
       log =
-        capture_log([level: :info], fn ->
+        capture_runner_log(runner.id, fn ->
           assert {:error, :tenant_halted} = Runners.dispatch(runner.tenant_id, runner.id, payload)
         end)
 
@@ -562,8 +544,8 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
         |> dispatch_payload()
         |> Map.merge(%{"dispatch_id" => junk, "claim_epoch" => Integer.pow(10, 500)})
 
-      log =
-        capture_log([level: :info], fn ->
+      {log, all} =
+        capture_runner_logs(runner.id, fn ->
           assert {:error, _} = Runners.dispatch(junk, runner.id, payload)
         end)
 
@@ -571,7 +553,8 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       assert log =~ "tenant_id=:invalid"
       assert log =~ "dispatch_id=:invalid"
       assert log =~ "claim_epoch=:invalid"
-      refute log =~ "DISPATCHJUNK"
+      refute all =~ "DISPATCHJUNK"
+      # Not unique to this test, so over this runner's entries only.
       refute log =~ "0000000000"
     end
   end

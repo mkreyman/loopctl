@@ -29,12 +29,16 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
   alias Loopctl.Repo
+  alias Loopctl.Test.RowLock
   alias Loopctl.Test.VerificationRunnerForge
 
   @repo VerificationRunnerForge.repo()
   @branch VerificationRunnerForge.branch()
   @sha VerificationRunnerForge.sha()
   @short VerificationRunnerForge.short()
+
+  # How long a table-lock holder keeps its lock with nobody releasing it.
+  @holder_ttl_ms 60_000
 
   setup :verify_on_exit!
 
@@ -74,9 +78,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
       stub_forge(ctx, %{
         compare: fn ->
           lock_run_once!(run)
-          {:ok, clean(["lib/widgets/thing.ex"])}
+          {:ok, build(:forge_comparison, %{files: ["lib/widgets/thing.ex"]})}
         end,
-        evidence: green()
+        evidence: build(:forge_evidence)
       })
 
       assert {:snooze, 60} = perform_busy(ctx, run)
@@ -96,7 +100,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "a stage row loopctl cannot read is a wait, not a verdict", ctx do
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
       run = fixture(:verification_run, Map.put(ctx, :ci_forge_faults, 2))
       hold_table_lock!("story_stages")
 
@@ -125,7 +129,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     # Review round 1, finding 3(b): the dispatch ledger is loopctl's own database, not the
     # forge. Contention there snoozes without touching the fault streak, and reads nothing.
     test "database contention resolving the branch is not a forge fault", ctx do
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
       run = fixture(:verification_run, Map.put(ctx, :ci_forge_faults, 2))
       hold_ledger_lock!()
 
@@ -139,7 +143,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "database contention past the age window records database_busy", ctx do
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
       run = fixture(:verification_run, Map.put(ctx, :age_seconds, 25 * 60 * 60))
       hold_ledger_lock!()
 
@@ -173,7 +177,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "starting the run", ctx do
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
       run = fixture(:verification_run, ctx)
       before = snapshot(ctx, run)
       lock_run_once!(run)
@@ -203,7 +207,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
 
     test "recording the resolved SHA", ctx do
-      stub_forge(ctx, %{evidence: green()})
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
       run = fixture(:verification_run, Map.merge(ctx, %{commit_sha: @short, ready: true}))
       before = snapshot(ctx, run)
 
@@ -223,7 +227,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
     test "recording a pass", ctx do
       run = fixture(:verification_run, Map.put(ctx, :ready, true))
-      stub_forge(ctx, %{evidence: locking(run, green())})
+      stub_forge(ctx, %{evidence: locking(run, build(:forge_evidence))})
       before = snapshot(ctx, run)
 
       assert {:snooze, 60} = perform_busy(ctx, run)
@@ -236,7 +240,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
     test "recording a fail", ctx do
       run = fixture(:verification_run, Map.put(ctx, :ready, true))
-      failed = evidence([ci_run(5, "completed", "failure")], [ci_job(5, "completed", "failure")])
+      failed = build(:forge_evidence, %{status: "completed", conclusion: "failure"})
       stub_forge(ctx, %{evidence: locking(run, failed)})
       before = snapshot(ctx, run)
 
@@ -264,7 +268,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
     test "resetting the fault streak on an answered wait", ctx do
       run = fixture(:verification_run, Map.merge(ctx, %{ready: true, ci_forge_faults: 2}))
-      pending = evidence([ci_run(5, "queued", nil)], [ci_job(5, "queued", nil)])
+      pending = build(:forge_evidence, %{status: "queued", conclusion: nil})
       stub_forge(ctx, %{evidence: locking(run, pending)})
       before = snapshot(ctx, run)
 
@@ -378,44 +382,24 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
     end
   end
 
-  # Locks the run on the FIRST call only (`hold_run_lock!/1`), so the poll after
-  # `release_run_lock!/0` writes freely.
+  # Locks the run on the FIRST call only, so the poll after `release_run_lock!/0` writes
+  # freely. A row lock on one verification run, held by another connection
+  # (`Loopctl.Test.RowLock`) until released or the test ends: the run's next write waits out
+  # its lock_timeout.
   defp lock_run_once!(run) do
-    unless Process.get(:run_lock), do: Process.put(:run_lock, hold_run_lock!(run))
+    unless Process.get(:run_lock),
+      do: Process.put(:run_lock, RowLock.hold!("verification_runs", run.id))
+
     :ok
   end
 
-  defp release_run_lock!, do: send(Process.get(:run_lock), :release)
+  defp release_run_lock!, do: RowLock.release(Process.get(:run_lock))
 
-  # A row lock on one verification run, held by another connection until released (or the
-  # test ends): the run's next write waits out its lock_timeout.
-  defp hold_run_lock!(run) do
-    test_pid = self()
-
-    holder =
-      spawn(fn ->
-        :ok = Sandbox.checkout(Loopctl.Repo, sandbox: false)
-
-        AdminRepo.transaction(fn ->
-          AdminRepo.query!("SELECT 1 FROM verification_runs WHERE id = $1 FOR UPDATE", [
-            Ecto.UUID.dump!(run.id)
-          ])
-
-          send(test_pid, :held)
-
-          receive do
-            :release -> :ok
-          end
-        end)
-
-        Sandbox.checkin(Loopctl.Repo)
-      end)
-
-    assert_receive :held, 5_000
-    on_exit(fn -> send(holder, :release) end)
-    holder
-  end
-
+  # A table lock held by another connection until released or the test ends. The release is
+  # registered BEFORE waiting for the lock, so a holder that is slow to report still gets
+  # it, and the holder gives up by itself after `@holder_ttl_ms`: it is unlinked, and a
+  # receive with no timeout would keep the lock, and its connection, past a test that died
+  # without running its `on_exit`.
   defp hold_table_lock!(table) do
     test_pid = self()
 
@@ -429,14 +413,16 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
           receive do
             :release -> :ok
+          after
+            @holder_ttl_ms -> :ok
           end
         end)
 
         Sandbox.checkin(Repo)
       end)
 
-    assert_receive :held, 5_000
     on_exit(fn -> send(holder, :release) end)
+    assert_receive :held, 5_000
     holder
   end
 end
