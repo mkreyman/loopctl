@@ -218,6 +218,10 @@ defmodule Loopctl.Vault.Rotation do
     * `:table` — restrict to one table, by its DB name
     * `:dry_run` — read, decrypt and classify, but write nothing. `reencrypted` then
       counts the rows a real run WOULD rewrite.
+    * `:around_write` — `(pk, write) -> rows`, called for every compare-and-set with `write`,
+      the zero-arity function that runs it and returns the rows it changed. The default
+      just calls `write`. A test passes one that writes the row (or raises) around the
+      pass's own write, which is where an application write races it.
 
   Returns `{:ok, report}`, or `{:error, report}` when any row failed to decrypt or could not
   be settled.
@@ -227,7 +231,8 @@ defmodule Loopctl.Vault.Rotation do
     context = %{
       active_tag: active_tag(),
       dry_run: Keyword.get(opts, :dry_run, false),
-      batch_size: batch_size(opts)
+      batch_size: batch_size(opts),
+      around_write: Keyword.get(opts, :around_write, fn _pk, write -> write.() end)
     }
 
     targets = selected_targets(opts)
@@ -470,14 +475,16 @@ defmodule Loopctl.Vault.Rotation do
   end
 
   defp write_row(report, target, context, pk, rewrites) do
-    case cas(target, pk, rewrites) do
+    case cas(target, context, pk, rewrites) do
       0 -> settle_race(report, target, context, pk)
       _rows -> tally(report, target.table, :reencrypted)
     end
   end
 
-  defp cas(target, pk, rewrites) do
-    AdminRepo.query!(update_sql(target, rewrites), update_params(pk, rewrites)).num_rows
+  defp cas(target, context, pk, rewrites) do
+    context.around_write.(pk, fn ->
+      AdminRepo.query!(update_sql(target, rewrites), update_params(pk, rewrites)).num_rows
+    end)
   end
 
   # A 0-row compare-and-set means the row moved under us, NOT that it is on the active
@@ -494,7 +501,7 @@ defmodule Loopctl.Vault.Rotation do
           :null -> tally(report, target.table, :skipped_null)
           :active -> tally(report, target.table, :skipped_concurrent)
           {:error, reason} -> record_failure(report, target, pk, reason)
-          {:rewrite, rewrites} -> retry_write(report, target, pk, rewrites)
+          {:rewrite, rewrites} -> retry_write(report, target, context, pk, rewrites)
         end
     end
   end
@@ -503,8 +510,8 @@ defmodule Loopctl.Vault.Rotation do
   # claim `skipped_concurrent`, which is defined as "a re-read showed it converted". It gets
   # its own bucket, and that bucket fails the run: the row may still be on the retired key,
   # and this count is what the runbook has the operator weigh before dropping it.
-  defp retry_write(report, target, pk, rewrites) do
-    case cas(target, pk, rewrites) do
+  defp retry_write(report, target, context, pk, rewrites) do
+    case cas(target, context, pk, rewrites) do
       0 -> tally(report, target.table, :skipped_unsettled)
       _rows -> tally(report, target.table, :reencrypted)
     end

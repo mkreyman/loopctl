@@ -7,7 +7,12 @@ defmodule Loopctl.Threads.ThreadReviewsRollbackTest do
   Driven the way `Loopctl.ContextRetriever.EntityDefinitionsRollbackTest` drives its
   migration: the file is loaded at runtime and run with `Ecto.Migration.Runner.run/9` in THIS
   process, inside a manual sandbox owner, so every statement lives in one transaction that is
-  rolled back on exit and the suite's schema is untouched. `async: false` for the same reason.
+  rolled back on exit and the suite's schema is untouched.
+
+  `async: false` because the subject is DDL on the SHARED `thread_reviews` table: `down` drops
+  it and `up` recreates it, and the DROP holds ACCESS EXCLUSIVE on `thread_reviews` until the
+  test's transaction rolls back, so every concurrent test reading or writing a review would
+  wait on it.
   """
   use ExUnit.Case, async: false
 

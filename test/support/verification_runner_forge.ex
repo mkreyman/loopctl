@@ -1,0 +1,155 @@
+defmodule Loopctl.Test.VerificationRunnerForge do
+  @moduledoc """
+  The forge stubs and run helpers shared by
+  `Loopctl.Workers.VerificationRunnerWorkerIntegrationTest` (async, sandboxed) and
+  `Loopctl.Workers.VerificationRunnerWorkerLockTest` (sync, committed: its subject is a lock
+  another connection holds).
+
+  The answers the stubs give are built in `Loopctl.Fixtures` (`build(:forge_evidence)`,
+  `build(:forge_comparison)`, `build(:ci_run)` and friends), and the records a run needs are
+  `fixture(:verification_story)` and `fixture(:verification_run)`.
+
+  The forge is `Loopctl.MockPullRequestSource`. Each stub answers ONLY for the intake source's
+  repository and the story's own branch; anything else is recorded as `{:wrong_read, ...}`
+  and answered with green evidence, so reading the wrong repository or branch shows up as a
+  wrong VERDICT, not only as a missing message. Stubs are process-scoped (Mox private mode):
+  the worker runs in the test process, so no test can answer another's reads.
+  """
+
+  import Loopctl.Fixtures
+  import Mox
+
+  alias Loopctl.Delivery.ForgeRepo
+  alias Loopctl.MockPullRequestSource
+  alias Loopctl.MockVerificationCredential
+  alias Loopctl.Verification
+  alias Loopctl.Verification.Credential
+  alias Loopctl.Workers.VerificationRunnerWorker
+
+  @repo "acme/widgets"
+  @branch "loop/story-branch"
+  @sha String.duplicate("a", 40)
+  @short "aaaaaaa"
+  @fork_point String.duplicate("b", 40)
+  @head_tree String.duplicate("e", 40)
+  @base_tree String.duplicate("f", 40)
+
+  @run_fields [
+    :status,
+    :started_at,
+    :completed_at,
+    :ac_results,
+    :ci_forge_faults,
+    :resolved_commit_sha,
+    :change_checked_at,
+    :updated_at
+  ]
+
+  @doc "The intake source's repository: the only one the stubs answer for."
+  def repo, do: @repo
+  @doc "The story's branch the stage row records."
+  def branch, do: @branch
+  @doc "The full commit SHA a run judges."
+  def sha, do: @sha
+  @doc "An abbreviated form of `sha/0`."
+  def short, do: @short
+  @doc "The merge base the comparison answers."
+  def fork_point, do: @fork_point
+  @doc "The head commit's tree."
+  def head_tree, do: @head_tree
+  @doc "The base's tree."
+  def base_tree, do: @base_tree
+
+  @doc """
+  `fixture(:verification_story)` under `tenant_id`, plus the credential stubs; returns the test
+  context. The records are the fixture's; this adds what is not a record.
+  """
+  def setup_story!(tenant_id) do
+    ctx = fixture(:verification_story, %{tenant_id: tenant_id, repo_full_name: @repo})
+    test_pid = self()
+
+    stub(MockVerificationCredential, :any_for_tenant?, fn _tenant_id -> true end)
+
+    stub(MockVerificationCredential, :for_read, fn tenant_id, repo ->
+      send(test_pid, {:credential_asked, tenant_id, repo})
+      {:ok, %Credential{kind: :operator_token, repo: ForgeRepo.operator(repo)}}
+    end)
+
+    Map.put(ctx, :test_pid, test_pid)
+  end
+
+  @doc "One poll of the worker, in the calling process."
+  def perform(ctx, run) do
+    VerificationRunnerWorker.perform(%Oban.Job{
+      args: %{"run_id" => run.id, "tenant_id" => ctx.tenant_id}
+    })
+  end
+
+  @doc "The run as stored now."
+  def reload(ctx, run) do
+    {:ok, reloaded} = Verification.get_run(ctx.tenant_id, run.id)
+    reloaded
+  end
+
+  @doc "Everything a poll may write on the run, `updated_at` included."
+  def snapshot(ctx, run), do: ctx |> reload(run) |> Map.take(@run_fields)
+
+  @doc """
+  The story's own reads answer `answers`; any other repository, branch or base is recorded
+  and answered GREEN, so a read of the wrong target would pass a run that must not pass.
+  """
+  def stub_forge(ctx, answers) do
+    base = Map.get(answers, :base, "master")
+    branch = Map.get(answers, :branch, @branch)
+    diff = Map.get(answers, :diff, ["lib/widgets/thing.ex"])
+
+    stub(MockPullRequestSource, :commit, fn
+      %ForgeRepo{full_name: @repo}, sha ->
+        send(ctx.test_pid, {:commit, sha})
+        {:ok, %{tree_sha: Map.get(answers, :tree, @head_tree), parents: [@fork_point]}}
+
+      repo, _sha ->
+        send(ctx.test_pid, {:wrong_read, :commit, repo, nil})
+        {:ok, %{tree_sha: @head_tree, parents: []}}
+    end)
+
+    stub(MockPullRequestSource, :compare, fn
+      %ForgeRepo{full_name: @repo}, ^base, sha ->
+        send(ctx.test_pid, {:compare, sha})
+
+        answers
+        |> Map.get_lazy(:compare, fn -> {:ok, build(:forge_comparison, %{files: diff})} end)
+        |> answer()
+
+      repo, other_base, _sha ->
+        send(ctx.test_pid, {:wrong_read, :compare, repo, other_base})
+        {:ok, build(:forge_comparison, %{files: ["lib/x.ex"]})}
+    end)
+
+    stub(MockPullRequestSource, :check_evidence, fn
+      %ForgeRepo{full_name: @repo}, sha, ^branch ->
+        send(ctx.test_pid, {:evidence, sha})
+        answers |> Map.fetch!(:evidence) |> answer()
+
+      repo, _sha, other_branch ->
+        send(ctx.test_pid, {:wrong_read, :check_evidence, repo, other_branch})
+        build(:forge_evidence, %{run_id: 99})
+    end)
+  end
+
+  @doc "A sequence of answers, one per call, from a process-held queue; the last repeats."
+  def sequence(answers) do
+    {:ok, agent} = Agent.start_link(fn -> answers end)
+
+    fn ->
+      Agent.get_and_update(agent, fn
+        [only] -> {only, [only]}
+        [next | rest] -> {next, rest}
+      end)
+    end
+  end
+
+  # An answer given as a value, or as a function called at the read.
+  defp answer(fun) when is_function(fun, 0), do: fun.()
+  defp answer(value), do: value
+end

@@ -51,9 +51,18 @@ defmodule Loopctl.Workers.ReviewCeilingWorker do
   def perform(%Oban.Job{args: %{"tenant_id" => tenant_id, "story_id" => story_id}}),
     do: reconcile(tenant_id, story_id)
 
-  def perform(%Oban.Job{}) do
-    candidates() |> Enum.each(&escalate/1)
-    :ok
+  def perform(%Oban.Job{}), do: sweep()
+
+  @doc """
+  The cron run: one attempt for every outstanding review ceiling, fleet-wide. `:tenant_id`
+  narrows the read to one tenant, so a test moves only the stages it wrote.
+  """
+  @spec sweep(keyword()) :: :ok
+  def sweep(opts \\ []) do
+    candidates_query()
+    |> scoped_to(Keyword.get(opts, :tenant_id))
+    |> AdminRepo.all()
+    |> Enum.each(&escalate/1)
   end
 
   @doc """
@@ -93,14 +102,16 @@ defmodule Loopctl.Workers.ReviewCeilingWorker do
     {:ok, candidates} =
       Repo.with_tenant(tenant_id, fn ->
         candidates_query()
-        |> where([e], e.tenant_id == ^tenant_id and e.story_id == ^story_id)
+        |> scoped_to(tenant_id)
+        |> where([e], e.story_id == ^story_id)
         |> Repo.all()
       end)
 
     Enum.each(candidates, &escalate/1)
   end
 
-  defp candidates, do: AdminRepo.all(candidates_query())
+  defp scoped_to(query, nil), do: query
+  defp scoped_to(query, tenant_id), do: where(query, [e], e.tenant_id == ^tenant_id)
 
   defp candidates_query do
     in_flight = StageMachine.in_flight_stages()

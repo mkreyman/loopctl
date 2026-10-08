@@ -12,7 +12,7 @@ defmodule Loopctl.HeavyReadPoolIsolationTest do
   onto a single checked-out connection — so this asserts the structural guarantees
   plus a no-deadlock concurrency smoke, not a starvation race.)
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   alias Loopctl.AdminRepo
   alias Loopctl.HeavyReadRepo

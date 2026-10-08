@@ -993,6 +993,81 @@ defmodule Loopctl.Fixtures do
     File.read!("test/support/intake_fixtures/benign_ticket_body.md")
   end
 
+  # Forge answers for `Loopctl.Workers.VerificationRunnerWorker` tests, as
+  # `Loopctl.Test.VerificationRunnerForge`'s stubs return them. The SHAs default to the forge
+  # module's `fork_point/0` and `base_tree/0`.
+  #
+  # A workflow run of `ci.yml` (or `:workflow`): `:id` 5, completed, successful by default.
+  def build(:ci_run, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    %{
+      id: Map.get(attrs, :id, 5),
+      workflow: Map.get(attrs, :workflow, ".github/workflows/ci.yml"),
+      status: Map.get(attrs, :status, "completed"),
+      conclusion: Map.get(attrs, :conclusion, "success")
+    }
+  end
+
+  # A job of a `:run_id` run (5 by default), named `test`, completed, successful by default.
+  def build(:ci_job, attrs) do
+    attrs = Enum.into(attrs, %{})
+    run_id = Map.get(attrs, :run_id, 5)
+
+    %{
+      id: run_id * 10,
+      run_id: run_id,
+      name: Map.get(attrs, :name, "test"),
+      status: Map.get(attrs, :status, "completed"),
+      conclusion: Map.get(attrs, :conclusion, "success"),
+      workflow: Map.get(attrs, :workflow, ".github/workflows/ci.yml")
+    }
+  end
+
+  # An unrelated workflow file (`lint.yml`) that succeeded, run 6 by default.
+  def build(:lint_run, attrs) do
+    attrs = Enum.into(attrs, %{})
+    build(:ci_run, %{id: Map.get(attrs, :id, 6), workflow: ".github/workflows/lint.yml"})
+  end
+
+  # The job of a `build(:lint_run)`.
+  def build(:lint_job, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    build(:ci_job, %{
+      run_id: Map.get(attrs, :run_id, 6),
+      name: "lint",
+      workflow: ".github/workflows/lint.yml"
+    })
+  end
+
+  # A check-evidence answer. `:runs` and `:jobs` give the lists outright; otherwise one
+  # `ci.yml` run and its `test` job, shaped by `:run_id`, `:status` and `:conclusion`, which
+  # by default is green: required check `test` succeeded in workflow run 5.
+  def build(:forge_evidence, attrs) do
+    attrs = Enum.into(attrs, %{})
+    shape = Map.take(attrs, [:status, :conclusion])
+    run_id = Map.get(attrs, :run_id, 5)
+
+    runs = Map.get_lazy(attrs, :runs, fn -> [build(:ci_run, Map.put(shape, :id, run_id))] end)
+    jobs = Map.get_lazy(attrs, :jobs, fn -> [build(:ci_job, Map.put(shape, :run_id, run_id))] end)
+
+    {:ok, %{runs: runs, jobs: jobs, statuses: []}}
+  end
+
+  # A comparison answer listing `:files` (none by default) changed since `:merge_base_sha`.
+  def build(:forge_comparison, attrs) do
+    attrs = Enum.into(attrs, %{})
+    files = Map.get(attrs, :files, [])
+
+    %{
+      merge_base_sha: Map.get(attrs, :merge_base_sha, String.duplicate("b", 40)),
+      base_tree_sha: String.duplicate("f", 40),
+      diffstat: %{files: length(files), changed_lines: 3 * length(files)},
+      diff: {:ok, %{files: files, renames: []}}
+    }
+  end
+
   @doc """
   Inserts a record into the database, auto-creating any required dependencies.
   Returns the inserted struct.
@@ -3127,6 +3202,74 @@ defmodule Loopctl.Fixtures do
     story
   end
 
+  # The project, epic, story and intake source a `Loopctl.Workers.VerificationRunnerWorker`
+  # run needs, under `:tenant_id`; returns `%{tenant_id:, project_id:, story_id:}`. The
+  # source's repository is `:repo_full_name` (`"acme/widgets"` by default) and
+  # `projects.repo_url` names ANOTHER repository on purpose: nothing may read it (#931
+  # finding a). `Loopctl.Test.VerificationRunnerForge` stubs the forge around these rows.
+  def fixture(:verification_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    project =
+      fixture(:project, %{tenant_id: tenant_id, repo_url: "https://github.com/evil/other"})
+
+    epic = fixture(:epic, %{tenant_id: tenant_id, project_id: project.id})
+    story = fixture(:story, %{tenant_id: tenant_id, epic_id: epic.id, project_id: project.id})
+
+    fixture(:intake_source, %{
+      tenant_id: tenant_id,
+      project_id: project.id,
+      repo_full_name: Map.get(attrs, :repo_full_name, "acme/widgets"),
+      required_checks: ["test"]
+    })
+
+    %{tenant_id: tenant_id, project_id: project.id, story_id: story.id}
+  end
+
+  # A verification run of `:commit_sha` for `:story_id`, created through
+  # `Loopctl.Verification.create_run/3`. Other keys in `attrs` are ignored, so a test context
+  # can be passed as it is. Three optional shapings write the run's columns directly:
+  #
+  #   * `:age_seconds` moves its creation that far back and, unless `started: false`, its
+  #     start too, as `running`;
+  #   * `ready: true` marks it started and change-checked, so a poll's only write is the one
+  #     after the forge's answer;
+  #   * `:ci_forge_faults` sets its consecutive forge-fault streak.
+  #
+  # Combined, a later one in that list wins a column both set.
+  #
+  # Returns the run as created; reload it to read a shaped column.
+  def fixture(:verification_run, attrs) do
+    attrs = Enum.into(attrs, %{})
+    sha = Map.get(attrs, :commit_sha, String.duplicate("a", 40))
+
+    {:ok, run} =
+      Loopctl.Verification.create_run(
+        Map.fetch!(attrs, :tenant_id),
+        Map.fetch!(attrs, :story_id),
+        %{commit_sha: sha}
+      )
+
+    # One keyword list, a later shaping's value winning: `ready: true` with `:age_seconds`
+    # sets `status` and `started_at` once, to the ready values, never twice in one UPDATE.
+    set =
+      attrs
+      |> verification_run_aged()
+      |> Keyword.merge(verification_run_ready(attrs))
+      |> Keyword.merge(Map.to_list(Map.take(attrs, [:ci_forge_faults])))
+
+    if set != [] do
+      {1, _} =
+        AdminRepo.update_all(
+          from(r in Loopctl.Verification.VerificationRun, where: r.id == ^run.id),
+          set: set
+        )
+    end
+
+    run
+  end
+
   # A PENDING issue-closure row (#805), inserted directly so a closer/worker test can start
   # from a verdict without walking a story through the stage machine to reach one.
   #
@@ -3731,6 +3874,23 @@ defmodule Loopctl.Fixtures do
 
     :ok
   end
+
+  defp verification_run_aged(%{age_seconds: seconds} = attrs) do
+    at = DateTime.add(DateTime.utc_now(), -seconds, :second)
+
+    if Map.get(attrs, :started, true),
+      do: [inserted_at: at, started_at: at, status: "running"],
+      else: [inserted_at: at]
+  end
+
+  defp verification_run_aged(_attrs), do: []
+
+  defp verification_run_ready(%{ready: true}) do
+    now = DateTime.utc_now()
+    [status: "running", started_at: now, change_checked_at: now]
+  end
+
+  defp verification_run_ready(_attrs), do: []
 
   defp sweep_tenant_ids(ids) do
     import Ecto.Query, only: [from: 2]
