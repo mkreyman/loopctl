@@ -23,6 +23,7 @@ defmodule Loopctl.Delivery.TriageTriggerLockTest do
   alias Loopctl.Delivery.TriageTrigger
   alias Loopctl.Repo
   alias Loopctl.Test.ProductionTopology
+  alias Loopctl.Test.RowLock
   alias Loopctl.WorkBreakdown.Stories
 
   setup :verify_on_exit!
@@ -71,7 +72,7 @@ defmodule Loopctl.Delivery.TriageTriggerLockTest do
     # session holding that row `FOR UPDATE` parks the open until the 2s `lock_timeout`
     # `Stages` sets locally fires — the `{:error, :busy}` its moduledoc calls ordinary and
     # retryable. A LOCK, not a sleep: nothing here depends on timing.
-    blocker = lock_story(story.id)
+    blocker = RowLock.hold!("stories", story.id)
 
     try do
       # The first version of `opened/2` matched `{_row, _}`, which `{:error, :busy}`
@@ -81,66 +82,11 @@ defmodule Loopctl.Delivery.TriageTriggerLockTest do
       assert {:error, {:stage_not_opened, :busy}} =
                TriageTrigger.promote(record)
     after
-      release(blocker)
+      RowLock.release(blocker)
     end
 
     # The half that makes the error true: `Loopctl.Delivery.Placement` selects on the stage
     # row and nothing else, so with no row the loop cannot see this story at all.
     assert Stages.get(tenant.id, story.id) == nil
-  end
-
-  # A SEPARATE database session holding one story row `FOR UPDATE`, on its own raw connection
-  # rather than a sandbox one: the sandbox owner's connection is the one this test process
-  # already runs on, and a lock cannot be held against yourself. Linked to the test process,
-  # so it dies with the test even if `release/1` is never reached.
-  defp lock_story(story_id), do: lock_story(story_id, 5)
-
-  defp lock_story(story_id, attempts_left) do
-    config = Application.get_env(:loopctl, AdminRepo)
-
-    {:ok, conn} =
-      Postgrex.start_link(
-        hostname: config[:hostname] || "127.0.0.1",
-        port: config[:port] || 5432,
-        username: config[:username],
-        password: config[:password],
-        database: config[:database],
-        pool_size: 1
-      )
-
-    try do
-      Postgrex.query!(conn, "BEGIN", [], timeout: 10_000)
-
-      # `num_rows`, asserted: a lock on nothing blocks nothing, and the promote would then
-      # succeed for the ordinary reason and this test would prove nothing at all.
-      %Postgrex.Result{num_rows: 1} =
-        Postgrex.query!(conn, "SELECT id FROM stories WHERE id = $1 FOR UPDATE", [
-          Ecto.UUID.dump!(story_id)
-        ])
-
-      conn
-    rescue
-      error in [DBConnection.ConnectionError, Postgrex.Error] ->
-        # RETRIED for the reason `release_test.exs` states about its own raw connection: this
-        # asks the server for one more at the moment the suite holds the most — three repos'
-        # pools plus Oban's notifier, and on this box a second project's suite besides.
-        # `too_many_clients` here is a property of WHEN the test runs, not of what it asserts,
-        # and a flake of that shape names a change that did not cause it. The failed
-        # connection is stopped first: retrying while HOLDING one is the opposite of waiting
-        # for room.
-        GenServer.stop(conn)
-
-        if attempts_left > 1 do
-          Process.sleep(1_000)
-          lock_story(story_id, attempts_left - 1)
-        else
-          reraise error, __STACKTRACE__
-        end
-    end
-  end
-
-  defp release(conn) do
-    Postgrex.query!(conn, "ROLLBACK", [])
-    GenServer.stop(conn)
   end
 end

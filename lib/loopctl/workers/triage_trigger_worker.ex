@@ -134,8 +134,16 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   @type outcome :: :promoted | :escalated | :retrying | :skipped | :errored
 
   @impl Oban.Worker
-  def perform(%Oban.Job{}) do
-    results = Enum.map(candidates(), &attempt/1)
+  def perform(%Oban.Job{}), do: drain()
+
+  @doc """
+  One run: attempts every `candidates/1` record and answers the job's result (`run_result/1`).
+  `opts` scopes the read exactly as `candidates/1`'s do; the cron job passes none, so it
+  drains the whole fleet.
+  """
+  @spec drain(keyword()) :: :ok | {:error, {:all_candidates_errored, pos_integer()}}
+  def drain(opts \\ []) do
+    results = Enum.map(candidates(opts), &attempt/1)
     tally = Enum.frequencies(results)
 
     if map_size(tally) > 0 do
@@ -308,9 +316,12 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   "fetched and skipped" are indistinguishable, while the difference is the whole point: a
   record that can never leave `pending_triage` occupies a slot in every oldest-first batch for
   ever, and enough of them starve the drain. `perform/1` calls this itself.
+
+  Fleet-wide by default, which is what the cron job reads. `:tenant_id` narrows it to one
+  tenant, so a test drains only the records it wrote rather than every committed one.
   """
-  @spec candidates() :: [Record.t()]
-  def candidates do
+  @spec candidates(keyword()) :: [Record.t()]
+  def candidates(opts \\ []) do
     from(r in Record,
       left_join: src in Source,
       on: src.id == r.source_id and src.tenant_id == r.tenant_id,
@@ -325,6 +336,10 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
       limit: @batch,
       select: r
     )
+    |> scoped_to(Keyword.get(opts, :tenant_id))
     |> AdminRepo.all()
   end
+
+  defp scoped_to(query, nil), do: query
+  defp scoped_to(query, tenant_id), do: where(query, [r], r.tenant_id == ^tenant_id)
 end

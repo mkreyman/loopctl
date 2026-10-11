@@ -2,20 +2,19 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
   @moduledoc """
   The corroboration gate's DEGRADED path: what happens when the similarity read itself fails.
 
-  `async: false` ON PURPOSE, and it is not a style choice. The only honest way to make the
-  scoring read fail is to take its tables away, and `ALTER TABLE ... RENAME` acquires an
-  ACCESS EXCLUSIVE lock — which blocks or breaks any concurrently-running async test that
-  touches `article_embeddings` (it took out `EmbeddingsSideTableReadsTest` when this lived in
-  the async consolidation suite). A sync test never runs alongside another, so the lock cannot
-  leak. Mirrors `BatchArticleEmbeddingWorkerTest`'s reasoning for its own `async: false`.
+  The failure is INJECTED at the read seam (`apply_confirmed_duplicates/2`'s `:scoring_read`,
+  the call that runs the pairwise-similarity query), so the module runs async. It used to
+  take the vector tables away with `ALTER TABLE ... RENAME`, whose ACCESS EXCLUSIVE lock
+  blocked every concurrent test touching `article_embeddings` and forced the module sync.
+  The real reader builds the real query and hands it to the seam, which fails the way an
+  outage does, with a connection error; every other step of the run is the real one.
   """
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
 
   setup :verify_on_exit!
 
   import Ecto.Query
-  import ExUnit.CaptureLog, only: [with_log: 1]
 
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
@@ -31,6 +30,9 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
   end
 
   defp status(id), do: AdminRepo.get!(Article, id).status
+
+  defp load_uuid(<<_::128>> = raw), do: Ecto.UUID.load!(raw)
+  defp load_uuid(other), do: other
 
   # Identical vectors => cosine 1.0, so the group would apply if scoring worked.
   defp corroborate_all!(tenant_id) do
@@ -61,23 +63,31 @@ defmodule Loopctl.Knowledge.ConsolidationScoringFailureTest do
     {:ok, _} = Consolidation.run(tenant.id, day: Date.add(Date.utc_today(), -1))
     {:ok, _} = Consolidation.run(tenant.id)
 
-    # Break BOTH vector sources, not just one. `score_pairs/2` picks its source from the
-    # US-41.1 side-table cutover flag, so breaking only `article_embeddings` leaves a
-    # pre-cutover tenant (which is what :test is) reading `articles.embedding` happily, and
-    # the test passes while proving nothing. Both are restored immediately either way; the
-    # DDL is also inside the sandbox transaction and rolls back with the test.
-    {result, log} =
-      with_log(fn ->
-        AdminRepo.query!("ALTER TABLE article_embeddings RENAME TO article_embeddings_broken")
-        AdminRepo.query!("ALTER TABLE articles RENAME COLUMN embedding TO embedding_broken")
+    # Only the EXECUTION of the scoring query is replaced: the real reader builds it, so the
+    # raise travels the path a real read failure takes, out of the reader and into the
+    # scoring rescue. The seam records the query it was handed, so a run that never reached
+    # the read cannot pass on the assertions below.
+    test_pid = self()
 
-        try do
-          Consolidation.apply_confirmed_duplicates(tenant.id)
-        after
-          AdminRepo.query!("ALTER TABLE articles RENAME COLUMN embedding_broken TO embedding")
-          AdminRepo.query!("ALTER TABLE article_embeddings_broken RENAME TO article_embeddings")
-        end
+    failing_read = fn query, tenant_id ->
+      send(test_pid, {:scoring_read, tenant_id, query})
+      raise DBConnection.ConnectionError, "tcp recv: closed"
+    end
+
+    # This process's OWN log: the module runs async, and the `refute` below over every
+    # process's log would fail on a concurrent consolidation test's line.
+    {result, log} =
+      Loopctl.OwnLog.with_own_log(fn ->
+        Consolidation.apply_confirmed_duplicates(tenant.id, scoring_read: failing_read)
       end)
+
+    tenant_id = tenant.id
+    assert_received {:scoring_read, ^tenant_id, %Ecto.Query{} = query}
+
+    # The pairwise self-join over THIS group's members, not some other read.
+    {sql, params} = AdminRepo.to_sql(:all, query)
+    assert sql =~ "<=>"
+    assert Enum.sort([a.id, b.id]) -- Enum.map(List.flatten(params), &load_uuid/1) == []
 
     assert %{applied: 0, skipped: 0, uncorroborated: 1} = result
     assert status(a.id) == :published
