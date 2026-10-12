@@ -180,10 +180,14 @@ defmodule Loopctl.Provider.Admission do
   workers. The base is live-tunable via the `"provider_admission_snooze_seconds"`
   `SystemConfig` key (default #{@default_snooze_seconds}s); a small `0..5s` jitter
   is added so a burst of snoozed jobs does not re-check the gate in lockstep.
+
+  `base` defaults to that live value; a caller (a test) passes its own instead of
+  writing the shared `SystemConfig` cache every concurrent reader sees.
   """
-  @spec snooze_seconds() :: pos_integer()
-  def snooze_seconds do
-    base = SystemConfig.get_int("provider_admission_snooze_seconds", @default_snooze_seconds)
+  @spec snooze_seconds(integer()) :: pos_integer()
+  def snooze_seconds(
+        base \\ SystemConfig.get_int("provider_admission_snooze_seconds", @default_snooze_seconds)
+      ) do
     # Clamp the (live-tunable, possibly misconfigured) base to >= 1 BEFORE adding
     # jitter. `:rand.uniform(6) - 1` is 0..5, so an unclamped base of 0 (or a
     # negative knob) could yield 0/negative — a {:snooze, 0} is an immediate

@@ -217,16 +217,9 @@ defmodule Loopctl.Provider.AdmissionTest do
     # An operator can set the live knob to 0 (or negative). Without the max(1, base)
     # clamp, `base + :rand.uniform(6) - 1` would range 0..5, and a {:snooze, 0} is an
     # immediate re-run against a still-shut gate (a tight snooze/re-check loop). The
-    # clamp guarantees >= 1. We set the persistent_term cache directly (the documented
-    # SystemConfig key format) rather than SystemConfig.put/2 to avoid a leaked DB row,
-    # and erase it on exit; intra-file tests run serially so the default is restored
-    # before the next test, and any concurrent cross-file reader is itself protected by
-    # the same clamp (>= 1).
-    pt_key = {Loopctl.SystemConfig, "provider_admission_snooze_seconds"}
-    :persistent_term.put(pt_key, 0)
-    on_exit(fn -> :persistent_term.erase(pt_key) end)
-
-    results = for _ <- 1..50, do: Admission.snooze_seconds()
+    # clamp guarantees >= 1. The base is passed in, never written to the shared
+    # SystemConfig cache every concurrent reader sees.
+    results = for _ <- 1..50, do: Admission.snooze_seconds(0)
 
     # max(1, 0) + (0..5) => 1..6, and crucially NEVER 0.
     assert Enum.all?(results, &(is_integer(&1) and &1 >= 1 and &1 <= 6))
@@ -234,11 +227,7 @@ defmodule Loopctl.Provider.AdmissionTest do
   end
 
   test "snooze_seconds/0 clamps a negative base to a positive duration (pos_integer @spec)" do
-    pt_key = {Loopctl.SystemConfig, "provider_admission_snooze_seconds"}
-    :persistent_term.put(pt_key, -100)
-    on_exit(fn -> :persistent_term.erase(pt_key) end)
-
-    results = for _ <- 1..50, do: Admission.snooze_seconds()
+    results = for _ <- 1..50, do: Admission.snooze_seconds(-100)
 
     # max(1, -100) + (0..5) => 1..6.
     assert Enum.all?(results, &(is_integer(&1) and &1 >= 1 and &1 <= 6))
