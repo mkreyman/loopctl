@@ -45,8 +45,7 @@
     }
   ],
   "technical_notes": [
-    "Legitimately sync: a module whose SUBJECT is the shared thing (CLAUDE.md, Test Conventions rule 1) - committed transactions racing on independent connections, a lock or write held by a second connection, migration or fault-injection DDL on a shared table, committed-corpus scale and plan tests, the pgbouncer and e2e journeys, and the lock guard's own test. The list itself, each entry with its reason, is @sync_allowed in test/loopctl/test_suite_hygiene_test.exs; it is not repeated here because it changes with every conversion.",
-    "Two DDL tests are convertible by injection rather than allow-listed: consolidation_scoring_failure (inject the similarity reader) and vault/rotation_race (inject a write hook)."
+    "Legitimately sync: a module whose SUBJECT is the shared thing (CLAUDE.md, Test Conventions rule 1) - committed transactions racing on independent connections, a lock or write held by a second connection, migration or fault-injection DDL on a shared table, committed-corpus scale and plan tests, the pgbouncer and e2e journeys, and the lock guard's own test. The list itself, each entry with its reason, is @sync_allowed in test/loopctl/test_suite_hygiene_test.exs; it is not repeated here because it changes with every conversion."
   ],
   "dependencies": [
     "US-46.2",

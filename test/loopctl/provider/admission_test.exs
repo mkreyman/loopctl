@@ -14,6 +14,7 @@ defmodule Loopctl.Provider.AdmissionTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Provider.Admission
   alias Loopctl.RateLimiter.Postgres
+  alias Loopctl.SystemConfig
 
   @tenant_a Ecto.UUID.generate()
   @tenant_b Ecto.UUID.generate()
@@ -213,24 +214,40 @@ defmodule Loopctl.Provider.AdmissionTest do
     assert results |> Enum.uniq() |> length() > 1
   end
 
-  test "snooze_seconds/0 clamps a misconfigured base of 0 to a positive duration (pos_integer @spec)" do
-    # An operator can set the live knob to 0 (or negative). Without the max(1, base)
-    # clamp, `base + :rand.uniform(6) - 1` would range 0..5, and a {:snooze, 0} is an
-    # immediate re-run against a still-shut gate (a tight snooze/re-check loop). The
-    # clamp guarantees >= 1. The base is passed in, never written to the shared
-    # SystemConfig cache every concurrent reader sees.
-    results = for _ <- 1..50, do: Admission.snooze_seconds(0)
+  describe "snooze_seconds/1 reads the live knob from the cache it is given" do
+    setup do
+      {:ok, cache: :ets.new(:admission_snooze, [:set, :public])}
+    end
 
-    # max(1, 0) + (0..5) => 1..6, and crucially NEVER 0.
-    assert Enum.all?(results, &(is_integer(&1) and &1 >= 1 and &1 <= 6))
-    refute Enum.any?(results, &(&1 <= 0))
-  end
+    test "uses the configured base", %{cache: cache} do
+      {:ok, _} = SystemConfig.put("provider_admission_snooze_seconds", 30, cache)
+      results = for _ <- 1..50, do: Admission.snooze_seconds(cache)
 
-  test "snooze_seconds/0 clamps a negative base to a positive duration (pos_integer @spec)" do
-    results = for _ <- 1..50, do: Admission.snooze_seconds(-100)
+      # 30 + (0..5) => 30..35: the knob, not the 5s default, is what was read.
+      assert Enum.all?(results, &(&1 >= 30 and &1 <= 35))
+    end
 
-    # max(1, -100) + (0..5) => 1..6.
-    assert Enum.all?(results, &(is_integer(&1) and &1 >= 1 and &1 <= 6))
+    test "clamps a misconfigured base of 0 to a positive duration (pos_integer @spec)", %{
+      cache: cache
+    } do
+      # An operator can set the live knob to 0 (or negative). Without the max(1, base)
+      # clamp, `base + :rand.uniform(6) - 1` would range 0..5, and a {:snooze, 0} is an
+      # immediate re-run against a still-shut gate (a tight snooze/re-check loop). The
+      # clamp guarantees >= 1.
+      {:ok, _} = SystemConfig.put("provider_admission_snooze_seconds", 0, cache)
+      results = for _ <- 1..50, do: Admission.snooze_seconds(cache)
+
+      # max(1, 0) + (0..5) => 1..6, and crucially NEVER 0.
+      assert Enum.all?(results, &(is_integer(&1) and &1 >= 1 and &1 <= 6))
+    end
+
+    test "clamps a negative base to a positive duration (pos_integer @spec)", %{cache: cache} do
+      {:ok, _} = SystemConfig.put("provider_admission_snooze_seconds", -100, cache)
+      results = for _ <- 1..50, do: Admission.snooze_seconds(cache)
+
+      # max(1, -100) + (0..5) => 1..6.
+      assert Enum.all?(results, &(is_integer(&1) and &1 >= 1 and &1 <= 6))
+    end
   end
 
   describe "TC-38.2.3: admission goes cluster-global through the SELECTED Postgres impl" do

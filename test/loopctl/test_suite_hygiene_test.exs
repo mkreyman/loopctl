@@ -16,6 +16,9 @@ defmodule Loopctl.TestSuiteHygieneTest do
   """
   use ExUnit.Case, async: true
 
+  alias Loopctl.Repo
+  alias Loopctl.Test.LockGuard
+
   @race "committed transactions racing on independent `sandbox: false` connections: the " <>
           "sandbox puts every allowed process on one connection, which serialises the race itself"
   @second_connection "a lock or write held by a SECOND connection is the subject, so its rows " <>
@@ -105,12 +108,12 @@ defmodule Loopctl.TestSuiteHygieneTest do
     "test/loopctl_web/runner_channel_thread_broken_chain_test.exs" => @audit_chain_fault
   }
 
-  # Writes to state every test process shares, checked in every file that runs
-  # beside other tests (sync-allowed modules run alone). test_helper.exs runs once,
-  # before any test: it raises Logger levels (CLAUDE.md's one sanctioned place) and
-  # creates the story-number counter. This file and the scale-module Mox guard name
-  # the patterns as their own controls. Erasing a persistent term is not
-  # matched: clearing a key a test's own setup made unique is cleanup.
+  # Writes to state every test process shares. A line matching `@global_writes`, or a call
+  # `global_calls/1` finds in the parsed file, fails unless that file's entry in
+  # `@global_write_allowed` names the write. Being sync-allowed exempts a module from
+  # nothing but `set_mox_global`: Mox's global mode needs a sync module, and the module is
+  # sync for the reason `@sync_allowed` gives. Erasing a persistent term is not matched:
+  # clearing a key a test's own setup made unique is cleanup.
   @global_writes ~r/
     Application\.(put_env|delete_env|put_all_env)\( |
     :application\.(set_env|unset_env)\( |
@@ -131,25 +134,44 @@ defmodule Loopctl.TestSuiteHygieneTest do
     set_mox_global
   /x
   @self_path "test/loopctl/test_suite_hygiene_test.exs"
-  @global_write_allowed [
-    @self_path,
-    "test/test_helper.exs",
-    "test/loopctl/config_embedding_read_path_test.exs"
-  ]
 
-  defp test_files, do: Path.wildcard("test/**/*_test.exs")
+  # path => {the writes that file may make, why}. Any other write in it still fails.
+  @global_write_allowed %{
+    @self_path => {~r/.*/, "names every pattern as its own positive control"},
+    "test/test_helper.exs" =>
+      {~r/Logger\.put_module_level\(|:persistent_term\.put\(/,
+       "runs once, before any test: raises Logger levels (CLAUDE.md's one sanctioned place) " <>
+         "and creates the story-number counter"},
+    "test/loopctl/config_embedding_read_path_test.exs" =>
+      {~r/set_mox_global/, "its own guard's control strings name the call"},
+    "test/loopctl/config_test_exs_partition_wiring_test.exs" =>
+      {~r/System\.(put_env|delete_env)\(/,
+       "config/test.exs reading the OS environment at load time is the subject"},
+    "test/loopctl/system_config_test.exs" =>
+      {~r/SystemConfig\.put\/2/,
+       "SystemConfig's default namespace is the subject, and every key is unique to its test"}
+  }
 
-  defp code_lines(path) do
-    path
-    |> File.read!()
+  # Read once: three scans and the control share every file's source and sync verdict.
+  setup_all do
+    tests = Path.wildcard("test/**/*_test.exs")
+    support = Path.wildcard("test/support/**/*.ex")
+    sources = Map.new(["test/test_helper.exs" | tests ++ support], &{&1, File.read!(&1)})
+    sync = for path <- tests, source_sync?(sources[path]), into: MapSet.new(), do: path
+    {:ok, tests: tests, support: support, sources: sources, sync: sync}
+  end
+
+  defp comment?(line), do: String.starts_with?(String.trim_leading(line), "#")
+
+  # Comment lines are blanked rather than dropped, so line numbers still match.
+  defp blank_comments(source) do
+    source
     |> String.split("\n")
-    |> Enum.reject(&String.starts_with?(String.trim_leading(&1), "#"))
+    |> Enum.map_join("\n", fn line -> if comment?(line), do: "", else: line end)
   end
 
   # Read from the parsed file, not its lines, so a `use` that `mix format`
   # wraps across lines is judged by its options all the same.
-  defp sync?(path), do: path |> File.read!() |> source_sync?()
-
   defp source_sync?(source) do
     {_ast, sync?} =
       source
@@ -171,12 +193,62 @@ defmodule Loopctl.TestSuiteHygieneTest do
   defp async?([opts]) when is_list(opts), do: Keyword.get(opts, :async) == true
   defp async?(_no_opts), do: false
 
-  test "every sync test module states why it cannot be async" do
-    files = test_files()
-    assert length(files) > 500
+  # Every global write in a source, as {line, what was written}.
+  defp global_writes(source) do
+    by_line =
+      for {line, number} <- source |> String.split("\n") |> Enum.with_index(1),
+          not comment?(line),
+          [text | _] <- [Regex.run(@global_writes, line)],
+          do: {number, text}
 
-    sync = files |> Enum.filter(&sync?/1) |> Enum.sort()
-    unlisted = sync -- Map.keys(@sync_allowed)
+    by_line ++ global_calls(Code.string_to_quoted!(source))
+  end
+
+  # Calls that write the node-wide cache without naming it, however `mix format` wraps
+  # them: `SystemConfig.put/2` (the default namespace, where `put/3` takes a test's own)
+  # and `TermCache.put/3` on a module namespace rather than a test's own ETS table.
+  defp global_calls(ast) do
+    {_ast, found} =
+      Macro.prewalk(ast, [], fn
+        {{:., _, [{:__aliases__, _, mod}, :put]}, meta, args} = node, acc when is_list(args) ->
+          {node, global_call(List.last(mod), args, meta[:line]) ++ acc}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    Enum.reverse(found)
+  end
+
+  defp global_call(:SystemConfig, args, line) when length(args) < 3,
+    do: [{line, "SystemConfig.put/2"}]
+
+  defp global_call(:TermCache, [namespace | _], line) do
+    if module_namespace?(namespace),
+      do: [{line, "TermCache.put/3 on a module namespace"}],
+      else: []
+  end
+
+  defp global_call(_module, _args, _line), do: []
+
+  defp module_namespace?({:__aliases__, _, _}), do: true
+  defp module_namespace?({:__MODULE__, _, _}), do: true
+  defp module_namespace?(namespace), do: is_atom(namespace)
+
+  defp allowed_write?(path, text, sync) do
+    named =
+      case Map.fetch(@global_write_allowed, path) do
+        {:ok, {pattern, _why}} -> text =~ pattern
+        :error -> false
+      end
+
+    named or (text =~ ~r/set_mox_global/ and MapSet.member?(sync, path))
+  end
+
+  test "every sync test module states why it cannot be async", %{tests: tests, sync: sync} do
+    assert length(tests) > 500
+
+    unlisted = sync |> Enum.reject(&Map.has_key?(@sync_allowed, &1)) |> Enum.sort()
 
     assert unlisted == [],
            "these run sync (async: false, or no async flag). Pass what they share in " <>
@@ -184,21 +256,21 @@ defmodule Loopctl.TestSuiteHygieneTest do
              "@sync_allowed with the reason its subject is the shared thing:\n" <>
              Enum.join(unlisted, "\n")
 
-    stale = Map.keys(@sync_allowed) -- sync
+    stale = @sync_allowed |> Map.keys() |> Enum.reject(&MapSet.member?(sync, &1)) |> Enum.sort()
     assert stale == [], "no longer sync, so drop from @sync_allowed:\n" <> Enum.join(stale, "\n")
   end
 
-  test "no test writes global state to steer the code" do
+  test "no test writes global state to steer the code", %{sources: sources, sync: sync} do
     offenders =
-      for path <- ["test/test_helper.exs" | test_files()] ++ Path.wildcard("test/support/**/*.ex"),
-          path not in @global_write_allowed,
-          path not in Map.keys(@sync_allowed),
-          Enum.any?(code_lines(path), &(&1 =~ @global_writes)),
-          do: path
+      for {path, source} <- Enum.sort(sources),
+          {line, text} <- global_writes(source),
+          not allowed_write?(path, text, sync),
+          do: "#{path}:#{line}: #{text}"
 
     assert offenders == [],
            "these write application env, the OS environment, the Mix shell, the Logger " <>
-             "config or levels, a persistent term or Mox's global mode. Pass the dependency in instead:\n" <>
+             "config or levels, a persistent term, the node-wide SystemConfig cache or " <>
+             "Mox's global mode. Pass the dependency in instead:\n" <>
              Enum.join(offenders, "\n")
   end
 
@@ -208,71 +280,139 @@ defmodule Loopctl.TestSuiteHygieneTest do
   # `Loopctl.Test.LockGuard` catches a lock still held at teardown on an owner
   # connection; this catches the statement in the source, wherever it runs.
   # Whole-file patterns, so a statement split across heredoc lines is still
-  # seen; a table may be schema-qualified or quoted.
-  @table ~S{(?:"?public"?\.)?"?([a-z_]+)"?}
+  # seen; a table may be schema-qualified or quoted, and LOCK, TRUNCATE and DROP INDEX
+  # may name several. An interpolated table cannot be read from the source, so it is
+  # reported whatever it names; an index is mapped to the table it is on.
+  @name ~S{(?:"?public"?\.)?"?[a-z_]+"?}
+  @target "(" <> @name <> ~S"|#\{[^}]*\})"
+  @targets "(" <> @name <> ~S"(?:\s*,\s*" <> @name <> ~S")*|#\{[^}]*\})"
   @shared_table_ddl [
-    ~r/ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?#{@table}/i,
-    ~r/LOCK\s+(?:TABLE\s+)?(?:ONLY\s+)?#{@table}\s+IN\s/i,
-    ~r/TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?#{@table}/i,
-    ~r/CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\b[^;]*?\bON\s+#{@table}/i,
-    ~r/CREATE\s+(?:UNIQUE\s+)?INDEX\b[^;"]*?\bON\s+#{@table}/i
+    table: ~r/\bALTER\s+TABLE\s+(?:(?:IF\s+EXISTS|ONLY)\s+)*#{@target}/i,
+    table: ~r/\bLOCK\s+TABLE\s+(?:ONLY\s+)?#{@targets}/i,
+    table: ~r/\bLOCK\s+(?:ONLY\s+)?#{@targets}\s+IN\s/i,
+    table: ~r/\bTRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?#{@targets}/i,
+    table:
+      ~r/\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\b[^;]{0,300}?\bON\s+(?:ONLY\s+)?#{@target}/i,
+    table: ~r/\bDROP\s+TRIGGER\b[^;]{0,200}?\bON\s+#{@target}/i,
+    table: ~r/\bCREATE\s+(?:UNIQUE\s+)?INDEX\b[^;]{0,300}?\bON\s+(?:ONLY\s+)?#{@target}/i,
+    index: ~r/\bDROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?#{@targets}/i
   ]
 
-  # The app's tables, and the ones its dependencies write that every test
-  # reaches (an Oban insert, a migration check).
-  defp shared_tables do
-    {:ok, modules} = :application.get_key(:loopctl, :modules)
+  # path => {the hits that file may show, why}: DDL text the source cannot show is safe.
+  @ddl_allowed %{
+    "test/loopctl/embeddings/legacy_index_retirement_runbook_test.exs" =>
+      {["articles"], "asserts the runbook's DROP INDEX text and runs no SQL"},
+    "test/loopctl/repo/reconcile_hnsw_index_migration_test.exs" =>
+      {[:interpolated],
+       "its interpolated table is one each test creates in its own sandbox transaction"}
+  }
 
-    for module <- [Oban.Job | modules],
-        Code.ensure_loaded?(module),
-        function_exported?(module, :__schema__, 1),
-        source = module.__schema__(:source),
-        is_binary(source),
-        into: MapSet.new(["schema_migrations"]),
-        do: source
+  # Every table in the test database is one other tests use: a table a test creates
+  # inside its own sandbox transaction is never committed, so no other connection sees
+  # it. Read from the catalog rather than the schemas, so a table only raw SQL reaches
+  # (`rate_limit_counters`) counts, and so an index resolves to its table.
+  defp catalog do
+    _backend_pids = LockGuard.start_owner!(Repo)
+    %{rows: tables} = Repo.query!("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+
+    %{rows: indexes} =
+      Repo.query!("SELECT indexname, tablename FROM pg_indexes WHERE schemaname = 'public'")
+
+    %{
+      tables: MapSet.new(tables, fn [table] -> table end),
+      indexes: Map.new(indexes, &List.to_tuple/1)
+    }
   end
 
-  # Comment lines are blanked rather than dropped, so line numbers still match.
-  defp shared_ddl(source, tables) do
-    code =
-      source
-      |> String.split("\n")
-      |> Enum.map_join("\n", fn line ->
-        if String.starts_with?(String.trim_leading(line), "#"), do: "", else: line
-      end)
+  defp shared_ddl(source, %{tables: tables, indexes: indexes}) do
+    code = blank_comments(source)
 
-    for pattern <- @shared_table_ddl,
-        [{start, _}, {from, length}] <- Regex.scan(pattern, code, return: :index),
-        table = code |> binary_part(from, length) |> String.downcase(),
-        MapSet.member?(tables, table),
-        do: {line_of(code, start), table}
+    hits =
+      for {kind, pattern} <- @shared_table_ddl,
+          [{start, _}, {from, length}] <- Regex.scan(pattern, code, return: :index),
+          target <- targets(binary_part(code, from, length)),
+          table = resolve(kind, target, indexes),
+          table == :interpolated or MapSet.member?(tables, table),
+          do: {line_of(code, start), table}
+
+    Enum.uniq(hits)
   end
+
+  defp targets(capture) do
+    if String.starts_with?(capture, "\#{") do
+      [:interpolated]
+    else
+      for [_, name] <- Regex.scan(~r/(?:"?public"?\.)?"?([a-z_]+)"?/i, capture),
+          do: String.downcase(name)
+    end
+  end
+
+  defp resolve(_kind, :interpolated, _indexes), do: :interpolated
+  defp resolve(:table, name, _indexes), do: name
+  defp resolve(:index, name, indexes), do: Map.get(indexes, name)
 
   defp line_of(code, offset),
     do: code |> binary_part(0, offset) |> String.split("\n") |> length()
 
-  test "no async test runs DDL or takes a lock on a table other tests use" do
-    tables = shared_tables()
-    assert MapSet.member?(tables, "tenants")
-    assert MapSet.member?(tables, "stories")
-
-    offenders =
-      for path <- test_files(),
-          # Its own control strings name these statements.
-          path != @self_path,
-          not sync?(path),
-          {number, table} <- path |> File.read!() |> shared_ddl(tables),
-          do: "#{path}:#{number}: #{table}"
-
-    assert offenders == [],
-           "these alter or lock a table every test shares, inside a transaction " <>
-             "that holds the lock to the test's end. Inject the failure, or use " <>
-             "a table the test creates:\n" <> Enum.join(offenders, "\n")
+  # A support helper's DDL runs in whichever test calls it: {module, "path:line: table"}.
+  defp ddl_helpers(support, sources, catalog) do
+    for path <- support,
+        [{line, table} | _] <- [shared_ddl(sources[path], catalog)],
+        [_, module] <- Regex.scan(~r/^\s*defmodule\s+([\w.]+)/m, sources[path]),
+        do: {module, "#{path}:#{line}: #{table}"}
   end
 
-  test "the scans see a sync module, a global write and shared DDL when there is one" do
+  # Named in full, or by its last segment under a multi-alias of its namespace.
+  defp references?(source, module) do
+    code = blank_comments(source)
+    {namespace, [last]} = module |> String.split(".") |> Enum.split(-1)
+    prefix = Enum.join(namespace, ".")
+
+    String.contains?(code, module) or
+      (prefix != "" and String.contains?(code, prefix <> ".{") and code =~ ~r/\b#{last}\b/)
+  end
+
+  test "no async test runs DDL or takes a lock on a table other tests use", ctx do
+    catalog = catalog()
+    assert MapSet.member?(catalog.tables, "stories")
+    assert MapSet.member?(catalog.tables, "rate_limit_counters")
+
+    helpers = ddl_helpers(ctx.support, ctx.sources, catalog)
+    assert Enum.any?(helpers, &match?({"Loopctl.Test.BrokenChain", _}, &1))
+
+    async = Enum.reject(ctx.tests, &(&1 == @self_path or MapSet.member?(ctx.sync, &1)))
+
+    hits = Map.new(async, &{&1, shared_ddl(ctx.sources[&1], catalog)})
+
+    direct =
+      for {path, path_hits} <- Enum.sort(hits),
+          {number, table} <- path_hits,
+          table not in elem(Map.get(@ddl_allowed, path, {[], nil}), 0),
+          do: "#{path}:#{number}: #{table}"
+
+    stale =
+      for {path, {tables, _why}} <- @ddl_allowed,
+          table <- tables,
+          not Enum.any?(Map.get(hits, path, []), &match?({_, ^table}, &1)),
+          do: "#{path}: #{table}"
+
+    assert stale == [], "no longer seen, so drop from @ddl_allowed:\n" <> Enum.join(stale, "\n")
+
+    via_helpers =
+      for {module, site} <- helpers,
+          path <- async,
+          references?(ctx.sources[path], module),
+          do: "#{path} calls #{module} (#{site})"
+
+    assert direct ++ via_helpers == [],
+           "these alter or lock a table every test shares, inside a transaction " <>
+             "that holds the lock to the test's end. Inject the failure, or use " <>
+             "a table the test creates:\n" <> Enum.join(direct ++ via_helpers, "\n")
+  end
+
+  test "the scans see a sync module, a global write and shared DDL when there is one", ctx do
     # Positive control: without it, a scan that matched nothing would pass all three.
-    assert Enum.any?(Map.keys(@sync_allowed), &sync?/1)
+    assert Enum.any?(Map.keys(@sync_allowed), &MapSet.member?(ctx.sync, &1))
     # Judged by its options, however a `use` is wrapped.
     refute source_sync?("defmodule M do\n  use Loopctl.DataCase,\n    async: true\nend")
     assert source_sync?("defmodule M do\n  use Loopctl.DataCase,\n    async: false\nend")
@@ -292,13 +432,80 @@ defmodule Loopctl.TestSuiteHygieneTest do
     assert "Mox.set_mox_global()" =~ @global_writes
     refute "Application.get_env(:loopctl, :k)" =~ @global_writes
 
-    tables = MapSet.new(["tenants", "audit_chain"])
+    # The node-wide cache, written through its wrappers, wrapped across lines or not.
+    assert global_writes(~s{SystemConfig.put(\n  "k",\n  0\n)}) == [{1, "SystemConfig.put/2"}]
+    assert global_writes(~s{SystemConfig.put("k", 0, cache)}) == []
+
+    assert global_writes(~s{TermCache.put(Loopctl.SystemConfig, "k", 0)}) ==
+             [{1, "TermCache.put/3 on a module namespace"}]
+
+    assert global_writes(~s{TermCache.put(__MODULE__, "k", 0)}) ==
+             [{1, "TermCache.put/3 on a module namespace"}]
+
+    assert global_writes(~s{TermCache.put(cache(), "k", 0)}) == []
+    # Sync-allowed exempts only Mox's global mode.
+    assert allowed_write?(
+             "test/loopctl/coordination_claim_race_test.exs",
+             "set_mox_global",
+             ctx.sync
+           )
+
+    refute allowed_write?(
+             "test/loopctl/coordination_claim_race_test.exs",
+             "Application.put_env(",
+             ctx.sync
+           )
+
+    refute allowed_write?("test/loopctl/system_config_test.exs", "Application.put_env(", ctx.sync)
+
+    catalog = %{
+      tables: MapSet.new(["tenants", "stories", "audit_chain"]),
+      indexes: %{"stories_pkey" => "stories"}
+    }
+
     lock = ~s{Repo.query!("LOCK TABLE tenants IN SHARE ROW EXCLUSIVE MODE")}
-    assert shared_ddl(lock, tables) == [{1, "tenants"}]
+    assert shared_ddl(lock, catalog) == [{1, "tenants"}]
+    assert shared_ddl(~s{Repo.query!("LOCK TABLE stories")}, catalog) == [{1, "stories"}]
+    assert shared_ddl(~s{"LOCK stories IN ACCESS EXCLUSIVE MODE"}, catalog) == [{1, "stories"}]
+
+    assert shared_ddl(~s{"LOCK TABLE stories, public.tenants IN SHARE MODE"}, catalog) ==
+             [{1, "stories"}, {1, "tenants"}]
+
     trigger = "x\ncreate trigger t\n  before insert on public.audit_chain"
-    assert shared_ddl(trigger, tables) == [{2, "audit_chain"}]
-    assert shared_ddl(~s{ALTER TABLE "tenants" ADD CHECK (false)}, tables) == [{1, "tenants"}]
-    assert shared_ddl(~s{sql!("LOCK TABLE lock_probe IN SHARE ROW EXCLUSIVE MODE")}, tables) == []
-    assert shared_ddl("DateTime.truncate(:second)", tables) == []
+    assert shared_ddl(trigger, catalog) == [{2, "audit_chain"}]
+
+    assert shared_ddl(~s{"DROP TRIGGER IF EXISTS t ON audit_chain"}, catalog) == [
+             {1, "audit_chain"}
+           ]
+
+    assert shared_ddl(~s{ALTER TABLE "tenants" ADD CHECK (false)}, catalog) == [{1, "tenants"}]
+
+    assert shared_ddl(~s{ALTER TABLE IF EXISTS ONLY stories ADD CHECK (false)}, catalog) == [
+             {1, "stories"}
+           ]
+
+    assert shared_ddl(~s{CREATE INDEX "stories_x_idx" ON stories (title)}, catalog) == [
+             {1, "stories"}
+           ]
+
+    assert shared_ddl(~s{DROP INDEX IF EXISTS stories_pkey}, catalog) == [{1, "stories"}]
+
+    assert shared_ddl(~S|"ALTER TABLE #{@table} ADD CHECK (false)"|, catalog) == [
+             {1, :interpolated}
+           ]
+
+    assert shared_ddl(~s{TRUNCATE stories, tenants}, catalog) == [{1, "stories"}, {1, "tenants"}]
+
+    assert shared_ddl(~s{sql!("LOCK TABLE lock_probe IN SHARE ROW EXCLUSIVE MODE")}, catalog) ==
+             []
+
+    assert shared_ddl("DateTime.truncate(:second)", catalog) == []
+    assert shared_ddl("  # LOCK TABLE stories", catalog) == []
+
+    # A helper is matched by name, never by a module whose name only contains it.
+    assert references?("Loopctl.Test.BrokenChain.install!(id)", "Loopctl.Test.BrokenChain")
+    assert references?("alias Loopctl.Test.{BrokenChain, Other}", "Loopctl.Test.BrokenChain")
+    refute references?("LoopctlWeb.StoryStageReportBrokenChainTest", "Loopctl.Test.BrokenChain")
+    refute references?("# Loopctl.Test.BrokenChain", "Loopctl.Test.BrokenChain")
   end
 end
