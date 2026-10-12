@@ -151,6 +151,40 @@ defmodule Loopctl.Runners.CapacityTest do
     Runners.release_slot(runner.tenant_id, dispatch_id, generation)
   end
 
+  describe "the lock wait" do
+    test "a caller passing nothing waits the deployed bound; a caller may pass a shorter one" do
+      assert Capacity.lock_timeout_ms([]) == Capacity.lock_timeout_ms()
+      assert Capacity.lock_timeout_ms(lock_timeout_ms: 100) == 100
+
+      show = fn opts ->
+        Capacity.set_lock_timeout!(Repo, opts)
+        %{rows: [[value]]} = Repo.query!("SHOW lock_timeout")
+        value
+      end
+
+      # Compared with the deployed value set EXPLICITLY, not a literal, so tuning the
+      # constant does not fail a test whose subject is the option.
+      {:ok, {default, deployed, short}} =
+        Repo.transaction(fn ->
+          {show.([]), show.(lock_timeout_ms: Capacity.lock_timeout_ms()),
+           show.(lock_timeout_ms: 100)}
+        end)
+
+      assert default == deployed
+      assert short == "100ms"
+    end
+
+    test "a wait that is not a positive integer raises rather than defaulting" do
+      # 0 is Postgres's "wait for ever"; a silent default would hide the caller's mistake.
+      for bad <- [nil, 0, -1, "100"] do
+        assert_raise ArgumentError, fn -> Capacity.lock_timeout_ms(lock_timeout_ms: bad) end
+      end
+
+      # Options alone are not mistaken for the repo.
+      assert_raise FunctionClauseError, fn -> Capacity.set_lock_timeout!(lock_timeout_ms: 100) end
+    end
+  end
+
   describe "reserve_slot/2" do
     test "a revoked runner cannot reserve" do
       runner = runner(%{max_sessions: 3})

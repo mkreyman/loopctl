@@ -390,7 +390,7 @@ defmodule LoopctlWeb.RunnerChannel do
            ReplyBucket.take(socket.assigns.reply_bucket, now, @reply_capacity, @reply_refill_ms) do
       socket = assign(socket, :reply_bucket, bucket)
 
-      case DispatchLedger.record_reply(tenant_id, runner.id, reply) do
+      case DispatchLedger.record_reply(tenant_id, runner.id, reply, lock_opts(socket)) do
         {:ok, record} -> {:reply, :ok, note_kind_refusal(socket, reply, record)}
         {:error, reason} -> refuse(socket, "dispatch_reply", message_error(reason))
       end
@@ -550,7 +550,7 @@ defmodule LoopctlWeb.RunnerChannel do
          {:ok, batch} <- RunnerContract.cast_trace_batch(payload) do
       socket = assign(socket, :last_trace_at, now)
 
-      case DispatchLedger.record_trace(tenant_id, runner.id, batch) do
+      case DispatchLedger.record_trace(tenant_id, runner.id, batch, lock_opts(socket)) do
         {:ok, acked_seq} -> {:reply, {:ok, %{acked_seq: acked_seq}}, socket}
         {:error, reason} -> refuse(socket, "trace", message_error(reason))
       end
@@ -986,14 +986,25 @@ defmodule LoopctlWeb.RunnerChannel do
 
   defp sole_live_socket?(_socket), do: false
 
-  # The push half of the delivery decision (`DispatchLedger.record_push/2`): this channel
+  # The lock wait of the ledger writes this channel makes DIRECTLY (push, drop, reply, trace,
+  # slot reservation): `Capacity.lock_timeout_ms/0`, unless the SOCKET carries
+  # `:lock_timeout_ms`. The writes behind `RunnerStages` and `RunnerReviews` (a session's end,
+  # the slot a stage report frees) are not given it and always wait the deployed bound: no
+  # test takes their busy path, so a shorter wait there would buy nothing. Nothing a runner sends can set it:
+  # `LoopctlWeb.RunnerSocket.connect/3` never assigns it and no join or message param reaches
+  # it. Only a test that builds the socket itself does, to get a busy answer without waiting
+  # out the deployed bound (US-46.7).
+  defp lock_opts(%{assigns: %{lock_timeout_ms: ms}}), do: [lock_timeout_ms: ms]
+  defp lock_opts(_socket), do: []
+
+  # The push half of the delivery decision (`DispatchLedger.record_push/3`): this channel
   # pushes only if it WON the row, so a channel that dropped the same broadcast cannot free
   # the slot of the session this push starts, and a second socket cannot push it twice. One
   # database wait, never two: a decision that could not be taken leaves the dispatch unsent
   # and its slot to the sweep's undelivered grace, rather than spending another lock_timeout
   # inside the process that holds the runner's socket.
   defp push_if_this_channel_decides(socket, dispatch) do
-    case DispatchLedger.record_push(socket.assigns.tenant_id, dispatch) do
+    case DispatchLedger.record_push(socket.assigns.tenant_id, dispatch, lock_opts(socket)) do
       {:ok, :pushed} ->
         push(socket, "dispatch", dispatch)
         # Remembered so a `kind_not_supported` reply can be attributed to the connection
@@ -1035,7 +1046,11 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   defp release_dropped_slot(socket, dispatch) do
-    case DispatchLedger.record_drop(socket.assigns.tenant_id, dispatch.dispatch_id) do
+    case DispatchLedger.record_drop(
+           socket.assigns.tenant_id,
+           dispatch.dispatch_id,
+           lock_opts(socket)
+         ) do
       {:ok, :released} ->
         :ok
 

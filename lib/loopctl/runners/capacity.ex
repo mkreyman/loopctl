@@ -149,7 +149,7 @@ defmodule Loopctl.Runners.Capacity do
   contends on, so it is the one to hold for the shortest time.
 
   **What an operator sees because the capacity lock is first:** a claim release sitting on a
-  story makes every dispatch in that tenant queue behind it, and past `lock_timeout_ms/0`
+  story makes every dispatch in that tenant queue behind it, and past `lock_timeout_ms/1`
   each falls out as `:capacity_busy` with nothing reserved. That is the deliberate trade —
   a bounded queue and a retryable refusal instead of a deadlock — and a burst of
   `:capacity_busy` in one tenant means a long-held story lock, not a capacity shortage.
@@ -171,11 +171,19 @@ defmodule Loopctl.Runners.Capacity do
   and the dispatch row before it starts (`admit_and_reserve/3`).
 
   Every transaction here that can queue behind another sets `lock_timeout`
-  (`lock_timeout_ms/0`). A dispatcher behind a stuck admission gets `:capacity_busy` rather
+  (`lock_timeout_ms/1`: the deployed `lock_timeout_ms/0` unless the caller passes
+  `:lock_timeout_ms`). A dispatcher behind a stuck admission gets `:capacity_busy` rather
   than an unbounded wait inside an open transaction; nothing is reserved and it may retry.
   A deadlock is classified the same way (`retryable?/1`) rather than raised: with one order
   it should not happen, and if a future path reintroduces one, a dispatcher retrying beats a
   crashed channel holding a runner's socket.
+
+  **Which functions default the option.** An ENTRY POINT, any function a channel, worker,
+  controller or executor calls, takes `opts \\\\ []`: most of their production callers hold no
+  lock opts, and the forwarding that matters is pinned by the busy-path tests (US-46.7).
+  `Loopctl.Verification` and `Loopctl.Verification.CiTarget` take `opts` with NO default:
+  they sit strictly between the worker that holds `opts` and those entry points, every caller
+  of theirs has `opts`, and a dropped forward there should fail to compile.
 
   ## Partitions
 
@@ -258,11 +266,35 @@ defmodule Loopctl.Runners.Capacity do
   @spec busy_retry_ms() :: pos_integer()
   def busy_retry_ms, do: 3 * @lock_timeout_ms
 
-  @doc "Bounds every lock wait for the rest of the current transaction."
-  @spec set_lock_timeout!(Ecto.Repo.t()) :: :ok
-  def set_lock_timeout!(repo \\ Repo) do
-    repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{@lock_timeout_ms}ms"])
+  @doc """
+  Bounds every lock wait for the rest of the current transaction, at
+  `lock_timeout_ms(opts)`.
+  """
+  @spec set_lock_timeout!(Ecto.Repo.t(), keyword()) :: :ok
+  def set_lock_timeout!(repo \\ Repo, opts \\ []) when is_atom(repo) and is_list(opts) do
+    repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{lock_timeout_ms(opts)}ms"])
     :ok
+  end
+
+  @doc """
+  The lock wait `opts` asks for: `:lock_timeout_ms`, else `lock_timeout_ms/0`.
+
+  An input so a test whose subject is the busy answer gets it without waiting out the
+  deployed wait (US-46.7). Only code sets it, never request data or channel params, and
+  production callers pass nothing. Anything but a positive integer raises, because a
+  `lock_timeout` of 0 is Postgres's "wait for ever" and a silent default would hide the
+  caller's mistake behind the deployed wait.
+  """
+  @spec lock_timeout_ms(keyword()) :: pos_integer()
+  def lock_timeout_ms(opts) when is_list(opts) do
+    case Keyword.get(opts, :lock_timeout_ms, @lock_timeout_ms) do
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      other ->
+        raise ArgumentError,
+              ":lock_timeout_ms must be a positive integer of milliseconds, got: #{inspect(other)}"
+    end
   end
 
   @doc """
@@ -785,7 +817,7 @@ defmodule Loopctl.Runners.Capacity do
   # after the write (and applies on top of it) — the same argument `recount/2` makes, which
   # is why this IS `recount/2`. Every caller is already inside a transaction, so the lock is
   # held to its commit: `release/4`'s callers run in `DispatchLedger`'s `in_tenant/2`,
-  # `runner_write/4` or an explicit `release_slot_in/4` that refuses to run outside one.
+  # `runner_write/5` or an explicit `release_slot_in/4` that refuses to run outside one.
   defp give_back(repo, tenant_id, runner_id) do
     recount(repo, tenant_id, runner_id)
   end

@@ -37,15 +37,19 @@ defmodule Loopctl.Verification.CiTarget do
           required_checks: [String.t()]
         }
 
-  @doc "Reads the facts for `story_id` and resolves them. See the moduledoc."
-  @spec gather(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @doc """
+  Reads the facts for `story_id` and resolves them. See the moduledoc. The route and stage
+  reads wait `Loopctl.Runners.Capacity.lock_timeout_ms(opts)` on a lock.
+  """
+  @spec gather(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, t()} | {:unconfigured, String.t()} | {:wait, :database_busy}
-  def gather(tenant_id, story_id) do
+  def gather(tenant_id, story_id, opts) do
     with {:story, {:ok, story}} <- {:story, Stories.get_story(tenant_id, story_id)},
          {:ok, source} <- source(tenant_id, story),
          {:ok, required} <- required_checks(source),
-         {:route, {:ok, route}} <- {:route, DispatchPayload.dispatch_route(tenant_id, story)},
-         {:stage, {:ok, stage}} <- {:stage, Stages.fetch(tenant_id, story.id)} do
+         {:route, {:ok, route}} <-
+           {:route, DispatchPayload.dispatch_route(tenant_id, story, story.claim_epoch, opts)},
+         {:stage, {:ok, stage}} <- {:stage, Stages.fetch(tenant_id, story.id, opts)} do
       resolve(story, source, required, route, stage && stage.branch)
     else
       {:story, {:error, :not_found}} -> {:unconfigured, "story_not_found"}
@@ -56,7 +60,7 @@ defmodule Loopctl.Verification.CiTarget do
   end
 
   @doc """
-  The pure half of `gather/2`: the target, given the story, its source, the required names,
+  The pure half of `gather/3`: the target, given the story, its source, the required names,
   the claim's dispatch route and the branch the stage row records.
   """
   @spec resolve(map(), map(), [String.t()], map(), String.t() | nil) ::

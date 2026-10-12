@@ -701,13 +701,14 @@ defmodule Loopctl.Runners do
   heal sweep (`heal_capacity/2`) gives it back, and it does not pass admission. Dispatch
   through `dispatch/3`, which ties each slot to its ledger row.
   """
-  @spec reserve_slot(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec reserve_slot(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, pos_integer()} | {:error, :runner_at_capacity | :capacity_busy}
-  def reserve_slot(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id) do
+  def reserve_slot(tenant_id, runner_id, opts \\ [])
+      when is_binary(tenant_id) and is_binary(runner_id) do
     Repo.with_tenant(tenant_id, fn ->
       # Bounded like every other capacity transaction: this one queues behind a heal or a
-      # release holding the same runner row.
-      Capacity.set_lock_timeout!(Repo)
+      # release holding the same runner row. The wait is `Capacity.lock_timeout_ms(opts)`.
+      Capacity.set_lock_timeout!(Repo, opts)
       Capacity.reserve(Repo, tenant_id, runner_id)
     end)
     |> flatten()
@@ -730,15 +731,15 @@ defmodule Loopctl.Runners do
   the transition that decided it rather than after it.
 
   `{:error, :capacity_busy}` means a lock this needed was not free within
-  `Capacity.lock_timeout_ms/0`: nothing was released and the call can be made again after
+  `Capacity.lock_timeout_ms(opts)`: nothing was released and the call can be made again after
   `Capacity.busy_retry_ms/0`. The slot stays bounded by the heal sweep meanwhile.
   """
-  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer(), keyword()) ::
           {:ok, :released | :already_released}
           | {:error, :unknown_dispatch | :capacity_busy}
-  def release_slot(tenant_id, dispatch_id, generation)
+  def release_slot(tenant_id, dispatch_id, generation, opts \\ [])
       when is_binary(tenant_id) and is_binary(dispatch_id) and is_integer(generation),
-      do: DispatchLedger.release_slot(tenant_id, dispatch_id, generation)
+      do: DispatchLedger.release_slot(tenant_id, dispatch_id, generation, opts)
 
   @doc """
   Every kind each of the tenant's runners has REFUSED with `kind_not_supported`, as

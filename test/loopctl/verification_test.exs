@@ -67,23 +67,23 @@ defmodule Loopctl.VerificationTest do
     end
   end
 
-  describe "start_run/1 and complete_run/3" do
+  describe "start_run/2 and complete_run/4" do
     test "transitions through running → pass" do
       %{tenant: tenant, story: story} = setup_ctx()
       {:ok, run} = Verification.create_run(tenant.id, story.id)
 
-      {:ok, running} = Verification.start_run(run)
+      {:ok, running} = Verification.start_run(run, [])
       assert running.status == "running"
       assert running.started_at != nil
 
-      {:ok, passed} = Verification.complete_run(running, "pass", %{"AC-1" => "pass"})
+      {:ok, passed} = Verification.complete_run(running, "pass", %{"AC-1" => "pass"}, [])
       assert passed.status == "pass"
       assert passed.completed_at != nil
       assert passed.ac_results["AC-1"] == "pass"
     end
   end
 
-  describe "record_poll/2" do
+  describe "record_poll/3" do
     # A bounded write rolls a refused changeset back and answers it as `{:error, changeset}`,
     # never as `{:ok, _}` and never as `:busy`, with nothing recorded.
     test "a refused value is its changeset error, and the run is unchanged" do
@@ -91,7 +91,7 @@ defmodule Loopctl.VerificationTest do
       {:ok, run} = Verification.create_run(tenant.id, story.id)
 
       for attrs <- [%{resolved_commit_sha: "abc1234"}, %{ci_forge_faults: -1}] do
-        assert {:error, %Ecto.Changeset{valid?: false}} = Verification.record_poll(run, attrs)
+        assert {:error, %Ecto.Changeset{valid?: false}} = Verification.record_poll(run, attrs, [])
       end
 
       assert %{resolved_commit_sha: nil, ci_forge_faults: 0} =

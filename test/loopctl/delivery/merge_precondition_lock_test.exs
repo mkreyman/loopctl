@@ -26,6 +26,7 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.MockMergeForge
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Test.MergeForge
   alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Story
@@ -35,6 +36,11 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   @base_head MergeForge.base_head()
   @merge MergeForge.merge()
   @session MergeForge.session()
+
+  # The lock wait the busy evaluate is given, instead of the deployed
+  # `Capacity.lock_timeout_ms/0` (US-46.7). It must answer in under HALF the deployed wait: a
+  # path that drops the option waits all of it, and the rest of evaluate fits in the margin.
+  @busy_wait_ms 500
 
   setup :verify_on_exit!
 
@@ -68,8 +74,9 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
          ctx do
       test_pid = self()
 
-      # A lock on the ledger held elsewhere: the route read waits out its lock_timeout and
-      # answers :busy, so nothing is judged on a guessed route.
+      # A lock on the ledger held elsewhere: the route read waits out its lock wait (a short
+      # one, US-46.7: the subject is the answer, not the wait) and answers :busy, so nothing is
+      # judged on a guessed route.
       holder =
         spawn(fn ->
           :ok = ProductionTopology.checkout_unboxed!([Repo])
@@ -86,8 +93,18 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
 
       assert_receive :held, 5_000
       on_exit(fn -> send(holder, :release) end)
+      started = System.monotonic_time(:millisecond)
 
-      assert {:ok, %Verdict{decision: :unevaluated, mode: nil}} = evaluate(ctx)
+      assert {:ok, %Verdict{decision: :unevaluated, mode: nil}} =
+               MergePrecondition.evaluate(
+                 ctx.tenant_id,
+                 ctx.story_id,
+                 opts() ++ [lock_timeout_ms: @busy_wait_ms]
+               )
+
+      # The short wait reached the route read, once: a dropped option answers the same, 5s
+      # later, and a second wait takes the answer past two of them.
+      assert System.monotonic_time(:millisecond) - started < div(Capacity.lock_timeout_ms(), 2)
       send(holder, :release)
     end
   end
@@ -165,8 +182,6 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
 
     assert_receive :row_held, 5_000
   end
-
-  defp evaluate(ctx), do: MergePrecondition.evaluate(ctx.tenant_id, ctx.story_id, opts())
 
   defp opts do
     [

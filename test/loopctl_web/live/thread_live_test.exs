@@ -122,7 +122,7 @@ defmodule LoopctlWeb.ThreadLiveTest do
   end
 
   # The implement dispatch a claim was placed under, as the ledger records it once its runner
-  # accepted it: what `DispatchPayload.dispatch_route/3` reads the placed base from.
+  # accepted it: what `DispatchPayload.dispatch_route/4` reads the placed base from.
   defp placed(ctx, runner, epoch, base_branch) do
     now = DateTime.utc_now()
 

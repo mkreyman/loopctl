@@ -7,11 +7,14 @@ defmodule Loopctl.Verification do
 
   ## Bounded writes
 
-  `start_run/1`, `record_poll/2` and `complete_run/3` are the verification runner's writes to
+  `start_run/2`, `record_poll/3` and `complete_run/4` are the verification runner's writes to
   its own run, and each runs inside a transaction with its lock wait bounded
-  (`Loopctl.Runners.Capacity.set_lock_timeout!/1`). Database contention (a lock wait that ran
-  out, a statement cancelled, a lost connection) is `{:error, :busy}` rather than a raise,
-  counted as `[:loopctl, :verification, :run_write_busy]`
+  (`Loopctl.Runners.Capacity.set_lock_timeout!/2`, at `Capacity.lock_timeout_ms(opts)`).
+  `opts` has no default, here or on `CiTarget.gather/3`: a runner write that forgot to pass
+  the wait its caller was given would otherwise compile and quietly wait the deployed one.
+  Entry points default it instead; `Loopctl.Runners.Capacity`'s moduledoc states the rule.
+  Database contention (a lock wait that ran out, a statement cancelled, a lost connection)
+  is `{:error, :busy}` rather than a raise, counted as `[:loopctl, :verification, :run_write_busy]`
   (`Loopctl.Delivery.Stages.answering_busy/4`, the one classification of that). A refused
   changeset is its `{:error, changeset}`, rolled back. On `{:error, :busy}` the runner waits
   and redoes the poll: nothing was written, or a lost connection committed it, which the next
@@ -123,9 +126,10 @@ defmodule Loopctl.Verification do
   Marks a run as started. `started_at` is written ONCE: a run re-entered after a snooze keeps
   the moment it first started (US-26.4.6). A bounded write (moduledoc, "Bounded writes").
   """
-  @spec start_run(VerificationRun.t()) :: {:ok, VerificationRun.t()} | {:error, term()}
-  def start_run(run) do
-    bounded_write(run, "verification run start", fn ->
+  @spec start_run(VerificationRun.t(), keyword()) ::
+          {:ok, VerificationRun.t()} | {:error, term()}
+  def start_run(run, opts) do
+    bounded_write(run, "verification run start", opts, fn ->
       update_run(run, %{status: "running", started_at: run.started_at || DateTime.utc_now()})
     end)
   end
@@ -137,9 +141,10 @@ defmodule Loopctl.Verification do
   commit passed the once-per-run change check (`:change_checked_at`). None is castable from
   any request. A bounded write (moduledoc, "Bounded writes").
   """
-  @spec record_poll(VerificationRun.t(), map()) :: {:ok, VerificationRun.t()} | {:error, term()}
-  def record_poll(run, attrs) do
-    bounded_write(run, "verification poll write", fn ->
+  @spec record_poll(VerificationRun.t(), map(), keyword()) ::
+          {:ok, VerificationRun.t()} | {:error, term()}
+  def record_poll(run, attrs, opts) do
+    bounded_write(run, "verification poll write", opts, fn ->
       run |> poll_changeset(attrs) |> AdminRepo.update()
     end)
   end
@@ -164,10 +169,11 @@ defmodule Loopctl.Verification do
   retired without executing (e.g. a stale backlog job age-gated before any CI call);
   it is distinct from `"error"`, which denotes a genuine failure.
   """
-  @spec complete_run(VerificationRun.t(), String.t(), map()) ::
+  @spec complete_run(VerificationRun.t(), String.t(), map(), keyword()) ::
           {:ok, VerificationRun.t()} | {:error, term()}
-  def complete_run(run, status, ac_results) when status in ["pass", "fail", "error", "skipped"] do
-    bounded_write(run, "verification run completion", fn ->
+  def complete_run(run, status, ac_results, opts)
+      when status in ["pass", "fail", "error", "skipped"] do
+    bounded_write(run, "verification run completion", opts, fn ->
       update_run(run, %{
         status: status,
         completed_at: DateTime.utc_now(),
@@ -177,15 +183,15 @@ defmodule Loopctl.Verification do
   end
 
   # Moduledoc, "Bounded writes".
-  defp bounded_write(run, what, write) do
+  defp bounded_write(run, what, opts, write) do
     Stages.answering_busy(run.tenant_id, [:loopctl, :verification, :run_write_busy], what, fn ->
-      AdminRepo.transaction(fn -> bounded(write) end)
+      AdminRepo.transaction(fn -> bounded(write, opts) end)
     end)
   end
 
   # Inside the transaction: the lock wait bounded, and a refused write rolled back.
-  defp bounded(write) do
-    Capacity.set_lock_timeout!(AdminRepo)
+  defp bounded(write, opts) do
+    Capacity.set_lock_timeout!(AdminRepo, opts)
 
     case write.() do
       {:ok, written} -> written
