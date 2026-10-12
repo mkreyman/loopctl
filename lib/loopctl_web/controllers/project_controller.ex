@@ -42,7 +42,7 @@ defmodule LoopctlWeb.ProjectController do
   # substitutes for NOTHING on :update/:delete of an existing work project (the
   # kb-scope equivalents are archive_kb_scope / restore_kb_scope, which operate on
   # a different row). The plug's moduledoc is explicit that an invented
-  # alternative is worse than none, so those two mount a bare gate.
+  # alternative is worse than none, so :update, :restore and :delete mount a bare gate.
   plug LoopctlWeb.Plugs.RequireHumanAnchor,
        [
          alternative: %{
@@ -57,9 +57,12 @@ defmodule LoopctlWeb.ProjectController do
        ]
        when action in [:create]
 
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:update, :delete]
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:update, :restore, :delete]
 
-  plug LoopctlWeb.Plugs.RequireRole, [role: :orchestrator] when action in [:create, :update]
+  plug LoopctlWeb.Plugs.RequireRole,
+       [role: :orchestrator]
+       when action in [:create, :update, :restore]
+
   plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:delete]
 
   plug LoopctlWeb.Plugs.RequireRole,
@@ -173,13 +176,37 @@ defmodule LoopctlWeb.ProjectController do
 
   operation(:update,
     summary: "Update project",
-    description: "Updates a project. Slug cannot be changed. Requires user+ role.",
+    description:
+      "Updates a project's name, repo_url, description, tech_stack, mission or metadata. " <>
+        "Orchestrator+ role on a human-anchored tenant. Slug cannot be changed. A body " <>
+        "carrying status is refused 422 whatever its value: archive with DELETE " <>
+        "/api/v1/projects/:id (user+) and restore with POST /api/v1/projects/:id/restore. " <>
+        "A blank name is refused 422.",
     parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
     request_body: {"Update params", "application/json", Schemas.ProjectCreateRequest},
     responses: %{
       200 => {"Updated project", "application/json", Schemas.ProjectResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error, or status in the body", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:restore,
+    summary: "Restore (un-archive) a work project",
+    description:
+      "Re-activates an archived kind: work project (the reverse of DELETE " <>
+        "/api/v1/projects/:id). Orchestrator+ role on a human-anchored tenant. Audited as " <>
+        "unarchived; an already-active project is returned unchanged. Re-activating " <>
+        "consumes an active max_projects slot, so it is rejected 422 when the tenant is at " <>
+        "its cap. A kind: kb scope is rejected 422; restore it with POST " <>
+        "/api/v1/kb-scopes/:id/restore.",
+    parameters: [id: [in: :path, type: :string, description: "Project UUID"]],
+    responses: %{
+      200 => {"Restored project", "application/json", Schemas.ProjectResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"A kb scope, or project limit reached", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -359,7 +386,7 @@ defmodule LoopctlWeb.ProjectController do
 
   # Only a knowledge-only scope may be archived/restored at agent role. A work project falls
   # through to this 422 so it can never be archived or restored without the human-anchored
-  # DELETE/PATCH /projects/:id path.
+  # DELETE /projects/:id and POST /projects/:id/restore paths.
   defp ensure_kb_scope(%{kind: :kb}), do: :ok
 
   defp ensure_kb_scope(_project),
@@ -425,8 +452,17 @@ defmodule LoopctlWeb.ProjectController do
   @doc """
   PATCH /api/v1/projects/:id
 
-  Updates a project. Requires user+ role. Slug cannot be changed.
+  Updates a project. Requires orchestrator+ role on a human-anchored tenant. Slug cannot be
+  changed, and neither can status: a body carrying `status` is refused 422 before the project
+  is read, because archiving is DELETE (user+) and restoring is POST /restore, each with its
+  own gate, cap check and audit action that a PATCH would skip.
   """
+  def update(_conn, %{"status" => _}) do
+    {:error, :unprocessable_entity,
+     "status cannot be changed with PATCH; archive with DELETE /api/v1/projects/:id and " <>
+       "restore with POST /api/v1/projects/:id/restore"}
+  end
+
   def update(conn, %{"id" => project_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
     audit_opts = AuditContext.from_conn(conn)
@@ -437,7 +473,6 @@ defmodule LoopctlWeb.ProjectController do
         repo_url: params["repo_url"],
         description: params["description"],
         tech_stack: params["tech_stack"],
-        status: safe_to_status(params["status"]),
         mission: params["mission"],
         metadata: params["metadata"]
       }
@@ -456,6 +491,34 @@ defmodule LoopctlWeb.ProjectController do
       end
     end
   end
+
+  @doc """
+  POST /api/v1/projects/:id/restore
+
+  Re-activates an archived `kind: :work` project, the reverse of DELETE /projects/:id.
+  Orchestrator+ role on a human-anchored tenant. Goes through `Projects.unarchive_project/3`,
+  so it is audited as `unarchived` and rejected 422 at the tenant's `max_projects` cap. A
+  `kind: :kb` scope is rejected 422 toward POST /kb-scopes/:id/restore, which is its own
+  agent-role path.
+  """
+  def restore(conn, %{"id" => project_id}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    audit_opts = AuditContext.from_conn(conn)
+
+    with {:ok, project} <- Projects.get_project(tenant_id, project_id),
+         :ok <- ensure_work_project(project),
+         {:ok, activated} <- restore_result(tenant_id, project, audit_opts) do
+      json(conn, %{project: project_json(activated)})
+    end
+  end
+
+  defp ensure_work_project(%{kind: :kb}),
+    do:
+      {:error, :unprocessable_entity,
+       "A knowledge-only project scope (kind: kb) is restored with POST " <>
+         "/api/v1/kb-scopes/:id/restore."}
+
+  defp ensure_work_project(_project), do: :ok
 
   @doc """
   DELETE /api/v1/projects/:id

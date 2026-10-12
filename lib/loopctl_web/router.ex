@@ -512,6 +512,7 @@ defmodule LoopctlWeb.Router do
     # restore re-activates it (re-consumes a slot). Both agent-managed, no custody surface.
     delete "/kb-scopes/:id", ProjectController, :archive_kb_scope
     post "/kb-scopes/:id/restore", ProjectController, :restore_kb_scope
+    post "/projects/:id/restore", ProjectController, :restore
     resources "/projects", ProjectController, only: [:create, :index, :show, :update, :delete]
     get "/projects/:id/progress", ProjectController, :progress
 

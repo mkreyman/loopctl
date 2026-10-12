@@ -6,6 +6,17 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`POST /api/v1/projects/:id/restore` re-activates an archived work project, and
+  `PATCH /api/v1/projects/:id` no longer changes status (#975).** BREAKING: a PATCH body
+  carrying `status` is now refused 422 whatever its value, where it used to archive or
+  re-activate the project. That path let an orchestrator key archive a project past the
+  user-role gate on DELETE, re-activate one past the tenant's `max_projects` cap, and restore
+  a kb scope around `restore_kb_scope`, all audited as a plain `updated`. Archive with
+  `DELETE /api/v1/projects/:id` (user+); restore a work project with the new endpoint
+  (orchestrator+, human-anchored tenant, 422 at the cap, audited as `unarchived`; MCP
+  `restore_project`, loopctl-mcp-server 2.115.0) and a kb scope with
+  `POST /api/v1/kb-scopes/:id/restore`. A blank `name` on PATCH is now 422 instead of 500.
+
 - **Each tenant can give loopctl its own GitHub token, and every forge call for that tenant
   uses it (#936).** The merge gate, story verification, post-deploy verification, thread
   checkpoint reads, the issue closer and thread issue links all authenticate per (tenant,

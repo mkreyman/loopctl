@@ -46,6 +46,8 @@ describe("delete_project", () => {
     const src = toolDefinitionSource("delete_project");
     assert.match(src, /SLUG stays taken/);
     assert.match(src, /restore_kb_scope/);
+    assert.match(src, /restore_project/);
+    assert.doesNotMatch(src, /no MCP tool reaches/);
     assert.match(src, /custody_tier_required/);
     assert.match(src, /insufficient_role/);
   });
@@ -64,5 +66,30 @@ describe("delete_project", () => {
     const body = indexSource.slice(start, indexSource.indexOf("\n}\n", start));
     assert.match(body, /process\.env\.LOOPCTL_USER_KEY/);
     assert.match(body, /exactKey: true/);
+  });
+});
+
+// #975: PATCH refuses status, so restore_project is the only way a work project comes back.
+describe("restore_project", () => {
+  test("is declared, dispatched and POSTs the restore route", () => {
+    assert.match(indexSource, /case "restore_project":\s*return await restoreProject\(args\);/);
+    const start = indexSource.indexOf("async function restoreProject(");
+    assert.ok(start > 0, "restoreProject handler exists");
+    const body = indexSource.slice(start, indexSource.indexOf("\n}\n", start));
+    assert.match(body, /"POST", `\/api\/v1\/projects\/\$\{project_id\}\/restore`/);
+  });
+
+  test("names what it refuses and where a kb scope goes instead", () => {
+    const src = toolDefinitionSource("restore_project");
+    assert.match(src, /max_projects/);
+    assert.match(src, /restore_kb_scope/);
+    assert.match(src, /custody_tier_required/);
+    assert.match(src, /insufficient_role/);
+  });
+
+  test("both README rows exist", () => {
+    for (const source of [readmeSource, rootReadmeSource]) {
+      assert.match(readmeRow(source, "restore_project"), /[Rr]estore/);
+    }
   });
 });

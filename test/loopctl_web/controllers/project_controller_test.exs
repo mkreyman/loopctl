@@ -799,6 +799,137 @@ defmodule LoopctlWeb.ProjectControllerTest do
     end
   end
 
+  describe "PATCH /api/v1/projects/:id refuses status (#975)" do
+    test "status: archived is 422 and leaves the project active", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{project.id}", %{"status" => "archived"})
+
+      assert json_response(conn, 422)["error"]["message"] =~ "DELETE /api/v1/projects/:id"
+      assert {:ok, %{status: :active}} = Projects.get_project(tenant.id, project.id)
+    end
+
+    test "status: active is 422 even alongside other fields, so the cap cannot be skipped",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{settings: %{"max_projects" => 1}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      archived = fixture(:project, %{tenant_id: tenant.id})
+      {:ok, archived} = Projects.archive_project(tenant.id, archived)
+      _active = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{archived.id}", %{"status" => "active", "name" => "x"})
+
+      assert json_response(conn, 422)["error"]["message"] =~ "/restore"
+
+      assert {:ok, %{status: :archived, name: name}} =
+               Projects.get_project(tenant.id, archived.id)
+
+      refute name == "x"
+    end
+
+    test "a blank name is 422, not 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> patch(~p"/api/v1/projects/#{project.id}", %{"name" => ""})
+
+      assert json_response(conn, 422)
+    end
+  end
+
+  describe "POST /api/v1/projects/:id/restore" do
+    test "re-activates an archived work project and audits it as unarchived", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {:ok, _} = Projects.archive_project(tenant.id, project)
+
+      conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/projects/#{project.id}/restore")
+
+      assert json_response(conn, 200)["project"]["status"] == "active"
+
+      {:ok, result} =
+        Loopctl.Audit.list_entries(tenant.id, entity_type: "project", action: "unarchived")
+
+      assert [_] = result.data
+    end
+
+    test "is 422 at the tenant's max_projects cap", %{conn: conn} do
+      tenant = fixture(:tenant, %{settings: %{"max_projects" => 1}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      archived = fixture(:project, %{tenant_id: tenant.id})
+      {:ok, _} = Projects.archive_project(tenant.id, archived)
+      _active = fixture(:project, %{tenant_id: tenant.id})
+
+      conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/projects/#{archived.id}/restore")
+
+      assert json_response(conn, 422)["error"]["message"] =~ "Project limit"
+      assert {:ok, %{status: :archived}} = Projects.get_project(tenant.id, archived.id)
+    end
+
+    test "refuses a kb scope toward its own restore path", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      {:ok, scope} =
+        Projects.create_project(tenant.id, %{name: "kb", slug: "kb-restore"}, kind: :kb)
+
+      {:ok, _} = Projects.archive_project(tenant.id, scope)
+
+      conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/projects/#{scope.id}/restore")
+
+      assert json_response(conn, 422)["error"]["message"] =~ "/api/v1/kb-scopes/:id/restore"
+      assert {:ok, %{status: :archived}} = Projects.get_project(tenant.id, scope.id)
+    end
+
+    test "is 403 for an agent key", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {:ok, _} = Projects.archive_project(tenant.id, project)
+
+      conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/projects/#{project.id}/restore")
+
+      assert json_response(conn, 403)
+    end
+
+    test "is 403 custody_tier_required on an agent-rooted tenant", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {:ok, _} = Projects.archive_project(tenant.id, project)
+
+      conn = conn |> auth_conn(raw_key) |> post(~p"/api/v1/projects/#{project.id}/restore")
+
+      assert json_response(conn, 403)["error"]["code"] == "custody_tier_required"
+    end
+
+    test "tenant B cannot restore tenant A's project", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {raw_key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :orchestrator})
+      project = fixture(:project, %{tenant_id: tenant_a.id})
+      {:ok, _} = Projects.archive_project(tenant_a.id, project)
+
+      conn = conn |> auth_conn(raw_key_b) |> post(~p"/api/v1/projects/#{project.id}/restore")
+
+      assert json_response(conn, 404)
+      assert {:ok, %{status: :archived}} = Projects.get_project(tenant_a.id, project.id)
+    end
+  end
+
   describe "DELETE /api/v1/projects/:id" do
     test "archives the project (soft delete)", %{conn: conn} do
       tenant = fixture(:tenant)
