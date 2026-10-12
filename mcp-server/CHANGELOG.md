@@ -5,6 +5,22 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.114.0 — 2026-10-11 (delete_project says it archives)
+
+### Changed
+
+- **`delete_project` describes what the endpoint actually does: it ARCHIVES.**
+  `DELETE /api/v1/projects/:id` sets the project's status to archived and removes no rows;
+  the old description said it deleted the project and its epics, stories and audit entries
+  irreversibly. The description now states that the slug stays taken (`create_project`
+  with it is refused 422, `resolve_project` still returns the archived project, and no
+  API call releases a slug), how to restore (`restore_kb_scope` for a kb scope; a work
+  project only by `PATCH /api/v1/projects/:id`, which no tool reaches yet), and the
+  refusals: `403 insufficient_role`, `403 custody_tier_required`, `404`.
+- **`delete_project` sends `LOOPCTL_USER_KEY` verbatim when it is set**, like the other
+  user-gated deletes, so a global `LOOPCTL_API_KEY` of a lesser role cannot displace it.
+  With no user key it falls back to the default key.
+
 ## 2.113.0 — 2026-10-01 (knowledge_get stops reporting real articles as missing)
 
 ### Fixed
