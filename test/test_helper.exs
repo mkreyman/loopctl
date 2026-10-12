@@ -34,29 +34,9 @@ Ecto.Adapters.SQL.Sandbox.mode(Process.whereis(Loopctl.AdminRepo), :manual)
 Loopctl.Fixtures.sweep_committed_runner_tenants(older_than: 600)
 {:ok, _lock_guard} = Loopctl.Test.LockGuard.start()
 
-# pgvector below 0.8.4 lets an HNSW insert race a VACUUM (autovacuum included) and fail with
-# `different vector dimensions 1536 and 0` (#965). Read the server's INSTALLED binary
-# (`default_version`), not `extversion`: the fix is in the shared library, and `extversion`
-# keeps the version the database was created with until `ALTER EXTENSION vector UPDATE`.
-# A warning, not a failure: the race is rare, and an old local image should not stop a run.
-Ecto.Adapters.SQL.Sandbox.unboxed_run(Loopctl.Repo, fn ->
-  case Loopctl.Repo.query!(
-         "SELECT default_version FROM pg_available_extensions WHERE name = 'vector'"
-       ).rows do
-    [[version]] when is_binary(version) ->
-      unless Loopctl.HeavyRead.version_at_least?(version, {0, 8, 4}) do
-        IO.puts(
-          :stderr,
-          "WARNING: the test database's pgvector is #{version}, below 0.8.4. A test may fail " <>
-            "with `different vector dimensions 1536 and 0`; that is pgvector's insert/VACUUM " <>
-            "race, not the test (#965, mkreyman/infra#280)."
-        )
-      end
-
-    _ ->
-      :ok
-  end
-end)
+# A test database on a pgvector older than the floor gets a warning, never a stopped run
+# (`Loopctl.DataCase.warn_if_pgvector_below_floor/0`, #965).
+Loopctl.DataCase.warn_if_pgvector_below_floor()
 
 # VM-global :atomics counter backing `Loopctl.Fixtures.next_story_number/0`.
 # Initialized once here, single-threaded, before any (async) test runs, so the

@@ -929,8 +929,9 @@ jobs:
       postgres:
         # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.2), so
         # the job never pulls a floating tag from Docker Hub: a present digest is not re-pulled.
-        # It moves with the host instances under mkreyman/infra#280, which takes them past the
-        # 0.8.4 floor (#965); moving it alone would split versions between jobs and pull.
+        # It is below the 0.8.4 floor (#965) and carries the insert/VACUUM race too, since
+        # autovacuum fires on the corpora these tests commit. It moves with the host instances
+        # under mkreyman/infra#280, once the new digest is pre-pulled on beelink.
         image: pgvector/pgvector@sha256:fce8fb583b92ef8af5150b373a96415d46a8cd38ba09b38efeea17c8b4c7d782
         env:
           POSTGRES_USER: postgres

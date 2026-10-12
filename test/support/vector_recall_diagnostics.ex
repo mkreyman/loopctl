@@ -156,10 +156,11 @@ defmodule Loopctl.VectorRecallDiagnostics do
   # read (the #535 mechanism) shows up here, and so does an iterative_scan setting that is
   # not what the config says it should be.
   defp backend_settings do
-    %{rows: [[version, ef_search, iterative_scan, statement_timeout]]} =
+    %{rows: [[version, installed, ef_search, iterative_scan, statement_timeout]]} =
       AdminRepo.query!(
         """
         SELECT (SELECT extversion FROM pg_extension WHERE extname = 'vector'),
+               (SELECT default_version FROM pg_available_extensions WHERE name = 'vector'),
                current_setting('hnsw.ef_search', true),
                current_setting('hnsw.iterative_scan', true),
                current_setting('statement_timeout', true)
@@ -167,7 +168,7 @@ defmodule Loopctl.VectorRecallDiagnostics do
         []
       )
 
-    "  pgvector=#{inspect(version)}\n" <>
+    "  pgvector=#{inspect(version)} installed=#{inspect(installed)}\n" <>
       "  session (OUTSIDE the read's SET LOCAL — a non-default here means one LEAKED): " <>
       "hnsw.ef_search=#{inspect(ef_search)} hnsw.iterative_scan=#{inspect(iterative_scan)} " <>
       "statement_timeout=#{inspect(statement_timeout)}\n" <>

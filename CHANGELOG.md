@@ -6,14 +6,6 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
-- **pgvector 0.8.4 is now the stated minimum (#965).** Below it, an HNSW index insert that
-  races a VACUUM (autovacuum included) can read a just-deleted neighbour as a zero-length
-  vector and fail with `different vector dimensions 1536 and 0`; pgvector fixed this in 0.8.4.
-  loopctl's re-embeds and deletes leave dead HNSW tuples, so any deployment below 0.8.4 can hit
-  it on an embedding write. Check the installed library with
-  `SELECT default_version FROM pg_available_extensions WHERE name = 'vector'`; after upgrading
-  the binary, `ALTER EXTENSION vector UPDATE` brings each database's `extversion` along.
-
 - **Each tenant can give loopctl its own GitHub token, and every forge call for that tenant
   uses it (#936).** The merge gate, story verification, post-deploy verification, thread
   checkpoint reads, the issue closer and thread issue links all authenticate per (tenant,
@@ -313,6 +305,14 @@ All notable changes to loopctl are documented here.
     MCP server 2.109.0 adds `thread_stage_report`.
 
 ### Changed
+
+- **pgvector 0.8.4 is now the stated minimum (#965).** Below it, an HNSW index insert that
+  races a VACUUM (autovacuum included) can read a just-deleted neighbour as a zero-length
+  vector and fail with `different vector dimensions 1536 and 0`; pgvector fixed this in 0.8.4.
+  loopctl's re-embeds and deletes leave dead HNSW tuples, so any deployment below 0.8.4 can hit
+  it on an embedding write. Check the installed library with
+  `SELECT default_version FROM pg_available_extensions WHERE name = 'vector'`; after upgrading
+  the binary, `ALTER EXTENSION vector UPDATE` brings each database's `extversion` along.
 
 - **Merge import reports orphans only on request (#880). Breaking for a caller that reads
   `stories_orphaned`.** `POST /api/v1/projects/:id/import?merge=true` omits the key unless
