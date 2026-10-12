@@ -100,16 +100,23 @@ defmodule Loopctl.DataCase do
   two work on different things: the exact plan covers reads that go through
   `Loopctl.HeavyRead`, and this covers what a module does around them.
 
-  Production is not affected: its rows are committed, so its graph is not made of dead
-  entries.
+  Production is not affected by the dead-entry problem above: its rows are committed, so its
+  graph is not made of dead entries.
 
-  **It needs pgvector 0.8.4 or later on the test database once a tagged module runs async.**
-  Before 0.8.4, VACUUM wiped a deleted element's vector without waiting for in-flight
-  inserts (fixed upstream by "Fix HNSW insert and vacuum race"). An INSERT into the same
-  table that had already picked that element as a neighbour then failed with
-  `different vector dimensions 1536 and 0` (#965). Seeing that error locally means the
-  database is on an older image (mkreyman/infra#280); it is not a defect in the test or
-  the diff.
+  **The test database needs pgvector 0.8.4 or later.** Before 0.8.4, VACUUM wiped a deleted
+  element's vector without waiting for in-flight inserts (fixed upstream by "Fix HNSW insert
+  and vacuum race"), so an INSERT that had already picked that element as a neighbour failed
+  with `different vector dimensions 1536 and 0`. Any VACUUM concurrent with an insert opens
+  that window, autovacuum included, so it is not confined to the modules carrying this tag
+  and making them `async: false` does not close it. That is the most likely reading of the
+  error (#965): first check the server's INSTALLED pgvector,
+  `SELECT default_version FROM pg_available_extensions WHERE name = 'vector'` (the fix is in
+  the binary; `extversion` keeps the version the database was created with until
+  `ALTER EXTENSION vector UPDATE`). Below 0.8.4 it is the race, and the host images move
+  under mkreyman/infra#280; at or above it, look for code that really writes or reads a
+  zero-length vector. `test/test_helper.exs` warns at suite start on an older binary.
+  Production needs the same floor, since re-embeds and deletes leave dead HNSW tuples for
+  autovacuum to race (README prerequisites).
 
   Runs unboxed (VACUUM cannot run inside a transaction) and, by default, never fails a test: a vacuum
   that cannot run leaves the suite exactly as flaky as it was before, which is a worse

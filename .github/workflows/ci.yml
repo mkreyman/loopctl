@@ -300,8 +300,11 @@ jobs:
     # Postgres 16 bound to 127.0.0.1:5432 — reachable because the job runs ON that
     # host — the same database local `mix test`
     # uses — so a service container declaring 5432:5432 cannot bind and the job
-    # would die before its first step. Verified that host instance has pgvector
-    # 0.8.2 available, which is why the pgvector image is not needed here.
+    # would die before its first step. That host instance supplies pgvector, which is why the
+    # pgvector image is not needed here. It must be 0.8.4 or later: below it an HNSW insert
+    # racing a VACUUM (autovacuum included) fails with `different vector dimensions 1536 and 0`
+    # (#965). The host images are 0.8.2 until mkreyman/infra#280 moves them, and
+    # test/test_helper.exs warns at suite start while they are.
     # config/test.exs hardcodes localhost + postgres/postgres for all three repos.
     env:
       # ci<run_id>, not the bare `ci` this used to be. The suffix separated CI from a
@@ -924,11 +927,11 @@ jobs:
       github.event_name == 'pull_request'
     services:
       postgres:
-        # Pinned by DIGEST (pgvector 0.8.7-pg16-trixie), so the job never pulls a floating tag
-        # from Docker Hub: a present digest is not re-pulled. 0.8.4 is the floor: below it an
-        # HNSW insert racing a VACUUM can read a just-deleted neighbour as a 0-dimension
-        # vector (#965, mkreyman/infra#280, which moves the host instances to this digest).
-        image: pgvector/pgvector@sha256:40d828eda66737aaacb934387a337babf1455ebd56e9bdd13fc08e211257c972
+        # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.2), so
+        # the job never pulls a floating tag from Docker Hub: a present digest is not re-pulled.
+        # It moves with the host instances under mkreyman/infra#280, which takes them past the
+        # 0.8.4 floor (#965); moving it alone would split versions between jobs and pull.
+        image: pgvector/pgvector@sha256:fce8fb583b92ef8af5150b373a96415d46a8cd38ba09b38efeea17c8b4c7d782
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -1348,8 +1351,9 @@ jobs:
     # loopback port Docker picks, so it cannot collide). nuc already runs a long-lived Postgres 16
     # bound to 127.0.0.1:5432, so a service container declaring 5432:5432 cannot bind and
     # the job dies at "Initialize containers" before its first step. That host instance
-    # has pgvector 0.8.2 available, which is what the pgvector/pgvector:pg16 image was
-    # supplying, so the image is not needed — only its port was ever in the way.
+    # supplies pgvector, which is what the pgvector/pgvector:pg16 image was supplying, so the
+    # image is not needed — only its port was ever in the way. The 0.8.4 floor the Test job's
+    # comment states applies here too (#965, mkreyman/infra#280).
     steps:
       - uses: actions/checkout@v4
         with:
