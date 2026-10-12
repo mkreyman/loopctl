@@ -506,9 +506,8 @@ defmodule Loopctl.Intake.IssueClosuresTest do
       #
       # The emoji matters. A ZWJ family emoji does NOT reproduce it — `inspect/1` escapes
       # that one into ASCII, so graphemes and code points come out equal and the two bounding
-      # strategies agree. `bin/mutate.sh` returned exit 1 on the first version of this test
-      # for exactly that reason, which is the tool refusing to certify a check that cannot
-      # fail.
+      # strategies agree. A mutation run on 2026-09-13 left the first version of this test green
+      # for exactly that reason: it was a check that could not fail.
       decorated = String.duplicate("🇺🇸", 2_000)
 
       assert {:ok, row} =

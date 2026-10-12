@@ -483,7 +483,7 @@ defmodule LoopctlWeb.DispatchController do
   # list. No catch-all for a nil `lineage_path` — the column is NOT NULL with a `[]` default,
   # so a nil there is a broken invariant, and `List.starts_with?/2` raising (nothing revoked)
   # is the right answer rather than an unreachable clause that reads as a guard. Placement
-  # removed exactly such a clause after `bin/mutate.sh` proved nothing could reach it.
+  # removed exactly such a clause once a mutation run (2026-09-15) proved nothing reached it.
   defp revoke_ceiling(_lineage_path, _caller_lineage, true), do: :ok
   defp revoke_ceiling(_lineage_path, [], false), do: {:error, :unlineaged_caller}
 

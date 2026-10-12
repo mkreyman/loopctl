@@ -229,7 +229,7 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
 
       # PIN THE SET THE LOOP ITERATES, against the REGISTRY rather than against itself. A
       # bare `for` over an empty map asserts nothing and still reports green — verified
-      # inert with `bin/mutate.sh` (report the columns as `%{}` and this test passed) before
+      # inert by a mutation run on 2026-09-06 (report the columns as `%{}` and this test passed) before
       # this assertion existed. Comparing to the declaration catches that, because the
       # declaration is the thing the report is supposed to be derived FROM.
       assert MapSet.new(Map.keys(columns)) == MapSet.new(declared.required ++ declared.enrichable)

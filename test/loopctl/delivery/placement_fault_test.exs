@@ -314,8 +314,8 @@ defmodule Loopctl.Delivery.PlacementFaultTest do
       # assertions read the SAME connection the delete ran on. Reading the setting from a
       # second checkout proves nothing: the pool would hand back a different connection and
       # report `origin` whether or not the first one leaked, which is precisely what makes this
-      # hazard nondeterministic in production use — `bin/mutate.sh` came back exit 1 on the
-      # two-checkout version.
+      # hazard nondeterministic in production use — a mutation run left the two-checkout
+      # version green (2026-10-07).
       delete_audit_chain_rows!([raw_id])
 
       # 1. It deletes. Without the suppression `audit_chain_prevent_delete_trigger` raises

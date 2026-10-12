@@ -202,7 +202,7 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorker do
   # made each other unfalsifiable. Deleting the `revoked_at` guard from the candidate
   # read left the UPDATE refusing the row; deleting it from the UPDATE left the
   # candidate read never offering the row. Both mutations came back green
-  # (`bin/mutate.sh` exit 1, twice) against a suite that does assert the behaviour —
+  # (two mutation runs, 2026-09-15) against a suite that does assert the behaviour —
   # the classic redundant-guard pair, where the check passes whatever either half does.
   #
   # "Active" here is the AUTH pipeline's notion (`Auth.load_active_api_key/1`), which

@@ -255,7 +255,7 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorkerTest do
     # revoked, or given a later expiry, between the read and the write must not be rewritten
     # on the strength of a stale read. Through `perform/1` that re-assertion is INVISIBLE —
     # the candidate read never offers such a row — so the two guards used to mask each other
-    # and `bin/mutate.sh` came back exit 1 on each in turn. These reach the write directly
+    # and mutating each in turn left the suite green (2026-09-15). These reach the write directly
     # with ids the read would never have produced, which is the only way the guard can go red.
 
     test "an id that is now revoked is skipped, keeping its ORIGINAL revoked_at" do

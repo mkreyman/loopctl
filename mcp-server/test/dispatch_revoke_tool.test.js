@@ -118,7 +118,7 @@ describe("the tool description states what the endpoint refuses", () => {
     // the tree. A description that omitted this would invite exactly that.
     //
     // Three SEPARATE assertions, not one alternation. The first version was
-    // `/subtree|descendant/i`, and `bin/mutate.sh` came back exit 1: deleting the headline
+    // `/subtree|descendant/i`, and a mutation run (2026-09-15) proved it inert: deleting the headline
     // left the passing mention further down, so the loose match could not tell "the warning
     // is here" from "a word from it survives somewhere". Each claim is now pinned where a
     // reader actually meets it — the headline, the mechanism, and the parameter's own

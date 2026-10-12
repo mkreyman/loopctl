@@ -230,7 +230,7 @@ defmodule Loopctl.Config.WorktreePartition do
   from repository-local config (checked on git 2.53.0), so an environment variable is the
   only way to make a SUCCESSFUL rev-parse write to stderr. THAT EXCEPTION IS NOT FALSIFIABLE
   by this repo's suite — flipping its clause to `true` leaves all 22 tests green
-  (`bin/mutate.sh`, exit 1, 2026-09-16) — which is tolerable only because clearing
+  (a mutation run, 2026-09-16) — which is tolerable only because clearing
   GIT_TRACE would change nothing the derivation ANSWERS; it would silence one developer's
   tracing of one command.
 

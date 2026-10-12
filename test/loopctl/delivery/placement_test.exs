@@ -783,9 +783,7 @@ defmodule Loopctl.Delivery.PlacementTest do
     #
     # NO MOCK CAN, BUT A TRIGGER CAN, and "a release that genuinely FAILED escalates" in
     # `Loopctl.Delivery.PlacementFaultTest` does exactly that. Round 1 of #865 left this gap
-    # open and said so; the comment here used to name `bin/mutate.sh` as what joined the two
-    # halves, which was a join that existed only
-    # while somebody ran that one mutation by hand. The call site in `undo_claim/5` and the
+    # open and said so. The call site in `undo_claim/5` and the
     # two-clause condition over `release` are now asserted by a test.
     test "a release that SUCCEEDED escalates nothing", ctx do
       %{runner: runner, story: story, channel: channel} = ctx
@@ -2457,8 +2455,8 @@ defmodule Loopctl.Delivery.PlacementTest do
   # 846.2 REVIEW ROUND 2, FINDING 5. `Placement.place/4` returns whatever
   # `DispatchPayload.fill/3` returns, so the two `@type error()` unions are one declaration in
   # two files — and round 1 added `invalid_branch_name` to the payload's and not to the
-  # placement's. Dialyzer does not catch it (measured: `bin/mutate.sh` on that union exits 1
-  # against `mix dialyzer`, because the placement union already carries a bare `atom()` and
+  # placement's. Dialyzer does not catch it (measured 2026-09-16: narrowing that union still
+  # passes `mix dialyzer`, because the placement union already carries a bare `atom()` and
   # dialyzer only refuses a contract that is impossible, never one that is merely too narrow).
   # So the drift needs a test, and this is it: the next caller written against the DOCUMENTED
   # set falls through to the fallback controller and answers 500 on an ordinary refusal.

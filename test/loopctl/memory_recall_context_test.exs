@@ -188,11 +188,9 @@ defmodule Loopctl.MemoryRecallContextTest do
 
     test "an error reason outside the mapped contract still renders the degraded envelope",
          ctx do
-      # Proven able to go red, by deleting the fallback clause under it:
-      #   bin/mutate.sh lib/loopctl/memory.ex --old-file <the clause> --delete \
-      #     -- mix test test/loopctl/memory_recall_context_test.exs
-      # exit 0 — the check failed under the mutation (FunctionClauseError on
-      # `knowledge_degraded_reason_tag/1`) and passed without it.
+      # Proven able to go red on 2026-09-05: with the fallback clause under it deleted from
+      # `lib/loopctl/memory.ex`, this test failed (FunctionClauseError on
+      # `knowledge_degraded_reason_tag/1`), and it passes with the clause in place.
       #
       # `Knowledge.search_combined/3` is specced to return `{:error, atom(), String.t()}`,
       # so its error contract can grow past the three reasons the tag clauses map. A

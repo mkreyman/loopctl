@@ -50,8 +50,8 @@ defmodule Loopctl.Repo.Migrations.AddStoryIntakeLinkAndIssueClosures do
     #
     # The `WHERE` is a SIZE optimisation and NOT the mechanism, stated because the obvious
     # reading is the wrong one: Postgres treats NULLs as distinct in a unique index by
-    # default, so unlinked stories are unconstrained with or without it. `bin/mutate.sh`
-    # returned exit 1 on removing this clause — no test can tell the difference, correctly —
+    # default, so unlinked stories are unconstrained with or without it. A mutation run
+    # removing this clause left every test green (2026-09-13) — no test can tell the difference, correctly —
     # and it is kept only because most stories carry no link and a full index would hold a
     # dead entry for every one of them.
     create unique_index(:stories, [:tenant_id, :intake_record_id],

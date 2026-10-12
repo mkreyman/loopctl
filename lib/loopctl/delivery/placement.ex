@@ -1447,8 +1447,8 @@ defmodule Loopctl.Delivery.Placement do
   # make `Role.role_at_least?/2` raise — cannot arrive here at all now that the role is derived
   # from the key rather than accepted as an option.
   #
-  # A defensive clause for those was written and REMOVED: `bin/mutate.sh` opened it to `:ok`
-  # and every test still passed (exit 1), which is the tool saying nothing can reach it. An
+  # A defensive clause for those was written and REMOVED: a mutation run opened it to `:ok`
+  # and every test still passed (2026-09-14), so nothing could reach it. An
   # unreachable clause that reads as a guard is worse than no clause — and if `resolve_caller/2`
   # ever hands this something else, that is a broken invariant inside this module and a crash
   # is the right answer, not a `:root_dispatch_forbidden` that hides it.

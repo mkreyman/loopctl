@@ -295,8 +295,8 @@ defmodule Loopctl.Delivery.StageMachine do
   #
   # The SOURCE filter is also what keeps `claimed` out as a destination: `queued` is the only
   # stage anything enters `claimed` from, and `queued` is not a source. A separate
-  # `to != :claimed` clause was here and is gone — `bin/mutate.sh` returned exit 1 on it,
-  # which is the tool saying no test can tell whether it is there. `stage_machine_test.exs`
+  # `to != :claimed` clause was here and is gone — deleting it left every test green
+  # (a mutation run, 2026-09-13), so no test could tell whether it was there. `stage_machine_test.exs`
   # asserts the property directly instead, so widening the source list to include `queued`
   # goes red rather than quietly handing a runner the transition that writes `runner_id` and
   # the claim's chain entry. The same test asserts every held-back edge and stage by name.
