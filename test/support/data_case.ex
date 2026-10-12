@@ -103,6 +103,14 @@ defmodule Loopctl.DataCase do
   Production is not affected: its rows are committed, so its graph is not made of dead
   entries.
 
+  **It needs pgvector 0.8.4 or later on the test database once a tagged module runs async.**
+  Before 0.8.4, VACUUM wiped a deleted element's vector without waiting for in-flight
+  inserts (fixed upstream by "Fix HNSW insert and vacuum race"). An INSERT into the same
+  table that had already picked that element as a neighbour then failed with
+  `different vector dimensions 1536 and 0` (#965). Seeing that error locally means the
+  database is on an older image (mkreyman/infra#280); it is not a defect in the test or
+  the diff.
+
   Runs unboxed (VACUUM cannot run inside a transaction) and, by default, never fails a test: a vacuum
   that cannot run leaves the suite exactly as flaky as it was before, which is a worse
   outcome to hide behind an exception than to carry on with.

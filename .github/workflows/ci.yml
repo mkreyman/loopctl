@@ -924,9 +924,11 @@ jobs:
       github.event_name == 'pull_request'
     services:
       postgres:
-        # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.2), so
-        # the job never pulls a floating tag from Docker Hub: a present digest is not re-pulled.
-        image: pgvector/pgvector@sha256:fce8fb583b92ef8af5150b373a96415d46a8cd38ba09b38efeea17c8b4c7d782
+        # Pinned by DIGEST (pgvector 0.8.7-pg16-trixie), so the job never pulls a floating tag
+        # from Docker Hub: a present digest is not re-pulled. 0.8.4 is the floor: below it an
+        # HNSW insert racing a VACUUM can read a just-deleted neighbour as a 0-dimension
+        # vector (#965, mkreyman/infra#280, which moves the host instances to this digest).
+        image: pgvector/pgvector@sha256:40d828eda66737aaacb934387a337babf1455ebd56e9bdd13fc08e211257c972
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
