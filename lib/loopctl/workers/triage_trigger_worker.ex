@@ -231,7 +231,7 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
   # Nothing to do and nobody to ask (see the moduledoc). Reachable only as a race against the
   # candidate read, which excludes revoked sources outright.
   #
-  # `bin/mutate.sh` returns exit 1 on this clause — no test can tell it from the catch-all
+  # Deleting this clause left every test green (2026-09-15) — no test can tell it from the catch-all
   # below, correctly, because the read makes the race the only way in and a fixture cannot
   # stage one. It is kept because the catch-all would LOG "leaving for the next run", and there
   # is no next run for this record: it is excluded from every later read. A log line that says

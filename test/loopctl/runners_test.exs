@@ -48,7 +48,7 @@ defmodule Loopctl.RunnersTest do
       assert agent.tenant_id == tenant.id
       # The LITERAL, not `Runners.agent_name("minis")`: comparing the name against the
       # function that produced it is a tautology no change to that function can fail, and
-      # `bin/mutate.sh` said so — rewriting the prefix came back inert against this test.
+      # a mutation run said so (2026-09-14): rewriting the prefix came back inert against this test.
       assert agent.name == "runner:minis"
       assert Runners.agent_name("minis") == "runner:minis"
       assert agent.agent_type == :implementer

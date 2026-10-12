@@ -789,7 +789,7 @@ defmodule Loopctl.Delivery.RunnerStages do
   # share lock and rolls back `:stale_claim_epoch` BEFORE its compare-and-set, so
   # `:stale_stage` — which only `diagnose/3` produces, after that check passed — cannot come
   # back to a zombie. Re-reading the story's epoch here would therefore be a guard nothing can
-  # make fail; it was written, mutation-tested (`bin/mutate.sh`, exit 1) and removed rather
+  # make fail; it was written, mutation-tested (inert, 2026-09-13) and removed rather
   # than left in reading as protection. If a future change lets `advance/4` answer
   # `:stale_stage` without having fenced the epoch first, this comment is the one to revisit:
   # the row's own `claim_epoch` is what it was last WRITTEN under and can never establish that

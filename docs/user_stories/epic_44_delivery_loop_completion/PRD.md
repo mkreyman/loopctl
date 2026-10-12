@@ -173,8 +173,6 @@ Seven served routes are missing from the curated index behind `list_routes`
 - Every new env var gets a row in `deploy/FLY_SECRETS.md`; every new refusal, field and edge is in
   the endpoint's `operation/2` spec and the runner contract; `runner_contract_test.exs` stays green
   in both directions.
-- Every added assertion is proved falsifiable with `bin/mutate.sh`, the wiring as well as the
-  mechanism.
 - No change to custody gates, roles or RLS. 44.1 and 44.2 only ever add a refusal.
 
 ## 5. Out of scope, with what each would take and what it blocks

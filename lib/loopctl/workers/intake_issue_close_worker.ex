@@ -199,9 +199,9 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
   catch
     # The `:exit` clause is for the MESSAGE only — `Exception.format_exit/1` renders a pool
     # checkout timeout readably where the generic formatter does not. The catch-all below it
-    # already handles exits, so removing this clause changes no behaviour and `bin/mutate.sh`
-    # correctly returns exit 1 on it; the falsifiable guard is the whole `catch`, which a
-    # mutation does turn red.
+    # already handles exits, so removing this clause changes no behaviour and a mutation run
+    # (2026-09-13) correctly left every test green; the falsifiable guard is the whole
+    # `catch`, whose removal does turn the suite red.
     :exit, reason -> errored(closure, "exit: " <> Exception.format_exit(reason))
     kind, value -> errored(closure, Exception.format(kind, value, __STACKTRACE__))
   end

@@ -7,8 +7,8 @@ defmodule Loopctl.SourceScanTest do
   against a declaration in both directions, and both call the "declared but does not enforce"
   direction the dangerous one — which is exactly the direction a comment could fake. Neither
   guard can prove the fix on its own: reverting the scanner to `String.contains?` leaves them
-  green, because no module in the tree happens to mention the call in prose. (`bin/mutate.sh`
-  said so — exit 1.) So the property is asserted here, on source this test writes itself.
+  green, because no module in the tree happens to mention the call in prose. (Measured by a
+  mutation run, 2026-09-14.) So the property is asserted here, on source this test writes itself.
   """
 
   use ExUnit.Case, async: true
