@@ -809,7 +809,7 @@ defmodule Loopctl.Runners.Capacity do
   # after the write (and applies on top of it) — the same argument `recount/2` makes, which
   # is why this IS `recount/2`. Every caller is already inside a transaction, so the lock is
   # held to its commit: `release/4`'s callers run in `DispatchLedger`'s `in_tenant/2`,
-  # `runner_write/4` or an explicit `release_slot_in/4` that refuses to run outside one.
+  # `runner_write/5` or an explicit `release_slot_in/4` that refuses to run outside one.
   defp give_back(repo, tenant_id, runner_id) do
     recount(repo, tenant_id, runner_id)
   end

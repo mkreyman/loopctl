@@ -43,7 +43,7 @@ defmodule Loopctl.Verification.CiTarget do
   """
   @spec gather(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, t()} | {:unconfigured, String.t()} | {:wait, :database_busy}
-  def gather(tenant_id, story_id, opts \\ []) do
+  def gather(tenant_id, story_id, opts) do
     with {:story, {:ok, story}} <- {:story, Stories.get_story(tenant_id, story_id)},
          {:ok, source} <- source(tenant_id, story),
          {:ok, required} <- required_checks(source),

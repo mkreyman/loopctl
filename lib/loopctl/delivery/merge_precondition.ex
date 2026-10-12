@@ -531,8 +531,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
     database by `Loopctl.Delivery.GateAInput`
   - `:effect_proof` — `%{intent: _, fixture_set: _, fixture_results: _, coverage: _}` for a
     change that touches an effect path. Absent, a `:prove_effect` outcome is a refusal
-  - `:lock_timeout_ms` — the lock wait of the claim-route read
-    (`Loopctl.Runners.Capacity.lock_timeout_ms/1`). Only a test passes it (US-46.7)
+  - `:lock_timeout_ms` — the lock wait of the claim-route read and of the stage-entry read
+    behind it (`Loopctl.Runners.Capacity.lock_timeout_ms/1`). Only a test passes it (US-46.7)
 
   ## Errors
 

@@ -239,10 +239,6 @@ defmodule Loopctl.Delivery.DispatchPayload do
   def dispatch_route(tenant_id, %Story{} = story, opts) when is_list(opts),
     do: dispatch_route(tenant_id, story, story.claim_epoch, opts)
 
-  # `dispatch_route/4` with the deployed wait, for the claim of `claim_epoch`.
-  def dispatch_route(tenant_id, %Story{} = story, claim_epoch) when is_integer(claim_epoch),
-    do: dispatch_route(tenant_id, story, claim_epoch, [])
-
   @doc """
   `dispatch_route/2` for the claim of `claim_epoch` rather than the current one (US-45.7): the
   route a checkpoint recorded under an earlier claim was built on. Same lock bound, same `:busy`.

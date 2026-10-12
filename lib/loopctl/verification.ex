@@ -10,6 +10,8 @@ defmodule Loopctl.Verification do
   `start_run/2`, `record_poll/3` and `complete_run/4` are the verification runner's writes to
   its own run, and each runs inside a transaction with its lock wait bounded
   (`Loopctl.Runners.Capacity.set_lock_timeout!/2`, at `Capacity.lock_timeout_ms(opts)`).
+  `opts` has no default, here or on `CiTarget.gather/3`: a runner write that forgot to pass
+  the wait its caller was given would otherwise compile and quietly wait the deployed one.
   Database contention (a lock wait that ran out, a statement cancelled, a lost connection)
   is `{:error, :busy}` rather than a raise, counted as `[:loopctl, :verification, :run_write_busy]`
   (`Loopctl.Delivery.Stages.answering_busy/4`, the one classification of that). A refused
@@ -125,7 +127,7 @@ defmodule Loopctl.Verification do
   """
   @spec start_run(VerificationRun.t(), keyword()) ::
           {:ok, VerificationRun.t()} | {:error, term()}
-  def start_run(run, opts \\ []) do
+  def start_run(run, opts) do
     bounded_write(run, "verification run start", opts, fn ->
       update_run(run, %{status: "running", started_at: run.started_at || DateTime.utc_now()})
     end)
@@ -140,7 +142,7 @@ defmodule Loopctl.Verification do
   """
   @spec record_poll(VerificationRun.t(), map(), keyword()) ::
           {:ok, VerificationRun.t()} | {:error, term()}
-  def record_poll(run, attrs, opts \\ []) do
+  def record_poll(run, attrs, opts) do
     bounded_write(run, "verification poll write", opts, fn ->
       run |> poll_changeset(attrs) |> AdminRepo.update()
     end)
@@ -168,7 +170,7 @@ defmodule Loopctl.Verification do
   """
   @spec complete_run(VerificationRun.t(), String.t(), map(), keyword()) ::
           {:ok, VerificationRun.t()} | {:error, term()}
-  def complete_run(run, status, ac_results, opts \\ [])
+  def complete_run(run, status, ac_results, opts)
       when status in ["pass", "fail", "error", "skipped"] do
     bounded_write(run, "verification run completion", opts, fn ->
       update_run(run, %{

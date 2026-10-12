@@ -81,10 +81,10 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     assert {:ok, %{base_branch: "main"}} = DispatchPayload.dispatch_route(story.tenant_id, story)
 
     assert {:ok, %{base_branch: "release-1"}} =
-             DispatchPayload.dispatch_route(story.tenant_id, story, earlier)
+             DispatchPayload.dispatch_route(story.tenant_id, story, earlier, [])
 
     assert {:ok, %{base_branch: nil}} =
-             DispatchPayload.dispatch_route(story.tenant_id, story, earlier + 7)
+             DispatchPayload.dispatch_route(story.tenant_id, story, earlier + 7, [])
   end
 
   test "a row that recorded no mode is pr; NO row is nil, for the caller's source fallback",

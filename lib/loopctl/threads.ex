@@ -707,7 +707,8 @@ defmodule Loopctl.Threads do
       Repo.with_tenant(tenant_id, fn -> diff_target(tenant_id, story_id, checkpoint_id) end)
 
     with {:ok, story, source, checkpoint} <- target,
-         {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story, checkpoint.claim_epoch) do
+         {:ok, route} <-
+           DispatchPayload.dispatch_route(tenant_id, story, checkpoint.claim_epoch, []) do
       base = DispatchPayload.placed_base_branch(route, source)
 
       # Read as the credential chosen for this (tenant, repository) (#936), like every forge

@@ -113,7 +113,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
     test "an already-started run past the window is not stale-skipped" do
       ctx = setup_ctx()
       run = run!(ctx, %{})
-      {:ok, _} = Verification.start_run(run)
+      {:ok, _} = Verification.start_run(run, [])
       backdate!(run, 25 * 60 * 60)
 
       refute match?({:cancel, :stale_run}, perform(ctx, run))
@@ -137,7 +137,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerTest do
       run = run!(ctx)
 
       {:ok, done} =
-        Verification.complete_run(run, "pass", %{"source" => "ci", "evidence_url" => "u"})
+        Verification.complete_run(run, "pass", %{"source" => "ci", "evidence_url" => "u"}, [])
 
       for status <- ~w(pass fail error skipped) do
         {:ok, done} = Verification.update_run(done, %{status: status})

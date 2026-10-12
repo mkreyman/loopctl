@@ -72,11 +72,11 @@ defmodule Loopctl.VerificationTest do
       %{tenant: tenant, story: story} = setup_ctx()
       {:ok, run} = Verification.create_run(tenant.id, story.id)
 
-      {:ok, running} = Verification.start_run(run)
+      {:ok, running} = Verification.start_run(run, [])
       assert running.status == "running"
       assert running.started_at != nil
 
-      {:ok, passed} = Verification.complete_run(running, "pass", %{"AC-1" => "pass"})
+      {:ok, passed} = Verification.complete_run(running, "pass", %{"AC-1" => "pass"}, [])
       assert passed.status == "pass"
       assert passed.completed_at != nil
       assert passed.ac_results["AC-1"] == "pass"
@@ -91,7 +91,7 @@ defmodule Loopctl.VerificationTest do
       {:ok, run} = Verification.create_run(tenant.id, story.id)
 
       for attrs <- [%{resolved_commit_sha: "abc1234"}, %{ci_forge_faults: -1}] do
-        assert {:error, %Ecto.Changeset{valid?: false}} = Verification.record_poll(run, attrs)
+        assert {:error, %Ecto.Changeset{valid?: false}} = Verification.record_poll(run, attrs, [])
       end
 
       assert %{resolved_commit_sha: nil, ci_forge_faults: 0} =

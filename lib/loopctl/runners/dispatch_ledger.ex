@@ -804,7 +804,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   def record_session_end(tenant_id, runner_id, message, attrs) do
     context = %{operation: :record_session_end, dispatch_id: message.dispatch_id, run_id: nil}
 
-    runner_write(tenant_id, runner_id, context, fn ->
+    runner_write(tenant_id, runner_id, context, [], fn ->
       with {:ok, record, current} <-
              lock_for_session_end(tenant_id, runner_id, message, attrs.story_id) do
         session_end(record, message, attrs, current)
@@ -847,7 +847,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   def record_review_session_end(tenant_id, runner_id, message, digest) do
     context = %{operation: :record_session_end, dispatch_id: message.dispatch_id, run_id: nil}
 
-    runner_write(tenant_id, runner_id, context, fn ->
+    runner_write(tenant_id, runner_id, context, [], fn ->
       with {:ok, record} <-
              held(tenant_id, runner_id, message.dispatch_id, lock: true) do
         review_session_end(record, message, digest)
@@ -901,7 +901,7 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
-  # Each clause returns its result BARE: `runner_write/4` wraps the function's value in the
+  # Each clause returns its result BARE: `runner_write/5` wraps the function's value in the
   # transaction's `{:ok, _}`, and `flatten/1` lifts a returned `{:error, _}` back out.
   #
   # An identical resend, whatever has happened to the epoch or the row's status since.
@@ -1450,9 +1450,6 @@ defmodule Loopctl.Runners.DispatchLedger do
   # message on rejoin, and the loop would never end. The contract cast refuses the known
   # cases first; this is the backstop, so reaching it is logged and counted — a run whose
   # `acked_seq` stops advancing must leave an operator a signal. Any other error raises.
-  defp runner_write(tenant_id, runner_id, context, fun),
-    do: runner_write(tenant_id, runner_id, context, [], fun)
-
   defp runner_write(tenant_id, runner_id, context, opts, fun) do
     in_tenant(tenant_id, fn ->
       Capacity.set_lock_timeout!(Repo, opts)
