@@ -423,9 +423,18 @@ defmodule LoopctlWeb.RecallControllerTest do
         |> Jason.encode!()
       end
 
-      first = render.()
+      # Recency is measured from the start of the UTC day (`RankingPriors.ranking_clock/1`),
+      # so the corpus is "unchanged" only within one day: a pair straddling midnight
+      # legitimately differs, and is re-taken.
+      {first, second} =
+        Enum.find_value(1..2, fn _ ->
+          day = Date.utc_today()
+          pair = {render.(), render.()}
+          if Date.utc_today() == day, do: pair
+        end)
+
       assert first != "[]", "an empty merge would make this determinism check vacuous"
-      assert first == render.()
+      assert first == second
     end
 
     test "TIED rows are broken deterministically by id, not by arrival order" do

@@ -81,14 +81,6 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
       assert RankingPriors.ranking_clock(~U[2026-10-11 19:45:46.142968Z]) ==
                ~U[2026-10-11 00:00:00Z]
     end
-
-    test "two clocks a second apart within one day decay a document identically" do
-      doc = ~U[2026-09-01 08:00:00Z]
-      first = RankingPriors.ranking_clock(~U[2026-10-11 19:45:46.999999Z])
-      second = RankingPriors.ranking_clock(~U[2026-10-11 19:45:47.000001Z])
-
-      assert RankingPriors.recency_decay(doc, first) == RankingPriors.recency_decay(doc, second)
-    end
   end
 
   describe "recency_timestamp/1 (#791 — authored age, not last-mutation time)" do

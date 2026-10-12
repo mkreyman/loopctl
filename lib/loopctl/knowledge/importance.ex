@@ -95,6 +95,7 @@ defmodule Loopctl.Knowledge.Importance do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
+  alias Loopctl.Knowledge.RankingPriors
   alias Loopctl.Knowledge.UsageScan
   alias Loopctl.Knowledge.UsageStampWriter
 
@@ -436,8 +437,7 @@ defmodule Loopctl.Knowledge.Importance do
 
   defp default_window_start(now) do
     now
-    |> DateTime.to_date()
-    |> DateTime.new!(~T[00:00:00], "Etc/UTC")
+    |> RankingPriors.ranking_clock()
     |> DateTime.add(-@window_days, :day)
   end
 

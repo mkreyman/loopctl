@@ -9,6 +9,9 @@ defmodule Loopctl.Knowledge.RankingPriors do
       (`recency_decay/2` is the single source of truth for both). Applied as a BOUNDED
       factor `1 - w + w * decay` on the score, so a stale document is nudged down but a
       brand-new one is never lifted above a document with materially stronger relevance.
+      Age is measured against `opts[:now]`, which defaults to `ranking_clock/1`, the START
+      of the current UTC day, and is floored at 0: every document whose content changed
+      today decays to exactly 1.0, and an unchanged corpus ranks identically all day.
       > #### "Recency" is AUTHORED age, and the field it reads is not negotiable {: .info}
       > `age_days` is measured from `recency_timestamp/1` — `content_changed_at`, falling
       > back to `updated_at` only when that is null. `updated_at` is bumped by ANY write
@@ -367,9 +370,9 @@ defmodule Loopctl.Knowledge.RankingPriors do
   second, and two recalls of an unchanged corpus a second apart rendered different bytes:
   a client's prompt cache did not survive a repeated turn. Snapped to the day, scores move
   once a day. At a 30-day decay constant a day of granularity changes a factor by at most
-  `w * (1 - exp(-1/30))`, about 1% of `w`, and it moves every document together. The rule
-  is the one `heat_since/1` and `Importance` follow: a DERIVED clock is snapped, an
-  explicit `:now` is taken verbatim.
+  `w * (1 - exp(-1/30))`, about 1% of `w`, and it moves every document together.
+  `heat_since/1` and `Importance` floor their windows with this function too: a DERIVED
+  clock is snapped, an explicit `:now` is taken verbatim.
   """
   @spec ranking_clock(DateTime.t()) :: DateTime.t()
   def ranking_clock(now \\ DateTime.utc_now()) do
