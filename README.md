@@ -817,7 +817,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `get_tenant` | Verify connectivity (current tenant info) | orchestrator |
 | `list_projects` | List all projects | orchestrator |
 | `create_project` | Create a new project | orchestrator |
-| `delete_project` | Delete a project and all dependents (irreversible) | user |
+| `delete_project` | Archive a project (no rows removed; the slug stays taken) | user |
 | `get_progress` | Project progress summary (supports `include_cost`) | orchestrator |
 | `import_stories` | Import epics and stories (supports `merge`) | orchestrator |
 | `list_stories` | List stories with filters (supports `include_token_totals`) | orchestrator |
