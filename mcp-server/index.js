@@ -94,6 +94,7 @@ import {
   listEpics as listEpicsRequest,
   updateEpic as updateEpicRequest,
 } from "./lib/epics.js";
+import { updateProject as updateProjectRequest } from "./lib/projects.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -1169,6 +1170,10 @@ async function createEpic(args) {
 
 async function updateEpic(args) {
   return toContent(await updateEpicRequest(args, { apiCall: orchestratorPinnedApiCall }));
+}
+
+async function updateProject(args) {
+  return toContent(await updateProjectRequest(args, { apiCall: orchestratorPinnedApiCall }));
 }
 
 async function deleteEpic(args) {
@@ -4242,7 +4247,7 @@ const TOOLS = [
   {
     name: "delete_project",
     description:
-      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, resolve_project by that slug still returns the archived project, create_project with it is refused 422, and no API call changes or releases a slug, so a new project needs a different one. The way back: restore_kb_scope for a kb scope; a work project is restored by PATCH /api/v1/projects/:id with status active, which no MCP tool reaches yet. Sent with LOOPCTL_USER_KEY verbatim when it is set (a global LOOPCTL_API_KEY does not displace it), else with the default key. Refusals: 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant.",
+      "ARCHIVE a project (DELETE /api/v1/projects/:id sets status to archived; it removes no rows). Its epics, stories and audit entries stay, and an already-archived project is a no-op. The SLUG stays taken: slugs are unique per tenant across archived projects too, resolve_project by that slug still returns the archived project, create_project with it is refused 422, and no API call changes or releases a slug, so a new project needs a different one. The way back: restore_kb_scope for a kb scope; a work project is restored by update_project with status active. Sent with LOOPCTL_USER_KEY verbatim when it is set (a global LOOPCTL_API_KEY does not displace it), else with the default key. Refusals: 403 insufficient_role below user role, 403 custody_tier_required on an agent-rooted tenant (the human-anchor gate), 404 for an id not in your tenant.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4250,6 +4255,35 @@ const TOOLS = [
           type: "string",
           description: "The UUID of the project to archive.",
         },
+      },
+      required: ["project_id"],
+    },
+  },
+  {
+    name: "update_project",
+    description:
+      "CORRECT OR RESTORE A PROJECT (PATCH /api/v1/projects/:id): any of `name`, `repo_url`, " +
+      "`description`, `tech_stack`, `status`, `mission`, `metadata`. `status: \"active\"` is how an " +
+      "ARCHIVED work project comes back (delete_project archives; a kb scope uses restore_kb_scope " +
+      "instead). `slug` and `kind` cannot change. The endpoint DROPS absent and null fields and " +
+      "silently ignores an unknown `status`, so a null, an unknown status and a call naming no " +
+      "field are refused locally; send an EMPTY STRING to clear `repo_url`, `description`, " +
+      "`tech_stack` or `mission` (a blank `name` is a 422). `metadata` is REPLACED WHOLE, never " +
+      "merged: read the project first and send the whole map. Needs an orchestrator-or-above key " +
+      "on a human-anchored tenant: LOOPCTL_ORCH_KEY, else LOOPCTL_USER_KEY, else the default key. " +
+      "Refusals: 403 insufficient_role for an agent key, 403 custody_tier_required on an " +
+      "agent-rooted tenant, 404 for an id not in your tenant, 422 for an invalid field.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "The project's UUID (from list_projects or resolve_project)." },
+        name: { type: "string" },
+        repo_url: { type: "string" },
+        description: { type: "string" },
+        tech_stack: { type: "string" },
+        status: { type: "string", enum: ["active", "archived"] },
+        mission: { type: "string" },
+        metadata: { type: "object", description: "Replaces the stored map whole." },
       },
       required: ["project_id"],
     },
@@ -10017,6 +10051,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "delete_project":
       return await deleteProject(args);
+
+    case "update_project":
+      return await updateProject(args);
 
     case "get_progress":
       return await getProgress(args);

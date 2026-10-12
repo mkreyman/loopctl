@@ -178,6 +178,7 @@ const DECLARED = {
   // ── duplicate: a PUT whose PATCH twin a tool really sends ────────────────
   "PUT /api/v1/articles/:param": "duplicate", // ArticleController.update — knowledge_update PATCHes it
   "PUT /api/v1/intake/sources/:param": "duplicate", // IntakeSourceController.update — intake_source_update PATCHes it
+  "PUT /api/v1/projects/:param": "duplicate", // ProjectController.update — update_project PATCHes it
 
   // ── gap: no tool reaches this. Real debt — delete the line when you ship one
   //
@@ -197,12 +198,11 @@ const DECLARED = {
   "GET /api/v1/tenants/:param/authenticators": "gap", // TenantAuthenticatorController.index
   "PATCH /api/v1/tenants/:param/authenticators/:param": "gap", // TenantAuthenticatorController.rename
   //
-  // The four PUT twins below were `duplicate` until the same round, each excused against a
-  // PATCH that is itself a `gap` a few lines down. Nothing reaches either verb. There were
-  // five: the intake-source PUT rejoined the `duplicate` block above when
-  // `intake_source_update` made its PATCH twin real, which is the ratchet working in the
-  // direction it is meant to move.
-  "PUT /api/v1/projects/:param": "gap", // ProjectController.update
+  // The PUT twins below were `duplicate` until the same round, each excused against a
+  // PATCH that is itself a `gap` a few lines down. Nothing reaches either verb. The
+  // intake-source and project PUTs rejoined the `duplicate` block above when
+  // `intake_source_update` and `update_project` made their PATCH twins real, which is the
+  // ratchet working in the direction it is meant to move.
   "PUT /api/v1/webhooks/:param": "gap", // WebhookController.update
   "PUT /api/v1/skills/:param": "gap", // SkillController.update
   "PUT /api/v1/token-budgets/:param": "gap", // TokenBudgetController.update
@@ -234,7 +234,6 @@ const DECLARED = {
   "GET /api/v1/agents": "gap", // AgentController.index
   "GET /api/v1/agents/:param": "gap", // AgentController.show
   "GET /api/v1/projects/:param": "gap", // ProjectController.show
-  "PATCH /api/v1/projects/:param": "gap", // ProjectController.update
   "GET /api/v1/projects/:param/export": "gap", // ImportExportController.export_project
   "POST /api/v1/projects/:param/ui-tests": "gap", // UiTestController.create
   "GET /api/v1/projects/:param/ui-tests": "gap", // UiTestController.index

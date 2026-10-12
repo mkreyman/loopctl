@@ -6,6 +6,12 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **An archived work project can be restored from a session (MCP server 2.115.0).** The new
+  `update_project` tool calls `PATCH /api/v1/projects/:id`; `status: "active"` undoes
+  `delete_project`'s archive, which until now only a human with `iex` could reverse. It also
+  corrects `name`, `repo_url`, `description`, `tech_stack`, `mission` and `metadata` (replaced
+  whole). Orchestrator role, human-anchored tenant.
+
 - **Each tenant can give loopctl its own GitHub token, and every forge call for that tenant
   uses it (#936).** The merge gate, story verification, post-deploy verification, thread
   checkpoint reads, the issue closer and thread issue links all authenticate per (tenant,
