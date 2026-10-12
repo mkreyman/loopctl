@@ -1640,14 +1640,16 @@ defmodule Loopctl.Knowledge.IngestionHealth do
         where: a.inserted_at >= ^cutoff,
         where: not is_nil(a.new_state),
         select: %{
+          id: a.id,
           tenant_id: a.tenant_id,
           inserted_at: a.inserted_at,
           state: fragment("? - 'summary'::text", a.new_state),
           rn:
             fragment(
-              "row_number() OVER (PARTITION BY ? ORDER BY ? DESC)",
+              "row_number() OVER (PARTITION BY ? ORDER BY ? DESC, ? DESC)",
               a.tenant_id,
-              a.inserted_at
+              a.inserted_at,
+              a.id
             )
         }
       )
@@ -1658,7 +1660,15 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       # `scan_limit` cut into a permanently unmonitored slice of tenants rather than a
       # sample, so the same high-UUID tail was never flagged and never auto-closed on any
       # run. Tenant-major still, so a cut splits at most one tenant's window.
-      order_by: [asc: fragment("md5(?::text || ?)", r.tenant_id, ^salt), desc: r.inserted_at],
+      # `id` breaks an `inserted_at` tie the same way the window above does, so the rows the
+      # window ranked and the order they come back in agree. The window's sort is not the
+      # index's: the scan is an Append across partitions with a range on `inserted_at`, so
+      # the planner sorts on (tenant_id, inserted_at) regardless and `id` is one more key.
+      order_by: [
+        asc: fragment("md5(?::text || ?)", r.tenant_id, ^salt),
+        desc: r.inserted_at,
+        desc: r.id
+      ],
       limit: ^scan_limit,
       select: %{tenant_id: r.tenant_id, inserted_at: r.inserted_at, state: r.state}
     )
@@ -1822,7 +1832,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
 
     data =
       base_query
-      |> order_by([a], desc: a.inserted_at)
+      |> order_by([a], desc: a.inserted_at, desc: a.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()

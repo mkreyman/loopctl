@@ -34,35 +34,40 @@ defmodule Loopctl.Provider.RetryAfter do
 
   @doc """
   Parse a raw `Retry-After` header value into non-negative clamped seconds, or
-  `nil` when absent/malformed.
+  `nil` when absent/malformed. An HTTP-date is measured from `now`, the clock unless a
+  caller (a test) passes the instant it built the date against.
   """
-  @spec parse(String.t() | nil) :: non_neg_integer() | nil
-  def parse(nil), do: nil
+  @spec parse(String.t() | nil, DateTime.t()) :: non_neg_integer() | nil
+  def parse(value, now \\ DateTime.utc_now())
 
-  def parse(value) when is_binary(value) do
-    case parse_value(String.trim(value)) do
+  def parse(nil, _now), do: nil
+
+  def parse(value, now) when is_binary(value) do
+    case parse_value(String.trim(value), now) do
       nil -> nil
       seconds -> clamp(seconds)
     end
   end
 
-  def parse(_other), do: nil
+  def parse(_other, _now), do: nil
 
   @doc """
   Extract the parsed Retry-After from a throttle response, but ONLY for a
   throttle status (`429`/`503`). Returns `nil` otherwise. `resp` is a
   `%Req.Response{}`; its `retry-after` header is a list of values (lowercased by
-  Req) — the first is used.
+  Req) — the first is used. `now` is passed through to `parse/2`.
   """
-  @spec from_response(integer(), Req.Response.t()) :: non_neg_integer() | nil
-  def from_response(status, %Req.Response{} = resp) when status in @throttle_statuses do
+  @spec from_response(integer(), Req.Response.t(), DateTime.t()) :: non_neg_integer() | nil
+  def from_response(status, resp, now \\ DateTime.utc_now())
+
+  def from_response(status, %Req.Response{} = resp, now) when status in @throttle_statuses do
     resp
     |> Req.Response.get_header("retry-after")
     |> List.first()
-    |> parse()
+    |> parse(now)
   end
 
-  def from_response(_status, _resp), do: nil
+  def from_response(_status, _resp, _now), do: nil
 
   @doc """
   Read a parsed Retry-After back out of a sanitized throttle error term (the
@@ -105,14 +110,14 @@ defmodule Loopctl.Provider.RetryAfter do
 
   defp clamp(seconds), do: seconds |> max(0) |> min(max_seconds())
 
-  defp parse_value(""), do: nil
+  defp parse_value("", _now), do: nil
 
-  defp parse_value(str) do
+  defp parse_value(str, now) do
     case Integer.parse(str) do
       {n, ""} when n >= 0 -> n
       # Not a bare non-negative integer — try the HTTP-date form. A negative or
       # fractional value (e.g. "-5", "30.5") is malformed per RFC → nil.
-      _ -> parse_http_date(str)
+      _ -> parse_http_date(str, now)
     end
   end
 
@@ -120,11 +125,11 @@ defmodule Loopctl.Provider.RetryAfter do
   # `:httpd_util.convert_request_date/1` returns a UTC erlang datetime or
   # `:bad_date`. It also RAISES (FunctionClauseError) on some non-date charlists
   # (e.g. `~c"-5"`), so rescue defensively — any parse failure is `nil`.
-  defp parse_http_date(str) do
+  defp parse_http_date(str, now) do
     case :httpd_util.convert_request_date(String.to_charlist(str)) do
       {{_y, _mo, _d}, {_h, _mi, _s}} = erl_datetime ->
         case DateTime.from_naive(NaiveDateTime.from_erl!(erl_datetime), "Etc/UTC") do
-          {:ok, dt} -> max(0, DateTime.diff(dt, DateTime.utc_now()))
+          {:ok, dt} -> max(0, DateTime.diff(dt, now))
           _ -> nil
         end
 

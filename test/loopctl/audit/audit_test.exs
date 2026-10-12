@@ -312,6 +312,20 @@ defmodule Loopctl.AuditTest do
       assert timestamps == Enum.sort(timestamps, {:desc, DateTime})
     end
 
+    # Entries one Multi writes share a microsecond, and an offset page must be the same page
+    # on every read, so `id` orders a tie in the direction of the requested order.
+    test "breaks an inserted_at tie on id, in the requested direction" do
+      tenant = fixture(:tenant)
+      at = ~U[2026-10-11 20:00:00.000000Z]
+      ids = for _ <- 1..4, do: fixture(:audit_log, %{tenant_id: tenant.id, inserted_at: at}).id
+
+      {:ok, desc} = Audit.list_entries(tenant.id)
+      {:ok, asc} = Audit.list_entries(tenant.id, order: :asc)
+
+      assert Enum.map(desc.data, & &1.id) == Enum.sort(ids, :desc)
+      assert Enum.map(asc.data, & &1.id) == Enum.sort(ids)
+    end
+
     test "filters by project_id" do
       tenant = fixture(:tenant)
       project_id = uuid()
@@ -340,6 +354,28 @@ defmodule Loopctl.AuditTest do
 
       assert length(result.data) == 1
       assert hd(result.data).project_id == project_id
+    end
+  end
+
+  describe "entity_history/4" do
+    test "breaks an inserted_at tie on id, oldest first" do
+      tenant = fixture(:tenant)
+      entity_id = uuid()
+      at = ~U[2026-10-11 20:00:00.000000Z]
+
+      ids =
+        for _ <- 1..4 do
+          fixture(:audit_log, %{
+            tenant_id: tenant.id,
+            entity_type: "project",
+            entity_id: entity_id,
+            inserted_at: at
+          }).id
+        end
+
+      {:ok, history} = Audit.entity_history(tenant.id, "project", entity_id)
+
+      assert Enum.map(history.data, & &1.id) == Enum.sort(ids)
     end
   end
 

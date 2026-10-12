@@ -63,12 +63,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     |> AdminRepo.update!()
   end
 
+  # Without an ORDER BY Postgres returns heap order, which a vacuum can make anything, so
+  # the read is ordered. Tests that compare two runs never rely on it: they take each run's
+  # entry from `run_lint!/1`, by identity rather than by clock.
   defp lint_audit_entries(tenant_id) do
     from(a in AuditLog,
       where: a.tenant_id == ^tenant_id,
-      where: a.action == "knowledge.lint_completed"
+      where: a.action == "knowledge.lint_completed",
+      order_by: [asc: a.inserted_at, asc: a.id]
     )
     |> AdminRepo.all()
+  end
+
+  # Runs the nightly pass once and returns the audit entry THAT run wrote: the one entry
+  # whose id was not there before it. Run order is then the order of the calls, never two
+  # `inserted_at` stamps that may tie or step backwards.
+  defp run_lint!(tenant_id) do
+    seen = MapSet.new(lint_audit_entries(tenant_id), & &1.id)
+    assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant_id}})
+    assert [entry] = Enum.reject(lint_audit_entries(tenant_id), &MapSet.member?(seen, &1.id))
+    entry
   end
 
   describe "perform/1 per-tenant" do
@@ -585,13 +599,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
       assert [_one] = resolutions(tenant.id, a.id, b.id)
 
-      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      second = run_lint!(tenant.id)
 
       # Still exactly one row, and the second run reports nothing new to judge — otherwise
       # the "judged" counter would climb every night on a static corpus and the convergence
       # signal in the audit event would be meaningless.
       assert [_still_one] = resolutions(tenant.id, a.id, b.id)
-      assert [_first, second] = lint_audit_entries(tenant.id)
       assert second.new_state["conflicts_judged_redundant"] == 0
     end
 
@@ -615,26 +628,21 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       AdminRepo.delete!(flag)
       # The relates_to edge survives, so the promoter raises a fresh flag on the next run.
 
-      # Backdate the verdict a day. `article_links.inserted_at` is SECOND precision while
-      # `conflict_resolutions.annotated_at` is microsecond, so a verdict and a flag created
-      # in the same second compare as verdict-after-flag whichever order they really
-      # happened in. Re-flagging is a different-night event in the real flow, so the day
-      # gap is the realistic case — shrinking it would be testing the timestamp precision,
-      # not the predicate.
+      # Backdate the verdict a day. Re-flagging is a different-night event in the real flow,
+      # so the day gap is the realistic case; it also puts the new flag clearly after the
+      # verdict rather than microseconds apart.
       AdminRepo.update_all(
         from(r in Loopctl.Knowledge.ConflictResolution, where: r.id == ^first.id),
         set: [annotated_at: DateTime.add(first.annotated_at, -1, :day)]
       )
 
-      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      second_run = run_lint!(tenant.id)
 
       # The observable is the DRAIN'S OWN COUNTER, not the verdict row: `record_verdict/4`
       # inserts `on_conflict: :nothing`, so a re-judged pair keeps its existing row and
       # nothing about that row moves. What the fix changes is whether the pair is SELECTED
       # as unjudged at all — the sibling idempotency test above asserts this counter is 0
       # when a pair genuinely has not been re-flagged, so the two pin both directions.
-      assert [_first_run, second_run] = lint_audit_entries(tenant.id)
-
       assert second_run.new_state["conflicts_judged_redundant"] == 1,
              "the drain skipped a flag raised AFTER the verdict it was matched against"
     end
@@ -733,31 +741,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       b = published_article_with_embedding(tenant.id, near_similar_embedding())
       relates_link(tenant.id, a.id, b.id, 0.96)
 
-      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
-      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      first = run_lint!(tenant.id)
+      second = run_lint!(tenant.id)
 
       # The pair is promoted exactly ONCE no matter how many times the worker runs
       # (guarded by promote_conflicts/1's `not exists` check AND the article_links
       # unique index — a same-direction re-insert can never mint a second row).
       assert [_only_one] = conflict_links(tenant.id, a.id, b.id)
 
-      # Idempotency is ORDER-INDEPENDENT: across the two runs exactly one promotion
-      # happened (the first); the other run promoted nothing new. Assert the MULTISET of
-      # per-run promotion counts, not positional order. `lint_audit_entries/1` is
-      # unordered and audit `inserted_at` is NOT a total order across two same-tenant
-      # runs — the audit_log column carries a DB-side `now()` (transaction-timestamp)
-      # default, so two entries written in this test's single sandbox transaction can
-      # share an `inserted_at` to the microsecond. Sorting on that key alone then leaves
-      # the "second" slot at the mercy of arbitrary heap return order and can surface the
-      # first run's entry (conflicts_promoted == 1) — the intermittent failure. (The
-      # production audit-history reader guards the same collision with a mandatory
-      # (inserted_at, id) tiebreak.)
-      promotions =
-        lint_audit_entries(tenant.id)
-        |> Enum.map(& &1.new_state["conflicts_promoted"])
-        |> Enum.sort()
-
-      assert promotions == [0, 1]
+      # The FIRST run promoted the pair and the second promoted nothing new, in run order:
+      # a promoter that fired only on the second run would leave the same counts sorted.
+      assert first.new_state["conflicts_promoted"] == 1
+      assert second.new_state["conflicts_promoted"] == 0
     end
   end
 

@@ -186,26 +186,22 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
              EmbeddingClient.generate_embedding(tenant.id, "x")
   end
 
-  test "a 503 with a Retry-After HTTP-date surfaces the throttle 4-tuple (~seconds out)" do
+  test "a 503 with a Retry-After surfaces the throttle 4-tuple carrying its seconds" do
     tenant = fixture(:tenant)
     set_embedding_key(tenant, "test-openai-key-UNAVAILABLE")
 
-    date =
-      DateTime.utc_now()
-      |> DateTime.add(30, :second)
-      |> Calendar.strftime("%a, %d %b %Y %H:%M:%S GMT")
-
+    # Delta-seconds, so the answer is exact: the subject is that the client carries the
+    # header into its error. The HTTP-date form measures from the clock, and is pinned
+    # against a fixed instant in RetryAfterTest.
     Req.Test.stub(EmbeddingClient, fn conn ->
       conn
-      |> Plug.Conn.put_resp_header("retry-after", date)
+      |> Plug.Conn.put_resp_header("retry-after", "30")
       |> Plug.Conn.put_status(503)
       |> Req.Test.json(%{"error" => %{"message" => "Service unavailable"}})
     end)
 
-    assert {:error, {:api_error, 503, :provider_error, seconds}} =
+    assert {:error, {:api_error, 503, :provider_error, 30}} =
              EmbeddingClient.generate_embedding(tenant.id, "x")
-
-    assert is_integer(seconds) and seconds >= 25 and seconds <= 30
   end
 
   # --- US-37.4 (AC-37.4.1): batch path — array in, map back BY response index ---
