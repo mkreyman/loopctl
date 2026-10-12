@@ -34,6 +34,10 @@ Ecto.Adapters.SQL.Sandbox.mode(Process.whereis(Loopctl.AdminRepo), :manual)
 Loopctl.Fixtures.sweep_committed_runner_tenants(older_than: 600)
 {:ok, _lock_guard} = Loopctl.Test.LockGuard.start()
 
+# A test database on a pgvector older than the floor gets a warning, never a stopped run
+# (`Loopctl.DataCase.warn_if_pgvector_below_floor/0`, #965).
+Loopctl.DataCase.warn_if_pgvector_below_floor()
+
 # VM-global :atomics counter backing `Loopctl.Fixtures.next_story_number/0`.
 # Initialized once here, single-threaded, before any (async) test runs, so the
 # counter is a single shared source of guaranteed-unique story numbers — no

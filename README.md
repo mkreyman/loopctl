@@ -94,7 +94,7 @@ loopctl never executes your code or pushes to your repository. It stores state, 
 ### Local Development
 
 ```bash
-# Prerequisites: Elixir 1.18+, PostgreSQL 16+
+# Prerequisites: Elixir 1.18+, PostgreSQL 16+ with pgvector 0.8.4+
 
 git clone https://github.com/mkreyman/loopctl.git
 cd loopctl

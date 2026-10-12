@@ -100,8 +100,28 @@ defmodule Loopctl.DataCase do
   two work on different things: the exact plan covers reads that go through
   `Loopctl.HeavyRead`, and this covers what a module does around them.
 
-  Production is not affected: its rows are committed, so its graph is not made of dead
-  entries.
+  Production is not affected by the dead-entry problem above: its rows are committed, so its
+  graph is not made of dead entries.
+
+  **The test database needs pgvector 0.8.4 or later** (`pgvector_floor/0`). Before 0.8.4, VACUUM wiped a deleted
+  element's vector without waiting for in-flight inserts (fixed upstream by "Fix HNSW insert
+  and vacuum race"), so an INSERT that had already picked that element as a neighbour failed
+  with `different vector dimensions 1536 and 0`. Any VACUUM concurrent with an insert opens
+  that window, autovacuum included, so it is not confined to the modules carrying this tag
+  and making them `async: false` does not close it. That is the most likely reading of the
+  error (#965): first check the server's INSTALLED pgvector,
+  `SELECT default_version FROM pg_available_extensions WHERE name = 'vector'` (the fix is in
+  the binary; `extversion` keeps the version the database was created with until
+  `ALTER EXTENSION vector UPDATE`). Below 0.8.4 it is the race, and the host images move
+  under mkreyman/infra#280; at or above it, look for code that really writes or reads a
+  zero-length vector. `warn_if_pgvector_below_floor/0` warns at suite start on an older
+  binary.
+
+  Skipping this VACUUM below the floor would trade the race for the dead-entry failures this
+  function exists for: taking the tag off was measured to fail 4 full-suite runs (above). So
+  it keeps running, and until the hosts move, the race is the cost of an old image.
+  Production needs the same floor, since re-embeds and deletes leave dead HNSW tuples for
+  autovacuum to race (README prerequisites).
 
   Runs unboxed (VACUUM cannot run inside a transaction) and, by default, never fails a test: a vacuum
   that cannot run leaves the suite exactly as flaky as it was before, which is a worse
@@ -161,6 +181,56 @@ defmodule Loopctl.DataCase do
       )
 
       :ok
+  end
+
+  # The pgvector release that fixed HNSW's insert/VACUUM race (#965). Read against the
+  # server's INSTALLED library, never `extversion` (see `vacuum_vector_indexes/1`).
+  @pgvector_floor {0, 8, 4}
+
+  @doc "The oldest pgvector the test database should run (`vacuum_vector_indexes/1`)."
+  @spec pgvector_floor() :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
+  def pgvector_floor, do: @pgvector_floor
+
+  @doc """
+  Warns on stderr when the test database's installed pgvector is older than
+  `pgvector_floor/0`. A warning, never a failure: an old local image should not stop a run,
+  and a catalog read that fails is reported the same way rather than raised.
+  """
+  @spec warn_if_pgvector_below_floor() :: :ok
+  def warn_if_pgvector_below_floor do
+    floor = @pgvector_floor |> Tuple.to_list() |> Enum.join(".")
+
+    case installed_pgvector() do
+      {:ok, version} ->
+        unless Loopctl.HeavyRead.version_at_least?(version, @pgvector_floor) do
+          IO.puts(
+            :stderr,
+            "WARNING: the test database's pgvector is #{version}, below #{floor}. A failure " <>
+              "reading `different vector dimensions 1536 and 0` is most likely pgvector's " <>
+              "insert/VACUUM race: confirm with Loopctl.DataCase.vacuum_vector_indexes/1's " <>
+              "doc before dismissing it (#965, mkreyman/infra#280)."
+          )
+        end
+
+      {:error, reason} ->
+        IO.puts(:stderr, "WARNING: could not read the test database's pgvector: #{reason}")
+    end
+
+    :ok
+  end
+
+  defp installed_pgvector do
+    Sandbox.unboxed_run(Loopctl.Repo, fn ->
+      Loopctl.Repo.query!(
+        "SELECT default_version FROM pg_available_extensions WHERE name = 'vector'"
+      )
+    end)
+    |> case do
+      %{rows: [[version]]} when is_binary(version) -> {:ok, version}
+      _ -> {:error, "no vector extension available"}
+    end
+  rescue
+    error -> {:error, Exception.message(error)}
   end
 
   @doc """
