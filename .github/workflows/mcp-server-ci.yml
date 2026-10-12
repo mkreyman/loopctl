@@ -72,7 +72,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          changed=$(git diff --name-only "$BASE" "$HEAD" -- \
+          # Compare against the MERGE BASE, never the base branch's tip: a branch cut before
+          # master changed a shipped file otherwise "changes" it too, and fails for a bump it
+          # owes nothing for.
+          fork=$(git merge-base "$BASE" "$HEAD")
+
+          changed=$(git diff --name-only "$fork" "$HEAD" -- \
             'mcp-server/index.js' 'mcp-server/lib/**' 'mcp-server/README.md')
 
           if [ -z "$changed" ]; then
@@ -83,7 +88,7 @@ jobs:
           echo "Published files changed in this PR:"
           echo "$changed"
 
-          base_version=$(git show "$BASE:mcp-server/package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          base_version=$(git show "$fork:mcp-server/package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
           head_version=$(node -p "require('./mcp-server/package.json').version")
 
           echo "version: base=$base_version head=$head_version"
