@@ -53,7 +53,8 @@ jobs:
   # fixed "the bump happened but no tag was pushed", this fixes "the code changed but no
   # bump happened".
   #
-  # Scoped to what npm actually SHIPS (package.json `files`), so test-only, smoke-test and
+  # Scoped to what npm actually SHIPS (package.json `files`, read at run time, plus
+  # package.json's own runtime fields), so test-only, smoke-test and
   # workflow edits do not demand a bump.
   version-bump:
     name: Published files require a version bump
@@ -68,17 +69,35 @@ jobs:
       - name: Fail if a shipped file changed without a version bump
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
-          # Compare against the MERGE BASE, never the base branch's tip: a branch cut before
-          # master changed a shipped file otherwise "changes" it too, and fails for a bump it
-          # owes nothing for.
-          fork=$(git merge-base "$BASE" "$HEAD")
+          # Every question here is asked of ONE pair: the base branch's tip ($BASE) against the
+          # merge result actions/checkout put in the working tree (HEAD). Their diff is exactly
+          # what this PR adds to master, so a branch cut before master changed a shipped file
+          # does not "change" it too, and the version compared is the one master will carry
+          # once this merges. Never the PR head (#969): it lacks master's later commits.
+          paths=$(node -p "require('./mcp-server/package.json').files.map((f) => 'mcp-server/' + f).join(' ')")
+          # shellcheck disable=SC2086 # one pathspec per shipped entry
+          changed=$(git diff --name-only "$BASE" HEAD -- $paths)
 
-          changed=$(git diff --name-only "$fork" "$HEAD" -- \
-            'mcp-server/index.js' 'mcp-server/lib/**' 'mcp-server/README.md')
+          # package.json ships too. Its runtime fields reach every install, while scripts and
+          # devDependencies do not, so only the former demand a bump.
+          git show "$BASE:mcp-server/package.json" > "$RUNNER_TEMP/base-package.json"
+          verdict=$(node -e '
+            const base = require(process.argv[1]);
+            const head = require("./mcp-server/package.json");
+            const runtime = ["main", "bin", "exports", "type", "engines", "files", "dependencies"];
+            const moved = runtime.filter((k) => JSON.stringify(base[k]) !== JSON.stringify(head[k]));
+            const parse = (v) => v.split("-")[0].split(".").map(Number);
+            const [a, b] = [parse(base.version), parse(head.version)];
+            const cmp = a.map((n, i) => n - b[i]).find((d) => d !== 0) ?? 0;
+            console.log([base.version, head.version, cmp < 0 ? "up" : "not-up", moved.join(",")].join(" "));
+          ' "$RUNNER_TEMP/base-package.json")
+          read -r base_version head_version direction runtime_moved <<< "$verdict"
+          if [ -n "$runtime_moved" ]; then
+            changed=$(printf '%s\nmcp-server/package.json (%s)' "$changed" "$runtime_moved")
+          fi
 
           if [ -z "$changed" ]; then
             echo "No published mcp-server file changed; no bump required."
@@ -87,14 +106,12 @@ jobs:
 
           echo "Published files changed in this PR:"
           echo "$changed"
-
-          base_version=$(git show "$fork:mcp-server/package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
-          head_version=$(node -p "require('./mcp-server/package.json').version")
-
           echo "version: base=$base_version head=$head_version"
 
-          if [ "$base_version" = "$head_version" ]; then
-            echo "::error::mcp-server published files changed but the version is still $head_version. Nothing publishes to npm without a version bump, so agents keep the OLD tool descriptions while the server serves the new payload. Bump mcp-server/package.json."
+          # HIGHER, not merely different: a lower version, or one master already carries, is
+          # already on npm, so autopublish finds nothing to do and the change never ships.
+          if [ "$direction" != "up" ]; then
+            echo "::error::mcp-server published files changed but the version did not rise above master's $base_version (head: $head_version). Nothing publishes to npm without a higher version, so agents keep the OLD tool descriptions while the server serves the new payload. Bump mcp-server/package.json above $base_version."
             exit 1
           fi
 
