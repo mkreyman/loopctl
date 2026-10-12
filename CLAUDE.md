@@ -431,13 +431,10 @@ TypeScript anywhere, so say so in the prompt or it will go looking for one. Do N
 `model` override: both agent definitions already pin `model: opus` and `effort: high`, a
 dispatcher cannot raise that, and an override can only lower it.
 
-**The dispatch prompt carries step 2's inner loop, or the rule buys nothing.** The evidence
-below is led by three tests that could not fail, and a fresh context writes an unfalsifiable
-assertion exactly as easily as a tired one — nothing about delegating fixes that by itself.
-So require, in the prompt: `mix format`, `mix compile --warnings-as-errors`, the tests for the
-files touched, `mix credo --strict`, and **for every assertion added, a `bin/mutate.sh`
-invocation reported back with its exit code**. A report without those is not done, and the
-reconcile read below is where you check it rather than take it.
+**The dispatch prompt carries step 2's inner loop, or the rule buys nothing.** Require, in
+the prompt: `mix format`, `mix compile --warnings-as-errors`, the tests for the files touched,
+and `mix credo --strict`. A report without those is not done, and the reconcile read below is
+where you check it rather than take it.
 
 **Then the session keeps the loop:** reconcile the agent's output against the diff, commit,
 PR, review gate, merge. The agent leaves its changes uncommitted — its correct end state. What
@@ -477,8 +474,7 @@ One session, 2026-09-15, five PRs on the delivery loop (#855, #856, #857, #859, 
 #854 fixes), every change hand-edited. What `/code-review high` found AFTER each was committed
 and pushed:
 
-- **three tests that could not fail**, each written to pin a NEW guard, each caught only by
-  `bin/mutate.sh` afterwards — and one needed the right mutation to show at all;
+- **three tests that could not fail**, each written to pin a NEW guard;
 - **a false claim deleted from one file and left standing in another by the same commit**
   (#857: the runner contract's "fenced" sentence, removed there and left in
   `triage_verdict.ex` forty lines above the code making it false);
