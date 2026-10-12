@@ -75,7 +75,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   repository). On no verdict it carries `ci_unavailable_reason`, a short code with no URL and
   no repository name, and nothing else: a final no-verdict ends the run. No exception message
   and no `inspect/1` output is ever written there; the rescue arm records `internal_error`
-  and logs the exception. A disposition is one `UPDATE` (`Verification.complete_run/3`), so a
+  and logs the exception. A disposition is one `UPDATE` (`Verification.complete_run/4`), so a
   write that fails leaves none of it.
 
   ## Stale-run age gate (US-36.1)
@@ -85,7 +85,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   retires a NOT-YET-STARTED run older than `verification_max_run_age_seconds` (default 24h)
   as `"skipped"` (`reason: "stale_run_skipped"`) and cancels the job with no read.
   `"skipped"`, not `"error"`: a deliberate non-execution carries no fault and no verification
-  signal (see `Loopctl.Verification.complete_run/3`).
+  signal (see `Loopctl.Verification.complete_run/4`).
 
   No run status here ever touches `stories.verified_status`: the chain-of-custody verify action
   is entirely separate (`LoopctlWeb.StoryVerificationController`).
@@ -113,14 +113,21 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   @max_forge_delay_seconds 60 * 60
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"run_id" => run_id, "tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{} = job), do: perform(job, [])
+
+  @doc """
+  `perform/1` with `opts`. `:lock_timeout_ms` bounds the lock wait of every write to the run
+  (`Loopctl.Verification`, "Bounded writes"; default `Capacity.lock_timeout_ms/0`). Oban calls
+  `perform/1`, so only a test whose subject is the busy answer sets it (US-46.7).
+  """
+  def perform(%Oban.Job{args: %{"run_id" => run_id, "tenant_id" => tenant_id}}, opts) do
     case Verification.get_run(tenant_id, run_id) do
       # A run with a disposition is never reopened (#931 finding h).
       {:ok, %{status: status}} when status in @terminal ->
         :ok
 
       {:ok, run} ->
-        process_run(run, tenant_id)
+        process_run(run, tenant_id, opts)
 
       {:error, :not_found} ->
         Logger.warning("VerificationRunner: run #{run_id} not found")
@@ -128,12 +135,12 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     end
   end
 
-  defp process_run(run, tenant_id) do
+  defp process_run(run, tenant_id, opts) do
     if stale_run?(run) do
-      skip_stale_run(run)
+      skip_stale_run(run, opts)
     else
-      case written(Verification.start_run(run)) do
-        {:ok, started} -> execute(started, tenant_id)
+      case written(Verification.start_run(run, opts)) do
+        {:ok, started} -> execute(started, tenant_id, opts)
         {:wait, :database_busy} -> {:snooze, snooze_seconds(run)}
       end
     end
@@ -148,7 +155,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
 
   defp stale_run?(_run), do: false
 
-  defp skip_stale_run(run) do
+  defp skip_stale_run(run, opts) do
     age_seconds = age(run)
 
     Logger.info(
@@ -157,10 +164,11 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     )
 
     run
-    |> Verification.complete_run("skipped", %{
-      "reason" => "stale_run_skipped",
-      "age_seconds" => age_seconds
-    })
+    |> Verification.complete_run(
+      "skipped",
+      %{"reason" => "stale_run_skipped", "age_seconds" => age_seconds},
+      opts
+    )
     |> settled(run, {:cancel, :stale_run})
   end
 
@@ -168,9 +176,9 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
     Application.get_env(:loopctl, :verification_max_run_age_seconds, @default_max_run_age_seconds)
   end
 
-  defp execute(run, tenant_id) do
+  defp execute(run, tenant_id, opts) do
     Logger.info("VerificationRunner: executing run #{run.id} for story #{run.story_id}")
-    run |> verify(tenant_id) |> settle()
+    run |> verify(tenant_id, opts) |> settle(opts)
   rescue
     error ->
       # The exception goes to the LOG only: ac_results is tenant-visible and records a code.
@@ -181,7 +189,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
 
       # The run has its disposition, so a retry would only find it terminal (#931 finding g).
       # A disposition loopctl could not write is a snooze, and the next poll runs again.
-      case no_verdict(run, "internal_error") do
+      case no_verdict(run, "internal_error", opts) do
         :ok -> {:cancel, :internal_error}
         snooze -> snooze
       end
@@ -190,20 +198,21 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   # -- resolving what to read -------------------------------------------------------------
 
   # Returns the run (with what this poll recorded on it) and the outcome.
-  defp verify(run, tenant_id) do
+  defp verify(run, tenant_id, opts) do
     with {:ok, sha} <- commit_sha(run),
          :ok <- tenant_named(tenant_id),
-         {:ok, target} <- CiTarget.gather(tenant_id, run.story_id),
+         {:ok, target} <- CiTarget.gather(tenant_id, run.story_id, opts),
          {:ok, credential} <- credential(tenant_id, target.repo),
-         {:ok, run, full} <- full_sha(run, sha, credential) do
-      judge(run, target |> Map.delete(:repo) |> Map.merge(%{sha: full, credential: credential}))
+         {:ok, run, full} <- full_sha(run, sha, credential, opts) do
+      request = target |> Map.delete(:repo) |> Map.merge(%{sha: full, credential: credential})
+      judge(run, request, opts)
     else
       outcome -> {run, outcome}
     end
   end
 
-  defp judge(run, request) do
-    case change_checked(run, request) do
+  defp judge(run, request, opts) do
+    case change_checked(run, request, opts) do
       {:ok, run} -> {run, @ci_adapter.verdict(request)}
       outcome -> {run, outcome}
     end
@@ -211,14 +220,14 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
 
   # The change check, once per run (moduledoc, 6). Only a pass is stamped: a refusal ends the
   # run, and a wait asks again next poll.
-  defp change_checked(%{change_checked_at: %DateTime{}} = run, _request), do: {:ok, run}
+  defp change_checked(%{change_checked_at: %DateTime{}} = run, _request, _opts), do: {:ok, run}
 
-  defp change_checked(run, request) do
-    with :ok <- @ci_adapter.check_change(request), do: stamp_change_checked(run)
+  defp change_checked(run, request, opts) do
+    with :ok <- @ci_adapter.check_change(request), do: stamp_change_checked(run, opts)
   end
 
-  defp stamp_change_checked(run),
-    do: written(Verification.record_poll(run, %{change_checked_at: DateTime.utc_now()}))
+  defp stamp_change_checked(run, opts),
+    do: written(Verification.record_poll(run, %{change_checked_at: DateTime.utc_now()}, opts))
 
   defp commit_sha(%{commit_sha: sha}) when is_binary(sha) and sha != "", do: {:ok, sha}
   defp commit_sha(_run), do: {:unconfigured, "no_commit_sha"}
@@ -246,63 +255,72 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   # AC-26.4.6.7: a full id is used as it is; an abbreviated one is resolved ONCE and the
   # answer persisted, so no later poll of this run reads the commit again. It leaves the fault
   # streak alone: it is not a CI answer, and it happens once per run.
-  defp full_sha(%{resolved_commit_sha: full} = run, _sha, _credential)
+  defp full_sha(%{resolved_commit_sha: full} = run, _sha, _credential, _opts)
        when is_binary(full),
        do: {:ok, run, full}
 
-  defp full_sha(run, sha, credential) do
+  defp full_sha(run, sha, credential, opts) do
     if Loopctl.GitSha.valid?(sha) do
       {:ok, run, sha}
     else
       case @ci_adapter.resolve_commit(sha, credential) do
-        {:ok, full} -> record_resolved(run, full)
+        {:ok, full} -> record_resolved(run, full, opts)
         outcome -> outcome
       end
     end
   end
 
-  defp record_resolved(run, full) do
-    with {:ok, run} <- written(Verification.record_poll(run, %{resolved_commit_sha: full})),
+  defp record_resolved(run, full, opts) do
+    with {:ok, run} <-
+           written(Verification.record_poll(run, %{resolved_commit_sha: full}, opts)),
          do: {:ok, run, full}
   end
 
   # -- settling one outcome ----------------------------------------------------------------
 
-  defp settle({run, {:pass, evidence}}) do
+  defp settle({run, {:pass, evidence}}, opts) do
     run
-    |> Verification.complete_run("pass", %{"source" => "ci", "evidence_url" => evidence.url})
+    |> Verification.complete_run(
+      "pass",
+      %{"source" => "ci", "evidence_url" => evidence.url},
+      opts
+    )
     |> settled(run, :ok)
   end
 
-  defp settle({run, {:fail, evidence}}) do
+  defp settle({run, {:fail, evidence}}, opts) do
     run
-    |> Verification.complete_run("fail", %{
-      "source" => "ci",
-      "evidence_url" => evidence.url,
-      "failed_check" => evidence.check,
-      "conclusion" => evidence.conclusion
-    })
+    |> Verification.complete_run(
+      "fail",
+      %{
+        "source" => "ci",
+        "evidence_url" => evidence.url,
+        "failed_check" => evidence.check,
+        "conclusion" => evidence.conclusion
+      },
+      opts
+    )
     |> settled(run, :ok)
   end
 
-  defp settle({run, {:wait, :ci_pending}}) do
+  defp settle({run, {:wait, :ci_pending}}, opts) do
     if expired?(run.inserted_at) do
-      no_verdict(run, "ci_wait_exhausted")
+      no_verdict(run, "ci_wait_exhausted", opts)
     else
       # The poll ended in a CI answer: a fault streak, if any, is over.
-      run |> reset_faults() |> settled(run, {:snooze, snooze_seconds(run)})
+      run |> reset_faults(opts) |> settled(run, {:snooze, snooze_seconds(run)})
     end
   end
 
   # Every poll that ends in a transient fault counts, whichever read faulted.
-  defp settle({run, {:wait, {:transient, retry_after}}}) do
+  defp settle({run, {:wait, {:transient, retry_after}}}, opts) do
     faults = (run.ci_forge_faults || 0) + 1
 
     if faults > MergePrecondition.max_consecutive_unevaluated() or expired?(run.inserted_at) do
-      no_verdict(run, "forge_unavailable")
+      no_verdict(run, "forge_unavailable", opts)
     else
       run
-      |> Verification.record_poll(%{ci_forge_faults: faults})
+      |> Verification.record_poll(%{ci_forge_faults: faults}, opts)
       |> settled(
         run,
         {:snooze, faults |> fault_backoff_seconds() |> max(forge_delay(retry_after))}
@@ -311,23 +329,27 @@ defmodule Loopctl.Workers.VerificationRunnerWorker do
   end
 
   # loopctl's own database, not the forge: waited on the CI cadence, never counted as a fault.
-  defp settle({run, {:wait, :database_busy}}) do
+  defp settle({run, {:wait, :database_busy}}, opts) do
     if expired?(run.inserted_at),
-      do: no_verdict(run, "database_busy"),
+      do: no_verdict(run, "database_busy", opts),
       else: {:snooze, snooze_seconds(run)}
   end
 
   # A refusal, a missing configuration and a permanent forge answer all end the run with no
   # verdict and its code.
-  defp settle({run, {kind, code}}) when kind in [:refused, :unconfigured, :no_verdict],
-    do: no_verdict(run, code)
+  defp settle({run, {kind, code}}, opts) when kind in [:refused, :unconfigured, :no_verdict],
+    do: no_verdict(run, code, opts)
 
-  defp reset_faults(%{ci_forge_faults: 0} = run), do: {:ok, run}
-  defp reset_faults(run), do: Verification.record_poll(run, %{ci_forge_faults: 0})
+  defp reset_faults(%{ci_forge_faults: 0} = run, _opts), do: {:ok, run}
+  defp reset_faults(run, opts), do: Verification.record_poll(run, %{ci_forge_faults: 0}, opts)
 
-  defp no_verdict(run, code) do
+  defp no_verdict(run, code, opts) do
     run
-    |> Verification.complete_run("error", %{"source" => "ci", "ci_unavailable_reason" => code})
+    |> Verification.complete_run(
+      "error",
+      %{"source" => "ci", "ci_unavailable_reason" => code},
+      opts
+    )
     |> settled(run, :ok)
   end
 

@@ -169,6 +169,8 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   `:mode` — the intake source's merge mode (`"pr"`, `"thread"`, or nil) the placement
   resolved, recorded on an implement dispatch's row only (US-45.4).
+
+  `:lock_timeout_ms` — the bound on every lock wait below (`Capacity.lock_timeout_ms/1`).
   """
   @spec record_sent(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, DispatchRecord.t()}
@@ -220,7 +222,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       # Every wait below — the admission lock, the story share lock, the runner row — is
       # bounded, so a stuck transaction elsewhere costs a dispatcher `:capacity_busy`, never
       # an open transaction waiting indefinitely.
-      Capacity.set_lock_timeout!(Repo)
+      Capacity.set_lock_timeout!(Repo, opts)
 
       # FIRST, before the story fence: the fleet lock order. Held to the end of the
       # transaction, it is what makes the tenant's admissions serialize.
@@ -324,10 +326,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   Recorded here rather than in `record_sent/3` because a re-send that is then DROPPED must
   not move the bound of a session an earlier push started.
   """
-  @spec record_push(Ecto.UUID.t(), map()) ::
+  @spec record_push(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, :pushed | {:already, String.t()}}
           | {:error, :unknown_dispatch | :capacity_busy}
-  def record_push(tenant_id, dispatch), do: decide_delivery(tenant_id, dispatch, "pushed")
+  def record_push(tenant_id, dispatch, opts \\ []),
+    do: decide_delivery(tenant_id, dispatch, "pushed", opts)
 
   @doc """
   Takes the delivery decision for a dispatch a channel is DROPPING instead of pushing, and
@@ -339,12 +342,13 @@ defmodule Loopctl.Runners.DispatchLedger do
   own decision could not be recorded is left to the heal sweep's undelivered grace rather
   than to a second wait inside the channel process, which holds the runner's socket.
   """
-  @spec record_drop(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec record_drop(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, :released | {:already, String.t()}}
           | {:error, :unknown_dispatch | :capacity_busy}
-  def record_drop(tenant_id, dispatch_id),
-    do:
-      decide_delivery(tenant_id, %{dispatch_id: dispatch_id, wall_clock_seconds: nil}, "dropped")
+  def record_drop(tenant_id, dispatch_id, opts \\ []) do
+    dispatch = %{dispatch_id: dispatch_id, wall_clock_seconds: nil}
+    decide_delivery(tenant_id, dispatch, "dropped", opts)
+  end
 
   @doc """
   `record_push/2` and `record_drop/2` inside the CALLER's transaction, on the caller's repo:
@@ -353,7 +357,8 @@ defmodule Loopctl.Runners.DispatchLedger do
   through `nil` — a caller inside its own transaction handles a missing row itself.
 
   The caller owns the transaction and its lock timeout; `record_push/2` and `record_drop/2`
-  are the forms that own one of their own. Public because the decision is the ONE ordering
+  are the forms that own one of their own, bounded at `Capacity.lock_timeout_ms(opts)`. Public
+  because the decision is the ONE ordering
   point between a push and a drop, so a test must be able to hold it open.
   """
   @spec decide_delivery_in(Ecto.Repo.t(), Ecto.UUID.t(), map(), String.t()) ::
@@ -373,9 +378,9 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
-  defp decide_delivery(tenant_id, dispatch, outcome) do
+  defp decide_delivery(tenant_id, dispatch, outcome, opts) do
     in_tenant(tenant_id, fn ->
-      Capacity.set_lock_timeout!(Repo)
+      Capacity.set_lock_timeout!(Repo, opts)
 
       case decide_delivery_in(Repo, tenant_id, dispatch, outcome) do
         nil -> Repo.rollback(:unknown_dispatch)
@@ -555,12 +560,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   between leaves the slot held until the heal sweep's bound
   (`Loopctl.Runners.Capacity`), which is the whole reason the in-transaction form exists.
   """
-  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer(), keyword()) ::
           {:ok, :released | :already_released}
           | {:error, :unknown_dispatch | :capacity_busy}
-  def release_slot(tenant_id, dispatch_id, generation) when is_integer(generation) do
+  def release_slot(tenant_id, dispatch_id, generation, opts \\ []) when is_integer(generation) do
     in_tenant(tenant_id, fn ->
-      Capacity.set_lock_timeout!(Repo)
+      Capacity.set_lock_timeout!(Repo, opts)
 
       case release_slot_in(Repo, tenant_id, dispatch_id, generation) do
         {:ok, outcome} -> outcome
@@ -1083,7 +1088,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   @doc """
   Applies a validated `dispatch_reply` from `runner_id`. See the moduledoc for the rules.
   """
-  @spec record_reply(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+  @spec record_reply(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, DispatchRecord.t()}
           | {:error,
              :unknown_dispatch
@@ -1092,10 +1097,10 @@ defmodule Loopctl.Runners.DispatchLedger do
              | :already_replied
              | :rejected_by_database
              | :capacity_busy}
-  def record_reply(tenant_id, runner_id, reply) do
+  def record_reply(tenant_id, runner_id, reply, opts \\ []) do
     context = %{operation: :record_reply, dispatch_id: reply.dispatch_id, run_id: nil}
 
-    runner_write(tenant_id, runner_id, context, fn ->
+    runner_write(tenant_id, runner_id, context, opts, fn ->
       story_lock = reply_story_lock(tenant_id, runner_id, reply)
 
       with {:ok, record, story} <-
@@ -1445,9 +1450,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   # message on rejoin, and the loop would never end. The contract cast refuses the known
   # cases first; this is the backstop, so reaching it is logged and counted — a run whose
   # `acked_seq` stops advancing must leave an operator a signal. Any other error raises.
-  defp runner_write(tenant_id, runner_id, context, fun) do
+  defp runner_write(tenant_id, runner_id, context, fun),
+    do: runner_write(tenant_id, runner_id, context, [], fun)
+
+  defp runner_write(tenant_id, runner_id, context, opts, fun) do
     in_tenant(tenant_id, fn ->
-      Capacity.set_lock_timeout!(Repo)
+      Capacity.set_lock_timeout!(Repo, opts)
       fun.()
     end)
   rescue

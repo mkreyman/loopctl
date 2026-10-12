@@ -220,7 +220,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
   - `branch` — the name the dispatch put on the wire (#846.2), or nil. `thread_branch/3`
     resolves the branch a thread is judged on from it
 
-  The read's lock wait is bounded (`Loopctl.Runners.Capacity.set_lock_timeout!/1`).
+  The read's lock wait is bounded (`Loopctl.Runners.Capacity.set_lock_timeout!/2`).
   `{:error, :busy}` for contention a caller retries out of
   (`Loopctl.Delivery.Stages.answering_busy/4`, counted as
   `[:loopctl, :delivery, :dispatch_route_busy]`); it never raises for that.
@@ -239,8 +239,9 @@ defmodule Loopctl.Delivery.DispatchPayload do
   @doc """
   `dispatch_route/2` for the claim of `claim_epoch` rather than the current one (US-45.7): the
   route a checkpoint recorded under an earlier claim was built on. Same lock bound, same `:busy`.
+  The wait is `Capacity.lock_timeout_ms(opts)`.
   """
-  @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer()) ::
+  @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer(), keyword()) ::
           {:ok,
            %{
              mode: :pr | :thread | nil,
@@ -248,7 +249,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
              base_branch: String.t() | nil
            }}
           | {:error, term()}
-  def dispatch_route(tenant_id, %Story{} = story, claim_epoch) do
+  def dispatch_route(tenant_id, %Story{} = story, claim_epoch, opts \\ []) do
     Stages.answering_busy(
       tenant_id,
       [:loopctl, :delivery, :dispatch_route_busy],
@@ -258,7 +259,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
         |> Repo.with_tenant(fn ->
           # A lock held on the ledger (a retention prune, a migration) costs the gate a bounded
           # wait and an `:unevaluated` answer, never a request held open behind it.
-          Capacity.set_lock_timeout!(Repo)
+          Capacity.set_lock_timeout!(Repo, opts)
           Repo.one(DispatchLedger.claim_route_query(tenant_id, story.id, claim_epoch))
         end)
         |> route()

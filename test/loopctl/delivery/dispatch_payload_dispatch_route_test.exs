@@ -70,7 +70,7 @@ defmodule Loopctl.Delivery.DispatchPayloadDispatchRouteTest do
     assert {:ok, %{base_branch: "trunk"}} = route(ctx)
   end
 
-  test "dispatch_route/3 reads the claim of the epoch it is given, not the current one (US-45.7)",
+  test "dispatch_route/4 reads the claim of the epoch it is given, not the current one (US-45.7)",
        ctx do
     earlier = ctx.story.claim_epoch
     record(ctx, @t1, mode: "thread", base_branch: "release-1", claim_epoch: earlier)

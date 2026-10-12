@@ -32,6 +32,11 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
   alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Story
 
+  # The lock wait a busy-path test is given, instead of the deployed
+  # `Capacity.lock_timeout_ms/0`: its subject is the answer a wait that ran out produces, not
+  # how long it waited (US-46.7). The races keep the deployed wait.
+  @busy_wait_ms 100
+
   setup :verify_on_exit!
 
   setup_all do
@@ -124,8 +129,10 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
       assert_receive :locked, 5_000
       started = System.monotonic_time(:millisecond)
 
-      assert send_dispatch(runner, d) == {:error, :capacity_busy}
-      assert System.monotonic_time(:millisecond) - started >= Capacity.lock_timeout_ms() - 100
+      assert send_dispatch(runner, d, busy()) == {:error, :capacity_busy}
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert elapsed >= @busy_wait_ms
+      assert elapsed < Capacity.lock_timeout_ms()
 
       send(holder.pid, :release)
       Task.await(holder)
@@ -220,10 +227,10 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
       assert_receive :blocking, 5_000
       started = System.monotonic_time(:millisecond)
 
-      assert reply(runner, d, %{}) == {:error, :capacity_busy}
+      assert reply(runner, d, %{}, busy()) == {:error, :capacity_busy}
       elapsed = System.monotonic_time(:millisecond) - started
-      assert elapsed >= Capacity.lock_timeout_ms() - 100
-      assert elapsed < Capacity.lock_timeout_ms() * 3
+      assert elapsed >= @busy_wait_ms
+      assert elapsed < Capacity.lock_timeout_ms()
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)
@@ -257,8 +264,9 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
 
       assert_receive :blocking, 5_000
 
-      assert on_own_connection(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
-               {:error, :capacity_busy}
+      assert on_own_connection(fn ->
+               Runners.reserve_slot(runner.tenant_id, runner.id, busy())
+             end) == {:error, :capacity_busy}
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)
@@ -293,7 +301,7 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
 
       assert_receive :blocking, 5_000
 
-      assert release(runner, d.dispatch_id, slot) == {:error, :capacity_busy}
+      assert release(runner, d.dispatch_id, slot, busy()) == {:error, :capacity_busy}
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)
@@ -490,13 +498,13 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
     dispatch
   end
 
-  defp send_dispatch(runner, dispatch),
+  defp send_dispatch(runner, dispatch, opts \\ []),
     do:
       on_own_connection(fn ->
-        DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+        DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch, opts)
       end)
 
-  defp reply(runner, dispatch, attrs) do
+  defp reply(runner, dispatch, attrs, opts \\ []) do
     payload =
       Map.merge(
         %{
@@ -508,7 +516,10 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
       )
 
     {:ok, reply} = RunnerContract.cast_dispatch_reply(payload)
-    on_own_connection(fn -> DispatchLedger.record_reply(runner.tenant_id, runner.id, reply) end)
+
+    on_own_connection(fn ->
+      DispatchLedger.record_reply(runner.tenant_id, runner.id, reply, opts)
+    end)
   end
 
   # Runs `fun` from `count` processes at once, each on its own connection, released
@@ -591,9 +602,13 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
   defp generation(runner, dispatch_id), do: record(runner, dispatch_id).slot_generation
 
   # The release a caller with no transaction of its own makes, naming the slot it holds.
-  defp release(runner, dispatch_id, generation),
+  defp release(runner, dispatch_id, generation, opts),
     do:
-      on_own_connection(fn -> Runners.release_slot(runner.tenant_id, dispatch_id, generation) end)
+      on_own_connection(fn ->
+        Runners.release_slot(runner.tenant_id, dispatch_id, generation, opts)
+      end)
+
+  defp busy, do: [lock_timeout_ms: @busy_wait_ms]
 
   defp hold_admission_lock!(tenant_id) do
     Repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [

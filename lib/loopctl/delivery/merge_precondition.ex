@@ -531,6 +531,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
     database by `Loopctl.Delivery.GateAInput`
   - `:effect_proof` — `%{intent: _, fixture_set: _, fixture_results: _, coverage: _}` for a
     change that touches an effect path. Absent, a `:prove_effect` outcome is a refusal
+  - `:lock_timeout_ms` — the lock wait of the claim-route read
+    (`Loopctl.Runners.Capacity.lock_timeout_ms/1`). Only a test passes it (US-46.7)
 
   ## Errors
 
@@ -1350,9 +1352,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # A pr-mode evaluation pays this read too, and cannot skip it: the ROW is what says the
     # story is pr, and the source's current mode cannot stand in for it (a story placed as a
     # thread under a source since flipped back to pr must still be judged as a thread). Its
-    # lock wait is bounded and contention answers `:unevaluated`, which the loop retries.
+    # lock wait is bounded (`Loopctl.Runners.Capacity.lock_timeout_ms(opts)`) and contention
+    # answers `:unevaluated`, which the loop retries.
     {mode, forge, {pr_number, checkpoint, pull_request}} =
-      case DispatchPayload.dispatch_route(story.tenant_id, story) do
+      case DispatchPayload.dispatch_route(story.tenant_id, story, story.claim_epoch, opts) do
         {:ok, route} ->
           # The repository with the credential every forge read below authenticates with
           # (#936), chosen per (tenant, repository) and only once there is a route to read

@@ -68,8 +68,9 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
          ctx do
       test_pid = self()
 
-      # A lock on the ledger held elsewhere: the route read waits out its lock_timeout and
-      # answers :busy, so nothing is judged on a guessed route.
+      # A lock on the ledger held elsewhere: the route read waits out its lock wait (a short
+      # one, US-46.7: the subject is the answer, not the wait) and answers :busy, so nothing is
+      # judged on a guessed route.
       holder =
         spawn(fn ->
           :ok = ProductionTopology.checkout_unboxed!([Repo])
@@ -87,7 +88,13 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
       assert_receive :held, 5_000
       on_exit(fn -> send(holder, :release) end)
 
-      assert {:ok, %Verdict{decision: :unevaluated, mode: nil}} = evaluate(ctx)
+      assert {:ok, %Verdict{decision: :unevaluated, mode: nil}} =
+               MergePrecondition.evaluate(
+                 ctx.tenant_id,
+                 ctx.story_id,
+                 opts() ++ [lock_timeout_ms: 100]
+               )
+
       send(holder, :release)
     end
   end
@@ -165,8 +172,6 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
 
     assert_receive :row_held, 5_000
   end
-
-  defp evaluate(ctx), do: MergePrecondition.evaluate(ctx.tenant_id, ctx.story_id, opts())
 
   defp opts do
     [

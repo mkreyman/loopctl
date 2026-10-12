@@ -1,6 +1,6 @@
 defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
   @moduledoc """
-  US-26.4.6 through `VerificationRunnerWorker.perform/1` when loopctl's OWN database is the
+  US-26.4.6 through `VerificationRunnerWorker.perform/2` when loopctl's OWN database is the
   obstacle: a lock another connection holds on the run row, on `story_stages` or on
   `runner_dispatches`. Each is a wait on the database cadence that counts no forge fault and
   changes nothing, never a verdict or `internal_error`.
@@ -29,6 +29,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Test.RowLock
   alias Loopctl.Test.VerificationRunnerForge
 
@@ -39,6 +40,10 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
   # How long a table-lock holder keeps its lock with nobody releasing it.
   @holder_ttl_ms 60_000
+
+  # The lock wait a busy poll is given, instead of the deployed `Capacity.lock_timeout_ms/0`:
+  # the subject is the answer a wait that ran out produces, not how long it waited (US-46.7).
+  @busy_wait_ms 100
 
   setup :verify_on_exit!
 
@@ -104,7 +109,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
       run = fixture(:verification_run, Map.put(ctx, :ci_forge_faults, 2))
       hold_table_lock!("story_stages")
 
-      assert {:snooze, 60} = perform(ctx, run)
+      assert {:snooze, 60} = perform(ctx, run, busy())
 
       reloaded = reload(ctx, run)
       assert reloaded.status == "running"
@@ -133,7 +138,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
       run = fixture(:verification_run, Map.put(ctx, :ci_forge_faults, 2))
       hold_ledger_lock!()
 
-      assert {:snooze, 60} = perform(ctx, run)
+      assert {:snooze, 60} = perform(ctx, run, busy())
 
       reloaded = reload(ctx, run)
       assert reloaded.status == "running"
@@ -142,12 +147,27 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
       refute_received {:credential_asked, _, _}
     end
 
+    # TC-46.7.1: the wait is the one the poll was given. A read that ignored it would wait out
+    # the deployed bound, which is the whole of what this module used to spend its time on.
+    test "a busy read answers within the wait it was given, not the deployed one", ctx do
+      stub_forge(ctx, %{evidence: build(:forge_evidence)})
+      run = fixture(:verification_run, ctx)
+      hold_ledger_lock!()
+
+      started = System.monotonic_time(:millisecond)
+      assert {:snooze, 60} = perform(ctx, run, busy())
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert elapsed >= @busy_wait_ms
+      assert elapsed < Capacity.lock_timeout_ms()
+    end
+
     test "database contention past the age window records database_busy", ctx do
       stub_forge(ctx, %{evidence: build(:forge_evidence)})
       run = fixture(:verification_run, Map.put(ctx, :age_seconds, 25 * 60 * 60))
       hold_ledger_lock!()
 
-      assert :ok = perform(ctx, run)
+      assert :ok = perform(ctx, run, busy())
 
       assert reload(ctx, run).ac_results == %{
                "source" => "ci",
@@ -305,7 +325,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
       before = snapshot(ctx, run)
 
-      {result, log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run) end)
+      {result, log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run, busy()) end)
       assert result == {:snooze, 60}
       assert log =~ "crashed"
       assert busy_warnings(ctx, log) == 1
@@ -364,11 +384,13 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
   # and no crash. A write that raised instead would reach the rescue arm, log the crash, and
   # try its `internal_error` write against the same lock: a second warning.
   defp perform_busy(ctx, run) do
-    {result, log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run) end)
+    {result, log} = ExUnit.CaptureLog.with_log(fn -> perform(ctx, run, busy()) end)
     assert busy_warnings(ctx, log) == 1
     refute log =~ "crashed"
     result
   end
+
+  defp busy, do: [lock_timeout_ms: @busy_wait_ms]
 
   defp busy_warnings(ctx, log) do
     ~r/gave up waiting: tenant_id=#{ctx.tenant_id} error="55P03"/ |> Regex.scan(log) |> length()

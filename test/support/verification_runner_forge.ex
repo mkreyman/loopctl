@@ -78,11 +78,15 @@ defmodule Loopctl.Test.VerificationRunnerForge do
     Map.put(ctx, :test_pid, test_pid)
   end
 
-  @doc "One poll of the worker, in the calling process."
-  def perform(ctx, run) do
-    VerificationRunnerWorker.perform(%Oban.Job{
-      args: %{"run_id" => run.id, "tenant_id" => ctx.tenant_id}
-    })
+  @doc """
+  One poll of the worker, in the calling process. `opts` reach `VerificationRunnerWorker.perform/2`
+  (`:lock_timeout_ms` for a test whose subject is a busy answer).
+  """
+  def perform(ctx, run, opts \\ []) do
+    VerificationRunnerWorker.perform(
+      %Oban.Job{args: %{"run_id" => run.id, "tenant_id" => ctx.tenant_id}},
+      opts
+    )
   end
 
   @doc "The run as stored now."

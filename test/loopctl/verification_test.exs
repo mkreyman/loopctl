@@ -67,7 +67,7 @@ defmodule Loopctl.VerificationTest do
     end
   end
 
-  describe "start_run/1 and complete_run/3" do
+  describe "start_run/2 and complete_run/4" do
     test "transitions through running → pass" do
       %{tenant: tenant, story: story} = setup_ctx()
       {:ok, run} = Verification.create_run(tenant.id, story.id)
@@ -83,7 +83,7 @@ defmodule Loopctl.VerificationTest do
     end
   end
 
-  describe "record_poll/2" do
+  describe "record_poll/3" do
     # A bounded write rolls a refused changeset back and answers it as `{:error, changeset}`,
     # never as `{:ok, _}` and never as `:busy`, with nothing recorded.
     test "a refused value is its changeset error, and the run is unchanged" do

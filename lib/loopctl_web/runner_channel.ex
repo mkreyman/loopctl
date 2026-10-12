@@ -390,7 +390,7 @@ defmodule LoopctlWeb.RunnerChannel do
            ReplyBucket.take(socket.assigns.reply_bucket, now, @reply_capacity, @reply_refill_ms) do
       socket = assign(socket, :reply_bucket, bucket)
 
-      case DispatchLedger.record_reply(tenant_id, runner.id, reply) do
+      case DispatchLedger.record_reply(tenant_id, runner.id, reply, lock_opts(socket)) do
         {:ok, record} -> {:reply, :ok, note_kind_refusal(socket, reply, record)}
         {:error, reason} -> refuse(socket, "dispatch_reply", message_error(reason))
       end
@@ -992,8 +992,16 @@ defmodule LoopctlWeb.RunnerChannel do
   # database wait, never two: a decision that could not be taken leaves the dispatch unsent
   # and its slot to the sweep's undelivered grace, rather than spending another lock_timeout
   # inside the process that holds the runner's socket.
+  # The lock wait of this channel's ledger writes: `Capacity.lock_timeout_ms/0`, unless the
+  # SOCKET carries `:lock_timeout_ms`. Nothing a runner sends can set it:
+  # `LoopctlWeb.RunnerSocket.connect/3` never assigns it and no join or message param reaches
+  # it. Only a test that builds the socket itself does, to get a busy answer without waiting
+  # out the deployed bound (US-46.7).
+  defp lock_opts(%{assigns: %{lock_timeout_ms: ms}}), do: [lock_timeout_ms: ms]
+  defp lock_opts(_socket), do: []
+
   defp push_if_this_channel_decides(socket, dispatch) do
-    case DispatchLedger.record_push(socket.assigns.tenant_id, dispatch) do
+    case DispatchLedger.record_push(socket.assigns.tenant_id, dispatch, lock_opts(socket)) do
       {:ok, :pushed} ->
         push(socket, "dispatch", dispatch)
         # Remembered so a `kind_not_supported` reply can be attributed to the connection
@@ -1035,7 +1043,11 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   defp release_dropped_slot(socket, dispatch) do
-    case DispatchLedger.record_drop(socket.assigns.tenant_id, dispatch.dispatch_id) do
+    case DispatchLedger.record_drop(
+           socket.assigns.tenant_id,
+           dispatch.dispatch_id,
+           lock_opts(socket)
+         ) do
       {:ok, :released} ->
         :ok
 

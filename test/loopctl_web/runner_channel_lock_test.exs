@@ -31,6 +31,9 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
   alias Loopctl.Runners.Runner
   alias Loopctl.Tenants
 
+  # The lock wait the channel is given where a test's subject is a busy answer (US-46.7).
+  @busy_wait_ms 100
+
   setup :verify_on_exit!
 
   setup_all do
@@ -291,6 +294,10 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
     setup ctx do
       {raw, runner} = tracked_committed_runner(ctx.committed, %{name: "minis", max_sessions: 4})
       {:ok, socket} = connect_runner_socket(raw)
+      # The channel's ledger writes wait this instead of `Capacity.lock_timeout_ms/0`: each
+      # test's subject is the answer a wait that ran out produces (US-46.7). Assigned on the
+      # socket the test built, which nothing a runner sends can reach.
+      socket = Phoenix.Socket.assign(socket, :lock_timeout_ms, @busy_wait_ms)
       {_reply, channel} = join_pool(socket, "minis", %{"max_sessions" => 4})
       %{runner: runner, channel: channel}
     end
@@ -360,7 +367,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
 
           # The drop's own decision runs into the lock timeout. An orderly refusal, not a
           # crash: the slot is left to the sweep's undelivered grace.
-          refute_push "dispatch", _, Capacity.lock_timeout_ms() + 3_000
+          refute_push "dispatch", _, @busy_wait_ms + 1_000
         end)
 
       assert log =~ "not delivered"
@@ -393,7 +400,7 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
       # ledger does not record would lose its slot to the heal sweep mid-session.
       # Long enough for the stamp's lock_timeout to expire, short enough that the blocker's
       # own connection checkout (15 s) does not.
-      refute_push "dispatch", _, Capacity.lock_timeout_ms() + 3_000
+      refute_push "dispatch", _, @busy_wait_ms + 1_000
       assert Process.alive?(channel.channel_pid)
       assert finish(blocker) == {:ok, :ok}
 

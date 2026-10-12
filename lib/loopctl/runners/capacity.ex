@@ -258,11 +258,28 @@ defmodule Loopctl.Runners.Capacity do
   @spec busy_retry_ms() :: pos_integer()
   def busy_retry_ms, do: 3 * @lock_timeout_ms
 
-  @doc "Bounds every lock wait for the rest of the current transaction."
-  @spec set_lock_timeout!(Ecto.Repo.t()) :: :ok
-  def set_lock_timeout!(repo \\ Repo) do
-    repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{@lock_timeout_ms}ms"])
+  @doc """
+  Bounds every lock wait for the rest of the current transaction, at
+  `lock_timeout_ms(opts)`.
+  """
+  @spec set_lock_timeout!(Ecto.Repo.t(), keyword()) :: :ok
+  def set_lock_timeout!(repo \\ Repo, opts \\ []) when is_list(opts) do
+    repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{lock_timeout_ms(opts)}ms"])
     :ok
+  end
+
+  @doc """
+  The lock wait `opts` asks for: `:lock_timeout_ms`, else `lock_timeout_ms/0`.
+
+  An input so a test whose subject is the busy answer gets it without waiting out the
+  deployed wait (US-46.7). Only code sets it, never request data or channel params, and
+  production callers pass nothing. Anything but a positive integer raises.
+  """
+  @spec lock_timeout_ms(keyword()) :: pos_integer()
+  def lock_timeout_ms(opts) when is_list(opts) do
+    case Keyword.get(opts, :lock_timeout_ms, @lock_timeout_ms) do
+      ms when is_integer(ms) and ms > 0 -> ms
+    end
   end
 
   @doc """

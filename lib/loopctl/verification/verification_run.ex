@@ -45,7 +45,7 @@ defmodule Loopctl.Verification.VerificationRun do
     # later poll; and transient forge faults in a row, which bound a wait on an unreachable
     # forge; and when the commit passed the once-per-run change check (empty change, CI
     # definitions), so a merge during the wait cannot turn a checked commit into a refused one.
-    # All written by `Loopctl.Verification.record_poll/2` only.
+    # All written by `Loopctl.Verification.record_poll/3` only.
     field :resolved_commit_sha, :string
     field :ci_forge_faults, :integer, default: 0
     field :change_checked_at, :utc_datetime_usec
