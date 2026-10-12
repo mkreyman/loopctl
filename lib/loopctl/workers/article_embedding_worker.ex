@@ -243,7 +243,7 @@ defmodule Loopctl.Workers.ArticleEmbeddingWorker do
   #
   # That signal is the point. `ArticleEmbeddingWorker` was the ONE remaining writer that
   # stored a prefix vector under an unmarked hash, and the readers that refuse to judge
-  # on a prefix (`Consolidation.pairwise_similarity_by_group/2`, `Memory`'s near-dup
+  # on a prefix (`Consolidation.pairwise_similarity_by_group/4`, `Memory`'s near-dup
   # scan) filter on that mark — so for the tenant's own articles, which is most of the
   # corpus, the filter matched nothing and the guard could never fire.
   defp embed_with_shrink(tenant_id, article, article_id, attempt, opts) do

@@ -1,9 +1,15 @@
 defmodule Loopctl.Workers.AuditPartitionWorkerTest do
-  # DELIBERATELY sync: not coupled to global STATE, but holding DDL LOCKS. The strip below
-  # takes SHARE UPDATE EXCLUSIVE on every audit_log leaf for the whole test transaction and
-  # `perform/1` then escalates to ACCESS EXCLUSIVE on the parent to drop expired partitions,
-  # while any async peer inserting an audit row holds ROW EXCLUSIVE — a circular wait. ExUnit
-  # runs sync modules after the async ones, so no peer holds those locks.
+  @moduledoc """
+  `Loopctl.Workers.AuditPartitionWorker`: future `audit_log` partitions created, expired ones
+  dropped, and every retained partition stamped with its autovacuum tuning (#579).
+
+  `async: false` because the subject is DDL on the SHARED `audit_log` partition tree. The
+  worker creates and drops partitions, which takes ACCESS EXCLUSIVE on the parent, and the
+  `#579` tests `ALTER TABLE ... RESET` every leaf, which holds SHARE UPDATE EXCLUSIVE on each
+  for the whole test transaction, while any async peer inserting an audit row holds ROW
+  EXCLUSIVE on a leaf: a circular wait. ExUnit runs sync modules after the async ones, so no
+  peer holds those locks.
+  """
   use Loopctl.DataCase, async: false
 
   setup :verify_on_exit!

@@ -5,8 +5,11 @@ defmodule Loopctl.Threads.ReviewDispatchRaceTest do
   and the second insert meets the `(tenant_id, dispatch_id)` unique index. That must answer
   `dispatch_id_conflict`, never raise.
 
-  `async: false` and COMMITTED: the race needs two real transactions, which the sandbox's one
-  shared connection cannot give. Swept with the committed tenant.
+  `async: false` and COMMITTED, because the subject is two real transactions meeting on the
+  story's thread advisory lock and on the `thread_reviews` `(tenant_id, dispatch_id)` unique
+  index, which one sandbox connection cannot give. The rows are this module's own committed
+  tenant, swept. And `await_waiter/1` reads `pg_locks` server-wide: alongside async tests,
+  any of their lock waits would read as the loser waiting.
   """
 
   use Loopctl.DataCase, async: false

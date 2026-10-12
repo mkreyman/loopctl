@@ -61,18 +61,26 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   `SET LOCAL` through), and no failure mode has EVER returned another tenant's rows — this
   was never an isolation defect.
 
-  ## Why this is `async: false`
+  ## Why this is `async: true`
 
-  Not the flake. The read-path CUTOVER FLAG is an injected collaborator
+  Nothing here is shared. The read-path CUTOVER FLAG is an injected collaborator
   (`Loopctl.Embeddings.ReadPathBehaviour`), so `enable_side_table_reads/0` is a
   PROCESS-SCOPED `Mox.stub/3` and nothing VM-global is written for it. (The flag's real
   per-node globality is covered in `test/loopctl/embeddings/system_config_read_path_test.exs`.)
+  The request-path reads it exercises go through `Loopctl.HeavyRead`, whose exact plan in
+  the default suite takes the shared HNSW graph out of the result, and its vectors are
+  per-test sparse (`test_vec/2`), so a concurrent test's rows neither hide nor outrank them.
 
-  `async: false` is kept as cheap insurance — these are the suite's heaviest vector
-  reads and serializing them lowers DB contention. It is NOT a fix: #519 added it on the
-  theory that concurrent async inserts perturbed a shared index, which is impossible
-  (ExUnit runs every async module to completion BEFORE any sync one), and the same
-  failure simply reappeared in `system_config_read_path_test.exs`.
+  It ran `async: false` until #953 as "cheap insurance": #519 added it on the theory that
+  concurrent async inserts perturbed a shared index, which the exact plan has since made
+  moot, while `Loopctl.EmbeddingsReviewFixesTest` already ran async with the same
+  `@moduletag :vacuum_vector_indexes`. Measured on minis, 2026-10-07, running the
+  vector-reading modules together: no `left: []` in 10 runs with this module async nor in 8
+  with it sync. What async DID break was the per-test vacuum: its tail truncation waited on
+  every open sandbox transaction and a second vacuum queued behind the first, so a run took
+  88-190s against 18-27s and 2 runs in 10 failed on a vacuum passing its 15s query timeout.
+  `Loopctl.DataCase.vacuum_vector_indexes/0` now skips truncation and locked tables; with
+  that, 10 async runs took 5-12s, with no vacuum timeout and no `left: []`.
 
   ## What #535 did fix (real, and still in place)
 
@@ -152,7 +160,7 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   vectors and a page size wider than the candidate set (below).
   """
 
-  use Loopctl.DataCase, async: false
+  use Loopctl.DataCase, async: true
 
   # #645 — vacuum the pgvector graph before each test in this module. Rolled-back tests
   # leave DEAD HNSW entries behind, and pgvector's scan skips dead elements rather than

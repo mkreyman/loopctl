@@ -18,7 +18,9 @@ defmodule Loopctl.TokenUsage.CorrectionLockTest do
        session (not re-entrant on one connection) — using two `sandbox: false`
        connections so they are genuinely independent.
 
-  Uses real (committing) connections, so `async: false`.
+  `async: false` because the subject is a Postgres advisory lock (`pg_advisory_xact_lock` on
+  `correction_lock_key/2`) held across two real, independent sessions; the key's own
+  properties are pure and live in the async `Loopctl.TokenUsage.CorrectionLockKeyTest`.
   """
 
   use ExUnit.Case, async: false
@@ -26,25 +28,6 @@ defmodule Loopctl.TokenUsage.CorrectionLockTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.TokenUsage
-
-  describe "correction_lock_key/2 (tokens-02, FIX 6)" do
-    test "is deterministic, scoped to (tenant, story), and in signed 64-bit range" do
-      tenant = Ecto.UUID.generate()
-      story = Ecto.UUID.generate()
-
-      key = TokenUsage.correction_lock_key(tenant, story)
-
-      assert is_integer(key)
-      # Release-independent: same inputs always yield the same key.
-      assert TokenUsage.correction_lock_key(tenant, story) == key
-      # Scoped: a different story or tenant yields a different key.
-      refute TokenUsage.correction_lock_key(tenant, Ecto.UUID.generate()) == key
-      refute TokenUsage.correction_lock_key(Ecto.UUID.generate(), story) == key
-      # Fits a PostgreSQL bigint advisory lock key.
-      assert key >= -0x8000_0000_0000_0000
-      assert key <= 0x7FFF_FFFF_FFFF_FFFF
-    end
-  end
 
   describe "advisory lock serialization across sessions (tokens-02)" do
     test "the per-story lock blocks a second real session while held, and frees on release" do

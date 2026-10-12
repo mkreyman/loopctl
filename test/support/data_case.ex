@@ -103,19 +103,54 @@ defmodule Loopctl.DataCase do
   Production is not affected: its rows are committed, so its graph is not made of dead
   entries.
 
-  Runs unboxed (VACUUM cannot run inside a transaction) and never fails a test: a vacuum
+  Runs unboxed (VACUUM cannot run inside a transaction) and, by default, never fails a test: a vacuum
   that cannot run leaves the suite exactly as flaky as it was before, which is a worse
   outcome to hide behind an exception than to carry on with.
+
+  ## Why `TRUNCATE OFF, SKIP_LOCKED`: so a tagged module can run async (#953)
+
+  A plain VACUUM ends by truncating the table's empty tail pages, which needs ACCESS
+  EXCLUSIVE; with any other transaction holding a lock on the table it retries for up to
+  5s per table before giving up (`wait_event` `VacuumTruncate`), and a second VACUUM of the
+  same table queues behind the first on SHARE UPDATE EXCLUSIVE (`Lock`/`relation`). Beside
+  the async suite's open sandbox transactions both happen on every call. Measured on minis,
+  2026-10-07, running the vector-reading modules together with
+  `Loopctl.EmbeddingsSideTableReadsTest` async: 88-190s a run against 18-27s with it sync,
+  and 2 runs in 10 failed on a vacuum query passing its 15s timeout. Truncation removes
+  nothing this repair needs: it only returns empty pages to the OS.
+
+  SKIP_LOCKED is a weaker guarantee, and the price of it is stated rather than hidden: a
+  table whose lock cannot be had at once is SKIPPED, silently, whoever holds it — another
+  test's vacuum, but equally a DDL statement or anything else conflicting with SHARE UPDATE
+  EXCLUSIVE. So the per-test call is best effort: the graph is usually repaired, not always.
+  A caller whose assertion DEPENDS on the repair passes `wait: true`, which drops
+  SKIP_LOCKED and keeps TRUNCATE OFF: it WAITS for each table's lock rather than skipping
+  the table, and does not truncate, so it never asks for the ACCESS EXCLUSIVE lock the
+  caller's own open sandbox transaction would hold it off. Waiting is all it does about a
+  lock; it raises only when the statement itself fails, a timeout included. Only a sync
+  module should pass it, since beside the async suite it waits as described above.
   """
-  @spec vacuum_vector_indexes() :: :ok
-  def vacuum_vector_indexes do
+  @spec vacuum_vector_indexes(keyword()) :: :ok
+  def vacuum_vector_indexes(opts \\ []) do
+    if Keyword.get(opts, :wait, false) do
+      vacuum_each_vector_table("VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF)")
+    else
+      best_effort_vacuum()
+    end
+  end
+
+  defp vacuum_each_vector_table(statement) do
     Sandbox.unboxed_run(Loopctl.Repo, fn ->
       for table <- @vector_tables do
-        Loopctl.AdminRepo.query!("VACUUM (INDEX_CLEANUP ON) #{table}", [])
+        Loopctl.AdminRepo.query!("#{statement} #{table}", [])
       end
     end)
 
     :ok
+  end
+
+  defp best_effort_vacuum do
+    vacuum_each_vector_table("VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF, SKIP_LOCKED)")
   rescue
     error ->
       require Logger

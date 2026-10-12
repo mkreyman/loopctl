@@ -149,7 +149,10 @@ defmodule Loopctl.MixProject do
       # allows ~> 3.0; the override lifts open_api_spex's stale optional cap
       # (~> 1.0 or ~> 2.0), which has no 3.0 support yet. open_api_spex only uses
       # Decimal for JSON-schema number casting, a 3.x-compatible surface.
-      {:decimal, "~> 3.1", override: true},
+      # The 3.1.2 floor refuses 3.1.0/3.1.1: CVE-2026-97853 (EEF-CVE-2026-97853,
+      # unbounded allocation in Decimal.round/3). Spelled as a range because
+      # "~> 3.1.2" would also cap below 3.2.0.
+      {:decimal, ">= 3.1.2 and < 4.0.0", override: true},
       {:esbuild, "~> 0.8", runtime: Mix.env() == :dev},
       {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
       {:telemetry_metrics, "~> 1.0"},
