@@ -63,10 +63,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     |> AdminRepo.update!()
   end
 
+  # Oldest first. Two tests match `[first_run, second_run]` positionally, and without an
+  # ORDER BY Postgres returns heap order, which is not insertion order once a vacuum has
+  # freed space on an earlier page: under the async suite the second run's row could come
+  # back first and the idempotency test read the FIRST night's counter as the second's.
   defp lint_audit_entries(tenant_id) do
     from(a in AuditLog,
       where: a.tenant_id == ^tenant_id,
-      where: a.action == "knowledge.lint_completed"
+      where: a.action == "knowledge.lint_completed",
+      order_by: [asc: a.inserted_at, asc: a.id]
     )
     |> AdminRepo.all()
   end
@@ -615,12 +620,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       AdminRepo.delete!(flag)
       # The relates_to edge survives, so the promoter raises a fresh flag on the next run.
 
-      # Backdate the verdict a day. `article_links.inserted_at` is SECOND precision while
-      # `conflict_resolutions.annotated_at` is microsecond, so a verdict and a flag created
-      # in the same second compare as verdict-after-flag whichever order they really
-      # happened in. Re-flagging is a different-night event in the real flow, so the day
-      # gap is the realistic case — shrinking it would be testing the timestamp precision,
-      # not the predicate.
+      # Backdate the verdict a day. Re-flagging is a different-night event in the real flow,
+      # so the day gap is the realistic case; it also puts the new flag clearly after the
+      # verdict rather than microseconds apart.
       AdminRepo.update_all(
         from(r in Loopctl.Knowledge.ConflictResolution, where: r.id == ^first.id),
         set: [annotated_at: DateTime.add(first.annotated_at, -1, :day)]
