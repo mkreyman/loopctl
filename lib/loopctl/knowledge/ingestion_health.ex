@@ -1645,9 +1645,10 @@ defmodule Loopctl.Knowledge.IngestionHealth do
           state: fragment("? - 'summary'::text", a.new_state),
           rn:
             fragment(
-              "row_number() OVER (PARTITION BY ? ORDER BY ? DESC)",
+              "row_number() OVER (PARTITION BY ? ORDER BY ? DESC, ? DESC)",
               a.tenant_id,
-              a.inserted_at
+              a.inserted_at,
+              a.id
             )
         }
       )
@@ -1822,7 +1823,7 @@ defmodule Loopctl.Knowledge.IngestionHealth do
 
     data =
       base_query
-      |> order_by([a], desc: a.inserted_at)
+      |> order_by([a], desc: a.inserted_at, desc: a.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()

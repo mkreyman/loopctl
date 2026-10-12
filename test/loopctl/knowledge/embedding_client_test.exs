@@ -190,6 +190,11 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
     tenant = fixture(:tenant)
     set_embedding_key(tenant, "test-openai-key-UNAVAILABLE")
 
+    # The client measures the date from its own clock, so the answer shrinks by however
+    # long this test takes to reach it; the window below is that measured time, not a
+    # guess at how fast the machine is.
+    started = System.monotonic_time(:millisecond)
+
     date =
       DateTime.utc_now()
       |> DateTime.add(30, :second)
@@ -205,7 +210,9 @@ defmodule Loopctl.Knowledge.EmbeddingClientTest do
     assert {:error, {:api_error, 503, :provider_error, seconds}} =
              EmbeddingClient.generate_embedding(tenant.id, "x")
 
-    assert is_integer(seconds) and seconds >= 25 and seconds <= 30
+    # The header drops the sub-second part and the diff truncates: up to 2s more.
+    elapsed = div(System.monotonic_time(:millisecond) - started, 1000) + 2
+    assert is_integer(seconds) and seconds >= 30 - elapsed and seconds <= 30
   end
 
   # --- US-37.4 (AC-37.4.1): batch path — array in, map back BY response index ---

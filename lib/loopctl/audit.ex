@@ -324,7 +324,7 @@ defmodule Loopctl.Audit do
 
     entries =
       base_query
-      |> order_by([a], asc: a.inserted_at)
+      |> order_by([a], asc: a.inserted_at, asc: a.id)
       |> limit(^page_size)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -395,6 +395,8 @@ defmodule Loopctl.Audit do
   defp filter_to(query, nil), do: query
   defp filter_to(query, to), do: where(query, [a], a.inserted_at <= ^to)
 
-  defp apply_order(query, :asc), do: order_by(query, [a], asc: a.inserted_at)
-  defp apply_order(query, :desc), do: order_by(query, [a], desc: a.inserted_at)
+  # `id` breaks a tie on `inserted_at` (several entries of one Multi share a microsecond), so
+  # an offset page is the same page on every read.
+  defp apply_order(query, :asc), do: order_by(query, [a], asc: a.inserted_at, asc: a.id)
+  defp apply_order(query, :desc), do: order_by(query, [a], desc: a.inserted_at, desc: a.id)
 end

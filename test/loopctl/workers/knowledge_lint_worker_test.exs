@@ -63,10 +63,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     |> AdminRepo.update!()
   end
 
-  # Oldest first. Two tests match `[first_run, second_run]` positionally, and without an
-  # ORDER BY Postgres returns heap order, which is not insertion order once a vacuum has
-  # freed space on an earlier page: under the async suite the second run's row could come
-  # back first and the idempotency test read the FIRST night's counter as the second's.
+  # Oldest first. Tests match its result positionally (`[first_run, second_run]`), and
+  # without an ORDER BY Postgres returns heap order, which is not insertion order once a
+  # vacuum has freed space on an earlier page: under the async suite the second run's row
+  # could come back first and the idempotency test read the FIRST night's counter as the
+  # second's. Run order rests on `inserted_at`: an app-side microsecond stamp
+  # (`timestamps()`), taken separately by each sequential run. `id` is a random UUID, so it
+  # only makes a tie deterministic, never ordered.
   defp lint_audit_entries(tenant_id) do
     from(a in AuditLog,
       where: a.tenant_id == ^tenant_id,
@@ -743,23 +746,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       # unique index — a same-direction re-insert can never mint a second row).
       assert [_only_one] = conflict_links(tenant.id, a.id, b.id)
 
-      # Idempotency is ORDER-INDEPENDENT: across the two runs exactly one promotion
-      # happened (the first); the other run promoted nothing new. Assert the MULTISET of
-      # per-run promotion counts, not positional order. `lint_audit_entries/1` is
-      # unordered and audit `inserted_at` is NOT a total order across two same-tenant
-      # runs — the audit_log column carries a DB-side `now()` (transaction-timestamp)
-      # default, so two entries written in this test's single sandbox transaction can
-      # share an `inserted_at` to the microsecond. Sorting on that key alone then leaves
-      # the "second" slot at the mercy of arbitrary heap return order and can surface the
-      # first run's entry (conflicts_promoted == 1) — the intermittent failure. (The
-      # production audit-history reader guards the same collision with a mandatory
-      # (inserted_at, id) tiebreak.)
-      promotions =
-        lint_audit_entries(tenant.id)
-        |> Enum.map(& &1.new_state["conflicts_promoted"])
-        |> Enum.sort()
-
-      assert promotions == [0, 1]
+      # The FIRST run promoted the pair and the second promoted nothing new, in run order:
+      # a promoter that fired only on the second run would leave the same counts sorted.
+      assert [
+               %{new_state: %{"conflicts_promoted" => 1}},
+               %{new_state: %{"conflicts_promoted" => 0}}
+             ] = lint_audit_entries(tenant.id)
     end
   end
 

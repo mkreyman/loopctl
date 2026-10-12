@@ -11,24 +11,20 @@ defmodule Loopctl.Provider.RetryAfterTest do
       assert RetryAfter.parse("  15  ") == 15
     end
 
-    test "an IMF-fixdate HTTP-date ~30s out parses to ~30s (max(0, diff))" do
-      target =
-        DateTime.utc_now()
-        |> DateTime.add(30, :second)
-        |> Calendar.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    test "an IMF-fixdate HTTP-date 30s out parses to 30s (max(0, diff))" do
+      # Measured from the instant the date was built, so the answer is exact however
+      # long the machine takes between building the header and reading it.
+      now = ~U[2026-10-11 20:00:00Z]
+      target = now |> DateTime.add(30, :second) |> Calendar.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
-      seconds = RetryAfter.parse(target)
-      # Class assertion (not an exact instant): within a small window of 30s.
-      assert seconds >= 27 and seconds <= 30
+      assert RetryAfter.parse(target, now) == 30
     end
 
     test "an HTTP-date in the PAST clamps to 0 (never negative)" do
-      past =
-        DateTime.utc_now()
-        |> DateTime.add(-120, :second)
-        |> Calendar.strftime("%a, %d %b %Y %H:%M:%S GMT")
+      now = ~U[2026-10-11 20:00:00Z]
+      past = now |> DateTime.add(-120, :second) |> Calendar.strftime("%a, %d %b %Y %H:%M:%S GMT")
 
-      assert RetryAfter.parse(past) == 0
+      assert RetryAfter.parse(past, now) == 0
     end
 
     test "absent / empty / malformed values → nil (defensive fallback)" do
