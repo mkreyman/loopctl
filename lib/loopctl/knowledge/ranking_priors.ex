@@ -342,8 +342,8 @@ defmodule Loopctl.Knowledge.RankingPriors do
 
   @doc """
   The recency decay `exp(-age_days / 30)` for a document whose content last changed at
-  `content_changed_at`, measured against `now`. Range `(0, 1]` (1.0 for content authored
-  exactly now). This is the SINGLE SOURCE OF TRUTH for the decay — `knowledge_context`
+  `content_changed_at`, measured against `now`. Range `(0, 1]` (1.0 for content changed at or
+  after `now`). This is the SINGLE SOURCE OF TRUTH for the decay — `knowledge_context`
   calls it too.
 
   Resolve the timestamp with `recency_timestamp/1` rather than reading a field off the row
@@ -352,8 +352,28 @@ defmodule Loopctl.Knowledge.RankingPriors do
   """
   @spec recency_decay(DateTime.t(), DateTime.t()) :: float()
   def recency_decay(content_changed_at, now) do
-    age_days = DateTime.diff(now, content_changed_at, :second) / 86_400.0
+    # Content changed after `now` is age 0, not a negative age: `ranking_clock/1` snaps `now`
+    # back to the start of the day, so today's edits are routinely "in the future" of it, and
+    # a negative age would push the decay, and the factor built on it, above 1.0.
+    age_days = max(DateTime.diff(now, content_changed_at, :second), 0) / 86_400.0
     :math.exp(-age_days / @decay_tau_days)
+  end
+
+  @doc """
+  The `now` a recency prior measures age against when the caller supplies none: the start of
+  the current UTC day.
+
+  The decay is measured in whole seconds, so an unsnapped clock moved every score once a
+  second, and two recalls of an unchanged corpus a second apart rendered different bytes:
+  a client's prompt cache did not survive a repeated turn. Snapped to the day, scores move
+  once a day. At a 30-day decay constant a day of granularity changes a factor by at most
+  `w * (1 - exp(-1/30))`, about 1% of `w`, and it moves every document together. The rule
+  is the one `heat_since/1` and `Importance` follow: a DERIVED clock is snapped, an
+  explicit `:now` is taken verbatim.
+  """
+  @spec ranking_clock(DateTime.t()) :: DateTime.t()
+  def ranking_clock(now \\ DateTime.utc_now()) do
+    DateTime.new!(DateTime.to_date(now), ~T[00:00:00], "Etc/UTC")
   end
 
   @doc """

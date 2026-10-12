@@ -2257,7 +2257,8 @@ defmodule Loopctl.Knowledge do
        }}
     else
       articles = fetch_full_context_articles(tenant_id, article_ids)
-      now = DateTime.utc_now()
+      # The same snapped clock search ranks with, so the two surfaces age a document alike.
+      now = RankingPriors.ranking_clock()
 
       article_ids_for_links = Enum.map(articles, & &1.id)
       linked_map = batch_linked_refs(tenant_id, article_ids_for_links, vis)
@@ -10628,7 +10629,7 @@ defmodule Loopctl.Knowledge do
 
   defp ranking_prior_opts(opts) do
     [
-      now: Keyword.get(opts, :now, DateTime.utc_now()),
+      now: Keyword.get_lazy(opts, :now, &RankingPriors.ranking_clock/0),
       recency_weight: recency_weight_opt(opts),
       authority?: authority_prior_enabled?(opts),
       strength: authority_strength_opt(opts),
