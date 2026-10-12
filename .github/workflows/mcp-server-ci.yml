@@ -53,8 +53,10 @@ jobs:
   # fixed "the bump happened but no tag was pushed", this fixes "the code changed but no
   # bump happened".
   #
-  # Scoped to what npm actually SHIPS (package.json `files`), so test-only, smoke-test and
-  # workflow edits do not demand a bump.
+  # Scoped to what npm actually SHIPS (npm's own `npm pack --dry-run` list for each side,
+  # plus package.json's runtime fields), so test-only, smoke-test and workflow edits do not
+  # demand a bump. mcp-server/scripts/check-version-bump.mjs says which commits it compares
+  # and why.
   version-bump:
     name: Published files require a version bump
     needs: changes
@@ -63,37 +65,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          # The merge commit and its parents: HEAD^1 is master as GitHub merged it, the
+          # base the script compares against.
+          fetch-depth: 2
 
       - name: Fail if a shipped file changed without a version bump
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-
-          changed=$(git diff --name-only "$BASE" "$HEAD" -- \
-            'mcp-server/index.js' 'mcp-server/lib/**' 'mcp-server/README.md')
-
-          if [ -z "$changed" ]; then
-            echo "No published mcp-server file changed; no bump required."
-            exit 0
-          fi
-
-          echo "Published files changed in this PR:"
-          echo "$changed"
-
-          base_version=$(git show "$BASE:mcp-server/package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
-          head_version=$(node -p "require('./mcp-server/package.json').version")
-
-          echo "version: base=$base_version head=$head_version"
-
-          if [ "$base_version" = "$head_version" ]; then
-            echo "::error::mcp-server published files changed but the version is still $head_version. Nothing publishes to npm without a version bump, so agents keep the OLD tool descriptions while the server serves the new payload. Bump mcp-server/package.json."
-            exit 1
-          fi
-
-          echo "Version bumped $base_version -> $head_version."
+        run: node mcp-server/scripts/check-version-bump.mjs
 
   test:
     name: Node unit tests
