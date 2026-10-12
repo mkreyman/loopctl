@@ -986,8 +986,11 @@ defmodule LoopctlWeb.RunnerChannel do
 
   defp sole_live_socket?(_socket), do: false
 
-  # The lock wait of this channel's ledger writes: `Capacity.lock_timeout_ms/0`, unless the
-  # SOCKET carries `:lock_timeout_ms`. Nothing a runner sends can set it:
+  # The lock wait of the ledger writes this channel makes DIRECTLY (push, drop, reply, trace,
+  # slot reservation): `Capacity.lock_timeout_ms/0`, unless the SOCKET carries
+  # `:lock_timeout_ms`. The writes behind `RunnerStages` and `RunnerReviews` (a session's end,
+  # the slot a stage report frees) are not given it and always wait the deployed bound: no
+  # test takes their busy path, so a shorter wait there would buy nothing. Nothing a runner sends can set it:
   # `LoopctlWeb.RunnerSocket.connect/3` never assigns it and no join or message param reaches
   # it. Only a test that builds the socket itself does, to get a busy answer without waiting
   # out the deployed bound (US-46.7).

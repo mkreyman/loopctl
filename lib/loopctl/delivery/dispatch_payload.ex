@@ -224,9 +224,9 @@ defmodule Loopctl.Delivery.DispatchPayload do
   `{:error, :busy}` for contention a caller retries out of
   (`Loopctl.Delivery.Stages.answering_busy/4`, counted as
   `[:loopctl, :delivery, :dispatch_route_busy]`); it never raises for that. Its wait is
-  `Capacity.lock_timeout_ms(opts)`.
+  `Capacity.lock_timeout_ms/0`; `dispatch_route/4` takes `opts` for another wait.
   """
-  @spec dispatch_route(Ecto.UUID.t(), Story.t(), keyword()) ::
+  @spec dispatch_route(Ecto.UUID.t(), Story.t()) ::
           {:ok,
            %{
              mode: :pr | :thread | nil,
@@ -234,15 +234,27 @@ defmodule Loopctl.Delivery.DispatchPayload do
              base_branch: String.t() | nil
            }}
           | {:error, term()}
-  def dispatch_route(tenant_id, story, opts \\ [])
-
-  def dispatch_route(tenant_id, %Story{} = story, opts) when is_list(opts),
-    do: dispatch_route(tenant_id, story, story.claim_epoch, opts)
+  def dispatch_route(tenant_id, %Story{} = story),
+    do: dispatch_route(tenant_id, story, story.claim_epoch, [])
 
   @doc """
   `dispatch_route/2` for the claim of `claim_epoch` rather than the current one (US-45.7): the
   route a checkpoint recorded under an earlier claim was built on. Same lock bound, same `:busy`.
-  The wait is `Capacity.lock_timeout_ms(opts)`.
+  """
+  @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer()) ::
+          {:ok,
+           %{
+             mode: :pr | :thread | nil,
+             branch: String.t() | nil,
+             base_branch: String.t() | nil
+           }}
+          | {:error, term()}
+  def dispatch_route(tenant_id, %Story{} = story, claim_epoch),
+    do: dispatch_route(tenant_id, story, claim_epoch, [])
+
+  @doc """
+  `dispatch_route/3` with `opts`: its wait is `Capacity.lock_timeout_ms(opts)`. A caller
+  holding `opts` reads the CURRENT claim by passing `story.claim_epoch`.
   """
   @spec dispatch_route(Ecto.UUID.t(), Story.t(), non_neg_integer(), keyword()) ::
           {:ok,

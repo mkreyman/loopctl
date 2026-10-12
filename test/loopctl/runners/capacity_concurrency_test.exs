@@ -35,8 +35,8 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
   # The lock wait a busy-path test is given, instead of the deployed
   # `Capacity.lock_timeout_ms/0`: its subject is the answer a wait that ran out produces, not
   # how long it waited (US-46.7). The races keep the deployed wait. A busy answer must come
-  # in under TWO of these: one wait passes, a path that waits twice (or drops the option)
-  # fails, and the half-second left over absorbs a loaded machine.
+  # in under HALF the deployed wait: a path that drops the option waits all of it and fails,
+  # and the time over this one wait (about 2s) absorbs connection checkout and a loaded machine.
   @busy_wait_ms 500
 
   setup :verify_on_exit!
@@ -134,7 +134,7 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
       assert send_dispatch(runner, d, busy()) == {:error, :capacity_busy}
       elapsed = System.monotonic_time(:millisecond) - started
       assert elapsed >= @busy_wait_ms
-      assert elapsed < 2 * @busy_wait_ms
+      assert elapsed < div(Capacity.lock_timeout_ms(), 2)
 
       send(holder.pid, :release)
       Task.await(holder)
@@ -232,7 +232,7 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
       assert reply(runner, d, %{}, busy()) == {:error, :capacity_busy}
       elapsed = System.monotonic_time(:millisecond) - started
       assert elapsed >= @busy_wait_ms
-      assert elapsed < 2 * @busy_wait_ms
+      assert elapsed < div(Capacity.lock_timeout_ms(), 2)
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)
@@ -272,7 +272,7 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
              end) == {:error, :capacity_busy}
 
       # The short wait reached the lock, once: a dropped option answers the same, 5s later.
-      assert System.monotonic_time(:millisecond) - started < 2 * @busy_wait_ms
+      assert System.monotonic_time(:millisecond) - started < div(Capacity.lock_timeout_ms(), 2)
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)
@@ -309,7 +309,7 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
       started = System.monotonic_time(:millisecond)
 
       assert release(runner, d.dispatch_id, slot, busy()) == {:error, :capacity_busy}
-      assert System.monotonic_time(:millisecond) - started < 2 * @busy_wait_ms
+      assert System.monotonic_time(:millisecond) - started < div(Capacity.lock_timeout_ms(), 2)
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)

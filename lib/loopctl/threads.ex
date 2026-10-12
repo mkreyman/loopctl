@@ -689,7 +689,7 @@ defmodule Loopctl.Threads do
   §6.1): the three-dot comparison of the base branch the checkpoint's OWN claim was placed on
   with the checkpoint's commit — the change as the merge gate judged it when that claim was
   current. A checkpoint of an earlier claim is judged against that claim's base, not the
-  current one's (`DispatchPayload.dispatch_route/4` with the checkpoint's `claim_epoch`).
+  current one's (`DispatchPayload.dispatch_route/3` with the checkpoint's `claim_epoch`).
 
   A claim whose dispatch ledger recorded no base (a row written before the column existed, or
   no row at all) falls back to the intake source's CURRENT base branch, and the answer says so:
@@ -707,8 +707,7 @@ defmodule Loopctl.Threads do
       Repo.with_tenant(tenant_id, fn -> diff_target(tenant_id, story_id, checkpoint_id) end)
 
     with {:ok, story, source, checkpoint} <- target,
-         {:ok, route} <-
-           DispatchPayload.dispatch_route(tenant_id, story, checkpoint.claim_epoch, []) do
+         {:ok, route} <- DispatchPayload.dispatch_route(tenant_id, story, checkpoint.claim_epoch) do
       base = DispatchPayload.placed_base_branch(route, source)
 
       # Read as the credential chosen for this (tenant, repository) (#936), like every forge

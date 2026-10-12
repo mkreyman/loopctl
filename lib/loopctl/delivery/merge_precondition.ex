@@ -1355,7 +1355,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # lock wait is bounded (`Loopctl.Runners.Capacity.lock_timeout_ms(opts)`) and contention
     # answers `:unevaluated`, which the loop retries.
     {mode, forge, {pr_number, checkpoint, pull_request}} =
-      case DispatchPayload.dispatch_route(story.tenant_id, story, opts) do
+      case DispatchPayload.dispatch_route(story.tenant_id, story, story.claim_epoch, opts) do
         {:ok, route} ->
           # The repository with the credential every forge read below authenticates with
           # (#936), chosen per (tenant, repository) and only once there is a route to read

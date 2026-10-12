@@ -154,17 +154,24 @@ defmodule Loopctl.Runners.CapacityTest do
   describe "the lock wait" do
     test "a caller passing nothing waits the deployed bound; a caller may pass a shorter one" do
       assert Capacity.lock_timeout_ms([]) == Capacity.lock_timeout_ms()
-      assert Capacity.lock_timeout_ms() == 5_000
       assert Capacity.lock_timeout_ms(lock_timeout_ms: 100) == 100
 
-      assert {:ok, ["5s", "100ms"]} =
-               Repo.transaction(fn ->
-                 Capacity.set_lock_timeout!(Repo)
-                 %{rows: [[deployed]]} = Repo.query!("SHOW lock_timeout")
-                 Capacity.set_lock_timeout!(Repo, lock_timeout_ms: 100)
-                 %{rows: [[short]]} = Repo.query!("SHOW lock_timeout")
-                 [deployed, short]
-               end)
+      show = fn opts ->
+        Capacity.set_lock_timeout!(Repo, opts)
+        %{rows: [[value]]} = Repo.query!("SHOW lock_timeout")
+        value
+      end
+
+      # Compared with the deployed value set EXPLICITLY, not a literal, so tuning the
+      # constant does not fail a test whose subject is the option.
+      {:ok, {default, deployed, short}} =
+        Repo.transaction(fn ->
+          {show.([]), show.(lock_timeout_ms: Capacity.lock_timeout_ms()),
+           show.(lock_timeout_ms: 100)}
+        end)
+
+      assert default == deployed
+      assert short == "100ms"
     end
 
     test "a wait that is not a positive integer raises rather than defaulting" do

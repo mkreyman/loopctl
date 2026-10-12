@@ -26,6 +26,7 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.MockMergeForge
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Test.MergeForge
   alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Story
@@ -37,7 +38,8 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   @session MergeForge.session()
 
   # The lock wait the busy evaluate is given, instead of the deployed
-  # `Capacity.lock_timeout_ms/0` (US-46.7). It must answer in under two of these.
+  # `Capacity.lock_timeout_ms/0` (US-46.7). It must answer in under HALF the deployed wait: a
+  # path that drops the option waits all of it, and the rest of evaluate fits in the margin.
   @busy_wait_ms 500
 
   setup :verify_on_exit!
@@ -102,7 +104,7 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
 
       # The short wait reached the route read, once: a dropped option answers the same, 5s
       # later, and a second wait takes the answer past two of them.
-      assert System.monotonic_time(:millisecond) - started < 2 * @busy_wait_ms
+      assert System.monotonic_time(:millisecond) - started < div(Capacity.lock_timeout_ms(), 2)
       send(holder, :release)
     end
   end

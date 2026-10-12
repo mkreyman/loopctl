@@ -12,6 +12,7 @@ defmodule Loopctl.Verification do
   (`Loopctl.Runners.Capacity.set_lock_timeout!/2`, at `Capacity.lock_timeout_ms(opts)`).
   `opts` has no default, here or on `CiTarget.gather/3`: a runner write that forgot to pass
   the wait its caller was given would otherwise compile and quietly wait the deployed one.
+  Entry points default it instead; `Loopctl.Runners.Capacity`'s moduledoc states the rule.
   Database contention (a lock wait that ran out, a statement cancelled, a lost connection)
   is `{:error, :busy}` rather than a raise, counted as `[:loopctl, :verification, :run_write_busy]`
   (`Loopctl.Delivery.Stages.answering_busy/4`, the one classification of that). A refused

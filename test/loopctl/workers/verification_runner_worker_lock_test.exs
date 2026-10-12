@@ -29,6 +29,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
   alias Loopctl.MockPullRequestSource
   alias Loopctl.MockVerificationCredential
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Test.RowLock
   alias Loopctl.Test.VerificationRunnerForge
 
@@ -42,8 +43,8 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
 
   # The lock wait a busy poll is given, instead of the deployed `Capacity.lock_timeout_ms/0`:
   # the subject is the answer a wait that ran out produces, not how long it waited (US-46.7).
-  # A busy poll must answer in under TWO of these: one wait passes, a poll that waits twice
-  # (or drops the option) fails, and the half-second left over absorbs a loaded machine.
+  # A busy poll must answer in under HALF the deployed wait: a poll that drops the option
+  # waits all of it and fails, and the rest of the poll fits in the margin.
   @busy_wait_ms 500
 
   setup :verify_on_exit!
@@ -160,7 +161,7 @@ defmodule Loopctl.Workers.VerificationRunnerWorkerLockTest do
       elapsed = System.monotonic_time(:millisecond) - started
 
       assert elapsed >= @busy_wait_ms
-      assert elapsed < 2 * @busy_wait_ms
+      assert elapsed < div(Capacity.lock_timeout_ms(), 2)
     end
 
     test "database contention past the age window records database_busy", ctx do

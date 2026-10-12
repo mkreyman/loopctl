@@ -78,7 +78,8 @@ defmodule Loopctl.Runners.DispatchLedger do
   event.
 
   A reply or trace that could not get a LOCK is a different answer: every transaction here
-  bounds its waits (`Capacity.lock_timeout_ms/0`) and answers `{:error, :capacity_busy}` on a
+  bounds its waits (`Capacity.lock_timeout_ms(opts)`, the deployed bound unless the caller
+  passes `:lock_timeout_ms`) and answers `{:error, :capacity_busy}` on a
   timeout or a broken deadlock, which the channel turns into `rate_limited` with that
   interval. Both halves matter. Unbounded, a reply queued behind a claim release held a pool
   connection for as long as that transaction ran; and reraising crashed the channel holding
@@ -1471,7 +1472,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       end
   end
 
-  # A lock this write could not get inside `Capacity.lock_timeout_ms/0`, or a deadlock
+  # A lock this write could not get inside `Capacity.lock_timeout_ms(opts)`, or a deadlock
   # Postgres broke by choosing it. Nothing was written; the runner is told to send it again.
   defp report_busy(%Postgrex.Error{postgres: postgres}, tenant_id, runner_id, context) do
     metadata = %{

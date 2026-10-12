@@ -149,7 +149,7 @@ defmodule Loopctl.Runners.Capacity do
   contends on, so it is the one to hold for the shortest time.
 
   **What an operator sees because the capacity lock is first:** a claim release sitting on a
-  story makes every dispatch in that tenant queue behind it, and past `lock_timeout_ms/0`
+  story makes every dispatch in that tenant queue behind it, and past `lock_timeout_ms/1`
   each falls out as `:capacity_busy` with nothing reserved. That is the deliberate trade —
   a bounded queue and a retryable refusal instead of a deadlock — and a burst of
   `:capacity_busy` in one tenant means a long-held story lock, not a capacity shortage.
@@ -171,11 +171,19 @@ defmodule Loopctl.Runners.Capacity do
   and the dispatch row before it starts (`admit_and_reserve/3`).
 
   Every transaction here that can queue behind another sets `lock_timeout`
-  (`lock_timeout_ms/0`). A dispatcher behind a stuck admission gets `:capacity_busy` rather
+  (`lock_timeout_ms/1`: the deployed `lock_timeout_ms/0` unless the caller passes
+  `:lock_timeout_ms`). A dispatcher behind a stuck admission gets `:capacity_busy` rather
   than an unbounded wait inside an open transaction; nothing is reserved and it may retry.
   A deadlock is classified the same way (`retryable?/1`) rather than raised: with one order
   it should not happen, and if a future path reintroduces one, a dispatcher retrying beats a
   crashed channel holding a runner's socket.
+
+  **Which functions default the option.** An ENTRY POINT, any function a channel, worker,
+  controller or executor calls, takes `opts \\\\ []`: most of their production callers hold no
+  lock opts, and the forwarding that matters is pinned by the busy-path tests (US-46.7).
+  `Loopctl.Verification` and `Loopctl.Verification.CiTarget` take `opts` with NO default:
+  they sit strictly between the worker that holds `opts` and those entry points, every caller
+  of theirs has `opts`, and a dropped forward there should fail to compile.
 
   ## Partitions
 
