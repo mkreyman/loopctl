@@ -48,7 +48,7 @@ defmodule Loopctl.Verification.CiTarget do
          {:ok, source} <- source(tenant_id, story),
          {:ok, required} <- required_checks(source),
          {:route, {:ok, route}} <-
-           {:route, DispatchPayload.dispatch_route(tenant_id, story, story.claim_epoch, opts)},
+           {:route, DispatchPayload.dispatch_route(tenant_id, story, opts)},
          {:stage, {:ok, stage}} <- {:stage, Stages.fetch(tenant_id, story.id, opts)} do
       resolve(story, source, required, route, stage && stage.branch)
     else

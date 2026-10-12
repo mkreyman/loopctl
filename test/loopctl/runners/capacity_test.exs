@@ -151,6 +151,33 @@ defmodule Loopctl.Runners.CapacityTest do
     Runners.release_slot(runner.tenant_id, dispatch_id, generation)
   end
 
+  describe "the lock wait" do
+    test "a caller passing nothing waits the deployed bound; a caller may pass a shorter one" do
+      assert Capacity.lock_timeout_ms([]) == Capacity.lock_timeout_ms()
+      assert Capacity.lock_timeout_ms() == 5_000
+      assert Capacity.lock_timeout_ms(lock_timeout_ms: 100) == 100
+
+      assert {:ok, ["5s", "100ms"]} =
+               Repo.transaction(fn ->
+                 Capacity.set_lock_timeout!(Repo)
+                 %{rows: [[deployed]]} = Repo.query!("SHOW lock_timeout")
+                 Capacity.set_lock_timeout!(Repo, lock_timeout_ms: 100)
+                 %{rows: [[short]]} = Repo.query!("SHOW lock_timeout")
+                 [deployed, short]
+               end)
+    end
+
+    test "a wait that is not a positive integer raises rather than defaulting" do
+      # 0 is Postgres's "wait for ever"; a silent default would hide the caller's mistake.
+      for bad <- [nil, 0, -1, "100"] do
+        assert_raise ArgumentError, fn -> Capacity.lock_timeout_ms(lock_timeout_ms: bad) end
+      end
+
+      # Options alone are not mistaken for the repo.
+      assert_raise FunctionClauseError, fn -> Capacity.set_lock_timeout!(lock_timeout_ms: 100) end
+    end
+  end
+
   describe "reserve_slot/2" do
     test "a revoked runner cannot reserve" do
       runner = runner(%{max_sessions: 3})

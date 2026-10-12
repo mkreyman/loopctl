@@ -1355,7 +1355,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # lock wait is bounded (`Loopctl.Runners.Capacity.lock_timeout_ms(opts)`) and contention
     # answers `:unevaluated`, which the loop retries.
     {mode, forge, {pr_number, checkpoint, pull_request}} =
-      case DispatchPayload.dispatch_route(story.tenant_id, story, story.claim_epoch, opts) do
+      case DispatchPayload.dispatch_route(story.tenant_id, story, opts) do
         {:ok, route} ->
           # The repository with the credential every forge read below authenticates with
           # (#936), chosen per (tenant, repository) and only once there is a route to read
@@ -1436,7 +1436,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
       # When the story entered `ci`, what a CI wait is measured from — read on exactly the path
       # that reads CI, so a lock wait on it can never mask a merged or moved head's decision
       # (#910 round 2, finding 2).
-      ci_entered_at: ci_entered_at(facts, pull_request, skip?, story)
+      ci_entered_at: ci_entered_at(facts, pull_request, skip?, story, opts)
     })
   end
 
@@ -1444,15 +1444,21 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # (contention is `{:error, :busy}`, a retry). A story that reached `ci` with no recorded
   # transition — a backfill, a repair — falls back to its checkpoint's recording, which is
   # always known, so the wait is bounded for every story (round 1 of #910, finding 8).
-  defp ci_entered_at(%{mode: :thread} = facts, {:ok, %{merged?: false}}, false = _skip?, story) do
-    case Stages.entered_at(story.tenant_id, story.id, :ci) do
+  defp ci_entered_at(
+         %{mode: :thread} = facts,
+         {:ok, %{merged?: false}},
+         false = _skip?,
+         story,
+         opts
+       ) do
+    case Stages.entered_at(story.tenant_id, story.id, :ci, opts) do
       {:ok, %DateTime{} = entered} -> {:ok, entered}
       {:ok, nil} -> {:ok, checkpoint_recorded_at(facts.checkpoint)}
       {:error, _reason} = error -> error
     end
   end
 
-  defp ci_entered_at(_facts, _pull_request, _skip?, _story), do: {:ok, nil}
+  defp ci_entered_at(_facts, _pull_request, _skip?, _story, _opts), do: {:ok, nil}
 
   defp checkpoint_recorded_at({:ok, %{recorded_at: %DateTime{} = at}}), do: at
   defp checkpoint_recorded_at(_checkpoint), do: nil

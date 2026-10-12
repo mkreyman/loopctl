@@ -223,9 +223,10 @@ defmodule Loopctl.Delivery.DispatchPayload do
   The read's lock wait is bounded (`Loopctl.Runners.Capacity.set_lock_timeout!/2`).
   `{:error, :busy}` for contention a caller retries out of
   (`Loopctl.Delivery.Stages.answering_busy/4`, counted as
-  `[:loopctl, :delivery, :dispatch_route_busy]`); it never raises for that.
+  `[:loopctl, :delivery, :dispatch_route_busy]`); it never raises for that. Its wait is
+  `Capacity.lock_timeout_ms(opts)`.
   """
-  @spec dispatch_route(Ecto.UUID.t(), Story.t()) ::
+  @spec dispatch_route(Ecto.UUID.t(), Story.t(), keyword()) ::
           {:ok,
            %{
              mode: :pr | :thread | nil,
@@ -233,8 +234,14 @@ defmodule Loopctl.Delivery.DispatchPayload do
              base_branch: String.t() | nil
            }}
           | {:error, term()}
-  def dispatch_route(tenant_id, %Story{} = story),
-    do: dispatch_route(tenant_id, story, story.claim_epoch)
+  def dispatch_route(tenant_id, story, opts \\ [])
+
+  def dispatch_route(tenant_id, %Story{} = story, opts) when is_list(opts),
+    do: dispatch_route(tenant_id, story, story.claim_epoch, opts)
+
+  # `dispatch_route/4` with the deployed wait, for the claim of `claim_epoch`.
+  def dispatch_route(tenant_id, %Story{} = story, claim_epoch) when is_integer(claim_epoch),
+    do: dispatch_route(tenant_id, story, claim_epoch, [])
 
   @doc """
   `dispatch_route/2` for the claim of `claim_epoch` rather than the current one (US-45.7): the
@@ -249,7 +256,7 @@ defmodule Loopctl.Delivery.DispatchPayload do
              base_branch: String.t() | nil
            }}
           | {:error, term()}
-  def dispatch_route(tenant_id, %Story{} = story, claim_epoch, opts \\ []) do
+  def dispatch_route(tenant_id, %Story{} = story, claim_epoch, opts) do
     Stages.answering_busy(
       tenant_id,
       [:loopctl, :delivery, :dispatch_route_busy],

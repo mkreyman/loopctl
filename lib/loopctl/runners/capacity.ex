@@ -263,7 +263,7 @@ defmodule Loopctl.Runners.Capacity do
   `lock_timeout_ms(opts)`.
   """
   @spec set_lock_timeout!(Ecto.Repo.t(), keyword()) :: :ok
-  def set_lock_timeout!(repo \\ Repo, opts \\ []) when is_list(opts) do
+  def set_lock_timeout!(repo \\ Repo, opts \\ []) when is_atom(repo) and is_list(opts) do
     repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{lock_timeout_ms(opts)}ms"])
     :ok
   end
@@ -273,12 +273,19 @@ defmodule Loopctl.Runners.Capacity do
 
   An input so a test whose subject is the busy answer gets it without waiting out the
   deployed wait (US-46.7). Only code sets it, never request data or channel params, and
-  production callers pass nothing. Anything but a positive integer raises.
+  production callers pass nothing. Anything but a positive integer raises, because a
+  `lock_timeout` of 0 is Postgres's "wait for ever" and a silent default would hide the
+  caller's mistake behind the deployed wait.
   """
   @spec lock_timeout_ms(keyword()) :: pos_integer()
   def lock_timeout_ms(opts) when is_list(opts) do
     case Keyword.get(opts, :lock_timeout_ms, @lock_timeout_ms) do
-      ms when is_integer(ms) and ms > 0 -> ms
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      other ->
+        raise ArgumentError,
+              ":lock_timeout_ms must be a positive integer of milliseconds, got: #{inspect(other)}"
     end
   end
 

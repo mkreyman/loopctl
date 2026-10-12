@@ -351,15 +351,15 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
-  `record_push/2` and `record_drop/2` inside the CALLER's transaction, on the caller's repo:
+  `record_push/3` and `record_drop/3` inside the CALLER's transaction, on the caller's repo:
   the compare-and-set on `delivery` and, for a drop that wins, the release. Returns
   `:pushed` | `:released` | `{:already, outcome}`, and raises `Ecto.NoResultsError` semantics
   through `nil` — a caller inside its own transaction handles a missing row itself.
 
-  The caller owns the transaction and its lock timeout; `record_push/2` and `record_drop/2`
-  are the forms that own one of their own, bounded at `Capacity.lock_timeout_ms(opts)`. Public
-  because the decision is the ONE ordering
-  point between a push and a drop, so a test must be able to hold it open.
+  The caller owns the transaction and its lock timeout; `record_push/3` and `record_drop/3`
+  are the forms that own one of their own, bounded at `Capacity.lock_timeout_ms(opts)`.
+  Public because the decision is the ONE ordering point between a push and a drop, so a test
+  must be able to hold it open.
   """
   @spec decide_delivery_in(Ecto.Repo.t(), Ecto.UUID.t(), map(), String.t()) ::
           :pushed | :released | {:already, String.t()} | nil
@@ -1241,9 +1241,9 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   @doc """
   Stores a validated `trace` batch from `runner_id` and returns the run's contiguous
-  `acked_seq`. See the moduledoc for the rules.
+  `acked_seq`. See the moduledoc for the rules. The wait is `Capacity.lock_timeout_ms(opts)`.
   """
-  @spec record_trace(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
+  @spec record_trace(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok, integer()}
           | {:error,
              :unknown_dispatch
@@ -1253,10 +1253,10 @@ defmodule Loopctl.Runners.DispatchLedger do
              | :run_mismatch
              | :rejected_by_database
              | :capacity_busy}
-  def record_trace(tenant_id, runner_id, batch) do
+  def record_trace(tenant_id, runner_id, batch, opts \\ []) do
     context = %{operation: :record_trace, dispatch_id: batch.dispatch_id, run_id: batch.run_id}
 
-    runner_write(tenant_id, runner_id, context, fn ->
+    runner_write(tenant_id, runner_id, context, opts, fn ->
       with {:ok, record, _story} <- fence_then_lock(tenant_id, runner_id, batch.dispatch_id),
            :ok <- epoch_matches(record, batch.claim_epoch),
            :ok <- accepted(record),

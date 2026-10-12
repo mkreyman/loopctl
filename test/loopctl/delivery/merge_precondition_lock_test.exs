@@ -26,6 +26,7 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
   alias Loopctl.Delivery.Stages
   alias Loopctl.MockMergeForge
   alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Test.MergeForge
   alias Loopctl.Test.ProductionTopology
   alias Loopctl.WorkBreakdown.Story
@@ -87,6 +88,7 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
 
       assert_receive :held, 5_000
       on_exit(fn -> send(holder, :release) end)
+      started = System.monotonic_time(:millisecond)
 
       assert {:ok, %Verdict{decision: :unevaluated, mode: nil}} =
                MergePrecondition.evaluate(
@@ -95,6 +97,8 @@ defmodule Loopctl.Delivery.MergePreconditionLockTest do
                  opts() ++ [lock_timeout_ms: 100]
                )
 
+      # The short wait reached the route read: a dropped option answers the same, 5s later.
+      assert System.monotonic_time(:millisecond) - started < Capacity.lock_timeout_ms()
       send(holder, :release)
     end
   end

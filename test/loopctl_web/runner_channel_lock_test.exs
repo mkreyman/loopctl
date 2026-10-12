@@ -149,6 +149,11 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
     Task.await(task, 30_000)
   end
 
+  # Returns once the channel has handled the broadcast queued before it: a system call is
+  # answered only after every earlier message, so the delivery decision has been taken (or
+  # its wait has run out) by then, however slow the machine is.
+  defp decided(channel), do: :sys.get_state(channel.channel_pid, 30_000)
+
   describe "the capacity a joining machine declares" do
     test "survives a database failure and re-applies the declaration on the next recheck", ctx do
       # #846.4 review findings 4 and 5, together, because they are two halves of one event.
@@ -332,8 +337,8 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
                    %{reason: "rate_limited", min_interval_ms: interval},
                    @lock_timeout_reply
 
-      # Longer than the wait that just ran out, so the retry is not straight back into the
-      # same queue.
+      # Longer than the DEPLOYED wait (not this test's shorter one), so a production retry is
+      # not straight back into the same queue.
       assert interval == Capacity.busy_retry_ms()
       assert interval > Capacity.lock_timeout_ms()
       assert Process.alive?(channel.channel_pid)
@@ -365,13 +370,13 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
             {:runner_dispatch, dispatch}
           )
 
-          # The drop's own decision runs into the lock timeout. An orderly refusal, not a
-          # crash: the slot is left to the sweep's undelivered grace.
-          refute_push "dispatch", _, @busy_wait_ms + 1_000
+          decided(channel)
         end)
 
-      assert log =~ "not delivered"
-      assert log =~ "capacity_busy"
+      # The drop's own decision ran into the lock timeout. An orderly refusal, not a crash:
+      # the slot is left to the sweep's undelivered grace.
+      refute_push "dispatch", _, 0
+      assert log =~ "drop not recorded: :capacity_busy"
       assert Process.alive?(channel.channel_pid)
       assert finish(blocker) == {:ok, :ok}
     end
@@ -390,17 +395,21 @@ defmodule LoopctlWeb.RunnerChannelLockTest do
           )
         )
 
-      Phoenix.PubSub.broadcast(
-        Loopctl.PubSub,
-        Runners.dispatch_topic(runner.id),
-        {:runner_dispatch, dispatch}
-      )
+      log =
+        capture_log(fn ->
+          Phoenix.PubSub.broadcast(
+            Loopctl.PubSub,
+            Runners.dispatch_topic(runner.id),
+            {:runner_dispatch, dispatch}
+          )
 
-      # The stamp runs into its lock_timeout, so the dispatch is NOT pushed: a push the
+          decided(channel)
+        end)
+
+      # The stamp ran into its lock_timeout, so the dispatch is NOT pushed: a push the
       # ledger does not record would lose its slot to the heal sweep mid-session.
-      # Long enough for the stamp's lock_timeout to expire, short enough that the blocker's
-      # own connection checkout (15 s) does not.
-      refute_push "dispatch", _, @busy_wait_ms + 1_000
+      refute_push "dispatch", _, 0
+      assert log =~ "delivery not recorded: :capacity_busy"
       assert Process.alive?(channel.channel_pid)
       assert finish(blocker) == {:ok, :ok}
 

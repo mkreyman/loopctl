@@ -263,10 +263,14 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
         end)
 
       assert_receive :blocking, 5_000
+      started = System.monotonic_time(:millisecond)
 
       assert on_own_connection(fn ->
                Runners.reserve_slot(runner.tenant_id, runner.id, busy())
              end) == {:error, :capacity_busy}
+
+      # The short wait reached the lock: a dropped option answers the same, 5s later.
+      assert System.monotonic_time(:millisecond) - started < Capacity.lock_timeout_ms()
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)
@@ -300,8 +304,10 @@ defmodule Loopctl.Runners.CapacityConcurrencyTest do
         end)
 
       assert_receive :blocking, 5_000
+      started = System.monotonic_time(:millisecond)
 
       assert release(runner, d.dispatch_id, slot, busy()) == {:error, :capacity_busy}
+      assert System.monotonic_time(:millisecond) - started < Capacity.lock_timeout_ms()
 
       send(blocker.pid, :finish)
       assert {:ok, :done} = Task.await(blocker, 30_000)

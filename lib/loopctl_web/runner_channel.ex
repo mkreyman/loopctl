@@ -550,7 +550,7 @@ defmodule LoopctlWeb.RunnerChannel do
          {:ok, batch} <- RunnerContract.cast_trace_batch(payload) do
       socket = assign(socket, :last_trace_at, now)
 
-      case DispatchLedger.record_trace(tenant_id, runner.id, batch) do
+      case DispatchLedger.record_trace(tenant_id, runner.id, batch, lock_opts(socket)) do
         {:ok, acked_seq} -> {:reply, {:ok, %{acked_seq: acked_seq}}, socket}
         {:error, reason} -> refuse(socket, "trace", message_error(reason))
       end
@@ -986,12 +986,6 @@ defmodule LoopctlWeb.RunnerChannel do
 
   defp sole_live_socket?(_socket), do: false
 
-  # The push half of the delivery decision (`DispatchLedger.record_push/2`): this channel
-  # pushes only if it WON the row, so a channel that dropped the same broadcast cannot free
-  # the slot of the session this push starts, and a second socket cannot push it twice. One
-  # database wait, never two: a decision that could not be taken leaves the dispatch unsent
-  # and its slot to the sweep's undelivered grace, rather than spending another lock_timeout
-  # inside the process that holds the runner's socket.
   # The lock wait of this channel's ledger writes: `Capacity.lock_timeout_ms/0`, unless the
   # SOCKET carries `:lock_timeout_ms`. Nothing a runner sends can set it:
   # `LoopctlWeb.RunnerSocket.connect/3` never assigns it and no join or message param reaches
@@ -1000,6 +994,12 @@ defmodule LoopctlWeb.RunnerChannel do
   defp lock_opts(%{assigns: %{lock_timeout_ms: ms}}), do: [lock_timeout_ms: ms]
   defp lock_opts(_socket), do: []
 
+  # The push half of the delivery decision (`DispatchLedger.record_push/3`): this channel
+  # pushes only if it WON the row, so a channel that dropped the same broadcast cannot free
+  # the slot of the session this push starts, and a second socket cannot push it twice. One
+  # database wait, never two: a decision that could not be taken leaves the dispatch unsent
+  # and its slot to the sweep's undelivered grace, rather than spending another lock_timeout
+  # inside the process that holds the runner's socket.
   defp push_if_this_channel_decides(socket, dispatch) do
     case DispatchLedger.record_push(socket.assigns.tenant_id, dispatch, lock_opts(socket)) do
       {:ok, :pushed} ->

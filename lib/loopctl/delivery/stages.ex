@@ -53,8 +53,8 @@ defmodule Loopctl.Delivery.Stages do
   ## Slow connections
 
   Every transition here sets `lock_timeout` (2s) and `statement_timeout` (5s) locally; the
-  read paths (`fetch/3`, `entered_at/3`) wait `Loopctl.Runners.Capacity.lock_timeout_ms/0`
-  (5s) instead. Either way a transaction waiting behind a lock holder — the reclaimer, a
+  read paths (`fetch/3`, `entered_at/4`) wait `Loopctl.Runners.Capacity.lock_timeout_ms(opts)`
+  (5s unless a caller passes its own) instead. Either way a transaction waiting behind a lock holder — the reclaimer, a
   claim, a concurrent transition, the tenant's audit-chain head — gives up instead of
   waiting without bound while holding a pooled connection. That, and a pool checkout that
   times out, is `{:error, :busy}`: nothing committed, and the call may be retried.
@@ -336,14 +336,14 @@ defmodule Loopctl.Delivery.Stages do
   When `story_id` last ENTERED `stage` — the newest transition into it — as `{:ok, at}`, or
   `{:ok, nil}` when it never has (US-45.6: what a merge gate's CI wait is measured from). Its
   lock wait is bounded and contention is `{:error, :busy}`, counted as
-  `[:loopctl, :delivery, :stage_read_busy]`.
+  `[:loopctl, :delivery, :stage_read_busy]`. The wait is `Capacity.lock_timeout_ms(opts)`.
   """
-  @spec entered_at(Ecto.UUID.t(), Ecto.UUID.t(), atom()) ::
+  @spec entered_at(Ecto.UUID.t(), Ecto.UUID.t(), atom(), keyword()) ::
           {:ok, DateTime.t() | nil} | {:error, term()}
-  def entered_at(tenant_id, story_id, stage) do
+  def entered_at(tenant_id, story_id, stage, opts \\ []) do
     answering_busy(tenant_id, [:loopctl, :delivery, :stage_read_busy], "stage entry read", fn ->
       Repo.with_tenant(tenant_id, fn ->
-        Capacity.set_lock_timeout!(Repo)
+        Capacity.set_lock_timeout!(Repo, opts)
 
         Repo.one(
           from e in StageEvent,
