@@ -165,6 +165,32 @@ defmodule Loopctl.Knowledge.IngestionHealthConsumerStallTest do
       assert candidate.hours_stale >= 48
     end
 
+    # Two runs stamped in one microsecond: the window keeps the one with the greater id, so
+    # which night the detector judges never depends on heap order.
+    test "of two runs tied on inserted_at, the window reads the one with the greater id" do
+      tenant = fixture(:tenant)
+      stalled = lint_run(tenant.id, 2, quiet_state(%{"drafts_offered" => 11}))
+
+      published =
+        fixture(:audit_log, %{
+          tenant_id: tenant.id,
+          entity_type: "knowledge_lint",
+          entity_id: tenant.id,
+          action: "knowledge.lint_completed",
+          actor_type: "system",
+          actor_label: "worker:knowledge_lint",
+          new_state: quiet_state(%{"drafts_offered" => 11, "drafts_published" => 1}),
+          inserted_at: stalled.inserted_at
+        })
+
+      candidate =
+        tenant.id
+        |> candidates_for(%{@opts | consumer_stall_runs: 1})
+        |> consumer_of(:drafts)
+
+      assert candidate != nil == stalled.id > published.id
+    end
+
     test "flags a paused draft drain that is holding drafts" do
       tenant = fixture(:tenant)
       held_draft(tenant.id)

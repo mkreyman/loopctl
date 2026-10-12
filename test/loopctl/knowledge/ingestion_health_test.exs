@@ -247,6 +247,24 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
       assert id == unresolved.id
     end
 
+    test "breaks an inserted_at tie on id, newest first" do
+      tenant = fixture(:tenant)
+      sources = ["session_log", "manual", "newsletter", "book"]
+
+      ids =
+        for source <- sources,
+            do: fixture(:ingestion_anomaly, %{tenant_id: tenant.id, source_type: source}).id
+
+      Loopctl.AdminRepo.update_all(
+        from(a in Loopctl.Knowledge.IngestionAnomaly, where: a.id in ^ids),
+        set: [inserted_at: ~U[2026-10-11 20:00:00Z]]
+      )
+
+      {:ok, %{data: data}} = IngestionHealth.list_anomalies(tenant.id)
+
+      assert Enum.map(data, & &1.id) == Enum.sort(ids, :desc)
+    end
+
     test "filters by source_type" do
       tenant = fixture(:tenant)
       fixture(:ingestion_anomaly, %{tenant_id: tenant.id, source_type: "session_log"})

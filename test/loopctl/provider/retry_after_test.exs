@@ -4,7 +4,7 @@ defmodule Loopctl.Provider.RetryAfterTest do
 
   alias Loopctl.Provider.RetryAfter
 
-  describe "parse/1" do
+  describe "parse/2" do
     test "delta-seconds integer string parses to that many seconds" do
       assert RetryAfter.parse("30") == 30
       assert RetryAfter.parse("0") == 0
@@ -72,7 +72,7 @@ defmodule Loopctl.Provider.RetryAfterTest do
     end
   end
 
-  describe "from_response/2" do
+  describe "from_response/3" do
     test "parses Retry-After only for throttle statuses (429/503)" do
       resp = %Req.Response{status: 429, headers: %{"retry-after" => ["30"]}}
       assert RetryAfter.from_response(429, resp) == 30
@@ -84,6 +84,14 @@ defmodule Loopctl.Provider.RetryAfterTest do
     test "ignores Retry-After for non-throttle statuses" do
       resp = %Req.Response{status: 401, headers: %{"retry-after" => ["30"]}}
       assert RetryAfter.from_response(401, resp) == nil
+    end
+
+    test "an HTTP-date is measured from the `now` it is given" do
+      now = ~U[2026-10-11 20:00:00Z]
+      date = now |> DateTime.add(30, :second) |> Calendar.strftime("%a, %d %b %Y %H:%M:%S GMT")
+      resp = %Req.Response{status: 503, headers: %{"retry-after" => [date]}}
+
+      assert RetryAfter.from_response(503, resp, now) == 30
     end
 
     test "a throttle status with no Retry-After header → nil" do

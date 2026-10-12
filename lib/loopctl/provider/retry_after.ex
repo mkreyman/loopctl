@@ -55,17 +55,19 @@ defmodule Loopctl.Provider.RetryAfter do
   Extract the parsed Retry-After from a throttle response, but ONLY for a
   throttle status (`429`/`503`). Returns `nil` otherwise. `resp` is a
   `%Req.Response{}`; its `retry-after` header is a list of values (lowercased by
-  Req) — the first is used.
+  Req) — the first is used. `now` is passed through to `parse/2`.
   """
-  @spec from_response(integer(), Req.Response.t()) :: non_neg_integer() | nil
-  def from_response(status, %Req.Response{} = resp) when status in @throttle_statuses do
+  @spec from_response(integer(), Req.Response.t(), DateTime.t()) :: non_neg_integer() | nil
+  def from_response(status, resp, now \\ DateTime.utc_now())
+
+  def from_response(status, %Req.Response{} = resp, now) when status in @throttle_statuses do
     resp
     |> Req.Response.get_header("retry-after")
     |> List.first()
-    |> parse()
+    |> parse(now)
   end
 
-  def from_response(_status, _resp), do: nil
+  def from_response(_status, _resp, _now), do: nil
 
   @doc """
   Read a parsed Retry-After back out of a sanitized throttle error term (the

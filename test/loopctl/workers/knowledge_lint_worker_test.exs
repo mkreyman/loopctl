@@ -63,13 +63,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     |> AdminRepo.update!()
   end
 
-  # Oldest first. Tests match its result positionally (`[first_run, second_run]`), and
-  # without an ORDER BY Postgres returns heap order, which is not insertion order once a
-  # vacuum has freed space on an earlier page: under the async suite the second run's row
-  # could come back first and the idempotency test read the FIRST night's counter as the
-  # second's. Run order rests on `inserted_at`: an app-side microsecond stamp
-  # (`timestamps()`), taken separately by each sequential run. `id` is a random UUID, so it
-  # only makes a tie deterministic, never ordered.
+  # Without an ORDER BY Postgres returns heap order, which a vacuum can make anything, so
+  # the read is ordered. Tests that compare two runs never rely on it: they take each run's
+  # entry from `run_lint!/1`, by identity rather than by clock.
   defp lint_audit_entries(tenant_id) do
     from(a in AuditLog,
       where: a.tenant_id == ^tenant_id,
@@ -77,6 +73,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       order_by: [asc: a.inserted_at, asc: a.id]
     )
     |> AdminRepo.all()
+  end
+
+  # Runs the nightly pass once and returns the audit entry THAT run wrote: the one entry
+  # whose id was not there before it. Run order is then the order of the calls, never two
+  # `inserted_at` stamps that may tie or step backwards.
+  defp run_lint!(tenant_id) do
+    seen = MapSet.new(lint_audit_entries(tenant_id), & &1.id)
+    assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant_id}})
+    assert [entry] = Enum.reject(lint_audit_entries(tenant_id), &MapSet.member?(seen, &1.id))
+    entry
   end
 
   describe "perform/1 per-tenant" do
@@ -593,13 +599,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
       assert [_one] = resolutions(tenant.id, a.id, b.id)
 
-      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      second = run_lint!(tenant.id)
 
       # Still exactly one row, and the second run reports nothing new to judge — otherwise
       # the "judged" counter would climb every night on a static corpus and the convergence
       # signal in the audit event would be meaningless.
       assert [_still_one] = resolutions(tenant.id, a.id, b.id)
-      assert [_first, second] = lint_audit_entries(tenant.id)
       assert second.new_state["conflicts_judged_redundant"] == 0
     end
 
@@ -631,15 +636,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
         set: [annotated_at: DateTime.add(first.annotated_at, -1, :day)]
       )
 
-      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      second_run = run_lint!(tenant.id)
 
       # The observable is the DRAIN'S OWN COUNTER, not the verdict row: `record_verdict/4`
       # inserts `on_conflict: :nothing`, so a re-judged pair keeps its existing row and
       # nothing about that row moves. What the fix changes is whether the pair is SELECTED
       # as unjudged at all — the sibling idempotency test above asserts this counter is 0
       # when a pair genuinely has not been re-flagged, so the two pin both directions.
-      assert [_first_run, second_run] = lint_audit_entries(tenant.id)
-
       assert second_run.new_state["conflicts_judged_redundant"] == 1,
              "the drain skipped a flag raised AFTER the verdict it was matched against"
     end
@@ -738,8 +741,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       b = published_article_with_embedding(tenant.id, near_similar_embedding())
       relates_link(tenant.id, a.id, b.id, 0.96)
 
-      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
-      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      first = run_lint!(tenant.id)
+      second = run_lint!(tenant.id)
 
       # The pair is promoted exactly ONCE no matter how many times the worker runs
       # (guarded by promote_conflicts/1's `not exists` check AND the article_links
@@ -748,10 +751,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
 
       # The FIRST run promoted the pair and the second promoted nothing new, in run order:
       # a promoter that fired only on the second run would leave the same counts sorted.
-      assert [
-               %{new_state: %{"conflicts_promoted" => 1}},
-               %{new_state: %{"conflicts_promoted" => 0}}
-             ] = lint_audit_entries(tenant.id)
+      assert first.new_state["conflicts_promoted"] == 1
+      assert second.new_state["conflicts_promoted"] == 0
     end
   end
 
