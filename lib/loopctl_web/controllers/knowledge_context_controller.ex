@@ -10,7 +10,9 @@ defmodule LoopctlWeb.KnowledgeContextController do
   context without additional round-trips.
 
   Scoring: `combined_score = (1 - recency_weight) * relevance + recency_weight * recency_score`
-  where `recency_score = exp(-age_in_days / 30.0)`.
+  where `recency_score = exp(-age_in_days / 30.0)`, age measured from the start of the current
+  UTC day and floored at 0 (`Loopctl.Knowledge.RankingPriors.ranking_clock/1`): content changed
+  today scores 1.0, and an unchanged corpus scores identically all day.
 
   Agent role is forced to `status: :published`. User role may override via
   query parameter.
@@ -68,7 +70,9 @@ defmodule LoopctlWeb.KnowledgeContextController do
         type: :number,
         description:
           "Weight for recency scoring, 0.0-1.0 (default 0.3). " <>
-            "Higher values boost recently-updated articles.",
+            "Higher values boost recently-updated articles. recency_score is " <>
+            "exp(-age_in_days / 30) with age measured from the start of the current UTC day " <>
+            "and floored at 0, so content changed today scores 1.0 and scores change once a day.",
         required: false
       ],
       status: [

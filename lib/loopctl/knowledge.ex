@@ -2147,7 +2147,10 @@ defmodule Loopctl.Knowledge do
 
   `combined_score = (1 - recency_weight) * relevance + recency_weight * recency_score`
 
-  where `recency_score = exp(-age_in_days / 30.0)`.
+  where `recency_score = exp(-age_in_days / 30.0)`, with age measured from `opts[:now]` when
+  given, otherwise from the start of the current UTC day (`RankingPriors.ranking_clock/1`), and
+  floored at 0. So every document whose content changed today scores 1.0, and scores move once a
+  day rather than once a second.
   """
   @spec get_context(Ecto.UUID.t(), String.t() | nil, keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
@@ -2168,6 +2171,9 @@ defmodule Loopctl.Knowledge do
     recency_weight = opts |> Keyword.get(:recency_weight, 0.3) |> max(0.0) |> min(1.0)
     status = Keyword.get(opts, :status, :published)
     api_key_id = Keyword.get(opts, :api_key_id)
+    # Read ONCE: the candidate search and the re-score below age a document against the same
+    # instant, so a call straddling midnight cannot rank with one day and score with the next.
+    now = Keyword.get_lazy(opts, :now, &RankingPriors.ranking_clock/0)
 
     # Run combined search with a wider internal limit to get candidate pool.
     # Suppress sub-search recording so context access is recorded once with
@@ -2185,6 +2191,7 @@ defmodule Loopctl.Knowledge do
         limit: limit * 3,
         offset: 0,
         status: status,
+        now: now,
         _skip_record_access: true
       )
 
@@ -2194,7 +2201,7 @@ defmodule Loopctl.Knowledge do
     case search_result do
       {:ok, search} ->
         {:ok, context} =
-          build_context_results(tenant_id, search, limit, recency_weight, fallback?, vis)
+          build_context_results(tenant_id, search, {limit, recency_weight, now}, fallback?, vis)
 
         context_ids = Enum.map(context.results, & &1.id)
 
@@ -2228,7 +2235,7 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp build_context_results(tenant_id, search, limit, recency_weight, fallback?, vis) do
+  defp build_context_results(tenant_id, search, {limit, recency_weight, now}, fallback?, vis) do
     article_ids =
       search.results
       |> Enum.map(& &1[:id])
@@ -2257,7 +2264,6 @@ defmodule Loopctl.Knowledge do
        }}
     else
       articles = fetch_full_context_articles(tenant_id, article_ids)
-      now = DateTime.utc_now()
 
       article_ids_for_links = Enum.map(articles, & &1.id)
       linked_map = batch_linked_refs(tenant_id, article_ids_for_links, vis)
@@ -9995,8 +10001,10 @@ defmodule Loopctl.Knowledge do
     - `:authority_strength` -- per-call override for the authority prior strength
       (default `:knowledge_authority_strength`, 0.05), floored at 0.0. Scales the
       bounded authority factor within the `[0.9, 1.1]` band.
-    - `:now` -- the `DateTime` the recency prior measures age against (default
-      `DateTime.utc_now/0`). Injected so the priors stay pure/deterministic in tests.
+    - `:now` -- the `DateTime` the recency prior measures age against, taken verbatim
+      (default `RankingPriors.ranking_clock/0`, the start of the current UTC day, so an
+      unchanged corpus ranks identically all day). Injected so the priors stay
+      pure/deterministic in tests.
 
   ## Returns
 
@@ -10569,8 +10577,9 @@ defmodule Loopctl.Knowledge do
   #
   # Post-fusion re-ranking applied on `search_combined/3`'s fused candidate list (and,
   # via apply_ranking_priors_fallback/2, on the degraded keyword_only path). PURE re-rank:
-  # no DB, and the clock is threaded through opts (`:now`, defaulting to utc_now here) so
-  # merge_results/5 stays DB-free and tests stay deterministic. Bounded BY DESIGN — see
+  # no DB, and the clock is threaded through opts (`:now`, defaulting to the day-snapped
+  # `RankingPriors.ranking_clock/0` here) so merge_results/5 stays DB-free and tests stay
+  # deterministic. Bounded BY DESIGN — see
   # Loopctl.Knowledge.RankingPriors — so the priors break ties without dominating strong
   # relevance.
 
@@ -10628,7 +10637,7 @@ defmodule Loopctl.Knowledge do
 
   defp ranking_prior_opts(opts) do
     [
-      now: Keyword.get(opts, :now, DateTime.utc_now()),
+      now: Keyword.get_lazy(opts, :now, &RankingPriors.ranking_clock/0),
       recency_weight: recency_weight_opt(opts),
       authority?: authority_prior_enabled?(opts),
       strength: authority_strength_opt(opts),
@@ -12110,7 +12119,7 @@ defmodule Loopctl.Knowledge do
   # what the lower bound already does — `meta.heat_window` says what was actually served.
   defp heat_since(since) do
     now = DateTime.utc_now()
-    today = floor_to_utc_day(now)
+    today = RankingPriors.ranking_clock(now)
 
     since
     |> case do
@@ -12130,9 +12139,6 @@ defmodule Loopctl.Knowledge do
 
   defp at_least(dt, lower),
     do: if(DateTime.compare(dt, lower) == :lt, do: lower, else: dt)
-
-  defp floor_to_utc_day(%DateTime{} = dt),
-    do: DateTime.new!(DateTime.to_date(dt), ~T[00:00:00], "Etc/UTC")
 
   # Aggregate over the EVENTS alone: no join to `articles`, so no article column (least of all
   # the unbounded body) enters the group key, and the article-side predicates ride in a bounded

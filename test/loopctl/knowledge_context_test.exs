@@ -4,6 +4,7 @@ defmodule Loopctl.KnowledgeContextTest do
   import Loopctl.Fixtures
 
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.RankingPriors
 
   setup :verify_on_exit!
 
@@ -71,6 +72,52 @@ defmodule Loopctl.KnowledgeContextTest do
         # At 30 days, exp(-30/30) = exp(-1) ~= 0.3679
         assert_in_delta first.recency_score, :math.exp(-1.0), 0.05
       end
+    end
+
+    test "ages a document against an injected :now, and by default against the start of the UTC day" do
+      tenant = fixture(:tenant)
+
+      article =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Clock Wiring Article",
+          body: "Content about clock wiring checks.",
+          category: :pattern,
+          status: :published,
+          tags: ["clock"]
+        })
+
+      # Two days before today's start: old enough that an unsnapped clock (hours past
+      # midnight) and the snapped one decay it measurably differently.
+      changed =
+        RankingPriors.ranking_clock() |> DateTime.add(-2, :day) |> DateTime.truncate(:second)
+
+      import Ecto.Query
+
+      Loopctl.AdminRepo.update_all(
+        from(a in Knowledge.Article, where: a.id == ^article.id),
+        set: [updated_at: changed, content_changed_at: changed]
+      )
+
+      score = fn opts ->
+        {:ok, %{results: [first | _]}} = Knowledge.get_context(tenant.id, "clock wiring", opts)
+        first.recency_score
+      end
+
+      # recency_score is reported to 4 places.
+      assert score.(now: DateTime.add(changed, 30, :day)) == Float.round(:math.exp(-1.0), 4)
+
+      # The derived clock is a day, so a default call scores exactly like one pinned to
+      # today's start. A pair straddling midnight legitimately differs, so it is re-taken.
+      {default, day} =
+        Enum.find_value(1..2, fn _ ->
+          day = RankingPriors.ranking_clock()
+          default = score.([])
+          if RankingPriors.ranking_clock() == day, do: {default, day}
+        end)
+
+      assert default == score.(now: day)
+      assert default == Float.round(RankingPriors.recency_decay(changed, day), 4)
     end
 
     test "combined_score formula: (1 - rw) * relevance + rw * recency" do

@@ -69,6 +69,18 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     test "a 30-day-old doc decays to exp(-1)" do
       assert_in_delta RankingPriors.recency_decay(days_ago(30), @now), :math.exp(-1), 1.0e-9
     end
+
+    test "content changed after now is age 0, never above 1.0" do
+      # The snapped clock puts today's edits after `now` routinely.
+      assert RankingPriors.recency_decay(DateTime.add(@now, 3, :hour), @now) == 1.0
+    end
+  end
+
+  describe "ranking_clock/1 (the derived now, snapped so repeated recalls render alike)" do
+    test "is the start of the UTC day" do
+      assert RankingPriors.ranking_clock(~U[2026-10-11 19:45:46.142968Z]) ==
+               ~U[2026-10-11 00:00:00Z]
+    end
   end
 
   describe "recency_timestamp/1 (#791 — authored age, not last-mutation time)" do
