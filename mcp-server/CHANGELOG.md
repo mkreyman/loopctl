@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.115.0 — 2026-10-11 (restore_project)
+
+### Added
+
+- **`restore_project` re-activates an archived work project** through
+  `POST /api/v1/projects/:id/restore`, the reverse of `delete_project`. It needs
+  orchestrator role or higher on a human-anchored tenant, is refused 422 at the tenant's
+  `max_projects` cap and for a kb scope (use `restore_kb_scope`), and the server audits it
+  as `unarchived`. It is now the only way a work project's status changes back:
+  `PATCH /api/v1/projects/:id` refuses a body carrying `status` with 422 (loopctl #975).
+
+### Changed
+
+- **`delete_project` names `restore_project` as the way back for a work project.**
+
 ## 2.114.0 — 2026-10-11 (delete_project says it archives)
 
 ### Changed

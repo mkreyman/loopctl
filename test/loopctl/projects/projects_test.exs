@@ -955,14 +955,25 @@ defmodule Loopctl.ProjectsTest do
       assert entry.new_state["name"] == "renamed"
     end
 
-    test "rejects invalid status" do
+    # Status moves only through archive_project/3 and unarchive_project/3, which carry the
+    # role gate, the max_projects cap and their own audit action (#975).
+    test "never changes status" do
       tenant = fixture(:tenant)
       project = fixture(:project, %{tenant_id: tenant.id})
 
-      assert {:error, changeset} =
-               Projects.update_project(tenant.id, project, %{status: :invalid})
+      assert {:ok, updated} =
+               Projects.update_project(tenant.id, project, %{status: :archived, name: "kept"})
 
-      assert errors_on(changeset).status != []
+      assert updated.status == :active
+      assert updated.name == "kept"
+    end
+
+    test "rejects a blank name with a changeset error, not a NOT NULL crash" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      assert {:error, changeset} = Projects.update_project(tenant.id, project, %{name: ""})
+      assert "can't be blank" in errors_on(changeset).name
     end
   end
 

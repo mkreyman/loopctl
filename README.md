@@ -818,6 +818,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `list_projects` | List all projects | orchestrator |
 | `create_project` | Create a new project | orchestrator |
 | `delete_project` | Archive a project (no rows removed; the slug stays taken) | user |
+| `restore_project` | Restore an archived work project (422 at the `max_projects` cap or for a kb scope) | orchestrator |
 | `get_progress` | Project progress summary (supports `include_cost`) | orchestrator |
 | `import_stories` | Import epics and stories (supports `merge`) | orchestrator |
 | `list_stories` | List stories with filters (supports `include_token_totals`) | orchestrator |

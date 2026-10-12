@@ -182,6 +182,7 @@
     ["GET","/api/v1/projects/:id/export","LoopctlWeb.ImportExportController",":export_project"],
     ["POST","/api/v1/projects/:id/import","LoopctlWeb.ImportExportController",":import_project"],
     ["GET","/api/v1/projects/:id/progress","LoopctlWeb.ProjectController",":progress"],
+    ["POST","/api/v1/projects/:id/restore","LoopctlWeb.ProjectController",":restore"],
     ["GET","/api/v1/projects/:project_id/articles","LoopctlWeb.ArticleController",":index"],
     ["POST","/api/v1/projects/:project_id/articles","LoopctlWeb.ArticleController",":create"],
     ["GET","/api/v1/projects/:project_id/epics","LoopctlWeb.EpicController",":index"],

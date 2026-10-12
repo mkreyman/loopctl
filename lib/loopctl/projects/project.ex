@@ -89,13 +89,16 @@ defmodule Loopctl.Projects.Project do
   @doc """
   Changeset for updating an existing project.
 
-  Slug cannot be changed after creation.
+  Slug cannot be changed after creation, and neither can status: archiving and restoring
+  are `archive_changeset/1` and `activate_changeset/1`, reached only through
+  `Projects.archive_project/3` and `Projects.unarchive_project/3`, which carry the role gate,
+  the `max_projects` cap and the audit action an ordinary edit does not.
   """
   @spec update_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
   def update_changeset(project, attrs) do
     project
-    |> cast(attrs, [:name, :repo_url, :description, :tech_stack, :status, :mission, :metadata])
-    |> validate_inclusion(:status, @statuses)
+    |> cast(attrs, [:name, :repo_url, :description, :tech_stack, :mission, :metadata])
+    |> validate_required([:name])
     |> validate_mission()
     |> validate_metadata()
   end
