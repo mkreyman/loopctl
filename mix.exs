@@ -67,7 +67,8 @@ defmodule Loopctl.MixProject do
           "CVE-2026-94194",
           # bandit 1.12.5 — no patched release exists: the advisory is introduced at
           # 1.4.0 with no `fixed` event, and as of 2026-10-15 1.12.5 is the newest
-          # bandit on hex. Recheck when bandit > 1.12.5.
+          # bandit on hex. Recheck when bandit > 1.12.5: endpoint_http2_test.exs fails
+          # on any bandit version change, so the move cannot go unnoticed.
           # CVE-2026-105659 (HIGH): HTTP/2 blocked-send deadlines reset on every
           # WINDOW_UPDATE, so a trickling client pins stream processes. HTTP/2 only, and
           # the endpoint serves none: config/runtime.exs sets `http_2_options: [enabled:

@@ -748,9 +748,14 @@ if config_env() == :prod do
   # To get SSL working, you will need to add the `https` key
   # to your endpoint configuration:
   #
+  # Keep `http_2_options: [enabled: false]` on it: otherwise a TLS client negotiating
+  # ALPN `h2` reaches Bandit's HTTP/2 stack and CVE-2026-105659 with it (see the
+  # `endpoint_http` block above and its ignore entry in mix.exs).
+  #
   #     config :loopctl, LoopctlWeb.Endpoint,
   #       https: [
   #         ...,
+  #         http_2_options: [enabled: false],
   #         port: 443,
   #         cipher_suite: :strong,
   #         keyfile: System.get_env("SOME_APP_SSL_KEY_PATH"),
