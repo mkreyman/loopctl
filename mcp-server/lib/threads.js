@@ -59,6 +59,25 @@ function claimKeyVar(env) {
   return env.LOOPCTL_API_KEY ? "LOOPCTL_API_KEY" : "LOOPCTL_AGENT_KEY";
 }
 
+// `kb_refs` (loopctl #978) is optional; when given it must be an array of strings. The server
+// owns every other rule (UUIDs, the bound, which articles this key can read), so this only
+// stops a call whose shape could never be right, such as one id passed as a bare string.
+function kbRefsShape(kbRefs) {
+  return (
+    kbRefs === undefined ||
+    kbRefs === null ||
+    (Array.isArray(kbRefs) && kbRefs.every((id) => typeof id === "string"))
+  );
+}
+
+function badKbRefs() {
+  return {
+    error: true,
+    status: 0,
+    body: "`kb_refs` must be an array of knowledge article ids (strings).",
+  };
+}
+
 // Drops keys whose value is undefined or null, so an absent optional is not sent as null.
 function compact(obj) {
   return Object.fromEntries(
@@ -86,11 +105,12 @@ export async function getThread({ story_id, after_seq, limit } = {}, { apiCall, 
 
 /** `POST /api/v1/stories/:id/thread/checkpoints` on the AGENT key. */
 export async function recordCheckpoint(
-  { story_id, claim_epoch, commit_sha, tree_sha, note } = {},
+  { story_id, claim_epoch, commit_sha, tree_sha, note, kb_refs } = {},
   { apiCall, env = process.env } = {},
 ) {
   if (!present(story_id)) return missing("story_id");
   if (!present(commit_sha)) return missing("commit_sha");
+  if (!kbRefsShape(kb_refs)) return badKbRefs();
   if (!present(tree_sha)) return missing("tree_sha");
   if (!Number.isInteger(claim_epoch) || claim_epoch < 0) {
     return {
@@ -103,7 +123,7 @@ export async function recordCheckpoint(
   return apiCall(
     "POST",
     checkpointsPath(story_id),
-    compact({ claim_epoch, commit_sha, tree_sha, note }),
+    compact({ claim_epoch, commit_sha, tree_sha, note, kb_refs }),
     env[claimKeyVar(env)],
     claimKeyVar(env),
   );
@@ -157,6 +177,7 @@ export async function recordEntry(
     idempotency_key,
     body,
     checkpoint_id,
+    kb_refs,
     principal = "agent",
   } = {},
   { apiCall, env = process.env } = {},
@@ -165,6 +186,7 @@ export async function recordEntry(
   if (!present(kind)) return missing("kind");
   if (!present(idempotency_key)) return missing("idempotency_key");
   if (!present(body)) return missing("body");
+  if (!kbRefsShape(kb_refs)) return badKbRefs();
 
   const keyVar = principal === "agent" ? claimKeyVar(env) : PRINCIPAL_KEYS[principal];
   if (!PRINCIPAL_KEYS[principal]) {
@@ -178,7 +200,7 @@ export async function recordEntry(
   return apiCall(
     "POST",
     entriesPath(story_id),
-    compact({ kind, idempotency_key, body, checkpoint_id }),
+    compact({ kind, idempotency_key, body, checkpoint_id, kb_refs }),
     env[keyVar],
     keyVar,
   );

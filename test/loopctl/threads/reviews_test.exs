@@ -732,7 +732,8 @@ defmodule Loopctl.Threads.ReviewsTest do
       %{cp1: cp1, cp2: cp2, f1: f1, fix: fix} = round_one_fixed(ctx)
       review = placed!(ctx)
 
-      assert {:ok, payload} = Reviews.payload(ctx.tenant_id, ctx.story.id, review.id)
+      assert {:ok, payload} =
+               Reviews.payload(ctx.tenant_id, ctx.story.id, review.id, visibility_agent_id: nil)
 
       assert payload.review.round == 2
       assert payload.story.id == ctx.story.id
@@ -750,7 +751,9 @@ defmodule Loopctl.Threads.ReviewsTest do
 
       for _ <- 1..Reviews.max_payload_fixes(), do: {:ok, _, :created} = fix(ctx, cp2, [f1.id])
 
-      {:ok, payload} = Reviews.payload(ctx.tenant_id, ctx.story.id, review.id)
+      {:ok, payload} =
+        Reviews.payload(ctx.tenant_id, ctx.story.id, review.id, visibility_agent_id: nil)
+
       assert payload.fixes_truncated
       assert length(payload.fixes) == Reviews.max_payload_fixes()
       assert Enum.all?(payload.fixes, &(hd(&1.findings).id == f1.id))
@@ -761,7 +764,8 @@ defmodule Loopctl.Threads.ReviewsTest do
       review = placed!(ctx)
       other = fixture(:stage_story, %{claim_epoch: 1})
 
-      assert {:error, :not_found} = Reviews.payload(other.tenant_id, ctx.story.id, review.id)
+      assert {:error, :not_found} =
+               Reviews.payload(other.tenant_id, ctx.story.id, review.id, visibility_agent_id: nil)
     end
   end
 

@@ -25,6 +25,7 @@ defmodule LoopctlWeb.ThreadController do
   alias Loopctl.Threads.Entry
   alias LoopctlWeb.ActorLabel
   alias LoopctlWeb.ClaimEpochParam
+  alias LoopctlWeb.Helpers.Visibility
   alias LoopctlWeb.ThreadHTTP
   alias OpenApiSpex.Schema
 
@@ -38,6 +39,18 @@ defmodule LoopctlWeb.ThreadController do
   plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:show, :entry]
 
   @max_body_bytes Entry.max_body_bytes()
+  @max_kb_refs Entry.max_kb_refs()
+
+  # ONE schema for both writes, bounded by the attribute the changeset reads.
+  @kb_refs_schema %Schema{
+    type: :array,
+    items: %Schema{type: :string, format: :uuid},
+    description:
+      "Knowledge article ids this write acted on (#978): this tenant's articles the key can " <>
+        "read, or published system canonicals. At most #{@max_kb_refs} DISTINCT ids; repeats " <>
+        "are dropped before the bound is counted, so a longer list with repeats is accepted. " <>
+        "Ids only: the thread never copies an article's body"
+  }
   @max_entry_page Threads.max_entry_page()
   @max_int4 2_147_483_647
   @caller_kinds Enum.map(Entry.caller_kinds(), &to_string/1)
@@ -79,7 +92,9 @@ defmodule LoopctlWeb.ThreadController do
         "the checkpoint already recorded, and the same commit under a NEW claim is recorded " <>
         "again (201) so that claim can cite it. " <>
         "`note` is the claimant's reasoning for the checkpoint, stored as the checkpoint " <>
-        "entry's body, capped at #{@max_body_bytes} bytes, UNTRUSTED.",
+        "entry's body, capped at #{@max_body_bytes} bytes, UNTRUSTED. " <>
+        "`kb_refs` names the knowledge articles the checkpoint acted on, as for an entry; " <>
+        "a resend that sends `kb_refs` must send the ones recorded.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Checkpoint", "application/json",
@@ -96,7 +111,8 @@ defmodule LoopctlWeb.ThreadController do
              description:
                "Bounded in BYTES (#{@max_body_bytes}), so multi-byte text reaches the limit " <>
                  "before maxLength's character count does"
-           }
+           },
+           kb_refs: @kb_refs_schema
          }
        }},
     responses: %{
@@ -110,17 +126,18 @@ defmodule LoopctlWeb.ThreadController do
       409 =>
         {"`not_claimant` (the key's agent is not the story's), `stale_claim_epoch` or " <>
            "`claim_not_live` (the claim has ended), or `checkpoint_conflict` (this commit is " <>
-           "already recorded under this claim with a different tree or note)", "application/json",
-         Schemas.ErrorResponse},
+           "already recorded under this claim with a different tree, note or `kb_refs`)",
+         "application/json", Schemas.ErrorResponse},
       503 =>
         {"`busy`: a lock the write needed (the story's thread lock, the story row, or the " <>
            "tenant's audit-chain lock) was held past the wait bound, or the connection was " <>
            "lost. Resend: a write that did commit is answered from its row", "application/json",
          Schemas.ErrorResponse},
       422 =>
-        {"A sha is not 40 or 64 lowercase hex characters, `note` is over the bound, or " <>
-           "`note` carries a credential (`secret_blocked`)", "application/json",
-         Schemas.ErrorResponse},
+        {"A sha is not 40 or 64 lowercase hex characters, `note` is over the bound, " <>
+           "`note` carries a credential (`secret_blocked`), `kb_refs` is not a list of at " <>
+           "most #{@max_kb_refs} distinct UUIDs, or names an article this key cannot read " <>
+           "(`unknown_kb_refs`)", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -137,7 +154,10 @@ defmodule LoopctlWeb.ThreadController do
         "refused here. The author is derived from the key. IDEMPOTENT per author " <>
         "on `idempotency_key` when the write is the same; reusing a key for a different " <>
         "entry is refused, and keys starting `loopctl:` are reserved. `body` is capped at " <>
-        "#{@max_body_bytes} bytes, refused when it carries a credential, and is UNTRUSTED.",
+        "#{@max_body_bytes} bytes, refused when it carries a credential, and is UNTRUSTED. " <>
+        "`kb_refs` names the knowledge articles the message acted on: ids only, at most " <>
+        "#{@max_kb_refs}, each an article of the tenant this key can read. A review of the " <>
+        "thread reads them beside the entry.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
       {"Entry", "application/json",
@@ -155,7 +175,8 @@ defmodule LoopctlWeb.ThreadController do
                "Bounded in BYTES (#{@max_body_bytes}), so multi-byte text reaches the limit " <>
                  "before maxLength's character count does"
            },
-           checkpoint_id: %Schema{type: :string, format: :uuid}
+           checkpoint_id: %Schema{type: :string, format: :uuid},
+           kb_refs: @kb_refs_schema
          }
        }},
     responses: %{
@@ -174,8 +195,10 @@ defmodule LoopctlWeb.ThreadController do
       422 =>
         {"A field is invalid (a non-UUID `checkpoint_id` included), the kind is not " <>
            "writable here, the key is reserved, the body carries a credential " <>
-           "(`secret_blocked`), or `checkpoint_id` is not a checkpoint of this story",
-         "application/json", Schemas.ErrorResponse},
+           "(`secret_blocked`), `checkpoint_id` is not a checkpoint of this story, " <>
+           "`kb_refs` is not a list of at most #{@max_kb_refs} UUIDs, or it names an " <>
+           "article this key cannot read (`unknown_kb_refs`, naming each)", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -236,8 +259,10 @@ defmodule LoopctlWeb.ThreadController do
              commit_sha: params["commit_sha"],
              tree_sha: params["tree_sha"],
              note: params["note"],
+             kb_refs: params["kb_refs"],
              author_principal: principal(api_key),
-             actor_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
+             actor_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id),
+             visibility_agent_id: visibility_agent_id(conn)
            ) do
       conn
       |> put_status(ThreadHTTP.status(status))
@@ -251,13 +276,14 @@ defmodule LoopctlWeb.ThreadController do
   def entry(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
 
-    attrs = Map.take(params, ~w(kind idempotency_key body checkpoint_id))
+    attrs = Map.take(params, ~w(kind idempotency_key body checkpoint_id kb_refs))
 
     with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
          {:ok, entry, status} <-
            Threads.record_entry(api_key.tenant_id, story_id, attrs,
              author_principal: principal(api_key),
-             actor_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
+             actor_lineage: Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id),
+             visibility_agent_id: visibility_agent_id(conn)
            ) do
       conn
       |> put_status(ThreadHTTP.status(status))
@@ -280,4 +306,9 @@ defmodule LoopctlWeb.ThreadController do
   defp tenant_id(conn), do: conn.assigns.current_api_key.tenant_id
 
   defp principal(api_key), do: ActorLabel.of(api_key)
+
+  # Derived from the authenticating key, never from the request: an agent may cite only what
+  # it can read (#163), and a higher role reads everything.
+  defp visibility_agent_id(conn),
+    do: Keyword.get(Visibility.scope_opts(conn), :visibility_agent_id)
 end

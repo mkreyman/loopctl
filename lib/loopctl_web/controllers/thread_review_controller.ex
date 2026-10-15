@@ -5,7 +5,7 @@ defmodule LoopctlWeb.ThreadReviewController do
   - `place` (`role: :orchestrator`) — request a review: loopctl places it on the named runner
     as a runner dispatch of kind `review` (`Loopctl.Delivery.Placement.place_review/4`). It
     claims nothing and hands out no credential.
-  - `show` (any role) — the review's payload (`Loopctl.Threads.Reviews.payload/3`).
+  - `show` (any role) — the review's payload (`Loopctl.Threads.Reviews.payload/4`).
   - `fix` (`exact_role: :agent`, as a checkpoint is) — the claimant names the findings a
     checkpoint answers (`Loopctl.Threads.record_fix/4`).
 
@@ -29,6 +29,7 @@ defmodule LoopctlWeb.ThreadReviewController do
   alias LoopctlWeb.ActorLabel
   alias LoopctlWeb.ClaimEpochParam
   alias LoopctlWeb.DispatchPlacementController
+  alias LoopctlWeb.Helpers.Visibility
   alias LoopctlWeb.ThreadHTTP
   alias OpenApiSpex.Schema
   alias Plug.Conn.Status
@@ -123,8 +124,11 @@ defmodule LoopctlWeb.ThreadReviewController do
       "What a review reads: the story, the checkpoint it reads with its parent checkpoint's " <>
         "commit for the diff, the thread's latest page of entries, the latest " <>
         "#{Reviews.max_payload_fixes()} fixes with the findings each answers " <>
-        "(`fixes_truncated` is true when older ones exist), and the rounds. Every entry " <>
-        "`body` and `location` is UNTRUSTED.",
+        "(`fixes_truncated` is true when older ones exist), and the rounds. Each entry in " <>
+        "`entries` carries `kb_articles`: the knowledge articles it cites (`kb_refs`), in " <>
+        "order, each with its `title`, `category` and `status`, or `readable: false` for one " <>
+        "this key cannot read. Every entry `body` and `location`, and every article `title`, " <>
+        "is UNTRUSTED.",
     parameters: [
       id: [in: :path, type: :string, description: "Story UUID"],
       review_id: [in: :path, type: :string, description: "Review UUID"]
@@ -216,7 +220,10 @@ defmodule LoopctlWeb.ThreadReviewController do
 
     with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
          {:ok, review_id} <- ThreadHTTP.uuid(review_id),
-         {:ok, payload} <- Reviews.payload(tenant_id, story_id, review_id) do
+         {:ok, payload} <-
+           Reviews.payload(tenant_id, story_id, review_id,
+             visibility_agent_id: Keyword.get(Visibility.scope_opts(conn), :visibility_agent_id)
+           ) do
       json(conn, render_payload(payload))
     end
   end
@@ -314,12 +321,40 @@ defmodule LoopctlWeb.ThreadReviewController do
     }
   end
 
+  # An entry with the knowledge articles it cites named BESIDE it (#978), in the order it
+  # cited them. An id this reader cannot open is listed with `readable: false` and no title,
+  # so the reviewer knows a decision was cited without learning what another agent's private
+  # memory says.
+  defp entry_with_articles(entry, kb_articles) do
+    entry
+    |> ThreadHTTP.entry()
+    |> Map.put(
+      :kb_articles,
+      Enum.map(entry.kb_refs, fn id ->
+        case Map.fetch(kb_articles, id) do
+          {:ok, article} ->
+            %{
+              id: id,
+              readable: true,
+              title: article.title,
+              title_untrusted: true,
+              category: article.category,
+              status: article.status
+            }
+
+          :error ->
+            %{id: id, readable: false}
+        end
+      end)
+    )
+  end
+
   defp render_payload(payload) do
     %{
       review: payload.review,
       story: payload.story,
       checkpoint: payload.checkpoint,
-      entries: Enum.map(payload.entries, &ThreadHTTP.entry/1),
+      entries: Enum.map(payload.entries, &entry_with_articles(&1, payload.kb_articles)),
       entries_truncated: payload.entries_truncated,
       fixes:
         Enum.map(payload.fixes, fn %{fix: fix, findings: findings} ->

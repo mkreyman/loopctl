@@ -224,6 +224,69 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
            |> json_response(404)
   end
 
+  test "the payload names each cited article beside the entry citing it (#978)", ctx do
+    readable = fixture(:article, %{tenant_id: ctx.tenant_id, title: "Use a CAS"})
+
+    private =
+      fixture(:article, %{
+        tenant_id: ctx.tenant_id,
+        metadata: %{"visibility" => "private", "agent_id" => Ecto.UUID.generate()}
+      })
+
+    {:ok, cp, :created} =
+      Threads.record_checkpoint(ctx.tenant_id, ctx.story.id,
+        agent_id: ctx.implementer.id,
+        claim_epoch: @epoch,
+        commit_sha: String.duplicate("1", 40),
+        tree_sha: @tree,
+        note: "relied on both",
+        kb_refs: [readable.id, private.id],
+        author_principal: "agent:#{ctx.implementer.id}",
+        actor_lineage: ctx.session.lineage_path,
+        visibility_agent_id: nil
+      )
+
+    %{review: review} = judged_review(ctx)
+
+    %{"entries" => entries} =
+      ctx.impl_raw
+      |> get_as("/api/v1/stories/#{ctx.story.id}/thread/reviews/#{review.id}")
+      |> json_response(200)
+
+    cited = Enum.find(entries, &(&1["kind"] == "checkpoint" and &1["checkpoint_id"] == cp.id))
+
+    readable_id = readable.id
+    private_id = private.id
+
+    assert [
+             %{
+               "id" => ^readable_id,
+               "readable" => true,
+               "title" => "Use a CAS",
+               "title_untrusted" => true
+             },
+             %{"id" => ^private_id, "readable" => false} = hidden
+           ] = cited["kb_articles"]
+
+    refute Map.has_key?(hidden, "title")
+
+    # An entry citing nothing lists nothing.
+    assert entries
+           |> Enum.reject(&(&1["id"] == cited["id"]))
+           |> Enum.all?(&(&1["kb_articles"] == []))
+
+    # A higher-role reader sees every article the writer cited.
+    %{"entries" => entries} =
+      ctx.operator_raw
+      |> get_as("/api/v1/stories/#{ctx.story.id}/thread/reviews/#{review.id}")
+      |> json_response(200)
+
+    assert entries
+           |> Enum.find(&(&1["id"] == cited["id"]))
+           |> Map.fetch!("kb_articles")
+           |> Enum.all?(& &1["readable"])
+  end
+
   test "the claimant records a fix; another key or no epoch is refused", ctx do
     checkpoint(ctx, 1)
     %{finding: finding} = judged_review(ctx)

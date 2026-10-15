@@ -75,6 +75,23 @@ describe("thread_checkpoint", () => {
     assert.equal(calls[0].keyHint, "LOOPCTL_API_KEY");
   });
 
+  test("sends kb_refs when given and refuses a non-array before any call", async () => {
+    const { calls, apiCall } = fakeApi();
+    await recordCheckpoint(
+      { story_id: STORY_ID, claim_epoch: 4, commit_sha: SHA, tree_sha: TREE, kb_refs: ["a1"] },
+      { apiCall, env: ENV },
+    );
+    assert.deepEqual(calls[0].body.kb_refs, ["a1"]);
+
+    const res = await recordCheckpoint(
+      { story_id: STORY_ID, claim_epoch: 4, commit_sha: SHA, tree_sha: TREE, kb_refs: "a1" },
+      { apiCall, env: ENV },
+    );
+    assert.equal(res.error, true);
+    assert.match(res.body, /kb_refs/);
+    assert.equal(calls.length, 1);
+  });
+
   test("refuses client-side without claim_epoch, calling nothing", async () => {
     const { calls, apiCall } = fakeApi();
     const res = await recordCheckpoint(
@@ -119,6 +136,16 @@ describe("thread_entry", () => {
       body: "looks right",
       checkpoint_id: "cp",
     });
+  });
+
+  test("sends kb_refs when given; a list of non-strings calls nothing", async () => {
+    const { calls, apiCall } = fakeApi();
+    await recordEntry({ ...message, kb_refs: ["a1", "a2"] }, { apiCall, env: ENV });
+    assert.deepEqual(calls[0].body.kb_refs, ["a1", "a2"]);
+
+    const res = await recordEntry({ ...message, kb_refs: [1] }, { apiCall, env: ENV });
+    assert.equal(res.error, true);
+    assert.equal(calls.length, 1);
   });
 
   test("principal user travels on the user key; an unknown principal calls nothing", async () => {
