@@ -142,12 +142,16 @@ defmodule Loopctl.Threads.Reviews do
 
   `kb_articles` names each knowledge article the page's entries cite (#978), keyed by id, so
   a reviewer sees which decision a checkpoint relied on and can open it. Only the articles the
-  READING key can see are named (`:visibility_agent_id`, server-resolved from that key): an id
-  absent from the map is one this reader cannot open, whatever the writer could.
+  READING key can see are named (`:visibility_agent_id`, server-resolved from that key, and
+  REQUIRED: `nil` names every article, so a caller must say so rather than get it by
+  omission): an id absent from the map is one this reader cannot open, whatever the writer
+  could.
   """
   @spec payload(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, map()} | {:error, :not_found}
-  def payload(tenant_id, story_id, review_id, opts \\ []) do
+  def payload(tenant_id, story_id, review_id, opts) do
+    vis = Keyword.fetch!(opts, :visibility_agent_id)
+
     {:ok, result} =
       Repo.with_tenant(tenant_id, fn ->
         with %Story{} = story <- Threads.story(tenant_id, story_id) || {:error, :not_found},
@@ -159,13 +163,13 @@ defmodule Loopctl.Threads.Reviews do
     # Read AFTER the tenant transaction closes: the titles come from `Loopctl.AdminRepo`, and
     # waiting on that pool from inside a held transaction would pin two connections at once.
     with {:ok, payload} <- result do
-      {:ok, Map.put(payload, :kb_articles, kb_articles(tenant_id, payload.entries, opts))}
+      {:ok, Map.put(payload, :kb_articles, kb_articles(tenant_id, payload.entries, vis))}
     end
   end
 
-  defp kb_articles(tenant_id, entries, opts) do
+  defp kb_articles(tenant_id, entries, vis) do
     ids = entries |> Enum.flat_map(& &1.kb_refs) |> Enum.uniq()
-    Knowledge.article_refs(tenant_id, ids, Keyword.get(opts, :visibility_agent_id))
+    Knowledge.article_refs(tenant_id, ids, vis)
   end
 
   defp review(tenant_id, story_id, review_id) do

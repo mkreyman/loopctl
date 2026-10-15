@@ -9,7 +9,10 @@ defmodule Loopctl.Threads.KbRefsTest do
 
   import Ecto.Query
 
+  alias Loopctl.AdminRepo
   alias Loopctl.AuditChain.Entry, as: ChainEntry
+  alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Repo
   alias Loopctl.Threads
   alias Loopctl.Threads.Entry
@@ -45,7 +48,10 @@ defmodule Loopctl.Threads.KbRefsTest do
       ctx.tenant_id,
       ctx.story.id,
       attrs,
-      Keyword.merge([author_principal: "agent:someone", actor_lineage: []], opts)
+      Keyword.merge(
+        [author_principal: "agent:someone", actor_lineage: [], visibility_agent_id: nil],
+        opts
+      )
     )
   end
 
@@ -60,11 +66,32 @@ defmodule Loopctl.Threads.KbRefsTest do
           commit_sha: @sha1,
           tree_sha: @tree,
           author_principal: "agent:#{ctx.agent.id}",
-          actor_lineage: []
+          actor_lineage: [],
+          visibility_agent_id: nil
         ],
         overrides
       )
     )
+  end
+
+  # The article becomes another agent's private memory: unreadable by every other agent key.
+  defp make_private(article) do
+    AdminRepo.update_all(from(a in Article, where: a.id == ^article.id),
+      set: [metadata: %{"visibility" => "private", "agent_id" => "owner"}]
+    )
+  end
+
+  defp system_canonical(ctx) do
+    {:ok, canonical} =
+      Knowledge.create_article(ctx.tenant_id, %{
+        title: "Shared canon decision",
+        body: "canon body",
+        category: :reference,
+        scope: :system,
+        status: :published
+      })
+
+    canonical
   end
 
   defp entries(ctx) do
@@ -129,7 +156,7 @@ defmodule Loopctl.Threads.KbRefsTest do
 
       assert id == private.id
 
-      # A higher role passes no visibility scope and reads everything.
+      # A higher role passes `nil` and reads everything.
       assert {:ok, _, :created} = entry(ctx, message("m3", [private.id]))
     end
 
@@ -137,7 +164,8 @@ defmodule Loopctl.Threads.KbRefsTest do
       ctx = claimed_story()
       over = for _ <- 1..(Entry.max_kb_refs() + 1), do: Ecto.UUID.generate()
 
-      for refs <- [over, "not-a-list", ["nope"], [123]] do
+      # `[nil]` and a 16-byte string would pass `Ecto.UUID`'s own cast, the second as a raw id.
+      for refs <- [over, "not-a-list", ["nope"], [123], [nil], ["my-article-slug!"]] do
         assert {:error, %Ecto.Changeset{errors: errors}} = entry(ctx, message("m", refs))
         assert Keyword.has_key?(errors, :kb_refs)
       end
@@ -152,6 +180,64 @@ defmodule Loopctl.Threads.KbRefsTest do
 
       assert {:ok, %{kb_refs: [id]}, :created} = entry(ctx, message("m", refs))
       assert id == a.id
+    end
+
+    test "a published system canonical is citable by any key" do
+      ctx = claimed_story()
+      canonical = system_canonical(ctx)
+
+      assert {:ok, %{kb_refs: [id]}, :created} =
+               entry(ctx, message("m", [canonical.id]), visibility_agent_id: "anyone")
+
+      assert id == canonical.id
+
+      # The review titles it from the same set.
+      assert %{^id => %{title: "Shared canon decision"}} =
+               Knowledge.article_refs(ctx.tenant_id, [id], "anyone")
+    end
+
+    test "a resend is answered from its row even after a cited article turned private" do
+      ctx = claimed_story()
+      a = article(ctx)
+
+      {:ok, first, :created} = entry(ctx, message("m", [a.id]), visibility_agent_id: "writer")
+      make_private(a)
+
+      assert {:ok, ^first, :existing} =
+               entry(ctx, message("m", [a.id]), visibility_agent_id: "writer")
+
+      # A NEW write citing it is refused: the verdict binds new writes only.
+      assert {:error, :unprocessable_entity, %{code: "unknown_kb_refs"}} =
+               entry(ctx, message("m2", [a.id]), visibility_agent_id: "writer")
+    end
+
+    test "a resend with malformed references is refused, not matched to a row citing nothing" do
+      ctx = claimed_story()
+      {:ok, _first, :created} = entry(ctx, message("m", []))
+
+      for refs <- ["nope", for(_ <- 0..Entry.max_kb_refs(), do: Ecto.UUID.generate())] do
+        assert {:error, %Ecto.Changeset{errors: errors}} = entry(ctx, message("m", refs))
+        assert Keyword.has_key?(errors, :kb_refs)
+      end
+    end
+
+    test "citing without a visibility scope is a caller bug, not an unscoped read" do
+      ctx = claimed_story()
+      a = article(ctx)
+
+      assert_raise KeyError, fn ->
+        Threads.record_entry(ctx.tenant_id, ctx.story.id, message("m", [a.id]),
+          author_principal: "agent:someone",
+          actor_lineage: []
+        )
+      end
+
+      # Citing nothing needs no scope, which is how the runner socket writes (#979).
+      assert {:ok, _, :created} =
+               Threads.record_entry(ctx.tenant_id, ctx.story.id, message("m", []),
+                 author_principal: "agent:someone",
+                 actor_lineage: []
+               )
     end
 
     test "a resend is the same write only with the same references" do
@@ -200,6 +286,17 @@ defmodule Loopctl.Threads.KbRefsTest do
       assert {:ok, _cp, :created} = checkpoint(ctx, note: "why", kb_refs: [a.id])
       assert [%{kind: :checkpoint, kb_refs: [id]}] = entries(ctx)
       assert id == a.id
+    end
+
+    test "a resend is answered from its row even after a cited article turned private" do
+      ctx = claimed_story()
+      a = article(ctx)
+
+      {:ok, cp, :created} = checkpoint(ctx, kb_refs: [a.id], visibility_agent_id: "writer")
+      make_private(a)
+
+      assert {:ok, ^cp, :existing} =
+               checkpoint(ctx, kb_refs: [a.id], visibility_agent_id: "writer")
     end
 
     test "a resend that sends references must send the recorded ones; one that omits them replays" do

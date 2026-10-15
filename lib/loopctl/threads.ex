@@ -148,7 +148,9 @@ defmodule Loopctl.Threads do
   - `:kb_refs` — the knowledge articles the checkpoint acted on (#978), checked as
     `record_entry/4` checks a message's. `nil` cites nothing.
   - `:visibility_agent_id` — SERVER-resolved from the calling key
-    (`LoopctlWeb.Helpers.Visibility`): an agent key may cite only the articles it can read.
+    (`LoopctlWeb.Helpers.Visibility`): an agent key may cite only the articles it can read,
+    and `nil` reads every article. Required whenever `:kb_refs` names any, so a caller that
+    forgets it fails rather than citing with no visibility scope.
   - `:author_principal` (required), `:actor_lineage` (required) — SERVER-resolved: a lineage
     list, or `:custody` for the lineage of the dispatch the story's claim recorded
     (`implementer_dispatch_id`), read under the story's lock
@@ -173,12 +175,12 @@ defmodule Loopctl.Threads do
          :ok <- same_object_format(commit_sha, tree_sha),
          :ok <- valid_note(note),
          :ok <- no_secret(note, :note, tenant_id, story_id),
-         {:ok, kb_refs} <- checkpoint_kb_refs(opts),
-         :ok <- kb_refs_readable(tenant_id, kb_refs || [], opts) do
+         {:ok, kb_refs} <- checkpoint_kb_refs(opts) do
+      readable = kb_refs_readable(tenant_id, kb_refs || [], opts)
       opts = Keyword.put(opts, :kb_refs, kb_refs)
 
       in_story_lock(tenant_id, story_id, fn ->
-        checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts)
+        checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, readable, opts)
       end)
     end
   end
@@ -329,13 +331,15 @@ defmodule Loopctl.Threads do
     `:dispatch_not_accepted`, as for a checkpoint.
 
   - `:visibility_agent_id` — SERVER-resolved from the calling key
-    (`LoopctlWeb.Helpers.Visibility`). `attrs["kb_refs"]` (#978) may name only knowledge
-    articles of the tenant that key can read; any other id refuses the whole entry 422
-    `unknown_kb_refs`, naming it, because a reference to nothing would be counted as a use.
+    (`LoopctlWeb.Helpers.Visibility`), `nil` reading every article; required whenever
+    `attrs["kb_refs"]` names any. `kb_refs` (#978) may name only knowledge articles that key
+    can read, the tenant's own or a published system canonical; any other id refuses the
+    whole entry 422 `unknown_kb_refs`, naming it.
 
   A resend of an entry already recorded by this author under this key is answered from the
-  row BEFORE either check: it writes nothing, so no claim needs to be current for it, and a
-  runner that lost the ack must be able to learn its note landed.
+  row BEFORE the claim and `kb_refs` checks: it writes nothing, so no claim needs to be
+  current for it, a cited article made private since cannot refuse it, and a runner that
+  lost the ack must be able to learn its note landed.
 
   Returns `{:ok, entry, :created | :existing}`.
   """
@@ -348,13 +352,22 @@ defmodule Loopctl.Threads do
 
     with :ok <- caller_kind(changeset),
          :ok <- screen(changeset, tenant_id, story_id),
-         :ok <-
-           kb_refs_readable(tenant_id, Ecto.Changeset.get_field(changeset, :kb_refs), opts) do
+         :ok <- valid_changeset(changeset) do
+      readable =
+        kb_refs_readable(tenant_id, Ecto.Changeset.get_field(changeset, :kb_refs), opts)
+
       in_story_lock(tenant_id, story_id, fn ->
-        entry_locked(tenant_id, story_id, changeset, opts)
+        entry_locked(tenant_id, story_id, changeset, readable, opts)
       end)
     end
   end
+
+  # A resend is compared field by field with the row it repeats, and an invalid changeset's
+  # fields are not what the caller sent: a `kb_refs` that failed its cast reads as the
+  # default `[]`, so a resend carrying a malformed list would compare equal to a row citing
+  # nothing and be acknowledged. Refused here, before any replay can see it.
+  defp valid_changeset(%Ecto.Changeset{valid?: true}), do: :ok
+  defp valid_changeset(changeset), do: {:error, changeset}
 
   @doc """
   Records a review of `story_id` placed as the runner dispatch `:dispatch_id` (US-45.3), for
@@ -1231,7 +1244,7 @@ defmodule Loopctl.Threads do
   # the fence: the write already happened under a claim that was live, and a lost response
   # followed by a lapsed lease must not read as "never recorded". It writes nothing. Anyone
   # else, and every new write, goes through the fence.
-  defp checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts) do
+  defp checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, readable, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
 
     case {locked_story(tenant_id, story_id),
@@ -1241,6 +1254,7 @@ defmodule Loopctl.Threads do
 
       {story, nil} ->
         with :ok <- fence(story, opts, epoch),
+             :ok <- readable,
              do:
                insert_checkpoint(
                  tenant_id,
@@ -1531,25 +1545,26 @@ defmodule Loopctl.Threads do
     end
   end
 
-  # Every cited id must be an article of THIS tenant that the writing key can read (#978).
-  # Asked BEFORE the story lock is taken: it reads `articles` on `Loopctl.AdminRepo`
-  # (`Knowledge.visible_article_ids/3`), and a lock held while waiting on that pool would
-  # stall every writer of the thread behind it. An article archived between this read and the
-  # insert is still a real article, which is all the reference claims.
+  # Every cited id must be an article the writing key can read (#978): one of this tenant's,
+  # or a published system canonical, the set `Knowledge.article_refs/3` names and a review
+  # renders, so what can be cited and what a review can title are one query.
+  #
+  # Asked BEFORE the story lock is taken: it reads `articles` on `Loopctl.AdminRepo`, and a
+  # lock held while waiting on that pool would stall every writer of the thread behind it.
+  # The verdict is APPLIED only to a new write, under the lock: a resend is answered from its
+  # row, so an article made private or deleted after the first write cannot turn the caller's
+  # retry into a refusal of a note that already landed. An article archived between this read
+  # and the insert is still a real article, which is all the reference claims.
   #
   # One answer for "no such article" and "an article you cannot read", so the refusal cannot
   # tell an agent that another agent's private memory exists.
   defp kb_refs_readable(_tenant_id, [], _opts), do: :ok
 
   defp kb_refs_readable(tenant_id, kb_refs, opts) do
-    visible =
-      Knowledge.visible_article_ids(
-        tenant_id,
-        kb_refs,
-        Keyword.get(opts, :visibility_agent_id)
-      )
+    citable =
+      Knowledge.article_refs(tenant_id, kb_refs, Keyword.fetch!(opts, :visibility_agent_id))
 
-    case Enum.reject(kb_refs, &MapSet.member?(visible, &1)) do
+    case Enum.reject(kb_refs, &Map.has_key?(citable, &1)) do
       [] ->
         :ok
 
@@ -1563,13 +1578,14 @@ defmodule Loopctl.Threads do
     end
   end
 
-  defp entry_locked(tenant_id, story_id, changeset, opts) do
+  defp entry_locked(tenant_id, story_id, changeset, readable, opts) do
     author = Keyword.fetch!(opts, :author_principal)
     key = Ecto.Changeset.get_field(changeset, :idempotency_key)
 
     with {:story, %Story{} = story} <- {:story, locked_story(tenant_id, story_id)},
          nil <- entry_by_key(tenant_id, story_id, author, key),
          :ok <- new_write_allowed(opts),
+         :ok <- readable,
          :ok <- epoch_current(story, Keyword.get(opts, :claim_epoch)),
          :ok <- checkpoint_of_story(changeset, tenant_id, story_id) do
       insert_entry(tenant_id, story_id, changeset, with_lineage(opts, tenant_id, story))

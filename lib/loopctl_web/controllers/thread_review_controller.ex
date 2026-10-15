@@ -221,7 +221,9 @@ defmodule LoopctlWeb.ThreadReviewController do
     with {:ok, story_id} <- ThreadHTTP.uuid(story_id),
          {:ok, review_id} <- ThreadHTTP.uuid(review_id),
          {:ok, payload} <-
-           Reviews.payload(tenant_id, story_id, review_id, Visibility.scope_opts(conn)) do
+           Reviews.payload(tenant_id, story_id, review_id,
+             visibility_agent_id: Keyword.get(Visibility.scope_opts(conn), :visibility_agent_id)
+           ) do
       json(conn, render_payload(payload))
     end
   end

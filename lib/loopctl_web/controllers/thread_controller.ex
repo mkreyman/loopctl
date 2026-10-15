@@ -45,10 +45,11 @@ defmodule LoopctlWeb.ThreadController do
   @kb_refs_schema %Schema{
     type: :array,
     items: %Schema{type: :string, format: :uuid},
-    maxItems: @max_kb_refs,
     description:
-      "Knowledge article ids this write acted on (#978). Repeats are dropped. Ids only: the " <>
-        "thread never copies an article's body"
+      "Knowledge article ids this write acted on (#978): this tenant's articles the key can " <>
+        "read, or published system canonicals. At most #{@max_kb_refs} DISTINCT ids; repeats " <>
+        "are dropped before the bound is counted, so a longer list with repeats is accepted. " <>
+        "Ids only: the thread never copies an article's body"
   }
   @max_entry_page Threads.max_entry_page()
   @max_int4 2_147_483_647
@@ -135,7 +136,7 @@ defmodule LoopctlWeb.ThreadController do
       422 =>
         {"A sha is not 40 or 64 lowercase hex characters, `note` is over the bound, " <>
            "`note` carries a credential (`secret_blocked`), `kb_refs` is not a list of at " <>
-           "most #{@max_kb_refs} UUIDs, or names an article this key cannot read " <>
+           "most #{@max_kb_refs} distinct UUIDs, or names an article this key cannot read " <>
            "(`unknown_kb_refs`)", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }

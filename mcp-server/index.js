@@ -8745,8 +8745,9 @@ const TOOLS = [
           type: "array",
           items: { type: "string" },
           description:
-            "Optional: ids of the knowledge articles this acted on (at most 20, ids only). " +
-            "Each must be an article of your tenant this key can read, or the write is 422 " +
+            "Optional: ids of the knowledge articles this acted on (at most 20 distinct, ids " +
+            "only). Each must be an article of your tenant this key can read, or a published " +
+            "system canonical, or the write is 422 " +
             "`unknown_kb_refs`. A review of the thread shows their titles beside this entry.",
         },
       },
@@ -8763,7 +8764,7 @@ const TOOLS = [
       "socket from the runner it was placed on, and a fix is thread_fix. A body carrying a credential is 422 `secret_blocked`. Idempotent per author " +
       "on `idempotency_key` for the same write; a different entry on the same key is 409 " +
       "`idempotency_key_reused`, and keys starting `loopctl:` are reserved. `kb_refs` names " +
-      "the knowledge articles the message acted on (ids only, at most 20, each readable by " +
+      "the knowledge articles the message acted on (ids only, at most 20 distinct, each readable by " +
       "this key, else 422 `unknown_kb_refs`). `principal` " +
       "picks the key: agent (default: the key claim_story uses, LOOPCTL_API_KEY else " +
       "LOOPCTL_AGENT_KEY), orchestrator or user.",
@@ -8779,8 +8780,9 @@ const TOOLS = [
           type: "array",
           items: { type: "string" },
           description:
-            "Optional: ids of the knowledge articles this acted on (at most 20, ids only). " +
-            "Each must be an article of your tenant this key can read, or the write is 422 " +
+            "Optional: ids of the knowledge articles this acted on (at most 20 distinct, ids " +
+            "only). Each must be an article of your tenant this key can read, or a published " +
+            "system canonical, or the write is 422 " +
             "`unknown_kb_refs`. A review of the thread shows their titles beside this entry.",
         },
         principal: { type: "string", enum: ["agent", "orchestrator", "user"] },

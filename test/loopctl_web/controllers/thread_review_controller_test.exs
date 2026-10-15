@@ -242,7 +242,8 @@ defmodule LoopctlWeb.ThreadReviewControllerTest do
         note: "relied on both",
         kb_refs: [readable.id, private.id],
         author_principal: "agent:#{ctx.implementer.id}",
-        actor_lineage: ctx.session.lineage_path
+        actor_lineage: ctx.session.lineage_path,
+        visibility_agent_id: nil
       )
 
     %{review: review} = judged_review(ctx)

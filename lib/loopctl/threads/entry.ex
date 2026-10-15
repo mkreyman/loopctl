@@ -37,6 +37,7 @@ defmodule Loopctl.Threads.Entry do
   # migration's CHECK, which must not call application code.
   @max_kb_refs 20
   @kb_ref_kinds [:message, :checkpoint]
+  @kb_refs_shape "kb_refs must be a list of knowledge article UUIDs"
 
   schema "thread_entries" do
     tenant_field()
@@ -90,20 +91,31 @@ defmodule Loopctl.Threads.Entry do
   def cast_kb_refs(nil), do: {:ok, []}
 
   def cast_kb_refs(refs) when is_list(refs) do
-    case Ecto.Type.cast({:array, Ecto.UUID}, refs) do
-      {:ok, ids} ->
-        ids = Enum.uniq(ids)
+    with {:ok, ids} <- cast_each_kb_ref(refs, []) do
+      ids = Enum.uniq(ids)
 
-        if length(ids) <= @max_kb_refs,
-          do: {:ok, ids},
-          else: {:error, "kb_refs may name at most #{@max_kb_refs} articles"}
-
-      _error ->
-        {:error, "kb_refs must be a list of knowledge article UUIDs"}
+      if length(ids) <= @max_kb_refs,
+        do: {:ok, ids},
+        else: {:error, "kb_refs may name at most #{@max_kb_refs} distinct articles"}
     end
   end
 
-  def cast_kb_refs(_refs), do: {:error, "kb_refs must be a list of knowledge article UUIDs"}
+  def cast_kb_refs(_refs), do: {:error, @kb_refs_shape}
+
+  # Each element by hand rather than `Ecto.Type.cast({:array, Ecto.UUID}, _)`, which passes a
+  # `nil` element through and reads any 16-byte string as a RAW uuid, so `[null]` or a
+  # 16-character slug would come back as an id the caller never sent. Only the 36-character
+  # text form is an article id here.
+  defp cast_each_kb_ref([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp cast_each_kb_ref([ref | rest], acc) when is_binary(ref) and byte_size(ref) == 36 do
+    case Ecto.UUID.cast(ref) do
+      {:ok, id} -> cast_each_kb_ref(rest, [id | acc])
+      :error -> {:error, @kb_refs_shape}
+    end
+  end
+
+  defp cast_each_kb_ref(_refs, _acc), do: {:error, @kb_refs_shape}
 
   @doc "A finding's severities, most severe first."
   @spec severities() :: [atom()]
