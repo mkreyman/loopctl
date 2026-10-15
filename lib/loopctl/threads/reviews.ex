@@ -69,6 +69,7 @@ defmodule Loopctl.Threads.Reviews do
 
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
+  alias Loopctl.Knowledge
   alias Loopctl.Repo
   alias Loopctl.Threads
   alias Loopctl.Threads.Checkpoint
@@ -138,10 +139,15 @@ defmodule Loopctl.Threads.Reviews do
   What a review reads (PRD §6): the story, the checkpoint diff reference, the thread's latest
   page of entries, and the latest #{@max_payload_fixes} fixes with the findings each answers
   (`fixes_truncated` when there are more). Entry bodies are UNTRUSTED text.
+
+  `kb_articles` names each knowledge article the page's entries cite (#978), keyed by id, so
+  a reviewer sees which decision a checkpoint relied on and can open it. Only the articles the
+  READING key can see are named (`:visibility_agent_id`, server-resolved from that key): an id
+  absent from the map is one this reader cannot open, whatever the writer could.
   """
-  @spec payload(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec payload(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, map()} | {:error, :not_found}
-  def payload(tenant_id, story_id, review_id) do
+  def payload(tenant_id, story_id, review_id, opts \\ []) do
     {:ok, result} =
       Repo.with_tenant(tenant_id, fn ->
         with %Story{} = story <- Threads.story(tenant_id, story_id) || {:error, :not_found},
@@ -150,7 +156,16 @@ defmodule Loopctl.Threads.Reviews do
         end
       end)
 
-    result
+    # Read AFTER the tenant transaction closes: the titles come from `Loopctl.AdminRepo`, and
+    # waiting on that pool from inside a held transaction would pin two connections at once.
+    with {:ok, payload} <- result do
+      {:ok, Map.put(payload, :kb_articles, kb_articles(tenant_id, payload.entries, opts))}
+    end
+  end
+
+  defp kb_articles(tenant_id, entries, opts) do
+    ids = entries |> Enum.flat_map(& &1.kb_refs) |> Enum.uniq()
+    Knowledge.article_refs(tenant_id, ids, Keyword.get(opts, :visibility_agent_id))
   end
 
   defp review(tenant_id, story_id, review_id) do

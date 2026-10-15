@@ -60,6 +60,7 @@ defmodule Loopctl.Threads do
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.GitSha
   alias Loopctl.Intake
+  alias Loopctl.Knowledge
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
@@ -144,6 +145,10 @@ defmodule Loopctl.Threads do
   - `:claim_epoch` (required) — the epoch the caller's claim returned
   - `:commit_sha`, `:tree_sha` (required) — lowercase hex, 40 or 64 characters
   - `:note` — the claimant's reasoning, stored as the checkpoint entry's body. Untrusted.
+  - `:kb_refs` — the knowledge articles the checkpoint acted on (#978), checked as
+    `record_entry/4` checks a message's. `nil` cites nothing.
+  - `:visibility_agent_id` — SERVER-resolved from the calling key
+    (`LoopctlWeb.Helpers.Visibility`): an agent key may cite only the articles it can read.
   - `:author_principal` (required), `:actor_lineage` (required) — SERVER-resolved: a lineage
     list, or `:custody` for the lineage of the dispatch the story's claim recorded
     (`implementer_dispatch_id`), read under the story's lock
@@ -167,7 +172,11 @@ defmodule Loopctl.Threads do
          :ok <- valid_sha(tree_sha, "tree_sha"),
          :ok <- same_object_format(commit_sha, tree_sha),
          :ok <- valid_note(note),
-         :ok <- no_secret(note, :note, tenant_id, story_id) do
+         :ok <- no_secret(note, :note, tenant_id, story_id),
+         {:ok, kb_refs} <- checkpoint_kb_refs(opts),
+         :ok <- kb_refs_readable(tenant_id, kb_refs || [], opts) do
+      opts = Keyword.put(opts, :kb_refs, kb_refs)
+
       in_story_lock(tenant_id, story_id, fn ->
         checkpoint_locked(tenant_id, story_id, commit_sha, tree_sha, opts)
       end)
@@ -319,6 +328,11 @@ defmodule Loopctl.Threads do
   - `:replay_only` — answer only a resend of an entry already recorded, and refuse a new one
     `:dispatch_not_accepted`, as for a checkpoint.
 
+  - `:visibility_agent_id` — SERVER-resolved from the calling key
+    (`LoopctlWeb.Helpers.Visibility`). `attrs["kb_refs"]` (#978) may name only knowledge
+    articles of the tenant that key can read; any other id refuses the whole entry 422
+    `unknown_kb_refs`, naming it, because a reference to nothing would be counted as a use.
+
   A resend of an entry already recorded by this author under this key is answered from the
   row BEFORE either check: it writes nothing, so no claim needs to be current for it, and a
   runner that lost the ack must be able to learn its note landed.
@@ -333,7 +347,9 @@ defmodule Loopctl.Threads do
     changeset = Entry.changeset(%Entry{}, attrs)
 
     with :ok <- caller_kind(changeset),
-         :ok <- screen(changeset, tenant_id, story_id) do
+         :ok <- screen(changeset, tenant_id, story_id),
+         :ok <-
+           kb_refs_readable(tenant_id, Ecto.Changeset.get_field(changeset, :kb_refs), opts) do
       in_story_lock(tenant_id, story_id, fn ->
         entry_locked(tenant_id, story_id, changeset, opts)
       end)
@@ -1239,7 +1255,13 @@ defmodule Loopctl.Threads do
         recorded = checkpoint_entry(existing)
 
         with :ok <- replay_allowed(recorded, Keyword.fetch!(opts, :author_principal), fence),
-             do: replay_checkpoint(existing, recorded, tree_sha, Keyword.get(opts, :note))
+             do:
+               replay_checkpoint(
+                 existing,
+                 recorded,
+                 tree_sha,
+                 Keyword.take(opts, [:note, :kb_refs])
+               )
     end
   end
 
@@ -1254,7 +1276,7 @@ defmodule Loopctl.Threads do
     Repo.one(
       from e in Entry,
         where: e.checkpoint_id == ^checkpoint.id and e.kind == :checkpoint,
-        select: %{author_principal: e.author_principal, body: e.body}
+        select: %{author_principal: e.author_principal, body: e.body, kb_refs: e.kb_refs}
     )
   end
 
@@ -1292,12 +1314,22 @@ defmodule Loopctl.Threads do
       else: {:error, :claim_not_live}
   end
 
-  # The same checkpoint, resent: the tree must match, and a note, when sent, must be the one
-  # recorded. Anything else is a different write, refused rather than acknowledged.
-  defp replay_checkpoint(%Checkpoint{tree_sha: tree_sha} = existing, recorded, tree_sha, note) do
-    if is_nil(note) or note == recorded.body,
-      do: {:ok, existing, :existing, []},
-      else: conflict("checkpoint_conflict", "commit_sha is already recorded with another note")
+  # The same checkpoint, resent: the tree must match, and a note or `kb_refs`, when sent, must
+  # be the one recorded. Anything else is a different write, refused rather than acknowledged.
+  defp replay_checkpoint(%Checkpoint{tree_sha: tree_sha} = existing, recorded, tree_sha, sent) do
+    note = Keyword.get(sent, :note)
+    kb_refs = Keyword.get(sent, :kb_refs)
+
+    cond do
+      not (is_nil(note) or note == recorded.body) ->
+        conflict("checkpoint_conflict", "commit_sha is already recorded with another note")
+
+      not (is_nil(kb_refs) or kb_refs == recorded.kb_refs) ->
+        conflict("checkpoint_conflict", "commit_sha is already recorded with other kb_refs")
+
+      true ->
+        {:ok, existing, :existing, []}
+    end
   end
 
   defp replay_checkpoint(_existing, _recorded, _tree_sha, _note),
@@ -1331,7 +1363,8 @@ defmodule Loopctl.Threads do
         kind: :checkpoint,
         idempotency_key: @reserved_key_prefix <> "checkpoint:#{commit_sha}:#{epoch}",
         body: Keyword.get(opts, :note) || "checkpoint #{commit_sha}",
-        checkpoint_id: checkpoint.id
+        checkpoint_id: checkpoint.id,
+        kb_refs: Keyword.get(opts, :kb_refs)
       })
 
     adopted = %{
@@ -1482,6 +1515,54 @@ defmodule Loopctl.Threads do
     end
   end
 
+  # A checkpoint's `kb_refs` arrive as an option, not through the entry changeset, so they are
+  # cast here by the same rule (`Entry.cast_kb_refs/1`) before anything is opened. `nil`
+  # stays nil: on a resend it means "not sent", which the replay does not compare.
+  defp checkpoint_kb_refs(opts) do
+    case Keyword.get(opts, :kb_refs) do
+      nil ->
+        {:ok, nil}
+
+      raw ->
+        case Entry.cast_kb_refs(raw) do
+          {:ok, ids} -> {:ok, ids}
+          {:error, message} -> {:error, :unprocessable_entity, message}
+        end
+    end
+  end
+
+  # Every cited id must be an article of THIS tenant that the writing key can read (#978).
+  # Asked BEFORE the story lock is taken: it reads `articles` on `Loopctl.AdminRepo`
+  # (`Knowledge.visible_article_ids/3`), and a lock held while waiting on that pool would
+  # stall every writer of the thread behind it. An article archived between this read and the
+  # insert is still a real article, which is all the reference claims.
+  #
+  # One answer for "no such article" and "an article you cannot read", so the refusal cannot
+  # tell an agent that another agent's private memory exists.
+  defp kb_refs_readable(_tenant_id, [], _opts), do: :ok
+
+  defp kb_refs_readable(tenant_id, kb_refs, opts) do
+    visible =
+      Knowledge.visible_article_ids(
+        tenant_id,
+        kb_refs,
+        Keyword.get(opts, :visibility_agent_id)
+      )
+
+    case Enum.reject(kb_refs, &MapSet.member?(visible, &1)) do
+      [] ->
+        :ok
+
+      unknown ->
+        {:error, :unprocessable_entity,
+         %{
+           code: "unknown_kb_refs",
+           message:
+             "kb_refs names no knowledge article this key can read: " <> Enum.join(unknown, ", ")
+         }}
+    end
+  end
+
   defp entry_locked(tenant_id, story_id, changeset, opts) do
     author = Keyword.fetch!(opts, :author_principal)
     key = Ecto.Changeset.get_field(changeset, :idempotency_key)
@@ -1542,7 +1623,8 @@ defmodule Loopctl.Threads do
     :severity,
     :location,
     :introduced_by,
-    :finding_ids
+    :finding_ids,
+    :kb_refs
   ]
 
   defp replay(existing, changeset) do
@@ -1607,10 +1689,16 @@ defmodule Loopctl.Threads do
             "author_principal" => entry.author_principal,
             "checkpoint_id" => entry.checkpoint_id
           },
-          Map.merge(judgement(entry), adopted)
+          judgement(entry) |> Map.merge(kb_refs_event(entry)) |> Map.merge(adopted)
         )
     })
   end
+
+  # The articles an entry cited ride in its chained event, so the citation is as tamper-evident
+  # as the body that carries it. An entry citing nothing carries no key, which keeps every
+  # event written before #978 the shape it was hashed as.
+  defp kb_refs_event(%Entry{kb_refs: [_ | _] = kb_refs}), do: %{"kb_refs" => kb_refs}
+  defp kb_refs_event(_entry), do: %{}
 
   # A judgement's event pins what the round count and the ceiling are computed from: which
   # review wrote it, its severity and origin, and the findings a fix answers. A message or a

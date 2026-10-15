@@ -5,6 +5,18 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.116.0 — 2026-10-15 (thread kb_refs)
+
+### Added
+
+- **`thread_entry` and `thread_checkpoint` take `kb_refs`**: the ids of the knowledge
+  articles the message or checkpoint acted on, at most 20, each an article of the tenant the
+  key can read (otherwise 422 `unknown_kb_refs`, naming the id). A checkpoint resent with
+  other `kb_refs` is 409 `checkpoint_conflict`. `thread_get` returns `kb_refs` on every
+  entry, and `thread_review_get` names each cited article's title, category and status
+  beside the entry that cites it, so a review sees the KB decisions behind each checkpoint
+  (loopctl #978). A non-array `kb_refs` is refused client-side before any call.
+
 ## 2.115.0 — 2026-10-11 (restore_project)
 
 ### Added

@@ -165,4 +165,66 @@ defmodule LoopctlWeb.ThreadControllerTest do
            |> get(~p"/api/v1/stories/#{Ecto.UUID.generate()}/thread")
            |> json_response(404)
   end
+
+  describe "kb_refs (#978)" do
+    test "a message and a checkpoint cite articles; the thread returns the ids", %{conn: conn} do
+      %{story: story, raw_key: key} = claimed_story()
+      article = fixture(:article, %{tenant_id: story.tenant_id})
+
+      entry = %{
+        "kind" => "message",
+        "idempotency_key" => "m1",
+        "body" => "per the decision",
+        "kb_refs" => [article.id]
+      }
+
+      assert %{"entry" => %{"kb_refs" => [id]}} =
+               conn
+               |> auth(key)
+               |> post(~p"/api/v1/stories/#{story.id}/thread/entries", entry)
+               |> json_response(201)
+
+      assert id == article.id
+
+      assert build_conn()
+             |> post_checkpoint(key, story, Map.put(@checkpoint, "kb_refs", [article.id]))
+             |> json_response(201)
+
+      %{"entries" => entries} =
+        build_conn()
+        |> auth(key)
+        |> get(~p"/api/v1/stories/#{story.id}/thread")
+        |> json_response(200)
+
+      assert Enum.map(entries, & &1["kb_refs"]) == [[article.id], [article.id]]
+    end
+
+    test "an id the key cannot read is 422 unknown_kb_refs naming it", %{conn: conn} do
+      %{story: story, raw_key: key} = claimed_story()
+      other_tenant = fixture(:article, %{})
+
+      private =
+        fixture(:article, %{
+          tenant_id: story.tenant_id,
+          metadata: %{"visibility" => "private", "agent_id" => Ecto.UUID.generate()}
+        })
+
+      for id <- [other_tenant.id, private.id] do
+        entry = %{"kind" => "message", "idempotency_key" => id, "body" => "b", "kb_refs" => [id]}
+
+        assert %{"error" => %{"code" => "unknown_kb_refs", "message" => message}} =
+                 conn
+                 |> auth(key)
+                 |> post(~p"/api/v1/stories/#{story.id}/thread/entries", entry)
+                 |> json_response(422)
+
+        assert message =~ id
+      end
+
+      assert %{"error" => %{"code" => "unknown_kb_refs"}} =
+               build_conn()
+               |> post_checkpoint(key, story, Map.put(@checkpoint, "kb_refs", [private.id]))
+               |> json_response(422)
+    end
+  end
 end

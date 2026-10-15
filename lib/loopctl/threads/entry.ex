@@ -32,6 +32,12 @@ defmodule Loopctl.Threads.Entry do
 
   @severities [:critical, :high, :medium, :low]
 
+  # The knowledge articles an entry may cite (#978): ids only, never bodies, bounded so a
+  # thread page and a review payload stay a ledger rather than a reading list. Restated in the
+  # migration's CHECK, which must not call application code.
+  @max_kb_refs 20
+  @kb_ref_kinds [:message, :checkpoint]
+
   schema "thread_entries" do
     tenant_field()
 
@@ -56,12 +62,48 @@ defmodule Loopctl.Threads.Entry do
     field :introduced_by, :string
     field :finding_ids, {:array, Ecto.UUID}
 
+    # The knowledge articles this entry acted on (#978), `message` and `checkpoint` only.
+    # `Loopctl.Threads` checks each names an article the writing key can see before the entry
+    # is written; the changeset only casts and bounds the list.
+    field :kb_refs, {:array, Ecto.UUID}, default: []
+
     timestamps(updated_at: false)
   end
 
   @doc "The largest `body`, in bytes, any entry may carry."
   @spec max_body_bytes() :: pos_integer()
   def max_body_bytes, do: @max_body_bytes
+
+  @doc "The most knowledge articles one entry may cite."
+  @spec max_kb_refs() :: pos_integer()
+  def max_kb_refs, do: @max_kb_refs
+
+  @doc "The entry kinds that may cite knowledge articles."
+  @spec kb_ref_kinds() :: [atom()]
+  def kb_ref_kinds, do: @kb_ref_kinds
+
+  @doc """
+  A caller's `kb_refs`, cast to canonical lowercase UUIDs with repeats dropped (first
+  occurrence kept), or the 422 message naming what is wrong. `nil` is an entry citing nothing.
+  """
+  @spec cast_kb_refs(term()) :: {:ok, [Ecto.UUID.t()]} | {:error, String.t()}
+  def cast_kb_refs(nil), do: {:ok, []}
+
+  def cast_kb_refs(refs) when is_list(refs) do
+    case Ecto.Type.cast({:array, Ecto.UUID}, refs) do
+      {:ok, ids} ->
+        ids = Enum.uniq(ids)
+
+        if length(ids) <= @max_kb_refs,
+          do: {:ok, ids},
+          else: {:error, "kb_refs may name at most #{@max_kb_refs} articles"}
+
+      _error ->
+        {:error, "kb_refs must be a list of knowledge article UUIDs"}
+    end
+  end
+
+  def cast_kb_refs(_refs), do: {:error, "kb_refs must be a list of knowledge article UUIDs"}
 
   @doc "A finding's severities, most severe first."
   @spec severities() :: [atom()]
@@ -76,11 +118,40 @@ defmodule Loopctl.Threads.Entry do
   def changeset(entry, attrs) do
     entry
     |> cast(attrs, [:kind, :idempotency_key, :body, :checkpoint_id])
+    |> put_kb_refs(attrs)
     |> validate_required([:kind, :idempotency_key, :body])
     |> validate_length(:idempotency_key, min: 1, max: 255)
     |> validate_length(:body, min: 1, max: @max_body_bytes, count: :bytes)
     |> unique_constraint(:idempotency_key, name: :thread_entries_idempotency_uidx)
     |> unique_constraint(:idempotency_key, name: :thread_entries_review_idempotency_uidx)
+  end
+
+  # Cast through `cast_kb_refs/1` rather than `cast/3`, so the HTTP surface, a checkpoint's
+  # note and this changeset agree on canonical form, de-duplication and the bound. A kind that
+  # cites nothing (a finding cites code, not KB) refuses a non-empty list.
+  defp put_kb_refs(changeset, attrs) do
+    raw = Map.get(attrs, :kb_refs, Map.get(attrs, "kb_refs"))
+
+    case cast_kb_refs(raw) do
+      {:ok, []} ->
+        put_change(changeset, :kb_refs, [])
+
+      {:ok, ids} ->
+        changeset
+        |> put_change(:kb_refs, ids)
+        |> validate_kb_ref_kind()
+
+      {:error, message} ->
+        add_error(changeset, :kb_refs, message)
+    end
+  end
+
+  defp validate_kb_ref_kind(changeset) do
+    kind = get_field(changeset, :kind)
+
+    if is_nil(kind) or kind in @kb_ref_kinds,
+      do: changeset,
+      else: add_error(changeset, :kb_refs, "only message and checkpoint entries cite articles")
   end
 
   @doc "The same validation, for an entry loopctl writes itself (a checkpoint's)."

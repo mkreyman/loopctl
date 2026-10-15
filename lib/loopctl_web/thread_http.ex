@@ -30,6 +30,7 @@ defmodule LoopctlWeb.ThreadHTTP do
       location_untrusted: true,
       introduced_by: entry.introduced_by,
       finding_ids: entry.finding_ids,
+      kb_refs: entry.kb_refs,
       inserted_at: entry.inserted_at
     }
   end
