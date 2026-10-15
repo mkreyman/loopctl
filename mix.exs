@@ -65,6 +65,16 @@ defmodule Loopctl.MixProject do
           # smuggled response can at worst put one tenant's relay response in
           # another's delivery record. Accepted against the crash above.
           "CVE-2026-94194",
+          # bandit 1.12.5 — no patched release exists: the advisory is introduced at
+          # 1.4.0 with no `fixed` event, and as of 2026-10-15 1.12.5 is the newest
+          # bandit on hex. Recheck when bandit > 1.12.5: endpoint_http2_test.exs fails
+          # on any bandit version change, so the move cannot go unnoticed.
+          # CVE-2026-105659 (HIGH): HTTP/2 blocked-send deadlines reset on every
+          # WINDOW_UPDATE, so a trickling client pins stream processes. HTTP/2 only, and
+          # the endpoint serves none: config/runtime.exs sets `http_2_options: [enabled:
+          # false]`, so Bandit closes a connection opening with the HTTP/2 preface
+          # (test/loopctl_web/endpoint_http2_test.exs fails if that changes).
+          "CVE-2026-105659",
           # cloak 1.1.4 and cloak_ecto 1.3.0 — no patched release exists for either
           # advisory below: as of 2026-10-07 both are the newest on hex (both 2024-04-06).
           # Each affects a module loopctl never uses. Every vault cipher is
