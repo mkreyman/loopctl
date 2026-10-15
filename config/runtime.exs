@@ -253,7 +253,15 @@ endpoint_http = [
   # message; the socket DSL `max_frame_size: 64_000` caps a single frame.
   # Without this, N sub-64KB continuation frames reassemble into one message up
   # to Bandit's 8 MB default, bypassing the per-frame cap.
-  websocket_options: [max_fragmented_message_size: 64_000]
+  websocket_options: [max_fragmented_message_size: 64_000],
+  # HTTP/2 is off: Bandit then closes a connection that opens with the HTTP/2 preface
+  # instead of serving it. Nothing needs it — Fly's proxy speaks HTTP/1.1 to the app
+  # (fly.toml `h2_backend = false`) — and leaving it on kept Bandit's HTTP/2 stack, and
+  # CVE-2026-105659 in it, reachable by prior-knowledge h2c from anything that can reach
+  # the port directly: the 6PN, or a self-host with no proxy in front. Bandit is mix.exs's
+  # ignored advisory only because of this line; test/loopctl_web/endpoint_http2_test.exs
+  # fails if it goes.
+  http_2_options: [enabled: false]
 ]
 
 # PORT overrides the env-specific default (dev.exs pins 4030; prod must set PORT —

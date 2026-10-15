@@ -317,6 +317,12 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The app's HTTP listener no longer serves HTTP/2.** Bandit now closes a connection that
+  opens with the HTTP/2 preface, which keeps CVE-2026-105659 (HIGH, Bandit's HTTP/2 stack,
+  no patched release) unreachable. Fly is unaffected: its proxy already speaks HTTP/1.1 to
+  the app (`h2_backend = false`). A self-host whose reverse proxy talks h2c to loopctl must
+  switch that upstream to HTTP/1.1.
+
 - **pgvector 0.8.4 is now the stated minimum (#965).** Below it, an HNSW index insert that
   races a VACUUM (autovacuum included) can read a just-deleted neighbour as a zero-length
   vector and fail with `different vector dimensions 1536 and 0`; pgvector fixed this in 0.8.4.
