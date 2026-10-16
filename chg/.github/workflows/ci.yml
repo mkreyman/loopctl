@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# A PR keeps only its newest run. Every master push gets its own group (keyed by sha),
+# so no master commit loses its verdict to a later push: the post-merge verifier and
+# culprit finder (design §3.8) need one result per commit.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # chg has no self-hosted registration and is not in either host's
+          # INFRA_POOL_REPOS (infra runbooks/ci-runner-setup.md). Setting the repo
+          # variable CI_RUNNER to '["self-hosted","beelink"]' moves the Linux leg there,
+          # provided that host has rustup or asdf (the toolchain step uses either).
+          - os: linux
+            runner: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
+          # The APFS clonefile(2) path (design §3.5) only compiles on macOS.
+          - os: macos
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Toolchain from .tool-versions
+        # Pins the toolchain for this job only (RUSTUP_TOOLCHAIN), never `rustup default`,
+        # which is per-user state shared by every job on a persistent runner.
+        run: |
+          ver=$(awk '$1=="rust"{print $2}' .tool-versions)
+          if command -v rustup >/dev/null; then
+            rustup toolchain install "$ver" --profile minimal --component rustfmt,clippy
+          elif command -v asdf >/dev/null; then
+            asdf plugin list | grep -qx rust || asdf plugin add rust
+            asdf install rust "$ver"
+            echo "$HOME/.asdf/shims" >> "$GITHUB_PATH"
+          else
+            echo "::error::runner has neither rustup nor asdf; provision one to build chg"
+            exit 1
+          fi
+          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Hosted and self-hosted runs must never share a cache entry
+          # (infra runbooks/ci-runner-setup.md: keys include runner.environment).
+          key: ${{ runner.environment }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # No --all-targets: that flag excludes doctests.
+      - run: cargo test --locked
