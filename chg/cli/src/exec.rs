@@ -196,13 +196,10 @@ fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
 /// A stable per-workspace slot for `isolation_env`, derived from the workspace path, so
 /// two workspaces on one machine never share a test database.
 pub fn workspace_slot(repo: &Path) -> String {
-    // FNV-1a: stable across Rust versions, unlike DefaultHasher.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in repo.as_os_str().as_encoded_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("ws{:08x}", h as u32)
+    format!(
+        "ws{}",
+        crate::store::fnv8(repo.as_os_str().as_encoded_bytes())
+    )
 }
 
 #[cfg(test)]

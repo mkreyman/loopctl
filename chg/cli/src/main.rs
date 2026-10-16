@@ -5,9 +5,14 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use chg::adapter::{self, Invoked};
 use chg::contract::{self, CommandName};
-use chg::exec::{self, Outcome};
-use chg::output::{self, Affected, Document, Status};
+use chg::exec;
+use chg::git;
+use chg::output::{Affected, Document};
+use chg::snapshot::{self, Built};
+use chg::store::Store;
+use chg::ws::{self, Hydrated};
 
 #[derive(Parser)]
 #[command(name = "chg", version = chg::VERSION, about = "Agent-first change system client")]
@@ -22,6 +27,59 @@ enum Top {
     Adapter {
         #[command(subcommand)]
         command: AdapterCmd,
+    },
+    /// The per-machine snapshot store.
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCmd,
+    },
+    /// Workspaces.
+    Ws {
+        #[command(subcommand)]
+        command: WsCmd,
+    },
+    /// Entry points for git hooks.
+    Hook {
+        #[command(subcommand)]
+        command: HookCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Build the snapshot of <sha>, cloned from the nearest existing one, then GC.
+    /// Exit 0 built or already present, 1 failed (nothing is left half-built).
+    Build { repo: PathBuf, sha: String },
+    /// List this repo's snapshots, newest first, as JSON lines.
+    List {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Keep the newest 3 and any with a live lease; remove the rest.
+    Gc {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WsCmd {
+    /// Clone the artifact paths from the nearest-ancestor snapshot into this worktree.
+    /// Exit 0 hydrated, 1 failed (worktree unchanged), 3 no snapshot (worktree unchanged).
+    Hydrate {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// `post-checkout <prev> <new> <flag>`: hydrates a worktree that `git worktree add`
+    /// just created (prev = all zeros, branch checkout). Never fails the checkout.
+    PostCheckout {
+        prev: String,
+        new: String,
+        flag: String,
     },
 }
 
@@ -58,6 +116,30 @@ enum AdapterCmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Top::Snapshot { command } => match command {
+            SnapshotCmd::Build { repo, sha } => {
+                with_worktree(Some(repo), |r| snapshot_build(r, &sha))
+            }
+            SnapshotCmd::List { repo } => with_worktree(repo, snapshot_list),
+            SnapshotCmd::Gc { repo } => with_worktree(repo, snapshot_gc),
+        },
+        Top::Ws { command } => match command {
+            WsCmd::Hydrate { repo } => with_worktree(repo, hydrate),
+        },
+        Top::Hook { command } => match command {
+            HookCmd::PostCheckout { prev, new: _, flag } => {
+                let created = flag == "1" && !prev.is_empty() && prev.bytes().all(|b| b == b'0');
+                if created && std::env::var_os("CHG_SKIP_HYDRATE").is_none() {
+                    let code = with_worktree(None, hydrate);
+                    if code != ExitCode::SUCCESS {
+                        eprintln!(
+                            "chg: the worktree is unhydrated; use the cold path (deps.get / install) as before"
+                        );
+                    }
+                }
+                ExitCode::SUCCESS
+            }
+        },
         Top::Adapter { command } => match command {
             AdapterCmd::Validate { repo } => validate(&repo_root(repo)),
             AdapterCmd::Exec {
@@ -95,21 +177,28 @@ fn main() -> ExitCode {
     }
 }
 
-/// `--repo`, else the git toplevel of the cwd, else the cwd; always canonical, because
-/// the workspace slot is derived from this path and `.`, `/w/a/` and a symlink must not
-/// give one tree several slots or several trees one slot.
+/// The adapter's root: `--repo` as given (the dir holding `.chg/`), else the git toplevel
+/// of the cwd, else the cwd. Always canonical, because the workspace slot is derived from
+/// this path and `.`, `/w/a/` and a symlink must not give one tree several slots or
+/// several trees one slot.
 fn repo_root(arg: Option<PathBuf>) -> PathBuf {
-    let raw = arg.unwrap_or_else(|| {
-        std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
+    let raw = arg.unwrap_or_else(|| git::toplevel(Path::new(".")).unwrap_or_else(|_| ".".into()));
     // A path that does not exist stays as given; loading the manifest then reports it.
     std::fs::canonicalize(&raw).unwrap_or(raw)
+}
+
+/// Runs `f` on the canonical root of the worktree holding `arg` (default the cwd), so a
+/// subdirectory never stands in for the worktree: artifacts, leases and git paths are
+/// all relative to the root.
+fn with_worktree(arg: Option<PathBuf>, f: impl FnOnce(&Path) -> ExitCode) -> ExitCode {
+    let dir = arg.unwrap_or_else(|| ".".into());
+    match git::toplevel(&dir) {
+        Ok(root) => f(&std::fs::canonicalize(&root).unwrap_or(root)),
+        Err(e) => {
+            eprintln!("chg: {} is not in a git worktree: {e}", dir.display());
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn validate(repo: &Path) -> ExitCode {
@@ -136,76 +225,120 @@ fn validate(repo: &Path) -> ExitCode {
 fn exec_cmd(
     repo: &Path,
     name: CommandName,
-    mut values: BTreeMap<&str, String>,
+    values: BTreeMap<&str, String>,
     timeout: Duration,
 ) -> ExitCode {
-    // Any failure on the way to a valid document. `affected` turns it into "run all".
-    let broken = |why: String| -> ExitCode {
-        if name == CommandName::Affected {
+    match adapter::invoke(repo, name, values, None, timeout) {
+        Invoked::Ok(doc) => {
+            println!("{}", doc.to_json());
+            ExitCode::SUCCESS
+        }
+        Invoked::Failed(doc) => {
+            println!("{}", doc.to_json());
+            ExitCode::from(1)
+        }
+        // `affected` turns any broken output into "run all".
+        Invoked::Broken(why) if name == CommandName::Affected => {
             eprintln!("chg: affected {why}; failing closed to the full suite");
             println!(
                 "{}",
                 Document::Affected(Affected::fail_closed(&why)).to_json()
             );
             ExitCode::SUCCESS
-        } else {
+        }
+        Invoked::Broken(why) => {
             eprintln!("chg: {name} {why}");
             ExitCode::from(2)
         }
-    };
+    }
+}
 
-    let manifest = match contract::load(repo) {
-        Ok(m) => m,
-        Err(e) => return broken(format!("cannot use the adapter: {e}")),
-    };
-    for p in name.required_placeholders() {
-        if !values.contains_key(p) {
-            return broken(format!("needs --{p}"));
+fn snapshot_build(repo: &Path, sha: &str) -> ExitCode {
+    let r = snapshot::build(repo, sha);
+    let store = Store::for_repo(repo);
+    let gc = store.map(|s| s.gc());
+    match r {
+        Ok(Built::Exists(m)) => {
+            println!(
+                "{}",
+                serde_json::json!({"snapshot": m.sha, "status": "exists"})
+            );
+        }
+        Ok(Built::Built(m)) => {
+            println!(
+                "{}",
+                serde_json::json!({"snapshot": m.sha, "status": "built", "from": m.from, "work": m.work, "ms": m.ms})
+            );
+        }
+        Err(e) => {
+            eprintln!("chg: snapshot build failed: {e}");
+            return ExitCode::from(1);
         }
     }
-    if name == CommandName::Shard {
-        // Shards are 1-based (`mix test --partitions`, `vitest --shard i/n`).
-        let n: u32 = values["n"].parse().unwrap_or(0);
-        let i: u32 = values["i"].parse().unwrap_or(0);
-        if n == 0 || i == 0 || i > n {
-            return broken(format!("needs 1 <= --i <= --n (got --i {i} --n {n})"));
+    if let Ok(Ok(removed)) = gc
+        && !removed.is_empty()
+    {
+        eprintln!("chg: gc removed {}", removed.join(", "));
+    }
+    ExitCode::SUCCESS
+}
+
+fn snapshot_list(repo: &Path) -> ExitCode {
+    match Store::for_repo(repo) {
+        Ok(s) => {
+            for m in s.list() {
+                println!("{}", serde_json::to_string(&m).expect("meta serializes"));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("chg: {e}");
+            ExitCode::from(1)
         }
     }
-    values.insert("workspace_slot", exec::workspace_slot(repo));
+}
 
-    let (code, document) = match exec::run(&manifest, repo, name, &values, timeout) {
-        Err(e) => return broken(e),
-        Ok(Outcome::TimedOut { after }) => {
-            return broken(format!("timed out after {}s", after.as_secs()));
+fn snapshot_gc(repo: &Path) -> ExitCode {
+    match Store::for_repo(repo).map(|s| s.gc()) {
+        Ok(Ok(removed)) => {
+            println!("{}", serde_json::json!({ "removed": removed }));
+            ExitCode::SUCCESS
         }
-        Ok(Outcome::Exited { code, document }) => (code, document),
-    };
-
-    let doc = match document.map(|l| output::check(name, &l)) {
-        None => return broken(format!("printed no JSON document (exit {code:?})")),
-        Some(Err(e)) => return broken(e),
-        Some(Ok(doc)) => doc,
-    };
-
-    let failed = match &doc {
-        Document::Snapshot(_) | Document::Affected(_) => false,
-        Document::Static(s) => !s.ok,
-        Document::Results(r) => r
-            .results
-            .iter()
-            .any(|t| matches!(t.status, Status::Fail | Status::Error)),
-    };
-    // The exit status and the document must agree: a crash that still printed a
-    // success-shaped line is not trusted, nor is a failure report from a clean exit.
-    let exit_failed = code != Some(0);
-    if exit_failed != failed {
-        let says = if failed { "failure" } else { "success" };
-        return broken(format!("exited {code:?} but its document reports {says}"));
+        Ok(Err(e)) => {
+            eprintln!("chg: gc: {e}");
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("chg: {e}");
+            ExitCode::from(1)
+        }
     }
-    println!("{}", doc.to_json());
-    if failed {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+}
+
+fn hydrate(ws_dir: &Path) -> ExitCode {
+    match ws::hydrate(ws_dir) {
+        Ok(Hydrated::Done {
+            snapshot,
+            behind,
+            paths,
+            ms,
+        }) => {
+            println!(
+                "{}",
+                serde_json::json!({"snapshot": snapshot, "behind": behind, "paths": paths, "ms": ms})
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Hydrated::NoSnapshot) => {
+            eprintln!(
+                "chg: no snapshot is an ancestor of HEAD in {}; build one with `chg snapshot build <repo> <sha>`",
+                ws_dir.display()
+            );
+            ExitCode::from(3)
+        }
+        Err(e) => {
+            eprintln!("chg: hydrate failed: {e}");
+            ExitCode::from(1)
+        }
     }
 }

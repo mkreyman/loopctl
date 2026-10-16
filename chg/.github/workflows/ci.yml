@@ -53,6 +53,27 @@ jobs:
             exit 1
           fi
           echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+      # The Linux clone path needs reflink; the hosted image's ext4 has none, so the
+      # clone tests run on an XFS loop image (the same setup as bin/chg-volume-setup.sh).
+      - name: XFS reflink scratch volume
+        if: matrix.os == 'linux' && runner.environment == 'github-hosted'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq xfsprogs >/dev/null
+          truncate -s 2G "$RUNNER_TEMP/xfs.img"
+          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/xfs.img"
+          sudo mkdir -p /mnt/chg-xfs
+          sudo mount -o loop "$RUNNER_TEMP/xfs.img" /mnt/chg-xfs
+          sudo chown "$(id -u):$(id -g)" /mnt/chg-xfs
+          echo "CHG_TEST_REFLINK_DIR=/mnt/chg-xfs" >> "$GITHUB_ENV"
+      # A self-hosted Linux runner tests on its chg volume (S5). Without one the clone
+      # tests fail rather than skip: CI=true makes a missing CHG_TEST_REFLINK_DIR an error.
+      - name: chg volume on a self-hosted runner
+        if: matrix.os == 'linux' && runner.environment == 'self-hosted'
+        run: |
+          # ci-tmp is 1777 (bin/chg-volume-setup.sh), so the runner account can write it.
+          if [ -d /srv/chg/ci-tmp ] && [ -w /srv/chg/ci-tmp ]; then
+            echo "CHG_TEST_REFLINK_DIR=/srv/chg/ci-tmp" >> "$GITHUB_ENV"
+          fi
       - uses: Swatinem/rust-cache@v2
         with:
           # Hosted and self-hosted runs must never share a cache entry
