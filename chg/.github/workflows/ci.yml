@@ -130,3 +130,35 @@ jobs:
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
       - run: mix test
+
+  # The pnpm adapter (adapters/typescript): unit tests, and an integration test that drives
+  # a fixture workspace through every command, including `chg adapter exec` (CHG_BIN).
+  typescript-adapter:
+    name: typescript-adapter (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: adapters/typescript
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: adapters/typescript/.tool-versions
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+      - name: Rust toolchain from .tool-versions
+        working-directory: .
+        run: |
+          ver=$(awk '$1=="rust"{print $2}' .tool-versions)
+          rustup toolchain install "$ver" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build chg
+        working-directory: .
+        run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
+      - run: git config --global user.name ci && git config --global user.email ci@localhost
+      - run: node --test test/unit.test.mjs test/integration.test.mjs
