@@ -1,0 +1,11 @@
+# chg
+
+The agent fleet's change system: Scion's coordination model (server-side landing with no global
+lock, affected-only checks before merge, batched verification after merge, auto-revert, Claude
+resolving conflicts, intent review) on git storage. Elixir and TypeScript repos are first-class.
+
+- Design and phases: [docs/design.md](docs/design.md)
+- Sources: [docs/sources.md](docs/sources.md)
+
+Layout as it lands: `cli/` (Rust: `chg` and `chgd`), `adapters/` (Elixir, TypeScript),
+`server/` (Elixir/Phoenix control plane, phase 2).
