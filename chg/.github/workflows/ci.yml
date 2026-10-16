@@ -83,3 +83,17 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       # No --all-targets: that flag excludes doctests.
       - run: cargo test --locked
+
+  # bin/chg-volume-setup.sh mounts and writes fstab, so its test needs root and a
+  # throwaway machine: a hosted runner, never a self-hosted one.
+  volume-setup:
+    name: volume-setup (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -q && sudo apt-get install -yq xfsprogs shellcheck >/dev/null
+      - run: shellcheck bin/chg-volume-setup.sh tests/volume-setup-test.sh
+      - run: sudo bash tests/volume-setup-test.sh
