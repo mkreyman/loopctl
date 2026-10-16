@@ -6,6 +6,7 @@ resolving conflicts, intent review) on git storage. Elixir and TypeScript repos 
 
 - Design and phases: [docs/design.md](docs/design.md)
 - Sources: [docs/sources.md](docs/sources.md)
+- Shadow phase and the gate switch (`chg check`, `chg gate`, `chg shadow`): [docs/shadow.md](docs/shadow.md)
 
 Layout as it lands: `cli/` (Rust: `chg` and `chgd`), `adapters/` (Elixir, TypeScript),
 `server/` (Elixir/Phoenix control plane, phase 2).

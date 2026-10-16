@@ -90,16 +90,11 @@ impl Store {
     pub fn for_repo(path: &Path) -> Result<Store, String> {
         let common = git::common_dir(path)?;
         let common = fs::canonicalize(&common).unwrap_or(common);
-        let named = if common.file_name().is_some_and(|n| n == ".git") {
-            common.parent().unwrap_or(&common)
-        } else {
-            &common
-        };
-        let name = named
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "repo".into());
-        let key = format!("{name}-{}", fnv8(common.as_os_str().as_encoded_bytes()));
+        let key = format!(
+            "{}-{}",
+            git::common_dir_name(&common),
+            fnv8(common.as_os_str().as_encoded_bytes())
+        );
         Ok(Store {
             dir: root().join(key),
         })
@@ -155,6 +150,41 @@ impl Store {
     /// database), so two at once would run their adapters against the same database.
     pub fn lock_build(&self) -> io::Result<Lock> {
         self.lock("build.lock", true)
+    }
+
+    /// Held for a whole shadow check. It lives at the store root, not in this repo's
+    /// dir, so pushes in quick succession queue across every repo and clone on this
+    /// machine instead of running their suites at once beside the real gate. `None` once
+    /// `wait` has passed with the lock still held elsewhere.
+    pub fn lock_shadow(&self, wait: Duration) -> io::Result<Option<Lock>> {
+        let root = root();
+        fs::create_dir_all(&root)?;
+        let f = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join("shadow.lock"))?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            // SAFETY: flock on an fd we own; released when the File closes.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Some(Lock(f)));
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(e);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Where shadow checks put their throwaway worktrees: inside the store, so they sit
+    /// on the snapshots' filesystem and hydrate by cloning.
+    pub fn shadow_dir(&self) -> PathBuf {
+        self.dir.join("shadow")
     }
 
     /// Complete snapshots, newest first. A directory without readable meta is a

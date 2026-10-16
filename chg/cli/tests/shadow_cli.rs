@@ -1,0 +1,572 @@
+//! Integration tests for S10: `chg check`, `chg gate` (the `CHG_GATE` switch), and the
+//! shadow phase (`chg check --shadow`, `chg shadow record`, `chg shadow report`), against
+//! a git repo driven by a stand-in adapter.
+
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
+use std::process::Command as Std;
+use std::time::{Duration, Instant};
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+use serde_json::Value;
+use tempfile::TempDir;
+
+/// Clone-capable on macOS (APFS); on Linux only under `CHG_TEST_REFLINK_DIR`.
+fn cow_tempdir() -> Option<TempDir> {
+    if cfg!(target_os = "macos") {
+        return Some(tempfile::tempdir().unwrap());
+    }
+    match std::env::var_os("CHG_TEST_REFLINK_DIR") {
+        Some(d) => Some(tempfile::tempdir_in(d).unwrap()),
+        None if std::env::var_os("CI").is_some() => {
+            panic!(
+                "CHG_TEST_REFLINK_DIR is unset in CI; mount a reflink-capable dir for the clone tests"
+            )
+        }
+        None => {
+            eprintln!("skipped: set CHG_TEST_REFLINK_DIR to a reflink-capable dir");
+            None
+        }
+    }
+}
+
+/// A stand-in adapter. `FAIL_TESTS=1` in the repo's `.chg/fail` makes `run` fail; each
+/// call is logged to `.chg/calls` in the directory it ran in.
+const ADAPTER: &str = r#"#!/bin/sh
+cmd=$1; shift
+echo "$cmd $(pwd)" >> "$CALLS"
+case "$cmd" in
+  snapshot) mkdir -p _build; echo built > _build/marker; echo '{"work":"full","ms":1}' ;;
+  static)   if ! git rev-parse --verify --quiet "$1^{commit}" >/dev/null; then
+              echo '{"ok":false,"failures":[{"check":"git","message":"base not in this repo"}]}'; exit 1
+            fi
+            echo '{"ok":true,"failures":[]}' ;;
+  affected) echo '{"mode":"subset","reason":"two files","tests":["test/a_test.exs","test/b_test.exs"]}' ;;
+  run)      if [ -f .chg/fail ]; then
+              echo '{"results":[{"id":"test/a_test.exs:3","status":"fail","ms":5}]}'; exit 1
+            fi
+            echo '{"results":[{"id":"test/a_test.exs:3","status":"pass","ms":5}]}' ;;
+  shard)    echo '{"results":[]}' ;;
+esac
+"#;
+
+const MANIFEST: &str = r#"[adapter]
+kind = "elixir"
+version = "1"
+artifacts = ["_build"]
+inputs = ["lib/**"]
+always_all = ["mix.exs"]
+isolation_env = { MIX_TEST_PARTITION = "{workspace_slot}" }
+
+[commands]
+snapshot = "sh .chg/adapter.sh snapshot"
+static   = "sh .chg/adapter.sh static {base}"
+affected = "sh .chg/adapter.sh affected {base}"
+run      = "sh .chg/adapter.sh run {file}"
+shard    = "sh .chg/adapter.sh shard {n} {i}"
+"#;
+
+struct Env {
+    _t: TempDir,
+    repo: PathBuf,
+    home: PathBuf,
+    store: PathBuf,
+    calls: PathBuf,
+}
+
+impl Env {
+    fn new(dir: TempDir) -> Env {
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let repo = root.join("product");
+        fs::create_dir_all(repo.join(".chg")).unwrap();
+        fs::create_dir_all(repo.join("lib")).unwrap();
+        fs::write(repo.join(".chg/adapter.toml"), MANIFEST).unwrap();
+        fs::write(repo.join(".chg/adapter.sh"), ADAPTER).unwrap();
+        fs::write(repo.join(".gitignore"), "_build/\n").unwrap();
+        fs::write(repo.join("lib/a.ex"), "one\n").unwrap();
+        let env = Env {
+            home: root.join("chg-home"),
+            store: root.join("store"),
+            calls: root.join("calls"),
+            repo,
+            _t: dir,
+        };
+        env.git(&["init", "-q", "-b", "master"]);
+        env.git(&["add", "-A"]);
+        env.git(&["commit", "-q", "-m", "one"]);
+        env
+    }
+
+    fn plain() -> Env {
+        Env::new(tempfile::tempdir().unwrap())
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let out = Std::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    fn commit(&self, file: &str, text: &str) -> String {
+        fs::write(self.repo.join(file), text).unwrap();
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", file]);
+        self.head()
+    }
+
+    fn chg(&self) -> Command {
+        let mut c = Command::cargo_bin("chg").unwrap();
+        c.current_dir(&self.repo)
+            .env("CHG_HOME", &self.home)
+            .env("CHG_STORE", &self.store)
+            .env("CALLS", &self.calls)
+            .env_remove("CHG_GATE");
+        c
+    }
+
+    fn log(&self) -> PathBuf {
+        self.home.join("shadow/product.jsonl")
+    }
+
+    fn rows(&self) -> Vec<Value> {
+        fs::read_to_string(self.log())
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn calls(&self) -> String {
+        fs::read_to_string(&self.calls).unwrap_or_default()
+    }
+
+    fn worktrees(&self) -> usize {
+        self.git(&["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count()
+    }
+}
+
+#[test]
+fn gate_mode_switch_env_beats_policy_and_off_is_the_fallback() {
+    let env = Env::plain();
+    let mode = |set: Option<&str>| {
+        let mut c = env.chg();
+        c.arg("gate");
+        if let Some(v) = set {
+            c.env("CHG_GATE", v);
+        }
+        let out = c.assert().success().get_output().stdout.clone();
+        String::from_utf8(out).unwrap().trim().to_string()
+    };
+    assert_eq!(mode(None), "shadow");
+    assert_eq!(mode(Some("off")), "off");
+
+    fs::write(env.repo.join(".chg/policy.toml"), "[gate]\nmode = \"on\"\n").unwrap();
+    assert_eq!(mode(None), "on");
+    // The rollback: CHG_GATE=off restores the old gate with no code change.
+    assert_eq!(mode(Some("off")), "off");
+    assert_eq!(mode(Some("bogus")), "off");
+
+    fs::write(
+        env.repo.join(".chg/policy.toml"),
+        "[gate]\nmode = \"off\"\n",
+    )
+    .unwrap();
+    assert_eq!(mode(None), "off");
+
+    // A policy that exists but cannot be read is unreadable, not absent: off, not the
+    // shadow default.
+    fs::remove_file(env.repo.join(".chg/policy.toml")).unwrap();
+    fs::create_dir(env.repo.join(".chg/policy.toml")).unwrap();
+    assert_eq!(mode(None), "off");
+    let out = env
+        .chg()
+        .arg("gate")
+        .env("CHG_GATE", std::ffi::OsStr::from_bytes(b"\xff"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8(out).unwrap().trim(), "off");
+}
+
+#[test]
+fn check_runs_static_then_the_affected_tests() {
+    let env = Env::plain();
+    let base = env.head();
+    env.commit("lib/a.ex", "two\n");
+    let out = env
+        .chg()
+        .args(["check", "--base", &base])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["verdict"], "pass");
+    assert_eq!(v["mode"], "subset");
+    assert_eq!(v["selected"].as_array().unwrap().len(), 2);
+    let calls = env.calls();
+    let order: Vec<&str> = calls
+        .lines()
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(order, ["static", "affected", "run"]);
+
+    fs::write(env.repo.join(".chg/fail"), "").unwrap();
+    env.chg()
+        .args(["check", "--base", &base])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("\"verdict\":\"fail\""))
+        .stdout(predicate::str::contains("test/a_test.exs:3"));
+}
+
+#[test]
+fn check_with_the_gate_off_exits_3_without_running_anything() {
+    let env = Env::plain();
+    env.chg()
+        .args(["check", "--base", "HEAD"])
+        .env("CHG_GATE", "off")
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("run the repo's own gate"));
+    assert_eq!(env.calls(), "");
+}
+
+#[test]
+fn shadow_with_the_gate_off_does_nothing() {
+    let env = Env::plain();
+    env.chg()
+        .args(["check", "--shadow", "--foreground", "--base", "HEAD"])
+        .env("CHG_GATE", "off")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("shadow skipped"));
+    assert!(env.rows().is_empty());
+    assert_eq!(env.calls(), "");
+}
+
+#[test]
+fn shadow_never_fails_the_push() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("chg")
+        .unwrap()
+        .current_dir(dir.path())
+        .env("CHG_HOME", dir.path().join("h"))
+        .args(["check", "--shadow"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("shadow skipped"));
+}
+
+#[test]
+fn shadow_without_a_snapshot_is_skipped_not_cold_built() {
+    let env = Env::plain();
+    env.chg()
+        .args(["check", "--shadow", "--foreground", "--base", "HEAD"])
+        .assert()
+        .success();
+    let rows = env.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["kind"], "chg");
+    assert_eq!(rows[0]["verdict"], "skipped");
+    assert!(rows[0]["reason"].as_str().unwrap().contains("no snapshot"));
+    assert_eq!(env.worktrees(), 1, "the throwaway worktree is removed");
+}
+
+#[test]
+fn shadow_judges_the_commit_in_a_throwaway_worktree() {
+    let Some(dir) = cow_tempdir() else { return };
+    let env = Env::new(dir);
+    let base = env.head();
+    env.chg()
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&base)
+        .assert()
+        .success();
+    let sha = env.commit("lib/a.ex", "two\n");
+    // The live tree moves on after the push; the shadow must judge the pushed commit.
+    fs::write(env.repo.join("lib/a.ex"), "uncommitted\n").unwrap();
+
+    env.chg()
+        .args(["check", "--shadow", "--foreground", "--base", &base])
+        .assert()
+        .success();
+    let rows = env.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!(r["verdict"], "pass", "{r}");
+    assert_eq!(r["sha"], sha.as_str());
+    assert_eq!(r["base"], base.as_str());
+    assert_eq!(r["mode"], "subset");
+    assert_eq!(r["selected"].as_array().unwrap().len(), 2);
+    assert!(r["host"].as_str().is_some_and(|h| !h.is_empty()));
+    assert!(r["hydrate_ms"].is_u64());
+
+    // Every adapter call ran outside the live tree.
+    let calls = env.calls();
+    let live = format!(" {}", env.repo.display());
+    for l in calls.lines().filter(|l| !l.starts_with("snapshot")) {
+        assert!(!l.ends_with(&live), "ran in the live tree: {l}");
+    }
+    assert_eq!(env.worktrees(), 1, "the throwaway worktree is removed");
+    assert_eq!(
+        fs::read_to_string(env.repo.join("lib/a.ex")).unwrap(),
+        "uncommitted\n"
+    );
+
+    // A check killed mid-run leaves its worktree registered; the next one clears it and
+    // runs at the same path, so in the same workspace slot and test database.
+    let store = fs::read_dir(&env.store)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    let ws = store.join("shadow/ws");
+    let first_dirs: Vec<String> = calls
+        .lines()
+        .filter(|l| l.starts_with("run "))
+        .map(|l| l["run ".len()..].to_string())
+        .collect();
+    assert_eq!(first_dirs.len(), 1, "{calls}");
+    env.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        ws.to_str().unwrap(),
+        &base,
+    ]);
+    fs::write(ws.join("left-behind"), "x").unwrap();
+    assert_eq!(env.worktrees(), 2);
+    fs::remove_file(&env.calls).unwrap();
+    env.chg()
+        .args(["check", "--shadow", "--foreground", "--base", &base])
+        .assert()
+        .success();
+    let rows = env.rows();
+    assert_eq!(rows[1]["verdict"], "pass", "{}", rows[1]);
+    let calls = env.calls();
+    let again: Vec<&str> = calls
+        .lines()
+        .filter(|l| l.starts_with("run "))
+        .map(|l| &l["run ".len()..])
+        .collect();
+    assert_eq!(again, vec![first_dirs[0].as_str()], "same path, same slot");
+    assert_eq!(env.worktrees(), 1, "the leftover is gone too");
+    assert!(!ws.exists());
+}
+
+#[test]
+fn check_with_a_sha_judges_only_that_exact_clean_tree() {
+    let env = Env::plain();
+    let base = env.head();
+    let sha = env.commit("lib/a.ex", "two\n");
+    let check = |extra: &[(&str, &str)]| {
+        let mut c = env.chg();
+        c.args(["check", "--sha", &sha, "--base", &base]);
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    assert_eq!(check(&[]).status.code(), Some(0));
+
+    // Uncommitted edits: refused before anything runs.
+    fs::write(env.repo.join("lib/a.ex"), "dirty\n").unwrap();
+    fs::remove_file(&env.calls).unwrap();
+    let out = check(&[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("differs from"));
+    assert_eq!(env.calls(), "", "nothing ran");
+    env.git(&["checkout", "-q", "--", "lib/a.ex"]);
+
+    // HEAD is not the commit asked about.
+    let later = env.commit("lib/a.ex", "three\n");
+    assert_ne!(later, sha);
+    let out = check(&[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not"));
+
+    // The tree changed while the tests ran: no verdict, whatever the tests said.
+    env.git(&["reset", "-q", "--hard", &sha]);
+    let marker = env.repo.join("lib/written-during-run.ex");
+    let touching = ADAPTER.replace(
+        "  run)      if",
+        "  run)      [ -n \"$TOUCH\" ] && echo x > \"$TOUCH\"\n            if",
+    );
+    fs::write(env.repo.join(".chg/adapter.sh"), touching).unwrap();
+    env.git(&["commit", "-qam", "touching adapter"]);
+    let sha = env.head();
+    let out = env
+        .chg()
+        .args(["check", "--sha", &sha, "--base", &base])
+        .env("TOUCH", &marker)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["verdict"], "error");
+    assert!(v["reason"].as_str().unwrap().contains("tree moved"), "{v}");
+}
+
+#[test]
+fn shadow_detaches_and_returns_at_once() {
+    let Some(dir) = cow_tempdir() else { return };
+    let env = Env::new(dir);
+    let base = env.head();
+    env.chg()
+        .args(["snapshot", "build"])
+        .arg(&env.repo)
+        .arg(&base)
+        .assert()
+        .success();
+    env.commit("lib/a.ex", "two\n");
+    // The adapter takes 2 s per call; the push must not wait for it.
+    let slow = ADAPTER.replace("cmd=$1; shift", "cmd=$1; shift\nsleep 2");
+    fs::write(env.repo.join(".chg/adapter.sh"), slow).unwrap();
+    env.git(&["commit", "-qam", "slow adapter"]);
+
+    let started = Instant::now();
+    env.chg()
+        .args(["check", "--shadow", "--base", &base])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("started in the background"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while env.rows().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let rows = env.rows();
+    assert_eq!(rows.len(), 1, "no row within 60 s");
+    assert_eq!(rows[0]["verdict"], "pass", "{}", rows[0]);
+}
+
+#[test]
+fn record_and_report_pair_verdicts_by_commit() {
+    let env = Env::plain();
+    let sha = env.head();
+    let chg_row = serde_json::json!({
+        "v": 1, "kind": "chg", "repo": "product", "host": "m1", "sha": sha,
+        "at_ms": 1, "verdict": "pass", "ms": 60000, "mode": "subset",
+        "selected": ["test/a_test.exs"]
+    });
+    fs::create_dir_all(env.home.join("shadow")).unwrap();
+    fs::write(env.log(), format!("{chg_row}\n")).unwrap();
+
+    let failures = env.home.join("failures.txt");
+    fs::write(&failures, "test/z_test.exs:9\n").unwrap();
+    env.chg()
+        .args(["shadow", "record", "--verdict", "fail", "--ms", "540000"])
+        .args(["--gate", "mix precommit", "--failures-file"])
+        .arg(&failures)
+        .assert()
+        .success();
+    let rows = env.rows();
+    assert_eq!(rows[1]["kind"], "gate");
+    assert_eq!(rows[1]["sha"], sha.as_str());
+    assert_eq!(rows[1]["source"], "local");
+
+    env.chg()
+        .args(["shadow", "report"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("pushes 1 on 1 machine(s) [m1]"))
+        .stdout(predicate::str::contains("MISS"))
+        .stdout(predicate::str::contains(
+            "not selected, failed in the gate: test/z_test.exs:9",
+        ))
+        .stdout(predicate::str::contains("not ready to cut over"));
+
+    let out = env
+        .chg()
+        .args(["shadow", "report", "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let r: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(r["misses"], 1);
+    assert_eq!(r["criteria"].as_array().unwrap().len(), 4);
+
+    env.chg()
+        .args(["shadow", "record", "--verdict", "maybe"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn report_reads_extra_logs_and_dedups_them() {
+    let env = Env::plain();
+    fs::create_dir_all(&env.home).unwrap();
+    let other = env.home.join("other.jsonl");
+    let mut lines = String::new();
+    for (i, host) in ["m1", "m2", "m3"].iter().enumerate() {
+        let sha = format!("{i:040}");
+        lines += &format!(
+            "{}\n{}\n",
+            serde_json::json!({"v":1,"kind":"chg","repo":"product","host":host,"sha":sha,"at_ms":1,"verdict":"pass","ms":1000}),
+            serde_json::json!({"v":1,"kind":"gate","repo":"product","host":host,"sha":sha,"at_ms":2,"verdict":"pass","ms":9000,"gate":"g","source":"local"})
+        );
+    }
+    fs::write(&other, &lines).unwrap();
+    env.chg()
+        .args(["shadow", "report", "--file"])
+        .arg(&other)
+        .arg("--file")
+        .arg(&other)
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("pushes 3 on 3 machine(s)"))
+        .stdout(predicate::str::contains("[x] machines: 3"))
+        .stdout(predicate::str::contains(
+            "[ ] shadow pushes with both verdicts: 3",
+        ));
+}
+
+#[test]
+fn the_hook_variables_do_not_leak_into_the_adapter() {
+    // From a pre-push hook git exports GIT_DIR. The adapter's git calls (here, static
+    // resolving the base) must still see the repo they run in, not the hook's.
+    let env = Env::plain();
+    let other = Env::plain();
+    let base = env.head();
+    env.commit("lib/a.ex", "two\n");
+    env.chg()
+        .args(["check", "--base", &base])
+        .env("GIT_DIR", other.repo.join(".git"))
+        .assert()
+        .success();
+}

@@ -90,7 +90,13 @@ pub fn run(
         env.push((k.clone(), substitute(tmpl, values, false)?));
     }
 
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    // From a git hook, GIT_DIR and friends point at the pushing worktree; an adapter that
+    // runs git (every `--base` diff does) must see the repo it runs in.
+    for v in crate::git::HOOK_ENV {
+        command.env_remove(v);
+    }
+    let mut child = command
         .arg("-c")
         .arg(&cmd)
         .current_dir(repo)

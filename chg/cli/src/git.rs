@@ -4,19 +4,23 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// The variables git exports to a hook. Anything started from a hook that runs git in
+/// another directory must drop them, or its git calls act on the hook's repository.
+pub const HOOK_ENV: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+    "GIT_OBJECT_DIRECTORY",
+];
+
 /// A `git -C dir` command with the hook-time variables removed: inside a hook git exports
 /// `GIT_DIR`/`GIT_INDEX_FILE`, which would silently redirect every call we make.
 pub fn cmd(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(dir);
-    for v in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_COMMON_DIR",
-        "GIT_PREFIX",
-        "GIT_OBJECT_DIRECTORY",
-    ] {
+    for v in HOOK_ENV {
         c.env_remove(v);
     }
     c.stdin(Stdio::null());
@@ -119,4 +123,116 @@ pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>, String> {
         );
     }
     Ok(paths)
+}
+
+/// `Ok` when the worktree at `dir` is exactly commit `sha`: HEAD is `sha`, and no
+/// tracked file differs and no untracked, unignored file exists. A check run on anything
+/// else would judge content the commit does not carry.
+pub fn is_exactly(dir: &Path, sha: &str) -> Result<(), String> {
+    let head = resolve(dir, "HEAD")?;
+    if head != sha {
+        return Err(format!("HEAD is {head}, not {sha}"));
+    }
+    let status = text(dir, &["status", "--porcelain", "--untracked-files=normal"])?;
+    if status.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<&str> = status.lines().take(10).collect();
+    Err(format!(
+        "the worktree differs from {sha}:\n  {}",
+        shown.join("\n  ")
+    ))
+}
+
+/// The base a branch is judged against when none is given: its merge-base with the
+/// remote's default branch (`origin/HEAD`, else `origin/master`, else `origin/main`).
+pub fn default_base(dir: &Path, rev: &str) -> Result<String, String> {
+    let target = text(
+        dir,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .or_else(|| {
+        ["refs/remotes/origin/master", "refs/remotes/origin/main"]
+            .into_iter()
+            .find(|r| resolve(dir, r).is_ok())
+            .map(String::from)
+    })
+    .ok_or_else(|| {
+        format!(
+            "no origin/HEAD, origin/master or origin/main in {}; pass --base",
+            dir.display()
+        )
+    })?;
+    text(dir, &["merge-base", rev, &target])
+}
+
+/// `owner/name` of the `origin` remote, for any URL form git accepts
+/// (`git@host:owner/name.git`, `https://host/owner/name`, an ssh host alias).
+pub fn origin_slug(dir: &Path) -> Option<String> {
+    let url = text(dir, &["remote", "get-url", "origin"]).ok()?;
+    slug_of(&url)
+}
+
+pub fn slug_of(url: &str) -> Option<String> {
+    let path = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.rsplit(['/', ':']);
+    let name = parts.next().filter(|s| !s.is_empty())?;
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{name}"))
+}
+
+/// The name of the repo whose shared git dir is `common`: the main worktree's directory
+/// for a `.git` dir, else the git dir's own name (a bare repo).
+pub fn common_dir_name(common: &Path) -> String {
+    let named = if common.file_name().is_some_and(|n| n == ".git") {
+        common.parent().unwrap_or(common)
+    } else {
+        common
+    };
+    named
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".into())
+}
+
+/// A short, filesystem-safe name for the repo `dir` belongs to: the origin's name, else
+/// the main worktree's directory name. Every worktree of a repo gets the same one.
+pub fn repo_key(dir: &Path) -> String {
+    let raw = origin_slug(dir)
+        .and_then(|s| s.rsplit('/').next().map(String::from))
+        .or_else(|| common_dir(dir).ok().map(|c| common_dir_name(&c)))
+        .unwrap_or_else(|| "repo".into());
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slug_of;
+
+    #[test]
+    fn slugs() {
+        for url in [
+            "git@github.com:mkreyman/home_care_billing.git",
+            "git@github-centerfield:mkreyman/home_care_billing.git",
+            "https://github.com/mkreyman/home_care_billing",
+            "https://github.com/mkreyman/home_care_billing.git/",
+            "ssh://git@github.com/mkreyman/home_care_billing.git",
+        ] {
+            assert_eq!(
+                slug_of(url).as_deref(),
+                Some("mkreyman/home_care_billing"),
+                "{url}"
+            );
+        }
+        assert_eq!(slug_of("repo"), None);
+    }
 }
