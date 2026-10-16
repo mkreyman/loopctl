@@ -360,22 +360,13 @@ fn join(base: &str, name: &str) -> String {
 }
 
 /// `*` any run of characters, `?` one character; a leading `.` must be matched literally.
+/// One path segment against a `*`/`?` pattern (`glob`'s matcher). Unlike a manifest glob,
+/// a pattern not starting with `.` skips hidden names, as a shell would.
 fn wildcard(pattern: &str, name: &str) -> bool {
     if name.starts_with('.') && !pattern.starts_with('.') {
         return false;
     }
-    fn go(p: &[char], n: &[char]) -> bool {
-        match (p.first(), n.first()) {
-            (None, None) => true,
-            (Some('*'), _) => go(&p[1..], n) || (!n.is_empty() && go(p, &n[1..])),
-            (Some('?'), Some(_)) => go(&p[1..], &n[1..]),
-            (Some(a), Some(b)) if a == b => go(&p[1..], &n[1..]),
-            _ => false,
-        }
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    go(&p, &n)
+    crate::glob::segment(pattern, name)
 }
 
 #[cfg(test)]

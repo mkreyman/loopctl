@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use crate::contract::{self, CommandName};
 use crate::exec::{self, Outcome};
-use crate::output::{self, Document, Status};
+use crate::output::{self, Affected, Document, Status};
+use crate::{git, glob};
 
 #[derive(Debug)]
 pub enum Invoked {
@@ -43,6 +44,20 @@ pub fn invoke(
         let i: u32 = values["i"].parse().unwrap_or(0);
         if n == 0 || i == 0 || i > n {
             return Invoked::Broken(format!("needs 1 <= --i <= --n (got --i {i} --n {n})"));
+        }
+    }
+    // `always_all` is applied here, once for every adapter kind: a hit selects the whole
+    // suite without asking the adapter. An unusable base fails closed like any breakage.
+    if name == CommandName::Affected {
+        match git::changed_paths(repo, &values["base"]) {
+            Err(e) => return Invoked::Broken(format!("cannot diff against the base: {e}")),
+            Ok(paths) => {
+                if let Some((path, pattern)) = glob::first_hit(&manifest.always_all, &paths) {
+                    return Invoked::Ok(Document::Affected(Affected::All {
+                        reason: format!("{path} matches always_all `{pattern}`"),
+                    }));
+                }
+            }
         }
     }
     values.insert(

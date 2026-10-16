@@ -18,6 +18,8 @@
 | `commands.run` | string | must use `{file}` |
 | `commands.shard` | string | must use `{n}` and `{i}` |
 
+Paths in `inputs` and `always_all` are globs anchored at the repo root: a `**` segment matches zero or more whole segments, and within a segment `*` matches any run of characters and `?` one character, neither crossing a `/`. So `mix.exs` is only the root file, `config/**` everything under `config/`, and `**/vitest*.config.ts` a Vitest config at any depth. `artifacts` name directories with the same syntax minus `**`, and there a `*` skips names starting with `.`.
+
 Unknown keys, unknown placeholders, a missing or empty command, an empty list, and a path that is absolute or contains `..` are all errors. `chg adapter validate` reports every problem in one pass (exit 0 valid, 1 invalid).
 
 A placeholder is `{` + lowercase letters or underscores + `}`. Anything else in braces is literal shell text: `${HOME}` (a `$` before the brace) and `awk '{print $1}'` pass through, and `{{` writes a literal `{`. Substitution is one pass over the template, so a value is never re-scanned.
@@ -42,6 +44,10 @@ Shards are 1-based: `chg adapter exec shard --n N --i I` requires `1 <= I <= N`.
 - 0: a valid document reporting success.
 - 1: a valid document reporting failure (`static.ok` false, or a `fail`/`error` result), from an adapter that exited non-zero.
 - 2: the adapter broke the contract: no document, a malformed one, a timeout, or an exit status that disagrees with the document (non-zero with success, zero with failure).
+
+`{file}` (for `run`) is the path of a file listing the tests to run, one repo-relative `path` or `path:line` per line: the list `affected` returned.
+
+Before running `affected`, `chg` compares the changed paths against `always_all` and, on a hit, prints `{"mode":"all","reason":"<path> matches always_all `<glob>`"}` without calling the adapter. The changed paths are those differing between `--base` and the working tree, tracked or untracked, with renames split into the deleted and the added path (`git diff --no-renames --name-only <base>` plus `git ls-files --others --exclude-standard`). An adapter selects within the same set and does not apply `always_all` itself. A `--base` that is not a commit fails closed.
 
 `affected` never exits 2. Any of those failures **fails closed**: it prints `{"mode":"all","reason":"failed closed: …"}` and the reason on stderr, and exits 0, so the caller runs the whole suite.
 

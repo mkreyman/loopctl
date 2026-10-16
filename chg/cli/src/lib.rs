@@ -5,6 +5,7 @@ pub mod clone;
 pub mod contract;
 pub mod exec;
 pub mod git;
+pub mod glob;
 pub mod output;
 pub mod snapshot;
 pub mod store;

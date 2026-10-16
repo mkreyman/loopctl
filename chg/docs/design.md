@@ -119,7 +119,7 @@ MCP: `change_submit`, `change_revise`, `change_status`, `change_wait` (long-poll
 
 ### 3.5 Workspaces in seconds
 
-On every machine, `chgd` keeps a **snapshot per verified trunk revision**, per repo: a source checkout plus the adapter's artifacts (Elixir: `deps`, `_build/{dev,test}`, `priv/plts`, and the `mix test --stale` manifest; TS: `node_modules` across the workspace, built `packages/*/dist`, the Playwright browsers path). When the verifier advances `verified/master`:
+On every machine, `chgd` keeps a **snapshot per verified trunk revision**, per repo: a source checkout plus the adapter's artifacts (Elixir: `deps`, `_build/{dev,test}` with the dialyzer PLT, and the adapter's test-reference cache; TS: `node_modules` across the workspace, built `packages/*/dist`, the Playwright browsers path). When the verifier advances `verified/master`:
 1. CoW-clone the previous snapshot.
 2. `git checkout` the new revision in the clone.
 3. Run the adapter's `snapshot` command, which is incremental: only the delta recompiles or reinstalls.
@@ -131,7 +131,7 @@ A new workspace is a `git worktree add` from the node's bare mirror at the verif
 Mechanics, verified on the fleet:
 - **macOS (APFS):** `clonefile(2)`, the same mechanism as `cp -c`. Workspaces and snapshots must sit on the same APFS volume, which `~/workspace` and `~/Library/Caches/chg` do.
 - **Linux:** minis, nuc and beelink are **ext4 on LVM with 0 free extents**, so there is no reflink and no room for a new logical volume. Use a sparse image file on the existing ext4 (`mkfs.xfs -m reflink=1`, loop-mounted at `/srv/chg` from fstab; 300 GB sparse on minis and beelink, 120 GB on nuc), cloned with `FICLONE` (`cp --reflink=always`). `.claude/worktrees` becomes a symlink into `/srv/chg/ws/<repo>`, so the worktree convention is unchanged. Overlayfs is rejected: each workspace would pin its lower snapshot (GC hazard), and its rename and inotify quirks hurt Vite/esbuild watchers.
-- **Elixir relocation:** a clone at a new path normally forces a full rebuild, because `.beam` files hold absolute source paths and the manifest stores the cwd (`mix/compilers/elixir.ex:104`). Elixir **1.19.2+ has `mix compile --no-check-cwd`**, and HCB runs 1.20.4. The Elixir adapter sets it for the `dev`/`test` compile alias in enrolled repos. Cost: stack-trace source paths point at the snapshot until a module recompiles. Mix compares content digests when mtimes differ, so a fresh checkout of identical content recompiles nothing. Phase-1 story S4 measures exactly that.
+- **Elixir relocation:** a clone at a new path normally forces a full rebuild, because `.beam` files hold absolute source paths and the manifest stores the cwd (`mix/compilers/elixir.ex:104`). Elixir **1.19.2+ has `mix compile --no-check-cwd`**, and HCB runs 1.20.4. Enrolled repos set it as `elixirc_options: [check_cwd: false]` in `mix.exs`, since `mix test` rejects the switch, and `mix chg.snapshot` refuses a project without it in dev or test. Cost: stack-trace source paths point at the snapshot until a module recompiles. Mix compares content digests when mtimes differ, so a fresh checkout of identical content recompiles nothing. Phase-1 story S4 measures exactly that.
 - **pnpm:** turn on `enableGlobalVirtualStore` (pnpm 10.12+; fleet-holding is on pnpm 12.11.2), so `node_modules` is mostly symlinks into one per-machine store. Cloning it is cheap, and a lockfile change reinstalls in seconds from the store.
 - **Databases:** the adapter declares per-workspace DB isolation (HCB: `MIX_TEST_PARTITION` keyed to the workspace; fleet-holding: its existing template-clone `TestRun`). Nothing about the database lives in a snapshot.
 
@@ -165,7 +165,7 @@ A revision's required checks are:
 
 They run where the change was made: `chg check` in the agent's workspace (phase 1, from `pre-push`), or on the runner pool (phase 3). Either way the result is a **verdict** keyed by `(check_id, input_fingerprint)`. The fingerprint is BLAKE3 over the revision tree's declared input globs, the lockfiles, the toolchain versions (`.tool-versions`, `packageManager`) and the adapter version. A verdict anyone has recorded for that fingerprint is never recomputed: local and CI are the same job, so nothing runs twice.
 
-Affected selection is the adapter's job (3.13). It always has a fail-closed escape: any path in the adapter's `always_all` list (mix.exs, mix.lock, config/**, migrations, test helpers, pnpm-lock.yaml, tsconfig*, vitest/playwright configs, CI definitions) selects the whole suite.
+Affected selection is the adapter's job (3.13). It always has a fail-closed escape, which `chg` applies before calling the adapter: any changed path matching the manifest's `always_all` list (mix.exs, mix.lock, config/**, migrations, test helpers, pnpm-lock.yaml, tsconfig*, vitest/playwright configs, CI definitions) selects the whole suite.
 
 ### 3.8 Post-merge verification, deploy gating, bisect, revert, flakes
 
@@ -225,10 +225,10 @@ shard    = "mix chg.shard --of {n} --index {i}"  # full-suite shard for verifica
 ```
 
 - **Elixir adapter:**
-  - `snapshot`: `mix deps.get && mix compile --no-check-cwd` for dev and test, a PLT build, then `mix test --stale` so the stale manifest exists at the snapshot revision. In an incremental snapshot this runs only the tests the delta affects, which doubles as cheap verification.
-  - `affected`: `mix test --stale --dry-run` (dry-run exists since 1.19.0) in the workspace cloned from that snapshot, so the selection is "tests referencing modules changed since the snapshot". `--stale` follows module references recursively. Runtime-only dispatch (string module names, Oban args) can escape it, which is why the post-merge full suite exists.
+  - `snapshot`: `mix deps.get`, `mix compile` for dev and test (with `check_cwd: false`), a PLT build, then `mix chg.refs`, which compiles every test file without running it and records its module references.
+  - `affected`: the `--stale` selection without running anything. `mix test --stale --dry-run` cannot do it: on 1.20.4 `--dry-run` turns `--stale` off, and the stale manifest is only written after a green run. So the adapter reads Mix's compile manifest for the module graph and its own reference cache for the tests, and applies `--stale`'s rule: a changed module plus every module referencing it, transitively, selects the test files with a compile or runtime reference into that set. Runtime-only dispatch (string module names, Oban args) can escape it, which is why the post-merge full suite exists.
   - `static`: format and credo on changed files, `compile --warnings-as-errors` (incremental), dialyzer against the warm PLT.
-  - `shard`: `mix test --partitions`.
+  - `shard`: test files split by a stable hash of their path; not `mix test --partitions`, because `MIX_TEST_PARTITION` already isolates each workspace's test database.
 - **TS (pnpm) adapter:**
   - `snapshot`: `pnpm install --frozen-lockfile` (global virtual store), `pnpm -r build` for package dists, Playwright browsers.
   - `affected`: packages from `pnpm --filter "...[<base>]"` (changed packages plus their dependents). Within them, Vitest `list --changed <base> --filesOnly` follows the module graph through transitive imports. Playwright `--only-changed=<base>` covers e2e specs that import changed files. If an app package changed, its smoke-tagged e2e subset runs; full e2e is post-merge only.
@@ -291,7 +291,7 @@ shard    = "mix chg.shard --of {n} --index {i}"  # full-suite shard for verifica
 | Change ids, op log, first-class conflicts | **Borrow from jj** (`Change-Id`, per-change event log, conflicts as a state rather than an error) | Agents are fluent in git. Switching the client to jj adds a learning cost and reliability risk for little gain, since our conflicts are rare and the resolver handles them. |
 | Merge queue | **Build (small)**. Reject GitHub merge queue, Aviator, Mergify and Graphite | They are all PR-shaped and keep pre-merge testing of the predicted tip on GitHub Actions: the serialization and CI wait we are removing (GitHub caps concurrency at 1-100 builds; Aviator's per-target queues need us to compute affected targets anyway). Uber SubmitQueue (Go, no releases) keeps master green by speculative pre-merge builds, which is compute we choose to spend post-merge instead; we take its conflict-graph idea as the overlap re-check. |
 | Presubmit/postsubmit split, culprit finding, auto-revert | **Borrow from Google TAP** (and SafeRevert's caution) | Batched postsubmit with bisect is the proven answer to "what does CI mean at agent scale". |
-| Workspace provisioning | **Build on OS primitives**: APFS `clonefile`, XFS reflink on a loop image, pnpm global virtual store, Elixir `--no-check-cwd` | No product does per-revision warm snapshots for mix and pnpm. Scalar and partial clone solve volume we do not have. |
+| Workspace provisioning | **Build on OS primitives**: APFS `clonefile`, XFS reflink on a loop image, pnpm global virtual store, Elixir `check_cwd: false` | No product does per-revision warm snapshots for mix and pnpm. Scalar and partial clone solve volume we do not have. |
 | Test result caching | **Build a verdict cache keyed by input fingerprint** (Bazel remote-cache model) | Adopting Bazel means rewriting both builds. Turborepo's cache covers TS tasks only and fleet-holding does not use turbo. |
 | Runner | **Build `chgd`**; retire GitHub Actions from the gate path in phase 3 | Actions on one host is the 20 s queue and the 6.9 agent-hours. loopctl-runner supervises Claude sessions, a different job, but its enrollment and lease ideas carry over. |
 | Review | **Reuse the existing review lenses and prompts**; build only the server-side payload builder and dispatch | The 226 s is mostly harness context and serial position, not the reviewer prompts. |
@@ -363,11 +363,11 @@ All stories ship in both repos unless marked otherwise. "Baseline" means the 202
 
 **S2. Elixir adapter (HCB).**
 - `mix chg.snapshot` is idempotent: a second run on the same revision does no work and exits 0 in under 10 s.
-- `mix chg.affected --base <sha>` returns `mode: all` when any `always_all` path changed, and otherwise the file list from `mix test --stale --dry-run`.
+- `chg adapter exec affected --base <sha>` returns `mode: all` when any `always_all` path changed (`chg` checks before calling the adapter), and otherwise `mix chg.affected`'s file list, which is the one `mix test --stale` would select.
 - Seeded test: an edit to one context module selects that module's tests and its dependents' tests and nothing unrelated.
 - An edit only to `config/runtime.exs` returns `all`.
 - `mix chg.static` runs format and credo on changed files only, plus `compile --warnings-as-errors` and dialyzer against the snapshot PLT.
-- The compile alias passes `--no-check-cwd` in dev and test.
+- Dev and test compile with the cwd check off (`elixirc_options: [check_cwd: false]`), and `mix chg.snapshot` refuses a project that does not.
 
 **S3. TS adapter (fleet-holding).**
 - `chg.snapshot` runs `pnpm install --frozen-lockfile` with `enableGlobalVirtualStore`, builds `packages/*`, and is idempotent.

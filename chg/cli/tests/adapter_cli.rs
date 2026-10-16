@@ -15,7 +15,29 @@ fn fixture(kind: &str) -> TempDir {
         .join(kind);
     let dir = tempfile::tempdir().unwrap();
     copy_dir(&src, dir.path());
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "fixture"]);
     dir
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git {args:?}");
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -126,11 +148,11 @@ fn validate_fails_when_the_manifest_is_missing() {
 fn affected_returns_the_adapter_subset_and_routes_noise_to_stderr() {
     for kind in KINDS {
         let repo = fixture(kind);
-        exec(repo.path(), &["affected", "--base", "abc123"])
+        exec(repo.path(), &["affected", "--base", "HEAD"])
             .assert()
             .success()
             .stdout(
-                "{\"mode\":\"subset\",\"reason\":\"changed since abc123\",\"tests\":[\"test/a_test.exs\",\"test/b c_test.exs\"]}\n",
+                "{\"mode\":\"subset\",\"reason\":\"changed since HEAD\",\"tests\":[\"test/a_test.exs\",\"test/b c_test.exs\"]}\n",
             )
             .stderr(predicate::str::contains("Compiling 2 files"));
     }
@@ -141,7 +163,7 @@ fn affected_fails_closed_on_every_kind_of_broken_output() {
     for mode in ["malformed", "garbage", "silent", "crash"] {
         for kind in KINDS {
             let repo = fixture(kind);
-            exec(repo.path(), &["affected", "--base", "abc123"])
+            exec(repo.path(), &["affected", "--base", "HEAD"])
                 .env("FAKE_MODE", mode)
                 .assert()
                 .success()
@@ -159,7 +181,7 @@ fn affected_fails_closed_on_timeout_and_kills_the_adapter() {
     let started = std::time::Instant::now();
     exec(
         repo.path(),
-        &["affected", "--base", "abc", "--timeout-secs", "1"],
+        &["affected", "--base", "HEAD", "--timeout-secs", "1"],
     )
     .env("FAKE_MODE", "sleep")
     .assert()
@@ -179,6 +201,101 @@ fn affected_fails_closed_on_an_invalid_manifest() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"mode\":\"all\""));
+}
+
+#[test]
+fn an_always_all_path_selects_everything_without_asking_the_adapter() {
+    for kind in KINDS {
+        let repo = fixture(kind);
+        let hit = if kind == "elixir" {
+            "config/runtime.exs"
+        } else {
+            "pnpm-lock.yaml"
+        };
+        std::fs::create_dir_all(repo.path().join("config")).unwrap();
+        std::fs::write(repo.path().join(hit), "x").unwrap();
+        // Garbage output would fail closed; the reason proves the adapter never ran.
+        exec(repo.path(), &["affected", "--base", "HEAD"])
+            .env("FAKE_MODE", "garbage")
+            .assert()
+            .success()
+            .stdout(predicate::str::starts_with(format!(
+                "{{\"mode\":\"all\",\"reason\":\"{hit} matches always_all"
+            )));
+    }
+}
+
+#[test]
+fn committed_and_deleted_always_all_paths_count_too() {
+    let repo = fixture("elixir");
+    let base = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["-C"])
+            .arg(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    std::fs::write(repo.path().join("mix.exs"), "x").unwrap();
+    git(repo.path(), &["add", "mix.exs"]);
+    git(repo.path(), &["commit", "-qm", "add"]);
+    git(repo.path(), &["rm", "-q", "mix.exs"]);
+    git(repo.path(), &["commit", "-qm", "rm"]);
+    exec(repo.path(), &["affected", "--base", base.trim()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed since"));
+    exec(repo.path(), &["affected", "--base", "HEAD~1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "mix.exs matches always_all `mix.exs`",
+        ));
+}
+
+#[test]
+fn an_adapter_below_the_git_toplevel_matches_its_own_paths() {
+    let top = tempfile::tempdir().unwrap();
+    let app = top.path().join("apps/hcb");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elixir"),
+        &app,
+    );
+    std::fs::create_dir_all(top.path().join("config")).unwrap();
+    std::fs::write(top.path().join("config/other.exs"), "x").unwrap();
+    git(top.path(), &["init", "-q"]);
+    git(top.path(), &["add", "apps", "config"]);
+    git(top.path(), &["commit", "-qm", "fixture"]);
+    // Outside the adapter's directory: not its change, though `config/**` would match.
+    std::fs::write(top.path().join("config/other.exs"), "y").unwrap();
+    git(top.path(), &["commit", "-qam", "outside"]);
+    exec(&app, &["affected", "--base", "HEAD~1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed since"));
+    std::fs::create_dir_all(app.join("config")).unwrap();
+    std::fs::write(app.join("config/runtime.exs"), "x").unwrap();
+    git(top.path(), &["add", "apps/hcb/config/runtime.exs"]);
+    git(top.path(), &["commit", "-qm", "inside"]);
+    exec(&app, &["affected", "--base", "HEAD~1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "config/runtime.exs matches always_all `config/**`",
+        ));
+}
+
+#[test]
+fn an_unknown_base_fails_closed() {
+    let repo = fixture("elixir");
+    exec(repo.path(), &["affected", "--base", "no-such-rev"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with(
+            "{\"mode\":\"all\",\"reason\":\"failed closed: cannot diff against the base",
+        ));
 }
 
 #[test]

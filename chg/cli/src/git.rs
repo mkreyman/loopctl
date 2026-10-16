@@ -90,3 +90,33 @@ pub fn distance(dir: &Path, from: &str, to: &str) -> Result<u64, String> {
         .parse()
         .map_err(|e| format!("rev-list --count: {e}"))
 }
+
+/// Paths that differ between `base` and the working tree, tracked or untracked, so an
+/// uncommitted edit counts. Renames are split into the deleted and the added path. Paths
+/// are relative to `dir` and limited to it, as the manifest's globs are, also when `dir`
+/// is below the git toplevel: `diff --relative`, and `ls-files` is relative already.
+pub fn changed_paths(dir: &Path, base: &str) -> Result<Vec<String>, String> {
+    let base = resolve(dir, base)?;
+    let mut paths = Vec::new();
+    for args in [
+        &[
+            "diff",
+            "--relative",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base.as_str(),
+        ][..],
+        &["ls-files", "--others", "--exclude-standard", "-z"][..],
+    ] {
+        let mut c = cmd(dir);
+        c.args(args);
+        let out = run(c)?.stdout;
+        paths.extend(
+            out.split(|&b| b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| String::from_utf8_lossy(p).into_owned()),
+        );
+    }
+    Ok(paths)
+}

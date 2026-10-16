@@ -97,3 +97,36 @@ jobs:
       - run: sudo apt-get update -q && sudo apt-get install -yq xfsprogs shellcheck >/dev/null
       - run: shellcheck bin/chg-volume-setup.sh tests/volume-setup-test.sh
       - run: sudo bash tests/volume-setup-test.sh
+
+  # The Mix adapter (adapters/elixir): its unit tests, and an integration test that
+  # installs it as an archive and drives a fixture project through every task, including
+  # `chg adapter exec` (CHG_BIN), which applies always_all before the adapter runs.
+  elixir-adapter:
+    name: elixir-adapter (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: adapters/elixir
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          version-file: adapters/elixir/.tool-versions
+          version-type: strict
+      - name: Rust toolchain from .tool-versions
+        working-directory: .
+        run: |
+          ver=$(awk '$1=="rust"{print $2}' .tool-versions)
+          rustup toolchain install "$ver" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$ver" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build chg
+        working-directory: .
+        run: cargo build --locked -p chg && echo "CHG_BIN=$PWD/target/debug/chg" >> "$GITHUB_ENV"
+      - run: git config --global user.name ci && git config --global user.email ci@localhost
+      - run: mix format --check-formatted
+      - run: mix compile --warnings-as-errors
+      - run: mix test
