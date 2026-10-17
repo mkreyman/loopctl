@@ -131,6 +131,12 @@ jobs:
   lint:
     name: Lint
     runs-on: [self-hosted, beelink]
+    # FORK-PR GUARD (#881): a fork PR never runs on the shared self-hosted pool — its job
+    # code runs as the github-runner uid every pool slot shares, with read access to other
+    # slots' live JIT config and secrets. On a fork PR this job is SKIPPED (a skipped job
+    # reports success, so required checks still pass); the human backstop is the fork-PR
+    # approval policy, all_external_contributors. Same guard on every self-hosted job here.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
         with:
@@ -295,6 +301,8 @@ jobs:
   test:
     name: Test
     runs-on: [self-hosted, beelink]
+    # Fork-PR guard — see the Lint job's comment (#881).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # NO `services:` block on a FIXED host port on self-hosted (scale-test's container binds a
     # loopback port Docker picks, so it cannot collide). nuc already runs a long-lived
     # Postgres 16 bound to 127.0.0.1:5432 — reachable because the job runs ON that
@@ -503,6 +511,8 @@ jobs:
   retrieval-eval:
     name: Retrieval Eval
     runs-on: [self-hosted, beelink]
+    # Fork-PR guard — see the Lint job's comment (#881).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
     # loopctl.retrieval.eval` opens its OWN DB connections, and config/test.exs puts all
     # three repos behind Ecto.Adapters.SQL.Sandbox, where a non-checked-out process has no
@@ -732,6 +742,8 @@ jobs:
   security:
     name: Security
     runs-on: [self-hosted, beelink]
+    # Fork-PR guard — see the Lint job's comment (#881).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
         with:
@@ -820,6 +832,8 @@ jobs:
   dialyzer:
     name: Dialyzer
     runs-on: [self-hosted, beelink]
+    # Fork-PR guard — see the Lint job's comment (#881).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
         with:
@@ -922,9 +936,11 @@ jobs:
     runs-on: [self-hosted, beelink]
     timeout-minutes: 30
     if: >
-      github.event_name == 'schedule' ||
+      (github.event_name == 'schedule' ||
       github.event_name == 'push' ||
-      github.event_name == 'pull_request'
+      github.event_name == 'pull_request') &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     services:
       postgres:
         # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.2), so
