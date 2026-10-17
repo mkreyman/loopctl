@@ -926,7 +926,8 @@ jobs:
 
   scale-test:
     name: Scale Tests (US-27.1)
-    # Runs on EVERY push and PR, plus the nightly schedule (the `if:` below). This ensures the scale suite (which commits real rows and runs
+    # Runs on every push and same-repo PR, plus the nightly schedule (the `if:` below); fork PRs skip it
+    # under the fork-PR guard. This ensures the scale suite (which commits real rows and runs
     # ANALYZE) is executed in CI and that the DBConnection.OwnershipError or
     # other regressions are caught before they reach production.
     # On beelink since 2026-09-26: 3-5 minutes on every push and PR had spent the account's
@@ -1320,7 +1321,10 @@ jobs:
     # automatically. Drift that no PR touches — a Postgres/pgvector upgrade, an ANALYZE
     # shift, a migration that fails to build an HNSW index — will not be caught until
     # somebody dispatches it. Dispatch it after any such infrastructure change.
-    if: github.event_name == 'workflow_dispatch'
+    # The fork-PR guard rides along so the Lint comment's "every self-hosted job" stays
+    # true and a future trigger widening (e.g. adding pull_request as a pre-merge gate)
+    # can never run fork code on the shared pool.
+    if: github.event_name == 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     env:
       # scale-nightly derives its own database per matrix file (loopctl_test_sn_<file>)
       # and drops it again at the end, so it never shared a name with anything. What it

@@ -33,9 +33,9 @@ defmodule LoopctlWeb.EndpointHttp2Test do
   @deadline 30_000
   @moduletag timeout: 4 * @deadline
 
-  # The version this suite's no-ignore state was reasoned against: OSV reports 1.13.1
-  # clean of every advisory 1.12.5 carried (1.13.0 fixed CVE-2026-105660 and
-  # CVE-2026-105659).
+  # The version this suite's no-ignore state was reasoned against: 1.13.0 fixed
+  # CVE-2026-105660; OSV reports 1.13.1 clean of every advisory 1.12.5 carried,
+  # CVE-2026-105659 included.
   @acknowledged_bandit "1.13.1"
 
   defp listeners do
