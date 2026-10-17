@@ -1,10 +1,12 @@
 defmodule LoopctlWeb.EndpointHttp2Test do
   @moduledoc """
-  The bandit advisory CVE-2026-105659 is ignored in mix.exs ONLY because the endpoint serves
-  no HTTP/2: `config/runtime.exs` sets `http_2_options: [enabled: false]`. This builds every
-  listener the way the endpoint boots it (`Bandit.PhoenixAdapter.child_specs/2` over the
-  endpoint's own config) and speaks to it, so it fails if that option goes, if a listener is
-  added without it, or if it stops meaning what the ignore entry says it means.
+  The endpoint serves no HTTP/2: `config/runtime.exs` sets `http_2_options: [enabled:
+  false]`. That began as the mitigation for CVE-2026-105659 while no patched bandit
+  existed; bandit 1.13.1 is OSV-clean and the advisory ignore is gone, but the option
+  stays (Fly's proxy speaks HTTP/1.1 to the app regardless). This builds every listener
+  the way the endpoint boots it (`Bandit.PhoenixAdapter.child_specs/2` over the
+  endpoint's own config) and speaks to it, so it fails if that option goes, if a
+  listener is added without it, or if a bandit move needs its advisories rechecked.
 
   The prod block in runtime.exs re-sets `http:`, and that does not drop the option: `Config`
   deep-merges keyword lists, so its `ip:` joins the all-envs list rather than replacing it.
@@ -31,8 +33,10 @@ defmodule LoopctlWeb.EndpointHttp2Test do
   @deadline 30_000
   @moduletag timeout: 4 * @deadline
 
-  # The version the ignore entry in mix.exs was reasoned against.
-  @acknowledged_bandit "1.12.5"
+  # The version this suite's no-ignore state was reasoned against: OSV reports 1.13.1
+  # clean of every advisory 1.12.5 carried (1.13.0 fixed CVE-2026-105660 and
+  # CVE-2026-105659).
+  @acknowledged_bandit "1.13.1"
 
   defp listeners do
     config = [
@@ -82,9 +86,9 @@ defmodule LoopctlWeb.EndpointHttp2Test do
     assert {:ok, "HTTP/1.1 200 OK\r\n"} = :gen_tcp.recv(socket, 0, @deadline)
   end
 
-  test "bandit is still the version the ignored advisory was reasoned against" do
+  test "bandit is still the version the advisory check was reasoned against" do
     assert to_string(Application.spec(:bandit, :vsn)) == @acknowledged_bandit,
-           "bandit moved: recheck CVE-2026-105659 in mix.exs ignore_advisories " <>
-             "(drop it if this version is patched), then update @acknowledged_bandit"
+           "bandit moved: recheck its advisories against mix.exs ignore_advisories " <>
+             "(a new one needs an entry with reasoning), then update @acknowledged_bandit"
   end
 end
