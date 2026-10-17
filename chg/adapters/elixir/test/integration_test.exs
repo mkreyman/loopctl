@@ -207,6 +207,14 @@ defmodule ChgAdapter.IntegrationTest do
     assert Sample.Accounts in rec.cover["test/sample/billing_test.exs"]
     assert Map.has_key?(rec.ms, "test/sample/billing_test.exs")
     assert Map.has_key?(rec.digests, Sample.Reports)
+    # Compile-time calls count for the file compiled. The compiling process's own calls
+    # count for no other file and are not global; a process it starts is timed, so before
+    # the first test module (here) it is global too.
+    assert Sample.Constants in rec.cover["test/sample/greeting_test.exs"]
+    assert Sample.Spawned in rec.cover["test/sample/greeting_test.exs"]
+    refute Sample.Constants in rec.global
+    refute Sample.Case in rec.global
+    refute Sample.Constants in rec.cover["test/sample/accounts_test.exs"]
 
     env = [{"CHG_COVER", record}]
     edit!(ctx, "lib/sample/reports.ex", &("# a comment shifts every line\n" <> &1))

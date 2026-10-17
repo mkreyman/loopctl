@@ -7,7 +7,8 @@ defmodule ChgAdapter.Record do
     * `elixir`, `otp`: the toolchain, which digests depend on;
     * `digests`: `ChgAdapter.Digest` of every project module;
     * `cover`: per test file, the project modules it executed (`ChgAdapter.Cover`);
-    * `global`: modules executed at boot or while compiling tests;
+    * `global`: modules executed outside any test's or test file compile's window (at
+      boot, between tests) or by a compiling process whose file is unknown;
     * `ms`: per test file, the summed time of its tests.
 
   `chg` decides where records live and which one to use. It names the file to write in

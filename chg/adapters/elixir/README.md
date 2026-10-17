@@ -48,8 +48,9 @@ median 98% of the suite's time, because nearly every module sits within a few re
 Recording (`CHG_RECORD`, on the verifier's whole-suite run, only when the tree is exactly HEAD):
 `ChgAdapter.Cover` traces every call into a project module from outside it, in a trace session of
 its own, and attributes each to the test modules running at that moment, so work handed to a
-GenServer, a Task or the Repo pool still counts. Calls made at boot or by a process compiling a
-test file go into a `global` set. The record also holds `ChgAdapter.Digest` of every module, and
+GenServer, a Task or the Repo pool still counts. A call made while a test file compiles (a
+macro, a module attribute) counts for that file. Calls made at boot, or by a compiling process
+whose file is not known, go into a `global` set. The record also holds `ChgAdapter.Digest` of every module, and
 each test file's time. Tracing costs about 8% of the suite's time.
 
 Selecting (`mix chg.affected`) against the record `chg` hands over in `CHG_COVER`: the nearest

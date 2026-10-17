@@ -171,7 +171,7 @@ defmodule ChgAdapter.SelectTest do
                ["test/greeting_test.exs"]
     end
 
-    test "a module that ran at boot or while tests compiled selects everything" do
+    test "a module that ran outside any one test file (global) selects everything" do
       assert {:all, reason} = cover([], now(%{Boot => "x2"}))
       assert reason =~ "Boot"
     end

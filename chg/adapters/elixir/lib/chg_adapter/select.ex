@@ -88,8 +88,8 @@ defmodule ChgAdapter.Select do
     * the record has no coverage for it (new, or it did not run);
     * its recorded coverage includes an altered module.
 
-  The whole suite runs when an altered module ran at boot or while test files compiled
-  (the record's `global`), when a new module is a protocol implementation (protocol
+  The whole suite runs when an altered module ran outside any one test file's window (the
+  record's `global`: at boot, between tests), when a new module is a protocol implementation (protocol
   dispatch reaches it with no call that names it), and when a file under the test paths
   that is not a test and defines no module (test data) changed since the base or the
   record.
@@ -124,7 +124,8 @@ defmodule ChgAdapter.Select do
 
       cond do
         m = Enum.find(altered, &MapSet.member?(global, &1)) ->
-          {:all, "#{inspect(m)} changed, and it ran at boot or while test files compiled"}
+          {:all,
+           "#{inspect(m)} changed, and it ran outside any one test file (the record's global)"}
 
         m = Enum.find(new_mods, input.impl?) ->
           {:all, "new protocol implementation #{inspect(m)}"}
