@@ -112,14 +112,15 @@ defmodule Loopctl.DataCase do
   error (#965): first check the server's INSTALLED pgvector,
   `SELECT default_version FROM pg_available_extensions WHERE name = 'vector'` (the fix is in
   the binary; `extversion` keeps the version the database was created with until
-  `ALTER EXTENSION vector UPDATE`). Below 0.8.4 it is the race, and the host images move
-  under mkreyman/infra#280; at or above it, look for code that really writes or reads a
+  `ALTER EXTENSION vector UPDATE`). Below 0.8.4 it is the race — upgrade the image (the fleet
+  hosts moved to 0.8.7 under mkreyman/infra#280, and CI's scale-test job pins 0.8.7 per
+  #977); at or above it, look for code that really writes or reads a
   zero-length vector. `warn_if_pgvector_below_floor/0` warns at suite start on an older
   binary.
 
   Skipping this VACUUM below the floor would trade the race for the dead-entry failures this
   function exists for: taking the tag off was measured to fail 4 full-suite runs (above). So
-  it keeps running, and until the hosts move, the race is the cost of an old image.
+  it keeps running, and on an old image the race remains the cost.
   Production needs the same floor, since re-embeds and deletes leave dead HNSW tuples for
   autovacuum to race (README prerequisites).
 
