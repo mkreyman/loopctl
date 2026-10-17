@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::check::{self, Outcome, Verdict};
 use crate::git;
+use crate::scratch::Scratch;
 use crate::store::{Store, now_ms};
 use crate::ws::{self, Hydrated};
 
@@ -273,37 +274,6 @@ fn prune_logs(dir: &Path) {
     }
 }
 
-/// The throwaway worktree, removed on drop however the check ended. Git is run against
-/// the shared git dir, never the pushing worktree, which may be removed (merged and
-/// cleaned up) while the shadow waits or runs.
-struct Scratch {
-    git_dir: PathBuf,
-    path: PathBuf,
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        clear(&self.git_dir, &self.path);
-    }
-}
-
-/// Unregisters and deletes the worktree at `path`, if any: a finished check's, or one a
-/// killed check left behind.
-fn clear(git_dir: &Path, path: &Path) {
-    let mut c = git::cmd(git_dir);
-    c.args(["worktree", "remove", "--force"])
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = c.status();
-    let _ = fs::remove_dir_all(path);
-    let mut c = git::cmd(git_dir);
-    c.args(["worktree", "prune"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = c.status();
-}
-
 /// The shadow check itself (`--foreground`): judge `sha` against `base` in a throwaway
 /// worktree and append a `chg` row. Returns the row it wrote.
 pub fn run_foreground(repo: &Path, sha: &str, base: &str) -> Result<Row, String> {
@@ -342,35 +312,15 @@ fn judge(repo: &Path, key: &str, sha: &str, base: &str) -> Row {
         Err(e) => return skipped(format!("shadow lock: {e}")),
     };
 
-    // One fixed path per repo: its workspace slot, so its test database, is the same on
-    // every run (as snapshot builds share one), and the lock makes it ours alone. A
-    // worktree a killed check left there is cleared first.
-    let path = store.shadow_dir().join("ws");
-    clear(&git_dir, &path);
+    // An unwritable store says nothing about the commit: skipped, as for no snapshot.
     if let Err(e) = fs::create_dir_all(store.shadow_dir()) {
         return skipped(format!("creating {}: {e}", store.shadow_dir().display()));
     }
-    // No hooks: the repo's post-checkout would hydrate (we do that below, and need its
-    // result), and any other hook of the repo has no business in a throwaway tree.
-    let mut c = git::cmd(&git_dir);
-    c.args([
-        "-c",
-        "core.hooksPath=/dev/null",
-        "worktree",
-        "add",
-        "--detach",
-        "--force",
-    ])
-    .arg(&path)
-    .arg(sha)
-    .env("CHG_SKIP_HYDRATE", "1");
-    if let Err(e) = git::run(c) {
-        clear(&git_dir, &path);
-        return failed(0, format!("worktree add: {e}"));
-    }
-    let scratch = Scratch {
-        git_dir,
-        path: fs::canonicalize(&path).unwrap_or(path),
+    // One fixed path per repo: its workspace slot, so its test database, is the same on
+    // every run (as snapshot builds share one), and the lock makes it ours alone.
+    let scratch = match Scratch::at(&git_dir, &store.shadow_dir().join("ws"), sha) {
+        Ok(s) => s,
+        Err(e) => return failed(0, e),
     };
 
     let t = Instant::now();
@@ -809,7 +759,7 @@ pub fn resolve_ci(repo: &Path, key: &str, rows: &[Row], check: &str, log: &Path)
     for sha in ci_wanted(key, rows, now_ms()) {
         // -X GET -f puts the fields in the query string, encoded: a check name may hold
         // spaces, `&` or `#`.
-        let out = Command::new("gh")
+        let out = crate::gh::cmd()
             .args(["api", "-X", "GET"])
             .arg(format!("repos/{slug}/commits/{sha}/check-runs"))
             .args(["-f", &format!("check_name={check}"), "-f", "per_page=100"])
@@ -817,7 +767,6 @@ pub fn resolve_ci(repo: &Path, key: &str, rows: &[Row], check: &str, log: &Path)
                 "--jq",
                 "[.check_runs[] | {status, conclusion, started_at, completed_at}]",
             ])
-            .stdin(Stdio::null())
             .output();
         let runs: Vec<serde_json::Value> = match out {
             Ok(o) if o.status.success() => serde_json::from_slice(&o.stdout).unwrap_or_default(),

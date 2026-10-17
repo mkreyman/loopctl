@@ -152,6 +152,16 @@ impl Store {
         self.lock("build.lock", true)
     }
 
+    /// Held for a whole job of `name` (`culprit`, `revert`) in this repo: each job owns one
+    /// fixed worktree, `job_dir(name)/ws`, so one workspace slot and test database.
+    pub fn lock_job(&self, name: &str) -> io::Result<Lock> {
+        self.lock(&format!("{name}.lock"), true)
+    }
+
+    pub fn job_dir(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+
     /// Held for a whole shadow check. It lives at the store root, not in this repo's
     /// dir, so pushes in quick succession queue across every repo and clone on this
     /// machine instead of running their suites at once beside the real gate. `None` once

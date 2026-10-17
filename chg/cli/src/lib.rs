@@ -4,14 +4,19 @@ pub mod adapter;
 pub mod check;
 pub mod clone;
 pub mod contract;
+pub mod culprit;
 pub mod exec;
 pub mod gate;
+pub mod gh;
 pub mod git;
 pub mod glob;
 pub mod output;
+pub mod revert;
+pub mod scratch;
 pub mod shadow;
 pub mod snapshot;
 pub mod store;
+pub mod verify;
 pub mod ws;
 
 /// `chg --version` output: the binary version and the adapter contract it implements.

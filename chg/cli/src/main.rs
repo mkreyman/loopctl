@@ -16,6 +16,7 @@ use chg::shadow;
 use chg::snapshot::{self, Built};
 use chg::store::Store;
 use chg::ws::{self, Hydrated};
+use chg::{culprit, revert, verify};
 
 #[derive(Parser)]
 #[command(name = "chg", version = chg::VERSION, about = "Agent-first change system client")]
@@ -84,6 +85,91 @@ enum Top {
     Shadow {
         #[command(subcommand)]
         command: ShadowCmd,
+    },
+    /// Run the whole suite (static checks included) on a trunk commit in this tree, and
+    /// on green fast-forward `verified/<branch>` on the remote to it; never backwards, and
+    /// never forced (story S8). Prints a JSON report. Exit 0 green (or nothing to do: the
+    /// ref is already there, or a newer commit is verified), 1 red, 2 no verdict.
+    Verify {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// The commit to verify (default HEAD). The tree must be exactly this commit.
+        #[arg(long)]
+        sha: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// The ref to advance, under refs/heads/.
+        #[arg(long = "ref", default_value = "verified/master")]
+        ref_name: String,
+        /// Do not run the suite: it already passed on this commit (a CI job). Only advance.
+        #[arg(long)]
+        no_run: bool,
+        /// Run the suite but leave the ref alone.
+        #[arg(long)]
+        no_push: bool,
+        /// Write the failing test ids here, one per line (for `chg culprit --tests`). Empty
+        /// when static checks failed: those are not tests to search with.
+        #[arg(long)]
+        failures_out: Option<PathBuf>,
+    },
+    /// Find the first commit on <bad>'s first-parent line after <good> at which the tests
+    /// failing on <bad> fail (story S8). Each failing test is rerun on <bad> first, and
+    /// one that passes there is reported flaky and left out. Runs in a throwaway worktree.
+    /// Prints a JSON report (`culprit` is null when nothing fails for real). Exit 0 with
+    /// an answer, 2 when the search could not run.
+    Culprit {
+        good: String,
+        bad: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// The failing test ids, one per line (`chg verify --failures-out`); default: run
+        /// the whole suite on <bad> to find them.
+        #[arg(long)]
+        tests: Option<PathBuf>,
+        /// Reruns on <bad> before a failing test counts as real.
+        #[arg(long, default_value_t = 2)]
+        reruns: u32,
+    },
+    /// File one open issue per flaky test (`chg culprit`'s `flaky`), or comment on the
+    /// one already open; idempotent per run id (story S8). Prints the issue URLs.
+    Flaky {
+        /// The flaky test ids, one per line.
+        #[arg(long)]
+        tests: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long, default_value = "flaky")]
+        label: String,
+    },
+    /// Open a PR reverting <culprit> on the trunk, arm auto-merge, file the story to
+    /// re-land it, and tell the culprit's PR (story S8). Idempotent on the culprit: a
+    /// retry, or a later red run naming it again, finishes what was started and opens
+    /// nothing twice. Prints a JSON report. Exit 0
+    /// when a revert PR exists, 1 when the revert does not apply (the story says so), 2
+    /// on error.
+    Revert {
+        culprit: String,
+        /// The verifier's run id, named in the PR and the story.
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// The trunk branch.
+        #[arg(long, default_value = "master")]
+        base: String,
+        /// The failing test ids, one per line, for the PR and the story.
+        #[arg(long)]
+        tests: Option<PathBuf>,
+        #[arg(long, default_value = "auto-revert")]
+        label: String,
+        #[arg(long, default_value = "reland")]
+        fix_label: String,
     },
 }
 
@@ -263,6 +349,85 @@ fn main() -> ExitCode {
                 json,
             } => shadow_report(&repo_root(repo), &files, &hosts, ci_check, json),
         },
+        Top::Verify {
+            repo,
+            sha,
+            remote,
+            ref_name,
+            no_run,
+            no_push,
+            failures_out,
+        } => verify_cmd(
+            &repo_root(repo),
+            sha.as_deref().unwrap_or("HEAD"),
+            &verify::Options {
+                remote: &remote,
+                ref_name: &ref_name,
+                no_run,
+                push: !no_push,
+            },
+            failures_out,
+        ),
+        Top::Culprit {
+            good,
+            bad,
+            repo,
+            tests,
+            reruns,
+        } => culprit_cmd(&repo_root(repo), &good, &bad, tests, reruns),
+        Top::Flaky {
+            tests,
+            run_id,
+            repo,
+            remote,
+            label,
+        } => {
+            let result = read_ids(&tests).and_then(|ids| {
+                revert::file_flaky(&repo_root(repo), &remote, &ids, &run_id, &label)
+            });
+            match result {
+                Ok(urls) => {
+                    for u in urls {
+                        println!("{u}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("chg: flaky: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        Top::Revert {
+            culprit,
+            run_id,
+            repo,
+            remote,
+            base,
+            tests,
+            label,
+            fix_label,
+        } => {
+            let failing = match tests.map(|t| read_ids(&t)).transpose() {
+                Ok(f) => f.unwrap_or_default(),
+                Err(e) => {
+                    eprintln!("chg: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            revert_cmd(
+                &repo_root(repo),
+                &culprit,
+                &revert::Options {
+                    remote: &remote,
+                    base: &base,
+                    run_id: &run_id,
+                    failing,
+                    label: &label,
+                    fix_label: &fix_label,
+                },
+            )
+        }
         Top::Adapter { command } => match command {
             AdapterCmd::Validate { repo } => validate(&repo_root(repo)),
             AdapterCmd::Exec {
@@ -675,5 +840,109 @@ fn shadow_report(
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// Test ids from a file, one per line; blank lines are skipped.
+fn read_ids(path: &Path) -> Result<Vec<String>, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+fn verify_cmd(
+    repo: &Path,
+    rev: &str,
+    o: &verify::Options,
+    failures_out: Option<PathBuf>,
+) -> ExitCode {
+    let r = match verify::run(repo, rev, o) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("chg: verify: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!("{}", serde_json::to_string(&r).expect("reports serialize"));
+    eprintln!(
+        "chg: verify {} {} in {}: {} ({})",
+        &r.sha[..12.min(r.sha.len())],
+        r.verdict.verdict.as_str(),
+        shadow::fmt_ms(r.verdict.ms),
+        r.verdict.reason,
+        serde_json::to_value(r.outcome).expect("serializes")
+    );
+    if let Some(path) = failures_out {
+        // Test ids only: a static failure (no `mode`: it stopped before the tests) lists
+        // check messages, which no test run can find, so the file stays empty and the
+        // red static check is left to a person.
+        let ids: &[String] = match r.verdict.mode {
+            Some(_) => &r.verdict.failures,
+            None => &[],
+        };
+        let body: String = ids.iter().map(|f| format!("{f}\n")).collect();
+        if let Err(e) = std::fs::write(&path, body) {
+            eprintln!("chg: writing {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+    }
+    match r.verdict.verdict {
+        Outcome::Pass | Outcome::Skipped => ExitCode::SUCCESS,
+        Outcome::Fail => ExitCode::from(1),
+        Outcome::Error => ExitCode::from(2),
+    }
+}
+
+fn culprit_cmd(
+    repo: &Path,
+    good: &str,
+    bad: &str,
+    tests: Option<PathBuf>,
+    reruns: u32,
+) -> ExitCode {
+    let tests = match tests.map(|t| read_ids(&t)).transpose() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("chg: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match culprit::find(repo, good, bad, tests, reruns) {
+        Ok(f) => {
+            println!("{}", serde_json::to_string(&f).expect("reports serialize"));
+            eprintln!("chg: culprit: {}", f.reason);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("chg: culprit: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn revert_cmd(repo: &Path, culprit: &str, o: &revert::Options) -> ExitCode {
+    match revert::open(repo, culprit, o) {
+        Ok(r) => {
+            println!("{}", serde_json::to_string(&r).expect("reports serialize"));
+            for w in &r.warnings {
+                eprintln!("chg: revert: {w}");
+            }
+            match &r.revert_pr {
+                Some(u) => {
+                    eprintln!("chg: revert PR {u}");
+                    ExitCode::SUCCESS
+                }
+                None => ExitCode::from(1),
+            }
+        }
+        Err(e) => {
+            eprintln!("chg: revert: {e}");
+            ExitCode::from(2)
+        }
     }
 }

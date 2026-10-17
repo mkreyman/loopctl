@@ -47,6 +47,8 @@ Shards are 1-based: `chg adapter exec shard --n N --i I` requires `1 <= I <= N`.
 
 `{file}` (for `run`) is the path of a file listing the tests to run, one repo-relative `path` or `path:line` per line: the list `affected` returned.
 
+A result `id` starts with the test's repo-relative file. What follows is nothing (the whole file, e.g. one that failed to load), `:<line>`, or ` > <name>`. `chg culprit` turns an id back into a `run` entry by dropping any ` > <name>`, and matches the results it gets by id.
+
 Before running `affected`, `chg` compares the changed paths against `always_all` and, on a hit, prints `{"mode":"all","reason":"<path> matches always_all `<glob>`"}` without calling the adapter. The changed paths are those differing between `--base` and the working tree, tracked or untracked, with renames split into the deleted and the added path (`git diff --no-renames --name-only <base>` plus `git ls-files --others --exclude-standard`). An adapter selects within the same set and does not apply `always_all` itself. A `--base` that is not a commit fails closed.
 
 `affected` never exits 2. Any of those failures **fails closed**: it prints `{"mode":"all","reason":"failed closed: …"}` and the reason on stderr, and exits 0, so the caller runs the whole suite.
