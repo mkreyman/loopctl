@@ -57,7 +57,7 @@ timings =
 
 total_ms = test_files |> Enum.map(&Map.get(timings, &1, 0)) |> Enum.sum()
 ms_of = fn files -> files |> Enum.map(&Map.get(timings, &1, 0)) |> Enum.sum() end
-secs = fn ms -> Float.round(ms / total_ms * wall_s, 1) end
+secs = fn ms -> if ms && total_ms > 0, do: Float.round(ms / total_ms * wall_s, 1) end
 
 lpt = fn files, k ->
   files
@@ -93,14 +93,15 @@ rows =
     hit = Enum.find_value(changed, fn p -> Enum.find(always_all, &glob_match?.(p, &1)) end)
 
     {mode, why, selected, altered} =
-      cond do
-        hit ->
-          {"all", "always_all: " <> hit, test_files, nil}
+      if hit do
+        {"all", "always_all: " <> hit, test_files, nil}
+      else
+        now = digests.(sha)
+        before = digests.(parent)
 
-        (now = digests.(sha)) == nil or (before = digests.(parent)) == nil ->
+        if now == nil or before == nil do
           {"all", "no digests (a commit did not compile)", test_files, nil}
-
-        true ->
+        else
           impls = MapSet.new(now.impls)
 
           case ChgAdapter.Select.by_coverage(%{
@@ -115,12 +116,16 @@ rows =
                  impl?: &MapSet.member?(impls, &1)
                }) do
             {:subset, why, tests} ->
-              n = Enum.count(now.digests, fn {m, d} -> Map.get(before.digests, m) != d end)
+              n =
+                Enum.count(now.digests, fn {m, d} -> Map.get(before.digests, m) != d end) +
+                  Enum.count(before.digests, fn {m, _} -> not Map.has_key?(now.digests, m) end)
+
               {"subset", why, tests, n}
 
             {:all, why} ->
               {"all", "selector: " <> why, test_files, nil}
           end
+        end
       end
 
     %{
