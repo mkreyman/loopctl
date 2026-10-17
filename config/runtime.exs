@@ -256,11 +256,9 @@ endpoint_http = [
   websocket_options: [max_fragmented_message_size: 64_000],
   # HTTP/2 is off: Bandit then closes a connection that opens with the HTTP/2 preface
   # instead of serving it. Nothing needs it — Fly's proxy speaks HTTP/1.1 to the app
-  # (fly.toml `h2_backend = false`) — and leaving it on kept Bandit's HTTP/2 stack, and
-  # CVE-2026-105659 in it, reachable by prior-knowledge h2c from anything that can reach
-  # the port directly: the 6PN, or a self-host with no proxy in front. Bandit is mix.exs's
-  # ignored advisory only because of this line; test/loopctl_web/endpoint_http2_test.exs
-  # fails if it goes.
+  # (fly.toml `h2_backend = false`). Off since #981, when it also kept the then-unpatched
+  # CVE-2026-105659 unreachable; bandit 1.13.1 patches that CVE, and the option stays
+  # because nothing serves h2. test/loopctl_web/endpoint_http2_test.exs fails if it goes.
   http_2_options: [enabled: false]
 ]
 
