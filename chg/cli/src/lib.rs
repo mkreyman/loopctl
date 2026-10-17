@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod check;
 pub mod clone;
 pub mod contract;
+pub mod cover;
 pub mod culprit;
 pub mod exec;
 pub mod gate;

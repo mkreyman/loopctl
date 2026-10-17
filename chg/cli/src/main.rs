@@ -81,6 +81,12 @@ enum Top {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Coverage records (story S2b): `chg verify` publishes one per green trunk commit to
+    /// the remote, and coverage selection and time-balanced shards read them.
+    Cover {
+        #[command(subcommand)]
+        command: CoverCmd,
+    },
     /// The shadow phase's log and report (story S10).
     Shadow {
         #[command(subcommand)]
@@ -170,6 +176,20 @@ enum Top {
         label: String,
         #[arg(long, default_value = "reland")]
         fix_label: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CoverCmd {
+    /// Mirror the remote's coverage records (`refs/chg/cover/*`); each is unpacked into
+    /// this machine's store when it is first used. Run it before `chg check` and before
+    /// balanced shards; it is cheap when nothing is new. Prints how many were new. Exit 0,
+    /// or 2 when the fetch failed (selection then uses whatever records are already here).
+    Fetch {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
     },
 }
 
@@ -278,6 +298,11 @@ enum AdapterCmd {
         n: Option<u32>,
         #[arg(long)]
         i: Option<u32>,
+        /// With `shard`: split by the recorded per-file time of the coverage record of
+        /// this commit, which must be in this machine's store (`chg cover fetch`). Give
+        /// every shard of one run the same sha.
+        #[arg(long)]
+        balance_by: Option<String>,
         /// Overrides the per-command wall-clock cap.
         #[arg(long)]
         timeout_secs: Option<u64>,
@@ -332,6 +357,20 @@ fn main() -> ExitCode {
             eprintln!("chg: gate {} ({})", r.mode, r.source);
             ExitCode::SUCCESS
         }
+        Top::Cover { command } => match command {
+            CoverCmd::Fetch { repo, remote } => {
+                with_worktree(repo, |r| match chg::cover::fetch(r, &remote) {
+                    Ok(n) => {
+                        println!("{n}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("chg: cover fetch: {e}");
+                        ExitCode::from(2)
+                    }
+                })
+            }
+        },
         Top::Shadow { command } => match command {
             ShadowCmd::Record {
                 repo,
@@ -437,6 +476,7 @@ fn main() -> ExitCode {
                 file,
                 n,
                 i,
+                balance_by,
                 timeout_secs,
             } => {
                 let Some(name) = CommandName::parse(&command) else {
@@ -459,7 +499,19 @@ fn main() -> ExitCode {
                 let timeout = timeout_secs
                     .map(Duration::from_secs)
                     .unwrap_or_else(|| exec::default_timeout(name));
-                exec_cmd(&repo_root(repo), name, values, timeout)
+                let root = repo_root(repo);
+                if let Some(sha) = balance_by {
+                    match balance_record(&root, name, &sha) {
+                        Ok(path) => {
+                            values.insert("shard_by", path);
+                        }
+                        Err(e) => {
+                            eprintln!("chg: --balance-by: {e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+                exec_cmd(&root, name, values, timeout)
             }
         },
     }
@@ -507,6 +559,22 @@ fn validate(repo: &Path) -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+/// The coverage record a balanced shard splits by. A missing record is an error, never a
+/// quiet fallback: a sibling shard that has it would split differently, and between them
+/// some files would run twice and others never.
+fn balance_record(repo: &Path, name: CommandName, rev: &str) -> Result<String, String> {
+    if name != CommandName::Shard {
+        return Err("only `shard` takes it".into());
+    }
+    let sha = git::resolve(repo, rev)?;
+    match chg::cover::materialize(repo, &Store::for_repo(repo)?, &sha)? {
+        Some(path) => Ok(path.to_string_lossy().into_owned()),
+        None => Err(format!(
+            "no coverage record of {sha} here; run `chg cover fetch`"
+        )),
     }
 }
 

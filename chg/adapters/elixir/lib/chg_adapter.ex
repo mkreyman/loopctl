@@ -144,6 +144,14 @@ defmodule ChgAdapter do
       not Enum.any?(ignore, &match_filter?(&1, path))
   end
 
+  @doc "True when `path` is under one of the project's test paths."
+  def test_path?(path) do
+    Enum.any?(
+      Mix.Project.config()[:test_paths] || ["test"],
+      &String.starts_with?(path, &1 <> "/")
+    )
+  end
+
   defp match_filter?(%Regex{} = r, file), do: Regex.match?(r, file)
   defp match_filter?(f, file) when is_function(f, 1), do: f.(file)
 

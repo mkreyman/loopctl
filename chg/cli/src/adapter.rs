@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::contract::{self, CommandName};
 use crate::exec::{self, Outcome};
 use crate::output::{self, Affected, Document, Status};
-use crate::{git, glob};
+use crate::{cover, git, glob};
 
 #[derive(Debug)]
 pub enum Invoked {
@@ -65,7 +65,22 @@ pub fn invoke(
         slot.unwrap_or_else(|| exec::workspace_slot(repo)),
     );
 
-    let (code, document) = match exec::run(&manifest, repo, name, &values, timeout) {
+    // Coverage records (`cover.rs`): `record` and `shard_by` are not placeholders but files
+    // chg hands the adapter, and `affected` gets the record to judge by.
+    let mut env = Vec::new();
+    if name == CommandName::Affected {
+        match coverage_record(repo, &manifest.always_all, &values["base"]) {
+            Ok(path) => env.push(("CHG_COVER".to_string(), path)),
+            Err(why) => eprintln!("chg: not selecting by coverage: {why}"),
+        }
+    }
+    for (key, var) in [("record", "CHG_RECORD"), ("shard_by", "CHG_SHARD_BY")] {
+        if let Some(v) = values.remove(key) {
+            env.push((var.to_string(), v));
+        }
+    }
+
+    let (code, document) = match exec::run(&manifest, repo, name, &values, &env, timeout) {
         Err(e) => return Invoked::Broken(e),
         Ok(Outcome::TimedOut { after }) => {
             return Invoked::Broken(format!("timed out after {}s", after.as_secs()));
@@ -99,4 +114,21 @@ pub fn invoke(
     } else {
         Invoked::Ok(doc)
     }
+}
+
+/// The record `affected` may judge by. Selection by coverage compares with the record, not
+/// the base, so an `always_all` path changed since the record rules it out: the adapter
+/// then selects from the base, where chg has already applied `always_all`.
+fn coverage_record(repo: &Path, always_all: &[String], base: &str) -> Result<String, String> {
+    let (sha, path) = cover::nearest(repo, base)?.ok_or_else(|| {
+        "no coverage record on the base's first-parent line within reach".to_string()
+    })?;
+    let since = git::changed_paths(repo, &sha)?;
+    if let Some((p, pattern)) = glob::first_hit(always_all, &since) {
+        return Err(format!(
+            "{p} changed since the record of {} and matches always_all `{pattern}`",
+            &sha[..12]
+        ));
+    }
+    Ok(path.to_string_lossy().into_owned())
 }

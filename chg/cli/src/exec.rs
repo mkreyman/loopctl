@@ -82,10 +82,11 @@ pub fn run(
     repo: &Path,
     name: CommandName,
     values: &BTreeMap<&str, String>,
+    extra_env: &[(String, String)],
     timeout: Duration,
 ) -> Result<Outcome, String> {
     let cmd = substitute(manifest.command(name), values, true)?;
-    let mut env = Vec::new();
+    let mut env = extra_env.to_vec();
     for (k, tmpl) in &manifest.isolation_env {
         env.push((k.clone(), substitute(tmpl, values, false)?));
     }

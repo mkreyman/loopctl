@@ -18,10 +18,10 @@ A product then adds:
 |---|---|---|
 | `mix chg.snapshot` | `snapshot` | `deps.get`, `compile` in dev and test, the dialyzer PLT (when dialyxir is a dependency), then `mix chg.refs`. Does nothing when HEAD, `mix.lock` and the toolchain match its marker. |
 | `mix chg.refs` | (part of `snapshot`) | Compiles the test files without running them or starting the app, and records each one's module references in `_build/chg/test_refs.etf`. |
-| `mix chg.affected --base <sha>` | `affected` | Test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest. |
+| `mix chg.affected --base <sha>` | `affected` | By coverage when `chg` hands it a record (`CHG_COVER`): test files whose recorded run executed a module whose compiled code changed. Otherwise test files referencing a module changed since `<sha>`, or any module that transitively references one, from Mix's compile manifest. |
 | `mix chg.static --base <sha>` | `static` | `format --check-formatted` and `credo --strict` on the changed files, `compile --warnings-as-errors`, `dialyzer`. |
 | `mix chg.run --tests <list>` | `run` | `mix test` on the listed paths, one result per test. |
-| `mix chg.shard --of <n> --index <i>` | `shard` | One stable shard of the whole suite. |
+| `mix chg.shard --of <n> --index <i>` | `shard` | One shard of the whole suite: stable by file name, or balanced by recorded time when `CHG_SHARD_BY` names a record. With `CHG_RECORD` set, it records coverage and timings to that file. |
 
 ## Why the selection does not use `mix test --stale --dry-run`
 
@@ -39,6 +39,41 @@ them, the sources that read it as an `@external_resource`, and, for a deleted so
 snapshot's record of what it defined. A deleted source the snapshot does not know selects every
 test. `always_all` is applied by `chg` before the adapter runs.
 
+## Coverage selection
+
+The graph selection is sound but dense: on HomeCareBilling's last 200 merged PRs it selected a
+median 98% of the suite's time, because nearly every module sits within a few references of a hub
+(the Repo, the router, the schemas). Coverage asks what actually ran instead.
+
+Recording (`CHG_RECORD`, on the verifier's whole-suite run, only when the tree is exactly HEAD):
+`ChgAdapter.Cover` traces every call into a project module from outside it, in a trace session of
+its own, and attributes each to the test modules running at that moment, so work handed to a
+GenServer, a Task or the Repo pool still counts. Calls made at boot or by a process compiling a
+test file go into a `global` set. The record also holds `ChgAdapter.Digest` of every module, and
+each test file's time. Tracing costs about 8% of the suite's time.
+
+Selecting (`mix chg.affected`) against the record `chg` hands over in `CHG_COVER`: the nearest
+on the base's first-parent line, at most `CHG_COVER_MAX_AGE` (default 100) commits back, with no
+`always_all` path changed since it:
+
+- the altered modules are those whose digest differs between the record and the current build
+  (new and deleted ones included), plus the readers of an `@external_resource` that changed since
+  the base or the record. Everything is compared with the record's green run, not the base, so a
+  comment, a line shift or a revert to the record's code alters nothing;
+- test data (a file under the test paths that is not a test) changed since the base or the
+  record selects the whole suite;
+- an altered module in `global`, or a new protocol implementation, selects the whole suite;
+- otherwise the selection is every test file that changed since the base or the record, that the
+  record has no coverage of (new), or whose recorded run executed an altered module.
+
+A digest hashes the compiled code with the project root taken out of its literals and its line
+table left out, so it is equal across checkouts and catches a change that reaches a module only
+at compile time (a macro, a struct default, a module attribute). A new module needs no coverage
+entry: nothing ran it, so only its own tests and the tests of what now calls it (whose callers
+changed and so differ in digest) can observe it. With no usable record (none fetched, too old,
+an `always_all` path changed since it, another Elixir or OTP) the graph selection runs, and its
+reason says why.
+
 ## Environment
 
 `affected`, `static`, `run`, `shard` and `refs` work in `MIX_ENV=test`. Started in another env, a
@@ -53,8 +88,8 @@ ebin. Each task therefore loads all of its modules before it compiles, and `run`
 ## Tests
 
     mix test test/select_test.exs test/static_test.exs test/runner_test.exs test/snapshot_test.exs \
-      test/chg_adapter_test.exs
-    CHG_BIN=../../target/debug/chg mix test test/integration_test.exs
+      test/chg_adapter_test.exs test/digest_test.exs test/shard_test.exs
+    CHG_BIN=$PWD/../../target/debug/chg mix test test/integration_test.exs
 
 The integration test builds the archive, installs it into a private `MIX_ARCHIVES`, and drives
 [fixtures/sample](fixtures/sample) through every task. With `CHG_BIN` set, it also drives them

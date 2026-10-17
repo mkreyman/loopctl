@@ -65,8 +65,8 @@ defmodule ChgAdapter.IntegrationTest do
   end
 
   # Runs a task and returns {document, exit status}; the document is the last stdout line.
-  defp chg(ctx, args) do
-    {out, status} = sh("mix", args, ctx.dir, [{"MIX_ARCHIVES", ctx.archives}])
+  defp chg(ctx, args, env \\ []) do
+    {out, status} = sh("mix", args, ctx.dir, [{"MIX_ARCHIVES", ctx.archives} | env])
     line = out |> String.split("\n", trim: true) |> List.last()
     {JSON.decode!(line), status}
   end
@@ -189,6 +189,44 @@ defmodule ChgAdapter.IntegrationTest do
     checks = Enum.map(failures, &{&1["check"], &1["file"]})
     assert {"format", "lib/sample/reports.ex"} in checks
     assert {"compile", "lib/sample/reports.ex"} in checks
+  end
+
+  test "a recorded run selects by compiled code: a comment selects nothing, a behaviour change its tests",
+       ctx do
+    snapshot!(ctx)
+    history = Path.join(ctx.root, "history-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(history)
+    record = Path.join(history, ctx.base <> ".cover")
+
+    assert {%{"results" => [_ | _]}, 0} =
+             chg(ctx, ["chg.shard", "--of", "1", "--index", "1"], [{"CHG_RECORD", record}])
+
+    rec = record |> File.read!() |> :erlang.binary_to_term()
+    assert rec.sha == ctx.base
+    assert Sample.Billing in rec.cover["test/sample/billing_test.exs"]
+    assert Sample.Accounts in rec.cover["test/sample/billing_test.exs"]
+    assert Map.has_key?(rec.ms, "test/sample/billing_test.exs")
+    assert Map.has_key?(rec.digests, Sample.Reports)
+
+    env = [{"CHG_COVER", record}]
+    edit!(ctx, "lib/sample/reports.ex", &("# a comment shifts every line\n" <> &1))
+    git!(ctx.dir, ["commit", "-qam", "comment"])
+
+    assert {%{"mode" => "subset", "tests" => [], "reason" => "coverage of " <> _}, 0} =
+             chg(ctx, ["chg.affected", "--base", "HEAD~1"], env)
+
+    edit!(ctx, "lib/sample/accounts.ex", &String.replace(&1, "user-", "member-"))
+
+    assert {%{"mode" => "subset", "tests" => tests, "reason" => "coverage of " <> _}, 0} =
+             chg(ctx, ["chg.affected", "--base", "HEAD"], env)
+
+    assert "test/sample/accounts_test.exs" in tests
+    assert "test/sample/billing_test.exs" in tests
+
+    # A record made at another commit is not written: the tree must be exactly HEAD.
+    dirty = Path.join(history, "dirty.cover")
+    chg(ctx, ["chg.shard", "--of", "1", "--index", "1"], [{"CHG_RECORD", dirty}])
+    refute File.exists?(dirty)
   end
 
   describe "through chg" do

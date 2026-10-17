@@ -33,10 +33,12 @@ fn cow_tempdir() -> Option<TempDir> {
 /// test named by `$FLAKY` fails the first time it runs and passes after. `$TS_IDS` reports
 /// ids the TypeScript adapter's way (`file > name`). A commit with `.chg/break-run` breaks
 /// the contract on `run`; one with `.chg/static-red` fails static checks. Each call is
-/// logged to `$CALLS` with the directory it ran in.
+/// logged to `$CALLS` with the directory it ran in, and to `$ENVLOG` with the coverage
+/// variables chg gave it. `shard` writes a record to `$CHG_RECORD` when asked.
 const ADAPTER: &str = r#"#!/bin/sh
 cmd=$1; shift
 echo "$cmd $(pwd)" >> "$CALLS"
+echo "$cmd cover=$CHG_COVER record=$CHG_RECORD shard_by=$CHG_SHARD_BY" >> "$ENVLOG"
 results() {
   out=""; bad=0
   while read -r id; do
@@ -62,7 +64,8 @@ case "$cmd" in
   affected) echo '{"mode":"all","reason":"stand-in"}' ;;
   run)      [ -f .chg/break-run ] && exit 3
             results < "$1" ;;
-  shard)    ls test/*_test.exs | sed 's/$/:1/' | results ;;
+  shard)    [ -n "$CHG_RECORD" ] && echo "record of $(git rev-parse HEAD)" > "$CHG_RECORD"
+            ls test/*_test.exs | sed 's/$/:1/' | results ;;
 esac
 "#;
 
@@ -206,6 +209,7 @@ impl Env {
             .env("GH_LOG", self.root.join("gh.log"))
             .env("GH_STATE", self.root.join("gh"))
             .env("CALLS", &self.calls)
+            .env("ENVLOG", self.root.join("envlog"))
             .env("FLAKY_SEEN", self.root.join("flaky-seen"))
             .env_remove("FLAKY")
             .env_remove("TS_IDS")
@@ -635,4 +639,237 @@ fn culprit_stops_when_a_probe_cannot_run_and_blames_nothing_red_at_good() {
     let f = json(&out);
     assert_eq!(f["culprit"], Value::Null, "{f}");
     assert!(f["reason"].as_str().unwrap().contains("as well"), "{f}");
+}
+
+#[test]
+fn coverage_records_travel_from_the_verifier_to_other_machines() {
+    let env = Env::new(tempfile::tempdir().unwrap());
+    let c1 = env.head();
+    let store = env.root.join("store");
+    let records = |under: &std::path::Path| -> Vec<PathBuf> {
+        let mut found = vec![];
+        for e in fs::read_dir(under).into_iter().flatten().flatten() {
+            let h = e.path().join("history");
+            for r in fs::read_dir(h).into_iter().flatten().flatten() {
+                found.push(r.path());
+            }
+        }
+        found
+    };
+
+    // The verifier's green whole-suite run writes a record and publishes it.
+    let out = env.chg().arg("verify").output().unwrap();
+    let r = json(&out);
+    assert_eq!(r["cover"], "published", "{r}");
+    let mine = records(&store);
+    assert_eq!(mine.len(), 1);
+    assert!(mine[0].ends_with(format!("history/{c1}.cover")));
+    assert_eq!(
+        fs::read_to_string(&mine[0]).unwrap(),
+        format!("record of {c1}\n")
+    );
+    let log = fs::read_to_string(env.root.join("envlog")).unwrap();
+    let told = format!("record={}", mine[0].display());
+    assert!(
+        log.lines()
+            .any(|l| l.starts_with("shard") && l.contains(&told)),
+        "the whole-suite shard was told where to write: {log}"
+    );
+
+    // Another machine (another clone, so another store) fetches it, once.
+    env.git(&["push", "-q", "origin", "master"]);
+    let other = env.root.join("other");
+    let st = Std::new("git")
+        .args(["clone", "-q"])
+        .arg(&env.remote)
+        .arg(&other)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let fetch = || {
+        let out = env
+            .chg()
+            .current_dir(&other)
+            .args(["cover", "fetch"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(fetch(), "1");
+    assert_eq!(fetch(), "0");
+
+    // A balanced shard reads the record it is pinned to, and refuses one it lacks.
+    fs::write(env.root.join("envlog"), "").unwrap();
+    let out = env
+        .chg()
+        .current_dir(&other)
+        .args([
+            "adapter",
+            "exec",
+            "shard",
+            "--n",
+            "2",
+            "--i",
+            "1",
+            "--balance-by",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Fetched records are unpacked when first used.
+    let theirs: Vec<PathBuf> = records(&store)
+        .into_iter()
+        .filter(|p| *p != mine[0])
+        .collect();
+    assert_eq!(theirs.len(), 1);
+    assert_eq!(fs::read(&theirs[0]).unwrap(), fs::read(&mine[0]).unwrap());
+    let log = fs::read_to_string(env.root.join("envlog")).unwrap();
+    assert!(
+        log.contains(&format!("shard_by={}", theirs[0].display())),
+        "{log}"
+    );
+
+    // `affected` there is handed the record nearest behind its base.
+    fs::write(env.root.join("envlog"), "").unwrap();
+    let out = env
+        .chg()
+        .current_dir(&other)
+        .args(["adapter", "exec", "affected", "--base", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let log = fs::read_to_string(env.root.join("envlog")).unwrap();
+    assert!(
+        log.contains(&format!("affected cover={} ", theirs[0].display())),
+        "{log}"
+    );
+
+    let c2 = env.commit("lib/a.ex", "two\n");
+    let out = env
+        .chg()
+        .args([
+            "adapter",
+            "exec",
+            "shard",
+            "--n",
+            "2",
+            "--i",
+            "1",
+            "--balance-by",
+            &c2,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("chg cover fetch"));
+
+    // --no-push keeps the record on this machine.
+    let out = env.chg().args(["verify", "--no-push"]).output().unwrap();
+    assert_eq!(json(&out)["cover"], "recorded");
+    assert!(
+        records(&store)
+            .iter()
+            .any(|p| p.ends_with(format!("{c2}.cover")))
+    );
+    let remote_refs = Std::new("git")
+        .arg("--git-dir")
+        .arg(&env.remote)
+        .args(["for-each-ref", "--format=%(refname)", "refs/chg/cover/"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&remote_refs.stdout).trim(),
+        format!("refs/chg/cover/{c1}")
+    );
+
+    // An always_all path changed since the nearest record (c2's) rules coverage out.
+    env.commit("mix.exs", "changed\n");
+    fs::write(env.root.join("envlog"), "").unwrap();
+    let out = env
+        .chg()
+        .args(["adapter", "exec", "affected", "--base", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("not selecting by coverage: mix.exs changed since the record of"),
+        "{err}"
+    );
+    let log = fs::read_to_string(env.root.join("envlog")).unwrap();
+    assert!(log.contains("affected cover= "), "{log}");
+
+    // A red run keeps no record: selection trusts that what a record covered passed.
+    let c3 = env.commit(".chg/broken", "test/a_test.exs:1\n");
+    let out = env.chg().arg("verify").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json(&out)["cover"], "no record: the suite failed");
+    assert!(
+        !records(&store)
+            .iter()
+            .any(|p| p.ends_with(format!("{c3}.cover")))
+    );
+}
+
+#[test]
+fn publishing_prunes_only_this_lines_old_records() {
+    let env = Env::new(tempfile::tempdir().unwrap());
+    let verify = |args: &[&str]| {
+        let out = env
+            .chg()
+            .env("CHG_COVER_MAX_AGE", "1")
+            .arg("verify")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(json(&out)["cover"], "published", "{}", json(&out));
+    };
+    let remote_records = || {
+        let out = Std::new("git")
+            .arg("--git-dir")
+            .arg(&env.remote)
+            .args([
+                "for-each-ref",
+                "--format=%(refname:lstrip=3)",
+                "refs/chg/cover/",
+            ])
+            .output()
+            .unwrap();
+        let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(String::from)
+            .collect();
+        v.sort();
+        v
+    };
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+
+    let c1 = env.head();
+    verify(&[]);
+    env.git(&["checkout", "-q", "-b", "side"]);
+    let s1 = env.commit("lib/side.ex", "side\n");
+    verify(&["--ref", "verified/side"]);
+    assert_eq!(remote_records(), sorted(vec![c1.clone(), s1.clone()]));
+
+    env.git(&["checkout", "-q", "master"]);
+    env.commit("lib/a.ex", "two\n");
+    let c3 = env.commit("lib/a.ex", "three\n");
+    verify(&[]);
+    // c1 is two first-parent commits behind c3, past the reach of 1; s1 is another line's.
+    assert_eq!(remote_records(), sorted(vec![s1, c3]));
 }

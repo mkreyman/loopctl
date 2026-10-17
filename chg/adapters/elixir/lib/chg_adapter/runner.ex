@@ -14,9 +14,11 @@ defmodule ChgAdapter.Runner do
       Path.join(System.tmp_dir!(), "chg-results-#{System.unique_integer([:positive])}.jsonl")
 
     System.put_env("CHG_RESULTS", results_file)
+    recording = start_recording(present)
     status = if present == [], do: 0, else: mix_test(present)
     results = read(results_file)
     File.rm(results_file)
+    stop_recording(recording, results)
 
     results =
       results ++
@@ -26,6 +28,69 @@ defmodule ChgAdapter.Runner do
     failed? = Enum.any?(results, &(&1.status in ["fail", "error"]))
     ChgAdapter.emit(%{results: results})
     ChgAdapter.halt(if failed?, do: 1, else: 0)
+  end
+
+  # With `CHG_RECORD` set (the verifier's full run), the run also writes a coverage record
+  # there. Recording never changes the verdict: a record that cannot be made is reported
+  # on stderr and not written.
+  defp start_recording([]), do: nil
+
+  defp start_recording(_present) do
+    with path when is_binary(path) and path != "" <- System.get_env("CHG_RECORD"),
+         {:ok, sha} <- clean_head() do
+      Mix.Task.run("compile")
+      {:ok, graph} = ChgAdapter.Graph.read()
+      modules = graph.source_modules |> Map.values() |> List.flatten() |> Enum.uniq()
+      %{path: path, sha: sha, modules: modules, cover: ChgAdapter.Cover.start(modules)}
+    else
+      {:error, why} ->
+        IO.puts(:standard_error, "chg: no coverage record: #{why}")
+        nil
+
+      _ ->
+        nil
+    end
+  rescue
+    e ->
+      IO.puts(:standard_error, "chg: no coverage record: #{Exception.message(e)}")
+      nil
+  end
+
+  defp stop_recording(nil, _results), do: :ok
+
+  defp stop_recording(r, results) do
+    %{cover: cover, global: global} = ChgAdapter.Cover.stop(r.cover)
+
+    ms =
+      Enum.reduce(results, %{}, fn t, acc ->
+        Map.update(acc, file_of(t.id), t.ms, &(&1 + t.ms))
+      end)
+
+    ChgAdapter.Record.write!(r.path, %{
+      sha: r.sha,
+      digests: ChgAdapter.Digest.of_modules(r.modules),
+      cover: cover,
+      global: global,
+      ms: ms
+    })
+
+    IO.puts(
+      :standard_error,
+      "chg: coverage record for #{r.sha}: #{map_size(cover)} test file(s), #{length(global)} module(s) used by every test"
+    )
+  rescue
+    e -> IO.puts(:standard_error, "chg: no coverage record: #{Exception.message(e)}")
+  end
+
+  # The record names a commit, so the tree must be exactly it.
+  defp clean_head do
+    case System.cmd("git", ["status", "--porcelain", "--untracked-files=no"],
+           stderr_to_stdout: true
+         ) do
+      {"", 0} -> ChgAdapter.resolve("HEAD")
+      {_, 0} -> {:error, "the tree has uncommitted changes"}
+      {out, _} -> {:error, "git status failed: #{String.trim(out)}"}
+    end
   end
 
   # In this VM, so the preloaded formatter survives the code-path pruning `mix test`'s

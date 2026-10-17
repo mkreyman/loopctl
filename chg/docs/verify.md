@@ -14,6 +14,12 @@ Every command works through the repo's adapter (`.chg/adapter.toml`), so it serv
   - **`--no-run`:** advances only. Use it for a CI job whose suite already passed on `S`.
 
   Exit 0 green or nothing to do, 1 red, 2 no verdict.
+
+  A green whole-suite run also writes the commit's coverage record (`CHG_RECORD`, see the adapter contract) when the adapter supports it, and `chg verify` publishes it as `refs/chg/cover/<sha>` on the remote. A red run keeps none: coverage selection skips a test whose executed code is unchanged since the record, which is sound only if the test passed there. Publishing deletes the remote's records that are ancestors of the commit and more than 100 first-parent commits behind it; another line's records are left to that line. The report's `cover` field says what happened: `published`, `recorded` (with `--no-push`), `recorded, not published: …`, or `no record: …`. Neither recording nor publishing changes the verdict.
+- `chg cover fetch [--remote origin]` mirrors the remote's record refs and prints how many were new. Run it on a gate machine before `chg check`, so `affected` selects by coverage, and before a balanced shard. A record is unpacked into this machine's store when first used, and the store keeps the 30 most recently unpacked.
+
+  `affected` judges by the nearest record on the base's first-parent line, at most `CHG_COVER_MAX_AGE` (default 100) commits behind, handed to the adapter as `CHG_COVER`. When a path changed since that record matches `always_all`, chg hands it none and says why on stderr, and the adapter selects from the base instead.
+- `chg adapter exec shard --n N --i I --balance-by <rev>` splits the suite by the test times in `rev`'s record, so N machines finish together. Every machine in a pool must pass the same `rev` (the verified sha) and hold its record; a missing record is an error (exit 2), never a silent fall back to the stable split, because two machines splitting by different rules would skip tests.
 - `chg culprit <good> <bad> [--tests F] [--reruns 2]` finds the merge that broke trunk:
   1. It takes the failing tests from `F`, or runs the whole suite on `bad` to find them.
   2. It reruns them `--reruns` times on `bad`. A test that passes on any rerun is `flaky` and leaves the search.

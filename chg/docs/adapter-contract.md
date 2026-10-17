@@ -39,6 +39,18 @@ Each command prints one JSON document as the **last non-empty line of stdout**. 
 
 Shards are 1-based: `chg adapter exec shard --n N --i I` requires `1 <= I <= N`.
 
+## Coverage records (optional)
+
+An adapter may keep a coverage record per verified commit, for selection by coverage and time-balanced shards. The format is the adapter's own; `chg` only stores, moves and picks the files. Three environment variables carry it:
+
+| Variable | Set on | Meaning |
+|---|---|---|
+| `CHG_COVER` | `affected`, when a usable record exists | the record to judge the change by: the nearest on the base's first-parent line within `CHG_COVER_MAX_AGE` (default 100) commits, with no `always_all` path changed since it. Without it, select from the base |
+| `CHG_RECORD` | the verifier's whole-suite `shard 1/1` | the file to write this commit's record to; write nothing when the tree is not exactly the commit |
+| `CHG_SHARD_BY` | `shard`, on `chg adapter exec shard --balance-by <rev>` | the record whose test times the shard splits by |
+
+An adapter that ignores all three is still a valid v1 adapter. Writing the record must never change the run's verdict: a failure to record goes to stderr only.
+
 ## `chg adapter exec <command>` exit codes
 
 - 0: a valid document reporting success.

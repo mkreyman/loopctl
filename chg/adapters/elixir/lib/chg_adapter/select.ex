@@ -60,6 +60,104 @@ defmodule ChgAdapter.Select do
       end
   end
 
+  @type coverage_input :: %{
+          changed: [String.t()],
+          since_record: [String.t()],
+          record: map(),
+          digests: %{module() => binary()},
+          graph: Graph.t(),
+          test_files: [String.t()],
+          test_file?: (String.t() -> boolean()),
+          test_path?: (String.t() -> boolean()),
+          impl?: (module() -> boolean())
+        }
+
+  @doc """
+  Coverage selection: the test files that executed a module this change alters, by the
+  record of a full run on an earlier commit (`ChgAdapter.Record`).
+
+  The question is which tests could now fail although they passed in the record's run,
+  so everything is compared with the record, not with the base. A module is altered when
+  its compiled digest differs from the record's (a compile-time effect, such as a macro or
+  struct default expanded into it, counts), when it is new or gone, or when it reads an
+  `@external_resource` that changed since the base or the record (it may read the file at
+  run time too, which no digest sees). A source edit that leaves the compiled code as it
+  was (a comment, a line shift, a revert to the record's code) alters nothing. A test file
+  is selected when:
+    * it changed since the base, or since the record (its coverage may be stale);
+    * the record has no coverage for it (new, or it did not run);
+    * its recorded coverage includes an altered module.
+
+  The whole suite runs when an altered module ran at boot or while test files compiled
+  (the record's `global`), when a new module is a protocol implementation (protocol
+  dispatch reaches it with no call that names it), and when a file under the test paths
+  that is not a test and defines no module (test data) changed since the base or the
+  record.
+  """
+  @spec by_coverage(coverage_input()) :: {:all, String.t()} | {:subset, String.t(), [String.t()]}
+  def by_coverage(%{record: record, digests: digests} = input) do
+    {tests_changed, _} = Enum.split_with(input.changed, input.test_file?)
+    others = Enum.uniq(input.changed ++ input.since_record) |> Enum.reject(input.test_file?)
+    # A deleted source needs no map here: its modules are in the record's digests and not
+    # in the current ones, so they count as altered below.
+    snapshot = %{source_modules: %{}, external: %{}}
+    %{source_modules: defines, external: readers} = input.graph
+
+    with {:ok, _, unmapped} <- modules_of(others, input.graph, snapshot, fn _ -> true end),
+         :ok <- no_test_data(unmapped, input.test_path?) do
+      sourced =
+        for p <- others,
+            src <- Map.get(readers, p, []),
+            m <- Map.get(defines, src, []),
+            into: MapSet.new(),
+            do: m
+
+      old = record.digests
+      new_mods = for m <- Map.keys(digests), not Map.has_key?(old, m), do: m
+
+      altered =
+        for({m, d} <- digests, Map.get(old, m) != d, do: m)
+        |> Enum.concat(for m <- Map.keys(old), not Map.has_key?(digests, m), do: m)
+        |> Enum.into(sourced)
+
+      global = MapSet.new(record.global)
+
+      cond do
+        m = Enum.find(altered, &MapSet.member?(global, &1)) ->
+          {:all, "#{inspect(m)} changed, and it ran at boot or while test files compiled"}
+
+        m = Enum.find(new_mods, input.impl?) ->
+          {:all, "new protocol implementation #{inspect(m)}"}
+
+        true ->
+          direct = MapSet.new(tests_changed ++ Enum.filter(input.since_record, input.test_file?))
+
+          tests =
+            for f <- input.test_files,
+                MapSet.member?(direct, f) or covers?(Map.get(record.cover, f), altered),
+                do: f
+
+          reason =
+            "coverage of #{String.slice(record.sha, 0, 12)} (#{Map.get(record, :age, 0)} commit(s) behind): " <>
+              "#{MapSet.size(altered)} altered module(s), #{length(tests)} of #{length(input.test_files)} test file(s)"
+
+          {:subset, reason, Enum.sort(tests)}
+      end
+    else
+      {:error, why} -> {:all, why}
+    end
+  end
+
+  defp covers?(nil, _altered), do: true
+  defp covers?(mods, altered), do: Enum.any?(mods, &MapSet.member?(altered, &1))
+
+  defp no_test_data(unmapped, test_path?) do
+    case Enum.find(unmapped, test_path?) do
+      nil -> :ok
+      p -> {:error, "#{p} is under the test paths and is not a test: test data changed"}
+    end
+  end
+
   # The modules a changed non-test path stands for, through the current graph and the
   # snapshot's: a deleted source or external resource is only in the snapshot's. A deleted
   # Elixir source neither knows cannot be mapped, and an unmapped deletion could hide a

@@ -8,6 +8,7 @@
 //!   snapshots/<sha>/.chg-snapshot.json
 //!   snapshots/.tmp-<sha>-<pid> a build in progress; renamed into place when done
 //!   leases/<sha>/<slot>        one per workspace hydrated from <sha>
+//!   history/<sha>.cover        a coverage record (`cover.rs`)
 //! ```
 //!
 //! The store is a cache: deleting any of it costs a rebuild, never correctness.

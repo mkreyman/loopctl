@@ -87,13 +87,19 @@ impl Verdict {
 
 /// Runs the check in `repo` against `base` (a commit). `all` skips selection.
 pub fn run(repo: &Path, base: &str, all: bool) -> Verdict {
+    run_recording(repo, base, all, None)
+}
+
+/// `run`, and when the whole suite runs, the adapter also writes a coverage record of it
+/// to `record` (`cover.rs`).
+pub fn run_recording(repo: &Path, base: &str, all: bool, record: Option<&Path>) -> Verdict {
     let started = Instant::now();
-    let mut v = check(repo, base, all);
+    let mut v = check(repo, base, all, record);
     v.ms = started.elapsed().as_millis() as u64;
     v
 }
 
-fn check(repo: &Path, base: &str, all: bool) -> Verdict {
+fn check(repo: &Path, base: &str, all: bool, record: Option<&Path>) -> Verdict {
     let values = |pairs: &[(&'static str, String)]| -> BTreeMap<&'static str, String> {
         pairs.iter().cloned().collect()
     };
@@ -188,10 +194,14 @@ fn check(repo: &Path, base: &str, all: bool) -> Verdict {
             ("subset", reason, tests, invoked)
         }
         Affected::All { reason } => {
+            let mut v = values(&[("n", "1".into()), ("i", "1".into())]);
+            if let Some(r) = record {
+                v.insert("record", r.to_string_lossy().into_owned());
+            }
             let invoked = adapter::invoke(
                 repo,
                 CommandName::Shard,
-                values(&[("n", "1".into()), ("i", "1".into())]),
+                v,
                 None,
                 exec::default_timeout(CommandName::Shard),
             );

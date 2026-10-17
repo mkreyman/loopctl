@@ -5,13 +5,20 @@
 //! it. It moves only by a plain (never forced) push of a commit that descends from where
 //! it is, so a slow verifier finishing after a newer one cannot move it back, and two
 //! verifiers racing cannot both win.
+//!
+//! A green run also writes a coverage record of the commit (story S2b, `cover.rs`), which
+//! gates on other machines select tests by, and publishes it to the remote. A red run's
+//! record is discarded: selection skips a test whose executed code is unchanged since the
+//! record, which is sound only if the test passed there.
 
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::check::{self, Outcome, Verdict};
+use crate::cover;
 use crate::git;
+use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -38,6 +45,10 @@ pub struct Report {
     pub before: Option<String>,
     pub outcome: RefOutcome,
     pub verdict: Verdict,
+    /// What became of this run's coverage record: `published`, `recorded` (`--no-push`),
+    /// or why there is none. Absent when the suite did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover: Option<String>,
 }
 
 pub struct Options<'a> {
@@ -82,18 +93,21 @@ fn fetch_ref(dir: &Path, remote: &str, name: &str, sha: &str) -> Result<(), Stri
 pub fn run(repo: &Path, rev: &str, o: &Options) -> Result<Report, String> {
     let sha = git::resolve(repo, rev)?;
     let before = remote_ref(repo, o.remote, o.ref_name)?;
-    let report = |outcome, verdict| Report {
+    let mut cover_note: Option<String> = None;
+    let report = |outcome, verdict, cover: &Option<String>| Report {
         sha: sha.clone(),
         ref_name: o.ref_name.to_string(),
         before: before.clone(),
         outcome,
         verdict,
+        cover: cover.clone(),
     };
     if let Some(b) = &before {
         if *b == sha {
             return Ok(report(
                 RefOutcome::Already,
                 Verdict::skipped(format!("{} is already at {sha}", o.ref_name)),
+                &None,
             ));
         }
         fetch_ref(repo, o.remote, o.ref_name, b)?;
@@ -104,6 +118,7 @@ pub fn run(repo: &Path, rev: &str, o: &Options) -> Result<Report, String> {
                     "{} is at {b}, which {sha} does not descend from: a newer commit is verified, or this is another line",
                     o.ref_name
                 )),
+                &None,
             ));
         }
     }
@@ -120,20 +135,48 @@ pub fn run(repo: &Path, rev: &str, o: &Options) -> Result<Report, String> {
             .clone()
             .or_else(|| git::resolve(repo, &format!("{sha}^")).ok())
             .unwrap_or_else(|| sha.clone());
-        let v = check::run(repo, &base, true);
-        match git::is_exactly(repo, &sha) {
+        let record = Store::for_repo(repo).and_then(|s| {
+            let dir = cover::history_dir(&s);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            Ok(cover::record_path(&s, &sha))
+        });
+        let v = check::run_recording(repo, &base, true, record.as_deref().ok());
+        let v = match git::is_exactly(repo, &sha) {
             Ok(()) => v,
             Err(e) => Verdict {
                 ms: v.ms,
                 ..Verdict::error(format!("the tree moved while the suite ran: {e}"))
             },
-        }
+        };
+        cover_note = Some(match (&record, v.verdict) {
+            (Err(e), _) => format!("no record: {e}"),
+            // A tree that moved mid-run recorded a mix of two commits.
+            (Ok(r), Outcome::Error) => {
+                let _ = std::fs::remove_file(r);
+                "no record: the run gave no verdict".into()
+            }
+            // Coverage selection skips a test whose executed code is as the record has
+            // it, which is sound only if that test passed there.
+            (Ok(r), Outcome::Fail) => {
+                let _ = std::fs::remove_file(r);
+                "no record: the suite failed".into()
+            }
+            (Ok(r), _) if !r.exists() => {
+                "no record: the adapter wrote none (see its stderr)".into()
+            }
+            (Ok(_), _) if !o.push => "recorded".into(),
+            (Ok(r), _) => match cover::publish(repo, o.remote, &sha, r) {
+                Ok(()) => "published".into(),
+                Err(e) => format!("recorded, not published: {e}"),
+            },
+        });
+        v
     };
     if verdict.verdict != Outcome::Pass {
-        return Ok(report(RefOutcome::Held, verdict));
+        return Ok(report(RefOutcome::Held, verdict, &cover_note));
     }
     if !o.push {
-        return Ok(report(RefOutcome::NotPushed, verdict));
+        return Ok(report(RefOutcome::NotPushed, verdict, &cover_note));
     }
 
     // Never forced: the remote refuses a push that is not a fast-forward, so a commit
@@ -143,12 +186,12 @@ pub fn run(repo: &Path, rev: &str, o: &Options) -> Result<Report, String> {
     c.args(["-c", "core.hooksPath=/dev/null", "push", "-q", o.remote])
         .arg(format!("{sha}:refs/heads/{}", o.ref_name));
     match git::run(c) {
-        Ok(_) => Ok(report(RefOutcome::Advanced, verdict)),
+        Ok(_) => Ok(report(RefOutcome::Advanced, verdict, &cover_note)),
         Err(e) => {
             // Lost a race: another verifier moved the ref on while the suite ran.
             let now = remote_ref(repo, o.remote, o.ref_name)?;
             if now.is_some() && now != before {
-                Ok(report(RefOutcome::Superseded, verdict))
+                Ok(report(RefOutcome::Superseded, verdict, &cover_note))
             } else {
                 Err(format!("pushing {}: {e}", o.ref_name))
             }
