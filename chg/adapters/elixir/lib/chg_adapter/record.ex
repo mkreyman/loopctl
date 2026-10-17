@@ -5,6 +5,7 @@ defmodule ChgAdapter.Record do
 
     * `sha`: the commit, which the tree was exactly;
     * `elixir`, `otp`: the toolchain, which digests depend on;
+    * `digest`: the form of the digests (`ChgAdapter.Digest.version/0`);
     * `digests`: `ChgAdapter.Digest` of every project module;
     * `cover`: per test file, the project modules it executed (`ChgAdapter.Cover`);
     * `global`: modules executed outside any test's or test file compile's window (at
@@ -22,18 +23,26 @@ defmodule ChgAdapter.Record do
 
   @doc "Writes `record` to `path` atomically."
   def write!(path, record) do
-    record = Map.merge(record, %{vsn: @vsn, elixir: System.version(), otp: otp()})
+    record =
+      Map.merge(record, %{
+        vsn: @vsn,
+        elixir: System.version(),
+        otp: otp(),
+        digest: ChgAdapter.Digest.version()
+      })
+
     ChgAdapter.write_atomic!(path, :erlang.term_to_binary(record, [:compressed]))
   end
 
   @doc """
   The record `chg` chose to judge a change on `rev` by (`CHG_COVER`), with how many
   first-parent commits it is behind `rev` as `:age`. `{:error, why}` when there is none,
-  or it was made by another toolchain.
+  or it was made by another toolchain or holds another form of digest.
   """
   def given(rev) do
     with path when path not in [nil, ""] <- System.get_env("CHG_COVER"),
          {:ok, record} <- read(path),
+         :ok <- same_digest(record),
          {n, 0} <- git(["rev-list", "--first-parent", "--count", "#{record.sha}..#{rev}"]),
          {age, ""} <- Integer.parse(String.trim(n)) do
       {:ok, Map.put(record, :age, age)}
@@ -41,6 +50,17 @@ defmodule ChgAdapter.Record do
       empty when empty in [nil, ""] -> {:error, "no coverage record given"}
       {:error, why} -> {:error, why}
       _ -> {:error, "cannot place the coverage record behind #{rev}"}
+    end
+  end
+
+  defp same_digest(r) do
+    case {Map.get(r, :digest), ChgAdapter.Digest.version()} do
+      {v, v} ->
+        :ok
+
+      {v, ours} ->
+        {:error,
+         "the coverage record holds digests of form #{inspect(v)}, this adapter makes form #{ours}"}
     end
   end
 
@@ -54,8 +74,15 @@ defmodule ChgAdapter.Record do
         do: {:ok, r},
         else: {:error, "the coverage record was made by Elixir #{r.elixir}/OTP #{r.otp}"}
     else
-      {:error, why} -> {:error, "cannot read #{path}: #{inspect(why)}"}
-      _ -> {:error, "unreadable coverage record #{path}"}
+      {:error, why} ->
+        {:error, "cannot read #{path}: #{inspect(why)}"}
+
+      %{vsn: v} ->
+        {:error,
+         "the coverage record #{path} is format #{inspect(v)}, this adapter reads #{@vsn}"}
+
+      _ ->
+        {:error, "unreadable coverage record #{path}"}
     end
   end
 

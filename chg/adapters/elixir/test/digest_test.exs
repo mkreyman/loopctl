@@ -81,6 +81,31 @@ defmodule ChgAdapter.DigestTest do
     assert Digest.of_modules([ChgDigestSample], dir, cache) == %{ChgDigestSample => fresh}
   end
 
+  # A map with atom keys is encoded in atom table order, which differs between VMs: the
+  # verifier's run that records digests and the run that compares with them. Each peer
+  # runs this VM's own emulator and code path, and makes the keys' atoms in its order.
+  test "a map literal has one digest in every VM, whatever order its keys' atoms were made in",
+       %{root: r} do
+    digest(r, "a", "%{zz_chg_key: 1, aa_chg_key: 2, mm_chg_key: %{yy_chg_key: 3, bb_chg_key: 4}}")
+    beam = String.to_charlist(Path.join(r, "a/ebin/Elixir.ChgDigestSample.beam"))
+
+    run = fn keys ->
+      paths = Enum.flat_map(:code.get_path(), &[~c"-pa", &1])
+      {:ok, peer, _} = :peer.start_link(%{connection: :standard_io, args: paths})
+
+      try do
+        for k <- keys, do: :peer.call(peer, :erlang, :binary_to_atom, [k])
+        :peer.call(peer, Digest, :of_file, [beam, Path.join(r, "a")])
+      after
+        :peer.stop(peer)
+      end
+    end
+
+    keys = ~w(zz_chg_key aa_chg_key mm_chg_key yy_chg_key bb_chg_key)
+    assert <<_::binary-16>> = d = run.(keys)
+    assert run.(Enum.reverse(keys)) == d
+  end
+
   test "an unreadable beam has no digest" do
     assert Digest.of_file(~c"/nonexistent.beam", "/") == nil
   end

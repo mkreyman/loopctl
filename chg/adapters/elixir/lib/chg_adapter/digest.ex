@@ -16,11 +16,20 @@ defmodule ChgAdapter.Digest do
   `file` and an integer `line`, as Logger metadata and Ecto query expressions do. A `line`
   without a `file` beside it may be data, and stays. A line number compiled into code
   rather than a literal still counts, which only ever selects more.
+
+  Literals are encoded `:deterministic`: plainly, a map with atom keys is written in atom
+  table order, which differs between the run that records digests and the run that
+  compares with them. A compile that iterates such a map (an attribute built with
+  `Map.keys/1`) can still lay a module out differently in another VM; that module then
+  looks altered, which only selects more.
   """
 
   # Bump when normalisation changes, so a cache of the old digests is not reused.
-  @version 2
+  @version 3
   @chunks [~c"AtU8", ~c"Code", ~c"StrT", ~c"ImpT", ~c"ExpT", ~c"FunT", ~c"LitT"]
+
+  @doc "The form of digest this adapter makes; a record keeps it, and only equal forms compare."
+  def version, do: @version
 
   @doc """
   Digests of `modules` (those with a beam on disk), keyed by module. With a `cache` file,
@@ -71,7 +80,7 @@ defmodule ChgAdapter.Digest do
     case :beam_lib.chunks(path, @chunks, [:allow_missing_chunks]) do
       {:ok, {_, chunks}} ->
         parts = for {id, data} <- chunks, is_binary(data), do: [id, normalize(id, data, root)]
-        :crypto.hash(:md5, :erlang.term_to_binary(parts))
+        :crypto.hash(:md5, :erlang.term_to_binary(parts, [:deterministic]))
 
       {:error, _, _} ->
         nil
@@ -100,7 +109,7 @@ defmodule ChgAdapter.Digest do
         {t |> :erlang.binary_to_term() |> walk(root), r}
       end)
 
-    :erlang.term_to_binary(terms)
+    :erlang.term_to_binary(terms, [:deterministic])
   end
 
   defp walk(b, root) when is_binary(b), do: :binary.replace(b, root, "<root>", [:global])
