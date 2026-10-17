@@ -303,8 +303,8 @@ jobs:
     # would die before its first step. That host instance supplies pgvector, which is why the
     # pgvector image is not needed here. It must be 0.8.4 or later: below it an HNSW insert
     # racing a VACUUM (autovacuum included) fails with `different vector dimensions 1536 and 0`
-    # (#965). The host images are 0.8.2 until mkreyman/infra#280 moves them, and
-    # test/test_helper.exs warns at suite start while they are.
+    # (#965). The host images moved to 0.8.7 with mkreyman/infra#280, so
+    # test/test_helper.exs's below-0.8.4 warning no longer fires on them.
     # config/test.exs hardcodes localhost + postgres/postgres for all three repos.
     env:
       # ci<run_id>, not the bare `ci` this used to be. The suffix separated CI from a
@@ -927,12 +927,12 @@ jobs:
       github.event_name == 'pull_request'
     services:
       postgres:
-        # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.2), so
-        # the job never pulls a floating tag from Docker Hub: a present digest is not re-pulled.
-        # It is below the 0.8.4 floor (#965) and carries the insert/VACUUM race too, since
-        # autovacuum fires on the corpora these tests commit. It moves with the host instances
-        # under mkreyman/infra#280, once the new digest is pre-pulled on beelink.
-        image: pgvector/pgvector@sha256:fce8fb583b92ef8af5150b373a96415d46a8cd38ba09b38efeea17c8b4c7d782
+        # Pinned by DIGEST to the image beelink's CI Postgres already runs (pgvector 0.8.7,
+        # tag 0.8.7-pg16-trixie), so the job never pulls a floating tag from Docker Hub: a
+        # present digest is not re-pulled. Above the 0.8.4 floor (#965), so the insert/VACUUM
+        # race is gone. Moved with the host instances under mkreyman/infra#280 (#977); the
+        # digest was pre-pulled on beelink (2026-10-13).
+        image: pgvector/pgvector@sha256:40d828eda66737aaacb934387a337babf1455ebd56e9bdd13fc08e211257c972
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
