@@ -1,6 +1,6 @@
 {
   "id": "US-47.3",
-  "title": "Stage mapping from change events",
+  "title": "Change events webhook",
   "epic": {
     "id": "epic_47",
     "name": "Change Protocol (loopctl half)"
@@ -8,88 +8,86 @@
   "priority": "high",
   "phase": "change_protocol",
   "story": {
-    "as_a": "delivery loop",
-    "i_want_to": "move a story's stage from its change's events",
-    "so_that": "the stage machine reflects landing, deploy and revert without a PR stage"
+    "as_a": "chg-server",
+    "i_want_to": "deliver a change's event log to loopctl",
+    "so_that": "a story learns what happened to its change without anyone polling GitHub"
   },
-  "rationale": "PRD \u00a75 mapping table. Reuses existing stages; adds two control-only edges.",
+  "rationale": "PRD \u00a75. Machine-called endpoint, exempt from the MCP-tool rule like the runner socket.",
   "acceptance_criteria": [
     {
       "id": "AC-47.3.1",
-      "description": "submitted moves implementing to reviewing; review_findings moves reviewing to implementing over :review_findings; check_passed with an approved review moves reviewing to ci; landed moves ci to merged with merge_sha set to the landing commit; deployed moves merged to deployed."
+      "description": "POST /api/v1/change_events/:source_id verifies an HMAC over timestamp + raw body with that source's change_events_secret. An unknown source id, a revoked or non-:chg source, a bad signature and a timestamp outside 5 minutes all return the same 401 and write nothing."
     },
     {
       "id": "AC-47.3.2",
-      "description": "verified records trunk_verified_sha on the stage row and writes no edge."
+      "description": "An event is idempotent on (tenant_id, repo, change_id, event_seq): a redelivery returns 200 with duplicate: true and applies nothing twice."
     },
     {
       "id": "AC-47.3.3",
-      "description": "A new control-only edge :reverted takes merged or deployed to implementing, keeping the claim; it is not runner-reportable and is distinct from :merge_refused."
+      "description": "Events apply in event_seq order per change. An event ahead of a gap is stored and applied when the gap fills; a gap older than 10 minutes enqueues one reconciliation job per change (Oban, unique on change) that pulls the missing events from chg."
     },
     {
       "id": "AC-47.3.4",
-      "description": "An event whose edge the machine does not allow from the row's current stage escalates over a new control-only edge :change_outside_lifecycle and records the event; it never forces the stage."
+      "description": "Every applied event is appended to the tenant audit chain with change_id, event_seq and sha."
     },
     {
       "id": "AC-47.3.5",
-      "description": "pr_open is never entered for a story whose intake source is mode: :chg."
+      "description": "The request makes no outbound call. Its operation/2 spec documents the 401, the duplicate answer and the body cap, which one module attribute holds for both the guard and the spec."
     }
   ],
   "test_cases": [
     {
       "id": "TC-47.3.1",
       "verifies": [
-        "AC-47.3.1",
-        "AC-47.3.5"
+        "AC-47.3.1"
       ],
-      "name": "happy path",
+      "name": "one 401 for every refusal",
       "type": "integration",
       "preconditions": [
-        "a chg-mode story at implementing"
+        "an enrolled :chg source"
       ],
       "steps": [
-        "apply submitted, check_passed + approval, landed, deployed"
+        "post to an unknown source id",
+        "post with a wrong HMAC",
+        "post with a 6-minute-old timestamp"
       ],
       "expected_results": [
-        "stages reviewing, ci, merged, deployed",
-        "pr_open never written",
-        "merge_sha is the landing sha"
+        "401 with identical bodies",
+        "no event row"
       ]
     },
     {
       "id": "TC-47.3.2",
       "verifies": [
-        "AC-47.3.3"
+        "AC-47.3.2"
       ],
-      "name": "revert",
+      "name": "redelivery",
       "type": "integration",
       "preconditions": [
-        "a story at deployed"
+        "event seq 1 applied"
       ],
       "steps": [
-        "apply reverted"
+        "post seq 1 again"
       ],
       "expected_results": [
-        "stage implementing over :reverted",
-        "claim unchanged"
+        "200 duplicate: true",
+        "one audit entry"
       ]
     },
     {
       "id": "TC-47.3.3",
       "verifies": [
-        "AC-47.3.4"
+        "AC-47.3.3"
       ],
-      "name": "outside lifecycle",
+      "name": "out of order",
       "type": "integration",
-      "preconditions": [
-        "a story an operator escalated"
-      ],
+      "preconditions": [],
       "steps": [
-        "apply landed"
+        "post seq 2",
+        "post seq 1"
       ],
       "expected_results": [
-        "escalated over :change_outside_lifecycle",
-        "event recorded"
+        "seq 2 applied only after seq 1"
       ]
     },
     {
@@ -97,22 +95,27 @@
       "verifies": [
         "AC-47.3.3"
       ],
-      "name": "not runner-reportable",
-      "type": "unit",
-      "preconditions": [],
+      "name": "gap reconciliation",
+      "type": "integration",
+      "preconditions": [
+        "seq 1 and 3 present, seq 2 missing for 11 minutes",
+        "mocked chg client"
+      ],
       "steps": [
-        "read runner_transitions/0"
+        "run the gap sweep"
       ],
       "expected_results": [
-        "neither new edge present"
+        "one reconciliation job",
+        "seq 2 fetched, both applied"
       ]
     }
   ],
   "technical_notes": [
-    "Both edges go in @transitions in lib/loopctl/delivery/stage_machine.ex and stay out of the runner allowlist.",
-    "Ask what writes the edge out of every stage a new writer leaves stories in (the stage_machine.ex comment on absorbing stages)."
+    "The chg client is a behaviour resolved from config (Loopctl.Changes.ChgClient), mocked in test/support/mocks.ex.",
+    "Build against chg phase 2's published event schema (mkreyman/chg#33), not a guess."
   ],
   "dependencies": [
+    "US-47.1",
     "US-47.2"
   ]
 }

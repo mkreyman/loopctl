@@ -12,7 +12,7 @@
     "i_want_to": "bind a chg change to the story it implements",
     "so_that": "a story's lifecycle can follow its change without a pull request"
   },
-  "rationale": "PRD \u00a74. The binding is the one join both halves need; everything else hangs off it.",
+  "rationale": "PRD \u00a74. The binding is the one join both halves need.",
   "acceptance_criteria": [
     {
       "id": "AC-47.1.1",
@@ -20,11 +20,11 @@
     },
     {
       "id": "AC-47.1.2",
-      "description": "Exactly one binding per story is current: the newest not superseded. Binding a second change supersedes the previous current one in the same transaction."
+      "description": "Exactly one binding per story is current. Binding a second change supersedes the previous current one in the same transaction."
     },
     {
       "id": "AC-47.1.3",
-      "description": "A story_id the tenant does not own never creates a binding; it is recorded as an unbound event and logged, and the answer is byte-identical to an unknown id."
+      "description": "A story_id the tenant does not own never creates a binding; it is recorded as an unbound event, and the answer is identical to an unknown id."
     },
     {
       "id": "AC-47.1.4",
@@ -48,7 +48,7 @@
       ],
       "expected_results": [
         "no row in either tenant",
-        "response identical to an unknown id"
+        "answer identical to an unknown id"
       ]
     },
     {
@@ -62,7 +62,7 @@
         "a story bound to change C1"
       ],
       "steps": [
-        "bind change C2 to the same story"
+        "bind C2 to the same story"
       ],
       "expected_results": [
         "C1 superseded",
@@ -84,13 +84,13 @@
       ],
       "expected_results": [
         "assigned_agent_id and implementer_dispatch_id unchanged",
-        "flag submitter_not_claimant set"
+        "submitter_not_claimant set"
       ]
     }
   ],
   "technical_notes": [
     "Context module Loopctl.Changes; every function takes tenant_id first.",
-    "Do not add a lineage or custody field here: CLAUDE.md, custody identity is never an injectable input."
+    "Custody identity is never an injectable input (CLAUDE.md, Dependency Injection)."
   ],
   "dependencies": []
 }

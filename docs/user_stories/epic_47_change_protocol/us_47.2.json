@@ -1,6 +1,6 @@
 {
   "id": "US-47.2",
-  "title": "Change events webhook",
+  "title": "Intake mode :chg closes the PR route",
   "epic": {
     "id": "epic_47",
     "name": "Change Protocol (loopctl half)"
@@ -8,31 +8,27 @@
   "priority": "high",
   "phase": "change_protocol",
   "story": {
-    "as_a": "chg-server",
-    "i_want_to": "deliver a change's event log to loopctl",
-    "so_that": "a story learns what happened to its change without anyone polling GitHub"
+    "as_a": "tenant operator",
+    "i_want_to": "enroll a repo's intake source in chg mode",
+    "so_that": "the PR route is closed for that repo and loopctl knows the secret and the reviewer root chg uses"
   },
-  "rationale": "PRD \u00a75. Machine-called endpoint, exempt from the MCP-tool rule like the runner socket.",
+  "rationale": "PRD \u00a73 item 3 and \u00a76. The forcing function on loopctl's side, and the registration everything after it reads.",
   "acceptance_criteria": [
     {
       "id": "AC-47.2.1",
-      "description": "POST /api/v1/change_events verifies an HMAC over timestamp + raw body with the intake source's change_events_secret; a bad signature or a timestamp outside 5 minutes is 401 and writes nothing."
+      "description": "Loopctl.Intake.Source.mode accepts :chg beside :pr. A :chg source carries an encrypted change_events_secret (redacted, never cast from a response) and a chg_root_dispatch_id; enrolling or switching to :chg without both is refused 422."
     },
     {
       "id": "AC-47.2.2",
-      "description": "An event is idempotent on (tenant_id, repo, change_id, event_seq): a redelivery returns 200 with duplicate: true and applies nothing twice."
+      "description": "chg_root_dispatch_id must name a parentless, unrevoked, orchestrator-role dispatch of the same tenant, or the write is refused 422 chg_root_invalid."
     },
     {
       "id": "AC-47.2.3",
-      "description": "Events apply in event_seq order per change. An event ahead of a gap is stored and applied when the gap fills; a gap older than 10 minutes enqueues one reconciliation job per change (Oban, unique on change) that pulls the missing events from chg."
+      "description": "MergePrecondition refuses any evaluation for a story on a :chg source with 409 change_protocol_enrolled, naming chg submit as the route."
     },
     {
       "id": "AC-47.2.4",
-      "description": "Every applied event is appended to the tenant audit chain with change_id, event_seq and sha."
-    },
-    {
-      "id": "AC-47.2.5",
-      "description": "The request makes no outbound call; change_events_secret gets a row in deploy/FLY_SECRETS.md only if it is read from env (it is a per-source column, so normally none), and the endpoint's operation/2 spec documents the 401, the duplicate answer and the body cap."
+      "description": "The endpoint specs (operation/2) document the new fields and refusals."
     }
   ],
   "test_cases": [
@@ -41,18 +37,16 @@
       "verifies": [
         "AC-47.2.1"
       ],
-      "name": "bad signature",
+      "name": "missing secret",
       "type": "integration",
       "preconditions": [
-        "an enrolled chg source"
+        "a :pr source"
       ],
       "steps": [
-        "post with a wrong HMAC",
-        "post with a 6-minute-old timestamp"
+        "switch to :chg without a secret"
       ],
       "expected_results": [
-        "401 both",
-        "no event row"
+        "422"
       ]
     },
     {
@@ -60,17 +54,16 @@
       "verifies": [
         "AC-47.2.2"
       ],
-      "name": "redelivery",
+      "name": "root must be a root",
       "type": "integration",
       "preconditions": [
-        "event seq 1 applied"
+        "a child dispatch"
       ],
       "steps": [
-        "post seq 1 again"
+        "enroll :chg naming it as chg_root_dispatch_id"
       ],
       "expected_results": [
-        "200 duplicate: true",
-        "one audit entry"
+        "422 chg_root_invalid"
       ]
     },
     {
@@ -78,44 +71,22 @@
       "verifies": [
         "AC-47.2.3"
       ],
-      "name": "out of order",
+      "name": "PR route closed",
       "type": "integration",
       "preconditions": [
-        "no events yet"
+        "a story on a :chg source"
       ],
       "steps": [
-        "post seq 2",
-        "post seq 1"
+        "call merge_precondition"
       ],
       "expected_results": [
-        "seq 2 applied only after seq 1"
-      ]
-    },
-    {
-      "id": "TC-47.2.4",
-      "verifies": [
-        "AC-47.2.3"
-      ],
-      "name": "gap reconciliation",
-      "type": "integration",
-      "preconditions": [
-        "seq 1 and 3 present, seq 2 missing for 11 minutes",
-        "mocked chg client"
-      ],
-      "steps": [
-        "run the gap sweep"
-      ],
-      "expected_results": [
-        "one reconciliation job",
-        "seq 2 fetched and both applied"
+        "409 change_protocol_enrolled"
       ]
     }
   ],
   "technical_notes": [
-    "The chg client is a behaviour resolved from config (Loopctl.Changes.ChgClient), mocked in test/support/mocks.ex.",
-    "Depends on chg phase 2 publishing its event schema; build against that schema, not a guess."
+    "#984 removes :thread from the same enum; whichever lands second resolves the conflict.",
+    "Load .claude/skills/chain-of-custody/SKILL.md: chg_root_dispatch_id is a custody input."
   ],
-  "dependencies": [
-    "US-47.1"
-  ]
+  "dependencies": []
 }

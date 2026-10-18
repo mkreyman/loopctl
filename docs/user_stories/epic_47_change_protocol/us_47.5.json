@@ -1,94 +1,136 @@
 {
   "id": "US-47.5",
-  "title": "Intake mode :chg and verification from verified/master",
+  "title": "Review custody for chg-dispatched reviews",
   "epic": {
     "id": "epic_47",
     "name": "Change Protocol (loopctl half)"
   },
-  "priority": "high",
+  "priority": "critical",
   "phase": "change_protocol",
   "story": {
-    "as_a": "merge gate and story verification",
-    "i_want_to": "treat a chg-enrolled repo as having no PR route",
-    "so_that": "the PR path is closed for that repo and verification reads the trunk verifier's verdict"
+    "as_a": "tenant operator",
+    "i_want_to": "accept review verdicts on chg-mode stories only from reviewers chg-server minted, and keep chg-server from verifying",
+    "so_that": "a story implemented and landed through chg keeps review/verify separation"
   },
-  "rationale": "PRD \u00a73 item 3 and \u00a77. The forcing function on loopctl's side.",
+  "rationale": "PRD \u00a76, including what the lineage gate does not prove for a chg reviewer.",
   "acceptance_criteria": [
     {
       "id": "AC-47.5.1",
-      "description": "Loopctl.Intake.Source.mode accepts :chg beside :pr. Enrolling or switching a source to :chg requires a change_events_secret."
+      "description": "review_complete on a :chg-source story is accepted only from a key whose dispatch is a strict descendant of the source's chg_root_dispatch_id; the root's own key or any other key is 409 chg_reviewer_required. One reviewer dispatch records at most one verdict."
     },
     {
       "id": "AC-47.5.2",
-      "description": "MergePrecondition refuses any evaluation for a :chg source with 409 change_protocol_enrolled, naming chg submit as the route."
+      "description": "review_records gains a nullable commit_sha. For a :chg story it is required and must be a revision of the story's current binding, else 422 commit_sha_not_bound."
     },
     {
       "id": "AC-47.5.3",
-      "description": "Story verification for a :chg source passes its CI-evidence input only when the current binding's landed sha is an ancestor of verified/master (compare by sha) and no reverted event follows it."
+      "description": "self_review_blocked, caller_lineage_required and unresolvable_dispatch_lineage behave unchanged; the new checks run in addition, never instead."
     },
     {
       "id": "AC-47.5.4",
-      "description": "A compare call that times out or errors answers unevaluated with Retry-After; it is never read as a pass."
+      "description": "verify_story, reject, verify_all and the bulk verify/reject paths refuse any caller whose lineage root is a registered chg_root_dispatch_id with 409 chg_root_cannot_verify."
+    },
+    {
+      "id": "AC-47.5.5",
+      "description": "A story that reaches merged with no review_records row for its landed revision escalates over a new control-only edge :review_missing (merged to escalated) through Escalations.escalate_as_control/3, and is never verified."
     }
   ],
   "test_cases": [
     {
       "id": "TC-47.5.1",
       "verifies": [
-        "AC-47.5.2"
+        "AC-47.5.1"
       ],
-      "name": "PR route closed",
+      "name": "chg child accepted",
       "type": "integration",
       "preconditions": [
-        "a :chg source"
+        "a :chg story",
+        "a child of the chg root"
       ],
       "steps": [
-        "call merge_precondition"
+        "review_complete with the child key and the landed sha"
       ],
       "expected_results": [
-        "409 change_protocol_enrolled"
+        "201"
       ]
     },
     {
       "id": "TC-47.5.2",
       "verifies": [
-        "AC-47.5.3"
+        "AC-47.5.1"
       ],
-      "name": "not yet verified",
+      "name": "non-chg reviewer refused",
       "type": "integration",
       "preconditions": [
-        "landed sha not an ancestor of verified/master (mocked forge)"
+        "a :chg story",
+        "an orchestrator key outside the chg subtree"
       ],
       "steps": [
-        "verify_story"
+        "review_complete"
       ],
       "expected_results": [
-        "CI evidence not satisfied"
+        "409 chg_reviewer_required"
       ]
     },
     {
       "id": "TC-47.5.3",
       "verifies": [
-        "AC-47.5.4"
+        "AC-47.5.2"
       ],
-      "name": "slow forge",
+      "name": "stale revision",
       "type": "integration",
       "preconditions": [
-        "mocked compare times out"
+        "review on revision 1, revision 2 current"
       ],
       "steps": [
-        "verify_story"
+        "review_complete naming a sha not in the binding"
       ],
       "expected_results": [
-        "unevaluated with Retry-After"
+        "422 commit_sha_not_bound"
+      ]
+    },
+    {
+      "id": "TC-47.5.4",
+      "verifies": [
+        "AC-47.5.4"
+      ],
+      "name": "chg cannot verify",
+      "type": "integration",
+      "preconditions": [
+        "a chg-root child key"
+      ],
+      "steps": [
+        "verify_story",
+        "bulk verify"
+      ],
+      "expected_results": [
+        "409 chg_root_cannot_verify both"
+      ]
+    },
+    {
+      "id": "TC-47.5.5",
+      "verifies": [
+        "AC-47.5.5"
+      ],
+      "name": "auto-approved landing",
+      "type": "integration",
+      "preconditions": [
+        "a docs-class change landed, no review"
+      ],
+      "steps": [
+        "apply landed"
+      ],
+      "expected_results": [
+        "escalated over :review_missing"
       ]
     }
   ],
   "technical_notes": [
-    "#984 removes :thread from the same enum; whichever lands second resolves the conflict.",
-    "Every forge call authenticates with the tenant's own GitHub token (#936)."
+    "Load .claude/skills/chain-of-custody/SKILL.md first.",
+    "Never convert an exact_role gate to role:. The caller's lineage is resolved server-side from the key (Dispatches.lineage_for_api_key/2), never from params."
   ],
   "dependencies": [
-    "US-47.3"
+    "US-47.2",
+    "US-47.4"
   ]
 }

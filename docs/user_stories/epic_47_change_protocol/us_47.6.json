@@ -1,71 +1,90 @@
 {
   "id": "US-47.6",
-  "title": "MCP tools for bindings and chg enrollment",
+  "title": "Story verification from verified/master",
   "epic": {
     "id": "epic_47",
     "name": "Change Protocol (loopctl half)"
   },
-  "priority": "medium",
+  "priority": "high",
   "phase": "change_protocol",
   "story": {
-    "as_a": "orchestrating session",
-    "i_want_to": "read a story's changes and enroll a repo in chg mode through MCP",
-    "so_that": "the new surface is reachable from a session, which is the only way the fleet reaches loopctl"
+    "as_a": "story verifier",
+    "i_want_to": "judge a chg-mode story's CI evidence from the trunk verifier",
+    "so_that": "verification reads the one sha that landed and was verified"
   },
-  "rationale": "CLAUDE.md: an operator-facing endpoint is not done until an MCP tool calls it.",
+  "rationale": "PRD \u00a77.",
   "acceptance_criteria": [
     {
       "id": "AC-47.6.1",
-      "description": "GET /api/v1/stories/:id/changes returns the story's bindings and each change's applied events, agent role, and a change_binding_get tool calls it."
+      "description": "For a :chg source, the CI-evidence input passes only when the current binding's landed sha is an ancestor of verified/master (compare by sha), no reverted event follows it, and a review_records row names that sha."
     },
     {
       "id": "AC-47.6.2",
-      "description": "intake_source_enroll and intake_source_update accept mode: chg and change_events_secret; the secret is write-only and never returned."
+      "description": "A compare call that times out or errors answers unevaluated with Retry-After; it is never read as a pass."
     },
     {
       "id": "AC-47.6.3",
-      "description": "Each tool's description states what the endpoint refuses and which key it needs; the declared-and-dispatched wiring test covers the new tool; mcp-server/README.md lists it."
+      "description": "Every other verify gate is unchanged."
     }
   ],
   "test_cases": [
     {
       "id": "TC-47.6.1",
       "verifies": [
-        "AC-47.6.3"
+        "AC-47.6.1"
       ],
-      "name": "wiring",
-      "type": "unit",
-      "preconditions": [],
+      "name": "not yet verified",
+      "type": "integration",
+      "preconditions": [
+        "landed sha not an ancestor of verified/master (mocked forge)"
+      ],
       "steps": [
-        "run the mcp-server tool wiring test"
+        "verify_story"
       ],
       "expected_results": [
-        "change_binding_get declared and dispatched"
+        "CI evidence not satisfied"
       ]
     },
     {
       "id": "TC-47.6.2",
       "verifies": [
-        "AC-47.6.2"
+        "AC-47.6.1"
       ],
-      "name": "secret write-only",
+      "name": "reverted",
       "type": "integration",
       "preconditions": [
-        "a source enrolled with a secret"
+        "landed, verified, then reverted"
       ],
       "steps": [
-        "read the source"
+        "verify_story"
       ],
       "expected_results": [
-        "no secret in the response"
+        "not satisfied"
+      ]
+    },
+    {
+      "id": "TC-47.6.3",
+      "verifies": [
+        "AC-47.6.2"
+      ],
+      "name": "slow forge",
+      "type": "integration",
+      "preconditions": [
+        "mocked compare times out"
+      ],
+      "steps": [
+        "verify_story"
+      ],
+      "expected_results": [
+        "unevaluated with Retry-After"
       ]
     }
   ],
   "technical_notes": [
-    "mcp-server is plain ESM tested with node --test."
+    "Every forge call authenticates with the tenant's own GitHub token (#936)."
   ],
   "dependencies": [
-    "US-47.1",
+    "US-47.4",
     "US-47.5"
   ]
 }

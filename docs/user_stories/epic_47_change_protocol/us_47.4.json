@@ -1,117 +1,164 @@
 {
   "id": "US-47.4",
-  "title": "Review custody for chg-dispatched reviews",
+  "title": "Stage mapping from change events",
   "epic": {
     "id": "epic_47",
     "name": "Change Protocol (loopctl half)"
   },
-  "priority": "critical",
+  "priority": "high",
   "phase": "change_protocol",
   "story": {
-    "as_a": "tenant operator",
-    "i_want_to": "have chg's review jobs record verdicts under a lineage separate from every implementer",
-    "so_that": "a story implemented and landed through chg can still be verified with its custody intact"
+    "as_a": "delivery loop",
+    "i_want_to": "move a story's stage from its change's events",
+    "so_that": "the stage machine reflects review, landing, deploy and revert without a PR stage"
   },
-  "rationale": "PRD \u00a76. chg auto-approves some classes and runs reviews headless; loopctl's custody must still hold.",
+  "rationale": "PRD \u00a75 mapping table. Reuses the existing stages and adds control-only edges where the main line has none.",
   "acceptance_criteria": [
     {
       "id": "AC-47.4.1",
-      "description": "The operator mints chg-server's key as a parentless orchestrator-role dispatch with the existing POST /api/v1/dispatches; no new mint path and no change to root_dispatch_forbidden or the role ceiling."
+      "description": "submitted for ANY revision moves implementing to reviewing over :forward; review_findings moves reviewing to implementing over :review_findings; review_approved (by model or by policy) together with check_passed on the same revision moves reviewing to ci over a new control-only edge :change_ready; landed moves ci to merged over :forward with merge_sha set to the landing commit; deployed moves merged to deployed over :forward."
     },
     {
       "id": "AC-47.4.2",
-      "description": "review_records gains a nullable commit_sha. review_complete for a chg-mode story requires it and refuses a sha that is not a revision of the story's current binding with 422 commit_sha_not_bound."
+      "description": "pr_open is never entered for a story on a :chg source. An event whose target stage is the row's current stage is recorded and applied as a no-op."
     },
     {
       "id": "AC-47.4.3",
-      "description": "self_review_blocked, caller_lineage_required and unresolvable_dispatch_lineage behave unchanged for a chg-minted reviewer key; a reviewer key on the implementer's chain is refused."
+      "description": "verified records trunk_verified_sha on the stage row and writes no edge."
     },
     {
       "id": "AC-47.4.4",
-      "description": "A landed event for a story-bound change with no review_records row for its landed revision leaves the story at merged flagged review_missing and escalates it; it never verifies."
+      "description": "A new control-only edge :reverted takes merged or deployed to implementing, keeping the claim. It is in @chained_edges, and clears/3 clears the merge- and head-keyed fields exactly as :merge_refused does."
     },
     {
       "id": "AC-47.4.5",
-      "description": "verify_story on a chg-mode story requires a review_records row whose commit_sha is the landed revision."
+      "description": "reverted on a verified story escalates over a new control-only edge :reverted_after_verify. reverted on a done story leaves it done, appends the revert to its audit history, and opens a new intake issue on the repo carrying chg's failing tests fenced as untrusted text."
+    },
+    {
+      "id": "AC-47.4.6",
+      "description": "An event whose edge is not allowed from the row's current stage escalates over a new control-only edge :change_outside_lifecycle through Escalations.escalate_as_control/3, records the event, and never forces the stage."
+    },
+    {
+      "id": "AC-47.4.7",
+      "description": "None of the new edges appears in runner_transitions/0."
     }
   ],
   "test_cases": [
     {
       "id": "TC-47.4.1",
       "verifies": [
-        "AC-47.4.3"
+        "AC-47.4.1",
+        "AC-47.4.2"
       ],
-      "name": "separate root passes",
+      "name": "two-round happy path",
       "type": "integration",
       "preconditions": [
-        "implementer under root R1, reviewer under chg root R2"
+        "a :chg story at implementing"
       ],
       "steps": [
-        "review_complete with the R2 child key"
+        "apply submitted r1, review_findings, submitted r2, review_approved + check_passed r2, landed, deployed"
       ],
       "expected_results": [
-        "201"
+        "stages reviewing, implementing, reviewing, ci, merged, deployed",
+        "pr_open never written",
+        "merge_sha is the landing sha"
       ]
     },
     {
       "id": "TC-47.4.2",
       "verifies": [
-        "AC-47.4.3"
+        "AC-47.4.1"
       ],
-      "name": "same chain refused",
+      "name": "policy auto-approval lands",
       "type": "integration",
       "preconditions": [
-        "reviewer key a descendant of the implementer's dispatch"
+        "a docs-class change at reviewing"
       ],
       "steps": [
-        "review_complete"
+        "apply review_approved by policy + check_passed, then landed"
       ],
       "expected_results": [
-        "409 self_review_blocked"
+        "stage merged"
       ]
     },
     {
       "id": "TC-47.4.3",
       "verifies": [
-        "AC-47.4.2",
-        "AC-47.4.5"
+        "AC-47.4.4"
       ],
-      "name": "verdict on a stale revision",
+      "name": "revert is a chained retraction",
       "type": "integration",
       "preconditions": [
-        "review recorded on revision 1, revision 2 landed"
+        "a story at deployed with merge_sha set"
       ],
       "steps": [
-        "verify_story"
+        "apply reverted"
       ],
       "expected_results": [
-        "refused: no review for the landed revision"
+        "stage implementing over :reverted",
+        "merge_sha cleared",
+        "a chained retraction entry"
       ]
     },
     {
       "id": "TC-47.4.4",
       "verifies": [
-        "AC-47.4.4"
+        "AC-47.4.5"
       ],
-      "name": "auto-approved landing",
+      "name": "revert after done",
       "type": "integration",
       "preconditions": [
-        "a docs-class change bound to a story, no review"
+        "a done story",
+        "mocked forge"
+      ],
+      "steps": [
+        "apply reverted"
+      ],
+      "expected_results": [
+        "stage done",
+        "audit entry",
+        "one intake issue"
+      ]
+    },
+    {
+      "id": "TC-47.4.5",
+      "verifies": [
+        "AC-47.4.6"
+      ],
+      "name": "outside lifecycle",
+      "type": "integration",
+      "preconditions": [
+        "a story an operator escalated"
       ],
       "steps": [
         "apply landed"
       ],
       "expected_results": [
-        "stage merged",
-        "review_missing escalation"
+        "escalated over :change_outside_lifecycle",
+        "event recorded"
+      ]
+    },
+    {
+      "id": "TC-47.4.6",
+      "verifies": [
+        "AC-47.4.7"
+      ],
+      "name": "not runner-reportable",
+      "type": "unit",
+      "preconditions": [],
+      "steps": [
+        "read runner_transitions/0"
+      ],
+      "expected_results": [
+        "no new edge present"
       ]
     }
   ],
   "technical_notes": [
-    "Load .claude/skills/chain-of-custody/SKILL.md before touching this.",
-    "Do not convert any exact_role gate to role:. Do not let commit_sha come from anything but the request body checked against the binding."
+    "Edges go in @transitions in lib/loopctl/delivery/stage_machine.ex.",
+    "For each new edge ask what writes the edge out of the stage it leaves stories in (the comment on absorbing stages in stage_machine.ex)."
   ],
   "dependencies": [
-    "US-47.1"
+    "US-47.3"
   ]
 }
