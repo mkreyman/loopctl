@@ -459,3 +459,32 @@ fn the_workspace_slot_follows_the_tree_not_the_spelling_of_its_path() {
     assert_eq!(s, slot_of(&mut dot_a));
     assert_ne!(s, slot_of(&mut dot_b));
 }
+
+#[test]
+fn inherited_chg_variables_never_reach_the_adapter() {
+    let dir = fixture("pnpm");
+    let repo = dir.path();
+    let manifest = std::fs::read_to_string(repo.join(".chg/adapter.toml")).unwrap();
+    std::fs::write(
+        repo.join(".chg/adapter.toml"),
+        manifest.replace(
+            r#"static   = "sh .chg/fake-adapter.sh static {base}""#,
+            r#"static   = "sh .chg/probe.sh {base}""#,
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".chg/probe.sh"),
+        "env | grep -E '^CHG_(SHA|COVER|RECORD|SHARD_BY)=' > probe.env\necho '{\"ok\":true,\"failures\":[]}'\n",
+    )
+    .unwrap();
+
+    exec(repo, &["static", "--base", "HEAD"])
+        .env("CHG_SHA", "0000000000000000000000000000000000000000")
+        .env("CHG_COVER", "/stale.cover")
+        .env("CHG_RECORD", "/stale.record")
+        .env("CHG_SHARD_BY", "/stale.record")
+        .assert()
+        .success();
+    assert_eq!(std::fs::read_to_string(repo.join("probe.env")).unwrap(), "");
+}

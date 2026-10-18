@@ -97,6 +97,11 @@ pub fn run(
     for v in crate::git::HOOK_ENV {
         command.env_remove(v);
     }
+    // Only chg decides what these say for this command: one inherited from a shell or a
+    // parent snapshot build would name the wrong commit or record.
+    for v in crate::adapter::ADAPTER_ENV {
+        command.env_remove(v);
+    }
     let mut child = command
         .arg("-c")
         .arg(&cmd)

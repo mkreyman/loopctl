@@ -34,6 +34,8 @@ fn cow_tempdir() -> Option<TempDir> {
 const SNAP: &str = r#"#!/bin/sh
 # Stand-in snapshot command: builds the artifacts once, then only what src/version changed.
 echo "$(pwd)" >> "$SNAP_LOG"
+# The tree has no .git; chg names its commit.
+mkdir -p _build; printf %s "$CHG_SHA" > _build/sha
 if [ -f _build/version ] && cmp -s src/version _build/version; then
   echo '{"work":"none","ms":1}'; exit 0
 fi
@@ -268,6 +270,7 @@ fn build_is_idempotent_and_incremental_from_the_previous_snapshot() {
         !snap1.join(".git").exists(),
         "a snapshot holds no git metadata"
     );
+    assert_eq!(fs::read_to_string(snap1.join("_build/sha")).unwrap(), one);
 
     // Same revision again: no adapter run at all.
     assert_eq!(e.build(&one)["status"], "exists");
@@ -289,6 +292,11 @@ fn build_is_idempotent_and_incremental_from_the_previous_snapshot() {
     );
     assert!(!snap2.join("src/gone.ex").exists());
     assert!(snap2.join("src/new.ex").exists());
+    assert_eq!(
+        fs::read_to_string(snap2.join("_build/sha")).unwrap(),
+        two,
+        "the adapter is told the new commit, not the one its cloned base was built at"
+    );
     assert!(
         snap2.join("deps/lib/dep.txt").exists(),
         "artifacts carried over by the clone"

@@ -22,6 +22,9 @@ pub enum Invoked {
 
 /// Runs `name` in `repo`. `slot` overrides the workspace slot derived from `repo`
 /// (a snapshot build passes one stable slot per repo, not one per temp dir).
+/// Every variable chg sets for an adapter command; `exec::run` removes inherited ones.
+pub const ADAPTER_ENV: [&str; 4] = ["CHG_COVER", "CHG_RECORD", "CHG_SHARD_BY", "CHG_SHA"];
+
 pub fn invoke(
     repo: &Path,
     name: CommandName,
@@ -65,8 +68,9 @@ pub fn invoke(
         slot.unwrap_or_else(|| exec::workspace_slot(repo)),
     );
 
-    // Coverage records (`cover.rs`): `record` and `shard_by` are not placeholders but files
-    // chg hands the adapter, and `affected` gets the record to judge by.
+    // Values chg hands the adapter as environment, not placeholders: the coverage files
+    // (`cover.rs`), with `affected` getting the record to judge by, and `sha`, the commit a
+    // snapshot build's tree holds, which has no `.git` to ask.
     let mut env = Vec::new();
     if name == CommandName::Affected {
         match coverage_record(repo, &manifest.always_all, &values["base"]) {
@@ -74,7 +78,11 @@ pub fn invoke(
             Err(why) => eprintln!("chg: not selecting by coverage: {why}"),
         }
     }
-    for (key, var) in [("record", "CHG_RECORD"), ("shard_by", "CHG_SHARD_BY")] {
+    for (key, var) in [
+        ("record", "CHG_RECORD"),
+        ("shard_by", "CHG_SHARD_BY"),
+        ("sha", "CHG_SHA"),
+    ] {
         if let Some(v) = values.remove(key) {
             env.push((var.to_string(), v));
         }

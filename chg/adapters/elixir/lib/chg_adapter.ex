@@ -87,6 +87,17 @@ defmodule ChgAdapter do
     {out, status}
   end
 
+  @doc """
+  The commit the tree holds: `CHG_SHA` when chg sets it (a snapshot build runs in a plain
+  tree with no `.git`), else git's HEAD.
+  """
+  def head! do
+    case System.get_env("CHG_SHA") do
+      sha when sha in [nil, ""] -> git!(["rev-parse", "HEAD"])
+      sha -> sha
+    end
+  end
+
   @doc "Trimmed stdout of a git command that must succeed."
   def git!(args) do
     case System.cmd("git", args, stderr_to_stdout: true) do

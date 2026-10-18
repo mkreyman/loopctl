@@ -60,7 +60,8 @@ async function snapshot(opts) {
   const started = Date.now();
   const key = {
     adapter: VERSION,
-    head: git.head(),
+    // A snapshot build runs in a plain tree with no .git; chg names its commit.
+    head: process.env.CHG_SHA || git.head(),
     lockfile: sha256(readFileSync(join(ROOT, "pnpm-lock.yaml"))),
     node: process.version,
     pnpm: (await capture("pnpm", ["--version"], { echo: false })).out.trim(),

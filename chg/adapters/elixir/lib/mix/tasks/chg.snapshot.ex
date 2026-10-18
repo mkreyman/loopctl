@@ -2,11 +2,13 @@ defmodule Mix.Tasks.Chg.Snapshot do
   @shortdoc "Builds the artifacts of a chg snapshot (contract command `snapshot`)"
   @moduledoc """
   Brings `deps`, `_build/{dev,test}`, the dialyzer PLT and the test reference cache up to
-  date with HEAD, incrementally from whatever is already there.
+  date with the commit the tree holds, incrementally from whatever is already there. chg
+  names that commit in `CHG_SHA`, since a snapshot tree has no `.git`; run by hand in a
+  checkout, it is git's HEAD (`ChgAdapter.head!/0`).
 
       mix chg.snapshot
 
-  Idempotent: when HEAD, `mix.lock` and the toolchain match the marker the last
+  Idempotent: when that commit, `mix.lock` and the toolchain match the marker the last
   successful run wrote, it does nothing and reports `{"work":"none"}`. The marker is
   written last, so an interrupted run is redone, never trusted.
 
@@ -82,7 +84,7 @@ defmodule Mix.Tasks.Chg.Snapshot do
 
     Enum.join(
       [
-        ChgAdapter.git!(["rev-parse", "HEAD"]),
+        ChgAdapter.head!(),
         Base.encode16(:crypto.hash(:sha256, lock), case: :lower),
         System.version(),
         System.otp_release()

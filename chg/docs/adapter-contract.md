@@ -26,6 +26,8 @@ A placeholder is `{` + lowercase letters or underscores + `}`. Anything else in 
 
 Commands run under `sh -c` from the repo root with stdin closed. Substituted values are shell-quoted. `chg` resolves the repo path canonically before use. `{workspace_slot}` is a stable id derived from the workspace path, so two workspaces on one machine never share a test database.
 
+`snapshot` runs in a plain tree with no `.git`, so `chg` exports `CHG_SHA`, the commit that tree holds. An adapter that keys its work on the commit reads `CHG_SHA` and asks git only when it is unset (`chg adapter exec snapshot` in a checkout). `chg` removes an inherited `CHG_SHA`, `CHG_COVER`, `CHG_RECORD` or `CHG_SHARD_BY` before every command, so each one is set only where this contract says.
+
 ## Output
 
 Each command prints one JSON document as the **last non-empty line of stdout**. Earlier stdout lines (`mix` prints `Compiling …` there) are passed through to stderr. Every schema rejects unknown fields.

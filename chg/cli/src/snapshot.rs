@@ -96,10 +96,12 @@ pub fn build(repo: &Path, rev: &str) -> Result<Built, String> {
         "snap{}",
         store::fnv8(store.dir.as_os_str().as_encoded_bytes())
     );
+    // The temp dir is a plain tree with no `.git`, so the adapter cannot ask git which
+    // commit it is: it gets the sha as `CHG_SHA`.
     let doc = match adapter::invoke(
         &tmp,
         CommandName::Snapshot,
-        BTreeMap::new(),
+        BTreeMap::from([("sha", sha.clone())]),
         Some(slot),
         exec::default_timeout(CommandName::Snapshot),
     ) {

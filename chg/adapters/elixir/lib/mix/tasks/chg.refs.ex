@@ -24,7 +24,7 @@ defmodule Mix.Tasks.Chg.Refs do
         {:error, why} -> Mix.raise(why)
       end
 
-    sha = ChgAdapter.git!(["rev-parse", "HEAD"])
+    sha = ChgAdapter.head!()
     {computed, unknown} = Refs.build!(sha, graph)
 
     IO.puts(

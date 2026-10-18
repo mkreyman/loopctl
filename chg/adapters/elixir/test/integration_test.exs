@@ -43,7 +43,7 @@ defmodule ChgAdapter.IntegrationTest do
     ])
 
     git!(dir, ["commit", "-qm", "fixture"])
-    %{dir: dir, archives: archives, base: git!(dir, ["rev-parse", "HEAD"])}
+    %{dir: dir, root: root, archives: archives, base: git!(dir, ["rev-parse", "HEAD"])}
   end
 
   defp sh(cmd, args, dir, env) do
@@ -91,6 +91,13 @@ defmodule ChgAdapter.IntegrationTest do
     git!(ctx.dir, ["commit", "-qam", "reports"])
     assert snapshot!(ctx) == "incremental"
     assert snapshot!(ctx) == "none"
+  end
+
+  test "snapshot builds a tree with no .git from CHG_SHA, the reference cache too", ctx do
+    File.rm_rf!(Path.join(ctx.dir, ".git"))
+    env = [{"CHG_SHA", ctx.base}, {"GIT_CEILING_DIRECTORIES", ctx.root}]
+    assert {%{"work" => "full"}, 0} = chg(ctx, ["chg.snapshot"], env)
+    assert {%{"work" => "none"}, 0} = chg(ctx, ["chg.snapshot"], env)
   end
 
   test "affected selects a context's tests and its dependents' tests, and nothing unrelated",
